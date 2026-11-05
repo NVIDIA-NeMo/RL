@@ -1084,7 +1084,8 @@ class MegatronGenerationMixin:
     def prepare_for_generation(self, tags=None, **kwargs) -> None:
         """Enter inference mode and start (or wake) the inference engine.
 
-        Idempotent wake: a plain call (no tags) on an already-serving engine returns immediately.
+        Idempotent wake: a plain call (no tags) on an already-serving engine returns immediately;
+        a paused one is woken.
         Refit-protocol calls (tags) are never skipped.
 
         Called in both colocated and non-colocated setups.
@@ -1095,6 +1096,7 @@ class MegatronGenerationMixin:
             tags is None
             and self._inference_engine_initialized
             and not self._inference_engine_asleep
+            and not self._inference_engine_paused
         ):
             print(
                 f"[Rank {self.rank}] prepare_for_generation: engine already "

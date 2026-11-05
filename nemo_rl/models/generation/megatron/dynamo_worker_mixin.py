@@ -409,9 +409,12 @@ class MegatronDynamoGenerationMixin:
         retry an unreachable coordinator; callers that need the release to land
         retry this call.
 
+        Every coordinator is attested concurrently, so one unreachable
+        coordinator does not keep the others from releasing their pins.
+
         Returns:
             True when every coordinator accepted the attestation; False (after
-            logging) when any call failed or timed out.
+            logging each failure) when any call failed or timed out.
         """
         if not coordinator_addresses:
             return True
@@ -423,22 +426,37 @@ class MegatronDynamoGenerationMixin:
             confirm_terminated,
         )
 
-        async def _attest() -> None:
-            for address in coordinator_addresses:
-                await confirm_terminated(address, owner, timeout=timeout_s)
+        async def _attest() -> list[Any]:
+            return await asyncio.gather(
+                *(
+                    confirm_terminated(address, owner, timeout=timeout_s)
+                    for address in coordinator_addresses
+                ),
+                return_exceptions=True,
+            )
 
         future = asyncio.run_coroutine_threadsafe(_attest(), self._inference_loop)
         try:
-            future.result(timeout=timeout_s * len(coordinator_addresses) + 5.0)
+            results = future.result(timeout=timeout_s + 5.0)
         except Exception:
             LOGGER.exception(
-                "handoff recovery for decode owner %s failed on %s",
+                "handoff recovery for decode owner %s did not finish on %s",
                 owner,
                 coordinator_addresses,
             )
             future.cancel()
             return False
-        return True
+        failed = False
+        for address, result in zip(coordinator_addresses, results, strict=True):
+            if isinstance(result, BaseException):
+                failed = True
+                LOGGER.error(
+                    "handoff recovery for decode owner %s failed on %s",
+                    owner,
+                    address,
+                    exc_info=result,
+                )
+        return not failed
 
     def _start_dynamo_event_reporter(
         self, parent_event_address: str

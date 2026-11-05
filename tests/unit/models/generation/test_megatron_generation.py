@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import gc
+import threading
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -1773,3 +1775,132 @@ def test_finish_generation_clears_router_replay_record_state(monkeypatch):
         assert RouterReplay.global_router_replay_instances == [replay]
     finally:
         RouterReplay.clear_global_router_replay_instances()
+
+
+class _ControlSignalEngine:
+    """Applies Megatron-LM's control-signal state checks to pause/suspend/wake."""
+
+    def __init__(self):
+        from megatron.core.inference.engines.dynamic_engine import EngineState
+
+        self.states = EngineState
+        self.state = EngineState.RUNNING
+        self.log = []
+
+    def signal(self, header):
+        self.log.append(header)
+        states = self.states
+        if header == "pause":
+            if self.state == states.RUNNING:
+                self.state = states.PAUSED
+        elif header == "unpause":
+            assert self.state == states.PAUSED, f"UNPAUSE in {self.state}"
+            self.state = states.RUNNING
+        elif header == "suspend":
+            assert self.state == states.PAUSED, f"SUSPEND in {self.state}"
+            self.state = states.SUSPENDED
+        elif header == "resume":
+            assert self.state == states.SUSPENDED, f"RESUME in {self.state}"
+            self.state = states.PAUSED
+
+    async def wait_until(self, state):
+        # RESUMED is reached on the way back to PAUSED.
+        target = {self.states.RESUMED: self.states.PAUSED}.get(state, state)
+        assert self.state == target, (state, self.state)
+
+
+@pytest.fixture
+def serving_worker(monkeypatch):
+    """A running engine on a real inference loop, driven through its client."""
+    from nemo_rl.models.generation.megatron.megatron_worker import (
+        MegatronGenerationRefitMixin,
+    )
+
+    class _Worker(MegatronGenerationRefitMixin, MegatronGenerationMixin):
+        pass
+
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda *a, **k: 0)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda *a, **k: None)
+    worker = object.__new__(_Worker)
+    worker._init_inference_engine_state()
+    worker.rank = 0
+    engine = _ControlSignalEngine()
+    worker.dynamic_inference_engine = engine
+    worker.inference_client = SimpleNamespace(
+        pause_engines=lambda: engine.signal("pause"),
+        unpause_engines=lambda: engine.signal("unpause"),
+        suspend_engines=lambda: engine.signal("suspend"),
+        resume_engines=lambda: engine.signal("resume"),
+    )
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    worker._inference_loop = loop
+    worker._inference_engine_initialized = True
+    worker._inference_engine_asleep = False
+    yield worker, engine
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(timeout=5)
+
+
+@pytest.mark.mcore
+def test_pause_then_suspend_does_not_pause_twice(serving_worker):
+    worker, engine = serving_worker
+    worker.pause_for_refit()
+    worker.pause_for_refit()
+    assert engine.log == ["pause"]
+
+    worker.suspend_for_refit()
+    assert engine.log == ["pause", "suspend"]
+    assert worker._inference_engine_asleep
+    assert not worker._inference_engine_paused
+
+    worker.resume_after_refit()
+    assert engine.log == ["pause", "suspend", "resume", "unpause"]
+    assert engine.state == engine.states.RUNNING
+
+
+@pytest.mark.mcore
+def test_abandoned_pause_unpauses(serving_worker):
+    worker, engine = serving_worker
+    worker.pause_for_refit()
+    worker.resume_after_refit()
+    assert engine.log == ["pause", "unpause"]
+    assert engine.state == engine.states.RUNNING
+
+    # A full suspend/wake cycle still works afterwards.
+    worker.suspend_for_refit()
+    worker.resume_after_refit()
+    assert engine.state == engine.states.RUNNING
+
+
+@pytest.mark.mcore
+def test_pause_after_suspend_is_a_noop(serving_worker):
+    worker, engine = serving_worker
+    worker.suspend_for_refit()
+    worker.pause_for_refit()
+    assert engine.log == ["pause", "suspend"]
+
+
+@pytest.mark.mcore
+def test_untagged_prepare_wakes_a_paused_engine(serving_worker, monkeypatch):
+    from nemo_rl.models.generation.megatron import megatron_worker as worker_module
+
+    worker, engine = serving_worker
+    monkeypatch.setattr(worker_module, "log_gpu_memory", lambda tag: None)
+    worker.cfg = {
+        "generation": {"mcore_generation_config": {"cuda_graph_impl": "none"}}
+    }
+    worker._colocated_reshard_plan = None
+    worker.is_generation_colocated = False
+    worker.inference_model = None
+    inference_model = torch.nn.Module()
+    inference_model.config = SimpleNamespace()
+    worker._inference_model_and_media_parts = lambda: (inference_model, None)
+
+    worker.pause_for_refit()
+    worker.prepare_for_generation()
+
+    assert engine.log == ["pause", "unpause"]
+    assert engine.state == engine.states.RUNNING
+    assert not worker._inference_engine_paused

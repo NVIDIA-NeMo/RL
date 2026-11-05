@@ -173,6 +173,8 @@ class _FakeEngine:
         self.short = _SHORT.get(self.name, self.name)
         self.env = env
         self.alive = True
+        # The probe raises RayActorError, as Ray does for a dead actor.
+        self.actor_dead = False
         self.coordinator = None
         self.fail_shutdown = False
         self.unclean_shutdown = False
@@ -201,12 +203,16 @@ class _FakeEngine:
 
     def call(self, rank: int, method: str, kwargs: dict) -> _Ref:
         if method == "is_alive":
+            if self.actor_dead:
+                return _Ref(error=ray.exceptions.RayActorError())
             return _Ref(self.alive)
         if method in (
             "start_dynamo_endpoint",
             "attach_dynamo_events",
             "dynamo_endpoint_metadata",
             "stop_dynamo_endpoint",
+            "confirm_decode_terminated",
+            "dynamo_coordinator_address",
             "dynamo_endpoint_error",
         ):
             if self.faults.get(method) == "hang":
@@ -294,13 +300,19 @@ class _FakeEngine:
         assert rank == 0
         return self.endpoint_error
 
-    def confirm_decode_terminated(self, addresses, owner, timeout_s):
+    def _confirm_decode_terminated(
+        self, rank, *, coordinator_addresses, owner, timeout_s
+    ):
+        assert rank == 0
         if self.fail_calls:
             raise RuntimeError(f"engine {self.name} is gone")
-        self.log.append(f"confirm {self.name} {owner} {addresses} {timeout_s}")
+        self.log.append(
+            f"confirm {self.name} {owner} {coordinator_addresses} {timeout_s}"
+        )
         return not self.reject_attestation
 
-    def dynamo_coordinator_address(self):
+    def _dynamo_coordinator_address(self, rank):
+        assert rank == 0
         return self.coordinator
 
     def shutdown(self):
@@ -875,7 +887,7 @@ def test_shutdown_stops_decode_attests_owners_then_prefill_then_the_runtime(
     _start_endpoints(generation)
     if coordinator:
         env.engine("p0").coordinator = _COORDINATOR
-    assert generation.prefill_coordinator_addresses() == (
+    assert generation._prefill_coordinator_addresses() == (
         [_COORDINATOR] if coordinator else []
     )
     for short, flags in faults.items():
@@ -899,20 +911,23 @@ def test_shutdown_bounds_every_endpoint_call_and_still_stops_the_engines(env, ca
     """A hung endpoint call is cut off at the control timeout; the engine still stops."""
     generation = env.started()
     _start_endpoints(generation)
+    env.engine("p0").coordinator = _COORDINATOR
+    env.engine("d0").faults["dynamo_endpoint_metadata"] = "hang"
     env.engine("d1").faults["stop_dynamo_endpoint"] = "hang"
+    env.engine("p0").faults["confirm_decode_terminated"] = "hang"
     env.log.clear()
     env.ray.get_timeouts.clear()
 
-    with caplog.at_level("ERROR"):
+    with caplog.at_level("WARNING"):
         assert generation.shutdown() is True
 
     assert [line for line in env.log if line.startswith("engine ")] == [
-        "engine prefill-0 down",
         "engine decode-0 down",
         "engine decode-1 down",
+        "engine prefill-0 down",
     ]
-    assert "Could not stop a Megatron engine's Dynamo endpoint" in caplog.text
-    assert env.ray.get_timeouts == [_CONTROL_TIMEOUT_S] * len(_IDS)
+    assert "Decode engine decode-1 did not stop cleanly" in caplog.text
+    assert env.ray.get_timeouts and None not in env.ray.get_timeouts
 
 
 # ---------------------------------------------------------------------------
@@ -1005,7 +1020,17 @@ def test_check_alive_names_the_engine_whose_endpoint_stopped(env):
     ):
         generation.check_alive()
     # Both the liveness probe and the endpoint check are bounded.
-    assert env.ray.get_timeouts == [_CONTROL_TIMEOUT_S] * 2
+    assert env.ray.get_timeouts and None not in env.ray.get_timeouts
+
+
+def test_check_alive_counts_a_dead_actor_as_dead(env):
+    """A dead actor raises on the probe rather than answering False."""
+    generation = env.started()
+    env.engine("d0").actor_dead = True
+    env.engine("d1").actor_dead = True
+    with pytest.raises(RuntimeError, match="died: decode-0, decode-1") as raised:
+        generation.check_alive()
+    assert isinstance(raised.value.__cause__, ray.exceptions.RayActorError)
 
 
 def test_first_resume_starts_the_endpoints_and_awaits_the_frontend(env):
