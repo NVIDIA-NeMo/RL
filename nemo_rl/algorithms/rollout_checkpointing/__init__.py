@@ -11,11 +11,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Rollout checkpointing for the single controller.
-
-- ``snapshots``: ``RolloutSnapshotter`` saves rollout state.
-- ``restore``: ``RolloutRestorer`` restores it and redispatches what it loaded.
-- ``state``: the state both sides read and the parts they share.
-- ``inventory``: TQ inventory checks both sides run.
-"""
