@@ -1,0 +1,76 @@
+defaults: ../../grpo_math_1B.yaml
+# Per-tensor FP8 KV cache on Nano v3.5 (NemotronH + MTP), the hybrid counterpart of
+# grpo-qwen3-8b-base-1n8g-fp8-kvcache-megatron: KV scales go only to the attention
+# layers among the Mamba/MoE ones, and calibration covers the MTP heads' attention.
+# H100 blockwise FP8 cannot cover the routed experts (moe_intermediate_size 1856 is
+# not a multiple of 128), so rollout quantizes only the attention qkv/o projections.
+grpo:
+  val_period: 20
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3.5-30BA3B-2n8g-megatron-ep8tp2-fp8-kvcache
+loss_fn:
+  use_importance_sampling_correction: true
+policy:
+  model_name: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 8192
+  automodel_cfg:
+    enabled: false
+  optimizer: null
+  scheduler: null
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 2
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    activation_checkpointing: true
+    bias_activation_fusion: false
+    mtp_num_layers: 5
+    mtp_use_repeated_layer: true
+    mtp_detach_heads: true
+    mtp_loss_scaling_factor: 0.3
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.1
+      use_precision_aware_optimizer: false
+    scheduler:
+      lr_decay_iters: null
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-07
+  make_sequence_length_divisible_by: ${mul:${policy.megatron_cfg.tensor_model_parallel_size},
+    2}
+  generation:
+    vllm_cfg:
+      precision: fp8
+      kv_cache_dtype: fp8
+      tensor_parallel_size: 2
+      gpu_memory_utilization: 0.7
+      quantization_ignored_layer_kws:
+      - mixer.in_proj
+      - mixer.out_proj
+      - mixer.up_proj
+      - mixer.down_proj
+      - mixer.gate
+      - experts
+data:
+  max_input_seq_length: 2048
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  dapo:
+    num_workers: 16
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  wandb:
+    name: grpo-nanov3.5-30BA3B-2n8g-megatron-ep8tp2-fp8-kvcache
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2
