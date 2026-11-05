@@ -322,6 +322,7 @@ def _master_config(generation: dict) -> SimpleNamespace:
     """The fields MegatronGeneration.validate_settings reads, at accepted values."""
     return SimpleNamespace(
         policy=_policy(generation),
+        env={"should_use_nemo_gym": False},
         async_rl=SimpleNamespace(
             recompute_kv_cache_after_weight_updates=False,
             generation_fleet_health=SimpleNamespace(enabled=False),

@@ -321,9 +321,10 @@ class MegatronDynamoGeneration(GenerationInterface):
 
         MegatronGeneration.validate_settings(master_config)
         policy_config = master_config.policy
-        validate_megatron_dynamo_generation(policy_config["generation"])
         # The raw flag: should_use_nemo_gym() asserts the HTTP server is exposed,
-        # which this mode never does, so it cannot answer the question.
+        # which this mode never does, so it cannot answer the question. Checked
+        # before the generation block so a Gym config is told about Gym, not
+        # about expose_http_server.
         if master_config.env.get("should_use_nemo_gym"):
             # Gym needs a server URL before generation is built; the frontend's
             # is known only once the runtime is up.
@@ -332,6 +333,7 @@ class MegatronDynamoGeneration(GenerationInterface):
                 "with policy.generation.dynamo=true; set env.should_use_nemo_gym="
                 "false or leave policy.generation.dynamo false."
             )
+        validate_megatron_dynamo_generation(policy_config["generation"])
         if policy_config.get("is_vlm"):
             raise ValueError(
                 "policy.is_vlm=true is not supported with policy.generation.dynamo="

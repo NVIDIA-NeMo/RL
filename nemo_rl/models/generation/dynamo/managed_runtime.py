@@ -15,10 +15,10 @@
 """Driver-owned Dynamo services: etcd, NATS and the OpenAI frontend.
 
 The engines are NeMo RL's own workers; each registers itself with these
-services from inside its worker (vLLM: ``native_engine``; Megatron:
-``MegatronDynamoGenerationMixin.start_dynamo_endpoint``), so the runtime only
-launches the services and waits to see the engines. The ``dynamo.vllm``
-subprocess fleet keeps ``legacy_managed_runtime.LegacyManagedDynamoRuntime``.
+services from inside its worker (``MegatronDynamoPolicyWorker.start_dynamo_endpoint``),
+so the runtime only launches the services and waits to see the engines. The
+``dynamo.vllm`` subprocess fleet keeps
+``legacy_managed_runtime.LegacyManagedDynamoRuntime``.
 """
 
 import atexit

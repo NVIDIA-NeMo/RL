@@ -35,7 +35,7 @@ run_test() {
 
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dynamo.sh
 run_test uv run --no-sync bash ./tests/functional/grpo_dynamo_single_controller.sh
-run_test uv run --no-sync bash ./tests/functional/grpo_dynamo_pd_megatron_single_controller.sh
+# grpo_dynamo_pd_megatron_single_controller.sh joins once the Megatron-LM pin includes megatron/inference/integrations/dynamo.
 
 cd "${PROJECT_ROOT}/tests"
 if compgen -G ".coverage*" > /dev/null; then

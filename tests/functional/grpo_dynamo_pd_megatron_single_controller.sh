@@ -31,9 +31,12 @@ mkdir -p "${LOG_DIR}"
 git config --global --add safe.directory "${PROJECT_ROOT}"
 
 # The engines' Dynamo endpoints and the frontend run from the Megatron workers'
-# environment (the mcore extra carries ai-dynamo); etcd and nats-server come
-# from NEMO_RL_DYNAMO_BIN_DIR, PATH, or the image's Dynamo venv.
-uv run --no-sync --extra mcore python -c \
+# venv (the mcore extra carries ai-dynamo); etcd and nats-server come from
+# NEMO_RL_DYNAMO_BIN_DIR, PATH, or the image's Dynamo venv.
+MCORE_VENV_ROOT="${NEMO_RL_VENV_DIR:-${PROJECT_ROOT}/venvs}"
+MCORE_PYTHON="${MCORE_VENV_ROOT}/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronDynamoPolicyWorker/bin/python"
+(cd "${PROJECT_ROOT}" && uv run --no-sync nemo_rl/utils/prefetch_venvs.py megatron_policy_worker.MegatronDynamoPolicyWorker)
+"${MCORE_PYTHON}" -c \
   'import importlib.metadata as m; assert m.version("ai-dynamo") == "1.5.1"'
 uv run --no-sync python -c \
   'from nemo_rl.models.generation.dynamo.managed_runtime import _service_executable as e; e("etcd"); e("nats-server")'

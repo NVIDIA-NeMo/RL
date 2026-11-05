@@ -260,8 +260,9 @@ What runs:
   forwards requests to the coordinator, and carries the KV handoff between
   prefill and decode over NIXL. The `mcore` extra carries `ai-dynamo` for this.
 - **Frontend, etcd, NATS.** Driver-owned `ManagedDynamoRuntime`
-  (`dynamo/managed_runtime.py`, shared with the vLLM backend), started by
-  `MegatronGeneration` once the engines' workers exist. The frontend runs from
+  (`dynamo/managed_runtime.py`; the vLLM `DynamoGeneration` still uses
+  `LegacyManagedDynamoRuntime`), started by
+  `MegatronDynamoGeneration` once the engines' workers exist. The frontend runs from
   the Megatron workers' environment. Prefill
   engines register as the `prefill` component and decode engines as `backend`;
   the frontend's prefill router splits each request between them. Rollouts are
@@ -338,7 +339,8 @@ Limits:
 
 The functional test is
 `tests/functional/grpo_dynamo_pd_megatron_single_controller.sh` (three GPUs:
-trainer, prefill, decode).
+trainer, prefill, decode). It is not in the L1 Dynamo suite until the pinned
+Megatron-LM includes the Dynamo integration.
 
 ## Run SWE1 with W&B
 

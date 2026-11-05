@@ -1764,3 +1764,14 @@ def test_validate_settings(settings, match) -> None:
     else:
         with pytest.raises((ValueError, NotImplementedError), match=match):
             MegatronDynamoGeneration.validate_settings(master_config)  # type: ignore[arg-type]
+
+
+def test_validate_settings_refuses_gym_before_the_server_checks() -> None:
+    # A Gym config exposes the HTTP server (should_use_nemo_gym() asserts it
+    # does); it must hear about Gym, not about expose_http_server.
+    master_config = _master_config(gym=True)
+    master_config.policy["generation"]["mcore_generation_config"][
+        "expose_http_server"
+    ] = True
+    with pytest.raises(NotImplementedError, match="NeMo-Gym rollouts are not yet"):
+        MegatronDynamoGeneration.validate_settings(master_config)  # type: ignore[arg-type]
