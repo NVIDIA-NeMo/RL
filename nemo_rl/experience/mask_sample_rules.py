@@ -11,47 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Controller-side ``mask_sample`` rules evaluated on the Gym ``/run`` response.
+"""``env.mask_sample_rules``: mask NeMo-Gym rollouts by fields of their response.
 
-Environments can already ask GRPO to drop a sample from the loss by setting
-``instance_config.mask_sample`` in their response. Many environments never
-do, even when the response says the sample is not a clean policy outcome
-(the verifier did not finish, the agent harness was cut off). These rules let
-the RL side derive that flag from fields the response already carries, with
-no environment change::
+Sets the same ``instance_config.mask_sample`` flag an environment would, for
+samples the environment does not flag itself::
 
     env:
       mask_sample_rules:
-        - name: eval_incomplete        # verifier timed out / errored -> reward is not a policy signal
+        - name: eval_incomplete
           field: evaluation_completed
           equals: false
-        - name: harness_unfinished     # agent harness hit sandbox_timeout or an exec error
-          field: opencode_finished
-          equals: false
-        - name: too_many_compactions   # drop rollouts that compacted more than 3 times
-          field: opencode_num_compactions
-          gt: 3
 
-A rule carries a dotted ``field`` and exactly one operator key:
-
-* ``equals`` matches when the field's value equals the operand, type-strict
-  for booleans (``equals: false`` does not match ``0``, ``""`` or ``null``).
-* ``gt`` / ``ge`` / ``lt`` / ``le`` compare numerically. They match only an
-  ``int`` or ``float`` value that is not a ``bool``; any other value never
-  matches. The operand must be a non-bool number.
-
-A rule with zero or several operator keys, or any key besides ``name`` and
-``field``, is a config error. A missing field never matches. A match sets the
-same ``instance_config.mask_sample`` flag an environment would, so everything
-downstream treats the row as env-flagged: the finalizer's ``mask_sample``
-column and the advantage stage's ``final_sample_mask``. Per-group match rates
-are logged as ``mask_rules/<name>_rate`` (with ``mask_rules/<name>_reward_mean``
-and ``mask_rules/any_rate``), and step totals as ``mask_rules/<name>_count``.
-
-The ``env.should_mask_flagged_samples`` gate drops the environment's own
-(possibly too coarse) flags, but not a flag one of these rules set: the rules
-are explicit operator choices and are honored regardless. An empty list, the
-default, leaves every code path exactly as before.
+Rules apply after the ``env.should_mask_flagged_samples`` gate.
 """
 
 from __future__ import annotations
@@ -77,8 +48,6 @@ from nemo_rl.data_plane.schema import MASK_SAMPLE
 ENV_MASK_SAMPLE_RULES_KEY = "mask_sample_rules"
 
 EQUALS = "equals"
-# Operator key -> numeric predicate (field value, operand). ``equals`` is handled
-# separately because it is type-strict rather than numeric.
 _COMPARATORS: dict[str, Callable[[Any, Any], bool]] = {
     "gt": _op.gt,
     "ge": _op.ge,
@@ -87,25 +56,20 @@ _COMPARATORS: dict[str, Callable[[Any, Any], bool]] = {
 }
 OPERATORS: tuple[str, ...] = (EQUALS, *_COMPARATORS)
 
-# Strict types: YAML ``"3"`` or ``true`` is never coerced into a number.
+# Strict, so YAML ``"3"`` or ``true`` is not coerced into a number.
 _Number = StrictInt | StrictFloat
 
 
 def _is_number(value: Any) -> bool:
-    """True for int/float values; bools are numbers in Python but never here."""
+    """True for int/float, but not bool."""
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 class MaskSampleRule(BaseModel, extra="forbid", frozen=True):
-    """One ``env.mask_sample_rules`` entry: mask a sample when ``field`` matches.
+    """One rule; exactly one operator key is set (``equals: null`` counts)."""
 
-    Exactly one operator key is set. Which one is decided by the keys the
-    rule was written with, so ``equals: null`` is a valid rule.
-    """
-
-    # Metric suffix; defaults to ``field`` with dots replaced by underscores.
+    # Defaults to ``field`` with dots replaced by underscores.
     name: StrictStr
-    # Dotted path into the Gym response, e.g. ``stats.duration_s``.
     field: StrictStr
     equals: Optional[StrictBool | StrictInt | StrictFloat | StrictStr] = None
     gt: Optional[_Number] = None
@@ -195,7 +159,7 @@ def _lookup(result: Mapping[str, Any], dotted: str) -> tuple[bool, Any]:
 
 
 def _equals(value: Any, equals: Any) -> bool:
-    # Type-strict for booleans: `equals: false` must not match a 0 or an empty string.
+    # `equals: false` must not match 0 or "".
     if isinstance(value, bool) or isinstance(equals, bool):
         return isinstance(value, bool) and isinstance(equals, bool) and value == equals
     return value == equals
@@ -204,8 +168,6 @@ def _equals(value: Any, equals: Any) -> bool:
 def _matches(value: Any, rule: MaskSampleRule) -> bool:
     if rule.operator == EQUALS:
         return _equals(value, rule.equals)
-    # Comparators only look at real numbers: a bool, str, None, list or mapping
-    # in the field is "not comparable" and never matches (NaN compares False too).
     if not _is_number(value):
         return False
     return bool(_COMPARATORS[rule.operator](value, rule.operand))
@@ -249,13 +211,7 @@ def mask_rule_step_metrics(
     any_count: int,
     rollouts_seen: int,
 ) -> dict[str, float]:
-    """Step-level rule metrics, logged by the controller under ``train/``.
-
-    ``mask_rules/rollouts_seen``, and per rule ``mask_rules/<name>_count``,
-    ``mask_rules/<name>_frac`` (of rollouts seen) and ``mask_rules/<name>_reward_mean``
-    (when it matched), plus ``mask_rules/any_count`` / ``mask_rules/any_frac``.
-    Empty when no rules are configured or no rollout was seen.
-    """
+    """Step-level ``mask_rules/*`` metrics; empty when there are no rules."""
     if not rules or rollouts_seen <= 0:
         return {}
     out: dict[str, float] = {"mask_rules/rollouts_seen": float(rollouts_seen)}
@@ -278,12 +234,7 @@ def mask_rule_metrics(
     reward_sums: Mapping[str, float] | None = None,
     any_count: int = 0,
 ) -> dict[str, float]:
-    """Per-group rule metrics attached to the group's rollout_metrics.
-
-    ``mask_rules/<name>_rate`` for every configured rule (0.0 when unmatched),
-    ``mask_rules/<name>_reward_mean`` when the rule matched (mean reward of the
-    rows it masked), and ``mask_rules/any_rate`` (rows masked by at least one rule).
-    """
+    """Per-group ``mask_rules/*`` metrics; empty when there are no rules."""
     if not rules or num_results <= 0:
         return {}
     out: dict[str, float] = {}
