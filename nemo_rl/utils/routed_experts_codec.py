@@ -29,6 +29,7 @@ depend on torch.
 """
 
 import base64
+import hashlib
 from typing import Any, Union
 
 import torch
@@ -42,12 +43,8 @@ _WIRE_TORCH_DTYPES = {
 _TORCH_DTYPE_NAMES = {v: k for k, v in _WIRE_TORCH_DTYPES.items()}
 
 
-def encode_routed_experts(routed_experts: torch.Tensor) -> str:
-    """Encode a [tokens, num_moe_layers, topk] tensor as a base64 envelope.
-
-    The tensor's own dtype (int8/int16/int32, as resolved by
-    ``resolve_routed_experts_dtype``) is preserved on the wire.
-    """
+def _route_array(routed_experts: torch.Tensor) -> tuple[str, Any]:
+    """Validate a route tensor; return its wire dtype name and CPU array."""
     if routed_experts.dim() != 3:
         raise ValueError(
             "routed_experts must have shape [tokens, num_moe_layers, topk], "
@@ -59,7 +56,32 @@ def encode_routed_experts(routed_experts: torch.Tensor) -> str:
             f"Unsupported routed_experts dtype {routed_experts.dtype}; "
             f"expected one of {sorted(_WIRE_TORCH_DTYPES)}."
         )
-    arr = routed_experts.detach().cpu().contiguous().numpy()
+    return dtype_name, routed_experts.detach().cpu().contiguous().numpy()
+
+
+def routed_experts_tensor_metadata(routed_experts: torch.Tensor) -> dict[str, Any]:
+    """Bind a captured route tensor to its dtype, shape, and content checksum.
+
+    Capture stages the tensor directly. Only this small descriptor enters Gym's
+    extras digest; consumers recreate it from the stored tensor for verification.
+    Hash contiguous little-endian bytes without allocating a base64 payload.
+    """
+    dtype_name, arr = _route_array(routed_experts)
+    arr = arr.astype(arr.dtype.newbyteorder("<"), copy=False)
+    return {
+        "dtype": dtype_name,
+        "shape": list(arr.shape),
+        "sha256": hashlib.sha256(memoryview(arr)).hexdigest(),
+    }
+
+
+def encode_routed_experts(routed_experts: torch.Tensor) -> str:
+    """Encode a [tokens, num_moe_layers, topk] tensor as a base64 envelope.
+
+    The tensor's own dtype (int8/int16/int32, as resolved by
+    ``resolve_routed_experts_dtype``) is preserved on the wire.
+    """
+    dtype_name, arr = _route_array(routed_experts)
     tokens, num_layers, topk = arr.shape
     # memoryview feeds the buffer to b64encode zero-copy; tobytes() would
     # materialize a full-size intermediate copy of the payload.
@@ -104,3 +126,14 @@ def decode_routed_experts(payload: Union[str, Any], dtype: torch.dtype) -> torch
         return torch.empty(shape, dtype=dtype)
     tensor = torch.frombuffer(raw, dtype=wire_dtype).reshape(shape)
     return tensor if tensor.dtype == dtype else tensor.to(dtype)
+
+
+def slice_routed_experts(
+    routed_experts: torch.Tensor, start: int, end: int
+) -> torch.Tensor:
+    """Return ``routed_experts[start:end]`` with its own storage.
+
+    A plain slice is a view, so serializing one message would carry the full
+    sample buffer. Cloning makes each message own only its token span.
+    """
+    return routed_experts[start:end].clone()

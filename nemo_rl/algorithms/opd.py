@@ -25,13 +25,15 @@ import asyncio
 import time
 import uuid
 from collections.abc import Iterable
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Literal, Optional
 
 import ray
 import torch
 from pydantic import BaseModel, Field, model_validator
+from tensordict import TensorDict
 
-from nemo_rl.data_plane.column_io import read_columns, write_columns
+from nemo_rl.data.multimodal_utils import teacher_multimodal_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import (
     OPD_FULL_HIDDEN_STATES_FIELD,
@@ -43,7 +45,7 @@ from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
     prepare_segment_topology,
 )
-from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.environments.nemo_gym_task import get_nemo_gym_attribution_key
 
 if TYPE_CHECKING:
     # Imported for typing only: teacher_worker_group imports this module's
@@ -73,14 +75,39 @@ class TeacherResourceConfig(BaseModel, extra="allow"):
     megatron_cfg_overrides: dict[str, Any] = Field(default_factory=dict)
 
 
+class TeacherResourceOverrides(BaseModel, extra="allow"):
+    """Partial ``TeacherResourceConfig`` whose fields all default to ``None``.
+
+    An omitted field therefore never clobbers ``default_teacher_cfg`` in the
+    defaults<-override merge (these blocks reach the merge via
+    ``model_dump(exclude_none=True)`` in ``_opd_cfg``, which strips unset
+    fields). The merged result is validated as ``TeacherResourceConfig`` in
+    ``create_teacher_configs_from_opd_config``.
+    """
+
+    tensor_model_parallel_size: Optional[int] = None
+    pipeline_model_parallel_size: Optional[int] = None
+    context_parallel_size: Optional[int] = None
+    expert_model_parallel_size: Optional[int] = None
+    num_nodes: Optional[int] = None
+    gpus_per_node: Optional[int] = None
+    precision: Optional[str] = None
+    micro_batch_size: Optional[int] = None
+    megatron_cfg_overrides: Optional[dict[str, Any]] = None
+
+
 class NonColocatedTeachersConfig(BaseModel, extra="allow"):
-    """Non-colocated (separate-GPU) teacher resourcing for on-policy distillation."""
+    """Non-colocated (separate-GPU) teacher resourcing for on-policy distillation.
+
+    Per-alias overrides merge shallowly with defaults: ``megatron_cfg_overrides``
+    replaces the default dictionary, while extra top-level keys merge individually.
+    """
 
     enabled: bool = False
     default_teacher_cfg: TeacherResourceConfig = Field(
         default_factory=TeacherResourceConfig
     )
-    teacher_overrides: dict[str, TeacherResourceConfig] = Field(default_factory=dict)
+    teacher_overrides: dict[str, TeacherResourceOverrides] = Field(default_factory=dict)
 
 
 class OnPolicyDistillationFullConfig(BaseModel, extra="allow"):
@@ -307,19 +334,20 @@ def assert_trust_region_supported(master_config: Any) -> None:
 
 
 def resolve_reference_aliases(
-    agent_refs: list[dict],
+    agent_refs: list[dict] | list[str],
     teacher_model_by_agent_name: dict[str, str],
     default_teacher_alias: Optional[str] = None,
     strict_agent_name_match: bool = False,
 ) -> list[str]:
-    """Map each agent_ref to a teacher alias.
+    """Map attribution keys or legacy agent references to teacher aliases.
 
-    Unmapped agents fall back to ``default_teacher_alias``; with
-    ``strict_agent_name_match`` an unmapped agent raises instead.
+    Keys are tasksets for materialized tasks and resolved agent names for flat
+    rows. Unmapped keys fall back to ``default_teacher_alias``; with
+    ``strict_agent_name_match`` an unmapped key raises instead.
     """
     aliases: list[str] = []
     for ref in agent_refs:
-        name = ref["name"]
+        name = ref if isinstance(ref, str) else ref["name"]
         if name in teacher_model_by_agent_name:
             aliases.append(name)
         elif strict_agent_name_match:
@@ -419,17 +447,18 @@ class TQTeacherLogprobCoordinator:
         self._teacher_lock_wait_time_s = 0.0
         self._aliases_seen: set[str] = set()
 
-    def _resolve_teacher(self, record: PromptGroupRecord) -> tuple[str, str]:
-        extra_env_info = record.extra_env_info
-        agent_ref = (
-            extra_env_info.get("agent_ref")
+    def _resolve_teacher(
+        self, extra_env_info: Optional[dict[str, Any]]
+    ) -> tuple[str, str]:
+        attribution_key = (
+            get_nemo_gym_attribution_key(extra_env_info)
             if isinstance(extra_env_info, dict)
             else None
         )
-        if not isinstance(agent_ref, dict):
+        if attribution_key is None:
             raise ValueError(
                 "on_policy_distillation is enabled but this prompt group has no "
-                "extra_env_info['agent_ref'] mapping to route it to a teacher. "
+                "NeMo-Gym attribution key to route it to a teacher. "
                 "SingleController MOPD requires the NeMo-Gym rollout path, and "
                 "regenerating this prompt cannot repair missing routing metadata."
             )
@@ -438,7 +467,7 @@ class TQTeacherLogprobCoordinator:
             self._opd_cfg.get("teacher_model_by_agent_name", {})
         )
         alias = resolve_reference_aliases(
-            [agent_ref],
+            [attribution_key],
             teacher_model_by_agent_name,
             default_teacher_alias=self._opd_cfg.get("default_teacher_alias"),
             strict_agent_name_match=bool(
@@ -477,18 +506,14 @@ class TQTeacherLogprobCoordinator:
             if remainder:
                 pad_count = dp_size - remainder
                 source_meta = meta.slice(actual_batch_size - 1, actual_batch_size)
-                source_data = read_columns(
-                    self._dp_client,
-                    source_meta,
-                    select_fields=TEACHER_LP_FIELDS,
-                    pad_value_dict={"input_ids": 0},
+                teacher_fields = [*TEACHER_LP_FIELDS, *teacher_multimodal_fields(meta)]
+                # Clone the wire row directly: decoding/re-encoding packed media
+                # would omit empty columns when the last row is text-only.
+                source_data = self._dp_client.get_samples(
+                    sample_ids=source_meta.sample_ids,
+                    partition_id=source_meta.partition_id,
+                    select_fields=teacher_fields,
                 )
-                input_ids = source_data["input_ids"]
-                input_lengths = source_data["input_lengths"]
-                if not isinstance(input_ids, torch.Tensor) or not isinstance(
-                    input_lengths, torch.Tensor
-                ):
-                    raise TypeError("MOPD teacher padding inputs must be tensors")
                 temporary_prefix = uuid.uuid4().hex
                 temporary_sample_ids = [
                     f"{meta.sample_ids[-1]}__teacher_pad_{temporary_prefix}_{index}"
@@ -498,20 +523,35 @@ class TQTeacherLogprobCoordinator:
                     partition_id=meta.partition_id,
                     task_name=meta.task_name,
                     sample_ids=temporary_sample_ids,
-                    fields=list(TEACHER_LP_FIELDS),
+                    fields=teacher_fields,
                     sequence_lengths=[meta.sequence_lengths[-1]] * pad_count,
+                    tags=(
+                        [deepcopy(source_meta.tags[0]) for _ in range(pad_count)]
+                        if source_meta.tags is not None
+                        else None
+                    ),
                 )
+                padding_fields: dict[str, torch.Tensor] = {}
+                for field in teacher_fields:
+                    value = source_data[field]
+                    if not isinstance(value, torch.Tensor):
+                        raise TypeError(
+                            f"MOPD teacher padding field {field!r} must be a tensor"
+                        )
+                    padding_fields[field] = (
+                        torch.nested.as_nested_tensor(
+                            [value.unbind()[0]] * pad_count, layout=value.layout
+                        )
+                        if value.is_nested
+                        else value.expand(pad_count, *value.shape[1:])
+                    )
                 # Keep this write inside the cleanup lifetime. A backend may
                 # write only some rows before reporting failure.
-                write_columns(
-                    self._dp_client,
-                    pad_meta,
-                    fields={
-                        "input_ids": input_ids.expand(pad_count, *input_ids.shape[1:]),
-                        "input_lengths": input_lengths.expand(
-                            pad_count, *input_lengths.shape[1:]
-                        ),
-                    },
+                self._dp_client.put_samples(
+                    sample_ids=temporary_sample_ids,
+                    partition_id=meta.partition_id,
+                    fields=TensorDict(padding_fields, batch_size=[pad_count]),
+                    tags=pad_meta.tags,
                 )
                 padded_meta = meta.concat(pad_meta)
 
@@ -542,10 +582,10 @@ class TQTeacherLogprobCoordinator:
     async def enrich(
         self,
         meta: KVBatchMeta,
-        record: PromptGroupRecord,
+        extra_env_info: Optional[dict[str, Any]],
     ) -> KVBatchMeta:
         """Write teacher logprobs before the replay-buffer slot becomes ready."""
-        alias, group_alias = self._resolve_teacher(record)
+        alias, group_alias = self._resolve_teacher(extra_env_info)
         started_at = time.perf_counter()
         lock_started_at = time.perf_counter()
         # Wait for a physical teacher without occupying a default-executor

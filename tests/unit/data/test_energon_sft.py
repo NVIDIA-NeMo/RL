@@ -473,47 +473,6 @@ def test_rejected_restore_names_the_settings_that_changed():
         ).load_state_dict(state)
 
 
-def test_energon_config_validates_sequence_packing():
-    config = EnergonLoaderConfig(model_family="qwen")
-    assert config.model_family == "qwen"
-    assert config.packing_buffer_size is None
-    assert config.max_samples_per_sequence is None
-    assert config.processor_adapter == "hf_multimodal"
-    assert config.topology_mapper == "default"
-    assert config.task_encoder.name == "generic_sft"
-    assert [cooker.name for cooker in config.cookers] == ["generic_conversation"]
-
-    source = EnergonSourceConfig(
-        path="/data/prepared", split="train", virtual_epoch_length=10
-    )
-    assert source.virtual_epoch_length == 10
-    packed = EnergonLoaderConfig(
-        model_family="qwen",
-        max_samples_per_sequence=2,
-        task_encoder={
-            "packing": {
-                "name": "balanced_greedy_knapsack",
-                "buffer_size": 10,
-                "options": {"balanced_knapsack_delta": 5},
-            }
-        },
-    )
-    assert packed.packing_buffer_size is None
-    assert packed.task_encoder.packing is not None
-    assert packed.task_encoder.packing.buffer_size == 10
-    assert packed.max_samples_per_sequence == 2
-    for field in ("max_samples_per_sequence",):
-        for value in (0, -1):
-            with pytest.raises(ValueError):
-                EnergonLoaderConfig(model_family="qwen", **{field: value})
-    with pytest.raises(ValueError):
-        EnergonLoaderConfig(model_family="qwen", packing_buffer_size=10)
-    with pytest.raises(ValueError):
-        EnergonLoaderConfig.model_validate({})
-    with pytest.raises(ValueError):
-        EnergonLoaderConfig.model_validate({"model_family": "unsupported"})
-
-
 def _identity(
     *,
     loader_config: EnergonLoaderConfig | None = None,

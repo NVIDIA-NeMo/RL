@@ -167,7 +167,12 @@ def configure_generation_config(
     # vLLM setting shared by the standard and managed Dynamo backends.
     if config["backend"] in ("vllm", "dynamo"):
         vllm_backed_config = cast(VllmConfig, config)
-        vllm_backed_config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
+        # Respect explicit checkpoint-loading overrides. Dummy loading relies
+        # on startup refit to initialize all generator weights, including frozen
+        # vision parameters; freezing alone does not exclude them from refit.
+        vllm_backed_config["vllm_cfg"].setdefault(
+            "load_format", "auto" if is_eval else "dummy"
+        )
 
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
@@ -232,6 +237,12 @@ def configure_generation_config(
                 config["vllm_cfg"]["skip_tokenizer_init"] = True
 
     elif config["backend"] == "trtllm":
+        # Resolve loading before the role engines copy the shared config.
+        trtllm_cfg = cast(TrtllmConfig, config)["trtllm_cfg"]
+        trtllm_cfg.setdefault(
+            "load_format",
+            "dummy" if trtllm_cfg.get("precision") == "fp8" or not is_eval else "auto",
+        )
         config = resolve_role_overrides(cast(TrtllmConfig, config))
 
     return config

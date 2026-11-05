@@ -18,7 +18,7 @@ import traceback
 import warnings
 from datetime import timedelta
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Iterable, Optional, cast
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, cast
 
 import torch
 import torch.distributed as dist
@@ -27,11 +27,9 @@ from torch.multiprocessing.reductions import rebuild_cuda_tensor
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.vllm.config import (
+    LEGACY_VLLM_FP32_LM_HEAD_ENV_VAR,
     VllmSpecificArgs,
-    vllm_nemotron_h_fp32_lm_head_enabled,
-)
-from nemo_rl.models.generation.vllm.patches import (
-    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
+    vllm_fp32_lm_head_enabled,
 )
 from nemo_rl.models.worker_config import resolve_worker_cls
 from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
@@ -75,8 +73,94 @@ POLICY_WORKER_OVERRIDES = {
     "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker": "nemo_rl.modelopt.models.policy.workers.automodel_quant_policy_worker.AutomodelQuantPolicyWorker",
 }
 
-_NEMOTRON_H_MODEL_TYPES = frozenset({"nemotron_h"})
-_NEMOTRON_H_ARCHITECTURES = frozenset({"NemotronHForCausalLM"})
+LoraRefitMode = Literal["native", "merged"]
+
+
+def is_lora_enabled(policy_config: "PolicyConfig") -> bool:
+    """Return whether either supported training backend has LoRA enabled."""
+    automodel_config = policy_config.get("automodel_cfg") or {}
+    automodel_lora = automodel_config.get("lora_cfg") or {}
+    megatron_config = policy_config.get("megatron_cfg") or {}
+    megatron_lora = megatron_config.get("peft") or {}
+    return bool(
+        (automodel_config.get("enabled") and automodel_lora.get("enabled"))
+        or (megatron_config.get("enabled") and megatron_lora.get("enabled"))
+    )
+
+
+def validate_lora_refit_policy_config(
+    policy_config: "PolicyConfig",
+) -> LoraRefitMode | None:
+    """Validate backend-independent policy requirements for LoRA refit."""
+    if not is_lora_enabled(policy_config):
+        return None
+
+    raw_generation_config = policy_config.get("generation")
+    if raw_generation_config is None:
+        return None
+    generation_config = cast(dict[str, Any], raw_generation_config)
+
+    if "lora_refit_mode" not in generation_config:
+        raise KeyError(
+            "LoRA training with rollout requires policy.generation.lora_refit_mode."
+        )
+    mode = generation_config["lora_refit_mode"]
+    if mode not in ("native", "merged"):
+        raise ValueError(
+            "policy.generation.lora_refit_mode must be 'native' or 'merged'."
+        )
+    if mode == "merged":
+        return cast(LoraRefitMode, mode)
+
+    if generation_config["backend"] != "vllm":
+        raise ValueError(
+            "Native LoRA refit requires policy.generation.backend=vllm. "
+            "Use lora_refit_mode=merged with other rollout backends."
+        )
+
+    automodel_config = policy_config.get("automodel_cfg") or {}
+    automodel_lora = automodel_config.get("lora_cfg") or {}
+    if not automodel_lora.get("enabled"):
+        raise ValueError(
+            "Native LoRA refit currently requires the Automodel LoRA policy. "
+            "Set policy.generation.lora_refit_mode=merged for Megatron LoRA."
+        )
+    if automodel_lora.get("use_dora"):
+        raise ValueError(
+            "Native LoRA refit does not support use_dora=true because vLLM "
+            "cannot apply the additional trainable magnitude vector."
+        )
+    if automodel_lora.get("moe_rank_scaling"):
+        raise ValueError(
+            "Native LoRA refit does not support moe_rank_scaling=true because "
+            "vLLM currently accepts one adapter rank and scaling factor."
+        )
+    if policy_config["precision"] not in (
+        "bfloat16",
+        "bf16",
+        "float16",
+        "fp16",
+    ):
+        raise ValueError(
+            "Native LoRA refit currently supports bfloat16 or float16 policy "
+            f"precision, got {policy_config['precision']!r}."
+        )
+    return cast(LoraRefitMode, mode)
+
+
+def configure_lora_refit(policy_config: "PolicyConfig") -> None:
+    """Validate LoRA refit for every backend and configure native vLLM."""
+    mode = validate_lora_refit_policy_config(policy_config)
+    if mode != "native":
+        return
+
+    from nemo_rl.models.generation.vllm.lora_utils import (
+        configure_vllm_lora_refit,
+        validate_vllm_lora_refit,
+    )
+
+    validate_vllm_lora_refit(policy_config)
+    configure_vllm_lora_refit(policy_config)
 
 
 def resolve_policy_worker_cls(default_cls: str, config: "PolicyConfig") -> str:
@@ -92,60 +176,11 @@ def resolve_policy_worker_cls(default_cls: str, config: "PolicyConfig") -> str:
     )
 
 
-def _normalize_model_type(model_type: object) -> str:
-    return str(model_type).lower().replace("-", "_")
-
-
-def _get_config_model_type(model_config: object) -> object | None:
-    return getattr(model_config, "model_type", None) or getattr(
-        model_config.__class__, "model_type", None
-    )
-
-
-def _get_config_architectures(model_config: object) -> list[str]:
-    architectures = getattr(model_config, "architectures", None) or []
-    if isinstance(architectures, str):
-        return [architectures]
-    try:
-        return [str(architecture) for architecture in architectures]
-    except TypeError:
-        return []
-
-
-def _is_nemotron_h_model_config(model_config: object) -> bool:
-    model_type = _get_config_model_type(model_config)
-    if (
-        model_type is not None
-        and _normalize_model_type(model_type) in _NEMOTRON_H_MODEL_TYPES
-    ):
-        return True
-
-    return any(
-        architecture in _NEMOTRON_H_ARCHITECTURES
-        for architecture in _get_config_architectures(model_config)
-    ) or any(
-        _is_nemotron_h_model_config(inner)
-        for inner in (
-            getattr(model_config, attr, None) for attr in ("llm_config", "text_config")
-        )
-        if inner is not None
-    )
-
-
-def _describe_model_config(model_config: object) -> str:
-    model_type = _get_config_model_type(model_config)
-    architectures = _get_config_architectures(model_config)
-    if architectures:
-        return f"architectures={architectures!r}, model_type={model_type!r}"
-    return f"model_type={model_type!r}"
-
-
 def validate_fp32_lm_head_config(
     config: "PolicyConfig",
     *,
     megatron_enabled: bool,
     automodel_enabled: bool,
-    model_config: object | None = None,
 ) -> None:
     """Reject fp32 LM-head settings that the selected backends cannot match."""
     megatron_cfg = config.get("megatron_cfg")
@@ -183,15 +218,28 @@ def validate_fp32_lm_head_config(
     vllm_cfg = cast(VllmSpecificArgs | dict[str, Any], vllm_cfg)
 
     env_vars = vllm_cfg.get("env_vars") or {}
-    if VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR in env_vars:
+    if LEGACY_VLLM_FP32_LM_HEAD_ENV_VAR in env_vars:
         raise ValueError(
-            f"{VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR} is reserved for "
-            "NeMo-RL internal vLLM Nemotron-H patch plumbing; configure fp32 "
-            "LM head with "
-            "policy.generation.vllm_cfg.fp32_lm_head instead."
+            f"{LEGACY_VLLM_FP32_LM_HEAD_ENV_VAR} is no longer read; configure "
+            "the fp32 LM head with policy.generation.vllm_cfg.fp32_lm_head "
+            "instead."
         )
+    # vLLM's head_dtype is set only through vllm_cfg.fp32_lm_head, so the
+    # trainer-match check below covers it.
+    for name, overrides in (
+        ("policy.hf_config_overrides", config.get("hf_config_overrides")),
+        (
+            "policy.generation.vllm_kwargs.hf_overrides",
+            (generation_config.get("vllm_kwargs") or {}).get("hf_overrides"),
+        ),
+    ):
+        if isinstance(overrides, dict) and "head_dtype" in overrides:
+            raise ValueError(
+                f"{name}.head_dtype is not supported; set "
+                "policy.generation.vllm_cfg.fp32_lm_head instead."
+            )
 
-    vllm_fp32 = vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg)
+    vllm_fp32 = vllm_fp32_lm_head_enabled(vllm_cfg)
     if automodel_enabled and vllm_fp32:
         raise ValueError(
             "policy.generation.vllm_cfg.fp32_lm_head=true is only supported "
@@ -207,20 +255,6 @@ def validate_fp32_lm_head_config(
             f"{vllm_cfg.get('fp32_lm_head')!r}. "
             "A one-sided fp32 head increases the generation/training logprob "
             "mismatch instead of reducing it."
-        )
-    if (
-        vllm_fp32
-        and model_config is not None
-        and not _is_nemotron_h_model_config(model_config)
-    ):
-        warnings.warn(
-            "policy.generation.vllm_cfg.fp32_lm_head=true currently only "
-            "patches vLLM's Nemotron-H model implementation "
-            "(NemotronHForCausalLM). The configured policy model does not "
-            f"look like Nemotron-H ({_describe_model_config(model_config)}), "
-            "so vLLM generation will not execute an fp32 LM-head path.",
-            UserWarning,
-            stacklevel=2,
         )
 
 
@@ -307,6 +341,41 @@ def configure_dynamo_cache() -> None:
     See https://github.com/pytorch/pytorch/issues/153791 for more details.
     """
     torch._inductor.config.autotune_local_cache = False
+
+
+def make_empty_cache_best_effort_under_expandable_segments() -> None:
+    """Skip torch.cuda.empty_cache() when expandable segments are on.
+
+    With ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``,
+    ``torch._C._cuda_emptyCache()`` can raise ``RuntimeError: std::get: wrong
+    index for variant`` and leave the caching allocator corrupted (the process
+    later dies of cudaErrorIllegalAddress), so catching the exception is not
+    enough. empty_cache is memory hygiene, not a correctness requirement, and
+    expandable segments already return freed blocks to the segment pool.
+
+    Opt-in via ``NRL_BEST_EFFORT_EMPTY_CACHE=1``: patching a global torch API
+    is intrusive. Without the flag this is a no-op.
+    """
+    if os.environ.get("NRL_BEST_EFFORT_EMPTY_CACHE", "0") != "1":
+        return
+    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if "expandable_segments:True" not in alloc_conf:
+        return
+    original_empty_cache = torch.cuda.empty_cache
+    if getattr(original_empty_cache, "_nrl_best_effort", False):
+        return
+
+    def _best_effort_empty_cache() -> None:
+        # Never call through: the failing flush corrupts the allocator even
+        # when its exception is caught (see the docstring above).
+        warnings.warn(
+            "torch.cuda.empty_cache() skipped under expandable_segments "
+            "(allocator-corrupting torch bug; see NRL empty_cache guard)",
+            stacklevel=2,
+        )
+
+    _best_effort_empty_cache._nrl_best_effort = True  # type: ignore[attr-defined]
+    torch.cuda.empty_cache = _best_effort_empty_cache
 
 
 def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
@@ -517,6 +586,7 @@ def stream_weights_via_ipc_zmq_impl(
         buffer_a = None
         buffer_b = None
         if had_buffers:
+            torch.cuda.ipc_collect()
             torch.cuda.empty_cache()
 
     used_bytes = 0
@@ -596,6 +666,7 @@ def stream_weights_via_ipc_zmq_impl(
                     await_recv = False
                 finally:
                     del transfer_buffer, direct_ipc_buffer, oversized_buffer
+                    torch.cuda.ipc_collect()
                     torch.cuda.empty_cache()
                 # Drop the caller-side reference before requesting the next
                 # generator item; otherwise the next bridge conversion can

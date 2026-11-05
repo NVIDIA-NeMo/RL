@@ -94,13 +94,6 @@ class TrtllmAsyncGenerationWorkerImpl:
             "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
             "NCCL_CUMEM_ENABLE": "1",
             "PATH": worker_path,
-            # The container runs as root, and Open MPI / PRTE refuse to start
-            # as root unless explicitly allowed. Set unconditionally so the
-            # engine's MPI init works whatever the launch environment carries.
-            "OMPI_ALLOW_RUN_AS_ROOT": "1",
-            "OMPI_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
-            "PRTE_ALLOW_RUN_AS_ROOT": "1",
-            "PRTE_ALLOW_RUN_AS_ROOT_CONFIRM": "1",
         }
         init_kwargs: dict[str, Any] = {}
 
@@ -219,11 +212,7 @@ class TrtllmAsyncGenerationWorkerImpl:
         # placement_bundle_indices / per_worker_gpu_share named params that
         # unconditionally overwrite kwargs["ray_placement_config"] — so we
         # must pass these as top-level kwargs, not via ray_placement_config.
-        print(
-            f"[TrtllmAsyncWorker] bundle_indices={self._bundle_indices}, "
-            f"pg={pg}, bundle_specs={pg.bundle_specs}",
-            flush=True,
-        )
+        print(f"[TrtllmAsyncWorker] bundle_indices={self._bundle_indices}", flush=True)
 
         # TRT-LLM expects one bundle-index list per placement group. A unified
         # PG can contain bundles on multiple nodes, allowing one TP replica to
@@ -236,6 +225,8 @@ class TrtllmAsyncGenerationWorkerImpl:
             backend="pytorch",
             tensor_parallel_size=tp_size,
             dtype=engine_cfg["precision"],
+            # Dummy weights skip a checkpoint read that the first training refit overwrites.
+            load_format=engine_cfg["load_format"],
             max_seq_len=engine_cfg["max_model_len"],
             max_batch_size=engine_cfg["max_batch_size"],
             max_num_tokens=engine_cfg["max_num_tokens"],
@@ -334,6 +325,33 @@ class TrtllmAsyncGenerationWorkerImpl:
         # they can override anything above for advanced tuning.
         llm_kwargs.update(extra_trtllm_kwargs)
 
+        if engine_cfg.get("is_mx") and engine_cfg["precision"] != "fp8":
+            raise ValueError("engine_cfg.is_mx=True requires precision='fp8'")
+
+        if engine_cfg["precision"] == "fp8":
+            # Imported here: TRT-LLM is an optional dependency.
+            from tensorrt_llm.llmapi.llm_args import MoeConfig
+            from transformers import AutoConfig
+
+            from nemo_rl.models.generation.trtllm.quantization.fp8 import (
+                configure_fp8_llm_kwargs,
+                configure_fp8_moe_backend,
+                validate_model_type,
+            )
+
+            validate_model_type(
+                AutoConfig.from_pretrained(
+                    self.model_name, trust_remote_code=True
+                ).model_type
+            )
+
+            is_mx = bool(engine_cfg.get("is_mx"))
+            configure_fp8_llm_kwargs(llm_kwargs, is_mx=is_mx)
+
+            # Block-FP8 needs the TRTLLM MoE backend (DeepGEMM would resmooth to
+            # E8M0); MXFP8 uses CUTLASS or CuTe DSL. Other MoeConfig fields kept.
+            configure_fp8_moe_backend(llm_kwargs, MoeConfig, is_mx=is_mx)
+
         # Propagate the nsight runtime_env down to TRT-LLM's internal Ray GPU
         # workers.  The outer actor's @ray.remote nsight config does NOT inherit
         # into TRT-LLM's RayExecutor workers (ray_executor.py sets an explicit
@@ -407,6 +425,14 @@ class TrtllmAsyncGenerationWorkerImpl:
         if self._http_base_url is not None:
             return self._http_base_url
 
+        from nemo_rl.utils.fastokens import (
+            check_fastokens_applied,
+            maybe_patch_fastokens,
+        )
+
+        # Apply fastokens inside this Ray actor before constructing the tokenizer.
+        maybe_patch_fastokens(False)
+
         from transformers import AutoTokenizer
 
         from nemo_rl.models.generation.trtllm.trtllm_http_server import start_server
@@ -415,6 +441,8 @@ class TrtllmAsyncGenerationWorkerImpl:
             self.model_name,
             trust_remote_code=True,
         )
+        tokenizer_backend = check_fastokens_applied(tokenizer)
+        print(f"[TrtllmAsyncWorker] HTTP tokenizer backend: {tokenizer_backend}")
         self._http_thread, self._http_base_url, self._http_server = start_server(
             llm=self.llm,
             tokenizer=tokenizer,
@@ -429,12 +457,19 @@ class TrtllmAsyncGenerationWorkerImpl:
                 "top_p": self.cfg["top_p"],
                 "top_k": self.cfg["top_k"],
             },
+            # grpo.validate() stamps validation rollouts with this profile.
+            val_sampling_config={
+                "temperature": self.cfg["val_temperature"],
+                "top_p": self.cfg["val_top_p"],
+                "top_k": self.cfg["val_top_k"],
+            },
             stop_token_ids=list(self.cfg.get("stop_token_ids") or []),
             default_chat_template_kwargs=self.engine_cfg.get(
                 "default_chat_template_kwargs"
             ),
             tool_parser=self.engine_cfg.get("tool_parser"),
             reasoning_parser=self.engine_cfg.get("reasoning_parser"),
+            chat_template=self.engine_cfg.get("chat_template"),
         )
         # host:port of the URL just returned; the disagg server is configured
         # with addresses, not URLs.
@@ -508,9 +543,10 @@ class TrtllmAsyncGenerationWorkerImpl:
                 without draining in-flight requests (in-flight weight
                 update). Default True preserves the original drain-first
                 behavior.
-            recompute_kv: If True (and ``drain=False``), preempt all
-                in-flight requests after the refit so the scheduler
-                re-prefills them under the new weights.
+            recompute_kv: If True, re-prefill in-flight requests under the new
+                weights and reset the prefix cache after the refit
+                (``recompute_kv_cache_after_weight_updates``). If False,
+                in-flight requests keep their current KV cache.
         """
         assert self.llm is not None
         try:
@@ -518,10 +554,16 @@ class TrtllmAsyncGenerationWorkerImpl:
                 "update_weights_from_collective",
                 kwargs={"drain": drain, "recompute_kv": recompute_kv},
             )
-            worker_result = results[0] if results else True
-            if not worker_result:
+            if not results:
+                print("Error: TRT-LLM weight update returned no worker results.")
+                return False
+            failed_workers = [
+                (rank, result) for rank, result in enumerate(results) if not result
+            ]
+            if failed_workers:
                 print(
-                    f"Error: TRT-LLM worker failed to update weights. Result: {worker_result}"
+                    "Error: TRT-LLM workers failed to update weights. "
+                    f"Results: {failed_workers}"
                 )
                 return False
             return True
@@ -530,16 +572,24 @@ class TrtllmAsyncGenerationWorkerImpl:
             import traceback
 
             traceback.print_exc()
-            return False
+            # Raise instead of returning False so the engine-side cause reaches
+            # the caller.
+            raise RuntimeError(f"TRT-LLM collective weight update failed: {e!r}") from e
 
     async def update_weights_via_ipc_zmq_async(self) -> bool:
         assert self.llm is not None
         try:
             results = await self.llm.collective_rpc("update_weights_via_ipc_zmq")
-            worker_result = results[0] if results else True
-            if not worker_result:
+            if not results:
+                print("Error: TRT-LLM IPC weight update returned no worker results.")
+                return False
+            failed_workers = [
+                (rank, result) for rank, result in enumerate(results) if not result
+            ]
+            if failed_workers:
                 print(
-                    f"Error: TRT-LLM worker failed to update weights via IPC. Result: {worker_result}"
+                    "Error: TRT-LLM workers failed to update weights via IPC. "
+                    f"Results: {failed_workers}"
                 )
                 return False
             return True
@@ -548,7 +598,9 @@ class TrtllmAsyncGenerationWorkerImpl:
             import traceback
 
             traceback.print_exc()
-            return False
+            # Raise instead of returning False so the engine-side cause reaches
+            # the caller.
+            raise RuntimeError(f"TRT-LLM IPC weight update failed: {e!r}") from e
 
     async def report_device_id_async(self) -> list[str]:
         assert self.llm is not None

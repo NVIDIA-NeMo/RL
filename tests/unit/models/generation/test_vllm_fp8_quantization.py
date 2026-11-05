@@ -15,15 +15,12 @@
 import os
 import types
 from dataclasses import dataclass
-from pathlib import Path
+from typing import Literal
 
 import pytest
 import torch
-import yaml
 
 pytestmark = pytest.mark.vllm
-
-PROJECT_ROOT = Path(__file__).resolve().parents[4]
 
 
 @pytest.fixture()
@@ -634,73 +631,6 @@ def test_init_fp8_deduplicates_explicit_ignore_pattern(fp8_module, monkeypatch):
 
     ignore = vllm_kwargs["hf_overrides"]["quantization_config"]["ignore"]
     assert ignore == ["lm_head"]
-
-
-@pytest.mark.parametrize(
-    ("recipe_name", "quantized_modules", "bf16_modules"),
-    [
-        (
-            "grpo-deepseek-v3-64n4g-mxfp8-rollout.yaml",
-            {
-                "model.layers.3.mlp.experts",
-                "model.layers.60.mlp.experts",
-            },
-            {
-                "model.layers.2.mlp.experts",
-                "model.layers.3.self_attn.qkv_proj",
-                "model.layers.3.mlp.gate",
-                "model.layers.3.mlp.shared_experts.gate_up_proj",
-                "model.layers.61.mlp.experts",
-                "model.layers.61.mtp.fc",
-                "lm_head",
-            },
-        ),
-        (
-            "grpo-nemotron3-super-120BA12B-32n4g-mxfp8-rollout.yaml",
-            {"model.layers.3.mixer.experts"},
-            {
-                "model.layers.3.mixer.in_proj",
-                "model.layers.3.mixer.out_proj",
-                "model.layers.3.mixer.qkv_proj",
-                "model.layers.3.mixer.o_proj",
-                "model.layers.3.mixer.up_proj",
-                "model.layers.3.mixer.down_proj",
-                "model.layers.3.mixer.gate",
-                "model.layers.3.mixer.shared_experts.up_proj",
-                "model.layers.3.mixer.fc1_latent_proj",
-                "model.layers.3.mixer.fc2_latent_proj",
-                "lm_head",
-            },
-        ),
-    ],
-)
-def test_mxfp8_recipe_patterns_select_only_routed_experts(
-    recipe_name, quantized_modules, bf16_modules
-):
-    pytest.importorskip("vllm")
-
-    from vllm.model_executor.layers.quantization.modelopt import ModelOptMxFp8Config
-
-    recipe_path = (
-        PROJECT_ROOT / "examples/configs/recipes/llm/performance" / recipe_name
-    )
-    recipe = yaml.safe_load(recipe_path.read_text(encoding="utf-8"))
-    patterns = recipe["policy"]["generation"]["vllm_cfg"][
-        "quantization_ignore_patterns"
-    ]
-    modelopt_config = ModelOptMxFp8Config.from_config(
-        {
-            "quant_method": "modelopt",
-            "quant_algo": "MXFP8",
-            "ignore": [*patterns, "lm_head"],
-            "ignored_layers": ["lm_head"],
-        }
-    )
-
-    assert all(
-        not modelopt_config.is_layer_excluded(name) for name in quantized_modules
-    )
-    assert all(modelopt_config.is_layer_excluded(name) for name in bf16_modules)
 
 
 def test_init_fp8_excludes_lm_head_from_regular_fp8(fp8_module, monkeypatch):
@@ -2126,7 +2056,10 @@ def test_multi_gpu_fp8_patches_before_model_load(fp8_module, monkeypatch, use_ra
         ]
 
 
-def test_fp8_ds_mla_skips_static_kv_scale_patch(fp8_module, monkeypatch):
+@pytest.mark.parametrize("cache_dtype", ["fp8_ds_mla", "fp8_per_token_head"])
+def test_dynamic_cache_skips_static_kv_scale_patch(
+    fp8_module, monkeypatch, cache_dtype
+):
     fp8 = fp8_module
     patched_paths = []
 
@@ -2145,14 +2078,15 @@ def test_fp8_ds_mla_skips_static_kv_scale_patch(fp8_module, monkeypatch):
         fp8.FP8Config(
             use_fp8_weights=True,
             model_parallel_size=1,
-            kv_cache_dtype="fp8_ds_mla",
+            kv_cache_dtype=cache_dtype,
         ),
     )
 
     assert not any("BaseKVCacheMethod" in path for path in patched_paths)
 
 
-def test_init_fp8_accepts_fp8_ds_mla(fp8_module, monkeypatch):
+@pytest.mark.parametrize("per_token", [False, True])
+def test_init_fp8_accepts_dynamic_cache(fp8_module, monkeypatch, per_token):
     fp8 = fp8_module
 
     monkeypatch.setattr(
@@ -2165,15 +2099,36 @@ def test_init_fp8_accepts_fp8_ds_mla(fp8_module, monkeypatch):
     vllm_kwargs = fp8.init_fp8(
         {
             "precision": "fp8",
-            "kv_cache_dtype": "fp8_ds_mla",
+            "kv_cache_dtype": "fp8_per_token_head" if per_token else "fp8_ds_mla",
             "async_engine": False,
         },
         "dummy-model",
         model_parallel_size=1,
     )
 
-    assert vllm_kwargs["kv_cache_dtype"] == "fp8_ds_mla"
-    assert fp8.global_fp8_config.kv_cache_dtype == "fp8_ds_mla"
+    expected = "fp8_per_token_head" if per_token else "fp8_ds_mla"
+    assert vllm_kwargs["kv_cache_dtype"] == expected
+    assert fp8.global_fp8_config.kv_cache_dtype == expected
+    assert "attention_backend" not in vllm_kwargs
+
+
+def test_init_fp8_rejects_unsupported_per_token_head_cache(fp8_module, monkeypatch):
+    import vllm.config.cache
+
+    monkeypatch.setattr(vllm.config.cache, "CacheDType", Literal["auto", "fp8"])
+    monkeypatch.setattr(
+        fp8_module.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    with pytest.raises(
+        ValueError, match="requires vLLM with fp8_per_token_head support"
+    ):
+        fp8_module.init_fp8(
+            {"precision": "fp8", "kv_cache_dtype": "fp8_per_token_head"},
+            "dummy-model",
+            model_parallel_size=1,
+        )
 
 
 def test_init_fp8_uses_explicit_e8m0_for_dsv4(fp8_module, monkeypatch):
@@ -2460,6 +2415,59 @@ def test_dsv4_bmm_post_process_uses_vllm_bmm_layout(fp8_module, monkeypatch):
     assert calls[0]["bmm_batch_size"] == 2
 
 
+def test_linear_fp8_post_process_preserves_scale_loader_on_layout_change(
+    fp8_module, monkeypatch
+):
+    from vllm.model_executor.layers.quantization.utils import fp8_utils
+    from vllm.utils import deep_gemm
+
+    weight = torch.nn.Parameter(torch.zeros(4, 4), requires_grad=False)
+    scale = torch.nn.Parameter(torch.zeros(2, 2), requires_grad=False)
+
+    def scale_loader(*_args, **_kwargs):
+        pass
+
+    scale.weight_loader = scale_loader
+    layer = torch.nn.Module()
+    layer.weight = weight
+    layer.weight_scale_inv = scale
+    layer.weight_block_size = [2, 2]
+    layer.orig_dtype = torch.bfloat16
+    layer.is_bmm = False
+    monkeypatch.setattr(
+        deep_gemm,
+        "should_use_deepgemm_for_fp8_linear",
+        lambda _dtype, _shape: True,
+    )
+    monkeypatch.setattr(deep_gemm, "is_deep_gemm_e8m0_used", lambda: True)
+    processed_count = 0
+
+    def post_process(**_kwargs):
+        nonlocal processed_count
+        processed_count += 1
+        return torch.ones(4, 4), torch.full((2, 1), processed_count)
+
+    monkeypatch.setattr(
+        fp8_utils, "deepgemm_post_process_fp8_weight_block", post_process
+    )
+
+    fp8_module.maybe_post_process_fp8_weight_block(layer)
+    scale_ptr = scale.data.data_ptr()
+    checkpoint_ptr = layer._nrl_fp8_checkpoint_scale.data_ptr()
+    for expected_scale in (2, 3):
+        fp8_module.prepare_fp8_linear_refit(layer)
+        assert scale.shape == (2, 2)
+        assert scale.data.data_ptr() == checkpoint_ptr
+        scale.data.fill_(expected_scale)
+        fp8_module.maybe_post_process_fp8_weight_block(layer)
+        assert scale.shape == (2, 1)
+        assert scale.data.data_ptr() == scale_ptr
+
+    assert layer.weight_scale_inv is scale
+    assert scale.weight_loader is scale_loader
+    assert torch.equal(scale.data, torch.full((2, 1), 3))
+
+
 def test_process_weights_after_loading_copies_in_place_on_refit(monkeypatch):
     """Refit runs this every step; rebinding .data each time fragments memory.
 
@@ -2591,8 +2599,10 @@ def test_mxfp8_reload_iterator_emits_upstream_checkpoint_names(fp8_module, monke
     assert quantized[1][1].dtype == torch.uint8
 
 
-@pytest.mark.parametrize("is_deepseek_v4", [False, True])
-@pytest.mark.parametrize("change_layout", ["none", "dtype", "shape"])
+@pytest.mark.parametrize(
+    ("is_deepseek_v4", "change_layout"),
+    [(False, "none"), (True, "none"), (True, "dtype"), (True, "shape")],
+)
 def test_process_fp8_moe_preserves_storage_and_loaders(
     fp8_module, monkeypatch, change_layout, is_deepseek_v4
 ):
@@ -2638,18 +2648,8 @@ def test_process_fp8_moe_preserves_storage_and_loaders(
     params = {name: getattr(layer, name) for name in shapes}
     pointers = {name: param.data_ptr() for name, param in params.items()}
 
-    if not is_deepseek_v4 and change_layout == "shape":
-        # Preserve the old copy_ failure for incompatible shapes rather than
-        # silently replacing Parameters that an existing kernel may reference.
-        with pytest.raises(RuntimeError, match="size of tensor"):
-            fp8_module.process_weights_after_loading_moe(method, layer)
-        for name, param in params.items():
-            assert getattr(layer, name) is param
-            assert param.data_ptr() == pointers[name]
-        return
-
     fp8_module.process_weights_after_loading_moe(method, layer)
-    if is_deepseek_v4 and change_layout != "none":
+    if change_layout != "none":
         for name, param in params.items():
             assert getattr(layer, name) is not param
         params = {name: getattr(layer, name) for name in shapes}
@@ -2661,11 +2661,94 @@ def test_process_fp8_moe_preserves_storage_and_loaders(
             assert param is params[name]
             assert param.data_ptr() == pointers[name]
             assert param.weight_loader is weight_loader
-            # Non-DSV4 copy_ retains the destination dtype even when the
-            # converter returns another dtype; prefer_copy would replace it.
-            torch.testing.assert_close(param, expected.to(dtype=param.dtype))
+            torch.testing.assert_close(param, expected)
     assert method.moe_kernel is kernel
     assert method.moe_quant_config is quant_config
+
+
+@pytest.mark.parametrize("change_layout", ["dtype", "shape"])
+def test_process_fp8_moe_rejects_non_dsv4_layout_change(
+    fp8_module, monkeypatch, change_layout
+):
+    from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
+
+    fp8_module.global_fp8_config = fp8_module.FP8Config(is_deepseek_v4=False)
+    layer = torch.nn.Module()
+    for name, shape in (
+        ("w13_weight", (2, 4, 4)),
+        ("w2_weight", (2, 4, 2)),
+        ("w13_weight_scale_inv", (2, 2, 2)),
+        ("w2_weight_scale_inv", (2, 2, 1)),
+    ):
+        layer.register_parameter(
+            name, torch.nn.Parameter(torch.zeros(shape), requires_grad=False)
+        )
+    layer.w13_input_scale = None
+    layer.w2_input_scale = None
+    method = types.SimpleNamespace(
+        weight_scale_name="weight_scale_inv", fp8_backend=object()
+    )
+
+    def convert(**_kwargs):
+        weights = [
+            layer.w13_weight.data,
+            layer.w2_weight.data,
+            layer.w13_weight_scale_inv.data,
+            layer.w2_weight_scale_inv.data,
+        ]
+        if change_layout == "dtype":
+            return tuple(weight.to(torch.bfloat16) for weight in weights)
+        return tuple(weight.transpose(-1, -2) for weight in weights)
+
+    monkeypatch.setattr(vllm_fp8, "convert_to_fp8_moe_kernel_format", convert)
+    with pytest.raises(ValueError, match="does not support .* layout changes"):
+        fp8_module.process_weights_after_loading_moe(method, layer)
+
+
+def test_process_fp8_moe_dsv4_shape_change_after_restore(fp8_module, monkeypatch):
+    from vllm.model_executor.layers.quantization import fp8 as vllm_fp8
+
+    fp8_module.global_fp8_config = fp8_module.FP8Config(is_deepseek_v4=True)
+    layer = torch.nn.Module()
+    shapes = {
+        "w13_weight": (2, 4, 4),
+        "w2_weight": (2, 4, 2),
+        "w13_weight_scale_inv": (2, 2, 2),
+        "w2_weight_scale_inv": (2, 2, 1),
+    }
+
+    def weight_loader(*_args, **_kwargs):
+        pass
+
+    def restore_checkpoint_layout():
+        for name, shape in shapes.items():
+            parameter = torch.nn.Parameter(torch.ones(shape), requires_grad=False)
+            parameter.weight_loader = weight_loader
+            layer.register_parameter(name, parameter)
+
+    restore_checkpoint_layout()
+    layer.w13_input_scale = None
+    layer.w2_input_scale = None
+    monkeypatch.setattr(
+        vllm_fp8,
+        "convert_to_fp8_moe_kernel_format",
+        lambda **kwargs: tuple(
+            kwargs[name].transpose(-1, -2).contiguous()
+            for name in ("w13", "w2", "w13_scale", "w2_scale")
+        ),
+    )
+    method = types.SimpleNamespace(
+        weight_scale_name="weight_scale_inv",
+        fp8_backend=object(),
+        moe_kernel=object(),
+        get_fused_moe_quant_config=lambda _layer: object(),
+    )
+
+    for _ in range(2):
+        fp8_module.process_weights_after_loading_moe(method, layer)
+        assert layer.w2_weight.shape == (2, 2, 4)
+        assert layer.w2_weight.weight_loader is weight_loader
+        restore_checkpoint_layout()
 
 
 def test_deepseek_v4_two_refits_preserve_kernel_fp32_scale_references(

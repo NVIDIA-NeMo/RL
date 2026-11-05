@@ -48,8 +48,9 @@ from nemo_rl.models.generation.vllm.config import (
     parse_nvfp4_pertoken_rollout,
     resolve_vllm_video_config,
     validate_nvfp4_pertoken_model,
-    vllm_nemotron_h_fp32_lm_head_enabled,
+    vllm_fp32_lm_head_enabled,
 )
+from nemo_rl.models.generation.vllm.lora_utils import make_native_lora_request
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 from nemo_rl.models.generation.vllm.utils import (
     FINISHED_REASON_LABEL,
@@ -65,8 +66,9 @@ from nemo_rl.models.generation.vllm.video_utils import (
 )
 from nemo_rl.models.generation.vllm.worker_utils import (
     find_tokenizer_required_architectures,
-    resolve_data_parallel_local_rank,
     resolve_distributed_executor_backend,
+    resolve_vllm_dp_settings,
+    resolve_vllm_dp_size,
 )
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
@@ -219,6 +221,25 @@ def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -
         merged_hf_overrides["quantization_config"] = merged_quantization_config
 
     vllm_kwargs["hf_overrides"] = merged_hf_overrides
+
+
+def _apply_fp32_lm_head(vllm_cfg: dict[str, Any], vllm_kwargs: dict[str, Any]) -> None:
+    """Turn on vLLM's fp32 LM head when ``vllm_cfg.fp32_lm_head`` is set.
+
+    ``head_dtype="float32"`` (vllm-project/vllm#48390) makes vLLM's
+    LogitsProcessor run the lm_head GEMM on the bf16 operands with an fp32
+    output, the same GEMM as Megatron's ``logit_dtype=float32``, for any model
+    whose lm_head is unquantized. ``vllm_kwargs["hf_overrides"]`` must be a dict.
+    """
+    if not vllm_fp32_lm_head_enabled(vllm_cfg):
+        return
+    hf_overrides = vllm_kwargs["hf_overrides"]
+    if hf_overrides.get("head_dtype", "float32") != "float32":
+        raise ValueError(
+            "vllm_cfg.fp32_lm_head=true conflicts with hf_overrides.head_dtype="
+            f"{hf_overrides['head_dtype']!r}; remove the override."
+        )
+    hf_overrides["head_dtype"] = "float32"
 
 
 def _validate_worker_extension_cls(
@@ -493,15 +514,14 @@ class BaseVllmGenerationWorker:
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
         self._extra_env_vars = extra_env_vars
+        self._native_lora_request: Any = None
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
-        vllm_cfg = self.cfg["vllm_cfg"]
         _apply_vllm_patches(
             self.py_executable,
             extra_env_vars=extra_env_vars,
-            nemotron_h_fp32_lm_head=vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg),
             require_moe_routed_experts_capture=bool(
                 (self.cfg.get("vllm_kwargs") or {}).get(
                     "enable_return_routed_experts", False
@@ -543,6 +563,7 @@ class BaseVllmGenerationWorker:
             import vllm
 
             self.SamplingParams = vllm.SamplingParams
+            self._native_lora_request = make_native_lora_request(self.cfg)
         except ImportError:
             raise ImportError(
                 "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
@@ -613,23 +634,22 @@ class BaseVllmGenerationWorker:
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
         # We should use vLLM DP if ep_size > tp_size since EP_SIZE = DP_SIZE * TP_SIZE in vLLM.
-        # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
-        if self.expert_parallel_size > self.tensor_parallel_size:
-            # set vLLM DP rank
-            world_size = int(os.environ["VLLM_DP_SIZE"]) * model_parallel_size
-            rank = int(os.environ["RANK"]) % world_size
-            os.environ["VLLM_DP_RANK"] = str(rank // model_parallel_size)
-            os.environ["VLLM_DP_RANK_LOCAL"] = str(
-                resolve_data_parallel_local_rank(
-                    rank, model_parallel_size, executor_backend
-                )
+        if (
+            resolve_vllm_dp_size(self.tensor_parallel_size, self.expert_parallel_size)
+            > 1
+        ):
+            env_updates, kwarg_updates = resolve_vllm_dp_settings(
+                rank=int(os.environ["RANK"]),
+                tensor_parallel_size=self.tensor_parallel_size,
+                pipeline_parallel_size=self.pipeline_parallel_size,
+                expert_parallel_size=self.expert_parallel_size,
+                addresses=eval(os.environ["AVAILABLE_ADDR_LIST"]),
+                ports=eval(os.environ["AVAILABLE_PORT_LIST"]),
+                async_engine=self.cfg["vllm_cfg"]["async_engine"],
+                executor_backend=executor_backend,
             )
-            # set vLLM DP address and port
-            leader_rank = int(os.environ["RANK"]) // world_size * world_size
-            addr_list = eval(os.environ["AVAILABLE_ADDR_LIST"])
-            port_list = eval(os.environ["AVAILABLE_PORT_LIST"])
-            os.environ["VLLM_DP_MASTER_IP"] = addr_list[leader_rank]
-            os.environ["VLLM_DP_MASTER_PORT"] = str(port_list[leader_rank])
+            os.environ.update(env_updates)
+            vllm_kwargs.update(kwarg_updates)
 
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
@@ -681,6 +701,7 @@ class BaseVllmGenerationWorker:
 
         if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
             vllm_kwargs["hf_overrides"] = {}
+        _apply_fp32_lm_head(self.cfg["vllm_cfg"], vllm_kwargs)
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
@@ -1033,6 +1054,19 @@ class BaseVllmGenerationWorker:
 
 
 class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationWorker):
+    def _generate_idle_dp_batch(self) -> None:
+        assert self.llm is not None
+        sampling_params = self.SamplingParams(
+            temperature=0.0,
+            max_tokens=self.cfg["max_new_tokens"],
+            ignore_eos=True,
+        )
+        self.llm.generate(
+            [{"prompt_token_ids": [self.cfg["_pad_token_id"]]}],
+            sampling_params,
+            use_tqdm=False,
+        )
+
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         import vllm
 
@@ -1101,6 +1135,14 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         """
         # Handle empty input case
         if len(data["input_ids"]) == 0:
+            if (
+                not self.cfg["vllm_cfg"]["async_engine"]
+                and resolve_vllm_dp_size(
+                    self.tensor_parallel_size, self.expert_parallel_size
+                )
+                > 1
+            ):
+                self._generate_idle_dp_batch()
             # Return empty BatchedDataDict with all required fields
             return BatchedDataDict[GenerationOutputSpec](
                 {
@@ -1166,7 +1208,12 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         prompts = format_prompt_for_vllm_generation(data)
         prompts = [self._tokenize_prompt_with_bos(prompt) for prompt in prompts]
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
-        outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
+        outputs = self.llm.generate(
+            prompts,
+            sampling_params,
+            use_tqdm=use_tqdm,
+            lora_request=self._native_lora_request,
+        )
 
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
@@ -1333,6 +1380,16 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 "generate_text cannot be used with async_engine=True. Use generate_text_async instead."
             )
 
+        if len(data["prompts"]) == 0:
+            if (
+                resolve_vllm_dp_size(
+                    self.tensor_parallel_size, self.expert_parallel_size
+                )
+                > 1
+            ):
+                self._generate_idle_dp_batch()
+            return BatchedDataDict[GenerationOutputSpec]({"texts": []})
+
         # Extract stop_strings if provided, else use default from config
         batch_stop_strings: list[list[str] | None] = data.get(
             "stop_strings", [self.cfg.get("stop_strings")] * len(data["prompts"])
@@ -1368,7 +1425,12 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
         )
         use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
         prompts = [self._tokenize_prompt_with_bos(prompt) for prompt in data["prompts"]]
-        outputs = self.llm.generate(prompts, sampling_params, use_tqdm=use_tqdm)
+        outputs = self.llm.generate(
+            prompts,
+            sampling_params,
+            use_tqdm=use_tqdm,
+            lora_request=self._native_lora_request,
+        )
         texts = [output.outputs[0].text for output in outputs]
 
         # Convert to BatchedDataDict

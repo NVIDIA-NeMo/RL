@@ -49,14 +49,19 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from nemo_rl.algorithms.grpo import (
     GRPOSaveState,
     MasterConfig,
+    _advantage_valid_mask,
+    _apply_mask_sample_filter,
     _clip_grpo_advantages,
     _create_advantage_estimator,
+    _dynamic_sampling_valid_mask,
     _initial_policy_generation_stale,
     _log_mixed_rewards_and_advantages_information,
     _placeholder_seq_logprob_error_metrics,
     _policy_dtype,
     _resolve_logprob_skip_flags,
+    _save_adaptive_loss_state,
     _should_log_nemo_gym_responses,
+    _update_adaptive_loss_state,
     _validation_early_stop_message,
     compute_and_apply_seq_logprob_error_masking,
     refit_policy_generation,
@@ -88,7 +93,11 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
-from nemo_rl.data.multimodal_utils import present_multimodal_fields
+from nemo_rl.data.multimodal_utils import (
+    per_token_multimodal_schema,
+    present_multimodal_fields,
+)
+from nemo_rl.data.utils import save_dataloader_state
 from nemo_rl.data_plane.grouping import group_index_column, row_group_ids
 from nemo_rl.data_plane.interfaces import KVBatchMeta
 from nemo_rl.data_plane.observability import (
@@ -291,19 +300,23 @@ def validate_sync(
 
     timer = Timer()
     total_rewards: list[float] = []
-    total_lengths: list[float] = []
+    total_length_tokens = 0.0  # per-batch mean length x rollouts
     all_message_logs: list[list[dict[str, str]]] = []
     additional_metrics: dict[str, Any] = {}
     capture_extras = should_use_nemo_gym(master_config)
 
     with timer.time("total_validation_time"):
         print(f"▶ Starting validation at step {step}...", flush=True)
-        max_batches = (
-            master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
-        )
+        max_val_samples = master_config.grpo.max_val_samples
+        val_batch_size = master_config.grpo.val_batch_size
+        # Include the partial final batch, then trim it to the prompt cap.
+        max_batches = -(-max_val_samples // val_batch_size)
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
+            num_left = max_val_samples - batch_idx * val_batch_size
+            if val_batch.size > num_left:
+                val_batch = val_batch.slice(0, num_left)
             n_prompts = int(val_batch.size)
             policy.prepare_val_partition(n_prompts, partition_id=partition_id)
             meta, driver_carry, rollout_metrics, _ = ray.get(
@@ -318,8 +331,11 @@ def validate_sync(
             )
             roles = driver_carry["turn_roles"]
             contents = driver_carry["turn_contents"]
-            total_rewards.extend(driver_carry["total_reward"].tolist())
-            total_lengths.append(rollout_metrics["mean_gen_tokens_per_sample"])
+            batch_rewards = driver_carry["total_reward"].tolist()
+            total_rewards.extend(batch_rewards)
+            total_length_tokens += rollout_metrics["mean_gen_tokens_per_sample"] * len(
+                batch_rewards
+            )
             all_message_logs.extend(
                 [{"role": r, "content": c} for r, c in zip(roles[i], contents[i])]
                 for i in range(n_prompts)
@@ -333,7 +349,7 @@ def validate_sync(
             if total_rewards
             else 0.0
         )
-        avg_length = sum(total_lengths) / len(total_lengths) if total_lengths else 0.0
+        avg_length = total_length_tokens / len(total_rewards) if total_rewards else 0.0
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
@@ -581,6 +597,7 @@ def grpo_train_sync(
         task_to_env=task_to_env,
         master_config=master_config,
         dp_cfg=dp_cfg,
+        per_token_multimodal_fields=per_token_multimodal_schema(processor),
     )
     policy.add_data_plane_snapshot_source(rollout_actor)
 
@@ -630,7 +647,9 @@ def grpo_train_sync(
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
 
-    while current_epoch < max_num_epochs and total_steps < max_num_steps:
+    while (
+        max_num_epochs is None or current_epoch < max_num_epochs
+    ) and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
         # 1-hop cross-iteration cache for dynamic_sampling: across
@@ -806,6 +825,12 @@ def grpo_train_sync(
                         else None
                     )
                     prompt_group_ids = group_index_column(row_group_ids(meta))
+                    # One policy-selected participation mask for every statistic
+                    # computed before the logprob pass (baseline/std, env baseline,
+                    # dynamic-sampling admission); see _dynamic_sampling_valid_mask.
+                    statistics_valid_mask = _dynamic_sampling_valid_mask(
+                        driver_carry, master_config.grpo
+                    )
                     (
                         baseline,
                         std,
@@ -813,7 +838,7 @@ def grpo_train_sync(
                     ) = calculate_baseline_and_std_per_prompt(
                         prompt_group_ids,
                         driver_carry["total_reward"],
-                        torch.ones_like(driver_carry["total_reward"]),
+                        statistics_valid_mask,
                         leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                         std_rewards=std_rewards,
                     )
@@ -821,12 +846,13 @@ def grpo_train_sync(
                     driver_carry["std"] = std
                     if "env_reward" in driver_carry:
                         # grpo.length_penalty rewrote total_reward; keep a
-                        # baseline of the env reward for the pct_* diagnostics.
+                        # baseline of the env reward for the pct_* diagnostics,
+                        # over the same population as the training baseline.
                         driver_carry["env_baseline"], _, _ = (
                             calculate_baseline_and_std_per_prompt(
                                 prompt_group_ids,
                                 driver_carry["env_reward"],
-                                torch.ones_like(driver_carry["env_reward"]),
+                                statistics_valid_mask,
                                 leave_one_out_baseline=master_config.grpo.use_leave_one_out_baseline,
                             )
                         )
@@ -844,7 +870,7 @@ def grpo_train_sync(
                             calculate_trivial_reward_distributions(
                                 prompt_group_ids,
                                 dynamic_sampling_rewards,
-                                torch.ones_like(dynamic_sampling_rewards),
+                                statistics_valid_mask,
                             )
                         )
                         tags["is_trivial_prompt_distribution"] = (
@@ -903,8 +929,15 @@ def grpo_train_sync(
                         pending_meta = None
                         pending_carry = None
 
+                # The dataset weight, before the mask_sample and overlong
+                # filters rewrite the column: the include population (see
+                # grpo._include_valid_mask).
+                dataset_loss_multiplier = driver_carry["loss_multiplier"]
                 # Mirrors legacy ``grpo.py:1707-1716`` — applied on the
                 # post-DS survivors so dropped rows don't affect this set.
+                metrics["num_mask_sample_filtered"] = _apply_mask_sample_filter(
+                    driver_carry
+                )
                 if master_config.grpo.overlong_filtering:
                     lm = driver_carry["loss_multiplier"].clone()
                     lm[driver_carry["truncated"]] = 0
@@ -1035,6 +1068,9 @@ def grpo_train_sync(
                 with timer.time("advantage_calculation"):
                     print("▶ Computing advantages...", flush=True)
                     mask = token_mask * sample_mask.unsqueeze(-1)
+                    advantage_valid_mask = _advantage_valid_mask(
+                        sample_mask, master_config.grpo, dataset_loss_multiplier
+                    )
 
                     # GRPO / Reinforce++ ignore ``repeated_batch`` (it's
                     # swallowed via ``**kwargs``); GDPO reads the
@@ -1055,12 +1091,18 @@ def grpo_train_sync(
                         prompt_ids=prompt_ids_for_adv,
                         rewards=rewards,
                         mask=mask,
+                        valid_mask=advantage_valid_mask,
+                        normalization_mask=token_mask
+                        * advantage_valid_mask.unsqueeze(-1),
                         repeated_batch=adv_inputs,
                         logprobs_policy=prev_logprobs,
                         logprobs_reference=reference_policy_logprobs,
                     )
                     del prompt_ids_for_adv
 
+                    # The pct_* diagnostics count the statistics population of
+                    # the configured policy: the same mask handed to
+                    # compute_advantage, as in the legacy loop.
                     _log_mixed_rewards_and_advantages_information(
                         logger=logger,
                         total_steps=total_steps,
@@ -1068,6 +1110,7 @@ def grpo_train_sync(
                         baseline=baseline_for_log,
                         advantages=advantages,
                         env_baseline=env_baseline_for_log,
+                        valid_mask=advantage_valid_mask,
                     )
                     del baseline_for_log, env_baseline_for_log
 
@@ -1277,6 +1320,7 @@ def grpo_train_sync(
                         print(f"Skipping aggregation for {k} ({type(v)})")
                 finalize_draft_ratio_metrics(metrics)
 
+                _update_adaptive_loss_state(loss_fn, metrics)
                 metrics.update(rollout_metrics)
                 metrics["generation_logger_metrics"] = generation_logger_metrics
                 total_valid_tokens += metrics["global_valid_toks"]
@@ -1314,6 +1358,7 @@ def grpo_train_sync(
                     elif hasattr(grpo_save_state, "val_reward"):
                         delattr(grpo_save_state, "val_reward")
                     grpo_save_state.consumed_samples = consumed_samples
+                    _save_adaptive_loss_state(grpo_save_state, loss_fn)
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
@@ -1366,17 +1411,14 @@ def grpo_train_sync(
                                 task_name,
                                 task_dataloader,
                             ) in wrapped_dataloader.dataloaders.items():
-                                torch.save(
+                                save_dataloader_state(
                                     task_dataloader.state_dict(),
-                                    os.path.join(
-                                        checkpoint_path,
-                                        f"train_dataloader_{task_name}.pt",
-                                    ),
+                                    checkpoint_path,
+                                    suffix=f"_{task_name}",
                                 )
                         else:
-                            torch.save(
-                                wrapped_dataloader.state_dict(),
-                                os.path.join(checkpoint_path, "train_dataloader.pt"),
+                            save_dataloader_state(
+                                wrapped_dataloader.state_dict(), checkpoint_path
                             )
                         checkpointer.begin_finalization(
                             checkpoint_path,
@@ -1392,8 +1434,11 @@ def grpo_train_sync(
             # / KV calibration.
             if not _should_log_nemo_gym_responses(master_config):
                 log_data: dict = {}
-                if "agent_ref" in repeated_batch:
-                    log_data["agent_ref"] = repeated_batch["agent_ref"]
+                for key in ("agent_ref", "attribution_key"):
+                    if driver_carry is not None and key in driver_carry:
+                        log_data[key] = driver_carry[key]
+                    elif key in repeated_batch:
+                        log_data[key] = repeated_batch[key]
                 if master_config.grpo.use_dynamic_sampling:
                     # Legacy semantics: ``rewards`` is unfiltered total_reward,
                     # ``filtered_rewards`` is the kept slice that's trained on.

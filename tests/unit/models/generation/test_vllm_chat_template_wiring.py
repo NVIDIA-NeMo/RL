@@ -25,14 +25,21 @@ These tests drive the real _setup_vllm_openai_api_server against a fake vLLM
 module tree, inspect consumer configuration, and exercise captured raw responses.
 """
 
+import asyncio
 import sys
 import types
 from collections.abc import AsyncIterator
+from copy import deepcopy
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
+from nemo_rl.data.captured_media import capture_processed_media
+from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
@@ -154,10 +161,13 @@ def _install_fake_vllm(monkeypatch):
         with_cancellation=lambda handler: handler,
     )
     module("vllm.renderers.online_renderer", OnlineRenderer=_OnlineRenderer)
-    module(
-        "vllm.exceptions",
-        VLLMValidationError=type("VLLMValidationError", (Exception,), {}),
-    )
+    module("vllm.renderers.hf", HfRenderer=placeholder("HfRenderer"))
+
+    class ValidationError(ValueError):
+        def __init__(self, message, **kwargs):
+            super().__init__(message)
+
+    module("vllm.exceptions", VLLMValidationError=ValidationError)
     module(
         "vllm.reasoning.abs_reasoning_parsers",
         ReasoningParserManager=type(
@@ -176,7 +186,7 @@ def _install_fake_vllm(monkeypatch):
         built.clear()
 
 
-def _build_server(monkeypatch, serving_chat_kwargs):
+def _build_server(monkeypatch, serving_chat_kwargs, *, capture_requests=(), app=None):
     """Run the real server setup and hand back the three consumer stubs."""
     _install_fake_vllm(monkeypatch)
 
@@ -194,8 +204,10 @@ def _build_server(monkeypatch, serving_chat_kwargs):
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
         served_model_name="served-model", model="model-path"
     )
+    worker._capture_calls = {id(request): None for request in capture_requests}
+    worker.routed_experts_dtype = torch.int16
 
-    worker._setup_vllm_openai_api_server(_FakeApp())
+    worker._setup_vllm_openai_api_server(app if app is not None else _FakeApp())
     assert _BUILT["chat"][0].kwargs["engine_client"] is worker._http_engine_client
     return _BUILT["renderer"], _BUILT["chat"], _BUILT["tokenize"]
 
@@ -236,14 +248,6 @@ async def test_captured_chat_logprobs_bypass(
     invalid_raw: bool,
 ) -> None:
     """Drive the real serving MRO and retain engine-native arrays unchanged."""
-    _, chats, _ = _build_server(monkeypatch, {})
-    serving = chats[0]
-    serving.return_tokens_as_token_ids = default_token_ids
-    serving.renderer = types.SimpleNamespace(tokenizer=None)
-    capture_calls = {}
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "_capture_calls", capture_calls, raising=False
-    )
     monkeypatch.setattr(
         VllmAsyncGenerationWorkerImpl,
         "_return_routed_experts_enabled",
@@ -256,8 +260,12 @@ async def test_captured_chat_logprobs_bypass(
         top_logprobs=0,
         return_tokens_as_token_ids=token_ids,
     )
-    if admitted:
-        capture_calls[id(request)] = object()
+    _, chats, _ = _build_server(
+        monkeypatch, {}, capture_requests=[request] if admitted else []
+    )
+    serving = chats[0]
+    serving.return_tokens_as_token_ids = default_token_ids
+    serving.renderer = types.SimpleNamespace(tokenizer=None)
     original_request_fields = vars(request).copy()
     ordinary_logprobs = object()
     builder = MagicMock(return_value=ordinary_logprobs)
@@ -400,3 +408,300 @@ def test_absent_kwargs_render_as_empty_dict(monkeypatch):
 
     assert renderer[0].kwargs["default_chat_template_kwargs"] == {}
     assert tokenization[0].kwargs["default_chat_template_kwargs"] == {}
+
+
+@pytest.mark.vllm
+def test_capture_bypasses_upstream_route_encoding_without_changing_plain_requests(
+    monkeypatch,
+):
+    """Run the installed vLLM response generator with interleaved requests."""
+    # Optional runtime: the existing scaffold replaces server initialization,
+    # but this regression must execute vLLM's real superclass conversion.
+    serving = pytest.importorskip("vllm.entrypoints.openai.chat_completion.serving")
+    from vllm.entrypoints.openai.chat_completion.protocol import (
+        ChatCompletionRequest,
+        ChatCompletionResponse,
+    )
+    from vllm.outputs import CompletionOutput, RequestOutput
+
+    class ServingWithoutEngine(serving.OpenAIServingChat):
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            _BUILT["chat"].append(self)
+            self.response_role = "assistant"
+            self.return_tokens_as_token_ids = True
+            self.parser_cls = None
+            self.enable_auto_tools = False
+            self._include_reasoning_tokens_details = False
+            self.enable_prompt_tokens_details = False
+            self.enable_per_request_metrics = False
+            self.enable_log_outputs = False
+            self.system_fingerprint = None
+
+    real_install = _install_fake_vllm
+
+    def install_with_real_response_type(monkeypatch):
+        real_install(monkeypatch)
+        monkeypatch.setattr(
+            sys.modules["vllm.entrypoints.openai.chat_completion.protocol"],
+            "ChatCompletionResponse",
+            ChatCompletionResponse,
+        )
+
+    monkeypatch.setattr(
+        sys.modules[__name__], "_OpenAIServingChat", ServingWithoutEngine
+    )
+    monkeypatch.setattr(
+        sys.modules[__name__], "_install_fake_vllm", install_with_real_response_type
+    )
+    upstream_encode = MagicMock(wraps=serving.numpy2base64)
+    rl_encode = MagicMock(wraps=vllm_utils.encode_routed_experts)
+    monkeypatch.setattr(serving, "numpy2base64", upstream_encode)
+    monkeypatch.setattr(vllm_utils, "encode_routed_experts", rl_encode)
+
+    requests = [
+        ChatCompletionRequest(
+            model="model", messages=[{"role": "user", "content": "x"}], logprobs=False
+        )
+        for _ in range(2)
+    ]
+    _, chats, _ = _build_server(monkeypatch, {}, capture_requests=[requests[0]])
+    chat = chats[0]
+    results = []
+    for request_index in range(2):
+        per_request = []
+        for step in range(2):
+            routes = torch.tensor(
+                [[[request_index * 10 + step, request_index * 10 + step + 1]]],
+                dtype=torch.int16,
+            ).numpy()
+            output = CompletionOutput(
+                index=0,
+                text="answer",
+                token_ids=[22],
+                cumulative_logprob=None,
+                logprobs=None,
+                routed_experts=routes,
+                finish_reason="stop",
+            )
+            per_request.append(
+                RequestOutput(
+                    request_id=str(request_index),
+                    prompt="x",
+                    prompt_token_ids=[10],
+                    prompt_logprobs=None,
+                    outputs=[output],
+                    finished=True,
+                )
+            )
+        results.append(per_request)
+
+    async def respond(index):
+        async def generate():
+            for result in results[index]:
+                await asyncio.sleep(0)
+                yield result
+
+        return await chat.chat_completion_full_generator(
+            requests[index],
+            generate(),
+            str(index),
+            "model",
+            [],
+            None,
+            types.SimpleNamespace(),
+        )
+
+    async def respond_both():
+        return await asyncio.gather(respond(0), respond(1))
+
+    capture_response, plain_response = asyncio.run(respond_both())
+
+    # Both upstream's numpy codec and RL's envelope codec run only for the
+    # plain request, even though capture is installed on the shared worker.
+    upstream_encode.assert_called_once()
+    assert upstream_encode.call_args.args[0] is results[1][-1].outputs[0].routed_experts
+    rl_encode.assert_called_once()
+    assert capture_response.choices[0].routed_experts is None
+    native = capture_response.choices[0].message.routed_experts
+    torch.testing.assert_close(
+        native, torch.tensor([[[1, 2]], [[-1, -1]]], dtype=torch.int16)
+    )
+    assert isinstance(plain_response.choices[0].routed_experts, str)
+    assert isinstance(plain_response.choices[0].message.routed_experts, str)
+    # The wrapper must not clear the engine's originals or copy their buffers.
+    for request_index, per_request in enumerate(results):
+        for step, result in enumerate(per_request):
+            assert result.outputs[0].routed_experts.tolist() == [
+                [[request_index * 10 + step, request_index * 10 + step + 1]]
+            ]
+
+
+@pytest.mark.parametrize("capture_media", [False, True])
+def test_prefix_splice_remaps_image_once(monkeypatch, capture_media):
+    """Captured and ordinary requests must use the same final image positions."""
+
+    @dataclass(frozen=True)
+    class Span:
+        offset: int
+        length: int
+        is_embed: object = None
+
+    template_tokens = [10, 31, 2, 11, 18, 18, 12]
+    final_tokens = [10, 77, 31, 2, 11, 18, 18, 12]
+    prompt = {
+        "prompt_token_ids": template_tokens,
+        "mm_placeholders": {"image": [Span(4, 2)]},
+        "mm_kwargs": {
+            "image": [
+                SimpleNamespace(
+                    get_data=lambda: {
+                        "pixel_values_flat": torch.zeros(3, 1, 2),
+                        "imgs_sizes": torch.tensor([1, 2]),
+                        "num_tokens_per_image": 2,
+                    }
+                )
+            ]
+        },
+    }
+    captured = []
+    admission = (
+        SimpleNamespace(mode="token_in", prev_len=4, request_replay=None)
+        if capture_media
+        else None
+    )
+
+    async def preprocess(self, *, messages, **kwargs):
+        rendered = (
+            deepcopy(prompt)
+            if len(messages) == 2
+            else {
+                "prompt_token_ids": [10, 31, 2],
+            }
+        )
+        return (None, [rendered])
+
+    def capture(
+        self, engine_prompt, *, admission, splice=None, verify_retained_media=False
+    ):
+        assert not verify_retained_media
+        if not capture_media:
+            return None
+        media = capture_processed_media(
+            engine_prompt,
+            prev_len=admission.prev_len,
+            splice=splice,
+            patch_size=1,
+        )
+        captured.append(media)
+        return media
+
+    monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", preprocess, raising=False)
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_media", capture_media, raising=False
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_capture_admission",
+        lambda self, request: admission,
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_resolve_admission_prefix",
+        lambda self, admission: [10, 77, 31, 2],
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_enter_request_prefix",
+        lambda self, request, prefix: setattr(
+            request, "required_prefix_token_ids", prefix
+        ),
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_request_media", capture
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_begin_request_capture", MagicMock()
+    )
+    renderers, _, _ = _build_server(monkeypatch, {})
+    renderer = renderers[0]
+    renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
+    request = SimpleNamespace(required_prefix_token_ids=[10, 77, 31, 2])
+    request.model_copy = lambda **kwargs: request
+    result = asyncio.run(
+        renderer.preprocess_chat(
+            request,
+            [{"role": "assistant"}, {"role": "tool"}],
+            None,
+            None,
+            {},
+        )
+    )
+
+    engine_prompt = result[1][0]
+    assert engine_prompt["prompt_token_ids"] == final_tokens
+    assert engine_prompt["mm_placeholders"]["image"][0].offset == 5
+    if capture_media:
+        assert captured[0].items[0].placeholder_offset == 5
+
+
+@pytest.mark.parametrize("overflows", [False, True])
+@pytest.mark.parametrize("failure_stage", ["capture", "remap"])
+def test_prefix_overflow_precedes_media_validation(
+    monkeypatch, overflows, failure_stage
+):
+    """An overflowing exact prefix must retain the normal context-length error."""
+    app = _FakeApp()
+
+    async def preprocess(self, *, messages, **kwargs):
+        prompt = {"prompt_token_ids": [10, 31, 2]}
+        if len(messages) == 2:
+            prompt = {
+                "prompt_token_ids": [10, 31, 2, 11, 18, 18, 12],
+                "mm_placeholders": {"image": [SimpleNamespace(offset=4, length=2)]},
+            }
+        return None, [prompt]
+
+    monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", preprocess, raising=False)
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_media", False, raising=False
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_admission", lambda self, request: None
+    )
+    capture = MagicMock(
+        side_effect=ValueError("retiled media") if failure_stage == "capture" else None,
+        return_value=None,
+    )
+    remap = MagicMock(side_effect=ValueError("retiled media"))
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_request_media", capture
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.remap_multimodal_placeholders",
+        remap,
+    )
+    renderers, _, _ = _build_server(monkeypatch, {}, app=app)
+    renderer = renderers[0]
+    renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
+    renderer.model_config = SimpleNamespace(max_model_len=8 if overflows else 16)
+    endpoint = next(fn for path, fn in app.routes if path == "/v1/chat/completions")
+    request = endpoint.__annotations__["request"]()
+    request.required_prefix_token_ids = [10, 77, 31, 2]
+    request.max_tokens, request.max_completion_tokens = 4, None
+    request.model_copy = lambda **kwargs: request
+    message = "maximum context length" if overflows else "retiled media"
+
+    with pytest.raises(ValueError, match=message):
+        asyncio.run(
+            renderer.preprocess_chat(
+                request, [{"role": "assistant"}, {"role": "tool"}], None, None, {}
+            )
+        )
+
+    if overflows:
+        capture.assert_not_called()
+        remap.assert_not_called()
+    else:
+        capture.assert_called_once()
+        assert remap.call_count == (failure_stage == "remap")

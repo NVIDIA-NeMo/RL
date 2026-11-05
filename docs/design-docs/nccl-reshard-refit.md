@@ -379,6 +379,15 @@ generation side maps those HF names onto whatever its own storage layout is.
   Misc weights continue through Megatron Bridge's
   packed-broadcast import path.
 
+Parameter-spec construction lives in two stateless collections in the existing
+backend files. `MegatronReshardParamSpecCollection` provides `_default_param_spec`
+and `_grouped_expert_spec` for source hooks. `VllmReshardParamSpecCollection`
+provides `_direct_param_spec`, `_default_staged_param_spec`, and the separate
+MXFP8, blockwise FP8, and TRTLLM grouped-expert factories. Workers retain parameter
+discovery, shared metadata and scale validation, factory selection, map construction,
+communicator lifecycle, and transport orchestration. The TRTLLM factory owns its
+destination-shard, mesh, expert-divisibility, and registered-name checks.
+
 **To extend to a new backend**, provide a destination map from canonical HF weights
 to that backend's local storage. Both backends implement this as
 `build_hf_to_local_param_map`; Megatron derives its targets from Bridge conversion tasks.
@@ -426,7 +435,7 @@ xferdtensor(src_tensor, src_mesh, src_placement,
 and dispatches to one of two transports:
 
 * **Core NCCL reshard** — the reshard operation provided by the **nccl4py
-  wrapper** (`nccl.m2n.reshard`). When the package is accesible, this is the default:
+  wrapper** (`nccl.m2n.reshard`). When the package is accessible, this is the default:
   the local shards, mesh rank grids, and placements are handed to the NCCL library,
   which executes the cross-mesh redistribution natively.
 * **`xferdtensor_python_impl`** (`nemo_rl/weight_sync/xferdtensor_python.py`) — a pure

@@ -34,6 +34,7 @@ NRL_FORCE_REBUILD_VENVS=true uv run coverage run -a --data-file=$PROJECT_ROOT/te
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.gpus_per_node=1 \
     policy.generation.colocated.resources.num_nodes=1 \
+    policy.generation.lora_refit_mode=merged \
     policy.generation.vllm_cfg.async_engine=true \
     grpo.async_grpo.enabled=true \
     loss_fn.use_importance_sampling_correction=true \

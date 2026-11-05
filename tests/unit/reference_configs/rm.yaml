@@ -88,9 +88,16 @@ policy:
     checkpoint:
       async_save: false
       ckpt_assume_constant_structure: false
+      parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
     tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 2
     context_parallel_size: 1
@@ -100,6 +107,7 @@ policy:
     sequence_parallel: false
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
+    reuse_logits_storage: false
 
     optimizer:
       optimizer: "adam"
@@ -236,6 +244,7 @@ logger:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
   num_val_samples_to_print: 0
+  extra_backends: []
 
 cluster:
   gpus_per_node: 1

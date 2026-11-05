@@ -45,6 +45,7 @@ from nemo_rl.data.llm_message_utils import (
     get_keys_from_message_log,
 )
 from nemo_rl.data.multimodal_utils import (
+    ROLLOUT_MATCHED_MEDIA_KEY,
     VLLM_MULTI_MODAL_DATA_KEY,
     VLLM_PROMPT_KEYS,
     PackedTensor,
@@ -62,9 +63,17 @@ from nemo_rl.environments.nemo_gym import (
     DEFAULT_THINKING_TAGS,
     NemoGymShardSet,
     as_nemo_gym_shard_set,
-    get_nemo_gym_route_name,
     get_pad_dynamic_image_shapes,
 )
+from nemo_rl.environments.nemo_gym_task import (
+    get_nemo_gym_attribution_key,
+    get_nemo_gym_task_input,
+    is_nemo_gym_task,
+)
+from nemo_rl.environments.nemotron_utils import (
+    verify_static_video_media_alignment,
+)
+from nemo_rl.experience.failures import GymRowFailure
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -97,6 +106,7 @@ from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
     print_multimodal_payload_metrics,
 )
+from nemo_rl.utils.routed_experts_codec import slice_routed_experts
 from nemo_rl.utils.timer import Timer
 
 TokenizerType = PreTrainedTokenizerBase
@@ -165,8 +175,10 @@ def attach_initial_nemo_gym_image_payloads(
     ):
         if extra_env_info is None or not isinstance(extra_env_info, dict):
             continue
-        initial_messages = extra_env_info.get("responses_create_params", {}).get(
-            "input", []
+        initial_messages = (
+            get_nemo_gym_task_input(extra_env_info)
+            .get("responses_create_params", {})
+            .get("input", [])
         )
         # Load images from Responses-API input messages in encounter order.
         images = [
@@ -272,20 +284,37 @@ def _reattach_original_multimodal_payloads(
 def _reattach_static_multimodal_payloads_to_result(
     result: dict[str, Any],
     source_message_log: list[dict[str, Any]],
+    tokenizer: Any = None,
 ) -> None:
     """Restore static media to each Gym-authored message-log representation."""
+    # input_message_log is commonly a slice of message_log, so the two views
+    # can alias the same message dictionaries. Process each target once.
+    processed_target_ids: set[int] = set()
     for log_key in ("input_message_log", "message_log"):
         target_log = result.get(log_key)
         if not target_log:
             continue
-        attach_static_multimodal_payload(target_log, source_message_log)
+        attach_static_multimodal_payload(
+            target_log,
+            source_message_log,
+            processed_target_ids=processed_target_ids,
+            tokenizer=tokenizer,
+        )
 
 
 def attach_static_multimodal_payload(
     target_message_log: list[dict[str, Any]],
     source_message_log: list[dict[str, Any]],
+    processed_target_ids: set[int] | None = None,
+    tokenizer: Any = None,
 ) -> None:
-    """Copy policy-ready media from static source turns to Gym-authored turns."""
+    """Copy policy-ready media from static source turns to Gym-authored turns.
+
+    A shared ``processed_target_ids`` prevents aliased views from consuming a
+    rollout-matched marker and then overwriting the repaired media. When a
+    tokenizer is supplied, static video placeholder geometry is verified
+    before tensors are copied.
+    """
     source_users = [
         message for message in source_message_log if message.get("role") == "user"
     ]
@@ -298,6 +327,14 @@ def attach_static_multimodal_payload(
             "turns than the source prompt."
         )
     for source, target in zip(source_users, target_users):
+        if processed_target_ids is not None:
+            if id(target) in processed_target_ids:
+                continue
+            processed_target_ids.add(id(target))
+        if target.pop(ROLLOUT_MATCHED_MEDIA_KEY, False):
+            continue
+        if tokenizer is not None:
+            verify_static_video_media_alignment(source, target, tokenizer)
         # Check if the source is empty or not.
         source_token_ids = source.get("token_ids")
         source_is_tokenized = (
@@ -397,7 +434,9 @@ def _attach_routed_experts_to_message_log_prefix(
         if not isinstance(token_ids, torch.Tensor):
             continue
         msg_len = int(token_ids.shape[0])
-        msg["routed_experts"] = routed_experts[cursor : cursor + msg_len]
+        msg["routed_experts"] = slice_routed_experts(
+            routed_experts, cursor, cursor + msg_len
+        )
         cursor += msg_len
     return cursor
 
@@ -683,9 +722,9 @@ def generate_responses(
                     "message_log token length does not match generation input_length "
                     f"({prefix_length} != {int(input_length.item())})."
                 )
-            assistant_message["routed_experts"] = routed_experts[
-                input_length:total_length
-            ]
+            assistant_message["routed_experts"] = slice_routed_experts(
+                routed_experts, int(input_length.item()), int(total_length.item())
+            )
 
         batch["message_log"][i].append(assistant_message)
 
@@ -824,9 +863,9 @@ async def generate_responses_async(
                     "message_log token length does not match generation input_length "
                     f"({prefix_length} != {int(input_length.item())})."
                 )
-            assistant_message["routed_experts"] = routed_experts[
-                input_length:total_length
-            ]
+            assistant_message["routed_experts"] = slice_routed_experts(
+                routed_experts, int(input_length.item()), int(total_length.item())
+            )
 
         batch["message_log"][i].append(assistant_message)
 
@@ -1902,7 +1941,7 @@ class _NemoGymStreamAccumulator:
         self,
         row_index: int,
         result: dict,
-        resolved_agent_ref: dict,
+        resolved_agent_ref: dict | None,
     ) -> _CompletedNemoGymGroup | None:
         """Add one streamed row and return its group when that group is complete."""
         if not isinstance(row_index, int):
@@ -1917,7 +1956,8 @@ class _NemoGymStreamAccumulator:
         if row_index in self._received_row_indices:
             raise ValueError(f"NeMo-Gym returned duplicate row index {row_index}")
 
-        self._rows[row_index]["agent_ref"] = resolved_agent_ref
+        row = self._rows[row_index]
+        row["agent_ref"] = None if is_nemo_gym_task(row) else resolved_agent_ref
         self._received_row_indices.add(row_index)
         group_index = row_index // self._num_generations
         group_results = self._pending_results[group_index]
@@ -1939,10 +1979,11 @@ class _NemoGymStreamAccumulator:
 
         rows = self._rows[start:end]
         if not self._allow_mixed_agents:
-            agent_names = [row["agent_ref"]["name"] for row in rows]
-            if len(set(agent_names)) != 1:
+            attribution_keys = [get_nemo_gym_attribution_key(row) for row in rows]
+            if None in attribution_keys or len(set(attribution_keys)) != 1:
                 raise ValueError(
-                    f"Expected one NeMo-Gym agent per prompt group, got {agent_names}"
+                    "Expected one NeMo-Gym attribution key per prompt group, "
+                    f"got {attribution_keys}"
                 )
 
         ordered_results = [group_results[index] for index in expected_row_indices]
@@ -2137,7 +2178,20 @@ def resolve_reward_penalty_config(
                     token_ids["think_open"] = inferred_open
                 if inferred_close is not None:
                     token_ids["think_close"] = inferred_close
+        else:
+            raise ValueError(
+                "penalize_malformed_think_tag needs open and close thinking tags in "
+                f"env.nemo_gym.thinking_tags, got {tags!r}"
+            )
 
+    if resolved.get("penalize_malformed_think_tag") and (
+        ("think_open" in token_ids) != ("think_close" in token_ids)
+    ):
+        raise ValueError(
+            "reward_penalties.token_ids.think_open and think_close must both be set "
+            "or both omitted; omitted IDs are inferred from single-token "
+            "thinking_tags, otherwise only the decoded-text check runs"
+        )
     if token_ids:
         resolved["token_ids"] = token_ids
 
@@ -2281,8 +2335,9 @@ def apply_reward_penalties(
         )
         if (think_open_token_id is None) != (think_close_token_id is None):
             raise ValueError(
-                "reward_penalties.token_ids.think_open and "
-                "reward_penalties.token_ids.think_close must both be set"
+                "reward_penalties.token_ids.think_open and think_close must both be "
+                "set or both omitted; omitted IDs are inferred from single-token "
+                "thinking_tags, otherwise only the decoded-text check runs"
             )
         for result in results:
             has_violation = any(
@@ -2332,10 +2387,6 @@ def apply_reward_penalties(
                     )
                     or DEFAULT_THINKING_TAGS
                 )
-                if len(thinking_tags) < 2:
-                    raise ValueError(
-                        "reward_penalties.thinking_tags must contain open and close tags"
-                    )
                 think_open_text, think_close_text = thinking_tags[:2]
                 output_items = (
                     result["full_result"].get("response", {}).get("output", [])
@@ -2409,10 +2460,12 @@ def _prepare_nemo_gym_rows(
     for row_index, row in enumerate(rows):
         group_index = row_index // num_generations
         rollout_index = row_index % num_generations
-        responses_create_params = row.get("responses_create_params")
+        responses_create_params = get_nemo_gym_task_input(row).get(
+            "responses_create_params"
+        )
         if not isinstance(responses_create_params, dict):
             raise TypeError(
-                "Each NeMo-Gym row must contain a responses_create_params dict"
+                "Each NeMo-Gym task input must contain a responses_create_params dict"
             )
 
         responses_create_params["temperature"] = sampling_params.temperature
@@ -2453,16 +2506,12 @@ def _bucket_nemo_gym_rows_by_instance(
         first-use order. Actors with no rows are omitted rather than sent an
         empty batch.
     """
+    if not rows:
+        return []
     buckets: dict[int, tuple[str, Any, list[dict]]] = {}
     for start in range(0, len(rows), num_generations):
         group = rows[start : start + num_generations]
-        route_names = {get_nemo_gym_route_name(row) for row in group}
-        if len(route_names) != 1:
-            raise ValueError(
-                f"NeMo-Gym prompt group at row {start} mixes routes "
-                f"{sorted(route_names)}. A group must reference exactly one route."
-            )
-        handle = shard_set.pick_handle(next(iter(route_names)))
+        handle = shard_set.pick_handle_for_group(group)
         if id(handle) not in buckets:
             buckets[id(handle)] = (shard_set.instance_label(handle), handle, [])
         buckets[id(handle)][2].extend(group)
@@ -2478,7 +2527,7 @@ async def _merge_nemo_gym_instance_streams(
     timer_prefix: str,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
-) -> AsyncGenerator[tuple[int, dict, dict, dict | None, str], None]:
+) -> AsyncGenerator[tuple[int, dict | None, dict, dict | None, str], None]:
     """Interleave K actor streams into one, yielding rows as they complete.
 
     ``run_rollouts`` is a streaming generator, so there is nothing to gather:
@@ -2528,7 +2577,15 @@ async def _merge_nemo_gym_instance_streams(
                 instance_label = iterators[iterator]
                 try:
                     future = task.result()
-                    row_index, resolved_agent_ref, result, timing_metrics = await future
+                    item = await future
+                    if isinstance(item, GymRowFailure):
+                        # This path retries the whole batch, not one row, so a
+                        # failed row still ends its instance's stream.
+                        stream = streams_by_iterator[iterator]
+                        if isinstance(stream, ray.ObjectRefGenerator):
+                            ray.cancel(stream)
+                        raise item.error
+                    row_index, resolved_agent_ref, result, timing_metrics = item
                 except StopAsyncIteration:
                     active_iterators.remove(iterator)
                     continue
@@ -2837,7 +2894,7 @@ async def run_async_nemo_gym_rollout(
                 )
                 if original_message_logs is not None:
                     _reattach_static_multimodal_payloads_to_result(
-                        result, original_message_logs[rowidx]
+                        result, original_message_logs[rowidx], tokenizer
                     )
                     result.pop("_initial_multimodal_data_omitted", None)
                 if completed_group is not None:
@@ -3189,6 +3246,13 @@ def _postprocess_single_nemo_gym_group(
     (``identity_num_generations``); the synchronous path hands the whole batch
     in as one call, so it may hold several prompt groups. Defaults to the batch.
     """
+    for row, result in zip(nemo_gym_rows, results):
+        attribution_key = get_nemo_gym_attribution_key(row)
+        if attribution_key is None:
+            raise ValueError("NeMo-Gym rollout has no attribution key")
+        result["attribution_key"] = attribution_key
+        result["agent_ref"] = None if is_nemo_gym_task(row) else row["agent_ref"]
+
     # Length-based reward shaping for low-effort prompts
     shaping = _apply_effort_shaping(results, nemo_gym_rows, effort_config)
 
@@ -3205,12 +3269,16 @@ def _postprocess_single_nemo_gym_group(
     if length_penalty_config is not None:
         # Copy the per-row fields the length adjustments consume.
         for nemo_gym_row, result in zip(nemo_gym_rows, results):
-            result["agent_ref"] = nemo_gym_row["agent_ref"]
-            result["profiled_rewards"] = nemo_gym_row.get("profiled_rewards")
-            result["profiled_output_lengths"] = nemo_gym_row.get(
+            task_input = get_nemo_gym_task_input(nemo_gym_row)
+            if is_nemo_gym_task(nemo_gym_row):
+                task_data = task_input.get("task_data")
+                if isinstance(task_data, dict):
+                    task_input = {**task_data, **task_input}
+            result["profiled_rewards"] = task_input.get("profiled_rewards")
+            result["profiled_output_lengths"] = task_input.get(
                 "profiled_output_lengths"
             )
-            result["profile_band"] = nemo_gym_row.get("profile_band")
+            result["profile_band"] = task_input.get("profile_band")
         env_rewards = torch.tensor([r["full_result"]["reward"] for r in results])
         length_penalty_metrics = apply_group_length_penalties(
             results,
@@ -3317,18 +3385,14 @@ def _postprocess_single_nemo_gym_group(
             # )
             # / batch_size,
         }
-    # Per-agent misc metrics
+    # Namespace metrics by taskset for materialized rows or agent for flat rows.
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
         agent_to_sample_metrics: dict[str, list[dict]] = defaultdict(list)
-        for nemo_gym_row, result, sample_metrics in zip(
-            nemo_gym_rows, results, all_sample_metrics
-        ):
-            agent_ref = nemo_gym_row["agent_ref"]
-            agent_name = agent_ref["name"]
+        for result, sample_metrics in zip(results, all_sample_metrics):
+            agent_name = result["attribution_key"]
             agent_to_results[agent_name].append(result["full_result"])
             agent_to_sample_metrics[agent_name].append(sample_metrics)
-            result["agent_ref"] = agent_ref
 
         per_agent_metrics = {}
         for agent_name, agent_results in agent_to_results.items():
@@ -3401,6 +3465,7 @@ def _postprocess_single_nemo_gym_group(
     final_batch = BatchedDataDict[DatumSpec](
         {
             "agent_ref": [r["agent_ref"] for r in results],
+            "attribution_key": [r["attribution_key"] for r in results],
             "message_log": [r["message_log"] for r in results],
             # length is used downstream for mean_prompt_length
             "length": torch.tensor(

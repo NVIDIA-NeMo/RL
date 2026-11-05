@@ -76,11 +76,11 @@ policy:
       cuda_graph_max_tokens: 512
       inference_cuda_graph_scope: "block"
       buffer_size_gb: 10
-      num_cuda_graphs: 4
+      num_cuda_graphs: -1  # Number of CUDA graphs to build; -1 autotunes
       block_size_tokens: 256
       use_cuda_graphs_for_non_decode_steps: true
       enable_chunked_prefill: true
-      enable_prefix_caching: false
+      enable_prefix_caching: true
       prefix_caching_mamba_gb: null
       prefix_caching_eviction_policy: lru
       prefix_caching_coordinator_policy: longest_prefix

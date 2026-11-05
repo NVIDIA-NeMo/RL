@@ -246,6 +246,7 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         chunk_size: int,
         tp_group: torch.distributed.ProcessGroup,
         inference_only: bool = False,
+        reuse_logits_storage: bool = False,
     ) -> torch.Tensor:
         # Create a mask of valid vocab ids (1 means it needs to be masked).
         target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
@@ -285,6 +286,7 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             ctx.save_for_backward(vocab_parallel_logits, target_mask, masked_target)
             ctx.chunk_size = chunk_size
             ctx.tp_group = tp_group
+            ctx.reuse_logits_storage = reuse_logits_storage
 
         return log_probs
 
@@ -292,7 +294,7 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
     def backward(
         ctx: Any,
         *grad_outputs: torch.Tensor,
-    ) -> tuple[torch.Tensor, None, None, None, None, None, None]:
+    ) -> tuple[torch.Tensor, None, None, None, None, None, None, None]:
         grad_output = grad_outputs[0]
         vocab_parallel_logits, target_mask, masked_target = ctx.saved_tensors
         chunk_size = ctx.chunk_size
@@ -302,7 +304,16 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
-        grad_input: torch.Tensor = torch.zeros_like(vocab_parallel_logits)
+        # Opt-in: write the grad into the logits' storage; only safe when this op is
+        # their sole consumer, as each chunk is read before its slice is overwritten.
+        reuse_logits_storage = (
+            ctx.reuse_logits_storage and not vocab_parallel_logits.is_leaf
+        )
+        grad_input: torch.Tensor = (
+            vocab_parallel_logits
+            if reuse_logits_storage
+            else torch.zeros_like(vocab_parallel_logits)
+        )
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
@@ -335,7 +346,7 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             del softmax_output, is_chosen, logits, chunk_grad_fp32
 
         # if you add an argument to the forward method, then you must add a corresponding None here
-        return grad_input, None, None, None, None, None, None
+        return grad_input, None, None, None, None, None, None, None
 
 
 class DistributedLogprobWithSampling(torch.autograd.Function):
@@ -1065,6 +1076,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
     sampling_params: Optional[TrainingSamplingParams] = None,
     target_is_pre_rolled: bool = False,
     return_packed_layout: bool = False,
+    reuse_logits_storage: bool = False,
 ) -> torch.Tensor:
     """Get log probabilities from TP sharded vocab logits for packed sequences.
 
@@ -1091,6 +1103,10 @@ def from_parallel_logits_to_logprobs_packed_sequences(
         return_packed_layout (bool): Keep the physical ``[1, T-1]`` layout.
             This is used when the input data was packed before it reached the
             model worker.
+        reuse_logits_storage (bool): Let the chunked path write its grad into
+            the logits' storage. After backward the logits tensor holds the grad,
+            so reading it as logits afterwards gives wrong values. Only for callers
+            whose logits have no other consumer.
 
     Returns:
         torch.Tensor: Log probabilities in unpacked ``[batch_size,
@@ -1156,6 +1172,7 @@ def from_parallel_logits_to_logprobs_packed_sequences(
                 chunk_size,
                 group,
                 inference_only,
+                reuse_logits_storage,
             ).contiguous()
         else:
             probs: torch.Tensor = DistributedLogprob.apply(  # type: ignore
@@ -1385,8 +1402,8 @@ class AllGatherCPTensor(torch.autograd.Function):
         )
 
         index = torch.tensor(
-            [cp_rank, (2 * cp_size - cp_rank - 1)], device="cpu", pin_memory=True
-        ).cuda(non_blocking=True)
+            [cp_rank, (2 * cp_size - cp_rank - 1)], device=grad_output.device
+        )
 
         grad_input = grad_output.index_select(seq_dim, index)
         grad_input = grad_input.view(
@@ -1695,12 +1712,156 @@ def get_next_token_logprobs_from_logits(
         next_token_logprobs = torch.nn.functional.log_softmax(
             next_token_logits_wo_last, dim=-1
         )
-        next_tokens = input_ids[:, 1:].cuda()  # Skip first token
+        next_tokens = input_ids[:, 1:].to(next_token_logits.device)  # Skip first token
         logprobs = next_token_logprobs.gather(
             dim=-1, index=next_tokens.unsqueeze(-1)
         ).squeeze(-1)
 
     return logprobs
+
+
+def get_policy_logprobs_at_sampler_topk(
+    sampler_topk_token_ids: torch.Tensor,
+    next_token_logits: torch.Tensor,
+    vocab_parallel_rank: Optional[int] = None,
+    vocab_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
+    chunk_size: Optional[int] = None,
+    cp_sharder: Optional["ContextParallelSharder"] = None,
+    cu_seqlens_q: Optional[CpuIntTuple] = None,
+    cu_seqlens_q_padded: Optional[CpuIntTuple] = None,
+    packed_sampler_topk_token_ids: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Next-token log-probs at each position's sampler top-k ids.
+
+    ``sampler_topk_token_ids`` is token-aligned like ``generation_logprobs`` (row t holds the
+    ids the sampler ranked when it drew token t), so it is rolled by one to line
+    up with the logits, which predict the next token; the result is aligned with
+    :func:`get_next_token_logprobs_from_logits`. On the vocab-parallel path the
+    full-vocabulary log-softmax and its backward run in fp32 inside
+    :class:`ChunkedDistributedGatherLogprob`, so the head and tail terms of score
+    centering cancel in fp32 rather than in the logits' dtype.
+
+    Args:
+        sampler_topk_token_ids: Sampler top-k ids ``[B, S, k]``, any integer dtype.
+        next_token_logits: Logits ``[B, S, V]``, or the ``[B, S // CP, V // TP]`` shard.
+        vocab_parallel_rank: Rank in the vocab parallel group (required with the group).
+        vocab_parallel_group: Process group for vocab parallelism.
+        context_parallel_group: Process group for context parallelism.
+        chunk_size: Sequence-dim chunk size for the vocab-parallel path
+            (policy.logprob_chunk_size); the whole sequence when None.
+        cp_sharder: Automodel context-parallel sharder; not supported here.
+        cu_seqlens_q: CPU unpadded boundaries for internally packed rows.
+        cu_seqlens_q_padded: CPU padded boundaries for those same rows.
+            With packing, CP shards are reconstructed separately per sequence.
+
+        packed_sampler_topk_token_ids: Caller-packed, next-token-aligned IDs
+            ``[1, T // CP, k]``, required with packed boundaries.
+
+    Returns:
+        Log-probs ``[B, S - 1, k]``.
+    """
+    if cp_sharder is not None or isinstance(
+        next_token_logits, torch.distributed.tensor.DTensor
+    ):
+        raise NotImplementedError(
+            "score centering supports the Megatron vocab-parallel and single-device paths"
+        )
+    if (cu_seqlens_q is None) != (cu_seqlens_q_padded is None):
+        raise ValueError(
+            "Both packed sequence boundary tuples must be supplied together"
+        )
+    if chunk_size is None:
+        chunk_size = int(next_token_logits.shape[1])
+    cp_size = (
+        1
+        if context_parallel_group is None
+        else torch.distributed.get_world_size(context_parallel_group)
+    )
+    cp_rank = (
+        0
+        if context_parallel_group is None
+        else torch.distributed.get_rank(context_parallel_group)
+    )
+    if cu_seqlens_q is not None:
+        if packed_sampler_topk_token_ids is None:
+            raise ValueError("Packed sampler IDs must be prepared by the loss caller")
+        targets = packed_sampler_topk_token_ids.to(
+            device=next_token_logits.device, dtype=torch.long
+        )
+    else:
+        sampler_topk_token_ids = sampler_topk_token_ids.to(
+            device=next_token_logits.device, dtype=torch.long
+        )
+        full_width = next_token_logits.shape[1] * cp_size
+        if sampler_topk_token_ids.shape[1] > full_width:
+            raise ValueError(
+                "Sampler top-k sequence is longer than trainer next_token_logits"
+            )
+        padding = sampler_topk_token_ids.new_zeros(
+            sampler_topk_token_ids.shape[0],
+            full_width - sampler_topk_token_ids.shape[1],
+            sampler_topk_token_ids.shape[-1],
+        )
+        targets = torch.cat([sampler_topk_token_ids, padding], dim=1).roll(-1, dims=1)
+        if cp_size > 1:
+            targets = _get_tokens_on_this_cp_rank(targets, cp_rank, cp_size, seq_dim=1)
+
+    if vocab_parallel_group is not None:
+        assert vocab_parallel_rank is not None
+        local_vocab = next_token_logits.shape[-1]
+        head = ChunkedDistributedGatherLogprob.apply(
+            next_token_logits,
+            targets,
+            vocab_parallel_rank * local_vocab,
+            (vocab_parallel_rank + 1) * local_vocab,
+            chunk_size,
+            vocab_parallel_group,
+            False,
+        )
+    else:
+        # CPU/reference path: sequence chunking bounds the temporary FP32 vocab.
+        head = torch.cat(
+            [
+                next_token_logits[:, start : start + chunk_size]
+                .float()
+                .log_softmax(-1)
+                .gather(-1, targets[:, start : start + chunk_size])
+                for start in range(0, next_token_logits.shape[1], chunk_size)
+            ],
+            dim=1,
+        )
+
+    if cu_seqlens_q is None:
+        if cp_size > 1:
+            head = allgather_cp_sharded_tensor(head, context_parallel_group, seq_dim=1)
+        return head[:, : sampler_topk_token_ids.shape[1] - 1]
+
+    # Packed CP is load-balanced within each sequence, not across the full pack.
+    assert cu_seqlens_q_padded is not None
+    rows = []
+    for i in range(len(cu_seqlens_q) - 1):
+        start = int(cu_seqlens_q_padded[i])
+        end = int(cu_seqlens_q_padded[i + 1])
+        row = head[:, start // cp_size : end // cp_size]
+        if cp_size > 1:
+            row = allgather_cp_sharded_tensor(row, context_parallel_group, seq_dim=1)
+        width = min(end - start - 1, sampler_topk_token_ids.shape[1] - 1)
+        row = row[:, :width]
+        rows.append(
+            torch.cat(
+                [
+                    row,
+                    row.new_zeros(
+                        1,
+                        sampler_topk_token_ids.shape[1] - 1 - width,
+                        sampler_topk_token_ids.shape[-1],
+                    ),
+                ],
+                dim=1,
+            )
+        )
+    return torch.cat(rows, dim=0)
 
 
 @torch.no_grad()

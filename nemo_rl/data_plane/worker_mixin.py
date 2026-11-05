@@ -41,7 +41,8 @@ from nemo_rl.data.llm_message_utils import attach_message_log_view
 from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.codec import pad_batch
-from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
+from nemo_rl.data_plane.column_io import fetch_columns
+from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, gdr_enabled
 from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
@@ -57,7 +58,11 @@ from nemo_rl.data_plane.schema import (
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
-from nemo_rl.experience.route_assembly import RouteFragment, execute_route_plan
+from nemo_rl.experience.route_assembly import (
+    RouteFragment,
+    RouteLayout,
+    execute_route_plan,
+)
 from nemo_rl.telemetry.instrumentation import accepts_trace_context
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
@@ -275,7 +280,8 @@ def _broadcast_batched_data_dict(
                 torch.distributed.broadcast(wire, src=src, group=group)
                 del wire
             if not is_leader:
-                values = values.to(src_device)
+                if torch.device(src_device).type != torch.device(bcast_device).type:
+                    values = values.to(src_device)
                 out[key] = torch.nested.nested_tensor_from_jagged(
                     values, offsets.to(values.device)
                 )
@@ -411,8 +417,7 @@ class TQWorkerMixin:
         # mooncake, so no GDR to order against a CUDA context.
         if (
             not isinstance(cfg, LocalDataPlaneConfig)
-            and cfg["backend"] == "mooncake_cpu"
-            and backend_config(cfg).use_gdr
+            and gdr_enabled(cfg)
             and not torch.cuda.is_initialized()
         ):
             raise RuntimeError(
@@ -440,17 +445,17 @@ class TQWorkerMixin:
         """NCCL group of TP×CP×PP siblings within this DP rank.
 
         ``None`` means "no siblings" (TP=CP=PP=1). Subclasses must
-        override using their parallelism state (DTensor ``device_mesh``,
+        override using their parallelism state (Automodel ``device_mesh``,
         Megatron ``parallel_state``). Returning ``None`` makes
         :meth:`_fetch` use independent fetch; returning a group makes
         it use leader-fetch + NCCL broadcast.
         """
         return None
 
-    def _routed_experts_dimensions(self) -> tuple[int, int]:
-        """Return model-owned ``(num_moe_layers, top_k)`` route dimensions."""
+    def _routed_experts_layout(self) -> RouteLayout:
+        """Return the model-owned route layout (MoE layer numbers, total layers, top-k)."""
         raise NotImplementedError(
-            "the router-replay policy worker must provide route dimensions"
+            "the router-replay policy worker must provide the route layout"
         )
 
     def _pad_value_dict(self) -> dict[str, Any]:
@@ -559,11 +564,7 @@ class TQWorkerMixin:
                         select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
                     )
                 else:
-                    td = dp_client.get_samples(
-                        sample_ids=meta.sample_ids,
-                        partition_id=meta.partition_id,
-                        select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
-                    )
+                    td = fetch_columns(dp_client, meta, meta.fields)
                 data = _materialize_fetched(
                     td,
                     local_batch=local_batch,
@@ -617,11 +618,7 @@ class TQWorkerMixin:
                 select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
             )
         else:
-            td = dp_client.get_samples(
-                sample_ids=meta.sample_ids,
-                partition_id=meta.partition_id,
-                select_fields=list(meta.fields),  # type: ignore[no-matching-overload]
-            )
+            td = fetch_columns(dp_client, meta, meta.fields)
         data = _materialize_fetched(
             td,
             local_batch=local_batch,
@@ -781,8 +778,11 @@ class TQWorkerMixin:
             ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
         )
 
-        # The worker supplies real model dims — the authoritative shape check.
-        num_moe_layers, top_k = self._routed_experts_dimensions()
+        # The worker supplies the real model layout — the authoritative shape
+        # check, and what lets a full-layer vLLM fragment be reduced to the
+        # MoE columns a hybrid model trains.
+        layout = self._routed_experts_layout()
+        num_moe_layers, top_k = layout.dims
         input_lengths = data["input_lengths"].reshape(-1).cpu().long()
         offsets = torch.nn.functional.pad(input_lengths.cumsum(0), (1, 0))
         values = torch.full(
@@ -796,7 +796,7 @@ class TQWorkerMixin:
             tensor, reason = execute_route_plan(
                 plan,
                 fragments,
-                dims=(num_moe_layers, top_k),
+                layout=layout,
                 canonical_len=canonical_len,
             )
             if tensor is None:
@@ -897,7 +897,7 @@ class TQWorkerMixin:
     def _local_coords(self) -> dict[str, int]:
         """This worker's (axis -> local-rank) mapping.
 
-        Subclasses MUST override: DTensor reads ``device_mesh``,
+        Subclasses MUST override: Automodel reads ``device_mesh``,
         Megatron reads ``parallel_state``. There's no honest default —
         a missing impl would silently make every rank a writeback
         leader and re-create the ``-601 ILLEGAL_CLIENT`` duplicate-write
@@ -991,6 +991,7 @@ class TQWorkerMixin:
         *,
         result_key: str,
         tq_field: str,
+        keep_on_gpu: bool = False,
     ) -> None:
         """Single chokepoint for ``*_presharded`` write-backs.
 
@@ -1002,6 +1003,8 @@ class TQWorkerMixin:
             result: Worker output containing ``result_key``.
             result_key: Key into ``result`` for the tensor to write back.
             tq_field: Field name on the TQ side.
+            keep_on_gpu: Write the tensor from its own device instead of
+                copying it to CPU first.
         """
         if self._dp_client is None:
             return
@@ -1024,7 +1027,8 @@ class TQWorkerMixin:
                 f"result[{result_key!r}] has batch dim {val.shape[0]} "
                 f"but meta.sample_ids has {len(meta.sample_ids)}."
             )
-        self._write_back(meta, {tq_field: val.detach().to("cpu")})
+        val = val.detach() if keep_on_gpu else val.detach().to("cpu")
+        self._write_back(meta, {tq_field: val})
 
     @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/train_presharded")
@@ -1111,6 +1115,7 @@ class TQWorkerMixin:
         micro_batch_size: Optional[int] = None,
         opd_full_payload: Optional[str] = None,
         opd_full_payload_dtype: Optional[str] = None,
+        keep_outputs_on_gpu: bool = False,
         opd_full_payload_field: Optional[str] = None,
         opd_full_teacher_index: Optional[int] = None,
         opd_full_teacher_index_field: Optional[str] = None,
@@ -1123,6 +1128,10 @@ class TQWorkerMixin:
             opd_full_payload: When set (``"hidden_states"`` or ``"logits"``), also
                 emit the full-vocabulary teacher payload from the same forward.
             opd_full_payload_dtype: Torch dtype name for that payload.
+            keep_outputs_on_gpu: Keep everything this call writes (logprobs
+                and any full-vocabulary payload) on this rank's GPU until the
+                data-plane PUT instead of copying it to CPU. The driver sets it
+                only on a GDR data plane (``gdr_keep_teacher_payload_on_gpu``).
             opd_full_payload_field: Data-plane column the payload is written to.
             opd_full_teacher_index: This teacher group's stable index (see
                 ``create_teacher_worker_groups``), tagged onto every row this
@@ -1156,6 +1165,7 @@ class TQWorkerMixin:
             result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
                 data=data,
                 micro_batch_size=micro_batch_size,
+                keep_on_gpu=keep_outputs_on_gpu,
             )
         else:
             if opd_full_payload_field is None:
@@ -1184,13 +1194,17 @@ class TQWorkerMixin:
                 payload=opd_full_payload,
                 payload_dtype=opd_full_payload_dtype,
                 micro_batch_size=micro_batch_size,
+                keep_on_gpu=keep_outputs_on_gpu,
             )
             # None off the last pipeline stage, which is what keeps this to a
             # single writer: the payload never leaves the stage that produced it.
             teacher_full_payload = result.get("teacher_full_payload")
             if teacher_full_payload is not None:
+                # On GPU when keep_outputs_on_gpu is set: the GDR PUT copies it
+                # straight into TQ's staging buffer, and TQ synchronizes this
+                # device before it reads.
                 stage_local_fields = {
-                    opd_full_payload_field: teacher_full_payload.detach().cpu()
+                    opd_full_payload_field: teacher_full_payload.detach()
                 }
                 if opd_full_teacher_index_field is not None:
                     # Guarded above: a column without an index already raised,
@@ -1203,6 +1217,7 @@ class TQWorkerMixin:
                         (teacher_full_payload.shape[0],),
                         int(opd_full_teacher_index),
                         dtype=torch.int64,
+                        device=teacher_full_payload.device,
                     )
                 self._write_back_stage_local(meta, stage_local_fields)
             del teacher_full_payload
@@ -1211,6 +1226,7 @@ class TQWorkerMixin:
             result,
             result_key="logprobs",
             tq_field="teacher_reference_logprobs",
+            keep_on_gpu=keep_outputs_on_gpu,
         )
         del result
 
