@@ -17,7 +17,7 @@
 With ``rollout_checkpointing.trace``, the controller appends one JSON line per
 event to ``rollout_trace.jsonl`` in the log directory: every rollout attempt's
 dispatch, seal, refusal, abandonment (with its reason) and resume, each prompt
-group's reservation, admission, seal and release, each training step and
+group's reservation, admission, seal and discard, each training step and
 weight sync, and each checkpoint published or restored. Every line carries the
 wall-clock time ``t`` and a ``run`` ID that is new for each process, so runs
 that resume into the same log directory stay apart.

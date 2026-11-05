@@ -905,12 +905,10 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     invariant failures still fail immediately.
 
     ``trace=True`` appends one JSON line per rollout event to
-    ``rollout_trace.jsonl`` in the log directory: each attempt's dispatch,
-    seal, abandonment and resume, each group's reservation and seal, each
-    training step, weight sync and published or restored checkpoint. It is for
-    checking what a stop and restore cost, rollout by rollout, and needs
-    ``rollout_recovery`` dispatch for the per-rollout events. It does not
-    enable checkpointing.
+    ``rollout_trace.jsonl`` in the log directory, to check what a stop and
+    restore cost. Per-rollout events need ``rollout_recovery`` dispatch. It does
+    not enable checkpointing. The events are listed in
+    ``nemo_rl/algorithms/rollout_checkpointing/trace.py``.
     """
 
     snapshot_attempt_interval_s: Annotated[Optional[float], Field(gt=0)] = None
