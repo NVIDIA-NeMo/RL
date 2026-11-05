@@ -45,7 +45,7 @@ import math
 from typing import Annotated, Literal, Optional
 
 import torch
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
@@ -63,6 +63,8 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     name: Literal["grpo", "gdpo", "opd", "reinforce_plus_plus"] = "grpo"
     # GRPO specific
     normalize_rewards: bool = True
+    # Full valid-group sample SD, independent of a leave-one-out baseline.
+    full_group_std: bool = False
     use_leave_one_out_baseline: bool = True
     # GDPO specific: optional per-component weights w_n for the aggregation.
     reward_weights: list[float] | None = None
@@ -75,6 +77,15 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
     # OPD specific: subtract the mean advantage over every valid token in the
     # batch the estimator sees (a whole step; see OPDAdvantageEstimator).
     subtract_global_baseline: bool = False
+
+    @model_validator(mode="after")
+    def validate_full_group_std(self) -> "AdvEstimatorConfig":
+        """Reject full_group_std for estimators that would ignore it."""
+        if self.full_group_std and self.name != "grpo":
+            raise ValueError(
+                f"adv_estimator.full_group_std is only supported for name='grpo', got {self.name!r}."
+            )
+        return self
 
 
 class GAEConfig(BaseModel, extra="allow"):
@@ -102,6 +113,7 @@ class GRPOAdvantageEstimator:
     ):
         self.use_leave_one_out_baseline = estimator_config.use_leave_one_out_baseline
         self.normalize_rewards = estimator_config.normalize_rewards
+        self.full_group_std = estimator_config.full_group_std
 
     def compute_advantage(self, prompt_ids, rewards, mask, valid_mask=None, **kwargs):
         """Compute GRPO advantages.
@@ -131,6 +143,7 @@ class GRPOAdvantageEstimator:
             rewards,
             torch.ones_like(rewards) if valid_mask is None else valid_mask.float(),
             leave_one_out_baseline=self.use_leave_one_out_baseline,
+            full_group_std=self.full_group_std,
         )
         advantages = (rewards - baseline).unsqueeze(-1)
 
@@ -142,6 +155,17 @@ class GRPOAdvantageEstimator:
                 std.unsqueeze(-1)[normalize_mask] + epsilon
             )
 
+        if self.full_group_std:
+            valid = (
+                torch.ones_like(rewards, dtype=torch.bool)
+                if valid_mask is None
+                else valid_mask.bool()
+            )
+            advantages = torch.where(
+                (valid & (std > 0)).unsqueeze(-1),
+                advantages,
+                torch.zeros_like(advantages),
+            )
         return advantages.expand(mask.shape)
 
 

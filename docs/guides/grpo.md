@@ -167,6 +167,12 @@ class DatumSpec(TypedDict):
     __extra__: Any  # This allows additional fields of any type
 ```
 
+A processor can cap one sample's response length by setting
+`extra_env_info["max_output_tokens"]` to a positive integer. The vLLM backend generates at
+most `min(max_new_tokens, max_output_tokens)` tokens for that sample, still bounded by the
+remaining context. Samples without the key keep `max_new_tokens`. Other generation
+backends raise an error instead of ignoring the cap.
+
 #### Data Processors
 
 We refer to each distinct environment your model aims to optimize against as a "task." For example, you might define tasks like "math" or "code."
@@ -819,6 +825,24 @@ Small `std` that is not a consequence of rounding errors will not be skipped.
 Dynamic sampling uses a separate whole-group test, $\min_j r_j = \max_j r_j$ over all $N$,
 so a prompt group is kept or dropped together, independently of leave-one-out baseline
 semantics.
+
+### Full-group standard deviation
+
+With the `grpo` estimator, `adv_estimator.full_group_std: true` keeps the baseline
+$b_i$ above but normalizes every rollout in the group by one shared scale:
+
+$$
+A_i = \frac{r_i - b_i}{\sigma + \epsilon}
+$$
+
+where $\sigma$ is the sample standard deviation (`correction=1`) of all valid rewards in
+the group, including $r_i$. Masked rows do not contribute to $\sigma$ and get zero
+advantage, and a group whose valid rewards are all equal gets $\sigma = 0$ and zero
+advantages. For the example above, $\sigma \approx 0.336$, so rollout 1 gets
+$A_1 \approx -2.83$ instead of $-0.95$ and every other rollout gets $A_i \approx 0.40$.
+
+The option is rejected for other estimators. The default `false` keeps the per-rollout
+$\sigma_i$.
 
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.

@@ -352,6 +352,8 @@ class GenerationDatumSpec(TypedDict):
     - input_ids: Tensor of token IDs representing the input sequences (right padded)
     - input_lengths: Tensor containing the actual length of each sequence (without padding)
     - stop_strings: Optional list of strings to stop generation (per sample)
+    - max_output_tokens: Optional per-sample cap on generated tokens (vLLM only);
+      None keeps the configured max_new_tokens for that sample
     - __extra__: Additional model-specific data fields
 
     Example of a batch with 4 entries with different sequence lengths:
@@ -377,6 +379,7 @@ class GenerationDatumSpec(TypedDict):
     input_ids: torch.Tensor
     input_lengths: torch.Tensor
     stop_strings: NotRequired[list[str]]
+    max_output_tokens: NotRequired[list[int | None]]
     __extra__: Any
 
 

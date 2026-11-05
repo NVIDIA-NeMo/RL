@@ -42,6 +42,7 @@ grpo:
   # Options: "grpo" (default) or "reinforce_plus_plus"
   adv_estimator:
     name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
+    full_group_std: false  # Centered full-valid-group sample SD; independent of leave-one-out mean
     normalize_rewards: ${grpo.normalize_rewards}
     use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
