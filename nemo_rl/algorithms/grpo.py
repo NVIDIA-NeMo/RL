@@ -429,12 +429,6 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Legacy async config block; SC reads its async knobs from `async_rl` instead.
     async_grpo: AsyncGRPOConfig | None = Field(default_factory=AsyncGRPOConfig)
     overlong_filtering: bool = False
-    # SingleController only. Rows masked as incomplete (env mask_sample, which
-    # env.mask_sample_rules also sets, or overlong_filtering) keep contributing
-    # their reward to the group baseline/std when True, so a timed-out rollout
-    # still reads as a failure for its siblings; they never contribute a
-    # gradient either way. Placeholder and seq-logprob-error rows stay excluded.
-    masked_sample_rewards_in_baseline: bool = False
     # whether to enable dynamic sampling, i.e.
     # whether to discard prompts whose rewards have zero standard deviation
     use_dynamic_sampling: bool = False
@@ -2583,22 +2577,16 @@ def _raise_if_length_penalty_enabled_without_nemo_gym(
 def _raise_if_single_controller_masking_options_set(
     master_config: MasterConfig,
 ) -> None:
-    """Reject the SingleController-only masking options on this driver.
+    """Reject ``env.mask_sample_rules`` on this driver.
 
-    ``env.mask_sample_rules`` and ``grpo.masked_sample_rewards_in_baseline`` are
-    implemented only by the SingleController path; here they would silently do
-    nothing, so a run expecting timed-out rollouts to be masked would train on
-    them instead.
+    The rules are implemented only by the SingleController path; here they would
+    silently do nothing, so a run expecting timed-out rollouts to be masked would
+    train on them instead.
     """
-    unsupported = []
     if master_config.env.get(ENV_MASK_SAMPLE_RULES_KEY):
-        unsupported.append(f"env.{ENV_MASK_SAMPLE_RULES_KEY}")
-    if master_config.grpo.masked_sample_rewards_in_baseline:
-        unsupported.append("grpo.masked_sample_rewards_in_baseline")
-    if unsupported:
         raise ValueError(
-            f"{' and '.join(unsupported)} are only supported by the SingleController "
-            "driver (examples/run_grpo_single_controller.py)."
+            f"env.{ENV_MASK_SAMPLE_RULES_KEY} is only supported by the "
+            "SingleController driver (examples/run_grpo_single_controller.py)."
         )
 
 
