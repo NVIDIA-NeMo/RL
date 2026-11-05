@@ -171,7 +171,11 @@ def check_dynamo_serving_chat_kwargs(generation_config: Mapping[str, Any]) -> No
             "templates itself and has no content-format setting. Remove it or "
             "set it to 'auto'."
         )
-    if serving.get("enable_auto_tools") is False:
+    # Without a tool parser the frontend parses no tool calls, so turning auto
+    # tools off changes nothing there (single-turn recipes set exactly this).
+    if serving.get("enable_auto_tools") is False and (
+        dynamo_parsers(generation_config)[0] is not None
+    ):
         raise ValueError(
             "policy.generation.vllm_cfg.http_server_serving_chat_kwargs."
             "enable_auto_tools=false is not supported with "

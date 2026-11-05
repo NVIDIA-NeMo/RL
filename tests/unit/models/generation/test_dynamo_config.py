@@ -212,7 +212,7 @@ def test_chat_template_and_default_kwargs_follow_the_native_server() -> None:
     ("serving_chat_kwargs", "error"),
     [
         ({"chat_template_content_format": "string"}, "no content-format setting"),
-        ({"enable_auto_tools": False}, "always parses"),
+        ({"enable_auto_tools": False, "tool_parser": "hermes"}, "always parses"),
     ],
 )
 def test_chat_settings_the_frontend_has_no_counterpart_for_are_rejected(
@@ -220,11 +220,13 @@ def test_chat_settings_the_frontend_has_no_counterpart_for_are_rejected(
 ) -> None:
     with pytest.raises(ValueError, match=error):
         configure_generation_config(_serving(**serving_chat_kwargs), _Tokenizer())
-    # The native defaults are what the frontend does anyway.
-    configure_generation_config(
+    # The native defaults are what the frontend does anyway, and with no tool
+    # parser there are no tool calls for auto tools to change.
+    for accepted in (
         _serving(chat_template_content_format="auto", enable_auto_tools=True),
-        _Tokenizer(),
-    )
+        _serving(enable_auto_tools=False, tool_parser=None),
+    ):
+        configure_generation_config(accepted, _Tokenizer())
 
 
 def test_a_bearer_token_is_rejected_because_the_frontend_checks_none() -> None:
