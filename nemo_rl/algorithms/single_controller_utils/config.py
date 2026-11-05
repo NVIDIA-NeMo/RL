@@ -1819,6 +1819,20 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "token_capture.enabled=true; without token capture, unfinished Gym "
             "siblings have no durable receipts to recover"
         )
+    if (
+        is_ppo_run(master_config)
+        and master_config.ppo.adv_estimator.name == "gae"  # type: ignore
+        and master_config.ppo.adv_estimator.whiten_execution_padding  # type: ignore
+        and not (
+            token_capture_config.forest_training
+            and token_capture_config.forest_padding_scope == "step"
+        )
+    ):
+        # Only step padding copies carry token_mask; group padding has none.
+        raise ValueError(
+            "ppo.adv_estimator.whiten_execution_padding requires "
+            "token_capture.forest_training=true and forest_padding_scope=step"
+        )
     if token_capture_config.forest_training:
         forest_algo_cfg = algo_config(master_config)
         if not token_capture_config.enabled:

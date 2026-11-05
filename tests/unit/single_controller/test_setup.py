@@ -4338,6 +4338,21 @@ def test_forest_startup_accepts_ppo_with_gae(forest_config):
     validate_single_controller_config(_forest_ppo_config(forest_config))
 
 
+@pytest.mark.parametrize("scope", ["group", "step"])
+def test_whiten_execution_padding_requires_step_padding(forest_config, scope):
+    mc = _forest_ppo_config(
+        forest_config, normalize_over="all_rows", whiten_execution_padding=True
+    )
+    mc.token_capture = mc.token_capture.model_copy(
+        update={"forest_padding_scope": scope}
+    )
+    if scope == "step":
+        validate_single_controller_config(mc)
+    else:
+        with pytest.raises(ValueError, match="forest_padding_scope=step"):
+            validate_single_controller_config(mc)
+
+
 def test_forest_startup_rejects_split_value_training(forest_config):
     mc = _forest_ppo_config(forest_config)
     mc.ppo.value_training_mode = "split"

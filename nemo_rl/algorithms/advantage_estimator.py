@@ -98,7 +98,12 @@ class GAEConfig(BaseModel, extra="allow"):
     whiten_execution_padding: bool = False
 
     @model_validator(mode="after")
-    def validate_whiten_execution_padding(self) -> "GAEConfig":
+    def validate_whitening_population(self) -> "GAEConfig":
+        # normalize_over only picks the whitening population.
+        if self.normalize_over == "all_rows" and not self.normalize_advantages:
+            raise ValueError(
+                "normalize_over=all_rows requires normalize_advantages=true"
+            )
         if self.whiten_execution_padding and self.normalize_over != "all_rows":
             raise ValueError(
                 "whiten_execution_padding requires normalize_over=all_rows"

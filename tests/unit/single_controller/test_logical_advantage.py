@@ -920,6 +920,11 @@ def test_gae_whitening_padding_requires_all_rows() -> None:
         GAEConfig(whiten_execution_padding=True)
 
 
+def test_gae_all_rows_requires_whitening() -> None:
+    with pytest.raises(ValueError, match="normalize_advantages=true"):
+        GAEConfig(normalize_over="all_rows", normalize_advantages=False)
+
+
 def _step_padded(source: str, multiple: int = 4):
     """Five real rows in two groups, padded once for the whole batch."""
     meta, data = _batch([("a", [(0.0, 2), (1.0, 1)]), ("b", [(2.0, 1), (3.0, 1)])])
