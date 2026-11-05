@@ -27,6 +27,21 @@ if TYPE_CHECKING:
     )
 
 
+def require_megatron_dynamo_integration() -> None:
+    """Fail before model setup if this Megatron-LM cannot serve an engine behind Dynamo.
+
+    The engine is only built at the first refit, after the model has loaded, so
+    a missing integration would otherwise surface late.
+    """
+    try:
+        import megatron.inference.integrations.dynamo.dynamic_engine  # noqa: F401
+    except ImportError as e:
+        raise RuntimeError(
+            "A Megatron engine behind Dynamo needs a Megatron-LM with the Dynamo "
+            "integration (megatron.inference.integrations.dynamo)"
+        ) from e
+
+
 class MegatronDynamoGenerationMixin:
     """Prefill/decode engine hooks for a Megatron worker served through Dynamo.
 

@@ -20,6 +20,7 @@ import pytest
 from nemo_rl.models.generation.megatron import dynamo_worker_mixin
 from nemo_rl.models.generation.megatron.dynamo_worker_mixin import (
     MegatronDynamoGenerationMixin,
+    require_megatron_dynamo_integration,
 )
 from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
 
@@ -100,3 +101,14 @@ def test_dynamo_worker_builds_the_handoff_engine(engine_modules, role):
         role=role, require_handoff_claim=True
     )
     plain.assert_not_called()
+
+
+def test_dynamo_worker_requires_the_megatron_dynamo_integration(monkeypatch):
+    module = "megatron.inference.integrations.dynamo.dynamic_engine"
+    monkeypatch.setitem(sys.modules, module, types.ModuleType(module))
+    require_megatron_dynamo_integration()
+
+    # None in sys.modules makes the import raise ImportError.
+    monkeypatch.setitem(sys.modules, module, None)
+    with pytest.raises(RuntimeError, match="megatron.inference.integrations.dynamo"):
+        require_megatron_dynamo_integration()

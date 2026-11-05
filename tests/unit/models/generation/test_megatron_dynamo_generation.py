@@ -26,10 +26,16 @@ from ray.exceptions import GetTimeoutError
 
 import nemo_rl.models.generation.megatron.dynamo_generation as generation_module
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.megatron.dynamo_config import (
+    dynamo_enabled,
+    engine_width,
+    megatron_dynamo_cfg,
+)
 from nemo_rl.models.generation.megatron.dynamo_generation import (
     MegatronDynamoEngine,
     MegatronDynamoGeneration,
 )
+from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.weight_sync.membership import desired_membership
 from tests.unit.models.generation.test_megatron_dynamo_config import (
     MEGATRON_POLICY,
@@ -313,7 +319,11 @@ def _with_role(policy_config: dict, role: str) -> dict:
     """``policy_config`` as an engine of ``role`` is built from it."""
     return {
         **policy_config,
-        "generation": {**policy_config["generation"], "_dynamo_role": role},
+        "generation": {
+            **policy_config["generation"],
+            "dynamo": False,
+            "_dynamo_role": role,
+        },
     }
 
 
@@ -468,6 +478,28 @@ def test_role_policy_config_merges_overrides_into_a_copy(
     assert merged["generation"]["_dynamo_role"] == "decode"
     assert shared == before
     assert merged["generation"] is not shared["generation"]
+
+
+@pytest.mark.parametrize("role", ["prefill", "decode"])
+def test_engine_config_builds_a_plain_engine_of_its_own_width(role):
+    """An engine's config has Dynamo off, so it is sized as one engine.
+
+    With ``dynamo`` left on, the engine's NVLink span would be a whole
+    prefill/decode replica instead of its own width.
+    """
+    generation = _megatron_config()
+    generation["dynamo_cfg"]["prefill_engine"] = {"tensor_model_parallel_size": 4}
+    shared = {**MEGATRON_POLICY, "generation": generation}
+
+    engine_config = generation_module.role_policy_config(
+        shared, role, megatron_dynamo_cfg(generation).role_overrides(role)
+    )
+
+    assert not dynamo_enabled(engine_config["generation"])
+    assert dynamo_enabled(shared["generation"])
+    assert MegatronGeneration.nvlink_domain_span(engine_config) == engine_width(
+        shared, role
+    )
 
 
 @pytest.mark.parametrize(

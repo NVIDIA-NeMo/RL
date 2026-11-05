@@ -78,7 +78,10 @@ def role_policy_config(
     engine for that role) and ``overrides`` (the role's
     ``dynamo_cfg.prefill_engine`` / ``decode_engine`` layout keys) merged into
     ``generation.mcore_generation_config``, which is where the dedicated
-    inference policy takes its layout from. ``policy_config`` is left as is.
+    inference policy takes its layout from. ``generation.dynamo`` is turned
+    off: each engine is a plain Megatron engine sized by its own layout, and
+    only ``MegatronDynamoGeneration`` serves through Dynamo. ``policy_config``
+    is left as is.
 
     Args:
         policy_config: The full ``policy`` config.
@@ -91,6 +94,9 @@ def role_policy_config(
     """
     config = copy.deepcopy(dict(policy_config))
     generation: dict[str, Any] = dict(config["generation"])
+    # Off, or the engine's NVLink span would be a whole prefill/decode replica
+    # instead of its own width.
+    generation["dynamo"] = False
     generation["_dynamo_role"] = role
     if overrides:
         generation["mcore_generation_config"] = {
