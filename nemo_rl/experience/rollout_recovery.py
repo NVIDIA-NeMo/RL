@@ -811,7 +811,12 @@ class RolloutRecoveryLedger:
                 else:
                     for sibling in record.siblings:
                         attempt = sibling.current_attempt
-                        if attempt.status is RolloutAttemptStatus.SEALED:
+                        if attempt.status in {
+                            RolloutAttemptStatus.SEALED,
+                            # Given up before the stop; already reported.
+                            RolloutAttemptStatus.ABANDONED,
+                            RolloutAttemptStatus.FAILED,
+                        }:
                             continue
                         episode = record.environment_episode(sibling.generation_index)
                         restore_key = (
@@ -867,14 +872,20 @@ class RolloutRecoveryLedger:
         """
         for sibling in record.siblings:
             attempt = sibling.current_attempt
+            # A try given up earlier was already reported.
+            already_abandoned = attempt.status in {
+                RolloutAttemptStatus.ABANDONED,
+                RolloutAttemptStatus.FAILED,
+            }
             attempt.status = RolloutAttemptStatus.ABANDONED
-            self._emit(
-                "attempt_abandoned",
-                record,
-                sibling.generation_index,
-                reason=reason,
-                whole_group=True,
-            )
+            if not already_abandoned:
+                self._emit(
+                    "attempt_abandoned",
+                    record,
+                    sibling.generation_index,
+                    reason=reason,
+                    whole_group=True,
+                )
             attempt.receipt = None
             attempt.logical_selection = None
             attempt.reward = None

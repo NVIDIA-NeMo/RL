@@ -191,8 +191,7 @@ def test_a_restart_reports_which_interrupted_rollouts_resume() -> None:
     assert events[1]["reason"] == "restart"
 
 
-def test_a_prompt_group_restart_reports_the_whole_group_thrown_away() -> None:
-    ledger = RolloutRecoveryLedger()
+def _prompt_group(ledger: RolloutRecoveryLedger) -> None:
     _reserve(
         ledger,
         group_id="g7",
@@ -204,6 +203,11 @@ def test_a_prompt_group_restart_reports_the_whole_group_thrown_away() -> None:
         restore_level=RecoveryTargetLevel.PROMPT_GROUP,
     )
     _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
+
+
+def test_a_prompt_group_restart_reports_the_whole_group_thrown_away() -> None:
+    ledger = RolloutRecoveryLedger()
+    _prompt_group(ledger)
     restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
     events: list[dict[str, Any]] = []
     restored.set_event_sink(
@@ -216,6 +220,22 @@ def test_a_prompt_group_restart_reports_the_whole_group_thrown_away() -> None:
         (event["event"], event["generation_index"], event["reason"]) for event in events
     ] == [("attempt_abandoned", 0, "restart"), ("attempt_abandoned", 1, "restart")]
     assert all(event["whole_group"] for event in events)
+
+
+@pytest.mark.parametrize("build", [_dispatched_turn_group, _prompt_group])
+def test_a_restart_does_not_rereport_an_already_abandoned_attempt(build) -> None:
+    ledger = RolloutRecoveryLedger()
+    build(ledger)
+    _mutate(lambda cut: ledger.abandon_unsealed(cut, "g7"))
+    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
+    events: list[dict[str, Any]] = []
+    restored.set_event_sink(
+        lambda event, **fields: events.append(dict(event=event, **fields))
+    )
+
+    _mutate(lambda cut: restored.prepare_for_restart(cut))
+
+    assert [e for e in events if e["event"] == "attempt_abandoned"] == []
 
 
 def test_the_controller_traces_steps_weight_syncs_and_checkpoints(
