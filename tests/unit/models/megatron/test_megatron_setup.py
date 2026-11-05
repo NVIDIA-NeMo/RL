@@ -3063,6 +3063,69 @@ class TestValidateChunkingConfig:
         # Should not raise
         _validate_chunking_config(config)
 
+    @staticmethod
+    def _reuse_config(**overrides):
+        config = {
+            "logprob_chunk_size": 1024,
+            "megatron_cfg": {"defer_fp32_logits": True, "reuse_logits_storage": True},
+            "sequence_packing": {"enabled": True, "fuse_loss": True},
+        }
+        config.update(overrides)
+        return config
+
+    def test_logits_storage_reuse_with_fused_chunked_packing(self):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        _validate_chunking_config(self._reuse_config())
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"logprob_chunk_size": None},
+            {"logprob_chunk_size": 0},
+            {"sequence_packing": {"enabled": False}},
+            {"sequence_packing": {"enabled": True, "fuse_loss": False}},
+            {"sequence_packing": {"enabled": True}},
+        ],
+        ids=["no-chunk", "zero-chunk", "no-packing", "unfused", "fuse-unset"],
+    )
+    def test_logits_storage_reuse_rejects_paths_that_ignore_it(self, overrides):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        config = self._reuse_config(**overrides)
+        with pytest.raises(ValueError, match="reuse_logits_storage=true requires"):
+            _validate_chunking_config(config)
+
+    def test_logits_storage_reuse_off_skips_its_checks(self):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        config = self._reuse_config(sequence_packing={"enabled": False})
+        config["megatron_cfg"]["reuse_logits_storage"] = False
+        _validate_chunking_config(config)
+
+    @pytest.mark.parametrize(
+        "generation",
+        [{"top_k": 10, "top_p": 1.0}, {"top_k": None, "top_p": 0.9}],
+        ids=["top-k", "top-p"],
+    )
+    def test_logits_storage_reuse_rejects_training_filtering(self, generation):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        config = self._reuse_config(generation=generation)
+        with pytest.raises(ValueError, match="top-k/top-p filtering"):
+            _validate_chunking_config(config)
+
+        # Filtering alone is fine when the reuse is off.
+        config["megatron_cfg"]["reuse_logits_storage"] = False
+        _validate_chunking_config(config)
+
+    @pytest.mark.parametrize("top_k", [None, -1], ids=["none", "negative"])
+    def test_logits_storage_reuse_with_unfiltered_generation(self, top_k):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        config = self._reuse_config(generation={"top_k": top_k, "top_p": 1.0})
+        _validate_chunking_config(config)
+
 
 @pytest.mark.mcore
 class TestCreateCheckpointConfig:

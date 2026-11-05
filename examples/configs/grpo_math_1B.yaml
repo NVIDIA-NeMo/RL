@@ -286,6 +286,7 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    reuse_logits_storage: false
     fp32_lm_head: false # Emit fp32 logits from Megatron's LM head; must match policy.generation.vllm_cfg.fp32_lm_head.
     moe_per_layer_logging: False
     moe_enable_deepep: false
@@ -576,6 +577,8 @@ policy:
       precision: ${policy.precision}
       # MXFP8 + Megatron only: quantize on trainer and stream E4M3 values plus scales.
       refit_prequantize: false
+      # auto, fp8, fp8_e4m3, fp8_ds_mla, or fp8_per_token_head.
+      # fp8_per_token_head requires precision=fp8 and a compatible backend (TRITON_ATTN).
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
       fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head} # Compute vLLM logits with an fp32 LM head.
