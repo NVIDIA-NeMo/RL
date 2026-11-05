@@ -2164,6 +2164,22 @@ def test_main_worker_without_nvfp4_pertoken_keeps_engine_kwargs():
     assert llm_kwargs == expected
 
 
+@pytest.mark.parametrize(
+    ("user_value", "expected"),
+    [(None, "vllm"), ("auto", "auto"), ("/path/to/config", "/path/to/config")],
+)
+def test_engine_ignores_model_sampling_defaults_unless_vllm_kwargs_sets_them(
+    user_value, expected
+):
+    from nemo_rl.models.generation.vllm import vllm_worker
+
+    llm_kwargs = {} if user_value is None else {"generation_config": user_value}
+
+    vllm_worker._use_vllm_sampling_defaults(llm_kwargs)
+
+    assert llm_kwargs["generation_config"] == expected
+
+
 def test_main_worker_rejects_custom_worker_extension():
     from nemo_rl.models.generation.vllm import vllm_worker
 

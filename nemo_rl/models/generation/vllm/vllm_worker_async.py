@@ -1646,13 +1646,12 @@ class VllmAsyncGenerationWorkerImpl(
             # caller that constructs a non-train GenerationSamplingParams. Multi-turn
             # agents issue their own requests, so this server-side check is the one
             # chokepoint they all pass.
-            # vLLM resolves an unset top_p from the model's generation_config.json
-            # (ModelConfig.generation_config defaults to "auto"), NOT to 1.0, so a
-            # request omitting it would sample off-policy while passing this check.
+            # vLLM resolves an unset top_p itself (from the model's
+            # generation_config.json if vllm_kwargs sets generation_config="auto"),
+            # so a request omitting it could sample off-policy while passing this check.
             assert request.top_p is not None, (
                 "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
-                "resolved by vLLM from the model's generation_config.json and would "
-                "bypass the on-policy sampling check."
+                "resolved by vLLM and would bypass the on-policy sampling check."
             )
             request_top_p = request.top_p
             is_train_sampling = (
@@ -1671,9 +1670,9 @@ class VllmAsyncGenerationWorkerImpl(
                 f"params (val_temperature={generation_config['val_temperature']}, "
                 f"val_top_p={generation_config['val_top_p']})"
             )
-            # vLLM fills an unset top_k/min_p/repetition_penalty from
-            # generation_config.json (e.g. Qwen2.5-Instruct's repetition_penalty=1.05).
-            # Pin top_k to what the trainer replays (as in
+            # With vllm_kwargs.generation_config="auto", vLLM fills an unset
+            # top_k/min_p/repetition_penalty from generation_config.json (e.g.
+            # Qwen2.5-Instruct's repetition_penalty=1.05). Pin top_k to what the trainer replays (as in
             # vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params) and
             # disable min_p and the repetition penalty. vLLM applies these and the
             # presence/frequency penalties and logit bias before sampling; the
