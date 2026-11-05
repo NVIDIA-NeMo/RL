@@ -37,11 +37,17 @@ class TrainingSamplingParams:
         top_k: Top-k filtering parameter (None or -1 to disable)
         top_p: Top-p filtering parameter (1.0 to disable)
         temperature: Temperature for scaling logits (default: 1.0)
+        top_p_keep_ties: Keep every token whose logit ties the smallest logit in the
+            top-p set. This is the support FlashInfer's top-p samplers draw from
+            (Megatron generation), and it does not depend on how the sort orders
+            tied tokens. When False, the top-p set keeps only the tied tokens that
+            the ascending sort places last, like vLLM's PyTorch sampler.
     """
 
     top_k: int | None = None
     top_p: float = 1.0
     temperature: float = 1.0
+    top_p_keep_ties: bool = False
 
 
 def _need_top_k_filtering(top_k: int | None) -> bool:
@@ -114,6 +120,7 @@ def _apply_top_k_top_p_fn(
     top_k: int | None,
     top_p: float,
     chunk_size: int | None = TOP_K_TOP_P_CHUNK_SIZE,
+    keep_ties: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply top-k and top-p masks to the logits with chunking for memory efficiency.
 
@@ -134,6 +141,8 @@ def _apply_top_k_top_p_fn(
         top_k: Top-k sampling parameter. Set to -1 or None to consider all tokens.
         top_p: Top-p (nucleus) sampling parameter. Must be in (0, 1]. Set to 1 to consider all tokens
         chunk_size: Number of tokens to process per chunk for memory efficiency. Defaults to TOP_K_TOP_P_CHUNK_SIZE.
+        keep_ties: Extend the top-p set to every token tied with its smallest logit
+            (see TrainingSamplingParams.top_p_keep_ties).
 
     Returns:
         filtered_logits: Filtered logits tensor with the same shape as input logits.
@@ -191,6 +200,13 @@ def _apply_top_k_top_p_fn(
         top_p_keep_mask_chunk = probs_sum > 1 - top_p
         # at least one
         top_p_keep_mask_chunk[..., -1] = True
+        if keep_ties:
+            # The kept set is a suffix of the ascending sort. Extend it to every
+            # token tied with its smallest logit, so membership does not depend on
+            # the order the sort gives tied tokens.
+            num_dropped = (~top_p_keep_mask_chunk).sum(dim=-1, keepdim=True)
+            boundary = logits_sort.gather(-1, num_dropped)
+            top_p_keep_mask_chunk |= logits_sort >= boundary
         logits_sort.masked_fill_(~top_p_keep_mask_chunk, -float("inf"))
 
         # Scatter back to original order
@@ -222,6 +238,7 @@ class _ApplyTopKTopP(torch.autograd.Function):
         top_k: Optional[int],
         top_p: float,
         chunk_size: int | None = TOP_K_TOP_P_CHUNK_SIZE,
+        keep_ties: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Apply top-k/top-p filtering and save masks for backward.
 
@@ -230,9 +247,10 @@ class _ApplyTopKTopP(torch.autograd.Function):
             top_k: Top-k sampling parameter. Set to -1 or None to consider all tokens.
             top_p: Top-p sampling parameter. Must be in (0, 1]. Set to 1 to consider all tokens.
             chunk_size: Number of tokens to process per chunk. Defaults to TOP_K_TOP_P_CHUNK_SIZE.
+            keep_ties: Keep every token tied with the smallest top-p logit.
         """
         filtered_logits, keep_mask = _apply_top_k_top_p_fn(
-            logits, top_k, top_p, chunk_size
+            logits, top_k, top_p, chunk_size, keep_ties
         )
 
         # Save masks for backward pass
@@ -250,7 +268,7 @@ class _ApplyTopKTopP(torch.autograd.Function):
         if keep_mask is not None:
             grad_filtered_logits = grad_filtered_logits.masked_fill(~keep_mask, 0.0)
 
-        return grad_filtered_logits, None, None, None
+        return grad_filtered_logits, None, None, None, None
 
 
 def apply_top_k_top_p(
@@ -258,6 +276,7 @@ def apply_top_k_top_p(
     top_k: int | None,
     top_p: float,
     chunk_size: int | None = TOP_K_TOP_P_CHUNK_SIZE,
+    keep_ties: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply top-k and top-p masks to the logits with proper gradient handling.
 
@@ -276,6 +295,8 @@ def apply_top_k_top_p(
         top_k: Top-k sampling parameter. Set to -1 to consider all tokens.
         top_p: Top-p (nucleus) sampling parameter. Must be in (0, 1]. Set to 1 to consider all tokens.
         chunk_size: Number of tokens to process per chunk. Defaults to TOP_K_TOP_P_CHUNK_SIZE.
+        keep_ties: Keep every token tied with the smallest top-p logit
+            (see TrainingSamplingParams.top_p_keep_ties).
 
     Returns:
         filtered_logits: Filtered logits tensor with the same shape as input logits.
@@ -284,4 +305,4 @@ def apply_top_k_top_p(
     """
     if not _need_top_k_filtering(top_k) and not _need_top_p_filtering(top_p):
         return logits, None
-    return _ApplyTopKTopP.apply(logits, top_k, top_p, chunk_size)
+    return _ApplyTopKTopP.apply(logits, top_k, top_p, chunk_size, keep_ties)

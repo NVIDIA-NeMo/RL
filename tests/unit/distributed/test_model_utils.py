@@ -1532,6 +1532,7 @@ class SamplingParamsTestActor:
                 top_k,
                 top_p,
                 False,
+                False,
             )
         else:
             actual_logprobs = ChunkedDistributedLogprobWithSampling.apply(
@@ -1540,6 +1541,7 @@ class SamplingParamsTestActor:
                 tp_group,
                 top_k,
                 top_p,
+                False,
                 chunk_size,
                 False,
             )
