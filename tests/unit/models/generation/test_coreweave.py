@@ -308,6 +308,7 @@ def test_hotload_only_commits_verified_weights(
     )
     events = []
     failure = [fail_activation]
+    weight = [2.0]
     operation = SimpleNamespace(
         id="operation", completed=True, state=SimpleNamespace(name="COMPLETED")
     )
@@ -350,7 +351,7 @@ def test_hotload_only_commits_verified_weights(
             assert method == "export_hf_checkpoint"
             return [
                 exporter.export_hf_checkpoint(
-                    iter([("weight", torch.full((2,), 2.0))]),
+                    iter([("weight", torch.full((2,), weight[0]))]),
                     kwargs["path"],
                     kwargs["allowed_names"],
                     kwargs["config_dir"],
@@ -365,7 +366,7 @@ def test_hotload_only_commits_verified_weights(
         "nemo_rl.weight_sync.coreweave_weight_synchronizer",
         "nemo_rl/weight_sync/coreweave_weight_synchronizer.py",
     )
-    gen = generation(adapter, state_dir=str(tmp_path / "state"))
+    gen = generation(adapter, state_dir=str(tmp_path / "state"), full_every=20)
     sync = module.CoreWeaveHotLoadWeightSynchronizer(Policy(), gen)
     gen.weight_synchronizer = sync
     assert sync.is_stale and sync.served_identity is None
@@ -379,6 +380,13 @@ def test_hotload_only_commits_verified_weights(
         assert not sync.is_stale
         assert sync.served_identity == "test-v000000"
         assert events == ["upload", "trigger", "wait", "verify", "manifest"]
+        unchanged = sync.sync_weights()
+        assert unchanged["hotload/skipped_empty"] == 1.0
+        assert not sync.is_stale
+        assert (
+            tmp_path / "state" / "served_identity"
+        ).read_text().strip() == sync.served_identity
+        weight[0] = 3.0
         failure[0] = True
         with pytest.raises(TimeoutError):
             sync.sync_weights()

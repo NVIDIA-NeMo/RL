@@ -41,4 +41,8 @@ class CoreWeaveHotLoadWeightSynchronizer(HotLoadWeightSynchronizer):
         """Block sampling from a failed update, including after an earlier success."""
         self._stale = True
         write_served_identity(self.state_dir / SERVED_IDENTITY_FILE, None)
-        return super().sync_weights(timer=timer, kv_scales=kv_scales)
+        metrics = super().sync_weights(timer=timer, kv_scales=kv_scales)
+        write_served_identity(
+            self.state_dir / SERVED_IDENTITY_FILE, self.served_identity
+        )
+        return metrics
