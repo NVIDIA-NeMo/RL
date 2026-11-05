@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import pickle
 import random
 import threading
 from contextlib import contextmanager
@@ -1787,4 +1788,18 @@ def test_snapshot_survives_partitions_registering_concurrently():
 
     assert not errors
     assert client.snapshot()["n_keys_outstanding"] == 400
+    client.close()
+
+
+def test_client_pickles_with_its_counters_for_the_controller_actor():
+    """The SC driver cloudpickles ``dp_client`` into the controller actor; the
+    stats lock must not stop that, and the clone must still count."""
+    client = _client(register=False)
+    _emit(client, [2.0, 3.0])
+
+    clone = pickle.loads(pickle.dumps(client))
+    _emit(clone, [1.0])
+
+    assert clone.snapshot()["by_op"]["put"]["calls"] == 3
+    assert client.snapshot()["by_op"]["put"]["calls"] == 2
     client.close()

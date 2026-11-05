@@ -1325,6 +1325,17 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # differencing and unit-conversion logic.
         self._prev_snapshot: dict[str, Any] = {}
 
+    def __getstate__(self) -> dict[str, Any]:
+        # The SC driver cloudpickles this client into the controller actor, and a
+        # lock cannot be pickled.
+        state = self.__dict__.copy()
+        del state["_stats_lock"]
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._stats_lock = threading.Lock()
+
     @property
     def observability_enabled(self) -> bool:
         """Whether the counters this wrapper accumulates are worth reading."""
