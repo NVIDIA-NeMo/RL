@@ -6734,6 +6734,7 @@ def _validation_engines_config(mock_grpo_components):
     config.policy["generation"]["colocated"]["enabled"] = False
     config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
     config.env = {"should_use_nemo_gym": True, "nemo_gym": {}}
+    config.checkpointing["metric_name"] = None
     return config
 
 
