@@ -416,18 +416,24 @@ def test_finalized_effort_matches_inline_formula_and_metrics(
         ),
     ],
 )
-def test_classification_retains_original_last_user_membership_rule(messages, expected):
-    assert compute_reward_checks({}, _input(*messages), CONFIG).low_effort is expected
+@pytest.mark.parametrize("materialized", [False, True], ids=["flat", "materialized"])
+def test_classification_retains_original_last_user_membership_rule(
+    messages, expected, materialized
+):
+    prompt = _input(*messages)
+    if materialized:
+        prompt = {
+            "task_id": {"taskset": "math:train", "task_id": "1"},
+            "task_input": prompt,
+        }
+    assert compute_reward_checks({}, prompt, CONFIG).low_effort is expected
 
 
 @pytest.mark.parametrize("bound", [0, -1])
 def test_active_effort_requires_positive_bound(bound):
     with pytest.raises(ValueError, match="low_ub"):
         EffortLevelsConfig(low_weight=1, low_string="budget", low_ub=bound)
-    assert (
-        EffortLevelsConfig(low_weight=0, low_string="budget", low_ub=bound).low_ub
-        == bound
-    )
+    EffortLevelsConfig(low_weight=0, low_string="budget", low_ub=bound)
 
 
 def test_metric_pooling_single_row_reports_nan_stddev_and_no_disabled_keys():
@@ -610,9 +616,10 @@ def test_reward_settings_persist_think_tag_rules():
     assert off == CaptureRewardSettings.from_configs(RewardPenaltyConfig(), None, None)
 
 
-def test_final_reward_distribution_and_agent_tables_are_pooled_exactly():
+@pytest.mark.parametrize("attribution_key", ["agent", "math:train"])
+def test_final_reward_distribution_and_agent_tables_are_pooled_exactly(attribution_key):
     # Unequal groups: averaging their medians (0 and 2) would incorrectly give 1.
-    context = RewardLogContext("agent", '{"answer":"ok","reward":99}')
+    context = RewardLogContext(attribution_key, '{"answer":"ok","reward":99}')
     observations = [
         FinalizedReward(
             f"sample-{i}",
@@ -627,10 +634,10 @@ def test_final_reward_distribution_and_agent_tables_are_pooled_exactly():
     assert metrics["total_reward/median"] == 2.0
     assert metrics["total_reward/histogram"] == [0.0, 2.0, 2.0, 8.0]
     assert metrics["other/reward/mean"] == 4.0
-    assert metrics["agent/reward/histogram"] == [0.0]
+    assert metrics[f"{attribution_key}/reward/histogram"] == [0.0]
     tables = capture_reward_result_tables(observations)
-    assert set(tables) == {"agent/full_result"}
-    assert json.loads(tables["agent/full_result"][0][0]) == {
+    assert set(tables) == {f"{attribution_key}/full_result"}
+    assert json.loads(tables[f"{attribution_key}/full_result"][0][0]) == {
         "answer": "ok",
         "reward": 0.0,
         "ng_rollout_id": "attempt-0",

@@ -2299,6 +2299,13 @@ class SingleControllerActor:
                         f"{request.group_id}"
                     )
                 else:
+                    extra_env_info: dict[str, Any] = {}
+                    if request.attribution_key is not None:
+                        extra_env_info["attribution_key"] = request.attribution_key
+                    if request.resolved_agent_name is not None:
+                        extra_env_info["agent_ref"] = {
+                            "name": request.resolved_agent_name
+                        }
                     try:
                         meta = finalized.meta
                         # Gym rollout metrics and the finalizer's verified token
@@ -2328,11 +2335,7 @@ class SingleControllerActor:
                             finalized.group_min_wv,
                             finalized.group_max_wv,
                             staging_keys=finalized.staging_keys,
-                            extra_env_info=(
-                                {"agent_ref": {"name": request.resolved_agent_name}}
-                                if request.resolved_agent_name is not None
-                                else None
-                            ),
+                            extra_env_info=extra_env_info or None,
                         )
                     except BaseException as commit_error:
                         try:

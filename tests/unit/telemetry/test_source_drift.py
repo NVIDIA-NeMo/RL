@@ -31,6 +31,8 @@ _SPAN_EMITTING_DIRS = (
     _REPO / "nemo_rl" / "models" / "policy",
     _REPO / "nemo_rl" / "models" / "value",
     _REPO / "nemo_rl" / "distributed",
+    # The Energon SFT worker lives here.
+    _REPO / "nemo_rl" / "data",
     _REPO / "nemo_rl" / "data_plane",
     _REPO / "nemo_rl" / "environments",
     _REPO / "nemo_rl" / "utils",
@@ -504,6 +506,94 @@ def test_every_context_accepting_method_is_dispatched_with_a_carrier():
     )
 
 
+def test_every_carrier_sending_dispatch_targets_a_decorated_method():
+    """Every method dispatched with a trace carrier is decorated to accept it."""
+    decorated = _context_accepting_methods()
+    methods = _worker_methods()
+    helpers = _forwarding_helpers()
+
+    dispatched: dict[str, str] = {}
+    for directory in (_REPO / "nemo_rl", _REPO / "examples"):
+        for source in _python_sources(directory):
+            for node in ast.walk(ast.parse(source.read_text())):
+                if not isinstance(node, ast.Call):
+                    continue
+                where = f"{source.relative_to(_REPO).as_posix()}:{node.lineno}"
+                for name in _carrier_targets(node, helpers):
+                    if name in methods:
+                        dispatched[name] = where
+
+    assert dispatched, "found no carrier-sending dispatches -- matcher gone stale?"
+    undecorated = {
+        name: where for name, where in dispatched.items() if name not in decorated
+    }
+    assert not undecorated, (
+        "methods dispatched with a trace carrier but missing "
+        f"@accepts_trace_context, so the call raises TypeError: {undecorated}"
+    )
+
+
+def _worker_methods() -> set[str]:
+    """Names of every method defined on a class under nemo_rl/."""
+    names: set[str] = set()
+    for source in _python_sources(_REPO / "nemo_rl"):
+        for node in ast.walk(ast.parse(source.read_text())):
+            if isinstance(node, ast.ClassDef):
+                names.update(
+                    child.name
+                    for child in node.body
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                )
+    return names
+
+
+def _forwarding_helpers() -> dict[str, tuple[str, int]]:
+    """Carrier-sending helpers, keyed to the parameter that names the dispatched method."""
+    helpers: dict[str, tuple[str, int]] = {}
+    for source in _python_sources(_REPO / "nemo_rl"):
+        for node in ast.walk(ast.parse(source.read_text())):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            parameters = [
+                argument.arg
+                for argument in (
+                    *node.args.posonlyargs,
+                    *node.args.args,
+                    *node.args.kwonlyargs,
+                )
+            ]
+            if parameters[:1] in (["self"], ["cls"]):
+                parameters = parameters[1:]
+            for inner in ast.walk(node):
+                called = getattr(getattr(inner, "func", None), "attr", None)
+                if not isinstance(inner, ast.Call) or not called:
+                    continue
+                if not called.startswith("run_all_workers_") or not _sends_carrier(
+                    inner
+                ):
+                    continue
+                named = inner.args[0] if inner.args else None
+                for keyword in inner.keywords:
+                    if keyword.arg == "method_name":
+                        named = keyword.value
+                if isinstance(named, ast.Name) and named.id in parameters:
+                    helpers[node.name] = (named.id, parameters.index(named.id))
+    return helpers
+
+
+def _carrier_targets(node: ast.Call, helpers: dict[str, tuple[str, int]]) -> list[str]:
+    """The method names *node* dispatches with a carrier, decorated or not."""
+    called = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+    if called and called.startswith("run_all_workers_") and _sends_carrier(node):
+        name = _string_arg(node) or _keyword_string(node, "method_name")
+        return [name] if name else []
+    if called in helpers:
+        parameter, index = helpers[called]
+        name = _keyword_string(node, parameter) or _string_arg(node, index)
+        return [name] if name else []
+    return []
+
+
 def test_every_presharded_entrypoint_is_wired_for_context():
     """The guard above cannot see an entrypoint that is wired on *neither* side.
 
@@ -628,12 +718,13 @@ def _dispatch_targets(
         name = _string_arg(node) or _keyword_string(node, "method_name")
         return [(name, _sends_carrier(node))] if name in decorated else []
     if called in indirect:
-        # A call into a helper that forwards the method name it is handed.
+        # A helper that forwards the method name it is handed, in either
+        # spelling: one taking only the name is naturally called positionally.
+        constants = [*node.args, *(keyword.value for keyword in node.keywords)]
         named = {
-            keyword.value.value
-            for keyword in node.keywords
-            if isinstance(keyword.value, ast.Constant)
-            and keyword.value.value in decorated
+            constant.value
+            for constant in constants
+            if isinstance(constant, ast.Constant) and constant.value in decorated
         }
         return [(name, indirect[called]) for name in sorted(named)]
     return []
