@@ -15,7 +15,53 @@
 import pytest
 import torch
 
-from nemo_rl.algorithms.logits_sampling_utils import apply_top_k_top_p
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    apply_temperature_scaling,
+    apply_top_k_top_p,
+    need_temperature_scaling,
+)
+
+
+def test_greedy_sampling_uses_unscaled_unfiltered_training_logprobs() -> None:
+    params = TrainingSamplingParams(top_k=5, top_p=0.8, temperature=0.0)
+
+    assert params.temperature == 1.0
+    assert params.top_k is None
+    assert params.top_p == 1.0
+
+
+@pytest.mark.parametrize("temperature", [-1.0, float("nan"), float("inf")])
+def test_invalid_temperature_is_rejected(temperature: float) -> None:
+    with pytest.raises(ValueError, match="temperature must"):
+        TrainingSamplingParams(temperature=temperature)
+
+
+@pytest.mark.parametrize(
+    ("temperature", "scale", "needs_scaling"),
+    [(0.0, 1.0, False), (1.0, 1.0, False), (0.5, 2.0, True), (2.0, 0.5, True)],
+)
+def test_temperature_scaling_matches_logits_mutation_guard(
+    temperature: float, scale: float, needs_scaling: bool
+) -> None:
+    params = TrainingSamplingParams(temperature=temperature)
+    logits = torch.tensor([[-2.0, 0.0, 2.0]])
+    original = logits.clone()
+
+    assert need_temperature_scaling(params) is needs_scaling
+    result = apply_temperature_scaling(logits, params)
+
+    assert result is logits
+    torch.testing.assert_close(result, original * scale)
+
+
+def test_absent_sampling_params_leave_logits_unscaled() -> None:
+    logits = torch.tensor([[-2.0, 0.0, 2.0]])
+    original = logits.clone()
+
+    assert not need_temperature_scaling(None)
+    assert apply_temperature_scaling(logits, None) is logits
+    torch.testing.assert_close(logits, original)
 
 
 @pytest.mark.parametrize(
