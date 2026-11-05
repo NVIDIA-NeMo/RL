@@ -222,6 +222,7 @@ policy:
     checkpoint:
       async_save: true
       ckpt_assume_constant_structure: true
+      parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
     # Compute next-token logprobs directly from hidden states with a chunked
     # linear cross-entropy fusion, avoiding materialization of the full
     # [batch, seq_len, vocab_size] logit tensor. Reduces peak memory and extends
@@ -577,7 +578,7 @@ policy:
       refit_prequantize: false
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
-      fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head} # Compute Nemotron-H logits with an fp32 LM head.
+      fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head} # Compute vLLM logits with an fp32 LM head.
       # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
       refit_with_reload_api: false
       tensor_parallel_size: 1
@@ -743,6 +744,10 @@ data_plane:
                                      # serialized groups and cost throughput;
                                      # higher buys little at linear HBM cost.
                                      # GDR needs that headroom to pay off.
+    gdr_keep_teacher_payload_on_gpu: true  # MOPD + use_gdr only: the teacher PUTs what it writes
+                                           # (logprobs; full-vocab hidden states or logits) straight
+                                           # from GPU, holding it in GPU memory until the PUT.
+                                           # false = copy to CPU first.
   observability:                      # per-op data-plane timing/volume
     enabled: true                     # per-op timing/volume; cost is below measurement noise
     verify_tensor_hash: false         # debug: per-row hash of each row's values+dtype+shape, wire-in vs wire-out
