@@ -74,7 +74,6 @@ apt-get install -y --no-install-recommends \
     wget \
     less \
     vim \
-    ccache \
     protobuf-compiler \
 
 # Nsight: install a pinned release from NVIDIA's devtools apt repo instead of
@@ -423,6 +422,12 @@ if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
     exit 0
 fi
 
+# ccache is a build-only tool: install it here and purge it at the end of this RUN so
+# no ccache binaries or package files remain in this layer or the release image.
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y --no-install-recommends ccache
+
 # These settings are build-only and intentionally do not persist in the final
 # NeMo-RL image. COMPILERCHECK=content is robust to compiler timestamp changes
 # between ephemeral CI runners.
@@ -520,6 +525,11 @@ bash /usr/local/libexec/prune_setuptools_cache.sh /root/.cache/uv
 if [ -n "${STRIP_UV_CACHE:-}" ]; then
     rm -rf /root/.cache/uv
 fi
+
+# Drop the build-only ccache (see the install above) before this layer commits.
+apt-get purge -y --auto-remove ccache
+apt-get clean
+rm -rf /var/lib/apt/lists/*
 EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
@@ -703,7 +713,9 @@ if [[ -z "$(find /root/.cache/ccache -mindepth 1 -print -quit)" ]]; then
     rsync -a /tmp/trtllm-ccache-seed/ /root/.cache/ccache/
 fi
 echo "TRT-LLM ccache state before export:"
-ccache --show-stats
+# ccache is not part of `base`, and this stage only copies files, so report the cache size
+# without the binary (no apt/network dependency here).
+du -sh /root/.cache/ccache
 mkdir -p /tmp/trtllm-ccache-export
 case "${CCACHE_EXPORT_MODE}" in
     incremental)
