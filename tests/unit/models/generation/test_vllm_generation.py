@@ -451,6 +451,7 @@ def test_context_capped_max_new_tokens():
 @pytest.mark.asyncio
 async def test_async_vllm_worker_uses_native_keep_pause_and_resume() -> None:
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._discard_refits = False
     worker.cfg = {"vllm_cfg": {"async_engine": True}}
     worker.llm = MagicMock(
         pause_generation=AsyncMock(),

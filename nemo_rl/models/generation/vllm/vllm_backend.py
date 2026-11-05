@@ -2287,6 +2287,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         self,
         refit_timeout_s: float | None = None,
         refit_with_reload_api: bool = False,
+        discard: bool = False,
     ) -> bool:
         """Update the model weights from collective communication.
 
@@ -2297,6 +2298,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         Args:
             refit_timeout_s: Refit watchdog timeout in seconds.
             refit_with_reload_api: Whether to use vLLM's native reload API.
+            discard: Receive the broadcast but keep the current weights. A
+                broadcast needs every member, so an engine that must not change
+                weights still has to take part.
         """
         from nemo_rl.distributed.refit_watchdog import (
             RefitAborted,
@@ -2311,7 +2315,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         with RefitAbortWatchdog(self.model_update_group, refit_timeout_s) as guard:
             hold_refit_for_fault_injection()
             try:
-                result = self._update_weights_from_collective(refit_with_reload_api)
+                if discard:
+                    result = self._discard_weights_from_collective()
+                else:
+                    result = self._update_weights_from_collective(refit_with_reload_api)
             except SpeculatorRuntimeError as error:
                 # An aborted broadcast leaves survivors with missing keys; the
                 # abort, not the coverage gap, is the recoverable root cause.
@@ -2321,6 +2328,21 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if guard.fired:
             raise RefitAborted(aborted)
         return result
+
+    def _discard_weights_from_collective(self) -> bool:
+        assert self.state_dict_info is not None, (
+            "state_dict_info is not prepared. "
+            "Please call prepare_refit_info when initializing the worker."
+        )
+        packed_broadcast_consumer(
+            iterator=iter(self.state_dict_info.items()),
+            group=self.model_update_group,
+            src=0,
+            post_unpack_func=lambda _batch: None,
+        )
+        gc.collect()
+        torch.cuda.empty_cache()
+        return True
 
     def _update_weights_from_collective(self, refit_with_reload_api: bool) -> bool:
         assert self.state_dict_info is not None, (

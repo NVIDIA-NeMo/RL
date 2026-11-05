@@ -78,6 +78,19 @@ grpo:
     max_generation_failures: 0
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
     recompute_kv_cache_after_weight_updates: true # Set false to retain pre-update KV caches (avoids repeated prefill).
+    # Lend the last num_engines vLLM engines to background validation: while a
+    # validation runs they serve it on the weights of the step it started at and
+    # training continues on the other engines; between validations they serve
+    # training through a router. 0 validates inline, pausing training. Requires
+    # vLLM, NeMo-Gym, in_flight_weight_updates and refit_transport: null.
+    validation_engines:
+      num_engines: 0
+      # Steps past their frozen weights the lent engines keep serving training
+      # rollouts during a validation; 0 keeps them on validation only.
+      serve_training_steps: 0
+      # Router deadline for one training request; null means none.
+      router_backend_timeout_s: null
+      router_connect_timeout_s: 5.0
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:

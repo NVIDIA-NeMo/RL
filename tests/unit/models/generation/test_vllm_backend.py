@@ -1932,6 +1932,79 @@ def test_native_collective_refit_uses_one_transport_buffer(monkeypatch):
 
 
 @pytest.mark.vllm
+def test_discarded_collective_refit_joins_the_broadcast_and_keeps_weights(
+    monkeypatch,
+):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext, expected_state_info = _make_collective_update_extension(vllm_backend)
+    ext._weight_update_lifecycle = MagicMock(
+        side_effect=AssertionError("discard must not run the load lifecycle")
+    )
+    ext._load_weights = MagicMock()
+    received = []
+
+    def packed_broadcast_consumer(iterator, group, src, post_unpack_func):
+        assert list(iterator) == [("model.weight", expected_state_info)]
+        assert group is ext.model_update_group
+        post_unpack_func([("model.weight", "weight-value")])
+        received.append(True)
+
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_consumer", packed_broadcast_consumer
+    )
+    monkeypatch.setattr(vllm_backend.gc, "collect", lambda: None)
+    monkeypatch.setattr(vllm_backend.torch.cuda, "empty_cache", lambda: None)
+
+    assert ext.update_weights_from_collective(discard=True) is True
+    assert received == [True]
+    ext._load_weights.assert_not_called()
+
+
+@pytest.mark.vllm
+@pytest.mark.asyncio
+async def test_async_worker_discarding_refits_skips_pause_resume_and_resets():
+    """A validating engine joins the refit but keeps serving on its weights."""
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
+    )
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._discard_refits = False
+    worker.cfg = {
+        "vllm_cfg": {
+            "async_engine": True,
+            "reset_encoder_cache_after_weight_update": True,
+        }
+    }
+    worker.llm = SimpleNamespace(
+        collective_rpc=AsyncMock(return_value=[True]),
+        pause_generation=AsyncMock(),
+        resume_generation=AsyncMock(),
+        reset_prefix_cache=AsyncMock(),
+        reset_encoder_cache=AsyncMock(),
+    )
+
+    await worker.set_discard_refits(True)
+    assert await worker.pause_generation_async(clear_cache=True) is True
+    assert await worker.update_weights_from_collective_async() is True
+    assert await worker.resume_generation_async() is True
+    await worker.reset_prefix_cache_async()
+
+    worker.llm.collective_rpc.assert_awaited_once_with(
+        "update_weights_from_collective", args=(None, False, True)
+    )
+    worker.llm.pause_generation.assert_not_awaited()
+    worker.llm.resume_generation.assert_not_awaited()
+    worker.llm.reset_prefix_cache.assert_not_awaited()
+    worker.llm.reset_encoder_cache.assert_not_awaited()
+
+    await worker.set_discard_refits(False)
+    assert await worker.pause_generation_async(clear_cache=False) is True
+    worker.llm.pause_generation.assert_awaited_once_with(mode="keep", clear_cache=False)
+
+
+@pytest.mark.vllm
 def test_sparse_delta_refit_rejected_for_native_trtllm_backend():
     from nemo_rl.models.generation.vllm import vllm_backend
 
@@ -3128,7 +3201,7 @@ def test_sync_weight_updates_check_every_internal_worker(
         (
             "update_weights_from_collective_async",
             "update_weights_from_collective",
-            (None, True),
+            (None, True, False),
         ),
     ],
 )
@@ -3144,6 +3217,7 @@ async def test_async_weight_updates_check_every_internal_worker(
     )
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._discard_refits = False
     worker.cfg = {
         "vllm_cfg": {
             "async_engine": True,
@@ -3176,6 +3250,7 @@ async def test_async_weight_update_skips_encoder_cache_reset_when_disabled():
     )
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._discard_refits = False
     worker.cfg = {"vllm_cfg": {"async_engine": True}}
     worker.llm = SimpleNamespace(
         collective_rpc=AsyncMock(return_value=[True]),
@@ -3195,6 +3270,7 @@ async def test_async_weight_update_fails_when_encoder_cache_reset_fails():
     )
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._discard_refits = False
     worker.cfg = {
         "vllm_cfg": {
             "async_engine": True,
@@ -4922,3 +4998,26 @@ def test_vllm_exposes_the_tied_embedding_detector_the_refit_filter_relies_on():
     )
 
     assert hasattr(AutoWeightsLoader, "_check_skipped_aliases")
+
+
+@pytest.mark.vllm
+def test_generation_set_discard_refits_reaches_only_the_given_shard_leaders(
+    monkeypatch,
+):
+    from nemo_rl.models.generation.vllm import vllm_generation
+
+    generation = vllm_generation.VllmGeneration.__new__(vllm_generation.VllmGeneration)
+    generation.cfg = {"vllm_cfg": {"async_engine": True}}
+    # Three TP2 shards: each shard's leader is its first worker.
+    workers = [MagicMock() for _ in range(6)]
+    generation.worker_group = SimpleNamespace(workers=workers)
+    generation.dp_size = 3
+    monkeypatch.setattr(vllm_generation.ray, "get", MagicMock(return_value=[None]))
+
+    generation.set_discard_refits([1, 2], True)
+
+    for idx, worker in enumerate(workers):
+        if idx in (2, 4):
+            worker.set_discard_refits.remote.assert_called_once_with(True)
+        else:
+            worker.set_discard_refits.remote.assert_not_called()

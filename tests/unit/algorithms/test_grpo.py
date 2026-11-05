@@ -69,6 +69,7 @@ from nemo_rl.algorithms.grpo import (
     _validate_seq_logprob_error_in_loss,
     _validate_use_kl_in_reward_compat,
     _validate_val_sampling,
+    _validate_validation_engines,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
@@ -6680,6 +6681,216 @@ def test_adaptive_ppo_clip_state_advances_and_is_checkpointed(
     resumed = ClippedPGLossFn(loss_config)
     _restore_adaptive_loss_state(resumed, _get_grpo_save_state(saved_state))
     assert resumed.cur_adaptive_ppo_clip_k == 0.5
+
+
+def _validation_engines_config(mock_grpo_components):
+    config = mock_grpo_components["master_config"]
+    config.grpo.async_grpo.enabled = True
+    config.grpo.async_grpo.in_flight_weight_updates = True
+    config.grpo.async_grpo.validation_engines.num_engines = 1
+    config.policy["generation"]["colocated"]["enabled"] = False
+    config.policy["generation"]["vllm_cfg"]["expose_http_server"] = True
+    config.env = {"should_use_nemo_gym": True, "nemo_gym": {}}
+    return config
+
+
+def test_validation_engines_accepts_a_supported_config(mock_grpo_components):
+    _validate_validation_engines(_validation_engines_config(mock_grpo_components))
+
+
+def _set_async(config, key, value):
+    setattr(config.grpo.async_grpo, key, value)
+
+
+@pytest.mark.parametrize(
+    "apply, error, message",
+    [
+        (lambda c: _set_async(c, "enabled", False), ValueError, "async_grpo.enabled"),
+        (
+            lambda c: _set_async(c, "in_flight_weight_updates", False),
+            ValueError,
+            "in_flight_weight_updates",
+        ),
+        (
+            lambda c: c.policy["generation"].update(backend="megatron"),
+            NotImplementedError,
+            "backend=vllm",
+        ),
+        (
+            lambda c: c.policy["generation"]["colocated"].update(enabled=True),
+            ValueError,
+            "colocated",
+        ),
+        (lambda c: setattr(c, "env", {}), NotImplementedError, "NeMo-Gym"),
+        (
+            lambda c: setattr(
+                c, "env", {"should_use_nemo_gym": True, "nemo_gym": {"shards": 2}}
+            ),
+            NotImplementedError,
+            "env.nemo_gym.shards",
+        ),
+        (
+            lambda c: c.policy["generation"].update(refit_transport="nccl_reshard"),
+            NotImplementedError,
+            "refit_transport",
+        ),
+        (
+            lambda c: c.policy["generation"].update(
+                vllm_kwargs={"scheduling_policy": "fcfs"}
+            ),
+            ValueError,
+            "scheduling_policy",
+        ),
+        (
+            lambda c: setattr(c.grpo, "debug_payload_metrics", True),
+            ValueError,
+            "debug_payload_metrics",
+        ),
+        (
+            lambda c: c.checkpointing.update(metric_name="val:accuracy"),
+            ValueError,
+            "val:accuracy",
+        ),
+    ],
+)
+def test_validation_engines_rejects_unsupported_configs(
+    mock_grpo_components, apply, error, message
+):
+    config = _validation_engines_config(mock_grpo_components)
+    apply(config)
+    with pytest.raises(error, match=message):
+        _validate_validation_engines(config)
+
+
+def test_validation_engines_warns_when_nothing_validates(mock_grpo_components):
+    config = _validation_engines_config(mock_grpo_components)
+    config.grpo.val_period = 0
+    config.grpo.val_at_end = False
+    with pytest.warns(UserWarning, match="never lent"):
+        _validate_validation_engines(config)
+
+
+class _FakeValidationEnginePool:
+    """Records the training loop's calls; ``serving_training`` is fixed."""
+
+    def __init__(self, serving_training: bool) -> None:
+        self.serving_training = serving_training
+        self.state = SimpleNamespace(value="validating")
+        self.lent_at: list[int] = []
+        self.refits: list[tuple[str, Any]] = []
+
+    def lend_to_validation(self, weight_version: int) -> None:
+        self.lent_at.append(weight_version)
+
+    def before_refit(self, *, validation_running: bool) -> None:
+        self.refits.append(("before", validation_running))
+
+    def after_refit(self, weight_version: int) -> None:
+        self.refits.append(("after", weight_version))
+
+
+def _run_async_grpo_with_validation_engines(mock_grpo_components, pool):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 5
+    master_config.grpo.val_period = 2
+    master_config.grpo.val_at_start = False
+    master_config.grpo.val_at_end = True
+    master_config.grpo.async_grpo.validation_engines.num_engines = 1
+    master_config.policy["generation"]["colocated"]["enabled"] = False
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_rollout_metrics = {"mean_gen_tokens_per_sample": 2.0}
+
+    with (
+        mock_async_grpo_infrastructure(mock_batch, mock_rollout_metrics),
+        patch(
+            "nemo_rl.algorithms.grpo.validate",
+            return_value=({"accuracy": 0.25}, {"total_validation_time": 1.0}),
+        ) as mock_validate,
+    ):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+            validation_engine_pool=pool,
+        )
+    validation_logs = [
+        (call.args[0], call.args[1])
+        for call in mock_grpo_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "validation"
+    ]
+    return mock_validate, validation_logs
+
+
+def test_async_grpo_validates_on_lent_engines_in_the_background(
+    mock_grpo_components,
+):
+    """Validation steps lend the engines and log results with their start step."""
+    pool = _FakeValidationEnginePool(serving_training=True)
+    mock_validate, validation_logs = _run_async_grpo_with_validation_engines(
+        mock_grpo_components, pool
+    )
+
+    assert sorted(call.kwargs["step"] for call in mock_validate.call_args_list) == [
+        2,
+        4,
+        5,
+    ]
+    # Lent right after the refit that published the validated step's weights.
+    assert pool.lent_at == [2, 4, 5]
+    assert [kind for kind, _ in pool.refits] == ["before", "after"] * 5
+    assert sorted(metrics["start_step"] for metrics, _ in validation_logs) == [2, 4, 5]
+    for metrics, log_step in validation_logs:
+        assert metrics["accuracy"] == 0.25
+        assert log_step >= metrics["start_step"]
+
+
+def test_async_grpo_skips_validation_while_engines_are_busy(mock_grpo_components):
+    """A validation due while the lent engines are busy is skipped and logged."""
+    pool = _FakeValidationEnginePool(serving_training=False)
+    mock_validate, validation_logs = _run_async_grpo_with_validation_engines(
+        mock_grpo_components, pool
+    )
+
+    mock_validate.assert_not_called()
+    assert pool.lent_at == []
+    assert validation_logs == [
+        ({"skipped": 1}, 2),
+        ({"skipped": 1}, 4),
+        ({"skipped": 1}, 5),
+    ]
+
+
+@pytest.mark.parametrize("num_engines, pool", [(0, object()), (1, None)])
+def test_async_grpo_requires_pool_exactly_with_validation_engines(
+    mock_grpo_components, num_engines, pool
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.async_grpo.validation_engines.num_engines = num_engines
+    with pytest.raises(ValueError, match="validation_engine_pool"):
+        async_grpo_train(
+            mock_grpo_components["policy"],
+            _mock_policy_generation(),
+            mock_grpo_components["train_dataloader"],
+            mock_grpo_components["val_dataloader"],
+            mock_grpo_components["tokenizer"],
+            mock_grpo_components["loss_fn"],
+            mock_grpo_components["task_to_env"],
+            mock_grpo_components["val_task_to_env"],
+            mock_grpo_components["logger"],
+            mock_grpo_components["checkpointer"],
+            _initial_grpo_save_state(),
+            master_config,
+            validation_engine_pool=pool,
+        )
 
 
 def test_training_stops_on_configured_pass_k_metric(mock_grpo_components):

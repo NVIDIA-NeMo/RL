@@ -15,17 +15,18 @@ import gc
 import json
 import math
 import os
+import threading
 import time
 import warnings
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
-from typing import Any, Callable, Literal, Optional, TypeVar, cast
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, TypeVar, cast
 
 import numpy as np
 import ray
 import torch
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, NonNegativeInt, PositiveFloat, model_validator
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -92,6 +93,8 @@ from nemo_rl.data.utils import (
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
     TOPO_RANK_UNKNOWN,
     ClusterConfig,
     RayVirtualCluster,
@@ -128,6 +131,7 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
 )
+from nemo_rl.models.generation.generation_router import start_generation_router
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
@@ -210,6 +214,9 @@ from nemo_rl.weight_sync.factory import (
 )
 from nemo_rl.weight_sync.interfaces import initialize_refit_metadata
 from nemo_rl.weight_sync.nccl_reshard_utils import check_nccl_reshard_refit_support
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.async_utils.validation_engines import ValidationEnginePool
 
 # ===============================================================================
 # Configuration
@@ -323,6 +330,32 @@ class RewardScalingConfig(BaseModel, extra="allow"):
         return self
 
 
+class ValidationEnginesConfig(BaseModel, extra="allow"):
+    """vLLM engines lent to background validation in async GRPO.
+
+    While a validation runs, the last ``num_engines`` vLLM engines serve it and
+    keep the weights of the step it started at, while training continues on the
+    other engines; between validations they serve training rollouts. Training
+    reaches the engines through a router so the lent ones can be taken out and
+    put back.
+    """
+
+    # Number of vLLM engines (DP shards) lent to validation. 0 disables, and
+    # validation then runs inline, pausing training.
+    num_engines: NonNegativeInt = 0
+    # While a validation runs, the lent engines also serve training rollouts on
+    # their frozen weights until the policy is this many steps ahead. Those
+    # rollouts carry the current weight version, so they can be up to this many
+    # steps older than their stamp. 0 keeps the lent engines on validation only.
+    serve_training_steps: NonNegativeInt = 0
+    # Deadline in seconds for one training request through the router. None
+    # means no deadline, as when NeMo-Gym calls the vLLM servers directly; a
+    # deadline shorter than the longest generation fails those rollouts.
+    router_backend_timeout_s: Optional[PositiveFloat] = None
+    # Deadline in seconds for the router's TCP connect to a vLLM server.
+    router_connect_timeout_s: PositiveFloat = 5.0
+
+
 class AsyncGRPOConfig(BaseModel, extra="allow"):
     enabled: bool = False
     # Maximum trajectory age in training steps for samples drawn from the
@@ -338,6 +371,10 @@ class AsyncGRPOConfig(BaseModel, extra="allow"):
     in_flight_weight_updates: bool = False
     # Recomputes the KV cache after weight updates.
     recompute_kv_cache_after_weight_updates: bool = True
+    # Engines lent to background validation; see ValidationEnginesConfig.
+    validation_engines: ValidationEnginesConfig = Field(
+        default_factory=ValidationEnginesConfig
+    )
 
 
 class RewardPenaltyTokenIdsConfig(BaseModel, extra="allow"):
@@ -673,6 +710,73 @@ def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
         )
 
 
+def _validate_validation_engines(master_config: MasterConfig) -> None:
+    """Reject grpo.async_grpo.validation_engines where it cannot work."""
+    async_config = master_config.grpo.async_grpo
+    if async_config is None or async_config.validation_engines.num_engines == 0:
+        return
+    prefix = "grpo.async_grpo.validation_engines.num_engines > 0"
+    if not async_config.enabled:
+        raise ValueError(f"{prefix} requires grpo.async_grpo.enabled=true.")
+    if not async_config.in_flight_weight_updates:
+        raise ValueError(
+            f"{prefix} requires grpo.async_grpo.in_flight_weight_updates=true: "
+            "refits run while validation requests are still in flight."
+        )
+    generation_config = master_config.policy["generation"]
+    if generation_config["backend"] != "vllm":
+        raise NotImplementedError(
+            f"{prefix} is supported only with policy.generation.backend=vllm."
+        )
+    if generation_config["colocated"]["enabled"]:
+        raise ValueError(
+            f"{prefix} requires policy.generation.colocated.enabled=false: a "
+            "colocated engine cannot serve validation while the policy trains."
+        )
+    if not should_use_nemo_gym(master_config):
+        raise NotImplementedError(
+            f"{prefix} is supported only with NeMo-Gym environments: validation "
+            "reaches the lent engines through its own NeMo-Gym stack."
+        )
+    if "shards" in master_config.env["nemo_gym"]:
+        raise NotImplementedError(
+            f"{prefix} does not support sharded NeMo-Gym (env.nemo_gym.shards)."
+        )
+    refit_transport = generation_config.get("refit_transport")
+    if refit_transport is not None:
+        raise NotImplementedError(
+            f"{prefix} requires policy.generation.refit_transport=null "
+            f"(collective NCCL refit), got {refit_transport!r}. Lent engines drop "
+            "refits while they validate, which only the collective path supports."
+        )
+    scheduling_policy = (generation_config.get("vllm_kwargs") or {}).get(
+        "scheduling_policy", "priority"
+    )
+    if scheduling_policy != "priority":
+        raise ValueError(
+            f"{prefix} requires vLLM priority scheduling, so training requests run "
+            "ahead of validation on the lent engines; got "
+            f"policy.generation.vllm_kwargs.scheduling_policy={scheduling_policy!r}."
+        )
+    if master_config.grpo.debug_payload_metrics:
+        raise ValueError(
+            f"{prefix} does not support grpo.debug_payload_metrics=true: background "
+            "validation traffic cannot be separated from training traffic."
+        )
+    metric_name = master_config.checkpointing["metric_name"]
+    if metric_name is not None and metric_name.startswith("val:"):
+        raise ValueError(
+            f"{prefix} does not support checkpointing.metric_name={metric_name!r}: "
+            "validation finishes after the checkpoint of its step is saved."
+        )
+    if master_config.grpo.val_period <= 0 and not master_config.grpo.val_at_end:
+        warnings.warn(
+            f"{prefix} but no periodic or final validation is configured, so the "
+            "engines are never lent.",
+            stacklevel=2,
+        )
+
+
 def _validate_multimodal_dedup_capability(master_config: MasterConfig) -> None:
     """Reject configurations whose media transfer path is not qualified."""
     if not master_config.grpo.deduplicate_multimodal_data:
@@ -749,15 +853,18 @@ def setup(
     MasterConfig,
     dict[str, Any],
     dict[str, str],
+    Optional["ValidationEnginePool"],
 ]:
     """Main entry point for running GRPO algorithm.
 
     Returns:
-        A 13-tuple, in order:
+        A 14-tuple, in order:
             policy, policy_generation, nemo_gym (the NeMo-Gym env actor, or None
             when not enabled), cluster, dataloader, val_dataloader, loss_fn,
             logger, checkpointer, grpo_save_state, master_config,
-            teacher_worker_groups, alias_to_group_alias.
+            teacher_worker_groups, alias_to_group_alias, validation_engine_pool
+            (the engines lent to validation, or None when
+            grpo.async_grpo.validation_engines is off).
     """
     # Start timing the entire setup process
     setup_start_time = time.perf_counter()
@@ -822,6 +929,7 @@ def setup(
 
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
+    _validate_validation_engines(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
 
     _validate_val_sampling(master_config)
@@ -1063,6 +1171,7 @@ def setup(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
     nemo_gym_actor = None
+    validation_engine_pool: Optional["ValidationEnginePool"] = None
 
     def _spinup_nemo_gym(base_urls, model_name, policy_api_key=None):
         """Spin up the NeMo Gym stack against the given generation server URLs.
@@ -1814,6 +1923,20 @@ def setup(
         ## make vllm hf overrides match the training policy
         vllm_kwargs["hf_overrides"] = policy_config.get("hf_config_overrides", {})
 
+        validation_engines_config = (
+            grpo_config.async_grpo.validation_engines
+            if grpo_config.async_grpo is not None
+            else None
+        )
+        if (
+            validation_engines_config is not None
+            and validation_engines_config.num_engines
+        ):
+            # Lent engines queue a whole validation at once. Priority scheduling
+            # lets the training requests the router sends them run first, or a
+            # rollout waits out the validation and stalls the training step.
+            vllm_kwargs["scheduling_policy"] = "priority"
+
         if enable_nemo_gym:
             # ---- NeMo Gym: reserve vLLM ports up-front so we can hand the
             # server URLs to NeMo Gym and spin it up while vLLM loads weights.
@@ -1841,10 +1964,60 @@ def setup(
                 deferred_vllm.finish_generation()
                 return deferred_vllm, time.perf_counter() - t0
 
+            # Deferred: async_utils imports grpo, so a module-level import is circular.
+            from nemo_rl.algorithms.async_utils.validation_engines import (
+                ValidationEnginePool,
+                split_validation_urls,
+            )
+
+            gym_base_urls = deferred_vllm.dp_openai_server_base_urls
+            validation_engine_router = None
+            validation_engine_urls: list[str] = []
+            if (
+                validation_engines_config is not None
+                and validation_engines_config.num_engines
+            ):
+                # Training rollouts go through a router, so the engines lent to
+                # validation can be taken out of training and put back.
+                _, validation_engine_urls = split_validation_urls(
+                    gym_base_urls, validation_engines_config.num_engines
+                )
+                validation_engine_router = start_generation_router(
+                    gym_base_urls,
+                    port_range_low=DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+                    port_range_high=DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+                    backend_timeout_s=validation_engines_config.router_backend_timeout_s,
+                    connect_timeout_s=validation_engines_config.router_connect_timeout_s,
+                    # Never sent: training always keeps at least one engine. Kept
+                    # outside the statuses NeMo-Gym retries forever.
+                    no_healthy_backend_status=409,
+                    health_managed=False,
+                    # Ahead of validation's default 0; vLLM runs lower first.
+                    request_priority=-1,
+                )
+                gym_base_urls = [ray.get(validation_engine_router.base_url.remote())]
+            training_nemo_gym_ready = threading.Event()
+
             def init_nemo_gym():
                 """Spin up NeMo Gym servers with the pre-assigned vLLM URLs."""
+                try:
+                    return _spinup_nemo_gym(
+                        gym_base_urls,
+                        generation_config["model_name"],
+                        policy_api_key=deferred_vllm.http_server_api_key,
+                    )
+                finally:
+                    training_nemo_gym_ready.set()
+
+            def init_validation_nemo_gym():
+                """Spin up the NeMo Gym stack that validates on the lent engines.
+
+                Waits for the training stack, so the two never prepare the same
+                server environments or probe the same ports at once.
+                """
+                training_nemo_gym_ready.wait()
                 return _spinup_nemo_gym(
-                    deferred_vllm.dp_openai_server_base_urls,
+                    validation_engine_urls,
                     generation_config["model_name"],
                     policy_api_key=deferred_vllm.http_server_api_key,
                 )
@@ -1863,6 +2036,8 @@ def setup(
                 init_tasks["vllm"] = init_vllm_deferred
                 init_tasks["policy"] = init_policy
             init_tasks["nemo_gym"] = init_nemo_gym
+            if validation_engine_router is not None:
+                init_tasks["validation_nemo_gym"] = init_validation_nemo_gym
 
             print(
                 f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}",
@@ -1879,6 +2054,11 @@ def setup(
                     }
             except BaseException:
                 _shutdown_completed_nemo_gym_startup(submitted.get("nemo_gym"))
+                _shutdown_completed_nemo_gym_startup(
+                    submitted.get("validation_nemo_gym")
+                )
+                if validation_engine_router is not None:
+                    ray.kill(validation_engine_router)
                 raise
 
             if colocated_inference:
@@ -1889,6 +2069,15 @@ def setup(
                 policy_generation, vllm_load_time = results["vllm"]
                 policy, policy_time = results["policy"]
             nemo_gym_actor, nemo_gym_time = results["nemo_gym"]
+            if validation_engine_router is not None:
+                validation_nemo_gym, _ = results["validation_nemo_gym"]
+                validation_engine_pool = ValidationEnginePool(
+                    generation=policy_generation,
+                    router=validation_engine_router,
+                    nemo_gym=validation_nemo_gym,
+                    num_engines=validation_engines_config.num_engines,
+                    serve_training_steps=validation_engines_config.serve_training_steps,
+                )
             setup_timing_metrics.generation_init_time_s = (
                 vllm_reserve_time + vllm_load_time
             )
@@ -2145,6 +2334,7 @@ def setup(
         master_config,
         teacher_worker_groups,
         alias_to_group_alias,
+        validation_engine_pool,
     )
 
 
@@ -5259,6 +5449,7 @@ def async_grpo_train(
     teacher_worker_groups: Optional[dict[str, Any]] = None,
     alias_to_group_alias: Optional[dict[str, str]] = None,
     processor: Optional[AutoProcessor] = None,
+    validation_engine_pool: Optional["ValidationEnginePool"] = None,
 ) -> None:
     """Run asynchronous GRPO training with replay buffer.
 
@@ -5278,7 +5469,17 @@ def async_grpo_train(
         max_trajectory_age_steps: Maximum age (in training steps) for trajectories to be used in training
         processor: Optional multimodal processor used to attach compact policy
             media to NeMo Gym prompt rows.
+        validation_engine_pool: Engines lent to background validation, from
+            setup(); required when grpo.async_grpo.validation_engines is on.
+            val_task_to_env must then be its NeMo-Gym stack.
     """
+    if (validation_engine_pool is None) != (
+        master_config.grpo.async_grpo.validation_engines.num_engines == 0
+    ):
+        raise ValueError(
+            "validation_engine_pool must be passed exactly when "
+            "grpo.async_grpo.validation_engines.num_engines > 0; it comes from setup()."
+        )
     # Ensure we are running with a compatible async generation backend.
     # Async GRPO supports vLLM, Megatron, and TRT-LLM;
     # SGLang async rollouts do not support the async GRPO replay path.
@@ -5320,7 +5521,12 @@ def async_grpo_train(
             )
 
     # Import async utilities only when needed
-    from nemo_rl.algorithms.async_utils import AsyncTrajectoryCollector, ReplayBuffer
+    from nemo_rl.algorithms.async_utils import (
+        AsyncTrajectoryCollector,
+        BackgroundValidationResult,
+        BackgroundValidator,
+        ReplayBuffer,
+    )
 
     timer = Timer(context={"worker": "driver"})
     _telemetry = get_telemetry_handle()
@@ -5594,6 +5800,48 @@ def async_grpo_train(
     print("📦 Started continuous background trajectory collection")
 
     print("✅ Policy generation setup complete, proceeding to validation...")
+
+    # validation_engines: periodic validations run in the background on the lent
+    # engines while training continues.
+    background_validator = BackgroundValidator(
+        validate_fn=lambda val_step: validate(
+            policy_generation,
+            val_dataloader,
+            tokenizer,
+            val_task_to_env,
+            step=val_step,
+            master_config=master_config,
+            logger=logger,
+            processor=processor,
+        )
+    )
+
+    def record_background_validation(
+        results: list[BackgroundValidationResult], log_step: int
+    ) -> Optional[str]:
+        """Log background validations at ``log_step``, the step they are collected at.
+
+        "validation/start_step" is set to the step each validation started at.
+
+        Returns the first early-stop message from a validation that reached the
+        threshold, if any.
+        """
+        early_stop_message = None
+        for result in results:
+            logger.log_metrics(
+                {**result.metrics, "start_step": result.val_step},
+                log_step,
+                prefix="validation",
+            )
+            logger.log_metrics(result.timings, log_step, prefix="timing/validation")
+            stop_message = _validation_early_stop_message(
+                result.metrics,
+                stop_at_validation_threshold,
+                stop_at_validation_metric,
+            )
+            if early_stop_message is None:
+                early_stop_message = stop_message
+        return early_stop_message
 
     # Run validation at start if configured
     if val_at_start and step == 0:
@@ -6274,6 +6522,24 @@ def async_grpo_train(
                         trajectory_collector.set_weight_version.remote(weight_version)
                     )
                 else:
+                    if validation_engine_pool is not None:
+                        if (
+                            val_at_end
+                            and is_last_step
+                            and background_validator.is_running()
+                        ):
+                            # The final validation needs the lent engines on
+                            # this step's weights, so the running validation
+                            # must finish before this refit.
+                            with timer.time("idle/validation"):
+                                stop_message = record_background_validation(
+                                    background_validator.wait_all(), step + 1
+                                )
+                            if early_stop_message is None:
+                                early_stop_message = stop_message
+                        validation_engine_pool.before_refit(
+                            validation_running=background_validator.is_running()
+                        )
                     # A context manager rather than start/stop, so the timer is
                     # stopped and the span closed even if the refit raises.
                     with (
@@ -6315,6 +6581,9 @@ def async_grpo_train(
                             )
                             ray.get(trajectory_collector.resume_after_refit.remote())
 
+                if validation_engine_pool is not None:
+                    validation_engine_pool.after_refit(weight_version)
+
                 # Clear logger metrics after each refit (weight sync), starting a new logging cycle
                 if policy_generation is not None:
                     policy_generation.clear_logger_metrics()
@@ -6326,6 +6595,39 @@ def async_grpo_train(
                     and (step + 1) >= val_start_at
                     and (step + 1) % val_period == 0
                 ) or (val_at_end and is_last_step)
+
+                if validation_engine_pool is not None:
+                    # Record background validations that have finished.
+                    stop_message = record_background_validation(
+                        background_validator.collect_finished(), step + 1
+                    )
+                    if early_stop_message is None:
+                        early_stop_message = stop_message
+                    if early_stop_message is not None:
+                        # Exit at the end of this step, after checkpointing.
+                        print(early_stop_message, flush=True)
+                        saving_this_step = master_config.checkpointing["enabled"]
+                    if should_run_validation and early_stop_message is None:
+                        if validation_engine_pool.serving_training:
+                            # Training continues while validation runs on the
+                            # lent engines; the result is recorded at a later
+                            # step (above) or before training stops.
+                            validation_engine_pool.lend_to_validation(weight_version)
+                            background_validator.launch(step + 1)
+                        else:
+                            # The lent engines are still validating or catching
+                            # up, so they do not hold this step's weights.
+                            warnings.warn(
+                                f"Skipping the validation at step {step + 1}: the "
+                                "validation engines are "
+                                f"{validation_engine_pool.state.value}. Use a longer "
+                                "grpo.val_period.",
+                                stacklevel=2,
+                            )
+                            logger.log_metrics(
+                                {"skipped": 1}, step + 1, prefix="validation"
+                            )
+                    should_run_validation = False
 
                 payload_metrics: dict[str, int | float] = {}
                 if should_run_validation:
@@ -6631,6 +6933,18 @@ def async_grpo_train(
                         policy_generation.prepare_for_generation()
                         ray.get(trajectory_collector.resume_after_refit.remote())
 
+                if background_validator.pending_steps and (
+                    is_last_step
+                    or should_save_by_timeout
+                    or early_stop_message is not None
+                ):
+                    # Training stops after this step: wait for the background
+                    # validation, including this step's, and record its result.
+                    with timer.time("idle/validation"):
+                        record_background_validation(
+                            background_validator.wait_all(), step + 1
+                        )
+
             # Logging
             # Log training data (match sync GRPO logging payload for parity).
             # NeMo Gym responses can be very large and expensive to log; when
@@ -6807,6 +7121,11 @@ def async_grpo_train(
         raise
 
     finally:
+        if background_validator.pending_steps:
+            print(
+                f"⚠️ Validations started at steps {background_validator.pending_steps} "
+                "did not finish before training stopped"
+            )
         # Finalize any pending async checkpoint before tearing down workers.
         try:
             checkpointer.shutdown()

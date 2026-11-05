@@ -32,7 +32,6 @@ from pathlib import Path
 from typing import Any, Callable, Optional, cast
 
 import ray
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -107,8 +106,6 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.distributed.virtual_cluster import (
     RayVirtualCluster,
-    _get_free_port_local,
-    _get_node_ip_local,
     prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
@@ -137,8 +134,8 @@ from nemo_rl.models.generation.fleet_health import (
     HealthyShardSelector,
 )
 from nemo_rl.models.generation.generation_router import (
-    GenerationRouterActor,
     GenerationRouterImpl,
+    start_generation_router,
 )
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
@@ -1009,19 +1006,10 @@ def _maybe_start_generation_router(
             "backend with async_engine and expose_http_server enabled."
         )
 
-    # Reserved once and passed in, so Ray recreating a restarted actor rebinds the same
-    # address. NeMo-Gym holds this URL for the life of the run and never re-resolves it.
-    port = _get_free_port_local(
-        router_config.port_range_low, router_config.port_range_high
-    )
-    router = GenerationRouterActor.options(  # type: ignore[attr-defined]
-        scheduling_strategy=NodeAffinitySchedulingStrategy(
-            node_id=ray.get_runtime_context().get_node_id(), soft=False
-        )
-    ).remote(
-        backend_urls=backend_urls,
-        host=_get_node_ip_local(),
-        port=port,
+    return start_generation_router(
+        backend_urls,
+        port_range_low=router_config.port_range_low,
+        port_range_high=router_config.port_range_high,
         backend_timeout_s=router_config.backend_timeout_s,
         connect_timeout_s=router_config.connect_timeout_s,
         no_healthy_backend_status=router_config.no_healthy_backend_status,
@@ -1030,12 +1018,6 @@ def _maybe_start_generation_router(
         # one, arming the reflex would retire backends permanently.
         health_managed=master_config.async_rl.generation_fleet_health.enabled,
     )
-    # Resolve the URL now so the driver fails here rather than inside Gym if the actor
-    # could not start. The router binds its socket inside __init__, so a port conflict
-    # fails actor construction and surfaces here with the port in the traceback.
-    base_url = ray.get(router.base_url.remote())
-    print(f"📡 Policy router fronting {len(backend_urls)} backend(s) at {base_url}")
-    return router
 
 
 def _build_advantage_estimator(master_config: MasterConfig) -> Any:

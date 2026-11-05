@@ -396,6 +396,11 @@ class VllmAsyncGenerationWorkerImpl(
         self._dynamo_endpoint_task: Optional[asyncio.Task] = None
 
         self._init_token_capture_state()
+        # While True this engine still joins every collective refit, because a
+        # broadcast hangs without all of its members, but drops the weights and
+        # skips the refit's pause, resume and cache resets. Set by
+        # VllmGeneration.set_discard_refits for engines lent to validation.
+        self._discard_refits = False
 
         super().__init__(
             config,
@@ -2835,7 +2840,11 @@ class VllmAsyncGenerationWorkerImpl(
 
             result_or_coro = await self.llm.collective_rpc(
                 "update_weights_from_collective",
-                args=(refit_timeout_s, self._refit_with_reload_api_enabled()),
+                args=(
+                    refit_timeout_s,
+                    self._refit_with_reload_api_enabled(),
+                    self._discard_refits,
+                ),
             )
 
             if asyncio.iscoroutine(result_or_coro):
@@ -2850,7 +2859,8 @@ class VllmAsyncGenerationWorkerImpl(
                     f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
-            await self._reset_encoder_cache_after_weight_update()
+            if not self._discard_refits:
+                await self._reset_encoder_cache_after_weight_update()
             return True
         except Exception as e:
             # Propagate a deliberate abort instead of folding it into `return False`. It
@@ -2957,6 +2967,9 @@ class VllmAsyncGenerationWorkerImpl(
             raise RuntimeError(
                 "reset_prefix_cache_async can only be used with async_engine=True. Use reset_prefix_cache instead."
             )
+        if self._discard_refits:
+            # The weights did not change, so the cached prefixes are still valid.
+            return
 
         await self.llm.reset_prefix_cache()
         gc.collect()
@@ -2972,6 +2985,8 @@ class VllmAsyncGenerationWorkerImpl(
             raise RuntimeError(
                 "pause_generation_async can only be used with async_engine=True"
             )
+        if self._discard_refits:
+            return True
 
         await self.llm.pause_generation(mode="keep", clear_cache=clear_cache)
         return True
@@ -2999,9 +3014,19 @@ class VllmAsyncGenerationWorkerImpl(
             raise RuntimeError(
                 "resume_generation_async can only be used with async_engine=True"
             )
+        if self._discard_refits:
+            return True
 
         await self.llm.resume_generation()
         return True
+
+    async def set_discard_refits(self, discard: bool) -> None:
+        """Make later collective refits drop their weights (True) or load them.
+
+        Takes effect at the next refit. Called between refits, so a pause is
+        never left without its matching resume.
+        """
+        self._discard_refits = discard
 
     async def sleep_async(self):
         """Async version of sleep."""
