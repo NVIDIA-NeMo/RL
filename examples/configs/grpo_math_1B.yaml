@@ -295,6 +295,8 @@ policy:
     moe_hybridep_prepad_packed_inputs: false
     moe_shared_expert_overlap: false
     use_gloo_process_groups: false
+    # Megatron-Core experimental code paths (e.g. the fused MoE routing map with moe_permute_fusion).
+    enable_megatron_core_experimental: false
     # Collective timeout (minutes) for default, Megatron model-parallel, and
     # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
     distributed_timeout_minutes: null

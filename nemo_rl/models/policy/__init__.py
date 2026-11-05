@@ -549,6 +549,10 @@ class MegatronConfig(TypedDict):
     # Create gloo process groups during Megatron distributed init.
     # Omitted: use the Megatron Bridge default.
     use_gloo_process_groups: NotRequired[bool]
+    # Enable Megatron-Core experimental code paths (Bridge's
+    # dist.enable_megatron_core_experimental), e.g. the fused MoE routing map
+    # with moe_permute_fusion. Omitted: use the Megatron Bridge default (False).
+    enable_megatron_core_experimental: NotRequired[bool]
     # Collective timeout (minutes) for the default process group and the
     # Megatron model-parallel and replica groups. Raise it when one rank can stall for
     # longer than the default, e.g. a dist-checkpoint shard write on a slow

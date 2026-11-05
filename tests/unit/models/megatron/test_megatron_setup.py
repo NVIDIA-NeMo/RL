@@ -3504,6 +3504,44 @@ def _dist_config_passed_to_container(config: dict[str, Any]) -> Any:
 
 
 @pytest.mark.mcore
+class TestCreateMegatronConfigMcoreExperimental:
+    """Tests for enable_megatron_core_experimental plumbing in _create_megatron_config."""
+
+    @pytest.fixture(autouse=True)
+    def _restore_flag(self):
+        from megatron.core import config as mcore_config
+
+        saved = mcore_config.is_experimental_enabled()
+        yield
+        mcore_config.set_experimental_flag(saved)
+
+    @pytest.mark.parametrize("value", [True, False])
+    def test_explicit_value_sets_dist_config_and_mcore_flag(self, value):
+        """The value reaches the dist config and Megatron-Core's global flag."""
+        from megatron.core import config as mcore_config
+
+        mcore_config.set_experimental_flag(not value)
+        dist_config = _dist_config_passed_to_container(
+            _megatron_config(enable_megatron_core_experimental=value)
+        )
+
+        assert dist_config.enable_megatron_core_experimental is value
+        assert mcore_config.is_experimental_enabled() is value
+
+    def test_absent_key_applies_bridge_default(self):
+        """Omitting the key applies the Megatron Bridge default to the flag."""
+        from megatron.bridge.training.config import DistributedInitConfig
+        from megatron.core import config as mcore_config
+
+        default = DistributedInitConfig().enable_megatron_core_experimental
+        mcore_config.set_experimental_flag(not default)
+        dist_config = _dist_config_passed_to_container(_megatron_config())
+
+        assert dist_config.enable_megatron_core_experimental is default
+        assert mcore_config.is_experimental_enabled() is default
+
+
+@pytest.mark.mcore
 class TestCreateMegatronConfigGlooProcessGroups:
     """Tests for use_gloo_process_groups plumbing in _create_megatron_config."""
 
