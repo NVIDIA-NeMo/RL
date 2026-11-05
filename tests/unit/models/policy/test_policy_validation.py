@@ -25,9 +25,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from nemo_rl.models.generation.vllm.patches import (
-    VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
-)
+from nemo_rl.models.generation.vllm.config import LEGACY_VLLM_FP32_LM_HEAD_ENV_VAR
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.lm_policy import Policy
 
@@ -232,20 +230,15 @@ def set_vllm_generation(
     return config
 
 
-def construct_policy_with_mocks(
-    config: PolicyConfig, model_config: object | None = None
-) -> Policy:
-    if model_config is None:
-        model_config = SimpleNamespace(
-            architectures=["NemotronHForCausalLM"], model_type="nemotron_h"
-        )
+def construct_policy_with_mocks(config: PolicyConfig) -> Policy:
     with (
         patch.dict("os.environ", {"TORCH_CUDA_ARCH_LIST": "9.0"}),
         patch("nemo_rl.models.policy.lm_policy.RayQueue"),
         patch("nemo_rl.models.policy.lm_policy.RayWorkerBuilder"),
         patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup"),
         patch(
-            "nemo_rl.models.policy.lm_policy.get_hf_config", return_value=model_config
+            "nemo_rl.models.policy.lm_policy.get_hf_config",
+            return_value=SimpleNamespace(),
         ),
         patch("nemo_rl.models.policy.lm_policy.FLOPTracker.from_config"),
     ):
@@ -262,42 +255,6 @@ def test_policy_accepts_matched_vllm_and_megatron_fp32_lm_head():
     set_vllm_generation(config, {"fp32_lm_head": True})
 
     policy = construct_policy_with_mocks(config)
-
-    assert policy.worker_group is not None
-
-
-def test_policy_warns_when_vllm_fp32_lm_head_model_is_not_nemotron_h():
-    config = create_megatron_config("test-model", tp=1)
-    config["megatron_cfg"]["fp32_lm_head"] = True
-    set_vllm_generation(config, {"fp32_lm_head": True})
-
-    with pytest.warns(UserWarning, match="Nemotron-H"):
-        policy = construct_policy_with_mocks(
-            config,
-            model_config=SimpleNamespace(
-                architectures=["Qwen2ForCausalLM"], model_type="qwen2"
-            ),
-        )
-
-    assert policy.worker_group is not None
-
-
-def test_policy_accepts_nested_nemotron_h_model_config():
-    config = create_megatron_config("test-model", tp=1)
-    config["megatron_cfg"]["fp32_lm_head"] = True
-    set_vllm_generation(config, {"fp32_lm_head": True})
-
-    policy = construct_policy_with_mocks(
-        config,
-        model_config=SimpleNamespace(
-            architectures=["NemotronH_Nano_VL_V2"],
-            model_type="NemotronH_Nano_VL_V2",
-            llm_config=SimpleNamespace(
-                architectures=["NemotronHForCausalLM"],
-                model_type="nemotron_h",
-            ),
-        ),
-    )
 
     assert policy.worker_group is not None
 
@@ -355,15 +312,37 @@ def test_policy_accepts_vllm_fp32_lm_head_disabled_with_automodel_trainer():
     assert policy.worker_group is not None
 
 
-def test_policy_rejects_fp32_lm_head_env_var_toggle():
+def test_policy_rejects_legacy_fp32_lm_head_env_var():
     config = create_automodel_config("test-model", tp=1)
-    set_vllm_generation(
-        config, {"env_vars": {VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR: "1"}}
-    )
+    set_vllm_generation(config, {"env_vars": {LEGACY_VLLM_FP32_LM_HEAD_ENV_VAR: "1"}})
 
     with (
         patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
-        pytest.raises(ValueError, match="policy.generation.vllm_cfg.fp32_lm_head"),
+        pytest.raises(ValueError, match="no longer read"),
+    ):
+        Policy(
+            cluster=create_mock_cluster(world_size=1),
+            config=config,
+            tokenizer=create_mock_tokenizer(),
+        )
+
+    worker_group.assert_not_called()
+
+
+@pytest.mark.parametrize("where", ["hf_config_overrides", "vllm_kwargs"])
+def test_policy_rejects_head_dtype_hf_override(where):
+    config = create_megatron_config("test-model", tp=1)
+    set_vllm_generation(config, {})
+    if where == "hf_config_overrides":
+        config["hf_config_overrides"] = {"head_dtype": "float32"}
+    else:
+        config["generation"]["vllm_kwargs"] = {
+            "hf_overrides": {"head_dtype": "float32"}
+        }
+
+    with (
+        patch("nemo_rl.models.policy.lm_policy.RayWorkerGroup") as worker_group,
+        pytest.raises(ValueError, match="head_dtype is not supported"),
     ):
         Policy(
             cluster=create_mock_cluster(world_size=1),
