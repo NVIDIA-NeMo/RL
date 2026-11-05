@@ -12,7 +12,7 @@
   "dependency_checkouts": {
     "automodel": "b916107a5ce8e77a3f18682f8b0eaa46a4b54389",
     "megatron_bridge": "7e9dcd609edf2bb9478d3fa4d9b9f8ee3875c16e",
-    "source": "Verified initialized submodules in sibling RL-pr4963; inspected AutoModel files have no diff against HEAD. New worktree submodules are not initialized in phase one."
+    "source": "Phase one inspected matching sibling checkouts. Implementation initialized this worktree and all recursive submodules at the exact pins; no dependency pins changed."
   },
   "pytorch": {
     "source": "Read directly from containers/nemo_rl.1030.sqsh using unsquashfs -cat",
@@ -26,8 +26,8 @@
     },
     "host_uv_cache_version_not_used": "2.10.0+cu129"
   },
-  "phase": "design_only",
-  "streaming_tests_run": false,
+  "phase": "implementation_validation",
+  "streaming_tests_run": true,
   "runtime_introspection": "dependency-runtime.json",
   "source_links": {
     "controller_train_dispatch": "https://github.com/NVIDIA-NeMo/RL/blob/047d31a7f75dda062e82e29561a7e8460dc24b7c/nemo_rl/algorithms/single_controller.py#L3340",

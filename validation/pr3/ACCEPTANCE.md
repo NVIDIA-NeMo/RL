@@ -1,7 +1,7 @@
 # PR3 acceptance plan
 
-**设计阶段，以下 streaming 测试全部 planned / NOT RUN。** 既有 PR1 的通过记录不作为
-本分支 streaming 通过的证据。只在用户确认设计后扩展 harness、添加测试/YAML 并执行。
+**设计已确认，实施与验收进行中。** 下文保留验收规格，实际通过、失败及未运行状态见
+[RESULTS.md](RESULTS.md)。既有 PR1 的通过记录不作为本分支 streaming 通过的证据。
 
 ## 固定环境和输入
 
@@ -12,7 +12,7 @@
   若实际依赖不兼容，明确记为环境受限并保存错误，不能把跳过当通过。
 - harness 复用 `tests/functional/automodel_sc_full_batch_parity.py`，增加
   `--local-batch-size`、`--dispatch-sizes`（每 rank 行数，用逗号分隔，和等于 local batch）。
-  **这两个参数尚未实现**；下列命令是实施时的确定 CLI 验收规格。
+  这两个参数已实现；下列命令在已分配容器内执行。
 - tiny dense/tiny native MoE 沿用 `test_automodel_split_parity.py` fixtures；每 rank 6 行，
   比较 dispatch `6`、`3,3`、`1,2,3`，每种 token/sequence loss 至少连续 3 个 optimizer steps。
   保留全局 sample IDs；固定每 rank microbatch 顺序、padding、mask、LP/advantages 和所有 RNG。
@@ -27,11 +27,11 @@ export UV_NO_SYNC=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 export CUBLAS_WORKSPACE_CONFIG=:4096:8 NVTE_ALLOW_NONDETERMINISTIC_ALGO=0
 cd "$PR3_REPO"
 
-# 命令 A：现有测试文件会扩展 case 参数；不得把现在仅 full-batch 的结果当 streaming 通过。
+# 命令 A：CPU 状态和两 GPU parity；显式选择 automodel，避免默认过滤。
 uv run --no-project --python "$PR3_PYTHON" python -m pytest -q \
+  --automodel-only \
   tests/unit/models/policy/test_automodel_split_state.py \
-  tests/unit/models/policy/test_automodel_split_parity.py \
-  tests/unit/single_controller/test_automodel_config.py
+  tests/unit/models/policy/test_automodel_split_parity.py
 
 # 命令 B：扩展后可对已准备的模型/recipe 定点重放；PR3_MODEL、PR3_RECIPE 必须是真实路径。
 for dispatch in 6 3,3 1,2,3; do
@@ -45,6 +45,9 @@ done
 
 # 命令 C：共享逻辑测试，新增 AutoModel alignment / cancellation cases。
 uv run --no-project --python "$PR3_PYTHON" python -m pytest -q \
+  -m 'not mcore and not hf_gated' \
+  tests/unit/single_controller/test_automodel_config.py \
+  tests/unit/single_controller/test_train_step_lifecycle.py \
   tests/unit/single_controller/test_sampler_interface.py \
   tests/unit/single_controller/test_train_pump_e2e.py \
   tests/unit/single_controller/test_checkpoint_recovery_matrix.py
@@ -54,9 +57,9 @@ Dense/HF 命令 B 加 `--force-hf`；native MoE recipe 指定 EP2/HybridEP，不
 2-GPU tests 和大模型 replay 复用同一比较逻辑。大模型另加 TE FusedAdam/raw state
 采集，不用小模型 AdamW 的结果替代真实 optimizer 资格化。
 
-## 分阶段门禁
+## 分阶段门禁（原设计规格，执行状态见 RESULTS.md）
 
-| 门禁 | 可执行操作/配置 | 必需判据与保存证据 | 当前状态 |
+| 门禁 | 可执行操作/配置 | 必需判据与保存证据 | 设计阶段状态 |
 | --- | --- | --- | --- |
 | G0 baseline | 记录 HEAD/submodule/image/包版本；命令 A 既有 case | PR1 full-batch/V1 严格回归保持；测试 collection/skip 明细完整 | 源码已核实，测试未执行 |
 | G1 dense parity | A/B：2 GPUs，EP1，固定输入，`6` / `3,3` / `1,2,3` | 每 rank **finish 内完成归一化后、clip 前**梯度；所有参数/buffers、完整 optimizer/scheduler 状态，连续3步 | NOT RUN |
@@ -67,7 +70,7 @@ Dense/HF 命令 B 加 `--force-hf`；native MoE recipe 指定 EP2/HybridEP，不
 | G6 EP16 replay | 16 training GPUs，Qwen3.5-35B-A3B-Base，full32 rows 对两次16 rows，至少3个真实固定 GRPO updates，TE FusedAdam | 每 rank preclip gradient、参数、raw optimizer/master/moments/remainders、scheduler、gate/buffer；沿用 G1/G3 判据并记录 dtype | NOT RUN |
 | G7 real overlap | debug allocation，dense Qwen2.5-1.5B；2 train+2 rollout GPU；8×4，threshold2；人为 gate 后半 rollout | 前部 backward 开始时后部 rollout **尚未完成**；同一 step ≥2 dispatch；GPU generation execute 与 training F/B 时间区间相交，不能只看 RPC/CPU 时间 | NOT RUN |
 | G8 cancellation/resume | G7 产生至少2个 dispatch 的 open step 后取消；从最后 committed checkpoint 重启，带 ready+in-flight 组 | 无半步 optimizer/scheduler/version 前进；sample claims/IDs 不丢不重；恢复后至少3步；无 stale gate/grad；不宣称随机轨迹等同 uninterrupted | NOT RUN |
-| G9 long run | Qwen3.5 EP16，full threshold8 vs streaming4，lookahead0，两边各300步；同镜像/代码/数据/seed/资源/optimizer | 保存所有 native/W&B scalars、dispatch分布/有效样本/版本、checkpoint及峰值显存；失败主动监控，不删异常点 | NOT RUN |
+| G9 long run | Qwen3.5 EP16，streaming4、lookahead0、300步；复用同事 baseline | 保存所有 native/W&B scalars、dispatch分布/有效样本/版本、checkpoint及峰值显存；失败主动监控，不删异常点 | 见 RESULTS.md |
 
 G1 必须移动/扩展原 harness 的比较位置：原来在 `train_microbatch` 后直接比较 `.grad`，
 streaming 此时尚未归一化；不能拿 raw numerator 梯度与 full-batch mean 梯度比较。
@@ -93,7 +96,7 @@ uv run --no-project --python /opt/nemo_rl_venv/bin/python python \
   examples/run_grpo_single_controller.py \
   --config examples/configs/recipes/llm/grpo-qwen3.5-35ba3b-base-3n8g-automodel-ep16-single-controller-full-batch.yaml \
   grpo.max_num_steps=300 async_rl.min_groups_for_streaming_train=4
-# Full-batch 对照只把上一条命令的 threshold=4 改为8。
+# 最终只提交 streaming；full-batch 数值对照保留在 fixed-input harness。
 ```
 
 配置：8 prompts×4 responses=32，MBS1，16 train/EP16/TP1/CP1，8 rollout/TP8，
@@ -109,4 +112,4 @@ dispatch 数与 GPU peak memory。图中保留 step time；在线 validation/acc
 
 所有结果记录 source SHA、镜像/依赖版本、命令、job ID、native log/W&B ID、checkpoint 和
 passed/failed/not-run/environment-limited；每10分钟查真实 Slurm 状态及进度，异常主动处理。
-本设计阶段不启动长跑，不释放之前 hold 的900步实验。
+旧的900步实验保持 hold。长跑只有 EP16 前置验证成功后才启动。

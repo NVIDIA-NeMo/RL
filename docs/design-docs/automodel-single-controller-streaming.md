@@ -1,6 +1,6 @@
-# AutoModel SC streaming：PR3 设计草案
+# AutoModel SC streaming：PR3 设计与实现
 
-状态：**待用户确认；尚未实施或通过 streaming 验收**。本文覆盖
+状态：**设计已确认，实现与分级验收进行中**。本文覆盖
 [issue #5090 的 PR3](https://github.com/NVIDIA-NeMo/RL/issues/5090)，初期仅支持 `in_order`。
 
 ## 开发基线和已核实事实
@@ -152,13 +152,19 @@ Qwen3.5 的 DP16、MBS1、4 responses 得到 multiple=4：8 组一步可分 4+4�
 2. **实现 worker 数值/状态契约**：counts、normalizers、metrics、失败/abort；V1 不改，
    full-batch 严格回归先保持，再接受有明确误差界的 streaming。
 3. **接入共享 alignment/cancellation**：扩展已有 sampler/pump tests；不增加 AutoModel sampler。
-4. **GPU 分级验收**：dense → native MoE EP2/bias/recompute → EP16 real-batch replay →
+4. **GPU 分级验收**：dense → native MoE EP2/bias/recompute → EP16 fixed-input replay →
    真 TQ/vLLM 的取消恢复与 GPU 时间轴 overlap；全部门禁后才启动长跑。
 5. **长跑**：Qwen3.5-35B-A3B-Base，16 train GPU EP16 + 8 rollout GPU TP8，batch=8×4、
-   MBS1、总长4096/生成2048、同 optimizer/seed，full threshold8 对 streaming threshold4，
-   lookahead 均0，目标各300步。先短跑检查后原任务继续，按实际 checkpoint/时间限制续段。
+   MBS1、总长4096/生成2048、同 optimizer/seed，streaming threshold4，lookahead0，
+   目标300步。按用户最新要求复用同事已有 baseline，不再提交 full-batch 300步对照。
+   先检查原任务首段，成功后继续同一任务，按实际 checkpoint/时间限制续段。
 
 [验收矩阵与命令](../../validation/pr3/ACCEPTANCE.md)给出每一门禁的操作、证据与判据。
 本阶段已核实源码，并在 debug allocation `21326763` 成功导入实际依赖、采集
 [runtime manifest](../../validation/pr3/dependency-runtime.json)；节点随后释放。
-dense/MoE/取消/overlap/300步 streaming **全部尚未验证**。
+实施阶段已通过 dense FP32、多 dispatch native MoE EP2、activation checkpointing、
+真实 Gate bias、取消及带 ready/in-flight 任务的恢复检查。BF16 整体梯度门槛及独立
+optimizer 执行对照通过，原有逐参数严格门槛未通过，不能混为一项。
+具体结果、证据及仍未验证的配置以
+[执行记录](../../validation/pr3/RESULTS.md)和
+[BF16 数值说明](../../validation/pr3/BF16_NUMERICS.md)为准。

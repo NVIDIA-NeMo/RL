@@ -20,8 +20,9 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
 
 AutoModel supports the initial text GRPO baseline: dense and MoE full-parameter FSDP2,
 TP=CP=1, fixed microbatches, disaggregated async vLLM, `in_order` with
-`max_lookahead_versions: 0`, and a streaming threshold equal to
-`grpo.num_prompts_per_step`. Packing, dynamic batching, CPU offload, HSDP,
+`max_lookahead_versions: 0`. Set the streaming threshold equal to
+`grpo.num_prompts_per_step` for full-batch execution, or use the streaming
+configuration below. Packing, dynamic batching, CPU offload, HSDP,
 LoRA, draft training, VLM, PPO, and distillation are not enabled in this stage.
 Both prompt-drop budgets must be zero. Explicit unsupported settings fail at
 setup; the worker also rejects unsupported model properties before training.
@@ -58,6 +59,33 @@ uv run --extra automodel python -m torch.distributed.run --standalone --nproc-pe
 See the [AutoModel full-batch design](../design-docs/automodel-single-controller-full-batch.md)
 for the lifecycle, numerical primitives, forward-padding contract, and training
 comparison curves.
+
+### AutoModel streaming
+
+Text GRPO with the per-prompt `grpo` advantage estimator also accepts
+`0 < async_rl.min_groups_for_streaming_train < grpo.num_prompts_per_step`.
+Ready prompt groups are processed while the remaining groups generate; one
+optimizer/scheduler update and refit still occur after the entire step.
+The sampler aligns chunks to both training and logprob microbatches on every
+DP rank. For DP16 with four responses per prompt and MBS1, chunks contain
+multiples of four prompt groups, so an eight-prompt step can split 4+4.
+The sampler may return the entire step when it is already ready.
+`train/policy_train_dispatches` records the number of actual policy backward
+dispatches, including a value of one when the entire step is selected together.
+
+Streaming retains the full-batch restrictions above and additionally requires
+`loss_fn.positive_example_nll_weight: 0` and zero auxiliary-loss coefficients
+on the actual AutoModel MoE gates. Token-level and sequence-level losses use
+the total valid counts across all dispatches; gradients normalize once before
+clipping. FSDP continues synchronizing each backward and retains reduced
+gradient shards between dispatches. This changes floating-point rounding;
+BF16 full-batch and streaming updates are not expected to be bitwise identical.
+
+Cancellation drains issued worker RPCs before aborting an uncommitted step.
+An uncertain commit or RPC that cannot drain requires checkpoint recovery.
+Checkpoints contain committed model/optimizer state and rollout recovery
+metadata, not half-step gradients. See the
+[streaming design and validation limits](../design-docs/automodel-single-controller-streaming.md).
 
 ### Mandatory settings
 
@@ -585,9 +613,9 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See
   [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: Megatron supports the configurations described in this guide.
-  AutoModel is limited to the [full-batch baseline](#automodel-full-batch-baseline);
-  the streaming and broader sampler options elsewhere in this guide do not
-  apply to AutoModel yet.
+  AutoModel supports the [full-batch baseline](#automodel-full-batch-baseline)
+  and [streaming GRPO](#automodel-streaming), both with `in_order` lookahead 0;
+  the broader sampler configurations elsewhere in this guide do not apply.
 - Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). Managed Dynamo (`backend: dynamo`) is supported on the native rollout path; see [Managed Dynamo generation](dynamo-generation.md#run-under-the-singlecontroller). SGLang and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, and the critic shards it against the configured `value.train_global_batch_size` rather than its actual size, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.

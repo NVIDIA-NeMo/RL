@@ -83,7 +83,7 @@ def test_full_batch_regression_recipe(recipe):
     [
         ("async_rl.sampler.max_lookahead_versions", 1),
         ("async_rl.sampler.name", "ready_first"),
-        ("async_rl.min_groups_for_streaming_train", 1),
+        ("async_rl.min_groups_for_streaming_train", 0),
         ("policy.dynamic_batching.enabled", True),
         ("policy.sequence_packing.enabled", True),
         ("policy.automodel_cfg.context_parallel_size", 2),
@@ -111,3 +111,24 @@ def test_megatron_unchanged(config):
     config["policy"]["automodel_cfg"]["enabled"] = False
     config["async_rl"]["sampler"]["max_lookahead_versions"] = 2
     _validate_automodel_single_controller_config(MasterConfig(**config))
+
+
+def test_streaming_supported(config):
+    config["async_rl"]["min_groups_for_streaming_train"] = 1
+    validate_single_controller_config(MasterConfig(**config))
+
+
+@pytest.mark.parametrize("option,value", [("positive_example_nll_weight", 0.1)])
+def test_streaming_rejects_independent_loss_normalization(config, option, value):
+    config["async_rl"]["min_groups_for_streaming_train"] = 1
+    config["loss_fn"][option] = value
+    with pytest.raises(ValueError, match="streaming requires"):
+        _validate_automodel_single_controller_config(MasterConfig(**config))
+
+
+@pytest.mark.parametrize("estimator", ["gdpo", "reinforce_plus_plus"])
+def test_streaming_rejects_batch_advantages(config, estimator):
+    config["async_rl"]["min_groups_for_streaming_train"] = 1
+    config["grpo"]["adv_estimator"]["name"] = estimator
+    with pytest.raises(ValueError, match="per-prompt GRPO"):
+        _validate_automodel_single_controller_config(MasterConfig(**config))

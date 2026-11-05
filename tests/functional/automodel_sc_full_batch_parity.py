@@ -22,10 +22,13 @@ network TransferQueue and live vLLM are covered by the separate SC smoke run.
 
 import argparse
 import copy
+import hashlib
 import json
 import os
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import ray
@@ -35,6 +38,7 @@ from omegaconf import OmegaConf
 from pydantic import TypeAdapter
 from torch.distributed.tensor import DTensor
 from torch.utils._pytree import tree_map
+from transformer_engine.pytorch.optimizers.fused_adam import FusedAdam
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.data_plane.adapters.local import local_batch_to_tensordict
@@ -47,14 +51,15 @@ from nemo_rl.models.policy.workers import automodel_policy_worker as worker_modu
 from nemo_rl.models.policy.workers.automodel_policy_worker import (
     AutomodelPolicyWorkerImpl,
 )
+from nemo_automodel.components.moe.layers import Gate
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 
-def local(tensor):
+def local(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
-def snapshot_model(worker):
+def snapshot_model(worker: AutomodelPolicyWorkerImpl) -> dict[str, torch.Tensor]:
     return {
         name: local(tensor).detach().cpu().clone()
         for name, tensor in list(worker.model.named_parameters())
@@ -63,14 +68,16 @@ def snapshot_model(worker):
 
 
 @torch.no_grad()
-def restore_model(worker, state):
+def restore_model(
+    worker: AutomodelPolicyWorkerImpl, state: dict[str, torch.Tensor]
+) -> None:
     for name, tensor in list(worker.model.named_parameters()) + list(
         worker.model.named_buffers()
     ):
         local(tensor).copy_(state[name])
 
 
-def snapshot_optimizer(worker):
+def snapshot_optimizer(worker: AutomodelPolicyWorkerImpl) -> dict[str, Any]:
     return tree_map(
         lambda x: (
             x.detach().cpu().clone()
@@ -81,7 +88,59 @@ def snapshot_optimizer(worker):
     )
 
 
-def compare_tree(actual, expected, *, rtol, atol):
+def snapshot_raw_optimizer(worker: AutomodelPolicyWorkerImpl) -> dict[str, Any]:
+    """Include TE's compressed buffers and scales, which state_dict dequantizes."""
+
+    def clone(value: Any) -> Any:
+        return (
+            local(value).detach().cpu().clone()
+            if isinstance(value, torch.Tensor)
+            else copy.deepcopy(value)
+        )
+
+    names = dict(worker.model.named_parameters())
+    state = {
+        name: tree_map(clone, worker.optimizer.state[parameter])
+        for name, parameter in names.items()
+        if parameter in worker.optimizer.state
+    }
+    scales = (
+        {
+            name: tree_map(clone, worker.optimizer._scales[parameter])
+            for name, parameter in names.items()
+            if parameter in worker.optimizer._scales
+        }
+        if isinstance(worker.optimizer, FusedAdam)
+        else None
+    )
+    return {"state": state, "scales": scales}
+
+
+def restore_optimizer(
+    worker: AutomodelPolicyWorkerImpl,
+    public: dict[str, Any],
+    raw: dict[str, Any],
+) -> None:
+    """Restore logical state and the exact compressed representation for replay."""
+    worker.optimizer.load_state_dict(public)
+    names = dict(worker.model.named_parameters())
+    for name, state in raw["state"].items():
+        for key, value in state.items():
+            destination = worker.optimizer.state[names[name]][key]
+            if isinstance(value, torch.Tensor):
+                local(destination).copy_(value)
+            else:
+                worker.optimizer.state[names[name]][key] = copy.deepcopy(value)
+    if isinstance(worker.optimizer, FusedAdam):
+        worker.optimizer._scales = {
+            names[name]: {
+                key: value.to(names[name].device) for key, value in scales.items()
+            }
+            for name, scales in raw["scales"].items()
+        }
+
+
+def compare_tree(actual: Any, expected: Any, *, rtol: float, atol: float) -> float:
     """Compare all leaves, returning the largest absolute tensor/scalar error."""
     if isinstance(expected, torch.Tensor):
         a, b = local(actual).detach().cpu(), local(expected).detach().cpu()
@@ -117,7 +176,160 @@ def compare_tree(actual, expected, *, rtol, atol):
     return 0.0
 
 
-def make_batch(gbs, seq_len):
+def compare_bf16_gradients(
+    actual: dict[str, torch.Tensor], expected: dict[str, torch.Tensor]
+) -> float:
+    """Apply the predeclared BF16 norm/direction contract and retain tensor errors."""
+    assert actual.keys() == expected.keys()
+    difference_squared = actual_squared = expected_squared = dot_product = 0.0
+    tensor_errors = {}
+    for name in expected:
+        actual_tensor = actual[name].double()
+        expected_tensor = expected[name].double()
+        difference = actual_tensor - expected_tensor
+        tensor_errors[name] = (
+            float(difference.abs().max()) if difference.numel() else 0.0
+        )
+        difference_squared += float(difference.square().sum())
+        actual_squared += float(actual_tensor.square().sum())
+        expected_squared += float(expected_tensor.square().sum())
+        dot_product += float((actual_tensor * expected_tensor).sum())
+    relative_l2 = (
+        (difference_squared / expected_squared) ** 0.5
+        if expected_squared
+        else difference_squared**0.5
+    )
+    cosine = (
+        dot_product / (actual_squared * expected_squared) ** 0.5
+        if actual_squared and expected_squared
+        else float(actual_squared == expected_squared)
+    )
+    norm_error = (
+        abs(actual_squared**0.5 - expected_squared**0.5) / expected_squared**0.5
+        if expected_squared
+        else actual_squared**0.5
+    )
+    report = {
+        "relative_l2": relative_l2,
+        "cosine": cosine,
+        "norm_relative_error": norm_error,
+        "tensor_max_abs": tensor_errors,
+    }
+    print("GRADIENT_CONTRACT " + json.dumps(report), flush=True)
+    assert relative_l2 <= 0.01, report
+    assert cosine >= 0.9999, report
+    assert norm_error <= 0.01, report
+    return max(tensor_errors.values(), default=0.0)
+
+
+def compare_bf16_model(
+    actual: dict[str, torch.Tensor], expected: dict[str, torch.Tensor]
+) -> float:
+    """Check FP32 master values and BF16 parameter ULPs without broad rtol."""
+    assert actual.keys() == expected.keys()
+    maximum = 0.0
+    for name, expected_tensor in expected.items():
+        actual_tensor = actual[name]
+        if expected_tensor.dtype == torch.bfloat16:
+            ulps = (
+                actual_tensor.view(torch.int16).int()
+                - expected_tensor.view(torch.int16).int()
+            ).abs()
+            assert not ulps.numel() or int(ulps.max()) <= 1, (name, int(ulps.max()))
+        else:
+            torch.testing.assert_close(
+                actual_tensor, expected_tensor, rtol=0, atol=1e-7
+            )
+        if expected_tensor.numel():
+            maximum = max(
+                maximum,
+                float((actual_tensor.double() - expected_tensor.double()).abs().max()),
+            )
+    return maximum
+
+
+def measure_tree(actual: Any, expected: Any) -> float:
+    """Measure differences without treating a diagnostic as numerical parity."""
+    if isinstance(expected, torch.Tensor):
+        assert actual.shape == expected.shape and actual.dtype == expected.dtype
+        assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
+        if expected.ndim == 0:
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        return (
+            float((actual.double() - expected.double()).abs().max())
+            if expected.numel()
+            else 0.0
+        )
+    if isinstance(expected, dict):
+        assert actual.keys() == expected.keys()
+        return max(
+            (measure_tree(actual[key], value) for key, value in expected.items()),
+            default=0.0,
+        )
+    if isinstance(expected, (list, tuple)):
+        assert len(actual) == len(expected)
+        return max(
+            (
+                measure_tree(value, reference)
+                for value, reference in zip(actual, expected)
+            ),
+            default=0.0,
+        )
+    assert actual == expected
+    return 0.0
+
+
+def optimizer_oracle(
+    worker: AutomodelPolicyWorkerImpl,
+    before: dict[str, torch.Tensor],
+    optim_before: dict[str, Any],
+    raw_optim_before: dict[str, Any],
+    sched_before: dict[str, Any],
+    gradients: dict[str, torch.Tensor],
+    gate_loads: list[tuple[Gate, torch.Tensor | None]],
+    buffers: dict[str, torch.Tensor],
+    clip: Callable[..., Any],
+) -> None:
+    """Apply a single reference update to the captured streaming gradients."""
+    actual_model = snapshot_model(worker)
+    actual_optimizer = snapshot_optimizer(worker)
+    actual_raw_optimizer = snapshot_raw_optimizer(worker)
+    actual_scheduler = copy.deepcopy(worker.scheduler.state_dict())
+    restore_model(worker, before)
+    restore_optimizer(worker, optim_before, raw_optim_before)
+    worker.scheduler.load_state_dict(sched_before)
+    for name, buffer in worker.model.named_buffers():
+        local(buffer).copy_(buffers[name])
+    for gate, load in gate_loads:
+        gate._cumulative_expert_load = load
+    for name, parameter in worker.model.named_parameters():
+        if name in gradients:
+            parameter.grad = torch.zeros_like(parameter)
+            local(parameter.grad).copy_(gradients[name])
+    clip(
+        worker.max_grad_norm,
+        [worker.model],
+        norm_type=2.0,
+        pp_enabled=False,
+        device_mesh=worker.device_mesh,
+        moe_mesh=worker.moe_mesh,
+        ep_axis_name="ep" if worker.moe_mesh is not None else None,
+        pp_axis_name=None,
+        foreach=True,
+        num_label_tokens=1,
+        dp_group_size=worker.dp_size * worker.cp_size,
+    )
+    worker.optimizer.step()
+    worker._update_moe_gate_bias_if_supported()
+    worker.scheduler.step()
+    worker.optimizer.zero_grad()
+    compare_tree(snapshot_model(worker), actual_model, rtol=0, atol=0)
+    compare_tree(snapshot_optimizer(worker), actual_optimizer, rtol=0, atol=0)
+    compare_tree(snapshot_raw_optimizer(worker), actual_raw_optimizer, rtol=0, atol=0)
+    compare_tree(worker.scheduler.state_dict(), actual_scheduler, rtol=0, atol=0)
+
+
+def make_batch(gbs: int, seq_len: int) -> BatchedDataDict[Any]:
     gen = torch.Generator().manual_seed(731)
     tokens = torch.randint(100, 1000, (gbs, seq_len), generator=gen)
     lengths = torch.tensor(
@@ -140,7 +352,7 @@ def make_batch(gbs, seq_len):
     )
 
 
-def run(args):
+def run(args: argparse.Namespace) -> None:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -150,7 +362,18 @@ def run(args):
     cfg = load_config(args.recipe)
     cfg.policy.model_name = args.model
     cfg.policy.tokenizer.name = args.model
-    cfg.policy.train_global_batch_size = world * 2
+    if args.precision is not None:
+        cfg.policy.precision = args.precision
+        if args.precision == "float32":
+            cfg.policy.automodel_cfg.automodel_kwargs.attn_implementation = "sdpa"
+    dispatch_sizes = (
+        [int(size) for size in args.dispatch_sizes.split(",")]
+        if args.dispatch_sizes is not None
+        else [args.local_batch_size]
+    )
+    if min(dispatch_sizes) < 1 or sum(dispatch_sizes) != args.local_batch_size:
+        raise ValueError("dispatch sizes must be positive and sum to local batch size")
+    cfg.policy.train_global_batch_size = world * args.local_batch_size
     cfg.policy.train_micro_batch_size = 1
     cfg.policy.logprob_batch_size = 1
     cfg.policy.dynamic_batching.enabled = False
@@ -167,17 +390,23 @@ def run(args):
     cfg.policy.generation.colocated.enabled = False
     # Keep the checkpoint's full-precision parameters and use a simple reference
     # optimizer whose complete state can be compared, including its step counter.
-    cfg.policy.optimizer = {
-        "name": "torch.optim.AdamW",
-        "kwargs": {"lr": 2e-6, "weight_decay": 0.1, "foreach": False, "fused": False},
-    }
-    cfg.policy.scheduler = [
-        {
-            "name": "torch.optim.lr_scheduler.StepLR",
-            "kwargs": {"step_size": 1, "gamma": 0.9},
-        },
-        {"milestones": []},
-    ]
+    if not args.recipe_optimizer:
+        cfg.policy.optimizer = {
+            "name": "torch.optim.AdamW",
+            "kwargs": {
+                "lr": 2e-6,
+                "weight_decay": 0.1,
+                "foreach": False,
+                "fused": False,
+            },
+        }
+        cfg.policy.scheduler = [
+            {
+                "name": "torch.optim.lr_scheduler.StepLR",
+                "kwargs": {"step_size": 1, "gamma": 0.9},
+            },
+            {"milestones": []},
+        ]
     policy_cfg = TypeAdapter(PolicyConfig).validate_python(
         OmegaConf.to_container(cfg.policy, resolve=True)
     )
@@ -210,7 +439,8 @@ def run(args):
                 "force_hf": args.force_hf,
                 "dp": world,
                 "ep": cfg.policy.automodel_cfg.expert_parallel_size,
-                "gbs": world * 2,
+                "gbs": world * args.local_batch_size,
+                "dispatch_sizes": dispatch_sizes,
                 "steps_per_loss_type": args.steps,
                 "rtol": args.rtol,
                 "atol": args.atol,
@@ -232,8 +462,11 @@ def run(args):
                 )
             )
             for step in range(args.steps):
-                batch = make_batch(world * 2, args.seq_len)
-                shard = batch.get_batch(rank, 2)
+                batch = make_batch(world * args.local_batch_size, args.seq_len)
+                if args.mask_rank is not None:
+                    start = args.mask_rank * args.local_batch_size
+                    batch["sample_mask"][start : start + args.local_batch_size] = 0
+                shard = batch.get_batch(rank, args.local_batch_size)
                 worker.prepare_for_lp_inference()
                 logprobs = worker.get_logprobs(shard)["logprobs"].cpu()
                 gathered = [
@@ -244,10 +477,11 @@ def run(args):
                 batch["prev_logprobs"] = full_lp
                 batch["generation_logprobs"] = full_lp - 0.02
                 batch["reference_policy_logprobs"] = full_lp + 0.01
-                shard = batch.get_batch(rank, 2)
+                shard = batch.get_batch(rank, args.local_batch_size)
                 worker.prepare_for_training()
                 before = snapshot_model(worker)
                 optim_before = snapshot_optimizer(worker)
+                raw_optim_before = snapshot_raw_optimizer(worker)
                 sched_before = copy.deepcopy(worker.scheduler.state_dict())
                 cpu_rng = torch.get_rng_state()
                 gpu_rng = torch.cuda.get_rng_state()
@@ -270,13 +504,13 @@ def run(args):
                     sync_metrics = worker.train(shard, loss_fn)
                 expected = snapshot_model(worker)
                 expected_optim = snapshot_optimizer(worker)
+                expected_raw_optim = snapshot_raw_optimizer(worker)
                 expected_sched = copy.deepcopy(worker.scheduler.state_dict())
                 restore_model(worker, before)
-                worker.optimizer.load_state_dict(optim_before)
+                restore_optimizer(worker, optim_before, raw_optim_before)
                 worker.scheduler.load_state_dict(sched_before)
                 torch.set_rng_state(cpu_rng)
                 torch.cuda.set_rng_state(gpu_rng)
-                del before, optim_before
                 partition = f"parity-{token_level}-{step}"
                 client.register_partition(
                     partition_id=partition,
@@ -301,46 +535,198 @@ def run(args):
                 )
                 metas, _ = shard_meta_for_dp(meta, dp_world=world)
                 worker.begin_train_step_presharded(loss_fn)
-                worker.train_microbatch_presharded(metas[rank])
-                split_grad = {
-                    n: local(p.grad)
-                    for n, p in worker.model.named_parameters()
-                    if p.grad is not None
+                offset = 0
+                for size in dispatch_sizes:
+                    worker.train_microbatch_presharded(
+                        metas[rank].slice(offset, offset + size)
+                    )
+                    offset += size
+                    retained_grad = {
+                        name: local(parameter.grad).detach().cpu().clone()
+                        for name, parameter in worker.model.named_parameters()
+                        if parameter.grad is not None
+                    }
+                    lp_cpu_rng = torch.get_rng_state()
+                    lp_gpu_rng = torch.cuda.get_rng_state()
+                    worker.prepare_for_lp_inference(keep_train_buffers=True)
+                    worker.get_logprobs(shard)
+                    worker.prepare_for_training()
+                    torch.set_rng_state(lp_cpu_rng)
+                    torch.cuda.set_rng_state(lp_gpu_rng)
+                    compare_tree(
+                        {
+                            name: local(parameter.grad)
+                            for name, parameter in worker.model.named_parameters()
+                            if parameter.grad is not None
+                        },
+                        retained_grad,
+                        rtol=0,
+                        atol=0,
+                    )
+                split_grad = {}
+                gate_loads = [
+                    (
+                        gate,
+                        gate._cumulative_expert_load.detach().clone()
+                        if gate._cumulative_expert_load is not None
+                        else None,
+                    )
+                    for gate in worker.model.modules()
+                    if isinstance(gate, Gate)
+                ]
+                backward_buffers = {
+                    name: local(buffer).detach().clone()
+                    for name, buffer in worker.model.named_buffers()
                 }
+
+                def capture_split(*clip_args, **clip_kwargs):
+                    split_grad.update(
+                        {
+                            name: local(parameter.grad).detach().cpu().clone()
+                            for name, parameter in worker.model.named_parameters()
+                            if parameter.grad is not None
+                        }
+                    )
+                    return original_clip(*clip_args, **clip_kwargs)
+
+                with patch.object(
+                    worker_module,
+                    "scale_grads_and_clip_grad_norm",
+                    side_effect=capture_split,
+                ):
+                    split_metrics = worker.finish_train_step_presharded()
                 errors = {
-                    "gradient_max_abs": compare_tree(
+                    "gradient_max_abs": compare_bf16_gradients(split_grad, captured)
+                    if args.bf16_contract
+                    else compare_tree(
                         split_grad, captured, rtol=args.rtol, atol=args.atol
                     )
                 }
-                # Exercise the existing LP transition with accumulated gradients.
-                worker.prepare_for_lp_inference(keep_train_buffers=True)
-                worker.get_logprobs(shard)
-                worker.prepare_for_training()
-                compare_tree(
-                    {
-                        n: local(p.grad)
-                        for n, p in worker.model.named_parameters()
-                        if p.grad is not None
-                    },
-                    captured,
-                    rtol=args.rtol,
-                    atol=args.atol,
-                )
-                split_metrics = worker.finish_train_step_presharded()
                 split_metrics.pop("is_replica_leader")
                 split_metrics.pop("route_fallback_counts")
+                if args.bf16_contract:
+                    torch.testing.assert_close(
+                        split_metrics["grad_norm"],
+                        sync_metrics["grad_norm"],
+                        rtol=0.01,
+                        atol=0,
+                    )
+                    split_metrics = dict(split_metrics)
+                    sync_metrics = dict(sync_metrics)
+                    split_metrics.pop("grad_norm")
+                    expected_grad_norm = sync_metrics.pop("grad_norm")
+                else:
+                    expected_grad_norm = sync_metrics["grad_norm"]
                 errors["metrics_max_abs"] = compare_tree(
                     split_metrics, sync_metrics, rtol=args.rtol, atol=args.atol
                 )
-                errors["parameter_max_abs"] = compare_tree(
-                    snapshot_model(worker), expected, rtol=args.rtol, atol=args.atol
-                )
-                errors["optimizer_max_abs"] = compare_tree(
-                    snapshot_optimizer(worker),
-                    expected_optim,
-                    rtol=args.rtol,
-                    atol=args.atol,
-                )
+                if args.optimizer_oracle:
+                    actual_model = snapshot_model(worker)
+                    actual_optim = snapshot_optimizer(worker)
+                    worst_name = next(iter(captured))
+                    worst_difference = -1.0
+                    for parameter_name in captured:
+                        difference = float(
+                            (actual_model[parameter_name] - expected[parameter_name])
+                            .abs()
+                            .max()
+                        )
+                        if difference > worst_difference:
+                            worst_name = parameter_name
+                            worst_difference = difference
+                    worst_index = int(
+                        (actual_model[worst_name] - expected[worst_name])
+                        .abs()
+                        .reshape(-1)
+                        .argmax()
+                    )
+                    print(
+                        "UPDATE_DIAGNOSTIC "
+                        + json.dumps(
+                            {
+                                "parameter": worst_name,
+                                "flat_index": worst_index,
+                                "full_batch_gradient": float(
+                                    captured[worst_name].reshape(-1)[worst_index]
+                                ),
+                                "streaming_gradient": float(
+                                    split_grad[worst_name].reshape(-1)[worst_index]
+                                ),
+                                "full_batch_parameter": float(
+                                    expected[worst_name].reshape(-1)[worst_index]
+                                ),
+                                "streaming_parameter": float(
+                                    actual_model[worst_name].reshape(-1)[worst_index]
+                                ),
+                                "lr": worker.optimizer.param_groups[0]["lr"],
+                            }
+                        ),
+                        flush=True,
+                    )
+                    errors["parameter_max_abs"] = measure_tree(actual_model, expected)
+                    errors["optimizer_max_abs"] = measure_tree(
+                        actual_optim, expected_optim
+                    )
+                    errors["raw_optimizer_max_abs"] = measure_tree(
+                        snapshot_raw_optimizer(worker), expected_raw_optim
+                    )
+                    try:
+                        compare_bf16_model(actual_model, expected)
+                    except AssertionError:
+                        v1_parameter_passed = False
+                    else:
+                        v1_parameter_passed = True
+                    try:
+                        compare_tree(actual_optim, expected_optim, rtol=1e-2, atol=1e-6)
+                    except AssertionError:
+                        v1_optimizer_passed = False
+                    else:
+                        v1_optimizer_passed = True
+                    optimizer_oracle(
+                        worker,
+                        before,
+                        optim_before,
+                        raw_optim_before,
+                        sched_before,
+                        split_grad,
+                        gate_loads,
+                        backward_buffers,
+                        original_clip,
+                    )
+                    print(
+                        "OPTIMIZER_ORACLE "
+                        + json.dumps(
+                            {
+                                "passed": True,
+                                "v1_parameter_gate_passed": v1_parameter_passed,
+                                "v1_optimizer_gate_passed": v1_optimizer_passed,
+                            }
+                        ),
+                        flush=True,
+                    )
+                else:
+                    errors["parameter_max_abs"] = (
+                        compare_bf16_model(snapshot_model(worker), expected)
+                        if args.bf16_contract
+                        else compare_tree(
+                            snapshot_model(worker),
+                            expected,
+                            rtol=args.rtol,
+                            atol=args.atol,
+                        )
+                    )
+                    errors["optimizer_max_abs"] = compare_tree(
+                        snapshot_optimizer(worker),
+                        expected_optim,
+                        rtol=1e-2 if args.bf16_contract else args.rtol,
+                        atol=1e-6 if args.bf16_contract else args.atol,
+                    )
+                    errors["raw_optimizer_max_abs"] = compare_tree(
+                        snapshot_raw_optimizer(worker),
+                        expected_raw_optim,
+                        rtol=1e-2 if args.bf16_contract else args.rtol,
+                        atol=1e-6 if args.bf16_contract else args.atol,
+                    )
                 compare_tree(
                     worker.scheduler.state_dict(), expected_sched, rtol=0, atol=0
                 )
@@ -350,12 +736,28 @@ def run(args):
                 )
                 dist.all_reduce(maxima, op=dist.ReduceOp.MAX)
                 errors = dict(zip(errors, maxima.cpu().tolist()))
+                if args.optimizer_oracle:
+                    gates = torch.tensor(
+                        [v1_parameter_passed, v1_optimizer_passed],
+                        device="cuda",
+                        dtype=torch.int64,
+                    )
+                    dist.all_reduce(gates, op=dist.ReduceOp.MIN)
+                    v1_parameter_passed, v1_optimizer_passed = map(bool, gates.tolist())
                 record = {
                     "token_level": token_level,
                     "step": step,
+                    "dispatch_sizes": dispatch_sizes,
+                    "optimizer_oracle": args.optimizer_oracle,
+                    "v1_parameter_gate_passed": v1_parameter_passed
+                    if args.optimizer_oracle
+                    else True,
+                    "v1_optimizer_gate_passed": v1_optimizer_passed
+                    if args.optimizer_oracle
+                    else True,
                     **errors,
                     "loss": float(sync_metrics["global_loss"].sum()),
-                    "grad_norm": float(sync_metrics["grad_norm"]),
+                    "grad_norm": float(expected_grad_norm),
                 }
                 records.append(record)
                 if rank == 0:
@@ -363,13 +765,14 @@ def run(args):
                     if run_log:
                         run_log.log(record)
                 client.clear_samples(None, partition)
-                del expected, expected_optim, split_grad
+                del expected, expected_optim, before, optim_before
+                split_grad.clear()
                 captured.clear()
                 # Abort after real backward must preserve parameters and schedule.
                 abort_before = snapshot_model(worker)
                 abort_optimizer = snapshot_optimizer(worker)
                 worker.begin_train_step(loss_fn)
-                worker.train_microbatch(shard)
+                worker.train_microbatch(shard.slice(0, dispatch_sizes[0]))
                 worker.abort_train_step()
                 compare_tree(snapshot_model(worker), abort_before, rtol=0, atol=0)
                 compare_tree(
@@ -388,6 +791,44 @@ def run(args):
                 json.dumps(
                     {
                         "passed": True,
+                        "source_sha": args.source_sha,
+                        "source_file_sha256": {
+                            str(
+                                path.relative_to(Path(__file__).resolve().parents[2])
+                            ): hashlib.sha256(path.read_bytes()).hexdigest()
+                            for path in (
+                                Path(__file__).resolve(),
+                                Path(worker_module.__file__).resolve(),
+                            )
+                        },
+                        "recipe_optimizer": args.recipe_optimizer,
+                        "optimizer_class": type(worker.optimizer).__qualname__,
+                        "model_parameter_dtypes": sorted(
+                            {
+                                str(parameter.dtype)
+                                for parameter in worker.model.parameters()
+                            }
+                        ),
+                        "raw_optimizer_tensor_dtypes": sorted(
+                            {
+                                str(value.dtype)
+                                for state in snapshot_raw_optimizer(worker)[
+                                    "state"
+                                ].values()
+                                for value in state.values()
+                                if isinstance(value, torch.Tensor)
+                            }
+                        ),
+                        "activation_checkpointing": cfg.policy.automodel_cfg.activation_checkpointing,
+                        "contract": "bf16_gradient_and_optimizer_oracle_v2"
+                        if args.optimizer_oracle
+                        else "full_batch_state_parity",
+                        "full_batch_parameter_gate_passed": all(
+                            record["v1_parameter_gate_passed"] for record in records
+                        ),
+                        "full_batch_optimizer_gate_passed": all(
+                            record["v1_optimizer_gate_passed"] for record in records
+                        ),
                         "records": records,
                         "wandb_url": run_log.url if run_log else None,
                     },
@@ -412,6 +853,13 @@ if __name__ == "__main__":
     )
     parser.add_argument("--output", required=True)
     parser.add_argument("--steps", type=int, default=2)
+    parser.add_argument("--local-batch-size", type=int, default=2)
+    parser.add_argument("--dispatch-sizes")
+    parser.add_argument("--precision", choices=("float32", "bfloat16"))
+    parser.add_argument("--bf16-contract", action="store_true")
+    parser.add_argument("--optimizer-oracle", action="store_true")
+    parser.add_argument("--recipe-optimizer", action="store_true")
+    parser.add_argument("--mask-rank", type=int)
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--rtol", type=float, default=1e-5)
     parser.add_argument("--atol", type=float, default=1e-6)

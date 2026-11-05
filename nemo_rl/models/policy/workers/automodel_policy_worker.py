@@ -16,7 +16,7 @@ import gc
 import warnings
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Generator, Iterable, Optional, cast
 
 import ray
@@ -35,7 +35,8 @@ from torch.distributed.tensor import DTensor
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
 )
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss import ClippedPGLossFn
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType, MetricNormalizer
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -104,6 +105,14 @@ from nemo_rl.utils.timer import Timer
 
 
 @dataclass
+class _GateSnapshot:
+    gate: Gate
+    cumulative_load: Optional[torch.Tensor]
+    last_load: Optional[torch.Tensor]
+    last_aux_loss: Optional[torch.Tensor]
+
+
+@dataclass
 class _TrainStepState:
     """State owned by one SC optimizer step, independently of synchronous train."""
 
@@ -111,8 +120,16 @@ class _TrainStepState:
     gbs: int
     mbs: int
     buffers: list[tuple[torch.Tensor, torch.Tensor]]
-    router_loads: list[tuple[Gate, Optional[torch.Tensor]]]
+    gates: list[_GateSnapshot]
+    local_valid_seqs: torch.Tensor
+    local_valid_toks: torch.Tensor
+    metric_normalizations: dict[str, MetricNormalizer]
     dispatched: bool = False
+    deferred_normalization: bool = False
+    failed: bool = False
+    local_rows: int = 0
+    num_chunks: int = 0
+    all_mb_metrics: list[dict[str, Any]] = field(default_factory=list)
     metrics: Optional[dict[str, Any]] = None
 
 
@@ -900,46 +917,86 @@ class AutomodelPolicyWorkerImpl(
                 (buffer, buffer.detach().clone()) for buffer in self.model.buffers()
             ],
             # AutoModel Gate keeps this training accumulator outside state_dict.
-            router_loads=[
-                (
-                    module,
-                    module._cumulative_expert_load.detach().clone()
+            gates=[
+                _GateSnapshot(
+                    gate=module,
+                    cumulative_load=module._cumulative_expert_load.detach().clone()
                     if module._cumulative_expert_load is not None
+                    else None,
+                    last_load=module._last_expert_load.detach().clone()
+                    if getattr(module, "_last_expert_load", None) is not None
+                    else None,
+                    last_aux_loss=module._last_aux_loss.detach().clone()
+                    if getattr(module, "_last_aux_loss", None) is not None
                     else None,
                 )
                 for module in self.model.modules()
                 if isinstance(module, Gate)
             ],
+            local_valid_seqs=torch.tensor(0.0, dtype=torch.float64, device="cuda"),
+            local_valid_toks=torch.tensor(0.0, dtype=torch.float64, device="cuda"),
+            metric_normalizations=loss_fn.metric_normalizations
+            if isinstance(loss_fn, ClippedPGLossFn)
+            else {},
         )
         self.optimizer.zero_grad()
         self.model.train()
         self._train_step_state = state
 
     def train_microbatch(self, data: BatchedDataDict[Any]) -> None:
-        """Compute a full dispatch's gradients using existing numerical primitives.
-
-        One dispatch may contain many backend forward/backward microbatches.
-        Requires exactly one complete batch; streaming is not supported.
-        """
+        """Accumulate one aligned dispatch without committing the optimizer."""
         state = self._train_step_state
         if state is None:
             raise RuntimeError("begin_train_step must precede train_microbatch")
-        if state.dispatched:
+        if state.failed:
+            raise RuntimeError(
+                "train dispatch failed; abort this step before continuing"
+            )
+        if state.dispatched and not state.deferred_normalization:
             raise RuntimeError(
                 "AutoModel SC accepts exactly one full-batch dispatch per step"
             )
-        state.dispatched = True
+        try:
+            self._train_microbatch_body(state, data)
+        except Exception:
+            state.failed = True
+            raise
+
+    def _train_microbatch_body(
+        self, state: _TrainStepState, data: BatchedDataDict[Any]
+    ) -> None:
+        """Run a dispatch, retaining numerator gradients for partial batches."""
         sizes = torch.tensor([data.size, -data.size], device="cuda")
         torch.distributed.all_reduce(
             sizes, op=torch.distributed.ReduceOp.MIN, group=self.dp_mesh.get_group()
         )
         minimum, negative_maximum = sizes.tolist()
         local_gbs = state.gbs // self.dp_size
-        if minimum != local_gbs or -negative_maximum != local_gbs:
+        if (
+            minimum != -negative_maximum
+            or minimum <= 0
+            or minimum % state.mbs
+            or state.local_rows + minimum > local_gbs
+        ):
             raise ValueError(
-                f"AutoModel SC requires {local_gbs} rows on every DP rank; "
+                f"AutoModel SC requires equal positive MBS-aligned rows on every DP rank, "
+                f"without exceeding {local_gbs} rows per step; "
                 f"received between {minimum} and {-negative_maximum}. Abort this step."
             )
+        if not state.dispatched:
+            state.deferred_normalization = minimum < local_gbs
+            if state.deferred_normalization:
+                if not isinstance(state.loss_fn, ClippedPGLossFn):
+                    raise ValueError("AutoModel streaming requires ClippedPGLossFn")
+                if state.loss_fn.positive_example_nll_weight != 0:
+                    raise ValueError(
+                        "AutoModel streaming requires positive_example_nll_weight=0"
+                    )
+                if any(snapshot.gate.aux_loss_coeff != 0 for snapshot in state.gates):
+                    raise ValueError(
+                        "AutoModel streaming requires MoE auxiliary loss coefficient=0"
+                    )
+        state.dispatched = True
         with self.timer.time("train"):
             sequence_dim, _ = check_sequence_dim(data)
             self.model.train()
@@ -961,13 +1018,38 @@ class AutomodelPolicyWorkerImpl(
                 if empty_cache_steps and mb_idx % empty_cache_steps == 0:
                     torch.cuda.empty_cache()
 
-            gb_result = process_global_batch(
-                data.to("cuda"),
-                state.loss_fn,
-                self.dp_mesh.get_group(),
-                batch_idx=0,
-                batch_size=local_gbs,
-            )
+            if state.deferred_normalization:
+                batch = data.to("cuda")
+                local_seqs = batch["sample_mask"].sum().to(torch.float64)
+                if "token_mask" in batch:
+                    local_toks = (
+                        (
+                            batch["token_mask"][:, 1:]
+                            * batch["sample_mask"].unsqueeze(-1)
+                        )
+                        .sum()
+                        .to(torch.float64)
+                    )
+                elif state.loss_fn.loss_type == LossType.TOKEN_LEVEL:
+                    raise ValueError("token-level loss requires token_mask")
+                else:
+                    local_toks = local_seqs * batch["input_ids"].shape[1]
+                state.local_valid_seqs += local_seqs
+                state.local_valid_toks += local_toks
+                placeholder = torch.tensor(1.0, device="cuda")
+                gb_result = {
+                    "batch": batch,
+                    "global_valid_seqs": placeholder,
+                    "global_valid_toks": placeholder,
+                }
+            else:
+                gb_result = process_global_batch(
+                    data.to("cuda"),
+                    state.loss_fn,
+                    self.dp_mesh.get_group(),
+                    batch_idx=0,
+                    batch_size=local_gbs,
+                )
             global_valid_seqs = gb_result["global_valid_seqs"]
             global_valid_toks = gb_result["global_valid_toks"]
             processed_iterator, iterator_len = get_microbatch_iterator(
@@ -1002,27 +1084,81 @@ class AutomodelPolicyWorkerImpl(
             all_mb_metrics = []
             for mb_idx, (_, loss_metrics) in enumerate(mb_results):
                 if mb_idx < iterator_len:
-                    loss_metrics[LEARNING_RATE_KEY] = self.optimizer.param_groups[0][
-                        "lr"
-                    ]
-                    loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
-                    loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                    if not state.deferred_normalization:
+                        loss_metrics[LEARNING_RATE_KEY] = self.optimizer.param_groups[
+                            0
+                        ]["lr"]
+                        loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
+                        loss_metrics["global_valid_toks"] = global_valid_toks.item()
                     if loss_metrics["num_valid_samples"] > 0:
                         mb_losses.append(loss_metrics["loss"])
                         all_mb_metrics.append(loss_metrics)
-            state.metrics = aggregate_training_statistics(
-                losses=[torch.tensor(mb_losses).sum().item()],
-                all_mb_metrics=all_mb_metrics,
-                grad_norm=None,
-                dp_group=self.dp_mesh.get_group(),
-                dtype=self.dtype,
-            )
+            if state.deferred_normalization:
+                state.all_mb_metrics.extend(all_mb_metrics)
+                release_moe_dispatcher_state(self.model)
+            else:
+                state.metrics = aggregate_training_statistics(
+                    losses=[torch.tensor(mb_losses).sum().item()],
+                    all_mb_metrics=all_mb_metrics,
+                    grad_norm=None,
+                    dp_group=self.dp_mesh.get_group(),
+                    dtype=self.dtype,
+                )
+            state.local_rows += minimum
+            state.num_chunks += 1
+
+    def _finalize_streaming_metrics(self, state: _TrainStepState) -> None:
+        """Normalize accumulated gradients and metrics once for the entire step."""
+        counts = torch.stack((state.local_valid_seqs, state.local_valid_toks))
+        torch.distributed.all_reduce(counts, group=self.dp_mesh.get_group())
+        global_seqs, global_toks = counts.tolist()
+        if global_seqs <= 0 or global_toks <= 0:
+            raise ValueError("AutoModel streaming step has no valid response tokens")
+        normalizer = (
+            MetricNormalizer.TOKENS
+            if state.loss_fn.loss_type == LossType.TOKEN_LEVEL
+            else MetricNormalizer.SEQUENCES
+        )
+        factors = {
+            MetricNormalizer.TOKENS: 1.0 / global_toks,
+            MetricNormalizer.SEQUENCES: 1.0 / global_seqs,
+            MetricNormalizer.NONE: 1.0,
+        }
+        for parameter in self.model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(factors[normalizer])
+        metrics = []
+        for contribution in state.all_mb_metrics:
+            normalized = {
+                name: value * factors[state.metric_normalizations.get(name, normalizer)]
+                for name, value in contribution.items()
+            }
+            normalized[LEARNING_RATE_KEY] = self.optimizer.param_groups[0]["lr"]
+            normalized["global_valid_seqs"] = global_seqs
+            normalized["global_valid_toks"] = global_toks
+            metrics.append(normalized)
+        state.metrics = aggregate_training_statistics(
+            losses=[torch.tensor([metric["loss"] for metric in metrics]).sum().item()],
+            all_mb_metrics=metrics,
+            grad_norm=None,
+            dp_group=self.dp_mesh.get_group(),
+            dtype=self.dtype,
+        )
 
     def finish_train_step(self) -> dict[str, Any]:
         """Commit one update; a failed commit requires checkpoint recovery."""
         state = self._train_step_state
-        if state is None or state.metrics is None:
-            raise RuntimeError("finish requires one successfully completed full batch")
+        if state is None or state.failed or state.num_chunks == 0:
+            raise RuntimeError(
+                "finish requires a successfully completed dispatch and no failure"
+            )
+        if state.deferred_normalization:
+            try:
+                self._finalize_streaming_metrics(state)
+            except Exception:
+                state.failed = True
+                raise
+        assert state.metrics is not None
         # Keep the fence raised until cleanup also succeeds: a failure after
         # optimizer.step still leaves the caller unsure whether it committed.
         self._train_step_commit_failed = True
@@ -1065,8 +1201,10 @@ class AutomodelPolicyWorkerImpl(
         with torch.no_grad():
             for buffer, saved in state.buffers:
                 buffer.copy_(saved)
-            for gate, load in state.router_loads:
-                gate._cumulative_expert_load = load
+            for snapshot in state.gates:
+                snapshot.gate._cumulative_expert_load = snapshot.cumulative_load
+                snapshot.gate._last_expert_load = snapshot.last_load
+                snapshot.gate._last_aux_loss = snapshot.last_aux_loss
         self.optimizer.zero_grad()
         release_moe_dispatcher_state(self.model)
         self._train_step_state = None

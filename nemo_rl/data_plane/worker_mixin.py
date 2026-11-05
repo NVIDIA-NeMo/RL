@@ -1331,3 +1331,4 @@ class TQWorkerMixin:
         zeros gradients.
         """
         self.abort_train_step()  # type: ignore[attr-defined]
+        self._route_fallback_counts = Counter()

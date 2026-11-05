@@ -29,6 +29,7 @@ contracts cheaply:
 
 from __future__ import annotations
 
+from collections import Counter
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -43,6 +44,13 @@ from nemo_rl.data_plane.schema import (
 )
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.models.policy.tq_policy import TQPolicy
+
+
+@pytest.fixture(autouse=True)
+def wait_for_stub_workers(monkeypatch):
+    wait = MagicMock()
+    monkeypatch.setattr("nemo_rl.models.policy.tq_policy.ray.wait", wait)
+    return wait
 
 
 class _SplitStubWorker(TQWorkerMixin):
@@ -91,6 +99,12 @@ def _meta() -> KVBatchMeta:
 
 
 class TestPreshardedWrappers:
+    def test_abort_clears_uncommitted_route_counts(self):
+        worker = _SplitStubWorker()
+        worker._route_fallback_counts = Counter({"missing": 3})
+        worker.abort_train_step_presharded()
+        assert not worker._route_fallback_counts
+
     def test_begin_forwards_args(self):
         w = _SplitStubWorker()
         loss_fn = object()
@@ -135,6 +149,7 @@ def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
     p.flops_tracker = None
     wg = MagicMock()
     wg.run_all_workers_single_data.return_value = ["f0", "f1"]
+    wg.run_all_workers_sharded_data.return_value.futures = ["f0", "f1"]
     p.worker_group = wg
     p.sharding_annotations = MagicMock()
     p.sharding_annotations.get_axis_size.return_value = 2
@@ -170,7 +185,9 @@ class TestTQPolicySplitFanout:
         mock_ray.get.assert_called_once_with(["f0", "f1"])
         wg.get_all_worker_results.assert_not_called()
 
-    def test_train_microbatches_from_meta_dispatches_and_returns_none(self):
+    def test_train_microbatches_from_meta_dispatches_and_returns_none(
+        self, wait_for_stub_workers
+    ):
         p, wg = _make_tq_policy()
         meta = _meta()
         with (
@@ -193,6 +210,9 @@ class TestTQPolicySplitFanout:
         # sharded dispatch returns a MultiWorkerFuture → waited via
         # get_all_worker_results (unlike the single-data fan-outs)
         wg.get_all_worker_results.assert_called_once()
+        wait_for_stub_workers.assert_called_once_with(
+            ["f0", "f1"], num_returns=2, fetch_local=False
+        )
 
     def test_train_microbatches_fetches_only_requested_fields(self):
         p, _ = _make_tq_policy()

@@ -1369,11 +1369,20 @@ def _validate_automodel_single_controller_config(master_config: MasterConfig) ->
         or sampler.warmup_lookahead_versions is not None
     ):
         raise ValueError(prefix + "requires in_order with max_lookahead_versions=0")
+    if async_cfg.min_groups_for_streaming_train < 1:
+        raise ValueError(prefix + "requires a positive streaming threshold")
     if (
         async_cfg.min_groups_for_streaming_train
-        != master_config.grpo.num_prompts_per_step
+        < master_config.grpo.num_prompts_per_step
     ):
-        raise ValueError(prefix + "requires the full-batch streaming threshold")
+        if master_config.grpo.adv_estimator.name != "grpo":
+            raise ValueError(
+                prefix + "streaming requires the per-prompt GRPO advantage estimator"
+            )
+        if master_config.loss_fn.positive_example_nll_weight != 0:
+            raise ValueError(
+                prefix + "streaming requires positive_example_nll_weight=0"
+            )
     if (
         async_cfg.rollout_failure.max_skipped_prompts
         or async_cfg.rollout_failure.max_consecutive_dropped_prompts

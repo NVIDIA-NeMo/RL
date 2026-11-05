@@ -55,6 +55,11 @@ def _policy() -> tuple[TQPolicy, MagicMock]:
     return policy, worker_group
 
 
+@pytest.fixture(autouse=True)
+def wait_for_stub_workers(monkeypatch):
+    monkeypatch.setattr("nemo_rl.models.policy.tq_policy.ray.wait", MagicMock())
+
+
 def test_train_placed_microbatches_keeps_fields_and_replica_delivery() -> None:
     policy, worker_group = _policy()
     dp_metas = [

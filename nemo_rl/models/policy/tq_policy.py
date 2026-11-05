@@ -463,6 +463,7 @@ class TQPolicy(TQDriverMixin, Policy):
                 common_kwargs={**common_kwargs, **trace_context_kwargs()},
             )
         # Wait for completion; per-rank returns are None.
+        ray.wait(futures.futures, num_returns=len(futures.futures), fetch_local=False)
         self.worker_group.get_all_worker_results(futures)
 
     def get_logprobs_from_meta(
@@ -649,6 +650,7 @@ class TQPolicy(TQDriverMixin, Policy):
             mbs=micro_batch_size,
             **trace_context_kwargs(),
         )
+        ray.wait(futures, num_returns=len(futures), fetch_local=False)
         ray.get(futures)
 
     def pause_train_step_with_offloading(self) -> None:
@@ -818,6 +820,7 @@ class TQPolicy(TQDriverMixin, Policy):
             )
         # Wait for completion only — workers return None (metrics
         # accumulate in their open-step state until finish_train_step).
+        ray.wait(futures.futures, num_returns=len(futures.futures), fetch_local=False)
         self.worker_group.get_all_worker_results(futures)
 
     def finish_train_step(self) -> dict[str, Any]:
@@ -831,6 +834,7 @@ class TQPolicy(TQDriverMixin, Policy):
             "finish_train_step_presharded",
             **trace_context_kwargs(),
         )
+        ray.wait(futures, num_returns=len(futures), fetch_local=False)
         results = ray.get(futures)
         # Filter to DP-replica leaders only. ``run_all_workers_single_data``
         # returns one result per GPU (TP×CP×PP×DP), but TP/CP/non-last-PP
@@ -854,6 +858,7 @@ class TQPolicy(TQDriverMixin, Policy):
             "abort_train_step_presharded",
             **trace_context_kwargs(),
         )
+        ray.wait(futures, num_returns=len(futures), fetch_local=False)
         ray.get(futures)
 
         if self.flops_tracker is not None:

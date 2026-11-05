@@ -256,6 +256,41 @@ log = logging.getLogger(__name__)
 # budget: at this point the run is over, so the only thing a completed restart buys is a
 # cleaner exit. Not configurable for the same reason.
 _SUPERVISOR_DRAIN_TIMEOUT_S = 30.0
+_TRAIN_PUMP_DRAIN_TIMEOUT_S = 120.0
+
+
+@dataclass
+class _TrainPumpLifecycle:
+    """Own a policy step while the shielded train pump drains cancellation."""
+
+    stop_requested: bool = False
+    step_open: bool = False
+    committing: bool = False
+
+    def check_cancelled(self) -> None:
+        if self.stop_requested:
+            raise asyncio.CancelledError
+
+    async def begin(self, trainer: TQPolicy, loss_fn: Any) -> None:
+        self.check_cancelled()
+        self.step_open = True
+        await asyncio.to_thread(trainer.begin_train_step, loss_fn)
+
+    async def dispatch(
+        self, trainer: TQPolicy, meta: KVBatchMeta, train_fields: tuple[str, ...]
+    ) -> None:
+        self.check_cancelled()
+        await asyncio.to_thread(
+            trainer.train_microbatches_from_meta, meta, train_fields=train_fields
+        )
+
+    async def finish(self, trainer: TQPolicy) -> dict[str, Any]:
+        self.check_cancelled()
+        self.committing = True
+        result = await asyncio.to_thread(trainer.finish_train_step)
+        self.step_open = False
+        self.committing = False
+        return result
 
 
 @dataclass(frozen=True)
@@ -2918,7 +2953,79 @@ class SingleControllerActor:
             // 2,
         }
 
+    def _streaming_selection_kwargs(self) -> dict[str, int]:
+        """Keep fixed AutoModel dispatches aligned before claiming prompt groups."""
+        if self._streaming_ppo:
+            return self._streaming_ppo_selection_kwargs()
+        policy = self._master_config.policy
+        automodel = policy.get("automodel_cfg")
+        if (
+            automodel is None
+            or not automodel["enabled"]
+            or self._async_cfg.min_groups_for_streaming_train
+            >= self._algo_cfg.num_prompts_per_step
+        ):
+            return {}
+        dp_size = self._trainer.sharding_annotations.get_axis_size("data_parallel")
+        sample_multiple = dp_size * math.lcm(
+            policy["train_micro_batch_size"], policy["logprob_batch_size"]
+        )
+        group_multiple = sample_multiple // math.gcd(
+            sample_multiple, self._algo_cfg.num_generations_per_prompt
+        )
+        if self._algo_cfg.num_prompts_per_step % group_multiple:
+            raise ValueError(
+                f"AutoModel streaming requires num_prompts_per_step divisible by {group_multiple}"
+            )
+        return {"group_multiple": group_multiple}
+
     async def _train_pump(self) -> None:
+        """Drain issued policy work before aborting a cancelled partial step."""
+        lifecycle = _TrainPumpLifecycle()
+        pump = asyncio.create_task(self._train_pump_body(lifecycle))
+        quiescent = False
+        try:
+            try:
+                await asyncio.shield(pump)
+            except asyncio.CancelledError:
+                lifecycle.stop_requested = True
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(pump), timeout=_TRAIN_PUMP_DRAIN_TIMEOUT_S
+                    )
+                except asyncio.CancelledError:
+                    if not pump.done():
+                        pump.cancel()
+                        raise RuntimeError(
+                            "train RPC drain was interrupted; recover workers from a checkpoint"
+                        ) from None
+                    quiescent = True
+                except asyncio.TimeoutError as error:
+                    pump.cancel()
+                    raise RuntimeError(
+                        "train RPC did not drain; recover workers from a checkpoint"
+                    ) from error
+                except Exception:
+                    quiescent = pump.done()
+                    raise
+                else:
+                    quiescent = True
+                raise
+            except Exception:
+                quiescent = True
+                raise
+            else:
+                quiescent = True
+        finally:
+            if quiescent and lifecycle.step_open and not lifecycle.committing:
+                cleanup = asyncio.create_task(
+                    asyncio.to_thread(self._trainer.abort_train_step)
+                )
+                await asyncio.wait_for(
+                    asyncio.shield(cleanup), timeout=_TRAIN_PUMP_DRAIN_TIMEOUT_S
+                )
+
+    async def _train_pump_body(self, lifecycle: _TrainPumpLifecycle) -> None:
         """Per-prompt-group streaming train loop.
 
         Per step, with 1-4 running per streaming chunk and 5-6 once the chunk
@@ -2966,9 +3073,10 @@ class SingleControllerActor:
         policy_training_start_step = (
             self._algo_cfg.policy_training_start_step if self._is_ppo else 0
         )
-        selection_kwargs = self._streaming_ppo_selection_kwargs()
+        selection_kwargs = self._streaming_selection_kwargs()
 
         while self._train_steps < self._algo_cfg.max_num_steps:
+            lifecycle.check_cancelled()
             maybe_gpu_profile_step(self._trainer, self._train_steps + 1)
             if self._gen is not self._trainer and isinstance(
                 self._gen, (VllmGeneration, MegatronGeneration)
@@ -2981,6 +3089,7 @@ class SingleControllerActor:
             step_open = False
             value_inference_prepared = False
             chunks_dispatched = 0
+            policy_train_dispatches = 0
             calibration_batches: list[BatchedDataDict[Any]] = []
             selected_rollout_metrics: list[dict[str, Any]] = []
             # Only the final epoch's metrics are retained for each model.
@@ -3026,6 +3135,7 @@ class SingleControllerActor:
                 while groups_dispatched < self._target_groups_for_step(
                     version_during_step
                 ):
+                    lifecycle.check_cancelled()
                     # ---- 1. Select the rollouts to train on ----
                     with self._timer.time("exposed_generation"):
                         await asyncio.sleep(0)
@@ -3359,16 +3469,14 @@ class SingleControllerActor:
                                     ),
                                 ):
                                     if not step_open:
-                                        await asyncio.to_thread(
-                                            self._trainer.begin_train_step,
-                                            self._loss_fn,
+                                        await lifecycle.begin(
+                                            self._trainer, self._loss_fn
                                         )
                                         step_open = True
-                                    await asyncio.to_thread(
-                                        self._trainer.train_microbatches_from_meta,
-                                        train_meta,
-                                        train_fields=self._train_fields,
+                                    await lifecycle.dispatch(
+                                        self._trainer, train_meta, self._train_fields
                                     )
+                                    policy_train_dispatches += 1
                                     # Full-batch PPO closes each policy epoch;
                                     # streaming keeps accumulating across chunks.
                                     if self._is_ppo and not self._streaming_ppo:
@@ -3377,8 +3485,8 @@ class SingleControllerActor:
                                         # optimizer update, as on the streaming path.
                                         async with self._checkpoint_save_lock:
                                             self._optimizer_commit_in_progress = True
-                                        policy_result = await asyncio.to_thread(
-                                            self._trainer.finish_train_step
+                                        policy_result = await lifecycle.finish(
+                                            self._trainer
                                         )
                                         step_open = False
 
@@ -3522,9 +3630,7 @@ class SingleControllerActor:
                                 tracer=self._tracer,
                             ),
                         ):
-                            policy_result = await asyncio.to_thread(
-                                self._trainer.finish_train_step
-                            )
+                            policy_result = await lifecycle.finish(self._trainer)
                         step_open = False
                     if is_policy_training_step and not self._gen.blocks_training():
                         # Publish exactly one policy version before full-batch
@@ -3605,15 +3711,15 @@ class SingleControllerActor:
                             tracer=self._tracer,
                         ),
                     ):
-                        policy_result = await asyncio.to_thread(
-                            self._trainer.finish_train_step
-                        )
-                    self._optimizer_commit_in_progress = True
+                        async with self._checkpoint_save_lock:
+                            self._optimizer_commit_in_progress = True
+                        policy_result = await lifecycle.finish(self._trainer)
 
                 # Aggregate step metrics
                 step_metrics = {}
                 if policy_result is not None:
                     step_metrics.update(aggregate_step_metrics(policy_result))
+                    step_metrics["policy_train_dispatches"] = policy_train_dispatches
                     _update_adaptive_loss_state(self._loss_fn, step_metrics)
                 if value_result is not None:
                     step_metrics.update(_compute_critic_metrics(value_result))
