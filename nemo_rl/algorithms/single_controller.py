@@ -2266,14 +2266,37 @@ class SingleControllerActor:
                                 f"group {request.group_id}: rollout and finalizer "
                                 f"metrics both report {sorted(overlap)!r}"
                             )
-                        group_metrics = {**rollout_metrics, **finalized.token_metrics}
-                        if group_metrics:
-                            # Same ROLLOUT_METRICS sidecar the echo path's commit writes.
+                        selected_metrics = list(
+                            meta.extra_info.get(ROLLOUT_METRICS, [])
+                        )
+                        # Keep corrected owner snapshots, without duplicating group
+                        # observations or restoring the raw rewards they replaced.
+                        sibling_metric_names = (
+                            {
+                                name
+                                for snapshot in request.telemetry
+                                if snapshot is not None
+                                for name in snapshot.metrics
+                            }
+                            if selected_metrics
+                            else set()
+                        )
+                        group_metrics = {
+                            **{
+                                name: value
+                                for name, value in rollout_metrics.items()
+                                if name not in sibling_metric_names
+                            },
+                            **finalized.token_metrics,
+                        }
+                        if group_metrics or selected_metrics:
+                            if group_metrics:
+                                selected_metrics.append(group_metrics)
                             meta = replace(
                                 meta,
                                 extra_info={
                                     **meta.extra_info,
-                                    ROLLOUT_METRICS: [group_metrics],
+                                    ROLLOUT_METRICS: selected_metrics,
                                 },
                             )
                         await self._buffer.commit_finalized(

@@ -1269,11 +1269,10 @@ def test_capture_proxy_metrics_cannot_be_confused_with_v1_messages():
     metrics = reduce_step([impl._compute_rollout_metrics(completions, "swe")])
     for scope in ("", "environment/swe/"):
         assert metrics[f"{scope}capture/calls_per_sample/histogram"] == [2]
-        assert metrics[f"{scope}capture/delta_tokens_per_sample/histogram"] == [13]
-        assert metrics[f"{scope}capture/deepest_chain_tokens_per_sample/histogram"] == [
-            20
-        ]
-        assert metrics[f"{scope}capture/max_delta_tokens_per_call/histogram"] == [9]
+        # Unverified receipt lengths must not substitute for finalized tokens.
+        assert not any(
+            key.startswith(f"{scope}capture/") and "tokens" in key for key in metrics
+        )
         assert f"{scope}turns_per_sample/histogram" not in metrics
         assert f"{scope}gen_tokens_per_sample/histogram" not in metrics
     assert "mean_gen_tokens_per_sample" not in metrics
@@ -1389,7 +1388,7 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
     assert completion.telemetry.environment == attribution_key
     assert (
         reduce_step([completion.telemetry.to_metrics()])[
-            f"environment/{attribution_key}/sample_count"
+            f"environment/{_rollout_environment_metric_component(attribution_key)}/sample_count"
         ]
         == 1
     )
@@ -1624,7 +1623,7 @@ def test_nemo_gym_receipt_rollout_metrics_leave_token_metrics_to_finalizer(
     # Receipt truncated flags are placeholders; the finalizer reports these rates.
     for key in ("truncation_rate", "natural_termination_rate", "agent/truncation_rate"):
         assert key not in metrics
-    assert metrics["turns_per_sample/histogram"] == [2, 1]
+    assert metrics["capture/calls_per_sample/histogram"] == [2, 1]
     # The finalizer reports every token metric from the verified rows.
     assert not any("tokens" in key for key in metrics)
 
@@ -2950,6 +2949,7 @@ class TestGenerateForFinalizationFlow:
 
         assert attempts == 1
         assert len(buf.abort_calls) == 1
+
     @pytest.mark.parametrize("partial", [False, True])
     @pytest.mark.parametrize("agent_name", ["resolved", "resolved/agent"])
     def test_restored_groups_keep_sealed_sibling_observations(
@@ -2960,7 +2960,7 @@ class TestGenerateForFinalizationFlow:
             _FakeCaptureBuffer(), telemetry_environment=agent_name
         )
         prompt = {"prompt": "p", "idx": 9}
-        original = _run(first.generate_for_finalization(prompt, target_step=7))
+        original, _ = _run(first.generate_for_finalization(prompt, target_step=7))
         state = first.recovery_ledger.state_dict()
         if partial:
             state["groups"][0]["status"] = "generating"
@@ -2989,7 +2989,7 @@ class TestGenerateForFinalizationFlow:
             restored._tq_buffer,
             lambda cut: restored.recovery_ledger.prepare_for_restart(cut),
         )
-        request = _run(
+        request, _ = _run(
             restored.generate_for_finalization(
                 prompt, target_step=7, lineage_group_id=original.group_id
             )
@@ -3002,12 +3002,11 @@ class TestGenerateForFinalizationFlow:
             for s in request.telemetry
         ] == [1.0, 2.0]
 
-    def test_fully_sealed_schema_two_group_uses_unknown_without_redispatch(self):
+    def test_fully_sealed_group_without_telemetry_uses_unknown_without_redispatch(self):
         first = _make_capture_manager(_FakeCaptureBuffer())
         prompt = {"prompt": "p", "idx": 9, "task_source": "dataset-source"}
-        original = _run(first.generate_for_finalization(prompt, target_step=7))
+        original, _ = _run(first.generate_for_finalization(prompt, target_step=7))
         state = first.recovery_ledger.state_dict()
-        state["schema_version"] = 2
         for sibling in state["groups"][0]["siblings"]:
             for attempt in sibling["attempts"]:
                 attempt.pop("telemetry")
@@ -3026,7 +3025,7 @@ class TestGenerateForFinalizationFlow:
             restored._tq_buffer,
             lambda cut: restored.recovery_ledger.prepare_for_restart(cut),
         )
-        request = _run(
+        request, _ = _run(
             restored.generate_for_finalization(
                 prompt, target_step=7, lineage_group_id=original.group_id
             )
@@ -3506,8 +3505,12 @@ def test_receipt_raw_metrics_preserve_mask_but_defer_reward(honor_mask: bool) ->
     impl = _nemo_gym_impl(honor_mask)
     result = _mask_gate_receipt_result()
     completions, _ = impl._results_to_completions([result])
-    metrics = impl._compute_rollout_metrics(
-        completions, "agent", full_results=[result["full_result"]]
+    metrics = reduce_step(
+        [
+            impl._compute_rollout_metrics(
+                completions, "agent", full_results=[result["full_result"]]
+            )
+        ]
     )
     assert metrics["agent/mask_sample/mean"] == 1.0
     assert not any("reward" in key for key in metrics)

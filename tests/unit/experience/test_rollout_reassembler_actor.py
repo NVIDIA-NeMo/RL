@@ -38,7 +38,7 @@ from nemo_rl.experience.metric_utils import (
     reduce_step,
 )
 from nemo_rl.experience.reward_penalties import FinalizedReward
-from nemo_rl.experience.rollout_reassembler import FinalizedGroup
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup, RolloutSelection
 from nemo_rl.experience.rollout_reassembler_actor import (
     ReassemblyRequest,
     RolloutReassemblerActor,
@@ -269,6 +269,45 @@ def test_finalizer_retains_only_complete_sibling_telemetry(
     else:
         assert ROLLOUT_METRICS not in meta.extra_info
         assert "lacks complete rollout telemetry" in caplog.text
+
+
+@pytest.mark.parametrize("physical_rows", [1, 4])
+def test_forest_telemetry_uses_logical_owners_not_segments(physical_rows: int) -> None:
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    actor._max_seq_len = 10
+    actor._finalizer = MagicMock()
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=[f"physical-{i}" for i in range(physical_rows)],
+        sequence_lengths=[3] * physical_rows,
+    )
+    actor._finalizer.finalize_group.return_value = FinalizedGroup(
+        meta=meta,
+        group_min_wv=4,
+        group_max_wv=4,
+        staging_keys=[],
+        reward_observations=[FinalizedReward("group_g0", "group_g0", 0.25, None)],
+    )
+    request = replace(
+        _request(),
+        rollout_environment="swe",
+        logical_selections=(RolloutSelection((), (), truncated=True),),
+        telemetry=(
+            RolloutTelemetry.from_metrics(
+                "swe",
+                {
+                    "environment/swe/sample_count": Metric([1], "sum"),
+                },
+            ),
+        ),
+    )
+    actor.finalize(request)
+    metrics = reduce_step(meta.extra_info[ROLLOUT_METRICS])
+    assert metrics["environment/swe/sample_count"] == 1
+    assert metrics["environment/swe/total_reward/histogram"] == [0.25]
+    assert metrics["environment/swe/truncated/histogram"] == [1]
+    assert metrics["truncation_rate"] == 1
 
 
 def test_finalizer_rejects_misaligned_telemetry_before_publication():

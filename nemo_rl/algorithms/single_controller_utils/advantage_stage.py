@@ -541,6 +541,7 @@ class AdvantageComputer:
             mask_sample=mask_sample,
             final_sample_mask=final_sample_mask,
             final_token_mask=mask,
+            logical_owners=owner_batch,
         )
 
         repeated_batch: dict[str, torch.Tensor] = {

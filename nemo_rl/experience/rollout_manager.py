@@ -1619,10 +1619,14 @@ class AsyncNemoGymRolloutImpl:
                     # recovery records inherit the current mask and reward semantics.
                     # Completion callbacks are token-capture receipt-only, making this
                     # conversion lightweight and safe to repeat during group metrics.
-                    row_completions, penalty_counts = self._results_to_completions([result])
+                    row_completions, penalty_counts = self._results_to_completions(
+                        [result]
+                    )
                     agent_name = _nemo_gym_metric_namespace(inputs_by_rowidx[rowidx])
                     row_metrics = self._compute_rollout_metrics(
-                        row_completions, agent_name, full_results=[result]
+                        row_completions,
+                        agent_name,
+                        full_results=[result.get("full_result") or {}],
                     )
                     row_shaping = shaping_by_rowidx[rowidx]
                     if row_shaping is not None:
@@ -2131,11 +2135,13 @@ class AsyncNemoGymRolloutImpl:
         truncated = [c.truncated for c in completions]
         environment = _rollout_environment_metric_component(agent_name)
         environment_prefix = f"environment/{environment}"
-        # The producer chooses names and reducers together. Capture observations
-        # count model calls/deltas, not message-log turns/tokens.
+        # Capture counts model calls, not message-log turns; token observations
+        # come from the finalizer after it verifies the captured rows.
         turn_name = "capture/calls_per_sample" if receipt_mode else "turns_per_sample"
         rollout_metrics: dict[str, Metric] = {}
-        metric_values = [(turn_name, turn_count)]
+        metric_values: list[tuple[str, Sequence[float | int]]] = [
+            (turn_name, turn_count)
+        ]
         if not receipt_mode:
             metric_values.extend(
                 [
@@ -2247,7 +2253,9 @@ class AsyncNemoGymRolloutImpl:
                 "concat",
             )
         if not receipt_mode:
-            rollout_metrics["mean_gen_tokens_per_sample"] = Metric(assistant_tokens, "mean")
+            rollout_metrics["mean_gen_tokens_per_sample"] = Metric(
+                assistant_tokens, "mean"
+            )
         return rollout_metrics
 
 

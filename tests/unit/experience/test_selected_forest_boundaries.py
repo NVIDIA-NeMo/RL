@@ -22,6 +22,7 @@ from responses_api_models.vllm_model.tests import test_framework_context as gym
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.environments.call_selection import select_captured_calls
+from nemo_rl.experience.metric_utils import reduce_step
 from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 from nemo_rl.experience.rollout_reassembler import (
     ActionOutputFlags,
@@ -1311,7 +1312,7 @@ def test_capture_lengths_count_unique_generations_before_padding(
     )
     assert result.meta is not None and result.meta.size == 4
     assert ROLLOUT_METRICS not in result.meta.extra_info
-    metrics = result.token_metrics
+    metrics = reduce_step([result.token_metrics])
     # This harness generates exactly one token per model call. Contexts and
     # duplicated ancestors in sibling rows must not change that population.
     assert metrics["gen_tokens_per_sample/histogram"] == [len(selected)]

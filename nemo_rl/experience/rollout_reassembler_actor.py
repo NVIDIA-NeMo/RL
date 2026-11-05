@@ -24,7 +24,11 @@ import ray
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
-from nemo_rl.data_plane.schema import ROLLOUT_METRICS, UNKNOWN_ROLLOUT_ENVIRONMENT, forest_row_ids
+from nemo_rl.data_plane.schema import (
+    ROLLOUT_METRICS,
+    UNKNOWN_ROLLOUT_ENVIRONMENT,
+    forest_row_ids,
+)
 from nemo_rl.experience.metric_utils import (
     Metric,
     RolloutTelemetry,
@@ -268,8 +272,11 @@ class RolloutReassemblerActor:  # pragma: no cover
                 rewards_by_sample = {
                     row.sample_id: row.reward for row in result.reward_observations
                 }
-                for snapshot, length, sample_id in zip(
-                    request.telemetry, lengths, result.meta.sample_ids, strict=True
+                lengths_by_sample = dict(
+                    zip(result.meta.sample_ids, lengths, strict=True)
+                )
+                for index, (snapshot, sample_id) in enumerate(
+                    zip(request.telemetry, request.canonical_sample_ids, strict=True)
                 ):
                     assert snapshot is not None
                     metrics = snapshot.to_metrics()
@@ -295,10 +302,13 @@ class RolloutReassemblerActor:  # pragma: no cover
                                 ],
                                 fields.reduce,
                             )
-                    # Receipts have no token payload: their producer uses a
-                    # placeholder False for truncated. Match the finalizer's
-                    # actual length-cap flag, never log that placeholder.
-                    truncated = int(length == self._max_seq_len)
+                    # Forest segments/padding are not new observations; use owner
+                    # truncation, or the verified length cap for ordinary capture.
+                    truncated = int(
+                        request.logical_selections[index].truncated
+                        if request.logical_selections is not None
+                        else lengths_by_sample[sample_id] == self._max_seq_len
+                    )
                     metrics.update(distribution(f"{prefix}/truncated", [truncated]))
                     for scope in ("", f"{prefix}/"):
                         metrics[f"{scope}truncation_rate"] = Metric([truncated], "mean")

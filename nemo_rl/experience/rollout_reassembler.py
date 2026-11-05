@@ -55,15 +55,15 @@ from nemo_rl.data_plane.schema import (
     INVALID_TOOL_CALL_MASK,
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
+    ROLLOUT_ENVIRONMENT_TAG,
     ROUTE_PLAN_TAG,
     SAMPLER_TOPK_LOGPROBS_FIELD,
     SAMPLER_TOPK_TOKEN_IDS_FIELD,
     TRUNCATED,
+    UNKNOWN_ROLLOUT_ENVIRONMENT,
     LogicalRowTag,
     forest_row_ids,
     forest_segment_id,
-    ROLLOUT_ENVIRONMENT_TAG,
-    UNKNOWN_ROLLOUT_ENVIRONMENT,
 )
 from nemo_rl.data_plane.tq_token_sink import (
     FetchedStagedCall,
@@ -71,7 +71,11 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSink,
     TQTokenSource,
 )
-from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.metric_utils import (
+    Metric,
+    distribution,
+    rollout_environment_metric_component,
+)
 from nemo_rl.experience.payload import pack_payload
 from nemo_rl.experience.reward_penalties import (
     CAPTURE_PENALTIES,
@@ -207,14 +211,14 @@ class FinalizedGroup:
     total_row_count: int = 0
     # Token metrics counted from the verified rows. The controller merges them
     # with the Gym rollout metrics into the group's ROLLOUT_METRICS sidecar.
-    token_metrics: dict[str, Any] = field(default_factory=dict)
+    token_metrics: dict[str, Metric] = field(default_factory=dict)
 
 
 def _capture_token_metrics(
     rows: list[FinalizedRollout],
     slots: list[int],
     contexts: Sequence[RewardLogContext | None],
-) -> dict[str, Any]:
+) -> dict[str, Metric]:
     """Count verified output per logical owner, before sample-level filtering.
 
     Called before execution padding. Invalid owners contribute zero; environment
@@ -231,11 +235,10 @@ def _capture_token_metrics(
             longest[slot] = max(longest[slot], max(row.generation_lengths, default=0))
             total[slot] = max(total[slot], len(row.token_ids))
     metrics = {
-        **calculate_single_metric(generated, n, "gen_tokens_per_sample"),
-        **calculate_single_metric(longest, n, "max_gen_tokens_per_turn"),
-        **calculate_single_metric(total, n, "total_tokens_per_sample"),
-        "mean_gen_tokens_per_sample": sum(generated) / n,
-        "max_gen_tokens_per_turn/p95": pct(longest, 95),
+        **distribution("gen_tokens_per_sample", generated),
+        **distribution("max_gen_tokens_per_turn", longest),
+        **distribution("total_tokens_per_sample", total),
+        "mean_gen_tokens_per_sample": Metric(generated, "mean"),
     }
     agents = {context.agent_name for context in contexts if context is not None}
     for agent in agents:
@@ -244,15 +247,16 @@ def _capture_token_metrics(
             for i, context in enumerate(contexts)
             if context and context.agent_name == agent
         ]
-        for name, values in (
-            ("gen_tokens_per_sample", generated),
-            ("total_tokens_per_sample", total),
-        ):
-            metrics.update(
-                calculate_single_metric(
-                    [values[i] for i in indices], len(indices), f"{agent}/{name}"
+        environment = rollout_environment_metric_component(agent)
+        for prefix in (agent, f"environment/{environment}"):
+            for name, values in (
+                ("gen_tokens_per_sample", generated),
+                ("total_tokens_per_sample", total),
+                ("max_gen_tokens_per_turn", longest),
+            ):
+                metrics.update(
+                    distribution(f"{prefix}/{name}", [values[i] for i in indices])
                 )
-            )
     return metrics
 
 
@@ -1114,6 +1118,7 @@ class RolloutReassembler:
             execution_row_multiple=execution_row_multiple,
             canonical_sample_ids=canonical_sample_ids,
             loss_multiplier=loss_multiplier,
+            rollout_environment=rollout_environment,
         )
         finalized.token_metrics = token_metrics
         return finalized
@@ -1147,6 +1152,7 @@ class RolloutReassembler:
         execution_row_multiple: int,
         canonical_sample_ids: list[str],
         loss_multiplier: float,
+        rollout_environment: str,
     ) -> FinalizedGroup:
         """Shared ordinary/Forest tensorization, single publication, and cleanup."""
         valid_rows = [row for row in rows if row.valid]

@@ -24,6 +24,9 @@ import torch
 from tensordict import TensorDict
 
 from nemo_rl.algorithms.metric_utils import REWARD_KEY
+from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
+    LogicalOwnerBatch,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import (
     ROLLOUT_ENVIRONMENT_TAG,
@@ -279,21 +282,25 @@ def environment_sample_counts(
     mask_sample: torch.Tensor,
     final_sample_mask: torch.Tensor,
     final_token_mask: torch.Tensor,
+    logical_owners: LogicalOwnerBatch | None = None,
 ) -> dict[str, float]:
-    """Count selected rows and trainable next-token targets by environment.
+    """Count selected samples and trainable next-token targets by environment.
 
     Older replay checkpoints lack environment tags and are reported as unknown.
     Environment flags count independently of other, potentially overlapping filters.
     Valid samples sum the final sample weights, as in the policy loss; valid tokens
     sum the weighted next-token mask, excluding the first sequence position.
+    Forest samples count each logical owner once and exclude execution padding.
 
     Args:
-        tags: One data-plane tag dict per selected sample, or None when the
+        tags: One data-plane tag dict per selected physical row, or None when the
             rows carry no tags at all.
         mask_sample: Bool tensor, True where the environment flagged the row.
-        final_sample_mask: Per-sample loss weights after every filter.
+        final_sample_mask: Per-row loss weights after every filter.
         final_token_mask: Per-token loss mask already multiplied by
             final_sample_mask.
+        logical_owners: Validated Forest ownership with final owner validity,
+            or None for one sample per physical row.
 
     Returns:
         Dict mapping "environment/<name>/<counter>" to its total for this
@@ -302,7 +309,7 @@ def environment_sample_counts(
 
     Raises:
         ValueError: If tags is given but its length does not match the
-            number of selected samples.
+            number of selected rows, or an owner's rows disagree on environment.
     """
     size = mask_sample.numel()
     if tags is not None and len(tags) != size:
@@ -315,6 +322,30 @@ def environment_sample_counts(
     valid_tokens = final_token_mask[:, 1:].sum(dim=-1).detach().cpu().tolist()
     valid_samples = final_sample_mask.detach().cpu().tolist()
     flagged = mask_sample.detach().cpu().tolist()
+    if logical_owners is not None:
+        owner_environments = [
+            environments[row]
+            for row in logical_owners.representative_rows.detach().cpu().tolist()
+        ]
+        owner_tokens = [0.0] * len(owner_environments)
+        owner_flagged = [False] * len(owner_environments)
+        for environment, tokens, masked, owner in zip(
+            environments,
+            valid_tokens,
+            flagged,
+            logical_owners.row_owner.detach().cpu().tolist(),
+            strict=True,
+        ):
+            if owner < 0:
+                continue
+            if environment != owner_environments[owner]:
+                raise ValueError("Forest owner rows disagree on environment")
+            owner_tokens[owner] += tokens
+            owner_flagged[owner] |= masked
+        environments = owner_environments
+        valid_tokens = owner_tokens
+        flagged = owner_flagged
+        valid_samples = logical_owners.valid_mask.detach().cpu().tolist()
     counts: dict[str, float] = {}
     for environment, tokens, valid, masked in zip(
         environments, valid_tokens, valid_samples, flagged, strict=True

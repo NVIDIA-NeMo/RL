@@ -309,6 +309,31 @@ def test_tokenless_segments_do_not_remove_an_owner_with_training_tokens(
         )
 
 
+@pytest.mark.parametrize("segments", [1, 2, 4])
+@pytest.mark.parametrize("reorder", [False, True])
+def test_environment_counts_follow_logical_owners(segments: int, reorder: bool) -> None:
+    meta, data = _batch([("a", [(0.0, segments), (1.0, 2), (3.0, 1)])], padding=True)
+    for tag in meta.tags:
+        tag["rollout_environment"] = "padding" if tag["is_execution_padding"] else "swe"
+    data["mask_sample"][segments : segments + 2] = True
+    data["mask_sample"][-1] = True
+    if segments > 1:
+        data["token_mask"][0] = 0
+    if reorder:
+        order = list(reversed(range(meta.size)))
+        meta, data = meta.subset(order), data[order]
+    ctrl = _controller(meta, data)
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid
+    generated_segments = max(1, segments - 1) + 1
+    assert ctrl._step_log_dict["environment_counts"][0] == {
+        "environment/swe/num_samples": 3,
+        "environment/swe/num_mask_sample_filtered": 1,
+        "environment/swe/num_valid_samples": 2,
+        "environment/swe/num_valid_tokens": 2 * generated_segments,
+    }
+
+
 @pytest.mark.parametrize("bounds", [(-0.2, 0.3), (0.2, 0.4), (-0.4, -0.2)])
 @pytest.mark.parametrize("reorder", [False, True])
 def test_clips_owner_advantages_once_without_activating_padding(bounds, reorder):

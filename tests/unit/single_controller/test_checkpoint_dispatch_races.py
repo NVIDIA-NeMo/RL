@@ -2409,10 +2409,12 @@ def test_recovery_rejects_mismatched_sidecar_version(tmp_path) -> None:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
     controller._master_config = SimpleNamespace(
-        token_capture=SimpleNamespace(enabled=False)
+        token_capture=SimpleNamespace(enabled=False, forest_training=False)
     )
     controller._last_checkpoint_path = str(tmp_path)
     controller._data_plane_checkpoint_metadata = {
+        "forest_training": False,
+        "forest_execution_row_multiple": None,
         "rollout_recovery_schema_version": ROLLOUT_RECOVERY_SCHEMA_VERSION,
         "rollout_recovery_payload_sha256": hashlib.sha256(
             path.read_bytes()
