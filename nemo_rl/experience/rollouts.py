@@ -2413,8 +2413,10 @@ def _prepare_nemo_gym_rows(
 
     group_ids: dict[int, str] = {}
     group_attempts: dict[int, int] = {}
+    fallback_task_indices: dict[int, int] = {}
     for group_index, group_start in enumerate(range(0, len(rows), num_generations)):
         group_rows = rows[group_start : group_start + num_generations]
+        fallback_task_indices[group_index] = uuid.uuid4().int
         existing_group_ids = {
             row[NEMO_GYM_GROUP_ID_KEY]
             for row in group_rows
@@ -2468,7 +2470,7 @@ def _prepare_nemo_gym_rows(
             else configured_max_tokens
         )
         row["_rowidx"] = row_index
-        row.setdefault(NEMO_GYM_TASK_INDEX_KEY, group_index)
+        row.setdefault(NEMO_GYM_TASK_INDEX_KEY, fallback_task_indices[group_index])
         row[NEMO_GYM_GROUP_ID_KEY] = group_ids[group_index]
         row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempts[group_index]
         row[NEMO_GYM_ROLLOUT_INDEX_KEY] = rollout_index

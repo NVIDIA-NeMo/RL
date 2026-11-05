@@ -33,9 +33,22 @@ def test_prepare_legacy_gym_rows_supplies_task_indices(existing_indices):
         sampling_params=SimpleNamespace(temperature=1.0, top_p=1.0),
         num_generations=2,
     )
-    assert [row["_ng_task_index"] for row in rows] == (
-        existing_indices if existing_indices is not None else [0, 0, 1, 1]
-    )
+    indices = [row["_ng_task_index"] for row in rows]
+    if existing_indices is not None:
+        assert indices == existing_indices
+    else:
+        assert all(type(index) is int and index >= 0 for index in indices)
+        assert indices[0] == indices[1]
+        assert indices[2] == indices[3]
+        assert indices[0] != indices[2]
+        next_rows = [{"responses_create_params": {}} for _ in range(2)]
+        rollouts_mod._prepare_nemo_gym_rows(
+            next_rows,
+            generation_config={"max_new_tokens": 64},
+            sampling_params=SimpleNamespace(temperature=1.0, top_p=1.0),
+            num_generations=2,
+        )
+        assert next_rows[0]["_ng_task_index"] not in indices
 
 
 @pytest.mark.parametrize("task_indices", [(7, 7, 2, 2), (7, 8, 2, 2)])
