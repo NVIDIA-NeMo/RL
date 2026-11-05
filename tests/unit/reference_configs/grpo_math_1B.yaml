@@ -592,6 +592,15 @@ env:
   math:
     num_workers: 8
     math_verify_impl: "hf_math_verify"
+  # SingleController + NeMo-Gym only. Each rule masks a sample from the loss when
+  # a dotted field of the Gym response matches it, using exactly one operator:
+  # `equals` (type-strict for booleans) or a numeric `gt`/`ge`/`lt`/`le`. A
+  # missing field never matches; `name` (default: the field) labels the
+  # mask_rules/<name>_* metrics. Example:
+  #   - name: eval_incomplete
+  #     field: evaluation_completed
+  #     equals: false
+  mask_sample_rules: []
 
 logger:
   log_dir: "logs"  # Base directory for all logs
