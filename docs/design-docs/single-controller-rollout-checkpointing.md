@@ -11,23 +11,6 @@ for changing it. For configuring recovery, the checkpoint layout and resuming a 
 [Checkpointing and Replay Recovery](../guides/single-controller.md#checkpointing-and-replay-recovery)
 in the Single-Controller guide.
 
-## Why It Is Separate
-
-Rollout checkpointing grew inside the controller one recovery level at a time. By the
-time turn-level recovery with NeMo Gym landed, the controller held 31 checkpoint and
-recovery methods, about 1,700 lines, and:
-
-- trainer checkpoints and rollout snapshots each built, validated, serialized and saved
-  the same rollout state in their own copy;
-- the controller built the Gym checkpoint coordinator, retired and forgot Gym episodes,
-  parsed Gym's manifest, and branched on whether Gym was present;
-- the rollout pump kept two copies of its dataloader loop and spare-pool drain, one
-  recording prompt groups in the ledger and one not;
-- tests had to build a controller to exercise any of it.
-
-The controller now calls this code through a small set of objects, and its checkpoint
-code names the environment backend only for Gym's task index (see Open Items).
-
 ## Layout
 
 ```text
@@ -187,6 +170,8 @@ interface in its own module and adds one branch to that builder.
 The recovery ledger names the environment's rollouts with backend-neutral types:
 `EnvironmentEpisode` and the `environment_*` queries. Its on-disk keys keep their
 original names (`gym_instance_id`, `gym_attempt`), so older checkpoints restore.
+`EnvironmentEpisode`'s row key format (`<rollout_id>-a<attempt>`) is Gym's, and a new
+backend must use it.
 
 ## Rules for New Code
 
@@ -210,17 +195,3 @@ original names (`gym_instance_id`, `gym_attempt`), so older checkpoints restore.
   restorer with `tests/unit/single_controller/_rollout_checkpoints.py`.
 - `tests/unit/single_controller/test_rollout_checkpoint.py` covers manifests, anchors,
   publication and retention.
-
-## Open Items
-
-- The Gym rollout path in `nemo_rl/experience/rollout_manager.py` still threads its
-  recovery-tracking arguments through several layers; it is not part of this package.
-- The ledger still keeps Gym's retire and forget queues. They could move into the Gym
-  backend, with the ledger reporting only which attempts it dropped or continued.
-- `EnvironmentEpisode`'s row key format (`<rollout_id>-a<attempt>`) is Gym's; a second
-  backend would have to adopt it.
-- Whether rollout state is saved, whether dispatch is recorded, and which environment
-  backend is used are still decided from several config keys in separate places.
-- Captured state, the snapshot manifest and the trainer save state carry Gym's next
-  task index under its Gym name (`next_nemo_gym_task_index`), and the controller sets
-  it on the rollout manager at startup.
