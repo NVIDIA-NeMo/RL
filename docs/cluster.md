@@ -172,6 +172,17 @@ sbatch ray.sub \
     **Watch segment divisibility.** With topology-aware placement the allocation
     becomes `--nodes=N+1`, which can trip the "`SEGMENT_SIZE` must evenly divide
     `NUM_NODES`" check in `tools/launch`.
+* - `NRL_TARGET_NOFILE=131072`
+  - Open-file soft limit `ray.sub` asks for. Ray's documented 65535 is a floor,
+    not a target, so the soft limit is raised toward this value rather than
+    pinned at the floor: to this value when the hard limit permits it, to the
+    hard limit itself when that falls between 65535 and this value, and left
+    alone with a warning below 65535. A soft limit that already clears the
+    target is never lowered. Raise the target for a workload whose connection
+    pool is configured above it — NeMo-Gym's `global_aiohttp_connector_limit`
+    defaults to 102400, and a pool larger than the descriptor ceiling surfaces
+    as `OSError: [Errno 24]` mid-request rather than as backpressure. The
+    resolved pair is printed as `[INFO] file descriptor limit: soft=... hard=...`.
 * - `NRL_MOUNT_HOST_ENROOT`
   - Unset by default; set to `1` to bind-mount the compute node's own enroot
     installation (every `/usr/bin/enroot*` file and the enroot library, share

@@ -389,6 +389,9 @@ class MegatronCheckpointConfig(TypedDict, total=False):
     ckpt_fully_parallel_save_process_group: str  # "dp" | "ep_dp"
     ckpt_fully_parallel_load_process_group: str  # "dp" | "ep_dp"
     ckpt_fully_parallel_load_exchange_algo: str  # "broadcast" | "gather_rounds"
+    # Applied by NeMo RL, not passed to Bridge: threads per rank reading torch_dist
+    # checkpoint files on load (nemo_rl/models/megatron/ckpt_parallel_read.py); 1 = off.
+    parallel_read_threads: int
 
 
 class MegatronConfig(TypedDict):
