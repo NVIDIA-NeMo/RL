@@ -17,13 +17,13 @@ SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd)
 source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
-NUM_NODES=2
+NUM_NODES=4
 GPUS_PER_NODE=8
 STEPS_PER_RUN=10
 MAX_STEPS=10
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 # Dynamic sampling resamples filtered groups, so a step generates more rollouts.
-NUM_MINUTES=140  # 2n x 8g x 140 min = 37.3 GPU-hours
+NUM_MINUTES=140  # Initial 4-node budget; calibrate against a completed run.
 # ===== END CONFIG =====
 
 EXP_DIR="${BASE_LOG_DIR:-$PROJECT_ROOT/logs/ruit_slurm}/${SLURM_JOB_ID:-local}-logs/nightly"
@@ -60,11 +60,17 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # to gate progress on (v1 reports these two under swapped names; see
 # docs/guides/single-controller.md#dynamic-sampling).
 uv run tests/check_metrics.py $JSON_METRICS \
-    'median(data["train/token_mult_prob_error"]) < 1.03' \
-    'median(data["train/unfiltered_reward"]) > 0.45' \
-    'max(data["train/zero_variance_prompt_groups"]) > 0' \
-    'max(data["train/dropped_prompt_groups"]) == 0' \
-    'median(data["timing/train/total_step_time"]) < 750'
+    'len(data["train/loss"]) == 10' \
+    'all_finite(data["train/loss"])' \
+    'all_finite(data["train/token_mult_prob_error"])' \
+    'median(data["train/token_mult_prob_error"]) < 1.02' \
+    'max(data["train/token_mult_prob_error"]) < 1.025' \
+    'median(data["train/unfiltered_reward"]) > 0.48' \
+    'min(data["train/zero_variance_prompt_groups"]) > 0' \
+    'min(data["train/skipped_step"]) == max(data["train/skipped_step"]) == 0' \
+    'min(data["train/dropped_prompt_groups"]) == max(data["train/dropped_prompt_groups"]) == 0' \
+    'median(data["timing/train/total_step_time"]) < 700' \
+    'max(data["timing/train/total_step_time"]) < 1100'
 
 # Clean up checkpoint directory after successful run to save space.
 rm -rf "$CKPT_DIR"
