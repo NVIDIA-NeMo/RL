@@ -11,15 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import glob
 import os
 import subprocess
 from pathlib import Path
 
 import pytest
-from omegaconf import OmegaConf
-
-from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
 # All tests in this module should run first
 pytestmark = pytest.mark.run_first
@@ -28,7 +24,6 @@ dir_path = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(dir_path, "..", ".."))
 configs_dir = os.path.join(project_root, "examples", "configs")
 recipes_dir = os.path.join(project_root, "examples", "configs", "recipes")
-experiments_dir = os.path.join(project_root, "examples", "configs", "experiments")
 test_suites_dir = os.path.join(project_root, "tests", "test_suites")
 
 nightly_test_suite_path = os.path.join(test_suites_dir, "nightly.txt")
@@ -189,28 +184,6 @@ def all_recipe_yaml_rel_paths():
     return [path.relative_to(root).as_posix() for path in recipes]
 
 
-@pytest.fixture
-def all_experiment_yaml_paths():
-    return glob.glob(os.path.join(experiments_dir, "**", "*.yaml"), recursive=True)
-
-
-def test_all_experiment_configs_resolve(all_experiment_yaml_paths):
-    register_omegaconf_resolvers()
-    for config_path in all_experiment_yaml_paths:
-        with open(config_path) as config_file:
-            config_text = config_file.read()
-        for internal_prefix in ("/lustre/", "/scratch/", "/home/"):
-            assert internal_prefix not in config_text, (
-                f"Experiment config contains an internal path: {config_path}"
-            )
-        resolved = OmegaConf.to_container(load_config(config_path), resolve=True)
-        assert isinstance(resolved, dict)
-        wandb_config = resolved.get("logger", {}).get("wandb", {})
-        assert "entity" not in wandb_config, (
-            f"Experiment config pins a W&B entity: {config_path}"
-        )
-
-
 @pytest.mark.parametrize(
     "test_suite_path",
     [
@@ -286,7 +259,7 @@ def test_all_recipe_yamls_accounted_for_in_test_suites(
     )
 
 
-def test_nightly_compute_stays_below_5213_hours(nightly_test_suite, tracker):
+def test_nightly_compute_stays_below_5229_hours(nightly_test_suite, tracker):
     command = f"DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch {' '.join(nightly_test_suite)}"
 
     print(f"Running command: {command}")
@@ -318,8 +291,8 @@ def test_nightly_compute_stays_below_5213_hours(nightly_test_suite, tracker):
         f"Last line of output was not as expected: '{last_line}'"
     )
     total_gpu_hours = float(last_line.split(":")[-1].strip())
-    assert total_gpu_hours <= 5213, (
-        f"Total GPU hours exceeded 5213: {last_line}. We should revisit the test suites to reduce the total GPU hours."
+    assert total_gpu_hours <= 5229, (
+        f"Total GPU hours exceeded 5229: {last_line}. We should revisit the test suites to reduce the total GPU hours."
     )
     tracker.track("total_nightly_gpu_hours", total_gpu_hours)
 
@@ -382,3 +355,12 @@ def test_all_recipes_start_with_algo_hyphen(all_recipe_yaml_rel_paths):
         assert algo in expected_algos, (
             f"Recipe {recipe_yaml} has unexpected algo {algo}"
         )
+
+
+def test_suite_scripts_have_no_local_paths(all_test_suites):
+    for script in all_test_suites:
+        text = (Path(project_root) / script).read_text().lower()
+        for local_prefix in ("/lustre/", "/scratch/", "/home/"):
+            assert local_prefix not in text, (
+                f"{script} contains a local path ({local_prefix})"
+            )

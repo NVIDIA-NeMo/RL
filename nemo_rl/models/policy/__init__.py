@@ -389,6 +389,9 @@ class MegatronCheckpointConfig(TypedDict, total=False):
     ckpt_fully_parallel_save_process_group: str  # "dp" | "ep_dp"
     ckpt_fully_parallel_load_process_group: str  # "dp" | "ep_dp"
     ckpt_fully_parallel_load_exchange_algo: str  # "broadcast" | "gather_rounds"
+    # Applied by NeMo RL, not passed to Bridge: threads per rank reading torch_dist
+    # checkpoint files on load (nemo_rl/models/megatron/ckpt_parallel_read.py); 1 = off.
+    parallel_read_threads: int
 
 
 class MegatronConfig(TypedDict):
@@ -605,8 +608,8 @@ class MegatronConfig(TypedDict):
     # When True, detach MTP heads from the main model so MTP loss does not affect main-model gradients.
     mtp_detach_heads: NotRequired[bool]
     # When True, clear the RotaryEmbedding LRU cache and MoE token dispatcher
-    # routing tensors in offload_before_refit (before weight transfer to the
-    # inference engine). Useful when training and logprob runs use different
+    # routing tensors after training (the policy before refit, the critic in
+    # finish_training). Useful when training and logprob runs use different
     # sequence lengths (rope cache) or for MoE models with activation recompute
     # (dispatcher reference cycles).
     clear_memory_caches_before_refit: NotRequired[bool]

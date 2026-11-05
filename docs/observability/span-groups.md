@@ -100,7 +100,7 @@ The controlling group is shown for each; a span is emitted whenever its group is
 | **GRPO / PPO** (async only) | `rl.grpo.generation` / `rl.ppo.generation` — `rollout` group, emitted by the collector actor, one span per rollout batch; the name follows the algorithm the collector was built for |
 | **PPO** | `rl.ppo.job`, `rl.ppo.step`, `rl.ppo.data_processing`, `rl.ppo.generation`, `rl.ppo.reward_calculation`, `rl.ppo.policy_and_reference_logprobs`, `rl.ppo.advantage_calculation`, `rl.ppo.policy_training`, `rl.ppo.value_training`, `rl.ppo.checkpointing`, `rl.ppo.evaluate` |
 | **SFT** | `rl.sft.job`, `rl.sft.step`, `rl.sft.data_processing`, `rl.sft.policy_training`, `rl.sft.checkpointing`, `rl.sft.evaluate` |
-| **SFT v2** | `rl.sft_v2.driver` wraps setup and training in the driver; `rl.sft_v2.job` and `rl.sft_v2.step` run in the controller (all unbucketed). `rl.sft_v2.read_batch` and `rl.sft_v2.prepare_batch` run on loader owners (`data_processing`); `rl.sft_v2.policy_training` runs in the controller (`policy_update`). Trace context crosses both Ray calls. |
+| **SFT v2** | `rl.sft_v2.driver` wraps setup and training in the driver; `rl.sft_v2.job` and `rl.sft_v2.step` run in the controller (all unbucketed). `rl.sft_v2.setup_loaders` covers loader construction in the controller and `rl.sft_v2.build_loader` the matching work on each loader owner (both `setup`, both unbucketed) — see [the Energon worker pool](#the-energon-worker-pool). `rl.sft_v2.read_batch` and `rl.sft_v2.prepare_batch` run on loader owners (`data_processing`); `rl.sft_v2.policy_training` runs in the controller (`policy_update`). `rl.sft_v2.checkpointing` wraps the save's loop-blocking part in the controller (`checkpoint`), including the loader snapshot each owner takes inside it; with `async_save` off that is all of it, so it accounts for the gap between two `rl.sft_v2.step` spans. Under `sft.defer_async_checkpoint_finalize` the handoff moves to a later step boundary, so only `rl.checkpoint.finalize` says when that save became resumable, and the blocking wait for it is counted inside the next `rl.sft_v2.checkpointing`. Trace context crosses every Ray call whose callee opens a span; the lifecycle calls inherited from `lm_policy` do not carry it, and lose nothing by it. |
 | **DPO** | `rl.dpo.job`, `rl.dpo.step`, `rl.dpo.policy_training`, `rl.dpo.checkpointing`, `rl.dpo.evaluate` |
 | **RM** | `rl.rm.job`, `rl.rm.step`, `rl.rm.checkpointing`, `rl.rm.evaluate` |
 | **Distillation** | `rl.distillation.job`, `rl.distillation.step`, `rl.distillation.data_processing`, `rl.distillation.generation`, `rl.distillation.teacher_logprob_inference`, `rl.distillation.policy_training`, `rl.distillation.checkpointing`, `rl.distillation.evaluate` |
@@ -174,7 +174,7 @@ carries no `rl.iteration` of its own. That covers more than worker internals:
 | --- | --- |
 | `rl.policy.load_model` and the other worker-side leaves | the policy workers |
 | `rl.gym.run_rollouts` | the `NemoGym` actor |
-| `rl.sft_v2.read_batch`, `rl.sft_v2.prepare_batch` | the Energon SFT worker |
+| `rl.sft_v2.build_loader`, `rl.sft_v2.read_batch`, `rl.sft_v2.prepare_batch` | the Energon SFT worker |
 | the async-GRPO collector's rollout spans | the collector actor |
 
 To scope those to a step, walk up to the driver-side ancestor that is stamped,
@@ -609,11 +609,25 @@ exists to fence off. Gating it on `rollout` instead would put that volume in
 dataset size. The group has to describe the volume, not the phase, even though
 these spans sit inside the rollout.
 
-Completing the trace on the server side is a change in the Gym repository, not
-this one — its app has to call `nemo.lens.contrib.fastapi.instrument_fastapi`.
-Until it does, the header arrives and is ignored, and Gym's internal spans (if
-any) stay in their own traces. Everything up to and including the client-side
-HTTP span still nests correctly.
+Gym's servers export their own spans whenever NeMo-RL is exporting; you don't
+need to set anything. To pass options to Gym's `telemetry:` block, set
+`env.nemo_gym.telemetry`, for example `{span_groups: "default,sandbox"}`.
+
+- `enabled: false` turns off Gym's servers only. A `NEMO_LENS_ENABLED=1`
+  already in the environment still turns them on.
+- `span_groups` in this block controls Gym's servers and
+  `NEMO_RL_OTEL_SPAN_GROUPS` controls NeMo-RL's processes. A
+  `NEMO_GYM_OTEL_SPAN_GROUPS` or `NEMO_LENS_SPAN_GROUPS` in the environment
+  overrides the block.
+- `job` and `rollout` exist in both libraries, so naming either turns it on
+  for both.
+- Gym servers are named `nemo-rl/<server name>`; `service_name` in this block
+  has no effect.
+- If your recipe sets `skip_venv_if_present`, rebuild or re-prefetch Gym's
+  venvs after turning telemetry on. An older venv has no `nemo-lens`, so its
+  server sends nothing.
+- Known issue: all Gym servers share one `service.instance.id` until
+  [Gym#5100](https://github.com/NVIDIA-NeMo/Gym/pull/5100) merges.
 
 Two failure modes degrade quietly rather than breaking a rollout. Without
 `nemo-lens[aiohttp]` installed the constructor logs a warning once and Gym's
@@ -671,6 +685,33 @@ to `max_inflight_prompts`. The scope propagates to nested calls and to
 coroutines started inside it, but not to raw threads — a data-plane call handed
 to a thread pool would read as batch-shaped.
 
+## The Energon worker pool
+
+SFT v2 loads through Energon, which runs `data.energon.num_workers` `DataLoader`
+subprocesses behind each loader owner. Nothing installs a tracer in them — that
+would mean an OTLP exporter per subprocess and a span per batch per process — so
+they are covered from the consuming side, which is where the answer matters: the
+workers run ahead of training, so what a reader needs is whether a batch was
+ready when the step asked for it, not how long it took to build.
+
+They start later than the span names suggest. `SavableDataLoader.__iter__`
+returns a generator, so building the loader forks nothing; the subprocesses
+start on the first `next()`, inside step 1's `read_batch`.
+
+| Signal | What it says |
+|---|---|
+| `rl.sft_v2.setup_loaders` (controller) over `rl.sft_v2.build_loader` (each owner) | building the loader objects — dataset resolution, task encoder, cache pool — and **not** the worker subprocesses. Unbucketed, like every `setup` span. The controller span carries `rl.energon.workers_per_rank` and `rl.energon.batches_in_flight_per_rank`, the only record of the pool's size anywhere in telemetry; each `build_loader` child carries `rl.energon.rank`, `rl.energon.world_size` and `rl.energon.restored`, so multiplying by `world_size` gives the job total |
+| `rl.sft_v2.read_batch` (each owner, per step) | the blocking dequeue. Near zero while the workers keep up; the span that grows when they stop, and the span that contains worker startup on step 1 |
+
+Read the wait off the spans, not a metric. There is one `read_batch` span per
+owner per step, so worker startup on step 1 shows up. The teed gauges keep only
+the last value per export interval, so they miss one-off stalls.
+`rl.sft_v2.loader.latency.max` also covers prepare, register and publish as
+well as the dequeue.
+
+Queue depth at dequeue time is not exported, so a pool that is keeping up and
+one that is barely keeping up both read as a near-zero wait.
+
 ## Coverage gaps
 
 A group being enabled does not guarantee spans: something has to emit them. Known
@@ -691,6 +732,7 @@ blanks today, so an empty trace is not read as a broken exporter:
 | `run_vlm_grpo.py`, `run_grpo_sliding_puzzle.py`, `run_xtoken_off_policy_distillation.py`, `run_eval.py` | these call the instrumented loops but never `init_telemetry_driver`, so a `telemetry:` block in their configs parses, the run succeeds, and nothing is emitted — driver or worker |
 | Non-presharded worker calls | the presharded data-plane entrypoints are parented, but `lm_policy` / `lm_value`'s own `train` / `get_logprobs` / `get_values` and every vLLM worker method are dispatched without a carrier, so those spans stay separate traces correlated by `nemo.run.id` |
 | Worker `__init__` spans | `rl.*.load_model` is opened before any call carries context, so the load spans are roots no matter what the caller does |
+| Energon `DataLoader` subprocesses | uninstrumented by design, and not individually visible: no per-batch build, decode or queue-depth span. They are described from the consuming side instead — see [The Energon worker pool](#the-energon-worker-pool) |
 
 ## Resource attributes (process tags)
 

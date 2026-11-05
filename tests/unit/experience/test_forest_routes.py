@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Real worker capture -> Gym extras -> TQ codecs -> Forest canonical publication.
+"""Real worker capture -> native route attachments -> Forest canonical publication.
 
 Generation and storage are doubles; route extraction, commitments, verification,
 owner collapse, publication and cleanup execute their production code.
 """
 
+from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import torch
 
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
@@ -51,13 +53,21 @@ class _RecordingSink(TQTokenSink):
         super().__init__(data_plane, staging_partition="staged")
         self.records = []
 
-    def stage(self, record: Any) -> Any:
+    def stage(
+        self, record: Any, *, attachments: Mapping[str, Any] | None = None
+    ) -> Any:
         self.records.append(record)
-        return super().stage(record)
+        return super().stage(record, attachments=attachments)
 
 
 def _segment(
-    worker: Any, sink: _RecordingSink, scope: str, *, child: bool = True, base: int = 10
+    worker: Any,
+    sink: _RecordingSink,
+    scope: str,
+    *,
+    child: bool = True,
+    base: int = 10,
+    has_routes: bool = True,
 ) -> dict[str, Any]:
     first = len(sink.records)
     prefix = []
@@ -85,9 +95,10 @@ def _segment(
             if not ordinal
             else [900, 901, base + 7, base + 3, base + 4, -1]
         )
-        payload["choices"][0]["message"]["routed_experts"] = [
-            [[value]] for value in values
-        ]
+        if has_routes:
+            payload["choices"][0]["message"]["routed_experts"] = torch.tensor(
+                values, dtype=torch.int32
+            ).reshape(-1, 1, 1)
         result = VllmAsyncGenerationWorkerImpl._finish_request_capture(
             worker, request, payload
         )
@@ -169,17 +180,13 @@ def test_forest_routes_patch_only_predecessor_tail_within_each_segment(
 
 @pytest.mark.parametrize("failure", ["boundary_tamper", "no_routes"])
 def test_bad_committed_routes_invalidate_whole_owner(
-    routes: tuple, monkeypatch: pytest.MonkeyPatch, failure: str
+    routes: tuple, failure: str
 ) -> None:
     data_plane, sink, worker, finalizer = routes
     first = _segment(worker, sink, "group_g0")
-    extract = worker.token_capture.adapter.extract_extras
-    if failure == "no_routes":
-        monkeypatch.setattr(
-            worker.token_capture.adapter, "extract_extras", lambda _: None
-        )
-    second = _segment(worker, sink, "group_g0", base=30)
-    monkeypatch.setattr(worker.token_capture.adapter, "extract_extras", extract)
+    second = _segment(
+        worker, sink, "group_g0", base=30, has_routes=failure != "no_routes"
+    )
     healthy = _segment(worker, sink, "group_g1", child=False, base=50)
     if failure == "boundary_tamper":
         row = data_plane.rows["staged", second["manifest"].records[-1].staging_key]
