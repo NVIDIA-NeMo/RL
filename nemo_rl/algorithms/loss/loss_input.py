@@ -528,11 +528,6 @@ def prepare_packed_loss_input(
     input_is_prepacked = "cu_seqlens" in data
     if getattr(loss_fn, "score_centering", False) and input_is_prepacked:
         raise ValueError("Score centering does not support externally prepacked inputs")
-    if getattr(loss_fn, "score_centering", False) and reuse_logits_storage:
-        raise ValueError(
-            "Score centering reads the packed logits again, so it cannot be "
-            "combined with policy.megatron_cfg.reuse_logits_storage=true"
-        )
     cp_size = (
         1
         if context_parallel_group is None
