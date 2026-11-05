@@ -1,0 +1,30 @@
+{
+  "observed_at": "2026-11-05T04:02:00-08:00",
+  "code_and_recipes_commit": "908494329d9d8b4a07fa0b482facae3e6de336da",
+  "image": "containers/nemo_rl.1030.sqsh",
+  "qualification": {
+    "job_id": 21329914,
+    "nodes": 2,
+    "gpus_per_node": 8,
+    "state": "PENDING",
+    "reason": "Priority"
+  },
+  "streaming_la0": {
+    "segment_job_ids": [21330508, 21330509, 21330510, 21330511],
+    "nodes": 3,
+    "gpus_per_node": 8,
+    "target_steps": 300,
+    "same_checkpoint_and_run_id_across_segments": true,
+    "state": "PENDING",
+    "reason": "afterok dependency chain starting with qualification",
+    "wandb_entity": "yuekaiz",
+    "wandb_project": "nemo-rl-automodel-sc",
+    "wandb_run_id": "yuekaiz5090streamla0s42"
+  },
+  "colleague_baselines": [
+    "https://forge.coreweave.com/wandb/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/c926b37d",
+    "https://forge.coreweave.com/wandb/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/2a121400"
+  ],
+  "status_log": "validation/pr3/slurm/watch.log",
+  "failure_marker": "validation/pr3/slurm/FAILURE_DETECTED"
+}

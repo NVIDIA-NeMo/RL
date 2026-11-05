@@ -20,7 +20,7 @@ in source-evidence.json and dependency-runtime.json. Product dependency pins unc
 | Actual overlap | **Passed with controlled tail admission**: CUDA traces show 13,111 intersecting kernel intervals, 76.116ms total overlap (`results/overlap-gated/kernel-overlap.json`). Initial ungated/delayed-decode traces showed no overlap; synchronized-region receipts alone were insufficient. Private gating/profiling changes timing, so this proves overlap and does not establish throughput. |
 | Stronger cancellation | Audit v4 passed: four dispatches on full steps, cancel after two completed partial dispatches at version2, drain then abort. Durable snapshot: 3 ready and 5 in-flight groups; restored and completed through step6. Receipt checks passed (`integration-audit-check-v4.log`). |
 | Qwen3.5 EP16 + recipe FusedAdam | Fixed synthetic input, two16-row dispatches vs full32, token/sequence loss, 3 updates each, activation checkpointing. Job21329914 pending. This is synthetic-input replay, not saved real-GRPO-input replay. |
-| Qwen3.5 streaming LA0 300 steps | Not launched; gated on EP16 qualification. User requested reuse of colleague convergence baseline. No extra full-batch convergence run. |
+| Qwen3.5 streaming LA0 300 steps | Queued with afterok dependency on EP16 qualification: jobs21330508–21330511 are continuation segments of **one** 300-update run. Training has not started. User requested reuse of colleague convergence baseline. No extra full-batch convergence run. |
 
 Numerical snapshots include preclip normalized gradient shards, every parameter
 and registered buffer, complete optimizer state_dict, scheduler state and exact
@@ -47,3 +47,11 @@ Supported first-stage scope: text GRPO/per-prompt advantages, full-parameter FSD
 fixed batches, TP=CP1, in_order LA0, disaggregated vLLM, zero MoE auxiliary loss and
 positive-example NLL. LA1, CPU offload, HSDP, LoRA, packing, dynamic batching, VLM,
 PPO and distillation remain rejected. Online validation/acc remains unavailable.
+
+Submitted jobs and the intended W&B run identity are recorded in jobs.json.
+The qualification must succeed and its worker/harness source hashes must still
+match before training starts. Each segment resumes the same checkpoint/run ID;
+segments skip startup if 300 updates are already complete. The deterministic
+watch_10min.sh process records queue/accounting/progress every ten minutes in
+slurm/watch.log and marks observed terminal failures in slurm/FAILURE_DETECTED.
+It performs status collection only; it does not retry experiments or send chat notifications.
