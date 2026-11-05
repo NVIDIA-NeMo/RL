@@ -196,6 +196,8 @@ def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
     manager._skipped_prompts = 0
     manager._consecutive_infra_drops = 0
     manager._filter_zero_variance_groups = False
+    manager._masked_reward_policy = None
+    manager._overlong_filtering = False
     manager._step_rewards = {}
     return manager
 
