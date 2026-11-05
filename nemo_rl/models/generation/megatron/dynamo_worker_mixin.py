@@ -135,22 +135,23 @@ class MegatronDynamoGenerationMixin:
         # processes and nodes.
         return {"hostname": _get_node_ip_local()}
 
-    def attach_dynamo_events(self, *, parent_event_address: str) -> bool:
+    def attach_dynamo_events(self, *, parent_event_address: str) -> None:
         """Send this engine's events to its Megatron Dynamo adapter.
 
         Runs on every rank once the engine and its coordinator are up, after
         rank zero started the adapter, the way the vLLM worker registers an
-        engine that already serves. Every rank reports progress; rank zero also
-        forwards KV events and sends "ready" with the coordinator address, which
-        is what lets the adapter register the engine with the frontend. A second
-        call is a no-op.
+        engine that already serves. Only rank zero's reporter connects: it
+        forwards progress and KV events and sends "ready" with the coordinator
+        address, which is what lets the adapter register the engine with the
+        frontend. The reporter is kept only once "ready" is sent, so a failed
+        attach can be retried; a repeat call with the same address is a no-op.
 
         Args:
             parent_event_address: ZMQ address the adapter listens on for
                 engine events.
 
-        Returns:
-            True, so the fan-out can be awaited uniformly.
+        Raises:
+            ValueError: A repeat call names a different adapter address.
         """
         if not self._inference_engine_initialized:
             raise RuntimeError(
@@ -158,16 +159,27 @@ class MegatronDynamoGenerationMixin:
                 "(the first refit builds it)"
             )
         if self._dynamo_event_reporter is not None:
-            return True
+            attached_address = self._dynamo_event_reporter.parent_address
+            if attached_address != parent_event_address:
+                raise ValueError(
+                    f"Engine events already go to {attached_address}; cannot "
+                    f"re-attach them to {parent_event_address}"
+                )
+            return
 
         async def _attach() -> None:
             # On the inference loop: the engine fires its progress and KV-event
             # callbacks there.
-            self._start_dynamo_event_reporter(parent_event_address)
-            self._report_dynamo_ready()
+            reporter = self._start_dynamo_event_reporter(parent_event_address)
+            try:
+                self._report_dynamo_ready(reporter)
+            except Exception:
+                # Leave nothing attached so a retry starts over and sends ready.
+                reporter.stop()
+                raise
+            self._dynamo_event_reporter = reporter
 
         asyncio.run_coroutine_threadsafe(_attach(), self._inference_loop).result()
-        return True
 
     def start_dynamo_endpoint(
         self,
@@ -182,16 +194,16 @@ class MegatronDynamoGenerationMixin:
     ) -> dict[str, Any]:
         """Host Megatron-LM's Dynamo adapter for this engine on this rank.
 
-        Runs on rank zero once the engine is built (the first refit builds it),
-        as the vLLM worker's ``start_dynamo_endpoint_async`` runs on an engine
-        that already serves. The adapter (``MegatronLLMEngine``, an
-        implementation of Dynamo's ``LLMEngine``) is driven by a Dynamo
-        ``Worker`` task on the inference loop. Unlike ``NativeVllmEngine`` it
-        does not hold the engine: in external launch mode it binds an event
-        socket, waits for the "ready" message ``attach_dynamo_events`` sends,
-        connects an ``InferenceClient`` to the coordinator, and only then
-        registers the engine with the frontend. The engine's role comes from
-        its config. A second call returns the first call's metadata.
+        Runs on rank zero once the engine is built (the first refit builds it).
+        The adapter (``MegatronLLMEngine``, an implementation of Dynamo's
+        ``LLMEngine``) is driven by a Dynamo ``Worker`` task on the inference
+        loop and does not hold the engine: in external launch mode it binds an
+        event socket, waits for the "ready" message ``attach_dynamo_events``
+        sends, connects an ``InferenceClient`` to the coordinator, and only
+        then registers the engine with the frontend. The engine's role comes
+        from its config. A second call returns the first call's metadata; after
+        ``stop_dynamo_endpoint`` the endpoint cannot be started again in this
+        process (Dynamo's runtime serves one ``Worker`` per process).
 
         Args:
             namespace: Dynamo namespace shared with the frontend.
@@ -209,6 +221,12 @@ class MegatronDynamoGenerationMixin:
             (decode only: the identity prefill pins KV blocks for).
         """
         role = self._dynamo_role
+        stopped = self._dynamo_endpoint_future
+        if stopped is not None and stopped.cancelled():
+            raise RuntimeError(
+                "This engine's Dynamo endpoint was stopped; Dynamo's runtime "
+                "serves one Worker per process, so restart the engine instead"
+            )
         if self._dynamo_endpoint_metadata is not None:
             return dict(self._dynamo_endpoint_metadata)
         if not self._inference_engine_initialized:
@@ -282,6 +300,9 @@ class MegatronDynamoGenerationMixin:
             )
             engine = MegatronLLMEngine(config, registration_model)
             worker_config = MegatronLLMEngine.worker_config(config, registration_model)
+            # Dynamo's Worker installs SIGTERM/SIGINT handlers in this actor
+            # process and, on those signals, shuts the adapter down its own way
+            # (it force-exits the process if that overruns its deadline).
             await Worker(engine, worker_config).run()
 
         self._dynamo_endpoint_future = asyncio.run_coroutine_threadsafe(
@@ -302,14 +323,26 @@ class MegatronDynamoGenerationMixin:
         return dict(self._dynamo_endpoint_metadata)
 
     def stop_dynamo_endpoint(self) -> None:
-        """Cancel the Dynamo endpoint task; the engine leaves discovery."""
+        """Cancel the Dynamo endpoint task and stop the engine's event reporter.
+
+        Cancelling drops Dynamo's ``Worker.run`` without its graceful path: no
+        request drain and no adapter cleanup. The engine's discovery entry
+        lapses when this process exits, so callers stop the engine next. The
+        stopped task stays recorded, so a later start is refused.
+        """
         future = self._dynamo_endpoint_future
-        self._dynamo_endpoint_future = None
-        self._dynamo_endpoint_metadata = None
         if future is not None:
             future.cancel()
+        # Only rank zero's reporter runs a thread; stopping it closes the
+        # socket to the adapter.
+        reporter = self._dynamo_event_reporter
+        self._dynamo_event_reporter = None
+        if reporter is not None:
+            reporter.stop()
 
-    def _start_dynamo_event_reporter(self, parent_event_address: str) -> None:
+    def _start_dynamo_event_reporter(
+        self, parent_event_address: str
+    ) -> "EngineEventReporter":
         """Connect the engine's progress and KV events to the adapter."""
         # Deferred: the Dynamo integration is optional (absent from older
         # Megatron-LM) and only Dynamo-attached engines load it.
@@ -324,12 +357,11 @@ class MegatronDynamoGenerationMixin:
             lambda: reporter.observe("progress", {})
         )
         reporter.start()
-        self._dynamo_event_reporter = reporter
+        return reporter
 
-    def _report_dynamo_ready(self) -> None:
+    def _report_dynamo_ready(self, reporter: "EngineEventReporter") -> None:
         """Rank zero tells the adapter where the coordinator is and what it serves."""
-        reporter = self._dynamo_event_reporter
-        if reporter is None or torch.distributed.get_rank() != 0:
+        if torch.distributed.get_rank() != 0:
             return
         if self.coordinator_addr is None:
             raise RuntimeError("The inference coordinator is not listening yet")

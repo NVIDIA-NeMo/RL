@@ -751,7 +751,7 @@ class MegatronGeneration(GenerationInterface):
         )
 
     def stop_dynamo_endpoint(self) -> None:
-        """Cancel rank zero's Dynamo endpoint task (an engine served through Dynamo)."""
+        """Stop rank zero's Dynamo endpoint task; callers shut the engine down next."""
         ray.get(
             self._policy.worker_group.run_single_worker_single_data(
                 method_name="stop_dynamo_endpoint", worker_idx=0

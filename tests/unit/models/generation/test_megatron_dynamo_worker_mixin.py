@@ -202,10 +202,14 @@ def dynamo_endpoint_env(monkeypatch):
             self.parent_address = parent_address
             self.events = []
             self.started_on = None
+            self.stopped = False
             records.reporters.append(self)
 
         def start(self):
             self.started_on = asyncio.get_running_loop()
+
+        def stop(self):
+            self.stopped = True
 
         def observe(self, kind, payload):
             self.events.append((kind, payload))
@@ -379,20 +383,26 @@ def test_dynamo_endpoint_registers_the_model_with_the_adapter(
 
 def test_stop_dynamo_endpoint_cancels_the_adapter_task(dynamo_endpoint_env):
     env = dynamo_endpoint_env
-    _start(env)
+    metadata = _start(env)
     future = env.worker._dynamo_endpoint_future
     _wait_until(lambda: env.records.run_started is not None)
+
+    env.worker.attach_dynamo_events(
+        parent_event_address=metadata["parent_event_address"]
+    )
+    (reporter,) = env.records.reporters
 
     env.worker.stop_dynamo_endpoint()
 
     _wait_until(future.done)
     assert future.cancelled()
-    # Stopping forgets the task, so a rebuilt worker can start a new one.
-    assert env.worker._dynamo_endpoint_future is None
-    assert env.worker._dynamo_endpoint_metadata is None
-    _start(env, excluded_ports=[])
-    assert len(env.records.configs) == 2
-    assert not env.worker._dynamo_endpoint_future.done()
+    assert reporter.stopped and env.worker._dynamo_event_reporter is None
+    # The stopped task stays recorded: Dynamo's runtime serves one Worker per
+    # process, so a second start in this process is refused.
+    assert env.worker._dynamo_endpoint_future is future
+    with pytest.raises(RuntimeError, match="restart the engine"):
+        _start(env, excluded_ports=[])
+    assert len(env.records.configs) == 1
 
 
 def test_dynamo_endpoint_and_events_need_a_built_engine(dynamo_endpoint_env):
@@ -412,7 +422,7 @@ def test_attach_dynamo_events_reports_ready_to_the_adapter_once(dynamo_endpoint_
     metadata = _start(env)
     address = metadata["parent_event_address"]
 
-    assert env.worker.attach_dynamo_events(parent_event_address=address) is True
+    assert env.worker.attach_dynamo_events(parent_event_address=address) is None
 
     (reporter,) = env.records.reporters
     assert reporter.parent_address == address
@@ -436,3 +446,28 @@ def test_dynamo_worker_requires_the_megatron_dynamo_integration(monkeypatch):
     monkeypatch.setitem(sys.modules, module, None)
     with pytest.raises(RuntimeError, match="megatron.inference.integrations.dynamo"):
         require_megatron_dynamo_integration()
+
+
+def test_attach_dynamo_events_retries_until_ready_and_pins_the_address(
+    dynamo_endpoint_env,
+):
+    """A failed "ready" leaves nothing attached; a re-attach elsewhere is refused."""
+    env = dynamo_endpoint_env
+    address = _start(env)["parent_event_address"]
+
+    # The coordinator is not listening yet, so "ready" cannot be sent.
+    env.worker.coordinator_addr = None
+    with pytest.raises(RuntimeError, match="not listening"):
+        env.worker.attach_dynamo_events(parent_event_address=address)
+    assert env.worker._dynamo_event_reporter is None
+    assert env.records.reporters[0].stopped
+
+    env.worker.coordinator_addr = "tcp://10.0.0.5:6000"
+    env.worker.attach_dynamo_events(parent_event_address=address)
+    assert env.worker._dynamo_event_reporter is env.records.reporters[1]
+    assert [kind for kind, _ in env.records.reporters[1].events] == ["ready"]
+
+    env.worker.attach_dynamo_events(parent_event_address=address)
+    assert len(env.records.reporters) == 2
+    with pytest.raises(ValueError, match="tcp://10.0.0.5:9999"):
+        env.worker.attach_dynamo_events(parent_event_address="tcp://10.0.0.5:9999")
