@@ -125,6 +125,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY,
 )
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
@@ -1916,6 +1917,9 @@ Depending on your data shape, you may want to change these values."""
             row, result = await task
             if isinstance(result, Exception):
                 return row, result
+            if row.get(NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY) is True:
+                # RL skipped capture for this rollout (validation): no manifest to read.
+                return row, self._skipped_capture_result(row, result)
             # Measure wall time with any receipt in flight, not the sum of
             # overlapping drain waits (which could exceed the batch duration).
             if active_postprocessors == 0:
@@ -2040,6 +2044,28 @@ Depending on your data shape, you may want to change these values."""
                 )
                 return manifest
             await asyncio.sleep(_CAPTURE_DRAIN_POLL_S)
+
+    @staticmethod
+    def _skipped_capture_result(nemo_gym_row: dict, nemo_gym_result: dict) -> dict:
+        """Return a rollout RL skipped capture for: reward and text only.
+
+        RL sets ``_ng_skip_token_capture: true`` on rollouts it does not train on,
+        such as validation rollouts. Gym then captures none of their model calls, so
+        the ledger has no manifest for them and TransferQueue holds nothing to
+        rebuild. Under token capture the response carries no token ids either (the
+        token echo is off), so the result keeps only what the Environment Server
+        returned: ``receipt`` is ``None`` and ``skip_token_capture`` is ``True``.
+        A rollout without the mark still needs its capture, and is masked as today
+        when it has none.
+        """
+        return {
+            "message_log": [],
+            "input_message_log": [],
+            "full_result": nemo_gym_result,
+            "rollout_id": nemo_gym_row.get(_NG_ROLLOUT_ID_BODY_KEY),
+            "receipt": None,
+            "skip_token_capture": True,
+        }
 
     async def _postprocess_receipt_mode(
         self, nemo_gym_row: dict, nemo_gym_result: dict

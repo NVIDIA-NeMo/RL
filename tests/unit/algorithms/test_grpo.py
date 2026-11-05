@@ -8196,6 +8196,8 @@ class TestValidateFunction:
         assert sampling_params.temperature == pytest.approx(0.1)
         assert sampling_params.top_p == pytest.approx(0.9)
         assert sampling_params.top_k is None
+        # RL does not train on validation rollouts, so Gym must not capture them.
+        assert mock_rollout.call_args.kwargs["skip_token_capture"] is True
         assert val_metrics["accuracy"] == pytest.approx(0.25)
         assert val_metrics["pass_k"] == pytest.approx(0.5)
 

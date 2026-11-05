@@ -21,6 +21,10 @@ NEMO_GYM_TASK_INDEX_KEY = "_ng_task_index"
 NEMO_GYM_GROUP_ID_KEY = "_ng_group_id"
 NEMO_GYM_GROUP_ATTEMPT_KEY = "_ng_group_attempt"
 NEMO_GYM_ROLLOUT_INDEX_KEY = "_ng_rollout_index"
+# Gym's SKIP_TOKEN_CAPTURE_KEY_NAME, copied because the driver runs without nemo_gym;
+# a test checks they still match. True on a rollout RL does not train on (a
+# validation rollout), so Gym captures none of its model calls.
+NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY = "_ng_skip_token_capture"
 NEXT_NEMO_GYM_TASK_INDEX_KEY = "next_ng_task_index"
 # Unconsumed suffix of a gap-fill dataloader batch, carried in the async
 # collector's rollouts state so a checkpoint cannot strand yielded prompts.

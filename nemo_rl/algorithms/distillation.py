@@ -1352,6 +1352,9 @@ def validate(
                     ),
                     max_rollout_turns=None,
                     greedy=False,
+                    # RL does not train on validation rollouts, so Gym captures none of their
+                    # model calls: a token-capture run stages nothing for them.
+                    skip_token_capture=True,
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics

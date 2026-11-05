@@ -54,6 +54,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.rollout_manager import (
@@ -3053,6 +3054,34 @@ def test_prepare_nemo_gym_rows_stamps_distinct_legacy_prompt_groups():
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0, 0]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 0, 1]
     assert [row["_rowidx"] for row in rows] == [0, 1, 2, 3]
+
+
+def test_prepare_nemo_gym_rows_marks_rows_rl_does_not_train_on():
+    rows = [{"responses_create_params": {}} for _ in range(2)]
+
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        generation_config={"max_new_tokens": 64},
+        sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+        num_generations=1,
+        skip_token_capture=True,
+    )
+
+    assert [row[NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY] for row in rows] == [True, True]
+
+
+def test_prepare_nemo_gym_rows_clears_a_mark_from_rows_rl_trains_on():
+    # A row reused from validation, or a dataset row carrying the key, is still captured for training.
+    rows = [{"responses_create_params": {}, NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY: True}]
+
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        generation_config={"max_new_tokens": 64},
+        sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+        num_generations=1,
+    )
+
+    assert NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY not in rows[0]
 
 
 def test_prepare_nemo_gym_rows_updates_mixed_materialized_and_flat_inputs():
