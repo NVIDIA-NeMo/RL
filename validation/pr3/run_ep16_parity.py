@@ -26,9 +26,15 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 
 @ray.remote(num_cpus=8, num_gpus=8)
-def run_rank(node_rank: int, master_address: str, source_sha: str) -> int:
+def run_rank(
+    node_rank: int, master_address: str, source_sha: str, normalizer_control: bool
+) -> int:
     repo = Path(os.environ["PR3_REPO"])
-    output = repo / "validation/pr3/results/ep16-fixed-input"
+    output = (
+        repo
+        / "validation/pr3/results"
+        / ("ep16-normalizer-control" if normalizer_control else "ep16-fixed-input")
+    )
     output.mkdir(parents=True, exist_ok=True)
     command = [
         "uv",
@@ -57,7 +63,7 @@ def run_rank(node_rank: int, master_address: str, source_sha: str) -> int:
         "--dispatch-sizes",
         "1,1",
         "--steps",
-        "3",
+        "1" if normalizer_control else "3",
         "--seq-len",
         "256",
         "--strict-determinism",
@@ -70,6 +76,8 @@ def run_rank(node_rank: int, master_address: str, source_sha: str) -> int:
         "--output",
         str(output),
     ]
+    if normalizer_control:
+        command.append("--normalizer-control")
     env = os.environ.copy()
     env.update(CUBLAS_WORKSPACE_CONFIG=":4096:8", NVTE_ALLOW_NONDETERMINISTIC_ALGO="0")
     with (output / f"node-{node_rank}.log").open("w") as log:
@@ -102,7 +110,12 @@ if __name__ == "__main__":
     )
     assert len(nodes) == 2, nodes
     source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    report = Path("validation/pr3/results/ep16-fixed-input/parity.json")
+    normalizer_control = os.environ["PR3_MODE"] == "normalizer-control"
+    report = Path(
+        "validation/pr3/results/ep16-normalizer-control/normalizer-control.json"
+        if normalizer_control
+        else "validation/pr3/results/ep16-fixed-input/parity.json"
+    )
     report.unlink(missing_ok=True)
     # Ray services start before run.sh sources the driver environment. Remote
     # tasks inherit those services' environment, not later driver exports.
@@ -131,11 +144,16 @@ if __name__ == "__main__":
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node["NodeID"], soft=False
             ),
-        ).remote(index, nodes[0]["NodeManagerAddress"], source)
+        ).remote(index, nodes[0]["NodeManagerAddress"], source, normalizer_control)
         for index, node in enumerate(nodes)
     ]
     ray.wait(futures, num_returns=len(futures), fetch_local=False)
     codes = ray.get(futures)
     assert codes == [0, 0], codes
     assert json.loads(report.read_text())["passed"]
-    print("EP16_FIXED_INPUT_PASSED", flush=True)
+    print(
+        "EP16_NORMALIZER_CONTROL_PASSED_DIAGNOSTIC_ONLY"
+        if normalizer_control
+        else "EP16_FIXED_INPUT_PASSED",
+        flush=True,
+    )

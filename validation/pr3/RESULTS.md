@@ -19,8 +19,9 @@ in source-evidence.json and dependency-runtime.json. Product dependency pins unc
 | Real vLLM streaming / resume | Audit v3 committed updates through 6 after recovery from step2. Durable snapshot: 4 ready groups plus 4 in-flight groups. Receipt checker passed group/sample uniqueness, ready-group reuse, lag0 and resumed steps2–5. |
 | Actual overlap | **Passed with controlled tail admission**: CUDA traces show 13,111 intersecting kernel intervals, 76.116ms total overlap (`results/overlap-gated/kernel-overlap.json`). Initial ungated/delayed-decode traces showed no overlap; synchronized-region receipts alone were insufficient. Private gating/profiling changes timing, so this proves overlap and does not establish throughput. |
 | Stronger cancellation | Audit v4 passed: four dispatches on full steps, cancel after two completed partial dispatches at version2, drain then abort. Durable snapshot: 3 ready and 5 in-flight groups; restored and completed through step6. Receipt checks passed (`integration-audit-check-v4.log`). |
-| Qwen3.5 EP16 + recipe FusedAdam | Fixed synthetic input, two16-row dispatches vs full32, token/sequence loss, 3 updates each, activation checkpointing. Job21329914 pending. This is synthetic-input replay, not saved real-GRPO-input replay. |
-| Qwen3.5 streaming LA0 300 steps | Queued with afterok dependency on EP16 qualification: jobs21330508–21330511 are continuation segments of **one** 300-update run. Training has not started. User requested reuse of colleague convergence baseline. No extra full-batch convergence run. |
+| Qwen3.5 EP16 + recipe FusedAdam | **FAILED** job21330640 on the first token-level preclip gradient comparison: observed rank relativeL2 about1.1–1.5%, exceeding1%; some cosine values also below.9999. Original limits unchanged. See ep16-failure.json; raw node logs retained. This was synthetic-input replay, not saved real-GRPO-input replay. |
+| Qwen3.5 streaming LA0 300 steps | **NOT STARTED.** Jobs21330687–21330690 cancelled on failed qualification dependency. No extra full-batch convergence run. |
+| Normalizer-placement diagnostic | Tiny EP2/FusedAdam/AC passed exact preclip-gradient/model/public+raw-optimizer/scales/scheduler comparison between full-input numerator backward and streaming. Ordinary-V1 versus numerator-only difference ~.91% on tiny. Qwen3.5 EP16 job21331026 running. Diagnostic cannot release training and does not relax original limits. |
 
 Numerical snapshots include preclip normalized gradient shards, every parameter
 and registered buffer, complete optimizer state_dict, scheduler state and exact
@@ -49,9 +50,22 @@ positive-example NLL. LA1, CPU offload, HSDP, LoRA, packing, dynamic batching, V
 PPO and distillation remain rejected. Online validation/acc remains unavailable.
 
 Submitted jobs and the intended W&B run identity are recorded in jobs.json.
-The qualification must succeed and its worker/harness source hashes must still
-match before training starts. Each segment resumes the same checkpoint/run ID;
-segments skip startup if 300 updates are already complete. The deterministic
+Qualification must succeed and worker/harness source hashes must still match
+before the guarded training launcher starts. The original contract has not passed
+on Qwen3.5; no training dependency remains active. The deterministic
 watch_10min.sh process records queue/accounting/progress every ten minutes in
 slurm/watch.log and marks observed terminal failures in slurm/FAILURE_DETECTED.
 It performs status collection only; it does not retry experiments or send chat notifications.
+
+First qualification attempt21329914 failed at the launcher before model initialization:
+Ray services started before run.sh's exports, so remote tasks lacked PR3_PYTHON.
+Fixad5582855 explicitly propagates the required non-secret interpreter/cache/model
+environment on remote tasks. Its blocked training chain was cancelled and replaced;
+raw failure logs remain in slurm/21329914-logs. This was not a model numerical result.
+
+The normalizer control runs ordinary V1, ordinary V1 with only its denominator
+moved from backward to clip entry, and SC streaming from identical state/RNG.
+The latter two must match exactly. This isolates normalization rounding from
+dispatch/LP state; it records original-gradient error separately and writes
+normalizer-control.json with releases_training:false, never a qualifying parity.json.
+Run it with --normalizer-control --steps1; its EP16 launcher uses a separate output folder.

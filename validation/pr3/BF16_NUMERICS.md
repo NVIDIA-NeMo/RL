@@ -40,3 +40,21 @@ Result reporting must distinguish v1 numerical parity, v2 optimizer execution
 correctness, and real-run convergence. A passing v2 oracle must not be described as
 passing the original strict BF16 parameter gate. Long-run qualification remains
 necessary, and only streaming LA0 is authorized for the final long run.
+
+## Qwen3.5 EP16: original gradient gate also failed
+
+Job21330640 reached real Qwen3.5-35B-A3B-Base training with EP16, activation
+checkpointing and the recipe's FusedAdam. The first token-level comparison
+failed: observed per-rank relativeL2 approximately1.1–1.5% (limit1%), with some
+cosine values below.9999. Norm-size differences remained below1%. No optimizer
+oracle pass or long-run qualification is inferred for this configuration.
+The dependent300-step jobs were cancelled; ep16-failure.json records the failure.
+
+A separate diagnostic freezes an exact criterion: an ordinary full-input V1
+backward with placeholder denominators and independent clip-entry normalization
+must match SC streaming in preclip gradients, parameters, public/raw optimizer
+state and scheduler exactly. Its ordinary early-normalization reference still
+records the unchanged1%/.9999/1% gates. This diagnostic passed tiny EP2/FusedAdam
+with activation checkpointing and both objectives; EP16 diagnostic21331026 is in
+progress. Its output explicitly does not release training. Global sharded-vector
+statistics are additional measurements, not a replacement for failed rank gates.

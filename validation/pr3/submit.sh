@@ -4,9 +4,9 @@ set -euo pipefail
 cd /lustre/fsw/portfolios/coreai/users/yuekaiz/single_controller/RL-pr5090-streaming
 [[ -f /lustre/fsw/portfolios/coreai/users/yuekaiz/containers/nemo_rl.1030.sqsh ]]
 mkdir -p validation/pr3/slurm
-mode=${1:?Choose parity or train}
+mode=${1:?Choose parity, normalizer-control or train}
 args=()
-if [[ "$mode" == parity ]]; then
+if [[ "$mode" == parity || "$mode" == normalizer-control ]]; then
   nodes=2
 elif [[ "$mode" == train ]]; then
   nodes=3
@@ -14,7 +14,7 @@ elif [[ "$mode" == train ]]; then
     args+=(--dependency="afterok:$PR3_DEPENDENCY")
   fi
 else
-  echo 'Choose parity or train' >&2
+  echo 'Choose parity, normalizer-control or train' >&2
   exit 2
 fi
 PR3_MODE="$mode" sbatch --parsable "${args[@]}" --nodes="$nodes" \

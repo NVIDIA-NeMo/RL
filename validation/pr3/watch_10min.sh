@@ -16,10 +16,10 @@ for (( poll=0; poll<288; poll++ )); do
     if [[ "$states" =~ FAILED|CANCELLED|TIMEOUT|NODE_FAIL|OUT_OF_MEMORY|BOOT_FAIL ]]; then
       printf '%s\n' "$states" >validation/pr3/slurm/FAILURE_DETECTED
     fi
-    for file in validation/pr3/slurm/slurm-*.out; do
+    for file in validation/pr3/slurm/*-logs/ray-driver.log validation/pr3/results/ep16-*/node-0.log; do
       [[ -f "$file" ]] || continue
       printf '%s\n' "$file"
-      tail -n 1000 "$file" | rg 'train step [0-9]+/|EP16_FIXED_INPUT_PASSED|PARITY_PASSED|already completed' | tail -n 3 || true
+      tail -n 1000 "$file" | rg 'train step [0-9]+/|EP16_.*PASSED|NORMALIZER_CONTROL|PARITY_PASSED|already completed' | tail -n 3 | cut -c 1-350 || true
     done
   } >>validation/pr3/slurm/watch.log 2>&1
   # All monitoring is read-only; failed qualifications never release training.

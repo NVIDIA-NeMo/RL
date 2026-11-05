@@ -1,0 +1,93 @@
+{
+  "job_id": 21330640,
+  "passed": false,
+  "failure_stage": "first token-level preclip gradient comparison",
+  "declared_limits_unchanged": {
+    "relative_l2_max": 0.01,
+    "cosine_min": 0.9999,
+    "norm_relative_error_max": 0.01
+  },
+  "observed_failures_by_rank": {
+    "14": {
+      "relative_l2": 0.01287928029755438,
+      "cosine": 0.9999171148947263,
+      "norm_relative_error": 0.000418325675065647
+    },
+    "12": {
+      "relative_l2": 0.013697508455096812,
+      "cosine": 0.9999061984207339,
+      "norm_relative_error": 0.00025926481219459743
+    },
+    "8": {
+      "relative_l2": 0.014007009799703284,
+      "cosine": 0.999901980821018,
+      "norm_relative_error": 0.0005073763844330886
+    },
+    "11": {
+      "relative_l2": 0.014583182083894782,
+      "cosine": 0.9998937605906358,
+      "norm_relative_error": 0.0005553137626131138
+    },
+    "13": {
+      "relative_l2": 0.014645273796353888,
+      "cosine": 0.9998927932899788,
+      "norm_relative_error": 0.0003937687555908218
+    },
+    "15": {
+      "relative_l2": 0.014608157366437197,
+      "cosine": 0.9998933737979133,
+      "norm_relative_error": 0.0005031443194576156
+    },
+    "10": {
+      "relative_l2": 0.015396895958346334,
+      "cosine": 0.9998814607716559,
+      "norm_relative_error": 0.00011864584752935503
+    },
+    "9": {
+      "relative_l2": 0.014178843540522627,
+      "cosine": 0.9998997397220911,
+      "norm_relative_error": 0.0008276531921611464
+    },
+    "7": {
+      "relative_l2": 0.014276046872041086,
+      "cosine": 0.9998980934401267,
+      "norm_relative_error": 0.00015462747948655634
+    },
+    "1": {
+      "relative_l2": 0.013679680633957726,
+      "cosine": 0.9999064750031809,
+      "norm_relative_error": 0.00039752423048856737
+    },
+    "6": {
+      "relative_l2": 0.013900476901423915,
+      "cosine": 0.9999033967976625,
+      "norm_relative_error": 6.521641472058817e-05
+    },
+    "4": {
+      "relative_l2": 0.014625619940911628,
+      "cosine": 0.9998931065329982,
+      "norm_relative_error": 0.0004719288977767925
+    },
+    "0": {
+      "relative_l2": 0.01166960676383957,
+      "cosine": 0.999943836780183,
+      "norm_relative_error": 0.0048281419195859
+    },
+    "3": {
+      "relative_l2": 0.01464075955594596,
+      "cosine": 0.9998930740846097,
+      "norm_relative_error": 0.0008220781691113136
+    },
+    "2": {
+      "relative_l2": 0.015027168996106668,
+      "cosine": 0.999887183195112,
+      "norm_relative_error": 0.0003286873220014584
+    },
+    "5": {
+      "relative_l2": 0.011351583792690537,
+      "cosine": 0.9999355955117212,
+      "norm_relative_error": 0.00029597733332705487
+    }
+  },
+  "training_started": false
+}

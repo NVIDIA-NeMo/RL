@@ -3,7 +3,7 @@ set -euo pipefail
 set +x
 source /lustre/fsw/portfolios/coreai/users/yuekaiz/single_controller/RL-pr5090-streaming/validation/pr3/environment.sh
 [[ "$USER" == root && -n "${SLURM_JOB_ID:-}" ]]
-if [[ "${PR3_MODE:-train}" == parity ]]; then
+if [[ "${PR3_MODE:-train}" == parity || "${PR3_MODE:-train}" == normalizer-control ]]; then
   uv run --no-project --python /opt/nemo_rl_venv/bin/python python validation/pr3/run_ep16_parity.py
   exit
 fi

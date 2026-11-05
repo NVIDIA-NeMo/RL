@@ -86,6 +86,9 @@ An uncertain commit or RPC that cannot drain requires checkpoint recovery.
 Checkpoints contain committed model/optimizer state and rollout recovery
 metadata, not half-step gradients. See the
 [streaming design and validation limits](../design-docs/automodel-single-controller-streaming.md).
+Qwen3.5 EP16 has not passed the declared BF16 gradient limit; its qualification
+and long-run validation remain incomplete. See the
+[validation record](../../validation/pr3/RESULTS.md) for passed and failed configurations.
 
 ### Mandatory settings
 

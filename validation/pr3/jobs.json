@@ -1,22 +1,22 @@
 {
-  "observed_at": "2026-11-05T04:02:00-08:00",
-  "code_and_recipes_commit": "908494329d9d8b4a07fa0b482facae3e6de336da",
+  "observed_at": "2026-11-05T04:41:00-08:00",
+  "code_and_recipes_commit": "ad5582855",
   "image": "containers/nemo_rl.1030.sqsh",
   "qualification": {
-    "job_id": 21329914,
+    "job_id": 21330640,
     "nodes": 2,
     "gpus_per_node": 8,
-    "state": "PENDING",
-    "reason": "Priority"
+    "state": "FAILED",
+    "reason": "first token-level gradient comparison exceeded declared 1% relativeL2 and some cosine limits"
   },
   "streaming_la0": {
-    "segment_job_ids": [21330508, 21330509, 21330510, 21330511],
+    "segment_job_ids": [21330687, 21330688, 21330689, 21330690],
     "nodes": 3,
     "gpus_per_node": 8,
     "target_steps": 300,
     "same_checkpoint_and_run_id_across_segments": true,
-    "state": "PENDING",
-    "reason": "afterok dependency chain starting with qualification",
+    "state": "CANCELLED",
+    "reason": "invalid afterok dependency after failed qualification; training never started",
     "wandb_entity": "yuekaiz",
     "wandb_project": "nemo-rl-automodel-sc",
     "wandb_run_id": "yuekaiz5090streamla0s42"
@@ -24,6 +24,22 @@
   "colleague_baselines": [
     "https://forge.coreweave.com/wandb/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/c926b37d",
     "https://forge.coreweave.com/wandb/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/2a121400"
+  ],
+  "normalizer_placement_diagnostic": {
+    "job_id": 21331026,
+    "state": "RUNNING",
+    "nodes": 2,
+    "gpus_per_node": 8,
+    "releases_training": false,
+    "tiny_ep2_exact_control_passed": true
+  },
+  "previous_attempts": [
+    {
+      "qualification_job_id": 21329914,
+      "result": "launcher failed before model initialization: Ray task did not inherit PR3_PYTHON",
+      "fix_commit": "ad5582855",
+      "blocked_training_jobs_cancelled": [21330508, 21330509, 21330510, 21330511]
+    }
   ],
   "status_log": "validation/pr3/slurm/watch.log",
   "failure_marker": "validation/pr3/slurm/FAILURE_DETECTED"
