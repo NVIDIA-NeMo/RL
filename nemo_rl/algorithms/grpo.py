@@ -767,9 +767,8 @@ def setup(
         generation_config = DynamoConfig.model_validate(generation_config).model_dump()
         policy_config["generation"] = generation_config
 
-    # generation.disaggregation is written in backend-agnostic terms, but only
-    # the TRT-LLM, vLLM and SGLang backends implement it: every other backend
-    # would silently ignore the block and serve aggregated, so refuse to start.
+    # Only trtllm, vllm and sglang implement generation.disaggregation; any
+    # other backend would silently serve aggregated, so refuse to start.
     disaggregated = resolve_disagg_layout(generation_config).enabled
     if disaggregated and generation_config["backend"] not in (
         "trtllm",
@@ -782,10 +781,8 @@ def setup(
             f"'{generation_config['backend']}'. Set it to false, or switch the "
             "backend."
         )
-    # The TRT-LLM and vLLM disagg frontends are only reachable over HTTP, so
-    # without NeMo-Gym the whole fleet would come up and fail at the first
-    # rollout instead. SGLang is the other way round: its PD path is the native
-    # /generate route of the built-in rollout, which NeMo-Gym does not use.
+    # The trtllm/vllm disagg frontends serve HTTP (NeMo-Gym) only; SGLang's PD
+    # path is the native /generate rollout, which NeMo-Gym does not use.
     if (
         disaggregated
         and generation_config["backend"] in ("trtllm", "vllm")

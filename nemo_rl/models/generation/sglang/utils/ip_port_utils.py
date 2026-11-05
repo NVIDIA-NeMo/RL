@@ -210,7 +210,7 @@ def _allocate_disagg_engine_addr_and_ports(
             f"engine {engine_index} restarts {len(slots)} of its {spec.num_slots} "
             "actors; an engine is started or restarted whole"
         )
-        dist_init_addr = None
+        dist_init_addr: str | None = None
         for rank, engine in slots:
             host = ray.get(engine._get_current_node_ip.remote())
             if host is None:

@@ -28,13 +28,27 @@ uv run examples/run_grpo.py \
     $@ \
     2>&1 | tee $RUN_LOG
 
+# Every engine of a disaggregated replica starts in a PD mode (SGLang logs its
+# ServerArgs); a run that silently came up aggregated must not pass the gates.
+assert_grep "disaggregation_mode='prefill'" "$RUN_LOG" \
+    "No prefill engine started: the rollouts ran aggregated, not disaggregated"
+assert_grep "disaggregation_mode='decode'" "$RUN_LOG" \
+    "No decode engine started: the rollouts ran aggregated, not disaggregated"
+
 # Convert tensorboard logs to json
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
+    # token_mult_prob_error is the gate that matters here: the prefill->decode
+    # KV handoff changes how the sampled tokens are produced, and a disagreement
+    # with the trainer's recomputed logprobs shows up in it first.
+    # gen_kl_error threshold: the 90-step PD and aggregated GB200 runs of this
+    # recipe both averaged 1.3e-4 (max 1.6e-4); 1e-3 leaves ~8x headroom.
     uv run tests/check_metrics.py $JSON_METRICS \
         'median(data["train/token_mult_prob_error"]) < 1.1' \
+        "data['train/token_mult_prob_error']['$MAX_STEPS'] < 1.1" \
+        'mean(data["train/gen_kl_error"]) < 0.001' \
         'mean(data["timing/train/total_step_time"], 2) < 25'
 
     # Clean up checkpoint directory after successful run to save space.

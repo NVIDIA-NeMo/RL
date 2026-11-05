@@ -31,24 +31,16 @@ policy:
         num_nodes: 1
     disaggregation:
       enabled: true
-      num_prefill_engines: 1
-      num_decode_engines: 1
     sglang_cfg:
       tp_size: 2
       sglang_server_config:
         num_gpus: 8
-        # SGLang refuses retract in PD mode; refits run between steps on idle
-        # engines, so abort has nothing to drop.
+        # SGLang refuses retract in PD mode. abort is safe here because GRPO
+        # refits between steps with no rollout in flight (async GRPO does not
+        # support SGLang; the SingleController entrypoint is refused).
         pause_generation_mode: abort
       sglang_router_config:
         use_distributed_post: true
-      prefill_engine: {}
-      decode_engine: {}
-      disagg:
-        router_scope: replica
-        transfer_backend: mooncake
-        prefill_policy: cache_aware
-        decode_policy: round_robin
 data:
   max_input_seq_length: 512
 logger:

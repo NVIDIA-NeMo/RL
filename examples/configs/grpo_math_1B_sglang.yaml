@@ -61,7 +61,7 @@ policy:
         # replica: one router per replica, KV never leaves the replica;
         # global: one router pools every engine of the fleet.
         router_scope: replica
-        # mooncake (SGLang default, no UCX) | nixl | mooncake_tcp | fake (test only).
+        # mooncake (SGLang default, no UCX) | nixl | mooncake_tcp.
         # Engines get WITH_NVIDIA_PEERMEM=0 (DMA-BUF registration) under mooncake
         # when nvidia-peermem is not loaded, and NCCL_NET_PLUGIN=none under nixl;
         # values already set in the environment win.

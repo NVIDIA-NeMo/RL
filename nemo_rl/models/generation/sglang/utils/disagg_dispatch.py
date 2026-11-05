@@ -15,20 +15,24 @@
 
 With one router per replica (``sglang_cfg.disagg.router_scope: replica``) each
 router balances only its own prefill/decode pool, so the split across routers
-is NeMo RL's. Two rules:
+is NeMo RL's. Three rules:
 
-* The samples of one prompt share a router. The router's ``cache_aware``
-  prefill policy then keeps them on the prefill engine holding their prefix,
-  as a single global router would; spread across routers, every router would
-  prefill the same prompt once.
-* A prompt not seen before goes to the router with the fewest requests in
-  flight, so the request counts stay within one prompt group of each other.
+* The samples of one prompt share a router, and so a replica. (Inside the
+  router, ``cache_aware`` does not pick the prefill engine by prefix: NeMo RL
+  sends token ids only, so the policy has no text to match and takes the
+  least-loaded engine.)
+* A prompt not seen before goes to the usable router with the fewest requests
+  in flight, so the request counts stay within one prompt group of each other.
+* Only usable routers are picked: a router whose replica has lost an engine
+  (fault tolerance kills it until the next refit) fails every request at once,
+  which would otherwise keep its in-flight count the lowest and draw most new
+  prompts to it.
 
 The dispatcher is touched from the generation object's event loop only, one
 coroutine at a time, plus ``reset`` between generation steps.
 """
 
-from collections.abc import Hashable
+from collections.abc import Hashable, Sequence
 
 
 class ReplicaDispatcher:
@@ -48,14 +52,21 @@ class ReplicaDispatcher:
         """The key the samples of one prompt share: a hash of the prompt tokens."""
         return hash(tuple(input_ids))
 
-    def acquire(self, key: Hashable) -> int:
-        """Pick the router for a request of prompt ``key`` and count it in flight."""
+    def acquire(self, key: Hashable, usable: Sequence[int]) -> int:
+        """Pick a usable router for a request of prompt ``key`` and count it in flight.
+
+        ``usable`` lists the routers whose replica is whole; a prompt that was
+        placed on a router that is no longer usable is moved.
+        """
+        assert usable, "at least one usable router is needed"
         if self.num_targets == 1:
             target = 0
         else:
-            target = self._sticky.get(key)
-            if target is None:
-                target = min(range(self.num_targets), key=self._inflight.__getitem__)
+            sticky = self._sticky.get(key)
+            if sticky is not None and sticky in usable:
+                target = sticky
+            else:
+                target = min(usable, key=self._inflight.__getitem__)
                 self._sticky[key] = target
         self._inflight[target] += 1
         return target

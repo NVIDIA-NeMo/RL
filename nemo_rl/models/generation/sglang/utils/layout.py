@@ -14,12 +14,9 @@
 """Engine layout for the SGLang backend: one spec per logical engine.
 
 An SGLang engine wider than a node is driven by one worker actor per node
-("slot"); ``SGLangGeneration.all_engines`` is the flat list of slots. Before
-prefill/decode disaggregation every engine had the same width, so the slot of
-an engine was plain arithmetic on ``nodes_per_engine``. Under disaggregation a
-prefill engine and a decode engine may differ in width, so the arithmetic is
-replaced by these specs, which also carry each engine's role, replica and
-router group.
+("slot"); ``SGLangGeneration.all_engines`` is the flat list of slots. A prefill
+engine and a decode engine of one replica may differ in width, so each engine's
+slots, GPUs, role, replica and router group are read from its spec.
 """
 
 from dataclasses import dataclass
@@ -78,12 +75,17 @@ def plan_sglang_engines(
     Engine order is :func:`plan_engines`'s: without disaggregation one
     aggregated engine per ``aggregated_width`` GPUs; with it, each replica's
     prefill engines followed by its decode engines. An engine wider than a node
-    takes whole nodes, as the uniform layout always did.
+    takes whole nodes, as the uniform layout always did, and no engine straddles
+    a node boundary (one actor drives one node's GPUs).
 
     ``router_scope`` picks how many sglang routers front the fleet under
     disaggregation: ``"replica"`` gives every replica its own prefill/decode
     pool, ``"global"`` pools every engine behind one router. Without
     disaggregation there is one router either way.
+
+    Raises:
+        ValueError: If an engine would start mid-node and cross into the next
+            one; the replica's widths must tile each node exactly.
     """
     roles, widths, num_replicas = plan_engines(
         num_gpus,
@@ -105,6 +107,20 @@ def plan_sglang_engines(
             assert width % gpus_per_node == 0, (
                 f"an SGLang engine of {width} GPUs must span whole "
                 f"{gpus_per_node}-GPU nodes"
+            )
+        # Same rule as disagg_layout.tile_engines_on_per_node_pgs: one actor
+        # drives one node's GPUs, so an engine never straddles a node boundary.
+        if width > gpus_per_node:
+            straddles = gpu_offset % gpus_per_node != 0
+        else:
+            straddles = (
+                gpu_offset // gpus_per_node != (gpu_offset + width - 1) // gpus_per_node
+            )
+        if straddles:
+            raise ValueError(
+                f"SGLang engine {index} ({role}, {width} GPUs) would start at GPU "
+                f"{gpu_offset} and cross a {gpus_per_node}-GPU node boundary. Pick "
+                "engine widths whose replica tiles each node exactly."
             )
         num_slots = max(1, width // gpus_per_node)
         replica = index // engines_per_replica

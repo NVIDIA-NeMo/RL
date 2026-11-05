@@ -9,10 +9,12 @@ lifecycle) and the *refit safety* (what happens when weights change mid-request)
 delegates both the *KV handshake* and the *routing inside a replica* to the inference
 backend's own disaggregation front-end — for TensorRT-LLM, `OpenAIDisaggServer`; for
 vLLM, NeMo RL's own frontend (`nemo_rl/models/generation/vllm/vllm_disagg_frontend.py`)
-over vLLM's `KVTransferConfig` connector (NixlConnector by default). The layout is the
-shared `generation.disaggregation` block for both backends; the vLLM specifics live under
-`vllm_cfg.prefill_engine`, `vllm_cfg.decode_engine`, `vllm_cfg.disagg_frontend` and
-`vllm_cfg.kv_transfer` (see Configuration below).
+over vLLM's `KVTransferConfig` connector (NixlConnector by default); for SGLang, the
+sglang router in PD mode. The layout is the shared `generation.disaggregation` block for
+all three backends; the vLLM specifics live under `vllm_cfg.prefill_engine`,
+`vllm_cfg.decode_engine`, `vllm_cfg.disagg_frontend` and `vllm_cfg.kv_transfer`, and the
+SGLang ones under `sglang_cfg.prefill_engine`, `sglang_cfg.decode_engine` and
+`sglang_cfg.disagg` (see Configuration below).
 
 ## Design
 
@@ -325,7 +327,7 @@ policy:
       decode_engine: {}
       disagg:                         # defaults on SGLangDisaggConfig
         router_scope: replica         # replica | global
-        transfer_backend: mooncake    # mooncake | nixl | mooncake_tcp | fake
+        transfer_backend: mooncake    # mooncake | nixl | mooncake_tcp
         prefill_policy: cache_aware   # random | round_robin | cache_aware
         decode_policy: round_robin
 ```
@@ -334,17 +336,21 @@ Engines are laid out per replica as on the other backends
 (`nemo_rl/models/generation/sglang/utils/layout.py`); widths may differ per role.
 With `router_scope: replica` every replica gets its own router, so a request's KV
 never leaves the replica's placement domain, and NeMo RL spreads prompts over the
-routers: the samples of one prompt share a router (the router's `cache_aware` policy
-then keeps them on the prefill engine holding their prefix) and a new prompt goes to
-the router with the fewest requests in flight
-(`nemo_rl/models/generation/sglang/utils/disagg_dispatch.py`). `global` pools every
+routers: the samples of one prompt share a router, and so a replica, and a new prompt
+goes to the usable router with the fewest requests in flight; a router whose replica has
+lost an engine is skipped (`nemo_rl/models/generation/sglang/utils/disagg_dispatch.py`).
+Inside a router, `cache_aware` does not pick the prefill engine by prefix: NeMo RL sends
+token ids only, so the policy has no text to match and takes the least-loaded engine.
+`global` pools every
 engine behind one router, which balances decode fleet-wide at the price of
 cross-replica KV transfers. Routers start with empty pools and the engines register
 with their role and, for prefill, their bootstrap port; `power_of_two` is refused
 because sglang-router 0.3.2 validates it against the workers configured at startup.
 
-Refits run between steps on idle engines (the SGLang backend has no async GRPO), so
-`abort` has nothing to drop; prefill engines pause before decode engines and resume
+`abort` is the pause mode SGLang allows in PD mode, and it is safe only when no rollout
+is in flight at refit: GRPO refits between steps (async GRPO does not support SGLang),
+and `SGLangGeneration.validate_settings` refuses the SingleController entrypoint, which
+refits with rollouts in flight. Prefill engines pause before decode engines and resume
 after them. Checked at setup: `colocated.enabled: false`, no external router,
 `pp_size: 1`, `pause_generation_mode: abort`, default `frontend_*` keys. A runnable
 recipe is `examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang-pd-disagg.yaml`.

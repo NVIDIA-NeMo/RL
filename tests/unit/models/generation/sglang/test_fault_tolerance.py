@@ -30,6 +30,7 @@ import pytest
 import requests
 from ray.exceptions import GetTimeoutError, RayActorError
 
+from nemo_rl.models.generation.interfaces import DisaggConfig
 from nemo_rl.models.generation.sglang import (
     fault_tolerance,
     sglang_generation,
@@ -38,6 +39,7 @@ from nemo_rl.models.generation.sglang import (
 from nemo_rl.models.generation.sglang.config import SGLangFaultToleranceConfig
 from nemo_rl.models.generation.sglang.fault_tolerance import RolloutHealthMonitor
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
+from nemo_rl.models.generation.sglang.utils.layout import plan_sglang_engines
 
 CHECK_INTERVAL = 0.01
 CHECK_TIMEOUT = 0.5
@@ -472,17 +474,28 @@ def _make_generation(monitor):
     gen.weight_synchronizer = None
     gen.all_engines = []
     gen.needs_offload = True
-    gen.num_gpus_per_engine = 1
-    gen.num_gpus_per_node = 1
     gen.gpu_offset = 0
     gen.num_new_engines = 0
     gen.rollout_engine_lock = None
     gen._health_monitor = monitor
-    gen._router_actor = None
     gen._http_client = None
     gen._async_loop = None
     gen._recover = lambda: None
     return gen
+
+
+def _uniform_specs(num_engines):
+    """One single-GPU aggregated engine per ``all_engines`` slot."""
+    specs, _, _ = plan_sglang_engines(
+        num_gpus=num_engines,
+        gpus_per_node=1,
+        layout=DisaggConfig(),
+        aggregated_width=1,
+        prefill_width=1,
+        decode_width=1,
+        router_scope="replica",
+    )
+    return specs
 
 
 @pytest.mark.parametrize(
@@ -542,6 +555,7 @@ def test_recover_leaves_num_new_engines_alone_when_nothing_died():
     """
     gen = _make_generation(_RecordingMonitor())
     gen.all_engines = [_FakeEngine(), _FakeEngine()]
+    gen._engine_specs = _uniform_specs(2)
     gen.num_new_engines = 4
 
     def _explode(port_cursors):
@@ -558,6 +572,7 @@ def test_recover_rearms_the_grace_period_for_restarted_engines():
     monitor = _RecordingMonitor()
     gen = _make_generation(monitor)
     gen.all_engines = [None]
+    gen._engine_specs = _uniform_specs(1)
     gen.num_new_engines = 1
     gen.needs_offload = False
     gen._start_engines = lambda port_cursors: ([], {})
@@ -647,6 +662,7 @@ def test_recover_probes_before_collecting_dead_slots(monitor_factory):
     survivor = _FakeEngine()
     replacement = _FakeEngine()
     gen.all_engines = [dead, survivor]
+    gen._engine_specs = _uniform_specs(2)
     gen._engine_urls = [None, None]
     gen._health_monitor = monitor_factory(gen)
     gen._health_monitor.start()
@@ -669,6 +685,7 @@ def test_replacement_weights_are_onloaded_once_after_recovery(monkeypatch, fake_
     monkeypatch.setattr(sglang_generation, "ray", fake_ray)
     gen = _make_generation(_RecordingMonitor())
     gen.all_engines = [None]
+    gen._engine_specs = _uniform_specs(1)
     gen.num_new_engines = 1
     events = []
     replacement = _FakeEngine()
@@ -699,6 +716,7 @@ def test_replacement_weights_are_onloaded_once_after_recovery(monkeypatch, fake_
 def test_restart_budget_aborts_before_boot(monitor_factory, max_restarts):
     gen = _make_generation(None)
     gen.all_engines = [None]
+    gen._engine_specs = _uniform_specs(1)
     gen._health_monitor = monitor_factory(gen, max_restarts=max_restarts)
     gen.needs_offload = False
     gen.num_new_engines = 1

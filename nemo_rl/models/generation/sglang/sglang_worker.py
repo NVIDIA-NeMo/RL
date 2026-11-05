@@ -585,6 +585,7 @@ class SGLangGenerationWorker:
             "cuda_graph_max_bs_prefill",
             "cuda_graph_bs_decode",
             "cuda_graph_bs_prefill",
+            "num_continuous_decode_steps",
         ]:
             if key in sglang_cfg_inner:
                 kwargs[key] = sglang_cfg_inner[key]

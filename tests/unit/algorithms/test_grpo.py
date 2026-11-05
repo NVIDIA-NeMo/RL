@@ -4433,6 +4433,101 @@ def test_setup_rejects_megatron_router_replay_before_side_effects(
     mock_logger.assert_not_called()
 
 
+class _PastTheDisaggregationGate(Exception):
+    """Raised by the check that follows the disaggregation gate in ``grpo.setup``."""
+
+
+@pytest.fixture
+def stop_after_disaggregation_gate(monkeypatch):
+    def _raise(_master_config):
+        raise _PastTheDisaggregationGate
+
+    monkeypatch.setattr(grpo_mod, "_validate_multimodal_dedup_capability", _raise)
+
+
+def _sglang_disaggregation_generation(backend="sglang", pause_mode="abort"):
+    return {
+        "backend": backend,
+        "colocated": {"enabled": False},
+        "disaggregation": {
+            "enabled": True,
+            "num_prefill_engines": 1,
+            "num_decode_engines": 1,
+        },
+        "sglang_cfg": {
+            "model_path": "Qwen/Qwen3-0.6B",
+            "tp_size": 1,
+            "dp_size": 1,
+            "pp_size": 1,
+            "ep_size": 1,
+            "sglang_server_config": {
+                "needs_offload": False,
+                "pause_generation_mode": pause_mode,
+                "num_gpus": 8,
+                "num_gpus_per_engine": 1,
+            },
+            "sglang_router_config": {"use_external_router": False},
+            "sglang_fault_tolerance_config": {"use_fault_tolerance": False},
+        },
+    }
+
+
+def _setup_up_to_the_disaggregation_gate(
+    master_config, generation, *, nemo_gym, monkeypatch
+):
+    master_config.policy["generation"] = generation
+    monkeypatch.setattr(grpo_mod, "should_use_nemo_gym", lambda _cfg: nemo_gym)
+    grpo_mod.setup(master_config, MagicMock(), MagicMock(), None)
+
+
+def test_setup_lets_sound_sglang_disaggregation_through(
+    mock_grpo_components, stop_after_disaggregation_gate, monkeypatch
+):
+    with pytest.raises(_PastTheDisaggregationGate):
+        _setup_up_to_the_disaggregation_gate(
+            mock_grpo_components["master_config"],
+            _sglang_disaggregation_generation(),
+            nemo_gym=False,
+            monkeypatch=monkeypatch,
+        )
+
+
+def test_setup_runs_the_sglang_disaggregation_validator(
+    mock_grpo_components, stop_after_disaggregation_gate, monkeypatch
+):
+    with pytest.raises(ValueError, match="pause_generation_mode must be 'abort'"):
+        _setup_up_to_the_disaggregation_gate(
+            mock_grpo_components["master_config"],
+            _sglang_disaggregation_generation(pause_mode="retract"),
+            nemo_gym=False,
+            monkeypatch=monkeypatch,
+        )
+
+
+def test_setup_refuses_sglang_disaggregation_with_nemo_gym(
+    mock_grpo_components, stop_after_disaggregation_gate, monkeypatch
+):
+    with pytest.raises(ValueError, match="NeMo-Gym"):
+        _setup_up_to_the_disaggregation_gate(
+            mock_grpo_components["master_config"],
+            _sglang_disaggregation_generation(),
+            nemo_gym=True,
+            monkeypatch=monkeypatch,
+        )
+
+
+def test_setup_refuses_disaggregation_on_a_backend_without_it(
+    mock_grpo_components, stop_after_disaggregation_gate, monkeypatch
+):
+    with pytest.raises(ValueError, match="only supported for"):
+        _setup_up_to_the_disaggregation_gate(
+            mock_grpo_components["master_config"],
+            _sglang_disaggregation_generation(backend="megatron"),
+            nemo_gym=False,
+            monkeypatch=monkeypatch,
+        )
+
+
 def test_setup_restores_adaptive_ppo_clip_state_from_checkpoint(
     mock_grpo_components, monkeypatch
 ):

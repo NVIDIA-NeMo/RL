@@ -33,7 +33,6 @@ from nemo_rl.models.generation.sglang import sglang_generation, sglang_router
 from nemo_rl.models.generation.sglang.config import (
     SGLANG_ROLE_ENGINE_ARG_KEYS,
     SGLangDisaggConfig,
-    SGLangRoleEngineArgs,
     resolve_sglang_disagg_config,
     resolve_sglang_role_overrides,
     sglang_disagg_server_kwargs,
@@ -103,8 +102,12 @@ def make_config(*, disagg=True, tp_size=1, num_gpus=8, **overrides):
 # ---------------------------------------------------------------------------
 # Config: role overrides, replica width, the disagg block, server kwargs
 # ---------------------------------------------------------------------------
-def test_the_role_override_whitelist_is_exactly_the_schema():
-    assert SGLANG_ROLE_ENGINE_ARG_KEYS == set(SGLangRoleEngineArgs.__annotations__)
+def test_a_role_key_with_the_wrong_type_is_rejected():
+    config = make_config(
+        **{"sglang_cfg.decode_engine": {"schedule_conservativeness": "0.7"}}
+    )
+    with pytest.raises(ValidationError, match="schedule_conservativeness"):
+        resolve_sglang_role_overrides(config)
     # The shared helper's kwargs channel is not a role knob on SGLang.
     assert "sglang_kwargs" not in SGLANG_ROLE_ENGINE_ARG_KEYS
 
@@ -150,6 +153,8 @@ def test_replica_width_counts_both_roles():
         }
     )
     assert sglang_replica_width(config) == 1 * 2 + 2 * 1
+    # A resolved config (role blocks carry the shared keys too) reads the same.
+    assert sglang_replica_width(resolve_sglang_role_overrides(config)) == 4
     assert sglang_replica_width(make_config(disagg=False, tp_size=4)) == 4
 
 
@@ -359,36 +364,90 @@ def test_multi_node_engines_take_whole_nodes_and_mixed_widths_keep_slots_straigh
         )
 
 
+@pytest.mark.parametrize(
+    "num_gpus, prefill_width, decode_width",
+    [
+        # Replica = P tp4 + D tp2 = 6 GPUs: engine 2 (replica 1's prefill) would take GPUs 6-9.
+        (24, 4, 2),
+        # Replica = P tp16 + D tp4 = 20 GPUs: engine 2 (a 2-node prefill) would start at GPU 20.
+        (40, 16, 4),
+    ],
+)
+def test_an_engine_that_would_straddle_a_node_is_refused(
+    num_gpus, prefill_width, decode_width
+):
+    with pytest.raises(ValueError, match="cross a 8-GPU node boundary"):
+        plan_sglang_engines(
+            num_gpus=num_gpus,
+            gpus_per_node=8,
+            layout=_layout(),
+            aggregated_width=1,
+            prefill_width=prefill_width,
+            decode_width=decode_width,
+            router_scope="replica",
+        )
+
+
+def test_node_aligned_mixed_widths_are_still_accepted():
+    # Control: P tp4 + D tp4 tiles 8-GPU nodes exactly.
+    specs, _, _ = plan_sglang_engines(
+        num_gpus=16,
+        gpus_per_node=8,
+        layout=_layout(),
+        aggregated_width=1,
+        prefill_width=4,
+        decode_width=4,
+        router_scope="replica",
+    )
+    assert [s.gpu_offset for s in specs] == [0, 4, 8, 12]
+
+
 # ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 def test_dispatcher_keeps_a_prompt_together_and_fills_the_least_loaded_router():
     dispatcher = ReplicaDispatcher(3)
+    every = range(3)
     key_a = ReplicaDispatcher.prompt_key([1, 2, 3])
     key_b = ReplicaDispatcher.prompt_key([4, 5])
     key_c = ReplicaDispatcher.prompt_key([6])
 
-    assert [dispatcher.acquire(key_a) for _ in range(4)] == [0, 0, 0, 0]
-    assert dispatcher.acquire(key_b) == 1
-    assert dispatcher.acquire(key_c) == 2
-    assert dispatcher.acquire(key_b) == 1
+    assert [dispatcher.acquire(key_a, every) for _ in range(4)] == [0, 0, 0, 0]
+    assert dispatcher.acquire(key_b, every) == 1
+    assert dispatcher.acquire(key_c, every) == 2
+    assert dispatcher.acquire(key_b, every) == 1
     assert dispatcher._inflight == [4, 2, 1]
 
     dispatcher.release(0)
     assert dispatcher._inflight == [3, 2, 1]
     # A sticky key stays put even when another router is emptier.
-    assert dispatcher.acquire(key_a) == 0
+    assert dispatcher.acquire(key_a, every) == 0
 
     dispatcher.reset()
     # After reset a prompt lands wherever the load is lowest.
-    assert dispatcher.acquire(key_a) == 2
+    assert dispatcher.acquire(key_a, every) == 2
     with pytest.raises(AssertionError):
         ReplicaDispatcher(2).release(1)
 
 
+def test_dispatcher_moves_a_prompt_off_a_router_that_is_no_longer_usable():
+    dispatcher = ReplicaDispatcher(3)
+    key = ReplicaDispatcher.prompt_key([1])
+    assert dispatcher.acquire(key, range(3)) == 0
+    dispatcher.release(0)
+    dispatcher.acquire(ReplicaDispatcher.prompt_key([2]), [2])
+    # Replica 0 lost an engine: its router is left out, and the prompt re-sticks
+    # to the least-loaded usable one (router 2 already holds a request).
+    assert dispatcher.acquire(key, [1, 2]) == 1
+    assert dispatcher.acquire(key, [1, 2]) == 1
+    assert dispatcher._inflight == [0, 2, 1]
+    with pytest.raises(AssertionError, match="usable"):
+        dispatcher.acquire(key, [])
+
+
 def test_dispatcher_with_one_router_never_consults_the_table():
     dispatcher = ReplicaDispatcher(1)
-    assert [dispatcher.acquire(k) for k in (1, 2, 3)] == [0, 0, 0]
+    assert [dispatcher.acquire(k, [0]) for k in (1, 2, 3)] == [0, 0, 0]
     assert dispatcher._inflight == [3]
     assert ReplicaDispatcher.prompt_key([7, 8]) == ReplicaDispatcher.prompt_key([7, 8])
 
@@ -510,7 +569,6 @@ def _bare_generation():
     generation._health_monitor = None
     generation.weight_synchronizer = None
     generation.all_engines = []
-    generation._router_actor = None
     generation._http_client = None
     generation._async_loop = None
     return generation
@@ -565,13 +623,20 @@ def test_aggregated_engines_pause_all_at_once(monkeypatch):
     events = []
     generation = _bare_generation()
     generation.all_engines = [_RecordingEngine(f"e{i}", events) for i in range(2)]
-    generation.num_gpus_per_engine = 1
-    generation.num_gpus_per_node = 1
+    generation._engine_specs, _, _ = plan_sglang_engines(
+        num_gpus=2,
+        gpus_per_node=1,
+        layout=_layout(enabled=False),
+        aggregated_width=1,
+        prefill_width=1,
+        decode_width=1,
+        router_scope="replica",
+    )
     generation.pause_generation(mode="retract")
     assert events == [("e0", "pause", "retract"), ("e1", "pause", "retract")]
 
 
-def test_slot_helpers_follow_the_specs_and_fall_back_to_the_uniform_layout():
+def test_slot_helpers_follow_the_specs():
     specs, _, _ = plan_sglang_engines(
         num_gpus=12,
         gpus_per_node=4,
@@ -595,17 +660,24 @@ def test_slot_helpers_follow_the_specs_and_fall_back_to_the_uniform_layout():
     with pytest.raises(IndexError):
         generation.engine_index_of_slot(3)
 
-    # Built without __init__: the uniform layout the old arithmetic assumed.
-    uniform = _bare_generation()
-    uniform.all_engines = ["a0", "a1", "b0", "b1"]
-    uniform.num_gpus_per_engine = 4
-    uniform.num_gpus_per_node = 2
-    uniform.gpu_offset = 0
-    uniform.router_ip, uniform.router_port = "127.0.0.1", 3000
+    # Two-node aggregated engines read the same way: two slots per engine.
+    uniform_specs, _, _ = plan_sglang_engines(
+        num_gpus=8,
+        gpus_per_node=2,
+        layout=_layout(enabled=False),
+        aggregated_width=4,
+        prefill_width=4,
+        decode_width=4,
+        router_scope="replica",
+    )
+    uniform = _generation_with_specs(uniform_specs, ["a0", "a1", "b0", "b1"])
+    uniform._router_endpoints = [("127.0.0.1", 3000)]
     assert uniform.engines == ["a0", "b0"]
     assert uniform.engine_gpu_counts == [4, 4]
     assert uniform.engine_slot_range(1) == range(2, 4)
     assert uniform.router_endpoint_for_engine(1) == ("127.0.0.1", 3000)
+    # Built without __init__, an instance has no engines to address.
+    assert _bare_generation().engines == []
 
 
 def test_engine_config_is_narrowed_to_the_role():
@@ -667,12 +739,51 @@ def test_generate_one_sample_posts_to_the_prompt_group_router_and_releases_it():
     assert urls[2] == "http://10.0.0.2:8600/generate"
     assert generation._dispatcher._inflight == [0, 0]
 
-    # Without routers to choose from, the single configured endpoint is used.
-    legacy = _bare_generation()
-    legacy._http_client = _Client()
-    legacy.router_ip, legacy.router_port = "127.0.0.1", 3000
-    asyncio.run(legacy.generate_one_sample({}, [5], 0))
+    # One router (aggregated, or router_scope: global): every request goes to it.
+    single = _bare_generation()
+    single._http_client = _Client()
+    single._router_endpoints = [("127.0.0.1", 3000)]
+    single._dispatcher = ReplicaDispatcher(1)
+    asyncio.run(single.generate_one_sample({}, [5], 0))
     assert posted[-1][0] == "http://127.0.0.1:3000/generate"
+
+
+def test_generate_one_sample_skips_a_replica_that_lost_an_engine():
+    posted = []
+
+    class _Client:
+        async def post(self, url, payload):
+            posted.append(url)
+            return {"meta_info": {}}
+
+    specs, _, num_routers = plan_sglang_engines(
+        num_gpus=4,
+        gpus_per_node=4,
+        layout=_layout(),
+        aggregated_width=1,
+        prefill_width=1,
+        decode_width=1,
+        router_scope="replica",
+    )
+    # Replica 0's decode engine is dead (fault tolerance set its slot to None).
+    generation = _generation_with_specs(specs, ["p0", None, "p1", "d1"])
+    generation._http_client = _Client()
+    generation._router_endpoints = [("10.0.0.1", 8600), ("10.0.0.2", 8600)]
+    generation._dispatcher = ReplicaDispatcher(num_routers)
+    assert generation._usable_routers() == [1]
+
+    async def run():
+        return await asyncio.gather(
+            *(generation.generate_one_sample({}, [i], i) for i in range(4))
+        )
+
+    asyncio.run(run())
+    assert posted == ["http://10.0.0.2:8600/generate"] * 4
+
+    # With no whole replica left every router stays in play; the request then
+    # fails and retries as before.
+    generation.all_engines = ["p0", None, None, "d1"]
+    assert generation._usable_routers() == [0, 1]
 
 
 def test_finish_generation_forgets_the_step_prompt_placements():
@@ -681,7 +792,9 @@ def test_finish_generation_forgets_the_step_prompt_placements():
     generation.needs_offload = False
     generation._dispatcher = ReplicaDispatcher(2)
     for prompt in ([1], [2]):
-        target = generation._dispatcher.acquire(ReplicaDispatcher.prompt_key(prompt))
+        target = generation._dispatcher.acquire(
+            ReplicaDispatcher.prompt_key(prompt), [0, 1]
+        )
         generation._dispatcher.release(target)
     assert generation._dispatcher._sticky
     generation.finish_generation()
@@ -775,6 +888,55 @@ def test_server_args_without_a_role_are_unchanged(monkeypatch):
     assert not any(key.startswith("disaggregation") for key in kwargs)
 
 
+# A value per role key that differs from anything a default config holds.
+_ROLE_VALUES = {
+    "tp_size": 1,
+    "ep_size": 1,
+    "mem_fraction_static": 0.55,
+    "max_running_requests": 17,
+    "chunked_prefill_size": 1234,
+    "max_prefill_tokens": 4321,
+    "schedule_policy": "lpm",
+    "schedule_conservativeness": 0.7,
+    "num_continuous_decode_steps": 3,
+    "disable_cuda_graph": True,
+    "disable_cuda_graph_padding": True,
+    "cuda_graph_backend_decode": "x",
+    "cuda_graph_backend_prefill": "y",
+    "cuda_graph_max_bs_decode": 24,
+    "cuda_graph_max_bs_prefill": 12,
+    "cuda_graph_bs_decode": [1, 2],
+    "cuda_graph_bs_prefill": [1],
+}
+
+
+def test_every_role_override_key_reaches_the_server_args(monkeypatch):
+    assert set(_ROLE_VALUES) == SGLANG_ROLE_ENGINE_ARG_KEYS
+    resolved = resolve_sglang_role_overrides(
+        make_config(**{"sglang_cfg.decode_engine": dict(_ROLE_VALUES)})
+    )
+    engine_cfg = {
+        **resolved,
+        "sglang_cfg": sglang_role_engine_config(resolved, "decode"),
+    }
+    engine_cfg["sglang_cfg"]["random_seed"] = 1
+    engine_cfg["sglang_cfg"]["skip_server_warmup"] = True
+    worker = _bare_worker(
+        monkeypatch,
+        sglang_cfg=engine_cfg,
+        width=1,
+        gpus_per_node=8,
+        rank=0,
+        node_rank=0,
+    )
+    worker.disagg_role = "decode"
+
+    kwargs = worker._compute_server_args("10.0.0.1:3002", 3001, "10.0.0.1", 3000)
+
+    dropped = {k for k, v in _ROLE_VALUES.items() if kwargs.get(k) != v}
+    assert not dropped, f"role keys accepted but never passed to ServerArgs: {dropped}"
+
+
 # ---------------------------------------------------------------------------
 # Router actor: PD mode
 # ---------------------------------------------------------------------------
@@ -837,6 +999,14 @@ def test_constructor_validates_disaggregation_before_allocating(monkeypatch):
     cluster._init_placement_groups.assert_not_called()
     loop_factory.assert_not_called()
     assert generation.shutdown()
+
+
+def test_validate_settings_refuses_disaggregation_on_the_single_controller_entrypoint():
+    aggregated = SimpleNamespace(policy={"generation": make_config(disagg=False)})
+    assert SGLangGeneration.validate_settings(aggregated) is None
+    disaggregated = SimpleNamespace(policy={"generation": make_config()})
+    with pytest.raises(ValueError, match="SingleController"):
+        SGLangGeneration.validate_settings(disaggregated)
 
 
 # ---------------------------------------------------------------------------
