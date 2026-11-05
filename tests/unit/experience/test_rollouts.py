@@ -57,6 +57,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_MODEL_SAMPLING_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
@@ -3143,6 +3144,34 @@ def test_nemo_gym_group_task_index_checks_each_prompt_group():
     assert rollouts_mod._nemo_gym_group_task_index([{}, {}], group_size=2) is None
     with pytest.raises(ValueError, match="one _ng_task_index per prompt group"):
         rollouts_mod._nemo_gym_group_task_index(rows, group_size=4)
+
+
+def test_prepare_nemo_gym_rows_marks_rows_rl_does_not_train_on():
+    rows = [{"responses_create_params": {}} for _ in range(2)]
+
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        generation_config={"max_new_tokens": 64},
+        sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+        num_generations=1,
+        skip_token_capture=True,
+    )
+
+    assert [row[NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY] for row in rows] == [True, True]
+
+
+def test_prepare_nemo_gym_rows_clears_a_mark_from_rows_rl_trains_on():
+    # A row reused from validation, or a dataset row carrying the key, is still captured for training.
+    rows = [{"responses_create_params": {}, NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY: True}]
+
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        generation_config={"max_new_tokens": 64},
+        sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+        num_generations=1,
+    )
+
+    assert NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY not in rows[0]
 
 
 def test_prepare_nemo_gym_rows_stamps_sampling_beside_mixed_materialized_and_flat_inputs():
