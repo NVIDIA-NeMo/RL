@@ -438,19 +438,17 @@ def setup(
                 "value.sequence_packing.enabled=true."
             )
     else:
-        # Automodel PPO value model currently doesn't support sequence packing and CP.
         assert (value_config.get("automodel_cfg") or {}).get("enabled"), (
             "Exactly one of value.megatron_cfg.enabled or value.automodel_cfg.enabled "
             "must be true for the PPO value model."
         )
-        assert value_config["sequence_packing"]["enabled"] is False, (
-            "Sequence packing is currently not supported for the Automodel PPO value model. "
-            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
-        )
-        assert value_config["automodel_cfg"]["context_parallel_size"] == 1, (
-            "Context parallelism (CP>1) is currently not supported for the Automodel PPO value model. "
-            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
-        )
+        if value_config["automodel_cfg"]["context_parallel_size"] > 1:
+            assert not value_config["sequence_packing"]["enabled"], (
+                "Automodel context parallelism is incompatible with value sequence "
+                "packing. Set value.sequence_packing.enabled=false when "
+                "value.automodel_cfg.context_parallel_size>1."
+            )
+
     # Set seed for all random number generators
     set_seed(ppo_config.seed)
 
