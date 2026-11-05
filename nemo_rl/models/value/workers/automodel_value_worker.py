@@ -511,8 +511,12 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         self.model.eval()
         torch.cuda.empty_cache()
 
-    def finish_training(self) -> None:
+    def finish_training(self, keep_resident: bool = False) -> None:
         """Offload value model and optimizer state after training."""
+        if keep_resident:
+            self.model.eval()
+            return
+
         self.model = self.move_to_cpu(self.model)
         self.model.eval()
 
@@ -522,8 +526,11 @@ class AutomodelValueWorkerImpl(AbstractPolicyWorker):
         gc.collect()
         torch.cuda.empty_cache()
 
-    def finish_inference(self) -> None:
+    def finish_inference(self, keep_resident: bool = False) -> None:
         """Offload value model parameters after inference."""
+        if keep_resident:
+            return
+
         self.model = self.move_to_cpu(self.model)
 
         gc.collect()

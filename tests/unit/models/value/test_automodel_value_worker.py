@@ -52,6 +52,20 @@ from nemo_rl.utils.checkpoint import CheckpointManager
 pytestmark = pytest.mark.automodel
 
 
+def test_finish_keeps_automodel_value_worker_resident():
+    from nemo_rl.models.value.workers.automodel_value_worker import (
+        AutomodelValueWorkerImpl,
+    )
+
+    worker = MagicMock()
+    AutomodelValueWorkerImpl.finish_training(worker, keep_resident=True)
+    AutomodelValueWorkerImpl.finish_inference(worker, keep_resident=True)
+
+    worker.model.eval.assert_called_once_with()
+    worker.move_to_cpu.assert_not_called()
+    worker.move_optimizer_to_device.assert_not_called()
+
+
 def test_right_shift_values_aligns_value_predictions_to_state_tokens():
     from nemo_rl.models.value.utils import right_shift_values
 

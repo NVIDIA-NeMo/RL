@@ -290,6 +290,7 @@ def patched_factories():
                 MagicMock(name="train_cluster"),
                 MagicMock(name="inference_cluster"),
                 None,
+                None,
             ),
         ) as mock_clusters,
         patch.object(
