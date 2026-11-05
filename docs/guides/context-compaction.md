@@ -93,7 +93,7 @@ The existing ledger tracks exact attempted call IDs. A missing worker acknowledg
 
 This figure describes the native recency client. Other harnesses choose their own compaction policies. The uncaught guard-rejection path shown here is a current limitation, not a recommended recovery policy.
 
-Set `async_rl.rollout_failure.nemo_gym.rollout_timeout_s` as a backstop for a hung prompt-group stream; it is not a per-model-call deadline or an acknowledgement that the remote engine stopped. A timeout or transport failure that prevents an agent result drops the prompt group. Forest training follows the existing drop budgets and `async_rl.rollout_failure.min_step_batch_fraction`: a permitted drop can reduce the number of complete prompt groups in a step. Each retained group still requires all logical siblings and their segments. Falling below the configured fraction, or retaining no groups, stops training; the controller logs `dropped_prompt_groups`. Loss normalization uses the retained valid tokens, with one optimizer step and unchanged configured global batch size. Forest training also does not redispatch failed groups because selected-response metadata is request-local; retry support is tracked in [#4557](https://github.com/NVIDIA-NeMo/RL/issues/4557). This differs from masking an invalid sibling while retaining the complete group, which is supported. Data-integrity errors still raise, and operator cancellation still propagates.
+Set `async_rl.rollout_failure.nemo_gym.rollout_timeout_s` as a backstop for a hung prompt-group stream; it is not a per-model-call deadline or an acknowledgement that the remote engine stopped. A timeout or transport failure that prevents an agent result drops the prompt group. Forest training follows the existing drop budgets and `async_rl.rollout_failure.min_step_batch_fraction`: a permitted drop can reduce the number of complete prompt groups in a step. Each retained group still requires all logical siblings and their segments. Falling below the configured fraction, or retaining no groups, stops training; the controller logs `dropped_prompt_groups`. Loss normalization uses the retained valid tokens, with one optimizer step and unchanged configured global batch size (a Forest PPO critic uses the step's row count). Forest training also does not redispatch failed groups because selected-response metadata is request-local; retry support is tracked in [#4557](https://github.com/NVIDIA-NeMo/RL/issues/4557). This differs from masking an invalid sibling while retaining the complete group, which is supported. Data-integrity errors still raise, and operator cancellation still propagates.
 
 Completed attempt receipts retain unselected records for cleanup. Before publication, the fixed selection determines exact canonical row and padding IDs. A lost canonical-write acknowledgement preserves source staging; the controller owns the exact publication cleanup keys. Foreign scope and invalid trainable selection fail before publication.
 
@@ -231,9 +231,12 @@ includes rows masked from the loss. Execution padding counts only with
 `whiten_execution_padding: true` (which requires `all_rows`); it never trains.
 The critic trains on all of a step's rows as one optimizer step, and execution
 padding is sized for both the policy's and the critic's data-parallel and
-microbatch shapes.
+microbatch shapes. Forest PPO requires `ppo.value_training_mode: whole_batch`.
+Each physical row is its own GAE episode: the reward sits on the row's last
+response token and values do not bootstrap across rows, which matters when
+`gae_lambda < 1`.
 
-Batch cardinality and advantages count logical rollouts, not physical rows. The environment-filtered metric also counts each flagged rollout once, excluding padding.
+Batch cardinality counts logical rollouts; GRPO advantages are per logical rollout, PPO advantages are per physical row. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` or `ppo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping, reward penalties, and message-level advantage overrides remain unsupported for forest training. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
 
 `token_capture.forest_padding_scope: step` (Forest only; default `group`) pads
 each training batch once to the row multiple, instead of padding every
