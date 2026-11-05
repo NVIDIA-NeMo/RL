@@ -1,7 +1,6 @@
 # Nano 3.5 SingleController DAPO with Megatron training and vLLM generation,
-# H100 2n8g. Groups whose generations all score the same are dropped and
-# resampled from a pool the rollout pump refills on demand, so the step keeps
-# its batch size.
+# H100 4n8g: two training nodes and two generation nodes. Uniform-reward
+# groups are resampled from a pool the rollout pump refills on demand.
 #
 # No NeMo-Gym: the filter is a property of the rollout pump, not of the
 # environment, so the cheaper built-in math env exercises it just as well and
@@ -13,11 +12,12 @@
 # rollout.
 # Launch with:
 #   uv run examples/run_grpo_single_controller.py \
-#     --config examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-2n8g-megatron-vllm-noncolocated-single-controller.yaml
+#     --config examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-megatron-vllm-noncolocated-single-controller.yaml
 defaults: ./dapo-nanov3.5-30BA3B-4n8g-automodel-ep8.yaml
 grpo:
   # One optimizer step per RL step: 8 prompts x 8 generations = batch 64.
   num_prompts_per_step: 8
+  max_num_steps: 10
   num_generations_per_prompt: 8
   # SC does not support validation yet.
   val_period: 0
@@ -34,8 +34,8 @@ grpo:
     enabled: false
 policy:
   train_global_batch_size: 64
+  offload_policy_before_refit: true
   sequence_packing:
-    # Megatron context parallelism requires packed sequence metadata.
     enabled: true
   dynamic_batching:
     enabled: false
@@ -47,10 +47,7 @@ policy:
     enabled: true
     activation_checkpointing: true
     bias_activation_fusion: false
-    tensor_model_parallel_size: 2
-    context_parallel_size: 2
     expert_model_parallel_size: 8
-    sequence_parallel: true
     moe_router_dtype: fp32
     optimizer:
       lr: 1.0e-06
@@ -66,9 +63,9 @@ policy:
       enabled: false
       resources:
         gpus_per_node: 8
-        num_nodes: 1
+        num_nodes: 2
 checkpointing:
-  checkpoint_dir: results/dapo-nanov3.5-30BA3B-2n8g-megatron-vllm-noncolocated-single-controller
+  checkpoint_dir: results/dapo-nanov3.5-30BA3B-4n8g-megatron-vllm-noncolocated-single-controller
   metric_name: null
   save_data_plane: true
 
@@ -90,9 +87,7 @@ async_rl:
     max_replacement_attempts: 1
     replacement_reserve_prompts: ${grpo.num_prompts_per_step}
 logger:
-  log_dir: logs/dapo-nanov3.5-30BA3B-2n8g-megatron-vllm-noncolocated-single-controller
+  log_dir: logs/dapo-nanov3.5-30BA3B-4n8g-megatron-vllm-noncolocated-single-controller
   wandb:
     project: nemo-rl
-    name: dapo-nanov3.5-30BA3B-2n8g-megatron-vllm-noncolocated-single-controller
-cluster:
-  num_nodes: 2
+    name: dapo-nanov3.5-30BA3B-4n8g-megatron-vllm-noncolocated-single-controller
