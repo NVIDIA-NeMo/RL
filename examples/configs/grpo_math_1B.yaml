@@ -6,12 +6,26 @@ grpo:
   max_num_epochs: 1
   max_num_steps: 1000000
   normalize_rewards: true
+  # Rows that vote in the advantage statistics (group baseline/std, GDPO/Reinforce++
+  # batch normalization, dynamic-sampling admission): include (default) every row,
+  # masked rewards too; exclude only rows with a nonzero loss weight. Loss masks unchanged.
+  masked_reward_policy: include
   use_leave_one_out_baseline: true
   val_period: 10
+  val_start_at: -1  # First step eligible for periodic validation; -1 disables the delay
   val_at_start: false
   val_at_end: false
   overlong_filtering: false
+  advantage_clip_low: null
+  advantage_clip_high: null
   max_val_samples: 256
+  # Validation rollouts per prompt; k > 1 also reports the pass_k metric.
+  # max_val_samples counts PROMPTS: total validation rollouts = max_val_samples * k.
+  val_num_generations_per_prompt: 1
+  # Early stop once this metric (e.g. accuracy or pass_k) reaches the threshold; null disables.
+  stop_at_validation_metric: null
+  # Required when stop_at_validation_metric is set.
+  stop_at_validation_threshold: null
   val_batch_size: 256
   seed: 42
   use_dynamic_sampling: false
@@ -28,9 +42,11 @@ grpo:
   # Options: "grpo" (default) or "reinforce_plus_plus"
   adv_estimator:
     name: "grpo"  # Use "reinforce_plus_plus" for Reinforce++ estimator
-    normalize_rewards: true
-    use_leave_one_out_baseline: false
+    normalize_rewards: ${grpo.normalize_rewards}
+    use_leave_one_out_baseline: ${grpo.use_leave_one_out_baseline}
     minus_baseline: true  # Reinforce++-baseline specific: subtract per-prompt mean baseline
+    proximal_teacher_alpha: 1.0  # OPD-specific: TROPD proximal-teacher weight in (0, 1]; 1.0 is plain MOPD
+    subtract_global_baseline: false  # OPD-specific: center advantages on the step's mean over valid tokens
   reward_scaling:
     enabled: false
     source_min: 0.0
@@ -38,13 +54,33 @@ grpo:
     target_min: 0.0
     target_max: 1.0
   seq_logprob_error_threshold: null
+  # Advantage value assigned to invalid tool call tokens (e.g. -5.0 to penalize). null disables.
+  invalid_tool_call_advantage: null
+  # Advantage value assigned to tokens with malformed <think>/</think> tags (e.g. -5.0). null disables.
+  malformed_thinking_advantage: null
 
   async_grpo:
     enabled: false # Set to true to enable async training mode
     # Max age (in training steps) for trajectories used in training
     max_trajectory_age_steps: 1
+    # Number of generation-worker failures tolerated before aborting.
+    # 0 (default) = fail on the first worker exception. Increase only
+    # when transient generation errors are expected and acceptable to drop.
+    max_generation_failures: 0
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
-    recompute_kv_cache_after_weight_updates: false # Set to true to recompute kv cache after in-flight-weight-updates
+    recompute_kv_cache_after_weight_updates: true # Set false to retain pre-update KV caches (avoids repeated prefill).
+
+# Reward-zeroing penalties applied to NeMo-Gym rollout results.
+reward_penalties:
+  penalize_duplicated_reasoning: false
+  penalize_empty_final_answer: false
+  penalize_unwanted_tokens: false
+  penalize_malformed_think_tag: false
+  # Optional model/tokenizer-specific token IDs. Add token IDs that should
+  # be penalized when emitted by the model. Unwanted token IDs must be
+  # specified explicitly; think-tag IDs are inferred when each tag encodes
+  # to one token. Example: {unwanted: [2], think_open: 12, think_close: 13}
+  token_ids: null
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
@@ -61,13 +97,41 @@ loss_fn:
   # Async GRPO requires importance sampling correction enabled
   # Set to true when async_grpo.enabled is true
   use_importance_sampling_correction: false
+  # "tis"          – clamp IS weights to [min, max], where min defaults to 0
+  # "icepop"       – zero out tokens with IS weight outside [min, max]
+  # "adaptive-ppo-clip" – advantage-aware token filtering with an entropy-adaptive upper bound
+  # "seq-mask-tis" – zero out sequences by geometric-mean IS ratio, non-truncated token IS correction
+  truncated_importance_sampling_type: null
   truncated_importance_sampling_ratio: null
-  truncated_importance_sampling_ratio_min: null  # Lower bound for ICE-POP
-  truncated_importance_sampling_type: tis  # "tis" (clamp to max) or "icepop" (filter outside [min, max])
+  # TIS lower bound; null means 0 for TIS. Set explicitly for ICE-POP / adaptive-ppo-clip / seq-mask-tis.
+  truncated_importance_sampling_ratio_min: null
+  # adaptive-ppo-clip only; ignored otherwise. The A > 0 upper bound is truncated_importance_sampling_ratio + k.
+  # After each step, k rises by k_step if approx_entropy is below the target and falls by k_step if above,
+  # clamped to [0, k_max]. Tokens with IS weight above outer_bound are dropped.
+  truncated_importance_sampling_adaptive_target_entropy: 0.3
+  truncated_importance_sampling_adaptive_k_step: 0.25
+  truncated_importance_sampling_adaptive_k_max: 1.0
+  truncated_importance_sampling_adaptive_outer_bound: 50.0
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false  # Set to true to force ratio=1.0 (requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt)
+  # Opt-in single-forward Megatron GRPO: apply the threshold during training
+  # and normalize gradients over survivors before the optimizer step.
+  seq_logprob_error_in_loss: false
   use_kl_in_reward: false  # Reinforce++: add KL penalty to reward instead of loss
+  use_cispo: false  # CISPO (https://arxiv.org/abs/2506.13585): clipped IS-weight policy optimization
+  # Disable PPO ratio (curr_logprobs - prev_logprobs).exp(); falls back to REINFORCE-style
+  # surrogate loss. Used by REINFORCE/RLOO. See https://arxiv.org/abs/2402.14740
+  disable_ppo_ratio: false
+  # VAPO positive-example NLL loss weight: L = L_PPO + mu * L_NLL(correct samples).
+  # 0.0 disables it. VAPO paper recommends 0.1.
+  positive_example_nll_weight: 0.0
+  # Keep full diagnostics; use "minimal" to skip diagnostic-only kernels.
+  metrics_level: "full"
+  enable_torch_compile: false
+  # Score centering (https://arxiv.org/abs/2609.20807): subtract the sampler-expected
+  # score per token, using the captured top-k (needs policy.generation.top_logprobs > 0).
+  score_centering: false
 
 checkpointing:
   enabled: true
@@ -77,15 +141,24 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
-  model_save_format: "safetensors"
-  save_consolidated: false
+  # Async GRPO: restore replay-buffer state on resume. Set false to regenerate
+  # the buffered window fresh instead of reusing completed groups (which skew
+  # toward short rollouts at a save boundary).
+  load_replay_buffer: true
+  save_optimizer: true
+  # SingleController only: include native TQ state and the metadata-only replay
+  # index. Required for recovery-capable samplers to preserve completed,
+  # unconsumed rollouts.
+  save_data_plane: false
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
   tokenizer:
     name: ${policy.model_name} ## specify if you'd like to use a tokenizer different from the model's default
     chat_template_kwargs: null # can be used to pass kwargs to the chat template, e.g., enable_thinking=true
-  hf_config_overrides: {} 
+    tokenizer_kwargs: null # extra kwargs forwarded to tokenizer loading, e.g., {fix_mistral_regex: false}
+    use_fastokens: false # opt-in Rust-backed BPE tokenizer for NeMo-RL tokenization; NRL_USE_FASTOKENS overrides this and also sets VLLM_USE_FASTOKENS.
+  hf_config_overrides: {}
   train_global_batch_size: 512
   train_micro_batch_size: 4
   generation_batch_size: 32 # Only used when generating using HF backend
@@ -94,17 +167,35 @@ policy:
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false # Only useful for non-colocated generation since colocated generation will always offload optimizer to cuda before refit
+  # Run the policy offload lifecycle before non-colocated refit.
+  offload_policy_before_refit: false
+  # Move optimizer state to CPU when the refit offload lifecycle runs.
+  offload_optimizer_for_refit: true
+  worker_extension_cls_fqn: null # optional registered policy-worker subclass; mutually exclusive with quant_cfg
 
-  dtensor_cfg:
-    _v2: true
+  automodel_cfg:
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      # Canonical Automodel modes: "false", "final", or "every".
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
+    deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
-    
+
+    # Automodel kwargs passed to from_pretrained.
+    # Uncomment force_hf if the custom model's adapter doesn't support per-tensor
+    # weight conversion (e.g. Qwen2, Llama). Auto-detected if not set.
+    # See https://github.com/NVIDIA-NeMo/RL/issues/2072
+    automodel_kwargs: {}
+      # force_hf: true
+
     # LoRA (Low-Rank Adaptation) Configuration
     lora_cfg:
       enabled: False  # Set to True to enable LoRA fine-tuning
@@ -117,12 +208,64 @@ policy:
       dropout_position: "post"  # Where to apply dropout: "pre" (before LoRA) or "post" (after LoRA)
       lora_A_init: "xavier"  # Initialization method for LoRA A matrix: "xavier" or "uniform"
       use_triton: true  # Use Triton-optimized kernels for LoRA (faster but requires flash-attn). Disable when tensor_parallel_size > 1
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
   
   megatron_cfg:
     enabled: false
+    # When true, offload_after_refit skips rerunning the full offload_before_refit
+    # pass and only re-offloads the optimizer with a single allocator cleanup.
+    # When true, stage the per-step reference-policy swap in persistent pinned
+    # CPU buffers instead of pageable copies (faster PCIe, more host RAM).
+    # Arbitrary overrides applied recursively to the Megatron Bridge model
+    # provider before model instantiation. Do not duplicate first-class fields.
+    model_overrides: {}
+    checkpoint:
+      async_save: true
+      ckpt_assume_constant_structure: true
+      parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
+    # Compute next-token logprobs directly from hidden states with a chunked
+    # linear cross-entropy fusion, avoiding materialization of the full
+    # [batch, seq_len, vocab_size] logit tensor. Reduces peak memory and extends
+    # the maximum trainable sequence length. Not compatible with context
+    # parallelism, sequence packing, or top-k/top-p training-time filtering.
+    use_fused_linear_logprobs: false
+    fused_linear_logprobs_chunk_size: 256
+    force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
-    converter_type: "Qwen2ForCausalLM"
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
+    # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
+    cuda_graph_impl: "none"
+    cuda_graph_modules: []
+    cuda_graph_warmup_steps: 3
+    # Offload specific module activations to CPU. Works for both dense and MoE
+    # models and requires transformer_engine. Different from optimizer_cpu_offload,
+    # which offloads optimizer states. On TE >= 2.10,
+    # also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
+    fine_grained_activation_offloading: false
+    # Modules to offload when fine_grained_activation_offloading is true.
+    # Common examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"].
+    # Supported names depend on the pinned Megatron-LM version and are
+    # validated by MCore. "attn_proj" requires "core_attn". See the latest
+    # upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+    offload_modules: null
+    # recompute_granularity controls activation checkpointing depth.
+    # "full": recompute all activations (default, max memory savings).
+    # "selective": recompute only specific modules (see recompute_modules).
+    # Only takes effect when activation_checkpointing: true.
+    recompute_granularity: "full"
+    # Modules to selectively recompute when recompute_granularity="selective".
+    # MCore options: ["core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts"].
+    # Null defaults to ["core_attn"]. Full list and per-module constraints:
+    # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
+    # Use ["moe"] for MoE models to recompute expert activations only.
+    recompute_modules: null
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
@@ -136,16 +279,50 @@ policy:
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
-    moe_permute_fusion: false
-    #gives ~20% training perf speedup with sequence packing
+    moe_permute_fusion: true
+    # gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
+    flash_attention_version: 2
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    reuse_logits_storage: false
+    fp32_lm_head: false # Emit fp32 logits from Megatron's LM head; must match policy.generation.vllm_cfg.fp32_lm_head.
     moe_per_layer_logging: False
     moe_enable_deepep: false
-    moe_token_dispatcher_type: "allgather"
+    moe_token_dispatcher_type: "alltoall"
+    # For HybridEP sequence packing with PP=1 and MTP disabled, set true to align
+    # uneven rank-local inputs before forward and avoid collective-order hangs.
+    moe_hybridep_prepad_packed_inputs: false
     moe_shared_expert_overlap: false
+    use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    distributed_timeout_minutes: null
+    # Multi-Token Prediction (MTP). mtp_num_layers=0 disables MTP.
+    mtp_num_layers: 0
+    # MTP loss weight added to the main next-token loss (0.0 disables the MTP loss contribution).
+    mtp_loss_scaling_factor: 0.0
+    # When true, repeat one MTP layer mtp_num_layers times instead of using distinct layers.
+    mtp_use_repeated_layer: false
+    # When true, detach MTP heads so MTP loss does not affect main-model gradients.
+    mtp_detach_heads: false
+    gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
+
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: None
+      restore_from: null  # Warm start: path to a native Megatron PEFT checkpoint (iter_XXXXXXX dir or its root) to initialize this run's LoRA weights from, e.g. a previous SFT run
 
     optimizer:
       optimizer: "adam"
@@ -173,6 +350,7 @@ policy:
       # optimizer cpu offload
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -196,7 +374,61 @@ policy:
       fp8_recipe: "blockwise"
       fp8_param: false
 
+    # Transformer Engine FP4 training; disabled by default.
+    fp4_cfg:
+      enabled: false
+      fp4: "e2m1"
+      fp4_recipe: "nvfp4"
+      fp4_param: false
+
+    # Keep boundary transformer layers in BF16 during FP8 or FP4 training.
+    # The layer counts apply only when first_last_layers_bf16 is true.
+    first_last_layers_bf16: false
+    num_layers_at_start_in_bf16: 1
+    num_layers_at_end_in_bf16: 1
+
     env_vars: null
+
+  draft:
+    enabled: false
+    model_name: null
+    loss_weight: 0.1
+    # Drafter family: "eagle3" (Megatron backend, or Automodel with the
+    # speculators-style TTT trainer), "dspark" / "dflash" (Automodel backend;
+    # dflash is the markov-free, confidence-free, bonus-anchor variant).
+    speculator_type: "eagle3"
+    # --- eagle3 (Megatron path) ---
+    num_layers: null
+    aux_layer_indices: null
+    # Tokens per FP32 vocab tile in the streaming draft soft-CE (Megatron
+    # path). Lower it if the tile (token_chunk_size x vocab, in fp32) is too
+    # large for the device; raise it if the GPU is launch-bound.
+    token_chunk_size: 4096
+    # Optional draft-only optimizer schedule (Megatron eagle3 path only). Set
+    # a mapping with `lr` and optional `min_lr`/`weight_decay` to enable it.
+    optimizer: null
+    # --- eagle3 (Automodel TTT path). Architecture fields (aux layer ids,
+    # draft_vocab_size, d2t/t2d maps, norm_before_residual, layer family)
+    # come from the speculators-format draft checkpoint's config.json. ---
+    # Draft param-group lr; must far exceed the policy RL lr so the draft
+    # tracks policy drift.
+    learning_rate: 1.0e-04
+    # TTT unroll depth; align generation's num_speculative_tokens with it.
+    ttt_steps: 3
+    # Per-step loss decay gamma (loss_k *= gamma^k).
+    ttt_step_loss_decay: 1.0
+    train_embed_and_head: true
+    # --- dspark/dflash (Automodel only; set speculator_type above to use).
+    # Architecture fields (block_size, target_layer_ids, mask_token_id,
+    # sample_from_anchor, markov/confidence head layout) come from the draft
+    # checkpoint's config.json. dflash requires confidence_loss_alpha: 0.0. ---
+    # num_anchors: 64  # draft-side transient memory scales with
+    #                  # num_anchors x block_size x vocab; shipped recipes
+    #                  # use 32-64, not a pretraining-scale value.
+    # ce_loss_alpha: 0.1
+    # l1_loss_alpha: 0.9
+    # confidence_loss_alpha: 1.0
+    # loss_decay_gamma: 4.0
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
   # for more details on dynamic batching and sequence packing.
@@ -211,11 +443,12 @@ policy:
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
     sequence_length_round: 64
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${policy.automodel_cfg.tensor_parallel_size}
   max_grad_norm: 1.0
 
   optimizer:
@@ -225,10 +458,6 @@ policy:
       weight_decay: 0.01
       betas: [0.9, 0.999]
       eps: 1e-8
-      # when using Dtensor, we need to set foreach
-      # and fused to False
-      foreach: False
-      fused: False
 
   scheduler:
     - name: "torch.optim.lr_scheduler.LinearLR"
@@ -243,40 +472,139 @@ policy:
     - milestones: [50]
 
   generation:
+    # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
+    # See ray.sub for the full port layout.
+    port_range_low: 3000
+    port_range_high: 4999
     backend: "vllm"
     max_new_tokens: ${policy.max_total_sequence_length}
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    top_logprobs: 0  # Sampler candidates per token for score centering; 0 disables collection.
+    # Validation-only sampling; defaults follow the train values above.
+    val_temperature: ${.temperature}
+    val_top_p: ${.top_p}
+    val_top_k: ${.top_k}
     stop_token_ids: null
     stop_strings: null
+    # Prefill/decode disaggregation: split each rollout replica into context
+    # (prefill) and generation (decode) engines, fronted by servers that expose
+    # the URLs the rollout client talks to.
+    disaggregation:
+      enabled: false
+      # Engines per replica; the two are independent, so the P:D ratio is free.
+      # The replica *count* is not configured -- it follows from the inference
+      # cluster's size, like the DP-shard count does without disaggregation.
+      num_prefill_engines: 1
+      num_decode_engines: 1
+      # Frontend workers per replica. Each is its own CPU-only actor with a
+      # distinct URL, and the rollout client's per-session affinity shards
+      # conversations across them, so one frontend's CPU stops being the
+      # replica's turn-throughput ceiling. replicas * workers must be <= 256.
+      num_frontend_workers: 1
+      # Render the chat template and tokenize on the frontends instead of in
+      # the prefill engine's adapter. Rendering cost grows with conversation
+      # length and the adapter is one thread per prefill engine, which can
+      # only be scaled by adding GPUs; frontends are CPU-only, which is what
+      # makes num_frontend_workers worth raising.
+      frontend_tokenize: false
+      # Base port for the frontends' deterministic ports
+      # (base + replica_idx * num_frontend_workers + frontend_idx). Like every
+      # service port they must stay below 9000, the ephemeral floor on some
+      # DGX/GB200 nodes; [8300, 8556) is their band in virtual_cluster.py.
+      frontend_base_port: 8300
+    # null = topology default (IPC colocated, NCCL non-colocated). For
+    # non-colocated Megatron generation it selects the packed collective; use
+    # mcore for native refit.
+    # Non-colocated vLLM also supports vllm_s3_sparse, vllm_zmq_sparse, and nixl.
+    # Non-colocated vLLM or Megatron generation supports nccl_reshard (M-to-N).
+    refit_transport: null
+    # LoRA refit representation for vLLM. Native keeps A/B factorized and is
+    # the correctness-first default; merged materializes full W + BA weights.
+    lora_refit_mode: native
+    # vLLM backend only - sglang/megatron/trtllm/dynamo require this to remain null.
+    # Selects the NeMo-RL Ray actor class, NOT vLLM's own `worker_extension_cls`.
+    worker_extension_cls_fqn: null # optional registered vLLM generation-worker subclass; mutually exclusive with quant_cfg
+    # Keep real-quant export tensors on CPU by default. Set false only for
+    # colocated CUDA-IPC refit to avoid a GPU -> CPU -> GPU round trip.
+    real_quant_export_cpu_offload: true
+    refit_cfg:
+      nixl:
+        update_weights_bucket_memory_ratio: 0.05
+        device: cuda
+        backend_name: UCX
+        backend_init_params: null
+        release_after_refit: false
+        shard_expert_weights: false
     mcore_generation_config:
-      buffer_size_gb: 20  # Total GPU memory (in GB) allocated for KV cache buffers
-      buffer_guaranteed_fraction: 0.1  # Fraction of buffer reserved for guaranteed active requests
-      num_cuda_graphs: 16  # Number of CUDA graphs to pre-compile for different batch sizes
+      max_model_len: ${policy.max_total_sequence_length}  # Engine-side max sequence length.
+      # Generation CUDA graphs. MCore accepts only these pairings:
+      #   cuda_graph_impl "none"  -> omit inference_cuda_graph_scope
+      #   cuda_graph_impl "local" -> inference_cuda_graph_scope "layer" or "block"
+      cuda_graph_impl: "local"
+      cuda_graph_sizing_distribution: hybrid  # MCore default: exponential prefill/mixed graphs and linear decode graphs.
+      cuda_graph_max_tokens: 512  # MCore default token ceiling for captured prefill/mixed graphs.
+      inference_cuda_graph_scope: "block"
+      buffer_size_gb: 10
+      num_cuda_graphs: -1  # Number of CUDA graphs to build; -1 autotunes
       block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
       use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
       enable_chunked_prefill: true  # Split long prefills into chunks for better memory management
-      unified_memory_level: 0  # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
+      enable_prefix_caching: true
+      prefix_caching_mamba_gb: null  # MCore default: no Mamba-state prefix-cache budget.
+      prefix_caching_eviction_policy: lru  # MCore default prefix-cache eviction policy.
+      prefix_caching_coordinator_policy: longest_prefix  # MCore default DP routing policy.
+      prefix_cache_ttl_seconds: 300.0  # MCore default coordinator cache-entry lifetime.
+      prefix_caching_routing_alpha: 1.0  # MCore default load penalty for prefix-affinity routing.
       max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
+      kv_cache_management_mode: "recompute"  # Must agree with recompute_kv_cache_after_weight_updates. Options: "persist", "offload", "recompute".
+      async_sched_mode: "async"  # Dynamic-batching scheduler mode. Options: "legacy", "async". "async" hides scheduler CPU time behind GPU compute.
+      materialize_only_last_token_logits: true
+      num_speculative_tokens: 0
+      # Hybrid models only; null keeps the model dtype. Commonly set to `float32`.
+      mamba_inference_ssm_states_dtype: null
+      mamba_inference_conv_states_dtype: null
+      refit_backend: null  # Native MCore copy-service backend, used only when refit_transport="mcore". Options: "gloo", "nccl", or "nccl_m2n" ("nvshmem" is currently broken, see https://github.com/NVIDIA-NeMo/RL/issues/3646).
+      refit_execution_batch_bytes: null  # Native MCore refit staging limit. null matches NeMo-RL's collective default (2% of total GPU memory, capped at 5 GiB); set a positive byte count to override.
+      logprobs_mode: processed_logprobs  # Return log-probs after sampling processors. Use raw_logprobs for parity with policy recomputation.
+      parsers: []  # OpenAI tool-call / response parser names exposed by the HTTP server (only used if expose_http_server=true).
+      expose_http_server: false  # Start an OpenAI-compatible HTTP server alongside the persistent engine. Required for NeMo-Gym.
+      http_server_num_replicas: 8  # HTTP frontend event loops per model-parallel coordinator.
     vllm_cfg:
+      http_server_api_key_required: false  # Require a per-job bearer token on the exposed server's /v1/* and /tokenize routes; the token is generated at startup and handed to the NeMo-Gym model server.
       async_engine: false
       precision: ${policy.precision}
+      # MXFP8 + Megatron only: quantize on trainer and stream E4M3 values plus scales.
+      refit_prequantize: false
+      # auto, fp8, fp8_e4m3, fp8_ds_mla, or fp8_per_token_head.
+      # fp8_per_token_head requires precision=fp8 and a compatible backend (TRITON_ATTN).
       kv_cache_dtype: "auto"
+      logprobs_mode: processed_logprobs
+      fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head} # Compute vLLM logits with an fp32 LM head.
+      # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
+      refit_with_reload_api: false
       tensor_parallel_size: 1
       pipeline_parallel_size: 1
       expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
       gpu_memory_utilization: 0.6
       max_model_len: ${policy.max_total_sequence_length}
-      # when enforce_eager is False, it is optional to set ++policy.generation.vllm_kwargs.compilation_config.use_inductor=False for better accuracy,
+      # when enforce_eager is False, it is optional to set ++policy.generation.vllm_kwargs.compilation_config.backend=eager for better accuracy,
       # with the flag, vllm will use the custom CUDA kernels instead of the Triton kernels generated by torch.compile
       # for more details, see convergence issue https://github.com/NVIDIA-NeMo/RL/issues/998
       enforce_eager: False
+      use_tqdm: true # Set to false to suppress vLLM generation progress bars. Only applies when async_engine is false
       use_deep_gemm: False
       num_last_layers_in_bf16: 0
       num_first_layers_in_bf16: 0
       enable_vllm_metrics_logger: true # Set to true to enable vLLM internal metrics logger, turn off for better performance
+      flat_logprobs: false # Requires async_engine: true and expose_http_server: true. Store logprobs in vLLM's FlatLogprobs (not for requests asking for prompt logprobs); avoids long GC pauses on the generation actor under large backlogs
+      output_loop_yield_budget_ms: null # Requires async_engine: true. e.g. 20: make vLLM's output loops yield so refit/control calls are not starved under a backlog
       vllm_metrics_logger_interval: 0.5 # Interval in seconds to collect vLLM logger metrics
+      http_refit_api_key_env_var: null # Optional env var containing the internal refit API key.
+      reset_encoder_cache_after_weight_update: false # Invalidate cached multimodal encoder outputs after a successful async refit. Only safe when generation is quiesced (grpo.async_grpo.in_flight_weight_updates=false).
+      http_refit_server_port: null # Optional fixed port for Kubernetes targetPorts.
+      zmq_refit_server_port: null # Optional fixed ZeroMQ relay port for Kubernetes targetPorts.
     vllm_kwargs: {}
     colocated:
       # true: generation shares training GPUs
@@ -291,6 +619,10 @@ data:
   max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
   shuffle: true
   num_workers: 1
+
+  # use multiple dataloader for train
+  # see https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/grpo.md#multiple-dataloaders for more details.
+  use_multiple_dataloader: false
 
   # dataset
   train:
@@ -335,6 +667,7 @@ env:
 logger:
   log_dir: "logs"  # Base directory for all logs
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
   wandb_enabled: false
   tensorboard_enabled: false
   mlflow_enabled: false  # Disable MLflow logging
@@ -343,6 +676,8 @@ logger:
   wandb:
     project: "grpo-dev"
     name: "grpo-dev-logger"
+    # Complete Gym payloads can create very large W&B artifacts. Enable only for debugging.
+    log_nemo_gym_full_result_tables: false
   swanlab:
     project: "grpo-dev"
     name: "grpo-dev-logger"
@@ -350,6 +685,7 @@ logger:
   mlflow:
     experiment_name: "grpo-dev"
     run_name: "grpo-dev-logger"
+    tracking_uri: "http://localhost:5000"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
@@ -357,3 +693,72 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  # Port range for the distributed master address (TCPStore / NCCL rendezvous)
+  # and per-worker available ports.  Kept below the OS ephemeral range
+  # (32768-60999 on stock Linux).  See ray.sub for the full port layout.
+  master_port_range_low: 1400
+  master_port_range_high: 1999
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable
+
+# TransferQueue-mediated data plane for sync GRPO.
+# Off by default — the legacy grpo_train trainer never engages this.
+# Flip enabled=true and run grpo_train_sync to use TQ-mediated bulk
+# transfer between rollout and train. See nemo_rl/data_plane/README.md.
+data_plane:
+  enabled: false
+  impl: transfer_queue
+  backend: "simple"                  # TQ storage backend ('simple' or 'mooncake_cpu')
+  claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
+  # Backend-specific blocks: only the one named by `backend` is read, and an
+  # absent block means that backend's defaults (see SimpleStorageConfig /
+  # MooncakeCpuConfig in nemo_rl/data_plane/interfaces.py).
+  simple:
+    storage_capacity: 1000000        # max samples retained per partition
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
+    storage_unit_placement: null     # all, or cluster names like [inference]; null = TQ SPREAD
+    # Keep large field values on node-local SSD instead of host memory. Needs
+    # no shared filesystem; data is temporary (removed on tq.close()).
+    ssd_offload:
+      enabled: false
+      path: null                     # node-local SSD dir; required when enabled
+      threshold_bytes: 1048576       # values >= this encoded size go to SSD
+  mooncake_cpu:
+    # Per client process — see MooncakeCpuConfig before raising these.
+    global_segment_size: 68719476736 # 64 GiB/process
+    local_buffer_size:    2147483648 # 2 GiB/process = 4 TQ transfer threads x 512 MiB slot
+    reuse_registered_buffers: true   # reuse RDMA-registered buffers
+    staging_buffer_size:   536870912 # 512 MiB/pool slot; bigger payloads register per transfer
+    storage_unit_segment_size: 0     # >0: CPU storage units own all memory (bytes each)
+    num_storage_units: null          # null = 2 per selected node
+    storage_unit_placement: all      # all, or cluster names: [inference], [train, teacher:<name>]
+    # Spill Mooncake memory to node-local SSD.
+    # Each segment owner (storage unit, or client) writes under its own subdir of path.
+    ssd_offload:
+      enabled: false
+      path: null                     # node-local SSD dir; required when enabled
+      offload_threshold: 0.5         # offload above this share of segment memory
+    use_gdr: false                   # GPU-memory RDMA staging in CUDA clients
+    gdr_staging_buffer_mb: 1024      # HBM reserved per active GDR client;
+                                     # 8 clients/node is ~8 GiB off the training
+                                     # budget. Must exceed the largest per-sample,
+                                     # per-field payload: below that, GDR reads of
+                                     # CPU-written values fail inside TransferQueue.
+                                     # Lower values split fetches into more
+                                     # serialized groups and cost throughput;
+                                     # higher buys little at linear HBM cost.
+                                     # GDR needs that headroom to pay off.
+    gdr_keep_teacher_payload_on_gpu: true  # MOPD + use_gdr only: the teacher PUTs what it writes
+                                           # (logprobs; full-vocab hidden states or logits) straight
+                                           # from GPU, holding it in GPU memory until the PUT.
+                                           # false = copy to CPU first.
+  observability:                      # per-op data-plane timing/volume
+    enabled: true                     # per-op timing/volume; cost is below measurement noise
+    verify_tensor_hash: false         # debug: per-row hash of each row's values+dtype+shape, wire-in vs wire-out
+
+# Multi-Teacher On-Policy Distillation (MOPD): distills from one or more teacher
+# models into the policy via token-level teacher-minus-student logprob advantages,
+# served by non-colocated teacher worker groups (OPD advantage estimator +
+# nemo_gym). null = disabled (default). See
+# examples/configs/recipes/llm/mopd-qwen3-1.7b-3n8g-megatron-pack.yaml for a full
+# enabled example.
+on_policy_distillation: null

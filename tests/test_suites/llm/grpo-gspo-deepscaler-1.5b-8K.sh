@@ -4,8 +4,10 @@ source $SCRIPT_DIR/common.env
 
 # ===== BEGIN CONFIG =====
 NUM_NODES=1
-STEPS_PER_RUN=40
-MAX_STEPS=40
+# Reduced from 40→30 steps: ~252s/step × 40 = 168min leaves too little margin
+# for startup + metrics in 240min (max SLURM allocation). 30 steps = 126min.
+STEPS_PER_RUN=30
+MAX_STEPS=30
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 NUM_MINUTES=240
 # ===== END CONFIG =====
@@ -34,8 +36,8 @@ uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 # Only run metrics if the target step is reached
 if [[ $(jq 'to_entries | .[] | select(.key == "train/loss") | .value | keys | map(tonumber) | max' $JSON_METRICS) -ge $MAX_STEPS ]]; then
     uv run tests/check_metrics.py $JSON_METRICS \
-        'median(data["train/token_mult_prob_error"]) < 1.1' \
-        "data['train/token_mult_prob_error']['$MAX_STEPS'] < 1.1"
+        'median(data["train/token_mult_prob_error"]) < 1.05' \
+        "max(data['train/gen_kl_error']) < 0.0005"
 
     # Clean up checkpoint directory after successful run to save space.
     rm -rf "$CKPT_DIR"

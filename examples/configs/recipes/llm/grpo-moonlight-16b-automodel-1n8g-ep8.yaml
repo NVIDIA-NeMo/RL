@@ -12,18 +12,20 @@ policy:
   train_micro_batch_size: 1
   max_total_sequence_length: 4096
   activation_checkpointing_enabled: false
-  dtensor_cfg:
+  automodel_cfg:
     expert_parallel_size: 8
     clear_cache_every_n_steps: 50
     automodel_kwargs:
       use_liger_kernel: false
       backend:
-        _target_: nemo_automodel.components.moe.utils.BackendConfig
+        _target_: nemo_automodel.components.models.common.utils.BackendConfig
         attn: te
         linear: te
         rms_norm: te
-        enable_deepep: true
+        experts: torch_mm
+        dispatcher: hybridep
         fake_balanced_gate: false
+        rope_fusion: false
         enable_hf_state_dict_adapter: true
         enable_fsdp_optimizations: false
         gate_precision: float64
@@ -31,7 +33,7 @@ policy:
     enabled: true
   sequence_packing:
     enabled: false
-  make_sequence_length_divisible_by: 4
+  make_sequence_length_divisible_by: 64
   optimizer:
     kwargs:
       lr: 3.0e-07
@@ -47,6 +49,12 @@ policy:
       total_iters: 10000000000
   - milestones:
     - 13
+  generation:
+    vllm_kwargs:
+      # vLLM 0.20's FlashInfer TRTLLM MoE backend stores bf16 expert
+      # weights in a blocked runtime layout that its load_weights path cannot
+      # refit. Use TRITON to keep the refit-compatible 3D MoE layout.
+      moe_backend: triton
 data:
   max_input_seq_length: 4096
 cluster:

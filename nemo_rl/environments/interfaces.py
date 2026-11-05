@@ -44,7 +44,9 @@ class EnvironmentReturn(NamedTuple, Generic[MetadataT]):
     observations: list[dict[str, str]]
     metadata: list[MetadataT]
     next_stop_strings: list[list[str] | None] | list[None]
-    rewards: Tensor
+    rewards: (
+        Tensor | dict[str, Tensor]
+    )  ## Tensor[B] for single-reward, dict of {name: Tensor[B]} for multi-reward (e.g. GDPO)
     terminateds: Tensor
     answers: list[str | None] | None
 

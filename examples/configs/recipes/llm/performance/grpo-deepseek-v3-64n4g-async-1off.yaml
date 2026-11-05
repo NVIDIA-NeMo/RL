@@ -2,24 +2,30 @@ defaults: ./grpo-deepseek-v3-64n8g-async-1off.yaml
 checkpointing:
   checkpoint_dir: results/grpo-deepseek-v3-64n4g-async-1off
 policy:
-  sequence_packing:
-    enabled: false
   megatron_cfg:
+    # HybridEP settings
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    env_vars:
+      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "16"
+      NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
+      NVLINK_DOMAIN_SIZE: "72"
+      USE_MNNVL: "1"
     pipeline_model_parallel_size: 8
-    expert_model_parallel_size: 16
     num_layers_in_first_pipeline_stage: 7
     num_layers_in_last_pipeline_stage: 6
   generation:
+    refit_transport: nccl_reshard
     colocated:
       resources:
         gpus_per_node: 4
     vllm_cfg:
       tensor_parallel_size: 16
-      gpu_memory_utilization: 0.8
 logger:
   log_dir: logs/grpo-deepseek-v3-64n4g-async-32T32G-1off
   wandb:
     name: grpo-deepseek-v3-64n4g-async-32T32G-1off
 cluster:
   gpus_per_node: 4
-  num_nodes: 64
+  segment_size: 16

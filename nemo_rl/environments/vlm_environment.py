@@ -15,7 +15,7 @@ import contextlib
 import io
 import logging
 from functools import partial
-from typing import Any, Callable, List, Optional, TypedDict
+from typing import Any, Callable, List, NotRequired, Optional, TypedDict
 
 import ray
 import torch
@@ -34,6 +34,7 @@ from nemo_rl.environments.rewards import (
     combine_reward_functions,
     exact_answer_alphanumeric_reward,
     format_reward,
+    geo3k_reward,
     math_expression_reward,
 )
 from nemo_rl.environments.utils import chunk_list_to_workers
@@ -41,7 +42,7 @@ from nemo_rl.environments.utils import chunk_list_to_workers
 
 class VLMEnvConfig(TypedDict):
     num_workers: int
-    stop_strings: Optional[list[str]]  # Default stop strings for this env
+    stop_strings: NotRequired[Optional[list[str]]]  # Default stop strings for this env
     reward_functions: List[dict[str, Any]]  # list of reward functions and their weights
 
 
@@ -76,6 +77,8 @@ class VLMVerifyWorker:
                 reward_func = math_expression_reward
             elif reward_func_name == "bbox_giou":
                 reward_func = bbox_giou_reward
+            elif reward_func_name == "geo3k":
+                reward_func = geo3k_reward
             else:
                 raise ValueError(f"Invalid reward function: {reward_func_name}")
 
@@ -144,6 +147,7 @@ class VLMEnvironment(EnvironmentInterface):
         self,
         message_log_batch: list[list[dict[str, str]]],
         metadata: list[VLMEnvironmentMetadata],
+        return_extracted_answer: bool = False,
     ) -> EnvironmentReturn:
         """Runs a step in the vlm environment.
 

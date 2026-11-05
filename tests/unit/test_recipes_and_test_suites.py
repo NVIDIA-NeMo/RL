@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import glob
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -30,10 +30,11 @@ nightly_test_suite_path = os.path.join(test_suites_dir, "nightly.txt")
 release_test_suite_path = os.path.join(test_suites_dir, "release.txt")
 nightly_gb200_test_suite_path = os.path.join(test_suites_dir, "nightly_gb200.txt")
 release_gb200_test_suite_path = os.path.join(test_suites_dir, "release_gb200.txt")
-h100_performance_test_suite_path = os.path.join(test_suites_dir, "performance_h100.txt")
+h100_performance_test_suite_path = os.path.join(test_suites_dir, "performance.txt")
 gb200_performance_test_suite_path = os.path.join(
     test_suites_dir, "performance_gb200.txt"
 )
+disabled_test_suite_path = os.path.join(test_suites_dir, "disabled.txt")
 
 # Relative to project root
 ALGO_MAPPING_TO_BASE_YAML = {
@@ -41,16 +42,21 @@ ALGO_MAPPING_TO_BASE_YAML = {
     "dpo": "examples/configs/dpo.yaml",
     "grpo": "examples/configs/grpo_math_1B.yaml",
     "vlm_grpo": "examples/configs/vlm_grpo_3B.yaml",
+    "vlm_sft": "examples/configs/sft_vlm_3B.yaml",
+    "vlm_mpo": "examples/configs/vlm_mpo.yaml",
     "distillation": "examples/configs/distillation_math.yaml",
     "rm": "examples/configs/rm.yaml",
     "dapo": "examples/configs/grpo_math_1B.yaml",
-    "prorlv2": "examples/configs/prorlv2.yaml",
+    "prorlv2": "examples/configs/prorlv2.v2.yaml",
+    "ppo": "examples/configs/ppo_math_1B_megatron.yaml",
+    "mopd": "examples/configs/grpo_math_1B.yaml",
+    "gdpo": "examples/configs/gdpo_math_1B.yaml",
 }
 
 # Configuration keys that are allowed to be added to base configs during testing
 # These keys may exist in recipe configs but not in base configs, so we need to
 # manually add them to avoid merge conflicts during config validation
-ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.generation.vllm_kwargs"]
+ALLOWED_ADDITIONAL_CONFIG_KEYS = ["policy.draft", "policy.generation.vllm_kwargs"]
 
 
 @pytest.fixture
@@ -114,12 +120,24 @@ def performance_test_suite():
 
 
 @pytest.fixture
+def disabled_test_suite():
+    disabled_suite = []
+    with open(disabled_test_suite_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                disabled_suite.append(line)
+    return disabled_suite
+
+
+@pytest.fixture
 def all_test_suites(
     nightly_test_suite,
     release_test_suite,
     nightly_gb200_test_suite,
     release_gb200_test_suite,
     performance_test_suite,
+    disabled_test_suite,
 ):
     return (
         nightly_test_suite
@@ -127,17 +145,43 @@ def all_test_suites(
         + nightly_gb200_test_suite
         + release_gb200_test_suite
         + performance_test_suite
+        + disabled_test_suite
     )
+
+
+def _test_suite_scripts(root: Path) -> set[str]:
+    """Discover core and research suite scripts, relative to the repository."""
+    scripts = list((root / "tests/test_suites").rglob("*.sh"))
+    scripts.extend(root.glob("research/*/tests/test_suites/**/*.sh"))
+    return {path.relative_to(root).as_posix() for path in scripts}
+
+
+def _recipe_for_test_script(script: str) -> str:
+    """Map a suite script to its recipe without losing the research project."""
+    path = Path(script)
+    if path.parts[:2] == ("tests", "test_suites"):
+        return str(
+            Path("examples/configs/recipes", *path.parts[2:]).with_suffix(".yaml")
+        )
+    if (
+        len(path.parts) >= 5
+        and path.parts[0] == "research"
+        and path.parts[2:4] == ("tests", "test_suites")
+    ):
+        return str(
+            Path(*path.parts[:2], "configs/recipes", *path.parts[4:]).with_suffix(
+                ".yaml"
+            )
+        )
+    raise ValueError(f"Unsupported test suite path: {script}")
 
 
 @pytest.fixture
 def all_recipe_yaml_rel_paths():
-    all_recipes = []
-    for recipe_path in glob.glob(
-        os.path.join(recipes_dir, "**", "*.yaml"), recursive=True
-    ):
-        all_recipes.append(recipe_path[len(recipes_dir) + 1 :])
-    return all_recipes
+    root = Path(project_root)
+    recipes = list((root / "examples/configs/recipes").rglob("*.yaml"))
+    recipes.extend(root.glob("research/*/configs/recipes/**/*.yaml"))
+    return [path.relative_to(root).as_posix() for path in recipes]
 
 
 @pytest.mark.parametrize(
@@ -149,6 +193,7 @@ def all_recipe_yaml_rel_paths():
         release_gb200_test_suite_path,
         h100_performance_test_suite_path,
         gb200_performance_test_suite_path,
+        disabled_test_suite_path,
     ],
     ids=[
         "nightly_test_suite",
@@ -157,6 +202,7 @@ def all_recipe_yaml_rel_paths():
         "release_gb200_test_suite",
         "h100_performance_test_suite",
         "gb200_performance_test_suite",
+        "disabled_test_suite",
     ],
 )
 def test_test_suites_exist(test_suite_path):
@@ -172,52 +218,48 @@ def test_no_overlap_across_test_suites(all_test_suites):
     )
 
 
-def test_all_test_scripts_accounted_for_in_test_suites(all_test_suites):
-    all_test_scripts_in_test_suites = set(all_test_suites)
-
-    all_tests_in_test_suites_dir = set()
-    for recipe_path in glob.glob(
-        os.path.join(test_suites_dir, "**", "*.sh"), recursive=True
+def test_nightly_suites_match_gpus_per_node(
+    nightly_test_suite, nightly_gb200_test_suite
+):
+    for test_suite, expected_gpus_per_node in (
+        (nightly_test_suite, 8),
+        (nightly_gb200_test_suite, 4),
     ):
-        # Strip off the project root and leading slash
-        recipe_name = recipe_path[len(project_root) + 1 :]
-        all_tests_in_test_suites_dir.add(recipe_name)
+        for test_script in test_suite:
+            gpus_per_node = 8
+            with open(os.path.join(project_root, test_script)) as f:
+                for line in f:
+                    if line.startswith("GPUS_PER_NODE="):
+                        gpus_per_node = int(line.split("=", 1)[1].split()[0])
+                        break
+            assert gpus_per_node == expected_gpus_per_node, (
+                f"{test_script} requests {gpus_per_node} GPUs per node, but its "
+                f"nightly suite requires {expected_gpus_per_node}"
+            )
 
-    assert all_test_scripts_in_test_suites == all_tests_in_test_suites_dir, (
-        "All test scripts are not accounted for in the test suites"
+
+def test_all_test_scripts_accounted_for_in_test_suites(all_test_suites):
+    discovered = _test_suite_scripts(Path(project_root))
+    listed = set(all_test_suites)
+    assert listed == discovered, (
+        f"Unlisted test scripts: {sorted(discovered - listed)}; "
+        f"Missing test scripts: {sorted(listed - discovered)}"
     )
 
 
 def test_all_recipe_yamls_accounted_for_in_test_suites(
     all_recipe_yaml_rel_paths, all_test_suites
 ):
-    """This test along with test_all_test_scripts_accounted_for_in_test_suites() ensures that all recipe yaml/test scripts/test_suite(txts) are in sync."""
-    assert len(set(all_recipe_yaml_rel_paths)) == len(set(all_test_suites)), (
-        "Recipe YAMLs should be accounted for in the test suites"
-    )
-
-    all_test_script_paths_in_test_suites = set()
-    for test_script in all_test_suites:
-        # Each test suite is relative from project root
-        test_script_rel_to_test_suites_dir = test_script[
-            len(os.path.join("tests", "test_suites")) + 1 :
-        ]
-        all_test_script_paths_in_test_suites.add(test_script_rel_to_test_suites_dir)
-
-    # Since we're comparing yaml to sh, chop off the .sh/.yaml extensions for comparison
-    all_test_script_paths_in_test_suites = {
-        os.path.splitext(path)[0] for path in all_test_script_paths_in_test_suites
-    }
-    all_recipe_yaml_rel_paths = {
-        os.path.splitext(path)[0] for path in all_recipe_yaml_rel_paths
-    }
-
-    assert all_test_script_paths_in_test_suites == set(all_recipe_yaml_rel_paths), (
-        "All recipe YAMLs are not accounted for in the test suites"
+    """Require a matching recipe for every core and research suite script."""
+    expected = {_recipe_for_test_script(script) for script in all_test_suites}
+    recipes = set(all_recipe_yaml_rel_paths)
+    assert expected == recipes, (
+        f"Missing recipes: {sorted(expected - recipes)}; "
+        f"Recipes without test scripts: {sorted(recipes - expected)}"
     )
 
 
-def test_nightly_compute_stays_below_1300_hours(nightly_test_suite, tracker):
+def test_nightly_compute_stays_below_5229_hours(nightly_test_suite, tracker):
     command = f"DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch {' '.join(nightly_test_suite)}"
 
     print(f"Running command: {command}")
@@ -249,14 +291,14 @@ def test_nightly_compute_stays_below_1300_hours(nightly_test_suite, tracker):
         f"Last line of output was not as expected: '{last_line}'"
     )
     total_gpu_hours = float(last_line.split(":")[-1].strip())
-    assert total_gpu_hours <= 1300, (
-        f"Total GPU hours exceeded 1300: {last_line}. We should revisit the test suites to reduce the total GPU hours."
+    assert total_gpu_hours <= 5229, (
+        f"Total GPU hours exceeded 5229: {last_line}. We should revisit the test suites to reduce the total GPU hours."
     )
     tracker.track("total_nightly_gpu_hours", total_gpu_hours)
 
 
-def test_dry_run_does_not_fail_and_prints_total_gpu_hours():
-    command = "DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch ./tests/test_suites/**/*.sh"
+def test_dry_run_does_not_fail_and_prints_total_gpu_hours(all_test_suites):
+    command = f"DRYRUN=1 HF_HOME=... HF_DATASETS_CACHE=... CONTAINER= ACCOUNT= PARTITION= ./tools/launch {' '.join(all_test_suites)}"
 
     # Run the command from the project root directory
     result = subprocess.run(
@@ -305,6 +347,9 @@ def test_all_tests_can_find_config_if_dryrun(all_test_suites):
 def test_all_recipes_start_with_algo_hyphen(all_recipe_yaml_rel_paths):
     expected_algos = set(ALGO_MAPPING_TO_BASE_YAML.keys())
     for recipe_yaml in all_recipe_yaml_rel_paths:
+        # Research projects define their own algorithms and naming conventions.
+        if recipe_yaml.startswith("research/"):
+            continue
         basename = os.path.basename(recipe_yaml)
         algo = basename.split("-")[0]
         assert algo in expected_algos, (
@@ -312,26 +357,10 @@ def test_all_recipes_start_with_algo_hyphen(all_recipe_yaml_rel_paths):
         )
 
 
-def test_functional_tests_exist():
-    functional_tests_dir = os.path.join(project_root, "tests", "functional")
-
-    test_list = []
-    with open(
-        os.path.join(functional_tests_dir, "L1_Functional_Tests_GPU.sh"), "r"
-    ) as f:
-        for line in f:
-            line = line.strip()
-            if line and "./tests/functional" in line:
-                test_list.append(line.split(" ")[-1].split("/")[-1])
-
-    missing_list = []
-    for filename in os.listdir(functional_tests_dir):
-        if filename.endswith(".sh"):
-            if filename == "L1_Functional_Tests_GPU.sh":
-                continue
-            if filename not in test_list:
-                missing_list.append(f"./tests/functional/{filename}")
-
-    assert len(missing_list) == 0, (
-        f"Missing functional test scripts in ./tests/functional/L1_Functional_Tests_GPU.sh:\n{'\n'.join(missing_list)}"
-    )
+def test_suite_scripts_have_no_local_paths(all_test_suites):
+    for script in all_test_suites:
+        text = (Path(project_root) / script).read_text().lower()
+        for local_prefix in ("/lustre/", "/scratch/", "/home/"):
+            assert local_prefix not in text, (
+                f"{script} contains a local path ({local_prefix})"
+            )

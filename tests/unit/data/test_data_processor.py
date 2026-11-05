@@ -12,14 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import sys
 import tempfile
 from collections import defaultdict
+from types import SimpleNamespace
 
 import pytest
 import torch
 from datasets import Dataset
+from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+from transformers import PreTrainedTokenizerFast
 
 abspath = os.path.abspath(__file__)
 sys.path.append("/".join(abspath.split("/")[:-4]))
@@ -27,20 +31,25 @@ sys.path.append("/".join(abspath.split("/")[:-4]))
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.datasets.eval_datasets import (
-    AIMEDataset,
     GPQADataset,
     MathDataset,
     MMLUDataset,
 )
 from nemo_rl.data.datasets.response_datasets import (
+    AIMEDataset,
     DeepScalerDataset,
     OpenMathInstruct2Dataset,
 )
 from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
 from nemo_rl.data.processors import (
+    PROCESSOR_REGISTRY,
+    _gym_row_has_video_media,
     helpsteer3_data_processor,
+    kd_data_processor,
     math_data_processor,
     math_hf_data_processor,
+    multichoice_qa_processor,
+    nemo_gym_data_processor,
 )
 from nemo_rl.models.policy import TokenizerConfig
 
@@ -67,6 +76,222 @@ class DummyTokenizer:
         if return_tensors == "pt":
             return {"input_ids": torch.tensor([encoded], dtype=torch.long)}
         return {"input_ids": encoded}
+
+
+def test_nemo_gym_data_processor_without_task_data_spec():
+    extra_env_info = {"agent_ref": {"name": "test_agent"}}
+
+    result = nemo_gym_data_processor(
+        datum_dict={
+            "extra_env_info": json.dumps(extra_env_info),
+            "task_name": "nemo_gym",
+        },
+        task_data_spec=None,
+        tokenizer=None,
+        max_seq_length=None,
+        idx=3,
+    )
+
+    assert result["extra_env_info"] == extra_env_info
+    assert result["idx"] == 3
+    assert result["task_name"] == "nemo_gym"
+    assert result["length"] == 0
+    # Placeholder token_ids must share the dtype of real tokenizer output so a
+    # mixed still-image/video Gym batch can be collated.
+    assert result["message_log"][0]["token_ids"].dtype == torch.long
+
+
+@pytest.mark.parametrize(
+    ("content_part", "expected"),
+    [
+        ({"type": "input_image", "image_url": "frame.png"}, False),
+        (
+            {
+                "type": "input_image",
+                "image_url": "frame.png",
+                "_is_video_frame": True,
+            },
+            True,
+        ),
+        ({"type": "input_video", "video_url": "clip.mp4"}, True),
+        ({"type": "video", "video": "clip.mp4"}, True),
+        ({"type": "video_url", "video_url": "clip.mp4"}, True),
+        ({"type": "output_text", "text": "not media"}, False),
+    ],
+)
+@pytest.mark.parametrize("materialized", [False, True], ids=["flat", "materialized"])
+def test_gym_row_has_video_media_is_row_specific(content_part, expected, materialized):
+    task_input = {
+        "responses_create_params": {
+            "input": [{"role": "user", "content": [content_part]}]
+        }
+    }
+    # A materialized task row nests the same request under task_input.
+    extra_env_info = (
+        {
+            "task_id": {"taskset": "video:train", "task_id": "0"},
+            "task_input": task_input,
+        }
+        if materialized
+        else task_input
+    )
+
+    assert _gym_row_has_video_media(extra_env_info) is expected
+
+
+def test_video_defaults_do_not_route_still_image_rows_to_video_processor():
+    extra_env_info = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [{"type": "input_image", "image_url": "frame.png"}],
+                }
+            ]
+        }
+    }
+
+    result = nemo_gym_data_processor(
+        datum_dict={
+            "extra_env_info": json.dumps(extra_env_info),
+            "task_name": "nemo_gym",
+        },
+        task_data_spec=TaskDataSpec(
+            task_name="nemo_gym", video_sampling_style="nemotron_vl"
+        ),
+        tokenizer=None,
+        max_seq_length=128,
+        idx=7,
+    )
+
+    assert result["idx"] == 7
+    assert result["extra_env_info"] == extra_env_info
+
+
+def test_video_defaults_still_route_cached_video_rows_to_video_processor():
+    extra_env_info = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "frame.png",
+                            "_is_video_frame": True,
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+
+    with pytest.raises(TypeError, match="Gym video data requires"):
+        nemo_gym_data_processor(
+            datum_dict={
+                "extra_env_info": json.dumps(extra_env_info),
+                "task_name": "nemo_gym",
+            },
+            task_data_spec=TaskDataSpec(
+                task_name="nemo_gym", video_sampling_style="nemotron_vl"
+            ),
+            tokenizer=None,
+            max_seq_length=128,
+            idx=8,
+        )
+
+
+def test_nemo_gym_data_processor_allows_nonvideo_rows_with_video_defaults(
+    monkeypatch,
+):
+    import nemo_rl.environments.nemo_gym_multimodal as multimodal
+
+    monkeypatch.setattr(
+        multimodal,
+        "nemo_gym_example_to_video_datum_spec",
+        lambda *args, **kwargs: None,
+    )
+    processor = SimpleNamespace(
+        apply_chat_template=lambda *args, **kwargs: None,
+        tokenizer=object(),
+    )
+
+    result = nemo_gym_data_processor(
+        datum_dict={
+            "extra_env_info": json.dumps({"agent_ref": {"name": "sav_tracks"}}),
+            "task_name": "nemo_gym",
+        },
+        task_data_spec=TaskDataSpec(video_sampling_style="nemotron_vl"),
+        tokenizer=processor,
+        max_seq_length=4096,
+        idx=4,
+    )
+
+    assert result["extra_env_info"]["agent_ref"]["name"] == "sav_tracks"
+    assert result["message_log"][0]["token_ids"].dtype == torch.long
+    assert result["message_log"][0]["token_ids"].numel() == 0
+
+
+def test_nemo_gym_video_config_preserves_non_video_rows(monkeypatch):
+    extra_env_info = {
+        "responses_create_params": {
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": "/shared/frames/frame-0001.jpg",
+                        },
+                        {"type": "input_text", "text": "unmarked image row"},
+                    ],
+                }
+            ]
+        }
+    }
+    tokenizer = DummyTokenizer()
+    tokenizer.tokenizer = tokenizer
+
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym_multimodal.nemo_gym_example_to_video_datum_spec",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = nemo_gym_data_processor(
+        datum_dict={
+            "extra_env_info": json.dumps(extra_env_info),
+            "task_name": "nemo_gym",
+        },
+        task_data_spec=TaskDataSpec(
+            task_name="nemo_gym",
+            video_sampling_style="nemotron_vl",
+        ),
+        tokenizer=tokenizer,
+        max_seq_length=None,
+        idx=7,
+    )
+
+    assert result["extra_env_info"] == extra_env_info
+    assert result["idx"] == 7
+    assert result["length"] == 0
+
+
+def test_nemo_gym_data_processor_forwards_per_row_image_tile_cap():
+    processor = SimpleNamespace(image_processor=SimpleNamespace(max_num_tiles=12))
+
+    result = nemo_gym_data_processor(
+        datum_dict={"extra_env_info": "{}", "task_name": "nemo_gym"},
+        task_data_spec=TaskDataSpec(image_max_num_tiles=6),
+        tokenizer=processor,
+        max_seq_length=4096,
+        idx=5,
+    )
+
+    extra_env_info = result["extra_env_info"]
+    metadata = extra_env_info["responses_create_params"]["metadata"]
+    assert json.loads(metadata["extra_body"])["mm_processor_kwargs"] == {
+        "max_num_tiles": 6
+    }
 
 
 def test_math_data_processor():
@@ -102,6 +327,154 @@ def test_math_data_processor():
     assert dataset[1]["extra_env_info"]["ground_truth"] == "answer2"
 
 
+# Real chat templates from issue #4185. Two-call rendering changes the prompt for
+# each of them; Qwen3 keeps the same token IDs and only checks the joined text.
+_EVAL_CHAT_TOKENIZERS = [
+    "Qwen/Qwen2.5-Math-1.5B-Instruct",
+    "moonshotai/Moonlight-16B-A3B-Instruct",
+    "openai/gpt-oss-20b",
+    "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16",
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+    "meta-llama/Llama-3.2-1B-Instruct",
+    "microsoft/Phi-4-mini-instruct",
+    "mistralai/Mistral-Nemo-Instruct-2407",
+    "zai-org/GLM-4.5-Air",
+    "Qwen/Qwen3-0.6B",
+]
+
+
+# Module scope loads each tokenizer once and keeps one in memory at a time.
+@pytest.fixture(
+    scope="module",
+    params=[
+        "default-system",
+        "default-system-bos",
+        *(
+            pytest.param(name, marks=pytest.mark.hf_gated)
+            for name in _EVAL_CHAT_TOKENIZERS
+        ),
+    ],
+)
+def eval_chat_tokenizer(request: pytest.FixtureRequest) -> PreTrainedTokenizerFast:
+    if not request.param.startswith("default-system"):
+        return get_tokenizer(
+            TokenizerConfig(name=request.param, chat_template="default")
+        )
+    backend = Tokenizer(
+        models.BPE(
+            vocab={
+                char: idx
+                for idx, char in enumerate(sorted(pre_tokenizers.ByteLevel.alphabet()))
+            },
+            merges=[],
+        )
+    )
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    template = (
+        "{% if messages[0]['role'] != 'system' %}"
+        "system: Default instruction.\n{% endif %}"
+        "{% for message in messages %}"
+        "{{ message['role'] + ': ' + message['content'] + '\\n' }}"
+        "{% endfor %}"
+        "{% if add_generation_prompt %}assistant:{% endif %}"
+    )
+    if request.param == "default-system-bos":
+        template = "{{ bos_token }}" + template
+    return PreTrainedTokenizerFast(
+        tokenizer_object=backend, bos_token="<bos>", chat_template=template
+    )
+
+
+@pytest.mark.parametrize("processor", [math_data_processor, multichoice_qa_processor])
+@pytest.mark.parametrize("with_system", [False, True])
+@pytest.mark.parametrize("with_prompt", [False, True])
+def test_eval_processors_render_complete_conversation(
+    eval_chat_tokenizer: PreTrainedTokenizerFast,
+    processor: TaskDataProcessFnCallable,
+    with_system: bool,
+    with_prompt: bool,
+) -> None:
+    tokenizer = eval_chat_tokenizer
+    spec = TaskDataSpec(task_name="eval")
+    spec.system_prompt = "Use only the supplied instruction." if with_system else None
+    datum = {
+        "problem": "What is 2+2?",
+        "expected_answer": 4,
+        "question": "What is 2+2?",
+        "answer": "B",
+        "options": {"A": "3", "B": "4", "C": None},
+        "subject": "arithmetic",
+    }
+    if with_system:
+        datum["task_name"] = "eval"
+    user_content = "What is 2+2?"
+    if processor is math_data_processor:
+        spec.prompt = "Solve: {}" if with_prompt else None
+        if with_prompt:
+            user_content = "Solve: What is 2+2?"
+        expected_info = {"ground_truth": "4"}
+    else:
+        spec.prompt = "Choose one." if with_prompt else None
+        if with_prompt:
+            user_content = "Choose one.\n\nQuestion: What is 2+2?\nOptions:\nA) 3\nB) 4"
+        expected_info = {"ground_truth": "B", "subject": "arithmetic"}
+    messages = []
+    if with_system:
+        messages.append({"role": "system", "content": spec.system_prompt})
+    messages.append({"role": "user", "content": user_content})
+    expected_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    expected_ids = tokenizer(expected_text, add_special_tokens=False)["input_ids"]
+
+    result = processor(datum, spec, tokenizer, max_seq_length=1024, idx=7)
+
+    # Evaluation sends joined content to generation, while training flattens token_ids.
+    rendered = "\n".join(message["content"] for message in result["message_log"])
+    token_ids = torch.cat([message["token_ids"] for message in result["message_log"]])
+    assert rendered == expected_text
+    assert token_ids.tolist() == expected_ids
+    assert result["length"] == len(expected_ids)
+    assert result["loss_multiplier"] == 1.0
+    assert result["extra_env_info"] == expected_info
+    assert result["idx"] == 7
+    assert result.get("task_name") == datum.get("task_name")
+
+
+@pytest.mark.parametrize("limit_offset", [-1, 0, 1])
+def test_eval_math_processor_length_boundary(
+    eval_chat_tokenizer: PreTrainedTokenizerFast, limit_offset: int
+) -> None:
+    tokenizer = eval_chat_tokenizer
+    spec = TaskDataSpec()
+    spec.system_prompt = "Answer concisely."
+    messages = [
+        {"role": "system", "content": spec.system_prompt},
+        {"role": "user", "content": "What is 2+2?"},
+    ]
+    expected_text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+    expected_ids = tokenizer(expected_text, add_special_tokens=False)["input_ids"]
+    max_seq_length = len(expected_ids) + limit_offset
+    result = math_data_processor(
+        {"problem": "What is 2+2?", "expected_answer": 4},
+        spec,
+        tokenizer,
+        max_seq_length=max_seq_length,
+        idx=0,
+    )
+
+    assert result["length"] == len(expected_ids)
+    assert result["loss_multiplier"] == (1.0 if limit_offset > 0 else 0.0)
+    token_ids = torch.cat([message["token_ids"] for message in result["message_log"]])
+    if limit_offset > 0:
+        assert token_ids.tolist() == expected_ids
+    else:
+        assert token_ids.tolist() == expected_ids[:4]
+
+
 @pytest.mark.hf_gated
 @pytest.mark.parametrize(
     "tokenizer_name",
@@ -117,6 +490,7 @@ def test_math_data_processor():
 @pytest.mark.parametrize(
     "dataset_cls",
     [
+        AIMEDataset,
         OpenMathInstruct2Dataset,
         DeepScalerDataset,
     ],
@@ -191,6 +565,46 @@ def test_math_hf_data_processor_without_prompt():
     assert "Solve 1+1." in result["message_log"][0]["content"]
 
 
+def test_math_hf_data_processor_with_system_prompt():
+    datum_dict = {
+        "messages": [
+            {"role": "user", "content": "Solve 1+1."},
+            {"role": "assistant", "content": "2"},
+        ],
+        "task_name": "math",
+    }
+    tokenizer = DummyTokenizer()
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False) as f:
+        f.write("You are a math expert.")
+        system_prompt_file = f.name
+
+    try:
+        math_task_spec = TaskDataSpec(
+            task_name="math",
+            prompt_file=None,
+            system_prompt_file=system_prompt_file,
+        )
+
+        result = math_hf_data_processor(
+            datum_dict=datum_dict,
+            task_data_spec=math_task_spec,
+            tokenizer=tokenizer,
+            max_seq_length=512,
+            idx=0,
+        )
+
+        assert result["extra_env_info"]["ground_truth"] == "2"
+        assert result["loss_multiplier"] == 1.0
+        assert len(result["message_log"]) == 1
+        assert result["message_log"][0]["role"] == "user"
+        # System prompt should be included in the rendered content
+        assert "You are a math expert." in result["message_log"][0]["content"]
+        assert "Solve 1+1." in result["message_log"][0]["content"]
+    finally:
+        os.unlink(system_prompt_file)
+
+
 @pytest.fixture
 def system_prompt_file(request):
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as file:
@@ -214,7 +628,6 @@ def system_prompt_file(request):
 @pytest.mark.parametrize(
     "dataset_cls",
     [
-        AIMEDataset,
         GPQADataset,
         MathDataset,
         MMLUDataset,
@@ -308,3 +721,121 @@ def test_helpsteer3_data_processor():
 
     # Length equals sum of token lengths
     assert out["length"] == sum(int(m["token_ids"].numel()) for m in msg_log)
+
+
+# ---------------------------------------------------------------------------
+# kd_data_processor — raw-text forwarder for cross-tokenizer distillation.
+# The cross-tokenizer collator tokenizes (twice), so this processor must NOT
+# emit input_ids / token_mask / loss_mask; it only carries raw text.
+# ---------------------------------------------------------------------------
+
+
+class TestKdDataProcessor:
+    def _spec(self) -> TaskDataSpec:
+        return TaskDataSpec(
+            task_name="kd",
+            prompt_file=None,
+            system_prompt_file=None,
+        )
+
+    def test_registry_resolves_kd_data_processor(self):
+        assert "kd_data_processor" in PROCESSOR_REGISTRY
+        assert PROCESSOR_REGISTRY["kd_data_processor"] is kd_data_processor
+
+    def test_output_keys_and_values(self):
+        out = kd_data_processor(
+            datum_dict={
+                "messages": [{"role": "assistant", "content": "the quick brown fox"}]
+            },
+            task_data_spec=self._spec(),
+            tokenizer=DummyTokenizer(),  # must not be called
+            max_seq_length=512,
+            idx=3,
+        )
+        assert out["message_log"] == [
+            {"role": "assistant", "content": "the quick brown fox"}
+        ]
+        # length is a fake placeholder for the kd pipeline.
+        assert out["length"] == 0
+        assert out["extra_env_info"] is None
+        assert out["loss_multiplier"] == 1.0
+        assert out["idx"] == 3
+
+    def test_task_name_forwarded_when_present(self):
+        out = kd_data_processor(
+            datum_dict={
+                "messages": [{"role": "assistant", "content": "hello"}],
+                "task_name": "code",
+            },
+            task_data_spec=self._spec(),
+            tokenizer=DummyTokenizer(),
+            max_seq_length=128,
+            idx=0,
+        )
+        assert out.get("task_name") == "code"
+
+    def test_task_name_absent_when_not_in_datum(self):
+        out = kd_data_processor(
+            datum_dict={"messages": [{"role": "assistant", "content": "hello"}]},
+            task_data_spec=self._spec(),
+            tokenizer=DummyTokenizer(),
+            max_seq_length=128,
+            idx=0,
+        )
+        assert "task_name" not in out
+
+    def test_does_not_emit_collator_keys(self):
+        # Drift-detector: tokenization is the collator's job, not the
+        # processor's. If a future change emits any of these keys, the
+        # CrossTokenizerCollator's contract is broken.
+        out = kd_data_processor(
+            datum_dict={"messages": [{"role": "assistant", "content": "hello"}]},
+            task_data_spec=self._spec(),
+            tokenizer=DummyTokenizer(),
+            max_seq_length=128,
+            idx=0,
+        )
+        for forbidden in ("input_ids", "token_mask", "loss_mask"):
+            assert forbidden not in out, (
+                f"kd_data_processor must not emit {forbidden!r}; the "
+                "cross-tokenizer collator handles tokenization."
+            )
+
+    def test_does_not_call_tokenizer(self):
+        # A passing MagicMock tokenizer would let any call slip by — use
+        # a real DummyTokenizer subclass whose methods raise if invoked.
+        class StrictTokenizer(DummyTokenizer):
+            def apply_chat_template(self, *a, **kw):  # noqa: ARG002
+                raise AssertionError("tokenizer must not be called")
+
+            def __call__(self, *a, **kw):  # noqa: ARG002
+                raise AssertionError("tokenizer must not be called")
+
+            def encode(self, *a, **kw):  # noqa: ARG002
+                raise AssertionError("tokenizer must not be called")
+
+        # Should not raise — the processor must not touch the tokenizer.
+        _ = kd_data_processor(
+            datum_dict={"messages": [{"role": "assistant", "content": "hello"}]},
+            task_data_spec=self._spec(),
+            tokenizer=StrictTokenizer(),
+            max_seq_length=128,
+            idx=0,
+        )
+
+    def test_long_text_not_truncated_in_processor(self):
+        # Per PR contract, truncation lives in CrossTokenizerCollator
+        # (via tokenizer max_length), NOT in the processor. The
+        # processor forwards the full raw text regardless of
+        # max_seq_length.
+        long_text = "a" * 10_000
+        out = kd_data_processor(
+            datum_dict={"messages": [{"role": "assistant", "content": long_text}]},
+            task_data_spec=self._spec(),
+            tokenizer=DummyTokenizer(),
+            max_seq_length=128,
+            idx=0,
+        )
+        assert out["message_log"][0]["content"] == long_text
+        # length is a fake placeholder for the kd pipeline.
+        assert out["length"] == 0

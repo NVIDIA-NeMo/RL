@@ -1,0 +1,317 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Column-level helpers above :class:`DataPlaneClient`.
+
+These helpers use :func:`fetch_columns` / :meth:`put_samples` to operate
+on **columns** (named fields) of a partition — not on the
+driver process specifically. The driver uses them to fetch a slice and
+materialize / write deltas back; worker-side dispatches use the
+equivalents on ``AbstractPolicyWorker`` (``self._fetch(meta)`` /
+``self._write_back``).
+
+  * :func:`read_columns` — ``fetch_columns → materialize`` (decode jagged
+    + object-array fields into a :class:`BatchedDataDict`).
+  * :func:`write_columns` — pack-to-wire + ``put_samples`` for deltas
+    against an existing :class:`KVBatchMeta`.
+  * :func:`kv_first_write` — pack-to-wire + ``put_samples`` for the
+    rollout-actor's first put of a partition. Returns a new
+    :class:`KVBatchMeta`.
+"""
+
+from typing import Any, Sequence
+
+import numpy as np
+import torch
+from tensordict import TensorDict
+
+from nemo_rl.data.llm_message_utils import attach_message_log_view
+from nemo_rl.data.multimodal_utils import (
+    PACKED_MULTIMODAL_FIELDS,
+    PER_TOKEN_MULTIMODAL_FIELDS,
+    row_shapes_key,
+)
+from nemo_rl.data_plane.codec import materialize, pack_jagged_fields
+from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
+from nemo_rl.data_plane.schema import (
+    GLOBAL_FORWARD_PAD_SEQLEN,
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
+    OPD_FULL_FIELDS,
+    SAMPLER_TOPK_FIELDS,
+    Layout,
+)
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+# Fields the codec packs jagged via ``pack_per_token_field``. Rest go
+# through ``.detach().contiguous()``. Add per-token fields here — no
+# separate structural check is needed because the codec's binary
+# dispatch (Tensor | ndarray[object]) errors loudly on unknown types.
+_TEXT_TOKEN_ALIGNED_FIELDS = frozenset(
+    {
+        "input_ids",
+        "generation_logprobs",
+        "prev_logprobs",
+        "reference_policy_logprobs",
+        "teacher_reference_logprobs",
+        *OPD_FULL_FIELDS,
+        "advantages",
+        "returns",
+        "values",
+        "token_mask",
+        "sample_mask",
+        "routed_experts",
+        *SAMPLER_TOPK_FIELDS,
+        INVALID_TOOL_CALL_MASK,
+        MALFORMED_THINKING_MASK,
+    }
+)
+
+# Per-token multimodal type maps are sequence-aligned too, so they pack the
+# same way. Unioned from the registry rather than re-listed, so a new
+# per-token modality cannot be added there and silently forgotten here.
+TOKEN_ALIGNED_FIELDS = _TEXT_TOKEN_ALIGNED_FIELDS | PER_TOKEN_MULTIMODAL_FIELDS
+
+
+def round_up(value: int, multiple: int) -> int:
+    """Smallest ``multiple``-aligned int ≥ ``value`` (no-op when ``multiple <= 1``)."""
+    if multiple <= 1:
+        return value
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def fetch_columns(
+    dp_client: DataPlaneClient,
+    meta: KVBatchMeta,
+    select_fields: Sequence[str] | None,
+) -> TensorDict:
+    """Fetch packed media only from the rows that carry it.
+
+    The data plane requires every requested field on every requested row
+    (TQ narrows a mixed fetch and the adapter raises). Geometry tags say
+    which rows carry each packed field, so fields sharing a row set are
+    fetched together and rows without media get empty entries. Every other
+    field, per-token media included, must exist on every row.
+
+    Raises:
+        ValueError: Fields are unspecified, or sparse media wire data is not
+            nested.
+        KeyError: A requested field is missing from one of its selected rows.
+    """
+    if select_fields is None:
+        raise ValueError("fetch_columns requires explicit select_fields")
+    all_rows = tuple(range(len(meta.sample_ids)))
+    groups: dict[tuple[int, ...], list[str]] = {}
+    for key in select_fields:
+        indices = all_rows
+        if key in PACKED_MULTIMODAL_FIELDS and meta.tags is not None:
+            indices = tuple(
+                i
+                for i, tag in enumerate(meta.tags)
+                if tag.get(row_shapes_key(key), {}).get("shapes")
+            )
+        if indices:
+            groups.setdefault(indices, []).append(key)
+
+    result = TensorDict({}, batch_size=[len(all_rows)])
+    for indices, fields in groups.items():
+        fetched = dp_client.get_samples(
+            sample_ids=[meta.sample_ids[i] for i in indices],
+            partition_id=meta.partition_id,
+            select_fields=fields,
+        )
+        for key in fields:
+            value = fetched[key]
+            if indices != all_rows:
+                if not isinstance(value, torch.Tensor) or not value.is_nested:
+                    raise ValueError(f"Sparse media field {key!r} must be nested")
+                parts = list(value.unbind())
+                rows = [parts[0].new_empty(0) for _ in all_rows]
+                for i, part in zip(indices, parts, strict=True):
+                    rows[i] = part
+                value = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+            result[key] = value
+    return result
+
+
+def read_columns(
+    dp_client: DataPlaneClient,
+    meta: KVBatchMeta,
+    select_fields: Sequence[str],
+    *,
+    layout: Layout = "padded",
+    pad_value_dict: dict[str, Any] | None = None,
+) -> BatchedDataDict[Any]:
+    """``fetch_columns → materialize``, with fetches grouped by row set.
+
+    Pads to ``meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN]`` (minted on
+    the driver by ``TQPolicy._stamp_pad_seqlen`` and inherited by every
+    per-rank shard via :func:`shard_meta_for_dp`) — so driver-fetched
+    and worker-returned columns land at one identical seq dim.
+
+    Args:
+        dp_client: Data-plane client used for the underlying fetch.
+        meta: ``KVBatchMeta`` describing the keys to fetch.
+        select_fields: Fields to fetch.
+        layout: Materialization layout (``"padded"`` or ``"jagged"``).
+        pad_value_dict: Per-field pad value for jagged tensors (e.g.
+            ``input_ids → pad_token_id``); defaults to 0.
+
+    Returns:
+        ``BatchedDataDict`` with the requested fields, materialized.
+
+    Raises:
+        ValueError: Sparse media wire data or metadata is invalid.
+        KeyError: A requested field is missing from one of its selected rows.
+    """
+    td = fetch_columns(dp_client, meta, select_fields)
+    pad_to_seqlen = int((meta.extra_info or {}).get(GLOBAL_FORWARD_PAD_SEQLEN, 0))
+    data = materialize(
+        td,
+        layout=layout,
+        pad_value_dict=pad_value_dict,
+        pad_to_seqlen=pad_to_seqlen,
+        tags=meta.tags,
+    )
+    attach_message_log_view(data)
+    return data
+
+
+def write_columns(
+    dp_client: DataPlaneClient,
+    meta: KVBatchMeta,
+    fields: "dict[str, torch.Tensor | np.ndarray]",
+) -> None:
+    """``put_samples(meta.sample_ids, fields=...)``.
+
+    Per-token tensor fields are converted to jagged via
+    :func:`pack_jagged_fields` so they land in TQ with the same row
+    lengths as the initial put. ``np.ndarray(dtype=object)`` leaves
+    pass through as-is.
+
+    Args:
+        dp_client: Data-plane client used for the underlying put.
+        meta: ``KVBatchMeta`` describing the keys being written.
+        fields: Map of field name to tensor or object array.
+    """
+    if not fields:
+        return
+
+    seq_lens = meta.sequence_lengths
+    lengths = torch.tensor(seq_lens, dtype=torch.long) if seq_lens is not None else None
+    td = pack_jagged_fields(
+        fields,
+        lengths=lengths,
+        token_aligned_fields=TOKEN_ALIGNED_FIELDS,
+    )
+    dp_client.put_samples(
+        sample_ids=meta.sample_ids,
+        partition_id=meta.partition_id,
+        fields=td,
+    )
+
+
+def kv_first_write(
+    final_batch_cpu: BatchedDataDict[Any],
+    *,
+    sample_ids: Sequence[str],
+    dp_client: DataPlaneClient,
+    partition_id: str,
+    extra_info: dict[str, Any] | None = None,
+    task_name: str = "train",
+    pad_to_multiple: int = 1,
+    tags: list[dict[str, Any]] | None = None,
+) -> KVBatchMeta:
+    """Single flat ``put_samples`` of every tensor field in ``final_batch_cpu``.
+
+    The rollout actor's first put of a partition. Caller mints
+    ``sample_ids`` (verl-style) — the helper is rollout-shape-agnostic.
+
+    Args:
+        final_batch_cpu: Rollout output already on CPU. Must contain
+            ``"sample_mask"`` (used as batch-size oracle: ``shape[0] == N``)
+            and ``"input_lengths"`` (per-row valid lengths for the jagged
+            pack). Tensor fields are packed jagged via
+            :func:`pack_jagged_fields`; ``np.ndarray(dtype=object)``
+            leaves pass through.
+        sample_ids: Pre-minted per-sample ids, one per row of
+            ``final_batch_cpu``.
+        dp_client: Data-plane client used for the put.
+        partition_id: TQ partition to write into.
+        extra_info: Optional extra fields to attach to the returned meta.
+        task_name: Consumer task tag stamped on the returned meta.
+        pad_to_multiple: Seq-dim alignment recorded in ``extra_info`` so
+            readers pad to a multiple compatible with downstream backends
+            (mcore SP, PyTorch CP).
+        tags: Optional per-sample primitive metadata (one dict per row).
+            Stored on the TQ controller alongside the samples; travels
+            with ``KVBatchMeta`` through ``subset`` / ``concat`` / ``slice``
+            so consumers can filter on it without fetching tensor data.
+
+    Returns:
+        ``KVBatchMeta`` covering the written samples.
+    """
+    n = int(final_batch_cpu["sample_mask"].shape[0])
+    if n == 0 or len(sample_ids) != n:
+        raise ValueError(
+            f"kv_first_write: sample_ids ({len(sample_ids)}) must match batch size ({n})"
+        )
+    if tags is not None and len(tags) != n:
+        raise ValueError(
+            f"kv_first_write: tags ({len(tags)}) must match batch size ({n})"
+        )
+    lengths = final_batch_cpu["input_lengths"]
+    # Binary wire dispatch: only ``torch.Tensor`` (including
+    # ``torch.nested``) and ``np.ndarray[object]`` cross the codec.
+    # Raise loudly on anything else instead of silently dropping —
+    # that's the class of silent-drop bug that let PackedTensor
+    # pixel_values disappear from the TQ pipe pre-Option B.
+    fields: dict[str, torch.Tensor | np.ndarray] = {}
+    for k, v in final_batch_cpu.items():
+        if isinstance(v, torch.Tensor) or (
+            isinstance(v, np.ndarray) and v.dtype == object
+        ):
+            fields[k] = v
+        else:
+            raise TypeError(
+                f"Field {k!r}: unexpected wire type {type(v).__name__}. "
+                "Only torch.Tensor (incl. torch.nested) and "
+                "np.ndarray[object] cross the wire boundary. Convert "
+                "domain-layer wrappers (e.g. PackedTensor via "
+                "torch.nested.as_nested_tensor) in the rollout actor "
+                "before calling kv_first_write."
+            )
+    td = pack_jagged_fields(
+        fields,
+        lengths=lengths,
+        token_aligned_fields=TOKEN_ALIGNED_FIELDS,
+    )
+    dp_client.put_samples(
+        sample_ids=list(sample_ids),
+        partition_id=partition_id,
+        fields=td,
+        tags=tags,
+    )
+
+    extras = dict(extra_info or {})
+    if pad_to_multiple > 1:
+        extras["pad_to_multiple"] = int(pad_to_multiple)
+    return KVBatchMeta(
+        partition_id=partition_id,
+        task_name=task_name,
+        sample_ids=list(sample_ids),
+        fields=list(td.keys()),
+        sequence_lengths=[int(s) for s in lengths.tolist()],
+        extra_info=extras,
+        tags=[dict(t) for t in tags] if tags is not None else None,
+    )

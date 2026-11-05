@@ -1,0 +1,117 @@
+# CI/CD
+
+NeMo RL uses GitHub Actions for continuous integration, testing, and release automation. The CI pipeline implements a tiered testing system that balances thoroughness with resource efficiency.
+
+## Test Levels
+
+Tests are organized into levels of increasing scope and cost:
+
+| Level | What runs | When |
+|-------|-----------|------|
+| **docs** | Doctests only, reuses pre-built main container (skips build); PRs to a release branch (e.g. `r0.8.0`) reuse that branch's container, same as Lfast | `CI:docs` label |
+| **L0** | Doctests + unit tests (3 parallel suites: Generation, Policy, Other) | `CI:L0` label |
+| **L1** | Doctests + unit tests + functional tests (GPU) | `CI:L1` label, push to main/merge-group |
+| **L2** | Same as L1 today (plan to add convergence tests) | `CI:L2` label |
+| **Lfast** | Fast unit + functional tests, reuses pre-built main container (skips build); PRs to a release branch (e.g. `r0.8.0`) reuse that branch's container, which is published only by builds of the release branch itself (pushes after merges), never by PR builds; until the first such build exists, Lfast on that branch cannot pull its image | `CI:Lfast` label |
+
+**Defaults:**
+- PRs do not run tests unless a CI label is applied.
+- Pushes to `main` and merge-group events force **L1**.
+- Nightly scheduled runs (09:00 UTC) run the full suite.
+- Doc-only changes are auto-detected and skip unnecessary tests.
+
+### When Lfast missed a failure
+
+`CI:Lfast` runs a subset of `CI:L1`. If L1 catches a failure that Lfast missed, promote the test that caught it into Lfast so the next PR sees it earlier:
+
+- Unit test: narrow or remove the entry that excludes it in `tests/unit/excluded_unit_tests.sh`. Tests under `research/*/tests/unit` never run in Lfast.
+- Functional test: change its `run_test <cmd>` line in `tests/functional/L1_Functional_Tests_*.sh` to `run_test fast <cmd>`. Lfast runs only the H100 scripts, so a test in an `L1_Functional_Tests_GB200_*.sh` script, or a failure that reproduces only on GB200, cannot be promoted this way.
+
+## Shared Build Caches
+
+- The prebuilt `main` container and the TRT-LLM ccache/wheel cache images are written only by builds of `main` itself. PR builds read them but never push to them.
+- Release branches (`r<major>.<minor>.<patch>`) get their own container tag (`:<branch>`), `<branch>-buildcache` and branch-scoped TRT-LLM caches, written only by pushes to that branch (manual dispatches on a release branch publish nothing shared). They never write `main`'s caches or the `uv-cache` image.
+- A PR's own image is tagged with its run ID and PR number only.
+
+## Triggering CI on Pull Requests
+
+1. **Apply a CI label** to your PR: `CI:docs`, `CI:L0`, `CI:L1`, `CI:L2`, or `CI:Lfast`. Use `CI:docs` for docs-only changes. Otherwise use `CI:Lfast` by default, including for new features and bug fixes; use `CI:L1` only for a large refactor, broad changes to core code, or dependency changes.
+2. **Comment** `/ok to test <commit-sha>` — a bot will acknowledge with a thumbs-up and start CI.
+   - If you are an external contributor, you will need an internal NVIDIA developer to comment this on your PR to trigger CI.
+3. The **`Skip CICD`** label bypasses tests entirely (except on `main`/merge-group).
+
+## Required Checks
+
+All PRs must pass these checks before merging:
+
+- **Lint**: ruff + pyrefly via pre-commit
+- **Branch freshness**: PR branch must be at most 10 commits behind the base branch
+- **Semantic PR title**: must follow conventional commit format
+- **DCO sign-off**: all commits must be signed with `--signoff` (see [CONTRIBUTING.md](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md))
+- **Secrets detection**: scans for accidentally committed secrets
+- **Submodule validation**: Automodel submodule must be fast-forwarded from the base branch
+
+## CI Pipeline Architecture
+
+The main pipeline (`cicd-main.yml`) runs through these stages:
+
+1. **Pre-flight**: determines test level from PR labels, changed files, and event type
+2. **Container build**: Docker image built on GPU runners (skipped for `Lfast` or when a pre-built `image_tag` is provided via `workflow_dispatch`)
+3. **Tests**: unit and functional tests run in containers on GPU runners using the custom `test-template` action. Doc tests also run in the GPU container, in parallel with the unit tests; no job waits for them. The CPU config checks (`test_recipes_and_test_suites.py`, `test_config_validation.py`) run on a GitHub-hosted CPU runner in parallel with the container build; no GPU job waits for them, and on a PR run a failure cancels the rest of the run.
+4. **Coverage**: aggregated from doc-tests, unit-tests, and e2e; uploaded to Codecov
+5. **QA Gate**: aggregates all job results into a single pass/fail status
+
+## Re-running a Failed Run
+
+To retry the same commit, re-run only the failed jobs (**Re-run jobs → Re-run failed jobs**, or `gh run rerun <run-id> --failed`). **Re-run all jobs** repeats every GPU job that already passed. See [CONTRIBUTING.md](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md).
+
+## Code Review
+
+Commenting `/claude-review` on a PR triggers an AI-powered code review. This is restricted to org members.
+
+## Nightly Runs
+
+- Full test suite runs daily at **09:00 UTC** on `main`. Failures send Slack alerts.
+- Nightly docs are published at **10:00 UTC** to a separate "nightly" version (does not overwrite stable "latest" docs).
+
+## Release Process
+
+All release workflows are manual (`workflow_dispatch`) with dry-run defaults:
+
+| Workflow | Purpose |
+|----------|---------|
+| `release-freeze.yml` | Create release branch and version bump |
+| `release.yaml` | Build wheel, create GitHub release, generate changelog |
+| `release-docs.yml` | Publish docs to S3 + Akamai CDN (versioned and/or "latest") |
+| `build-test-publish-wheel.yml` | Auto-publish to TestPyPI on main/release pushes (dry-run by default) |
+
+## Infrastructure
+
+- **VM health checks** (`healthcheck_vms.yml`): daily GPU health checks (07:00 UTC) on self-hosted runners. Auto-reboots degraded VMs and alerts via Slack on persistent failures.
+- **Merge queue retry** (`merge-queue-retry.yml`): auto-retries PRs dequeued due to CI timeout (max 3 retries before alerting).
+- **Stale cleanup** (`close-inactive-issue-pr.yml`): daily auto-close of inactive issues and PRs.
+- **Cherry-pick** (`cherry-pick-release-commit.yml`): auto-creates cherry-pick PRs from release branches back to main.
+- **Community bot** (`community-bot.yml`): syncs issues and comments to a GitHub Project board for tracking.
+
+## Workflow Reference
+
+| Workflow | Trigger | Purpose |
+|----------|---------|---------|
+| `cicd-main.yml` | push, PR, schedule, dispatch | Main CI pipeline |
+| `build-test-publish-wheel.yml` | push main/r** | Wheel build + TestPyPI |
+| `release.yaml` | dispatch | Full release |
+| `release-freeze.yml` | dispatch | Code freeze |
+| `release-docs.yml` | dispatch, callable | Publish docs to S3/CDN |
+| `release-nightly-docs.yml` | schedule (10:00 UTC) | Nightly docs publish |
+| `detect-secrets.yml` | PR | Secrets scanning |
+| `semantic-pull-request.yml` | PR | PR title validation |
+| `labeler.yaml` | PR | Auto-label by file path |
+| `lockfile-check.yml` | PR (dependency paths) | uv.lock freshness vs submodule pyprojects |
+| `claude-review.yml` | `/claude-review` comment | AI code review |
+| `healthcheck_vms.yml` | schedule (07:00 UTC), dispatch | GPU runner health |
+| `automodel-submodule-checks.yml` | PR | Submodule validation |
+| `merge-queue-retry.yml` | PR dequeued (timeout) | Auto-retry merge queue |
+| `cherry-pick-release-commit.yml` | push main | Release cherry-picks |
+| `close-inactive-issue-pr.yml` | schedule (01:30 UTC) | Stale issue/PR cleanup |
+| `community-bot.yml` | issues, comments | Project board sync |
+| `pr-checks-comment.yml` | PR | Post submodule check results |

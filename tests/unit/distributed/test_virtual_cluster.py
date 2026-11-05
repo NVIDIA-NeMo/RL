@@ -11,22 +11,76 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
 import os
+import random
+import re
+import socket
 import subprocess
+import sys
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import MagicMock, patch
 
 import pytest
 import ray
+from ray._common.utils import load_class
 
+from nemo_rl.distributed import virtual_cluster
 from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_DATA_PLANE_PORT_RANGE_HIGH,
+    DEFAULT_DATA_PLANE_PORT_RANGE_LOW,
+    DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+    DEFAULT_GYM_PORT_RANGE_HIGH,
+    DEFAULT_GYM_PORT_RANGE_LOW,
+    DEFAULT_MASTER_PORT_RANGE_HIGH,
+    DEFAULT_MASTER_PORT_RANGE_LOW,
+    DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH,
+    DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW,
+    DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH,
+    DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW,
+    DEFAULT_VLLM_PORT_RANGE_LOW,
+    DEFAULT_VLLM_PORTS_PER_ENGINE,
     PY_EXECUTABLES,
+    RAY_CLUSTER_EXTERNAL,
+    RAY_CLUSTER_REUSED_LOCAL,
+    RAY_CLUSTER_STARTED_LOCAL,
     RayVirtualCluster,
     ResourceInsufficientError,
+    _bind_socket_in_range,
+    _get_free_consecutive_ports_local,
+    _get_free_port_local,
     _get_node_ip_and_free_port,
+    _init_ray,
+    _reserve_data_plane_ports,
 )
 from nemo_rl.utils.venvs import create_local_venv
 from tests.unit.conftest import TEST_ASSETS_DIR
+
+
+def _ray_sub_default(name: str) -> int:
+    ray_sub = (Path(__file__).resolve().parents[3] / "ray.sub").read_text()
+    match = re.search(
+        rf'^{re.escape(name)}="?\$\{{[A-Z0-9_]+:-(\d+)\}}"?',
+        ray_sub,
+        re.MULTILINE,
+    )
+    assert match is not None, f"{name} default not found in ray.sub"
+    return int(match.group(1))
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    (("SANDBOX_PORT", 6000), ("SANDBOX_BASE_PORT", 6001)),
+)
+def test_ray_sub_default_handles_quoted_and_aliased_variables(
+    name: str, expected: int
+) -> None:
+    assert _ray_sub_default(name) == expected
 
 
 def test_get_node_ip_and_free_port_does_not_start_with_zero():
@@ -65,28 +119,6 @@ def test_env_max_retries_non_integer():
         with pytest.raises(ValueError):
             cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
             cluster._init_placement_groups()
-
-
-def test_env_max_retries_default_value():
-    """Test that default value for NRL_VIRTUAL_CLUSTER_MAX_RETRIES is used when not set."""
-
-    # Ensure environment variable is not set
-    with (
-        patch.dict(os.environ, {}, clear=True),
-        patch(
-            "nemo_rl.distributed.virtual_cluster.RayVirtualCluster._init_placement_groups"
-        ) as mock_init,
-    ):
-        # Mock successful initialization
-        mock_init.return_value = [MagicMock()]
-
-        # Create cluster
-        cluster = RayVirtualCluster(bundle_ct_per_node_list=[1])
-        cluster._init_placement_groups()
-
-        # Default value should be 6 (as seen in the code)
-        # We can't directly verify this, but we can check that initialization was attempted
-        assert mock_init.call_count == 1
 
 
 def test_env_max_retries_exhausted():
@@ -195,6 +227,134 @@ def test_ray_uses_same_cluster_for_permuted_cuda_devices():
         assert mock_ray_shutdown.call_count == 0
 
 
+@pytest.mark.parametrize(
+    "cluster_res, expected",
+    [
+        # A cluster NeMo-RL started earlier, whose CVD tag still matches.
+        ({"GPU": 1, "nrl_tag_0": 1}, RAY_CLUSTER_REUSED_LOCAL),
+        # Somebody else's cluster (ray.sub, KubeRay): no nrl_tag_ resource.
+        ({"GPU": 8}, RAY_CLUSTER_EXTERNAL),
+    ],
+)
+def test_init_ray_reports_how_it_got_its_cluster(cluster_res, expected):
+    """Recorded on rl.setup.ray_init: attaching and booting differ by minutes,
+    and that difference is the usual reason two identical runs disagree on
+    time-to-first-step.
+    """
+    with (
+        patch("ray.init"),
+        patch("ray.shutdown"),
+        patch("ray.cluster_resources", return_value=cluster_res),
+        patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True),
+    ):
+        assert _init_ray() == expected
+
+
+def test_init_ray_reports_a_freshly_booted_cluster():
+    with (
+        patch("ray.init", side_effect=[ConnectionError("no cluster"), None]),
+        patch("ray.shutdown"),
+        patch("ray.cluster_resources", return_value={"GPU": 1}),
+        patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True),
+    ):
+        assert _init_ray() == RAY_CLUSTER_STARTED_LOCAL
+
+
+def test_maybe_configure_data_plane_env_then_init_ray_threads_env_vars():
+    """This is the pattern every data-plane-enabled launcher uses --
+    maybe_configure_data_plane_env(config.data_plane) immediately before
+    init_ray() -- because init_ray's env_vars snapshot is the only point a
+    backend engine knob becomes cluster-wide (see both functions'
+    docstrings). init_ray itself has no data-plane awareness; the ordering
+    at the call site is what makes this work, so exercise the two calls
+    together rather than mocking either one out.
+
+    The fabric probe and the already-imported guard ARE mocked: both read
+    process/host state (sysfs, sys.modules) that would otherwise make this
+    test's outcome depend on the machine it runs on and on whether another
+    test already imported the transfer_queue adapter.
+    """
+    from nemo_rl.data_plane.factory import maybe_configure_data_plane_env
+    from nemo_rl.distributed.virtual_cluster import init_ray
+
+    env_mod = "nemo_rl.data_plane.adapters.transfer_queue_env"
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+        patch(f"{env_mod}.fabric_is_roce_only", return_value=True),
+        patch(f"{env_mod}._engine_already_imported", return_value=None),
+    ):
+        # Matching tag -> init_ray takes the "reuse existing cluster" path
+        # and returns after exactly one ray.init call, the one whose
+        # runtime_env we need to inspect.
+        mock_cluster_resources.return_value = {"nrl_tag_0": 1}
+        env = {"CUDA_VISIBLE_DEVICES": "0"}
+        with patch.dict(os.environ, env, clear=True):
+            maybe_configure_data_plane_env(
+                {
+                    "enabled": True,
+                    "impl": "transfer_queue",
+                    "backend": "mooncake_cpu",
+                    "claim_meta_poll_interval_s": 0.5,
+                }
+            )
+            init_ray()
+
+        assert mock_ray_init.call_count == 1
+        env_vars = mock_ray_init.call_args_list[0][1]["runtime_env"]["env_vars"]
+        assert env_vars["MC_STORE_MEMCPY"] == "0"
+        assert env_vars["MC_ENABLE_DEST_DEVICE_AFFINITY"] == "1"
+
+
+def test_init_ray_adds_hf_modules_cache_to_cluster_pythonpath():
+    """Direct actors must import trust_remote_code classes while unpickling."""
+    from nemo_rl.distributed.virtual_cluster import init_ray
+
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+    ):
+        mock_cluster_resources.return_value = {"nrl_tag_0": 1}
+        env = {
+            "CUDA_VISIBLE_DEVICES": "0",
+            "HF_MODULES_CACHE": "/hf/modules",
+            "PYTHONPATH": "/project",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            init_ray()
+
+        env_vars = mock_ray_init.call_args_list[0][1]["runtime_env"]["env_vars"]
+        assert env_vars["HF_MODULES_CACHE"] == "/hf/modules"
+        assert env_vars["PYTHONPATH"].split(os.pathsep) == [
+            "/hf/modules",
+            "/project",
+        ]
+
+
+def test_init_ray_alone_has_no_data_plane_awareness():
+    """Every non-data-plane launcher's call (bare init_ray(), no preceding
+    maybe_configure_data_plane_env) must not touch mooncake env vars --
+    init_ray does not know the data plane exists."""
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+    ):
+        mock_cluster_resources.return_value = {"nrl_tag_0": 1}
+        env = {"CUDA_VISIBLE_DEVICES": "0"}
+        with patch.dict(os.environ, env, clear=True):
+            from nemo_rl.distributed.virtual_cluster import init_ray
+
+            init_ray()
+
+        env_vars = mock_ray_init.call_args_list[0][1]["runtime_env"]["env_vars"]
+        assert "MC_STORE_MEMCPY" not in env_vars
+        assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in env_vars
+
+
+@pytest.mark.skipif(
+    os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1",
+    reason="No venv is built when every PY_EXECUTABLES entry is sys.executable",
+)
 def test_mcore_py_executable():
     # The temporary directory is created within the project.
     # For some reason, creating a virtual environment outside of the project
@@ -246,3 +406,604 @@ def test_not_create_sorted_bundle_indices_for_per_node_pg():
     cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)
     cluster._init_placement_groups(strategy=None, use_unified_pg=False)
     assert cluster._sorted_bundle_indices is None
+
+
+class TestBindSocketInRange:
+    """Tests for _bind_socket_in_range()."""
+
+    def test_binds_port_within_range(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            port = _bind_socket_in_range(s, 11001, 11100)
+            assert 11001 <= port < 11100
+
+    def test_raises_after_max_retries_exhausted(self):
+        mock_sock = MagicMock()
+        mock_sock.bind.side_effect = OSError("Address already in use")
+        with pytest.raises(RuntimeError, match="Could not find a free port"):
+            _bind_socket_in_range(mock_sock, 11999, 12000, max_retries=10)
+        assert mock_sock.bind.call_count == 10
+
+    def test_retries_on_occupied_port(self):
+        mock_sock = MagicMock()
+        mock_sock.bind.side_effect = [
+            OSError("Address already in use"),
+            OSError("Address already in use"),
+            OSError("Address already in use"),
+            None,
+        ]
+        port = _bind_socket_in_range(mock_sock, 12001, 12100, max_retries=50)
+        assert 12001 <= port < 12100
+        assert mock_sock.bind.call_count == 4
+
+    def test_single_port_range(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            port = _bind_socket_in_range(s, 12010, 12011)
+            assert port == 12010
+
+    def test_exhaustive_selection_skips_excluded_ports(self, monkeypatch):
+        mock_sock = MagicMock()
+        monkeypatch.setattr("random.shuffle", lambda candidates: None)
+
+        port = _bind_socket_in_range(
+            mock_sock,
+            12020,
+            12023,
+            max_retries=None,
+            excluded_ports={12020, 12021},
+        )
+
+        assert port == 12022
+        mock_sock.bind.assert_called_once_with(("", 12022))
+
+    def test_bounded_path_draws_from_the_supplied_rng(self):
+        """The supplied rng, not the process-wide `random` module, picks the port."""
+        mock_sock = MagicMock()
+
+        port = _bind_socket_in_range(mock_sock, 12100, 12200, rng=random.Random(1234))
+
+        assert port == random.Random(1234).randint(12100, 12199)
+        mock_sock.bind.assert_called_once_with(("", port))
+
+    def test_exhaustive_path_draws_from_the_supplied_rng(self):
+        """The max_retries=None shuffle must also honor the supplied rng."""
+        mock_sock = MagicMock()
+
+        port = _bind_socket_in_range(
+            mock_sock, 12200, 12300, max_retries=None, rng=random.Random(1234)
+        )
+
+        expected_candidates = list(range(12200, 12300))
+        random.Random(1234).shuffle(expected_candidates)
+        assert port == expected_candidates[0]
+        mock_sock.bind.assert_called_once_with(("", port))
+
+    def test_distinct_seeds_decorrelate_ports(self):
+        """The property rng exists for: ranks on one node must not collide.
+
+        Without it every rank replays the same process-wide sequence.
+        """
+        ports = set()
+        for rank in range(4):
+            mock_sock = MagicMock()
+            ports.add(
+                _bind_socket_in_range(mock_sock, 12300, 13300, rng=random.Random(rank))
+            )
+
+        assert len(ports) == 4
+
+
+class TestGetFreePortLocal:
+    """Tests for _get_free_port_local()."""
+
+    def test_returns_port_in_default_range(self):
+        port = _get_free_port_local()
+        assert DEFAULT_MASTER_PORT_RANGE_LOW <= port < DEFAULT_MASTER_PORT_RANGE_HIGH
+
+    def test_returns_port_in_custom_range(self):
+        port = _get_free_port_local(port_range_low=13000, port_range_high=13100)
+        assert 13000 <= port < 13100
+
+    def test_port_is_reusable_after_return(self):
+        port = _get_free_port_local(port_range_low=13100, port_range_high=13200)
+        # The socket is closed after _get_free_port_local returns (context manager),
+        # so we should be able to bind to the same port again.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("", port))
+
+    def test_multiple_calls_return_different_ports(self):
+        ports = {
+            _get_free_port_local(port_range_low=13200, port_range_high=14000)
+            for _ in range(10)
+        }
+        # With a range of 800 ports, 10 calls should very likely produce multiple unique ports
+        assert len(ports) > 1
+
+
+class TestGetFreeConsecutivePortsLocal:
+    """Tests for _get_free_consecutive_ports_local()."""
+
+    def test_single_port_in_range(self):
+        port = _get_free_consecutive_ports_local(14000, 14100, consecutive=1)
+        assert 14000 <= port < 14100
+
+    def test_returns_bindable_contiguous_block(self):
+        n = 5
+        base = _get_free_consecutive_ports_local(14100, 14300, consecutive=n)
+        assert 14100 <= base
+        assert base + n - 1 < 14300
+        # All n ports are simultaneously bindable.
+        socks = []
+        try:
+            for offset in range(n):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("", base + offset))
+                socks.append(s)
+        finally:
+            for s in socks:
+                s.close()
+
+    def test_start_port_below_low_is_clamped(self):
+        base = _get_free_consecutive_ports_local(
+            14300, 14400, consecutive=1, start_port=1000
+        )
+        assert base >= 14300
+
+    def test_cursor_advance_yields_non_overlapping_blocks(self):
+        n = 3
+        first = _get_free_consecutive_ports_local(14400, 14600, consecutive=n)
+        second = _get_free_consecutive_ports_local(
+            14400, 14600, consecutive=n, start_port=first + n
+        )
+        assert second >= first + n
+
+    def test_raises_when_range_exhausted(self):
+        # A 3-wide range cannot fit a block of 5.
+        with pytest.raises(RuntimeError, match="consecutive free ports"):
+            _get_free_consecutive_ports_local(14600, 14603, consecutive=5)
+
+    def test_port_is_reusable_after_return(self):
+        base = _get_free_consecutive_ports_local(14700, 14800, consecutive=2)
+        # Sockets are closed before return, so the block can be re-bound.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", base))
+
+    def test_raises_when_start_port_at_or_above_high(self):
+        with pytest.raises(RuntimeError, match="consecutive free ports"):
+            _get_free_consecutive_ports_local(
+                14850, 14900, consecutive=1, start_port=15000
+            )
+
+    def test_block_fits_exactly_against_high_boundary(self):
+        # high is exclusive: a block whose last port is high-1 must still fit.
+        n = 4
+        base = _get_free_consecutive_ports_local(14900, 14900 + n, consecutive=n)
+        assert base == 14900
+        socks = []
+        try:
+            for offset in range(n):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("", base + offset))
+                socks.append(s)
+        finally:
+            for s in socks:
+                s.close()
+
+    def test_rejects_non_positive_consecutive(self):
+        with pytest.raises(AssertionError, match="consecutive must be >= 1"):
+            _get_free_consecutive_ports_local(14950, 15000, consecutive=0)
+
+
+class TestReserveDataPlanePorts:
+    """Tests for _reserve_data_plane_ports().
+
+    The defaults the data plane lands on -- 50050 for mooncake's metadata
+    server and 50051 for the master RPC, both from TransferQueue's config.yaml,
+    plus 9003 for the master's metrics server from its own gflag -- all sit
+    inside the 9000-65000 ephemeral range these nodes use. The kernel can hand
+    any of them to an outgoing connection in the minutes between job start and
+    the master's bind, and the master then exits with EADDRINUSE after every
+    node is already up.
+    """
+
+    def test_ports_are_distinct_bindable_and_in_band(self):
+        ports = _reserve_data_plane_ports(3)
+
+        # Distinctness is the regression worth guarding: without excluded_ports
+        # the allocator can hand back the same port twice, pointing two of the
+        # master's servers at one address.
+        assert len(set(ports)) == 3, f"all ports must differ, got {ports}"
+        for label, port in zip(("metadata", "master", "metrics"), ports):
+            assert (
+                DEFAULT_DATA_PLANE_PORT_RANGE_LOW
+                <= port
+                < DEFAULT_DATA_PLANE_PORT_RANGE_HIGH
+            ), f"{label} port {port} escaped the band ray.sub's map documents"
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                # No SO_REUSEADDR, matching mooncake_master: a port obtainable
+                # only by reusing a lingering slot is not one the master could
+                # bind either.
+                s.bind(("", port))
+
+    def test_ports_stay_below_the_ephemeral_floor(self):
+        ephemeral_range = Path("/proc/sys/net/ipv4/ip_local_port_range")
+        if not ephemeral_range.exists():
+            pytest.skip(f"{ephemeral_range} is unavailable on this platform")
+
+        ephemeral_low = int(ephemeral_range.read_text().split()[0])
+        assert max(_reserve_data_plane_ports(3)) < ephemeral_low
+
+    def test_occupied_port_is_routed_around(self):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+            try:
+                held.bind(("", DEFAULT_DATA_PLANE_PORT_RANGE_LOW))
+            except OSError:
+                pytest.skip(
+                    f"port {DEFAULT_DATA_PLANE_PORT_RANGE_LOW} is in use on this host"
+                )
+            held.listen(1)
+            ports = _reserve_data_plane_ports(3)
+
+        assert DEFAULT_DATA_PLANE_PORT_RANGE_LOW not in ports
+
+    def test_raises_when_the_band_cannot_satisfy_the_request(self, monkeypatch):
+        # A one-port band also proves each choice is excluded from the next:
+        # without that, the second call would reuse the first port instead of
+        # failing.
+        monkeypatch.setattr(
+            virtual_cluster,
+            "DEFAULT_DATA_PLANE_PORT_RANGE_HIGH",
+            DEFAULT_DATA_PLANE_PORT_RANGE_LOW + 1,
+        )
+        try:
+            # The one-port case has to succeed first, or a busy port would
+            # raise this same error before the exclusion is ever reached and
+            # the assertion below would pass for the wrong reason.
+            _reserve_data_plane_ports(1)
+        except RuntimeError:
+            pytest.skip(
+                f"port {DEFAULT_DATA_PLANE_PORT_RANGE_LOW} is in use on this host"
+            )
+
+        with pytest.raises(RuntimeError, match="Could not find a free port in range"):
+            _reserve_data_plane_ports(2)
+
+
+class TestRayVirtualClusterPortRange:
+    """Tests for port range propagation in RayVirtualCluster."""
+
+    def test_custom_port_range(self):
+        cluster = RayVirtualCluster(
+            bundle_ct_per_node_list=[1],
+            port_range_low=20000,
+            port_range_high=25000,
+        )
+        assert cluster.port_range_low == 20000
+        assert cluster.port_range_high == 25000
+
+
+class TestVllmPortAssignment:
+    """Tests for VLLM_PORT env var calculation in BaseVllmGenerationWorker.configure_worker."""
+
+    @pytest.mark.parametrize(
+        "bundle_indices,expected_port",
+        [
+            # TP=1: single-bundle engines, engine_index = bundle index
+            ((0, [0]), 7000),
+            ((0, [1]), 7100),
+            ((0, [7]), 7700),
+            ((1, [0]), 7000),
+            ((1, [3]), 7300),
+            # TP=4: multi-bundle engine, engine_index = first_bundle // tp_size
+            ((0, [0, 1, 2, 3]), 7000),  # 0 // 4 = 0
+            ((0, [4, 5, 6, 7]), 7100),  # 4 // 4 = 1
+            # TP=2: multi-bundle engine
+            ((0, [0, 1]), 7000),  # 0 // 2 = 0
+            ((0, [2, 3]), 7100),  # 2 // 2 = 1
+            ((0, [6, 7]), 7300),  # 6 // 2 = 3
+            # TP=8: entire node is one engine
+            ((0, [0, 1, 2, 3, 4, 5, 6, 7]), 7000),  # 0 // 8 = 0
+        ],
+    )
+    def test_vllm_port_assignment(self, bundle_indices, expected_port):
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(
+            num_gpus=1, bundle_indices=bundle_indices
+        )
+        assert env_vars["VLLM_PORT"] == str(expected_port)
+
+    @pytest.mark.parametrize(
+        "num_gpus_per_node,bundle_indices,expected_slot",
+        [
+            # expected_slot is the node-local engine index; the port is
+            # DEFAULT_VLLM_PORT_RANGE_LOW + slot * DEFAULT_VLLM_PORTS_PER_ENGINE.
+            # Deriving it from the constants keeps this test correct if the base
+            # of the vLLM port band changes.
+            #
+            # With 8 GPUs per node, engines that fit on one node give the same
+            # slot as the original index, since the bundle id modulo 8 is
+            # unchanged within a node.
+            (8, (0, [0]), 0),
+            (8, (0, [7]), 7),
+            (8, (0, [4, 5, 6, 7]), 1),  # (4 % 8) // 4
+            (8, (0, [0, 1, 2, 3, 4, 5, 6, 7]), 0),  # 8-GPU engine
+            # A model-parallel size larger than the per-node GPU count means the
+            # engine spans several nodes. Each engine's rank-0 process is on a
+            # different node, so they all use node-local slot 0. The original
+            # index would instead climb (the second engine gives 16 // 16 = 1,
+            # and so on).
+            (8, (0, list(range(16))), 0),  # 16-GPU engine across 2 nodes
+            (8, (0, list(range(16, 32))), 0),  # second such engine
+            (8, (0, list(range(32, 48))), 0),  # third such engine
+            (8, (0, list(range(32))), 0),  # DeepSeek-V3 generation TP=32
+            # 4 GPUs per node, for example GB200 NVL72.
+            (4, (0, [3]), 3),  # 3 % 4
+            (4, (0, [0, 1, 2, 3]), 0),  # 4-GPU engine
+            (4, (0, list(range(8, 16))), 0),  # 8-GPU engine across 2 nodes
+        ],
+    )
+    def test_vllm_port_assignment_respects_num_gpus_per_node(
+        self, num_gpus_per_node, bundle_indices, expected_slot
+    ):
+        from nemo_rl.distributed.virtual_cluster import (
+            DEFAULT_VLLM_PORT_RANGE_LOW,
+            DEFAULT_VLLM_PORTS_PER_ENGINE,
+        )
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(
+            num_gpus=1,
+            bundle_indices=bundle_indices,
+            num_gpus_per_node=num_gpus_per_node,
+        )
+        expected_port = (
+            DEFAULT_VLLM_PORT_RANGE_LOW + expected_slot * DEFAULT_VLLM_PORTS_PER_ENGINE
+        )
+        assert env_vars["VLLM_PORT"] == str(expected_port)
+
+    @pytest.mark.parametrize(
+        "num_gpus_per_node,bundle_indices",
+        [
+            (8, (0, list(range(16)))),  # 16-GPU engine across 2 nodes
+            (8, (0, list(range(32)))),  # DeepSeek-V3 generation TP=32, 4 nodes
+            (4, (0, list(range(8, 16)))),  # 8-GPU engine across 2 GB200 nodes
+        ],
+    )
+    def test_node_spanning_engines_keep_a_port_below_the_ephemeral_floor(
+        self, num_gpus_per_node, bundle_indices
+    ):
+        """Engines that span nodes must still get a port in the reserved band.
+
+        Leaving VLLM_PORT unset would send vLLM to kernel-assigned ephemeral
+        ports, reintroducing the TOCTOU contention the port layout exists to
+        avoid. The vLLM 0.25 TCPStore/MessageQueue collision within one engine's
+        window is handled by offsetting the TCPStore search instead (see
+        _patch_vllm_ray_executor_v2_tcpstore_port).
+        """
+        from nemo_rl.distributed.virtual_cluster import (
+            DEFAULT_VLLM_PORT_RANGE_LOW,
+            DEFAULT_VLLM_PORTS_PER_ENGINE,
+        )
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        # Lowest observed ephemeral floor on some GB200 nodes.
+        EPHEMERAL_FLOOR = 9000
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(
+            num_gpus=1,
+            bundle_indices=bundle_indices,
+            num_gpus_per_node=num_gpus_per_node,
+        )
+        assert "VLLM_PORT" in env_vars
+        port = int(env_vars["VLLM_PORT"])
+        assert DEFAULT_VLLM_PORT_RANGE_LOW <= port < EPHEMERAL_FLOOR
+        # The TCPStore search is offset by 32 within the engine's window, so the
+        # whole window must stay below the ephemeral floor.
+        assert port + DEFAULT_VLLM_PORTS_PER_ENGINE <= EPHEMERAL_FLOOR
+
+    def test_no_vllm_port_without_bundle_indices(self):
+        from nemo_rl.models.generation.vllm.vllm_worker import (
+            BaseVllmGenerationWorker,
+        )
+
+        _, env_vars, _, _ = BaseVllmGenerationWorker.configure_worker(num_gpus=1)
+        assert "VLLM_PORT" not in env_vars
+
+
+def _ray_sub_reserved_ports() -> set[int]:
+    """Every port ray.sub hands to Ray itself."""
+    reserved = {
+        _ray_sub_default("PORT"),
+        _ray_sub_default("RAY_CLIENT_SERVER_PORT"),
+        _ray_sub_default("DASHBOARD_PORT"),
+    }
+    # ray.sub gives the head node these ports + 1; workers get the odd values.
+    for name in (
+        "NODE_MANAGER_PORT",
+        "OBJECT_MANAGER_PORT",
+        "RUNTIME_ENV_AGENT_PORT",
+        "DASHBOARD_AGENT_GRPC_PORT",
+        "METRICS_EXPORT_PORT",
+        "DASHBOARD_AGENT_LISTEN_PORT",
+    ):
+        reserved |= {_ray_sub_default(name), _ray_sub_default(name) + 1}
+    reserved |= set(
+        range(
+            _ray_sub_default("MIN_WORKER_PORT"),
+            _ray_sub_default("MAX_WORKER_PORT") + 1,
+        )
+    )
+    return reserved
+
+
+def test_router_band_does_not_collide_with_ray_sub_ports():
+    reserved = _ray_sub_reserved_ports()
+
+    router_band = set(
+        range(
+            DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW,
+            DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH,
+        )
+    )
+    assert not router_band & reserved, sorted(router_band & reserved)
+
+
+def test_data_plane_band_does_not_collide_with_ray_sub_ports():
+    reserved = _ray_sub_reserved_ports()
+
+    data_plane_band = set(
+        range(DEFAULT_DATA_PLANE_PORT_RANGE_LOW, DEFAULT_DATA_PLANE_PORT_RANGE_HIGH)
+    )
+    assert not data_plane_band & reserved, sorted(data_plane_band & reserved)
+
+
+def test_default_port_ranges_ordered_and_below_ephemeral_floor():
+    # Lowest observed ephemeral floor on some GB200 nodes; stock Linux is 32768.
+    EPHEMERAL_FLOOR = 9000
+    assert (
+        DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW
+        < DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH
+        <= DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW
+    )
+    assert DEFAULT_MASTER_PORT_RANGE_LOW < DEFAULT_MASTER_PORT_RANGE_HIGH
+    assert DEFAULT_GENERATION_PORT_RANGE_LOW < DEFAULT_GENERATION_PORT_RANGE_HIGH
+    assert DEFAULT_GYM_PORT_RANGE_LOW < DEFAULT_GYM_PORT_RANGE_HIGH
+    # Ordered, non-overlapping bands: master < generation < gym < vllm.
+    assert DEFAULT_MASTER_PORT_RANGE_HIGH < DEFAULT_GENERATION_PORT_RANGE_LOW
+    assert DEFAULT_GENERATION_PORT_RANGE_HIGH < DEFAULT_GYM_PORT_RANGE_LOW
+    assert DEFAULT_GYM_PORT_RANGE_HIGH < DEFAULT_VLLM_PORT_RANGE_LOW
+    # Top vLLM engine (8 GPUs, TP=1) stays below the ephemeral floor.
+    assert (
+        DEFAULT_VLLM_PORT_RANGE_LOW + 8 * DEFAULT_VLLM_PORTS_PER_ENGINE
+        < EPHEMERAL_FLOOR
+    )
+    # SGLang router / Prometheus carve-outs live inside the vLLM band (only one
+    # rollout backend runs at a time), stay above the 8-engine vLLM high-water
+    # mark and the Ray dashboard, and sit below the ephemeral floor.
+    assert (
+        DEFAULT_VLLM_PORT_RANGE_LOW + 8 * DEFAULT_VLLM_PORTS_PER_ENGINE
+        < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
+    )
+    assert _ray_sub_default("DASHBOARD_PORT") < DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW
+    assert DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW < DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH
+    assert (
+        DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH < DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW
+    )
+    assert (
+        DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW
+        < DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH
+    )
+    assert DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH < EPHEMERAL_FLOOR
+    # The data-plane band sits below the Ray GCS ports, which is the only gap
+    # left under the router band, and has to hold every port mooncake's master
+    # listens on.
+    assert DEFAULT_DATA_PLANE_PORT_RANGE_LOW < DEFAULT_DATA_PLANE_PORT_RANGE_HIGH
+    assert DEFAULT_DATA_PLANE_PORT_RANGE_HIGH <= _ray_sub_default("PORT")
+    assert (
+        DEFAULT_DATA_PLANE_PORT_RANGE_HIGH - DEFAULT_DATA_PLANE_PORT_RANGE_LOW >= 3
+    ), "the band must fit the metadata, master RPC and metrics ports"
+    # Avoid privileged ports (<1024).
+    assert DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW > 1024
+    assert DEFAULT_MASTER_PORT_RANGE_LOW > 1024
+    assert DEFAULT_DATA_PLANE_PORT_RANGE_LOW > 1024
+
+
+_REGISTRY_PROBE = """
+import json
+
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    ACTOR_ENVIRONMENT_REGISTRY,
+    get_actor_python_env,
+)
+from nemo_rl.distributed.virtual_cluster import PY_EXECUTABLES
+
+envs = {fqn: get_actor_python_env(fqn) for fqn in ACTOR_ENVIRONMENT_REGISTRY}
+# Also assert on PY_EXECUTABLES directly: a constant with no registry entry
+# is invisible to envs, so the class-level promise needs its own check.
+constants = {n: getattr(PY_EXECUTABLES, n) for n in vars(PY_EXECUTABLES) if n.isupper()}
+print(
+    json.dumps(
+        {
+            "all_system": set(envs.values()) | set(constants.values())
+            == {PY_EXECUTABLES.SYSTEM},
+            "envs": envs,
+            "constants": constants,
+        }
+    )
+)
+"""
+
+
+@pytest.mark.parametrize("use_system_executable", [False, True])
+def test_actor_registry_honors_system_flag(use_system_executable):
+    # The registry freezes its executable strings at import, so the flag can
+    # only be exercised in a fresh interpreter.
+    env = dict(os.environ)
+    env["NEMO_RL_PY_EXECUTABLES_SYSTEM"] = "1" if use_system_executable else "0"
+    result = subprocess.run(
+        [sys.executable, "-c", _REGISTRY_PROBE],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout.strip().splitlines()[-1])
+
+    if use_system_executable:
+        assert payload["all_system"], (payload["envs"], payload["constants"])
+    else:
+        envs = payload["envs"]
+        assert envs[
+            "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker"
+        ].startswith("uv run")
+        assert envs["nemo_rl.environments.nemo_gym.NemoGym"].startswith("uv run")
+
+
+def test_init_ray_worker_setup_drops_srun_env_in_trtllm_workers_only():
+    """TRT-LLM's MPI_Init breaks under srun's launcher env; other workers keep it."""
+    from nemo_rl.distributed.virtual_cluster import init_ray
+
+    with (
+        patch("ray.init") as mock_ray_init,
+        patch("ray.cluster_resources") as mock_cluster_resources,
+    ):
+        mock_cluster_resources.return_value = {"nrl_tag_0": 1}
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "0"}, clear=True):
+            init_ray()
+        hook_path = mock_ray_init.call_args_list[0][1]["runtime_env"][
+            "worker_process_setup_hook"
+        ]
+    # A module path, as Ray loads it in each worker: a callable would break a
+    # nested ray.init (vLLM's EngineCore at TP>1).
+    assert isinstance(hook_path, str)
+    hook = load_class(hook_path)
+
+    launcher = {
+        "SLURM_JOBID": "14",
+        "SLURM_JOB_ID": "14",
+        "SLURM_STEP_ID": "0",
+        "PMIX_NAMESPACE": "x",
+        "PMI_FD": "3",
+        "MPI_LOCALRANKID": "0",
+        "OMPI_MCA_plm": "s",
+        "OMPI_ALLOW_RUN_AS_ROOT": "1",
+    }
+    kept = {"PRTE_ALLOW_RUN_AS_ROOT": "1", "HOME": "/root"}
+    env = {**launcher, **kept}
+    spec = "importlib.util.find_spec"
+
+    with patch.dict(os.environ, env, clear=True), patch(spec, return_value=object()):
+        hook()
+        assert dict(os.environ) == kept
+
+    with patch.dict(os.environ, env, clear=True), patch(spec, return_value=None):
+        hook()
+        assert dict(os.environ) == env

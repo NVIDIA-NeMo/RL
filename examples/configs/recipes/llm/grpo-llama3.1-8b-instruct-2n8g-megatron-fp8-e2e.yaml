@@ -15,11 +15,10 @@ policy:
   logprob_batch_size: 2
   max_total_sequence_length: 4096
   make_sequence_length_divisible_by: 1
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   megatron_cfg:
     enabled: true
-    converter_type: LlamaForCausalLM
     pipeline_model_parallel_size: 2
     activation_checkpointing: true
     defer_fp32_logits: true
@@ -39,7 +38,7 @@ policy:
     max_new_tokens: 4096
     vllm_cfg:
       precision: fp8
-      gpu_memory_utilization: 0.5
+      gpu_memory_utilization: 0.4
       max_model_len: 4096
       use_deep_gemm: true
 data:

@@ -1,6 +1,6 @@
 # Fault Tolerance Launcher Guide
 
-The `ft_launcher` is provided by `nvidia-resiliency-ext` (included in NeMo RL dependencies) and enables automatic fault tolerance and recovery for distributed training runs.
+The `ft_launcher` is provided by `nvidia-resiliency-ext` (available via the `nvrx` optional extra, e.g. `uv run --extra nvrx ft_launcher ...`) and enables automatic fault tolerance and recovery for distributed training runs.
 
 ## Key Arguments
 
@@ -14,7 +14,7 @@ The `ft_launcher` is provided by `nvidia-resiliency-ext` (included in NeMo RL de
 ## Basic Usage
 
 ```bash
-uv run ft_launcher \
+uv run --extra nvrx ft_launcher \
     --ft-cfg-path examples/ft_launcher/ft_config.yaml \
     --ft-rank-heartbeat-timeout 450 \
     --ft-initial-rank-heartbeat-timeout 1200 \

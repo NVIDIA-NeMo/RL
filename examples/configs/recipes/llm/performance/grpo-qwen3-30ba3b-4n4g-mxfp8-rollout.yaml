@@ -1,0 +1,69 @@
+defaults: ../../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 64
+  num_generations_per_prompt: 32
+loss_fn:
+  use_importance_sampling_correction: true
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-mxfp8-rollout
+policy:
+  model_name: Qwen/Qwen3-30B-A3B
+  train_global_batch_size: 2048
+  train_micro_batch_size: 1
+  logprob_batch_size: 2
+  max_total_sequence_length: 4096
+  sequence_packing:
+    fuse_loss: true
+  automodel_cfg:
+    enabled: false
+  optimizer: null
+  scheduler: null
+  make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
+  megatron_cfg:
+    enabled: true
+    empty_unused_memory_level: 1
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 16
+    sequence_parallel: false
+    moe_grouped_gemm: true
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    moe_hybridep_prepad_packed_inputs: true
+    optimizer:
+      lr: 3.0e-07
+      min_lr: 3.0e-08
+    scheduler:
+      lr_warmup_iters: 50
+      lr_warmup_init: 3.0e-08
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "16"
+      NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
+      NVLINK_DOMAIN_SIZE: "72"
+      USE_MNNVL: "1"
+  generation:
+    vllm_cfg:
+      tensor_parallel_size: 1
+      precision: "fp8"
+      is_mx: true
+      refit_prequantize: true
+      quantization_ignore_patterns:
+        - model.layers.*.self_attn.*
+        - model.layers.*.mlp.gate
+        - lm_head
+    vllm_kwargs:
+      moe_backend: flashinfer_trtllm
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-4n4g-mxfp8-rollout
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-30ba3b-4n4g-mxfp8-rollout
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4
+  segment_size: 4

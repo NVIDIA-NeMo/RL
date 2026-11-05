@@ -2,6 +2,9 @@
 dpo:
   max_num_epochs: 1
   max_num_steps: 150
+  # Optional checkpoint boundary for time-sliced jobs. The final scheduler
+  # horizon remains max_num_steps across resumed segments.
+  stop_after_step: null
   val_period: 25
   val_batches: 8
   val_global_batch_size: 8
@@ -28,6 +31,12 @@ checkpointing:
   keep_top_k: 3
   save_period: 50
   checkpoint_must_save_by: null
+  save_optimizer: true
+  # pretrained_checkpoint: load weights from an existing megatron-bridge or
+  # Megatron-LM checkpoint instead of converting from HuggingFace.
+  # pretrained_checkpoint:
+  #   path: "/path/to/checkpoint"  # iter dir or checkpoint root
+  #   format: "megatron_bridge"    # or "megatron_lm"
 
 policy:
   model_name: "meta-llama/Llama-3.2-1B-Instruct"
@@ -47,18 +56,35 @@ policy:
   precision: "bfloat16"
 
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
-  dtensor_cfg:
+  automodel_cfg:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      # Canonical Automodel modes: "false", "final", or "every".
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: False
     sequence_parallel: false
     activation_checkpointing: false
+    deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
     clear_cache_every_n_steps: null
+
+    # Automodel kwargs passed to from_pretrained.
+    # Uncomment force_hf if the custom model's adapter doesn't support per-tensor
+    # weight conversion (e.g. Qwen2, Llama). Auto-detected if not set.
+    # See https://github.com/NVIDIA-NeMo/RL/issues/2072
+    automodel_kwargs: {}
+      # force_hf: true
+
     # LoRA (Low-Rank Adaptation) Configuration
     lora_cfg:
       enabled: False  # Set to True to enable LoRA fine-tuning
@@ -71,6 +97,7 @@ policy:
       dropout_position: "post"  # Where to apply dropout: "pre" (before LoRA) or "post" (after LoRA)
       lora_A_init: "xavier"  # Initialization method for LoRA A matrix: "xavier" or "uniform"
       use_triton: true  # Use Triton-optimized kernels for LoRA (faster but requires flash-attn). Disable when tensor_parallel_size > 1
+      restore_from: null  # Warm start: path to a PEFT adapter checkpoint (adapter_model.safetensors + adapter_config.json) to initialize this run's LoRA weights from, e.g. a previous SFT run's step_*/policy/weights
 
   dynamic_batching:
     enabled: false
@@ -80,7 +107,7 @@ policy:
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${policy.automodel_cfg.tensor_parallel_size}
   max_grad_norm: 1.0
 
   optimizer:
@@ -90,7 +117,7 @@ policy:
       weight_decay: 0.1
       betas: [0.9, 0.98]
       eps: 1e-5
-      # when using Dtensor, we need to set foreach
+      # when using Automodel, we need to set foreach
       # and fused to False
       foreach: False
       fused: False
@@ -110,8 +137,48 @@ policy:
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
     enabled: false
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+      parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
+    use_fused_linear_logprobs: false
+    fused_linear_logprobs_chunk_size: 256
+    force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
+    # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
+    cuda_graph_impl: "none"
+    cuda_graph_modules: []
+    cuda_graph_warmup_steps: 3
+    # Offload specific module activations to CPU. Works for both dense and MoE
+    # models and requires transformer_engine. Different from optimizer_cpu_offload,
+    # which offloads optimizer states. On TE >= 2.10,
+    # also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
+    fine_grained_activation_offloading: false
+    # Modules to offload when fine_grained_activation_offloading is true.
+    # Common examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"].
+    # Supported names depend on the pinned Megatron-LM version and are
+    # validated by MCore. "attn_proj" requires "core_attn". See the latest
+    # upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+    offload_modules: null
+    # recompute_granularity controls activation checkpointing depth.
+    # "full": recompute all activations (default, max memory savings).
+    # "selective": recompute only specific modules (see recompute_modules).
+    # Only takes effect when activation_checkpointing: true.
+    recompute_granularity: "full"
+    # Modules to selectively recompute when recompute_granularity="selective".
+    # MCore options: ["core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts"].
+    # Null defaults to ["core_attn"]. Full list and per-module constraints:
+    # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
+    # Use ["moe"] for MoE models to recompute expert activations only.
+    recompute_modules: null
     tensor_model_parallel_size: 2
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
@@ -125,17 +192,40 @@ policy:
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "aux_loss"
     moe_router_bias_update_rate: 1e-3
-    moe_permute_fusion: false
+    moe_permute_fusion: true
     #gives ~20% training perf speedup with sequence packing 
     apply_rope_fusion: True
+    flash_attention_version: 2
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    reuse_logits_storage: false
+    fp32_lm_head: false # Emit fp32 logits from Megatron's LM head.
     moe_per_layer_logging: False
     moe_enable_deepep: false
-    moe_token_dispatcher_type: "allgather"
+    moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
-    
+    use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    distributed_timeout_minutes: null
+    gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
+
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: null
+      restore_from: null  # Warm start: path to a native Megatron PEFT checkpoint (iter_XXXXXXX dir or its root) to initialize this run's LoRA weights from, e.g. a previous SFT run
+
     optimizer:
       optimizer: "adam"
       lr: 5.0e-6 #4.0e-5
@@ -162,6 +252,7 @@ policy:
       # optimizer cpu offload
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -250,6 +341,7 @@ logger:
   swanlab_enabled: false # Disable SwanLab logging
   monitor_gpus: true  # If true, will monitor GPU usage and log to wandb and/or tensorboard
   num_val_samples_to_print: 0 # Number of validation samples to pretty print on terminal
+  extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
   wandb:
     project: "dpo-dev"
     name: "dpo"
@@ -261,6 +353,7 @@ logger:
   mlflow:
     experiment_name: "dpo-dev"
     run_name: "dpo"
+    tracking_uri: "http://localhost:5000"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
@@ -268,3 +361,4 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

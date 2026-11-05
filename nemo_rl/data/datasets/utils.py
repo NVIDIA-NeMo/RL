@@ -13,16 +13,42 @@
 # limitations under the License.
 
 import base64
+import functools
+import importlib
+import inspect
 import io
 import os
-from typing import Optional, Union
+import warnings
+from pathlib import Path
+from typing import Any, Mapping, Optional, Union
 
+import numpy as np
 import torch
-from datasets import DatasetDict, load_dataset, load_from_disk
+from datasets import (
+    Dataset,
+    DatasetDict,
+    concatenate_datasets,
+    load_dataset,
+    load_from_disk,
+)
+from huggingface_hub.utils._cache_manager import _scan_cached_repo
 from PIL import Image
+from torch.utils.data import ConcatDataset
 from transformers import AutoProcessor, PreTrainedTokenizerBase
 
 TokenizerType = Union[PreTrainedTokenizerBase, AutoProcessor]
+
+
+def load_audio_from_file(path: str, sampling_rate: int = 16000) -> np.ndarray:
+    """Decode an audio file (or the audio track of a video) as a 1-D float32 array."""
+    import torchaudio
+
+    waveform, sr = torchaudio.load(path)
+    if sr != sampling_rate:
+        waveform = torchaudio.functional.resample(waveform, sr, sampling_rate)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(0, keepdim=True)
+    return waveform.squeeze(0).numpy().astype(np.float32)
 
 
 def assert_no_double_bos(token_ids: torch.Tensor, tokenizer: TokenizerType) -> None:
@@ -32,18 +58,24 @@ def assert_no_double_bos(token_ids: torch.Tensor, tokenizer: TokenizerType) -> N
         token_ids: List of token IDs
         tokenizer: Tokenizer
     """
-    if tokenizer.bos_token_id is not None:
+    # AutoProcessor wraps a tokenizer; unwrap if needed
+    if isinstance(tokenizer, PreTrainedTokenizerBase):
+        _tok = tokenizer
+    elif hasattr(tokenizer, "tokenizer"):
+        _tok = tokenizer.tokenizer
+    else:
+        raise TypeError(f"Unsupported tokenizer type: {type(tokenizer)}")
+
+    if _tok.bos_token_id is not None:
         token_ids_list = token_ids.tolist()
         if len(token_ids_list) > 1:
             assert not (
-                token_ids_list[0] == tokenizer.bos_token_id
-                and token_ids_list[1] == tokenizer.bos_token_id
+                token_ids_list[0] == _tok.bos_token_id
+                and token_ids_list[1] == _tok.bos_token_id
             ), "Found double BOS token in the first two positions of the message."
     else:
-        # `name_or_path` is not available for AutoProcessor, temp fix in get_tokenizer
-        print(
-            f"skip assert_start_single_bos since Tokenizer {tokenizer.name_or_path} has no BOS token"
-        )
+        name = getattr(_tok, "name_or_path", str(type(_tok).__name__))
+        print(f"skip assert_start_single_bos since Tokenizer {name} has no BOS token")
 
 
 def pil_to_base64(image: Image.Image, format: str = "PNG") -> str:
@@ -66,6 +98,8 @@ def load_dataset_from_path(
     data_path: str,
     data_subset: Optional[str] = None,
     data_split: Optional[str] = "train",
+    *,
+    preserve_jsonl_rows: bool = False,
 ):
     """Load a dataset from a local file, huggingface dataset, or Arrow dataset (saved with save_to_disk).
 
@@ -73,6 +107,10 @@ def load_dataset_from_path(
         data_path: The path to the dataset.
         data_subset: The subset to load from the dataset. Only supported for huggingface datasets.
         data_split: The split to load from the dataset.
+        preserve_jsonl_rows: Load each JSONL row as an unparsed string in a
+            ``text`` column. Hugging Face materializes the text builder's
+            Arrow cache under ``HF_DATASETS_CACHE``, so subsequent jobs can
+            memory-map and reuse it instead of rebuilding Python strings.
     """
     FILEEXT2TYPE = {
         ".arrow": "arrow",
@@ -82,9 +120,20 @@ def load_dataset_from_path(
         ".parquet": "parquet",
         ".txt": "text",
     }
-    suffix = os.path.splitext(data_path)[-1]
+    suffix = (
+        ".jsonl"
+        if data_path.lower().endswith(".jsonl.packed")
+        else os.path.splitext(data_path)[-1].lower()
+    )
+    dataset_type = FILEEXT2TYPE.get(suffix)
+    # Keep each JSONL line as an unparsed string, whatever the file suffix.
+    keep_raw_lines = suffix == ".jsonl" or (
+        os.path.isfile(data_path) and dataset_type not in ("arrow", "csv", "parquet")
+    )
+    if preserve_jsonl_rows and keep_raw_lines:
+        dataset_type = "text"
     # load from local file (not save_to_disk format)
-    if dataset_type := FILEEXT2TYPE.get(suffix):
+    if dataset_type:
         assert data_subset is None, (
             "data_subset is only supported for huggingface datasets"
         )
@@ -112,11 +161,149 @@ def load_dataset_from_path(
     return raw_dataset
 
 
+def resolve_external_dataset_class(dataset_name: str) -> type:
+    """Resolve a fully-qualified dotted dataset path to a class.
+
+    Used by both ``load_response_dataset`` and ``load_preference_dataset``
+    to support user-defined datasets that live outside ``nemo_rl`` so users
+    do not have to edit the built-in ``DATASET_REGISTRY`` to plug in their
+    own dataset class. The class must be importable from ``PYTHONPATH`` (or
+    the active virtual environment).
+
+    The caller is expected to have already verified that ``dataset_name``
+    looks like a dotted import path (i.e. contains a ``.``); this helper
+    focuses on the import / attribute-lookup / type-validation steps and
+    raises ``ValueError`` with an actionable message on any failure.
+    """
+    module_path, _, class_name = dataset_name.rpartition(".")
+    try:
+        module = importlib.import_module(module_path)
+    except ImportError as e:
+        raise ValueError(
+            f"Could not import module {module_path!r} for "
+            f"dataset_name={dataset_name!r}. Ensure the module is "
+            "installed and importable from PYTHONPATH."
+        ) from e
+    if not hasattr(module, class_name):
+        raise ValueError(
+            f"Module {module_path!r} has no attribute {class_name!r} "
+            f"(referenced by dataset_name={dataset_name!r})."
+        )
+    dataset_class = getattr(module, class_name)
+    if not isinstance(dataset_class, type):
+        raise ValueError(
+            f"dataset_name={dataset_name!r} resolved to {dataset_class!r}, "
+            "which is not a class. Expected a dataset class."
+        )
+    return dataset_class
+
+
+# Constructor-consumed keys from ResponseDatasetConfig / PreferenceDatasetConfig
+# that change *which data* a run sees. If one of these is set but the resolved
+# dataset class does not accept it, the user silently gets different data than
+# they configured. Keys consumed by the dispatchers themselves (dataset_name,
+# env_name, processor, prompt_file, system_prompt_file) are deliberately absent.
+_BEHAVIORAL_DATASET_CONFIG_KEYS = (
+    "chat_key",
+    "chosen_key",
+    "data_path",
+    "download_dir",
+    "input_key",
+    "output_key",
+    "prompt_key",
+    "rejected_key",
+    "seed",
+    "split",
+    "split_validation_size",
+    "subset",
+)
+
+
+def warn_on_unsupported_dataset_config_keys(
+    dataset_class: Any, data_config: Mapping[str, Any]
+) -> None:
+    """Warn when behavioral dataset config keys would be silently ignored.
+
+    The dataset dispatchers instantiate with ``dataset_class(**data_config)``
+    and every built-in dataset accepts ``**kwargs``, so a config key the class
+    does not actually support is swallowed without any feedback — e.g.
+    ``split_validation_size`` on datasets that never call
+    ``split_train_validation``. For the keys in
+    ``_BEHAVIORAL_DATASET_CONFIG_KEYS``, warn when the resolved class does not
+    declare the parameter anywhere in its ``__init__`` MRO.
+
+    The check walks the MRO because some datasets consume keys via
+    ``**kwargs`` and forward them to a base-class ``__init__`` that declares
+    them (e.g. the intent datasets). ``functools.partial`` registry entries
+    (the AIME variants) are unwrapped first. ``None`` values are skipped
+    (``subset: null`` is the documented default), as is a falsy
+    ``split_validation_size`` (0 means "no validation split" everywhere).
+    """
+    while isinstance(dataset_class, functools.partial):
+        dataset_class = dataset_class.func
+    if not isinstance(dataset_class, type):
+        return
+
+    accepted: set[str] = set()
+    for klass in dataset_class.__mro__:
+        init = klass.__dict__.get("__init__")
+        if init is None:
+            continue
+        try:
+            signature = inspect.signature(init)
+        except (TypeError, ValueError):
+            # Signature not introspectable (e.g. C extension): don't guess.
+            return
+        accepted.update(
+            param.name
+            for param in signature.parameters.values()
+            if param.kind
+            in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        )
+
+    for key in _BEHAVIORAL_DATASET_CONFIG_KEYS:
+        if key not in data_config or key in accepted:
+            continue
+        value = data_config[key]
+        if value is None or (key == "split_validation_size" and not value):
+            continue
+        warnings.warn(
+            f"Dataset config key {key}={value!r} is not supported by "
+            f"{dataset_class.__name__} and will be ignored. Remove the key, or "
+            "use a dataset class that supports it.",
+            stacklevel=3,
+        )
+
+
 def update_single_dataset_config(data_config: dict, default_data_config: dict) -> None:
     """Fill the single dataset config with default dataset config."""
     for key in default_data_config.keys():
         if key not in data_config:
             data_config[key] = default_data_config[key]
+
+
+def merge_datasets(datasets: list[Any]) -> Any:
+    """Merge map-style datasets while supporting non-HF wrappers.
+
+    Hugging Face's ``concatenate_datasets`` only accepts HF ``Dataset`` objects.
+    Some response datasets, such as ``PreservingDataset``, intentionally bypass the
+    HF schema machinery to preserve heterogeneous nested structures. When those
+    datasets are present, fall back to a generic concatenation wrapper that still
+    provides ``__len__`` and integer ``__getitem__`` for downstream processing.
+    """
+    if not datasets:
+        raise ValueError("Expected at least one dataset to merge.")
+
+    if len(datasets) == 1:
+        return datasets[0]
+
+    if all(isinstance(dataset, Dataset) for dataset in datasets):
+        return concatenate_datasets(datasets)
+
+    return ConcatDataset(datasets)
 
 
 def extract_necessary_env_names(data_config: dict) -> list[str]:
@@ -132,12 +319,42 @@ def extract_necessary_env_names(data_config: dict) -> list[str]:
         The necessary environment names.
     """
     necessary_env_names = set()
-    keys = ["train", "validation", "default"]
-    for key in keys:
-        if (
-            key in data_config
-            and data_config[key] is not None
-            and "env_name" in data_config[key]
-        ):
-            necessary_env_names.add(data_config[key]["env_name"])
+    for key in ("train", "validation", "default"):
+        configs = data_config.get(key)
+        if not isinstance(configs, list):
+            configs = [configs]
+        for config in configs:
+            if isinstance(config, dict) and "env_name" in config:
+                necessary_env_names.add(config["env_name"])
     return list(necessary_env_names)
+
+
+def get_huggingface_cache_path(repo_id, branch="main", repo_type="datasets"):
+    cache_path = None
+    try:
+        cache_list = ["HUGGINGFACE_HUB_CACHE", "HF_HOME"]
+        for cache_name in cache_list:
+            if cache_name in os.environ and os.path.exists(os.environ[cache_name]):
+                if os.environ[cache_name].split("/")[-1] == "hub":
+                    cache_path = os.environ[cache_name]
+                else:
+                    cache_path = os.path.join(os.environ[cache_name], "hub")
+        if not cache_path:
+            home = os.path.expanduser("~")
+            cache_path = os.path.join(home, ".cache", "huggingface", "hub")
+        if cache_path and os.path.isdir(cache_path):
+            org, repo_name = repo_id.split("/")
+            repo_path = Path(
+                os.path.join(cache_path, f"{repo_type}--{org}--{repo_name}/")
+            )
+            hf_cache_info = _scan_cached_repo(repo_path=repo_path)
+            revs = {r.refs: r for r in hf_cache_info.revisions}
+            if branch is not None:
+                revs = {refs: r for refs, r in revs.items() if branch in refs}
+            rev2keep = max(revs.values(), key=lambda r: r.last_modified)
+            return str(rev2keep.snapshot_path)
+        else:
+            return None
+    except Exception as e:
+        print(f"{type(e)}: {e}")
+        return None

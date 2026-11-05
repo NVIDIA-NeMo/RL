@@ -1,0 +1,1937 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Blackbox finalization: token-free receipts + staged deltas -> canonical rows.
+
+Orchestration only:
+per rollout, apply the rollout-level receipt guards, fetch the staged base
+rows the receipt manifest names through the ``TokenSource`` (normally
+validated ``StagedCallBaseSnapshot`` values), and delegate all token, digest,
+lineage, and terminal-chain semantics to Gym's ``verify_and_linearize``. Any
+rejection becomes a masked placeholder row — the group always publishes
+exactly N rows so GRPO group shape survives; validity folds into
+``sample_mask`` (no new train field) and placeholders copy
+``prompt_ids_for_adv`` from a valid sibling so per-prompt baselines stay
+well-formed.
+
+Router replay runs one unified flow: both modes construct the same
+``RouteAssemblyPlan`` from Gym's link spans and extras commitments. Deferred
+mode publishes the encoded plan beside the canonical row and leaves staged
+route fragments live until policy consumption; direct mode executes the plan
+eagerly with fragments fetched in the same batch — any executor failure is a
+pre-publication ``route_assembly:<reason>`` rejection.
+"""
+
+from __future__ import annotations
+
+import math
+import time
+from collections import Counter
+from collections.abc import Sequence
+from dataclasses import asdict, dataclass, field, replace
+from graphlib import CycleError, TopologicalSorter
+from typing import TYPE_CHECKING, Any, Optional, cast
+
+import torch
+
+from nemo_rl.data.captured_media import (
+    MediaColumnSpec,
+    verified_media_items,
+    verify_media_geometry,
+)
+from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import (
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
+    MASK_SAMPLE,
+    ROUTE_PLAN_TAG,
+    SAMPLER_TOPK_LOGPROBS_FIELD,
+    SAMPLER_TOPK_TOKEN_IDS_FIELD,
+    TRUNCATED,
+    LogicalRowTag,
+    forest_row_ids,
+    forest_segment_id,
+)
+from nemo_rl.data_plane.tq_token_sink import (
+    FetchedStagedCall,
+    StagedMediaTensors,
+    TQTokenSink,
+    TQTokenSource,
+)
+from nemo_rl.experience.metric_utils import calculate_single_metric, pct
+from nemo_rl.experience.payload import pack_payload
+from nemo_rl.experience.reward_penalties import (
+    CAPTURE_PENALTIES,
+    FinalizedReward,
+    RewardChecks,
+    RewardLogContext,
+    finalize_capture_reward,
+)
+from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+from nemo_rl.experience.route_assembly import (
+    ROUTE_MISSING_SENTINEL,
+    RouteFragment,
+    RouteLayout,
+    boundary_route_rows,
+    execute_route_plan,
+)
+from nemo_rl.experience.route_plan import (
+    ROUTE_PLAN_SCHEMA_VERSION,
+    RouteAssemblyPlan,
+    RouteSpan,
+    encode_route_plan,
+    encoded_route_plan_size_bytes,
+    validate_route_plan,
+)
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+    from nemo_rl.experience.rollouts import EffortLevelsConfig
+
+
+@dataclass(frozen=True)
+class FinalizedRollout:
+    """One rollout's canonical row, or its rejection."""
+
+    rollout_id: str
+    valid: bool
+    rejection_reason: Optional[str]
+    token_ids: list[int]
+    token_mask: list[float]
+    logprobs: list[float]
+    prompt_len: int
+    reward: float
+    staging_keys: list[str]
+    min_wv: Optional[int] = None
+    max_wv: Optional[int] = None
+    # Router replay (R3): [len(token_ids), num_moe_layers, topk] int16 from
+    # the executed route plan; None when the rollout staged no routes.
+    routed_experts: Optional[torch.Tensor] = None
+    route_plan: Optional[RouteAssemblyPlan] = None
+    # Gym validates the receipt chain; RL validates selected-call membership.
+    model_call_ids: tuple[str, ...] = ()
+    media: Optional[dict[str, PackedTensor]] = None
+    penalty_counts: dict[str, int] = field(default_factory=dict)
+    reward_metrics: dict[str, float] = field(default_factory=dict)
+    # Sampler top-k per token (policy.generation.top_logprobs): [len(token_ids), k]
+    # int32 ids and float32 log-probs, zeros on carried tokens; None when off.
+    sampler_topk_token_ids: Optional[torch.Tensor] = None
+    sampler_topk_logprobs: Optional[torch.Tensor] = None
+    output_masks: dict[str, list[bool]] = field(default_factory=dict)
+    # One length per owned call, even when adjacent generations have no input gap.
+    generation_lengths: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class ActionOutputFlags:
+    """RL's existing detector result for one selected model action."""
+
+    invalid_tool_call: bool
+    malformed_thinking: bool
+
+
+@dataclass(frozen=True)
+class RolloutSelection:
+    """Eligible calls and flags within one attempt, independent of commit order.
+
+    Selection order determines root/path priority, including the grouping prompt;
+    parents determine reconstruction order. The receipt identifies the scored
+    terminal separately. Providers need not use Gym's accepted-history matcher.
+    """
+
+    response_ids: tuple[str, ...]
+    action_flags: tuple[ActionOutputFlags, ...]
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
+class SegmentReceipt:
+    """Metadata-only selection for one ordinary captured physical segment."""
+
+    capture_rollout_id: str
+    receipt: Optional[dict[str, Any]]
+    selected_response_ids: tuple[str, ...]
+    # Optional for ordinary slice callers; Forest dispatch supplies semantic stops.
+    truncated: bool = False
+    # Image columns occupy the selected terminal's existing staging key.
+    action_flags: tuple[ActionOutputFlags, ...] | None = None
+
+
+@dataclass
+class _LogicalRows:
+    rows: list[FinalizedRollout]
+    prompt_ids: list[list[int]]
+    mask_sample: list[bool]
+    tags: list[dict[str, Any]]
+    staging_keys: list[str]
+    truncated: list[bool]
+    valid_owner_count: int
+
+
+@dataclass
+class FinalizedGroup:
+    """What ``finalize_group`` hands back for ``commit_finalized``."""
+
+    meta: Optional[KVBatchMeta]
+    group_min_wv: int
+    group_max_wv: int
+    staging_keys: list[str]
+    canonical_output_tokens: int = 0
+    metrics: dict[str, float] = field(default_factory=dict)
+    reward_observations: list[FinalizedReward] = field(default_factory=list)
+    # True when the finalizer rejected the whole group as a structural outcome
+    # (see drop_reason); the caller aborts the slot instead of committing it.
+    # Policy decisions like a low valid-rollout fraction are made by the caller,
+    # using logical-owner metrics for forests or row counts for ordinary capture.
+    # Only the caller can source a replacement.
+    dropped: bool = False
+    # Which policy dropped the group, for the caller's log line.
+    drop_reason: Optional[str] = None
+    # Real rows that verified vs. real rows in the group; padding is excluded.
+    # Forest admission uses logical-owner metrics instead. 0/0 on a dropped
+    # group (the caller does not read these when dropped is True).
+    valid_row_count: int = 0
+    total_row_count: int = 0
+    # Token metrics counted from the verified rows. The controller merges them
+    # with the Gym rollout metrics into the group's ROLLOUT_METRICS sidecar.
+    token_metrics: dict[str, Any] = field(default_factory=dict)
+
+
+def _capture_token_metrics(
+    rows: list[FinalizedRollout],
+    slots: list[int],
+    contexts: Sequence[RewardLogContext | None],
+) -> dict[str, Any]:
+    """Count verified output per logical owner, before sample-level filtering.
+
+    Called before execution padding. Invalid owners contribute zero; environment
+    masks do not erase verified generations. Shared ancestors already have zero
+    loss on later paths, and generation_lengths excludes those same owned calls.
+    """
+    n = len(contexts)
+    generated = [0] * n
+    longest = [0] * n
+    total = [0] * n
+    for row, slot in zip(rows, slots, strict=True):
+        if row.valid:
+            generated[slot] += sum(int(mask) for mask in row.token_mask)
+            longest[slot] = max(longest[slot], max(row.generation_lengths, default=0))
+            total[slot] = max(total[slot], len(row.token_ids))
+    metrics = {
+        **calculate_single_metric(generated, n, "gen_tokens_per_sample"),
+        **calculate_single_metric(longest, n, "max_gen_tokens_per_turn"),
+        **calculate_single_metric(total, n, "total_tokens_per_sample"),
+        "mean_gen_tokens_per_sample": sum(generated) / n,
+        "max_gen_tokens_per_turn/p95": pct(longest, 95),
+    }
+    agents = {context.agent_name for context in contexts if context is not None}
+    for agent in agents:
+        indices = [
+            i
+            for i, context in enumerate(contexts)
+            if context and context.agent_name == agent
+        ]
+        for name, values in (
+            ("gen_tokens_per_sample", generated),
+            ("total_tokens_per_sample", total),
+        ):
+            metrics.update(
+                calculate_single_metric(
+                    [values[i] for i in indices], len(indices), f"{agent}/{name}"
+                )
+            )
+    return metrics
+
+
+def _concat_media(parts: list[StagedMediaTensors]) -> StagedMediaTensors:
+    """Concatenate per-call media deltas along the terminal chain, in order.
+
+    Packed patches (``[1, total_patches, F]``) join along the patch dim, the
+    per-frame sizes and per-video frame counts along their only dim. Parts
+    must agree on pixel dtype and patch feature width (no silent promotion)
+    and either all or none may carry frame counts (no mixed image/video
+    chains). Each part was already validated by ``validate_media_tensors``.
+    """
+    if not parts:
+        raise ValueError("media chain has no parts")
+    if len(parts) == 1:
+        return parts[0]
+    first = parts[0].imgs
+    for part in parts[1:]:
+        if part.imgs.dtype != first.dtype:
+            raise ValueError(
+                f"media chain mixes pixel dtypes {first.dtype} and {part.imgs.dtype}"
+            )
+        if part.imgs.shape[-1] != first.shape[-1]:
+            raise ValueError(
+                "media chain mixes patch feature widths "
+                f"{int(first.shape[-1])} and {int(part.imgs.shape[-1])}"
+            )
+    frames_present = [part.num_frames is not None for part in parts]
+    if any(frames_present) and not all(frames_present):
+        raise ValueError(
+            "num_frames is staged on some calls of the chain but not others"
+        )
+    return StagedMediaTensors(
+        imgs=torch.cat([part.imgs for part in parts], dim=1),
+        imgs_sizes=torch.cat([part.imgs_sizes.reshape(-1, 2) for part in parts], dim=0),
+        num_frames=(
+            torch.cat([part.num_frames.reshape(-1) for part in parts], dim=0)  # type: ignore[union-attr]
+            if all(frames_present)
+            else None
+        ),
+    )
+
+
+def _trainer_media(staged: StagedMediaTensors) -> dict[str, PackedTensor]:
+    """Wrap the engine's media tensors as the trainer's one-row PackedTensors.
+
+    ``pixel_values`` keeps MInf's packed-patch layout: ``[total_patches, C*P*P]``
+    per row, so rows concatenate along dim 0 with no padding. Bridge's
+    ``_patchify_dynamic_images`` accepts that 2-D layout directly. ``imgs_sizes`` and
+    ``num_frames`` mirror what ``extract_multimodal_model_inputs`` emits on the
+    token-echo path (stills get one frame per image).
+    """
+    imgs = staged.imgs
+    if imgs.ndim == 3 and imgs.shape[0] == 1:
+        imgs = imgs.squeeze(0)
+    media = {"pixel_values": PackedTensor([imgs], dim_to_pack=0)}
+    sizes = staged.imgs_sizes.reshape(-1, 2).to(torch.int32)
+    media["imgs_sizes"] = PackedTensor([sizes], dim_to_pack=0)
+    frames = (
+        staged.num_frames.reshape(-1).to(torch.int32)
+        if staged.num_frames is not None
+        else torch.ones(sizes.shape[0], dtype=torch.int32)
+    )
+    media["num_frames"] = PackedTensor([frames], dim_to_pack=0)
+    return media
+
+
+def _empty_trainer_media(
+    spec: MediaColumnSpec, num_rows: int
+) -> dict[str, PackedTensor]:
+    """Media fields for a group in which no rollout carried media.
+
+    Each logical row gets a zero-row segment in ``_trainer_media``'s layout
+    (``[0, 3*P*P]`` pixels, ``[0, 2]`` sizes, ``[0]`` frames) rather than no
+    segment at all: a segment-less row ships nothing, so the group would
+    publish without the media columns and TransferQueue would narrow any
+    train fetch that mixes its keys with media keys. A zero-row segment
+    keeps the column present, in the pinned dtype, and rebuilds on the
+    trainer as a ``[0, 3*P*P]`` tensor the Omni model treats as "no images".
+    """
+    pixels = torch.empty(0, spec.pixel_feature_dim, dtype=spec.pixel_dtype)
+    sizes = torch.empty(0, 2, dtype=torch.int32)
+    frames = torch.empty(0, dtype=torch.int32)
+    return {
+        "pixel_values": PackedTensor([pixels for _ in range(num_rows)], dim_to_pack=0),
+        "imgs_sizes": PackedTensor([sizes for _ in range(num_rows)], dim_to_pack=0),
+        "num_frames": PackedTensor([frames for _ in range(num_rows)], dim_to_pack=0),
+    }
+
+
+def _media_fields_for_group(rows: list[FinalizedRollout]) -> dict[str, PackedTensor]:
+    """Stack per-rollout media into group-level PackedTensors, one logical row each.
+
+    Rows without media (text rollouts, placeholders) contribute an empty
+    logical row so every media field stays aligned with ``input_ids``.
+    """
+    per_row = [row.media if (row.valid and row.media) else None for row in rows]
+    if not any(per_row):
+        return {}
+    fields = sorted({key for media in per_row if media for key in media})
+    stacked: dict[str, PackedTensor] = {}
+    for key in fields:
+        reference = next(media[key] for media in per_row if media and key in media)
+        parts = [
+            media[key]
+            if (media and key in media)
+            else PackedTensor.empty_rows_like(reference, 1)
+            for media in per_row
+        ]
+        stacked[key] = PackedTensor.concat(parts)
+    return stacked
+
+
+class RolloutReassembler:
+    """Receipts -> verified rows -> N-row publish, off the generation hot path."""
+
+    def __init__(
+        self,
+        dp_client: Any,
+        *,
+        partition_id: str,
+        staging_partition: str,
+        pad_token_id: int,
+        max_seq_len: int,
+        reward_penalty_config: RewardPenaltyConfig | None = None,
+        effort_config: EffortLevelsConfig | None = None,
+        router_replay_enabled: bool = False,
+        defer_routed_experts_to_policy: bool = False,
+        capture_media: bool = False,
+        media_columns: Optional[MediaColumnSpec] = None,
+        tokenizer: Any = None,
+        thinking_tags: Sequence[str] | None = None,
+        top_logprobs: int = 0,
+    ) -> None:
+        self._reward_penalty_config = reward_penalty_config
+        # Decodes generations for the malformed-think-tag string check.
+        self._tokenizer = tokenizer
+        self._thinking_tags = thinking_tags
+        self._effort_config = effort_config
+        self._dp_client = dp_client
+        self._partition_id = partition_id
+        # Whether the staging partition carries media columns (setup's
+        # ``token_capture.enabled and processor is not None``). Text-only runs
+        # never read media columns; media-enabled runs must find them.
+        self._capture_media = capture_media
+        if capture_media and media_columns is None:
+            raise ValueError(
+                "media capture requires media_columns (the pixel dtype and patch "
+                "size the serving workers pinned the staging column to)"
+            )
+        self._media_columns = media_columns
+        self._pad_token_id = int(pad_token_id)
+        self._max_seq_len = int(max_seq_len)
+        self._router_replay_enabled = router_replay_enabled
+        self._defer_routed_experts_to_policy = defer_routed_experts_to_policy
+        # policy.generation.top_logprobs: sampler top-k columns to assemble (0 = none).
+        self._top_logprobs = int(top_logprobs)
+        if self._defer_routed_experts_to_policy and not self._router_replay_enabled:
+            raise ValueError(
+                "defer_routed_experts_to_policy requires router replay to be enabled"
+            )
+        self._staging_partition = staging_partition
+        # (num_moe_layers, topk), learned from the first rebuilt row that
+        # carries routes; placeholder-only groups need it to shape their
+        # sentinel tensors consistently with the model.
+        self._routed_dims: Optional[tuple[int, int]] = None
+        self._source = TQTokenSource(
+            dp_client, staging_partition=staging_partition, capture_media=capture_media
+        )
+        # The sink's clear() is the staging-partition delete; no staging
+        # writes happen here.
+        self._staging = TQTokenSink(
+            dp_client, staging_partition=staging_partition, capture_media=capture_media
+        )
+
+    # ── per rollout ─────────────────────────────────────────────────────────
+
+    def finalize_rollout(
+        self,
+        rollout_id: str,
+        receipt: Optional[dict[str, Any]],
+        *,
+        reward: float,
+        forest_training: bool = False,
+        action_flags: tuple[ActionOutputFlags, ...] | None = None,
+        loss_excluded_call_ids: frozenset[str] = frozenset(),
+        reward_checks: RewardChecks | None = None,
+        reward_call_id: str | None = None,
+    ) -> FinalizedRollout:
+        """Verify one receipt against its staged rows and linearize the main chain.
+
+        Never raises for rollout-level problems: every rejection returns an
+        invalid row whose reason feeds the metrics; the group publisher
+        substitutes a placeholder.
+        """
+        # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+        from nemo_gym.token_id_capture.staging.rebuild import (
+            RebuildError,
+            ReceiptVerificationError,
+            verify_and_linearize,
+        )
+        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+
+        def rejected(reason: str, staging_keys: list[str]) -> FinalizedRollout:
+            return FinalizedRollout(
+                rollout_id=rollout_id,
+                valid=False,
+                rejection_reason=reason,
+                token_ids=[],
+                token_mask=[],
+                logprobs=[],
+                prompt_len=0,
+                reward=reward,
+                staging_keys=staging_keys,
+            )
+
+        if receipt is None:
+            return rejected("missing_receipt", [])
+        try:
+            parsed = RolloutReceipt.model_validate(receipt)
+        except (TypeError, ValueError) as error:
+            return rejected(f"invalid_receipt:{error}", [])
+        staging_keys = [record.staging_key for record in parsed.manifest]
+        if parsed.capture_key != rollout_id:
+            return rejected(f"identity_mismatch:{parsed.capture_key}", staging_keys)
+        if parsed.failure_reason is not None:
+            return rejected(f"rollout_failed:{parsed.failure_reason}", staging_keys)
+        if parsed.capture_poisoned:
+            return rejected("capture_poisoned", staging_keys)
+        # An unpoisoned receipt must name a terminal call that is in the manifest
+        # (RolloutReceipt validators), so a valid receipt here is never empty.
+        if len(set(staging_keys)) != len(staging_keys):
+            return rejected(
+                "duplicate_staging_key",
+                list(dict.fromkeys(staging_keys)),
+            )
+        records_by_call = {record.model_call_id: record for record in parsed.manifest}
+        if len(records_by_call) != len(parsed.manifest):
+            return rejected("duplicate_manifest_call_id", staging_keys)
+
+        fetch_fragments = (
+            self._router_replay_enabled and not self._defer_routed_experts_to_policy
+        ) or (self._capture_media and forest_training)
+        try:
+            fetched = self._source.fetch_for_finalization(
+                staging_keys,
+                include_route_fragments=fetch_fragments,
+                include_sampler_topk=self._top_logprobs > 0,
+            )
+        except KeyError as error:
+            return rejected(f"missing_staging_row:{error}", staging_keys)
+        except (TypeError, ValueError) as error:
+            return rejected(f"invalid_staging_row:{error}", staging_keys)
+        fetched_by_call = {}
+        for record, item in zip(parsed.manifest, fetched):
+            if item.staging_key != record.staging_key:
+                return rejected(
+                    f"staging_key_mismatch:{record.model_call_id}", staging_keys
+                )
+            if item.snapshot.model_call_id != record.model_call_id:
+                return rejected(
+                    f"call_id_mismatch:{record.model_call_id}", staging_keys
+                )
+            fetched_by_call[record.model_call_id] = item
+        if len(fetched_by_call) != len(fetched):
+            return rejected("duplicate_fetched_call_id", staging_keys)
+
+        # All base token/digest/lineage/terminal semantics belong to Gym; the
+        # finalizer never re-verifies them.
+        try:
+            row = verify_and_linearize(parsed, [item.snapshot for item in fetched])
+        except (
+            KeyError,
+            ValueError,
+            TypeError,
+            ReceiptVerificationError,
+            RebuildError,
+            NotImplementedError,
+        ) as error:
+            return rejected(f"rebuild_failed:{error}", staging_keys)
+        penalty_counts: dict[str, int] = {}
+        reward_metrics: dict[str, float] = {}
+        # Forest applies shaping once, using the scored call rather than an arbitrary
+        # graph endpoint. Other segments retain the same logical rollout reward.
+        if not forest_training or reward_call_id is not None:
+            reward_spans = row.link_spans
+            if reward_call_id is not None:
+                call_ids = [span[0] for span in reward_spans]
+                if reward_call_id not in call_ids:
+                    return rejected("reward_call_missing", staging_keys)
+                reward_spans = reward_spans[: call_ids.index(reward_call_id) + 1]
+            try:
+                reward, penalty_counts, reward_metrics = finalize_capture_reward(
+                    reward,
+                    checks=reward_checks,
+                    penalty_config=self._reward_penalty_config,
+                    effort_config=self._effort_config,
+                    token_ids=row.token_ids,
+                    link_spans=reward_spans,
+                    decode=self._decode if self._tokenizer is not None else None,
+                    thinking_tags=self._thinking_tags,
+                )
+            except ValueError as error:
+                return rejected(f"reward_processing:{error}", staging_keys)
+        weight_versions = [record.weight_version for record in parsed.manifest]
+        min_wv, max_wv = min(weight_versions), max(weight_versions)
+
+        # Media: the presence flags fetched with the base columns say which
+        # terminal-chain calls carry pixels; one batched read pulls them,
+        # after token verification so a rejected rollout never moves pixels.
+        media, media_failure = self._resolve_media(
+            row, fetched_by_call, verify_occurrences=forest_training
+        )
+        if media_failure is not None:
+            return rejected(media_failure, staging_keys)
+        # The row is the chain's deltas back to back (carried tokens, then the
+        # call's generated tokens); the staged top-k covers only the generated
+        # part, so each span gets zeros for its carried tokens first.
+        sampler_topk_token_ids = sampler_topk_logprobs = None
+        if self._top_logprobs > 0:
+            ids_parts: list[torch.Tensor] = []
+            logprob_parts: list[torch.Tensor] = []
+            for call_id, carry_len, generation_len in row.link_spans:
+                sampler_topk = fetched_by_call[call_id].sampler_topk
+                assert sampler_topk is not None
+                fragment_ids, fragment_logprobs = sampler_topk
+                expected_shape = (generation_len, self._top_logprobs)
+                if (
+                    tuple(fragment_ids.shape) != expected_shape
+                    or tuple(fragment_logprobs.shape) != expected_shape
+                ):
+                    return rejected(f"topk_length_mismatch:{call_id}", staging_keys)
+                carried = (carry_len, self._top_logprobs)
+                ids_parts += [torch.zeros(carried, dtype=torch.int32), fragment_ids]
+                logprob_parts += [
+                    torch.zeros(carried, dtype=torch.float32),
+                    fragment_logprobs,
+                ]
+            sampler_topk_token_ids = torch.cat(ids_parts)
+            sampler_topk_logprobs = torch.cat(logprob_parts)
+
+        route_plan = None
+        routed_experts: Optional[torch.Tensor] = None
+        if self._router_replay_enabled:
+            # One plan construction for both modes: join Gym's link spans and
+            # extras commitments with the fetch's staging keys and route
+            # lengths. Cleanup keys cover the whole manifest; off-chain rows
+            # stay cleanup-owned but produce no spans.
+            commitments_by_call = {
+                commitment.model_call_id: commitment
+                for commitment in row.extras_commitments
+            }
+            route_spans: list[RouteSpan] = []
+            seen_span_call_ids: set[str] = set()
+            for call_id, carry_len, generation_len in row.link_spans:
+                if call_id in seen_span_call_ids:
+                    return rejected(f"duplicate_route_span:{call_id}", staging_keys)
+                seen_span_call_ids.add(call_id)
+                record = records_by_call.get(call_id)
+                item = fetched_by_call.get(call_id)
+                commitment = commitments_by_call.get(call_id)
+                if record is None or item is None or commitment is None:
+                    return rejected(f"route_span_identity:{call_id}", staging_keys)
+                expected_routed_len = record.delta_len + boundary_route_rows(
+                    record.prev_len
+                )
+                if forest_training and item.routed_len == 0:
+                    return rejected("route_assembly:missing_fragment", staging_keys)
+                if item.routed_len not in (0, expected_routed_len):
+                    return rejected(f"routed_len_mismatch:{call_id}", staging_keys)
+                if generation_len < 0 or generation_len > record.delta_len:
+                    return rejected(
+                        f"route_generation_span_mismatch:{call_id}", staging_keys
+                    )
+                if carry_len < 0:
+                    return rejected(
+                        f"route_carry_span_mismatch:{call_id}", staging_keys
+                    )
+                route_spans.append(
+                    RouteSpan(
+                        staging_key=record.staging_key,
+                        carry_len=int(carry_len),
+                        generation_len=int(generation_len),
+                        staged_route_len=item.routed_len,
+                        extras_digest_version=commitment.extras_digest_version,
+                        extras_digest=commitment.extras_digest,
+                        boundary_rows=(
+                            boundary_route_rows(record.prev_len)
+                            if item.routed_len
+                            else 0
+                        ),
+                    )
+                )
+            if sum(span.carry_len + span.generation_len for span in route_spans) != len(
+                row.token_ids
+            ):
+                return rejected("route_span_length_mismatch", staging_keys)
+            plan = RouteAssemblyPlan(
+                schema_version=ROUTE_PLAN_SCHEMA_VERSION,
+                staging_partition=self._staging_partition,
+                spans=tuple(route_spans),
+                cleanup_staging_keys=tuple(staging_keys),
+                expected_token_length=len(row.token_ids),
+            )
+            try:
+                validate_route_plan(plan)
+            except (TypeError, ValueError) as error:
+                return rejected(f"invalid_route_plan:{error}", staging_keys)
+            # Both modes carry the constructed plan on the rollout; only
+            # deferred mode publishes it (direct mode executes it eagerly and
+            # the published row carries the assembled tensor instead).
+            route_plan = plan
+            if not self._defer_routed_experts_to_policy:
+                routed_experts, failure = self._execute_direct_plan(plan, fetched)
+                if failure is not None:
+                    return rejected(f"route_assembly:{failure}", staging_keys)
+
+        # Shared calls remain exact context, but an earlier row owns their loss.
+        token_mask = list(row.token_mask)
+        for span in row.weight_version_spans:
+            if span.model_call_id in loss_excluded_call_ids:
+                token_mask[span.start : span.end] = [0.0] * (span.end - span.start)
+        output_masks = {}
+        if action_flags is not None:
+            if len(action_flags) != len(row.link_spans) or any(
+                not isinstance(flags, ActionOutputFlags)
+                or type(flags.invalid_tool_call) is not bool
+                or type(flags.malformed_thinking) is not bool
+                for flags in action_flags
+            ):
+                return rejected("action_flags_mismatch", staging_keys)
+            output_masks = {
+                key: [False] * len(row.token_ids)
+                for key in (INVALID_TOOL_CALL_MASK, MALFORMED_THINKING_MASK)
+            }
+            position = 0
+            for flags, (call_id, carry_len, generation_len) in zip(
+                action_flags, row.link_spans, strict=True
+            ):
+                start, end = position + carry_len, position + carry_len + generation_len
+                output_masks[INVALID_TOOL_CALL_MASK][start:end] = [
+                    flags.invalid_tool_call and call_id not in loss_excluded_call_ids
+                ] * generation_len
+                output_masks[MALFORMED_THINKING_MASK][start:end] = [
+                    flags.malformed_thinking and call_id not in loss_excluded_call_ids
+                ] * generation_len
+                position = end
+        return FinalizedRollout(
+            rollout_id=rollout_id,
+            valid=True,
+            rejection_reason=None,
+            token_ids=row.token_ids,
+            token_mask=token_mask,
+            generation_lengths=tuple(
+                length
+                for call_id, _, length in row.link_spans
+                if call_id not in loss_excluded_call_ids
+            ),
+            logprobs=row.logprobs,
+            prompt_len=row.prompt_len,
+            reward=reward,
+            staging_keys=staging_keys,
+            min_wv=min_wv,
+            max_wv=max_wv,
+            routed_experts=routed_experts,
+            route_plan=route_plan,
+            media=media,
+            model_call_ids=tuple(row.model_call_ids),
+            output_masks=output_masks,
+            penalty_counts=penalty_counts,
+            reward_metrics=reward_metrics,
+            sampler_topk_token_ids=sampler_topk_token_ids,
+            sampler_topk_logprobs=sampler_topk_logprobs,
+        )
+
+    def _decode(self, token_ids: Sequence[int]) -> str:
+        return self._tokenizer.decode(list(token_ids), skip_special_tokens=False)
+
+    def _resolve_media(
+        self,
+        row: Any,
+        fetched_by_call: dict[str, FetchedStagedCall],
+        *,
+        verify_occurrences: bool = False,
+    ) -> tuple[Optional[dict[str, PackedTensor]], Optional[str]]:
+        """Read and validate the media columns along the terminal chain.
+
+        Each call row holds only the media new to that call (the worker
+        slices at the parent chain's item count), so the chain's parts are
+        concatenated in order, like the token deltas. Returns
+        ``(media, rejection_reason)``. Text-only partitions and text rollouts
+        return ``(None, None)`` without touching storage; media-carrying
+        rollouts cost exactly one batched tensor read. The media columns live
+        on the call rows themselves, so cleanup needs no extra key.
+        """
+        if not self._capture_media:
+            return None, None
+        items: list[FetchedStagedCall] = []
+        descriptors = []
+        for call_id, _carry_len, _generation_len in row.link_spans:
+            item = fetched_by_call.get(call_id)
+            if item is None:
+                return None, f"media_chain_identity:{call_id}"
+            if verify_occurrences:
+                try:
+                    occurrences = verified_media_items(item)
+                except (KeyError, TypeError, ValueError) as error:
+                    return None, f"invalid_media_evidence:{error}"
+                if item.media_present:
+                    descriptors.append(occurrences)
+            if item.media_present:
+                items.append(item)
+        if not items:
+            return None, None
+        if len({item.media_has_frames for item in items}) != 1:
+            return None, "media_chain_incompatible:mixed image and video calls"
+        try:
+            parts = self._source.fetch_media(items)
+            if verify_occurrences:
+                for occurrences, part in zip(descriptors, parts, strict=True):
+                    verify_media_geometry(occurrences, part)
+        except (KeyError, TypeError, ValueError) as error:
+            return None, f"invalid_media_columns:{error}"
+        try:
+            combined = _concat_media(parts)
+            media = _trainer_media(combined)
+        except (TypeError, ValueError, RuntimeError) as error:
+            return None, f"media_chain_incompatible:{error}"
+        return media, None
+
+    def _execute_direct_plan(
+        self,
+        plan: RouteAssemblyPlan,
+        fetched: list[Any],
+    ) -> tuple[Optional[torch.Tensor], Optional[str]]:
+        """Run the shared executor eagerly with locally fetched fragments.
+
+        Returns ``(None, None)`` when the rollout staged no routes at all —
+        the group tensor build fills those rows with sentinels, exactly like
+        a deferred row whose plan is all-sentinel.
+        """
+        fragments: dict[str, RouteFragment] = {
+            item.staging_key: item.fragment
+            for item in fetched
+            if item.fragment is not None
+        }
+        if not any(span.staged_route_len > 0 for span in plan.spans):
+            return None, None
+        if fragments:
+            # Direct mode has no policy model in-process; the fragments'
+            # own (num_moe_layers, topk) is the learned-dims heuristic, and
+            # the trainer's model-shape check remains authoritative.
+            first = next(iter(fragments.values())).routes
+            if first.dim() != 3:
+                return None, "fragment_rank"
+            self._routed_dims = (int(first.shape[1]), int(first.shape[2]))
+        if self._routed_dims is None:
+            return None, "missing_fragment"
+        return execute_route_plan(
+            plan,
+            fragments,
+            layout=RouteLayout.compressed(
+                num_moe_layers=self._routed_dims[0], top_k=self._routed_dims[1]
+            ),
+            canonical_len=plan.expected_token_length,
+        )
+
+    # ── per group ───────────────────────────────────────────────────────────
+
+    def finalize_group(
+        self,
+        group_id: str,
+        rollout_ids: list[str],
+        receipts: list[Optional[dict[str, Any]]],
+        rewards: list[float],
+        *,
+        mask_sample: list[bool],
+        fallback_weight_version: int,
+        prompt_idx: int,
+        loss_multiplier: float = 1.0,
+        canonical_sample_ids: Optional[list[str]] = None,
+        logical_selections: Optional[list[RolloutSelection]] = None,
+        execution_row_multiple: int = 1,
+        reward_checks: Optional[list[RewardChecks | None]] = None,
+        reward_log_contexts: Optional[list[RewardLogContext | None]] = None,
+    ) -> FinalizedGroup:
+        """Publish one prompt group, with optional physical rows per logical owner.
+
+        Blocking (TQ round trips); run via ``asyncio.to_thread`` from the
+        dispatch task. ``fallback_weight_version`` stamps a group none of
+        whose rollouts produced a valid row (placeholder-only groups still
+        need a staleness tag). ``mask_sample`` is the per-rollout
+        advantage-stage flag the native ``pack_payload`` path emits from each
+        ``Completion``; it rides along unchanged so the train pump's
+        environment masking reads the same field on both paths (placeholder
+        rows already train nothing through ``sample_mask`` 0).
+        ``loss_multiplier`` supplies the dataset-level weight for every valid
+        row, matching the ordinary ``record_to_train_batch`` path. ``truncated``
+        is not carried from the dispatcher -- the receipt path has no real
+        tokens to measure it from at dispatch time -- so it is computed here
+        instead, from each row's rebuilt length against ``max_seq_len``.
+        """
+        assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
+            "rollout_ids, receipts, rewards, and mask_sample must be parallel"
+        )
+        if canonical_sample_ids is None:
+            canonical_sample_ids = rollout_ids
+        assert len(canonical_sample_ids) == len(rollout_ids), (
+            "canonical_sample_ids must be one per rollout"
+        )
+        checks_by_rollout = (
+            tuple(reward_checks)
+            if reward_checks is not None
+            else (None,) * len(rollout_ids)
+        )
+        assert len(checks_by_rollout) == len(rollout_ids), (
+            "reward_checks must be one per rollout"
+        )
+        log_contexts = (
+            reward_log_contexts
+            if reward_log_contexts is not None
+            else [None] * len(rollout_ids)
+        )
+        assert len(log_contexts) == len(rollout_ids), (
+            "reward_log_contexts must be one per rollout"
+        )
+        if type(execution_row_multiple) is not int or execution_row_multiple < 1:
+            raise ValueError("execution_row_multiple must be a positive integer")
+        if logical_selections is None and execution_row_multiple != 1:
+            raise ValueError("execution row padding requires logical Forest segments")
+        if logical_selections is not None and loss_multiplier != 1.0:
+            raise ValueError("Forest currently requires unit dataset loss_multiplier")
+        _group_t0 = time.perf_counter()
+        logical = None
+        if logical_selections is None:
+            rows = [
+                self.finalize_rollout(
+                    rollout_id, receipt, reward=reward, reward_checks=checks
+                )
+                for rollout_id, receipt, reward, checks in zip(
+                    rollout_ids, receipts, rewards, checks_by_rollout
+                )
+            ]
+        else:
+            logical_segments = self._plan_selected_calls(
+                rollout_ids, receipts, logical_selections
+            )
+            logical = self._finalize_logical_rows(
+                group_id,
+                rollout_ids,
+                logical_segments,
+                rewards,
+                mask_sample,
+                canonical_sample_ids=canonical_sample_ids,
+                receipts=receipts,
+                reward_checks=checks_by_rollout,
+            )
+            rows = logical.rows
+            # Keep every captured call cleanup-owned, including unselected roots.
+            logical.staging_keys = list(
+                dict.fromkeys(
+                    key
+                    for receipt in receipts
+                    for key in _receipt_staging_keys(receipt)
+                )
+            )
+            mask_sample = logical.mask_sample
+        _rollouts_ms = (time.perf_counter() - _group_t0) * 1000.0
+        valid_rows = [row for row in rows if row.valid]
+        staging_keys = (
+            logical.staging_keys
+            if logical is not None
+            else [key for row in rows for key in row.staging_keys]
+        )
+        metrics = {
+            "finalize/invalid_row_rate": 1.0 - len(valid_rows) / len(rows),
+            "finalize/calls_per_rollout": (
+                sum(len(row.staging_keys) for row in rows) / len(rows)
+            ),
+            # Fraction of valid rows that carry captured media. 1.0 on a VLM
+            # run is the signal that the learner trains on captured pixels
+            # rather than text-only rows; text runs report 0.0.
+            "finalize/media_row_rate": (
+                sum(1 for row in valid_rows if row.media) / len(valid_rows)
+                if valid_rows
+                else 0.0
+            ),
+        }
+        if logical is not None:
+            metrics["finalize/logical_owner_count"] = float(len(rollout_ids))
+            metrics["finalize/valid_logical_owner_count"] = float(
+                logical.valid_owner_count
+            )
+        # Per-row counts are pooled by the consuming controller once per
+        # committed group, alongside the retained reward observations;
+        # rejected placeholders never enter this population.
+        for row in valid_rows:
+            for name, value in row.reward_metrics.items():
+                metrics[name] = metrics.get(name, 0.0) + value
+        config = self._reward_penalty_config
+        if config is not None:
+            for spec in CAPTURE_PENALTIES:
+                if spec.enabled(config):
+                    metrics[f"finalize/penalty_count/{spec.name}"] = float(
+                        sum(row.penalty_counts.get(spec.name, 0) for row in valid_rows)
+                    )
+        # Ledger-derived admission counters (per group): each manifest row
+        # carries its admission mode. token_in_rate near 1.0 is the capture
+        # health signal (a text root only opens each chain); this replaces the
+        # deleted gate metrics route.
+        manifest_rows = [
+            record
+            for receipt in receipts
+            if isinstance(receipt, dict)
+            for record in (receipt.get("manifest") or [])
+            if isinstance(record, dict)
+        ]
+        if manifest_rows:
+            token_in_calls = sum(
+                1 for record in manifest_rows if record.get("mode") == "token_in"
+            )
+            metrics["finalize/token_in_calls"] = float(token_in_calls)
+            metrics["finalize/text_root_calls"] = float(
+                len(manifest_rows) - token_in_calls
+            )
+            metrics["finalize/token_in_rate"] = token_in_calls / len(manifest_rows)
+        metrics["finalize/capture_poisoned_rollouts"] = float(
+            sum(
+                1
+                for receipt in receipts
+                if isinstance(receipt, dict) and receipt.get("capture_poisoned")
+            )
+        )
+        # Logical placeholders share a rejection bucket; retain the ingestion cause.
+        metrics["finalize/selection_not_closed_rollouts"] = float(
+            sum(
+                1
+                for receipt in receipts
+                if isinstance(receipt, dict)
+                and receipt.get("failure_reason") == "selection_not_closed"
+            )
+        )
+        # Per-method terminal-selection breakdown. Witness methods
+        # (declared/response_id/content) resolve from evidence; heuristic is
+        # the no-witness parent-link fallback — a nonzero heuristic fraction
+        # on a declaring harness is a regression signal. Failed selections
+        # stamp the last stage attempted, so masked rollouts stay visible in
+        # their method's bucket (cross-reference finalize/invalid_row_rate).
+        # Receipts whose manifest never parsed carry no method (None) and
+        # fall in no bucket. Method list is derived from Gym's own type
+        # rather than hand-copied, so a new resolution method Gym adds gets a
+        # bucket automatically instead of silently missing from these
+        # metrics; the annotation is ``Literal[...] | None``, so unwrap the
+        # Literal and skip the None member.
+        from typing import Literal, get_args, get_origin
+
+        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+
+        terminal_selection_methods = tuple(
+            method
+            for member in get_args(
+                RolloutReceipt.model_fields["terminal_selection"].annotation
+            )
+            if get_origin(member) is Literal
+            for method in get_args(member)
+        )
+        for method in terminal_selection_methods:
+            method_receipts = sum(
+                1
+                for receipt in receipts
+                if isinstance(receipt, dict)
+                and receipt.get("terminal_selection") == method
+            )
+            metrics[f"finalize/terminal_selection_{method}_count"] = float(
+                method_receipts
+            )
+            metrics[f"finalize/terminal_selection_{method}_fraction"] = (
+                method_receipts / len(receipts)
+            )
+        witness_disagreements = sum(
+            1
+            for receipt in receipts
+            if isinstance(receipt, dict)
+            and "witness_disagreement"
+            in str(receipt.get("terminal_attribution_reason") or "")
+        )
+        metrics["finalize/terminal_witness_disagreement_count"] = float(
+            witness_disagreements
+        )
+        rejection_reasons: Counter[str] = Counter()
+        for row in rows:
+            if not row.valid:
+                reason_bucket = (row.rejection_reason or "unknown").split(":", 1)[0]
+                rejection_reasons[reason_bucket] += 1
+                print(
+                    f"  finalize: rollout {row.rollout_id} rejected "
+                    f"({row.rejection_reason}) — placeholder",
+                    flush=True,
+                )
+        for reason_bucket, count in rejection_reasons.items():
+            metrics[f"finalize/capture_failure_reason_{reason_bucket}_count"] = float(
+                count
+            )
+
+        # (row index, logical slot, row): one entry per rollout.
+        if logical is None:
+            reward_rows = [(index, index, row) for index, row in enumerate(rows)]
+        else:
+            reward_rows = [
+                (index, tag["logical_slot"], row)
+                for index, (tag, row) in enumerate(zip(logical.tags, rows, strict=True))
+                if tag["segment_index"] == 0
+            ]
+        reward_observations = [
+            FinalizedReward(
+                canonical_sample_ids[slot],
+                rollout_ids[slot],
+                row.reward,
+                log_contexts[slot],
+            )
+            for _, slot, row in reward_rows
+            if row.valid
+        ]
+        # Truncated rollouts among the reward observations, pooled into
+        # termination rates like the penalty counts; receipt-side rates only
+        # saw a placeholder truncated=False.
+        truncated_flags = self._truncated_flags(rows, logical)
+        metrics["finalize/truncated_count"] = 0.0
+        for index, slot, row in reward_rows:
+            if row.valid:
+                truncated = float(truncated_flags[index])
+                metrics["finalize/truncated_count"] += truncated
+                context = log_contexts[slot]
+                if context is not None:
+                    key = f"finalize/truncated_count/{context.agent_name}"
+                    metrics[key] = metrics.get(key, 0.0) + truncated
+
+        # Compute before _publish_rows appends execution padding.
+        token_metrics = _capture_token_metrics(
+            rows,
+            [tag["logical_slot"] for tag in logical.tags]
+            if logical is not None
+            else list(range(len(rows))),
+            log_contexts,
+        )
+        finalized = self._publish_rows(
+            group_id,
+            rows,
+            rollout_ids,
+            mask_sample=mask_sample,
+            fallback_weight_version=fallback_weight_version,
+            prompt_idx=prompt_idx,
+            staging_keys=staging_keys,
+            metrics=metrics,
+            rollouts_ms=_rollouts_ms,
+            reward_observations=reward_observations,
+            logical=logical,
+            execution_row_multiple=execution_row_multiple,
+            canonical_sample_ids=canonical_sample_ids,
+            loss_multiplier=loss_multiplier,
+        )
+        finalized.token_metrics = token_metrics
+        return finalized
+
+    def _truncated_flags(
+        self, rows: Sequence[FinalizedRollout], logical: Optional[_LogicalRows]
+    ) -> list[bool]:
+        """Per-row truncation, shared by the TRUNCATED column and termination rates.
+
+        Forest rows carry their rollout's Gym-reported truncation; ordinary rows
+        count as truncated when they fill ``max_seq_len``.
+        """
+        if logical is not None:
+            return list(logical.truncated)
+        return [len(row.token_ids) == self._max_seq_len for row in rows]
+
+    def _publish_rows(
+        self,
+        group_id: str,
+        rows: list[FinalizedRollout],
+        rollout_ids: list[str],
+        *,
+        mask_sample: list[bool],
+        fallback_weight_version: int,
+        prompt_idx: int,
+        staging_keys: list[str],
+        metrics: dict[str, float],
+        rollouts_ms: float,
+        reward_observations: list[FinalizedReward],
+        logical: Optional[_LogicalRows],
+        execution_row_multiple: int,
+        canonical_sample_ids: list[str],
+        loss_multiplier: float,
+    ) -> FinalizedGroup:
+        """Shared ordinary/Forest tensorization, single publication, and cleanup."""
+        valid_rows = [row for row in rows if row.valid]
+        real_row_count = len(rows)
+        if logical is not None:
+            if not valid_rows:
+                self._clear_staging(staging_keys)
+                metrics["finalize/group_dropped"] = 1.0
+                return FinalizedGroup(
+                    meta=None,
+                    group_min_wv=fallback_weight_version,
+                    group_max_wv=fallback_weight_version,
+                    staging_keys=[],
+                    metrics=metrics,
+                    dropped=True,
+                    drop_reason="Forest group has no verified input layout for dummy rows",
+                )
+            planned_ids = forest_row_ids(
+                group_id,
+                canonical_sample_ids,
+                [
+                    tag["segment_count"]
+                    for tag in logical.tags
+                    if tag["segment_index"] == 0
+                ],
+                execution_row_multiple=execution_row_multiple,
+            )
+            padding_count = len(planned_ids) - real_row_count
+            dummy_layout = valid_rows[0]
+            for ordinal in range(padding_count):
+                rows.append(
+                    replace(
+                        dummy_layout,
+                        rollout_id=planned_ids[real_row_count + ordinal],
+                        valid=False,
+                        reward=0.0,
+                        staging_keys=[],
+                    )
+                )
+                logical.prompt_ids.append([self._pad_token_id])
+                logical.mask_sample.append(True)
+                logical.truncated.append(False)
+                logical.tags.append(
+                    asdict(
+                        LogicalRowTag(
+                            dispatch_group_id=group_id,
+                            logical_group_size=len(rollout_ids),
+                            logical_rollout_id=None,
+                            logical_slot=None,
+                            segment_index=None,
+                            segment_count=0,
+                            is_execution_padding=True,
+                        )
+                    )
+                    | {
+                        "num_invalid_tool_calls": 0,
+                        "num_malformed_thinking": 0,
+                        "num_assistant_messages": 0,
+                    }
+                )
+            metrics["finalize/execution_padding_rows"] = float(padding_count)
+            # Failed owners retain their own reward/grouping identity, but
+            # logprob forwards need a sound full input/media layout as well.
+            layouts = [row if row.valid else dummy_layout for row in rows]
+            for row, tag in zip(rows, logical.tags, strict=True):
+                tag["uses_borrowed_input"] = not row.valid
+        else:
+            layouts = rows
+        group_min_wv = min(
+            (r.min_wv for r in valid_rows if r.min_wv is not None),
+            default=fallback_weight_version,
+        )
+        group_max_wv = max(
+            (r.max_wv for r in valid_rows if r.max_wv is not None),
+            default=fallback_weight_version,
+        )
+
+        _tensorize_t0 = time.perf_counter()
+        # Placeholders borrow a valid sibling's prompt ids so per-prompt
+        # baselines group correctly; an all-placeholder group uses a single
+        # pad token (its rows all carry sample_mask 0 and never train).
+        sibling_prompt = (
+            valid_rows[0].token_ids[: valid_rows[0].prompt_len] if valid_rows else []
+        ) or [self._pad_token_id]
+
+        n = len(rows)
+        seq_lens = [max(1, len(row.token_ids)) for row in layouts]
+        max_len = max(seq_lens)
+        input_ids = torch.full((n, max_len), self._pad_token_id, dtype=torch.int64)
+        token_mask = torch.zeros((n, max_len), dtype=torch.float32)
+        logprobs = torch.zeros((n, max_len), dtype=torch.float32)
+        if logical is None:
+            prompt_ids_for_adv = torch.tensor([sibling_prompt] * n, dtype=torch.int64)
+        else:
+            # Original per-owner prompts, never a later segment prompt.
+            prompt_ids_for_adv = torch.nested.as_nested_tensor(
+                [
+                    torch.tensor(prompt, dtype=torch.int64)
+                    for prompt in logical.prompt_ids
+                ],
+                layout=torch.jagged,
+            )
+        sample_mask = torch.zeros(n, dtype=torch.float32)
+        lengths = torch.tensor(seq_lens, dtype=torch.long)
+        rewards_t = torch.tensor([row.reward for row in rows], dtype=torch.float32)
+        sampler_topk_token_ids = sampler_topk_logprobs = None
+        if self._top_logprobs > 0:
+            sampler_topk_shape = (n, max_len, self._top_logprobs)
+            sampler_topk_token_ids = torch.zeros(sampler_topk_shape, dtype=torch.int32)
+            sampler_topk_logprobs = torch.zeros(sampler_topk_shape, dtype=torch.float32)
+        for i, row in enumerate(rows):
+            if logical is not None:
+                input_ids[i, : seq_lens[i]] = torch.tensor(
+                    layouts[i].token_ids, dtype=torch.int64
+                )
+            if not row.valid:
+                continue
+            length = len(row.token_ids)
+            input_ids[i, :length] = torch.tensor(row.token_ids, dtype=torch.int64)
+            token_mask[i, :length] = torch.tensor(row.token_mask, dtype=torch.float32)
+            logprobs[i, :length] = torch.tensor(row.logprobs, dtype=torch.float32)
+            sample_mask[i] = float(loss_multiplier)
+            if sampler_topk_token_ids is not None:
+                assert sampler_topk_logprobs is not None
+                assert row.sampler_topk_token_ids is not None
+                assert row.sampler_topk_logprobs is not None
+                sampler_topk_token_ids[i, :length] = row.sampler_topk_token_ids
+                sampler_topk_logprobs[i, :length] = row.sampler_topk_logprobs
+
+        train_batch: dict[str, Any] = {
+            "input_ids": input_ids,
+            "input_lengths": lengths,
+            "generation_logprobs": logprobs,
+            "token_mask": token_mask,
+            "sample_mask": sample_mask,
+            "prompt_ids_for_adv": prompt_ids_for_adv,
+            "total_reward": rewards_t,
+            MASK_SAMPLE: torch.tensor(mask_sample, dtype=torch.bool),
+            TRUNCATED: torch.tensor(
+                self._truncated_flags(rows, logical), dtype=torch.bool
+            ),
+        }
+        if sampler_topk_token_ids is not None:
+            train_batch[SAMPLER_TOPK_TOKEN_IDS_FIELD] = sampler_topk_token_ids
+            train_batch[SAMPLER_TOPK_LOGPROBS_FIELD] = sampler_topk_logprobs
+        if logical is not None:
+            for key in (INVALID_TOOL_CALL_MASK, MALFORMED_THINKING_MASK):
+                values = torch.zeros((n, max_len), dtype=torch.bool)
+                for index, row in enumerate(rows):
+                    if row.valid and key in row.output_masks:
+                        values[index, : len(row.token_ids)] = torch.tensor(
+                            row.output_masks[key], dtype=torch.bool
+                        )
+                train_batch[key] = values
+        if self._router_replay_enabled and not self._defer_routed_experts_to_policy:
+            has_routed_row = any(r.valid and r.routed_experts is not None for r in rows)
+            if not has_routed_row and self._routed_dims is None and not valid_rows:
+                # Nothing to learn (L, K) from yet — e.g. an all-poisoned
+                # group before the first healthy rollout. Dropping loses no
+                # training signal (no valid rows or routes) and keeps the
+                # partition schema consistent for groups that do publish.
+                return self._drop_group(
+                    group_id,
+                    reason=(
+                        "router replay on, no rollout carried routed_experts, "
+                        "and (L, K) is unknown yet"
+                    ),
+                    staging_keys=staging_keys,
+                    group_min_wv=group_min_wv,
+                    group_max_wv=group_max_wv,
+                    metrics=metrics,
+                )
+            train_batch["routed_experts"] = self._build_routed_experts_tensor(
+                rows, max_len=max_len, metrics=metrics
+            )
+        # Media rides the same packed/tagged transport as the token-echo path
+        # (pack_payload encodes PackedTensor fields and mints row-shape tags).
+        media_fields = _media_fields_for_group(layouts)
+        if self._capture_media and not media_fields:
+            # All-text groups still need the serving worker's pinned columns.
+            assert self._media_columns is not None
+            media_fields = _empty_trainer_media(self._media_columns, len(rows))
+        train_batch.update(media_fields)
+        sample_ids, fields, tags = pack_payload(
+            train_batch,
+            weight_version=group_min_wv,
+            group_id=group_id,
+            prompt_idx=prompt_idx,
+        )
+        if self._defer_routed_experts_to_policy:
+            encoded_sizes = 0
+            span_count = 0
+            for tag, row, expected_length in zip(tags, rows, seq_lens):
+                plan = row.route_plan
+                if plan is None:
+                    plan = RouteAssemblyPlan(
+                        schema_version=ROUTE_PLAN_SCHEMA_VERSION,
+                        staging_partition=self._staging_partition,
+                        spans=(),
+                        cleanup_staging_keys=tuple(row.staging_keys),
+                        expected_token_length=expected_length,
+                    )
+                encoded = encode_route_plan(plan)
+                tag[ROUTE_PLAN_TAG] = encoded
+                encoded_sizes += encoded_route_plan_size_bytes(plan)
+                span_count += len(plan.spans)
+            metrics["finalize/route_plan_span_count"] = float(span_count)
+            metrics["finalize/route_plan_encoded_bytes"] = float(encoded_sizes)
+            valid_route_rows = sum(
+                1 for row in valid_rows if row.route_plan and row.route_plan.spans
+            )
+            if valid_rows:
+                metrics["finalize/routed_experts_row_coverage"] = (
+                    valid_route_rows / len(valid_rows)
+                )
+        if logical is None:
+            assert sample_ids == canonical_sample_ids, (
+                "canonical sample ids must equal the stable logical rollout ids: "
+                f"{sample_ids} != {canonical_sample_ids}"
+            )
+        else:
+            sample_ids = [row.rollout_id for row in rows]
+            if tuple(sample_ids) != planned_ids:
+                raise ValueError("Forest publication IDs differ from the cleanup plan")
+            for tag, owner_tag in zip(tags, logical.tags, strict=True):
+                tag.update(owner_tag)
+        _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0
+        _put_t0 = time.perf_counter()
+        self._call_dp(
+            "put_samples",
+            sample_ids=sample_ids,
+            partition_id=self._partition_id,
+            fields=fields,
+            tags=tags,
+        )
+        _put_ms = (time.perf_counter() - _put_t0) * 1000.0
+        _clear_ms = 0.0
+        if not self._defer_routed_experts_to_policy:
+            _clear_t0 = time.perf_counter()
+            self._clear_staging(staging_keys)
+            _clear_ms = (time.perf_counter() - _clear_t0) * 1000.0
+        # Per-step W&B breakdown of training-row assembly (capture arm) rides
+        # FinalizedGroup.metrics into the controller's rollout metrics.
+        metrics["row_assembly/rollouts_ms"] = rollouts_ms
+        metrics["row_assembly/tensorize_ms"] = _tensorize_ms
+        metrics["row_assembly/tq_put_ms"] = _put_ms
+        if not self._defer_routed_experts_to_policy:
+            metrics["row_assembly/clear_staging_ms"] = _clear_ms
+        meta = KVBatchMeta(
+            partition_id=self._partition_id,
+            task_name="train",
+            sample_ids=list(sample_ids),
+            fields=cast(list[str], list(fields.keys())),
+            sequence_lengths=[int(s) for s in lengths.tolist()],
+            tags=[dict(t) for t in tags],
+        )
+        return FinalizedGroup(
+            meta=meta,
+            group_min_wv=group_min_wv,
+            group_max_wv=group_max_wv,
+            staging_keys=(staging_keys if self._defer_routed_experts_to_policy else []),
+            canonical_output_tokens=sum(
+                int(mask) for row in valid_rows for mask in row.token_mask
+            ),
+            metrics=metrics,
+            reward_observations=reward_observations,
+            valid_row_count=len(valid_rows),
+            total_row_count=real_row_count,
+        )
+
+    # ── internals ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _plan_selected_calls(
+        rollout_ids: list[str],
+        receipts: list[Optional[dict[str, Any]]],
+        selections: list[RolloutSelection],
+    ) -> list[list[SegmentReceipt]]:
+        """Plan paths to selected leaves using committed capture parents."""
+        # Capture wire types are optional outside this finalization path.
+        from nemo_gym.token_id_capture.staging.records import (
+            CallRecord,
+            RolloutReceipt,
+            staging_key,
+        )
+
+        if len(selections) != len(rollout_ids):
+            raise ValueError("Selection must cover every logical owner")
+        plans = []
+        for owner, receipt, selection in zip(
+            rollout_ids, receipts, selections, strict=True
+        ):
+            parsed = RolloutReceipt.model_validate(receipt)
+            _receipt_staging_keys(receipt)
+            if parsed.capture_key != owner or any(
+                record.staging_key != staging_key(owner, record.model_call_id)
+                for record in parsed.manifest
+            ):
+                raise ValueError("Foreign capture ownership in selected attempt")
+            selected = selection.response_ids
+            if (
+                (not selected and not parsed.capture_poisoned)
+                or len(set(selected)) != len(selected)
+                or len(selection.action_flags) != len(selected)
+            ):
+                raise ValueError(
+                    "Selected responses must be nonempty, unique, and have parallel action flags"
+                )
+            if parsed.capture_poisoned:
+                # One masked owner needs no accepted-response or initial-prompt
+                # witness. Never train its partial history, even if it is sound.
+                plans.append(
+                    [SegmentReceipt(owner, parsed.model_dump(), (), action_flags=())]
+                )
+                continue
+            by_response = {record.response_id: record for record in parsed.manifest}
+            if (
+                len(by_response) != len(parsed.manifest)
+                or len({record.model_call_id for record in parsed.manifest})
+                != len(parsed.manifest)
+                or any(response not in by_response for response in selected)
+            ):
+                raise ValueError(
+                    "Selected response is missing or ambiguous in the capture manifest"
+                )
+            # Selection supplies membership and semantic root order. Completion
+            # order in the manifest says nothing about independent branches.
+            positions = {
+                response_id: index for index, response_id in enumerate(selected)
+            }
+            by_call = {by_response[r].model_call_id: by_response[r] for r in selected}
+            if parsed.terminal_model_call_id not in by_call:
+                raise ValueError("Scored terminal is absent from selected calls")
+            flags_by_call = dict(zip(by_call, selection.action_flags, strict=True))
+            graph = {
+                call_id: (record.parent_call_id,)
+                if record.parent_call_id is not None
+                else ()
+                for call_id, record in by_call.items()
+            }
+            if any(
+                parent not in by_call
+                for parents in graph.values()
+                for parent in parents
+            ):
+                raise ValueError(
+                    "Selected continuation is missing its selected predecessor"
+                )
+            try:
+                selected_records = [
+                    by_call[c] for c in TopologicalSorter(graph).static_order()
+                ]
+            except CycleError as error:
+                raise ValueError("Selected capture contains a cycle") from error
+            root_positions: dict[str, int] = {}
+            parents: set[str] = set()
+            for record in selected_records:
+                if record.parent_call_id is None:
+                    root_positions[record.model_call_id] = positions[record.response_id]
+                else:
+                    root_positions[record.model_call_id] = root_positions[
+                        record.parent_call_id
+                    ]
+                    parents.add(record.parent_call_id)
+            endpoints = sorted(
+                (
+                    record
+                    for record in selected_records
+                    if record.model_call_id not in parents
+                ),
+                key=lambda record: (
+                    root_positions[record.model_call_id],
+                    positions[record.response_id],
+                ),
+            )
+            owner_plan = []
+            for endpoint in endpoints:
+                chain: list[CallRecord] = []
+                cursor: CallRecord | None = endpoint
+                while cursor is not None:
+                    chain.append(cursor)
+                    cursor = (
+                        by_call[cursor.parent_call_id]
+                        if cursor.parent_call_id is not None
+                        else None
+                    )
+                chain.reverse()
+                row_receipt = parsed.model_copy(
+                    update={
+                        "manifest": chain,
+                        "terminal_model_call_id": chain[-1].model_call_id,
+                        "terminal_selection": "declared",
+                    }
+                )
+                owner_plan.append(
+                    SegmentReceipt(
+                        capture_rollout_id=owner,
+                        receipt=row_receipt.model_dump(),
+                        selected_response_ids=tuple(
+                            record.response_id for record in chain
+                        ),
+                        action_flags=tuple(
+                            flags_by_call[record.model_call_id] for record in chain
+                        ),
+                        truncated=selection.truncated,
+                    )
+                )
+            plans.append(owner_plan)
+        return plans
+
+    def _finalize_logical_rows(
+        self,
+        group_id: str,
+        rollout_ids: list[str],
+        logical_segments: list[list[SegmentReceipt]],
+        rewards: list[float],
+        mask_sample: list[bool],
+        *,
+        canonical_sample_ids: list[str],
+        receipts: list[Optional[dict[str, Any]]],
+        reward_checks: tuple[RewardChecks | None, ...],
+    ) -> _LogicalRows:
+        """Verify ordinary segments, then keep all or none of each owner's rows.
+
+        A missing initial prompt is a structural group failure: a sibling's
+        possibly different post-agent prompt is not evidence for a failed owner.
+        No publication or cleanup happens before this method completes.
+        """
+        # Optional Gym dependency; ordinary/non-Gym import paths remain unchanged.
+        from nemo_gym.token_id_capture.staging.records import (
+            RolloutReceipt,
+            staging_key,
+        )
+
+        n = len(rollout_ids)
+        if not n or len(logical_segments) != n:
+            raise ValueError("logical segments must cover every logical slot")
+        if canonical_sample_ids != [f"{group_id}_g{i}" for i in range(n)]:
+            raise ValueError("logical rollout IDs must match their dispatch slots")
+        if not all(math.isfinite(reward) for reward in rewards):
+            raise ValueError("logical rewards must be finite")
+        if self._defer_routed_experts_to_policy:
+            raise ValueError("logical capture requires direct route assembly")
+
+        prepared = _LogicalRows([], [], [], [], [], [], 0)
+        seen_responses: set[str] = set()
+        for slot, (owner_id, segments, reward, owner_mask) in enumerate(
+            zip(
+                canonical_sample_ids,
+                logical_segments,
+                rewards,
+                mask_sample,
+                strict=True,
+            )
+        ):
+            if not segments:
+                raise ValueError(f"{owner_id}: missing initial prompt evidence")
+            rebuilt = []
+            scored_call = RolloutReceipt.model_validate(
+                receipts[slot]
+            ).terminal_model_call_id
+            reward_row: FinalizedRollout | None = None
+            parsed_receipts = []
+            owner_valid = True
+            owner_records = {}
+            owner_flags = {}
+            owner_responses: set[str] = set()
+            owned_responses: list[set[str]] = []
+            for ordinal, segment in enumerate(segments):
+                expected_id = rollout_ids[slot]
+                if segment.capture_rollout_id != expected_id:
+                    raise ValueError("capture ID must match the dispatched attempt")
+                parsed = (
+                    RolloutReceipt.model_validate(segment.receipt)
+                    if segment.receipt is not None
+                    else None
+                )
+                if parsed is not None:
+                    if parsed.capture_key != expected_id or any(
+                        record.staging_key
+                        != staging_key(expected_id, record.model_call_id)
+                        for record in parsed.manifest
+                    ):
+                        raise ValueError("foreign receipt/staging ownership")
+                    prepared.staging_keys.extend(
+                        record.staging_key for record in parsed.manifest
+                    )
+                applies_reward = (
+                    reward_row is None
+                    and parsed is not None
+                    and any(
+                        record.model_call_id == scored_call
+                        for record in parsed.manifest
+                    )
+                )
+                row = self.finalize_rollout(
+                    expected_id,
+                    segment.receipt,
+                    reward=reward,
+                    forest_training=True,
+                    action_flags=segment.action_flags,
+                    loss_excluded_call_ids=frozenset(owner_records),
+                    reward_checks=reward_checks[slot],
+                    reward_call_id=scored_call if applies_reward else None,
+                )
+                if applies_reward:
+                    reward_row = row
+                selected = segment.selected_response_ids
+                record_by_call = (
+                    {record.model_call_id: record for record in parsed.manifest}
+                    if parsed
+                    else {}
+                )
+                actual = tuple(
+                    record_by_call[call_id].response_id
+                    for call_id in row.model_call_ids
+                )
+                selection_valid = (
+                    bool(selected)
+                    and all(isinstance(item, str) and item for item in selected)
+                    and len(set(selected)) == len(selected)
+                    and not seen_responses.intersection(selected)
+                    and selected[-1] not in owner_responses
+                    and actual == selected
+                )
+                for call_id in row.model_call_ids:
+                    record = record_by_call[call_id]
+                    if (
+                        call_id in owner_records and owner_records[call_id] != record
+                    ) or (
+                        record.response_id in owner_responses
+                        and call_id not in owner_records
+                    ):
+                        selection_valid = False
+                for response_id, flags in zip(selected, segment.action_flags or ()):
+                    if response_id in owner_flags and owner_flags[response_id] != flags:
+                        selection_valid = False
+                    owner_flags[response_id] = flags
+                owned_responses.append(set(selected) - owner_responses)
+                if selection_valid:
+                    owner_responses.update(selected)
+                    owner_records.update(
+                        (call_id, record_by_call[call_id])
+                        for call_id in row.model_call_ids
+                    )
+                owner_valid = owner_valid and row.valid and selection_valid
+                rebuilt.append(row)
+                parsed_receipts.append(parsed)
+            seen_responses.update(owner_responses)
+
+            first = rebuilt[0]
+            parsed = parsed_receipts[0]
+            selected = segments[0].selected_response_ids
+            roots = (
+                [
+                    record
+                    for record in parsed.manifest
+                    if selected
+                    and record.response_id == selected[0]
+                    and record.parent_call_id is None
+                ]
+                if parsed
+                else []
+            )
+            failed_capture = (
+                parsed is not None and parsed.capture_poisoned and not selected
+            )
+            if not failed_capture and len(roots) != 1:
+                raise ValueError(f"{owner_id}: missing initial prompt evidence")
+            if failed_capture:
+                # Grouping uses dispatch identity, not these non-training tokens.
+                original_prompt = [self._pad_token_id]
+            elif first.valid:
+                if first.model_call_ids[0] != roots[0].model_call_id:
+                    raise ValueError(
+                        f"{owner_id}: selected initial root disagrees with receipt"
+                    )
+                original_prompt = first.token_ids[: first.prompt_len]
+            else:
+                # Only recover grouping identity, never training validity, from
+                # a sound selected root when a later call poisoned segment zero.
+                root_receipt = RolloutReceipt(
+                    capture_key=segments[0].capture_rollout_id,
+                    manifest=roots,
+                    terminal_model_call_id=roots[0].model_call_id,
+                    terminal_selection="declared",
+                )
+                root = self.finalize_rollout(
+                    segments[0].capture_rollout_id,
+                    root_receipt.model_dump(),
+                    reward=reward,
+                    forest_training=True,
+                )
+                if not root.valid:
+                    raise ValueError(
+                        f"{owner_id}: unverifiable initial prompt evidence"
+                    )
+                original_prompt = root.token_ids[: root.prompt_len]
+            if not original_prompt:
+                raise ValueError(f"{owner_id}: empty initial grouping prompt")
+            if owner_valid:
+                if reward_row is None:
+                    raise ValueError(f"{owner_id}: missing scored-call reward evidence")
+                rebuilt = [replace(row, reward=reward_row.reward) for row in rebuilt]
+                prepared.valid_owner_count += 1
+            else:
+                rebuilt = [
+                    replace(
+                        first,
+                        rollout_id=forest_segment_id(owner_id, 0),
+                        valid=False,
+                        rejection_reason="logical_owner_invalid",
+                        token_ids=[],
+                        token_mask=[],
+                        logprobs=[],
+                        prompt_len=0,
+                        model_call_ids=(),
+                        routed_experts=None,
+                        route_plan=None,
+                        media=None,
+                        output_masks={},
+                    )
+                    for _ in segments
+                ]
+            for ordinal, row in enumerate(rebuilt):
+                segment = segments[ordinal]
+                flags = tuple(
+                    flags
+                    for response_id, flags in zip(
+                        segment.selected_response_ids, segment.action_flags or ()
+                    )
+                    if response_id in owned_responses[ordinal]
+                )
+                prepared.rows.append(
+                    replace(row, rollout_id=forest_segment_id(owner_id, ordinal))
+                )
+                prepared.prompt_ids.append(original_prompt)
+                prepared.mask_sample.append(owner_mask)
+                prepared.truncated.append(
+                    any(segment.truncated for segment in segments)
+                )
+                prepared.tags.append(
+                    asdict(
+                        LogicalRowTag(
+                            dispatch_group_id=group_id,
+                            logical_rollout_id=owner_id,
+                            logical_slot=slot,
+                            logical_group_size=n,
+                            segment_index=ordinal,
+                            segment_count=len(rebuilt),
+                            is_execution_padding=False,
+                        )
+                    )
+                    | {
+                        "num_invalid_tool_calls": sum(
+                            flag.invalid_tool_call for flag in flags
+                        ),
+                        "num_malformed_thinking": sum(
+                            flag.malformed_thinking for flag in flags
+                        ),
+                        "num_assistant_messages": len(owned_responses[ordinal]),
+                    }
+                )
+        prepared.staging_keys = list(dict.fromkeys(prepared.staging_keys))
+        return prepared
+
+    def _build_routed_experts_tensor(
+        self,
+        rows: list[FinalizedRollout],
+        *,
+        max_len: int,
+        metrics: dict[str, float],
+    ) -> torch.Tensor:
+        """[n, max_len, L, K] int16 routes for the group; sentinel elsewhere.
+
+        Padding, placeholder rows, and valid rows whose rebuild carried no
+        routes are all-sentinel: Megatron's replay falls back to its own
+        router for exactly those positions. (L, K) is learned from the first
+        rebuilt row that carries routes and cached for placeholder-only
+        groups; a group arriving before any routed row has been seen cannot
+        be shaped and fails loudly (unreachable once the first real rollout
+        of the run finalizes).
+        """
+        for row in rows:
+            if row.valid and row.routed_experts is not None:
+                self._routed_dims = (
+                    int(row.routed_experts.shape[1]),
+                    int(row.routed_experts.shape[2]),
+                )
+                break
+        if self._routed_dims is None:
+            raise RuntimeError(
+                "policy.router_replay.enabled=true (token-capture mode) but no "
+                "finalized rollout has carried routed_experts yet, so the "
+                "placeholder group tensor cannot be shaped. Check vLLM "
+                "enable_return_routed_experts and the staging-extras path."
+            )
+        num_moe_layers, topk = self._routed_dims
+        routed = torch.full(
+            (len(rows), max_len, num_moe_layers, topk),
+            ROUTE_MISSING_SENTINEL,
+            dtype=torch.int16,
+        )
+        rows_with_routes = 0
+        valid_rows = 0
+        sentinel_tokens = 0
+        covered_tokens = 0
+        for i, row in enumerate(rows):
+            if not row.valid:
+                continue
+            valid_rows += 1
+            covered_tokens += len(row.token_ids)
+            if row.routed_experts is None:
+                # The final token never has a recorded route; don't count it.
+                sentinel_tokens += max(len(row.token_ids) - 1, 0)
+                continue
+            rows_with_routes += 1
+            row_routes = row.routed_experts
+            if row_routes.shape != (len(row.token_ids), num_moe_layers, topk):
+                raise RuntimeError(
+                    "rebuilt routed_experts shape "
+                    f"{tuple(row_routes.shape)} does not match "
+                    f"({len(row.token_ids)}, {num_moe_layers}, {topk}) for "
+                    f"rollout {row.rollout_id}"
+                )
+            routed[i, : row_routes.shape[0]] = row_routes
+            # The final token never has a recorded route; don't count it.
+            sentinel_tokens += int(
+                row_routes[:-1].eq(ROUTE_MISSING_SENTINEL).all(-1).all(-1).sum().item()
+            )
+        if valid_rows:
+            metrics["finalize/routed_experts_row_coverage"] = (
+                rows_with_routes / valid_rows
+            )
+        if covered_tokens:
+            metrics["finalize/routed_experts_sentinel_token_fraction"] = (
+                sentinel_tokens / covered_tokens
+            )
+        return routed
+
+    def _drop_group(
+        self,
+        group_id: str,
+        *,
+        reason: str,
+        staging_keys: list[str],
+        group_min_wv: int,
+        group_max_wv: int,
+        metrics: dict[str, float],
+    ) -> FinalizedGroup:
+        """Reject a whole group and hand the caller a ``dropped`` result.
+
+        Logs the drop, releases the group's staging rows, marks the
+        ``finalize/group_dropped`` metric, and carries ``reason`` through as
+        ``drop_reason`` for the caller's log line.
+        """
+        print(f"  finalize: group {group_id} dropped — {reason}", flush=True)
+        self._clear_staging(staging_keys)
+        metrics["finalize/group_dropped"] = 1.0
+        return FinalizedGroup(
+            meta=None,
+            group_min_wv=group_min_wv,
+            group_max_wv=group_max_wv,
+            staging_keys=[],
+            canonical_output_tokens=0,
+            metrics=metrics,
+            dropped=True,
+            drop_reason=reason,
+            valid_row_count=0,
+            total_row_count=0,
+        )
+
+    def _clear_staging(self, staging_keys: list[str]) -> None:
+        if not staging_keys:
+            return
+        try:
+            self._staging.clear(staging_keys)
+        except Exception as error:
+            raise RuntimeError(
+                "finalizer staging cleanup failed for known keys "
+                f"partition={self._staging_partition!r}, keys={staging_keys!r}"
+            ) from error
+
+    def _call_dp(self, method_name: str, **kwargs: Any) -> Any:
+        import ray
+
+        method = getattr(self._dp_client, method_name)
+        remote = getattr(method, "remote", None)
+        if remote is not None:
+            return ray.get(remote(**kwargs))
+        return method(**kwargs)

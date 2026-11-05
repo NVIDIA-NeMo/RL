@@ -1,6 +1,6 @@
 # NeMo Gym Integration
 
-This document describes how NeMo RL integrates with [NeMo Gym](https://docs.nvidia.com/nemo/gym/latest/index.html) for multi-step and multi-turn reinforcement learning training.
+This document describes how NeMo RL integrates with [NeMo Gym](https://docs.nvidia.com/nemo/gym/v0.2.1/index.html) for multi-step and multi-turn rollout collection. NeMo Gym rollouts are supported by GRPO and on-policy distillation.
 
 ## Overview
 
@@ -9,6 +9,10 @@ NeMo Gym provides HTTP-based training environments for LLMs. **NeMo Gym is CPU-o
 - **Decoupled architecture**: Environments don't need direct access to model internals
 - **Multi-step/multi-turn support**: Agents can orchestrate complex interactions with tools
 - **Refit compatibility**: NeMo RL's weight synchronization works transparently
+
+The same NeMo Gym rollout path is used by GRPO and on-policy distillation when `env.should_use_nemo_gym` is enabled. Distillation uses the generated NeMo Gym conversations as the student on-policy samples before computing teacher logits and the distillation loss.
+
+For on-policy distillation, NeMo Gym controls the rollout turn count from its environment and agent configuration. The standard distillation `distillation.max_rollout_turns` setting is not used by the NeMo Gym rollout path.
 
 ## Configuration
 
@@ -29,9 +33,127 @@ env:
     config_paths:
       - resources_servers/math/configs/math.yaml
       - responses_api_agents/simple_agent/configs/simple_agent.yaml
+
+logger:
+  wandb:
+    # Optional debugging aid. Keep disabled for normal training because complete
+    # result payloads can produce many large W&B Table artifacts.
+    log_nemo_gym_full_result_tables: false
 ```
 
-For a complete example, see `examples/nemo_gym/` and its associated configs.
+When `log_nemo_gym_full_result_tables` is `false`, NeMo RL does not construct
+the per-agent `full_result` Tables. This prevents those payloads from entering
+the async replay buffer and avoids uploading them to W&B. Numeric per-agent
+rollout metrics are unaffected. Set the flag to `true` only when the complete
+Gym result payloads are needed for a short debugging run.
+
+The exposed vLLM HTTP server binds every interface of its node and, by default,
+checks no credential on its OpenAI routes; the NeMo Gym model server sends the
+placeholder key `dummy_key`. Set `policy.generation.vllm_cfg.http_server_api_key_required: true`
+to require a bearer token instead (the setting needs `expose_http_server: true`
+and is refused at setup without it): NeMo RL generates one random key per job,
+every vLLM worker refuses a `/v1/*` or `/tokenize` request without
+`Authorization: Bearer <key>` (HTTP 401), and the same key reaches the NeMo Gym
+model server as `policy_api_key`. The saved and logged job configuration never
+carries the key: the vLLM workers receive it in their own configuration copy,
+and the Gym servers receive it as an environment variable
+(`NEMO_RL_POLICY_API_KEY`) that each server resolves in its own process, so
+Gym's serialized global config, its head server's `/global_config_dict_yaml`
+endpoint and the server command lines carry only the variable name. The
+residual exposure is the server processes' environment and the Gym actor's
+constructor arguments, the same as for the token-capture secret. The setting
+covers the vLLM backend only: the Megatron, TRT-LLM and Dynamo exposed servers
+check no credential and their Gym actors keep `dummy_key` (Dynamo rejects the
+setting at configuration time rather than ignoring it).
+
+For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
+
+### Dataset formats and routing
+
+NeMo RL supports two Gym dataset formats. Both enter Gym through an Environment Server:
+
+- **Flat rows** identify the Agent through `agent_ref.name` or `task_source`. Gym resolves the Environment Server associated with that Agent, including through `legacy_agent`.
+- **Materialized task rows** contain `task_id` and `task_input`. Set `env.nemo_gym.environment_server_routes` to map each row's `task_id.taskset` to a configured Environment Server entry name.
+
+The taskset mapping can also be supplied in a Gym YAML loaded through `config_paths`; RL reads it from Gym's merged configuration. RL sends each prompt group to an actor hosting the selected server. With the current Gym pin, materialized task rows can target `single_agent_turn` or `single_agent_turn_legacy`.
+
+See [Data Format Translation](#data-format-translation) for the field layout of each format.
+
+#### Train on a taskset
+
+`examples/nemo_gym/grpo_openmathreasoning_nemotron_nano_v2_9b_single_agent_turn.yaml` trains on OpenMathReasoning and validates on AIME24. It routes the `openmathreasoning` taskset to a `single_agent_turn` Environment Server that runs Simple Agent with the `math_with_judge` resources server, using local math verification without a judge model. The recipe uses Nemotron Nano 9B v2's default thinking mode and a 16K sequence limit. Its header shows how to prepare the train and validation splits as taskset rows, which have this shape:
+
+```json
+{
+  "task_id": {"taskset": "openmathreasoning", "task_id": "0"},
+  "task_input": {
+    "responses_create_params": {"input": [{"role": "user", "content": "What is 2 + 2?"}]},
+    "question": "What is 2 + 2?",
+    "expected_answer": "4"
+  }
+}
+```
+
+`task_input` must contain `responses_create_params`, because NeMo RL writes the policy's `temperature`, `top_p`, and `max_output_tokens` there. A taskset whose rows lack it fails on its first batch.
+
+Rollout metrics for these rows are named after the taskset instead of an agent, for example `openmathreasoning/truncation_rate`.
+
+Taskset names are also the keys for per-environment settings. For materialized rows, use `task_id.taskset` as the key in `on_policy_distillation.teacher_model_by_agent_name`, `grpo.length_penalty.agent_overrides`, and `rollout_recovery.task_source_target_level_overrides`. Length and recovery overrides may be sparse: unmatched tasksets keep the configured defaults. Teacher selection uses `default_teacher_alias` when configured, unless `strict_agent_name_match` requires an explicit match. Recovery ignores agent overrides for materialized rows; flat rows retain agent-over-task-source precedence.
+
+Set these keys in a YAML file, where a key such as `weather:train` needs no quoting. A Hydra command-line override cannot express a key that contains `:`: `++rollout_recovery.task_source_target_level_overrides.weather:train=prompt_group` fails to parse, and `{weather:train: prompt_group}` is read as the key `weather`.
+
+An Environment Server can report a failed episode as terminal, meaning a retry cannot succeed. The single controller does not retry such a prompt, and under the default `async_rl.rollout_failure.max_skipped_prompts: 0` the run stops. Non-terminal failures, such as an unavailable model server, are retried as infrastructure failures.
+
+### Shard NeMo Gym across nodes
+
+NeMo RL normally starts one NeMo Gym actor for a job. That actor runs every configured Gym server on one node. Use `env.nemo_gym.shards` when the combined environments need more capacity than one node can provide.
+
+Each shard defines a self-contained Gym configuration. NeMo RL starts one actor for each shard replica and routes every prompt group to the shard that hosts its agent or task source, or, for a materialized task, its selected Environment Server.
+
+Put `environment_server_routes` at the top level of `env.nemo_gym`, where every shard inherits it, or in the configuration of the shard that hosts the Environment Server. Setup rejects a taskset that routes to different servers in different shards, or whose hosting shard lacks the route.
+
+```yaml
+env:
+  nemo_gym:
+    config_paths: null
+    shards:
+      - name: tools
+        port_range_low: 5000
+        port_range_high: 5499
+        config_paths:
+          - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+          - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+      - name: math
+        port_range_low: 5500
+        port_range_high: 5999
+        config_paths:
+          - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+          - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    common_inherited_overlays:
+      - policy_model
+    allowed_duplicate_entries:
+      - policy_model
+```
+
+Set the inherited top-level `config_paths` to `null` when the shard list replaces it. Each shard can also set `inherited_overlays` to claim inherited Gym entries, `overrides` to add shard-specific configuration, `replicas` to start identical actor instances, `actor_cpus` to reserve CPU capacity, and a non-overlapping port range.
+
+Use `common_inherited_overlays` for inherited entries that every shard needs. List an entry in `allowed_duplicate_entries` when it may appear in more than one shard. NeMo RL rejects unclaimed inherited entries, duplicate routable entries, and overlapping port ranges during setup.
+
+#### Choose actor placement
+
+The default `placement_strategy` is `STRICT_SPREAD`, which requires Ray to place each actor on a different node. This provides the capacity isolation that sharding is designed for.
+
+For a single-node test, set:
+
+```yaml
+env:
+  nemo_gym:
+    placement_strategy: PACK
+```
+
+`PACK` validates configuration, routing, and teardown on one machine, but it does not provide node-level capacity isolation. The other supported Ray strategies are `SPREAD` and `STRICT_PACK`. Shards with `replicas > 1` require the default `STRICT_SPREAD`; replicas share one merged configuration and port range, so any other strategy could place them on the same node.
+
+See `examples/nemo_gym/grpo_sharded_gym_smoke.yaml` for a complete manual smoke configuration.
 
 ### Version Requirements
 
@@ -43,20 +165,24 @@ NeMo Gym runs as a Ray actor within NeMo RL's Ray cluster, so the same Ray and P
 %%{init: {'theme': 'default', 'themeVariables': { 'lineColor': '#5c6bc0', 'primaryTextColor': '#333'}}}%%
 flowchart LR
     subgraph RL["NeMo RL"]
-        GRPO["GRPO Loop"]
+        Loop["Training Loop<br/>(GRPO or Distillation)"]
         vLLM["vLLM + HTTP"]
         Bridge["NemoGym Actor"]
     end
     
     subgraph Gym["NeMo Gym"]
+        Environment["Environment Server"]
         Agent["Agent"]
         Model["Model (Proxy)"]
         Resources["Resources"]
     end
     
-    GRPO -->|refit| vLLM
-    GRPO -->|run_rollouts| Bridge
+    Loop -->|refit| vLLM
+    Loop -->|run_rollouts| Bridge
     Bridge -->|spawns| Gym
+    Bridge -->|via Gym collector| Environment
+    Environment <--> Agent
+    Environment <--> Resources
     Agent <--> Model
     Agent <--> Resources
     Model -->|HTTP| vLLM
@@ -75,7 +201,7 @@ The integration is handled by the `NemoGym` Ray actor at `nemo_rl/environments/n
 
 1. **Created by NeMo RL** during training setup via `NemoGym.remote(config)`
 2. **Joins the existing Ray cluster** that NeMo RL already initialized
-3. **Spawns NeMo Gym servers** as OS subprocesses (Head, Agent, Model, Resources)
+3. **Spawns NeMo Gym servers** as OS subprocesses (Head, Environment, Agent, Model, Resources)
 4. **Injects vLLM base URLs** so NeMo Gym's Model Server knows where to proxy requests
 5. **Exposes `run_rollouts()`** as the entry point for the training loop to call
 
@@ -83,31 +209,37 @@ The integration is handled by the `NemoGym` Ray actor at `nemo_rl/environments/n
 %%{init: {'theme': 'default', 'themeVariables': { 'lineColor': '#5c6bc0', 'primaryTextColor': '#333'}}}%%
 flowchart LR
     subgraph RL["NeMo RL"]
-        GRPO["GRPO Loop"]
+        Loop["Training Loop<br/>(GRPO or Distillation)"]
         Actor["NemoGym Actor"]
     end
     
     subgraph Gym["NeMo Gym"]
         RCH["RolloutCollectionHelper"]
+        Environment["Environment Server"]
         Agent["Agent Server"]
     end
     
-    GRPO --> Actor
-    Actor --> Agent
-    Agent --> RCH
+    Loop --> Actor
+    Actor -->|run_examples| RCH
+    RCH -->|POST /run| Environment
+    Environment <--> Agent
+    Environment -->|completed result| RCH
     RCH --> Actor
-    Actor --> GRPO
+    Actor --> Loop
 
     style RL fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
     style Gym fill:#fff3e0,stroke:#ef6c00,stroke-width:2px
 ```
 
 The flow is:
-1. GRPO Loop calls `run_rollouts.remote(batch)` on the NemoGym Actor
-2. Actor sends `POST /run` to the Agent Server
-3. Agent Server orchestrates the rollout via RolloutCollectionHelper
-4. Results return to the Actor
-5. Actor returns results to the training loop
+1. The GRPO or distillation rollout layer starts a streaming `run_rollouts` call on the NemoGym Actor
+2. The actor calls Gym's `RolloutCollectionHelper.run_examples()` in its own process
+3. The collector sends `POST /run` to each row's Environment Server, which executes or delegates the episode. For materialized tasks, NeMo RL selects the server using `environment_server_routes` before calling the collector; for flat rows, the collector resolves the server associated with the Agent
+4. Completed examples return through the collector to the actor
+5. Actor post-processes and streams each completed example back with its original row index
+6. The rollout layer emits a prompt group after all generations for that prompt are complete; synchronous callers drain the stream and retain full-batch behavior
+
+With `single_agent_turn`, the Environment Server owns Resources and Agent session seeding, Agent invocation, verification, and cleanup. Simple Agent still owns the model/tool loop within that invocation, which can include multiple model and tool calls. The `legacy_agent` Environment Server instead relays the request to the existing Agent `/run`; that Agent retains its rollout lifecycle.
 
 ## vLLM HTTP Server
 
@@ -150,39 +282,62 @@ sequenceDiagram
 
 ## Training Loop Control Flow
 
+The following sequence shows `single_agent_turn` with Simple Agent. For `legacy_agent`, the Environment Server delegates the episode to Agent `/run` instead.
+
 ```mermaid
 %%{init: {'theme': 'default', 'themeVariables': { 'lineColor': '#5c6bc0', 'primaryTextColor': '#333'}}}%%
 sequenceDiagram
     autonumber
     box rgb(227, 242, 253) NeMo RL
-        participant GRPO as GRPO Loop
+        participant Loop as Training Loop
         participant Policy as Policy Workers
         participant vLLM as vLLM HTTP
         participant Bridge as NemoGym Actor
     end
     box rgb(255, 243, 224) NeMo Gym
-        participant Agent as Agent Server
+        participant Collector as RolloutCollectionHelper
+        participant Environment as Environment Server
+        participant Agent as Simple Agent Server
         participant Model as Model Server
         participant Resource as Resource Server
     end
     
-    GRPO->>Policy: Refit (trigger weight sync)
+    Loop->>Policy: Refit (trigger weight sync)
     Policy->>vLLM: Sync weights to vLLM
-    GRPO->>Bridge: run_rollouts.remote(batch)
-    Bridge->>Agent: POST /run
-    Agent->>Model: POST /v1/responses
-    Model->>vLLM: POST /v1/chat/completions
-    vLLM-->>Model: Response
-    Model-->>Agent: Responses API format
-    Agent->>Resource: Execute tool / compute reward
-    Resource-->>Agent: Tool result / reward
-    Agent-->>Bridge: Results + rewards
-    Bridge-->>GRPO: Token IDs, logprobs, rewards
-    GRPO->>Policy: Compute loss and train
+    Loop->>Bridge: streaming run_rollouts(batch)
+    Bridge->>Collector: run_examples(batch)
+    Collector->>Environment: POST /run (episode request)
+    Environment->>Resource: POST /seed_session
+    Resource-->>Environment: Resources session
+    Environment->>Agent: POST /v1/agent_sessions
+    Agent-->>Environment: Agent session
+    Environment->>Agent: Invoke /v1/responses
+    loop Model/tool loop
+        Agent->>Model: POST /v1/responses
+        Model->>vLLM: POST /v1/chat/completions
+        vLLM-->>Model: Response
+        Model-->>Agent: Responses API format
+        opt Model requests tools
+            Agent->>Resource: Execute tools
+            Resource-->>Agent: Tool results
+        end
+    end
+    Agent-->>Environment: Agent response
+    Environment->>Agent: POST /v1/agent_sessions/close
+    Agent-->>Environment: Session observations
+    Environment->>Resource: POST /verify
+    Resource-->>Environment: Verified result + reward
+    Environment->>Resource: POST /close_session
+    Environment-->>Collector: Episode response
+    Collector-->>Bridge: Completed row + result
+    Bridge-->>Loop: Stream row index, token IDs, logprobs, reward
+    Note over Loop,Bridge: Async GRPO emits each complete prompt group;<br/>sync paths drain all rows before continuing
+    Loop->>Policy: Compute loss and train
 ```
 
-> **NeMo Gym server types** (see [Core Components](https://docs.nvidia.com/nemo/gym/latest/about/concepts/core-components.html)):
-> - **Agent Server**: Orchestrates the rollout loop
+> **NeMo Gym server types** (see [Gym architecture](https://docs.nvidia.com/nemo/gym/main/about/architecture)):
+> - **Environment Server**: Runs the episode lifecycle; `single_agent_turn` manages sessions and verification, while `legacy_agent` delegates to Agent `/run`
+> - **Agent Server**: Implements agent behavior; Simple Agent runs the model/tool loop
 > - **Model Server**: HTTP proxy to vLLM; translates Responses API ↔ Chat Completions
 > - **Resource Server**: Provides tools and rewards
 
@@ -191,23 +346,36 @@ sequenceDiagram
 | Step | Location | Description |
 |------|----------|-------------|
 | **Refit** | NeMo RL | Synchronizes policy weights to vLLM workers. For async RL, refit timing may differ—see {doc}`generation` for details. |
-| **run_rollouts.remote()** | NeMo RL | Ray remote call from GRPO loop to the NemoGym actor |
-| **POST /run** | NeMo RL → NeMo Gym | HTTP request from NemoGym actor to Agent Server subprocess |
-| **Rollout orchestration** | NeMo Gym | Agent calls Model Server and Resources Server via HTTP |
+| **Streaming `run_rollouts()`** | NeMo RL | Ray generator call from the rollout layer to the NemoGym actor; rows can arrive out of input order |
+| **POST /run** | NeMo Gym collector → Environment Server | The actor calls `RolloutCollectionHelper.run_examples()`; the collector dispatches each row to an Environment Server |
+| **Episode orchestration** | NeMo Gym | `single_agent_turn` seeds sessions, invokes the Agent, verifies, and cleans up; `legacy_agent` delegates to Agent `/run` |
+| **Model/tool loop** | NeMo Gym | Simple Agent calls Model Server and executes requested tools on Resources Server |
 | **POST /v1/chat/completions** | NeMo Gym → NeMo RL | Model Server proxies to NeMo RL's vLLM HTTP endpoint |
 | **Result processing** | NeMo RL | NemoGym actor extracts token IDs, logprobs, rewards |
 
 ### Async Result Processing
 
-The NemoGym actor uses an **as-completed** pattern to overlap waiting with post-processing:
+The NemoGym actor and NeMo RL rollout layer use an **as-completed** pattern to overlap waiting, post-processing, and downstream collection:
 
-1. **Results return out of order**: Single steps of the rollouts (the "assistant" + "tool" turns) complete at different times depending on conversation length and tool calls. Rather than waiting for all results, the actor processes each result as soon as it completes. Note: this is pipelining within NeMo Gym, not asynchronous processing of global batch steps by NeMo RL.
+1. **Completed examples return out of order**: Full rollout examples complete at different times depending on conversation length and tool calls. The actor processes and streams each example as soon as it completes, tagged with its original row index.
 
 2. **Immediate post-processing**: As each rollout completes, the actor immediately extracts token IDs and logprobs. This overlaps CPU work with network I/O from slower rollouts still in flight.
 
-3. **Reordering at the end**: Each example carries an index. After all results are collected, results are reordered to match the original batch order before returning to the training loop.
+3. **Prompt-group buffering**: Async GRPO groups the streamed rows by prompt and emits a group as soon as all of that prompt's generations have arrived. A slow prompt therefore does not prevent already-complete prompt groups from entering the replay buffer. Synchronous GRPO, PPO, and distillation use the same stream but drain the complete batch before continuing.
+
+4. **Stable ordering where required**: Each example carries a row index. Prompt groups preserve their input slices, and full-batch synchronous callers restore input order before returning.
 
 This pattern maximizes throughput by keeping the CPU busy while waiting for network responses.
+
+### Async GRPO Collector Invariants
+
+The async GRPO collector uses the same prompt-group contract for Gym and native environments:
+
+- One batch worker owns each reserved target weight until all expected prompt groups are buffered or the batch fails.
+- Every yielded prompt (Gym and native) receives a monotonic `_ng_task_index` equal to its position in the dataloader stream. The counter is checkpointed, restored, and cross-checked against buffered trajectories. On a legacy resume, task identities are never reused after restart; on a frontier-aligned resume, the counter is deliberately rewound to the saved base ordinal so the covered window re-yields under its original indices (rows already trained or retained are dropped before dispatch, and per-batch uniqueness is still enforced).
+- A partial Gym stream can be retried without duplicating groups that were already accepted by the replay buffer.
+- Native rollouts still execute as one batch. Their per-sample metrics are aggregated separately for each prompt group before buffering, so batch-level metrics are not duplicated across groups.
+- Gym rows are validated for range, uniqueness, completeness, and single-agent grouping. Results are restored to input order within a prompt group before post-processing.
 
 ## Data Format Translation
 
@@ -219,9 +387,10 @@ flowchart LR
     end
     
     subgraph Gym["NeMo Gym"]
-        Example["Example Dict"]
+        Example["Flat Row or<br/>Materialized Task"]
         ReqResp["Responses API"]
         ReqChat["Chat Completions"]
+        GymResult["Rollout Result"]
     end
     
     subgraph RL2["NeMo RL Output"]
@@ -232,8 +401,8 @@ flowchart LR
     Example --> ReqResp
     ReqResp --> ReqChat
     ReqChat --> ReqResp
-    ReqResp --> Example
-    Example --> Result
+    ReqResp --> GymResult
+    GymResult --> Result
 
     style RL1 fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
     style RL2 fill:#e3f2fd,stroke:#1565c0,stroke-width:2px
@@ -241,12 +410,15 @@ flowchart LR
 ```
 
 **Formats**:
-- **DatumSpec** (NeMo RL): Training-focused format with `prompt`, `prompt_token_ids`, and task metadata
-- **Example Dict** (NeMo Gym): Environment-focused format containing `responses_create_params` and `expected` answer
+- **DatumSpec** (NeMo RL): Carries the Gym row in `extra_env_info`; Gym constructs the actual conversation during rollout
+- **Flat row** (NeMo Gym): Contains top-level `responses_create_params`, task-specific fields, and `agent_ref` or `task_source` for routing
+- **Materialized task** (NeMo Gym): Contains structured `task_id` (`taskset` and `task_id`) and `task_input`. For `single_agent_turn`, `task_input` holds `responses_create_params` at its top level; task-specific fields sit beside it or under `task_data`
 - **Responses API** (NeMo Gym): OpenAI Responses API format with `input`, `tools`, and multi-turn conversation
 - **Chat Completions** (vLLM): OpenAI Chat Completions format for the actual inference call
 
-**Data flow**: DatumSpec is converted to Example Dict, which passes through to the Responses API with generation parameters (`temperature`, `top_p`) added for on-policy sampling. The Model Server translates Responses API ↔ Chat Completions (converting message formats, extracting reasoning content, attaching token IDs). Results flow back with token IDs and logprobs extracted into the final Result.
+**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and updates `responses_create_params` with generation parameters (`temperature`, `top_p`) at the row's top level or inside `task_input`. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`; the collector wraps each task in an episode request containing `episode_id` and `task`. Materialized tasks carry no Agent reference, so NeMo RL attributes their metrics, teacher selection, and per-key overrides to `task_id.taskset`.
+
+The Agent sends Responses API requests to the Model Server, which translates Responses API ↔ Chat Completions (converting message formats, extracting reasoning content, attaching token IDs). NeMo RL validates materialized-task episode replies and extracts successful results before the usual result processing. Token IDs, logprobs, and rewards then populate the final Result.
 
 ## Tokenization and On-Policy Corrections
 
@@ -254,4 +426,4 @@ Token IDs are extracted at the NeMo RL vLLM layer via the `/tokenize` endpoint. 
 - Tokenization matches the exact model and tokenizer used for generation
 - No re-tokenization drift between generation and training
 
-For details on on-policy token ID handling, see {doc}`../guides/environments` and the [NeMo Gym on-policy corrections documentation](https://docs.nvidia.com/nemo/gym/latest/contribute/rl-framework-integration/openai-compatible-http-server-on-policy-correction.html).
+For details on on-policy token ID handling, see {doc}`../guides/environments` and the [NeMo Gym on-policy corrections documentation](https://docs.nvidia.com/nemo/gym/v0.2.1/contribute/rl-framework-integration/openai-compatible-http-server-on-policy-correction.html).

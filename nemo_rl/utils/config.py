@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+import warnings
 from pathlib import Path
 from typing import Optional, Union, cast
 
@@ -32,6 +34,10 @@ def merge_with_override(
 ) -> DictConfig:
     """Merge configs with support for _override_ marker to completely override sections."""
     for key in list(override_config.keys()):
+        # Keep mandatory values (``???``) unresolved while composing configs.
+        # A child config or a CLI override may provide them after inheritance.
+        if OmegaConf.is_missing(override_config, key):
+            continue
         if isinstance(override_config[key], DictConfig):
             if override_config[key].get("_override_", False):
                 # remove the _override_ marker
@@ -188,9 +194,46 @@ def parse_hydra_overrides(cfg: DictConfig, overrides: list[str]) -> DictConfig:
         raise OverridesError(f"Failed to parse Hydra overrides: {str(e)}") from e
 
 
+def warn_if_config_path_overridden(
+    key: str,
+    *,
+    configured: Optional[str],
+    effective: Optional[str],
+    reason: str,
+) -> None:
+    """Emit a soft warning when a configured path is replaced at runtime.
+
+    A replaced path sends output somewhere other than where the config says, so
+    call sites that replace one report it here. Nothing is reported when the
+    path is unset (``None`` or empty) or both paths name the same location.
+
+    Args:
+        key: Dotted config key, e.g. ``"logger.log_dir"``.
+        configured: The path the config specifies.
+        effective: The path the run uses instead.
+        reason: Why the path is replaced; shown in parentheses.
+    """
+    if not configured:
+        return
+    same_location = effective is not None and (
+        os.path.abspath(str(configured)) == os.path.abspath(str(effective))
+    )
+    if same_location:
+        return
+    warnings.warn(
+        f"Config value {key}={configured!r} is overridden; using {effective!r} "
+        f"({reason}).",
+        stacklevel=2,
+    )
+
+
 def register_omegaconf_resolvers() -> None:
     """Register shared OmegaConf resolvers used in configs."""
+    if not OmegaConf.has_resolver("add"):
+        OmegaConf.register_new_resolver("add", lambda a, b: a + b)
     if not OmegaConf.has_resolver("mul"):
         OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
+    if not OmegaConf.has_resolver("div"):
+        OmegaConf.register_new_resolver("div", lambda a, b: a / b)
     if not OmegaConf.has_resolver("max"):
         OmegaConf.register_new_resolver("max", lambda a, b: max(a, b))

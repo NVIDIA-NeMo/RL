@@ -30,6 +30,25 @@ DEFAULT_VENV_DIR = os.path.join(git_root, "venvs")
 logger = logging.getLogger(__name__)
 
 
+def add_hf_modules_cache_to_pythonpath(env_vars: dict[str, str]) -> dict[str, str]:
+    """Make Hugging Face ``trust_remote_code`` modules importable by Ray actors."""
+    result = env_vars.copy()
+    modules_cache = result.get("HF_MODULES_CACHE")
+    if modules_cache is None:
+        try:
+            from transformers.utils import HF_MODULES_CACHE
+        except ImportError:
+            return result
+        modules_cache = HF_MODULES_CACHE
+        result["HF_MODULES_CACHE"] = modules_cache
+
+    pythonpath = result.get("PYTHONPATH", "")
+    path_entries = pythonpath.split(os.pathsep) if pythonpath else []
+    if modules_cache not in path_entries:
+        result["PYTHONPATH"] = os.pathsep.join([modules_cache, *path_entries])
+    return result
+
+
 @lru_cache(maxsize=None)
 def create_local_venv(
     py_executable: str, venv_name: str, force_rebuild: bool = False
@@ -50,6 +69,17 @@ def create_local_venv(
     Returns:
         str: Path to the python executable in the created virtual environment
     """
+    # A single token that is an executable file is already an interpreter, not a
+    # command line to run under uv -- there is nothing to build.
+    parts = shlex.split(py_executable)
+    if len(parts) == 1 and os.path.isfile(parts[0]) and os.access(parts[0], os.X_OK):
+        logger.warning(
+            f"{py_executable} is an interpreter, not a uv command, so no venv was built "
+            f"for {venv_name}; using it as-is (NEMO_RL_PY_EXECUTABLES_SYSTEM=1 sets every "
+            "PY_EXECUTABLES entry to sys.executable)."
+        )
+        return py_executable
+
     # This directory is where virtual environments will be installed
     # It is local to the driver process but should be visible to all worker nodes
     # If this directory is not accessible from worker nodes (e.g., on a distributed
@@ -93,8 +123,13 @@ def create_local_venv(
     # Command doesn't matter, since `uv` syncs the environment no matter the command.
     exec_cmd.extend(["echo", f"Finished creating venv {venv_path}"])
 
-    # Always run uv sync first to ensure the build requirements are set (for --no-build-isolation packages)
-    subprocess.run(["uv", "sync", "--directory", git_root], env=env, check=True)
+    # Run uv sync first to ensure build requirements are set (for --no-build-isolation packages).
+    # --inexact: this base-set sync must not prune extras out of a venv that was
+    # pre-materialized in the image; pruning and re-adding hardlinked packages would copy
+    # them up into the image's final layer.
+    subprocess.run(
+        ["uv", "sync", "--inexact", "--directory", git_root], env=env, check=True
+    )
     subprocess.run(exec_cmd, env=env, check=True)
 
     # Return the path to the python executable in the virtual environment
@@ -158,8 +193,13 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     Returns:
         str: Path to the python executable in the created virtual environment
     """
-    # Determine the number of alive Ray nodes
-    nodes = [n for n in ray.nodes() if n.get("Alive", False)]
+    # Skip nodes with 0 CPUs (e.g. unschedulable head nodes) — including them
+    # makes the STRICT_SPREAD placement group infeasible.
+    nodes = [
+        n
+        for n in ray.nodes()
+        if n.get("Alive", False) and n.get("Resources", {}).get("CPU", 0) > 0
+    ]
     num_nodes = len(nodes)
     # Reserve one CPU on each node using a STRICT_SPREAD placement group
     bundles = [{"CPU": 1} for _ in range(num_nodes)]
@@ -186,3 +226,45 @@ def create_local_venv_on_each_node(py_executable: str, venv_name: str):
     ray.util.remove_placement_group(pg)
     # Return mapping from node IP to venv python path
     return paths[0]
+
+
+def make_actor_runtime_env(
+    actor_class_fqn: str,
+    *,
+    extra_env_vars: dict[str, str] | None = None,
+) -> dict:
+    """Build a Ray ``runtime_env`` for one of our registered actors.
+
+    Resolves the actor's tier-specific py_executable via the registry,
+    materializes a per-node venv when uv-managed, and packages it with
+    ``VIRTUAL_ENV`` / ``UV_PROJECT_ENVIRONMENT`` env vars so workers see
+    the same interpreter as the driver. Additional actor-specific environment
+    variables can be supplied via ``extra_env_vars``.
+
+    Used by ReplayBuffer, AsyncTrajectoryCollector, and SyncRolloutActor
+    — three actors that need the VLLM tier's venv on every node. Also
+    used by the SGLang router and SGLang generation engines (SGLANG tier).
+    """
+    # Local import — venvs.py is dep-light; the registry imports
+    # PY_EXECUTABLES which transitively pulls heavier deps.
+    from nemo_rl.distributed.ray_actor_environment_registry import (
+        get_actor_python_env,
+    )
+
+    py_exec = get_actor_python_env(actor_class_fqn)
+    if py_exec.startswith("uv"):
+        py_exec = create_local_venv_on_each_node(py_exec, actor_class_fqn)
+    venv = os.path.dirname(os.path.dirname(py_exec))  # strip bin/python
+    env_vars = add_hf_modules_cache_to_pythonpath(
+        {
+            **os.environ,
+            "VIRTUAL_ENV": venv,
+            "UV_PROJECT_ENVIRONMENT": venv,
+        }
+    )
+    if extra_env_vars:
+        env_vars.update(extra_env_vars)
+    return {
+        "py_executable": py_exec,
+        "env_vars": env_vars,
+    }

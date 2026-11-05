@@ -12,9 +12,46 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict
+import warnings
+from collections.abc import Mapping
+from typing import Annotated, Any, Literal, NotRequired, TypedDict, cast, get_args
 
-from nemo_rl.models.generation.interfaces import GenerationConfig
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+)
+
+from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
+    get_num_routed_experts,
+)
+from nemo_rl.models.generation.vllm.lora_utils import LoraRefitMode
+from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
+    MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
+    MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16,
+    NvFp4PerTokenRolloutConfig,
+    resolve_boundary_ignore_patterns,
+)
+
+VllmRefitTransportName = Literal["s3", "zmq"]
+VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
+VLLM_SPARSE_REFIT_TRANSPORTS = frozenset({"vllm_s3_sparse", "vllm_zmq_sparse"})
+REFITTABLE_FP8_KV_CACHE_DTYPES = frozenset({"fp8", "fp8_e4m3"})
+
+
+# TODO(rohitrango): Move model-specific video fields behind ProcessorInterface.
+class VllmVideoConfig(BaseModel):
+    """Video sampling contract shared by policy preprocessing and vLLM."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sampling_style: Literal["nemotron_vl"]
+    num_frames: PositiveInt
+    temporal_patch_size: PositiveInt
 
 
 class VllmSpecificArgs(TypedDict):
@@ -26,21 +63,590 @@ class VllmSpecificArgs(TypedDict):
     # Additional arguments for vLLM inserted by nemo rl based on the context of when vllm is used
     skip_tokenizer_init: bool
     async_engine: bool
+    # Optional video contract. When present, NeMo RL registers its TorchCodec
+    # loader and uses these exact sampling values on both sides of GRPO.
+    video: NotRequired[VllmVideoConfig]
     load_format: NotRequired[str]
     precision: NotRequired[str]
-    kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3"]
+    # Whether vLLM returns logprobs before or after generation-time logit
+    # processors. RL policy recomputation uses raw model logits, so recipes
+    # with generation-time processors should request ``raw_logprobs`` when
+    # comparing generation and policy logprobs.
+    logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
+    # Compute the logits with an fp32 LM head: bf16 operands, fp32 GEMM output,
+    # via vLLM's head_dtype="float32" hf_override (any model whose lm_head is
+    # unquantized). Pair this with policy.megatron_cfg.fp32_lm_head when using
+    # a Megatron trainer.
+    fp32_lm_head: NotRequired[bool]
+    # Cap each request's generated tokens so the training prompt plus response
+    # fits within max_model_len. This is needed when multimodal processing makes
+    # the training prompt longer than its text-only representation.
+    cap_max_tokens_to_context: NotRequired[bool]
+    # Use ModelOpt MXFP8 quantization when precision is fp8.
+    is_mx: NotRequired[bool]
+    # With is_mx, quantize weights to MXFP8 on the trainer during refit and
+    # stream E4M3 data plus scales (~47% smaller payload) instead of BF16;
+    # the vLLM worker then skips its per-refit re-quantization. Requires the
+    # Megatron policy backend.
+    refit_prequantize: NotRequired[bool]
+    # Deprecated in 0.8. Use quantization_ignore_patterns instead.
+    quantization_ignored_layer_kws: NotRequired[list[str]]
+    # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
+    # Supports exact names, substrings, and fnmatch wildcards.
+    quantization_ignore_patterns: NotRequired[list[str]]
+    # Dynamic per-(token, head) scales require FP8 precision and Triton attention.
+    kv_cache_dtype: Literal[
+        "auto", "fp8", "fp8_e4m3", "fp8_ds_mla", "fp8_per_token_head"
+    ]
     enforce_eager: NotRequired[bool]
+    enable_return_routed_experts: NotRequired[bool]
+    # Collect vLLM request, cache, and cumulative token counters in a model-owner
+    # background thread for performance diagnostics.
+    enable_vllm_metrics_logger: NotRequired[bool]
+    # Store each request's logprobs in vLLM's FlatLogprobs (a few flat lists per
+    # request) instead of a dict plus one Logprob object per generated token. Same
+    # values; avoids long full GC pauses on the generation actor when many requests
+    # with logprobs are in flight. Applies to requests through the exposed HTTP
+    # server that ask for logprobs but not prompt logprobs, so it requires
+    # async_engine: true and expose_http_server: true. Default false.
+    flat_logprobs: NotRequired[bool]
+    # Bound how long vLLM's front-end output loops may hold the generation actor's
+    # event loop under a backlog: output_handler yields once per engine step and the
+    # output-socket reader after this many ms of continuous work (20 is a good value).
+    # Keeps refit and other control calls responsive. Requires async_engine: true.
+    # None (default) disables it.
+    output_loop_yield_budget_ms: NotRequired[float | None]
+    # Sampling cadence for the optional vLLM metrics logger.
+    vllm_metrics_logger_interval: NotRequired[float]
+    # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
+    use_tqdm: NotRequired[bool]
     # By default, NeMo RL only has a Python handle to the vllm.LLM generation engine. The expose_http_server flag here will expose that generation engine as an HTTP server.
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
     expose_http_server: NotRequired[bool]
+    # Require `Authorization: Bearer <key>` on the exposed server's OpenAI routes
+    # (/v1/* and /tokenize). VllmGeneration generates one random key per job, hands
+    # it to the workers, and exposes it as `http_server_api_key` for the NeMo-Gym
+    # model server. Needs expose_http_server; refused at setup without it.
+    # Absent or false: the routes accept unauthenticated requests.
+    http_server_api_key_required: NotRequired[bool]
+    # The generated key. Filled by VllmGeneration in the copy of the config the
+    # workers receive; never set in a YAML.
+    http_server_api_key: NotRequired[str]
+    # Environment variable containing the internal refit API key.
+    http_refit_api_key_env_var: NotRequired[str | None]
+    # Invalidate weight-dependent multimodal encoder outputs after a successful
+    # async refit. Enable only when generation is quiesced during weight updates.
+    reset_encoder_cache_after_weight_update: NotRequired[bool]
+    # Fixed internal refit endpoint port for stable Kubernetes targetPorts.
+    http_refit_server_port: NotRequired[int | None]
+    # Fixed ZeroMQ relay port for stable Kubernetes targetPorts.
+    zmq_refit_server_port: NotRequired[int | None]
     # These kwargs are passed to the vllm.LLM HTTP server Chat Completions endpoint config. Typically this will include things like tool parser, chat template, etc
     http_server_serving_chat_kwargs: NotRequired[dict[str, Any]]
     # Miscellaneous top level vLLM HTTP server arguments.
     # A filepath that can be imported to register a vLLM tool parser
     tool_parser_plugin: NotRequired[str]
+    # Extra environment variables forwarded to every vLLM worker process. Useful
+    # for per-recipe knobs (e.g. forcing a specific fused-MoE backend) without
+    # affecting other test cases.
+    env_vars: NotRequired[dict[str, str]]
+    # Opt into vLLM's native reload_weights API for refit. The default stays
+    # False so existing IPC/NCCL refit behavior keeps using NeMo-RL's legacy
+    # loader path.
+    refit_with_reload_api: NotRequired[bool]
+    # A filepath that can be imported to register a vLLM reasoning parser
+    reasoning_parser_plugin: NotRequired[str]
+
+
+# Read by the removed Nemotron-H fp32 LM-head source patch. Rejected in configs
+# so recipes that still set it fail instead of silently running a bf16 head.
+LEGACY_VLLM_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
+
+
+def vllm_fp32_lm_head_enabled(
+    vllm_cfg: VllmSpecificArgs | dict[str, Any],
+) -> bool:
+    """Return whether vLLM should compute logits with an fp32 LM head."""
+    return bool(vllm_cfg.get("fp32_lm_head"))
+
+
+class VllmDeltaCompressionConfig(BaseModel, extra="allow"):
+    encoding: Literal["xor", "overwrite"] = "xor"
+    sparse_bucket_size_bytes: PositiveInt = 512 * 1024**2
+    export_chunk_bytes: dict[str, PositiveInt] = Field(
+        default_factory=lambda: {"s3": 64 * 1024**2, "zmq": 256 * 1024**2}
+    )
+    zstd_threads: dict[str, NonNegativeInt] = Field(
+        default_factory=lambda: {"s3": 0, "zmq": 0}
+    )
+
+
+class VllmRefitStorageConfig(BaseModel, extra="allow"):
+    s3_bucket: str | None = None
+    s3_region: str = "us-east-1"
+    s3_prefix: str = "nemo-rl-refit"
+    staging_dir: str = "/dev/shm"
+
+
+class VllmRefitBaselineConfig(BaseModel, extra="allow"):
+    in_memory: bool = False
+    mmap_dir: str | None = None
+
+
+class VllmRefitTuningConfig(BaseModel, extra="allow"):
+    encode_workers: dict[str, PositiveInt] = Field(
+        default_factory=lambda: {"s3": 8, "zmq": 8}
+    )
+    transfer_workers: dict[str, PositiveInt] = Field(
+        default_factory=lambda: {"s3": 32, "zmq": 4}
+    )
+    zmq_retries: NonNegativeInt = 3
+    zmq_relay_payload_workers: PositiveInt = 16
+    zmq_relay_forward_workers: PositiveInt = 8
+    apply_queue_depth: PositiveInt = 32
+    apply_batch_size: PositiveInt = 8
+    partition_workers: PositiveInt = 8
+
+
+class VllmSparseRefitConfig(BaseModel, extra="allow"):
+    delta_compression: VllmDeltaCompressionConfig = Field(
+        default_factory=VllmDeltaCompressionConfig
+    )
+    storage: VllmRefitStorageConfig = Field(default_factory=VllmRefitStorageConfig)
+    baseline: VllmRefitBaselineConfig = Field(default_factory=VllmRefitBaselineConfig)
+    tuning: VllmRefitTuningConfig = Field(default_factory=VllmRefitTuningConfig)
+    verify_samples_per_payload: NonNegativeInt = 0
+    request_timeout_s: PositiveFloat = 600.0
+
+
+class VllmNixlRefitConfig(BaseModel, extra="forbid"):
+    update_weights_bucket_memory_ratio: Annotated[float, Field(gt=0, lt=1)] = 0.05
+    device: str = "cuda"
+    backend_name: str = "UCX"
+    backend_init_params: dict[str, Any] | None = None
+    release_after_refit: bool = False
+    shard_expert_weights: bool = False
+
+
+class VllmCheckpointEnginePluginConfig(BaseModel, extra="allow"):
+    update_weights_bucket_memory_ratio: Annotated[float, Field(gt=0, lt=1)] = 0.05
+    release_after_refit: bool = False
+
+
+class VllmRefitConfig(BaseModel, extra="allow"):
+    sparse: VllmSparseRefitConfig = Field(default_factory=VllmSparseRefitConfig)
+    nixl: VllmNixlRefitConfig = Field(default_factory=VllmNixlRefitConfig)
 
 
 class VllmConfig(GenerationConfig):
     vllm_cfg: VllmSpecificArgs
     vllm_kwargs: NotRequired[dict[str, Any]]
+    # Per-token NVFP4 W4A4 rollout (TE-training flow; no ModelOpt training).
+    # Mutually exclusive with quant_cfg/real_quant below. Defaults and validation
+    # live in NvFp4PerTokenRolloutConfig.
+    nvfp4_pertoken_rollout: NotRequired[NvFp4PerTokenRolloutConfig]
+    # Null uses the topology default (IPC colocated, NCCL non-colocated).
+    # Built-ins select sparse delta over S3/ZeroMQ or NIXL.
+    # A custom checkpoint engine may use a ``module:ClassName`` selector.
+    refit_transport: NotRequired[VllmRefitSelector | str | None]
+    refit_cfg: NotRequired[VllmRefitConfig | None]
+    # LoRA policies use vLLM's factorized adapter runtime by default. Set to
+    # ``merged`` to opt into materializing and refitting full ``W + BA`` weights.
+    lora_refit_mode: NotRequired[LoraRefitMode]
+
+    # quantization config
+    quant_cfg: NotRequired[str | None]
+    # When set with ``quant_cfg``, initialize rollout vLLM with real ModelOpt
+    # NVFP4 kernels and stream packed quantized weights instead of fake-quant
+    # modules. This is intended for ModelOpt NVFP4 rollout experiments.
+    real_quant: NotRequired[bool]
+    # CPU offload remains the default. Disabling it is supported only for
+    # colocated CUDA-IPC refit, where packed export tensors can stay on GPU.
+    real_quant_export_cpu_offload: NotRequired[bool]
+    real_quant_ignore: NotRequired[list[str]]
+
+    # FQN of a worker extension class to use instead of the resolved default
+    # generation worker. Must be a subclass of the resolved worker and cannot
+    # be combined with quant_cfg. Its runtime environment must already be in
+    # ACTOR_ENVIRONMENT_REGISTRY.
+    worker_extension_cls_fqn: NotRequired[str | None]
+
+
+def resolve_vllm_kv_cache_dtype(vllm_cfg: VllmSpecificArgs) -> str:
+    """Return the selected cache format and validate dynamic FP8 precision."""
+    kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
+    if kv_cache_dtype == "fp8_per_token_head" and vllm_cfg.get("precision") != "fp8":
+        raise ValueError("fp8_per_token_head requires precision='fp8'")
+    return kv_cache_dtype
+
+
+def validate_vllm_quantization_config(config: VllmConfig) -> None:
+    """Reject quantization options that would otherwise be silently ignored."""
+    vllm_cfg = config.get("vllm_cfg")
+    if vllm_cfg is None:
+        return
+    if vllm_cfg.get("kv_cache_dtype") == "fp8_per_token_head":
+        resolve_vllm_kv_cache_dtype(vllm_cfg)
+        if config.get("real_quant"):
+            raise ValueError("fp8_per_token_head does not support real_quant")
+        vllm_kwargs = config.get("vllm_kwargs") or {}
+        attention_config = vllm_kwargs.get("attention_config") or {}
+        for backend in (
+            vllm_kwargs.get("attention_backend"),
+            attention_config.get("backend"),
+        ):
+            if backend is not None and backend != "TRITON_ATTN":
+                raise ValueError(
+                    "kv_cache_dtype='fp8_per_token_head' requires TRITON_ATTN; "
+                    "set vllm_kwargs.attention_backend or "
+                    "vllm_kwargs.attention_config.backend to 'TRITON_ATTN'. "
+                    f"Got {backend!r}."
+                )
+    refit_prequantize = vllm_cfg.get("refit_prequantize")
+    if refit_prequantize is not None and not isinstance(refit_prequantize, bool):
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize must be a boolean."
+        )
+    if refit_prequantize and not (
+        vllm_cfg.get("precision") == "fp8" and vllm_cfg.get("is_mx") is True
+    ):
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize requires "
+            "precision='fp8' and is_mx=true."
+        )
+    if refit_prequantize and config.get("refit_transport") == "nccl_reshard":
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize is not supported with "
+            "nccl_reshard; that transport owns its weight-format conversion."
+        )
+    if refit_prequantize and vllm_cfg.get("refit_with_reload_api"):
+        raise ValueError(
+            "policy.generation.vllm_cfg.refit_prequantize is not supported with "
+            "refit_with_reload_api; prequantized refit uses receiver scale names "
+            "that are not accepted by vLLM's native reload path."
+        )
+
+
+def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
+    """Reject async-actor options that would otherwise be silently ignored."""
+    vllm_cfg = config.get("vllm_cfg")
+    if vllm_cfg is None:
+        return
+    if vllm_cfg.get("flat_logprobs") and not (
+        vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
+    ):
+        raise ValueError(
+            "policy.generation.vllm_cfg.flat_logprobs only applies to requests "
+            "through the async engine's HTTP server; it requires async_engine: true "
+            "and expose_http_server: true."
+        )
+    budget_ms = vllm_cfg.get("output_loop_yield_budget_ms")
+    if budget_ms is None:
+        return
+    if not vllm_cfg.get("async_engine"):
+        raise ValueError(
+            "policy.generation.vllm_cfg.output_loop_yield_budget_ms requires "
+            "async_engine: true."
+        )
+    if budget_ms <= 0:
+        raise ValueError(
+            "policy.generation.vllm_cfg.output_loop_yield_budget_ms must be positive "
+            f"(or null to disable), got {budget_ms}."
+        )
+
+
+def resolve_vllm_video_config(config: VllmConfig) -> VllmVideoConfig | None:
+    """Validate and return the optional vLLM video sampling contract."""
+    vllm_config = cast(dict[str, Any], config["vllm_cfg"])
+    if "video_loader" in vllm_config:
+        raise ValueError(
+            "policy.generation.vllm_cfg.video_loader is not supported; "
+            "use policy.generation.vllm_cfg.video"
+        )
+
+    raw_video_config = vllm_config.get("video")
+    if raw_video_config is None:
+        return None
+    return VllmVideoConfig.model_validate(raw_video_config)
+
+
+def materialize_vllm_video_config(
+    policy_config: dict[str, Any], data_config: dict[str, Any]
+) -> None:
+    """Apply one video contract to tokenizer, data, and vLLM request config."""
+    generation_config = policy_config["generation"]
+    if generation_config["backend"] != "vllm":
+        return
+
+    video_config = resolve_vllm_video_config(generation_config)
+    if video_config is None:
+        return
+
+    # Keep the normalized value dict-shaped for OmegaConf/Ray serialization.
+    generation_config["vllm_cfg"]["video"] = video_config.model_dump()
+
+    tokenizer_video_config = policy_config["tokenizer"].setdefault("video", {})
+    tokenizer_video_config["num_frames"] = video_config.num_frames
+
+    # TODO(rohitrango): Let ProcessorInterface materialize model-specific data keys.
+    data_defaults = data_config.setdefault("default", {})
+    data_defaults.update(
+        {
+            "num_frames": video_config.num_frames,
+            "video_sampling_style": video_config.sampling_style,
+            "video_temporal_patch_size": video_config.temporal_patch_size,
+        }
+    )
+
+    vllm_kwargs = generation_config.get("vllm_kwargs")
+    if vllm_kwargs is None:
+        raise ValueError(
+            "policy.generation.vllm_kwargs is required when vllm_cfg.video is set"
+        )
+    limit_mm_per_prompt = vllm_kwargs.get("limit_mm_per_prompt")
+    if not isinstance(limit_mm_per_prompt, dict):
+        raise ValueError(
+            "policy.generation.vllm_kwargs.limit_mm_per_prompt must configure video"
+        )
+    video_limit = limit_mm_per_prompt.get("video")
+    if not isinstance(video_limit, dict):
+        raise ValueError(
+            "policy.generation.vllm_kwargs.limit_mm_per_prompt.video must be a mapping"
+        )
+    video_limit["num_frames"] = video_config.num_frames
+
+    media_io_kwargs = vllm_kwargs.setdefault("media_io_kwargs", {})
+    if not isinstance(media_io_kwargs, dict):
+        raise ValueError(
+            "policy.generation.vllm_kwargs.media_io_kwargs must be a mapping"
+        )
+    video_media_io_kwargs = media_io_kwargs.setdefault("video", {})
+    if not isinstance(video_media_io_kwargs, dict):
+        raise ValueError(
+            "policy.generation.vllm_kwargs.media_io_kwargs.video must be a mapping"
+        )
+    # VideoMediaIO otherwise defaults to 32 independently of the policy-side
+    # frame count. Materializing the value here makes a mismatch impossible.
+    video_media_io_kwargs["num_frames"] = video_config.num_frames
+
+
+# Entry points with end-to-end coverage for the per-token NVFP4 rollout.
+# Every other entry point shares the same Megatron training worker and vLLM
+# refit path, so the mode is expected to work there, but is unvalidated.
+NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS = frozenset({"grpo"})
+
+
+def parse_nvfp4_pertoken_rollout(
+    config: VllmConfig,
+) -> NvFp4PerTokenRolloutConfig | None:
+    """Parse the optional per-token rollout block under its strict schema."""
+    raw = config.get("nvfp4_pertoken_rollout")
+    if raw is None:
+        return None
+    parsed = NvFp4PerTokenRolloutConfig.model_validate(raw)
+    return parsed if parsed.enabled else None
+
+
+def normalize_nvfp4_pertoken_policy_config(
+    policy_config: Mapping[str, Any],
+    *,
+    entry_point: str = "grpo",
+) -> None:
+    """Derive rollout BF16 exclusions from the policy's Megatron boundary.
+
+    This runs on the driver before generation workers are created so trainer
+    and rollout actors receive one normalized precision contract.
+
+    ``entry_point`` names the calling algorithm so an unvalidated one warns
+    instead of appearing supported; see
+    ``NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS``.
+    """
+    generation_config = policy_config.get("generation") or {}
+    if generation_config.get("backend") != "vllm":
+        return
+    rollout = parse_nvfp4_pertoken_rollout(cast(VllmConfig, generation_config))
+    if rollout is None:
+        return
+    if entry_point not in NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS:
+        warnings.warn(
+            "generation.nvfp4_pertoken_rollout has end-to-end coverage on "
+            f"{sorted(NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS)} only. {entry_point} "
+            "reuses the same Megatron training worker and vLLM refit path, so the "
+            "mode is expected to work, but it has not been validated there.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    from transformers import AutoConfig
+
+    model_name = policy_config.get("model_name")
+    if not model_name:
+        raise ValueError(
+            "NVFP4 per-token boundary resolution requires policy.model_name"
+        )
+    overrides = policy_config.get("hf_config_overrides") or {}
+    hf_config = AutoConfig.from_pretrained(
+        model_name, trust_remote_code=True, **overrides
+    )
+    text_config = getattr(hf_config, "text_config", None)
+    num_hidden_layers = overrides.get("num_hidden_layers")
+    if num_hidden_layers is None:
+        num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
+    if num_hidden_layers is None and text_config is not None:
+        num_hidden_layers = getattr(text_config, "num_hidden_layers", None)
+    if num_hidden_layers is None:
+        raise ValueError(
+            "NVFP4 per-token boundary resolution requires num_hidden_layers "
+            "in the HF config"
+        )
+
+    megatron_cfg = policy_config.get("megatron_cfg") or {}
+    first_last_layers_bf16 = bool(megatron_cfg.get("first_last_layers_bf16", False))
+    num_start = int(
+        megatron_cfg.get(
+            "num_layers_at_start_in_bf16",
+            MCORE_DEFAULT_NUM_LAYERS_AT_START_IN_BF16,
+        )
+        or 0
+    )
+    num_end = int(
+        megatron_cfg.get(
+            "num_layers_at_end_in_bf16",
+            MCORE_DEFAULT_NUM_LAYERS_AT_END_IN_BF16,
+        )
+        or 0
+    )
+    raw_rollout = generation_config.setdefault("nvfp4_pertoken_rollout", {})
+    # A user-written value is only cross-checked; the Megatron boundary below
+    # is what the rollout ends up using.
+    expected_ignore = (
+        rollout.additional_ignore if "additional_ignore" in raw_rollout else None
+    )
+    resolved = resolve_boundary_ignore_patterns(
+        num_hidden_layers=int(num_hidden_layers),
+        first_last_layers_bf16=first_last_layers_bf16,
+        num_layers_at_start_in_bf16=num_start,
+        num_layers_at_end_in_bf16=num_end,
+        expected_additional_ignore=expected_ignore,
+    )
+    raw_rollout["additional_ignore"] = resolved
+    print(
+        "[nvfp4_pertoken] derived rollout BF16 decoder layers from Megatron: "
+        f"{resolved}",
+        flush=True,
+    )
+
+
+def validate_nvfp4_pertoken_generation(
+    config: VllmConfig, *, is_eval: bool
+) -> NvFp4PerTokenRolloutConfig | None:
+    """Reject topology and rollout combinations unsupported by per-token NVFP4."""
+    rollout = parse_nvfp4_pertoken_rollout(config)
+    if rollout is None:
+        return None
+    if is_eval:
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout does not support standalone evaluation"
+        )
+    if config.get("quant_cfg") is not None or config.get("real_quant"):
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout is mutually exclusive with "
+            "generation.quant_cfg and generation.real_quant"
+        )
+    if config.get("refit_transport") is not None:
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires refit_transport=null"
+        )
+    colocated = config.get("colocated") or {}
+    vllm_cfg = config["vllm_cfg"]
+    if not colocated.get("enabled"):
+        raise ValueError("generation.nvfp4_pertoken_rollout requires colocated rollout")
+    if vllm_cfg["pipeline_parallel_size"] > 1:
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout does not support vLLM PP>1 yet: "
+            "a stage that owns quantized layers rejects another stage's expert "
+            "weights during refit. Set generation.vllm_cfg.pipeline_parallel_size=1."
+        )
+    if vllm_cfg.get("expert_parallel_size") != 1:
+        raise ValueError("generation.nvfp4_pertoken_rollout requires vLLM EP=1")
+    if vllm_cfg.get("kv_cache_dtype") != "auto":
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires kv_cache_dtype=auto"
+        )
+    if vllm_cfg.get("precision") != "bfloat16":
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires vLLM precision=bfloat16"
+        )
+    speculative_config = (config.get("vllm_kwargs") or {}).get("speculative_config")
+    if speculative_config and not (
+        isinstance(speculative_config, dict)
+        and speculative_config.get("num_speculative_tokens") == 0
+    ):
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout does not support speculative decoding"
+        )
+    return rollout
+
+
+def validate_nvfp4_pertoken_model(hf_config: Any) -> None:
+    """Preflight the model before vLLM performs constructed-model validation."""
+    if get_num_routed_experts(hf_config) is None:
+        architectures = getattr(hf_config, "architectures", []) or []
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires a model with routed "
+            f"experts; no routed-expert count was found for {architectures or 'the HF config'}."
+        )
+
+
+def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
+    """Validate the selected refit transport and resolve its scoped defaults."""
+    validate_vllm_quantization_config(config)
+    rollout = parse_nvfp4_pertoken_rollout(config)
+    if cast(dict[str, Any], config).get("checkpoint_engine") is not None:
+        raise ValueError(
+            "policy.generation.checkpoint_engine was replaced by "
+            "policy.generation.refit_transport='nixl' and "
+            "policy.generation.refit_cfg.nixl."
+        )
+    transport = config.get("refit_transport")
+    if rollout is not None and transport is not None:
+        raise ValueError(
+            "generation.nvfp4_pertoken_rollout requires refit_transport=null"
+        )
+    if transport is None:
+        return None
+    if transport == "nccl_reshard":
+        # nccl_reshard doesn't takes refit_cfg.
+        return None
+    if transport not in get_args(VllmRefitSelector) and ":" not in transport:
+        raise ValueError(
+            f"Unknown vLLM refit transport {transport!r}: expected null, "
+            "'nccl_reshard', 'vllm_s3_sparse', 'vllm_zmq_sparse', 'nixl', or a "
+            "'module:ClassName' checkpoint-engine path."
+        )
+    # The encoder-cache reset is implemented only on the collective/IPC and
+    # nccl_reshard async refit paths (both returned above). Fail loudly rather
+    # than let other transports silently keep stale multimodal encoder outputs
+    # across weight updates. Some callers re-validate partial generation
+    # configs (e.g. worker-side NIXL setup), so vllm_cfg may be absent here.
+    vllm_cfg = config.get("vllm_cfg")
+    if vllm_cfg and vllm_cfg.get("reset_encoder_cache_after_weight_update"):
+        raise ValueError(
+            "vllm_cfg.reset_encoder_cache_after_weight_update is not supported "
+            f"with refit_transport={transport!r}: this transport's refit path "
+            "does not reset the multimodal encoder cache, so stale multimodal "
+            "embeddings would silently survive weight updates. Supported "
+            "transports: null (collective/IPC) and 'nccl_reshard'."
+        )
+    refit_config = VllmRefitConfig.model_validate(config.get("refit_cfg") or {})
+    if ":" in transport:
+        plugin_config = (refit_config.model_extra or {}).get(transport)
+        if plugin_config is None:
+            raise ValueError(
+                f"Custom checkpoint-engine transport {transport!r} requires "
+                f"policy.generation.refit_cfg[{transport!r}]."
+            )
+        VllmCheckpointEnginePluginConfig.model_validate(plugin_config)
+    config["refit_cfg"] = refit_config
+    return refit_config

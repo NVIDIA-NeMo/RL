@@ -4,7 +4,7 @@
 
 NeMo RL supports multiple training backends to accommodate different model sizes and hardware configurations:
 
-- **PyTorch** - This leverages [NeMo AutoModel](https://github.com/NVIDIA-NeMo/Automodel) to provide accelerated PyTorch training with improved memory efficiency (PyTorch-native TP, SP, PP, CP, and FSDP2)
+- [**Automodel**](https://github.com/NVIDIA-NeMo/Automodel) - Accelerated PyTorch training with improved memory efficiency (PyTorch-native TP, SP, CP, EP, and FSDP2)
 - [**Megatron**](https://github.com/NVIDIA-NeMo/Megatron-Bridge) - NVIDIA's high-performance training framework for scaling to large models with 6D parallelisms
 
 The training backend is automatically determined based on your YAML configuration settings. For detailed information on backend selection, configuration, and examples, see the [Training Backends documentation](../design-docs/training-backends.md).
@@ -18,3 +18,6 @@ NeMo RL supports multiple generation/rollout backends to accommodate different m
 
 For detailed information on backend selection, configuration, and examples, see the [Generation Backends documentation](../design-docs/generation.md).
 
+See [Weight Refit: Choosing a Transport](../guides/refit.md) to select colocated
+IPC, NCCL, sparse delta, or NIXL checkpoint-engine refit for the configured
+training and generation backends.

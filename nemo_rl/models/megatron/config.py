@@ -12,33 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Callable, NamedTuple, Optional, TypedDict
+from dataclasses import dataclass
+from typing import Any, Callable, NamedTuple, Optional
 
 import torch
+from megatron.bridge.models.model_provider import ModelProviderMixin
 from megatron.bridge.training.config import ConfigContainer
 from megatron.bridge.training.state import GlobalState
 from megatron.core.optimizer import MegatronOptimizer
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.transformer import MegatronModule
 
-
-class MegatronGenerationConfig(TypedDict):
-    # Total GPU memory (in GB) allocated for KV cache buffers
-    buffer_size_gb: int
-    # Number of CUDA graphs to pre-compile for different batch sizes
-    num_cuda_graphs: int
-    # Size of each KV cache block in tokens (affects memory granularity)
-    block_size_tokens: int
-    # Enable CUDA graphs for prefill/context processing
-    use_cuda_graphs_for_non_decode_steps: bool
-    # Split long prefills into chunks for better memory management
-    enable_chunked_prefill: bool
-    # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
-    unified_memory_level: int
-    # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens.
-    # Can cause OOM if set too high so should be tuned with buffer_size_gb if OOMing. If set too
-    # low, then will only do 512 tokens at a time, which can be slow.
-    max_tokens: int
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 
 
 ## returned from validate_and_set_config
@@ -54,8 +39,24 @@ class RuntimeConfig(NamedTuple):
     dtype: torch.dtype
     optimizer_cpu_offload: bool
     offload_optimizer_for_logprob: bool
+    offload_optimizer_for_refit: bool
     is_generation_colocated: Optional[bool]
+    sampling_params: Optional[TrainingSamplingParams]
     final_padded_vocab_size: int
+
+
+@dataclass
+class ColocatedReshardPlan:
+    """Setup-time plan for building the dedicated colocated inference model.
+
+    Produced by `setup_model_and_optimizer` when the inference and training layouts differ.
+    Consumed by the first `prepare_for_generation` call.
+    """
+
+    # Pre-wrap provider snapshot; build_inference_model mutates it to the inference layout.
+    initial_model_provider: ModelProviderMixin
+    # The resolved megatron_cfg the inference model runs with.
+    inference_megatron_cfg: dict[str, Any]
 
 
 ## returned from setup_model_and_optimizer
@@ -72,3 +73,5 @@ class ModelAndOptimizerState(NamedTuple):
     scheduler: OptimizerParamScheduler
     checkpointing_context: dict[str, Any]
     param_sync_func: Optional[Callable]
+    draft_model: Optional[MegatronModule] = None
+    colocated_reshard_plan: Optional[ColocatedReshardPlan] = None

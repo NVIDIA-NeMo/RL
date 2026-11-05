@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Tests for TelemetryConfig and the YAML->env translation."""
+
+import os
+
+from nemo_rl.telemetry.config import TelemetryConfig
+from nemo_rl.telemetry.setup import _ENV_FIELD_MAP, _config_to_env
+
+
+def test_config_to_env_translation():
+    tel = TelemetryConfig(
+        enabled=True,
+        span_groups="per_step",
+        logs_enabled=True,
+        vllm_native_tracing=True,
+        exporter="console",
+        service_name="my-rl",
+    )
+    _config_to_env(tel)
+    assert os.environ["NEMO_RL_OTEL_ENABLED"] == "1"
+    assert os.environ["NEMO_RL_OTEL_SPAN_GROUPS"] == "per_step"
+    assert os.environ["NEMO_RL_OTEL_LOGS_ENABLED"] == "1"
+    assert os.environ["NEMO_RL_OTEL_VLLM_NATIVE_TRACING"] == "1"
+    assert os.environ["NEMO_RL_OTEL_EXPORTER"] == "console"
+    assert os.environ["OTEL_SERVICE_NAME"] == "my-rl"
+
+
+def test_a_stale_rank_filtering_key_is_not_propagated():
+    """``extra="allow"`` accepts an obsolete key; it must not reach a worker.
+
+    ``export_strategy`` was a real field until lens removed the machinery, so
+    old YAMLs still carry it. Projecting it would put a ``NEMO_RL_OTEL_*`` var
+    in the environment that nothing reads -- and that the next reader would
+    reasonably assume still works.
+    """
+    _config_to_env(TelemetryConfig(enabled=True, export_strategy="sampled"))
+    assert "NEMO_RL_OTEL_EXPORT_STRATEGY" not in os.environ
+
+
+def test_disabled_translates_to_zero():
+    _config_to_env(TelemetryConfig(enabled=False))
+    assert os.environ["NEMO_RL_OTEL_ENABLED"] == "0"
+
+
+def test_env_wins_over_yaml():
+    os.environ["NEMO_RL_OTEL_SPAN_GROUPS"] = "all"
+    _config_to_env(TelemetryConfig(enabled=True, span_groups="per_step"))
+    # setdefault must not overwrite a pre-existing env var.
+    assert os.environ["NEMO_RL_OTEL_SPAN_GROUPS"] == "all"
+
+
+def test_env_field_map_fields_exist_on_config():
+    cfg = TelemetryConfig()
+    for field in _ENV_FIELD_MAP:
+        assert hasattr(cfg, field), field
+
+
+def test_every_config_field_propagates_to_workers():
+    # A field that exists on the config but is missing from _ENV_FIELD_MAP is
+    # settable in YAML yet never reaches a worker. service_name is the one
+    # exception: it maps onto the unprefixed OTEL_SERVICE_NAME.
+    declared = set(TelemetryConfig.model_fields) - {"service_name"}
+    assert declared == set(_ENV_FIELD_MAP)

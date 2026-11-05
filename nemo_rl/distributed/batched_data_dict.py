@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -17,7 +17,9 @@ from typing import (
     Any,
     Generic,
     Iterator,
+    Literal,
     Mapping,
+    NotRequired,
     Optional,
     Sequence,
     Type,
@@ -30,15 +32,70 @@ import torch
 from typing_extensions import Self
 
 from nemo_rl.data.multimodal_utils import (
+    MULTIMODAL_CONTENT_TYPES,
+    PACKED_MULTIMODAL_FIELDS,
+    PER_TOKEN_MULTIMODAL_FIELDS,
+    VLLM_PROMPT_KEYS,
     PackedTensor,
 )
 from nemo_rl.data.packing import get_packer
+from nemo_rl.data_plane.schema import OPD_FULL_FIELDS
 from nemo_rl.distributed.collectives import (
     gather_jagged_object_lists,
     rebalance_nd_tensor,
 )
 
 DictT = TypeVar("DictT", bound=Mapping[str, Any])
+
+_COUPLED_MULTIMODAL_KEYS = (
+    ("pixel_values", "image_grid_thw"),
+    ("pixel_values", "imgs_sizes"),
+    ("pixel_values", "num_frames"),
+    ("pixel_values_videos", "video_grid_thw"),
+)
+
+
+def _prepare_multimodal_sharing(
+    value: Any,
+    *,
+    media_context: bool = False,
+) -> dict[int, Any]:
+    """Enable PackedTensor provenance and return deepcopy memo entries.
+
+    PackedTensor is an explicit multimodal type. Raw vLLM-ready payloads are
+    shared only under named media keys or typed content parts. Containers are
+    still deep-copied so rollout rows may diverge safely.
+    """
+    shared_leaves: dict[int, Any] = {}
+
+    def visit(item: Any, in_media_context: bool = False) -> None:
+        if isinstance(item, PackedTensor):
+            item.enable_deduplication()
+            return
+        if isinstance(item, dict):
+            content_type = item.get("type")
+            # "type" is not always a content-type string: text rows carry tool
+            # / JSON-schema dicts where item["type"] is itself a dict, which is
+            # unhashable and would crash the set-membership test.
+            typed_media = (
+                isinstance(content_type, str)
+                and content_type in MULTIMODAL_CONTENT_TYPES
+            )
+            for key, child in item.items():
+                visit(
+                    child,
+                    in_media_context or typed_media or key in VLLM_PROMPT_KEYS,
+                )
+            return
+        if isinstance(item, (list, tuple)):
+            for child in item:
+                visit(child, in_media_context)
+            return
+        if in_media_context:
+            shared_leaves[id(item)] = item
+
+    visit(value, media_context)
+    return shared_leaves
 
 
 class SequencePackingArgs(TypedDict):
@@ -51,9 +108,13 @@ class SequencePackingArgs(TypedDict):
     input_key: str
     input_lengths_key: str
     algorithm: str
+    # Omit to preserve the packer's execution order.
+    microbatch_order: NotRequired[Literal["packer", "largest_first"]]
     sequence_length_pad_multiple: (
         int  # pad each sequence to a multiple of this value (for CP/TP alignment)
     )
+    pair_grouping_key: NotRequired[str]
+    max_sequences_per_bin: NotRequired[int]
 
 
 class DynamicBatchingArgs(TypedDict):
@@ -72,11 +133,24 @@ class DynamicBatchingArgs(TypedDict):
     )
 
 
+def _select_nested_rows(
+    tensor: torch.Tensor, indices: Union[range, list[int], torch.Tensor]
+) -> torch.Tensor:
+    if len(indices) == 0:
+        indices = range(0)
+    if isinstance(indices, range):
+        offsets = tensor.offsets()[indices.start : indices.stop + 1]
+        return torch.nested.nested_tensor_from_jagged(
+            tensor.values()[offsets[0] : offsets[-1]], offsets - offsets[0]
+        )
+    rows = tensor.unbind()
+    return torch.nested.as_nested_tensor(
+        [rows[i] for i in indices], layout=torch.jagged
+    )
+
+
 class BatchedDataDict(UserDict, Generic[DictT]):
-    # keys that are model specific, but not part of the PackedTensor
-    ADDITIONAL_OPTIONAL_KEY_TENSORS = [
-        "token_type_ids",  # specific to gemma3 that tells where the image tokens are in the sequence, not required for llm-only inference/training
-    ]
+    _PIXEL_DTYPE_CAST_KEYS = frozenset({"pixel_values", "pixel_values_videos"})
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -86,23 +160,92 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         self.elem_counts_per_gb = None
 
     def get_multimodal_dict(
-        self, as_tensors: bool = False, device: Optional[torch.device] = None
+        self,
+        as_tensors: bool = False,
+        device: Optional[torch.device] = None,
+        pixel_dtype: Optional[torch.dtype] = None,
+        pixel_preprocess_mode: Optional[str] = None,
     ) -> dict[str, Any]:
-        """Return a regular dict of tensors or packed multimodal data items."""
-        multimodal_dict = {}
+        """Return the multimodal fields as a dict.
+
+        Four cases per (k, v):
+          * ``PackedTensor`` — in-memory form, keep as-is.
+          * ``k`` in ``PACKED_MULTIMODAL_FIELDS`` — data-plane wire form,
+            which cannot be rebuilt here: raises. ``codec.materialize``
+            reassembles it earlier via ``reassemble_packed_multimodal``.
+          * ``k`` in ``PER_TOKEN_MULTIMODAL_FIELDS`` — plain per-token
+            tensor, keep as-is.
+          * anything else — not multimodal, skip.
+
+        ``pixel_dtype`` converts pixel tensors without materializing repeated
+        logical segments. This is used to reduce policy-bound Ray payloads.
+        """
+        if as_tensors:
+            for value_key, metadata_key in _COUPLED_MULTIMODAL_KEYS:
+                value = self.data.get(value_key)
+                metadata = self.data.get(metadata_key)
+                if not isinstance(value, PackedTensor) or not isinstance(
+                    metadata, PackedTensor
+                ):
+                    continue
+                # Legacy values have no logical indirection to validate. Keep
+                # the per-row scan off the flag-off policy hot path.
+                if not (
+                    value.deduplication_enabled
+                    or value._row_offsets is not None
+                    or metadata.deduplication_enabled
+                    or metadata._row_offsets is not None
+                ):
+                    continue
+                value_counts = value.logical_segment_counts_by_row()
+                metadata_counts = metadata.logical_segment_counts_by_row()
+                if value_counts != metadata_counts:
+                    raise ValueError(
+                        "Coupled multimodal keys must have the same ordered "
+                        f"per-row segment counts, but {value_key!r} has "
+                        f"{value_counts} and {metadata_key!r} has "
+                        f"{metadata_counts}."
+                    )
+
+        result: dict[str, Any] = {}
         for k, v in self.data.items():
             if isinstance(v, PackedTensor):
-                multimodal_dict[k] = v.as_tensor(device=device) if as_tensors else v
-            elif k in self.ADDITIONAL_OPTIONAL_KEY_TENSORS:
-                multimodal_dict[k] = v
-
-        return multimodal_dict
+                # In-memory PackedTensor (or a per-token field a caller
+                # happened to wrap; matches the pre-refactor behavior of
+                # unwrapping via as_tensor).
+                if pixel_dtype is not None and k in self._PIXEL_DTYPE_CAST_KEYS:
+                    v = v.to_dtype(pixel_dtype)
+                preprocess_mode = pixel_preprocess_mode if k == "pixel_values" else None
+                result[k] = v.as_tensor(device, preprocess_mode) if as_tensors else v
+            elif k in PER_TOKEN_MULTIMODAL_FIELDS:
+                # Plain per-token tensor: emit as-is.
+                result[k] = v
+            elif k in PACKED_MULTIMODAL_FIELDS:
+                # Data-plane wire form: a value that reached here without
+                # ``codec.materialize`` reassembling it. Purely a fail-loud
+                # guard -- never a reconstruction path, because neither case is
+                # recoverable from here. A *nested* value still needs the
+                # per-segment shapes, which live only on ``KVBatchMeta.tags``;
+                # taking its flat rows as-is would emit 1-D pixels and train
+                # image-blind. A *dense* value means the field was padded and
+                # the row boundaries are already gone.
+                raise ValueError(
+                    f"{k!r} is still in data-plane wire form "
+                    f"({'nested' if getattr(v, 'is_nested', False) else 'dense'}). "
+                    "Packed multimodal fields must be rebuilt by "
+                    "multimodal_utils.reassemble_packed_multimodal (which "
+                    "codec.materialize calls) before get_multimodal_dict."
+                )
+            # else: not a multimodal field, silently skip.
+        return result
 
     @classmethod
     def from_batches(
         cls: Type[Self],
         batches: Sequence[Mapping[Any, Any]],
         pad_value_dict: Optional[dict[str, int | float]] = None,
+        *,
+        allow_missing_packed_tensors: bool = False,
     ) -> Self:
         """Given a list of batches, stack the tensors/lists within and put them in a single dictionary.
 
@@ -111,15 +254,91 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         Args:
             batches (list[Dict]): A list of dictionaries, each containing a batch of data.
             pad_value_dict (Optional[dict[str, int]]): An optional dict mapping keys to non-default(0) padding values.
+            allow_missing_packed_tensors: Represent missing ``PackedTensor``
+                media keys as empty logical rows. This is opt-in so ordinary
+                flag-off concatenation retains its strict key checks.
 
         Returns:
             BatchedDataDict: A new BatchedDataDict containing the stacked data.
         """
         stacked_dict: Self = cls()
         pad_value_dict = pad_value_dict or {}
+        if not batches:
+            return stacked_dict
 
-        for k in sorted(batches[0]):
-            list_of_tensors = [item[k] for item in batches]
+        def batch_size(item: Mapping[Any, Any]) -> int:
+            if not item:
+                return 0
+
+            if not allow_missing_packed_tensors:
+                # Preserve the legacy shared primitive exactly unless sparse
+                # PackedTensor normalization was explicitly requested.
+                return len(next(iter(item.values())))
+
+            sizes = set()
+            for value in item.values():
+                if isinstance(value, PackedTensor):
+                    sizes.add(len(value))
+                elif isinstance(value, torch.Tensor):
+                    sizes.add(value.shape[0])
+                else:
+                    sizes.add(len(value))
+            if len(sizes) != 1:
+                raise ValueError(
+                    "Source batch has inconsistent logical row counts: "
+                    f"{sorted(sizes)}."
+                )
+            return next(iter(sizes))
+
+        keys = sorted({key for item in batches for key in item})
+        for k in keys:
+            missing_nonempty_batches = [
+                idx
+                for idx, item in enumerate(batches)
+                if k not in item and batch_size(item)
+            ]
+            if missing_nonempty_batches:
+                present_values = [item[k] for item in batches if k in item]
+                if not (
+                    allow_missing_packed_tensors
+                    and present_values
+                    and all(isinstance(value, PackedTensor) for value in present_values)
+                ):
+                    raise KeyError(
+                        f"Key {k!r} is missing from non-empty batches "
+                        f"{missing_nonempty_batches}."
+                    )
+
+                template = present_values[0]
+                assert isinstance(template, PackedTensor)
+                list_of_tensors = [
+                    (
+                        item[k]
+                        if k in item
+                        else PackedTensor.empty_rows_like(template, batch_size(item))
+                    )
+                    for item in batches
+                    if k in item or batch_size(item)
+                ]
+            else:
+                list_of_tensors = [item[k] for item in batches if k in item]
+
+            if allow_missing_packed_tensors and isinstance(
+                list_of_tensors[0], PackedTensor
+            ):
+                source_batches = [
+                    item for item in batches if k in item or batch_size(item)
+                ]
+                for batch_index, (item, packed_tensor) in enumerate(
+                    zip(source_batches, list_of_tensors)
+                ):
+                    expected_rows = batch_size(item)
+                    if len(packed_tensor) != expected_rows:
+                        raise ValueError(
+                            f"PackedTensor key {k!r} has {len(packed_tensor)} "
+                            f"logical rows in source batch {batch_index}, "
+                            f"expected {expected_rows}."
+                        )
 
             if isinstance(list_of_tensors[0], list):
                 tensor_or_list: list[Any] | torch.Tensor = [
@@ -127,24 +346,25 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 ]
             elif isinstance(list_of_tensors[0], PackedTensor):
                 tensor_or_list = PackedTensor.concat(list_of_tensors)
+            elif torch.is_tensor(list_of_tensors[0]) and list_of_tensors[0].is_nested:
+                tensor_or_list = torch.nested.as_nested_tensor(
+                    [row for tensor in list_of_tensors for row in tensor.unbind()],
+                    layout=torch.jagged,
+                )
             elif all(x.ndim == 1 for x in list_of_tensors):
                 tensor_or_list = torch.cat(list_of_tensors)
             elif isinstance(list_of_tensors[0], torch.Tensor):
                 pad_value = pad_value_dict.get(k, 0)
-                # We now add the following if statement to handle the 3D case in distillation
-                # (i.e., teacher top-k logits and indices); the else branch is the original code.
-                if list_of_tensors[0].ndim == 3:
-                    # For 3D tensors, pad only along the sequence dimension (the 1st dimension here),
-                    # keeping the feature dimension.
+                # Preserve structured per-token fields such as teacher top-k data
+                # [B, S, K] and routed experts [B, S, L, topk].
+                if list_of_tensors[0].ndim >= 3:
                     max_seq_len = max(tensor.shape[1] for tensor in list_of_tensors)
                     padded_tensors = []
                     for tensor in list_of_tensors:
-                        # Pad along the 1st dimension to max_seq_len.
                         pad_length = max_seq_len - tensor.shape[1]
                         padded = torch.nn.functional.pad(
                             tensor,
-                            # Only pad the last two dimensions (sequence length).
-                            (0, 0, 0, pad_length),
+                            (0, 0) * (tensor.ndim - 2) + (0, pad_length),
                             mode="constant",
                             value=pad_value,
                         )
@@ -225,7 +445,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         indices = torch.arange(B).tensor_split(chunks)[rank]
 
         for k in self.data:
-            if torch.is_tensor(self.data[k]):
+            if torch.is_tensor(self.data[k]) and self.data[k].is_nested:
+                chunked_batch[k] = _select_nested_rows(self.data[k], indices.tolist())
+            elif torch.is_tensor(self.data[k]):
                 chunked_batch[k] = self.data[k][indices].clone()
             elif isinstance(self.data[k], PackedTensor):
                 chunked_batch[k] = self.data[k].slice(indices)
@@ -254,7 +476,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
         for k, v in self.data.items():
             sorted_v: torch.Tensor | list[Any]
-            if torch.is_tensor(v):
+            if torch.is_tensor(v) and v.is_nested:
+                sorted_v = _select_nested_rows(v, reordered_indices)
+            elif torch.is_tensor(v):
                 sorted_v = v.index_select(
                     dim=0, index=torch.IntTensor(reordered_indices)
                 )
@@ -415,7 +639,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             # finally reorder the data along the sorted sequence len indices
             for k, v in self.data.items():
                 sorted_v: torch.Tensor | list[Any] | PackedTensor
-                if torch.is_tensor(v):
+                if torch.is_tensor(v) and v.is_nested:
+                    sorted_v = _select_nested_rows(v, batch_sorted_indices)
+                elif torch.is_tensor(v):
                     sorted_v = v.index_select(
                         dim=0, index=torch.IntTensor(batch_sorted_indices)
                     )
@@ -426,12 +652,21 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 data[k] = sorted_v
 
         elif sequence_packing_args is not None:
+            microbatch_order = sequence_packing_args.get("microbatch_order")
+            if microbatch_order not in {None, "packer", "largest_first"}:
+                raise ValueError(
+                    "sequence packing microbatch_order must be 'packer' or "
+                    f"'largest_first', got {microbatch_order!r}"
+                )
             bin_packer = get_packer(
                 algorithm=sequence_packing_args["algorithm"],
                 bin_capacity=sequence_packing_args["max_tokens_per_microbatch"],
                 collect_metrics=False,  # TODO(ahmadki): make configurable
                 min_bin_count=shards,
                 bin_count_multiple=shards,
+                max_sequences_per_bin=sequence_packing_args.get(
+                    "max_sequences_per_bin"
+                ),
             )
 
             input_lengths_key = sequence_packing_args["input_lengths_key"]
@@ -444,8 +679,21 @@ class BatchedDataDict(UserDict, Generic[DictT]):
             def _get_padded_seqlen(seqlen: int) -> int:
                 return (seqlen + pad_multiple - 1) // pad_multiple * pad_multiple
 
+            grouping_key = sequence_packing_args.get("pair_grouping_key")
+            grouping_values = None
+            if grouping_key is not None:
+                if grouping_key not in self.data:
+                    raise KeyError(
+                        f"sequence_packing pair_grouping_key={grouping_key!r} "
+                        "is not present in the batch"
+                    )
+                grouping_values = self.data[grouping_key]
+                if not isinstance(grouping_values, torch.Tensor):
+                    grouping_values = torch.as_tensor(grouping_values)
+
             # Store bin assignments for each chunk to reuse later
             all_chunk_bin_assignments = []
+            all_chunk_padded_seqlens = []
 
             # Process each chunk separately to respect chunk boundaries
             for chunk_idx in range(num_chunks):
@@ -458,11 +706,47 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     _get_padded_seqlen(seq_len.item()) for seq_len in chunk_seqlens
                 ]
 
-                # Pack sequences in this chunk into bins
-                chunk_bin_assignments = bin_packer.pack(
-                    sequence_lengths=chunk_padded_seqlens_list,
-                )
+                if grouping_values is None:
+                    chunk_bin_assignments = bin_packer.pack(
+                        sequence_lengths=chunk_padded_seqlens_list,
+                    )
+                else:
+                    # Treat every preference pair as one atomic virtual item.
+                    # The packer sees the pair's combined padded length and the
+                    # resulting bins are expanded back to sequence-row indices.
+                    chunk_groups = grouping_values[chunk_start:chunk_end]
+                    group_to_members: dict[int, list[int]] = {}
+                    for local_idx, group_id in enumerate(chunk_groups.tolist()):
+                        group_to_members.setdefault(int(group_id), []).append(local_idx)
+                    sorted_group_ids = sorted(group_to_members)
+                    group_lengths = [
+                        sum(
+                            chunk_padded_seqlens_list[member]
+                            for member in group_to_members[group_id]
+                        )
+                        for group_id in sorted_group_ids
+                    ]
+                    bin_capacity = sequence_packing_args["max_tokens_per_microbatch"]
+                    for group_id, group_length in zip(sorted_group_ids, group_lengths):
+                        if group_length > bin_capacity:
+                            raise ValueError(
+                                f"sequence_packing pair group {group_id} requires "
+                                f"{group_length} tokens but "
+                                f"max_tokens_per_microbatch={bin_capacity}"
+                            )
+                    group_bins = bin_packer.pack(sequence_lengths=group_lengths)
+                    chunk_bin_assignments = [
+                        [
+                            member
+                            for group_position in group_bin
+                            for member in group_to_members[
+                                sorted_group_ids[group_position]
+                            ]
+                        ]
+                        for group_bin in group_bins
+                    ]
                 all_chunk_bin_assignments.append(chunk_bin_assignments)
+                all_chunk_padded_seqlens.append(chunk_padded_seqlens_list)
 
             # create shards with the packed bins
             sharded_data: list[list[dict]] = [[] for _ in range(shards)]
@@ -478,33 +762,43 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     [] for _ in range(shards)
                 ]
 
-                num_bins = len(all_chunk_bin_assignments[chunk_idx])
                 chunk_start = chunk_idx * batch_size
-                for bin_idx in range(num_bins):
-                    shard_idx = bin_idx % shards
-                    bin_indices = all_chunk_bin_assignments[chunk_idx][bin_idx]
-                    global_bin_indices = [i + chunk_start for i in bin_indices]
-                    sharded_data[shard_idx].append(
-                        self.select_indices(global_bin_indices)
-                    )
-                    global_indices_per_shard[shard_idx].extend(global_bin_indices)
-                    bin_seqlen = sum(
-                        [
-                            _get_padded_seqlen(input_lens[i].item())
-                            for i in global_bin_indices
-                        ]
-                    )
+                chunk_padded_seqlens = all_chunk_padded_seqlens[chunk_idx]
+                for shard_idx in range(shards):
+                    # Keep the packer's round-robin bin-to-rank assignment.
+                    # Only execution order within each rank is configurable.
+                    shard_bin_assignments = all_chunk_bin_assignments[chunk_idx][
+                        shard_idx::shards
+                    ]
+                    if microbatch_order == "largest_first":
+                        # Establish the largest token-scaled allocations first so
+                        # smaller microbatches can reuse their cached segments.
+                        shard_bin_assignments = sorted(
+                            shard_bin_assignments,
+                            key=lambda bin_indices: sum(
+                                chunk_padded_seqlens[i] for i in bin_indices
+                            ),
+                            reverse=True,
+                        )
 
-                    if chunk_sharded_micro_indices[shard_idx] == []:
-                        chunk_sharded_micro_indices[shard_idx].append(
-                            [0, len(bin_indices)]
+                    for bin_indices in shard_bin_assignments:
+                        global_bin_indices = [i + chunk_start for i in bin_indices]
+                        sharded_data[shard_idx].append(
+                            self.select_indices(global_bin_indices)
                         )
-                    else:
-                        prev_bin_end = chunk_sharded_micro_indices[shard_idx][-1][1]
-                        chunk_sharded_micro_indices[shard_idx].append(
-                            [prev_bin_end, prev_bin_end + len(bin_indices)]
-                        )
-                    chunk_sharded_micro_lengths[shard_idx].append(bin_seqlen)
+                        global_indices_per_shard[shard_idx].extend(global_bin_indices)
+                        bin_seqlen = sum(chunk_padded_seqlens[i] for i in bin_indices)
+
+                        if chunk_sharded_micro_indices[shard_idx] == []:
+                            chunk_sharded_micro_indices[shard_idx].append(
+                                [0, len(bin_indices)]
+                            )
+                        else:
+                            prev_bin_end = chunk_sharded_micro_indices[shard_idx][-1][1]
+                            chunk_sharded_micro_indices[shard_idx].append(
+                                [prev_bin_end, prev_bin_end + len(bin_indices)]
+                            )
+                        chunk_sharded_micro_lengths[shard_idx].append(bin_seqlen)
 
                 for shard_idx in range(shards):
                     sharded_micro_indices[shard_idx].append(
@@ -539,6 +833,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
 
         # Group data by shard position across all chunks
         for shard_idx in range(shards):
+            shard_ranges: list[tuple[int, int]] = []
             for chunk_idx in range(num_chunks):
                 # Calculate indices for this particular sub-shard within the chunk
                 chunk_start = chunk_idx * batch_size
@@ -549,41 +844,43 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                     # or if shard_end calculation goes beyond total_batch_size
                     shard_start = min(shard_start, total_batch_size)
                     shard_end = min(shard_end, total_batch_size)
-                indices = torch.arange(shard_start, shard_end)
 
-                for k in data:
-                    if k not in aggregated_shards[shard_idx]:
-                        # First time seeing this key for this shard, initialize it
-                        if torch.is_tensor(data[k]):
-                            aggregated_shards[shard_idx][k] = data[k][indices].clone()
-                        elif isinstance(data[k], PackedTensor):
-                            aggregated_shards[shard_idx][k] = data[k].slice(
-                                indices.tolist()
-                            )
-                        else:
-                            aggregated_shards[shard_idx][k] = [
-                                data[k][i] for i in indices
-                            ]
-                    else:
-                        # Append to existing data - concatenate tensors or extend lists
-                        if torch.is_tensor(data[k]):
-                            aggregated_shards[shard_idx][k] = torch.cat(
-                                [
-                                    aggregated_shards[shard_idx][k],
-                                    data[k][indices].clone(),
-                                ]
-                            )
-                        elif isinstance(data[k], PackedTensor):
-                            aggregated_shards[shard_idx][k] = PackedTensor.concat(
-                                [
-                                    aggregated_shards[shard_idx][k],
-                                    data[k].slice(indices.tolist()),
-                                ]
-                            )
-                        else:
-                            aggregated_shards[shard_idx][k].extend(
-                                [data[k][i] for i in indices]
-                            )
+                if shard_start < shard_end:
+                    shard_ranges.append((shard_start, shard_end))
+
+            for k, v in data.items():
+                if torch.is_tensor(v):
+                    # Pre-allocate and copy each chunk once
+                    rows = sum(end - start for start, end in shard_ranges)
+                    shard_tensor = torch.empty(
+                        (rows, *v.shape[1:]),
+                        dtype=v.dtype,
+                        device=v.device,
+                    )
+                    offset = 0
+                    for start, end in shard_ranges:
+                        span = end - start
+                        shard_tensor[offset : offset + span].copy_(v[start:end])
+                        offset += span
+
+                    aggregated_shards[shard_idx][k] = shard_tensor
+                elif isinstance(v, PackedTensor):
+                    # PackedTensor is collected per chunk then concatenated once
+                    packed_slices = [
+                        v.slice(list(range(start, end))) for start, end in shard_ranges
+                    ]
+
+                    aggregated_shards[shard_idx][k] = (
+                        PackedTensor.concat(packed_slices)
+                        if packed_slices
+                        else PackedTensor.empty_rows_like(v, 0)
+                    )
+                else:
+                    shard_values = []
+                    for start, end in shard_ranges:
+                        shard_values.extend([v[i] for i in range(start, end)])
+
+                    aggregated_shards[shard_idx][k] = shard_values
 
         # map inputs to microbatches such that the total number tokens in
         # a microbatch is as close to (including padding tokens) 'max_tokens_per_microbatch'
@@ -602,7 +899,7 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 for shard_indice in range(shard_size):
                     # use the max seqlen of all shards to calculate the total number of tokens in the mb
                     # this ensures each DP rank has the same batch size each iteration which is
-                    # required for FSDP2 and megatron policies.
+                    # required for Automodel and megatron policies.
                     max_seqlen_this_shard_indice = 0
                     chunk_start = chunk_idx * shard_size
                     chunk_end = (chunk_idx + 1) * shard_size
@@ -718,15 +1015,29 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 assert end <= self.data[k].shape[0], (
                     f"end: {end} is greater than the shape of the tensor: {self.data[k].shape[0]} for key: {k}"
                 )
-            sliced_batch[k] = self.data[k][start:end]
+            v = self.data[k]
+            sliced_batch[k] = (
+                _select_nested_rows(v, range(start, end))
+                if isinstance(v, torch.Tensor) and v.is_nested
+                else v[start:end]
+            )
         return sliced_batch
 
-    def repeat_interleave(self, num_repeats: int) -> Self:
+    def repeat_interleave(
+        self,
+        num_repeats: int,
+        *,
+        share_immutable_media: bool = False,
+    ) -> Self:
         """Repeats the batch num_repeats times.
 
         For each element in the batch, repeat each value num_repeats times.
         i.e:
         {"key": torch.tensor([1, 2, 3]), "other_key": [1, 2, 3]} -> {"key": torch.tensor([1, 1, 2, 2, 3, 3]), "other_key": [1, 1, 2, 2, 3, 3]}
+
+        When ``share_immutable_media`` is enabled, only explicit multimodal
+        leaves share storage. Every surrounding row/message/content container
+        remains independent.
         """
         repeated_batch: Self = type(self)()
         for k, v in self.data.items():
@@ -739,16 +1050,43 @@ class BatchedDataDict(UserDict, Generic[DictT]):
                 )
             else:
                 # For lists or other sequences, use a list comprehension to repeat each element
-                repeated_batch[k] = [
-                    deepcopy(item) for item in v for _ in range(num_repeats)
-                ]
+                repeated_items = []
+                for item in v:
+                    shared_leaves = (
+                        _prepare_multimodal_sharing(
+                            item,
+                            media_context=k in VLLM_PROMPT_KEYS,
+                        )
+                        if share_immutable_media
+                        else {}
+                    )
+                    repeated_items.extend(
+                        deepcopy(item, dict(shared_leaves)) for _ in range(num_repeats)
+                    )
+                repeated_batch[k] = repeated_items
         return repeated_batch
 
     def truncate_tensors(self, dim: int, truncated_len: int):
         """Truncates tensors in this dict of a given dim to a given length."""
         for k, v in self.items():
+            # Packed multimodal fields are not sequence-aligned — their
+            # dim 1 is patch/image count — so narrowing them to the token
+            # seqlen silently corrupts images (or raises when the patch
+            # count is smaller than the seqlen). The in-memory
+            # ``PackedTensor`` form is skipped by ``torch.is_tensor``
+            # below, but the data-plane wire form is a nested tensor, so
+            # name it here.
+            if k in PACKED_MULTIMODAL_FIELDS:
+                continue
+            if torch.is_tensor(v) and v.is_nested:
+                continue
             if torch.is_tensor(v) and len(v.shape) >= dim + 1:
-                self.data[k] = torch.narrow(v, dim=dim, start=0, length=truncated_len)
+                length = truncated_len
+                if k in OPD_FULL_FIELDS:
+                    # materialize() leaves the payload at its natural width,
+                    # which can already be shorter than this microbatch's seqlen.
+                    length = min(truncated_len, int(v.shape[dim]))
+                self.data[k] = torch.narrow(v, dim=dim, start=0, length=length)
 
     def make_microbatch_iterator_with_dynamic_shapes(
         self,
@@ -815,9 +1153,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         """Get the batch size of the batch."""
         # Get the first key and use its size as the batch size
         # This assumes all keys have the same batch size
-        key = next(iter(self.data))
         if not self.data:
             return 0
+        key = next(iter(self.data))
         if not torch.is_tensor(self.data[key]):
             return len(self.data[key])
         return self.data[key].shape[0]  # type: ignore # it's a tensor here
@@ -842,7 +1180,9 @@ class BatchedDataDict(UserDict, Generic[DictT]):
         """
         selected_batch: Self = type(self)()
         for k, v in self.data.items():
-            if torch.is_tensor(v):
+            if torch.is_tensor(v) and v.is_nested:
+                selected_batch[k] = _select_nested_rows(v, indices)
+            elif torch.is_tensor(v):
                 selected_batch[k] = v[indices]
             elif isinstance(v, PackedTensor):
                 selected_batch[k] = v.slice(indices)

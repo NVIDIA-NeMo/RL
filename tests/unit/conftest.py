@@ -63,6 +63,18 @@ def pytest_addoption(parser):
         default=False,
         help="Run ONLY sglang tests",
     )
+    parser.addoption(
+        "--trtllm-only",
+        action="store_true",
+        default=False,
+        help="Run ONLY TensorRT-LLM tests",
+    )
+    parser.addoption(
+        "--nemo-gym-only",
+        action="store_true",
+        default=False,
+        help="Run ONLY nemo_gym tests",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -72,6 +84,8 @@ def pytest_collection_modifyitems(config, items):
     run_automodel_only = config.getoption("--automodel-only")
     run_vllm_only = config.getoption("--vllm-only")
     run_sglang_only = config.getoption("--sglang-only")
+    run_trtllm_only = config.getoption("--trtllm-only")
+    run_nemo_gym_only = config.getoption("--nemo-gym-only")
 
     # Check for mutually exclusive options
     exclusive_options = [
@@ -79,10 +93,17 @@ def pytest_collection_modifyitems(config, items):
         run_automodel_only,
         run_vllm_only,
         run_sglang_only,
+        run_trtllm_only,
+        run_nemo_gym_only,
     ]
-    if sum(exclusive_options) > 1:
+    combined_vllm_gym = (
+        run_vllm_only and run_nemo_gym_only and sum(exclusive_options) == 2
+    )
+    if sum(exclusive_options) > 1 and not combined_vllm_gym:
         raise ValueError(
-            "--mcore-only, --automodel-only, --vllm-only, and --sglang-only are mutually exclusive"
+            "--mcore-only, --automodel-only, --vllm-only, --sglang-only, "
+            "--trtllm-only, and --nemo-gym-only are mutually exclusive, except "
+            "--vllm-only --nemo-gym-only selects tests requiring both dependencies"
         )
 
     marker_expr = config.getoption("-m", default="")
@@ -168,6 +189,39 @@ def pytest_collection_modifyitems(config, items):
         # Exclude sglang tests by default
         new_items = [
             item for item in new_items if not item.get_closest_marker("sglang")
+        ]
+
+    # Filter by TensorRT-LLM marker
+    if run_trtllm_only:
+        try:
+            import tensorrt_llm  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "Cannot run TensorRT-LLM tests: tensorrt_llm is not available.\n"
+                "Please run tests with: uv run --extra trtllm --group test pytest ..."
+            )
+        new_items = [item for item in new_items if item.get_closest_marker("trtllm")]
+    else:
+        new_items = [
+            item for item in new_items if not item.get_closest_marker("trtllm")
+        ]
+
+    # Filter by nemo_gym marker
+    if run_nemo_gym_only:
+        # Validate that nemo_gym is available
+        try:
+            from nemo_gym import config_types  # noqa: F401
+        except ImportError:
+            raise ImportError(
+                "Cannot run nemo_gym tests: nemo_gym is not available.\n"
+                "Please run tests with: uv run --extra nemo_gym --group test pytest ..."
+            )
+        # Include only nemo_gym tests
+        new_items = [item for item in new_items if item.get_closest_marker("nemo_gym")]
+    else:
+        # Exclude nemo_gym tests by default
+        new_items = [
+            item for item in new_items if not item.get_closest_marker("nemo_gym")
         ]
 
     # Ensure run_first tests are prioritized
@@ -331,6 +385,15 @@ def pytest_sessionstart(session):
 
 
 def pytest_sessionfinish(session, exitstatus):
+    # run_unit.sh treats exit 5 as success for ordinary shards. The common lane
+    # must fail if every dependency test was deselected or skipped at import.
+    if (
+        session.config.getoption("--vllm-only")
+        and session.config.getoption("--nemo-gym-only")
+        and exitstatus == pytest.ExitCode.NO_TESTS_COLLECTED
+    ):
+        exitstatus = session.exitstatus = pytest.ExitCode.USAGE_ERROR
+        print("The combined vLLM + Gym shard collected no tests")
     if not hasattr(session.config, "_unit_test_data"):
         return
 
@@ -497,10 +560,10 @@ def mock_2gpu_distributed_env():
     tp_mesh.device_type = "cuda"
     tp_mesh.size.return_value = 2  # Set tp_size to match your test case
 
-    # Create the 2D mesh that acts like a dictionary (this is so we can test DTensorPolicyWorker with TP > 1)
+    # Create the 2D mesh that acts like a dictionary (this is so we can test the Automodel policy worker with TP > 1)
     mesh_2d = unittest.mock.MagicMock()
-    mesh_2d.__getitem__.side_effect = (
-        lambda key: dp_mesh if key == "dp" else tp_mesh if key == "tp" else None
+    mesh_2d.__getitem__.side_effect = lambda key: (
+        dp_mesh if key == "dp" else tp_mesh if key == "tp" else None
     )
     mesh_2d.device_type = "cuda"
 

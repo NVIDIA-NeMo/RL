@@ -15,64 +15,45 @@
 import gc
 import os
 import traceback
+import warnings
+from datetime import timedelta
 from enum import Enum
-from typing import Any, Dict, Optional, cast
+from typing import TYPE_CHECKING, Any, Iterable, Literal, Optional, cast
 
-import requests
 import torch
 import torch.distributed as dist
 import zmq
 from torch.multiprocessing.reductions import rebuild_cuda_tensor
-from transformers import (
-    AutoModelForCausalLM,
-    AutoModelForImageTextToText,
-    AutoModelForTextToWaveform,
-)
-
-# Try to import nemo_automodel classes, fallback to None if not available
-try:
-    from nemo_automodel._transformers.auto_model import (
-        NeMoAutoModelForCausalLM,
-        NeMoAutoModelForImageTextToText,
-        NeMoAutoModelForTextToWaveform,
-    )
-
-    NEMO_AUTOMODEL_AVAILABLE = True
-except ImportError:
-    # nemo_automodel is not installed, classes will be None
-    NeMoAutoModelForCausalLM = None  # type: ignore
-    NeMoAutoModelForImageTextToText = None  # type: ignore
-    NeMoAutoModelForTextToWaveform = None  # type: ignore
-    NEMO_AUTOMODEL_AVAILABLE = False
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.models.generation.vllm.config import (
+    LEGACY_VLLM_FP32_LM_HEAD_ENV_VAR,
+    VllmSpecificArgs,
+    vllm_fp32_lm_head_enabled,
+)
+from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 
-# an automodel factory for loading the huggingface models from correct class
+if TYPE_CHECKING:
+    from nemo_rl.models.policy import PolicyConfig
 
-AUTOMODEL_FACTORY: Dict[str, Any] = {
-    "qwen2_5_vl": AutoModelForImageTextToText,
-    "qwen2_vl": AutoModelForImageTextToText,
-    "qwen2_5_omni": AutoModelForTextToWaveform,
-    "llava": AutoModelForImageTextToText,
-    "internvl": AutoModelForImageTextToText,
-    "gemma3": AutoModelForImageTextToText,
-    "smolvlm": AutoModelForImageTextToText,
-    "mistral3": AutoModelForImageTextToText,
-    "llama4": AutoModelForImageTextToText,
+# Environment for bitwise-reproducible policy workers. These are read when the
+# worker creates its cuBLAS handles and selects Transformer Engine kernels, so
+# they are set in the worker's runtime environment, before the process starts.
+DETERMINISTIC_ENV_VARS = {
+    "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+    "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
 }
 
-if NEMO_AUTOMODEL_AVAILABLE:
-    AUTOMODEL_FACTORY = {
-        "qwen2_5_vl": NeMoAutoModelForImageTextToText,
-        "qwen2_vl": NeMoAutoModelForImageTextToText,
-        "qwen2_5_omni": NeMoAutoModelForTextToWaveform,
-        "llava": NeMoAutoModelForImageTextToText,
-        "internvl": NeMoAutoModelForImageTextToText,
-        "gemma3": NeMoAutoModelForImageTextToText,
-        "smolvlm": NeMoAutoModelForImageTextToText,
-        "mistral3": NeMoAutoModelForImageTextToText,
-        "llama4": NeMoAutoModelForImageTextToText,
-    }
+
+def enable_deterministic_algorithms() -> None:
+    """Switch torch to deterministic algorithms in this process.
+
+    ``warn_only=True`` keeps ops without a deterministic implementation running
+    (torch warns instead of raising), so enabling this never breaks a model.
+    """
+    torch.use_deterministic_algorithms(True, warn_only=True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class IPCProtocol(Enum):
@@ -82,107 +63,197 @@ class IPCProtocol(Enum):
     ACK = "ack"
 
 
-def apply_top_k_top_p(
-    logits: torch.Tensor,
-    top_k: Optional[int] = None,
-    top_p: Optional[float] = None,
-) -> torch.Tensor:
-    """Apply top-k and top-p masks to the logits.
+# TODO: Replace this hard-coded map with a generic plugin-registration
+# hook on ``Policy`` (e.g. a ``worker_cls_overrides`` registry populated by
+# ``nemo_rl.modelopt`` on import) so core has no knowledge of ModelOpt-specific
+# worker classes.
+POLICY_WORKER_OVERRIDES = {
+    "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": "nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker.MegatronQuantPolicyWorker",
+    "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker": "nemo_rl.modelopt.models.policy.workers.automodel_quant_policy_worker.AutomodelQuantPolicyWorker",
+}
 
-    Simplified version of VLLM's implementation for scalar parameters.
-
-    Based on VLLM's implementation:
-    https://github.com/vllm-project/vllm/blob/34a20c49b3f81f64133428b3a0d62309db1256f9/vllm/v1/sample/ops/topk_topp_sampler.py
-    SPDX-License-Identifier: Apache-2.0
-    Copyright contributors to the vLLM project
-
-    Args:
-        logits: Input logits tensor of shape [batch_size, seq_len, vocab_size]
-        top_k: Top-k sampling parameter. Set to -1 to consider all tokens.
-        top_p: Top-p (nucleus) sampling parameter. Must be in (0, 1]. Set to 1 to consider all tokens.
-
-    Returns:
-        Filtered logits with sampling parameters applied
-    """
-    if top_p is None or top_p == 1.0:
-        if top_k is None or top_k == -1:
-            return logits
-        # Avoid sorting vocab for top-k only case
-        return apply_top_k_only(logits, top_k)
-
-    # Apply top-p (requires sorting)
-    logits_sort, logits_idx = logits.sort(dim=-1, descending=False)
-
-    if top_k is not None and top_k != -1:
-        # Apply top-k first
-        top_k_index = logits_sort.size(-1) - top_k
-        # Get all the top_k values - need to broadcast the index across all dimensions
-        index_tensor = torch.full(
-            logits_sort.shape[:-1],
-            top_k_index,
-            device=logits_sort.device,
-            dtype=torch.long,
-        )
-        top_k_threshold = logits_sort.gather(-1, index_tensor.unsqueeze(-1))
-        top_k_mask = logits_sort < top_k_threshold
-        logits_sort.masked_fill_(top_k_mask, -float("inf"))
-
-    # Apply top-p
-    probs_sort = logits_sort.softmax(dim=-1)
-    probs_sum = torch.cumsum(probs_sort, dim=-1)
-    top_p_mask = probs_sum <= 1 - top_p
-    # at least one
-    top_p_mask[..., -1] = False
-    logits_sort.masked_fill_(top_p_mask, -float("inf"))
-
-    # Re-sort the probabilities
-    logits = logits_sort.scatter(dim=-1, index=logits_idx, src=logits_sort)
-    return logits
+LoraRefitMode = Literal["native", "merged"]
 
 
-def apply_top_k_only(
-    logits: torch.Tensor,
-    top_k: int,
-) -> torch.Tensor:
-    """Apply top-k mask to the logits.
-
-    Simplified version of VLLM's implementation for scalar parameters.
-    This implementation doesn't involve sorting the entire vocab.
-
-    Based on VLLM's implementation:
-    https://github.com/vllm-project/vllm/blob/34a20c49b3f81f64133428b3a0d62309db1256f9/vllm/v1/sample/ops/topk_topp_sampler.py
-    SPDX-License-Identifier: Apache-2.0
-    Copyright contributors to the vLLM project
-
-    Args:
-        logits: Input logits tensor of shape [batch_size, seq_len, vocab_size]
-        top_k: Top-k sampling parameter.
-
-    Returns:
-        Filtered logits with top-k applied
-    """
-    if top_k >= logits.shape[-1] or top_k == -1:
-        return logits
-
-    # Get top-k values and create mask
-    top_k_values, _ = torch.topk(logits, top_k, dim=-1)
-    threshold = top_k_values[..., -1:].expand_as(logits)
-    mask = logits >= threshold
-
-    # Apply mask: keep top-k values, set others to -inf
-    logits = torch.where(
-        mask,
-        logits,
-        torch.tensor(-float("inf"), device=logits.device, dtype=logits.dtype),
+def is_lora_enabled(policy_config: "PolicyConfig") -> bool:
+    """Return whether either supported training backend has LoRA enabled."""
+    automodel_config = policy_config.get("automodel_cfg") or {}
+    automodel_lora = automodel_config.get("lora_cfg") or {}
+    megatron_config = policy_config.get("megatron_cfg") or {}
+    megatron_lora = megatron_config.get("peft") or {}
+    return bool(
+        (automodel_config.get("enabled") and automodel_lora.get("enabled"))
+        or (megatron_config.get("enabled") and megatron_lora.get("enabled"))
     )
-    return logits
 
 
-def resolve_model_class(model_name: str) -> Any:
-    """Resolve the appropriate model class for a given model name."""
-    if NEMO_AUTOMODEL_AVAILABLE:
-        return AUTOMODEL_FACTORY.get(model_name.lower(), NeMoAutoModelForCausalLM)
-    return AUTOMODEL_FACTORY.get(model_name.lower(), AutoModelForCausalLM)
+def validate_lora_refit_policy_config(
+    policy_config: "PolicyConfig",
+) -> LoraRefitMode | None:
+    """Validate backend-independent policy requirements for LoRA refit."""
+    if not is_lora_enabled(policy_config):
+        return None
+
+    raw_generation_config = policy_config.get("generation")
+    if raw_generation_config is None:
+        return None
+    generation_config = cast(dict[str, Any], raw_generation_config)
+
+    if "lora_refit_mode" not in generation_config:
+        raise KeyError(
+            "LoRA training with rollout requires policy.generation.lora_refit_mode."
+        )
+    mode = generation_config["lora_refit_mode"]
+    if mode not in ("native", "merged"):
+        raise ValueError(
+            "policy.generation.lora_refit_mode must be 'native' or 'merged'."
+        )
+    if mode == "merged":
+        return cast(LoraRefitMode, mode)
+
+    if generation_config["backend"] != "vllm":
+        raise ValueError(
+            "Native LoRA refit requires policy.generation.backend=vllm. "
+            "Use lora_refit_mode=merged with other rollout backends."
+        )
+
+    automodel_config = policy_config.get("automodel_cfg") or {}
+    automodel_lora = automodel_config.get("lora_cfg") or {}
+    if not automodel_lora.get("enabled"):
+        raise ValueError(
+            "Native LoRA refit currently requires the Automodel LoRA policy. "
+            "Set policy.generation.lora_refit_mode=merged for Megatron LoRA."
+        )
+    if automodel_lora.get("use_dora"):
+        raise ValueError(
+            "Native LoRA refit does not support use_dora=true because vLLM "
+            "cannot apply the additional trainable magnitude vector."
+        )
+    if automodel_lora.get("moe_rank_scaling"):
+        raise ValueError(
+            "Native LoRA refit does not support moe_rank_scaling=true because "
+            "vLLM currently accepts one adapter rank and scaling factor."
+        )
+    if policy_config["precision"] not in (
+        "bfloat16",
+        "bf16",
+        "float16",
+        "fp16",
+    ):
+        raise ValueError(
+            "Native LoRA refit currently supports bfloat16 or float16 policy "
+            f"precision, got {policy_config['precision']!r}."
+        )
+    return cast(LoraRefitMode, mode)
+
+
+def configure_lora_refit(policy_config: "PolicyConfig") -> None:
+    """Validate LoRA refit for every backend and configure native vLLM."""
+    mode = validate_lora_refit_policy_config(policy_config)
+    if mode != "native":
+        return
+
+    from nemo_rl.models.generation.vllm.lora_utils import (
+        configure_vllm_lora_refit,
+        validate_vllm_lora_refit,
+    )
+
+    validate_vllm_lora_refit(policy_config)
+    configure_vllm_lora_refit(policy_config)
+
+
+def resolve_policy_worker_cls(default_cls: str, config: dict) -> str:
+    """Return the quantized policy worker FQN if ``quant_cfg`` is set, else ``default_cls``.
+
+    Safe to call even when ModelOpt is not installed — returns ``default_cls``
+    unchanged whenever ``quant_cfg`` is ``None``, so the core policy path stays
+    import-free of ModelOpt.
+    """
+    if config.get("quant_cfg") is None:
+        return default_cls
+    return POLICY_WORKER_OVERRIDES.get(default_cls, default_cls)
+
+
+def validate_fp32_lm_head_config(
+    config: "PolicyConfig",
+    *,
+    megatron_enabled: bool,
+    automodel_enabled: bool,
+) -> None:
+    """Reject fp32 LM-head settings that the selected backends cannot match."""
+    megatron_cfg = config.get("megatron_cfg")
+    megatron_fp32_value = (
+        megatron_cfg.get("fp32_lm_head")
+        if megatron_enabled and megatron_cfg is not None
+        else None
+    )
+    if megatron_fp32_value not in (None, True, False):
+        raise ValueError("policy.megatron_cfg.fp32_lm_head must be true or false.")
+    megatron_fp32 = bool(megatron_fp32_value)
+
+    if (
+        megatron_fp32
+        and megatron_cfg is not None
+        and megatron_cfg.get("use_fused_linear_logprobs")
+    ):
+        raise ValueError(
+            "policy.megatron_cfg.fp32_lm_head has no effect with "
+            "use_fused_linear_logprobs=true (the fused linear+CE kernel bypasses "
+            "output_layer). Disable one of them."
+        )
+
+    generation_config = config.get("generation")
+    if generation_config is None:
+        return
+
+    generation_backend = generation_config["backend"]
+    if generation_backend != "vllm":
+        return
+
+    vllm_cfg = generation_config.get("vllm_cfg")
+    if vllm_cfg is None:
+        return
+    vllm_cfg = cast(VllmSpecificArgs | dict[str, Any], vllm_cfg)
+
+    env_vars = vllm_cfg.get("env_vars") or {}
+    if LEGACY_VLLM_FP32_LM_HEAD_ENV_VAR in env_vars:
+        raise ValueError(
+            f"{LEGACY_VLLM_FP32_LM_HEAD_ENV_VAR} is no longer read; configure "
+            "the fp32 LM head with policy.generation.vllm_cfg.fp32_lm_head "
+            "instead."
+        )
+    # vLLM's head_dtype is set only through vllm_cfg.fp32_lm_head, so the
+    # trainer-match check below covers it.
+    for name, overrides in (
+        ("policy.hf_config_overrides", config.get("hf_config_overrides")),
+        (
+            "policy.generation.vllm_kwargs.hf_overrides",
+            (generation_config.get("vllm_kwargs") or {}).get("hf_overrides"),
+        ),
+    ):
+        if isinstance(overrides, dict) and "head_dtype" in overrides:
+            raise ValueError(
+                f"{name}.head_dtype is not supported; set "
+                "policy.generation.vllm_cfg.fp32_lm_head instead."
+            )
+
+    vllm_fp32 = vllm_fp32_lm_head_enabled(vllm_cfg)
+    if automodel_enabled and vllm_fp32:
+        raise ValueError(
+            "policy.generation.vllm_cfg.fp32_lm_head=true is only supported "
+            "with the Megatron trainer because Automodel has no matching "
+            "policy.automodel_cfg fp32 LM-head implementation."
+        )
+    if megatron_enabled and megatron_fp32 != vllm_fp32:
+        raise ValueError(
+            "fp32 LM head must be enabled on both Megatron training and vLLM "
+            "generation or neither: "
+            f"policy.megatron_cfg.fp32_lm_head={megatron_fp32_value!r} but "
+            f"policy.generation.vllm_cfg.fp32_lm_head="
+            f"{vllm_cfg.get('fp32_lm_head')!r}. "
+            "A one-sided fp32 head increases the generation/training logprob "
+            "mismatch instead of reducing it."
+        )
 
 
 def is_vllm_v1_engine_enabled() -> bool:
@@ -270,6 +341,41 @@ def configure_dynamo_cache() -> None:
     torch._inductor.config.autotune_local_cache = False
 
 
+def make_empty_cache_best_effort_under_expandable_segments() -> None:
+    """Skip torch.cuda.empty_cache() when expandable segments are on.
+
+    With ``PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True``,
+    ``torch._C._cuda_emptyCache()`` can raise ``RuntimeError: std::get: wrong
+    index for variant`` and leave the caching allocator corrupted (the process
+    later dies of cudaErrorIllegalAddress), so catching the exception is not
+    enough. empty_cache is memory hygiene, not a correctness requirement, and
+    expandable segments already return freed blocks to the segment pool.
+
+    Opt-in via ``NRL_BEST_EFFORT_EMPTY_CACHE=1``: patching a global torch API
+    is intrusive. Without the flag this is a no-op.
+    """
+    if os.environ.get("NRL_BEST_EFFORT_EMPTY_CACHE", "0") != "1":
+        return
+    alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    if "expandable_segments:True" not in alloc_conf:
+        return
+    original_empty_cache = torch.cuda.empty_cache
+    if getattr(original_empty_cache, "_nrl_best_effort", False):
+        return
+
+    def _best_effort_empty_cache() -> None:
+        # Never call through: the failing flush corrupts the allocator even
+        # when its exception is caught (see the docstring above).
+        warnings.warn(
+            "torch.cuda.empty_cache() skipped under expandable_segments "
+            "(allocator-corrupting torch bug; see NRL empty_cache guard)",
+            stacklevel=2,
+        )
+
+    _best_effort_empty_cache._nrl_best_effort = True  # type: ignore[attr-defined]
+    torch.cuda.empty_cache = _best_effort_empty_cache
+
+
 def get_runtime_env_for_policy_worker(policy_worker_name: str) -> dict[str, Any]:
     """Get runtime environment configuration for policy workers.
 
@@ -317,6 +423,84 @@ def get_handle_from_tensor(tensor: torch.Tensor) -> tuple[Any]:
     return reduce_tensor(tensor.detach())[1:]
 
 
+def ensure_teacher_ipc_buffer(
+    storage: Optional[torch.Tensor],
+    handle: Optional[tuple[Any, ...]],
+    num_microbatches: int,
+    batch_size: int,
+    seq_len: int,
+    vocab_size: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[torch.Tensor, tuple[Any, ...]]:
+    """Lazy-alloc / grow ``[N_mb, B, T, V]`` teacher-logits IPC storage.
+
+    Returns the (possibly reallocated) ``(storage, handle)``. Reallocates and
+    re-exports the IPC handle whenever any dim of the requested shape exceeds
+    the current storage, or dtype/device changed; otherwise the existing
+    storage and cached handle are returned unchanged.
+    """
+    needs_realloc = (
+        storage is None
+        or storage.shape[0] < num_microbatches
+        or storage.shape[1] < batch_size
+        or storage.shape[2] < seq_len
+        or storage.shape[3] < vocab_size
+        or storage.dtype != dtype
+        or storage.device != device
+    )
+    if needs_realloc:
+        storage = torch.empty(
+            (num_microbatches, batch_size, seq_len, vocab_size),
+            dtype=dtype,
+            device=device,
+        )
+        handle = get_handle_from_tensor(storage)
+    assert storage is not None and handle is not None
+    return storage, handle
+
+
+def aggregate_per_sample_handles(
+    worker_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Flatten teacher per-sample IPC handles into a global-batch-ordered list.
+
+    Each worker returns ``{"dp_rank": int, "per_sample_handles": list}`` where
+    the handle list is in local sample order; the several workers sharing a
+    ``dp_rank`` are TP/CP replicas that each contribute one shard per sample.
+    Concatenating samples in ``sorted(dp_rank)`` order reproduces the original
+    global sample order (rank 0 holds the first ``gbs/dp`` samples, rank 1 the
+    next, ...), so the result is a length-``gbs`` list independent of the
+    teacher's DP degree. Element ``i`` is ``{"teacher_shards": [shard, ...]}``
+    holding all TP×CP shards of global sample ``i``.
+    """
+    handles_by_dp_rank: dict[int, list[list[dict[str, Any]]]] = {}
+    for worker_result in worker_results:
+        dp_rank = worker_result["dp_rank"]
+        handles_by_dp_rank.setdefault(dp_rank, []).append(
+            worker_result["per_sample_handles"]
+        )
+    aggregated: list[dict[str, Any]] = []
+    for dp_rank in sorted(handles_by_dp_rank.keys()):
+        worker_handles_in_dp = handles_by_dp_rank[dp_rank]
+        num_samples = len(worker_handles_in_dp[0])
+        for worker_handles in worker_handles_in_dp:
+            assert len(worker_handles) == num_samples, (
+                f"dp={dp_rank}: per_sample_handles length mismatch "
+                f"{[len(h) for h in worker_handles_in_dp]}"
+            )
+        for sample_idx in range(num_samples):
+            aggregated.append(
+                {
+                    "teacher_shards": [
+                        worker_handles[sample_idx]
+                        for worker_handles in worker_handles_in_dp
+                    ]
+                }
+            )
+    return aggregated
+
+
 def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
     """Calculate aligned size for memory alignment.
 
@@ -331,7 +515,11 @@ def calculate_aligned_size(size_bytes: int, alignment: int = 512) -> int:
 
 
 def stream_weights_via_ipc_zmq_impl(
-    params_generator, buffer_size_bytes: int, zmq_socket, rank: int, worker_name: str
+    params_generator,
+    buffer_size_bytes: int,
+    zmq_socket,
+    rank: int,
+    worker_name: str,
 ) -> None:
     """Shared implementation for streaming weights via IPC ZMQ with improved memory management.
 
@@ -375,8 +563,10 @@ def stream_weights_via_ipc_zmq_impl(
     def pack_tensor(buffer, tensor, used_bytes) -> int:
         """Pack tensor into buffer and return new used_bytes."""
         tensor_bytes = tensor.nbytes
+        # reshape(-1) (not view(-1)): the params iterator may yield
+        # non-contiguous tensors and view would raise on incompatible stride.
         buffer[used_bytes : used_bytes + tensor_bytes].data.copy_(
-            tensor.data.view(-1).view(dtype=torch.uint8), non_blocking=True
+            tensor.data.reshape(-1).view(dtype=torch.uint8), non_blocking=True
         )
         return used_bytes + calculate_aligned_size(tensor_bytes)
 
@@ -385,6 +575,18 @@ def stream_weights_via_ipc_zmq_impl(
     buffer_b: torch.Tensor | None = None
     current_buffer: torch.Tensor | None = None
 
+    def release_staging_buffers() -> None:
+        """Release acyclic IPC buffers without scanning the worker object graph."""
+        nonlocal buffer_a, buffer_b, current_buffer
+
+        had_buffers = buffer_a is not None or buffer_b is not None
+        current_buffer = None
+        buffer_a = None
+        buffer_b = None
+        if had_buffers:
+            torch.cuda.ipc_collect()
+            torch.cuda.empty_cache()
+
     used_bytes = 0
     param_names = []
     await_recv = False
@@ -392,16 +594,90 @@ def stream_weights_via_ipc_zmq_impl(
 
     try:
         for name, tensor in params_generator:
-            # Initialize device and buffers on first tensor
-            if buffer_a is None:
-                buffer_a = allocate_buffer(tensor.device)
-                buffer_b = allocate_buffer(tensor.device)
-                current_buffer = buffer_a
-
             aligned_size = calculate_aligned_size(tensor.nbytes)
-            assert aligned_size <= buffer_size_bytes, (
-                f"Parameter {name} too large for buffer: {aligned_size} > {buffer_size_bytes}"
+            # Resolve the transfer device without allocating staging storage.
+            # CPU exports still need CUDA storage for the IPC reducer.
+            buffer_device = (
+                current_buffer.device if current_buffer is not None else tensor.device
             )
+            if buffer_device.type == "cpu" and torch.cuda.is_available():
+                buffer_device = torch.device("cuda", torch.cuda.current_device())
+
+            # A parameter larger than a single staging buffer cannot be packed
+            # with ordinary parameters. Ship it on its own rather than failing
+            # the refit. The staging buffers are sized from *free
+            # memory* (NRL_REFIT_BUFFER_MEMORY_RATIO, default 0.3, halved again
+            # for ping-pong) with no floor at the largest parameter, so a big
+            # embedding can exceed one: DeepSeek-V3's model.embed_tokens.weight
+            # is 1.73 GiB against a 1.65 GiB buffer.
+            if aligned_size > buffer_size_bytes:
+                if param_names:
+                    await_recv = send_buffer_group_overlap(
+                        current_buffer, param_names, used_bytes, await_recv
+                    )
+                    count_of_groups += 1
+                    used_bytes, param_names = 0, []
+
+                # The regular staging pair is no longer needed for this
+                # transfer. Wait for its last consumer before releasing it;
+                # keeping both buffers alive can consume the only headroom
+                # available for a multi-GiB expert parameter.
+                if await_recv:
+                    zmq_socket.recv()
+                    await_recv = False
+                release_staging_buffers()
+
+                # The policy generators already yield contiguous tensors. A
+                # uint8 view can therefore be exported through CUDA IPC
+                # directly, avoiding a second allocation as large as the
+                # parameter. Retain the copy fallback for other callers that
+                # may yield a non-contiguous oversized tensor.
+                direct_ipc_buffer = None
+                oversized_buffer = None
+                transfer_buffer = None
+                try:
+                    # Only CUDA storage has a CUDA IPC reducer. A contiguous
+                    # CPU tensor (notably grouped-expert fallback output) must
+                    # still be copied to CUDA, but do so only after releasing
+                    # the regular ping-pong pair to recover enough headroom.
+                    if tensor.is_cuda and tensor.is_contiguous():
+                        direct_ipc_buffer = tensor.reshape(-1).view(torch.uint8)
+                        transfer_buffer = direct_ipc_buffer
+                    else:
+                        oversized_buffer = torch.empty(
+                            aligned_size,
+                            device=buffer_device,
+                            dtype=torch.uint8,
+                            requires_grad=False,
+                        )
+                        pack_tensor(oversized_buffer, tensor, 0)
+                        transfer_buffer = oversized_buffer
+
+                    await_recv = send_buffer_group_overlap(
+                        transfer_buffer, [name], aligned_size, await_recv=False
+                    )
+                    count_of_groups += 1
+                    # The exported tensor or fallback buffer is not kept alive
+                    # across the next send, so consume its ACK before releasing
+                    # the last reference to its CUDA storage.
+                    zmq_socket.recv()
+                    await_recv = False
+                finally:
+                    del transfer_buffer, direct_ipc_buffer, oversized_buffer
+                    torch.cuda.ipc_collect()
+                    torch.cuda.empty_cache()
+                # Drop the caller-side reference before requesting the next
+                # generator item; otherwise the next bridge conversion can
+                # overlap with this multi-GiB tensor after its consumer ACKed.
+                del tensor
+                continue
+
+            # Oversized exports never use the regular pair. Allocate it only
+            # when an ordinary parameter arrives, including after oversized ones.
+            if buffer_a is None:
+                buffer_a = allocate_buffer(buffer_device)
+                buffer_b = allocate_buffer(buffer_device)
+                current_buffer = buffer_a
 
             # Check if we need to send current buffer and switch to the other one
             if used_bytes + aligned_size > buffer_size_bytes:
@@ -429,8 +705,13 @@ def stream_weights_via_ipc_zmq_impl(
         if await_recv:
             zmq_socket.recv()
 
-        # Final synchronization and completion signal
+        # The receiver synchronizes and drops every IPC view before ACKing a
+        # group, so the final data ACK is the staging buffers' safe lifetime
+        # boundary. Reclaim them before asking the receiver to run its final
+        # post-load conversion, which can otherwise retain both large buffers
+        # for the whole conversion and amplify a single-rank tail.
         torch.cuda.current_stream().synchronize()
+        release_staging_buffers()
         zmq_socket.send_pyobj(IPCProtocol.COMPLETE)
         zmq_socket.recv()
 
@@ -455,15 +736,16 @@ def stream_weights_via_ipc_zmq_impl(
         ) from e
 
     finally:
-        # Clean up buffers in finally block to ensure cleanup even on exceptions
-        if buffer_a is not None:
-            del buffer_a
-        if buffer_b is not None:
-            del buffer_b
+        # Tensor references are acyclic and deterministic; a full gc.collect()
+        # scans the entire model object graph and can become a multi-second
+        # rank straggler without releasing anything that refcounting cannot.
+        release_staging_buffers()
 
-        # Force garbage collection and clear CUDA cache
-        gc.collect()
-        torch.cuda.empty_cache()
+
+# Positions in ``torch.multiprocessing.reductions.rebuild_cuda_tensor``'s
+# argument tuple (unchanged since torch 1.x; see its signature).
+_REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX = 6
+_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX = 7
 
 
 def rebuild_cuda_tensor_from_ipc(
@@ -472,263 +754,556 @@ def rebuild_cuda_tensor_from_ipc(
     """Rebuild a CUDA tensor from an IPC handle."""
     func = rebuild_cuda_tensor
     args = cuda_ipc_handle[0]
-    list_args = list(args)
-    list_args[6] = device_id
+    list_args: list[Any] = list(args)
+    list_args[_REBUILD_CUDA_TENSOR_ARG_DEVICE_INDEX] = device_id
+    # The producer (training venv) may run a newer torch than this consumer;
+    # see nemo_rl.utils.cuda_ipc for the version-byte compatibility rewrite.
+    list_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX] = (
+        normalize_cuda_ipc_handle(
+            list_args[_REBUILD_CUDA_TENSOR_ARG_STORAGE_HANDLE_INDEX]
+        )
+    )
     return func(*list_args)
 
 
-def stream_weights_via_http_impl(
-    params_generator,
-    sglang_url_to_gpu_uuids: dict[str, list[str]],
-    rank: int,
-    worker_name: str,
-    current_device_uuid: str,
+# ---------------------------------------------------------------------------
+# SGLang weight-update plumbing (colocate IPC gather + disaggregate broadcast)
+# ---------------------------------------------------------------------------
+def _derive_engine_gpu_offsets(engine_gpu_counts: list[int]) -> list[int]:
+    """Cumulative-sum offsets for a dense engine layout."""
+    offsets: list[int] = []
+    cursor = 0
+    for c in engine_gpu_counts:
+        offsets.append(cursor)
+        cursor += c
+    return offsets
+
+
+def connect_colocate_topology(
+    *,
+    engine_gpu_counts: list[int],
+    engine_gpu_offsets: Optional[list[int]] = None,
+    worker_state: dict,
 ) -> None:
-    """Stream weights to SGLang servers via HTTP API (update_weights_from_tensor).
+    """Generalized colocate rollout-engine connect for Automodel and Megatron.
 
-    Flow: Each rank creates IPC handler → gather handlers in rank order → send list → SGLang matches by tp_rank index
+    Builds a Gloo gather subgroup for each engine's GPU rank range and stashes
+    rank-only routing state into ``worker_state``:
 
-    Key points:
-    - Each rank creates handler on its own GPU
-    - Handlers are gathered in rank order: [rank0_handler, rank1_handler, ...]
-    - List index = rank = GPU ID
-    - SGLang automatically matches: handler = serialized_handlers[tp_rank]
+    - ``worker_state["_ipc_gather_group"]``: ``ProcessGroup`` covering this
+      trainer rank's engine, or ``None`` if the rank is a placeholder /
+      not covered by any engine.
+    - ``worker_state["_ipc_gather_groups"]``: all subgroup handles created for
+      this layout, retained so a rebuild can destroy every live group.
+    - ``worker_state["_ipc_gather_src"]``: the source rank inside the gather
+      group (the first GPU index of the covering engine), or ``None``.
+    - ``worker_state["_ipc_engine_index"]``: index into the caller's engine
+      list, or ``None``. The caller is responsible for resolving the actor
+      handle / URL at call time so post-recover actor swaps are picked up.
+    - ``worker_state["_ipc_layout_key"]``: cached topology signature so
+      subsequent connects with the same layout are no-ops.
 
-    Args:
-        params_generator: Generator yielding (name, tensor) pairs
-        sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
-        rank: Worker rank for logging
-        worker_name: Name of the worker for logging
-        current_device_uuid: UUID of the current training worker's GPU
+    All trainer ranks must enter this function collectively (each call to
+    ``dist.new_group`` is collective). When the layout changes (e.g. a
+    recovered engine resizes the topology) the cached subgroup is destroyed
+    and rebuilt for the new layout.
     """
-    from nemo_rl.models.generation.sglang.sglang_copied_utils import (
+    if not engine_gpu_counts:
+        raise ValueError("engine_gpu_counts must be non-empty")
+    if engine_gpu_offsets is None:
+        engine_gpu_offsets = _derive_engine_gpu_offsets(engine_gpu_counts)
+    elif len(engine_gpu_offsets) != len(engine_gpu_counts):
+        raise ValueError(
+            "engine_gpu_offsets and engine_gpu_counts must have the same length, "
+            f"got {len(engine_gpu_offsets)} vs {len(engine_gpu_counts)}"
+        )
+
+    layout_key = (tuple(engine_gpu_counts), tuple(engine_gpu_offsets))
+    if worker_state.get("_ipc_layout_key") == layout_key:
+        return
+
+    old_groups = worker_state.get("_ipc_gather_groups")
+    if old_groups is None:
+        old_group = worker_state.get("_ipc_gather_group")
+        old_groups = [old_group] if old_group is not None else []
+    for old_group in old_groups:
+        if not isinstance(old_group, dist.ProcessGroup):
+            continue
+        try:
+            dist.destroy_process_group(old_group)
+        except Exception:
+            # Some torch builds raise when the group has no peers; safe to
+            # ignore — the new group below replaces it.
+            pass
+
+    my_rank = dist.get_rank()
+    new_group = None
+    new_groups = []
+    new_src: Optional[int] = None
+    new_engine_idx: Optional[int] = None
+    for i, (offset, count) in enumerate(
+        zip(engine_gpu_offsets, engine_gpu_counts, strict=True)
+    ):
+        group_ranks = list(range(offset, offset + count))
+        grp = dist.new_group(ranks=group_ranks, backend="gloo")
+        new_groups.append(grp)
+        if my_rank in group_ranks:
+            new_group = grp
+            new_src = offset
+            new_engine_idx = i
+
+    worker_state["_ipc_gather_group"] = new_group
+    worker_state["_ipc_gather_groups"] = new_groups
+    worker_state["_ipc_gather_src"] = new_src
+    worker_state["_ipc_engine_index"] = new_engine_idx
+    worker_state["_ipc_layout_key"] = layout_key
+    worker_state.setdefault("weight_version", 0)
+
+
+def _check_weight_sync_results(results: list) -> None:
+    from collections.abc import Mapping
+
+    for result in results:
+        if isinstance(result, Mapping):
+            success = result.get("success")
+            error_msg = (
+                result.get("error_message")
+                or result.get("error")
+                or result.get("message")
+                or "unknown error"
+            )
+        elif hasattr(result, "success"):
+            success = result.success
+            error_msg = getattr(result, "error_message", "unknown error")
+        else:
+            continue
+
+        if success is False:
+            raise RuntimeError(
+                f"SGLang weight sync failed on rollout engine: {error_msg}. "
+                "Check SGLang version compatibility."
+            )
+
+
+def iter_named_tensor_buckets(
+    params_generator: Iterable[tuple[str, torch.Tensor]],
+    buffer_size_bytes: int,
+) -> "Iterable[list[tuple[str, torch.Tensor]]]":
+    """Group ``(name, tensor)`` pairs into buckets of at most ``buffer_size_bytes``.
+
+    Waits on async DTensor redistributes (``.wait()``) before sizing, so the
+    yielded tensors are always materialized and safe to serialize.
+    """
+    if buffer_size_bytes <= 0:
+        raise ValueError(f"buffer_size_bytes must be positive, got {buffer_size_bytes}")
+
+    bucket: list[tuple[str, torch.Tensor]] = []
+    bucket_size = 0
+    for name, tensor in params_generator:
+        if hasattr(tensor, "wait"):
+            tensor = tensor.wait()
+        tensor_size = tensor.numel() * tensor.element_size()
+        if bucket and bucket_size + tensor_size > buffer_size_bytes:
+            yield bucket
+            bucket = []
+            bucket_size = 0
+        bucket.append((name, tensor))
+        bucket_size += tensor_size
+
+    if bucket:
+        yield bucket
+
+
+def send_hf_buckets_via_ipc_actor_impl(
+    *,
+    bucket_iterator: Iterable[list[tuple[str, torch.Tensor]]],
+    rollout_engines: list,
+    worker_state: dict,
+    weight_version: Optional[int] = None,
+) -> None:
+    """Send finalized HF tensor buckets to colocated SGLang engines via Ray IPC.
+
+    Per bucket: group by dtype, serialize a ``FlattenedTensorBucket`` per
+    dtype, ``dist.gather_object`` to the gather source rank, then on the
+    source rank call ``ipc_engine.update_weights_from_tensor.remote(...)``
+    once per dtype, **block on ``ray.get(refs)`` per chunk**, validate
+    engine return values, synchronize all trainer ranks, then drop the
+    trainer-side ``flattened_tensor`` references before moving on.
+
+    The trainer-side topology (``_ipc_gather_group`` / ``_ipc_gather_src`` /
+    ``_ipc_engine_index``) must already have been set up by
+    :func:`connect_colocate_topology`. Placeholder ranks (no covering engine)
+    return immediately — they must not call ``gather_object``. Non-source
+    trainer ranks participate in the gather and completion broadcast; they
+    don't issue Ray RPCs and don't ``ray.get``.
+
+    Returns ``None``. Raises ``RuntimeError`` if any chunk fails on the
+    engine side.
+    """
+    import ray
+
+    from nemo_rl.models.generation.sglang.utils.train_utils import (
+        FlattenedTensorBucket,
         MultiprocessingSerializer,
     )
 
-    print("[sglang refit details] entering stream_weights_via_http_impl")
+    gather_group = worker_state.get("_ipc_gather_group")
+    gather_src = worker_state.get("_ipc_gather_src")
+    engine_idx = worker_state.get("_ipc_engine_index")
 
-    target_urls = [
-        url
-        for url, uuids in sglang_url_to_gpu_uuids.items()
-        if current_device_uuid in uuids
-    ]
+    if gather_group is None or gather_src is None or engine_idx is None:
+        # Placeholder rank: skips the gather, but must still drain the iterator.
+        # It lazily drives export_hf_weights, whose PP broadcast and TP gather
+        # are collective over the whole trainer world.
+        for _bucket in bucket_iterator:
+            del _bucket
+        return None
 
-    if not target_urls:
-        raise RuntimeError(
-            f"{worker_name} (rank {rank}): No matching SGLang server found for GPU UUID {current_device_uuid}. "
-            f"Available servers: {list(sglang_url_to_gpu_uuids.keys())}"
-        )
+    if weight_version is None:
+        worker_state["weight_version"] = worker_state.get("weight_version", 0) + 1
+        weight_version = worker_state["weight_version"]
 
-    if len(target_urls) > 1:
-        print(
-            f"[WARNING] {worker_name} (rank {rank}): GPU UUID {current_device_uuid} matches multiple SGLang servers: {target_urls}. "
-            f"Using the first one: {target_urls[0]}"
-        )
-        target_urls = [target_urls[0]]
-
-    base_url = target_urls[0]
-    url = f"{base_url}/update_weights_from_tensor"
-    sglang_gpu_uuids = sglang_url_to_gpu_uuids[base_url]
-
-    ipc_gather_group, ipc_gather_src, matching_ranks = _setup_ipc_gather_group(
-        rank, current_device_uuid, sglang_gpu_uuids, sglang_url_to_gpu_uuids
-    )
-    print(
-        f"[sglang refit] {worker_name} (rank {rank}): ipc_gather_group={ipc_gather_group}, ipc_gather_src={ipc_gather_src}, matching_ranks={matching_ranks}"
-    )
-    tensor_count = 0
+    ipc_engine = rollout_engines[engine_idx]
+    my_rank = dist.get_rank()
 
     try:
-        tensor_list = list(params_generator)
-        total_tensors = len(tensor_list)
+        for bucket in bucket_iterator:
+            if not bucket:
+                continue
 
-        if rank == ipc_gather_src:
-            print(
-                f"[sglang refit details] {worker_name}: Starting weight update - "
-                f"Total parameters to update: {total_tensors}",
-                flush=True,
-            )
+            # No async-collective ``.wait()`` here — Megatron's AutoBridge
+            # yields plain ``torch.Tensor``, no DTensor wrapping.
 
-        for idx, (name, tensor) in enumerate(tensor_list):
-            torch.cuda.current_stream().synchronize()
-            tensor = tensor.contiguous().cuda()
+            if getattr(FlattenedTensorBucket, "supports_multi_dtypes", False):
+                by_dtype: dict = {"dtype": list(bucket)}
+            else:
+                by_dtype = {}
+                for name, tensor in bucket:
+                    by_dtype.setdefault(tensor.dtype, []).append((name, tensor))
 
-            named_tensors = [(name, tensor)]
-            serialized_handler = MultiprocessingSerializer.serialize(
-                named_tensors, output_str=True
-            )
-            # output_str=True ensures the return type is str
-            serialized_handler_str = cast(str, serialized_handler)
-
-            gathered_handlers = _gather_ipc_handlers(
-                serialized_handler_str,
-                ipc_gather_group,
-                ipc_gather_src,
-                rank,
-                matching_ranks,
-            )
-
-            if rank == ipc_gather_src and gathered_handlers is not None:
-                _send_tensor_to_sglang(
-                    url,
-                    name,
-                    gathered_handlers,
-                    tensor.shape,
-                    str(tensor.dtype),
-                    flush_cache=False,
+            serialized: list[str] = []
+            long_lived_tensors: list[dict] = []
+            for _dtype, named_tensors in by_dtype.items():
+                bkt = FlattenedTensorBucket(named_tensors=named_tensors)
+                payload = {
+                    "flattened_tensor": bkt.get_flattened_tensor(),
+                    "metadata": bkt.get_metadata(),
+                }
+                long_lived_tensors.append(payload)
+                serialized_payload = MultiprocessingSerializer.serialize(
+                    payload, output_str=True
                 )
-                tensor_count += 1
+                if not isinstance(serialized_payload, str):
+                    raise TypeError("SGLang IPC serialization did not return text")
+                serialized.append(serialized_payload)
 
-            del tensor, serialized_handler
-            if rank == ipc_gather_src:
-                del gathered_handlers
-            torch.cuda.empty_cache()
-
-        if rank == ipc_gather_src:
-            print(
-                f"[sglang refit details] {worker_name}: Weight update completed - "
-                f"Successfully updated {tensor_count}/{total_tensors} parameters to SGLang server: {base_url}",
-                flush=True,
+            group_world = dist.get_world_size(gather_group)
+            gathered = cast(
+                Optional[list[Optional[list[str]]]],
+                [None] * group_world if my_rank == gather_src else None,
             )
-            if tensor_count != total_tensors:
-                print(
-                    f"[sglang refit details] {worker_name}: WARNING - Expected {total_tensors} tensors, "
-                    f"but only sent {tensor_count}",
-                    flush=True,
+            dist.gather_object(
+                serialized,
+                object_gather_list=gathered,
+                dst=gather_src,
+                group=gather_group,
+            )
+
+            refs: list = []
+            if my_rank == gather_src:
+                if gathered is None or any(payload is None for payload in gathered):
+                    raise RuntimeError("SGLang IPC gather returned incomplete payloads")
+                gathered_payloads = cast(list[list[str]], gathered)
+                num_dtypes = len(gathered_payloads[0])
+                for i in range(num_dtypes):
+                    refs.append(
+                        ipc_engine.update_weights_from_tensor.remote(
+                            serialized_named_tensors=[
+                                payload[i] for payload in gathered_payloads
+                            ],
+                            load_format="flattened_bucket",
+                            weight_version=str(weight_version),
+                        )
+                    )
+
+            # The serialized IPC handles gathered on the source may point at
+            # flattened tensors owned by non-source trainer ranks. Keep every
+            # rank's tensors alive until the source finishes the engine RPCs.
+            sync_error: Optional[str] = None
+            source_exc: Optional[BaseException] = None
+            if my_rank == gather_src:
+                try:
+                    results = ray.get(refs)
+                    _check_weight_sync_results(results)
+                except BaseException as exc:
+                    source_exc = exc
+                    sync_error = repr(exc)
+
+            sync_state = [sync_error]
+            dist.broadcast_object_list(sync_state, src=gather_src, group=gather_group)
+            del long_lived_tensors, refs
+
+            if source_exc is not None:
+                raise source_exc
+            if sync_state[0] is not None:
+                raise RuntimeError(
+                    f"SGLang IPC weight update failed on gather src rank "
+                    f"{gather_src}: {sync_state[0]}"
                 )
-
-    except Exception as e:
-        print(
-            f"{worker_name} (rank {rank}): Error during HTTP weight streaming: {e}.\n"
-            f"{traceback.format_exc()}"
-        )
-        raise
-
     finally:
         gc.collect()
         torch.cuda.empty_cache()
 
+    return None
 
-def _setup_ipc_gather_group(
-    rank: int,
-    current_device_uuid: str,
-    sglang_gpu_uuids: list[str],
-    sglang_url_to_gpu_uuids: dict[str, list[str]],
-) -> tuple[Optional[dist.ProcessGroup], Optional[int], Optional[list[int]]]:
-    """Setup gather configuration for IPC handlers.
 
-    Returns:
-        Tuple of (gather_group, gather_src_rank, matching_ranks)
-        - gather_group: None (use default FSDP group)
-        - gather_src_rank: The rank that will collect and send to SGLang server
-        - matching_ranks: List of ranks that belong to the same SGLang server
+def init_process_group(
+    backend: "str | dist.Backend | None" = None,
+    init_method: Optional[str] = None,
+    timeout: Optional[timedelta] = None,
+    world_size: int = -1,
+    rank: int = -1,
+    store: "Optional[dist.Store]" = None,
+    group_name: Optional[str] = None,
+    pg_options: Any = None,
+) -> "torch.distributed.ProcessGroup":
+    """Create a side-by-side ``ProcessGroup`` without touching the default world.
+
+    ``torch.distributed.init_process_group`` initializes the *default* world
+    process group. Once the Megatron trainer has stood up its own world during
+    Policy construction, calling it again to talk to SGLang either errors with
+    "trying to initialize the default process group twice" or — depending on
+    torch version — silently hangs in rendezvous against a peer that has
+    already finished its own custom-group setup.
+
+    Same approach as SGLang's ``sglang.srt.utils.common.init_custom_process_group``:
+    replay the public API's wiring (rendezvous → ``PrefixStore`` →
+    ``_new_process_group_helper``) but skip the "set as default PG" step, so
+    multiple independent groups can coexist in the same process.
+
+    Only one of ``init_method`` and ``store`` may be set; otherwise the
+    rendezvous source is ambiguous.
     """
-    if not dist.is_initialized():
-        return None, None, None
+    from torch.distributed.distributed_c10d import (
+        Backend,
+        GroupName,
+        PrefixStore,
+        _get_default_group,
+        _new_process_group_helper,
+        _world,
+        default_pg_timeout,
+        rendezvous,
+    )
 
-    world_size = dist.get_world_size()
-    my_rank = dist.get_rank()
+    assert (store is None) or (init_method is None), (
+        "Cannot specify both init_method and store."
+    )
 
-    all_ranks_uuids = [None] * world_size
-    dist.all_gather_object(all_ranks_uuids, current_device_uuid)
+    if store is not None:
+        assert world_size > 0, "world_size must be positive if using store"
+        assert rank >= 0, "rank must be non-negative if using store"
+    elif init_method is None:
+        init_method = "env://"
 
-    matching_ranks = [
-        r for r, uuid in enumerate(all_ranks_uuids) if uuid in sglang_gpu_uuids
-    ]
+    backend = Backend(backend) if backend else Backend("undefined")
+    if timeout is None:
+        timeout = default_pg_timeout
 
-    if len(matching_ranks) == 0:
-        return None, None, None
+    if store is None:
+        assert init_method is not None
+        rendezvous_iterator = rendezvous(init_method, rank, world_size, timeout=timeout)
+        store, rank, world_size = next(rendezvous_iterator)
+        store.set_timeout(timeout)
+        # PrefixStore so multiple co-tenant groups don't trample each other's keys.
+        store = PrefixStore(group_name or "", store)
 
-    matching_ranks = sorted(matching_ranks)
-    gather_src = matching_ranks[0]
+    group_name = GroupName(group_name or "")
 
-    return None, gather_src, matching_ranks
+    # ``pg_options`` was renamed to ``backend_options`` in PyTorch 2.6:
+    #   https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844
+    # Use numeric tuple compare — string compare ``"2.10" >= "2.6"`` returns
+    # False because ``"1"`` sorts before ``"6"`` lexicographically.
+    _torch_mm = tuple(int(x) for x in torch.__version__.split("+")[0].split(".")[:2])
+    pg_options_kw = "backend_options" if _torch_mm >= (2, 6) else "pg_options"
 
-
-def _gather_ipc_handlers(
-    serialized_handler: str,
-    gather_group: Optional[dist.ProcessGroup],
-    gather_src: Optional[int],
-    rank: int,
-    matching_ranks: Optional[list[int]] = None,
-) -> Optional[list[str]]:
-    """Gather IPC handlers from all ranks in the default FSDP group, then filter by server.
-
-    Args:
-        serialized_handler: Serialized IPC handler from this rank
-        gather_group: Process group (None means use default FSDP group)
-        gather_src: Rank that will collect and filter handlers
-        rank: Current rank
-        matching_ranks: List of ranks that belong to the same SGLang server
-
-    Returns:
-        List of serialized handlers in rank order (only on gather_src rank), None otherwise
-        The list contains handlers from matching_ranks only, in rank order
-    """
-    if gather_src is None:
-        return None
-
-    if not dist.is_initialized():
-        return None
-
-    world_size = dist.get_world_size()
-
-    all_handlers: list[Optional[str]] = [None for _ in range(world_size)]
-    dist.all_gather_object(all_handlers, serialized_handler)
-    all_handlers_str = cast(list[str], all_handlers)
-
-    if rank == gather_src and matching_ranks is not None:
-        filtered_handlers: list[str] = [all_handlers_str[r] for r in matching_ranks]
-        return filtered_handlers
-    else:
-        return None
-
-
-def _send_tensor_to_sglang(
-    url: str,
-    tensor_name: str,
-    gathered_handlers: list[str],
-    shape: torch.Size,
-    dtype: str,
-    flush_cache: bool = False,
-) -> None:
-    """Send gathered IPC handlers to SGLang server via HTTP.
-
-    Key: gathered_handlers are in rank order [rank0, rank1, ...]
-    SGLang will automatically match: handler = serialized_handlers[tp_rank]
-
-    Args:
-        url: SGLang server URL
-        tensor_name: Name of the tensor
-        gathered_handlers: List of serialized IPC handlers in rank order
-        shape: Tensor shape
-        dtype: Tensor dtype
-        flush_cache: Whether to flush cache after this tensor (for last tensor)
-    """
-    payload = {
-        "serialized_named_tensors": gathered_handlers,
-        "flush_cache": flush_cache,
-    }
-
+    # Disable the ncclCommSplit path (see docstring). Safe to mutate here:
+    # nothing else reads ``bound_device_id`` during group construction, and
+    # refit setup does not create process groups from other threads.
+    default_pg = _get_default_group() if dist.is_initialized() else None
+    saved_bound_device_id = getattr(default_pg, "bound_device_id", None)
+    if saved_bound_device_id is not None:
+        default_pg.bound_device_id = None
     try:
-        response = requests.post(
-            url,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-            timeout=120,
+        pg, _ = _new_process_group_helper(
+            world_size,
+            rank,
+            [],
+            backend,
+            store,
+            group_name=group_name,
+            **{pg_options_kw: pg_options},
+            timeout=timeout,
         )
-        response.raise_for_status()
-    except requests.exceptions.HTTPError as e:
-        error_msg = f"Failed to send tensor '{tensor_name}' to {url}: {e}"
+    finally:
+        if saved_bound_device_id is not None:
+            default_pg.bound_device_id = saved_bound_device_id
+
+    if not isinstance(pg, dist.ProcessGroup):
+        raise RuntimeError("Torch returned an invalid custom process group")
+
+    # Map identity ranks so collective ops can resolve member ranks for ``pg``.
+    _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
+    return pg
+
+
+def connect_rollout_engines_from_distributed(
+    *,
+    group_name: str,
+    rollout_engines: list,
+    engine_gpu_counts: list[int],
+) -> "torch.distributed.ProcessGroup":
+    """Set up the SGLang NCCL weight-update group with trainer rank 0 as rank 0.
+
+    Only trainer rank 0 broadcasts because the AutoBridge path restores
+    full HF weights, not per-PP slices.
+
+    The caller (a trainer) must invoke this only on rank 0; other ranks must
+    not call it.
+    """
+    import ray
+
+    from nemo_rl.distributed.virtual_cluster import _get_free_port_local
+
+    master_address = ray._private.services.get_node_ip_address()
+    master_port = _get_free_port_local()
+    world_size = 1 + sum(engine_gpu_counts)
+
+    refs = []
+    rank_cursor = 1
+    for engine, gpu_count in zip(rollout_engines, engine_gpu_counts, strict=True):
+        refs.append(
+            engine.init_weights_update_group.remote(
+                master_address,
+                master_port,
+                rank_cursor,
+                world_size,
+                group_name,
+                "nccl",
+            )
+        )
+        rank_cursor += gpu_count
+
+    group = init_process_group(
+        backend="nccl",
+        init_method=f"tcp://{master_address}:{master_port}",
+        world_size=world_size,
+        rank=0,
+        group_name=group_name,
+    )
+    ray.get(refs)
+    return group
+
+
+def disconnect_rollout_engines_from_distributed(
+    *,
+    group_name: str,
+    model_update_group: "torch.distributed.ProcessGroup",
+    rollout_engines: list,
+) -> None:
+    """Tear down trainer-side and engine-side NCCL state for ``group_name``."""
+    import ray
+    from ray.exceptions import RayError
+
+    refs = [
+        engine.destroy_weights_update_group.remote(group_name)
+        for engine in rollout_engines
+    ]
+    try:
+        dist.destroy_process_group(model_update_group)
+    except (RuntimeError, ValueError) as exc:
+        warnings.warn(
+            f"Failed to destroy the trainer side of SGLang weight-update group "
+            f"{group_name!r}: {exc!r}",
+            stacklevel=2,
+        )
+    try:
+        ray.get(refs)
+    except (RayError, RuntimeError) as exc:
+        warnings.warn(
+            f"Failed to destroy the engine side of SGLang weight-update group "
+            f"{group_name!r}: {exc!r}",
+            stacklevel=2,
+        )
+
+
+def broadcast_hf_buckets_via_distributed_impl(
+    *,
+    bucket_iterator: Iterable[list[tuple[str, torch.Tensor]]],
+    rollout_engines: list,
+    rollout_engine_lock,
+    group_name: str,
+    model_update_group: "torch.distributed.ProcessGroup",
+    weight_version: int,
+) -> None:
+    """Broadcast finalized HF tensor buckets to SGLang via NCCL (rank 0 only).
+
+    Per-bucket protocol: trainer rank 0 sends per-tensor metadata to every
+    engine via Ray (``update_weights_from_distributed``), then issues one
+    ``dist.broadcast`` per tensor over the NCCL group, then waits for the Ray
+    refs to confirm engines finished loading the bucket.
+
+    Trainer rank 0 acquires the rollout-engine lock for each bucket to serialize
+    weight-update broadcasts. The generation side does not acquire it; pausing
+    the health monitor keeps serving probes out of the refit phase.
+    """
+    import time as _time
+
+    import ray
+
+    for bucket in bucket_iterator:
+        if not bucket:
+            continue
+
+        # No async-collective ``.wait()`` here — AutoBridge yields plain
+        # ``torch.Tensor`` for the Megatron path (no DTensor wrapping).
+
+        names = [name for name, _ in bucket]
+        dtypes = [tensor.dtype for _, tensor in bucket]
+        shapes = [tensor.shape for _, tensor in bucket]
+
+        lock_timeout_s = 300
+        lock_deadline = _time.monotonic() + lock_timeout_s
+        while not ray.get(rollout_engine_lock.acquire.remote()):
+            if _time.monotonic() >= lock_deadline:
+                raise TimeoutError(
+                    "Timed out after 300 seconds waiting for the SGLang "
+                    "rollout-engine lock."
+                )
+            _time.sleep(0.1)
         try:
-            error_detail = response.text
-            error_msg += f"\nResponse status: {response.status_code}"
-            error_msg += f"\nResponse body: {error_detail[:500]}"
-        except:
-            pass
-        print(f"[sglang refit] {error_msg}", flush=True)
-        raise RuntimeError(error_msg) from e
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to send tensor '{tensor_name}' to {url}: {e}"
-        ) from e
+            refs = [
+                engine.update_weights_from_distributed.remote(
+                    names=names,
+                    dtypes=dtypes,
+                    shapes=shapes,
+                    group_name=group_name,
+                    weight_version=str(weight_version),
+                )
+                for engine in rollout_engines
+            ]
+            # broadcast needs contiguous buffers; AutoBridge yields views. Held
+            # in a list because with async_op=True they must outlive wait().
+            send_buffers = [
+                tensor.data if tensor.data.is_contiguous() else tensor.data.contiguous()
+                for _, tensor in bucket
+            ]
+            handles = [
+                dist.broadcast(buffer, 0, group=model_update_group, async_op=True)
+                for buffer in send_buffers
+            ]
+            for handle in handles:
+                handle.wait()
+            del send_buffers
+            ray.get(refs)
+        finally:
+            ray.get(rollout_engine_lock.release.remote())

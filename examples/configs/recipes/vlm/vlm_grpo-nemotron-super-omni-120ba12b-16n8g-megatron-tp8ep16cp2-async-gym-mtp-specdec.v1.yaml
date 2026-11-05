@@ -1,0 +1,24 @@
+defaults: ./vlm_grpo-nemotron-super-omni-120ba12b-16n8g-megatron-tp8ep16cp2-async-gym-mtp.v1.yaml
+policy:
+  generation:
+    vllm_kwargs:
+      # MTP speculative decoding. Only method and num_speculative_tokens are
+      # set: this container's vLLM SpeculativeConfig has no attention_backend
+      # field and rejects it, and the backend is already selected globally by
+      # vllm_kwargs.attention_backend.
+      speculative_config:
+        method: mtp
+        num_speculative_tokens: 5
+      # Super is a hybrid Mamba model, so the recurrent SSM state must roll back
+      # when draft tokens are rejected. MambaCacheMode defaults to "none";
+      # "align" is what makes rejection correct for this model.
+      mamba_cache_mode: align
+      enable_chunked_prefill: true
+      max_num_batched_tokens: 8480
+checkpointing:
+  checkpoint_dir: results/nemotron-super-omni-async-gym-mtp-specdec
+  save_period: 5
+logger:
+  log_dir: logs/nemotron-super-omni-async-gym-mtp-specdec
+  wandb:
+    name: nemotron-super-omni-async-gym-mtp-specdec

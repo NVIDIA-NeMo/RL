@@ -1,0 +1,766 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import asyncio
+from copy import deepcopy
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
+
+import ray
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from transformers import AutoProcessor
+from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.held_port import RemoteHeldPortReservation
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.generation.interfaces import (
+    GenerationDatumSpec,
+    GenerationInterface,
+    GenerationOutputSpec,
+    agreed_media_columns,
+    reject_unenforceable_refit_deadline,
+)
+from nemo_rl.models.generation.megatron.config import (
+    MCoreGenerationConfig,
+    dedicated_inference_megatron_cfg,
+    merged_inference_megatron_cfg,
+)
+from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data.captured_media import MediaColumnSpec
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
+    from nemo_rl.distributed.worker_groups import RayWorkerGroup
+    from nemo_rl.models.policy.lm_policy import Policy
+    from nemo_rl.weight_sync.membership import RefitMembership
+
+
+class MegatronGeneration(GenerationInterface):
+    """Generation interface backed by Megatron (colocated or non-colocated)."""
+
+    @staticmethod
+    def effective_megatron_cfg(config: PolicyConfig) -> dict[str, Any]:
+        """The megatron_cfg the generation workers actually run with.
+
+        Colocated generation uses a dedicated inference-layout model when its
+        resolved layout differs from training, and otherwise shares the training
+        model. Non-colocated generation always builds a dedicated policy from
+        mcore_generation_config merged on top. Always returns a fresh dict.
+        """
+        if config["generation"]["colocated"]["enabled"]:
+            inference_mcfg = dedicated_inference_megatron_cfg(config)
+            if inference_mcfg is not None:
+                return inference_mcfg
+            return dict(config["megatron_cfg"])
+        return merged_inference_megatron_cfg(config)
+
+    @classmethod
+    def nvlink_domain_span(cls, config: PolicyConfig) -> int:
+        """Largest GPU group requiring full NVLink connectivity.
+
+        Colocated reshard hosts a second, inference-layout model on the same ranks.
+        """
+        if config["generation"]["colocated"]["enabled"]:
+            # Placement must satisfy both the resident training layout and any
+            # dedicated inference layout built on those same ranks.
+            layouts = [dict(config["megatron_cfg"])]
+            inference_mcfg = dedicated_inference_megatron_cfg(config)
+            if inference_mcfg is not None:
+                layouts.append(inference_mcfg)
+        else:
+            layouts = [cls.effective_megatron_cfg(config)]
+        return max(
+            max(
+                mcfg["tensor_model_parallel_size"] * mcfg["context_parallel_size"],
+                mcfg.get("expert_tensor_parallel_size", 1)
+                * mcfg.get("expert_model_parallel_size", 1),
+            )
+            for mcfg in layouts
+        )
+
+    @classmethod
+    def init_cluster_placement_groups(
+        cls,
+        cluster: RayVirtualCluster,
+        config: PolicyConfig,
+    ) -> None:
+        """Pre-initialize the inference cluster's placement groups.
+
+        Args:
+            cluster: The inference `RayVirtualCluster`.
+            config: The full `PolicyConfig` (megatron parallelism + colocation).
+        """
+        colocated = config["generation"]["colocated"]["enabled"]
+        cluster._init_placement_groups(
+            strategy=None if colocated else "PACK",
+            use_unified_pg=cls.nvlink_domain_span(config) > cluster.num_gpus_per_node,
+        )
+
+    @staticmethod
+    def frontend_ranks(cluster: RayVirtualCluster, config: PolicyConfig) -> list[int]:
+        """Distributed ranks that will host an HTTP frontend.
+
+        Copy of the engine's ``is_mp_coordinator = tp_rank == 0 and pp_rank == 0``.
+        Megatron orders ranks TP-fastest, PP-slowest, so PP selects a leading
+        slice and TP a stride within it. CP and DP are not divided out because
+        the predicate ignores them.
+        """
+        mcore_cfg = MegatronGeneration.effective_megatron_cfg(config)
+        tensor_model_parallel_size = mcore_cfg["tensor_model_parallel_size"]
+        pipeline_model_parallel_size = mcore_cfg["pipeline_model_parallel_size"]
+        return list(
+            range(
+                0,
+                cluster.world_size() // pipeline_model_parallel_size,
+                tensor_model_parallel_size,
+            )
+        )
+
+    @staticmethod
+    def _rank_placement(cluster: RayVirtualCluster) -> list[tuple[int, int]]:
+        """The (placement group index, bundle index) each rank will occupy, in rank order.
+
+        Mirrors how `Policy` hands bundles to its worker group: a unified
+        placement group is walked in NVLink-sorted order, otherwise bundles are
+        taken group by group. Reserving a port for a rank means placing the
+        holder on the bundle that rank will land on, so the two must agree.
+        """
+        if cluster._sorted_bundle_indices is not None:
+            # Sorted indices imply a unified PG, and there is only ever one.
+            return [
+                (0, bundle_index) for bundle_index in cluster._sorted_bundle_indices
+            ]
+        return [
+            (pg_index, bundle_index)
+            for pg_index, placement_group in enumerate(cluster.get_placement_groups())
+            for bundle_index in range(placement_group.bundle_count)
+        ]
+
+    @classmethod
+    def reserve_http_server_addresses(
+        cls,
+        cluster: RayVirtualCluster,
+        config: PolicyConfig,
+    ) -> tuple[list[str], dict[int, int], list[ray.actor.ActorHandle]]:
+        """Reserve every OpenAI server address before any generation worker exists.
+
+        This is megatron's substitute for vLLM's `defer_model_load` overlap.
+        See https://github.com/NVIDIA-NeMo/RL/issues/3752
+
+        One address is reserved per frontend-hosting rank so NeMo Gym can be
+        handed the full set up front. Gym distributes sessions across the URLs it
+        is given, so reserving only one would pin every session to a single
+        frontend no matter how many the engine goes on to start.
+
+        Ports are only ever bound per node, so two frontends on different nodes
+        may be handed the same port number; no cross-node uniqueness is sought.
+
+        Args:
+            cluster: The cluster the generation workers will run on.
+            config: The full `PolicyConfig`.
+
+        Returns:
+            Tuple of (server base URLs, {distributed rank: reserved port},
+            port-holder actor handles). The caller must keep the handles
+            referenced until the workers have adopted the sockets (worker init
+            complete), then `ray.kill` them.
+        """
+        # Colocated generation shares the training policy's cluster and uses the
+        # default placement-group init, triggered lazily by the read below.
+        if not config["generation"]["colocated"]["enabled"]:
+            cls.init_cluster_placement_groups(cluster, config)
+
+        placement_groups = cluster.get_placement_groups()
+        placement = cls._rank_placement(cluster)
+        ranks = cls.frontend_ranks(cluster, config)
+
+        # Zero-gap reservation: a holder actor on each frontend's node binds and
+        # HOLDS the socket (num_cpus=0, so it schedules even on a full bundle);
+        # the rank later adopts the live fd via receive_held_socket, so the port
+        # can never be stolen in between and any free port is safe.
+        holders = [
+            RemoteHeldPortReservation.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=placement_groups[placement[rank][0]],
+                    placement_group_bundle_index=placement[rank][1],
+                ),
+            ).remote()
+            for rank in ranks
+        ]
+        addresses = ray.get([holder.address.remote() for holder in holders])
+        urls = [f"http://{node_ip}:{port}/v1" for node_ip, port in addresses]
+        rank_to_port = {
+            rank: port for rank, (_, port) in zip(ranks, addresses, strict=True)
+        }
+        return urls, rank_to_port, holders
+
+    @classmethod
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
+        """Reject config the Megatron generation backend cannot honor."""
+        policy_config: PolicyConfig = master_config.policy
+        recompute_kv_cache_after_weight_updates: bool = (
+            master_config.async_rl.recompute_kv_cache_after_weight_updates
+        )
+        if not (
+            "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]
+        ):
+            raise ValueError(
+                "policy.generation.backend='megatron' requires the Megatron trainer "
+                "(policy.megatron_cfg.enabled=true): refit transfers weights via Megatron reshard; "
+                "colocated generation shares the training policy's worker group."
+            )
+
+        mcore_cfg = cast(MCoreGenerationConfig, policy_config["generation"])[
+            "mcore_generation_config"
+        ]
+
+        # Recompute-after-refit is implemented engine-side (kv_cache_management_mode="recompute");
+        # the loop-level flag must agree with that mode, and setup errors on a mismatch.
+        kv_cache_mode = mcore_cfg["kv_cache_management_mode"]
+        if recompute_kv_cache_after_weight_updates != (kv_cache_mode == "recompute"):
+            raise ValueError(
+                "async_rl.recompute_kv_cache_after_weight_updates="
+                f"{recompute_kv_cache_after_weight_updates} conflicts with "
+                "policy.generation.mcore_generation_config."
+                f"kv_cache_management_mode={kv_cache_mode!r}: with "
+                "policy.generation.backend='megatron' the two must agree. Either "
+                "set the flag to true with kv_cache_management_mode='recompute', "
+                "or leave the flag false with 'persist'/'offload'."
+            )
+
+        if master_config.async_rl.generation_fleet_health.enabled:
+            raise NotImplementedError(
+                "async_rl.generation_fleet_health.enabled=true is not supported "
+                f"for the {cls.__name__} generation backend"
+            )
+
+    @classmethod
+    def verify_served_addresses(
+        cls, served_urls: list[Optional[str]], reserved_urls: list[str]
+    ) -> None:
+        """Fail loud if the engine serves anywhere but the pre-published addresses.
+
+        Order is not significant -- NeMo Gym spreads sessions over the set it was
+        given -- but the set must match exactly: a frontend serving an address
+        Gym never received takes no traffic, and an address Gym holds that
+        nothing serves fails its health check.
+        """
+        if sorted(filter(None, served_urls)) != sorted(reserved_urls):
+            raise RuntimeError(
+                "Megatron servers came up at different addresses than the ones "
+                f"pre-published to NeMo Gym: reserved {sorted(reserved_urls)}, "
+                f"serving {sorted(filter(None, served_urls))}."
+            )
+
+    def __init__(
+        self,
+        config: PolicyConfig,
+        tokenizer: PreTrainedTokenizerBase,
+        cluster: Optional[RayVirtualCluster] = None,
+        policy: Optional["Policy"] = None,
+        name_prefix: str = "megatron_generation",
+        processor: Optional[AutoProcessor] = None,
+        skip_weight_load: bool = False,
+        reserved_http_server_ports: Optional[dict[int, int]] = None,
+    ):
+        """Initialize a MegatronGeneration instance.
+
+        Exactly one of `cluster` or `policy` must be provided.
+
+        Args:
+            config: PolicyConfig for the Megatron model.
+            tokenizer: The tokenizer for the model.
+            cluster: Cluster for a dedicated, non-colocated inference Policy.
+            policy: Existing training Policy reused for colocated generation.
+            name_prefix: Prefix for naming the worker group (non-colocated only).
+            processor: Optional processor for VLMs (non-colocated only).
+            skip_weight_load: Do not load weights from the checkpoint; refit will do it.
+                Inference-engine initialization is deferred until that first refit so CUDA
+                graphs capture the final persistent weight buffers rather than placeholder
+                checkpoint tensors.
+            reserved_http_server_ports: Driver-reserved OpenAI server ports, keyed by
+                the distributed rank that will adopt each one (non-colocated only).
+        """
+        # Import here to avoid circular imports
+        from nemo_rl.models.policy.lm_policy import Policy
+
+        assert (cluster is None) != (policy is None), (
+            "Provide exactly one of `cluster` or `policy`."
+        )
+        assert not (skip_weight_load and policy is not None), (
+            "skip_weight_load only applies to the dedicated inference policy."
+        )
+        assert not (reserved_http_server_ports is not None and policy is not None), (
+            "reserved_http_server_ports only applies to the dedicated inference "
+            "policy; when colocated, pass them to the training policy instead."
+        )
+
+        # `self.cfg` exposes the `generation` that matches the `GenerationInterface` contract.
+        # `self._policy_config` keeps a reference to the full PolicyConfig. Dedicated
+        # inference receives a copy because worker setup may modify it.
+        self._policy_config = config
+        self.cfg: MCoreGenerationConfig = config["generation"]
+        refit_transport = self.cfg.get("refit_transport")
+        if refit_transport not in (None, "mcore", "nccl_reshard"):
+            raise ValueError(
+                "policy.generation.refit_transport must be null, 'mcore', or "
+                f"'nccl_reshard' for Megatron generation, got {refit_transport!r}."
+            )
+        if self.uses_native_refit:
+            refit_backend = self.cfg["mcore_generation_config"].get("refit_backend")
+            if refit_backend not in ("gloo", "nccl", "nccl_m2n", "nvshmem"):
+                raise ValueError(
+                    "policy.generation.mcore_generation_config.refit_backend "
+                    "must be 'gloo', 'nccl', 'nccl_m2n', or 'nvshmem' when "
+                    f"refit_transport='mcore', got {refit_backend!r}."
+                )
+            if policy is not None and refit_backend == "nccl_m2n":
+                raise ValueError(
+                    "policy.generation.mcore_generation_config.refit_backend="
+                    "'nccl_m2n' is only supported with non-colocated generation."
+                )
+        else:
+            refit_backend = self.cfg["mcore_generation_config"].get("refit_backend")
+            if refit_backend is not None:
+                raise ValueError(
+                    "policy.generation.mcore_generation_config.refit_backend="
+                    f"{refit_backend!r} is "
+                    f"invalid when refit_transport={refit_transport!r}; it is only "
+                    "read by the native MCore refit (refit_transport='mcore')."
+                )
+        # Populated after the first prepare_for_generation (which starts the HTTP server).
+        self.dp_openai_server_base_urls: list[Optional[str]] = []
+        # Installed by setup via create_weight_synchronizer.
+        self.weight_synchronizer: Optional["WeightSynchronizer"] = None
+        # The nccl_reshard synchronizer records its current rank layout before
+        # dispatching any communicator or refit calls. None is the legacy/full-group
+        # path used by refit implementations that do not manage membership.
+        self._refit_membership: Optional["RefitMembership"] = None
+
+        if policy is not None:
+            # Reuse the existing training policy.
+            self._policy = policy
+            self._owns_policy = False
+            if self.cfg["mcore_generation_config"]["expose_http_server"]:
+                self._policy.offload_before_refit()
+                self.prepare_for_generation()
+            return
+
+        # Stand up a dedicated inference-only policy.
+        self._owns_policy = True
+        self._policy_config = {
+            **deepcopy(config),
+            "megatron_cfg": self.effective_megatron_cfg(config),
+        }
+        # Reserve GPUs before Policy workers grab them, to prevent disjoint NVLS domains.
+        self.init_cluster_placement_groups(cluster, self._policy_config)
+        self._policy = Policy(
+            cluster=cluster,
+            config=self._policy_config,
+            tokenizer=tokenizer,
+            name_prefix=name_prefix,
+            processor=processor,
+            init_optimizer=False,
+            init_reference_model=False,
+            skip_weight_load=skip_weight_load,
+            is_refit_destination=True,
+            reserved_http_server_ports=reserved_http_server_ports,
+        )
+
+        # Skip-load models do not have their final refit weight buffers yet.
+        # Defer engine initialization so CUDA graphs capture the persistent buffers.
+        # The engine + HTTP server then first come up at the initial refit.
+        if not skip_weight_load:
+            self.prepare_for_generation()
+
+    @property
+    def uses_native_refit(self) -> bool:
+        """Whether non-colocated refit uses Megatron Core's native mechanism."""
+        return self.cfg.get("refit_transport") == "mcore"
+
+    @property
+    def worker_group(self) -> "RayWorkerGroup":
+        """The underlying policy's worker group (fleet-health probes read dp_size)."""
+        return self._policy.worker_group
+
+    def shard_liveness_ref(self, shard_idx: int) -> ray.ObjectRef:
+        """Liveness of the worker leading this shard. The caller need not know the layout.
+
+        Same shape as the vLLM backend's. Declared here because this generation object
+        wraps a Policy, so its workers are AbstractPolicyWorkers and answer ``is_alive``
+        like any other -- the fleet probe needs no knowledge of which of the two it holds.
+        """
+        leader_idx = self.worker_group.get_dp_leader_worker_idx(shard_idx)
+        return self.worker_group.workers[leader_idx].is_alive.remote()
+
+    def init_collective(
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Join the configured refit collective after the training ranks.
+
+        Args:
+            ip: IP address for the process group rendezvous.
+            port: Port for the process group rendezvous.
+            world_size: Total world size (train + inference workers).
+            train_world_size: Number of training workers (used to offset ranks).
+
+        Returns:
+            List of Ray ObjectRefs for the collective init futures.
+        """
+        if self.uses_native_refit:
+            return self._policy.init_collective_mcore_generation(
+                ip,
+                port,
+                world_size,
+                rank_offset=train_world_size,
+                refit_execution_batch_bytes=self.cfg["mcore_generation_config"][
+                    "refit_execution_batch_bytes"
+                ],
+                refit_backend=self.cfg["mcore_generation_config"]["refit_backend"],
+            )
+        return self._policy.init_collective(
+            ip,
+            port,
+            world_size,
+            train_world_size=train_world_size,
+            rank_offset=train_world_size,
+        )
+
+    def update_weights_from_collective(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
+        """Receive weights through the configured Megatron refit mechanism."""
+        if self.uses_native_refit:
+            reject_unenforceable_refit_deadline("Megatron", refit_timeout_s)
+            return self._policy.swap_weights_via_reshard(is_source=False)
+        return self._policy.worker_group.run_all_workers_single_data(
+            "update_weights_from_collective", refit_timeout_s=refit_timeout_s
+        )
+
+    def init_nccl_reshard_comm_group(
+        self,
+        *,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Join every training PP stage's NCCL M-to-N communicator."""
+        return self._policy.worker_group.run_all_workers_single_data(
+            "init_nccl_reshard_comm_groups_generation",
+            pp_ips=pp_ips,
+            pp_ports=pp_ports,
+            pp_size=pp_size,
+            train_ranks_per_stage=train_ranks_per_stage,
+            sub_world_size=sub_world_size,
+        )
+
+    def set_refit_membership(self, membership: "RefitMembership") -> None:
+        """Record the inference ranks participating in nccl_reshard refits."""
+        self._refit_membership = membership
+
+    def _refit_ranked_workers(
+        self, membership: Optional["RefitMembership"] = None
+    ) -> list[tuple[Any, int, int]]:
+        """Return ``(actor, rebuilt rank, original rank)`` for live workers."""
+        active = membership or self._refit_membership
+        if active is None:
+            return [
+                (worker, rank, rank)
+                for rank, worker in enumerate(self.worker_group.workers)
+            ]
+
+        workers = self.worker_group.workers
+        ranked_workers: list[tuple[Any, int, int]] = []
+        for shard_idx, rank_prefix in active.shard_prefixes.items():
+            worker_start = shard_idx * active.workers_per_shard
+            for local_rank in range(active.workers_per_shard):
+                worker_idx = worker_start + local_rank
+                if worker_idx >= len(workers):
+                    raise RuntimeError(
+                        f"shard {shard_idx} maps to worker {worker_idx}, but the "
+                        f"group has {len(workers)} workers"
+                    )
+                ranked_workers.append(
+                    (workers[worker_idx], rank_prefix + local_rank, worker_idx)
+                )
+        return ranked_workers
+
+    def rebuild_collective(
+        self, membership: "RefitMembership", ip: str, port: int
+    ) -> list[ray.ObjectRef]:
+        """Build the misc-weight communicator over the selected Megatron ranks."""
+        futures = []
+        for worker, rank, original_rank in self._refit_ranked_workers(membership):
+            futures.append(
+                worker.init_collective.remote(
+                    ip=ip,
+                    port=port,
+                    world_size=membership.world_size,
+                    train_world_size=membership.train_world_size,
+                    rank_offset=membership.train_world_size + rank - original_rank,
+                    nccl_peer=self.get_collective_sender_spec().nccl_peer,
+                )
+            )
+        return futures
+
+    def rebuild_nccl_reshard_comm_group(
+        self,
+        membership: "RefitMembership",
+        *,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Build bulk communicators over the selected Megatron ranks."""
+        return [
+            worker.init_nccl_reshard_comm_groups_generation.remote(
+                pp_ips=pp_ips,
+                pp_ports=pp_ports,
+                pp_size=pp_size,
+                train_ranks_per_stage=train_ranks_per_stage,
+                sub_world_size=sub_world_size,
+                rank_prefix=rank,
+            )
+            for worker, rank, _original_rank in self._refit_ranked_workers(membership)
+        ]
+
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict[str, Any]) -> None:
+        """Build each inference worker's HF-to-Megatron M-to-N receive map."""
+        futures = [
+            worker.prepare_nccl_reshard_refit_info.remote(refit_info=refit_info)
+            for worker, _rank, _original_rank in self._refit_ranked_workers()
+        ]
+        ray.get(futures)
+
+    def nccl_reshard_refit(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
+        """Receive one NCCL M-to-N refit on every Megatron inference worker."""
+        return [
+            worker.nccl_reshard_refit.remote(refit_timeout_s=refit_timeout_s)
+            for worker, _rank, _original_rank in self._refit_ranked_workers()
+        ]
+
+    def generate(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> BatchedDataDict[GenerationOutputSpec]:
+        """Generate a batch of data using the Megatron generation backend.
+
+        mcore's data-parallel coordinator only accepts requests from DP rank 0 —
+        the other workers' engine loops drain the coordinator queue but never
+        receive a Python-side call. So we dispatch straight to worker 0.
+
+        Args:
+            data: BatchedDataDict containing input_ids and input_lengths.
+            greedy: Whether to use greedy decoding.
+
+        Returns:
+            BatchedDataDict conforming to GenerationOutputSpec.
+        """
+        future = self._policy.worker_group.run_single_worker_single_data(
+            method_name="generate",
+            worker_idx=0,
+            data=data,
+            greedy=greedy,
+        )
+        return ray.get(future)
+
+    async def generate_async(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
+    ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Generate asynchronously, yielding `(index, batch)` tuples as they complete."""
+        worker = self._policy.worker_group.workers[0]
+        # Not .options(num_returns="streaming"): this process cannot unpickle the
+        # Megatron worker class (no Megatron here), so Ray gives the handle a
+        # placeholder class whose methods are not generators. Ray >= 2.58 checks
+        # that in .options() and raises; _remote() skips the check.
+        # NOTE(@cspades): https://github.com/ray-project/ray/pull/64749
+        futures = worker.generate_async._remote(
+            kwargs={"data": data, "greedy": greedy}, num_returns="streaming"
+        )
+        try:
+            async for result_ref in futures:
+                index, result_batch = await result_ref
+                result_batch["gen_leader_worker_idx"] = [0]
+                yield index, result_batch
+        except (asyncio.CancelledError, GeneratorExit):
+            ray.cancel(futures)
+            raise
+
+    def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
+        """Initialize / re-enter inference mode on every worker.
+
+        First call starts the persistent inference engine, coordinator, and the OpenAI HTTP server.
+        Subsequent calls re-enter inference mode after a refit.
+        """
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "prepare_for_generation", **kwargs
+        )
+        ray.get(futures)
+        if (
+            not self.dp_openai_server_base_urls
+            and self.cfg["mcore_generation_config"]["expose_http_server"]
+        ):
+            url_futures = self._policy.worker_group.run_all_workers_single_data(
+                "report_dp_openai_server_base_url"
+            )
+            self.dp_openai_server_base_urls = [
+                url for url in ray.get(url_futures) if url is not None
+            ]
+        return True
+
+    def finish_generation(self, *, release_gpu: bool = True) -> bool:
+        """Clean up after generation.
+
+        When `release_gpu` is False, a colocated engine keeps serving instead of standing down.
+        """
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "finish_generation", release_gpu=release_gpu
+        )
+        ray.get(futures)
+        return True
+
+    def setup_token_capture(
+        self,
+        dp_cfg: "DataPlaneConfig",
+        staging_partition: str,
+        *,
+        capture_media: bool = False,
+        top_logprobs: int = 0,
+    ) -> "Optional[MediaColumnSpec]":
+        """Install MInf's canonical prompt and completion capture hooks.
+
+        Returns the media column spec the coordinators pinned (``None`` for
+        text-only capture).
+        """
+        if top_logprobs != 0:
+            raise NotImplementedError(
+                "Megatron generation does not capture sampler top-k"
+            )
+        if not self.cfg["mcore_generation_config"]["expose_http_server"]:
+            raise ValueError(
+                "Megatron token capture requires mcore_generation_config."
+                "expose_http_server=true"
+            )
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "setup_token_capture",
+            dp_cfg=dp_cfg,
+            staging_partition=staging_partition,
+            capture_media=capture_media,
+        )
+        return agreed_media_columns(ray.get(futures))
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Rotate the policy epoch stamped by MInf on subsequent requests."""
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "set_rollout_weight_version", version=version
+        )
+        ray.get(futures)
+
+    def blocks_training(self) -> bool:
+        """Whether the engine must stand down before a training step.
+
+        Colocated generation shares the training GPUs, so the training
+        loop must wind the engine down before it can train.
+        """
+        return bool(self.cfg["colocated"]["enabled"])
+
+    def wake_carries_weight_updates(self) -> bool:
+        """The colocated wake reshards (or shares tensors); see the ABC."""
+        return bool(self.cfg["colocated"]["enabled"])
+
+    def invalidate_kv_cache(self) -> bool:
+        """Report whether weight updates invalidate the KV cache.
+
+        Under "recompute" mode the engine drops and rebuilds its KV cache
+        across the suspend/resume that brackets every weight update, so
+        invalidation is genuinely handled; report it truthfully instead of
+        inheriting the interface's `False` (which makes the trajectory
+        collector warn every step).
+        """
+        return (
+            self.cfg["mcore_generation_config"].get("kv_cache_management_mode")
+            == "recompute"
+        )
+
+    def preinit_nvshmem_collective(self) -> list[ray.ObjectRef]:
+        """Pre-initialize NVShmem collectively outside CUDA graph capture.
+
+        Must be called simultaneously on both training and inference workers.
+        """
+        if not self.uses_native_refit:
+            raise RuntimeError(
+                "NVSHMEM pre-initialization is only valid with refit_transport='mcore'."
+            )
+        return self._policy.preinit_nvshmem()
+
+    def suspend_for_refit(self) -> None:
+        """Suspend the inference engine for safe weight updates."""
+        ray.get(
+            self._policy.worker_group.run_all_workers_single_data("suspend_for_refit")
+        )
+
+    def resume_after_refit(self) -> None:
+        """Resume the inference engine after weight updates."""
+        ray.get(
+            self._policy.worker_group.run_all_workers_single_data("resume_after_refit")
+        )
+
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
+        """Prepare Bridge conversion tasks on every dedicated inference worker."""
+        if not self._owns_policy or self.uses_native_refit:
+            return
+        if state_dict_info is None:
+            raise ValueError("Megatron collective refit requires state_dict_info.")
+        futures = self._policy.worker_group.run_all_workers_single_data(
+            "prepare_refit_info", state_dict_info=state_dict_info
+        )
+        ray.get(futures)
+
+    def start_gpu_profiling(self) -> None:
+        """Start GPU profiling on the dedicated inference workers.
+
+        No-op when colocated: the shared workers are already profiled through the training policy.
+        """
+        if self._owns_policy:
+            self._policy.start_gpu_profiling()
+
+    def stop_gpu_profiling(self) -> None:
+        """Stop GPU profiling on the dedicated inference workers."""
+        if self._owns_policy:
+            self._policy.stop_gpu_profiling()
+
+    def shutdown(self) -> bool:
+        """Shut down all inference workers and clean up resources."""
+        if not self._owns_policy:
+            return True
+        return self._policy.shutdown()
+
+    def __del__(self) -> None:
+        """Safety net to ensure workers are shut down."""
+        if hasattr(self, "_policy") and self._owns_policy:
+            self._policy.shutdown()

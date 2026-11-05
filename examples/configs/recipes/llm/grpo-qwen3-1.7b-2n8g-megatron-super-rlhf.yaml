@@ -1,0 +1,55 @@
+defaults: ../../../nemo_gym/nemotron-3-super/stage3_rlhf.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-1.7b-2n8g-megatron-super-rlhf
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 8
+  async_grpo:
+    enabled: false
+policy:
+  model_name: Qwen/Qwen3-1.7B
+  train_global_batch_size: 16
+  max_total_sequence_length: 8192
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    context_parallel_size: 1
+    expert_model_parallel_size: 1
+    sequence_parallel: false
+    activation_checkpointing: false
+    mtp_num_layers: 0
+  generation:
+    colocated:
+      enabled: true
+    vllm_cfg:
+      tensor_parallel_size: 1
+      reasoning_parser_plugin: null
+      http_server_serving_chat_kwargs:
+        reasoning_parser: deepseek_r1
+    vllm_kwargs:
+      mamba_cache_mode: "none"
+data:
+  train:
+    data_path: ${oc.env:HF_HOME}/superv3_data/rlhf/train-split.jsonl
+  validation:
+    data_path: ${oc.env:HF_HOME}/superv3_data/rlhf/val-split.jsonl
+env:
+  nemo_gym:
+    uv_venv_dir: "${oc.env:HF_HOME}/gym_venvs"
+    num_gpu_nodes: 1
+    genrm_compare_resources_server:
+      resources_servers:
+        genrm_compare:
+          num_rollouts_per_prompt: 8
+    genrm_model:
+      responses_api_models:
+        genrm_model:
+          vllm_serve_kwargs:
+            data_parallel_size: 1
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-1.7b-2n8g-megatron-super-rlhf
+cluster:
+  num_nodes: 1

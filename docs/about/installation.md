@@ -1,5 +1,49 @@
 # Installation and Prerequisites
 
+## Docker Quickstart
+
+The fastest way to get started is with the pre-built NGC container, which includes all system dependencies (CUDA, cuDNN, vLLM, SGLang) pre-installed and removes the need for manual system-level setup.
+
+```sh
+# Pull the latest stable release
+docker pull nvcr.io/nvidia/nemo-rl:latest
+
+# Clone the repo (needed to mount your source into the container)
+git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
+cd nemo-rl
+
+# Set HuggingFace variables in your shell before running (recommended):
+# export HF_TOKEN=hf_...                        # required for gated models (e.g. Llama)
+# export HF_HOME=~/.cache/huggingface           # model and tokenizer cache
+# export HF_DATASETS_CACHE=~/.cache/huggingface/datasets  # dataset cache
+
+# Launch the container
+docker run --rm -it \
+  -u root \
+  --runtime=nvidia \
+  --gpus all \
+  --shm-size=64g \
+  --ulimit memlock=-1 \
+  -v $PWD:/opt/nemo-rl \
+  -v ${HF_HOME:-$HOME/.cache/huggingface}:/hf_home \
+  -v ${HF_DATASETS_CACHE:-$HOME/.cache/huggingface/datasets}:/hf_datasets_cache \
+  -e HF_HOME=/hf_home \
+  -e HF_DATASETS_CACHE=/hf_datasets_cache \
+  -e HF_TOKEN \
+  -e WANDB_API_KEY \
+  -w /opt/nemo-rl \
+  nvcr.io/nvidia/nemo-rl:latest \
+  bash
+```
+
+Once inside the container, run any training command directly:
+
+```sh
+uv run python examples/run_grpo.py
+```
+
+For instructions on building your own image (e.g. from a custom branch), see the [Docker documentation](../docker.md).
+
 ## Clone the Repository
 
 Clone **NeMo RL** with submodules:
@@ -8,7 +52,7 @@ Clone **NeMo RL** with submodules:
 git clone git@github.com:NVIDIA-NeMo/RL.git nemo-rl --recursive
 cd nemo-rl
 
-# If you are already cloned without the recursive option, you can initialize the submodules recursively
+# If you have already cloned without the recursive option, you can initialize the submodules recursively
 git submodule update --init --recursive
 
 # Different branches of the repo can have different pinned versions of these third-party submodules. Ensure
@@ -29,14 +73,14 @@ If you are using the Megatron backend on bare metal (outside of a container), yo
 # Check if you have libcudnn installed
 dpkg -l | grep cudnn.*cuda
 
-# Find the version you need here: https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network
-# As an example, these are the "Linux Ubuntu 20.04 x86_64" instructions
-wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2004/x86_64/cuda-keyring_1.1-1_all.deb
+# Find the version you need here: https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=24.04&target_type=deb_network
+# As an example, these are the "Linux Ubuntu 24.04 x86_64" instructions
+wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
 sudo dpkg -i cuda-keyring_1.1-1_all.deb
 sudo apt update
-sudo apt install cudnn  # Will install cuDNN meta packages which points to the latest versions
-# sudo apt install cudnn9-cuda-12  # Will install cuDNN version 9.x.x compiled for cuda 12.x
-# sudo apt install cudnn9-cuda-12-8  # Will install cuDNN version 9.x.x compiled for cuda 12.8
+sudo apt install cudnn  # Will install cuDNN meta packages that point to the latest versions
+# sudo apt install cudnn9-cuda-13  # Will install cuDNN version 9.x.x compiled for cuda 13.x (CUDA 13 — current primary)
+# sudo apt install cudnn9-cuda-13-2  # Will install cuDNN version 9.x.x compiled for cuda 13.2 specifically
 ```
 
 ### libibverbs (For vLLM Dependencies)
@@ -71,12 +115,31 @@ uv venv
 > Please do not use `-p/--python` and instead allow `uv venv` to read it from `.python-version`.
 > This ensures that the version of python used is always what we prescribe.
 
+## Configure cuDNN for Transformer Engine (Bare Metal Only)
+
+> [!IMPORTANT]
+> **Skip this section if you are using the NeMo RL container** — these environment variables are already set in the Dockerfile.
+>
+> When running on bare metal (outside a container), your system may have a different cuDNN version than the pip-installed `nvidia-cudnn-cu13` package. Transformer Engine (TE) prioritizes system libraries by default, which can cause version mismatch crashes or force fallback to slower attention backends (UnfusedDotProductAttention instead of FusedAttention).
+>
+> Set these environment variables before running any commands:
+>
+> ```sh
+> # Point TE at the pip-installed cuDNN (adjust path if UV_PROJECT_ENVIRONMENT is set)
+> export CUDNN_HOME=.venv/lib/python3.13/site-packages/nvidia/cudnn
+> export LD_LIBRARY_PATH=".venv/lib/python3.13/site-packages/nvidia/cudnn/lib:${LD_LIBRARY_PATH:-}"
+>
+> # Verify TE picks up the correct cuDNN version (TE is in the mcore extra).
+> # The version should match the nvidia-cudnn-cu13 pin in pyproject.toml.
+> uv run --extra mcore python -c "import transformer_engine.pytorch as te; print(te.get_cudnn_version())"
+> ```
+
 ## Using UV to Run Commands
 
 Use `uv run` to launch all commands. It handles pip installing implicitly and ensures your environment is up to date with our lock file.
 
 ```sh
-# Example: Run GRPO with DTensor backend
+# Example: Run GRPO with Automodel backend
 uv run python examples/run_grpo.py
 
 # Example: Run GRPO with Megatron backend
@@ -88,5 +151,5 @@ uv run python examples/run_grpo.py --config examples/configs/grpo_math_1B_megatr
 >   This ensures consistent environment usage across different shells and sessions.
 > - Ensure your system has the appropriate CUDA drivers installed, and that your PyTorch version is compatible with both your CUDA setup and hardware.
 > - If you update your environment in `pyproject.toml`, it is necessary to force a rebuild of the virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run.
-> - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+> - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `hf auth login` as well for Llama models.
 

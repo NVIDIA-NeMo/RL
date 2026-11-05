@@ -13,11 +13,14 @@
 # limitations under the License.
 import logging
 import os
+import random
+import socket
 import sys
 import time
-from typing import Optional, TypedDict
+from typing import NamedTuple, Optional, Sequence
 
 import ray
+from pydantic import BaseModel
 from ray.util.placement_group import (
     PlacementGroup,
     placement_group,
@@ -26,13 +29,39 @@ from ray.util.placement_group import (
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from nemo_rl.telemetry.instrumentation import (
+    safe_set_span_attributes,
+    setup_span,
+)
+from nemo_rl.utils.venvs import add_hf_modules_cache_to_pythonpath
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# How init_ray obtained its cluster, recorded on the rl.setup.ray_init span.
+RAY_CLUSTER_SOURCE_ATTR = "rl.ray.cluster_source"
+RAY_CLUSTER_EXTERNAL = "attached_external"
+RAY_CLUSTER_REUSED_LOCAL = "reused_local"
+RAY_CLUSTER_STARTED_LOCAL = "started_local"
+# See nemo_rl.distributed.ray_worker_setup.
+_WORKER_PROCESS_SETUP_HOOK = (
+    "nemo_rl.distributed.ray_worker_setup.ray_worker_process_setup"
+)
 
-class ClusterConfig(TypedDict):
+
+class ClusterConfig(BaseModel, extra="allow"):
     gpus_per_node: int
     num_nodes: int
+    # Port range for the distributed master address (TCPStore / NCCL rendezvous)
+    # and per-worker available ports used by RayVirtualCluster.  These ports are
+    # kept below the OS ephemeral range (32768-60999 on stock Linux) to avoid
+    # TOCTOU collisions with kernel-assigned source ports.  When absent,
+    # RayVirtualCluster falls back to DEFAULT_MASTER_PORT_RANGE_LOW/HIGH
+    # (1400-1999).  See ray.sub for the full port layout.
+    master_port_range_low: Optional[int] = None
+    master_port_range_high: Optional[int] = None
+    # Nodes per NVLink domain segment for topology-aware alignment; None to disable
+    segment_size: Optional[int] = None
 
 
 # Get the directory path of the current module and the root of the package
@@ -41,6 +70,12 @@ git_root = os.path.abspath(os.path.join(dir_path, "../.."))
 
 
 class PY_EXECUTABLES:
+    """Command each Ray actor launches under, one entry per uv extra combination.
+
+    Every uv command below is rewritten to SYSTEM when NEMO_RL_PY_EXECUTABLES_SYSTEM
+    is set to 1, so callers never apply that check themselves.
+    """
+
     SYSTEM = sys.executable
 
     # Use NeMo-RL direct dependencies.
@@ -48,9 +83,6 @@ class PY_EXECUTABLES:
 
     # Use NeMo-RL direct dependencies and vllm.
     VLLM = f"uv run --locked --extra vllm --directory {git_root}"
-
-    # Use NeMo-RL direct dependencies and fsdp.
-    FSDP = f"uv run --locked --extra fsdp --directory {git_root}"
 
     # Use NeMo-RL direct dependencies and nemo-automodel.
     AUTOMODEL = f"uv run --locked --extra automodel --directory {git_root}"
@@ -61,13 +93,171 @@ class PY_EXECUTABLES:
     # Use NeMo-Gym dependencies
     NEMO_GYM = f"uv run --locked --extra nemo_gym --directory {git_root}"
 
+    # Default env for the vLLM generation workers (see
+    # ray_actor_environment_registry.py). It carries nemo_gym so the worker can
+    # host Gym's token capture (token_capture.enabled) without swapping the
+    # worker's env at runtime: worker venvs are cached by actor class name, so
+    # a venv prebuilt with plain `--extra vllm` would be reused as-is and the
+    # nemo_gym import would fail.
+    VLLM_GYM = f"uv run --locked --extra vllm --extra nemo_gym --directory {git_root}"
+
     # Use NeMo-RL direct dependencies and SGLang.
     SGLANG = f"uv run --locked --extra sglang --directory {git_root}"
 
+    # Use NeMo-RL direct dependencies and TRT-LLM.
+    TRTLLM = f"uv run --locked --extra trtllm --directory {git_root}"
+
+    # Use NeMo-RL direct dependencies and ModelOpt.
+    MODELOPT_VLLM = (
+        f"uv run --locked --extra modelopt --extra vllm --directory {git_root}"
+    )
+    MODELOPT_AUTOMODEL = (
+        f"uv run --locked --extra modelopt --extra automodel --directory {git_root}"
+    )
+    MODELOPT_MCORE = (
+        f"uv run --locked --extra modelopt --extra mcore --directory {git_root}"
+    )
+
+    @classmethod
+    def _resolve_system_overrides(cls) -> None:
+        """Rewrite every uv command constant to the system executable when the flag is set."""
+        if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") != "1":
+            return
+        for name in [n for n in vars(cls) if n.isupper()]:
+            setattr(cls, name, cls.SYSTEM)
+
+
+PY_EXECUTABLES._resolve_system_overrides()
+
+
+def uv_py_executable(extras: Sequence[str]) -> str:
+    """py_executable of a uv-managed venv with the given extras (same shape as PY_EXECUTABLES.*).
+
+    Honors NEMO_RL_PY_EXECUTABLES_SYSTEM the same way the PY_EXECUTABLES constants do.
+    The check has to live here as well: _resolve_system_overrides rewrites the class
+    attributes, but this builds a fresh string, so the rewrite cannot reach it.
+    """
+    if os.environ.get("NEMO_RL_PY_EXECUTABLES_SYSTEM", "0") == "1":
+        return PY_EXECUTABLES.SYSTEM
+    extra_flags = "".join(f"--extra {extra} " for extra in extras)
+    return f"uv run --locked {extra_flags}--directory {git_root}"
+
+
+# Default port ranges — kept below the OS ephemeral range.  On some DGX/GB200
+# nodes the ephemeral floor is as low as 9000 (32768 on stock Linux), so every
+# service port is pinned below 9000 to avoid TOCTOU collisions.  See ray.sub for
+# the full layout including Ray's own GCS / worker gRPC ports.
+#
+# Python port-range bounds below are half-open: [low, high).
+#
+#   1150-1199    Data plane (TQ/mooncake)        (DEFAULT_DATA_PLANE_PORT_RANGE_*, driver-local
+#                                                 allocation: metadata server, master RPC,
+#                                                 master metrics)
+#   [1202, 1300) SingleController gen. router    (driver-local allocation)
+#   1313-1399    Dynamo etcd/NATS control plane  (driver-local allocation)
+#   1400-1999    Master address / TCPStore       (cluster.master_port_range_low/high)
+#   [3000, 4999) Shared NeMo RL generation range (policy.generation.port_range_low/high)
+#     [3000, 4000) Dynamo frontend/token-wrapper HTTP endpoints
+#     [4000, 4100) Dynamo worker system endpoints (node-local free-port selection)
+#   5000-5999    NeMo Gym HTTP servers           (env.nemo_gym.port_range_low/high)
+#   6000         NeMo-Skills sandbox Nginx       (NEMO_SKILLS_SANDBOX_PORT; ray.sub starts one
+#                                                 sidecar per allocated node, driver included)
+#   6001-6999    NeMo-Skills sandbox uWSGI       (SANDBOX_BASE_PORT)
+#   7000-8999    vLLM engine rendezvous          (VLLM_PORT env var, 100-port spacing)
+#   [8300, 8556) PD-disagg frontends             (generation.disaggregation.frontend_base_port;
+#                                                 carved out of the vLLM band like SGLang below,
+#                                                 256 = the replicas * frontends cap)
+#   8600-8799    SGLang router                   (DEFAULT_SGLANG_ROUTER_PORT_RANGE_*, hard-coded;
+#                                                 carved out of the vLLM band — only one rollout
+#                                                 backend runs at a time)
+#   8800-8999    SGLang Prometheus metrics       (DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_*, hard-coded)
+DEFAULT_GENERATION_ROUTER_PORT_RANGE_LOW = 1202
+DEFAULT_GENERATION_ROUTER_PORT_RANGE_HIGH = 1300
+DEFAULT_GENERATION_PORT_RANGE_LOW = 3000
+DEFAULT_GENERATION_PORT_RANGE_HIGH = 4999
+DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW = 1313
+DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH = 1400
+DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW = 3000
+DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH = 4000
+DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_LOW = 4000
+DEFAULT_DYNAMO_SYSTEM_PORT_RANGE_HIGH = 4100
+DEFAULT_GYM_PORT_RANGE_LOW = 5000
+DEFAULT_GYM_PORT_RANGE_HIGH = 5999
+# vLLM TP/DP rendezvous ports.  Each engine gets PORTS_PER_ENGINE ports starting
+# at LOW + engine_index * PORTS_PER_ENGINE.  With 8 GPUs and TP=1 (8 engines):
+# 7000 + 8*100 = 7800, still below the 9000 ephemeral floor.
+DEFAULT_VLLM_PORT_RANGE_LOW = 7000
+DEFAULT_VLLM_PORTS_PER_ENGINE = 100
+# SGLang control-plane ports, carved out of the top of the vLLM rendezvous band —
+# safe because only one rollout backend runs at a time, and a vLLM run only
+# climbs past 8600 with >=16 engines on a single node.  Both bands also steer
+# clear of the Ray dashboard carve-out at 8265 (see ray.sub).
+# PD-disagg frontend ports: deterministic, base + replica_idx *
+# num_frontend_workers + frontend_idx, so a restarted frontend re-binds the URL
+# Gym holds. Carved out of the vLLM band (TRT-LLM is the only backend with
+# disaggregation) above the Ray dashboard at 8265; 256 ports is the
+# replicas * frontends cap that TRT-LLM's request ids impose.
+DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW = 8300
+DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH = 8556
+DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW = 8600
+DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH = 8799
+DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW = 8800
+DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_HIGH = 8999
+# Master address / TCPStore range, tucked below the Ray worker-gRPC band (2000+).
+DEFAULT_MASTER_PORT_RANGE_LOW = 1400
+DEFAULT_MASTER_PORT_RANGE_HIGH = 1999
+# One band for every port the data plane binds on the driver: mooncake's
+# metadata server, the master's RPC endpoint, and the master's metrics server.
+# The defaults those three land on -- 50050 and 50051 from TransferQueue's
+# config.yaml, 9003 from mooncake_master's own gflag -- all sit inside the
+# 9000-65000 ephemeral range these nodes use, so the kernel can hand one out as
+# a source port for outgoing traffic before the master binds it. This band is
+# the gap left below the Ray GCS ports (1200+) — see ray.sub's port map. Fifty
+# ports is ample: one master serves the whole job.
+DEFAULT_DATA_PLANE_PORT_RANGE_LOW = 1150
+DEFAULT_DATA_PLANE_PORT_RANGE_HIGH = 1200
+
+# ---------------------------------------------------------------------------
+# Topology resource keys
+# ---------------------------------------------------------------------------
+# These constants define the Ray custom-resource keys that ray.sub injects
+# into each worker node at cluster start-up. The probe pipeline is:
+#
+#   ray.sub  (topology_probe.sh)    -- parses nvidia-smi -q for ClusterUUID
+#                                   -- parses SLURM_TOPOLOGY_ADDR for topo_rank
+#                                   -- prefixes ClusterUUID with NVLINK_DOMAIN_PREFIX
+#                                   -- registers both as Ray custom resources
+#   virtual_cluster.py              -- reads these resources to sort ranks
+#
+# If you rename any of the below keys, you must also update the corresponding strings in ray.sub
+
+NVLINK_DOMAIN_PREFIX = "nvlink_domain_"
+"""Ray resource key prefix for the NVLink domain.
+Each node registers one resource ``nvlink_domain_<ClusterUUID>: 1``
+where ClusterUUID is parsed directly from ``nvidia-smi -q`` output by ray.sub.
+Nodes sharing the same key belong to the same NVLink switch fabric (e.g. one GB200 NVL72 rack)."""
+
+TOPO_RANK_KEY = "topo_rank"
+"""Ray resource key for the SLURM topological rank.
+Derived from ``SLURM_TOPOLOGY_ADDR`` (when ``SLURM_TOPOLOGY_ADDR_PATTERN=block.node``),
+falling back to ``SLURM_PROCID + 2`` on worker nodes (head node is pinned to ``1``),
+then to hostname digits when SLURM is unavailable. Values are always ``>= 1`` so that
+Ray does not drop the custom resource (Ray drops value-0 custom resources).
+Used to sort nodes within and across NVLink domains so rank assignment follows physical topology."""
+
+NVLINK_DOMAIN_UNKNOWN = "unknown"
+"""Sentinel returned when no NVLink domain info is available for a node."""
+
+TOPO_RANK_UNKNOWN: int = -1
+"""Sentinel returned when no topological rank is available for a node."""
+
 
 @ray.remote  # pragma: no cover
-def _get_node_ip_and_free_port() -> tuple[str, int]:
-    return _get_node_ip_local(), _get_free_port_local()
+def _get_node_ip_and_free_port(
+    port_range_low: int = DEFAULT_MASTER_PORT_RANGE_LOW,
+    port_range_high: int = DEFAULT_MASTER_PORT_RANGE_HIGH,
+) -> tuple[str, int]:
+    return _get_node_ip_local(), _get_free_port_local(port_range_low, port_range_high)
 
 
 def _get_node_ip_local() -> str:
@@ -77,32 +267,214 @@ def _get_node_ip_local() -> str:
     return node_ip
 
 
-def _get_free_port_local() -> int:
-    import socket
+def _bind_socket_in_range(
+    sock: socket.socket,
+    port_range_low: int,
+    port_range_high: int,
+    max_retries: int | None = 50,
+    excluded_ports: set[int] | None = None,
+    rng: Optional[random.Random] = None,
+) -> int:
+    """Try to bind *sock* to a random port in [port_range_low, port_range_high).
 
+    When *max_retries* is ``None``, try every non-excluded port once. Otherwise,
+    preserve the existing bounded random-retry behavior.
+
+    Args:
+        rng: Source of candidate ports. Defaults to the ``random`` module. That
+            module's state is process-wide and seeded per run, so every rank of a
+            job draws the same sequence; ranks sharing a node then contend for one
+            port, and whichever binds after the others have closed silently reuses
+            it. Pass a rank-seeded ``random.Random`` to decorrelate them.
+
+    Raises ``RuntimeError`` after *max_retries* failed attempts.
+    """
+    excluded = excluded_ports or set()
+    if max_retries is None:
+        candidates = [
+            port
+            for port in range(port_range_low, port_range_high)
+            if port not in excluded
+        ]
+        if rng is None:
+            random.shuffle(candidates)
+        else:
+            rng.shuffle(candidates)
+        for port in candidates:
+            try:
+                sock.bind(("", port))
+                return port
+            except OSError:
+                continue
+        retry_description = f"all {len(candidates)} available ports"
+    else:
+        for _ in range(max_retries):
+            if rng is None:
+                port = random.randint(port_range_low, port_range_high - 1)
+            else:
+                port = rng.randint(port_range_low, port_range_high - 1)
+            if port in excluded:
+                continue
+            try:
+                sock.bind(("", port))
+                return port
+            except OSError:
+                continue
+        retry_description = f"{max_retries} attempts"
+
+    raise RuntimeError(
+        f"Could not find a free port in range [{port_range_low}, {port_range_high}) "
+        f"after {retry_description}."
+    )
+
+
+def _get_free_port_local(
+    port_range_low: int = DEFAULT_MASTER_PORT_RANGE_LOW,
+    port_range_high: int = DEFAULT_MASTER_PORT_RANGE_HIGH,
+    *,
+    max_retries: int | None = 50,
+    excluded_ports: set[int] | None = None,
+    rng: Optional[random.Random] = None,
+) -> int:
+    """Find a free port, holding it only long enough to learn its number.
+
+    Args:
+        rng: Source of candidate ports; see :func:`_bind_socket_in_range`. Callers
+            that run on several ranks of one node should pass a rank-seeded
+            generator, or they will all be handed the same port.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))  # Bind to port 0 to get a random free port
+        port = _bind_socket_in_range(
+            s,
+            port_range_low,
+            port_range_high,
+            max_retries=max_retries,
+            excluded_ports=excluded_ports,
+            rng=rng,
+        )
         s.listen(1)
-        port = s.getsockname()[1]
 
     return port
 
 
+def _get_free_consecutive_ports_local(
+    port_range_low: int,
+    port_range_high: int,
+    consecutive: int = 1,
+    start_port: Optional[int] = None,
+) -> int:
+    """Find ``consecutive`` contiguous bindable ports and return the base.
+
+    Scans upward from *start_port* within [port_range_low, port_range_high).
+    *start_port* lets a caller thread a per-node cursor so successive blocks do
+    not overlap. Raises ``RuntimeError`` if no such block exists in the range.
+    """
+    assert consecutive >= 1, f"consecutive must be >= 1, got {consecutive}"
+    base = port_range_low if start_port is None else max(start_port, port_range_low)
+    while base + consecutive - 1 < port_range_high:
+        socks: list[socket.socket] = []
+        try:
+            for offset in range(consecutive):
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.bind(("", base + offset))
+                s.listen(1)
+                socks.append(s)
+            return base
+        except OSError:
+            base += 1
+        finally:
+            for s in socks:
+                s.close()
+    raise RuntimeError(
+        f"Could not find {consecutive} consecutive free ports in "
+        f"[{port_range_low}, {port_range_high})."
+    )
+
+
+def _reserve_data_plane_ports(count: int) -> list[int]:
+    """Reserve *count* distinct ports for the data plane's driver-side servers.
+
+    The defaults those servers land on -- 50050 and 50051 from TransferQueue's
+    ``config.yaml``, 9003 from mooncake_master's ``metrics_port`` gflag -- sit
+    inside the 9000-65000 ephemeral range these nodes use. The kernel can
+    therefore hand any of them to an outgoing connection during the minutes
+    between job start and the master's bind, after which the master dies with
+    EADDRINUSE. That is why ray.sub's port map keeps every service below 9000,
+    and this allocates from the band that map leaves free.
+
+    Every one of these ports is passed to the servers explicitly and reaches
+    clients through the TQ controller actor rather than being assumed, so
+    relocating them costs nothing.
+
+    ``excluded_ports`` keeps the returned ports distinct, and
+    ``_get_free_port_local`` binds without ``SO_REUSEADDR``, matching
+    mooncake_master: a port obtainable only by reusing a lingering slot is not
+    one the master could bind either.
+
+    Returns:
+        *count* ports from the data-plane band, in allocation order.
+    """
+    reserved: list[int] = []
+    for _ in range(count):
+        reserved.append(
+            _get_free_port_local(
+                DEFAULT_DATA_PLANE_PORT_RANGE_LOW,
+                DEFAULT_DATA_PLANE_PORT_RANGE_HIGH,
+                max_retries=None,
+                excluded_ports=set(reserved),
+            )
+        )
+    return reserved
+
+
 def init_ray(log_dir: Optional[str] = None) -> None:
+    """Initialise Ray, under a ``rl.setup.ray_init`` span.
+
+    Split from :func:`_init_ray` only so the span can record which of the three
+    outcomes below happened. Attaching to a cluster someone else is running and
+    booting a fresh one differ by tens of seconds, and that difference is the
+    usual reason two otherwise identical runs disagree on time-to-first-step.
+    """
+    with setup_span("ray_init") as span:
+        outcome = _init_ray(log_dir)
+        safe_set_span_attributes(span, {RAY_CLUSTER_SOURCE_ATTR: outcome})
+
+
+def _init_ray(log_dir: Optional[str] = None) -> str:
     """Initialise Ray.
 
     Try to attach to an existing local cluster.
     If that cluster uses the same CUDA_VISIBLE_DEVICES or Slurm managed tag we will reuse it.
     Otherwise, we will detach and start a fresh local cluster.
 
+    Any process env var that must reach every worker (e.g. a backend engine
+    knob such as data_plane's) has to be set before this call, in the caller
+    — this function snapshots ``dict(os.environ)`` below into
+    ``runtime_env["env_vars"]``, which is the only point such a setting
+    becomes cluster-wide. See
+    :func:`~nemo_rl.data_plane.factory.maybe_configure_data_plane_env`, which
+    a data-plane-enabled launcher calls immediately before this one.
+
     Args:
         log_dir: Optional directory to store Ray logs and temp files.
+
+    Returns:
+        How the cluster was obtained: one of the ``RAY_CLUSTER_*`` constants.
     """
-    # Set up runtime environment
-    env_vars = dict(os.environ)
+    # Ray actors deserialize constructor arguments before importing NeMo-RL.
+    # Put Hugging Face's generated ``transformers_modules`` package on the
+    # cluster-wide PYTHONPATH so trust_remote_code objects can be unpickled at
+    # that boundary. This covers both V1 worker groups and direct V2/SC actors.
+    env_vars = add_hf_modules_cache_to_pythonpath(dict(os.environ))
     env_vars.pop("RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES", None)
+
     runtime_env = {
         "env_vars": env_vars,  # Pass thru all user environment variables
+        # A module path, not the function: Ray rewrites a callable hook's
+        # runtime_env entry to its bare name, so a nested ray.init (vLLM's
+        # EngineCore at TP>1) sees a hook that no longer matches and refuses
+        # to connect.
+        "worker_process_setup_hook": _WORKER_PROCESS_SETUP_HOOK,
     }
 
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "ALL")
@@ -131,7 +503,7 @@ def init_ray(log_dir: Optional[str] = None) -> None:
                 logger.info(
                     f"Connected to existing Ray cluster (driver CVD_TAG '{cvd_tag}' matched): {cluster_res}"
                 )
-                return
+                return RAY_CLUSTER_REUSED_LOCAL
 
             # If neither reuse condition is met, but we connected to *something*
             logger.info(
@@ -151,7 +523,7 @@ def init_ray(log_dir: Optional[str] = None) -> None:
         # Always reuse if it's an externally managed cluster.
         else:
             logger.info(f"Connected to existing Ray cluster: {cluster_res}")
-            return
+            return RAY_CLUSTER_EXTERNAL
 
     except ConnectionError:
         logger.debug("No existing Ray cluster found, will start a new one.")
@@ -175,18 +547,373 @@ def init_ray(log_dir: Optional[str] = None) -> None:
     logger.info(
         f"Started local cluster with tag '{cvd_tag}': {ray.cluster_resources()}"
     )
+    return RAY_CLUSTER_STARTED_LOCAL
 
 
 @ray.remote(num_gpus=1)
-class GetGPUIDActor:  # pragma: no cover
-    """Util actor class to return GPU id of the current worker."""
+def _get_gpu_id_info() -> tuple[int, str, int]:  # pragma: no cover
+    """Return (gpu_id, nvlink_domain, topo_rank) for the current worker's bundle.
 
-    def get_gpu_id(self):
-        return ray.get_gpu_ids()[0]
+    Reads custom resources set by ray.sub (see NVLINK_DOMAIN_PREFIX / TOPO_RANK_KEY).
+    """
+    gpu_id = ray.get_gpu_ids()[0]
+    nvlink_domain = NVLINK_DOMAIN_UNKNOWN
+    topo_rank = TOPO_RANK_UNKNOWN
+    runtime_ctx = ray.get_runtime_context()
+    node_id = runtime_ctx.get_node_id()
+    all_node_resources: dict = {}
+    for node in ray.nodes():
+        if node.get("NodeID") == node_id:
+            all_node_resources = node.get("Resources", {})
+            break
+    for key, val in all_node_resources.items():
+        if key.startswith(NVLINK_DOMAIN_PREFIX):
+            nvlink_domain = key
+        if key == TOPO_RANK_KEY:
+            topo_rank = int(val)
+    return gpu_id, nvlink_domain, topo_rank
+
+
+def get_reordered_bundle(
+    pg: PlacementGroup,
+    segment_size: int | None = None,
+    gpus_per_node: int | None = None,
+) -> tuple[list[int], list[int], tuple[str, ...]]:
+    """Return bundle indices and GPU IDs ordered by physical topology.
+
+    Spins up one short-lived task per bundle (``_get_gpu_id_info``) to discover
+    each bundle's physical GPU ID, NVLink domain, and ``topo_rank``, then orders
+    bundles via ``_sort_bundle_indices_by_topology``:
+
+      * No topology info available -> sort by ``(node_id, gpu_id)``.
+      * Topology info available    -> sort by ``(domain_min_topo_rank, topo_rank, gpu_id)``.
+      * ``segment_size`` set        -> additionally drop bundles from NVLink
+        domains that cannot form a complete ``segment_size``-node segment.
+
+    Args:
+        pg: Placement group whose bundles to reorder.
+        segment_size: Nodes per NVLink domain segment for topology-aware
+            alignment; ``None`` disables segment filtering.
+        gpus_per_node: Required when ``segment_size`` is set.
+
+    Returns:
+        ``(reordered_bundle_indices, reordered_gpu_ids, nvlink_domain_per_bundle_index)``
+        where ``nvlink_domain_per_bundle_index`` is indexed by *original* bundle index.
+    """
+    pg_data = placement_group_table(pg)
+    num_bundles = len(pg_data["bundles"])
+    bundle_to_node_ids = pg_data["bundles_to_node_id"]
+
+    # Fire-and-forget tasks to get GPU id + topology info per bundle.
+    # Tasks reuse the raylet's worker pool and avoid GCS actor registrations.
+    info_refs = [
+        _get_gpu_id_info.options(
+            num_cpus=0.01,  # both small to enable assignment in colocated case
+            num_gpus=0.01,
+            resources=None,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=i,
+            ),
+        ).remote()
+        for i in range(num_bundles)
+    ]
+    infos = ray.get(info_refs)
+    gpu_ids = [info[0] for info in infos]
+    nvlink_domains = [info[1] for info in infos]
+    topo_ranks = [info[2] for info in infos]
+
+    bundle_data = [
+        (gpu_ids[i], nvlink_domains[i], topo_ranks[i], bundle_to_node_ids[i])
+        for i in range(num_bundles)
+    ]
+    reordered_bundle_indices = _sort_bundle_indices_by_topology(
+        bundle_data,
+        segment_size=segment_size,
+        gpus_per_node=gpus_per_node,
+    )
+    reordered_gpu_ids = [gpu_ids[i] for i in reordered_bundle_indices]
+    return reordered_bundle_indices, reordered_gpu_ids, tuple(nvlink_domains)
 
 
 class ResourceInsufficientError(Exception):
     """Exception raised when the cluster does not have enough resources to satisfy the requested configuration."""
+
+
+def get_ray_cluster_topology() -> dict[str, tuple[str, int]]:
+    """Query all alive Ray nodes for their NVLink domain and topo_rank.
+
+    Returns:
+        Dict mapping node_id -> (nvlink_domain, topo_rank).
+        nvlink_domain is NVLINK_DOMAIN_UNKNOWN and topo_rank is TOPO_RANK_UNKNOWN
+        if topology info is unavailable.
+    """
+    topology: dict[str, tuple[str, int]] = {}
+    for node in ray.nodes():
+        if not node.get("Alive", False):
+            continue
+        node_id = node.get("NodeID", "")
+        resources = node.get("Resources", {})
+        nvlink_domain = NVLINK_DOMAIN_UNKNOWN
+        topo_rank = TOPO_RANK_UNKNOWN
+        for key, val in resources.items():
+            if key.startswith(NVLINK_DOMAIN_PREFIX):
+                nvlink_domain = key
+            if key == TOPO_RANK_KEY:
+                topo_rank = int(val)
+        topology[node_id] = (nvlink_domain, topo_rank)
+    return topology
+
+
+def select_segment_nodes(
+    topology: dict[str, tuple[str, int]],
+    segment_size: int,
+    num_nodes: int,
+) -> tuple[list[str], list[str]]:
+    """Partition Ray node IDs into segment-aligned selected nodes and remainder.
+
+    Greedily selects complete segments (segment_size nodes) from each NVLink domain,
+    sorted by topological order, until num_nodes is reached.
+
+    Args:
+        topology: Dict mapping node_id -> (nvlink_domain, topo_rank) from get_ray_cluster_topology().
+        segment_size: Number of nodes per NVLink domain segment.
+        num_nodes: Total number of nodes to select.
+
+    Returns:
+        (selected_node_ids, remaining_node_ids): Selected nodes are in topological order.
+
+    Raises:
+        ValueError: If segment_size does not evenly divide num_nodes.
+        ResourceInsufficientError: If not enough complete segments can be formed.
+    """
+    if num_nodes % segment_size != 0:
+        raise ValueError(
+            f"num_nodes ({num_nodes}) must be divisible by "
+            f"segment_size ({segment_size})."
+        )
+
+    domain_nodes: dict[str, list[tuple[str, int]]] = {}
+    for nid, (domain, topo_rank) in topology.items():
+        # Skip nodes with no NVLink-domain info. They all collapse into a single
+        # NVLINK_DOMAIN_UNKNOWN pseudo-domain with TOPO_RANK_UNKNOWN (-1), so they
+        # would sort first and be selected — but the resulting placement-group
+        # constraint {NVLINK_DOMAIN_UNKNOWN: 0.001} names a Ray resource that
+        # ray.sub never registers, so the bundle can never schedule. Excluding
+        # them here means we only ever pin to real, registered NVLink domains
+        # (and these nodes fall through to remaining_node_ids).
+        if domain == NVLINK_DOMAIN_UNKNOWN:
+            continue
+        domain_nodes.setdefault(domain, []).append((nid, topo_rank))
+    for domain in domain_nodes:
+        domain_nodes[domain].sort(key=lambda x: x[1])
+
+    # Sort domains by the minimum topo_rank of their nodes.
+    sorted_domains = sorted(
+        domain_nodes.items(),
+        key=lambda item: item[1][0][1],
+    )
+
+    num_segments_needed = num_nodes // segment_size
+    selected_node_ids: list[str] = []
+    segments_taken = 0
+
+    for domain, nodes in sorted_domains:
+        if segments_taken >= num_segments_needed:
+            break
+        segments_available = len(nodes) // segment_size
+        segments_to_take = min(segments_available, num_segments_needed - segments_taken)
+        nodes_to_take = segments_to_take * segment_size
+        for nid, _ in nodes[:nodes_to_take]:
+            selected_node_ids.append(nid)
+        segments_taken += segments_to_take
+
+    if segments_taken < num_segments_needed:
+        domain_summary = {d: len(ns) for d, ns in sorted_domains}
+        raise ResourceInsufficientError(
+            f"Cannot form {num_segments_needed} complete segments of {segment_size} nodes. "
+            f"Nodes per domain: {domain_summary}. "
+            f"Need {num_nodes} nodes total."
+        )
+
+    remaining_node_ids = [nid for nid in topology if nid not in set(selected_node_ids)]
+
+    domains_used = set()
+    for nid in selected_node_ids:
+        domains_used.add(topology[nid][0])
+    logger.info(
+        f"[TOPOLOGY] Segment selection: {segments_taken} segments of {segment_size} nodes "
+        f"from {len(domains_used)} NVLink domains -> {len(selected_node_ids)} selected nodes, "
+        f"{len(remaining_node_ids)} remaining nodes"
+    )
+
+    return selected_node_ids, remaining_node_ids
+
+
+def prepare_segment_topology(
+    segment_size: int | None,
+    num_nodes: int,
+    *,
+    topology: dict[str, tuple[str, int]] | None = None,
+    role: str = "training",
+) -> tuple[list[dict[str, float]] | None, list[str], dict[str, tuple[str, int]]]:
+    """Compute node resource constraints for topology-aware cluster placement.
+
+    Fetches cluster topology if not provided, selects segment-aligned nodes,
+    and returns per-node domain constraints ready for ``RayVirtualCluster``.
+
+    Args:
+        segment_size: Nodes per NVLink domain segment. ``None`` disables topology logic.
+        num_nodes: Number of nodes to select.
+        topology: Pre-fetched topology dict; fetched automatically when ``None``.
+        role: Label used in progress messages (e.g. ``"training"``, ``"inference"``).
+
+    Returns:
+        ``(node_resource_constraints, remaining_node_ids, topology)``
+
+        - *node_resource_constraints*: per-node domain-pinning dicts for
+          ``RayVirtualCluster``, or ``None`` when ``segment_size`` is ``None`` or
+          no NVLink domain info is available.
+        - *remaining_node_ids*: node IDs not selected; pass the corresponding
+          sub-topology to a follow-up call to allocate an inference cluster.
+        - *topology*: the topology dict used (empty dict when ``segment_size`` is
+          ``None``, for safe sub-topology slicing by callers).
+    """
+    if segment_size is None:
+        return None, [], {}
+
+    if topology is None:
+        topology = get_ray_cluster_topology()
+
+    has_topology = any(
+        domain != NVLINK_DOMAIN_UNKNOWN for domain, _ in topology.values()
+    )
+    if not has_topology:
+        print(
+            f"  ⚠ segment_size={segment_size} is set but no NVLink domain info "
+            "found, falling back to unordered allocation",
+            flush=True,
+        )
+        return None, list(topology.keys()), topology
+
+    selected_node_ids, remaining_node_ids = select_segment_nodes(
+        topology, segment_size, num_nodes
+    )
+    node_resource_constraints = [{topology[nid][0]: 0.001} for nid in selected_node_ids]
+    print(
+        f"  ✓ Topology-aware allocation: {num_nodes} {role} nodes in "
+        f"{len(set(topology[nid][0] for nid in selected_node_ids))} NVLink domains "
+        f"(segment_size={segment_size})",
+        flush=True,
+    )
+    return node_resource_constraints, remaining_node_ids, topology
+
+
+def _sort_bundle_indices_by_topology(
+    bundle_data: list[tuple[int, str, int, str]],
+    segment_size: int | None = None,
+    gpus_per_node: int | None = None,
+) -> list[int]:
+    """Compute topology-aware sort order for bundle indices.
+
+    When topology information is available: sort by (domain_min_topo_rank, topo_rank, gpu_id).
+    When segment_size is set: additionally validate that each NVLink domain contributes
+    complete segments (segment_size nodes), discarding bundles from incomplete domains.
+    Else: sort by (node_id, gpu_id).
+
+    Args:
+        bundle_data: For each bundle i, (gpu_id, nvlink_domain, topo_rank, node_id).
+        segment_size: If set, number of nodes per NVLink domain segment. Bundles from
+            domains with fewer than segment_size nodes are excluded.
+        gpus_per_node: Required when segment_size is set. Number of GPUs per node.
+
+    Returns:
+        List of bundle indices in sorted order.
+
+    Raises:
+        ValueError: If segment_size is set but gpus_per_node is not.
+    """
+    if segment_size is not None and gpus_per_node is None:
+        raise ValueError("gpus_per_node is required when segment_size is set")
+
+    if not bundle_data:
+        return []
+
+    has_topology = any(
+        b[1] != NVLINK_DOMAIN_UNKNOWN or b[2] != TOPO_RANK_UNKNOWN for b in bundle_data
+    )
+
+    # Without topology info, fall back to deterministic (node_id, gpu_id) ordering.
+    if not has_topology:
+        basic = [
+            (i, node_id, gpu_id)
+            for i, (gpu_id, _, _, node_id) in enumerate(bundle_data)
+        ]
+        return [idx for idx, _, _ in sorted(basic, key=lambda x: (x[1], x[2]))]
+
+    class BundleInfo(NamedTuple):
+        idx: int
+        node_id: str
+        gpu_id: int
+        domain: str
+        topo_rank: int
+
+    bundle_infos = [
+        BundleInfo(
+            idx=i,
+            node_id=node_id,
+            gpu_id=gpu_id,
+            domain=nvlink_domain,
+            topo_rank=topo_rank,
+        )
+        for i, (gpu_id, nvlink_domain, topo_rank, node_id) in enumerate(bundle_data)
+    ]
+
+    if segment_size is not None:
+        assert gpus_per_node is not None
+        domain_bundles: dict[str, list[BundleInfo]] = {}
+        for info in bundle_infos:
+            domain_bundles.setdefault(info.domain, []).append(info)
+
+        filtered: list[BundleInfo] = []
+        for domain, bundles in domain_bundles.items():
+            domain_node_count = len(set(b.node_id for b in bundles))
+            usable_nodes = (domain_node_count // segment_size) * segment_size
+            usable_gpus = usable_nodes * gpus_per_node
+            bundles.sort(key=lambda x: (x.topo_rank, x.gpu_id))
+            kept = bundles[:usable_gpus]
+            discarded = bundles[usable_gpus:]
+            if discarded:
+                logger.info(
+                    f"[TOPOLOGY] Domain {domain}: keeping {len(kept)} bundles "
+                    f"({usable_nodes} nodes), discarding {len(discarded)} bundles "
+                    f"({domain_node_count - usable_nodes} incomplete segment nodes)"
+                )
+            filtered.extend(kept)
+        bundle_infos = filtered
+
+    domain_to_min_topo_rank: dict[str, int] = {}
+    for info in bundle_infos:
+        if (
+            info.domain not in domain_to_min_topo_rank
+            or info.topo_rank < domain_to_min_topo_rank[info.domain]
+        ):
+            domain_to_min_topo_rank[info.domain] = info.topo_rank
+
+    indices = [
+        info.idx
+        for info in sorted(
+            bundle_infos,
+            key=lambda x: (domain_to_min_topo_rank[x.domain], x.topo_rank, x.gpu_id),
+        )
+    ]
+    for rank, idx in enumerate(indices):
+        gpu_id, nvlink_domain, topo_rank, node_id = bundle_data[idx]
+        logger.info(
+            f"[TOPOLOGY] Rank {rank} -> GPU {gpu_id} on node {node_id} "
+            f"(nvlink_domain: {nvlink_domain}, topo_rank: {topo_rank})"
+        )
+    return indices
 
 
 class RayVirtualCluster:
@@ -210,6 +937,10 @@ class RayVirtualCluster:
         num_gpus_per_node: int = 8,
         name: str = "",
         placement_group_strategy: str = "SPREAD",
+        port_range_low: Optional[int] = None,
+        port_range_high: Optional[int] = None,
+        segment_size: int | None = None,
+        node_resource_constraints: list[dict[str, float]] | None = None,
     ):
         """Initialize a virtual cluster using Ray placement groups.
 
@@ -221,11 +952,29 @@ class RayVirtualCluster:
             num_gpus_per_node: Number of GPUs per node
             name: Name prefix for placement groups
             placement_group_strategy: Ray placement group strategy ("STRICT_PACK", "PACK", or "SPREAD")
+            port_range_low: Lower bound (inclusive) of the port range for master address allocation.
+                Falls back to DEFAULT_MASTER_PORT_RANGE_LOW if None.
+            port_range_high: Upper bound (exclusive) of the port range for master address allocation.
+                Falls back to DEFAULT_MASTER_PORT_RANGE_HIGH if None.
+            segment_size: Nodes per NVLink domain segment for topology-aware alignment.
+                         When set, _sort_bundle_indices_by_topology trims incomplete domain segments.
+            node_resource_constraints: Per-logical-node extra Ray resource requirements.
+                         Length must match bundle_ct_per_node_list. Each dict is merged into
+                         every bundle spec for that node, pinning it to a physical domain.
+                         Built from NVLink domain resources injected by ray.sub.
+                         Example: [{"nvlink_domain_<uuid>": 0.001}] * 16 pins 16 nodes to a single NVLink domain.
         """
+        if node_resource_constraints is not None:
+            assert len(node_resource_constraints) == len(bundle_ct_per_node_list), (
+                f"node_resource_constraints length ({len(node_resource_constraints)}) must match "
+                f"bundle_ct_per_node_list length ({len(bundle_ct_per_node_list)})"
+            )
+
         self._bundle_ct_per_node_list = bundle_ct_per_node_list
         self._world_size = sum(self._bundle_ct_per_node_list)
         self._node_placement_groups: Optional[list[PlacementGroup]] = None
         self._sorted_bundle_indices: Optional[list[int]] = None
+        self._nvlink_domain_per_bundle_index: Optional[tuple[str, ...]] = None
 
         self.num_gpus_per_node = num_gpus_per_node
         self.use_gpus = use_gpus
@@ -236,6 +985,19 @@ class RayVirtualCluster:
         self.max_colocated_worker_groups = max_colocated_worker_groups
         self.name = name
         self.placement_group_strategy = placement_group_strategy
+        self.port_range_low = (
+            port_range_low
+            if port_range_low is not None
+            else DEFAULT_MASTER_PORT_RANGE_LOW
+        )
+        self.port_range_high = (
+            port_range_high
+            if port_range_high is not None
+            else DEFAULT_MASTER_PORT_RANGE_HIGH
+        )
+        self._allocated_master_ports: set[int] = set()
+        self.segment_size = segment_size
+        self.node_resource_constraints = node_resource_constraints
 
     def _init_placement_groups(
         self, strategy: str | None = None, use_unified_pg: bool = False
@@ -313,15 +1075,22 @@ class RayVirtualCluster:
         # num_gpus_per_bundle == 1 indicates that there is 1 GPU per process
         num_gpus_per_bundle = 1 if self.use_gpus else 0
 
+        def _make_bundle(node_idx: int) -> dict:
+            bundle: dict = {"CPU": num_cpus_per_bundle, "GPU": num_gpus_per_bundle}
+            if (
+                self.node_resource_constraints
+                and self.node_resource_constraints[node_idx]
+            ):
+                bundle.update(self.node_resource_constraints[node_idx])
+            return bundle
+
         placement_groups = []
         if use_unified_pg:
             # Create a single unified placement group for cross-node model parallelism
             all_bundles = []
-            for bundle_count in self._bundle_ct_per_node_list:
+            for node_idx, bundle_count in enumerate(self._bundle_ct_per_node_list):
                 for _ in range(bundle_count):
-                    all_bundles.append(
-                        {"CPU": num_cpus_per_bundle, "GPU": num_gpus_per_bundle}
-                    )
+                    all_bundles.append(_make_bundle(node_idx))
 
             placement_groups = [
                 placement_group(
@@ -332,10 +1101,7 @@ class RayVirtualCluster:
             # Create per-node placement groups to respect bundle_ct_per_node_list
             for node_idx, bundle_count in enumerate(self._bundle_ct_per_node_list):
                 if bundle_count > 0:
-                    node_bundles = [
-                        {"CPU": num_cpus_per_bundle, "GPU": num_gpus_per_bundle}
-                        for _ in range(bundle_count)
-                    ]
+                    node_bundles = [_make_bundle(node_idx) for _ in range(bundle_count)]
                     pg = placement_group(
                         bundles=node_bundles,
                         strategy="PACK",  # Use PACK to keep bundles together
@@ -386,36 +1152,81 @@ class RayVirtualCluster:
         Returns:
             Tuple of (address, port)
         """
-        # Get placement groups if not already created
-        if not self._node_placement_groups:
-            self.get_placement_groups()
+        results = self.get_available_addresses_and_ports_batch([(pg_idx, bundle_idx)])
+        return results[0]
 
-        # Get the placement group
+    def get_available_addresses_and_ports_batch(
+        self,
+        pg_bundle_pairs: list[tuple[int, int]],
+        batch_size: int = 256,
+    ) -> list[tuple[str, int]]:
+        """Discovers available addresses and ports for multiple bundles in parallel.
+
+        Fires all remote tasks up front, then collects results in batches via ray.wait()
+        to avoid putting too many objects into the Ray object
+        store at once.
+        See https://docs.ray.io/en/latest/ray-core/patterns/ray-get-too-many-objects.html
+
+        Args:
+            pg_bundle_pairs: List of ``(pg_idx, bundle_idx)`` pairs.
+            batch_size: Maximum number of ready futures to fetch at once.
+
+        Returns:
+            List of ``(address, port)`` tuples in the same order as ``pg_bundle_pairs``.
+        """
         placement_groups = self.get_placement_groups()
-        if len(placement_groups) == 1:
-            pg = placement_groups[0]
-        else:
-            pg = placement_groups[pg_idx]
+        refs: list[ray.ObjectRef] = []
+        for pg_idx, bundle_idx in pg_bundle_pairs:
+            pg = (
+                placement_groups[0]
+                if len(placement_groups) == 1
+                else placement_groups[pg_idx]
+            )
+            if not pg.bundle_specs:
+                raise RuntimeError(
+                    "No valid placement groups found to get available address and port"
+                )
 
-        if pg.bundle_specs:
-            # Launch port finder on the given bundle of this placement group
-            addr, port = ray.get(
+            refs.append(
                 _get_node_ip_and_free_port.options(
                     scheduling_strategy=PlacementGroupSchedulingStrategy(
                         placement_group=pg, placement_group_bundle_index=bundle_idx
                     ),
                     # Need to explicitly set to 0 since it's possible for this to be unschedulable if all CPUs are already in use.
                     num_cpus=0,
-                ).remote()
+                ).remote(self.port_range_low, self.port_range_high)
             )
-            return addr, port
 
-        raise RuntimeError(
-            "No valid placement groups found to get available address and port"
-        )
+        if len(refs) <= batch_size:
+            return ray.get(refs)
+
+        # ray.wait returns refs in completion order, so map each ref back to
+        # its input index to preserve worker-to-port ordering.
+        ref_to_idx = {ref: idx for idx, ref in enumerate(refs)}
+        results: list[Optional[tuple[str, int]]] = []
+        for _ in refs:
+            results.append(None)
+        remaining = list(refs)
+        while remaining:
+            ready, remaining = ray.wait(
+                remaining, num_returns=min(batch_size, len(remaining))
+            )
+            for ref, value in zip(ready, ray.get(ready)):
+                results[ref_to_idx[ref]] = value
+
+        ordered_results: list[tuple[str, int]] = []
+        for result in results:
+            assert result is not None
+            ordered_results.append(result)
+        return ordered_results
 
     def get_master_address_and_port(self) -> tuple[str, int]:
         """Gets the master address and port for the distributed training setup.
+
+        Each call returns a unique port that has not been returned by previous
+        calls on this cluster instance.  This prevents NCCL process-group
+        collisions when multiple worker groups (e.g. policy and value) share the
+        same cluster and node.
 
         Returns:
             Tuple of (address, port)
@@ -424,61 +1235,115 @@ class RayVirtualCluster:
         if not self._node_placement_groups:
             self.get_placement_groups()
 
-        # If sorted bundle indices are available, get the address and port for the first bundle index
         if self._sorted_bundle_indices is not None:
-            return self.get_available_address_and_port(
-                pg_idx=0, bundle_idx=self._sorted_bundle_indices[0]
-            )
+            pg_idx, bundle_idx = 0, self._sorted_bundle_indices[0]
+        else:
+            pg_idx, bundle_idx = 0, 0
 
-        # Otherwise, get the address and port for bundle index 0
-        return self.get_available_address_and_port(pg_idx=0, bundle_idx=0)
+        max_retries = 10
+        for _ in range(max_retries):
+            addr, port = self.get_available_address_and_port(pg_idx, bundle_idx)
+            if port not in self._allocated_master_ports:
+                self._allocated_master_ports.add(port)
+                return addr, port
+
+        raise RuntimeError(
+            f"Failed to find a unique master port after {max_retries} retries. "
+            f"Already allocated ports: {self._allocated_master_ports}"
+        )
 
     def _get_sorted_bundle_indices(self) -> Optional[list[int]]:
-        """Gets the sorted bundle indices for the placement groups."""
+        """Gets the sorted bundle indices for the placement groups.
+
+        Returns:
+            List of bundle indices in sorted order.
+        """
         if self._node_placement_groups is None:
             raise ValueError(
                 "Placement groups must be initialized before calling _get_sorted_bundle_indices"
             )
 
         if not self.use_gpus:
+            self._nvlink_domain_per_bundle_index = None
             return None
 
         if len(self._node_placement_groups) != 1:
+            self._nvlink_domain_per_bundle_index = None
             return None
 
-        pg = self._node_placement_groups[0]
-        pg_data = placement_group_table(pg)
-        num_bundles = len(pg_data["bundles"])
-        bundle_to_node_ids = pg_data["bundles_to_node_id"]
-
-        # use info actor to get the GPU id
-        info_actors = []
-        for i in range(num_bundles):
-            info_actors.append(
-                GetGPUIDActor.options(
-                    num_cpus=0.01,  # set both num_cpus and num_gpus to be small values to enable assignment in colocated case
-                    num_gpus=0.01,
-                    resources=None,
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=pg,
-                        placement_group_bundle_index=i,
-                    ),
-                ).remote()
+        reordered_bundle_indices, _, nvlink_domain_per_bundle_index = (
+            get_reordered_bundle(
+                self._node_placement_groups[0],
+                segment_size=self.segment_size,
+                gpus_per_node=self.num_gpus_per_node if self.segment_size else None,
             )
+        )
+        self._nvlink_domain_per_bundle_index = nvlink_domain_per_bundle_index
+        num_bundles = len(nvlink_domain_per_bundle_index)
+        assert len(reordered_bundle_indices) == num_bundles, (
+            f"Topology sort returned {len(reordered_bundle_indices)} bundle indices "
+            f"but the cluster has {num_bundles}. Some NVLink domains had incomplete "
+            f"segments and were trimmed. Ensure cluster.segment_size divides evenly "
+            f"into each domain's node count and that node_resource_constraints are set "
+            f"to pin nodes to complete segments before creating this cluster."
+        )
+        return reordered_bundle_indices
 
-        gpu_ids = ray.get([actor.get_gpu_id.remote() for actor in info_actors])
-        for actor in info_actors:
-            ray.kill(actor)
+    def get_topology_sorted_pg_indices(self) -> list[int]:
+        """Placement group indices ordered by physical topology.
 
-        # original index, node_id, gpu_id
-        bundle_infos = [
-            (i, bundle_to_node_ids[i], gpu_ids[i]) for i in range(num_bundles)
-        ]
-        pg_reordered_bundle_indices = [
-            bundle_info[0]
-            for bundle_info in sorted(bundle_infos, key=lambda x: (x[1], x[2]))
-        ]  # sort by node_id, then gpu_id
-        return pg_reordered_bundle_indices
+        The unified-PG path sorts *bundles* (see ``_get_sorted_bundle_indices``),
+        but with per-node placement groups the caller consumes whole PGs, and Ray
+        decides which physical node backs each one. Two PGs that are adjacent in
+        creation order can therefore sit in different NVLink domains, which for a
+        consumer whose unit spans several nodes (a TRT-LLM disaggregated replica,
+        say) silently demotes its inter-node traffic from NVLink to InfiniBand.
+
+        Sorting by ``(nvlink_domain's smallest topo_rank, topo_rank)`` puts nodes
+        of one domain next to each other, so consecutive PGs belong to the same
+        domain wherever the allocation allows it. Ordering *within* a domain is
+        not a bandwidth concern (an NVL72 fabric is uniform) but keeps a given
+        config reproducible across runs.
+
+        Returns:
+            Indices into ``get_placement_groups()``. Falls back to the existing
+            order when the cluster is CPU-only, is a single unified PG, or has no
+            topology information -- ordering is an optimization, never a
+            requirement.
+        """
+        pgs = self.get_placement_groups()
+        identity = list(range(len(pgs)))
+        if not self.use_gpus or len(pgs) <= 1:
+            return identity
+
+        topology = get_ray_cluster_topology()
+        if not any(domain != NVLINK_DOMAIN_UNKNOWN for domain, _ in topology.values()):
+            return identity
+
+        node_of_pg: list[str] = []
+        for pg in pgs:
+            bundles_to_node = placement_group_table(pg)["bundles_to_node_id"]
+            if not bundles_to_node:
+                return identity
+            node_of_pg.append(next(iter(bundles_to_node.values())))
+        if any(node_id not in topology for node_id in node_of_pg):
+            return identity
+
+        # Rank domains by their smallest topo_rank so domain order is stable and
+        # follows the fabric, not dict iteration order.
+        domain_rank: dict[str, int] = {}
+        for domain, topo_rank in topology.values():
+            if domain not in domain_rank or topo_rank < domain_rank[domain]:
+                domain_rank[domain] = topo_rank
+
+        return sorted(
+            identity,
+            key=lambda i: (
+                domain_rank[topology[node_of_pg[i]][0]],
+                topology[node_of_pg[i]][1],
+                i,
+            ),
+        )
 
     def shutdown(self) -> bool:
         """Cleans up and releases all resources associated with this virtual cluster.
@@ -487,6 +1352,11 @@ class RayVirtualCluster:
 
         This method is idempotent and can be safely called multiple times.
         """
+        # Skip if Ray is already gone (typically from __del__ during _Py_Finalize
+        # after Ray's atexit teardown). Any Ray API call would trigger a fatal
+        # core_worker_process.cc:88 CHECK. Placement groups die with Ray.
+        if not ray.is_initialized():
+            return True
         if self._node_placement_groups is not None:
             # Remove all placement groups
             for pg in self._node_placement_groups:
@@ -498,6 +1368,8 @@ class RayVirtualCluster:
 
             # Reset internal state
             self._node_placement_groups = None
+            self._sorted_bundle_indices = None
+            self._nvlink_domain_per_bundle_index = None
 
         return True
 

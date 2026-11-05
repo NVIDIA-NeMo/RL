@@ -1,0 +1,21 @@
+# Super 2K unpacked control. Packing changes only in the sibling config.
+defaults: vlm_mpo-nemotron-omni-nopack-legacy-parity.yaml
+
+policy:
+  model_name: REPLACE_WITH_NEMOTRON_SUPER_OMNI_MODEL
+  tokenizer:
+    name: ${policy.model_name}
+  max_total_sequence_length: 2048
+  megatron_cfg:
+    tensor_model_parallel_size: 8
+    expert_model_parallel_size: 32
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    # Initial Super parity excludes the checkpoint's auxiliary MTP head.
+    mtp_num_layers: 0
+    mtp_loss_scaling_factor: 0.0
+    # Match the legacy no-pack run's unfused logprob path.
+    use_fused_linear_logprobs: false
+
+data:
+  max_input_seq_length: 2048

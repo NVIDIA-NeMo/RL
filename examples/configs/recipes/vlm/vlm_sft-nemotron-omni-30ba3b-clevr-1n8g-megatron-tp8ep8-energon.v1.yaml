@@ -1,0 +1,47 @@
+defaults: vlm_sft-qwen2.5-vl-3b-instruct-clevr-1n2g-megatrontp1-energon.v1.yaml
+sft:
+  max_num_steps: 100
+policy:
+  model_name: /data/models/Nemotron-3-Nano-Omni-30B-A3B-Reasoning-BF16
+  megatron_cfg:
+    empty_unused_memory_level: 2
+    activation_checkpointing: true
+    bias_activation_fusion: false
+    tensor_model_parallel_size: 8
+    expert_model_parallel_size: 8
+    sequence_parallel: true
+    freeze_vision_model: true
+    freeze_vision_projection: false
+    freeze_sound_encoder: true
+    freeze_sound_projection: true
+    moe_router_dtype: fp32
+    moe_router_load_balancing_type: none
+    moe_aux_loss_coeff: 0.0
+    moe_router_enable_expert_bias: true
+    defer_fp32_logits: true
+    radio_force_cpe_eval_mode: true
+    optimizer:
+      optimizer_cpu_offload: true
+      optimizer_offload_fraction: 1.0
+    distributed_data_parallel_config:
+      overlap_param_gather: false
+checkpointing:
+  enabled: false
+data:
+  add_bos: false
+  add_eos: false
+  energon:
+    model_family: nemotron
+logger:
+  wandb_enabled: false
+  log_dir: logs/sft-nemotron-omni-30b-clevr-energon-tp4etp4-v2
+  wandb:
+    name: sft-nemotron-omni-30b-clevr-energon-tp4etp4-v2
+  tensorboard:
+    log_dir: tb_logs-sft-nemotron-omni-30b-clevr-energon-tp4etp4-v2
+  swanlab:
+    name: sft-nemotron-omni-30b-clevr-energon-tp4etp4-v2
+  mlflow:
+    run_name: sft-nemotron-omni-30b-clevr-energon-tp4etp4-v2
+cluster:
+  gpus_per_node: 8

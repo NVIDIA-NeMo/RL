@@ -1,0 +1,958 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import os
+import tempfile
+from collections.abc import Iterator
+from copy import deepcopy
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import ray
+import torch
+import torch.nn as nn
+
+from nemo_rl.algorithms.utils import get_tokenizer
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.models.generation import configure_generation_config
+from nemo_rl.models.policy.lm_policy import Policy
+from tests.unit.models.policy.test_megatron_worker import create_megatron_test_config
+from tests.unit.test_utils import SimpleLossFn
+
+pytestmark = pytest.mark.mcore
+
+_MODELOPT_AVAILABLE = False
+try:
+    import modelopt.torch.quantization as mtq  # noqa: F401
+
+    _MODELOPT_AVAILABLE = True
+except ImportError:
+    pass
+
+_WORKER_IMPORTABLE = False
+if _MODELOPT_AVAILABLE:
+    try:
+        from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
+        from modelopt.torch.quantization.nn.modules.tensor_quantizer import (
+            TensorQuantizer,
+        )
+
+        from nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker import (
+            MegatronQuantPolicyWorker,
+        )
+
+        _WORKER_IMPORTABLE = True
+    except ImportError:
+        pass
+
+_CUDA_AVAILABLE = torch.cuda.is_available()
+
+requires_quant = pytest.mark.skipif(
+    not (_CUDA_AVAILABLE and _MODELOPT_AVAILABLE),
+    reason="Requires CUDA + modelopt for FP8 quantization",
+)
+
+requires_weight_folding = pytest.mark.skipif(
+    not _WORKER_IMPORTABLE,
+    reason="Requires modelopt + megatron deps for weight folding tests",
+)
+
+_VOCAB_SIZE = 32000
+_BATCH_SIZE = 8
+_NUM_GPUS = 2
+_NVFP4_A16_RECIPE = (
+    Path(__file__).resolve().parents[4]
+    / "examples/modelopt/quant_configs/nvfp4_a16_mlp_only.yaml"
+).as_posix()
+
+
+class _FakeModelOptBridge:
+    def __init__(self):
+        self.transformer_config = SimpleNamespace(num_layers=0)
+        self.calls = []
+
+    def export_hf_weights_modelopt(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        yield "model.layers.0.mlp.down_proj.weight", torch.ones(2, 2)
+
+
+def _make_real_quant_worker():
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.cfg = {
+        "quant_cfg": _NVFP4_A16_RECIPE,
+        "generation": {
+            "backend": "vllm",
+            "quant_cfg": _NVFP4_A16_RECIPE,
+            "real_quant": True,
+            "real_quant_export_cpu_offload": True,
+            "real_quant_ignore": ["lm_head"],
+            "vllm_cfg": {"kv_cache_dtype": "auto"},
+        },
+    }
+    worker.model = object()
+    worker.draft_model = None
+    worker.refit_conversion_tasks = ["task"]
+    worker.megatron_bridge = _FakeModelOptBridge()
+    worker.rank = 0
+    return worker
+
+
+@requires_weight_folding
+def test_modelopt_policy_worker_uses_real_quant_refit_timeout(monkeypatch):
+    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
+
+    events = []
+
+    class FakeSocket:
+        def setsockopt(self, option, value):
+            events.append(("setsockopt", option, value))
+
+        def bind(self, address):
+            events.append(("bind", address))
+
+    class FakeContext:
+        def socket(self, socket_type):
+            events.append(("socket", socket_type))
+            return FakeSocket()
+
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.cfg = {}
+    worker._use_real_quant_refit = lambda: True
+    worker.get_zmq_address = lambda: "ipc:///tmp/modelopt-test.sock"
+    monkeypatch.setattr(megatron_quant_policy_worker.zmq, "Context", FakeContext)
+
+    worker.maybe_init_zmq()
+
+    timeout = megatron_quant_policy_worker.MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS
+    assert events == [
+        ("socket", megatron_quant_policy_worker.zmq.REQ),
+        ("setsockopt", megatron_quant_policy_worker.zmq.SNDTIMEO, 120_000),
+        ("setsockopt", megatron_quant_policy_worker.zmq.RCVTIMEO, 120_000),
+        ("setsockopt", megatron_quant_policy_worker.zmq.LINGER, 0),
+        ("bind", "ipc:///tmp/modelopt-test.sock"),
+        ("setsockopt", megatron_quant_policy_worker.zmq.SNDTIMEO, timeout),
+        ("setsockopt", megatron_quant_policy_worker.zmq.RCVTIMEO, timeout),
+    ]
+
+
+def create_quant_megatron_test_config(model_name, tp=1, pp=1, precision="float32"):
+    """Wrap the base Megatron test config with quantization fields."""
+    config = create_megatron_test_config(
+        model_name=model_name, tp=tp, pp=pp, precision=precision
+    )
+    config["quant_cfg"] = "FP8_DEFAULT_CFG"
+    config["quant_calib_size"] = 1
+    config["quant_calib_data"] = "random"
+    config["quant_batch_size"] = 1
+    config["quant_sequence_length"] = 128
+    return config
+
+
+@requires_weight_folding
+def test_modelopt_layer_spec_config_selects_layer_specs():
+    from functools import partial
+
+    from megatron.bridge.models.gpt_provider import transformer_engine_layer_spec
+    from megatron.bridge.models.mamba.mamba_provider import (
+        modelopt_mamba_stack_spec,
+        transformer_engine_mamba_stack_spec,
+    )
+    from megatron.core.post_training.modelopt.gpt.model_specs import (
+        get_gpt_modelopt_spec,
+    )
+
+    from nemo_rl.modelopt.models.policy.workers.utils import (
+        get_quantization_layer_spec,
+        get_quantization_mamba_stack_spec,
+    )
+
+    assert get_quantization_layer_spec(True) is transformer_engine_layer_spec
+    assert (
+        get_quantization_mamba_stack_spec(True) is transformer_engine_mamba_stack_spec
+    )
+
+    layer_spec = get_quantization_layer_spec(False)
+    assert isinstance(layer_spec, partial)
+    assert layer_spec.func is get_gpt_modelopt_spec
+    assert get_quantization_mamba_stack_spec(False) is modelopt_mamba_stack_spec
+
+
+@requires_weight_folding
+def test_quantization_model_specs_support_hybrid_and_legacy_mamba_providers():
+    from nemo_rl.modelopt.models.policy.workers.megatron_quant_policy_worker import (
+        _set_quantization_model_specs,
+    )
+    from nemo_rl.modelopt.models.policy.workers.utils import (
+        get_quantization_layer_spec,
+        get_quantization_mamba_stack_spec,
+    )
+
+    hybrid_config = SimpleNamespace(hybrid_stack_spec=None)
+    _set_quantization_model_specs(hybrid_config, True)
+    assert hybrid_config.transformer_layer_spec is get_quantization_layer_spec(True)
+    assert hybrid_config.hybrid_stack_spec is get_quantization_mamba_stack_spec(True)
+
+    legacy_config = SimpleNamespace(mamba_stack_spec=None)
+    _set_quantization_model_specs(legacy_config, False)
+    assert (
+        legacy_config.transformer_layer_spec.func
+        is get_quantization_layer_spec(False).func
+    )
+    assert legacy_config.mamba_stack_spec is get_quantization_mamba_stack_spec(False)
+
+
+@requires_weight_folding
+def test_warns_when_other_quantized_startup_caches_exist(tmp_path, monkeypatch):
+    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
+
+    base_path = tmp_path / "model"
+    selected_path = tmp_path / "model_modelopt_selected"
+    old_hashed_path = tmp_path / "model_modelopt_old"
+    legacy_path = tmp_path / "model_quantized"
+    invalid_path = tmp_path / "model_modelopt_invalid"
+    for cache_path in (old_hashed_path, legacy_path, invalid_path):
+        (cache_path / "iter_0000000").mkdir(parents=True)
+
+    monkeypatch.setattr(
+        megatron_quant_policy_worker,
+        "has_modelopt_state",
+        lambda path: "invalid" not in path,
+    )
+
+    with pytest.warns(
+        UserWarning,
+        match=r"checkpointing\.checkpoint_dir",
+    ) as warning_records:
+        megatron_quant_policy_worker._warn_if_other_quant_checkpoint_caches(
+            base_path.as_posix(),
+            selected_path.as_posix(),
+        )
+
+    message = str(warning_records[0].message)
+    assert old_hashed_path.as_posix() in message
+    assert legacy_path.as_posix() in message
+    assert invalid_path.as_posix() not in message
+
+
+@requires_weight_folding
+def test_real_quant_refit_detection_requires_vllm_quant_cfg_and_flag():
+    worker = _make_real_quant_worker()
+
+    assert worker._use_real_quant_refit()
+
+    worker.cfg["generation"]["real_quant"] = False
+    assert not worker._use_real_quant_refit()
+
+    worker.cfg["generation"]["real_quant"] = True
+    worker.cfg["generation"]["quant_cfg"] = None
+    assert not worker._use_real_quant_refit()
+
+    worker.cfg["generation"]["quant_cfg"] = "NVFP4_DEFAULT_CFG"
+    worker.cfg["generation"]["backend"] = "megatron"
+    assert not worker._use_real_quant_refit()
+
+
+@requires_weight_folding
+def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
+    worker = _make_real_quant_worker()
+
+    output = list(worker._iter_real_quant_refit_params())
+
+    assert output[0][0] == "model.layers.0.mlp.down_proj.weight"
+    args, kwargs = worker.megatron_bridge.calls[0]
+    assert args == ([worker.model],)
+    assert kwargs["quant_mode"] == "w4a16_nvfp4"
+    assert kwargs["cpu"] is True
+    assert kwargs["show_progress"] is False
+    assert kwargs["conversion_tasks"] == worker.refit_conversion_tasks
+    assert kwargs["ignore_patterns"] == ["lm_head"]
+
+
+@requires_weight_folding
+def test_iter_real_quant_refit_params_can_keep_export_on_gpu() -> None:
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["real_quant_export_cpu_offload"] = False
+
+    list(worker._iter_real_quant_refit_params())
+
+    _, kwargs = worker.megatron_bridge.calls[0]
+    assert kwargs["cpu"] is False
+
+
+@pytest.mark.parametrize("quant_mode", ["w4a16_nvfp4", "nvfp4"])
+@requires_quant
+@requires_weight_folding
+def test_modelopt_real_quant_cpu_and_gpu_exports_are_byte_identical(
+    quant_mode: str,
+) -> None:
+    # Megatron Bridge is an optional dependency needed only by this CUDA test.
+    from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
+    from megatron.bridge.models.conversion.modelopt_utils import (
+        QuantMeta,
+        get_modelopt_quant_exporter,
+    )
+
+    qformat, export_weight = get_modelopt_quant_exporter(quant_mode)
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    source = torch.randn(
+        (32, 32),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    meta = QuantMeta(
+        qformat=qformat,
+        block_size=16,
+        weight_amax=source.abs().max(),
+        input_amax=torch.tensor(2.0, device="cuda"),
+    )
+
+    def export_hook(
+        name: str,
+        tensor: torch.Tensor,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        yield from export_weight(name, tensor, meta)
+
+    weight = HFWeightTuple("model.layers.0.mlp.down_proj.weight", source)
+    cpu_export = list(weight.iter_finalized(cpu=True, export_hook=export_hook))
+    gpu_export = list(weight.iter_finalized(cpu=False, export_hook=export_hook))
+
+    assert [name for name, _ in cpu_export] == [name for name, _ in gpu_export]
+    assert len(cpu_export) == (4 if quant_mode == "nvfp4" else 3)
+    for (_, cpu_tensor), (_, gpu_tensor) in zip(cpu_export, gpu_export, strict=True):
+        assert cpu_tensor.device.type == "cpu"
+        assert gpu_tensor.device.type == "cuda"
+        assert cpu_tensor.shape == gpu_tensor.shape
+        assert cpu_tensor.dtype == gpu_tensor.dtype
+        assert torch.equal(
+            cpu_tensor.contiguous().reshape(-1).view(torch.uint8),
+            gpu_tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu(),
+        )
+
+
+@requires_weight_folding
+def test_iter_real_quant_refit_params_exports_w4a4_mode():
+    worker = _make_real_quant_worker()
+    quant_cfg = "NVFP4_EXPERTS_ONLY_CFG"
+    worker.cfg["quant_cfg"] = quant_cfg
+    worker.cfg["generation"]["quant_cfg"] = quant_cfg
+
+    list(worker._iter_real_quant_refit_params())
+
+    _, kwargs = worker.megatron_bridge.calls[0]
+    assert kwargs["quant_mode"] == "nvfp4"
+
+
+@requires_weight_folding
+def test_iter_real_quant_refit_params_rejects_policy_generation_mode_mismatch():
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["quant_cfg"] = "NVFP4_EXPERTS_ONLY_CFG"
+
+    with pytest.raises(ValueError, match="matching policy and generation"):
+        list(worker._iter_real_quant_refit_params())
+
+
+@requires_weight_folding
+def test_iter_params_with_optional_kv_scales_uses_real_quant_export(monkeypatch):
+    worker = _make_real_quant_worker()
+    monkeypatch.setattr(
+        worker,
+        "_iter_real_quant_refit_params",
+        lambda kv_scales=None: iter([("real.weight", torch.ones(1))]),
+    )
+
+    output = list(worker._iter_params_with_optional_kv_scales({"scale": 1.0}))
+
+    assert output[0][0] == "real.weight"
+    torch.testing.assert_close(output[0][1], torch.ones(1))
+
+
+@requires_weight_folding
+def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
+    from nemo_rl.modelopt.models.policy.workers import megatron_quant_policy_worker
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    class FakeTensorQuantizer:
+        def __init__(self, amax):
+            self.is_enabled = True
+            self._amax = amax
+
+    class FakeQuantModule:
+        def __init__(self):
+            self.input_quantizer = FakeTensorQuantizer(torch.tensor([3.0]))
+
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.cfg = {"generation": {"backend": "vllm", "quant_cfg": "FP8_DEFAULT_CFG"}}
+    worker.rank = 0
+    worker.refit_conversion_tasks = [
+        SimpleNamespace(
+            param_name="decoder.layers.0.mlp.linear_fc2.weight",
+            global_param_name="decoder.layers.0.mlp.linear_fc2.weight",
+            param_weight=torch.ones(2, 2),
+            megatron_module=FakeQuantModule(),
+            mapping=SimpleNamespace(
+                hf_param="model.layers.0.mlp.down_proj.weight",
+            ),
+        )
+    ]
+
+    monkeypatch.setattr(
+        megatron_quant_policy_worker,
+        "TensorQuantizer",
+        FakeTensorQuantizer,
+    )
+    monkeypatch.setattr(
+        MegatronPolicyWorkerImpl,
+        "_iter_params_with_optional_kv_scales",
+        lambda self, kv_scales=None: iter(
+            [("model.layers.0.mlp.down_proj.weight", torch.ones(2, 2))]
+        ),
+    )
+
+    output = list(worker._iter_params_with_optional_kv_scales())
+
+    assert [name for name, _ in output] == [
+        "model.layers.0.mlp.down_proj.weight",
+        "model.layers.0.mlp.down_proj.input_quantizer._amax",
+    ]
+    torch.testing.assert_close(output[1][1], torch.tensor([3.0]))
+
+
+@requires_weight_folding
+def test_folded_quantizer_error_includes_parameter_name(monkeypatch):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    class FailingQuantizer:
+        def __call__(self, _weight):
+            raise ValueError("invalid quantizer state")
+
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.cfg = {
+        "generation": {
+            "backend": "vllm",
+            "quant_cfg": "FP8_DEFAULT_CFG",
+            "real_quant": False,
+        }
+    }
+    worker.rank = 0
+    task = SimpleNamespace(
+        param_name="decoder.layers.0.mlp.linear_fc2.weight",
+        global_param_name="decoder.layers.0.mlp.linear_fc2.weight",
+        param_weight=torch.ones(2, 2),
+        megatron_module=object(),
+        mapping=SimpleNamespace(hf_param="model.layers.0.mlp.down_proj.weight"),
+    )
+    worker.refit_conversion_tasks = [task]
+
+    monkeypatch.setattr(
+        worker,
+        "_find_weight_quantizer",
+        lambda *_args: FailingQuantizer(),
+    )
+
+    def access_refit_task_weights(self, kv_scales=None):
+        for refit_task in self.refit_conversion_tasks:
+            yield refit_task.param_name, refit_task.param_weight
+
+    monkeypatch.setattr(
+        MegatronPolicyWorkerImpl,
+        "_iter_params_with_optional_kv_scales",
+        access_refit_task_weights,
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        list(worker._iter_params_with_optional_kv_scales())
+
+    assert (
+        "Failed to apply weight quantizer for param "
+        "'decoder.layers.0.mlp.linear_fc2.weight'"
+    ) in str(exc_info.value)
+    assert isinstance(exc_info.value.__cause__, ValueError)
+    assert str(exc_info.value.__cause__) == "invalid quantizer state"
+    assert worker.refit_conversion_tasks == [task]
+
+
+@requires_weight_folding
+def test_stream_weights_via_ipc_zmq_uses_real_quant_generator_without_move(
+    monkeypatch,
+):
+    from nemo_rl.models.policy import utils as policy_utils
+
+    worker = _make_real_quant_worker()
+    worker.zmq_socket = object()
+    calls = []
+
+    monkeypatch.setattr(worker, "maybe_init_zmq", lambda: calls.append("init_zmq"))
+
+    def fail_move_model(*args, **kwargs):
+        raise AssertionError("stream_weights_via_ipc_zmq should not move the model")
+
+    monkeypatch.setattr(worker, "move_model", fail_move_model)
+
+    def fake_stream_weights_via_ipc_zmq_impl(**kwargs):
+        calls.append(kwargs)
+        assert list(kwargs["params_generator"])[0][0] == (
+            "model.layers.0.mlp.down_proj.weight"
+        )
+
+    monkeypatch.setattr(
+        policy_utils,
+        "stream_weights_via_ipc_zmq_impl",
+        fake_stream_weights_via_ipc_zmq_impl,
+    )
+
+    worker.stream_weights_via_ipc_zmq(buffer_size_bytes=123, kv_scales={"scale": 1.0})
+
+    assert calls[0] == "init_zmq"
+    assert calls[1]["buffer_size_bytes"] == 123
+    assert calls[1]["zmq_socket"] is worker.zmq_socket
+    assert calls[1]["rank"] == 0
+
+
+@requires_weight_folding
+def test_stream_weights_via_ipc_zmq_does_not_move_without_real_quant(monkeypatch):
+    from nemo_rl.models.policy import utils as policy_utils
+
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["real_quant"] = False
+    worker.zmq_socket = object()
+    calls = []
+
+    monkeypatch.setattr(worker, "maybe_init_zmq", lambda: calls.append("init_zmq"))
+
+    def fail_move_model(*args, **kwargs):
+        raise AssertionError("stream_weights_via_ipc_zmq should not move the model")
+
+    monkeypatch.setattr(worker, "move_model", fail_move_model)
+    monkeypatch.setattr(
+        worker,
+        "_iter_params_with_optional_kv_scales",
+        lambda kv_scales=None: iter([("model.weight", torch.ones(1))]),
+    )
+
+    def fake_stream_weights_via_ipc_zmq_impl(**kwargs):
+        calls.append(kwargs)
+        params = list(kwargs["params_generator"])
+        assert params[0][0] == "model.weight"
+        torch.testing.assert_close(params[0][1], torch.ones(1))
+
+    monkeypatch.setattr(
+        policy_utils,
+        "stream_weights_via_ipc_zmq_impl",
+        fake_stream_weights_via_ipc_zmq_impl,
+    )
+
+    worker.stream_weights_via_ipc_zmq(buffer_size_bytes=123, kv_scales={"scale": 1.0})
+
+    assert calls[0] == "init_zmq"
+    assert calls[1]["buffer_size_bytes"] == 123
+    assert calls[1]["zmq_socket"] is worker.zmq_socket
+    assert calls[1]["rank"] == 0
+
+
+def _make_cluster(name):
+    return RayVirtualCluster(
+        name=name,
+        bundle_ct_per_node_list=[_NUM_GPUS],
+        use_gpus=True,
+        num_gpus_per_node=_NUM_GPUS,
+        max_colocated_worker_groups=1,
+    )
+
+
+def _prepare_config(model_name, precision="float32"):
+    config = create_quant_megatron_test_config(model_name, precision=precision)
+    tokenizer = get_tokenizer(config["tokenizer"])
+    config["generation"] = configure_generation_config(config["generation"], tokenizer)
+    return config, tokenizer
+
+
+@requires_quant
+@pytest.mark.timeout(600)
+@pytest.mark.hf_gated
+def test_quant_megatron_training(tiny_llama_model_path):
+    """Quantized Megatron policy training should converge (loss decreases, no NaN/Inf)."""
+    cluster = _make_cluster("test-quant-train")
+    config, tokenizer = _prepare_config(tiny_llama_model_path)
+
+    policy = None
+    try:
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=False,
+        )
+
+        # Verify quantizers were calibrated during init
+        stats_futures = policy.worker_group.run_all_workers_single_data(
+            "get_quantizer_stats"
+        )
+        stats_list = ray.get(stats_futures)
+        for rank, stats in enumerate(stats_list):
+            print(f"Rank {rank} quantizer stats: {stats}")
+            assert stats["enabled"] > 0, f"Rank {rank}: no enabled quantizers"
+            assert stats["with_amax"] == stats["enabled"], (
+                f"Rank {rank}: {stats['enabled'] - stats['with_amax']} enabled quantizers missing amax"
+            )
+            assert stats["positive_amax"] == stats["with_amax"], (
+                f"Rank {rank}: {stats['with_amax'] - stats['positive_amax']} quantizers have non-positive amax"
+            )
+
+        torch.manual_seed(42)
+        seq_len = 128
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.randint(0, _VOCAB_SIZE, (_BATCH_SIZE, seq_len)),
+                "input_lengths": torch.full((_BATCH_SIZE,), seq_len, dtype=torch.int32),
+                "attention_mask": torch.ones(_BATCH_SIZE, seq_len),
+                "labels": torch.randint(0, _VOCAB_SIZE, (_BATCH_SIZE, seq_len)),
+                "sample_mask": torch.ones(_BATCH_SIZE),
+            }
+        )
+
+        loss_fn = SimpleLossFn()
+        policy.prepare_for_training()
+
+        losses = []
+        for step in range(3):
+            results = policy.train(data, loss_fn)
+            loss_tensor = results["loss"]
+            assert not torch.isnan(loss_tensor).any(), f"NaN loss at step {step}"
+            assert not torch.isinf(loss_tensor).any(), f"Inf loss at step {step}"
+            losses.append(loss_tensor[-1].item())
+            print(f"Quant training step {step}: loss={losses[-1]:.6f}")
+
+        policy.finish_training()
+
+        assert losses[0] > losses[-1], (
+            f"Loss should decrease: {losses[0]:.6f} -> {losses[-1]:.6f}"
+        )
+    finally:
+        if policy:
+            policy.shutdown()
+        cluster.shutdown()
+
+
+@requires_quant
+@pytest.mark.timeout(600)
+@pytest.mark.hf_gated
+def test_quant_megatron_reference_policy(tiny_llama_model_path):
+    """Reference model should remain unchanged after quantized training."""
+    cluster = _make_cluster("test-quant-refpol")
+
+    config, tokenizer = _prepare_config(tiny_llama_model_path)
+    config["megatron_cfg"]["optimizer"]["lr"] = 1e-2
+    config["megatron_cfg"]["optimizer"]["min_lr"] = 1e-3
+
+    policy = None
+    try:
+        policy = Policy(
+            cluster=cluster,
+            config=config,
+            tokenizer=tokenizer,
+            init_reference_model=True,
+        )
+
+        torch.manual_seed(42)
+        seq_len = 64
+        input_ids = torch.randint(0, _VOCAB_SIZE, (_BATCH_SIZE, seq_len))
+        input_lengths = torch.full((_BATCH_SIZE,), seq_len, dtype=torch.int32)
+        attention_mask = torch.ones(_BATCH_SIZE, seq_len)
+
+        infer_data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "attention_mask": attention_mask,
+            }
+        )
+
+        policy.prepare_for_lp_inference()
+        initial_logprobs = policy.get_logprobs(infer_data)["logprobs"]
+        reference_logprobs = policy.get_reference_policy_logprobs(infer_data)[
+            "reference_logprobs"
+        ]
+
+        # Logprobs contract checks
+        assert initial_logprobs.dtype == torch.float32
+        assert initial_logprobs.shape == input_ids.shape
+        assert torch.all(initial_logprobs[:, 0] == 0), (
+            "First token logprobs should be zero"
+        )
+        assert not torch.isnan(initial_logprobs).any(), "Active logprobs contain NaN"
+        assert not torch.isinf(initial_logprobs).any(), "Active logprobs contain Inf"
+        assert not torch.isnan(reference_logprobs).any(), (
+            "Reference logprobs contain NaN"
+        )
+
+        # Quantized active model and unquantized reference model diverge even before training
+        quant_gap = torch.max(torch.abs(initial_logprobs - reference_logprobs)).item()
+        print(f"Pre-training quantization gap (active vs ref): {quant_gap:.6f}")
+
+        train_data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "attention_mask": attention_mask,
+                "labels": torch.randint(0, _VOCAB_SIZE, (_BATCH_SIZE, seq_len)),
+                "sample_mask": torch.ones(_BATCH_SIZE),
+            }
+        )
+
+        loss_fn = SimpleLossFn()
+        policy.prepare_for_training()
+
+        losses = []
+        for step in range(10):
+            results = policy.train(train_data, loss_fn)
+            losses.append(results["loss"][-1].item())
+            print(f"Quant ref-pol training step {step}: loss={losses[-1]:.6f}")
+
+        policy.finish_training()
+
+        assert losses[0] > losses[-1], (
+            f"Loss should decrease: {losses[0]:.6f} -> {losses[-1]:.6f}"
+        )
+
+        policy.prepare_for_lp_inference()
+        post_train_logprobs = policy.get_logprobs(infer_data)["logprobs"]
+        post_train_ref_logprobs = policy.get_reference_policy_logprobs(infer_data)[
+            "reference_logprobs"
+        ]
+
+        torch.testing.assert_close(
+            reference_logprobs, post_train_ref_logprobs, rtol=1e-4, atol=1e-4
+        )
+
+        logprobs_changed = not torch.allclose(
+            initial_logprobs, post_train_logprobs, rtol=1e-2, atol=1e-2
+        )
+        max_diff = torch.max(torch.abs(initial_logprobs - post_train_logprobs)).item()
+        assert logprobs_changed, (
+            f"Active model logprobs should change after training "
+            f"(max diff={max_diff:.6f})"
+        )
+    finally:
+        if policy:
+            policy.shutdown()
+        cluster.shutdown()
+
+
+@requires_quant
+@pytest.mark.timeout(600)
+@pytest.mark.hf_gated
+def test_quant_megatron_checkpoint_save_restore(tiny_llama_model_path):
+    """Quantized checkpoint round-trip: save -> kill -> restore -> logprobs match."""
+    import gc
+
+    with tempfile.TemporaryDirectory(prefix="quant_ckpt_") as temp_dir:
+        checkpoint_dir = os.path.join(temp_dir, "quant_restore_test")
+
+        config, tokenizer = _prepare_config(tiny_llama_model_path)
+
+        torch.manual_seed(42)
+        seq_len = 32
+        input_ids = torch.randint(0, _VOCAB_SIZE, (_BATCH_SIZE, seq_len))
+        input_lengths = torch.full((_BATCH_SIZE,), seq_len, dtype=torch.int32)
+        attention_mask = torch.ones(_BATCH_SIZE, seq_len)
+
+        train_data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                "input_lengths": input_lengths,
+                "attention_mask": attention_mask,
+                "labels": torch.randint(0, _VOCAB_SIZE, (_BATCH_SIZE, seq_len)),
+                "sample_mask": torch.ones(_BATCH_SIZE),
+            }
+        )
+
+        sample_size = _BATCH_SIZE // 2
+        sample_data = BatchedDataDict(
+            {
+                "input_ids": input_ids[:sample_size],
+                "input_lengths": input_lengths[:sample_size],
+                "attention_mask": attention_mask[:sample_size],
+            }
+        )
+
+        # --- Phase 1: train & save ---
+        cluster1 = _make_cluster("test-quant-ckpt-1")
+        policy1 = None
+        logprobs_before_save = None
+        try:
+            policy1 = Policy(cluster=cluster1, config=config, tokenizer=tokenizer)
+
+            loss_fn = SimpleLossFn()
+            policy1.prepare_for_training()
+            for step in range(5):
+                results = policy1.train(train_data, loss_fn)
+                print(
+                    f"Quant ckpt phase-1 step {step}: "
+                    f"loss={results['loss'][-1].item():.6f}"
+                )
+
+            policy1.prepare_for_lp_inference()
+            logprobs_before_save = policy1.get_logprobs(sample_data)["logprobs"]
+            print(f"Logprobs before save (first vals): {logprobs_before_save[0, :5]}")
+
+            policy1.save_checkpoint(
+                weights_path=checkpoint_dir,
+                optimizer_path=checkpoint_dir,
+                is_final_checkpoint=False,
+            )
+            assert os.path.exists(checkpoint_dir), "Checkpoint dir not created"
+        finally:
+            if policy1:
+                policy1.finish_training()
+                policy1.shutdown()
+            cluster1.shutdown()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        # --- Phase 2: restore & compare ---
+        cluster2 = _make_cluster("test-quant-ckpt-2")
+        policy2 = None
+        try:
+            restore_config = deepcopy(config)
+            policy2 = Policy(
+                cluster=cluster2,
+                config=restore_config,
+                tokenizer=tokenizer,
+                weights_path=checkpoint_dir,
+                init_reference_model=False,
+            )
+
+            policy2.prepare_for_lp_inference()
+            logprobs_restored = policy2.get_logprobs(sample_data)["logprobs"]
+            print(f"Logprobs restored (first vals): {logprobs_restored[0, :5]}")
+
+            max_diff = torch.max(
+                torch.abs(logprobs_before_save - logprobs_restored)
+            ).item()
+            mean_diff = torch.mean(
+                torch.abs(logprobs_before_save - logprobs_restored)
+            ).item()
+            print(f"Checkpoint restore diff -- max: {max_diff}, mean: {mean_diff}")
+
+            assert torch.allclose(logprobs_before_save, logprobs_restored, atol=1e-4), (
+                f"Restored logprobs should match saved (max_diff={max_diff})"
+            )
+        finally:
+            if policy2:
+                policy2.shutdown()
+            cluster2.shutdown()
+
+
+_find_wq = (
+    MegatronQuantPolicyWorker._find_weight_quantizer if _WORKER_IMPORTABLE else None
+)
+
+if _WORKER_IMPORTABLE:
+
+    class _SingleWeightQuantModule(QuantModule):
+        """Minimal QuantModule with one GEMM weight and its quantizer."""
+
+        def __init__(self, enable_quantizer=True):
+            nn.Module.__init__(self)
+            self.weight = nn.Parameter(torch.randn(4, 4))
+            self.weight_quantizer = TensorQuantizer()
+            if not enable_quantizer:
+                self.weight_quantizer.disable()
+
+        def iter_weights_for_calibration(self):
+            yield self.weight, self.weight_quantizer
+
+    class _MultiWeightQuantModule(QuantModule):
+        """QuantModule with multiple GEMM weights (e.g. MoE grouped GEMM)."""
+
+        def __init__(self, num_weights=3):
+            nn.Module.__init__(self)
+            for i in range(num_weights):
+                setattr(self, f"weight{i}", nn.Parameter(torch.randn(4, 4)))
+            self.weight_quantizer = TensorQuantizer()
+            self._num_weights = num_weights
+
+        def iter_weights_for_calibration(self):
+            for i in range(self._num_weights):
+                yield getattr(self, f"weight{i}"), self.weight_quantizer
+
+
+@requires_weight_folding
+class TestFindWeightQuantizer:
+    """Tests for MegatronQuantPolicyWorker._find_weight_quantizer."""
+
+    def test_matches_gemm_weight(self):
+        """GEMM weight should be matched to its enabled quantizer."""
+        module = _SingleWeightQuantModule(enable_quantizer=True)
+        result = _find_wq(module, module.weight)
+        assert result is module.weight_quantizer
+
+    def test_skips_non_weight_param(self):
+        """A tensor that is NOT the module's weight must not be matched."""
+        module = _SingleWeightQuantModule(enable_quantizer=True)
+        bias = nn.Parameter(torch.randn(4))
+        assert _find_wq(module, bias) is None
+
+    def test_skips_different_tensor_same_shape(self):
+        """A tensor with the same shape/values but different identity must not match."""
+        module = _SingleWeightQuantModule(enable_quantizer=True)
+        clone = module.weight.clone()
+        assert _find_wq(module, clone) is None
+
+    def test_skips_disabled_quantizer(self):
+        """Disabled quantizer should not be returned even for the correct weight."""
+        module = _SingleWeightQuantModule(enable_quantizer=False)
+        assert _find_wq(module, module.weight) is None
+
+    def test_non_quant_module(self):
+        """Plain nn.Module (not a QuantModule) should always return None."""
+        linear = nn.Linear(4, 4)
+        assert _find_wq(linear, linear.weight) is None
+
+    def test_none_module(self):
+        """None module should return None."""
+        tensor = torch.randn(4, 4)
+        assert _find_wq(None, tensor) is None
+
+    def test_none_param_weight(self):
+        """None param_weight should return None."""
+        module = _SingleWeightQuantModule(enable_quantizer=True)
+        assert _find_wq(module, None) is None
+
+    def test_multi_weight_matches_each(self):
+        """Each weight in a multi-weight module should match the shared quantizer."""
+        module = _MultiWeightQuantModule(num_weights=3)
+        for i in range(3):
+            w = getattr(module, f"weight{i}")
+            result = _find_wq(module, w)
+            assert result is module.weight_quantizer, (
+                f"weight{i} should match the quantizer"
+            )
+
+    def test_multi_weight_rejects_unknown(self):
+        """A tensor not in the multi-weight module should not match."""
+        module = _MultiWeightQuantModule(num_weights=3)
+        unknown = nn.Parameter(torch.randn(4, 4))
+        assert _find_wq(module, unknown) is None

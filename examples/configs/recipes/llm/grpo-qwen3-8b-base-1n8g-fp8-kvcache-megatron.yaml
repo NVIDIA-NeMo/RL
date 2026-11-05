@@ -11,13 +11,12 @@ policy:
   train_micro_batch_size: 1
   logprob_batch_size: 1
   max_total_sequence_length: 8192
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
   optimizer: null
   scheduler: null
   megatron_cfg:
     enabled: true
-    converter_type: Qwen3ForCausalLM
     tensor_model_parallel_size: 4
     optimizer:
       lr: 1.0e-06

@@ -17,10 +17,11 @@ import json
 import os
 from collections import Counter
 from itertools import combinations
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 import ray
 import torch
+from pydantic import BaseModel
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
@@ -32,6 +33,7 @@ from nemo_rl.data.llm_message_utils import get_keys_from_message_log
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.environments.math_environment import MathEnvConfig
+from nemo_rl.environments.vlm_environment import VLMEnvConfig
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy import TokenizerConfig
@@ -50,16 +52,17 @@ class EvalConfig(TypedDict):
 
 
 # TODO: this should updated, but is left to avoid breaking changes
-class _PassThroughMathConfig(TypedDict):
-    math: MathEnvConfig
+class _PassThroughEnvConfig(TypedDict):
+    math: NotRequired[MathEnvConfig]
+    mmau: NotRequired[VLMEnvConfig]
 
 
-class MasterConfig(TypedDict):
+class MasterConfig(BaseModel, extra="allow"):
     eval: EvalConfig
     generation: GenerationConfig  # Fixed: was 'generate'
     tokenizer: TokenizerConfig  # Added missing tokenizer key
     data: EvalDataConfigType
-    env: _PassThroughMathConfig
+    env: _PassThroughEnvConfig
     cluster: ClusterConfig
 
 
@@ -89,9 +92,9 @@ def setup(
         VLLM model, data loader, and config.
     """
     # Extract individual configs for easier access
-    eval_config = master_config["eval"]
-    generation_config = master_config["generation"]
-    cluster_config = master_config["cluster"]
+    eval_config = master_config.eval
+    generation_config = master_config.generation
+    cluster_config = master_config.cluster
 
     # Set seed for reproducibility
     set_seed(eval_config["seed"])
@@ -134,13 +137,13 @@ def setup(
     print("\n▶ Setting up compute cluster...")
     cluster = RayVirtualCluster(
         name="eval_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-        * cluster_config["num_nodes"],
+        bundle_ct_per_node_list=[cluster_config.gpus_per_node]
+        * cluster_config.num_nodes,
         use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
+        num_gpus_per_node=cluster_config.gpus_per_node,
         max_colocated_worker_groups=1,
     )
-    print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
+    print(f"  ✓ Ray cluster initialized with {cluster_config.num_nodes} nodes")
 
     # ==========================
     #           Model
@@ -285,19 +288,21 @@ def run_env_eval(vllm_generation, dataloader, env, master_config):
         env: Environment that scores responses.
         master_config: Configuration settings.
     """
-    # Check if async engine is enabled and run appropriate version
-    if master_config["generation"]["vllm_cfg"]["async_engine"]:
-        asyncio.run(
-            _run_env_eval_impl(
-                vllm_generation, dataloader, env, master_config, use_async=True
-            )
+    generation_config = master_config.generation
+    backend = generation_config.get("backend", "")
+    if backend == "sglang":
+        use_async = bool(generation_config.get("use_async_rollouts", False))
+    elif backend == "vllm":
+        use_async = bool(
+            generation_config.get("vllm_cfg", {}).get("async_engine", False)
         )
     else:
-        asyncio.run(
-            _run_env_eval_impl(
-                vllm_generation, dataloader, env, master_config, use_async=False
-            )
+        use_async = False
+    asyncio.run(
+        _run_env_eval_impl(
+            vllm_generation, dataloader, env, master_config, use_async=use_async
         )
+    )
 
 
 async def _run_env_eval_impl(
@@ -305,8 +310,8 @@ async def _run_env_eval_impl(
 ):
     """Unified implementation for both sync and async evaluation."""
     # Extract for easier access
-    generation_config = master_config["generation"]
-    eval_config = master_config["eval"]
+    generation_config = master_config.generation
+    eval_config = master_config.eval
     metric = eval_config["metric"]
     num_tests_per_prompt = eval_config["num_tests_per_prompt"]
     k_value = eval_config["k_value"]
@@ -321,12 +326,56 @@ async def _run_env_eval_impl(
         if num_tests_per_prompt > 1:
             batch = batch.repeat_interleave(num_tests_per_prompt)
 
-        # get input prompt from message_log
+        # Get input prompts from message_log, preserving any vLLM-ready data.
+        vllm_content_rows = batch.get("vllm_content", None)
+        multi_modal_rows = batch.get("vllm_multi_modal_data", None)
         prompts = []
-        for message_log in batch["message_log"]:
-            content = [message["content"] for message in message_log]
-            content = "\n".join(content)
-            prompts.append(content)
+        prompts_for_display = []
+        for i, message_log in enumerate(batch["message_log"]):
+            vllm_content = (
+                vllm_content_rows[i] if vllm_content_rows is not None else None
+            )
+            multi_modal_data = (
+                multi_modal_rows[i] if multi_modal_rows is not None else None
+            )
+            if vllm_content is not None:
+                prompt_dict = {"prompt": vllm_content}
+                prompt_display = vllm_content
+                if multi_modal_data:
+                    prompt_dict["multi_modal_data"] = multi_modal_data
+                prompts.append(prompt_dict)
+                prompts_for_display.append(prompt_display)
+            elif multi_modal_data:
+                # Fallback for custom processors supplying media without text.
+                prompt_token_ids = []
+                for message in message_log:
+                    token_ids = message["token_ids"]
+                    prompt_token_ids.extend(
+                        token_ids.tolist()
+                        if isinstance(token_ids, torch.Tensor)
+                        else token_ids
+                    )
+                prompt_dict = {
+                    "prompt_token_ids": prompt_token_ids,
+                    "multi_modal_data": multi_modal_data,
+                }
+                prompt_display = "\n".join(
+                    str(message["content"]) for message in message_log
+                )
+                prompts.append(prompt_dict)
+                prompts_for_display.append(prompt_display)
+            else:
+                # Text-only fallback: use raw prompt strings (vLLM will tokenize them).
+                # Note: utils.py's format_prompt_for_vllm_generation uses pre-tokenized
+                # prompt_token_ids instead, since the training pipeline already has
+                # input_ids tensors. Both are valid vLLM inputs but may tokenize
+                # slightly differently. Truncated VLM rows also reach this branch,
+                # so stringify their content, which is still a list of typed parts.
+                fallback_content = "\n".join(
+                    str(message["content"]) for message in message_log
+                )
+                prompts.append(fallback_content)
+                prompts_for_display.append(fallback_content)
 
         # generate by vllm
         inputs = BatchedDataDict({"prompts": prompts})
@@ -353,7 +402,7 @@ async def _run_env_eval_impl(
         # Collect data for JSON file
         for i, (prompt, output, message_log, reward, extra_info) in enumerate(
             zip(
-                prompts,
+                prompts_for_display,
                 outputs,
                 batch["message_log"],
                 rewards.tolist(),
@@ -406,11 +455,16 @@ async def _run_env_eval_impl(
 async def _generate_texts(vllm_generation, inputs, use_async):
     """Generate texts using either sync or async method."""
     if use_async:
-        # Use async generation - collect all results
-        results = []
-        async for idx, result in vllm_generation.generate_text_async(inputs):
-            results.append((idx, result["texts"][0]))
+        # generate_text_async accepts one sample per call; fan out and gather.
+        async def _generate_single_sample(i):
+            single = inputs.slice(i, i + 1)
+            async for _, result in vllm_generation.generate_text_async(single):
+                return (i, result["texts"][0])
+            raise RuntimeError(f"No output produced for sample {i}")
 
+        results = await asyncio.gather(
+            *(_generate_single_sample(i) for i in range(inputs.size))
+        )
         # Sort by index to maintain order
         results.sort(key=lambda x: x[0])
         return [text for _, text in results]
@@ -430,14 +484,14 @@ def _save_evaluation_data_to_json(evaluation_data, master_config, save_path):
     """
     # Extract configuration information
     config_data = {
-        "model_name": master_config["generation"]["model_name"],
-        "dataset_name": master_config["data"]["dataset_name"],
-        "metric": master_config["eval"]["metric"],
-        "k_value": master_config["eval"]["k_value"],
-        "num_tests_per_prompt": master_config["eval"]["num_tests_per_prompt"],
-        "temperature": master_config["generation"]["temperature"],
-        "top_p": master_config["generation"]["top_p"],
-        "top_k": master_config["generation"]["top_k"],
+        "model_name": master_config.generation["model_name"],
+        "dataset_name": master_config.data["dataset_name"],
+        "metric": master_config.eval["metric"],
+        "k_value": master_config.eval["k_value"],
+        "num_tests_per_prompt": master_config.eval["num_tests_per_prompt"],
+        "temperature": master_config.generation["temperature"],
+        "top_p": master_config.generation["top_p"],
+        "top_k": master_config.generation["top_k"],
     }
 
     # Create directory if it doesn't exist
@@ -488,10 +542,10 @@ def _print_results(
     num_tests_per_prompt,
 ):
     """Print evaluation results."""
-    dataset_name = os.path.basename(master_config["data"]["dataset_name"])
+    dataset_name = os.path.basename(master_config.data["dataset_name"])
     model_name = os.path.basename(generation_config["model_name"])
     max_new_tokens = generation_config["vllm_cfg"]["max_model_len"]
-    seed = master_config["eval"]["seed"]
+    seed = master_config.eval["seed"]
     temperature = generation_config["temperature"]
     top_p = generation_config["top_p"]
     top_k = generation_config["top_k"]

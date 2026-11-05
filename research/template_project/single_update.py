@@ -17,9 +17,10 @@ What it does:
  1) Sets up a RayVirtualCluster
  2) Initializes VllmGeneration
  3) Initializes LM Policy
- 4) Trains on a tiny synthetic batch (global batch size = 2) with NLLLoss
+ 4) Executes custom methods on all workers
  5) Refits the generation engine with the latest policy weights
- 6) Optionally repeats the train→refit cycle in a short loop
+ 6) Trains on a tiny synthetic batch (global batch size = 2) with NLLLossFn
+ 7) Optionally repeats the train→refit cycle in a short loop
 
 Notes:
 - The configuration is defined entirely in this file, inspired by examples/configs/grpo_math_1B.yaml
@@ -31,13 +32,21 @@ import argparse
 import os
 
 from omegaconf import OmegaConf
+from rich.pretty import pprint
 from template_project.data_utils import create_batch_from
 
 from nemo_rl.algorithms.grpo import MasterConfig, refit_policy_generation
-from nemo_rl.algorithms.loss_functions import NLLLoss
+from nemo_rl.algorithms.loss import NLLLossFn
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, init_ray
+from nemo_rl.distributed.ray_actor_environment_registry import (
+    ACTOR_ENVIRONMENT_REGISTRY,
+)
+from nemo_rl.distributed.virtual_cluster import (
+    PY_EXECUTABLES,
+    RayVirtualCluster,
+    init_ray,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.policy.lm_policy import Policy
@@ -46,11 +55,17 @@ from nemo_rl.utils.config import (
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
+
+# register the worker extension class to the actor environment registry
+ACTOR_ENVIRONMENT_REGISTRY[
+    "template_project.worker_extension.AutomodelPolicyWorkerExtension"
+] = PY_EXECUTABLES.AUTOMODEL
 
 
 def main(config: MasterConfig) -> None:
     # 0) Config
-    policy_config = config["policy"]
+    policy_config = config.policy
     tokenizer = get_tokenizer(policy_config["tokenizer"])
     policy_config["generation"] = configure_generation_config(
         policy_config["generation"], tokenizer
@@ -61,10 +76,10 @@ def main(config: MasterConfig) -> None:
     init_ray()
     cluster = RayVirtualCluster(
         name="single_update_cluster",
-        bundle_ct_per_node_list=[config["cluster"]["gpus_per_node"]]
-        * config["cluster"]["num_nodes"],
+        bundle_ct_per_node_list=[config.cluster.gpus_per_node]
+        * config.cluster.num_nodes,
         use_gpus=True,
-        num_gpus_per_node=config["cluster"]["gpus_per_node"],
+        num_gpus_per_node=config.cluster.gpus_per_node,
         max_colocated_worker_groups=1
         if policy_config["generation"]["backend"] == "megatron"
         else 2,
@@ -88,16 +103,30 @@ def main(config: MasterConfig) -> None:
         config=policy_config,
         tokenizer=tokenizer,
         init_reference_model=False,
+        worker_extension_cls_fqn="template_project.worker_extension.AutomodelPolicyWorkerExtension",
     )
     print("  ✓ Policy created")
+
+    # 4) Executes custom methods on all workers
+    # 4.1) Run a method on all workers in parallel with the same data
+    print("\n▶ Running a method on all workers in parallel with the same data...")
+    results = policy.run_all_workers_single_data("get_worker_rank")
+    print(f"  ✓ Results for get_worker_rank: {results}")
+
+    # 4.2) Run a method on all workers in parallel with different data
+    print("\n▶ Running a method on all workers in parallel with different data...")
+    worker_nums = config.cluster.gpus_per_node * config.cluster.num_nodes
+    input_list = [i for i in range(worker_nums)]
+    results = policy.run_all_workers_multiple_data("return_input", input=input_list)
+    print(f"  ✓ Results for return_input: {results}")
 
     # Prepare refit info once before first refit
     state_dict_info = policy.prepare_refit_info()
     policy_generation.prepare_refit_info(state_dict_info or {})
 
-    # 4) Create tiny numeric batch and train with NLLLoss
-    print("\n▶ Creating tiny numeric batch and training with NLLLoss...")
-    train_sentences = ["a b c d e hello", "a d f world"] * config["policy"][
+    # Create tiny numeric batch and train with NLLLossFn
+    print("\n▶ Creating tiny numeric batch and training with NLLLossFn...")
+    train_sentences = ["a b c d e hello", "a d f world"] * config.policy[
         "train_global_batch_size"
     ]
     generation_prompts = [
@@ -116,7 +145,7 @@ def main(config: MasterConfig) -> None:
         "What is the capital of the Nepal?",
     ]
     data = create_batch_from(tokenizer, sentences=train_sentences)
-    loss_fn = NLLLoss()
+    loss_fn = NLLLossFn()
 
     # Optionally repeat the train→refit cycle
     num_iters = int(os.environ.get("SINGLE_UPDATE_ITERS", "10"))
@@ -132,6 +161,7 @@ def main(config: MasterConfig) -> None:
             }
         )
 
+        # 5) Refits the generation engine with the latest policy weights
         print("  • Refit generation with latest policy weights...")
         refit_policy_generation(
             policy=policy,
@@ -153,6 +183,8 @@ def main(config: MasterConfig) -> None:
         )
         for i, out_text in enumerate(decoded):
             print(f"    - prompt: '{generation_prompts[i]}' -> '{out_text}'")
+
+        # 6) Trains on a tiny synthetic batch (global batch size = 2) with NLLLossFn
         policy.prepare_for_training()
         results = policy.train(data, loss_fn)
         loss_tensor = results["loss"]
@@ -195,9 +227,10 @@ if __name__ == "__main__":
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    check_outdated_config(config)
+    config = MasterConfig(**config)
     print("Applied CLI overrides")
-    from rich.pretty import pprint
 
     pprint(config)
 

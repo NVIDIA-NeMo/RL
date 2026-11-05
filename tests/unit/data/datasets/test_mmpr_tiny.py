@@ -1,0 +1,432 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from unittest.mock import MagicMock
+
+import pytest
+import torch
+from PIL import Image
+
+from nemo_rl.data.datasets.response_datasets.mmpr_tiny import (
+    MMPRTinyDataset,
+    format_mmpr_tiny_dataset,
+)
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
+
+
+class TestFormatMMPRTinyDataset:
+    """Tests for the MMPR-Tiny data formatting function."""
+
+    def test_format_single_image_with_placeholder(self):
+        sample = {
+            "images": ["/path/to/image.png"],
+            "question": "<image>\nWhat is the angle?",
+            "answer": "A",
+            "task_name": "mmpr-tiny",
+        }
+        result = format_mmpr_tiny_dataset(sample)
+
+        assert result["task_name"] == "mmpr-tiny"
+        messages = result["messages"]
+        assert len(messages) == 2
+        assert messages[0]["role"] == "user"
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == "A"
+
+        # Content should be: image, then text (no <image> token in text)
+        user_content = messages[0]["content"]
+        image_items = [c for c in user_content if c["type"] == "image"]
+        text_items = [c for c in user_content if c["type"] == "text"]
+        assert len(image_items) == 1
+        assert image_items[0]["image"] == "/path/to/image.png"
+        assert all("<image>" not in t["text"] for t in text_items)
+        assert any("What is the angle?" in t["text"] for t in text_items)
+
+    def test_format_single_image_no_placeholder(self):
+        """When no <image> placeholder exists, the image is prepended."""
+        sample = {
+            "images": ["/path/to/image.png"],
+            "question": "How many circles?",
+            "answer": "4",
+            "task_name": "mmpr-tiny",
+        }
+        result = format_mmpr_tiny_dataset(sample)
+        user_content = result["messages"][0]["content"]
+
+        # Image should be prepended since there's no placeholder
+        assert user_content[0]["type"] == "image"
+        assert user_content[0]["image"] == "/path/to/image.png"
+        assert result["messages"][1]["content"] == "4"
+
+    def test_format_multi_image_with_placeholders(self):
+        """Multi-image row with <image> placeholders interleaved in text."""
+        sample = {
+            "images": ["/img/a.png", "/img/b.png", "/img/c.png", "/img/d.png"],
+            "question": "A.\n<image>\nB.\n<image>\nC.\n<image>\nD.\n<image>\nChoose one.",
+            "answer": "B",
+            "task_name": "mmpr-tiny",
+        }
+        result = format_mmpr_tiny_dataset(sample)
+        user_content = result["messages"][0]["content"]
+
+        image_items = [c for c in user_content if c["type"] == "image"]
+        text_items = [c for c in user_content if c["type"] == "text"]
+
+        assert len(image_items) == 4
+        assert [c["image"] for c in image_items] == [
+            "/img/a.png",
+            "/img/b.png",
+            "/img/c.png",
+            "/img/d.png",
+        ]
+        assert all("<image>" not in t["text"] for t in text_items)
+
+    def test_format_numbered_image_placeholders(self):
+        """Rows with <image><image_N> patterns should consume both tokens."""
+        sample = {
+            "images": ["/img/0.png", "/img/1.png"],
+            "question": "<image><image_1>\nFront\n<image><image_2>\nTop",
+            "answer": "6",
+            "task_name": "mmpr-tiny",
+        }
+        result = format_mmpr_tiny_dataset(sample)
+        user_content = result["messages"][0]["content"]
+
+        image_items = [c for c in user_content if c["type"] == "image"]
+        text_items = [c for c in user_content if c["type"] == "text"]
+
+        assert len(image_items) == 2
+        assert [c["image"] for c in image_items] == ["/img/0.png", "/img/1.png"]
+        # No <image_N> tokens should leak into text
+        for t in text_items:
+            assert "<image" not in t["text"]
+
+
+class TestMMPRTinyDataset:
+    """Tests for the MMPRTinyDataset class."""
+
+    def test_invalid_split_raises_value_error(self):
+        with pytest.raises(ValueError, match="Invalid split: valB"):
+            MMPRTinyDataset(split="valB", download_dir="/tmp/fake")
+
+    def test_invalid_split_test_raises_value_error(self):
+        with pytest.raises(ValueError, match="Invalid split"):
+            MMPRTinyDataset(split="test", download_dir="/tmp/fake")
+
+    def test_missing_download_dir_raises_value_error(self):
+        with pytest.raises(ValueError, match="download_dir is required"):
+            MMPRTinyDataset(download_dir="")
+
+
+def _make_stub_nemotron_processor(*, include_imgs_sizes=True, num_tiles=1):
+    """Build a minimal stub whose class name is NemotronNanoVLV2Processor.
+
+    The stub implements just enough of the AutoProcessor interface for
+    vlm_hf_data_processor to exercise the placeholder-style code path.
+    It captures the exact text passed to __call__ for assertion.
+    """
+    fake_input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+
+    class _ImageProcessor:
+        model_input_names = ["pixel_values"]
+
+    class NemotronNanoVLV2Processor:
+        image_token = "<image>"
+        model_input_names = ["input_ids", "pixel_values"]
+
+        def __init__(self):
+            self.image_processor = _ImageProcessor()
+            self.tokenizer = MagicMock()
+            self.tokenizer.model_input_names = ["input_ids"]
+            self.captured_call_text = None
+
+        def apply_chat_template(self, messages, **kwargs):
+            parts = []
+            for msg in messages:
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    parts.append(content)
+                elif isinstance(content, list):
+                    for item in content:
+                        if isinstance(item, dict) and "text" in item:
+                            parts.append(item["text"])
+            formatted_text = " ".join(parts)
+            if kwargs.get("tokenize"):
+                return {"input_ids": fake_input_ids}
+            return formatted_text
+
+        def __call__(self, text=None, images=None, **kwargs):
+            self.captured_call_text = text
+            result = {
+                "input_ids": fake_input_ids,
+                "pixel_values": torch.randn(num_tiles, 3, 224, 224),
+            }
+            if include_imgs_sizes:
+                result["imgs_sizes"] = torch.tensor([[224, 224]] * num_tiles)
+            return result
+
+    return NemotronNanoVLV2Processor()
+
+
+@pytest.fixture()
+def tiny_image_path(tmp_path):
+    """Create a minimal 1x1 PNG for processor smoke tests."""
+    img_path = tmp_path / "test_image.png"
+    Image.new("RGB", (1, 1), color="red").save(img_path)
+    return str(img_path)
+
+
+# The raw question text as it appears in the MMPR dataset (with <image> token)
+_RAW_QUESTION = "<image>\nWhat is the measure of angle BAC?"
+# The clean question after <image> stripping by format_mmpr_tiny_dataset
+_CLEAN_QUESTION = "What is the measure of angle BAC?"
+# Inline prompt template for tests — double-braces escape the literal \boxed{}
+# so str.format leaves it intact, and the single {} slot takes the question.
+_TEST_PROMPT_TEMPLATE = (
+    "Solve step by step. Put your final answer in \\boxed{{}}.\n\nQuestion: {}"
+)
+
+
+def _run_processor(tiny_image_path, processor=None):
+    """Helper: run vlm_hf_data_processor on an MMPR sample and return
+    (result DatumSpec, stub processor with captured_call_text)."""
+    from nemo_rl.data.interfaces import TaskDataSpec
+    from nemo_rl.data.processors import vlm_hf_data_processor
+
+    task_data_spec = TaskDataSpec(task_name="mmpr-tiny")
+    task_data_spec.prompt = _TEST_PROMPT_TEMPLATE
+    processor = processor or _make_stub_nemotron_processor()
+    sample = {
+        "images": [tiny_image_path],
+        "question": _RAW_QUESTION,
+        "answer": "A",
+        "task_name": "mmpr-tiny",
+    }
+
+    result = vlm_hf_data_processor(
+        datum_dict=sample,
+        task_data_spec=task_data_spec,
+        processor=processor,
+        max_seq_length=8192,
+        idx=0,
+    )
+    return result, processor
+
+
+class TestVLMProcessorMMPRTiny:
+    """Smoke test: vlm_hf_data_processor with mmpr-tiny task through the
+    NemotronNanoVLV2Processor placeholder-style code path."""
+
+    def test_processor_produces_valid_datum_spec(self, tiny_image_path):
+        result, processor = _run_processor(tiny_image_path)
+
+        assert "message_log" in result
+        assert "length" in result
+        assert "extra_env_info" in result
+        assert "ground_truth" in result["extra_env_info"]
+        assert result["extra_env_info"]["ground_truth"] == "A"
+        assert result["vllm_content"] == processor.captured_call_text
+        assert result["vllm_content"].count("<image>") == 1
+        assert "vllm_multi_modal_data" in result
+        assert isinstance(result["vllm_multi_modal_data"]["image"], Image.Image)
+        assert result["task_name"] == "mmpr-tiny"
+        user_message = result["message_log"][0]
+        assert torch.equal(user_message["num_frames"].as_tensor(), torch.tensor([1]))
+        assert user_message["pixel_values"].preprocess_mode == "patchify"
+        assert user_message["pixel_values"].preprocess_kwargs == {"patch_dim": 16}
+        assert user_message["pixel_values"].as_tensor().dtype == torch.float32
+
+    def test_vllm_receives_raw_prompt_and_learner_keeps_processed_ids(
+        self, tiny_image_path
+    ):
+        result, processor = _run_processor(tiny_image_path)
+        learner_ids = result["message_log"][0]["token_ids"].clone()
+        batch = BatchedDataDict(
+            input_ids=learner_ids.unsqueeze(0),
+            input_lengths=torch.tensor([len(learner_ids)]),
+            vllm_content=[result["vllm_content"]],
+            vllm_multi_modal_data=[result["vllm_multi_modal_data"]],
+        )
+        prompt = format_prompt_for_vllm_generation(batch)[0]
+        assert prompt["prompt"] == processor.captured_call_text
+        assert "prompt_token_ids" not in prompt
+        assert prompt["multi_modal_data"] is not None
+        assert (
+            prompt["multi_modal_data"]["image"]
+            is result["vllm_multi_modal_data"]["image"]
+        )
+        assert torch.equal(batch["input_ids"][0], learner_ids)
+
+    def test_text_only_row_preserves_formatted_vllm_content(self):
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        processor = _make_stub_nemotron_processor()
+        task_data_spec = TaskDataSpec(task_name="text-only")
+        task_data_spec.prompt = "Answer: {}"
+
+        result = vlm_hf_data_processor(
+            datum_dict={
+                "messages": [
+                    {"role": "user", "content": "What is 2 + 2?"},
+                    {"role": "assistant", "content": "4"},
+                ],
+                "task_name": "text-only",
+            },
+            task_data_spec=task_data_spec,
+            processor=processor,
+            max_seq_length=8192,
+            idx=0,
+        )
+
+        assert result["vllm_content"] == "Answer: What is 2 + 2?"
+        assert result["vllm_multi_modal_data"] == {}
+
+    def test_vllm_multi_modal_data_collapses_single_item_and_keeps_lists(
+        self, tiny_image_path
+    ):
+        """vLLM's ``multi_modal_data`` takes a bare value for one item per
+        modality and a list for several; the processor performs that collapse."""
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        single, _ = _run_processor(tiny_image_path)
+        assert isinstance(single["vllm_multi_modal_data"]["image"], Image.Image)
+
+        task_data_spec = TaskDataSpec(task_name="mmpr-tiny")
+        task_data_spec.prompt = _TEST_PROMPT_TEMPLATE
+        multi = vlm_hf_data_processor(
+            datum_dict={
+                "images": [tiny_image_path, tiny_image_path],
+                "question": "<image>\nLeft.\n<image>\nRight.",
+                "answer": "A",
+                "task_name": "mmpr-tiny",
+            },
+            task_data_spec=task_data_spec,
+            processor=_make_stub_nemotron_processor(num_tiles=2),
+            max_seq_length=8192,
+            idx=0,
+        )
+        assert multi["vllm_content"].count("<image>") == 2
+        images = multi["vllm_multi_modal_data"]["image"]
+        assert isinstance(images, list)
+        assert len(images) == 2
+        assert all(isinstance(image, Image.Image) for image in images)
+
+    def test_truncated_datum_emits_empty_vllm_prompt_data(self, tiny_image_path):
+        """Over-length rows are masked out and must carry no vLLM media."""
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        task_data_spec = TaskDataSpec(task_name="mmpr-tiny")
+        task_data_spec.prompt = _TEST_PROMPT_TEMPLATE
+        result = vlm_hf_data_processor(
+            datum_dict={
+                "images": [tiny_image_path],
+                "question": _RAW_QUESTION,
+                "answer": "A",
+                "task_name": "mmpr-tiny",
+            },
+            task_data_spec=task_data_spec,
+            processor=_make_stub_nemotron_processor(),
+            max_seq_length=1,
+            idx=0,
+        )
+
+        assert result["loss_multiplier"] == 0.0
+        assert result["vllm_content"] is None
+        assert result["vllm_multi_modal_data"] == {}
+
+    def test_conversation_preprocessor_is_preserved(self, tiny_image_path):
+        processor = _make_stub_nemotron_processor()
+        processor.conversation_preprocessor = MagicMock(
+            return_value={"role": "user", "content": "preprocessed"}
+        )
+
+        result, _ = _run_processor(tiny_image_path, processor=processor)
+
+        processor.conversation_preprocessor.assert_called_once()
+        assert result["vllm_content"] == "preprocessed"
+        assert processor.captured_call_text == "preprocessed"
+
+    def test_historical_tiled_processor_gets_media_metadata(self, tiny_image_path):
+        from nemo_rl.data.interfaces import TaskDataSpec
+        from nemo_rl.data.processors import vlm_hf_data_processor
+
+        task_data_spec = TaskDataSpec(task_name="mmpr-tiny")
+        task_data_spec.prompt = _TEST_PROMPT_TEMPLATE
+        processor = _make_stub_nemotron_processor(include_imgs_sizes=False, num_tiles=3)
+        result = vlm_hf_data_processor(
+            datum_dict={
+                "images": [tiny_image_path],
+                "question": _RAW_QUESTION,
+                "answer": "A",
+                "task_name": "mmpr-tiny",
+            },
+            task_data_spec=task_data_spec,
+            processor=processor,
+            max_seq_length=8192,
+            idx=0,
+        )
+
+        user_message = result["message_log"][0]
+        assert torch.equal(
+            user_message["imgs_sizes"].as_tensor(),
+            torch.tensor([[224, 224], [224, 224], [224, 224]]),
+        )
+        assert torch.equal(
+            user_message["num_frames"].as_tensor(), torch.ones(3, dtype=torch.int32)
+        )
+
+    def test_prompted_text_contains_boxed_literal_and_no_raw_dataset_string(
+        self, tiny_image_path
+    ):
+        result, processor = _run_processor(tiny_image_path)
+        processed_text = processor.captured_call_text
+
+        # Positive: literal \boxed{} must survive prompt formatting
+        assert "\\boxed{}" in processed_text
+
+        # Negative: the raw dataset string (with <image> prefix) must NOT leak through
+        assert _RAW_QUESTION not in processed_text
+
+    def test_placeholder_conversion_exact_string(self, tiny_image_path):
+        """Verify the exact tokenizer input for the placeholder-style processor path.
+
+        The processor stub captures the text argument passed to __call__.
+        It must equal "<image>\\n<prompted_question>" where prompted_question
+        is the prompt template formatted with the clean question text.
+        """
+        result, processor = _run_processor(tiny_image_path)
+
+        prompted_question = _TEST_PROMPT_TEMPLATE.format(_CLEAN_QUESTION)
+
+        # The placeholder-style path should produce: "<image>\n<prompted_question>"
+        expected_tokenizer_input = "<image>\n" + prompted_question
+
+        # The stub's apply_chat_template joins message parts with spaces,
+        # so the captured text passed to __call__ is the chat-templated string.
+        # vLLM must receive the unexpanded chat-template output.
+        assert result["vllm_content"] == expected_tokenizer_input
+
+        # Verify exactly one <image> token in the final output
+        assert processor.captured_call_text.count("<image>") == 1
+
+        # Verify the question text is present
+        assert _CLEAN_QUESTION in processor.captured_call_text
+
+        # Verify the captured __call__ text also matches
+        # (processor.__call__ receives the apply_chat_template output)
+        assert processor.captured_call_text == expected_tokenizer_input

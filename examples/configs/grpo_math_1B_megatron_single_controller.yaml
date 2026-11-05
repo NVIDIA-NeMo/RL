@@ -1,0 +1,275 @@
+# SingleController variant of grpo_math_1B.yaml.
+defaults: grpo_math_1B.yaml
+
+# SC does not support validation yet.
+grpo:
+  # Null out the legacy async_grpo block inherited from grpo_math_1B.yaml:
+  # SC reads async_rl instead, and the entrypoint raises if this block is set.
+  async_grpo: null
+  val_period: 0
+  # Optional NeMo-Gym message-level penalties. Values overwrite computed
+  # advantages on tokens belonging to the corresponding assistant message.
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+
+# Reward-zeroing penalties applied to NeMo-Gym rollout results.
+reward_penalties:
+  penalize_duplicated_reasoning: false
+  penalize_empty_final_answer: false
+  penalize_unwanted_tokens: false
+  penalize_malformed_think_tag: false
+  # Optional model/tokenizer-specific IDs. Example:
+  # token_ids: {unwanted: [2], think_open: 12, think_close: 13}
+
+async_rl:
+  sampler:
+    name: in_order
+    # How far generation may run ahead of the trainer.
+    max_lookahead_versions: 1
+  # Recompute generation KV caches after each weight update.
+  recompute_kv_cache_after_weight_updates: true
+  # Min ready groups the streaming trainer waits for before dispatching a batch.
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  # Cap on in-flight generate_and_push calls in the rollout pump.
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
+  max_buffered_rollouts: 64
+  # Enable per-rollout diagnostic prints (prompt content / completion previews).
+  diagnostics: false
+  # Stream every consumed sample to train_data_step<N>.jsonl in the log dir (debug).
+  log_full_train_data: false
+  # Writer used by log_full_train_data. json writes JSONL files; set target to a
+  # dotted import path of a DebugWriter defined outside this repo to store the dump
+  # elsewhere (extra keys are passed to its constructor).
+  debug_writer:
+    target: json
+  # With policy.megatron_cfg.checkpoint.async_save: finalize async checkpoints at a
+  # later step boundary so the disk write overlaps training (non-colocated generation).
+  defer_async_checkpoint_finalize: false
+  # CPU actors that run the advantage stage. 0 keeps it in the controller
+  # process, which both holds a whole cohort's advantage inputs in the
+  # controller's heap and blocks its event loop while the stage runs.
+  num_advantage_workers: 0
+
+  # ── Resiliency ─────────────────────────────────────────────────────────────
+  # What happens to a prompt whose rollout fails. Infrastructure failures are
+  # re-dispatched (the retry re-enters shard selection, so it lands elsewhere);
+  # deterministic per-prompt failures get a much smaller budget because another
+  # shard would fail identically.
+  #
+  # The budgets here govern BOTH rollout paths -- the retry loop sits above the
+  # native/NeMo-Gym split. Anything path-specific lives in the sub-blocks below,
+  # so the structure says which knob applies where. Filling in the block for the
+  # path a run is not taking is rejected at setup rather than silently ignored.
+  rollout_failure:
+    max_infra_attempts_per_prompt: 5  # infra budget; exhausting it drops the prompt
+    max_data_attempts_per_prompt: 2   # data budget; 1 retry separates transient from deterministic
+    backoff_base_s: 1.0
+    max_backoff_s: 30.0
+    # Prompts allowed to exhaust their data budget and be dropped. 0 fails the run
+    # on the first one, propagating the original error. The two budgets above are
+    # INDEPENDENT counters, so one prompt can consume up to their sum minus one.
+    max_skipped_prompts: 0
+    # CONSECUTIVE prompts allowed to exhaust their infra budget and be dropped; any
+    # committed rollout resets the count. 0 fails the run on the first one. Raise it
+    # on a large fleet where losing the odd shard is expected and a whole run is
+    # expensive to restart -- a step short a few groups still trains, and the count
+    # only keeps climbing if nothing at all is coming back.
+    max_consecutive_dropped_prompts: 0
+    # Smallest batch a step may train on, as a fraction of num_prompts_per_step.
+    # The budgets above are run-scoped and cannot bound how short one step gets, so
+    # this is what guarantees the gradient is computed from most of a batch. The floor
+    # is ceil(fraction * num_prompts_per_step), so small batches tolerate no drops.
+    min_step_batch_fraction: 0.9
+    # What happens to the step a dropped prompt was stamped for (in_order sampler only;
+    # an unstamped sampler strands nothing). "shrink" trains the step on fewer groups,
+    # bounded by the floor above. "replace" substitutes a fresh prompt so the step keeps
+    # its configured batch size -- what the v1 stack does -- and still shrinks if the
+    # attempts or spares below run out. When a later step already has a finished group,
+    # replace borrows it to close the dropped step immediately and sends the fresh
+    # prompt to repay that step instead, so the trainer does not idle waiting on a new
+    # rollout; promoted_prompt_groups reports when that happened.
+    on_dropped_prompt: shrink         # shrink | replace
+    max_replacement_attempts: 1       # fresh prompts tried per lost group
+    # Low-water mark for the spare-prompt pool. Refilled by diverting one whole batch
+    # from the dataloader before it is admitted, so a refill yields a batch of spares.
+    replacement_reserve_prompts: 1
+
+    # Deadlines. null disables, which is the default and reproduces the historical
+    # behaviour of waiting forever. Set them in any run that matters: without one a
+    # wedged generation engine parks a rollout permanently, holding a
+    # max_inflight_prompts slot for the rest of the job.
+    native:                           # AsyncRolloutImpl only
+      generation_timeout_s: null      # one generate_async turn
+      env_timeout_s: null             # one environment step
+    nemo_gym:                         # AsyncNemoGymRolloutImpl only
+      rollout_timeout_s: null         # the whole prompt-group rollout, retries included
+      # Re-send just the rows that never arrived before retrying the whole group.
+      # Gym's stream dies on its first failing row, so one bad row loses every later
+      # one; recovering those individually beats redoing all N.
+      max_row_attempts: 3
+
+  # Last-resort stall detection. stall_timeout_s must exceed interval_s and every
+  # deadline above, so a merely-slow rollout is not reported as a stall.
+  stall_watchdog:
+    interval_s: 30.0
+    stall_timeout_s: 600.0
+    stall_action: warn                # warn | abort
+    gym_subprocess_check: true        # polls NeMo-Gym's RunHelper for dead servers
+
+  # Per-shard liveness for the generation fleet. Off by default, in which case shard
+  # selection keeps its historical health-blind round-robin. On, a shard that fails
+  # probes or real requests is quarantined instead of keeping its 1/N of traffic, and
+  # the run aborts with an attributable error once too few shards remain.
+  generation_fleet_health:
+    enabled: false
+    probe_interval_s: 5.0             # must exceed probe_timeout_s
+    probe_timeout_s: 2.0
+    unhealthy_threshold: 3            # ~15s to quarantine at the default interval
+    healthy_threshold: 2              # successes before a suspect shard is trusted again
+    selection: least_outstanding      # steers away from a slow shard without diagnosing it
+    max_restart_attempts_per_shard: 5
+    restart_dead_shards: false        # restart a dead shard and re-admit it at the next refit.
+                                      # Does not raise the min_healthy_shards floor: a RESTARTING
+                                      # shard is not serving, so the run can still abort mid-restart.
+    restart_timeout_s: 1800.0         # budget for one restart attempt. Nothing under it has a bound
+                                      # of its own, so without this a bundle that can never be filled
+                                      # leaves the shard RESTARTING for the rest of the run: never
+                                      # retried, never retired. Generous on purpose -- firing early
+                                      # costs a restart that was merely slow.
+    restart_backoff_s: 60.0           # wait after a failed restart before trying again. Without it the
+                                      # whole attempt budget can burn inside 25s at the default probe
+                                      # interval, none of the attempts having waited for the cause to clear.
+    min_healthy_shards: 1             # below this the run aborts
+    refit_timeout_s: 300.0            # deadline for one refit collective, then each worker aborts its own
+                                      # communicator. Required for recovery, not cosmetic: without it a shard
+                                      # dying mid-refit leaves the trainers blocked in NCCL and the rebuild
+                                      # queues behind them, so the recovery wedges too. ~150x a healthy refit
+                                      # at this size (~1.9s); raise it for frontier-scale models (~500s at
+                                      # 405B). null disarms the watchdog entirely.
+
+  # NeMo-Gym-facing router in front of the generation fleet. Gym picks an endpoint by
+  # round-robin over a list fixed at process start and never fails over, so it is handed
+  # one NeMo-RL-owned URL instead and the routing decision moves next to generation_fleet_health.
+  # Only meaningful on the NeMo-Gym path; the native path calls generation over Ray.
+  generation_router:
+    enabled: false
+    port_range_low: 1202              # between Ray client (1201) and management (1301+)
+    port_range_high: 1300
+    backend_timeout_s: 600.0          # covers a whole generation; Gym sets none at all
+    connect_timeout_s: 5.0            # a local handshake is ms-or-never
+    no_healthy_backend_status: 409    # must stay outside Gym's retry set
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-single-controller
+  metric_name: null
+  # Periodic rollout snapshots need an immutable trainer anchor for every
+  # completed step. Keep this at 1 when
+  # rollout_checkpointing.snapshot_attempt_interval_s is set.
+  save_period: 1
+  # Include native TQ state and the metadata-only replay index. A save failure
+  # aborts checkpoint finalization.
+  save_data_plane: true
+
+# Frequent rollout-only snapshots are disabled unless
+# snapshot_attempt_interval_s is set. When
+# disabled, existing periodic snapshots are ignored. Enabling them requires a
+# durable trainer checkpoint for the current completed step and native TQ
+# checkpoint support. save_period=1 provides an anchor after every train step.
+rollout_checkpointing:
+  snapshot_attempt_interval_s: null
+  telemetry_interval_s: null
+  max_consecutive_failures: 3
+  keep_latest_k: 2
+  restore_mode: latest
+  # Advanced escape hatch for runtime-only fields from external integrations.
+  # Every config path not excluded here or by NeMo-RL's built-in denylist must
+  # match before a bootstrap rollout snapshot can be restored.
+  extra_fingerprint_excluded_paths: []
+
+policy:
+  automodel_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+
+  generation:
+    # HTTP ports inherit the shared [3000, 4999) band from grpo_math_1B.yaml.
+    mcore_generation_config:
+      cuda_graph_sizing_distribution: hybrid
+      cuda_graph_max_tokens: 512
+      prefix_caching_mamba_gb: null
+      prefix_caching_eviction_policy: lru
+      prefix_caching_coordinator_policy: longest_prefix
+      prefix_cache_ttl_seconds: 300.0
+      prefix_caching_routing_alpha: 1.0
+      http_server_num_replicas: 8
+    vllm_cfg:
+      async_engine: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        num_nodes: 1
+
+logger:
+  wandb:
+    name: grpo-single-controller-dev
+  swanlab:
+    name: grpo-single-controller-dev
+  mlflow:
+    run_name: grpo-single-controller-dev
+
+data_plane:
+  enabled: true
+
+# Ledger-authoritative token capture via NeMo-Gym. Off by default; the
+# single-controller recovery options require it.
+token_capture:
+  enabled: false
+  # Optional multi-path reconstruction; keeps one reward/advantage per rollout.
+  forest_training: false
+  # returned_history (default) or all_captured, including discarded attempts.
+  selection_policy: returned_history
+  staging_partition: rollout_staging
+
+
+# Target recovery boundary for unfinished token-capture groups. "turn" enables
+# coordinated Gym participant snapshots; "sibling" preserves sealed siblings;
+# "prompt_group" regenerates every sibling in an unfinished group.
+# "turn" also requires env.should_use_nemo_gym, the vllm generation backend,
+# token_capture.enabled: true, rollout_checkpointing.snapshot_attempt_interval_s,
+# rollout_checkpointing.restore_mode: latest, both override maps left empty,
+# only legacy_agent Gym environment servers, and
+# async_rl.stall_watchdog.stall_timeout_s above
+# gym_prepare_timeout_s + 2 * token_capture.control_timeout_s.
+rollout_recovery:
+  target_level: sibling
+  # Per-Gym-task-source coarsening override, keyed on extra_env_info.task_source.
+  # Until Gym advertises group-scoring capability, configure GenRM explicitly:
+  #   task_source_target_level_overrides:
+  #     genrm_compare_resources_server: prompt_group
+  task_source_target_level_overrides: {}
+  # Agent-specific override for rows already carrying extra_env_info.agent_ref.
+  # A matching agent entry wins over a matching task-source entry and also
+  # provides compatibility for legacy datasets without task_source.
+  #   agent_target_level_overrides: {genrm_agent: prompt_group}
+  agent_target_level_overrides: {}
+  # Seconds every Gym deployment gets to park its in-flight steps before a
+  # "turn" checkpoint gives up on this attempt. Raise it for long agent or
+  # environment steps; token_capture.control_timeout_s still bounds each
+  # other Gym control call.
+  gym_prepare_timeout_s: 300.0
+  # With "turn", setup fails if a Gym server's checkpoint mode is restart_only
+  # (the default for agents and resources servers). Such a server's in-flight
+  # rollouts start over after a crash.
+  # Set true to accept that with a warning; only valid with target_level: turn.
+  allow_restart_only_gym_servers: false
+
+# Leaving either map above non-empty requires the top-level token_capture section
+# to set enabled: true.
+
+cluster:
+  # Master ports inherit the shared 1400-1999 band from grpo_math_1B.yaml.
+  gpus_per_node: 2

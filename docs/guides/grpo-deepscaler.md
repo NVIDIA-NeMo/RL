@@ -44,7 +44,7 @@ Use `generation.model_name` to specify the path to the Hugging Face checkpoint. 
 
 > [!NOTE]
 > AIME24 only has 30 examples so the accuracy can be very noisy.
-> To reduce the variance consider runing `run_eval.py` with `eval.num_tests_per_prompt=16`.
+> To reduce the variance consider running `run_eval.py` with `eval.num_tests_per_prompt=16`.
 
 ## Evaluation Results
 Using the above instructions to train DeepSeek-R1-Distill-Qwen-1.5B on the DeepScaleR dataset, we can track the model's performance on the AIME24 benchmark throughout training. The following plot shows the evaluation metrics as training progresses:

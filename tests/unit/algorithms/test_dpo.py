@@ -20,13 +20,76 @@ import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
 
 from nemo_rl.algorithms.dpo import (
-    _default_dpo_save_state,
+    DPOConfig,
+    MasterConfig,
+    _get_dpo_save_state,
+    _initial_dpo_save_state,
     add_ref_logprobs_to_data,
     dpo_train,
 )
-from nemo_rl.algorithms.loss_functions import PreferenceLoss
+from nemo_rl.algorithms.loss import PreferenceLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
+
+
+def test_get_dpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
+    assert _get_dpo_save_state({}) == _initial_dpo_save_state()
+
+    loaded_state = {
+        "epoch": 1,
+        "step": 3,
+        "total_steps": 13,
+        "consumed_samples": 32,
+        "val:accuracy": 0.75,
+    }
+
+    save_state = _get_dpo_save_state(loaded_state)
+
+    assert vars(save_state) == {
+        "epoch": 1,
+        "step": 3,
+        "total_steps": 13,
+        "consumed_samples": 32,
+        "total_valid_tokens": 0,
+    }
+    assert "total_valid_tokens" not in loaded_state
+
+
+def test_get_dpo_save_state_restores_mpo_reward_shift():
+    from nemo_rl.algorithms.mpo import MPOSaveState
+
+    def initial_state() -> MPOSaveState:
+        return MPOSaveState(
+            epoch=0,
+            step=0,
+            total_steps=0,
+            consumed_samples=0,
+            total_valid_tokens=0,
+            reward_shift=0.25,
+            reward_shift_num_updates=0,
+        )
+
+    save_state = _get_dpo_save_state(
+        {
+            "total_steps": 12,
+            "reward_shift": -1.5,
+            "reward_shift_num_updates": 12,
+            "val:accuracy": 0.75,
+        },
+        save_state_cls=MPOSaveState,
+        initial_save_state_fn=initial_state,
+    )
+
+    assert save_state == MPOSaveState(
+        epoch=0,
+        step=0,
+        total_steps=12,
+        consumed_samples=0,
+        total_valid_tokens=0,
+        reward_shift=-1.5,
+        reward_shift_num_updates=12,
+    )
 
 
 class MockPolicy:
@@ -75,7 +138,9 @@ def test_add_logprobs_to_batch():
     mock_policy = MockPolicy(mock_logprobs)
 
     # Create a mock master config
-    mock_master_config = {"policy": {"train_micro_batch_size": 1}}
+    mock_master_config = MasterConfig.model_construct(
+        **{"policy": {"train_micro_batch_size": 1}}
+    )
 
     # Get the augmented batches
     augmented_batches = list(
@@ -169,41 +234,40 @@ def mock_dpo_components():
     tokenizer = MagicMock()
     tokenizer.pad_token_id = 0
 
-    loss_fn = PreferenceLoss()
+    loss_fn = PreferenceLossFn()
     logger = MagicMock()
     checkpointer = MagicMock()
 
     # Create mock master config
-    master_config = {
-        "dpo": {
-            "max_num_steps": 5,
-            "max_num_epochs": 2,
-            "val_period": 100,
-            "val_batches": 1,
-            "val_global_batch_size": 1,
-            "val_micro_batch_size": 1,
-            "val_at_start": False,
-            "val_at_end": False,
-        },
-        "policy": {
-            "train_global_batch_size": 2,
-            "make_sequence_length_divisible_by": 1,
-            "reward_model_cfg": {
-                "enabled": True,
-                "reward_model_type": "bradley_terry",
+    master_config = MasterConfig.model_construct(
+        **{
+            "dpo": DPOConfig.model_construct(
+                max_num_steps=5,
+                max_num_epochs=2,
+                val_period=100,
+                val_batches=1,
+                val_global_batch_size=1,
+                val_micro_batch_size=1,
+                val_at_start=False,
+                val_at_end=False,
+            ),
+            "policy": {
+                "train_global_batch_size": 2,
+                "make_sequence_length_divisible_by": 1,
+                "reward_model_cfg": {
+                    "enabled": True,
+                    "reward_model_type": "bradley_terry",
+                },
+                "train_micro_batch_size": 1,
             },
-            "train_micro_batch_size": 1,
-        },
-        "checkpointing": {
-            "enabled": False,
-            "checkpoint_must_save_by": None,
-            "save_period": 10,
-        },
-        "cluster": {
-            "num_nodes": 1,
-            "gpus_per_node": 1,
-        },
-    }
+            "checkpointing": {
+                "enabled": False,
+                "checkpoint_must_save_by": None,
+                "save_period": 10,
+            },
+            "cluster": ClusterConfig(num_nodes=1, gpus_per_node=1),
+        }
+    )
 
     return {
         "policy": policy,
@@ -220,9 +284,9 @@ def mock_dpo_components():
 def test_exit_on_max_steps(mock_dpo_components):
     """Test that training loop exits when max_num_steps is reached"""
     # Set max steps to 12, which is less than len(train_dataloader) * max_num_epochs
-    mock_dpo_components["master_config"]["dpo"]["max_num_steps"] = 12
+    mock_dpo_components["master_config"].dpo.max_num_steps = 12
 
-    dpo_save_state = _default_dpo_save_state()
+    dpo_save_state = _initial_dpo_save_state()
 
     # Run training
     dpo_train(
@@ -239,15 +303,92 @@ def test_exit_on_max_steps(mock_dpo_components):
 
     # Verify we only trained for 12 steps.
     assert mock_dpo_components["policy"].train.call_count == 12
+    final_timing_call = [
+        call
+        for call in mock_dpo_components["logger"].log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "timing/train"
+    ][-1]
+    assert final_timing_call.kwargs["step_finished"] is True
+
+
+def test_configured_stop_forces_checkpoint_without_shortening_run(
+    mock_dpo_components, capsys
+):
+    cfg = mock_dpo_components["master_config"]
+    cfg.dpo = DPOConfig.model_validate(
+        {
+            **cfg.dpo.model_dump(),
+            "max_num_steps": 100,
+            "max_num_epochs": 10,
+            "stop_after_step": 3,
+        }
+    )
+    cfg.checkpointing["enabled"] = True
+    cfg.checkpointing["save_period"] = 100
+    cfg.checkpointing["metric_name"] = None
+
+    checkpointer = mock_dpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/segment_ckpt/tmp_step"
+    dpo_save_state = _initial_dpo_save_state()
+
+    with patch("nemo_rl.algorithms.dpo.torch.save"):
+        dpo_train(
+            mock_dpo_components["policy"],
+            mock_dpo_components["train_dataloader"],
+            mock_dpo_components["val_dataloader"],
+            mock_dpo_components["tokenizer"],
+            mock_dpo_components["loss_fn"],
+            cfg,
+            mock_dpo_components["logger"],
+            checkpointer,
+            dpo_save_state,
+        )
+
+    assert cfg.dpo.max_num_steps == 100
+    assert mock_dpo_components["policy"].train.call_count == 3
+    assert [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list] == [3]
+    assert dpo_save_state.total_steps == 3
+    assert "Configured stop-after step 3 has been reached" in capsys.readouterr().out
+
+
+def test_configured_stop_already_reached_does_not_retrain(mock_dpo_components, capsys):
+    cfg = mock_dpo_components["master_config"]
+    cfg.dpo = DPOConfig.model_validate(
+        {
+            **cfg.dpo.model_dump(),
+            "max_num_steps": 100,
+            "max_num_epochs": 10,
+            "stop_after_step": 3,
+        }
+    )
+    dpo_save_state = _initial_dpo_save_state()
+    dpo_save_state.total_steps = 3
+
+    dpo_train(
+        mock_dpo_components["policy"],
+        mock_dpo_components["train_dataloader"],
+        mock_dpo_components["val_dataloader"],
+        mock_dpo_components["tokenizer"],
+        mock_dpo_components["loss_fn"],
+        cfg,
+        mock_dpo_components["logger"],
+        mock_dpo_components["checkpointer"],
+        dpo_save_state,
+    )
+
+    mock_dpo_components["policy"].train.assert_not_called()
+    mock_dpo_components["checkpointer"].init_tmp_checkpoint.assert_not_called()
+    assert dpo_save_state.total_steps == 3
+    assert "Configured stop-after step 3 was already reached" in capsys.readouterr().out
 
 
 def test_exit_on_max_epochs(mock_dpo_components):
     """Test that training loop exits when max_num_epochs is reached"""
     # Set max epochs to 2 and max steps to a large number
-    mock_dpo_components["master_config"]["dpo"]["max_num_epochs"] = 2
-    mock_dpo_components["master_config"]["dpo"]["max_num_steps"] = 100
+    mock_dpo_components["master_config"].dpo.max_num_epochs = 2
+    mock_dpo_components["master_config"].dpo.max_num_steps = 100
 
-    dpo_save_state = _default_dpo_save_state()
+    dpo_save_state = _initial_dpo_save_state()
 
     # Run training
     dpo_train(
@@ -266,16 +407,24 @@ def test_exit_on_max_epochs(mock_dpo_components):
     assert mock_dpo_components["policy"].train.call_count == 20
 
 
-def test_exit_on_timeout(mock_dpo_components, capsys):
+def test_exit_on_timeout(mock_dpo_components, capsys, tmp_path):
     """Test that training loop exits when timeout is reached"""
     # Set max steps and epochs to large numbers
-    mock_dpo_components["master_config"]["dpo"]["max_num_steps"] = 100
-    mock_dpo_components["master_config"]["dpo"]["max_num_epochs"] = 10
+    mock_dpo_components["master_config"].dpo.max_num_steps = 100
+    mock_dpo_components["master_config"].dpo.max_num_epochs = 10
+    mock_dpo_components["master_config"].checkpointing["enabled"] = True
+    mock_dpo_components["master_config"].checkpointing["metric_name"] = None
+    mock_dpo_components["checkpointer"].init_tmp_checkpoint.return_value = str(
+        tmp_path / "tmp_step"
+    )
 
-    dpo_save_state = _default_dpo_save_state()
+    dpo_save_state = _initial_dpo_save_state()
 
     # Mock TimeoutChecker to return False for first 7 checks, then True (timeout)
-    with patch("nemo_rl.algorithms.dpo.TimeoutChecker") as mock_timeout_class:
+    with (
+        patch("nemo_rl.algorithms.dpo.torch.save"),
+        patch("nemo_rl.algorithms.dpo.TimeoutChecker") as mock_timeout_class,
+    ):
         mock_timeout_instance = MagicMock()
         # Create a side_effect that returns False 7 times, then True
         check_results = [False] * 7 + [True]
@@ -297,6 +446,12 @@ def test_exit_on_timeout(mock_dpo_components, capsys):
 
         # Verify training stopped at 8 steps (when check_save returned True)
         assert mock_dpo_components["policy"].train.call_count == 8
+        assert (
+            mock_dpo_components["policy"].save_checkpoint.call_args.kwargs[
+                "is_final_checkpoint"
+            ]
+            is False
+        )
 
         # Verify the timeout message was printed and is near the end (not followed by more training)
         captured = capsys.readouterr()
@@ -317,3 +472,37 @@ def test_exit_on_timeout(mock_dpo_components, capsys):
             assert "Epoch" not in line or "Epoch 1/10" in line, (
                 f"Training continued to next epoch after timeout: {line}"
             )
+
+
+def test_ft_save_period_triggers_periodic_saves(mock_dpo_components):
+    """ft_save_period triggers checkpoint saves independent of save_period."""
+    cfg = mock_dpo_components["master_config"]
+    cfg.dpo.val_period = 0
+    cfg.dpo.max_num_steps = 5
+    cfg.dpo.max_num_epochs = 1
+    cfg.checkpointing["enabled"] = True
+    cfg.checkpointing["save_period"] = 100  # only the final step would save
+    cfg.checkpointing["ft_save_period"] = 2
+    cfg.checkpointing["metric_name"] = None
+
+    checkpointer = mock_dpo_components["checkpointer"]
+    checkpointer.init_tmp_checkpoint.return_value = "/tmp/ft_ckpt_test/tmp_step"
+
+    dpo_save_state = _initial_dpo_save_state()
+
+    with patch("nemo_rl.algorithms.dpo.torch.save"):
+        dpo_train(
+            mock_dpo_components["policy"],
+            mock_dpo_components["train_dataloader"],
+            mock_dpo_components["val_dataloader"],
+            mock_dpo_components["tokenizer"],
+            mock_dpo_components["loss_fn"],
+            cfg,
+            mock_dpo_components["logger"],
+            checkpointer,
+            dpo_save_state,
+        )
+
+    # ft_save_period=2 -> steps 2, 4; save_period=100 contributes only the last step (5).
+    saved_steps = [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list]
+    assert saved_steps == [2, 4, 5]

@@ -6,10 +6,22 @@ grpo:
     in_flight_weight_updates: true
 loss_fn:
   use_importance_sampling_correction: true
+  force_on_policy_ratio: false
 checkpointing:
   checkpoint_dir: results/grpo-qwen3-30ba3b-24n8g-async-8off
 policy:
+  train_global_batch_size: 512
   megatron_cfg:
+    # HybridEP settings
+    moe_token_dispatcher_type: flex
+    moe_flex_dispatcher_backend: hybridep
+    moe_hybridep_num_sms: 32
+    moe_hybridep_prepad_packed_inputs: true
+    env_vars:
+      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "8"
+      NUM_OF_TOKENS_PER_CHUNK_COMBINE_API: "128"
+      NVLINK_DOMAIN_SIZE: "8"
+      USE_MNNVL: "0"
     tensor_model_parallel_size: 1
     pipeline_model_parallel_size: 1
     expert_model_parallel_size: 8

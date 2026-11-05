@@ -21,17 +21,44 @@ logging.basicConfig(
     format="%(levelname)s:%(name)s:%(filename)s:%(lineno)d: %(message)s",
 )
 
+# The call above installs the root handler but sets no level, so the root logger
+# stays at WARNING -- and because basicConfig returns early once handlers exist,
+# no later call can raise it (virtual_cluster.py's level=INFO is already a
+# no-op). Every nemo_rl logger inherited that, so until this line no log.info or
+# log.debug record anywhere in the package could reach a run's output, and the
+# instrumentation that emits them was unreachable rather than merely quiet.
+#
+# Set the level on the `nemo_rl` logger rather than on root: records still reach
+# the root handler, but raising the level does not also turn on debug output for
+# torch, ray, httpx and every other third-party logger.
+#
+# INFO by default. That is a change -- it surfaces the package's existing info
+# records, which are ~50 call sites concentrated in venv, cluster and vLLM-patch
+# setup, so they land at startup rather than per step. DEBUG additionally
+# enables the per-chunk and CUDA-allocator records on the training path, which
+# are per chunk per rank and are not meant for a normal run.
+logging.getLogger("nemo_rl").setLevel(os.environ.get("NRL_LOG_LEVEL", "INFO").upper())
+
 """
 This is a work around to ensure whenever NeMo RL is imported, that we
-add Megatron-LM to the python path. This is because the only sub-package
-that's officially installed is megatron.core. So we add the whole repo into
-the path so we can access megatron.{training,legacy,inference,...}
+add Megatron-LM to the python path. The editable install of megatron-core
+only exposes the packages declared in Megatron-LM's pyproject.toml
+(megatron.core and megatron.training), but megatron.training lazily imports
+megatron.{legacy,post_training} in some code paths (e.g., loading old fp16
+checkpoints, detecting modelopt state for quantization-aware flows). Adding
+the whole repo to the path makes megatron.{legacy,inference,post_training,...}
+importable too.
 
 Since users may pip install NeMo RL, this is a convenience so they do not
-have to manually run with PYTHONPATH=3rdparty/Megatron-LM-workspace/Megatron-LM.
+have to manually run with PYTHONPATH=3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/3rdparty/Megatron-LM.
 """
 megatron_path = (
-    Path(__file__).parent.parent / "3rdparty" / "Megatron-LM-workspace" / "Megatron-LM"
+    Path(__file__).parent.parent
+    / "3rdparty"
+    / "Megatron-Bridge-workspace"
+    / "Megatron-Bridge"
+    / "3rdparty"
+    / "Megatron-LM"
 )
 if megatron_path.exists() and str(megatron_path) not in sys.path:
     sys.path.append(str(megatron_path))
@@ -52,6 +79,13 @@ from nemo_rl.package_info import (
 
 os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
 os.environ["RAY_ENABLE_UV_RUN_RUNTIME_ENV"] = "0"
+# Reaping a dead generation worker's EngineCore needs a raylet setting too
+# (RAY_process_group_cleanup_enabled), but it is NOT set here: it is a raylet-wide
+# behaviour change and importing nemo_rl is not consent to it. It also would not work from
+# here on a cluster -- the raylet is already running by then. It belongs wherever the
+# raylet is launched: ray.sub for Slurm, and
+# nemo_rl.models.generation.maybe_configure_engine_reaping_env for a driver that starts its
+# own.
 
 
 def _is_build_isolation():
@@ -271,12 +305,19 @@ _patch_nsight_file()
 
 # Need to set PYTHONPATH to include transformers downloaded modules.
 # Assuming the cache directory is the same cross venvs.
-def patch_transformers_module_dir(env_vars: dict[str, str]):
-    hf_home = os.environ.get("HF_HOME", None)
-    if hf_home is None:
-        return env_vars
+def patch_transformers_module_dir(
+    env_vars: dict[str, str], *, apply_to_current_interpreter: bool = False
+):
+    # Prefer the explicit cache. A per-run HF_MODULES_CACHE keeps concurrent
+    # runs from racing on generated module names, and deriving the directory
+    # from HF_HOME instead would silently point at a different tree.
+    module_dir = os.environ.get("HF_MODULES_CACHE")
+    if module_dir is None:
+        hf_home = os.environ.get("HF_HOME")
+        if hf_home is None:
+            return env_vars
+        module_dir = os.path.join(hf_home, "modules")
 
-    module_dir = os.path.join(hf_home, "modules")
     if not os.path.isdir(module_dir):
         return env_vars
 
@@ -285,7 +326,29 @@ def patch_transformers_module_dir(env_vars: dict[str, str]):
     else:
         env_vars["PYTHONPATH"] = f"{module_dir}:{env_vars['PYTHONPATH']}"
 
+    # Updating PYTHONPATH only affects interpreters started after this process.
+    # Ray actors may import NeMo RL before unpickling trust_remote_code objects,
+    # so make the dynamic module package importable in the current interpreter.
+    if apply_to_current_interpreter:
+        while module_dir in sys.path:
+            sys.path.remove(module_dir)
+        sys.path.insert(0, module_dir)
+
     return env_vars
 
 
-patch_transformers_module_dir(os.environ)
+patch_transformers_module_dir(os.environ, apply_to_current_interpreter=True)
+
+
+# Install compatibility fixes before trust_remote_code model configurations are
+# loaded in this interpreter. The dynamic-module hashing patch is version-gated;
+# the torch-FX helper is installed only when Transformers no longer exposes it.
+from nemo_rl.transformers_compat import (  # noqa: E402
+    _patch_transformers_dynamic_module_symlink_cache,
+    _patch_transformers_torch_fx_compat,
+)
+
+_patch_transformers_dynamic_module_symlink_cache()
+_patch_transformers_torch_fx_compat()
+del _patch_transformers_dynamic_module_symlink_cache
+del _patch_transformers_torch_fx_compat

@@ -1,0 +1,12 @@
+defaults: ./grpo-qwen3-1.7b-1n8g-megatron-eagle3.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-1.7b-1n4g-megatron-eagle3
+
+logger:
+  log_dir: logs/grpo-qwen3-1.7b-1n4g-megatron-eagle3
+  wandb:
+    name: grpo-qwen3-1.7b-1n4g-megatron-eagle3
+
+cluster:
+  gpus_per_node: 4

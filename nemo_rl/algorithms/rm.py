@@ -14,34 +14,52 @@
 import os
 import warnings
 from collections import defaultdict
+from dataclasses import asdict, dataclass, fields
 from functools import partial
-from pathlib import Path
-from typing import Optional, TypedDict
+from typing import Any, Optional
 
 import numpy as np
-import torch
+from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
-from nemo_rl.algorithms.loss_functions import (
-    PreferenceLoss,
-)
+from nemo_rl.algorithms.loss import PreferenceLossFn
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import preference_collate_fn
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import TaskDataSpec
-from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
+from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
+from nemo_rl.distributed.virtual_cluster import (
+    ClusterConfig,
+    RayVirtualCluster,
+    prepare_segment_topology,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import PolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.telemetry.config import TelemetryConfig
+from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
+    evaluate_span,
+    iteration_scope,
+    managed_span,
+    umbrella_span,
+    umbrella_trace_fn,
+)
+from nemo_rl.telemetry.setup import get_telemetry_handle
+from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+)
 from nemo_rl.utils.logger import Logger, LoggerConfig
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
-class RMSaveState(TypedDict):
+@dataclass
+class RMSaveState:
     epoch: int  # Track current epoch
     step: int  # Track step within current epoch
     total_steps: int  # Track total number of steps across all epochs
@@ -49,40 +67,53 @@ class RMSaveState(TypedDict):
     total_valid_tokens: int  # Track total number of non-padding tokens during training
 
 
-def _default_rm_save_state() -> RMSaveState:
-    return {
-        "epoch": 0,
-        "step": 0,
-        "total_steps": 0,
-        "consumed_samples": 0,
-        "total_valid_tokens": 0,
-    }
+def _initial_rm_save_state() -> RMSaveState:
+    return RMSaveState(
+        epoch=0, step=0, total_steps=0, consumed_samples=0, total_valid_tokens=0
+    )
 
 
-class RMConfig(TypedDict):
-    max_num_steps: int
-    max_num_epochs: int
-    val_period: int
-    val_batches: int
-    val_global_batch_size: int
-    val_micro_batch_size: int
-    val_at_start: bool
+def _get_rm_save_state(
+    loaded_state: Optional[dict[str, Any]],
+) -> RMSaveState:
+    if loaded_state is None:
+        return _initial_rm_save_state()
+
+    # Start from current defaults so partial/legacy checkpoints remain loadable.
+    known_fields = {field.name for field in fields(RMSaveState)}
+    state_values = vars(_initial_rm_save_state()).copy()
+    state_values.update(
+        {key: value for key, value in loaded_state.items() if key in known_fields}
+    )
+    return RMSaveState(**state_values)
+
+
+class RMConfig(BaseModel, extra="allow"):
+    max_num_steps: int = -1
+    max_num_epochs: int = 1
+    val_period: int = 16
+    val_batches: int = -1
+    val_global_batch_size: int = 32
+    val_micro_batch_size: int = 1
+    val_at_start: bool = False
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
-    val_at_end: bool
-    seed: int
+    val_at_end: bool = False
+    seed: int = 42
 
 
-class MasterConfig(TypedDict):
+class MasterConfig(BaseModel, extra="allow"):
     policy: PolicyConfig
     data: DataConfig
     rm: RMConfig
     logger: LoggerConfig
     cluster: ClusterConfig
     checkpointing: CheckpointingConfig
+    telemetry: Optional[TelemetryConfig] = None
 
 
-class RMValMetrics(TypedDict):
+@dataclass
+class RMValMetrics:
     loss: float
     accuracy: float
     rewards_chosen_mean: float
@@ -103,7 +134,7 @@ def setup(
     RayVirtualCluster,
     StatefulDataLoader,
     dict[str, StatefulDataLoader],
-    PreferenceLoss,
+    PreferenceLossFn,
     MasterConfig,
     Logger,
     TaskDataSpec,
@@ -114,29 +145,48 @@ def setup(
     Returns:
         Tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, master_config, logger
     """
-    set_seed(master_config["rm"]["seed"])
+    set_seed(master_config.rm.seed)
 
     # Extract individual configs for easier access
-    policy_config = master_config["policy"]
-    data_config = master_config["data"]
-    logger_config = master_config["logger"]
-    cluster_config = master_config["cluster"]
-    rm_config = master_config["rm"]
+    policy_config = master_config.policy
+
+    # TODO(https://github.com/NVIDIA-NeMo/RL/issues/2482): remove once CP is supported for RM training.
+    automodel_cfg = policy_config.get("automodel_cfg", {})
+    if (
+        automodel_cfg.get("enabled", False)
+        and automodel_cfg.get("context_parallel_size", 1) > 1
+    ):
+        raise ValueError(
+            "Context parallelism (context_parallel_size > 1) is not supported for reward model "
+            "training on the Automodel backend. The log_sigmoid operator used in the RM loss does "
+            "not have a DTensor sharding strategy registered for CP meshes. "
+            "Please set policy.automodel_cfg.context_parallel_size=1. "
+            "See https://github.com/NVIDIA-NeMo/RL/issues/2482 for tracking."
+        )
+
+    data_config = master_config.data
+    rm_config = master_config.rm
+    logger_config = master_config.logger
+    cluster_config = master_config.cluster
+    checkpointing_config = master_config.checkpointing
+
+    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
+    if checkpointing_pretrained is not None:
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
     # ==========================
     #         Logger
     # ==========================
     logger = Logger(logger_config)
-    logger.log_hyperparams(master_config)
+    logger.log_hyperparams(master_config.model_dump())
 
     # ==========================
     #      Checkpointing
     # ==========================
-    checkpointer = CheckpointManager(master_config["checkpointing"])
+    checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    rm_save_state: Optional[RMSaveState] = checkpointer.load_training_info(
-        last_checkpoint_path
-    )
+    loaded_state = checkpointer.load_training_info(last_checkpoint_path)
+    rm_save_state = _get_rm_save_state(loaded_state)
 
     # ==========================
     #           Data
@@ -158,15 +208,12 @@ def setup(
     )
 
     if last_checkpoint_path is not None:
-        dataloader_state_dict = torch.load(
-            os.path.join(last_checkpoint_path, "train_dataloader.pt")
-        )
-        train_dataloader.load_state_dict(dataloader_state_dict)
+        load_dataloader_state(train_dataloader, last_checkpoint_path, data_config)
 
     val_dataloader = {
         k: StatefulDataLoader(
             v,
-            batch_size=rm_config["val_global_batch_size"],
+            batch_size=rm_config.val_global_batch_size,
             shuffle=False,
             collate_fn=partial(
                 preference_collate_fn,
@@ -186,15 +233,21 @@ def setup(
     #          Cluster
     # ==========================
     print("\n▶ Setting up compute cluster...")
+    num_nodes = cluster_config.num_nodes
+    segment_size = cluster_config.segment_size
+    node_resource_constraints, _, _ = prepare_segment_topology(segment_size, num_nodes)
     cluster = RayVirtualCluster(
         name="rm_cluster",
-        bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-        * cluster_config["num_nodes"],
+        bundle_ct_per_node_list=[cluster_config.gpus_per_node] * num_nodes,
         use_gpus=True,
-        num_gpus_per_node=cluster_config["gpus_per_node"],
+        num_gpus_per_node=cluster_config.gpus_per_node,
         max_colocated_worker_groups=1,
+        port_range_low=cluster_config.master_port_range_low,
+        port_range_high=cluster_config.master_port_range_high,
+        segment_size=segment_size,
+        node_resource_constraints=node_resource_constraints,
     )
-    print(f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes")
+    print(f"  ✓ Ray cluster initialized with {num_nodes} nodes")
 
     # ==========================
     #   Training
@@ -202,8 +255,8 @@ def setup(
     print("\n▶ Setting up model...")
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         total_train_iters = min(
-            rm_config["max_num_steps"],
-            rm_config["max_num_epochs"] * len(train_dataloader),
+            rm_config.max_num_steps,
+            rm_config.max_num_epochs * len(train_dataloader),
         )
         ## NOTE: we double the train_iters because effective batch size is doubled
         ## for (chosen, rejected) pairs
@@ -213,23 +266,21 @@ def setup(
                 if "iters" in k:
                     policy_config["megatron_cfg"]["scheduler"][k] *= 2
 
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
+
     policy = Policy(
         cluster=cluster,
         config=policy_config,
         tokenizer=tokenizer,
-        weights_path=Path(last_checkpoint_path) / "policy" / "weights"
-        if last_checkpoint_path
-        else None,
-        optimizer_path=Path(last_checkpoint_path) / "policy" / "optimizer"
-        if last_checkpoint_path
-        else None,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
         init_optimizer=True,
         init_reference_model=False,
     )
     # print the node IP and GPU ID of the policy workers for debugging
     policy.print_node_ip_and_gpu_id()
 
-    loss_fn = PreferenceLoss()
+    loss_fn = PreferenceLossFn()
     print("  ✓ Model initialized")
 
     print("\n" + "=" * 60)
@@ -279,12 +330,14 @@ def validate(
         )
         prefix = f"validation-{val_dataset_name}"
 
-        logger.log_metrics(k_val_metrics, step, prefix=prefix)
+        logger.log_metrics(asdict(k_val_metrics), step, prefix=prefix)
         logger.log_metrics(k_validation_timings, step, prefix=f"timing/{prefix}")
 
-        for metric_name in RMValMetrics.__annotations__.keys():
+        for metric_name in [f.name for f in fields(RMValMetrics)]:
             if metric_name != "num_valid_samples":
-                val_metrics[f"{prefix}_{metric_name}"] = k_val_metrics[metric_name]
+                val_metrics[f"{prefix}_{metric_name}"] = getattr(
+                    k_val_metrics, metric_name
+                )
         validation_timings[prefix + "_total_validation_time"] = k_validation_timings[
             "total_validation_time"
         ]
@@ -314,15 +367,17 @@ def validate_one_dataset(
 ):
     """Run validation on one validation dataset."""
     if val_dataloader is None:
-        assert val_dataloader is not None or master_config["dpo"]["val_period"] == 0, (
-            "val_dataloader is None, so dpo.val_period must be 0"
+        assert val_dataloader is not None or master_config.rm.val_period == 0, (
+            "val_dataloader is None, so rm.val_period must be 0"
         )
         print("  ⚠️ No validation dataloader provided, skipping validation")
         return
 
     timer = Timer()
-
-    with timer.time("total_validation_time"):
+    with (
+        timer.time("total_validation_time"),
+        evaluate_span("rm", **{RL_ITERATION_ATTR: step}),
+    ):
         print(f"▶ Starting validation at step {step} for `{dataset_name}` set..")
 
         # Show a progress indicator for validation
@@ -355,7 +410,7 @@ def validate_one_dataset(
                     " This is likely because there were no valid samples."
                 )
             else:
-                for metric_name in RMValMetrics.__annotations__.keys():
+                for metric_name in [f.name for f in fields(RMValMetrics)]:
                     dict_val_metrics[metric_name] += [
                         sum(val_results["all_mb_metrics"][metric_name])
                     ]
@@ -380,7 +435,7 @@ def validate_one_dataset(
                         ]
                     )
                     / sum_num_valid_samples
-                    for metric_name in RMValMetrics.__annotations__.keys()
+                    for metric_name in [f.name for f in fields(RMValMetrics)]
                     if metric_name != "num_valid_samples"
                 },
             )
@@ -392,7 +447,7 @@ def validate_one_dataset(
             val_metrics = RMValMetrics(
                 **{
                     metric_name: 0.0
-                    for metric_name in RMValMetrics.__annotations__.keys()
+                    for metric_name in [f.name for f in fields(RMValMetrics)]
                 }
             )
 
@@ -406,12 +461,14 @@ def validate_one_dataset(
     if num_valid_batches > 0:
         # Print summary of validation results
         print(f"\n📊 Validation Results for `{dataset_name}` set:")
-        for metric_name in RMValMetrics.__annotations__.keys():
+        for metric_name in [f.name for f in fields(RMValMetrics)]:
             if metric_name != "num_valid_samples":
-                print(f"    • Validation {metric_name}: {val_metrics[metric_name]:.4f}")
+                print(
+                    f"    • Validation {metric_name}: {getattr(val_metrics, metric_name):.4f}"
+                )
             else:
                 print(
-                    f"    • Validation num valid samples: {val_metrics['num_valid_samples']:.0f}"
+                    f"    • Validation num valid samples: {val_metrics.num_valid_samples:.0f}"
                 )
 
         # Print timing information
@@ -425,6 +482,7 @@ def validate_one_dataset(
     return val_metrics, timing_metrics
 
 
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.rm.job")
 def rm_train(
     policy,
     train_dataloader,
@@ -438,31 +496,24 @@ def rm_train(
 ):
     # Run basic rm training
     timer = Timer()
+    _telemetry = get_telemetry_handle()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
-        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
     )
     timeout.start_iterations()
-    if rm_save_state is None:
-        rm_save_state = _default_rm_save_state()
-        current_epoch = 0
-        current_step = 0
-        total_steps = 0
-        total_valid_tokens = 0
-    else:
-        current_epoch = rm_save_state["epoch"]
-        current_step = rm_save_state["step"]
-        total_steps = rm_save_state["total_steps"]
-        total_valid_tokens = rm_save_state.get(
-            "total_valid_tokens", 0
-        )  # Default to 0 for backward compatibility with older checkpoints
+    current_epoch = rm_save_state.epoch
+    current_step = rm_save_state.step
+    total_steps = rm_save_state.total_steps
+    total_valid_tokens = rm_save_state.total_valid_tokens
 
-    rm_config = master_config["rm"]
+    rm_config = master_config.rm
     # Validation configuration
-    val_period = rm_config["val_period"]
-    val_at_start = rm_config["val_at_start"]
-    val_at_end = rm_config["val_at_end"]
-    max_num_epochs = rm_config["max_num_epochs"]
+    val_period = rm_config.val_period
+    val_at_start = rm_config.val_at_start
+    val_at_end = rm_config.val_at_end
+    max_num_epochs = rm_config.max_num_epochs
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
@@ -474,28 +525,38 @@ def rm_train(
             loss_fn,
             step=0,
             master_config=master_config,
-            val_batches=rm_config["val_batches"],
-            val_batch_size=rm_config["val_global_batch_size"],
-            val_mbs=rm_config["val_micro_batch_size"],
+            val_batches=rm_config.val_batches,
+            val_batch_size=rm_config.val_global_batch_size,
+            val_mbs=rm_config.val_micro_batch_size,
             logger=logger,
         )
 
     policy.prepare_for_training()
 
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
+
     while current_epoch < max_num_epochs and (
-        master_config["rm"]["max_num_steps"] == -1
-        or total_steps < master_config["rm"]["max_num_steps"]
+        master_config.rm.max_num_steps == -1
+        or total_steps < master_config.rm.max_num_steps
     ):
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
         for batch in train_dataloader:
             print(
-                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config['rm']['max_num_steps'] if master_config['rm']['max_num_steps'] != -1 else len(train_dataloader))} {'=' * 25}"
+                f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config.rm.max_num_steps if master_config.rm.max_num_steps != -1 else len(train_dataloader))} {'=' * 25}"
             )
             maybe_gpu_profile_step(policy, total_steps + 1)
             val_metrics, validation_timings = None, None
 
-            with timer.time("total_step_time"):
+            with (
+                iteration_scope(total_steps + 1),
+                timer.time("total_step_time"),
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
+                    "rl.rm.step",
+                    tracer=_tracer,
+                ),
+            ):
                 # Prepare batch and generate responses
                 print("▶ Taking a training step...")
 
@@ -505,14 +566,14 @@ def rm_train(
                     eval_mode=False,
                     ## NOTE: we double the batch size here because each preference example corresponds to a pair of
                     ## examples, chosen and rejected, and the pair needs to be processed as part of the same microbatch.
-                    gbs=master_config["policy"]["train_global_batch_size"] * 2,
-                    mbs=master_config["policy"]["train_micro_batch_size"] * 2,
+                    gbs=master_config.policy["train_global_batch_size"] * 2,
+                    mbs=master_config.policy["train_micro_batch_size"] * 2,
                     timer=timer,
                 )
 
                 is_last_step = (
-                    master_config["rm"]["max_num_steps"] != -1
-                    and total_steps + 1 >= master_config["rm"]["max_num_steps"]
+                    master_config.rm.max_num_steps != -1
+                    and total_steps + 1 >= master_config.rm.max_num_steps
                 ) or (
                     current_epoch + 1 == max_num_epochs
                     and current_step + 1 == len(train_dataloader)
@@ -529,9 +590,9 @@ def rm_train(
                         loss_fn,
                         step=total_steps + 1,
                         master_config=master_config,
-                        val_batches=rm_config["val_batches"],
-                        val_batch_size=rm_config["val_global_batch_size"],
-                        val_mbs=rm_config["val_micro_batch_size"],
+                        val_batches=rm_config.val_batches,
+                        val_batch_size=rm_config.val_global_batch_size,
+                        val_mbs=rm_config.val_micro_batch_size,
                         logger=logger,
                     )
                 metrics = {
@@ -549,52 +610,51 @@ def rm_train(
                 ## Checkpointing
                 timeout.mark_iteration()
 
-                rm_save_state["consumed_samples"] += master_config["policy"][
+                rm_save_state.consumed_samples += master_config.policy[
                     "train_global_batch_size"
                 ]
 
                 should_save_by_step = (
                     is_last_step
-                    or (total_steps + 1) % master_config["checkpointing"]["save_period"]
+                    or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and (total_steps + 1) % ft_save_period == 0
+                    )
                 )
                 should_save_by_timeout = timeout.check_save()
 
-                if master_config["checkpointing"]["enabled"] and (
+                if master_config.checkpointing["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     ## +1 because step is 0-indexed
-                    rm_save_state["step"] = (current_step + 1) % len(train_dataloader)
-                    rm_save_state["total_steps"] = total_steps + 1
-                    rm_save_state["epoch"] = current_epoch
-                    rm_save_state["total_valid_tokens"] = total_valid_tokens
+                    rm_save_state.step = (current_step + 1) % len(train_dataloader)
+                    rm_save_state.total_steps = total_steps + 1
+                    rm_save_state.epoch = current_epoch
+                    rm_save_state.total_valid_tokens = total_valid_tokens
                     # Remove outdated validation metrics
-                    for key in list(rm_save_state):
+                    for key in list(vars(rm_save_state)):
                         if (
                             key.startswith("val")
                             and any(
                                 [
                                     key.endswith(f"_{metric_name}")
-                                    for metric_name in RMValMetrics.__annotations__.keys()
+                                    for metric_name in [
+                                        f.name for f in fields(RMValMetrics)
+                                    ]
                                     if metric_name != "num_valid_samples"
                                 ]
                             )
                             and (val_metrics is None or key not in val_metrics)
                         ):
-                            del rm_save_state[key]
+                            delattr(rm_save_state, key)
                     if val_metrics is not None:
-                        rm_save_state.update(val_metrics)
+                        for k, v in val_metrics.items():
+                            setattr(rm_save_state, k, v)
 
-                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_loss --> 'val:validation-default_loss'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -603,45 +663,57 @@ def rm_train(
                                 "This checkpoint will not be saved as top-k.",
                                 stacklevel=2,
                             )
-                            if full_metric_name in rm_save_state:
-                                del rm_save_state[full_metric_name]
+                            if hasattr(rm_save_state, full_metric_name):
+                                delattr(rm_save_state, full_metric_name)
                         elif metric_name not in metrics_source:
                             raise ValueError(
                                 f"Metric {metric_name} not found in {prefix} metrics"
                             )
                         else:
-                            rm_save_state[full_metric_name] = metrics_source[
-                                metric_name
-                            ]
+                            setattr(
+                                rm_save_state,
+                                full_metric_name,
+                                metrics_source[metric_name],
+                            )
 
-                    with timer.time("checkpointing"):
+                    with (
+                        timer.time("checkpointing"),
+                        managed_span(
+                            RLSpanGroup.CHECKPOINT,
+                            "rl.rm.checkpointing",
+                            tracer=_tracer,
+                        ),
+                    ):
                         print(f"Saving checkpoint for step {total_steps + 1}...")
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            total_steps + 1, rm_save_state, master_config
+                            total_steps + 1, vars(rm_save_state), master_config
                         )
-
                         policy.save_checkpoint(
                             weights_path=os.path.join(
                                 checkpoint_path, "policy", "weights"
                             ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
-                            ),
+                            )
+                            if checkpointer.save_optimizer
+                            else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config["checkpointing"],
+                            is_final_checkpoint=is_last_step,
                         )
-                        torch.save(
-                            train_dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        save_dataloader_state(
+                            train_dataloader.state_dict(), checkpoint_path
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=policy.finalize_async_save,
+                        )
 
             timing_metrics = timer.get_timing_metrics(reduction_op="sum")
 
             print("\n📊 Training Results:")
-            for metric_name in RMValMetrics.__annotations__.keys():
+            for metric_name in [f.name for f in fields(RMValMetrics)]:
                 if metric_name != "num_valid_samples":
                     print(f"  • {metric_name}: {float(metrics[metric_name]):.4f}")
                 else:
@@ -661,26 +733,32 @@ def rm_train(
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
 
             total_num_gpus = (
-                master_config["cluster"]["num_nodes"]
-                * master_config["cluster"]["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
             timing_metrics["valid_tokens_per_sec_per_gpu"] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
-            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+            logger.log_metrics(
+                timing_metrics,
+                total_steps + 1,
+                prefix="timing/train",
+                step_finished=True,
+            )
 
             timer.reset()
             current_step += 1
             total_steps += 1
 
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if (
-                master_config["rm"]["max_num_steps"] != -1
-                and total_steps >= master_config["rm"]["max_num_steps"]
+                master_config.rm.max_num_steps != -1
+                and total_steps >= master_config.rm.max_num_steps
             ):
+                checkpointer.shutdown()
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
@@ -689,3 +767,10 @@ def rm_train(
 
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
+
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_num_epochs falls through the while loop and bypasses
+    # the inline shutdown() calls at the max_num_steps / timeout early returns,
+    # so without this the daemon finalization thread could be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()

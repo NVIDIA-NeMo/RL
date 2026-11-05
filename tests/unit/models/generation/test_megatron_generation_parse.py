@@ -1,0 +1,509 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""CPU tests for the GPU-free slices of the megatron generation worker.
+
+The end-to-end megatron generation tests need GPUs and several minutes, which
+makes them a poor guard for the wire format of the engine's reply. That format
+does change: megatron-core stopped echoing `prompt_tokens` back unless
+`SamplingParams.return_prompt_tokens` is set, and every synchronous L1 functional
+test began failing with `AttributeError: 'NoneType' object has no attribute
+'tolist'` -- while two async ones swallowed the error per sample and still
+reported success. These tests pin the packing logic without a GPU.
+
+The same reasoning covers the NeMo-Gym port-reservation wiring
+(test_http_server_port_reservation): its safety properties are pure
+socket/plumbing contracts, pinned here without a GPU.
+"""
+
+import socket
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+import torch
+from megatron.core.inference.config import (
+    AsyncScheduleMode,
+    CudaGraphSizingDistribution,
+    InferenceConfig,
+    PrefixCachingCoordinatorPolicy,
+    PrefixCachingEvictionPolicy,
+)
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+    text_generation_server as mlm_text_gen_server,
+)
+from megatron.core.transformer.enums import InferenceCudaGraphScope
+
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.held_port import HeldPortReservation
+from nemo_rl.models.generation.megatron.megatron_worker import (
+    MegatronGenerationMixin,
+    _apply_inference_cuda_graph_scope,
+    _apply_optional_inference_config_kwargs,
+    _resolve_coordinator_policy,
+)
+
+PAD = 0
+
+
+@pytest.mark.mcore
+def test_inference_cuda_graph_scope_is_applied_when_configured():
+    engine_model = SimpleNamespace(config=SimpleNamespace())
+
+    _apply_inference_cuda_graph_scope(
+        engine_model, {"inference_cuda_graph_scope": "block"}
+    )
+
+    assert (
+        engine_model.config.inference_cuda_graph_scope is InferenceCudaGraphScope.block
+    )
+
+
+@pytest.mark.mcore
+def test_optional_inference_config_kwargs_are_typed_and_forwarded():
+    inference_config_kwargs = {}
+
+    _apply_optional_inference_config_kwargs(
+        inference_config_kwargs,
+        {
+            "cuda_graph_sizing_distribution": "hybrid",
+            "cuda_graph_max_tokens": "512",
+            "async_sched_mode": "async",
+            "vision_embedding_cache_max_bytes": "1024",
+            "allow_stale_multimodal_embeddings": 1,
+            "prefix_caching_eviction_policy": "lru",
+            "prefix_caching_mamba_gb": None,
+            "prefix_cache_ttl_seconds": "300",
+            "prefix_caching_routing_alpha": "0.75",
+            "logging_step_interval": "10",
+        },
+    )
+
+    assert inference_config_kwargs == {
+        "cuda_graph_sizing_distribution": CudaGraphSizingDistribution.HYBRID,
+        "cuda_graph_max_tokens": 512,
+        "async_sched_mode": AsyncScheduleMode.ASYNC,
+        "vision_embedding_cache_max_bytes": 1024,
+        "allow_stale_multimodal_embeddings": True,
+        "prefix_caching_eviction_policy": PrefixCachingEvictionPolicy.LRU,
+        "prefix_caching_mamba_gb": None,
+        "prefix_cache_ttl_seconds": 300.0,
+        "prefix_caching_routing_alpha": 0.75,
+        "logging_step_interval": 10,
+    }
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("mcore_generation_config", "expected_policy"),
+    [
+        (
+            {
+                "enable_prefix_caching": False,
+                "prefix_caching_coordinator_policy": "longest_prefix",
+            },
+            PrefixCachingCoordinatorPolicy.LOAD_BALANCED,
+        ),
+        (
+            {"enable_prefix_caching": True},
+            InferenceConfig.prefix_caching_coordinator_policy,
+        ),
+        (
+            {
+                "enable_prefix_caching": True,
+                "prefix_caching_coordinator_policy": "longest_prefix",
+            },
+            PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        ),
+        (
+            {
+                "enable_prefix_caching": True,
+                "prefix_caching_coordinator_policy": "first_prefix_block",
+            },
+            PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK,
+        ),
+    ],
+)
+def test_resolve_coordinator_policy(
+    mcore_generation_config: dict[str, object],
+    expected_policy: PrefixCachingCoordinatorPolicy,
+) -> None:
+    """The engine and every frontend must use the same routing policy."""
+    assert _resolve_coordinator_policy(mcore_generation_config) is expected_policy
+
+
+class FakeInferenceReply:
+    """The subset of mcore's DynamicInferenceRequest the parse path reads.
+
+    `prompt_tokens` defaults to None to match what the inference client actually
+    hands back: the engine drops it before serializing unless the caller opts in.
+    """
+
+    def __init__(
+        self,
+        generated_tokens: list[int],
+        generated_log_probs: list[float],
+        prompt_tokens: torch.Tensor | None = None,
+    ) -> None:
+        self.prompt_tokens = prompt_tokens
+        self.generated_tokens = generated_tokens
+        self.generated_log_probs = generated_log_probs
+
+
+def parse(data: BatchedDataDict, result: list[FakeInferenceReply]) -> BatchedDataDict:
+    """Calls the mixin method unbound, so no engine or distributed setup is needed."""
+    worker = SimpleNamespace(tokenizer=SimpleNamespace(pad_token_id=PAD))
+    return MegatronGenerationMixin._parse_result_to_batched_data_dict(
+        worker, data, result
+    )
+
+
+@pytest.fixture
+def two_sample_batch() -> BatchedDataDict:
+    """Two right-padded prompts of different lengths (3 and 2 real tokens)."""
+    return BatchedDataDict(
+        {
+            "input_ids": torch.tensor(
+                [[5, 6, 7, PAD], [8, 9, PAD, PAD]], dtype=torch.long
+            ),
+            "input_lengths": torch.tensor([3, 2], dtype=torch.long),
+        }
+    )
+
+
+@pytest.mark.mcore
+def test_packs_replies_that_omit_prompt_tokens(two_sample_batch):
+    """The regression: a reply with prompt_tokens=None must still pack correctly."""
+    result = [
+        FakeInferenceReply(generated_tokens=[11, 12], generated_log_probs=[-0.1, -0.2]),
+        FakeInferenceReply(generated_tokens=[13], generated_log_probs=[-0.3]),
+    ]
+
+    out = parse(two_sample_batch, result)
+
+    # Row width is the padded prompt length (4) plus the longest generation (2).
+    torch.testing.assert_close(
+        out["output_ids"],
+        torch.tensor(
+            [[5, 6, 7, 11, 12, PAD], [8, 9, 13, PAD, PAD, PAD]], dtype=torch.long
+        ),
+    )
+    # Generation is placed at the true prompt length, not the padded length, so
+    # sample 1's tokens must land at index 2 rather than 4.
+    torch.testing.assert_close(out["generation_lengths"], torch.tensor([2, 1]))
+    torch.testing.assert_close(out["unpadded_sequence_lengths"], torch.tensor([5, 3]))
+
+    expected_logprobs = torch.zeros(2, 6)
+    expected_logprobs[0, 3:5] = torch.tensor([-0.1, -0.2])
+    expected_logprobs[1, 2:3] = torch.tensor([-0.3])
+    torch.testing.assert_close(out["logprobs"], expected_logprobs)
+
+
+@pytest.mark.mcore
+def test_ignores_echoed_prompt_tokens(two_sample_batch):
+    """An engine that does echo the prompt back must not change the output.
+
+    The prompt is taken from the submitted batch either way, so the two mcore
+    behaviours are indistinguishable downstream and no version branch is needed.
+    """
+    without_echo = [
+        FakeInferenceReply(generated_tokens=[11, 12], generated_log_probs=[-0.1, -0.2]),
+        FakeInferenceReply(generated_tokens=[13], generated_log_probs=[-0.3]),
+    ]
+    with_echo = [
+        FakeInferenceReply(
+            generated_tokens=[11, 12],
+            generated_log_probs=[-0.1, -0.2],
+            prompt_tokens=torch.tensor([5, 6, 7], dtype=torch.long),
+        ),
+        FakeInferenceReply(
+            generated_tokens=[13],
+            generated_log_probs=[-0.3],
+            prompt_tokens=torch.tensor([8, 9], dtype=torch.long),
+        ),
+    ]
+
+    baseline = parse(two_sample_batch, without_echo)
+    echoed = parse(two_sample_batch, with_echo)
+
+    for key in (
+        "output_ids",
+        "logprobs",
+        "generation_lengths",
+        "unpadded_sequence_lengths",
+    ):
+        torch.testing.assert_close(echoed[key], baseline[key])
+
+
+@pytest.mark.mcore
+def test_handles_a_reply_with_no_generated_tokens(two_sample_batch):
+    """A request that produced nothing must yield the prompt and a zero length."""
+    result = [
+        FakeInferenceReply(generated_tokens=[], generated_log_probs=[]),
+        FakeInferenceReply(generated_tokens=[13], generated_log_probs=[-0.3]),
+    ]
+
+    out = parse(two_sample_batch, result)
+
+    torch.testing.assert_close(out["generation_lengths"], torch.tensor([0, 1]))
+    torch.testing.assert_close(out["unpadded_sequence_lengths"], torch.tensor([3, 3]))
+    assert out["output_ids"][0].tolist() == [5, 6, 7, PAD, PAD]
+
+
+@pytest.mark.mcore
+def test_http_server_port_reservation(monkeypatch):
+    """The NeMo-Gym overlap contract, exercised back to back.
+
+    The server URL is published to NeMo Gym before any worker exists, so: the
+    reserved port is bound and listening from reservation time (early Gym
+    probes queue instead of being refused), the worker adopts that same socket
+    through the fd handoff — the port is never released in between — and the
+    server falls back to a fresh port only when nothing was reserved.
+
+    Adoption is deferred to server startup rather than worker init, so that a
+    listening fd is never live across model initialization, where a long-lived
+    child process could inherit it and absorb SO_REUSEPORT traffic it never
+    serves.
+    """
+    # The holder resolves the node IP via held_port; the server resolves it via
+    # virtual_cluster (megatron_worker imports it at call time). Patch both.
+    monkeypatch.setattr(
+        "nemo_rl.distributed.held_port._get_node_ip_local",
+        lambda: "10.0.0.5",
+    )
+    monkeypatch.setattr(
+        "nemo_rl.distributed.virtual_cluster._get_node_ip_local",
+        lambda: "10.0.0.5",
+    )
+    holder = HeldPortReservation()
+    node_ip, port = holder.address()
+    assert node_ip == "10.0.0.5"
+
+    # Held and listening from reservation time: early Gym probes queue
+    # instead of being refused.
+    with socket.create_connection(("127.0.0.1", port), timeout=5):
+        pass
+
+    # Server start with the network and MLM server stubbed out.
+    started = {}
+    monkeypatch.setattr(
+        mlm_text_gen_server,
+        "start_text_gen_server",
+        lambda **kwargs: started.update(kwargs),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.distributed.virtual_cluster._get_free_port_local",
+        lambda *_args, **_kwargs: 12345,
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    requests_mock = MagicMock()
+    health_get = requests_mock.Session.return_value.__enter__.return_value.get
+    health_get.return_value.status_code = 200
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.requests",
+        requests_mock,
+    )
+
+    for reserved_port, expected_port in ((port, port), (None, 12345)):
+        worker = SimpleNamespace(
+            coordinator_addr="tcp://127.0.0.1:5555",
+            megatron_tokenizer=object(),
+            rank=0,
+            cfg={
+                "generation": {
+                    "temperature": 1.0,
+                    "top_p": 1.0,
+                    "top_k": None,
+                    "mcore_generation_config": {
+                        "block_size_tokens": 64,
+                        "enable_prefix_caching": False,
+                        "parsers": [],
+                    },
+                }
+            },
+            _reserved_http_server_port=reserved_port,
+            inference_wrapped_model=SimpleNamespace(multimodal_prompt_config=None),
+        )
+        base_url = MegatronGenerationMixin._setup_openai_api_server(worker)
+        reserved_socket = started["sock"]
+        try:
+            assert started["server_port"] == expected_port
+            assert base_url == f"http://10.0.0.5:{expected_port}/v1"
+            assert started["block_size_tokens"] == 64
+            assert (
+                started["prefix_caching_coordinator_policy"]
+                is PrefixCachingCoordinatorPolicy.LOAD_BALANCED
+            )
+            if reserved_port is None:
+                assert reserved_socket is None
+                continue
+
+            # Adoption occurs only at HTTP startup, after model initialization
+            # can no longer leak the listener into long-lived child processes.
+            assert holder._sock.fileno() == -1
+            assert reserved_socket.getsockname()[1] == port
+
+            # Still accepting after the holder closed its copy: the port was
+            # never released across the handoff.
+            with socket.create_connection(("127.0.0.1", port), timeout=5):
+                pass
+
+            # MCore closes the handed-off fd and gives every frontend replica
+            # its own SO_REUSEPORT listener. Such a listener can join the reuse
+            # group while this test stub still holds the adopted duplicate.
+            replica = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                replica.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                replica.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                replica.bind(("0.0.0.0", port))
+            finally:
+                replica.close()
+        finally:
+            if reserved_socket is not None:
+                reserved_socket.close()
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("gen_cfg_extra", "expected", "absent"),
+    [
+        # Replica count reaches MCore, and stays absent when unconfigured.
+        pytest.param({}, {}, ["num_replicas"], id="num-replicas-unset"),
+        pytest.param(
+            {"http_server_num_replicas": 8},
+            {"num_replicas": 8},
+            [],
+            id="num-replicas-forwarded",
+        ),
+    ],
+)
+def test_http_server_kwargs_follow_policy_config(
+    monkeypatch, gen_cfg_extra, expected, absent
+):
+    started = _start_stubbed_http_server(monkeypatch, gen_cfg_extra=gen_cfg_extra)
+
+    assert {key: started[key] for key in expected} == expected
+    assert not set(absent) & set(started)
+
+
+def _start_stubbed_http_server(
+    monkeypatch,
+    *,
+    gen_cfg_extra: dict | None = None,
+    sampling_cfg: dict | None = None,
+) -> dict:
+    """Run ``_setup_openai_api_server`` against a stubbed MCore server; return its kwargs."""
+    started = {}
+    monkeypatch.setattr(
+        mlm_text_gen_server,
+        "start_text_gen_server",
+        lambda **kwargs: started.update(kwargs),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.distributed.virtual_cluster._get_node_ip_local",
+        lambda: "10.0.0.5",
+    )
+    monkeypatch.setattr(
+        "nemo_rl.distributed.virtual_cluster._get_free_port_local",
+        lambda *_args, **_kwargs: 12345,
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    requests_mock = MagicMock()
+    health_get = requests_mock.Session.return_value.__enter__.return_value.get
+    health_get.return_value.status_code = 200
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.requests",
+        requests_mock,
+    )
+
+    worker = SimpleNamespace(
+        coordinator_addr="tcp://127.0.0.1:5555",
+        megatron_tokenizer=object(),
+        rank=0,
+        cfg={
+            "generation": {
+                **(sampling_cfg or {"temperature": 1.0, "top_p": 1.0, "top_k": None}),
+                "mcore_generation_config": {
+                    "block_size_tokens": 64,
+                    "enable_prefix_caching": False,
+                    "parsers": [],
+                    **(gen_cfg_extra or {}),
+                },
+            }
+        },
+        _reserved_http_server_port=None,
+        inference_wrapped_model=SimpleNamespace(multimodal_prompt_config=None),
+    )
+
+    MegatronGenerationMixin._setup_openai_api_server(worker)
+    return started
+
+
+@pytest.mark.mcore
+def test_mp_coordinator_starts_exposed_http_server(monkeypatch):
+    coordinator_call = object()
+    future = MagicMock()
+    setup_server = MagicMock(return_value="http://10.0.0.5:5555/v1")
+    worker = SimpleNamespace(
+        cfg={"generation": {"mcore_generation_config": {"expose_http_server": True}}},
+        dynamic_inference_engine=SimpleNamespace(is_mp_coordinator=True),
+        _inference_loop=object(),
+        _start_inference_coordinator=MagicMock(return_value=coordinator_call),
+        _setup_openai_api_server=setup_server,
+    )
+    run_coroutine = MagicMock(return_value=future)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.megatron.megatron_worker.asyncio.run_coroutine_threadsafe",
+        run_coroutine,
+    )
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    MegatronGenerationMixin._run_async_coordinator_start(worker)
+
+    run_coroutine.assert_called_once_with(coordinator_call, worker._inference_loop)
+    future.result.assert_called_once_with()
+    setup_server.assert_called_once_with()
+    assert worker.base_url == "http://10.0.0.5:5555/v1"
+
+
+@pytest.mark.mcore
+@pytest.mark.parametrize(
+    ("sampling", "expected"),
+    [
+        (
+            {"temperature": 1.0, "top_p": 1.0, "top_k": None},
+            {"default_temperature": 1.0, "default_top_p": 1.0, "default_top_k": 0},
+        ),
+        (
+            {"temperature": 0.7, "top_p": None, "top_k": -1},
+            {"default_temperature": 0.7, "default_top_p": 1.0, "default_top_k": 0},
+        ),
+        (
+            {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+            {"default_temperature": 0.6, "default_top_p": 0.95, "default_top_k": 20},
+        ),
+    ],
+)
+def test_http_server_defaults_follow_generation_sampling(
+    monkeypatch, sampling, expected
+):
+    """Requests that omit sampling fields use the training sampling profile.
+
+    Without explicit server defaults, MCore falls back to hardcoded values or to
+    the model's generation_config.json, which can differ from the parameters the
+    policy recomputes log probabilities with.
+    """
+    started = _start_stubbed_http_server(monkeypatch, sampling_cfg=sampling)
+
+    assert {key: started[key] for key in expected} == expected

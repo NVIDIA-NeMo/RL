@@ -29,7 +29,7 @@ We also allow multiple colocated local clusters, which are uniquely identified b
 # (1) Start a fresh cluster on GPU=0
 CUDA_VISIBLE_DEVICES=0 uv run examples/run_grpo.py
 
-# (2) While (1) is running, this will start a new cluster using GPUs 1 and 2 without interferring with (1)
+# (2) While (1) is running, this will start a new cluster using GPUs 1 and 2 without interfering with (1)
 # Ensure that the CUDA_VISIBLE_DEVICES do not overlap already running jobs.
 CUDA_VISIBLE_DEVICES=1,2 uv run examples/run_grpo.py
 ```

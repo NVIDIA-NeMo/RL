@@ -11,29 +11,34 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
 import time
 
 import pytest
 import ray
 
-from nemo_rl.distributed.ray_actor_environment_registry import (
-    get_actor_python_env,
-)
-from nemo_rl.environments.math_environment import MathEnvironment
+from nemo_rl.environments.utils import create_env
+
+# ============================================================================
+# Environment fixtures
+# ============================================================================
 
 
 @pytest.fixture(scope="module")
 def math_env():
     """Create a MathEnvironment actor for testing."""
-    env = MathEnvironment.options(
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.math_environment.MathEnvironment"
-            ),
-            "env_vars": dict(os.environ),
-        }
-    ).remote({"num_workers": 2})
+    env = create_env("math", {"num_workers": 2})
+    yield env
+    # Clean up the actor and wait for it to be killed
+    env.shutdown.remote()
+    ray.kill(env)
+    # Give some time for cleanup
+    time.sleep(0.1)
+
+
+@pytest.fixture(scope="module")
+def math_multi_reward_env():
+    """Create a MathMultiRewardEnvironment actor for testing."""
+    env = create_env("math_multi_reward", {"num_workers": 2})
     yield env
     # Clean up the actor and wait for it to be killed
     env.shutdown.remote()
@@ -45,21 +50,18 @@ def math_env():
 @pytest.fixture(scope="module")
 def multichoice_env(request):
     """Create a MathEnvironment actor for testing."""
-    verifier_type = request.param
-    env = MathEnvironment.options(
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.math_environment.MathEnvironment"
-            ),
-            "env_vars": dict(os.environ),
-        }
-    ).remote({"num_workers": 2, "verifier_type": verifier_type})
+    env = create_env("math", {"num_workers": 2, "verifier_type": request.param})
     yield env
     # Clean up the actor and wait for it to be killed
     env.shutdown.remote()
     ray.kill(env)
     # Give some time for cleanup
     time.sleep(0.1)
+
+
+# ============================================================================
+# Data fixtures
+# ============================================================================
 
 
 @pytest.fixture
@@ -84,6 +86,41 @@ def basic_test_data():
             {"ground_truth": "4"},
             {"ground_truth": "\\boxed{12}"},
             {"ground_truth": "\\boxed{5}"},
+        ],
+    }
+
+
+@pytest.fixture
+def multi_reward_test_data():
+    """Common test data for basic math problems with multiple rewards."""
+    return {
+        "message_log_batch": [
+            [
+                {"role": "user", "content": "What is 2 + 2?"},
+                {
+                    "role": "assistant",
+                    "content": "<think>2 + 2 = 4</think>\n<answer>4</answer>",
+                },
+            ],
+            [
+                {"role": "user", "content": "What is 3 * 4?"},
+                {
+                    "role": "assistant",
+                    "content": "<think>3 * 4 = 12</think>\n<answer>12.5</answer>",
+                },
+            ],
+            [
+                {"role": "user", "content": "What is 10 - 5?"},
+                {
+                    "role": "assistant",
+                    "content": "<think>10 - 5 = 5\n<answer>5</answer>",
+                },
+            ],
+        ],
+        "metadata": [
+            {"ground_truth": "4"},
+            {"ground_truth": "12"},
+            {"ground_truth": "5"},
         ],
     }
 
@@ -170,6 +207,11 @@ def multiple_assistant_test_data():
     }
 
 
+# ============================================================================
+# Environment tests
+# ============================================================================
+
+
 def test_math_env_step_basic(math_env, basic_test_data):
     """Test basic functionality of MathEnvironment step with simple messages."""
     result = ray.get(
@@ -198,6 +240,64 @@ def test_math_env_step_basic(math_env, basic_test_data):
     # Check rewards and done flags
     assert result.rewards.shape == (3,), "Rewards should be a tensor of shape (3,)"
     assert all(result.rewards == 1.0), "All rewards should be 1.0 for correct answers"
+    assert result.terminateds.shape == (3,), (
+        "Terminated flags should be a tensor of shape (3,)"
+    )
+    assert all(result.terminateds == 1.0), "All terminated flags should be 1.0"
+
+
+def test_multi_reward_env_step_basic(math_multi_reward_env, multi_reward_test_data):
+    """Test basic step: correct answer + valid format -> all 3 rewards 1.0."""
+    result = ray.get(
+        math_multi_reward_env.step.remote(
+            multi_reward_test_data["message_log_batch"],
+            multi_reward_test_data["metadata"],
+        )
+    )
+
+    # Check observations (based on correctness reward, index 0)
+    assert len(result.observations) == 3, (
+        "Should return observations for all 3 messages"
+    )
+    assert all(obs["role"] == "environment" for obs in result.observations), (
+        "All observations should be from environment"
+    )
+
+    # Check observations for each data point
+    assert result.observations[0]["content"] == "Environment: correct"
+    assert result.observations[1]["content"] == "Environment: incorrect"
+    assert result.observations[2]["content"] == "Environment: correct"
+
+    # Check metadata
+    assert len(result.metadata) == 3, "Should return metadata for all 3 messages"
+    assert result.metadata == multi_reward_test_data["metadata"], (
+        "Metadata should be unchanged"
+    )
+
+    # Check rewards: dict with 3 named components, each Tensor of shape (3,)
+    assert isinstance(result.rewards, dict), "Rewards should be a dict"
+    expected_keys = {"reward/correctness", "reward/integer", "reward/format"}
+    assert set(result.rewards.keys()) == expected_keys, (
+        f"Reward keys should be {expected_keys}, got {set(result.rewards.keys())}"
+    )
+    for name, tensor in result.rewards.items():
+        assert tensor.shape == (3,), f"{name} should be a tensor of shape (3,)"
+
+    # Check rewards for each data point
+    # Sample 0: correct answer "4", integer, valid format -> all 1.0
+    assert result.rewards["reward/correctness"][0] == 1.0
+    assert result.rewards["reward/integer"][0] == 1.0
+    assert result.rewards["reward/format"][0] == 1.0
+    # Sample 1: wrong answer, not integer, valid format -> only format 1.0
+    assert result.rewards["reward/correctness"][1] == 0.0
+    assert result.rewards["reward/integer"][1] == 0.0
+    assert result.rewards["reward/format"][1] == 1.0
+    # Sample 2: correct answer "4", integer, bad format -> correctness+integer 1.0
+    assert result.rewards["reward/correctness"][2] == 1.0
+    assert result.rewards["reward/integer"][2] == 1.0
+    assert result.rewards["reward/format"][2] == 0.0
+
+    # Check terminated flags
     assert result.terminateds.shape == (3,), (
         "Terminated flags should be a tensor of shape (3,)"
     )
@@ -407,3 +507,63 @@ Now, let's consider \(f = x - n = (2 + \sqrt{3})^{1000} - \lfloor (2 + \sqrt{3})
         "Terminated flags should be a tensor of shape (1,)"
     )
     assert result.terminateds[0] == 1.0, "Terminated flag should be 1.0"
+
+
+def test_math_env_extracted_answers_stay_aligned_with_rewards(math_env):
+    """One score and one answer per sample, even when extraction finds nothing.
+
+    ``HFVerifyWorker.verify`` used to commit the score before attempting the
+    extraction, so a generation math-verify cannot parse produced a second
+    score from the except branch and pushed every later reward one slot out of
+    position. Nothing downstream notices: ``eval_pass_k`` splits the rewards
+    positionally and would report a wrong number rather than fail.
+    """
+    responses = [
+        "The answer is \\boxed{42}",  # correct
+        "I don't know.",  # nothing parseable
+        "The answer is \\boxed{137}",  # wrong, but parseable
+    ]
+    message_log_batch = [
+        [{"role": "assistant", "content": content}] for content in responses
+    ]
+    metadata = [{"ground_truth": "42"} for _ in responses]
+
+    result = ray.get(math_env.step.remote(message_log_batch, metadata, True))
+
+    assert result.rewards.shape == (3,), (
+        "one score per sample; an unparseable generation used to add a second"
+    )
+    assert result.rewards[0] == 1.0
+    assert result.rewards[2] == 0.0, "the wrong answer keeps its own slot"
+    assert len(result.answers) == 3
+    assert result.answers[1] is None, "nothing parseable means no answer"
+    assert result.answers[2] == "137", "the first prediction, not its first character"
+
+
+@pytest.mark.parametrize(
+    "extracted_answer,impl,expected",
+    [
+        # Nothing parsed at all -- math-verify returns an empty prediction list.
+        ((["42"], []), "hf_math_verify", None),
+        # A wrong but parseable answer: the prediction, not its first character.
+        ((["42"], ["137"]), "hf_math_verify", "137"),
+        # A match anywhere in the list wins.
+        ((["42"], ["7", "42"]), "hf_math_verify", "42"),
+        # Shapes the hf branch can hand back when its sympy conversion gives up.
+        (None, "hf_math_verify", None),
+        (("only-one-element",), "hf_math_verify", None),
+        # The dapo branch returns a plain normalized string, not a pair.
+        ("137", "dapo_math_verify", "137"),
+        (None, "dapo_math_verify", None),
+    ],
+)
+def test_select_extracted_answer_never_raises(extracted_answer, impl, expected):
+    """The whole fix rests on this helper not raising.
+
+    The caller commits the sample's score before asking for its answer, so an
+    exception here would either retract a score the verifier already returned
+    or desynchronize the results list from the batch.
+    """
+    from nemo_rl.environments.math_environment import _select_extracted_answer
+
+    assert _select_extracted_answer(extracted_answer, impl) == expected

@@ -16,27 +16,13 @@ config = AutoConfig.from_pretrained("microsoft/DialoGPT-small")
 print(f"Loaded config: {config.model_type}")
 
 # Test nemo_automodel import
-try:
-    import nemo_automodel
-    from nemo_automodel.components._transformers.auto_model import NeMoAutoModelForCausalLM
-    print("[NeMo Automodel import successful]")
-except ImportError as e:
-    print(f"[WARNING] NeMo Automodel import failed: {e}")
-    print("[This may be expected if nemo_automodel is not fully built]")
+import nemo_automodel
+from nemo_automodel._transformers.auto_model import NeMoAutoModelForCausalLM
+print("[NeMo Automodel import successful]")
 
 # Test flash-attn import (part of automodel extra)
-try:
-    import flash_attn
-    print(f"[Flash Attention available: {flash_attn.__version__}]")
-except ImportError:
-    print("[WARNING] Flash Attention not available")
-
-# Test vllm import (part of automodel extra) 
-try:
-    import vllm
-    print(f"[vLLM available: {vllm.__version__}]")
-except ImportError:
-    print("[WARNING] vLLM not available")
+import flash_attn
+print(f"[Flash Attention available: {flash_attn.__version__}]")
 
 print("[Automodel extra dependencies test successful]")
 EOF
@@ -47,18 +33,12 @@ uv run --extra automodel --no-build-isolation python <<"EOF"
 import nemo_rl
 
 # Test automodel utilities
-try:
-    from nemo_rl.utils.automodel_checkpoint import detect_checkpoint_format, load_checkpoint, save_checkpoint
-    print("[Automodel checkpoint utilities import successful]")
-except ImportError as e:
-    print(f"[Automodel checkpoint utilities import failed: {e}]")
+from nemo_rl.models.automodel.checkpoint import AutomodelCheckpointManager
+print("[Automodel checkpoint utilities import successful]")
 
 # Test automodel factory
-try:
-    from nemo_rl.models.policy.utils import AUTOMODEL_FACTORY, NEMO_AUTOMODEL_AVAILABLE
-    print(f"[Automodel factory available: {NEMO_AUTOMODEL_AVAILABLE}]")
-except ImportError as e:
-    print(f"[Automodel factory import failed: {e}]")
+from nemo_rl.models.automodel.utils import AUTOMODEL_FACTORY
+print(f"[Automodel factory available: {len(AUTOMODEL_FACTORY)} entries]")
 
 print("[Automodel integration test successful]")
 EOF

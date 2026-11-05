@@ -13,13 +13,13 @@ This document focuses on DAPO-specific features: Dynamic Sampling and Overlong R
 
 ## Quickstart: Launch a DAPO Run
 
-To get started quickly, use the example configuration [examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml](../../examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml). You can launch this using the same script as GRPO:
+To get started quickly, use the example configuration [examples/configs/recipes/llm/dapo-qwen2.5-7b.v2.yaml](../../examples/configs/recipes/llm/dapo-qwen2.5-7b.v2.yaml). You can launch this using the same script as GRPO:
 
 ```bash
-uv run examples/run_grpo.py --config examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml {overrides}
+uv run examples/run_grpo.py --config examples/configs/recipes/llm/dapo-qwen2.5-7b.v2.yaml {overrides}
 ```
 
-**Reminder**: Don't forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for LLaMA models.
+**Reminder**: Don't forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `hf auth login` as well for LLaMA models.
 
 ## Dynamic Sampling
 
@@ -44,6 +44,8 @@ Standard GRPO trains on all generated responses, even when they have identical r
 
 ## Reward Shaping
 DAPO introduces an overlong reward shaping mechanism to reduce reward noise and stabilize training. This approach penalizes responses that exceed a specified length threshold, helping to prevent the model from generating excessively long outputs while maintaining solution quality.
+
+The response length is the total number of tokens over all generated assistant turns in a sample. For multi-turn rollouts (tool use, NeMo Gym agents, `max_rollout_turns > 1`), every generated assistant turn counts toward `max_response_length`. Assistant turns in the original prompt history, including empty placeholders, and user, environment, and tool turns do not count. Generated turns are identified by their `generation_logprobs` before missing logprobs are filled for training. For a single-turn rollout this is the length of the one generated assistant response.
 
 For a detailed explanation of the overlong reward shaping mechanism, please refer to Section 3.4 of the [DAPO paper](https://arxiv.org/pdf/2503.14476). For implementation details, see the [`apply_reward_shaping`](../../nemo_rl/algorithms/reward_functions.py) function.
 
@@ -75,7 +77,7 @@ grpo:
 - **`batch_multiplier`**: Factor that scales the initial prompt pool size for sampling.
 - **`dynamic_sampling_max_gen_batches`**: Maximum number of batches to be used for accumulating nonzero standard deviation prompts.
 - **`reward_scaling`**: When enabled, clamps each reward in the batch to [source_min, source_max] and linearly rescales it to [target_min, target_max]. Defaults: source_min=0.0, source_max=1.0, target_min=0.0, target_max=1.0.
-- **`reward_shaping`**: When enabled, applies the overlong penalty mechanism described in the Reward Shaping section above. Responses exceeding `max_response_length - overlong_buffer_length` receive penalties proportional to their excess length, helping to reduce reward noise and stabilize training.
+- **`reward_shaping`**: When enabled, applies the overlong penalty mechanism described in the Reward Shaping section above. Responses whose total generated assistant-turn length exceeds `max_response_length - overlong_buffer_length` receive penalties proportional to their excess length, helping to reduce reward noise and stabilize training.
 
 > [!NOTE]
 > When dynamic sampling is enabled, monitor the `filtered_reward` metric to track the average reward of the prompts with std > 0.
@@ -83,12 +85,12 @@ grpo:
 > [!NOTE]
 > **Clip-Higher** and **Token-Level Policy Gradient Loss** are already supported in NeMo RL and can be configured through the `loss_fn` section of your experiment config:
 > - Set `ratio_clip_max` to enable Clip-Higher (e.g., `ratio_clip_max: 0.28`)
-> - Set `token_level_loss: true` to enable Token-Level Policy Gradient Loss
+> - Set `token_level_loss: true` to enable Token-Level Policy Gradient Loss (see [Loss Normalization](grpo.md#loss-normalization-token_level_loss) for what this changes and the tradeoff against sequence-level normalization)
 > 
-> See the full [DAPO example config](../../examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml) for reference.
+> See the full [DAPO example config](../../examples/configs/recipes/llm/dapo-qwen2.5-7b.v2.yaml) for reference.
 
 ## Example Training Results
-Using the [DAPO example config](../../examples/configs/recipes/llm/dapo-qwen2.5-7b.yaml), you can expect to see intermediate plots such as the training reward curve and validation accuracy on AIME24 for Qwen/Qwen2.5-Math-7B. These plots serve as reference outputs to help verify reproducibility. They are not intended to reflect the best accuracy that can be achieved using DAPO for this model.
+Using the [DAPO example config](../../examples/configs/recipes/llm/dapo-qwen2.5-7b.v2.yaml), you can expect to see intermediate plots such as the training reward curve and validation accuracy on AIME24 for Qwen/Qwen2.5-Math-7B. These plots serve as reference outputs to help verify reproducibility. They are not intended to reflect the best accuracy that can be achieved using DAPO for this model.
 
 ![DAPO Qwen2.5-7B Training Reward](../assets/dapo_train_reward.png)
 ![DAPO Qwen2.5-7B Validation Accuracy](../assets/dapo_val_acc.png)

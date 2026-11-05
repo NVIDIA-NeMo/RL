@@ -1,0 +1,1737 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Generation failures on the native GRPO rollout path must never reach training.
+
+The regression these tests guard is subtle and silent. `_run_single_rollout` used to
+catch every exception from `_generate_response`, print it, and `break` out of the turn
+loop. Execution then fell through to build a Completion holding only the prompt, with
+`reward=0.0`, which `generate_and_push` committed as a training row.
+
+It did not even crash downstream: `add_grpo_token_loss_masks_and_generation_logprobs`
+zero-fills a missing `generation_logprobs` and sets `token_loss_mask=0`, so the row is
+well formed. It contributes no gradient -- but its zero reward *does* enter the
+per-prompt GRPO baseline, so with `use_leave_one_out_baseline` one dead vLLM worker
+silently shifts the advantage of every sibling in the group.
+"""
+
+import asyncio
+import contextlib
+import uuid
+
+import pytest
+import ray.exceptions
+import torch
+
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
+from nemo_rl.environments.interfaces import EnvironmentReturn
+from nemo_rl.experience.failures import (
+    FailureClass,
+    GenerationUnavailable,
+    GymAdmissionClosed,
+    GymRowFailure,
+    GymTransportError,
+    RolloutDataFailure,
+    RolloutFailure,
+    RolloutRedispatchExhausted,
+    RolloutTimeout,
+    classify_rollout_failure,
+)
+from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
+from nemo_rl.experience.rollout_manager import (
+    AsyncRolloutImpl,
+    RequestDeadlineRegistry,
+    RolloutManager,
+    RolloutRetryPolicy,
+    RolloutStats,
+    RolloutTimeouts,
+    _classify_generation_failure,
+    _Deadline,
+    _gather_cancelling_siblings,
+    _LedgerDispatchRecorder,
+)
+from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from nemo_rl.utils.timer import Timer
+
+
+@pytest.fixture
+def terminating_env(monkeypatch):
+    """Make calculate_rewards return a terminated, zero-reward step.
+
+    Lets the success-path tests exercise a whole rollout turn without standing up a
+    real environment actor.
+    """
+
+    def _fake(sample_batch, task_to_env):
+        del sample_batch, task_to_env
+        return EnvironmentReturn(
+            observations=[{"role": "environment", "content": ""}],
+            metadata=[None],
+            next_stop_strings=[None],
+            rewards=torch.tensor([0.0]),
+            terminateds=torch.tensor([True]),
+            answers=[None],
+        )
+
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollout_manager.calculate_rewards", _fake, raising=True
+    )
+    return _fake
+
+
+class _TokenizedText:
+    def __init__(self, input_ids: torch.Tensor) -> None:
+        self.input_ids = input_ids
+
+
+class _FakeTokenizer:
+    pad_token_id = 0
+
+    def decode(self, ids, skip_special_tokens=True):
+        del skip_special_tokens
+        return f"<{len(ids)} tokens>"
+
+    def __call__(self, text, return_tensors=None, add_special_tokens=True):
+        """Tokenize an environment observation to one id per character."""
+        del return_tensors, add_special_tokens
+        return _TokenizedText(torch.tensor([[7] * len(text)], dtype=torch.long))
+
+
+class _FakeGeneration:
+    """Generation stub whose behaviour is chosen per call.
+
+    `behaviours` is consumed in call order; each entry is either an exception to raise
+    or the string "hang" / "ok".
+    """
+
+    def __init__(self, behaviours):
+        self._behaviours = list(behaviours)
+        self.calls = 0
+        self.cancelled = 0
+
+    async def generate_async(self, data):
+        del data
+        index = min(self.calls, len(self._behaviours) - 1)
+        behaviour = self._behaviours[index]
+        self.calls += 1
+
+        if isinstance(behaviour, BaseException):
+            raise behaviour
+        if behaviour == "hang":
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+        if behaviour == "slow":
+            await asyncio.sleep(0.05)
+        yield (
+            0,
+            {
+                "output_ids": torch.tensor([[1, 2, 3, 4]]),
+                "unpadded_sequence_lengths": torch.tensor([4]),
+            },
+        )
+
+
+def _make_impl(
+    generation, *, num_generations=1, max_turns=1, timeouts=None
+) -> AsyncRolloutImpl:
+    """Build an AsyncRolloutImpl without firing its real __init__."""
+    impl = object.__new__(AsyncRolloutImpl)
+    impl._tokenizer = _FakeTokenizer()
+    impl._task_to_env = {}
+    impl._num_generations_per_prompt = num_generations
+    impl._max_seq_len = 128
+    impl._max_rollout_turns = max_turns
+    impl._policy_generation = generation
+    impl._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
+    impl._deadline_registry = None
+    impl._forest_training = False
+    return impl
+
+
+def _sample(idx=7):
+    return {
+        "idx": idx,
+        "message_log": [
+            {"role": "user", "content": "hi", "token_ids": torch.tensor([1, 2])}
+        ],
+        "extra_env_info": {},
+        "task_name": "calc",
+        "stop_strings": None,
+    }
+
+
+def _make_manager(buffer, impl, retry_policy=None) -> RolloutManager:
+    """Build a RolloutManager without firing the real __init__."""
+    manager = object.__new__(RolloutManager)
+    manager._impl = impl
+    manager._tokenizer = None
+    manager._num_generations_per_prompt = 1
+    manager._tq_buffer = buffer
+    manager._weight_version = 0
+    manager._retry_policy = (
+        retry_policy
+        if retry_policy is not None
+        else RolloutRetryPolicy.single_attempt()
+    )
+    manager._stats = RolloutStats()
+    manager._forest_training = False
+    manager._canonical_groups_finalized = 0
+    manager._canonical_output_tokens = 0
+    manager._recovery_siblings_reused = 0
+    manager._recovery_siblings_redispatched = 0
+    manager._skipped_prompts = 0
+    manager._consecutive_infra_drops = 0
+    return manager
+
+
+class _RecordingBuffer:
+    """TQReplayBuffer stand-in that records whether anything was ever committed."""
+
+    def __init__(self) -> None:
+        self.commits: list[str] = []
+        self.removals: list[str] = []
+
+    def reserve(self, *, weight_version, target_step=None, group_id=None) -> str:
+        del weight_version, target_step
+        return group_id or str(uuid.uuid4())
+
+    async def commit(self, group_id, record, start_weight_version, end_weight_version):
+        del start_weight_version, end_weight_version
+        self.commits.append(group_id)
+        return record
+
+    async def remove_group(self, group_id, *, remove_in_dp: bool = False) -> int:
+        del remove_in_dp
+        self.removals.append(group_id)
+        return 1
+
+
+class TestGenerationFailureIsClassifiedAndRaised:
+    def test_dead_worker_becomes_generation_unavailable(self):
+        impl = _make_impl(_FakeGeneration([ray.exceptions.RayActorError()]))
+        with pytest.raises(GenerationUnavailable) as excinfo:
+            asyncio.run(impl._run_single_rollout(_sample(), traj_idx=3))
+        assert isinstance(excinfo.value.__cause__, ray.exceptions.RayActorError)
+
+    def test_failure_message_names_the_prompt_and_trajectory(self):
+        impl = _make_impl(_FakeGeneration([ray.exceptions.RayActorError()]))
+        with pytest.raises(GenerationUnavailable, match=r"prompt_idx=7 traj_idx=3"):
+            asyncio.run(impl._run_single_rollout(_sample(idx=7), traj_idx=3))
+
+    def test_deterministic_error_becomes_a_data_failure(self):
+        impl = _make_impl(_FakeGeneration([ValueError("prompt too long")]))
+        with pytest.raises(RolloutDataFailure) as excinfo:
+            asyncio.run(impl._run_single_rollout(_sample(), traj_idx=0))
+        assert isinstance(excinfo.value.__cause__, ValueError)
+
+    def test_cancellation_is_not_reclassified_as_a_rollout_failure(self):
+        """CancelledError derives from BaseException, so `except Exception` must miss it.
+
+        Reclassifying it would turn a shutdown into a data failure and, once retries
+        exist, retry a rollout the controller is deliberately tearing down.
+        """
+        impl = _make_impl(_FakeGeneration([asyncio.CancelledError()]))
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(impl._run_single_rollout(_sample(), traj_idx=0))
+
+
+class TestNoPartialCompletionSurvives:
+    def test_run_rollout_raises_instead_of_returning_a_zero_reward_record(self):
+        """The core regression guard: a failed generation yields no record at all."""
+        impl = _make_impl(_FakeGeneration([ray.exceptions.RayActorError()]))
+        with pytest.raises(RolloutFailure):
+            asyncio.run(impl.run_rollout(_sample()))
+
+    def test_generate_and_push_never_commits_a_failed_rollout(self):
+        """End of the chain: nothing reaches the replay buffer, so nothing reaches training."""
+        buffer = _RecordingBuffer()
+        impl = _make_impl(_FakeGeneration([ray.exceptions.RayActorError()]))
+
+        manager = _make_manager(buffer, impl)
+
+        # A dead worker is an infra failure, so the single-attempt default budget is
+        # exhausted immediately and surfaces as RolloutRedispatchExhausted.
+        with pytest.raises(RolloutRedispatchExhausted):
+            asyncio.run(manager.generate_and_push(_sample()))
+
+        assert buffer.commits == [], "a failed generation must not be committed"
+        assert len(buffer.removals) == 1, "the reserved slot must be released"
+
+
+class TestSiblingCancellation:
+    def test_one_failure_cancels_the_other_generations_in_the_group(self):
+        """Siblings must not keep occupying generation capacity for a discarded group.
+
+        asyncio.gather propagates the first exception but leaves the rest running
+        detached; on this path that means N-1 generations still queued against the
+        fleet for a prompt whose result is already being thrown away.
+        """
+        # First call fails, every later call hangs until cancelled.
+        generation = _FakeGeneration([ray.exceptions.RayActorError(), "hang"])
+        impl = _make_impl(generation, num_generations=4)
+
+        with pytest.raises(RolloutFailure):
+            asyncio.run(impl.run_rollout(_sample()))
+
+        assert generation.calls == 4, "all four generations should have started"
+        assert generation.cancelled == 3, (
+            "the three surviving siblings must be cancelled"
+        )
+
+
+class TestGatherCancellingSiblings:
+    def test_returns_results_in_input_order(self):
+        async def _value(i):
+            await asyncio.sleep((5 - i) * 0.001)
+            return i
+
+        result = asyncio.run(
+            _gather_cancelling_siblings([_value(0), _value(1), _value(2)])
+        )
+        assert result == [0, 1, 2]
+
+    def test_propagates_the_original_exception_type(self):
+        async def _boom():
+            raise ray.exceptions.RayActorError()
+
+        async def _hang():
+            await asyncio.Event().wait()
+
+        with pytest.raises(ray.exceptions.RayActorError):
+            asyncio.run(_gather_cancelling_siblings([_boom(), _hang()]))
+
+    def test_drains_cancelled_siblings_before_unwinding(self):
+        """The helper must not leave tasks pending when it returns control."""
+        started = []
+        finished = []
+
+        async def _boom():
+            await asyncio.sleep(0.01)
+            raise ValueError("x")
+
+        async def _slow():
+            started.append(1)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                finished.append(1)
+                raise
+
+        async def _main():
+            with pytest.raises(ValueError):
+                await _gather_cancelling_siblings([_boom(), _slow()])
+            # If the helper returned before draining, this would still be 0.
+            assert finished == [1]
+            assert not [
+                t for t in asyncio.all_tasks() if t is not asyncio.current_task()
+            ]
+
+        asyncio.run(_main())
+
+
+class TestGenerationDeadline:
+    def test_a_hung_generation_raises_rollout_timeout(self):
+        """The wedge this exists to prevent: a generation that never returns."""
+        impl = _make_impl(
+            _FakeGeneration(["hang"]),
+            timeouts=RolloutTimeouts(generation_s=0.05),
+        )
+        with pytest.raises(GenerationUnavailable) as excinfo:
+            asyncio.run(impl._run_single_rollout(_sample(), traj_idx=0))
+        # Classified as infra, so the retry policy will re-dispatch it.
+        assert isinstance(excinfo.value.__cause__, RolloutTimeout)
+
+    def test_the_hung_generation_is_cancelled_not_abandoned(self):
+        generation = _FakeGeneration(["hang"])
+        impl = _make_impl(generation, timeouts=RolloutTimeouts(generation_s=0.05))
+        with pytest.raises(GenerationUnavailable):
+            asyncio.run(impl._run_single_rollout(_sample(), traj_idx=0))
+        assert generation.cancelled == 1
+
+    def test_no_deadline_configured_means_no_timeout(self, terminating_env):
+        """Default config must behave exactly as before: wait indefinitely."""
+        impl = _make_impl(
+            _FakeGeneration(["slow"]), timeouts=RolloutTimeouts(generation_s=None)
+        )
+        completion, _ = asyncio.run(impl._run_single_rollout(_sample(), traj_idx=0))
+        assert completion.reward == 0.0
+
+    def test_slow_but_healthy_generation_does_not_trip_the_deadline(
+        self, terminating_env
+    ):
+        """Guards against over-tightening: a slow success must still succeed."""
+        impl = _make_impl(
+            _FakeGeneration(["slow"]), timeouts=RolloutTimeouts(generation_s=5.0)
+        )
+        completion, metrics = asyncio.run(
+            impl._run_single_rollout(_sample(), traj_idx=0)
+        )
+        assert metrics["turn_count"] == 1
+        assert any(m["role"] == "assistant" for m in completion.message_log)
+
+    def test_the_environment_step_has_its_own_deadline(self, monkeypatch):
+        """A hung env actor leaks a rollout permit exactly like a hung generation.
+
+        The sleep is deliberately short. calculate_rewards runs under asyncio.to_thread
+        and Python cannot kill a running thread, so the deadline frees the rollout while
+        the thread keeps its pool slot -- and asyncio.run waits for the default executor
+        on the way out. A long sleep here would stall the test for exactly that reason,
+        which is itself the documented caveat.
+        """
+
+        def _hang(sample_batch, task_to_env):
+            del sample_batch, task_to_env
+            import time
+
+            time.sleep(1.0)
+
+        monkeypatch.setattr(
+            "nemo_rl.experience.rollout_manager.calculate_rewards", _hang, raising=True
+        )
+        impl = _make_impl(_FakeGeneration(["ok"]), timeouts=RolloutTimeouts(env_s=0.05))
+        with pytest.raises(RolloutTimeout, match="environment step"):
+            asyncio.run(impl._run_single_rollout(_sample(), traj_idx=0))
+
+
+class TestDeadlineHelper:
+    def test_expiry_is_reported_as_rollout_timeout(self):
+        async def _main():
+            async with _Deadline(0.01, "unit under test"):
+                await asyncio.sleep(10)
+
+        with pytest.raises(RolloutTimeout, match="unit under test exceeded 0.01s"):
+            asyncio.run(_main())
+
+    def test_an_inner_timeout_error_is_not_relabelled(self):
+        """A TimeoutError from the wrapped code must not read as a deadline breach.
+
+        Otherwise a genuine downstream timeout would be reported with our deadline's
+        duration, sending anyone debugging it to the wrong knob.
+        """
+
+        async def _main():
+            async with _Deadline(30.0, "unit under test"):
+                raise TimeoutError("something downstream timed out")
+
+        with pytest.raises(TimeoutError) as excinfo:
+            asyncio.run(_main())
+        assert not isinstance(excinfo.value, RolloutTimeout)
+
+    def test_none_disables_the_deadline(self):
+        async def _main():
+            async with _Deadline(None, "unit under test"):
+                await asyncio.sleep(0.01)
+            return "completed"
+
+        assert asyncio.run(_main()) == "completed"
+
+    def test_outer_cancellation_still_propagates_as_cancellation(self):
+        """Tearing down the controller must not look like a rollout timeout."""
+
+        async def _main():
+            async def _body():
+                async with _Deadline(30.0, "unit under test"):
+                    await asyncio.Event().wait()
+
+            task = asyncio.ensure_future(_body())
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_main())
+
+
+def _gym_rows(count: int) -> list[dict]:
+    """Gym 0.15 rows carry task_source until the remote actor resolves an agent."""
+    return [{"_rowidx": i, "task_source": "workplace_assistant"} for i in range(count)]
+
+
+class _PartialGymMethod:
+    """Gym stream that fails partway through, then succeeds on re-dispatch.
+
+    Reproduces the shape that matters: NeMo-Gym's stream dies on its first failing row,
+    so every later row is lost with it even though nothing was wrong with them.
+    """
+
+    def __init__(self, fail_after_rows: int, failures_before_success: int) -> None:
+        self._fail_after_rows = fail_after_rows
+        self._failures_before_success = failures_before_success
+        self.attempts = 0
+        self.dispatched: list[list[int]] = []
+        self.dispatched_task_indices: list[list[int | None]] = []
+
+    def options(self, **kwargs):
+        del kwargs
+        return self
+
+    def remote(self, inputs, timer_prefix, per_prompt=False):
+        del timer_prefix, per_prompt
+        self.dispatched.append([row["_rowidx"] for row in inputs])
+        self.dispatched_task_indices.append(
+            [row.get(NEMO_GYM_TASK_INDEX_KEY) for row in inputs]
+        )
+        attempt = self.attempts
+        self.attempts += 1
+        return self._stream(inputs, attempt)
+
+    async def _stream(self, inputs, attempt):
+        should_fail = attempt < self._failures_before_success
+        for position, row in enumerate(inputs):
+            if should_fail and position >= self._fail_after_rows:
+                raise ConnectionResetError("gym stream died mid-flight")
+            yield _row_result(row["_rowidx"])
+
+
+async def _row_result(rowidx: int):
+    """A minimally complete NeMo-Gym result, enough to build a Completion."""
+    return (
+        rowidx,
+        {"name": "agent"},
+        {
+            "input_message_log": [{"role": "user", "token_ids": [1]}],
+            "message_log": [{"role": "assistant", "token_ids": [2]}],
+            "full_result": {"reward": 1.0},
+        },
+        None,
+    )
+
+
+class _FakeGymMethod:
+    """Mimics `env.run_rollouts.options(...).remote(...)` returning a result stream."""
+
+    def __init__(self, rows_to_yield, hang_after) -> None:
+        self._rows_to_yield = rows_to_yield
+        self._hang_after = hang_after
+        self.cancelled = 0
+
+    def options(self, **kwargs):
+        del kwargs
+        return self
+
+    def remote(self, inputs, timer_prefix, per_prompt=False):
+        del timer_prefix, per_prompt
+        return self._stream(len(inputs))
+
+    async def _stream(self, num_inputs):
+        async def _result(rowidx):
+            return (
+                rowidx,
+                {"name": "agent"},
+                {"input_message_log": [], "message_log": []},
+                None,
+            )
+
+        for rowidx in range(min(self._rows_to_yield, num_inputs)):
+            yield _result(rowidx)
+        if self._hang_after:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.cancelled += 1
+                raise
+
+
+def _make_gym_impl(
+    gym_method, *, num_generations=2, timeouts=None, row_attempts=1, stats=None
+):
+    from nemo_rl.experience.rollout_manager import AsyncNemoGymRolloutImpl
+
+    impl = object.__new__(AsyncNemoGymRolloutImpl)
+    impl._forest_training = False
+    impl._dispatch_admission_gate = None
+    impl._tokenizer = _FakeTokenizer()
+    impl._task_to_env = {"nemo_gym": type("Env", (), {"run_rollouts": gym_method})()}
+    impl._num_generations_per_prompt = num_generations
+    impl._max_seq_len = 128
+    impl._max_rollout_turns = 1
+    impl._generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_new_tokens": 128,
+    }
+    impl.set_next_nemo_gym_task_index(0)
+    impl._timeouts = timeouts if timeouts is not None else RolloutTimeouts()
+    impl._deadline_registry = None
+    impl._max_gym_row_attempts = row_attempts
+    impl._forest_training = False
+    # Real counters by default so row-level re-dispatches are observable; production
+    # shares the owning RolloutManager's instance.
+    impl._stats = stats if stats is not None else RolloutStats()
+    # Upstream default; this fixture is about re-dispatch, not sample masking.
+    impl._mask_env_flagged_samples = True
+    # Full-result tables are likewise opt-in in the real constructor.
+    impl._log_full_result_tables = False
+    # Reward penalties are off; direct construction must still satisfy the impl contract.
+    impl._reward_penalty_config = None
+    # Effort-level reward shaping is off unless env.nemo_gym.effort_levels is set.
+    impl._effort_config = None
+    return impl
+
+
+class TestGymRolloutDeadline:
+    """The gym path is where the silent wedge described in the resiliency report lives.
+
+    NeMo-Gym retries a dead vLLM endpoint forever with no HTTP timeout, so without a
+    deadline here the rollout never returns and permanently holds a
+    max_inflight_prompts permit.
+    """
+
+    def test_a_hung_gym_stream_raises_rollout_timeout(self):
+        method = _FakeGymMethod(rows_to_yield=0, hang_after=True)
+        impl = _make_gym_impl(method, timeouts=RolloutTimeouts(rollout_s=0.05))
+        with pytest.raises(RolloutTimeout, match="NeMo-Gym prompt group"):
+            asyncio.run(impl._run_rollouts(_gym_rows(2), Timer(), "timing/rollout"))
+        assert method.cancelled == 1, "the hung stream must be cancelled"
+
+    def test_the_deadline_spans_the_whole_stream_not_each_row(self):
+        """A steady drip of fast rows must not keep resetting the budget.
+
+        One slow row holding the group up is exactly the case that has to fire, and a
+        per-await deadline would never see it.
+        """
+        method = _FakeGymMethod(rows_to_yield=1, hang_after=True)
+        impl = _make_gym_impl(method, timeouts=RolloutTimeouts(rollout_s=0.05))
+        with pytest.raises(RolloutTimeout):
+            asyncio.run(impl._run_rollouts(_gym_rows(2), Timer(), "timing/rollout"))
+
+    def test_a_truncated_stream_is_an_infra_failure_not_a_bare_runtime_error(self):
+        """Rows going missing is a transport problem, so it must be retriable."""
+        method = _FakeGymMethod(rows_to_yield=1, hang_after=False)
+        impl = _make_gym_impl(method)
+        with pytest.raises(GymTransportError, match=r"missing rows \[1\] of 2"):
+            asyncio.run(impl._run_rollouts(_gym_rows(2), Timer(), "timing/rollout"))
+
+    def test_no_deadline_configured_leaves_the_stream_unbounded(self):
+        """Default config must not introduce a deadline where there was none."""
+        method = _FakeGymMethod(rows_to_yield=1, hang_after=False)
+        impl = _make_gym_impl(method, timeouts=RolloutTimeouts(rollout_s=None))
+        # Reaches the missing-rows check rather than timing out first.
+        with pytest.raises(GymTransportError):
+            asyncio.run(impl._run_rollouts(_gym_rows(2), Timer(), "timing/rollout"))
+
+
+class TestPartialGymRedispatch:
+    """Only the rows that never arrived are re-sent.
+
+    At num_generations_per_prompt=16, one bad row killing the stream costs 16
+    regenerations if the whole group is redone. It should cost the rows that were lost.
+    """
+
+    def test_only_the_missing_rows_are_re_dispatched(self):
+        # Rows 0-1 land, then the stream dies; the retry should carry rows 2-3 only.
+        method = _PartialGymMethod(fail_after_rows=2, failures_before_success=1)
+        impl = _make_gym_impl(method, num_generations=4, row_attempts=3)
+        impl.set_next_nemo_gym_task_index(17)
+
+        record = asyncio.run(
+            impl.run_rollout(
+                {
+                    "idx": 0,
+                    "message_log": [],
+                    "extra_env_info": {
+                        "task_source": "workplace_assistant",
+                        "responses_create_params": {},
+                    },
+                }
+            )
+        )
+
+        assert method.dispatched == [[0, 1, 2, 3], [2, 3]]
+        assert method.dispatched_task_indices == [[17, 17, 17, 17], [17, 17]]
+        assert impl.get_next_nemo_gym_task_index() == 18
+        assert len(record.completions) == 4
+
+    def test_completed_rows_survive_across_attempts(self):
+        """The point of the exercise: work already done is not thrown away.
+
+        Attempt 1 lands rows 0-2 before the stream dies. Only 3-4 are re-sent, and the
+        group finishes there -- 7 row-generations instead of the 10 a whole-group retry
+        would have cost.
+        """
+        method = _PartialGymMethod(fail_after_rows=3, failures_before_success=2)
+        impl = _make_gym_impl(method, num_generations=5, row_attempts=3)
+
+        completions, _, _ = asyncio.run(
+            impl._run_rollouts(_gym_rows(5), Timer(), "timing/rollout")
+        )
+
+        assert method.dispatched == [[0, 1, 2, 3, 4], [3, 4]]
+        assert len(completions) == 5
+        assert sum(len(d) for d in method.dispatched) == 7
+
+    def test_prompt_group_defers_complete_retry_to_the_outer_manager(self):
+        method = _PartialGymMethod(fail_after_rows=2, failures_before_success=1)
+        impl = _make_gym_impl(method, num_generations=4, row_attempts=3)
+
+        with pytest.raises(ConnectionResetError, match="gym stream died"):
+            asyncio.run(
+                impl._run_rollouts(
+                    _gym_rows(4),
+                    Timer(),
+                    "timing/rollout",
+                    recovery_granularity=RecoveryGranularity.PROMPT_GROUP,
+                )
+            )
+
+        assert method.dispatched == [[0, 1, 2, 3]]
+        assert impl._stats.gym_row_redispatches == 0
+
+    def test_a_stale_echo_of_a_landed_row_is_rejected(self):
+        """Re-dispatch narrows the stream; an echo of an already-landed row must not win.
+
+        Attempt 1 lands row 0 then dies. Attempt 2 carries only the rows that never
+        arrived, so a stream replaying row 0 is echoing stale work -- and silently
+        accepting it would overwrite a good result with an older one. This guard had no
+        test at all: deleting the two lines it lives in left the suite green.
+        """
+
+        class _EchoingMethod(_PartialGymMethod):
+            def __init__(self) -> None:
+                super().__init__(fail_after_rows=1, failures_before_success=1)
+
+            async def _stream(self, inputs, attempt):
+                if attempt == 0:
+                    yield _row_result(0)
+                    raise ConnectionResetError("stream died after row 0")
+                # Handed rows 1..n-1, but answers with row 0 all the same.
+                yield _row_result(0)
+
+        impl = _make_gym_impl(_EchoingMethod(), num_generations=3, row_attempts=3)
+
+        with pytest.raises(ValueError, match="which was not dispatched"):
+            asyncio.run(impl._run_rollouts(_gym_rows(3), Timer(), "timing/rollout"))
+
+    def test_row_redispatches_are_counted(self):
+        """Otherwise gym retries rows all run with every visible counter flat."""
+        stats = RolloutStats()
+        method = _PartialGymMethod(fail_after_rows=2, failures_before_success=1)
+        impl = _make_gym_impl(method, num_generations=4, row_attempts=3, stats=stats)
+
+        asyncio.run(impl._run_rollouts(_gym_rows(4), Timer(), "timing/rollout"))
+
+        # Attempt 2 re-sent exactly the two rows that never arrived.
+        assert method.dispatched == [[0, 1, 2, 3], [2, 3]]
+        assert stats.gym_row_redispatches == 2
+        assert stats.as_metrics()["rollout/gym_row_redispatch_total"] == 2.0
+
+    def test_the_transport_error_that_lost_the_rows_is_chained(self):
+        """A short-but-clean final stream otherwise reports missing rows with no cause.
+
+        Attempt 1 dies with a transport error; attempt 2 ends cleanly without supplying
+        the rest. Without the chain the operator reads "rows missing" at exactly the
+        moment they need to know why.
+        """
+
+        class _ShortSecondAttempt(_PartialGymMethod):
+            def __init__(self) -> None:
+                super().__init__(fail_after_rows=1, failures_before_success=1)
+
+            async def _stream(self, inputs, attempt):
+                if attempt == 0:
+                    yield _row_result(0)
+                    raise ConnectionResetError("the transport error to blame")
+                return
+                yield  # unreachable; keeps this an async generator
+
+        impl = _make_gym_impl(_ShortSecondAttempt(), num_generations=3, row_attempts=2)
+
+        with pytest.raises(GymTransportError) as exc_info:
+            asyncio.run(impl._run_rollouts(_gym_rows(3), Timer(), "timing/rollout"))
+        cause = exc_info.value.__cause__
+        assert isinstance(cause, ConnectionResetError)
+        assert "the transport error to blame" in str(cause)
+
+    def test_exhausting_the_row_budget_reports_a_transport_failure(self):
+        method = _PartialGymMethod(fail_after_rows=1, failures_before_success=99)
+        impl = _make_gym_impl(method, num_generations=4, row_attempts=2)
+
+        with pytest.raises(ConnectionResetError) as exc_info:
+            asyncio.run(impl._run_rollouts(_gym_rows(4), Timer(), "timing/rollout"))
+        assert method.attempts == 2, "the budget bounds the re-dispatches"
+        assert exc_info.value.__notes__ == [
+            "NeMo-Gym instance 'nemo_gym' failed during rollout collection"
+        ]
+
+    def test_a_data_failure_is_not_re_dispatched(self):
+        """Another dispatch cannot help a prompt NeMo-Gym is unable to serve."""
+
+        class _DataFailingMethod(_PartialGymMethod):
+            async def _stream(self, inputs, attempt):
+                del attempt
+                yield _row_result(inputs[0]["_rowidx"])
+                raise ValueError("NeMo Gym returned a result with no generation data")
+
+        method = _DataFailingMethod(fail_after_rows=1, failures_before_success=99)
+        impl = _make_gym_impl(method, num_generations=4, row_attempts=5)
+
+        with pytest.raises(ValueError, match="no generation data"):
+            asyncio.run(impl._run_rollouts(_gym_rows(4), Timer(), "timing/rollout"))
+        assert method.attempts == 1, "a deterministic failure must not be retried"
+
+    def test_a_single_attempt_budget_reproduces_the_old_behaviour(self):
+        method = _PartialGymMethod(fail_after_rows=2, failures_before_success=1)
+        impl = _make_gym_impl(method, num_generations=4, row_attempts=1)
+
+        with pytest.raises(ConnectionResetError):
+            asyncio.run(impl._run_rollouts(_gym_rows(4), Timer(), "timing/rollout"))
+        assert method.attempts == 1
+
+    def test_rows_must_carry_their_own_index(self):
+        """Re-dispatch maps Gym's echoed _rowidx back onto the group, so this is a contract."""
+        method = _PartialGymMethod(fail_after_rows=99, failures_before_success=0)
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=2)
+
+        with pytest.raises(ValueError, match="carries invalid _rowidx"):
+            asyncio.run(
+                impl._run_rollouts(
+                    [{"agent_ref": {"name": "a"}}], Timer(), "timing/rollout"
+                )
+            )
+
+    def test_row_indices_must_fit_within_the_prompt_group(self):
+        method = _PartialGymMethod(fail_after_rows=99, failures_before_success=0)
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=2)
+        rows = _gym_rows(2)
+        rows[1]["_rowidx"] = 2
+
+        with pytest.raises(ValueError, match="carries invalid _rowidx=2"):
+            asyncio.run(impl._run_rollouts(rows, Timer(), "timing/rollout"))
+
+    def test_row_indices_must_be_unique(self):
+        method = _PartialGymMethod(fail_after_rows=99, failures_before_success=0)
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=2)
+        rows = _gym_rows(2)
+        rows[1]["_rowidx"] = 0
+
+        with pytest.raises(ValueError, match="duplicate _rowidx values"):
+            asyncio.run(impl._run_rollouts(rows, Timer(), "timing/rollout"))
+
+    def test_the_group_deadline_spans_re_dispatches(self):
+        """The budget belongs to the prompt group, not to each attempt.
+
+        Otherwise N attempts silently multiply rollout_timeout_s by N.
+        """
+
+        class _SlowThenHang(_PartialGymMethod):
+            async def _stream(self, inputs, attempt):
+                if attempt == 0:
+                    yield _row_result(inputs[0]["_rowidx"])
+                    raise ConnectionResetError("died")
+                await asyncio.Event().wait()
+                yield _row_result(inputs[0]["_rowidx"])  # pragma: no cover
+
+        method = _SlowThenHang(fail_after_rows=1, failures_before_success=1)
+        impl = _make_gym_impl(
+            method,
+            num_generations=2,
+            row_attempts=5,
+            timeouts=RolloutTimeouts(rollout_s=0.1),
+        )
+        with pytest.raises(RolloutTimeout, match="NeMo-Gym prompt group"):
+            asyncio.run(impl._run_rollouts(_gym_rows(2), Timer(), "timing/rollout"))
+
+
+class TestClassifyGenerationFailure:
+    def test_infra_maps_to_generation_unavailable(self):
+        out = _classify_generation_failure(
+            ConnectionResetError("x"), prompt_idx=1, traj_idx=2
+        )
+        assert isinstance(out, GenerationUnavailable)
+
+    def test_data_maps_to_rollout_data_failure(self):
+        out = _classify_generation_failure(
+            AssertionError("non-contiguous"), prompt_idx=1, traj_idx=2
+        )
+        assert isinstance(out, RolloutDataFailure)
+
+    @pytest.mark.parametrize(
+        "cause",
+        [
+            RuntimeError("EngineDeadError"),  # vLLM, worker still alive
+            RuntimeError("CUDA out of memory"),
+            ValueError("something we have never seen"),
+        ],
+    )
+    def test_a_ray_boundary_error_from_generation_is_infrastructure(self, cause):
+        """The boundary destroys the cause, so classify by the call site instead.
+
+        An exception raised inside a still-LIVING generation worker arrives as a bare
+        RayTaskError -- not a RayActorError, and not in _INFRA_TYPES -- so the generic
+        classifier can only fall through to DATA, and the prompt got 2 attempts instead
+        of the 5 the fleet-failure path exists for.
+
+        Scoped to this call site on purpose: globally, unrecognized-means-DATA is still
+        the right default. Here we know the RPC was a generation, so "that shard could
+        not serve it" is the correct reading whatever the cause was.
+        """
+        exc = ray.exceptions.RayTaskError("gen", "traceback", cause)
+        out = _classify_generation_failure(exc, prompt_idx=1, traj_idx=2)
+        assert isinstance(out, GenerationUnavailable)
+        assert classify_rollout_failure(out) is FailureClass.INFRA
+
+    def test_a_plain_data_error_is_still_data(self):
+        """The widening is Ray-boundary-only; ordinary bad prompts are unaffected."""
+        out = _classify_generation_failure(
+            ValueError("token ids are not contiguous"), prompt_idx=1, traj_idx=2
+        )
+        assert isinstance(out, RolloutDataFailure)
+        assert classify_rollout_failure(out) is FailureClass.DATA
+
+    def test_both_branches_are_rollout_failures(self):
+        for exc in (ConnectionResetError("x"), AssertionError("y")):
+            out = _classify_generation_failure(exc, prompt_idx=0, traj_idx=0)
+            assert isinstance(out, RolloutFailure)
+
+
+def test_request_deadlines_pause_while_the_engine_is_stood_down():
+    """One flow through the stand-down credit's whole contract: suspend banks
+    each live deadline's remaining budget and disarms it; a deadline entered
+    mid-suspension starts disarmed with its full budget banked; a disabled
+    (None) deadline is untouched; resume re-arms every clock at now + banked.
+    Then the counter-case: the credit pauses expiry, it never disables it."""
+    registry = RequestDeadlineRegistry()
+
+    async def credit_flow() -> None:
+        loop = asyncio.get_running_loop()
+        async with _Deadline(1.0, "generation turn", registry=registry) as live:
+            await asyncio.sleep(0.2)
+            registry.suspend("weight_sync")
+            assert live._timeout is not None and live._timeout.when() is None
+            banked = live._remaining
+            assert banked is not None and 0.0 < banked <= 0.8
+            registry.suspend("gym_checkpoint")
+            async with _Deadline(0.2, "generation turn", registry=registry) as late:
+                # Entered while suspended: disarmed, full budget banked.
+                assert late._timeout is not None and late._timeout.when() is None
+                assert late._remaining == pytest.approx(0.2, abs=0.05)
+                async with _Deadline(None, "generation turn", registry=registry) as off:
+                    assert off._remaining is None  # disabled: nothing to bank
+                # Wall clock far past both budgets: nothing fires while frozen.
+                await asyncio.sleep(1.2)
+                # Clocks stay frozen until every holder has released its pause.
+                registry.resume("weight_sync")
+                assert registry.suspended
+                assert live._timeout.when() is None
+                assert late._timeout.when() is None
+                registry.resume("gym_checkpoint")
+                assert not registry.suspended
+                assert live._timeout.when() == pytest.approx(
+                    loop.time() + banked, abs=0.05
+                )
+                await asyncio.sleep(0.05)  # well inside both banked budgets
+
+    asyncio.run(credit_flow())
+
+    async def expiry_still_fires() -> None:
+        async with _Deadline(0.2, "generation turn", registry=registry):
+            registry.suspend()
+            await asyncio.sleep(0.4)  # frozen: outlives the whole budget
+            registry.resume()
+            await asyncio.sleep(0.6)  # burns through the banked ~0.2s
+
+    with pytest.raises(RolloutTimeout, match="generation turn exceeded"):
+        asyncio.run(expiry_still_fires())
+
+
+class _RecordingDispatchRecorder:
+    """RolloutDispatchRecorder stand-in that logs every ledger hook in order."""
+
+    def __init__(self, events: list[tuple]) -> None:
+        self.events = events
+
+    @contextlib.asynccontextmanager
+    async def submitting(self, generation_indices):
+        indices = list(generation_indices)
+        self.events.append(("submitting", indices))
+        yield lambda: self.events.append(("mark", indices))
+
+    async def refused(self, generation_index: int) -> None:
+        self.events.append(("refused", generation_index))
+
+
+class _AdmissionClosedGymMethod:
+    """Gym stream whose first dispatch refuses ``parked`` rows at checkpoint admission."""
+
+    def __init__(self, parked: set[int], events: list[tuple]) -> None:
+        self._parked = set(parked)
+        self.events = events
+        self.dispatched: list[list[int]] = []
+        self.release_admitted = asyncio.Event()
+        self.release_admitted.set()
+
+    def options(self, **kwargs):
+        del kwargs
+        return self
+
+    def remote(self, inputs, timer_prefix, per_prompt=False):
+        del timer_prefix, per_prompt
+        rows = [row["_rowidx"] for row in inputs]
+        self.dispatched.append(rows)
+        self.events.append(("remote", rows))
+        first = len(self.dispatched) == 1
+        return self._stream(rows, first)
+
+    async def _stream(self, rows, first):
+        refused = [row for row in rows if first and row in self._parked]
+        admitted = [row for row in rows if row not in refused]
+        # Gym answers a refusal immediately; admitted rows finish later.
+        for rowidx in refused:
+            yield self._parked_item(rowidx)
+        for rowidx in admitted:
+            yield self._admitted_item(rowidx)
+
+    @staticmethod
+    async def _parked_item(rowidx):
+        return GymAdmissionClosed("checkpoint_admission_closed", rowidx)
+
+    async def _admitted_item(self, rowidx):
+        await self.release_admitted.wait()
+        return await _row_result(rowidx)
+
+
+class TestGymAdmissionClosedRows:
+    """A row Gym refuses at checkpoint admission never ran: unwind it, re-send it."""
+
+    def test_retry_failure_cancels_the_blocked_original_stream(self, monkeypatch):
+        from nemo_rl.experience import rollout_manager
+
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.0)
+
+        async def exercise():
+            events = []
+            original_cancelled = asyncio.Event()
+
+            class FailingRetry(_AdmissionClosedGymMethod):
+                async def _stream(self, rows, first):
+                    if first:
+                        yield self._parked_item(1)
+                        try:
+                            await asyncio.Event().wait()
+                        finally:
+                            original_cancelled.set()
+                    else:
+                        assert rows == [1]
+                        raise GymTransportError("refused sibling retry broke")
+
+            method = FailingRetry({1}, events)
+            impl = _make_gym_impl(method)
+            with pytest.raises(GymTransportError, match="refused sibling retry broke"):
+                await asyncio.wait_for(
+                    impl._stream_rows(
+                        impl._task_to_env["nemo_gym"],
+                        _gym_rows(2),
+                        [None, None],
+                        [None, None],
+                        2,
+                        "timing/rollout",
+                        dispatch_recorder=_RecordingDispatchRecorder(events),
+                        admission_closed_rows=set(),
+                    ),
+                    timeout=2,
+                )
+            assert original_cancelled.is_set()
+            assert method.dispatched == [[0, 1], [1]]
+
+        asyncio.run(exercise())
+
+    @pytest.mark.parametrize("parked", [{14, 15}, set(range(16))])
+    def test_cohort_can_finish_after_checkpoint_refuses_members(
+        self, monkeypatch, parked
+    ):
+        """Accepted rows cannot return until all refused siblings are admitted."""
+        from nemo_rl.experience import rollout_manager
+
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.0)
+
+        async def exercise():
+            events = []
+            gate = DataPlaneCheckpointBarrier()
+            checkpoint = gate.checkpoint()
+            all_refused = asyncio.Event()
+
+            class Recorder(_RecordingDispatchRecorder):
+                async def refused(self, index):
+                    if not any(event[0] == "refused" for event in events):
+                        await checkpoint.__aenter__()
+                    await super().refused(index)
+                    if sum(event[0] == "refused" for event in events) == len(parked):
+                        all_refused.set()
+
+            class Cohort(_AdmissionClosedGymMethod):
+                def __init__(self):
+                    super().__init__(parked, events)
+                    self.release_admitted.clear()
+                    self.members = set()
+
+                def remote(self, inputs, timer_prefix, per_prompt=False):
+                    first = not self.dispatched
+                    self.members.update(
+                        row["_rowidx"]
+                        for row in inputs
+                        if not first or row["_rowidx"] not in parked
+                    )
+                    if len(self.members) == 16:
+                        self.release_admitted.set()
+                    return super().remote(inputs, timer_prefix, per_prompt)
+
+            method = Cohort()
+            impl = _make_gym_impl(method, num_generations=16, row_attempts=1)
+            impl._dispatch_admission_gate = gate
+            task = asyncio.create_task(
+                impl._run_rollouts(
+                    _gym_rows(16),
+                    Timer(),
+                    "timing/rollout",
+                    dispatch_recorder=Recorder(events),
+                )
+            )
+            await asyncio.wait_for(all_refused.wait(), timeout=2)
+            try:
+                await asyncio.sleep(0)
+                assert method.dispatched == [list(range(16))]
+                assert not task.done()
+            finally:
+                await checkpoint.__aexit__(None, None, None)
+            completions, _, _ = await asyncio.wait_for(task, timeout=2)
+            assert len(completions) == 16
+            resent = [index for batch in method.dispatched[1:] for index in batch]
+            assert sorted(resent) == sorted(parked)
+            assert impl._stats.gym_admission_closed_rows == len(parked)
+            assert impl._stats.gym_row_redispatches == 0
+
+        asyncio.run(exercise())
+
+    def test_cancellation_stops_queued_admission_retries(self, monkeypatch):
+        from nemo_rl.experience import rollout_manager
+
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.01)
+
+        async def exercise():
+            events = []
+            method = _AdmissionClosedGymMethod({1}, events)
+            method.release_admitted.clear()
+            impl = _make_gym_impl(method, row_attempts=1)
+            gate = DataPlaneCheckpointBarrier()
+            impl._dispatch_admission_gate = gate
+            task = asyncio.create_task(
+                impl._run_rollouts(
+                    _gym_rows(2),
+                    Timer(),
+                    "timing/rollout",
+                    dispatch_recorder=_RecordingDispatchRecorder(events),
+                )
+            )
+            while ("refused", 1) not in events:
+                await asyncio.sleep(0)
+            async with gate.checkpoint():
+                await asyncio.sleep(0.02)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            await asyncio.sleep(0.02)
+            assert method.dispatched == [[0, 1]]
+
+        asyncio.run(asyncio.wait_for(exercise(), timeout=2))
+
+    def test_refused_row_is_unwound_and_resent_without_spending_a_row_attempt(
+        self, monkeypatch
+    ):
+        from nemo_rl.experience import rollout_manager
+
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.0)
+        events: list[tuple] = []
+        method = _AdmissionClosedGymMethod(parked={1}, events=events)
+        stats = RolloutStats()
+        # One row attempt: a refusal must not consume it.
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=1, stats=stats)
+        impl._dispatch_admission_gate = DataPlaneCheckpointBarrier()
+
+        completions, _, _ = asyncio.run(
+            impl._run_rollouts(
+                _gym_rows(2),
+                Timer(),
+                "timing/rollout",
+                dispatch_recorder=_RecordingDispatchRecorder(events),
+            )
+        )
+
+        assert len(completions) == 2
+        assert method.dispatched == [[0, 1], [1]]
+        # Marked only after Ray accepted each submission; the refusal is unwound
+        # before the row is re-sent.
+        assert events == [
+            ("submitting", [0, 1]),
+            ("remote", [0, 1]),
+            ("mark", [0, 1]),
+            ("refused", 1),
+            ("submitting", [1]),
+            ("remote", [1]),
+            ("mark", [1]),
+        ]
+        assert stats.gym_admission_closed_rows == 1
+        assert stats.gym_row_redispatches == 0
+        assert not stats.data_retries_by_reason
+
+    def test_nothing_is_submitted_or_marked_while_the_gate_is_closed(self):
+        events: list[tuple] = []
+        method = _AdmissionClosedGymMethod(parked=set(), events=events)
+        impl = _make_gym_impl(method, num_generations=2)
+        gate = DataPlaneCheckpointBarrier()
+        impl._dispatch_admission_gate = gate
+
+        async def exercise() -> None:
+            async with gate.checkpoint():
+                task = asyncio.create_task(
+                    impl._run_rollouts(
+                        _gym_rows(2),
+                        Timer(),
+                        "timing/rollout",
+                        dispatch_recorder=_RecordingDispatchRecorder(events),
+                    )
+                )
+                await asyncio.sleep(0.05)
+                assert events == []
+            await asyncio.wait_for(task, timeout=5.0)
+
+        asyncio.run(exercise())
+        assert events[:3] == [
+            ("submitting", [0, 1]),
+            ("remote", [0, 1]),
+            ("mark", [0, 1]),
+        ]
+
+    def test_checkpoint_excludes_a_refused_row_and_does_not_deadlock(self, monkeypatch):
+        """The real recorder, ledger and barrier, with a checkpoint mid-flight.
+
+        Row 1 is refused while row 0 is still running in Gym. A checkpoint that
+        closes the gate must then see only row 0 as Gym-owned, and row 1's
+        re-send must wait at the gate instead of becoming DISPATCHED under it.
+        """
+        from nemo_rl.algorithms.async_utils.replay_buffer import (
+            DataPlaneCheckpointBarrier,
+        )
+        from nemo_rl.experience import rollout_manager
+        from nemo_rl.experience.rollout_recovery import (
+            RecoveryTargetLevel,
+            RolloutAttemptStatus,
+            RolloutRecoveryLedger,
+        )
+
+        # Long enough for the checkpoint below to close the gate before the re-send.
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.2)
+        events: list[tuple] = []
+        method = _AdmissionClosedGymMethod(parked={1}, events=events)
+        method.release_admitted.clear()
+        impl = _make_gym_impl(method, num_generations=2, row_attempts=1)
+        gate = DataPlaneCheckpointBarrier()
+        impl._dispatch_admission_gate = gate
+
+        async def exercise() -> None:
+            barrier = DataPlaneCheckpointBarrier()
+            ledger = RolloutRecoveryLedger()
+            async with barrier.mutation() as cut:
+                group = ledger.reserve_group(
+                    cut,
+                    group_id="g7",
+                    admission_id="batch-7",
+                    prompt_id="7",
+                    prompt_payload={"idx": 7, "message_log": []},
+                    expected_generations=2,
+                    target_step=7,
+                    start_weight_version=7,
+                    restore_level=RecoveryTargetLevel.TURN,
+                    admitted=True,
+                )
+            manager = object.__new__(RolloutManager)
+            manager._recovery_ledger = ledger
+            manager._data_plane_checkpoint_barrier = barrier
+            recorder = _LedgerDispatchRecorder(
+                manager=manager, group_id="g7", gym_instance_id="tools/replica-0"
+            )
+
+            def status(index: int) -> RolloutAttemptStatus:
+                return ledger.get_group("g7").siblings[index].current_attempt.status
+
+            task = asyncio.create_task(
+                impl._run_rollouts(
+                    _gym_rows(2),
+                    Timer(),
+                    "timing/rollout",
+                    dispatch_recorder=recorder,
+                )
+            )
+
+            # Both rows start RESERVED and are marked together, so this only
+            # holds once Gym's refusal of row 1 has been unwound.
+            async def refusal_unwound() -> None:
+                while not (
+                    status(0) is RolloutAttemptStatus.DISPATCHED
+                    and status(1) is RolloutAttemptStatus.RESERVED
+                ):
+                    await asyncio.sleep(0.001)
+
+            # Bounded: a regressed unwind fails here instead of hanging the job.
+            await asyncio.wait_for(refusal_unwound(), timeout=5.0)
+
+            async def checkpoint() -> tuple:
+                async with gate.checkpoint():
+                    async with barrier.checkpoint():
+                        inventory = ledger.gym_checkpoint_inventory(
+                            {"tools/replica-0"}
+                        )["tools/replica-0"]
+                    await asyncio.sleep(0.05)
+                    return inventory, status(1)
+
+            inventory, held_status = await asyncio.wait_for(checkpoint(), timeout=5.0)
+            assert inventory == (group.gym_episode(0),)
+            assert held_status is RolloutAttemptStatus.RESERVED
+
+            method.release_admitted.set()
+            await asyncio.wait_for(task, timeout=5.0)
+            assert status(0) is RolloutAttemptStatus.DISPATCHED
+            assert status(1) is RolloutAttemptStatus.DISPATCHED
+            assert method.dispatched == [[0, 1], [1]]
+
+        asyncio.run(exercise())
+
+
+class _EarlyEndingGym:
+    """NemoGym actor whose first stream returns row 0, then dies with rows still running.
+
+    Gym runs every row of a dispatch as its own task, so the rows that never
+    came back are still executing there after the stream breaks. It has no
+    ``checkpoint_retire``: only the next checkpoint retires them.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple] = []
+        self.run_rollouts = self._RunRollouts(self)
+
+    class _RunRollouts:
+        def __init__(self, gym: "_EarlyEndingGym") -> None:
+            self._gym = gym
+
+        def options(self, **kwargs):
+            del kwargs
+            return self
+
+        def remote(self, inputs, timer_prefix, per_prompt=False):
+            del timer_prefix, per_prompt
+            first = not self._gym.events
+            self._gym.events.append(
+                {row["_rowidx"]: row["_ng_rollout_id"] for row in inputs}
+            )
+            return self._stream([row["_rowidx"] for row in inputs], first)
+
+        async def _stream(self, rows, first):
+            if first:
+                yield _row_result(rows[0])
+                raise ConnectionResetError("gym stream died mid-flight")
+            for rowidx in rows:
+                yield _row_result(rowidx)
+
+
+class _ShortCleanEndGym(_EarlyEndingGym):
+    """First stream returns row 0, refuses row 1 at admission, and ends cleanly without row 2."""
+
+    def __init__(self) -> None:
+        super().__init__()
+
+        async def stream(rows, first):
+            if first:
+                yield _row_result(rows[0])
+                yield _AdmissionClosedGymMethod._parked_item(rows[1])
+                return
+            for rowidx in rows:
+                yield _row_result(rowidx)
+
+        self.run_rollouts._stream = stream
+
+
+class _RowFailingGym(_EarlyEndingGym):
+    """First stream fails row 1 with ``error`` and still returns rows 0 and 2."""
+
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.streamed_past_the_failure = False
+
+        async def failed(rowidx):
+            return GymRowFailure(rowidx, error)
+
+        async def stream(rows, first):
+            if first:
+                yield _row_result(rows[0])
+                yield failed(rows[1])
+                self.streamed_past_the_failure = True
+                yield _row_result(rows[2])
+                return
+            for rowidx in rows:
+                yield _row_result(rowidx)
+
+        self.run_rollouts._stream = stream
+
+
+class TestGymEarlyStreamEnd:
+    """Rows still running in Gym when a stream breaks must not overlap their replacements."""
+
+    def test_stream_failure_replaces_a_refused_row_that_has_since_been_resent(
+        self, monkeypatch
+    ):
+        """A concurrent admission re-send is Gym-owned again before failure cleanup."""
+        from nemo_rl.experience import rollout_manager
+
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.0)
+        retry_started = asyncio.Event()
+        cancelled = []
+
+        class OverlappingStreams(_EarlyEndingGym._RunRollouts):
+            def remote(self, inputs, timer_prefix, per_prompt=False):
+                rows = [row["_rowidx"] for row in inputs]
+                self._gym.events.append(
+                    {row["_rowidx"]: row["_ng_rollout_id"] for row in inputs}
+                )
+                return self.respond(rows, len(self._gym.events))
+
+            async def respond(self, rows, dispatch_number):
+                if dispatch_number == 1:
+                    yield _AdmissionClosedGymMethod._parked_item(2)
+                    await retry_started.wait()
+                    raise GymTransportError("original stream broke")
+                if dispatch_number == 2:
+                    assert rows == [2]
+                    retry_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        cancelled.append(2)
+                for index in rows:
+                    yield _row_result(index)
+
+        gym = _EarlyEndingGym()
+        gym.run_rollouts = OverlappingStreams(gym)
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=2
+        )
+        completions, _, _ = asyncio.run(asyncio.wait_for(run(), timeout=2))
+        assert len(completions) == 3
+        assert cancelled == [2]
+        first, refused_resend, replaced = gym.events
+        assert refused_resend == {2: first[2]}
+        # Row 2 was in Gym again when the stream broke, so it is replaced too.
+        assert set(replaced) == {0, 1, 2}
+        assert set(replaced.values()).isdisjoint(first.values())
+        assert self._queued(ledger) == set(episodes.values())
+        assert all(len(s.attempts) == 2 for s in ledger.get_group("g7").siblings)
+
+    @pytest.mark.parametrize("refused_index", [None, 2])
+    def test_full_cohort_retry_uses_the_durable_new_group_attempt(self, refused_index):
+        """A timed-out GenRM attempt stays failed even under new rollout IDs."""
+        attempts = []
+
+        class FailedCohortMethod(_EarlyEndingGym._RunRollouts):
+            def remote(self, inputs, timer_prefix, per_prompt=False):
+                coordinates = [row.get("_ng_group_attempt", 0) for row in inputs]
+                attempts.append(coordinates)
+                expected = 0 if len(attempts) == 1 else 1
+                assert coordinates == [expected] * 3
+                return super().remote(inputs, timer_prefix, per_prompt)
+
+            async def _stream(self, rows, first):
+                if first:
+                    if refused_index is not None:
+                        yield _AdmissionClosedGymMethod._parked_item(refused_index)
+                    raise GymTransportError("GenRM cohort attempt 0 timed out")
+                for index in rows:
+                    yield _row_result(index)
+
+        gym = _EarlyEndingGym()
+        gym.run_rollouts = FailedCohortMethod(gym)
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=2
+        )
+        completions, _, _ = asyncio.run(run())
+        assert len(completions) == 3
+        assert attempts == [[0, 0, 0], [1, 1, 1]]
+        group = ledger.get_group("g7")
+        assert max(len(sibling.attempts) for sibling in group.siblings) - 1 == 1
+        # A refused row never reached Gym, so only the others wait for retirement.
+        assert self._queued(ledger) == {
+            episode for index, episode in episodes.items() if index != refused_index
+        }
+
+    @staticmethod
+    def _dispatch(
+        gym: _EarlyEndingGym,
+        granularity: RecoveryGranularity,
+        row_attempts: int,
+    ):
+        from nemo_rl.experience.rollout_recovery import (
+            RecoveryTargetLevel,
+            RolloutRecoveryLedger,
+        )
+
+        impl = _make_gym_impl(None, num_generations=3, row_attempts=row_attempts)
+        impl._task_to_env = {"nemo_gym": gym}
+        impl._dispatch_admission_gate = DataPlaneCheckpointBarrier()
+        barrier = DataPlaneCheckpointBarrier()
+        ledger = RolloutRecoveryLedger()
+        manager = object.__new__(RolloutManager)
+        manager._recovery_ledger = ledger
+        manager._data_plane_checkpoint_barrier = barrier
+
+        async def reserve():
+            async with barrier.mutation() as cut:
+                return ledger.reserve_group(
+                    cut,
+                    group_id="g7",
+                    admission_id="batch-7",
+                    prompt_id="7",
+                    prompt_payload={"idx": 7, "message_log": []},
+                    expected_generations=3,
+                    target_step=7,
+                    start_weight_version=7,
+                    restore_level=(
+                        RecoveryTargetLevel.PROMPT_GROUP
+                        if granularity is RecoveryGranularity.PROMPT_GROUP
+                        else RecoveryTargetLevel.TURN
+                    ),
+                    admitted=True,
+                )
+
+        group = asyncio.run(reserve())
+        rows = [
+            {
+                "_rowidx": index,
+                "task_source": "workplace_assistant",
+                "_ng_rollout_id": group.gate_rollout_id(index),
+            }
+            for index in range(3)
+        ]
+        recorder = _LedgerDispatchRecorder(
+            manager=manager, group_id="g7", gym_instance_id="tools/replica-0"
+        )
+        episodes = {index: group.gym_episode(index) for index in range(3)}
+
+        async def run():
+            return await impl._run_rollouts(
+                rows,
+                Timer(),
+                "timing/rollout",
+                recovery_granularity=granularity,
+                dispatch_recorder=recorder,
+            )
+
+        async def abandon():
+            # What the group task does once _run_rollouts raises.
+            async with barrier.mutation() as cut:
+                ledger.abandon_unsealed(cut, "g7")
+
+        return run, abandon, episodes, ledger
+
+    @staticmethod
+    def _queued(ledger) -> set:
+        return set(
+            ledger.gym_checkpoint_retirements({"tools/replica-0"})["tools/replica-0"]
+        )
+
+    def test_rows_still_running_are_queued_for_retirement_and_resent_under_new_ids(
+        self,
+    ):
+        from nemo_rl.experience.rollout_recovery import RolloutAttemptStatus
+
+        gym = _EarlyEndingGym()
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=3
+        )
+
+        completions, _, _ = asyncio.run(run())
+
+        assert len(completions) == 3
+        first, resent = gym.events
+        assert set(resent) == {1, 2}
+        assert set(resent.values()).isdisjoint(first.values())
+        group = ledger.get_group("g7")
+        for index in (1, 2):
+            sibling = group.siblings[index]
+            assert sibling.attempts[0].status is RolloutAttemptStatus.ABANDONED
+            assert sibling.current_attempt.status is RolloutAttemptStatus.DISPATCHED
+            assert group.gate_rollout_id(index) == resent[index]
+        # Rows 1 and 2 never came back, so Gym may still be running them.
+        assert self._queued(ledger) == {episodes[1], episodes[2]}
+
+    @pytest.mark.parametrize(
+        "granularity", [RecoveryGranularity.SIBLING, RecoveryGranularity.PROMPT_GROUP]
+    )
+    def test_a_short_clean_end_on_the_last_attempt_is_missing_rows_not_a_reused_id(
+        self, granularity: RecoveryGranularity, monkeypatch
+    ):
+        """The refused row's re-send must not take the lost row along under the
+        rollout ID Gym may still be running."""
+        from nemo_rl.experience import rollout_manager
+
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.0)
+        gym = _ShortCleanEndGym()
+        run, abandon, episodes, ledger = self._dispatch(
+            gym, granularity, row_attempts=1
+        )
+
+        with pytest.raises(GymTransportError, match="missing rows"):
+            asyncio.run(run())
+
+        first, refused_resend = gym.events
+        assert refused_resend == {1: first[1]}
+        asyncio.run(abandon())
+        assert episodes[2] in self._queued(ledger)
+
+    def test_a_short_clean_end_with_attempts_left_resends_the_lost_row_under_a_new_id(
+        self, monkeypatch
+    ):
+        from nemo_rl.experience import rollout_manager
+
+        monkeypatch.setattr(rollout_manager, "_PARKED_REDISPATCH_BACKOFF_S", 0.0)
+        gym = _ShortCleanEndGym()
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=2
+        )
+
+        completions, _, _ = asyncio.run(run())
+
+        assert len(completions) == 3
+        first, refused_resend, replaced = gym.events
+        # The refused row never ran, so it keeps its ID; the lost row gets a new one.
+        assert refused_resend == {1: first[1]}
+        assert set(replaced) == {2}
+        assert replaced[2] != first[2]
+        assert ledger.get_group("g7").gate_rollout_id(2) == replaced[2]
+        assert self._queued(ledger) == {episodes[2]}
+
+    def test_a_prompt_group_leaves_its_running_siblings_for_the_group_abandon(self):
+        gym = _EarlyEndingGym()
+        run, abandon, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.PROMPT_GROUP, row_attempts=1
+        )
+
+        with pytest.raises(ConnectionResetError):
+            asyncio.run(run())
+
+        assert len(gym.events) == 1
+        asyncio.run(abandon())
+        # The prompt retry dispatches fresh attempts next; none may overlap these.
+        assert {episodes[1], episodes[2]} <= self._queued(ledger)
+
+    def test_a_failed_row_is_resent_alone_while_its_siblings_finish(self):
+        gym = _RowFailingGym(GymTransportError("gym /run failed with HTTP 503"))
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=2
+        )
+
+        completions, _, _ = asyncio.run(run())
+
+        assert len(completions) == 3
+        first, resent = gym.events
+        # Rows 0 and 2 streamed back on the first dispatch; only row 1 goes again.
+        assert set(resent) == {1}
+        assert resent[1] != first[1]
+        assert self._queued(ledger) == {episodes[1]}
+
+    def test_a_failed_row_on_the_last_attempt_raises_once_its_siblings_finish(self):
+        gym = _RowFailingGym(GymTransportError("gym /run failed with HTTP 503"))
+        run, _, _, _ = self._dispatch(gym, RecoveryGranularity.SIBLING, row_attempts=1)
+
+        with pytest.raises(GymTransportError, match="HTTP 503"):
+            asyncio.run(run())
+
+        assert len(gym.events) == 1
+        assert gym.streamed_past_the_failure
+
+    def test_a_failed_row_stops_counting_as_gym_owned_before_its_siblings_return(
+        self,
+    ):
+        """A checkpoint drain waits on every dispatched attempt Gym did not
+        export, and the siblings that would end the stream stay parked until
+        the checkpoint resumes, so a failed row must not wait for the stream."""
+        parked = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def failed(rowidx):
+            return GymRowFailure(
+                rowidx, GymTransportError("gym /run failed with broken pipe")
+            )
+
+        async def stream(rows, first):
+            if first:
+                yield _row_result(rows[0])
+                yield failed(rows[1])
+                parked.set()
+                await resume.wait()
+                yield _row_result(rows[2])
+                return
+            for rowidx in rows:
+                yield _row_result(rowidx)
+
+        gym = _EarlyEndingGym()
+        gym.run_rollouts._stream = stream
+        run, _, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.SIBLING, row_attempts=2
+        )
+
+        async def exercise():
+            task = asyncio.create_task(run())
+            await asyncio.wait_for(parked.wait(), timeout=2)
+            held = ledger.gym_episodes_still_held(
+                {"tools/replica-0": list(episodes.values())}
+            )["tools/replica-0"]
+            resume.set()
+            completions, _, _ = await asyncio.wait_for(task, timeout=2)
+            return held, completions
+
+        held, completions = asyncio.run(exercise())
+
+        assert episodes[1] not in held
+        assert episodes[2] in held
+        assert len(completions) == 3
+        first, resent = gym.events
+        assert set(resent) == {1}
+        assert resent[1] != first[1]
+        # Replaced once on arrival; the cleanup after the stream reuses it.
+        assert len(ledger.get_group("g7").siblings[1].attempts) == 2
+        assert self._queued(ledger) == {episodes[1]}
+
+    def test_a_failed_row_ends_a_prompt_group_stream_at_once(self):
+        """The whole cohort is replaced, so its other rows cannot save it."""
+        gym = _RowFailingGym(GymTransportError("gym /run failed with HTTP 503"))
+        run, abandon, episodes, ledger = self._dispatch(
+            gym, RecoveryGranularity.PROMPT_GROUP, row_attempts=1
+        )
+
+        with pytest.raises(GymTransportError, match="HTTP 503"):
+            asyncio.run(run())
+
+        assert not gym.streamed_past_the_failure
+        asyncio.run(abandon())
+        assert {episodes[1], episodes[2]} <= self._queued(ledger)
+
+    def test_a_data_failure_ends_the_group_at_once(self):
+        gym = _RowFailingGym(RolloutDataFailure("prompt exceeds max_model_len"))
+        run, _, _, _ = self._dispatch(gym, RecoveryGranularity.SIBLING, row_attempts=3)
+
+        with pytest.raises(RolloutDataFailure, match="max_model_len"):
+            asyncio.run(run())
+
+        assert len(gym.events) == 1
+        assert not gym.streamed_past_the_failure

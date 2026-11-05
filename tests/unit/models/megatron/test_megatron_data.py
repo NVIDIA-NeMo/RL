@@ -23,7 +23,6 @@ focusing on:
 - Sequence dimension validation
 """
 
-import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -38,6 +37,26 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.utils.sequence_lengths import to_cpu_int_tuple
+from tests.unit.models.megatron.megatron_data_actors import (
+    GetPackSequenceParametersTestActor,
+    PackSequencesTestActor,
+)
+
+
+def _direct_packed_microbatch() -> BatchedDataDict:
+    return BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[10, 11, 12, 13, 20, 21, 22, 23]]),
+            "target_ids": torch.tensor([[11, 12, 13, 14, 21, 22, 23, 24]]),
+            "token_mask": torch.tensor([[1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]]),
+            "position_ids": torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]]),
+            "sample_mask": torch.tensor([0.5]),
+            "packed_cu_seqlens": torch.tensor([[0, 4, 8]], dtype=torch.int32),
+            "packed_cu_seqlens_lengths": torch.tensor([3]),
+            "packed_max_seqlen": torch.tensor([4]),
+        }
+    )
 
 
 @pytest.mark.mcore
@@ -73,11 +92,59 @@ class TestProcessedMicrobatchDataclass:
         assert torch.equal(microbatch.position_ids, mock_position_ids)
         assert microbatch.packed_seq_params == mock_packed_seq_params
         assert torch.equal(microbatch.cu_seqlens_padded, mock_cu_seqlens_padded)
+        assert microbatch.routed_experts is None
+        assert microbatch.routed_experts_cp_sharded is None
 
 
 @pytest.mark.mcore
 class TestGetAndValidateSeqlen:
     """Tests for get_and_validate_seqlen function."""
+
+    def test_deferred_router_padding_preserves_real_routes(self):
+        from nemo_rl.data_plane.codec import pad_batch, pad_field
+        from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
+
+        routes = torch.arange(577 * 2 * 6).reshape(1, 577, 2, 6)
+        data = BatchedDataDict(
+            input_ids=torch.zeros(1, 577, dtype=torch.long),
+            input_lengths=torch.tensor([577]),
+            routed_experts=routes,
+        )
+        data = pad_batch(data, {}, 918, skip=MICROBATCH_PADDED_FIELDS)
+        assert data["routed_experts"].shape[1] == 577
+        assert get_and_validate_seqlen(data) == (1, 918)
+        # Use the same deferred padding operation as process_microbatches.
+        padded = pad_field("routed_experts", data["routed_experts"], -1, 918)
+        assert torch.equal(padded[:, :577], routes)
+        assert (padded[:, 577:] == -1).all()
+
+    @pytest.mark.parametrize("route_width", [576, 919])
+    def test_deferred_router_padding_rejects_invalid_coverage(self, route_width: int):
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
+
+        data = BatchedDataDict(
+            input_ids=torch.zeros(1, 918, dtype=torch.long),
+            input_lengths=torch.tensor([577]),
+            routed_experts=torch.zeros(1, route_width, 2, 6, dtype=torch.int16),
+        )
+        with pytest.raises(AssertionError, match="must cover every real token"):
+            get_and_validate_seqlen(data)
+
+    @pytest.mark.parametrize("lengths", [None, torch.tensor([577, 577])])
+    def test_deferred_router_padding_requires_aligned_lengths(
+        self, lengths: torch.Tensor | None
+    ):
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
+
+        data = BatchedDataDict(
+            input_ids=torch.zeros(1, 918, dtype=torch.long),
+            routed_experts=torch.zeros(1, 577, 2, 6, dtype=torch.int16),
+        )
+        if lengths is not None:
+            data["input_lengths"] = lengths
+        with pytest.raises(AssertionError, match="requires input_lengths"):
+            get_and_validate_seqlen(data)
 
     def test_get_and_validate_seqlen_valid(self):
         """Test get_and_validate_seqlen with valid data."""
@@ -141,10 +208,141 @@ class TestGetAndValidateSeqlen:
         sequence_dim, seq_dim_size = get_and_validate_seqlen(data)
         assert seq_dim_size == 10
 
+    def test_get_and_validate_seqlen_skips_packed_multimodal_fields(self):
+        """mcore twin of the automodel ``check_sequence_dim`` skip.
+
+        A packed multimodal field has patch/image count on dim 1, not seqlen.
+        Without the skip every VLM step through the data plane trips the assert.
+        """
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
+
+        data = MagicMock()
+        data.__getitem__ = MagicMock(
+            side_effect=lambda k: torch.zeros(2, 10) if k == "input_ids" else None
+        )
+        data.items = MagicMock(
+            return_value=[
+                ("input_ids", torch.zeros(2, 10)),
+                # [B, max_patches, C, H, W] — dim 1 is 7 patches, not 10 tokens.
+                ("pixel_values", torch.zeros(2, 7, 3, 2, 2)),
+                ("image_grid_thw", torch.zeros(2, 4, 3)),
+            ]
+        )
+
+        sequence_dim, seq_dim_size = get_and_validate_seqlen(data)
+
+        assert sequence_dim == 1
+        assert seq_dim_size == 10
+
+    def test_get_and_validate_seqlen_still_checks_per_token_multimodal(self):
+        """Only the *packed* registry is exempt. Per-token maps like
+        ``mm_token_type_ids`` are ``[B, S]``, so a seqlen mismatch there is a
+        real bug that must keep failing."""
+        from nemo_rl.models.megatron.data import get_and_validate_seqlen
+
+        data = MagicMock()
+        data.__getitem__ = MagicMock(
+            side_effect=lambda k: torch.zeros(2, 10) if k == "input_ids" else None
+        )
+        data.items = MagicMock(
+            return_value=[
+                ("input_ids", torch.zeros(2, 10)),
+                ("mm_token_type_ids", torch.zeros(2, 15)),  # Mismatched!
+            ]
+        )
+
+        with pytest.raises(AssertionError) as exc_info:
+            get_and_validate_seqlen(data)
+
+        assert "Dim 1 must be the sequence dim" in str(exc_info.value)
+
 
 @pytest.mark.mcore
 class TestProcessMicrobatch:
     """Tests for process_microbatch function."""
+
+    @staticmethod
+    def _prepacked_batch() -> BatchedDataDict:
+        return BatchedDataDict(
+            {
+                "input_ids": torch.tensor([[1, 2, 3, 0, 5, 6, 7, 0]]),
+                "input_lengths": torch.tensor([8]),
+                "token_mask": torch.tensor([[1, 1, 1, 0, 1, 1, 1, 0]]),
+                "sample_mask": torch.tensor([1.0]),
+                "cu_seqlens": [torch.tensor([0, 3, 6], dtype=torch.int32)],
+                "cu_seqlens_padded": [torch.tensor([0, 4, 8], dtype=torch.int32)],
+            }
+        )
+
+    @pytest.mark.parametrize(
+        ("cu_seqlens", "cu_seqlens_padded", "input_width"),
+        [
+            ([0, 3, 6], [0, 4], 8),
+            ([0], [0], 8),
+            ([1, 3], [0, 4], 8),
+            ([0, 2], [1, 4], 8),
+            ([0, 3], [0, 9], 8),
+            ([0, 0], [0, 4], 8),
+            ([0, 5], [0, 4], 8),
+        ],
+        ids=[
+            "shape-mismatch",
+            "no-source",
+            "logical-start",
+            "padded-start",
+            "pack-too-wide",
+            "empty-source",
+            "source-exceeds-padding",
+        ],
+    )
+    def test_prepare_prepacked_rejects_invalid_boundaries(
+        self,
+        cu_seqlens: list[int],
+        cu_seqlens_padded: list[int],
+        input_width: int,
+    ) -> None:
+        from nemo_rl.models.megatron.data import _prepare_prepacked
+
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.arange(input_width).unsqueeze(0),
+                "cu_seqlens": [torch.tensor(cu_seqlens, dtype=torch.int32)],
+                "cu_seqlens_padded": [
+                    torch.tensor(cu_seqlens_padded, dtype=torch.int32)
+                ],
+            }
+        )
+        with (
+            patch(
+                "nemo_rl.models.megatron.data.get_context_parallel_rank",
+                return_value=0,
+            ),
+            patch(
+                "nemo_rl.models.megatron.data.get_context_parallel_world_size",
+                return_value=1,
+            ),
+            pytest.raises(ValueError, match="Invalid prepacked source boundaries"),
+        ):
+            _prepare_prepacked(data, model_slices_context_parallel_inputs=False)
+
+    def test_prepare_prepacked_rejects_cp_incompatible_source_lengths(self) -> None:
+        from nemo_rl.models.megatron.data import _prepare_prepacked
+
+        data = BatchedDataDict(
+            {
+                "input_ids": torch.arange(6).unsqueeze(0),
+                "cu_seqlens": [torch.tensor([0, 3], dtype=torch.int32)],
+                "cu_seqlens_padded": [torch.tensor([0, 6], dtype=torch.int32)],
+            }
+        )
+        with (
+            patch(
+                "nemo_rl.models.megatron.data.get_context_parallel_world_size",
+                return_value=2,
+            ),
+            pytest.raises(ValueError, match="divisible by 2 \\* context_parallel_size"),
+        ):
+            _prepare_prepacked(data, model_slices_context_parallel_inputs=False)
 
     @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
     def test_process_microbatch_no_packing(self, mock_get_masks):
@@ -178,6 +376,109 @@ class TestProcessMicrobatch:
         # Verify get_ltor_masks_and_position_ids was called
         mock_get_masks.assert_called_once()
 
+    def test_process_microbatch_pads_dense_mxfp8_tokens(self):
+        """Dense MXFP8 batches pad all sequence tensors to a 32-token boundary."""
+        from nemo_rl.models.megatron import data as megatron_data
+
+        data_dict = {
+            "input_ids": torch.arange(72).unsqueeze(0),
+            "token_mask": torch.ones(1, 72),
+            "input_lengths": torch.tensor([72]),
+            "pixel_values": torch.ones(1, 3, 8, 8),
+        }
+
+        with patch.object(
+            megatron_data,
+            "get_ltor_masks_and_position_ids",
+            return_value=(
+                torch.ones(1, 96),
+                None,
+                torch.arange(96).unsqueeze(0),
+            ),
+        ):
+            result = megatron_data.process_microbatch(
+                data_dict,
+                pad_individual_seqs_to_multiple_of=32,
+                pack_sequences=False,
+                straggler_timer=MagicMock(),
+            )
+
+        assert result.original_seq_length == 72
+        assert result.input_ids.shape == (1, 96)
+        assert data_dict["token_mask"].shape == (1, 96)
+        assert torch.count_nonzero(data_dict["token_mask"][:, 72:]) == 0
+        assert data_dict["pixel_values"].shape == (1, 3, 8, 8)
+
+    @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
+    def test_process_microbatch_repairs_routed_experts_padding_without_packing(
+        self, mock_get_masks
+    ):
+        """Materialized jagged padding must remain valid router replay data."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        mock_get_masks.return_value = (
+            torch.ones(2, 4),
+            None,
+            torch.arange(4).unsqueeze(0).expand(2, -1),
+        )
+
+        routed_experts = torch.tensor(
+            [
+                [
+                    [[4, 5], [6, 7]],
+                    [[8, 9], [10, 11]],
+                    [[0, 0], [0, 0]],
+                    [[0, 0], [0, 0]],
+                ],
+                [
+                    [[12, 13], [14, 15]],
+                    [[16, 17], [18, 19]],
+                    [[20, 21], [22, 23]],
+                    [[0, 0], [0, 0]],
+                ],
+            ],
+            dtype=torch.int32,
+        )
+        data_dict = {
+            "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
+            "input_lengths": torch.tensor([2, 3]),
+            "routed_experts": routed_experts,
+        }
+
+        result = process_microbatch(
+            data_dict,
+            pack_sequences=False,
+            straggler_timer=MagicMock(),
+        )
+
+        expected = routed_experts.clone()
+        default_route = torch.tensor([0, 1], dtype=torch.int32)
+        expected[0, 2:] = default_route.view(1, 1, 2).expand(2, 2, 2)
+        expected[1, 3:] = default_route.view(1, 1, 2).expand(1, 2, 2)
+        assert torch.equal(result.routed_experts, expected)
+        assert torch.equal(result.routed_experts_cp_sharded, expected)
+
+    @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
+    def test_process_microbatch_requires_lengths_for_dense_routed_experts(
+        self, mock_get_masks
+    ):
+        """Dense routed_experts padding repair needs original sequence lengths."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        data_dict = {
+            "input_ids": torch.tensor([[1, 2, 0, 0], [3, 4, 5, 0]]),
+            "routed_experts": torch.zeros(2, 4, 2, 2, dtype=torch.int32),
+        }
+
+        with pytest.raises(ValueError, match="routed_experts requires input_lengths"):
+            process_microbatch(
+                data_dict,
+                pack_sequences=False,
+                straggler_timer=MagicMock(),
+            )
+
+        mock_get_masks.assert_not_called()
+
     @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
     @patch(
         "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=1
@@ -209,7 +510,11 @@ class TestProcessMicrobatch:
         data_dict.__getitem__ = MagicMock(
             side_effect=lambda k: input_ids if k == "input_ids" else seq_lengths
         )
-        data_dict.__contains__ = MagicMock(return_value=True)
+        # This fixture provides neither mtp_loss_mask nor routed_experts, so those
+        # optional packing branches must not fire.
+        data_dict.__contains__ = MagicMock(
+            side_effect=lambda k: k in {"input_ids", "input_lengths"}
+        )
 
         result = process_microbatch(
             data_dict,
@@ -228,6 +533,870 @@ class TestProcessMicrobatch:
 
         # Verify pack was called
         mock_pack.assert_called_once()
+
+    def test_process_direct_packed_row_cp_slices_all_target_aligned_tensors(self):
+        from nemo_rl.models.megatron import data as megatron_data
+
+        data = _direct_packed_microbatch()
+        data["mtp_loss_mask"] = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+        packed_seq_params = MagicMock()
+        cp_indices = [1, 2, 5, 6]
+
+        def shard_bundle(
+            batch: dict[str, torch.Tensor],
+            cu_seqlens: torch.Tensor,
+            packed_max_seqlen: torch.Tensor,
+            *,
+            cp_size: int,
+            cp_rank: int,
+            direct_packed_metadata=None,
+        ) -> tuple[dict[str, torch.Tensor], MagicMock]:
+            expected_cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
+            assert set(batch) == {"tokens", "labels", "loss_mask", "position_ids"}
+            assert torch.equal(cu_seqlens, expected_cu_seqlens)
+            assert torch.equal(packed_max_seqlen, torch.tensor([4]))
+            assert (cp_size, cp_rank) == (2, 1)
+            assert direct_packed_metadata is not None
+            return {
+                key: value[:, cp_indices] for key, value in batch.items()
+            }, packed_seq_params
+
+        with (
+            patch.object(megatron_data, "get_context_parallel_rank", return_value=1),
+            patch.object(
+                megatron_data, "get_context_parallel_world_size", return_value=2
+            ),
+            patch.object(
+                megatron_data,
+                "_get_direct_packed_bundle_on_this_cp_rank",
+                side_effect=shard_bundle,
+                create=True,
+            ),
+        ):
+            result = megatron_data.process_microbatch(data, pack_sequences=True)
+
+        assert {
+            "input_ids": result.input_ids_cp_sharded.tolist(),
+            "labels": result.labels_cp_sharded.tolist(),
+            "loss_mask": result.loss_mask_cp_sharded.tolist(),
+            "mtp_loss_mask": result.mtp_loss_mask.tolist(),
+            "position_ids": result.position_ids.tolist(),
+            "packed_seq_params": result.packed_seq_params is packed_seq_params,
+            "attention_mask": result.attention_mask,
+        } == {
+            "input_ids": [[11, 12, 21, 22]],
+            "labels": [[12, 13, 22, 23]],
+            "loss_mask": [[0.5, 0.0, 0.0, 0.5]],
+            "mtp_loss_mask": [[0.5, 0.0, 0.0, 0.5]],
+            "position_ids": [[1, 2, 1, 2]],
+            "packed_seq_params": True,
+            "attention_mask": None,
+        }
+
+    def test_process_direct_packed_row_requires_packed_max_seqlen(self):
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        data = _direct_packed_microbatch()
+        del data["packed_max_seqlen"]
+
+        with pytest.raises(ValueError, match="packed_max_seqlen"):
+            process_microbatch(data)
+
+    @pytest.mark.parametrize(
+        ("field", "process_kwargs", "message"),
+        [
+            (
+                "routed_experts",
+                {},
+                "Router replay is not supported",
+            ),
+            (
+                None,
+                {"delegate_pack_to_model": True},
+                "delegate_pack_to_model=True",
+            ),
+        ],
+    )
+    def test_process_direct_packed_row_rejects_unsupported_main_features(
+        self,
+        field: str | None,
+        process_kwargs: dict[str, bool],
+        message: str,
+    ):
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        data = _direct_packed_microbatch()
+        if field == "routed_experts":
+            data[field] = torch.zeros(1, 8, 1, 1, dtype=torch.long)
+
+        with pytest.raises(NotImplementedError, match=message):
+            process_microbatch(data, **process_kwargs)
+
+    def test_process_direct_packed_row_rejects_misaligned_mtp_mask(self):
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        data = _direct_packed_microbatch()
+        data["mtp_loss_mask"] = torch.ones_like(data["token_mask"])
+
+        with pytest.raises(ValueError, match="mtp_loss_mask must match"):
+            process_microbatch(data)
+
+    def test_direct_packed_cp_helper_accepts_odd_segments_without_cp(self):
+        from nemo_rl.models.megatron import data as megatron_data
+
+        params = MagicMock()
+        with patch.object(
+            megatron_data, "PackedSeqParams", return_value=params
+        ) as packed_seq_params:
+            result, result_params = (
+                megatron_data._get_direct_packed_bundle_on_this_cp_rank(
+                    {"tokens": torch.tensor([[10, 11, 12]])},
+                    torch.tensor([0, 3], dtype=torch.int32),
+                    torch.tensor([3]),
+                    cp_size=1,
+                    cp_rank=0,
+                )
+            )
+
+        assert torch.equal(result["tokens"], torch.tensor([[10, 11, 12]]))
+        assert result_params is params
+        assert packed_seq_params.call_args.kwargs["total_tokens"] == 3
+
+    def test_direct_packed_cp_helper_uses_mcore_per_document_partitioning(self):
+        from nemo_rl.models.megatron import data as megatron_data
+
+        params = MagicMock()
+        cp_group = MagicMock()
+        cp_indices = [1, 2, 5, 6]
+
+        def partition(
+            batch: dict[str, torch.Tensor],
+            *,
+            is_hybrid_cp: bool,
+            cp_group: object,
+        ) -> dict[str, torch.Tensor]:
+            assert is_hybrid_cp is False
+            assert cp_group is not None
+            assert torch.equal(
+                batch["cu_seqlens"],
+                torch.tensor([[0, 4, 8]], dtype=torch.int32),
+            )
+            for key in ("tokens", "labels", "loss_mask", "position_ids"):
+                batch[key] = batch[key][:, cp_indices]
+            return batch
+
+        bundle = {
+            "tokens": torch.arange(8).unsqueeze(0),
+            "labels": torch.arange(10, 18).unsqueeze(0),
+            "loss_mask": torch.ones(1, 8),
+            "position_ids": torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]]),
+        }
+        with (
+            patch.object(
+                megatron_data, "get_context_parallel_group", return_value=cp_group
+            ),
+            patch.object(
+                megatron_data,
+                "get_batch_on_this_cp_rank",
+                side_effect=partition,
+                create=True,
+            ) as get_batch,
+            patch.object(
+                megatron_data, "PackedSeqParams", return_value=params
+            ) as packed_seq_params,
+        ):
+            result, result_params = (
+                megatron_data._get_direct_packed_bundle_on_this_cp_rank(
+                    bundle,
+                    torch.tensor([0, 4, 8], dtype=torch.int32),
+                    torch.tensor([4]),
+                    cp_size=2,
+                    cp_rank=1,
+                )
+            )
+
+        assert get_batch.call_count == 1
+        assert result["tokens"].tolist() == [[1, 2, 5, 6]]
+        assert result["labels"].tolist() == [[11, 12, 15, 16]]
+        assert result_params is params
+        assert packed_seq_params.call_args.kwargs["total_tokens"] == 4
+
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=1
+    )
+    @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
+    def test_process_microbatch_preserves_prepacked_logical_and_physical_boundaries(
+        self, mock_pack, mock_cp_world, mock_cp_rank
+    ):
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        data = self._prepacked_batch()
+        result = process_microbatch(
+            data,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            mtp_enabled=True,
+        )
+
+        mock_pack.assert_not_called()
+        assert torch.equal(result.input_ids_cp_sharded, data["input_ids"])
+        assert torch.equal(
+            result.packed_seq_params.cu_seqlens_q,
+            torch.tensor([0, 3, 6], dtype=torch.int32),
+        )
+        assert torch.equal(
+            result.packed_seq_params.cu_seqlens_q_padded,
+            torch.tensor([0, 4, 8], dtype=torch.int32),
+        )
+        assert result.packed_seq_params.pad_between_seqs is True
+        assert torch.equal(
+            result.position_ids,
+            torch.tensor([[0, 1, 2, 0, 0, 1, 2, 0]]),
+        )
+
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=1
+    )
+    def test_process_microbatch_trims_prepacked_batch_padding(
+        self, mock_cp_world, mock_cp_rank
+    ):
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        data = self._prepacked_batch()
+        data["input_ids"] = torch.nn.functional.pad(data["input_ids"], (0, 4))
+        data["token_mask"] = torch.nn.functional.pad(data["token_mask"], (0, 4))
+        data["mtp_loss_mask"] = data["token_mask"].clone()
+        data["media_token_validity_mask"] = data["token_mask"].bool()
+
+        result = process_microbatch(
+            data,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+        )
+
+        assert result.original_seq_length == 8
+        assert result.input_ids.shape == (1, 8)
+        assert data["input_ids"].shape == (1, 8)
+        assert data["token_mask"].shape == (1, 8)
+        assert result.mtp_loss_mask.shape == (1, 8)
+        assert result.media_token_validity_mask.shape == (1, 8)
+        assert result.packed_seq_params.total_tokens == 8
+
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2
+    )
+    def test_process_microbatch_cp_slices_each_prepacked_source(
+        self, mock_cp_world, mock_cp_rank
+    ):
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        data = self._prepacked_batch()
+        data["mtp_loss_mask"] = data["token_mask"].clone()
+        result = process_microbatch(
+            data,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+        )
+
+        assert torch.equal(result.input_ids_cp_sharded, torch.tensor([[1, 0, 5, 0]]))
+        assert torch.equal(result.mtp_loss_mask, torch.tensor([[1, 0, 1, 0]]))
+        assert result.packed_seq_params.total_tokens == 4
+
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2
+    )
+    def test_process_microbatch_builds_prepacked_router_padding_mask(
+        self, mock_cp_world, mock_cp_rank
+    ):
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        data = self._prepacked_batch()
+        result = process_microbatch(
+            data,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            create_packed_seq_padding_mask=True,
+        )
+
+        assert torch.equal(
+            result.padding_mask, torch.tensor([[False, True, False, True]])
+        )
+
+        full_result = process_microbatch(
+            self._prepacked_batch(),
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            create_packed_seq_padding_mask=True,
+            model_slices_context_parallel_inputs=True,
+            mtp_enabled=True,
+        )
+
+        assert torch.equal(
+            full_result.padding_mask,
+            torch.tensor([[False, False, False, True, False, False, False, True]]),
+        )
+        assert torch.equal(
+            full_result.position_ids,
+            torch.tensor([[0, 1, 2, 0, 0, 1, 2, 0]]),
+        )
+
+    @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
+    def test_process_microbatch_no_packing_propagates_mtp_loss_mask(
+        self, mock_get_masks
+    ):
+        """Without packing, a precomputed mtp_loss_mask is passed through."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        mock_get_masks.return_value = (
+            torch.ones(1, 4),
+            None,
+            torch.arange(4).unsqueeze(0),
+        )
+        input_ids = torch.tensor([[1, 2, 3, 4]])
+        mtp_loss_mask = torch.tensor([[1, 1, 0, 0]])
+        data_dict = {"input_ids": input_ids, "mtp_loss_mask": mtp_loss_mask}
+
+        result = process_microbatch(
+            data_dict, pack_sequences=False, straggler_timer=MagicMock()
+        )
+        assert result.mtp_loss_mask is not None
+        assert torch.equal(result.mtp_loss_mask, mtp_loss_mask)
+
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2
+    )
+    @patch(
+        "nemo_rl.models.megatron.data.get_packed_seq_cp_partition_indices",
+        return_value=torch.tensor([0, 3, 4, 7]),
+    )
+    @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
+    def test_process_microbatch_keeps_full_thd_for_model_cp_slicing(
+        self, mock_pack, mock_indices, mock_cp_world, mock_cp_rank
+    ):
+        """Full THD input does not calculate replay indices when routes are absent."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        full_tokens = torch.tensor([[1, 2, 3, 0, 4, 5, 0, 0]])
+        local_tokens = full_tokens[:, [0, 3, 4, 7]]
+        cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+        cu_seqlens_padded = torch.tensor([0, 4, 8], dtype=torch.int32)
+        mock_pack.return_value = (
+            full_tokens,
+            local_tokens,
+            MagicMock(),
+            cu_seqlens,
+            cu_seqlens_padded,
+        )
+        input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
+
+        result = process_microbatch(
+            {"input_ids": input_ids, "input_lengths": torch.tensor([3, 2])},
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            model_slices_context_parallel_inputs=True,
+            straggler_timer=MagicMock(),
+        )
+
+        assert torch.equal(result.input_ids, full_tokens)
+        assert torch.equal(result.input_ids_cp_sharded, full_tokens)
+        assert torch.equal(result.packed_seq_params.cu_seqlens_q, cu_seqlens)
+        assert torch.equal(
+            result.packed_seq_params.cu_seqlens_q_padded, cu_seqlens_padded
+        )
+        assert result.packed_seq_params.total_tokens == 8
+        mock_indices.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("cu_seqlens", "cu_seqlens_padded", "expected_pad_between_seqs"),
+        [
+            ([0, 3], [0, 4], True),
+            ([0, 4], [0, 4], False),
+        ],
+        ids=["trailing-padding", "no-padding"],
+    )
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2
+    )
+    @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
+    def test_process_microbatch_marks_single_sequence_trailing_padding(
+        self,
+        mock_pack,
+        mock_cp_world,
+        mock_cp_rank,
+        cu_seqlens,
+        cu_seqlens_padded,
+        expected_pad_between_seqs,
+    ):
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        full_tokens = torch.tensor([[1, 2, 3, 0]])
+        cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
+        cu_seqlens_padded = torch.tensor(cu_seqlens_padded, dtype=torch.int32)
+        mock_pack.return_value = (
+            full_tokens,
+            full_tokens,
+            MagicMock(),
+            cu_seqlens,
+            cu_seqlens_padded,
+        )
+
+        result = process_microbatch(
+            {
+                "input_ids": full_tokens,
+                "input_lengths": cu_seqlens[1:].clone(),
+            },
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            model_slices_context_parallel_inputs=True,
+            straggler_timer=MagicMock(),
+        )
+
+        assert result.packed_seq_params.pad_between_seqs is expected_pad_between_seqs
+        assert torch.equal(result.packed_seq_params.cu_seqlens_q, cu_seqlens)
+        assert torch.equal(
+            result.packed_seq_params.cu_seqlens_q_padded, cu_seqlens_padded
+        )
+
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2
+    )
+    @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
+    def test_process_microbatch_keeps_full_mtp_mask_for_model_cp_slicing(
+        self, mock_pack, mock_cp_world, mock_cp_rank
+    ):
+        """A model that slices CP inputs itself receives the full, unsharded mask.
+
+        Such a model inserts media into the full THD row before selecting its
+        CP-owned tokens, and validates that every token-aligned tensor it shards
+        has the same sequence length. Handing it a CP-local mask alongside
+        full-length input_ids fails that check before training starts, so the
+        mask must stay full and be sliced by the model in lockstep with the
+        tokens.
+        """
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        # A distinct return per call, so the assertions below discriminate both
+        # which tuple index was read (0 is the full THD row, 1 the CP-local
+        # shard, and they differ in width) and which call it came from. A
+        # shared return_value would let a regression that re-packs input_ids in
+        # place of mtp_loss_mask pass unnoticed, since both sides would then be
+        # the same object.
+        tokens_full = torch.tensor([[1, 2, 3, 4, 5, 6, 0, 0]])
+        tokens_cp = torch.tensor([[1, 2, 3, 4]])
+        mask_full = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]])
+        mask_cp = torch.tensor([[1, 1, 1, 0]])
+
+        def _pack_returns(tensor, *args, **kwargs):
+            full, cp = (
+                (mask_full, mask_cp)
+                if tensor is data_dict["mtp_loss_mask"]
+                else (tokens_full, tokens_cp)
+            )
+            return (
+                full,
+                cp,
+                MagicMock(),
+                torch.tensor([0, 5, 8], dtype=torch.int32),
+                torch.tensor([0, 5, 8], dtype=torch.int32),
+            )
+
+        mock_pack.side_effect = _pack_returns
+
+        data_dict = {
+            "input_ids": torch.tensor(
+                [[1, 2, 3, 4, 5, 0, 0, 0], [6, 7, 8, 0, 0, 0, 0, 0]]
+            ),
+            "input_lengths": torch.tensor([5, 3]),
+            "mtp_loss_mask": torch.tensor(
+                [[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0, 0]]
+            ),
+        }
+
+        result = process_microbatch(
+            data_dict,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            model_slices_context_parallel_inputs=True,
+            mtp_enabled=True,
+            straggler_timer=MagicMock(),
+        )
+
+        # The mask was packed, not re-derived from input_ids: one call per
+        # tensor, and the second is the mask itself.
+        assert mock_pack.call_count == 3
+        assert torch.equal(
+            mock_pack.call_args_list[1].args[0], data_dict["mtp_loss_mask"]
+        )
+
+        assert result.mtp_loss_mask is not None
+        # The full row, not the CP-sharded one.
+        assert torch.equal(result.mtp_loss_mask, mask_full)
+        # And it lines up with the tokens the model will slice. Because the two
+        # pack calls return distinct tensors, this compares across calls rather
+        # than a tensor with itself.
+        assert result.input_ids_cp_sharded is result.input_ids
+        assert torch.equal(result.input_ids_cp_sharded, tokens_full)
+        assert result.mtp_loss_mask.shape[1] == result.input_ids_cp_sharded.shape[1]
+        # position_ids must also take the full row here, for the same reason
+        # as mtp_loss_mask: the model slices CP itself and expects every
+        # token-aligned input at the same (unsharded) length.
+        assert result.position_ids is not None
+        assert torch.equal(result.position_ids, tokens_full)
+
+    def test_caller_packing_matches_mbridge_thd_contract(self):
+        from megatron.bridge.data.packing.in_batch import (
+            pack_right_padded_sequence_batch_to_mcore_thd,
+        )
+
+        from nemo_rl.models.megatron.data import _pack_sequences_for_megatron
+
+        input_ids = torch.tensor([[1, 2, 3, 0, 0], [4, 5, 0, 0, 0]])
+        seq_lengths = torch.tensor([3, 2])
+        (
+            full_tokens,
+            _local_tokens,
+            _packed_seq_params,
+            cu_seqlens,
+            cu_seqlens_padded,
+        ) = _pack_sequences_for_megatron(
+            input_ids,
+            to_cpu_int_tuple(seq_lengths),
+            pad_individual_seqs_to_multiple_of=4,
+            cp_size=1,
+        )
+        mbridge_batch = {
+            "input_ids": input_ids.clone(),
+            "position_ids": torch.arange(input_ids.shape[1])
+            .unsqueeze(0)
+            .expand_as(input_ids)
+            .clone(),
+            "attention_mask": torch.arange(input_ids.shape[1]).unsqueeze(0)
+            < seq_lengths.unsqueeze(1),
+        }
+        pack_right_padded_sequence_batch_to_mcore_thd(
+            mbridge_batch,
+            pad_to_multiple_of=4,
+        )
+
+        assert torch.equal(full_tokens, mbridge_batch["input_ids"])
+        assert torch.equal(cu_seqlens, mbridge_batch["cu_seqlens_q"])
+        assert torch.equal(cu_seqlens_padded, mbridge_batch["cu_seqlens_q_padded"])
+
+    @patch("nemo_rl.models.megatron.data.get_ltor_masks_and_position_ids")
+    def test_process_microbatch_no_packing_mtp_loss_mask_absent(self, mock_get_masks):
+        """mtp_loss_mask defaults to None when not provided."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        mock_get_masks.return_value = (
+            torch.ones(1, 4),
+            None,
+            torch.arange(4).unsqueeze(0),
+        )
+        data_dict = {"input_ids": torch.tensor([[1, 2, 3, 4]])}
+
+        result = process_microbatch(
+            data_dict, pack_sequences=False, straggler_timer=MagicMock()
+        )
+        assert result.mtp_loss_mask is None
+
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=1
+    )
+    @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
+    def test_process_microbatch_with_packing_packs_mtp_loss_mask(
+        self, mock_pack, mock_cp_world, mock_cp_rank
+    ):
+        """With packing, mtp_loss_mask is packed like input_ids and propagated."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        # Distinct tensors at index 0 and 1 so the assertion below can catch an
+        # off-by-one read (the implementation must take index 1, the CP-sharded
+        # packed tensor, not index 0).
+        packed_idx0 = torch.zeros(1, 8, dtype=torch.long)
+        packed_idx1 = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
+        mock_pack.return_value = (
+            packed_idx0,
+            packed_idx1,
+            MagicMock(),
+            torch.tensor([0, 5, 8], dtype=torch.int32),
+            torch.tensor([0, 5, 8], dtype=torch.int32),
+        )
+
+        data_dict = {
+            "input_ids": torch.tensor(
+                [[1, 2, 3, 4, 5, 0, 0, 0], [6, 7, 8, 0, 0, 0, 0, 0]]
+            ),
+            "input_lengths": torch.tensor([5, 3]),
+            "mtp_loss_mask": torch.tensor(
+                [[1, 1, 1, 1, 1, 0, 0, 0], [1, 1, 1, 0, 0, 0, 0, 0]]
+            ),
+        }
+
+        result = process_microbatch(
+            data_dict,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            mtp_enabled=True,
+            straggler_timer=MagicMock(),
+        )
+
+        # _pack_sequences_for_megatron is called for input_ids, mtp_loss_mask, position_ids.
+        assert mock_pack.call_count == 3
+        # mtp_loss_mask takes the packed tensor (index 1 of the pack return tuple).
+        assert result.mtp_loss_mask is not None
+        assert torch.equal(result.mtp_loss_mask, packed_idx1)
+        assert result.position_ids is not None
+        assert torch.equal(result.position_ids, packed_idx1)
+
+    @pytest.mark.parametrize(
+        (
+            "mtp_enabled",
+            "with_mtp_loss_mask",
+            "cp_size",
+            "cp_rank",
+            "model_slices_context_parallel_inputs",
+            "expected_position_ids",
+        ),
+        [
+            # Segments concatenate with no padding; positions restart at 0 at
+            # every packed boundary rather than running across the buffer.
+            pytest.param(
+                True,
+                False,
+                1,
+                0,
+                False,
+                [[0, 1, 2, 3, 4, 5, 0, 1, 2]],
+                id="cp1-logprob-pass",
+            ),
+            pytest.param(
+                True,
+                True,
+                1,
+                0,
+                False,
+                [[0, 1, 2, 3, 4, 5, 0, 1, 2]],
+                id="cp1-train-pass",
+            ),
+            pytest.param(
+                True, False, 2, 0, False, [[0, 1, 0, 0, 0, 0]], id="cp2-rank0-local"
+            ),
+            pytest.param(
+                True, False, 2, 1, False, [[2, 3, 4, 5, 1, 2]], id="cp2-rank1-local"
+            ),
+            # A model that slices CP itself gets the full THD row on every rank.
+            pytest.param(
+                True,
+                False,
+                2,
+                1,
+                True,
+                [[0, 1, 2, 3, 4, 5, 0, 0, 0, 1, 2, 0]],
+                id="cp2-full-row-for-model-cp-slicing",
+            ),
+            pytest.param(False, False, 2, 1, False, None, id="mtp-disabled"),
+        ],
+    )
+    def test_process_microbatch_with_packing_builds_mtp_position_ids(
+        self,
+        mtp_enabled,
+        with_mtp_loss_mask,
+        cp_size,
+        cp_rank,
+        model_slices_context_parallel_inputs,
+        expected_position_ids,
+    ):
+        """With packing, MTP models get position_ids in the token layout they consume.
+
+        The trigger is the model running MTP, not the presence of mtp_loss_mask:
+        logprob passes carry no mask yet still run the MTP block, and
+        HybridModel asserts position_ids there. Runs the real
+        _pack_sequences_for_megatron, so the CP=2 cases check the zigzag shard
+        and the full-row variant against literal layouts.
+        """
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        # Token value == position + 1, so alignment with the model-forward
+        # tokens can be checked without re-deriving the packing.
+        input_ids = torch.tensor([[1, 2, 3, 4, 5, 6, 0, 0], [1, 2, 3, 0, 0, 0, 0, 0]])
+        seq_lengths = torch.tensor([6, 3])
+        data_dict = {"input_ids": input_ids, "input_lengths": seq_lengths}
+        if with_mtp_loss_mask:
+            data_dict["mtp_loss_mask"] = (input_ids != 0).long()
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.data.get_context_parallel_rank",
+                return_value=cp_rank,
+            ),
+            patch(
+                "nemo_rl.models.megatron.data.get_context_parallel_world_size",
+                return_value=cp_size,
+            ),
+        ):
+            result = process_microbatch(
+                data_dict,
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=2 * cp_size if cp_size > 1 else 1,
+                pack_sequences=True,
+                model_slices_context_parallel_inputs=model_slices_context_parallel_inputs,
+                mtp_enabled=mtp_enabled,
+                straggler_timer=MagicMock(),
+            )
+
+        if not mtp_enabled:
+            assert result.position_ids is None
+            return
+
+        assert result.position_ids is not None
+        assert result.position_ids.tolist() == expected_position_ids
+        # Same layout as the tokens the model will embed: full row or CP shard.
+        assert result.position_ids.shape == result.input_ids_cp_sharded.shape
+        real_tokens = result.input_ids_cp_sharded != 0
+        assert torch.equal(
+            result.position_ids[real_tokens],
+            result.input_ids_cp_sharded[real_tokens] - 1,
+        )
+
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2
+    )
+    @patch("nemo_rl.models.megatron.data._shard_routed_experts_for_cp")
+    @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
+    def test_process_microbatch_packs_routed_experts_with_tokens(
+        self, mock_pack, mock_shard, mock_cp_world, mock_cp_rank
+    ):
+        """Test routed_experts follows the same per-seq zigzag CP path as tokens."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
+        seq_lengths = torch.tensor([3, 2])
+        routed_experts = torch.arange(2 * 4 * 3 * 2, dtype=torch.int32).reshape(
+            2, 4, 3, 2
+        )
+        # Each sequence is padded to a multiple of cp*2 (=4), packed to 8 tokens.
+        # The CP shard for rank 0 / cp_size 2 is the per-seq zigzag selection.
+        packed_tokens = torch.tensor([[1, 2, 3, 0, 4, 5, 0, 0]])
+        packed_routed_experts = torch.arange(1 * 8 * 3 * 2, dtype=torch.int32).reshape(
+            1, 8, 3, 2
+        )
+        # zigzag for cp_rank=0, cp_size=2 over a 4-token seq selects positions {0, 3}
+        cp_tokens = torch.tensor([[1, 0, 4, 0]])
+        cp_routed_experts = packed_routed_experts[:, [0, 3, 4, 7]]
+        cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+        cu_seqlens_padded = torch.tensor([0, 4, 8], dtype=torch.int32)
+        # Main's packer returns the 5-tuple (input_ids only); the routed expert CP
+        # sharding is delegated to the standalone helper.
+        mock_pack.return_value = (
+            packed_tokens,
+            cp_tokens,
+            MagicMock(),
+            cu_seqlens,
+            cu_seqlens_padded,
+        )
+        mock_shard.return_value = (
+            packed_routed_experts,
+            cp_routed_experts,
+            None,
+            None,
+        )
+
+        data_dict = {
+            "input_ids": input_ids,
+            "input_lengths": seq_lengths,
+            "routed_experts": routed_experts,
+        }
+
+        result = process_microbatch(
+            data_dict,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            straggler_timer=MagicMock(),
+        )
+
+        # Main's packer is called with input_ids only (no routed_experts kwarg).
+        pack_args = mock_pack.call_args
+        assert torch.equal(pack_args.args[0], input_ids)
+        assert "routed_experts" not in pack_args.kwargs
+        # The helper does the routed expert CP sharding.
+        shard_args = mock_shard.call_args
+        assert torch.equal(shard_args.args[0], routed_experts)
+        assert torch.equal(result.input_ids, packed_tokens)
+        assert torch.equal(result.input_ids_cp_sharded, cp_tokens)
+        assert torch.equal(result.routed_experts, packed_routed_experts)
+        assert torch.equal(result.routed_experts_cp_sharded, cp_routed_experts)
+
+    @patch("nemo_rl.models.megatron.data.get_context_parallel_rank", return_value=0)
+    @patch(
+        "nemo_rl.models.megatron.data.get_context_parallel_world_size", return_value=2
+    )
+    @patch(
+        "nemo_rl.models.megatron.data.get_packed_seq_cp_partition_indices",
+        return_value=torch.tensor([0, 3, 4, 7]),
+    )
+    @patch("nemo_rl.models.megatron.data._shard_routed_experts_for_cp")
+    @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
+    def test_model_cp_slicing_uses_shared_indices_for_router_replay(
+        self,
+        mock_pack,
+        mock_shard,
+        mock_indices,
+        mock_cp_world,
+        mock_cp_rank,
+    ):
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]])
+        routed_experts = torch.arange(2 * 4 * 3 * 2, dtype=torch.int32).reshape(
+            2, 4, 3, 2
+        )
+        packed_tokens = torch.tensor([[1, 2, 3, 0, 4, 5, 0, 0]])
+        packed_routes = torch.arange(1 * 8 * 3 * 2, dtype=torch.int32).reshape(
+            1, 8, 3, 2
+        )
+        cu_seqlens = torch.tensor([0, 3, 5], dtype=torch.int32)
+        cu_seqlens_padded = torch.tensor([0, 4, 8], dtype=torch.int32)
+        mock_pack.return_value = (
+            packed_tokens,
+            packed_tokens[:, [0, 3, 4, 7]],
+            MagicMock(),
+            cu_seqlens,
+            cu_seqlens_padded,
+        )
+        mock_shard.return_value = (
+            packed_routes,
+            torch.full_like(packed_routes[:, :4], -1),
+            None,
+            None,
+        )
+
+        result = process_microbatch(
+            {
+                "input_ids": input_ids,
+                "input_lengths": torch.tensor([3, 2]),
+                "routed_experts": routed_experts,
+            },
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            model_slices_context_parallel_inputs=True,
+            straggler_timer=MagicMock(),
+        )
+
+        assert torch.equal(result.input_ids_cp_sharded, packed_tokens)
+        assert torch.equal(
+            result.routed_experts_cp_sharded,
+            packed_routes[:, [0, 3, 4, 7]],
+        )
+        mock_indices.assert_called_once()
 
     def test_process_microbatch_packing_requires_seq_length_key(self):
         """Test that packing requires seq_length_key."""
@@ -265,6 +1434,346 @@ class TestProcessMicrobatch:
             )
 
         assert "input_lengths not found in data_dict" in str(exc_info.value)
+
+    @patch("nemo_rl.models.megatron.data._pack_sequences_for_megatron")
+    @patch("nemo_rl.models.megatron.data._prepare_vlm_batch_for_megatron")
+    def test_process_microbatch_delegate_pack_to_model(self, mock_prepare, mock_pack):
+        """Test that delegate_pack_to_model routes packing to the VLM helper.
+
+        When the model self-packs (mbridge VLM wrappers), process_microbatch must
+        call _prepare_vlm_batch_for_megatron instead of _pack_sequences_for_megatron,
+        and must surface the bool attention_mask while keeping position_ids None.
+        """
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        mock_input_ids = torch.tensor([[1, 2, 3, 4, 5]])
+        mock_cp_sharded = torch.tensor([[1, 2, 3, 0, 0], [4, 5, 0, 0, 0]])
+        mock_attention_mask = torch.tensor(
+            [[True, True, True, False, False], [True, True, False, False, False]]
+        )
+        mock_packed_seq_params = MagicMock()
+        mock_cu_seqlens_padded = torch.tensor([0, 3, 5], dtype=torch.int32)
+        mock_prepare.return_value = (
+            mock_input_ids,
+            mock_cp_sharded,
+            mock_attention_mask,
+            mock_packed_seq_params,
+            None,
+            mock_cu_seqlens_padded,
+        )
+
+        input_ids = torch.tensor([[1, 2, 3, 0, 0], [4, 5, 0, 0, 0]])
+        seq_lengths = torch.tensor([3, 2])
+        data_dict = MagicMock()
+        data_dict.__getitem__ = MagicMock(
+            side_effect=lambda k: input_ids if k == "input_ids" else seq_lengths
+        )
+        # A self-packing VLM batch carries no routed_experts; membership must
+        # reflect the real keys so process_microbatch does not mis-read a 1-D
+        # tensor as routed_experts.
+        data_dict.__contains__ = MagicMock(
+            side_effect=lambda k: k in {"input_ids", "input_lengths"}
+        )
+
+        result = process_microbatch(
+            data_dict,
+            seq_length_key="input_lengths",
+            pack_sequences=True,
+            delegate_pack_to_model=True,
+            pad_full_seq_to=8,
+            straggler_timer=MagicMock(),
+        )
+
+        # VLM helper was used, and the classic packer was NOT invoked (guards
+        # against a regression silently routing to _pack_sequences_for_megatron).
+        mock_prepare.assert_called_once()
+        mock_pack.assert_not_called()
+        # pad_full_seq_to must be forwarded to the helper
+        assert mock_prepare.call_args[1]["pad_full_seq_to"] == 8
+
+        # The bool attention_mask is surfaced (unlike the classic packing path,
+        # which returns None), and position_ids stays None.
+        assert torch.equal(result.attention_mask, mock_attention_mask)
+        assert result.position_ids is None
+        assert result.packed_seq_params == mock_packed_seq_params
+        assert torch.equal(result.input_ids, mock_input_ids)
+        assert torch.equal(result.input_ids_cp_sharded, mock_cp_sharded)
+        assert torch.equal(result.cu_seqlens_padded, mock_cu_seqlens_padded)
+
+    def test_process_microbatch_delegate_pack_rejects_mtp_loss_mask(self):
+        """Self-packing models must explicitly advertise MTP-mask ownership.
+
+        Qwen3-VL and other wrappers that have not implemented this contract stay
+        fail-closed rather than receiving a full-batch mask for CP-sharded tokens.
+        """
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        input_ids = torch.tensor([[1, 2, 3, 0, 0], [4, 5, 0, 0, 0]])
+        seq_lengths = torch.tensor([3, 2])
+        data_dict = MagicMock()
+        data_dict.__getitem__ = MagicMock(
+            side_effect=lambda k: input_ids if k == "input_ids" else seq_lengths
+        )
+        data_dict.__contains__ = MagicMock(
+            side_effect=lambda k: k in {"input_ids", "input_lengths", "mtp_loss_mask"}
+        )
+
+        with pytest.raises(AssertionError) as exc_info:
+            process_microbatch(
+                data_dict,
+                seq_length_key="input_lengths",
+                pack_sequences=True,
+                delegate_pack_to_model=True,
+                pad_full_seq_to=8,
+                straggler_timer=MagicMock(),
+            )
+
+        assert "model_owns_mtp_loss_mask_packing" in str(exc_info.value)
+
+    def test_process_microbatch_delegates_padded_mtp_loss_mask(self):
+        """A capable wrapper receives a padded full mask to pack with its IDs."""
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        input_ids = torch.tensor([[1, 2, 3, 0, 0], [4, 5, 0, 0, 0]])
+        mtp_loss_mask = torch.tensor([[0, 0, 1, 0, 0], [0, 1, 0, 0, 0]])
+        result = process_microbatch(
+            {
+                "input_ids": input_ids,
+                "input_lengths": torch.tensor([3, 2]),
+                "mtp_loss_mask": mtp_loss_mask,
+            },
+            seq_length_key="input_lengths",
+            pad_individual_seqs_to_multiple_of=4,
+            pack_sequences=True,
+            delegate_pack_to_model=True,
+            delegate_mtp_loss_mask_to_model=True,
+        )
+
+        assert result.input_ids_cp_sharded.shape == (2, 4)
+        assert torch.equal(
+            result.mtp_loss_mask,
+            torch.tensor([[0, 0, 1, 0], [0, 1, 0, 0]]),
+        )
+
+    @pytest.mark.parametrize(
+        "pack_sequences, delegate_pack_to_model",
+        [
+            # Qwen2.5-VL: its forward has no media_token_validity_mask kwarg.
+            (False, False),
+            # Qwen3-VL: packs internally, which rejects a caller-side mask.
+            (True, True),
+        ],
+    )
+    def test_process_microbatch_drops_grpo_mask_for_unsupported_models(
+        self, pack_sequences, delegate_pack_to_model
+    ):
+        """A GRPO-attached mask must not reach a model that cannot consume it."""
+        from nemo_rl.data.multimodal_utils import attach_media_token_validity_mask
+        from nemo_rl.models.megatron.data import process_microbatch
+
+        input_ids = torch.tensor([[1, 2, 3, 0, 0], [4, 5, 0, 0, 0]])
+        data = {
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor([3, 2]),
+            "media_token_validity_mask": torch.ones_like(input_ids, dtype=torch.bool),
+        }
+        # Unsupported models resolve no media placeholder id at worker setup.
+        attach_media_token_validity_mask(data, None)
+
+        result = process_microbatch(
+            data,
+            seq_length_key="input_lengths",
+            pack_sequences=pack_sequences,
+            delegate_pack_to_model=delegate_pack_to_model,
+            straggler_timer=MagicMock(),
+        )
+
+        assert result.media_token_validity_mask is None
+
+
+@pytest.mark.mcore
+class TestPrepareVlmBatchForMegatron:
+    """Tests for _prepare_vlm_batch_for_megatron.
+
+    This is the VLM + CP self-packing path: NeMo-RL only pads each sequence and
+    builds an attention_mask / cu_seqlens, leaving the actual pack + CP-shard to
+    the model's own preprocess_packed_seqs. The function is pure CPU tensor logic.
+    """
+
+    def test_basic_no_extra_padding(self):
+        """align=1, no pad_full_seq_to: mask matches lengths, packed view is concat."""
+        from nemo_rl.models.megatron.data import _prepare_vlm_batch_for_megatron
+
+        input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        seq_lengths = torch.tensor([3, 2])
+
+        (
+            packed_input_ids,
+            input_ids_2d,
+            attention_mask,
+            packed_seq_params,
+            cu_seqlens,
+            cu_seqlens_padded,
+        ) = _prepare_vlm_batch_for_megatron(
+            input_ids, seq_lengths, pad_individual_seqs_to_multiple_of=1
+        )
+
+        # No alignment padding -> [B, S] layout is unchanged for the model forward.
+        assert torch.equal(input_ids_2d, input_ids)
+
+        # attention_mask is bool and follows the (padded) sequence lengths.
+        assert attention_mask.dtype == torch.bool
+        assert torch.equal(
+            attention_mask,
+            torch.tensor([[True, True, True], [True, True, False]]),
+        )
+
+        # cu_seqlens_padded is the cumulative sum of padded lengths, int32.
+        assert cu_seqlens_padded.dtype == torch.int32
+        assert torch.equal(
+            cu_seqlens_padded, torch.tensor([0, 3, 5], dtype=torch.int32)
+        )
+
+        # cu_seqlens (unpadded) is unused on this path.
+        assert cu_seqlens is None
+
+        # packed view concatenates per-seq padded slices into [1, total].
+        assert torch.equal(packed_input_ids, torch.tensor([[1, 2, 3, 4, 5]]))
+
+        # PackedSeqParams describes the full (pre-shard) packed layout.
+        assert packed_seq_params.qkv_format == "thd"
+        assert packed_seq_params.max_seqlen_q == 3
+        assert torch.equal(packed_seq_params.cu_seqlens_q, cu_seqlens_padded)
+        assert torch.equal(packed_seq_params.cu_seqlens_q_padded, cu_seqlens_padded)
+
+    def test_alignment_padding_rounds_up_and_truncates(self):
+        """align=4 rounds each length up; over-wide input_ids are truncated to padded_max."""
+        from nemo_rl.models.megatron.data import _prepare_vlm_batch_for_megatron
+
+        # Width 8 input, lengths [3, 2] padded up to [4, 4] -> padded_max 4.
+        input_ids = torch.arange(1, 17).reshape(2, 8)
+        seq_lengths = torch.tensor([3, 2])
+
+        (
+            packed_input_ids,
+            input_ids_2d,
+            attention_mask,
+            packed_seq_params,
+            _,
+            cu_seqlens_padded,
+        ) = _prepare_vlm_batch_for_megatron(
+            input_ids, seq_lengths, pad_individual_seqs_to_multiple_of=4
+        )
+
+        # Truncated to padded_max = 4 columns.
+        assert input_ids_2d.shape == (2, 4)
+        assert torch.equal(input_ids_2d, input_ids[:, :4])
+
+        # padded_lens are [4, 4] so every column is "valid".
+        assert attention_mask.all()
+        assert torch.equal(
+            cu_seqlens_padded, torch.tensor([0, 4, 8], dtype=torch.int32)
+        )
+        assert packed_seq_params.max_seqlen_q == 4
+        assert packed_input_ids.shape == (1, 8)
+
+    def test_alignment_padding_pads_narrow_input(self):
+        """When input is narrower than padded_max, rows are zero-padded on the right."""
+        from nemo_rl.models.megatron.data import _prepare_vlm_batch_for_megatron
+
+        # Width 3 input, lengths [3, 3] padded up to [4, 4] -> padded_max 4 > 3.
+        input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        seq_lengths = torch.tensor([3, 3])
+
+        (
+            packed_input_ids,
+            input_ids_2d,
+            attention_mask,
+            _,
+            _,
+            cu_seqlens_padded,
+        ) = _prepare_vlm_batch_for_megatron(
+            input_ids, seq_lengths, pad_individual_seqs_to_multiple_of=4
+        )
+
+        assert input_ids_2d.shape == (2, 4)
+        assert torch.equal(input_ids_2d, torch.tensor([[1, 2, 3, 0], [4, 5, 6, 0]]))
+        assert torch.equal(
+            cu_seqlens_padded, torch.tensor([0, 4, 8], dtype=torch.int32)
+        )
+        assert torch.equal(packed_input_ids, torch.tensor([[1, 2, 3, 0, 4, 5, 6, 0]]))
+
+    def test_pad_full_seq_to_extends_last_sequence(self):
+        """pad_full_seq_to (PP>1) absorbs the deficit into the last sequence's length."""
+        from nemo_rl.models.megatron.data import _prepare_vlm_batch_for_megatron
+
+        # natural padded sum = 3 + 2 = 5; pad_full_seq_to=8 -> last grows by 3 to 5.
+        input_ids = torch.tensor([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]])
+        seq_lengths = torch.tensor([3, 2])
+
+        (
+            packed_input_ids,
+            input_ids_2d,
+            attention_mask,
+            packed_seq_params,
+            _,
+            cu_seqlens_padded,
+        ) = _prepare_vlm_batch_for_megatron(
+            input_ids,
+            seq_lengths,
+            pad_individual_seqs_to_multiple_of=1,
+            pad_full_seq_to=8,
+        )
+
+        # Total packed length now equals pad_full_seq_to.
+        assert int(cu_seqlens_padded[-1]) == 8
+        assert torch.equal(
+            cu_seqlens_padded, torch.tensor([0, 3, 8], dtype=torch.int32)
+        )
+
+        # The extended last sequence's tail positions are marked "valid" (they are
+        # masked out at the loss layer, not here); the first sequence keeps its mask.
+        assert torch.equal(
+            attention_mask,
+            torch.tensor(
+                [
+                    [True, True, True, False, False],
+                    [True, True, True, True, True],
+                ]
+            ),
+        )
+        assert packed_seq_params.max_seqlen_q == 5
+        assert packed_input_ids.shape == (1, 8)
+
+    def test_pad_full_seq_to_too_small_raises(self):
+        """pad_full_seq_to below the natural padded sum is a hard error."""
+        from nemo_rl.models.megatron.data import _prepare_vlm_batch_for_megatron
+
+        input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        seq_lengths = torch.tensor([3, 2])  # natural padded sum = 5
+
+        with pytest.raises(AssertionError, match="increase pad_full_seq_to"):
+            _prepare_vlm_batch_for_megatron(
+                input_ids,
+                seq_lengths,
+                pad_individual_seqs_to_multiple_of=1,
+                pad_full_seq_to=4,
+            )
+
+    def test_pad_full_seq_to_deficit_not_multiple_of_align_raises(self):
+        """The pad_full_seq_to deficit must be divisible by the per-seq alignment."""
+        from nemo_rl.models.megatron.data import _prepare_vlm_batch_for_megatron
+
+        input_ids = torch.arange(1, 9).reshape(2, 4)
+        seq_lengths = torch.tensor([4, 4])  # align=4 -> padded sum = 8
+
+        with pytest.raises(AssertionError, match="must be a multiple"):
+            _prepare_vlm_batch_for_megatron(
+                input_ids,
+                seq_lengths,
+                pad_individual_seqs_to_multiple_of=4,
+                pad_full_seq_to=10,  # deficit = 2, not a multiple of 4
+            )
 
 
 @pytest.mark.mcore
@@ -332,10 +1841,113 @@ class TestProcessGlobalBatch:
 
         assert "sample_mask must be present in the data!" in str(exc_info.value)
 
+    def test_process_global_batch_counts_all_target_aligned_direct_tokens(self):
+        from nemo_rl.models.megatron.data import process_global_batch
+
+        batch = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(1, 4, dtype=torch.long),
+                "target_ids": torch.zeros(1, 4, dtype=torch.long),
+                "token_mask": torch.ones(1, 4),
+                "sample_mask": torch.ones(1),
+                # packed_cu_seqlens is the marker for the direct path; a row
+                # carrying target_ids without it is a legacy online row.
+                "packed_cu_seqlens": torch.tensor([[0, 4]], dtype=torch.int32),
+            }
+        )
+        data = MagicMock()
+        data.get_batch.return_value = batch
+
+        with (
+            patch.object(torch.Tensor, "cuda", lambda tensor: tensor),
+            patch("torch.distributed.all_reduce"),
+        ):
+            result = process_global_batch(
+                data=data,
+                loss_fn=MagicMock(),
+                dp_group=MagicMock(),
+                batch_idx=0,
+                batch_size=1,
+            )
+
+        assert result["global_valid_toks"].item() == 4
+
+    def test_process_global_batch_keeps_next_token_shift_for_legacy_online_masks(self):
+        from nemo_rl.models.megatron.data import process_global_batch
+
+        batch = BatchedDataDict(
+            {
+                "input_ids": torch.zeros(1, 4, dtype=torch.long),
+                "token_mask": torch.ones(1, 4),
+                "sample_mask": torch.ones(1),
+            }
+        )
+        data = MagicMock()
+        data.get_batch.return_value = batch
+
+        with (
+            patch.object(torch.Tensor, "cuda", lambda tensor: tensor),
+            patch("torch.distributed.all_reduce"),
+        ):
+            result = process_global_batch(
+                data=data,
+                loss_fn=MagicMock(),
+                dp_group=MagicMock(),
+                batch_idx=0,
+                batch_size=1,
+            )
+
+        assert result["global_valid_toks"].item() == 3
+
 
 @pytest.mark.mcore
 class TestGetMicrobatchIterator:
     """Tests for get_microbatch_iterator function."""
+
+    @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
+    @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
+    def test_get_microbatch_iterator_prepacked_expert_bias_creates_padding_mask(
+        self, mock_make_iterator, mock_get_and_validate_seqlen
+    ):
+        from nemo_rl.models.megatron.data import get_microbatch_iterator
+
+        mock_get_and_validate_seqlen.return_value = (1, 8)
+        mock_make_iterator.return_value = iter([])
+
+        mock_data = MagicMock()
+        mock_data.__contains__.side_effect = {
+            "cu_seqlens": True,
+            "cu_seqlens_padded": True,
+        }.get
+        mock_data.make_microbatch_iterator.return_value = iter([])
+        mock_data.size = 2
+
+        cfg = {
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": True, "fuse_loss": True},
+            "megatron_cfg": {"moe_router_enable_expert_bias": True},
+            "make_sequence_length_divisible_by": 1,
+        }
+
+        _, data_iterator_len, micro_batch_size, _, _ = get_microbatch_iterator(
+            data=mock_data,
+            cfg=cfg,
+            mbs=4,
+            straggler_timer=MagicMock(),
+        )
+
+        mock_data.make_microbatch_iterator.assert_called_once_with(1)
+        mock_data.make_microbatch_iterator_for_packable_sequences.assert_not_called()
+        assert (
+            mock_make_iterator.call_args.kwargs["prepad_packed_seq_for_hybridep"]
+            is False
+        )
+        assert data_iterator_len == 2
+        assert micro_batch_size == 1
+        assert (
+            mock_make_iterator.call_args.kwargs["create_packed_seq_padding_mask"]
+            is True
+        )
 
     @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
@@ -357,6 +1969,13 @@ class TestGetMicrobatchIterator:
         cfg = {
             "dynamic_batching": {"enabled": True},
             "sequence_packing": {"enabled": False},
+            "make_sequence_length_divisible_by": 1,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "context_parallel_size": 1,
+                "fp8_cfg": {"enabled": False},
+            },
         }
 
         (
@@ -411,7 +2030,10 @@ class TestGetMicrobatchIterator:
                 "sequence_parallel": False,
                 "pipeline_model_parallel_size": 1,
                 "context_parallel_size": 1,
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
             },
+            "make_sequence_length_divisible_by": 1,
         }
 
         (
@@ -425,6 +2047,7 @@ class TestGetMicrobatchIterator:
             cfg=cfg,
             mbs=4,
             straggler_timer=MagicMock(),
+            mtp_enabled=True,
         )
 
         # Verify sequence packing path was taken
@@ -433,6 +2056,195 @@ class TestGetMicrobatchIterator:
         # With sequence packing, micro_batch_size should be 1
         assert micro_batch_size == 1
         assert data_iterator_len == 10
+        assert (
+            mock_make_iterator.call_args.kwargs["create_packed_seq_padding_mask"]
+            is True
+        )
+        assert mock_make_iterator.call_args.kwargs["mtp_enabled"] is True
+
+    @pytest.mark.parametrize("packing_enabled", [False, True])
+    def test_get_microbatch_iterator_uses_one_row_for_direct_packed_sft(
+        self, packing_enabled: bool
+    ):
+        from nemo_rl.models.megatron import data as megatron_data
+
+        data = MagicMock()
+        data.size = 3
+        data.__contains__.side_effect = lambda key: key == "packed_cu_seqlens"
+        data.__getitem__.side_effect = lambda key: (
+            torch.zeros(3, 8, dtype=torch.long) if key == "input_ids" else None
+        )
+        data.make_microbatch_iterator.return_value = iter([])
+        cfg = {
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": packing_enabled, "fuse_loss": False},
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "pipeline_model_parallel_size": 1,
+                "context_parallel_size": 1,
+                "moe_router_enable_expert_bias": True,
+            },
+            "make_sequence_length_divisible_by": 1,
+        }
+
+        with (
+            patch.object(megatron_data, "get_and_validate_seqlen") as get_seqlen,
+            patch.object(
+                megatron_data,
+                "make_processed_microbatch_iterator",
+                return_value=iter([]),
+            ) as make_iterator,
+        ):
+            _, iterator_len, micro_batch_size, seq_dim_size, _ = (
+                megatron_data.get_microbatch_iterator(
+                    data=data,
+                    cfg=cfg,
+                    mbs=4,
+                    straggler_timer=MagicMock(),
+                )
+            )
+
+        data.make_microbatch_iterator_for_packable_sequences.assert_not_called()
+        assert make_iterator.call_args.kwargs["create_packed_seq_padding_mask"] is False
+        assert make_iterator.call_args.kwargs["prepad_packed_seq_for_hybridep"] is False
+        assert {
+            "raw_micro_batch_size": data.make_microbatch_iterator.call_args.args[0],
+            "iterator_len": iterator_len,
+            "micro_batch_size": micro_batch_size,
+            "seq_dim_size": seq_dim_size,
+            "seqlen_validation_calls": get_seqlen.call_count,
+        } == {
+            "raw_micro_batch_size": 1,
+            "iterator_len": 3,
+            "micro_batch_size": 1,
+            "seq_dim_size": 8,
+            "seqlen_validation_calls": 0,
+        }
+
+    def test_direct_packed_alignment_requires_sequence_parallel_config(self):
+        from nemo_rl.models.megatron.data import (
+            _get_packed_sequence_alignment_factors,
+        )
+
+        with pytest.raises(KeyError, match="sequence_parallel"):
+            _get_packed_sequence_alignment_factors(
+                {
+                    "tensor_model_parallel_size": 1,
+                    "context_parallel_size": 1,
+                }
+            )
+
+    @patch("nemo_rl.models.megatron.data.get_fp8_token_alignment", return_value=64)
+    def test_packed_alignment_uses_shared_fp8_token_alignment(
+        self, _mock_fp8_token_alignment
+    ):
+        from nemo_rl.models.megatron.data import (
+            _get_packed_sequence_alignment_factors,
+        )
+
+        _, kernel_divisor = _get_packed_sequence_alignment_factors(
+            {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "context_parallel_size": 1,
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+            }
+        )
+
+        assert kernel_divisor == 64
+
+    def test_get_microbatch_iterator_rejects_direct_length_before_policy_padding(
+        self,
+    ):
+        from nemo_rl.models.megatron.data import get_microbatch_iterator
+
+        data = MagicMock()
+        data.size = 1
+        data.__contains__.side_effect = lambda key: key == "packed_cu_seqlens"
+        data.__getitem__.side_effect = lambda key: (
+            torch.zeros(1, 8, dtype=torch.long) if key == "input_ids" else None
+        )
+        data.make_microbatch_iterator.return_value = iter([])
+        cfg = {
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": False},
+            "make_sequence_length_divisible_by": 16,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "pipeline_model_parallel_size": 1,
+                "context_parallel_size": 1,
+                "fp8_cfg": {"enabled": False},
+            },
+        }
+
+        with pytest.raises(
+            ValueError,
+            match="Direct packed sequence length 8 must be divisible by 16",
+        ):
+            get_microbatch_iterator(
+                data=data,
+                cfg=cfg,
+                mbs=1,
+                straggler_timer=MagicMock(),
+            )
+
+    @pytest.mark.parametrize(
+        ("pack_length", "fp8_cfg", "required_multiple"),
+        [
+            pytest.param(3, {"enabled": False}, 2, id="tp2-sp"),
+            pytest.param(
+                128,
+                {"enabled": True, "fp8_recipe": "blockwise"},
+                256,
+                id="tp2-sp-blockwise-fp8",
+            ),
+        ],
+    )
+    def test_get_microbatch_iterator_rejects_misaligned_direct_packed_length(
+        self,
+        pack_length,
+        fp8_cfg,
+        required_multiple,
+    ):
+        from nemo_rl.models.megatron.data import get_microbatch_iterator
+
+        data = MagicMock()
+        data.size = 1
+        data.__contains__.side_effect = lambda key: key == "packed_cu_seqlens"
+        data.__getitem__.side_effect = lambda key: (
+            torch.zeros(1, pack_length, dtype=torch.long)
+            if key == "input_ids"
+            else None
+        )
+        data.make_microbatch_iterator.return_value = iter([])
+        cfg = {
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": True},
+            "make_sequence_length_divisible_by": 2,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 2,
+                "sequence_parallel": True,
+                "pipeline_model_parallel_size": 1,
+                "context_parallel_size": 1,
+                "fp8_cfg": fp8_cfg,
+            },
+        }
+
+        with pytest.raises(
+            ValueError,
+            match=(
+                rf"Direct packed sequence length {pack_length} "
+                rf"must be divisible by {required_multiple}"
+            ),
+        ):
+            get_microbatch_iterator(
+                data=data,
+                cfg=cfg,
+                mbs=1,
+                straggler_timer=MagicMock(),
+            )
 
     @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
@@ -454,6 +2266,13 @@ class TestGetMicrobatchIterator:
         cfg = {
             "dynamic_batching": {"enabled": False},
             "sequence_packing": {"enabled": False},
+            "make_sequence_length_divisible_by": 1,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "context_parallel_size": 1,
+                "fp8_cfg": {"enabled": False},
+            },
         }
 
         mbs = 4
@@ -477,6 +2296,67 @@ class TestGetMicrobatchIterator:
         assert micro_batch_size == mbs
         assert data_iterator_len == 16 // mbs
         assert seq_dim_size == 64
+
+    def test_get_microbatch_iterator_pads_dense_mxfp8_to_32(self):
+        """MXFP8 dense logprob batches expose their padded schedule length."""
+        from nemo_rl.models.megatron import data as megatron_data
+
+        mock_data = MagicMock()
+        mock_data.size = 2
+        mock_data.make_microbatch_iterator.return_value = iter([])
+        cfg = {
+            "dynamic_batching": {"enabled": False},
+            "sequence_packing": {"enabled": False},
+            "make_sequence_length_divisible_by": 1,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 1,
+                "sequence_parallel": False,
+                "context_parallel_size": 1,
+                "fp8_cfg": {"enabled": True, "fp8_recipe": "mxfp8"},
+            },
+        }
+
+        with (
+            patch.object(
+                megatron_data, "get_and_validate_seqlen", return_value=(1, 72)
+            ),
+            patch.object(
+                megatron_data, "make_processed_microbatch_iterator"
+            ) as mock_make_iterator,
+        ):
+            *_, seq_dim_size, padded_seq_length = megatron_data.get_microbatch_iterator(
+                data=mock_data,
+                cfg=cfg,
+                mbs=1,
+                straggler_timer=MagicMock(),
+            )
+
+            assert seq_dim_size == 72
+            assert padded_seq_length == 96
+            assert (
+                mock_make_iterator.call_args.kwargs[
+                    "pad_individual_seqs_to_multiple_of"
+                ]
+                == 32
+            )
+
+    def test_non_packed_pad_factor_combines_tp_sequence_parallel_alignment(self):
+        """Dense sequence-parallel batches align to the TP scatter factor."""
+        from nemo_rl.models.megatron.data import (
+            _get_non_packed_sequence_pad_factor,
+        )
+
+        cfg = {
+            "make_sequence_length_divisible_by": 6,
+            "megatron_cfg": {
+                "tensor_model_parallel_size": 4,
+                "sequence_parallel": True,
+                "context_parallel_size": 1,
+                "fp8_cfg": {"enabled": False},
+            },
+        }
+
+        assert _get_non_packed_sequence_pad_factor(cfg) == 12
 
     @patch("nemo_rl.models.megatron.data.get_and_validate_seqlen")
     @patch("nemo_rl.models.megatron.data.make_processed_microbatch_iterator")
@@ -509,6 +2389,7 @@ class TestGetMicrobatchIterator:
                 "pipeline_model_parallel_size": 1,
                 "context_parallel_size": 1,
             },
+            "make_sequence_length_divisible_by": 1,
         }
 
         get_microbatch_iterator(
@@ -527,6 +2408,101 @@ class TestGetMicrobatchIterator:
 @pytest.mark.mcore
 class TestMakeProcessedMicrobatchIterator:
     """Tests for make_processed_microbatch_iterator function."""
+
+    @patch("nemo_rl.models.megatron.data.process_microbatch")
+    @patch("nemo_rl.models.megatron.data._validate_direct_packed_microbatch")
+    def test_direct_packed_metadata_is_validated_before_cuda_transfer(
+        self,
+        validate_direct_packed,
+        process_microbatch,
+    ):
+        from nemo_rl.models.megatron.data import (
+            DirectPackedMetadata,
+            ProcessedInputs,
+            make_processed_microbatch_iterator,
+        )
+
+        metadata = DirectPackedMetadata(cu_seqlens_length=3, max_seqlen=4)
+        validate_direct_packed.return_value = metadata
+        process_microbatch.return_value = ProcessedInputs(
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3, 4]]),
+            attention_mask=None,
+            position_ids=torch.arange(4).unsqueeze(0),
+            packed_seq_params=MagicMock(),
+            cu_seqlens_padded=torch.tensor([0, 4]),
+        )
+        data = _direct_packed_microbatch()
+        data["mtp_loss_mask"] = data["token_mask"] * data["sample_mask"].unsqueeze(-1)
+
+        def move_to_cuda(device):
+            assert device == "cuda"
+            assert validate_direct_packed.call_count == 1
+            return data
+
+        with patch.object(data, "to", side_effect=move_to_cuda):
+            next(
+                make_processed_microbatch_iterator(
+                    raw_iterator=iter([data]),
+                    cfg={"sequence_packing": {"enabled": False}},
+                    seq_length_key=None,
+                    pad_individual_seqs_to_multiple_of=1,
+                    pad_packed_seq_to_multiple_of=1,
+                    straggler_timer=MagicMock(),
+                    pad_full_seq_to=None,
+                )
+            )
+
+        assert process_microbatch.call_args.kwargs["direct_packed_metadata"] == metadata
+
+    def test_direct_packed_metadata_rejects_inconsistent_max_seqlen(self):
+        from nemo_rl.models.megatron.data import _validate_direct_packed_microbatch
+
+        data = _direct_packed_microbatch()
+        data["packed_max_seqlen"] = torch.tensor([3])
+
+        with pytest.raises(
+            ValueError,
+            match="packed_max_seqlen must equal the longest packed segment",
+        ):
+            _validate_direct_packed_microbatch(data, context_parallel_size=1)
+
+    def test_direct_packed_metadata_rejects_segments_below_cp_granularity(self):
+        from nemo_rl.models.megatron.data import _validate_direct_packed_microbatch
+
+        # Segments are 4 tokens each, so they cannot be zigzag-sharded across
+        # cp=4, which needs every segment to be a multiple of 8.
+        data = _direct_packed_microbatch()
+
+        with pytest.raises(
+            ValueError,
+            match="segment lengths must be divisible by",
+        ):
+            _validate_direct_packed_microbatch(data, context_parallel_size=4)
+
+    def test_direct_packed_metadata_rejects_non_increasing_boundaries(self):
+        from nemo_rl.models.megatron.data import _validate_direct_packed_microbatch
+
+        data = _direct_packed_microbatch()
+        data["packed_cu_seqlens"] = torch.tensor([[0, 9, 8]], dtype=torch.int32)
+
+        with pytest.raises(
+            ValueError,
+            match="packed_cu_seqlens must contain increasing boundaries",
+        ):
+            _validate_direct_packed_microbatch(data, context_parallel_size=1)
+
+    def test_direct_packed_metadata_requires_input_ids(self):
+        from nemo_rl.models.megatron.data import _validate_direct_packed_microbatch
+
+        data = _direct_packed_microbatch()
+        del data["input_ids"]
+
+        with pytest.raises(
+            ValueError,
+            match="missing required fields: input_ids",
+        ):
+            _validate_direct_packed_microbatch(data, context_parallel_size=1)
 
     @patch("nemo_rl.models.megatron.data.process_microbatch")
     def test_make_processed_microbatch_iterator_basic(self, mock_process):
@@ -584,6 +2560,47 @@ class TestMakeProcessedMicrobatchIterator:
         mock_data_dict.to.assert_called_once_with("cuda")
 
     @patch("nemo_rl.models.megatron.data.process_microbatch")
+    def test_make_processed_microbatch_iterator_propagates_direct_labels_and_mask(
+        self, mock_process
+    ):
+        from nemo_rl.models.megatron.data import (
+            ProcessedInputs,
+            make_processed_microbatch_iterator,
+        )
+
+        labels = torch.tensor([[2, 3, 4, -100]])
+        loss_mask = torch.tensor([[1.0, 1.0, 1.0, 0.0]])
+        mock_process.return_value = ProcessedInputs(
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3, 4]]),
+            attention_mask=None,
+            position_ids=torch.arange(4).unsqueeze(0),
+            packed_seq_params=MagicMock(),
+            cu_seqlens_padded=torch.tensor([0, 4]),
+            labels_cp_sharded=labels,
+            loss_mask_cp_sharded=loss_mask,
+        )
+        data = MagicMock()
+        data.to.return_value = data
+
+        processed = next(
+            make_processed_microbatch_iterator(
+                raw_iterator=iter([data]),
+                cfg={"sequence_packing": {"enabled": True}},
+                seq_length_key="input_lengths",
+                pad_individual_seqs_to_multiple_of=1,
+                pad_packed_seq_to_multiple_of=1,
+                straggler_timer=MagicMock(),
+                pad_full_seq_to=None,
+            )
+        )
+
+        assert (
+            processed.labels_cp_sharded is labels,
+            processed.loss_mask_cp_sharded is loss_mask,
+        ) == (True, True)
+
+    @patch("nemo_rl.models.megatron.data.process_microbatch")
     def test_make_processed_microbatch_iterator_with_packing(self, mock_process):
         """Test make_processed_microbatch_iterator with sequence packing."""
         from nemo_rl.models.megatron.data import (
@@ -616,6 +2633,7 @@ class TestMakeProcessedMicrobatchIterator:
             pad_packed_seq_to_multiple_of=16,
             straggler_timer=MagicMock(),
             pad_full_seq_to=1024,
+            mtp_enabled=True,
         )
 
         microbatch = next(processed_iterator)
@@ -628,546 +2646,7 @@ class TestMakeProcessedMicrobatchIterator:
         assert call_kwargs["pad_individual_seqs_to_multiple_of"] == 8
         assert call_kwargs["pad_packed_seq_to_multiple_of"] == 16
         assert call_kwargs["pad_full_seq_to"] == 1024
-
-
-@ray.remote(num_gpus=1)
-class PackSequencesTestActor:
-    def __init__(self, cp_size):
-        self.cp_size = cp_size
-        self.env_vars = dict(os.environ)
-
-    def run_all_pack_sequences_tests(self):
-        """Run all sequence packing tests in a single call to avoid expensive reinitializations."""
-        from nemo_rl.distributed.model_utils import _get_tokens_on_this_cp_rank
-        from nemo_rl.models.megatron.data import _pack_sequences_for_megatron
-
-        # Initialize process group if CP > 1
-        if self.cp_size > 1:
-            torch.distributed.init_process_group(backend="nccl")
-            rank = int(os.environ["RANK"])
-        else:
-            rank = 0
-
-        results = {}
-
-        # Test 1: Basic packing functionality
-        results["basic"] = self._test_basic_packing(_pack_sequences_for_megatron)
-        if not results["basic"]["success"]:
-            return results["basic"]
-
-        # Test 2: Variable sequence lengths
-        results["variable_lengths"] = self._test_variable_lengths(
-            _pack_sequences_for_megatron
-        )
-        if not results["variable_lengths"]["success"]:
-            return results["variable_lengths"]
-
-        # Test 3: Content preservation and consistency
-        results["consistency"] = self._test_consistency(_pack_sequences_for_megatron)
-        if not results["consistency"]["success"]:
-            return results["consistency"]
-
-        # Test 4: Edge cases
-        results["edge_cases"] = self._test_edge_cases(_pack_sequences_for_megatron)
-        if not results["edge_cases"]["success"]:
-            return results["edge_cases"]
-
-        # Test 5: Context parallelism (only if CP > 1)
-        if self.cp_size > 1:
-            results["context_parallel"] = self._test_context_parallel(
-                _pack_sequences_for_megatron, _get_tokens_on_this_cp_rank, rank
-            )
-            if not results["context_parallel"]["success"]:
-                return results["context_parallel"]
-        else:
-            results["context_parallel"] = {
-                "success": True,
-                "error": None,
-                "skipped": "CP=1",
-            }
-
-        return {"success": True, "error": None, "detailed_results": results}
-
-    def _test_basic_packing(self, _pack_sequences_for_megatron):
-        """Test basic sequence packing without context parallelism."""
-        try:
-            # Test parameters
-            batch_size = 3
-            max_seq_len = 10
-            vocab_size = 100
-
-            # Create test data with variable sequence lengths
-            input_ids = torch.randint(
-                0, vocab_size, (batch_size, max_seq_len), device="cuda"
-            )
-            seq_lengths = torch.tensor([8, 5, 7], device="cuda")
-
-            # Test 1: Basic packing without CP
-            packed_input_ids, _, packed_seq_params, cu_seqlens, cu_seqlens_padded = (
-                _pack_sequences_for_megatron(
-                    input_ids, seq_lengths, cp_rank=0, cp_size=1
-                )
-            )
-
-            # Verify shapes
-            expected_total_tokens = seq_lengths.sum().item()
-            if packed_input_ids.shape != (1, expected_total_tokens):
-                return {
-                    "success": False,
-                    "error": f"Basic packing shape mismatch: expected (1, {expected_total_tokens}), got {packed_input_ids.shape}",
-                }
-
-            # Verify cu_seqlens
-            expected_cu_seqlens = torch.tensor(
-                [0, 8, 13, 20], device="cuda", dtype=torch.int32
-            )
-            if not torch.equal(cu_seqlens, expected_cu_seqlens):
-                return {
-                    "success": False,
-                    "error": f"cu_seqlens mismatch: expected {expected_cu_seqlens}, got {cu_seqlens}",
-                }
-
-            # Verify PackedSeqParams
-            if packed_seq_params.qkv_format != "thd":
-                return {
-                    "success": False,
-                    "error": f"Wrong qkv_format: expected 'thd', got {packed_seq_params.qkv_format}",
-                }
-
-            if packed_seq_params.max_seqlen_q != 8:
-                return {
-                    "success": False,
-                    "error": f"Wrong max_seqlen_q: expected 8, got {packed_seq_params.max_seqlen_q}",
-                }
-
-            # Test 2: Packing with individual sequence padding
-            (
-                packed_input_ids_pad,
-                _,
-                packed_seq_params_pad,
-                cu_seqlens_pad,
-                cu_seqlens_padded_pad,
-            ) = _pack_sequences_for_megatron(
-                input_ids,
-                seq_lengths,
-                pad_individual_seqs_to_multiple_of=4,
-                cp_rank=0,
-                cp_size=1,
-            )
-
-            # With padding to multiple of 4: [8, 5, 7] -> [8, 8, 8] = 24 tokens
-            expected_total_tokens_pad = 24
-            if packed_input_ids_pad.shape != (1, expected_total_tokens_pad):
-                return {
-                    "success": False,
-                    "error": f"Padded packing shape mismatch: expected (1, {expected_total_tokens_pad}), got {packed_input_ids_pad.shape}",
-                }
-
-            # Verify padded cu_seqlens
-            expected_cu_seqlens_padded = torch.tensor(
-                [0, 8, 16, 24], device="cuda", dtype=torch.int32
-            )
-            if not torch.equal(cu_seqlens_padded_pad, expected_cu_seqlens_padded):
-                return {
-                    "success": False,
-                    "error": f"Padded cu_seqlens mismatch: expected {expected_cu_seqlens_padded}, got {cu_seqlens_padded_pad}",
-                }
-
-            return {"success": True, "error": None}
-
-        except Exception as e:
-            return {"success": False, "error": f"Basic packing test failed: {str(e)}"}
-
-    def _test_variable_lengths(self, _pack_sequences_for_megatron):
-        """Test sequence packing with variable sequence lengths."""
-        try:
-            # Test parameters
-            batch_size = 4
-            max_seq_len = 12
-            vocab_size = 50
-
-            # Create test data with highly variable sequence lengths
-            input_ids = torch.randint(
-                0, vocab_size, (batch_size, max_seq_len), device="cuda"
-            )
-            seq_lengths = torch.tensor([12, 3, 8, 1], device="cuda")
-
-            # Test 1: Variable lengths without padding
-            packed_input_ids, _, packed_seq_params, cu_seqlens, cu_seqlens_padded = (
-                _pack_sequences_for_megatron(
-                    input_ids, seq_lengths, cp_rank=0, cp_size=1
-                )
-            )
-
-            # Verify total tokens
-            expected_total_tokens = seq_lengths.sum().item()  # 12 + 3 + 8 + 1 = 24
-            if packed_input_ids.shape != (1, expected_total_tokens):
-                return {
-                    "success": False,
-                    "error": f"Variable lengths shape mismatch: expected (1, {expected_total_tokens}), got {packed_input_ids.shape}",
-                }
-
-            # Verify cu_seqlens
-            expected_cu_seqlens = torch.tensor(
-                [0, 12, 15, 23, 24], device="cuda", dtype=torch.int32
-            )
-            if not torch.equal(cu_seqlens, expected_cu_seqlens):
-                return {
-                    "success": False,
-                    "error": f"Variable lengths cu_seqlens mismatch: expected {expected_cu_seqlens}, got {cu_seqlens}",
-                }
-
-            # Test 2: Variable lengths with padding
-            (
-                packed_input_ids_pad,
-                _,
-                packed_seq_params_pad,
-                cu_seqlens_pad,
-                cu_seqlens_padded_pad,
-            ) = _pack_sequences_for_megatron(
-                input_ids,
-                seq_lengths,
-                pad_individual_seqs_to_multiple_of=4,
-                cp_rank=0,
-                cp_size=1,
-            )
-
-            # With padding to multiple of 4: [12, 3, 8, 1] -> [12, 4, 8, 4] = 28 tokens
-            expected_total_tokens_pad = 28
-            if packed_input_ids_pad.shape != (1, expected_total_tokens_pad):
-                return {
-                    "success": False,
-                    "error": f"Variable lengths padded shape mismatch: expected (1, {expected_total_tokens_pad}), got {packed_input_ids_pad.shape}",
-                }
-
-            # Verify padded cu_seqlens
-            expected_cu_seqlens_padded = torch.tensor(
-                [0, 12, 16, 24, 28], device="cuda", dtype=torch.int32
-            )
-            if not torch.equal(cu_seqlens_padded_pad, expected_cu_seqlens_padded):
-                return {
-                    "success": False,
-                    "error": f"Variable lengths padded cu_seqlens mismatch: expected {expected_cu_seqlens_padded}, got {cu_seqlens_padded_pad}",
-                }
-
-            # Verify max_seqlen
-            if packed_seq_params.max_seqlen_q != 12:
-                return {
-                    "success": False,
-                    "error": f"Variable lengths wrong max_seqlen_q: expected 12, got {packed_seq_params.max_seqlen_q}",
-                }
-
-            if packed_seq_params_pad.max_seqlen_q != 12:
-                return {
-                    "success": False,
-                    "error": f"Variable lengths padded wrong max_seqlen_q: expected 12, got {packed_seq_params_pad.max_seqlen_q}",
-                }
-
-            return {"success": True, "error": None}
-
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Variable lengths test failed: {str(e)}",
-            }
-
-    def _test_consistency(self, _pack_sequences_for_megatron):
-        """Test that packing produces consistent results and that content is preserved."""
-        try:
-            # Test parameters
-            batch_size = 2
-            seq_len = 8
-            vocab_size = 20
-
-            # Create deterministic test data
-            torch.manual_seed(123)
-            input_ids = torch.randint(
-                0, vocab_size, (batch_size, seq_len), device="cuda"
-            )
-            seq_lengths = torch.tensor([6, 4], device="cuda")
-
-            # Test consistency between multiple calls
-            (
-                packed_input_ids_1,
-                _,
-                packed_seq_params_1,
-                cu_seqlens_1,
-                cu_seqlens_padded_1,
-            ) = _pack_sequences_for_megatron(
-                input_ids, seq_lengths, cp_rank=0, cp_size=1
-            )
-
-            (
-                packed_input_ids_2,
-                _,
-                packed_seq_params_2,
-                cu_seqlens_2,
-                cu_seqlens_padded_2,
-            ) = _pack_sequences_for_megatron(
-                input_ids, seq_lengths, cp_rank=0, cp_size=1
-            )
-
-            # Verify consistency
-            if not torch.equal(packed_input_ids_1, packed_input_ids_2):
-                return {
-                    "success": False,
-                    "error": "Inconsistent packed_input_ids between calls",
-                }
-
-            if not torch.equal(cu_seqlens_1, cu_seqlens_2):
-                return {
-                    "success": False,
-                    "error": "Inconsistent cu_seqlens between calls",
-                }
-
-            # Verify content preservation
-            # Extract the first sequence (length 6) and compare with original
-            first_seq_packed = packed_input_ids_1[0, :6]
-            first_seq_original = input_ids[0, :6]
-
-            if not torch.equal(first_seq_packed, first_seq_original):
-                return {
-                    "success": False,
-                    "error": "Content not preserved in first sequence",
-                }
-
-            # Extract the second sequence (length 4) and compare with original
-            second_seq_packed = packed_input_ids_1[0, 6:10]
-            second_seq_original = input_ids[1, :4]
-
-            if not torch.equal(second_seq_packed, second_seq_original):
-                return {
-                    "success": False,
-                    "error": "Content not preserved in second sequence",
-                }
-
-            return {"success": True, "error": None}
-
-        except Exception as e:
-            return {"success": False, "error": f"Consistency test failed: {str(e)}"}
-
-    def _test_edge_cases(self, _pack_sequences_for_megatron):
-        """Test edge cases and error conditions."""
-        try:
-            # Test 1: Single sequence
-            batch_size = 1
-            seq_len = 10
-            vocab_size = 50
-
-            input_ids = torch.randint(
-                0, vocab_size, (batch_size, seq_len), device="cuda"
-            )
-            seq_lengths = torch.tensor([seq_len], device="cuda")
-
-            packed_input_ids, _, packed_seq_params, cu_seqlens, cu_seqlens_padded = (
-                _pack_sequences_for_megatron(
-                    input_ids, seq_lengths, cp_rank=0, cp_size=1
-                )
-            )
-
-            # Verify single sequence packing
-            if packed_input_ids.shape != (1, seq_len):
-                return {
-                    "success": False,
-                    "error": f"Single sequence shape mismatch: expected (1, {seq_len}), got {packed_input_ids.shape}",
-                }
-
-            expected_cu_seqlens = torch.tensor(
-                [0, seq_len], device="cuda", dtype=torch.int32
-            )
-            if not torch.equal(cu_seqlens, expected_cu_seqlens):
-                return {
-                    "success": False,
-                    "error": f"Single sequence cu_seqlens mismatch: expected {expected_cu_seqlens}, got {cu_seqlens}",
-                }
-
-            # Test 2: Empty sequences (length 0)
-            batch_size = 3
-            max_seq_len = 5
-            input_ids = torch.randint(
-                0, vocab_size, (batch_size, max_seq_len), device="cuda"
-            )
-            seq_lengths = torch.tensor([3, 0, 2], device="cuda")
-
-            packed_input_ids, _, packed_seq_params, cu_seqlens, cu_seqlens_padded = (
-                _pack_sequences_for_megatron(
-                    input_ids, seq_lengths, cp_rank=0, cp_size=1
-                )
-            )
-
-            # Should handle empty sequences gracefully
-            expected_total_tokens = 5  # 3 + 0 + 2
-            if packed_input_ids.shape != (1, expected_total_tokens):
-                return {
-                    "success": False,
-                    "error": f"Empty sequence shape mismatch: expected (1, {expected_total_tokens}), got {packed_input_ids.shape}",
-                }
-
-            expected_cu_seqlens = torch.tensor(
-                [0, 3, 3, 5], device="cuda", dtype=torch.int32
-            )
-            if not torch.equal(cu_seqlens, expected_cu_seqlens):
-                return {
-                    "success": False,
-                    "error": f"Empty sequence cu_seqlens mismatch: expected {expected_cu_seqlens}, got {cu_seqlens}",
-                }
-
-            # Test 3: Large padding values
-            batch_size = 2
-            seq_len = 4
-            input_ids = torch.randint(
-                0, vocab_size, (batch_size, seq_len), device="cuda"
-            )
-            seq_lengths = torch.tensor([3, 2], device="cuda")
-
-            packed_input_ids, _, packed_seq_params, cu_seqlens, cu_seqlens_padded = (
-                _pack_sequences_for_megatron(
-                    input_ids,
-                    seq_lengths,
-                    pad_individual_seqs_to_multiple_of=8,
-                    cp_rank=0,
-                    cp_size=1,
-                )
-            )
-
-            # With padding to multiple of 8: [3, 2] -> [8, 8] = 16 tokens
-            expected_total_tokens = 16
-            if packed_input_ids.shape != (1, expected_total_tokens):
-                return {
-                    "success": False,
-                    "error": f"Large padding shape mismatch: expected (1, {expected_total_tokens}), got {packed_input_ids.shape}",
-                }
-
-            return {"success": True, "error": None}
-
-        except Exception as e:
-            return {"success": False, "error": f"Edge cases test failed: {str(e)}"}
-
-    def _test_context_parallel(
-        self, _pack_sequences_for_megatron, _get_tokens_on_this_cp_rank, rank
-    ):
-        """Test sequence packing with context parallelism."""
-        # Test parameters
-        batch_size = 2
-        seq_len = 16  # Ensure divisible by cp_size * 2
-        vocab_size = 100
-
-        # Ensure sequence length is compatible with CP
-        if seq_len % (2 * self.cp_size) != 0:
-            seq_len = (seq_len // (2 * self.cp_size) + 1) * (2 * self.cp_size)
-
-        # Create test data
-        torch.manual_seed(42)  # For reproducibility
-        input_ids = torch.arange(seq_len * batch_size, device="cuda").reshape(
-            batch_size, seq_len
-        )
-        seq_lengths = torch.tensor([seq_len, seq_len], device="cuda")
-
-        # Test 1: CP packing with individual sequence padding
-        (
-            packed_input_ids,
-            packed_input_ids_cp_sharded,
-            packed_seq_params,
-            cu_seqlens,
-            cu_seqlens_padded,
-        ) = _pack_sequences_for_megatron(
-            input_ids,
-            seq_lengths,
-            pad_individual_seqs_to_multiple_of=self.cp_size * 2,
-            cp_rank=rank,
-            cp_size=self.cp_size,
-        )
-
-        # Verify the packed tensor shape
-        expected_tokens_per_rank = seq_len // self.cp_size
-        expected_total_tokens = batch_size * expected_tokens_per_rank
-        if packed_input_ids_cp_sharded.shape != (1, expected_total_tokens):
-            return {
-                "success": False,
-                "error": f"CP packing shape mismatch: expected (1, {expected_total_tokens}), got {packed_input_ids_cp_sharded.shape}",
-            }
-
-        # Verify cu_seqlens for original sequences
-        expected_cu_seqlens = torch.tensor(
-            [0, seq_len, seq_len * 2], device="cuda", dtype=torch.int32
-        )
-        if not torch.equal(cu_seqlens, expected_cu_seqlens):
-            return {
-                "success": False,
-                "error": f"CP cu_seqlens mismatch: expected {expected_cu_seqlens}, got {cu_seqlens}",
-            }
-
-        # Verify PackedSeqParams
-        if packed_seq_params.qkv_format != "thd":
-            return {
-                "success": False,
-                "error": f"CP wrong qkv_format: expected 'thd', got {packed_seq_params.qkv_format}",
-            }
-
-        # Test 2: CP packing with full sequence padding
-        pad_full_seq_to = (batch_size * seq_len) + 8  # Add some padding
-        (
-            packed_input_ids_full,
-            packed_input_ids_cp_sharded,
-            packed_seq_params_full,
-            cu_seqlens_full,
-            cu_seqlens_padded_full,
-        ) = _pack_sequences_for_megatron(
-            input_ids,
-            seq_lengths,
-            pad_individual_seqs_to_multiple_of=self.cp_size * 2,
-            pad_packed_seq_to=pad_full_seq_to,
-            cp_rank=rank,
-            cp_size=self.cp_size,
-        )
-
-        # Verify the packed tensor shape with full padding
-        expected_tokens_per_rank_full = pad_full_seq_to // self.cp_size
-        if packed_input_ids_cp_sharded.shape != (1, expected_tokens_per_rank_full):
-            return {
-                "success": False,
-                "error": f"CP full padding shape mismatch: expected (1, {expected_tokens_per_rank_full}), got {packed_input_ids_cp_sharded.shape}",
-            }
-
-        # Verify cu_seqlens_padded for full padding
-        expected_cu_seqlens_padded_full = torch.tensor(
-            [0, seq_len, pad_full_seq_to], device="cuda", dtype=torch.int32
-        )
-        if not torch.equal(cu_seqlens_padded_full, expected_cu_seqlens_padded_full):
-            return {
-                "success": False,
-                "error": f"CP full padding cu_seqlens_padded mismatch: expected {expected_cu_seqlens_padded_full}, got {cu_seqlens_padded_full}",
-            }
-
-        correct_ids_0 = torch.tensor(
-            [0, 1, 2, 3, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 0, 0, 0, 0, 0, 0],
-            device="cuda",
-        )
-        correct_ids_1 = torch.tensor(
-            [4, 5, 6, 7, 8, 9, 10, 11, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 0, 0],
-            device="cuda",
-        )
-
-        if (
-            rank == 0
-            and torch.sum(torch.abs(packed_input_ids_cp_sharded - correct_ids_0)).item()
-            != 0
-        ):
-            return {
-                "success": False,
-                "error": f"CP full padding ids mismatch: expected {correct_ids_0}, got {packed_input_ids_cp_sharded[0, :20]}",
-            }
-        if (
-            rank == 1
-            and torch.sum(torch.abs(packed_input_ids_cp_sharded - correct_ids_1)).item()
-            != 0
-        ):
-            return {
-                "success": False,
-                "error": f"CP full padding ids mismatch: expected {correct_ids_1}, got {packed_input_ids_cp_sharded[0, 20:]}",
-            }
-
-        return {"success": True, "error": None}
+        assert call_kwargs["mtp_enabled"] is True
 
 
 PACK_SEQUENCES_TEST_ACTOR_FQN = (
@@ -1260,6 +2739,7 @@ def pack_sequences_setup(request):
             cluster.shutdown()
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize("pack_sequences_setup", [1], indirect=True, ids=["cp1"])
 def test_pack_sequences_comprehensive(pack_sequences_setup):
     """Comprehensive test of pack sequences functionality without context parallelism."""
@@ -1284,6 +2764,7 @@ def test_pack_sequences_comprehensive(pack_sequences_setup):
                     print(f"    Error: {test_result['error']}")
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize("pack_sequences_setup", [2], indirect=True, ids=["cp2"])
 def test_pack_sequences_with_context_parallel(pack_sequences_setup):
     """Test pack sequences functionality with context parallelism."""
@@ -1311,423 +2792,95 @@ def test_pack_sequences_with_context_parallel(pack_sequences_setup):
                         print(f"    Error: {test_result['error']}")
 
 
-@ray.remote(num_gpus=1)
-class GetPackSequenceParametersTestActor:
-    def __init__(self):
-        pass
+@pytest.mark.mcore
+@pytest.mark.parametrize("cp_size", [1, 2], ids=["cp1", "cp2"])
+def test_shard_routed_experts_for_cp_matches_input_ids_zigzag(cp_size):
+    """_shard_routed_experts_for_cp selects the SAME tokens as the input_ids zigzag.
 
-    def run_all_get_pack_sequence_parameters_for_megatron_tests(self):
-        """Test _get_pack_sequence_parameters_for_megatron function with various configurations."""
-        from nemo_rl.models.megatron.data import (
-            _get_pack_sequence_parameters_for_megatron,
+    Pure CPU tensor ops: no Ray/GPU/mcore-runtime needed (the @pytest.mark.mcore
+    marker only gates that nemo_rl.models.megatron.data is importable). The routed
+    expert [.,.,0,0] channel encodes each token's packed value; after the helper
+    re-derives the per-seq padded boundaries from cu_seqlens_padded and applies the
+    same per-seq zigzag, the CP-sharded routed channel must equal the CP-sharded
+    input_ids on every layer.
+    """
+    from nemo_rl.models.megatron.data import (
+        _pack_sequences_for_megatron,
+        _shard_routed_experts_for_cp,
+    )
+
+    pad_to_multiple = cp_size * 2  # per-seq pad factor; zigzag requires 2*cp alignment
+    num_layers = 3
+    topk = 2
+    batch_size = 2
+    seq_lengths = torch.tensor([3, 5], dtype=torch.int32)
+    max_seq_len = int(seq_lengths.max())
+
+    # Encode each token's value as a unique nonzero code so the zigzag SELECTION
+    # (which source positions land on this rank) is observable. Padding stays 0.
+    input_ids = torch.zeros(batch_size, max_seq_len, dtype=torch.long)
+    routed_experts = torch.zeros(
+        batch_size, max_seq_len, num_layers, topk, dtype=torch.int32
+    )
+    for b in range(batch_size):
+        for t in range(int(seq_lengths[b])):
+            code = 100 * b + t + 1  # nonzero, unique per (b, t)
+            input_ids[b, t] = code
+            # [.,.,*,0] = the token code on every layer; [.,.,*,1] = a valid 2nd route
+            routed_experts[b, t, :, 0] = code
+            routed_experts[b, t, :, 1] = code + 1000
+
+    (
+        _all_input_ids,
+        input_ids_cp_sharded,
+        _packed_seq_params,
+        cu_seqlens,
+        cu_seqlens_padded,
+    ) = _pack_sequences_for_megatron(
+        input_ids,
+        to_cpu_int_tuple(seq_lengths),
+        pad_individual_seqs_to_multiple_of=pad_to_multiple,
+        cp_rank=0,
+        cp_size=cp_size,
+    )
+
+    (
+        routed_packed,
+        routed_cp_sharded,
+        identity_packed,
+        identity_cp_sharded,
+    ) = _shard_routed_experts_for_cp(
+        routed_experts,
+        None,
+        seq_lengths,
+        cu_seqlens,
+        cu_seqlens_padded,
+        cp_rank=0,
+        cp_size=cp_size,
+    )
+
+    # token_identity was None -> both identity outputs are None.
+    assert identity_packed is None
+    assert identity_cp_sharded is None
+
+    # (a) routed CP token axis length matches the input_ids CP token axis length.
+    assert routed_cp_sharded.shape[1] == input_ids_cp_sharded.shape[1]
+
+    # (b) the CP-sharded routed positions equal the CP-sharded input_ids positions
+    #     (identical zigzag selection) on every MoE layer.
+    for layer in range(num_layers):
+        assert torch.equal(
+            routed_cp_sharded[0, :, layer, 0].to(torch.long),
+            input_ids_cp_sharded[0].to(torch.long),
         )
 
-        # Test 1: Basic configuration - no parallelism, no FP8
-        megatron_cfg = {
-            "tensor_model_parallel_size": 1,
-            "sequence_parallel": False,
-            "pipeline_model_parallel_size": 1,
-            "context_parallel_size": 1,
-        }
-        max_seq_len = 1023
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        if pad_individual != 1 or pad_packed != 1 or pad_to is not None:
-            return {
-                "success": False,
-                "error": f"Expected pad_individual=1, pad_packed=1, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        # Test 2: Context parallelism only
-        megatron_cfg = {
-            "tensor_model_parallel_size": 1,
-            "sequence_parallel": False,
-            "pipeline_model_parallel_size": 1,
-            "context_parallel_size": 4,
-        }
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        if pad_individual != 4 * 2 or pad_packed != 1 or pad_to is not None:
-            return {
-                "success": False,
-                "error": f"Expected pad_individual=4*2, pad_packed=1, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        # Test 3: Tensor parallelism with sequence parallelism
-        megatron_cfg = {
-            "tensor_model_parallel_size": 2,
-            "sequence_parallel": True,
-            "pipeline_model_parallel_size": 1,
-            "context_parallel_size": 1,
-        }
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        expected_individual = 2  # tp_size when SP is enabled
-        if pad_individual != 2 or pad_packed != 1 or pad_to is not None:
-            return {
-                "success": False,
-                "error": f"Expected pad_individual=2, pad_packed=1, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        # Test 4: Tensor parallelism without sequence parallelism
-        megatron_cfg = {
-            "tensor_model_parallel_size": 2,
-            "sequence_parallel": False,
-            "pipeline_model_parallel_size": 1,
-            "context_parallel_size": 1,
-        }
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        if pad_individual != 1 or pad_packed != 1 or pad_to is not None:
-            return {
-                "success": False,
-                "error": f"Expected pad_individual=1, pad_packed=1, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        # Test 5: Pipeline parallelism
-        megatron_cfg = {
-            "tensor_model_parallel_size": 1,
-            "sequence_parallel": False,
-            "pipeline_model_parallel_size": 4,
-            "context_parallel_size": 1,
-        }
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        if pad_individual != 1 or pad_packed != 1 or pad_to != max_seq_len:
-            return {
-                "success": False,
-                "error": f"Expected pad_individual=1, pad_packed=1, pad_to={max_seq_len}, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        # Test 6: Combined CP and TP with SP
-        megatron_cfg = {
-            "tensor_model_parallel_size": 2,
-            "sequence_parallel": True,
-            "pipeline_model_parallel_size": 1,
-            "context_parallel_size": 4,
-        }
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        expected_individual = 4 * 2 * 2  # cp_size * 2 * tp_size
-        if (
-            pad_individual != expected_individual
-            or pad_packed != 1
-            or pad_to is not None
-        ):
-            return {
-                "success": False,
-                "error": f"Expected pad_individual={expected_individual}, pad_packed=1, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        # Test 7: FP8 enabled with default recipe
-        megatron_cfg = {
-            "tensor_model_parallel_size": 1,
-            "sequence_parallel": False,
-            "pipeline_model_parallel_size": 1,
-            "context_parallel_size": 1,
-            "fp8_cfg": {
-                "enabled": True,
-                "fp8": "hybrid",
-                "fp8_recipe": "tensorwise",
-                "fp8_param": False,
-            },
-        }
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        if pad_individual != 1 or pad_packed != 16 or pad_to is not None:
-            return {
-                "success": False,
-                "error": f"Expected pad_individual=1, pad_packed=16, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        # Test 8: FP8 enabled with blockwise recipe
-        megatron_cfg = {
-            "tensor_model_parallel_size": 1,
-            "sequence_parallel": False,
-            "pipeline_model_parallel_size": 1,
-            "context_parallel_size": 1,
-            "fp8_cfg": {
-                "enabled": True,
-                "fp8": "e4m3",
-                "fp8_recipe": "blockwise",
-                "fp8_param": False,
-            },
-        }
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        if pad_individual != 1 or pad_packed != 128 or pad_to is not None:
-            return {
-                "success": False,
-                "error": f"Expected pad_individual=1, pad_packed=128, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        # Test 9: FP8 with CP and TP+SP
-        megatron_cfg = {
-            "tensor_model_parallel_size": 2,
-            "sequence_parallel": True,
-            "pipeline_model_parallel_size": 1,
-            "context_parallel_size": 4,
-            "fp8_cfg": {
-                "enabled": True,
-                "fp8": "e4m3",
-                "fp8_recipe": "blockwise",
-                "fp8_param": False,
-            },
-        }
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        expected_individual = 4 * 2 * 2  # cp_size * 2 * tp_size
-        expected_packed = 128 * 4 * 2 * 2  # divisor * cp_size * 2 * tp_size
-        if (
-            pad_individual != expected_individual
-            or pad_packed != expected_packed
-            or pad_to is not None
-        ):
-            return {
-                "success": False,
-                "error": f"Expected pad_individual={expected_individual}, pad_packed={expected_packed}, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        # Test 10: All parallelism types with FP8 and PP
-        megatron_cfg = {
-            "tensor_model_parallel_size": 2,
-            "sequence_parallel": True,
-            "pipeline_model_parallel_size": 4,
-            "context_parallel_size": 2,
-            "fp8_cfg": {
-                "enabled": True,
-                "fp8": "hybrid",
-                "fp8_recipe": "tensorwise",
-                "fp8_param": False,
-            },
-        }
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        expected_individual = 2 * 2 * 2  # cp_size * 2 * tp_size
-        expected_packed = 16 * 2 * 2 * 2  # divisor * cp_size * 2 * tp_size
-
-        def _round_up_to_multiple_of(x, y):
-            return (x + y - 1) // y * y
-
-        if (
-            pad_individual != expected_individual
-            or pad_packed != expected_packed
-            or pad_to != _round_up_to_multiple_of(max_seq_len, expected_packed)
-        ):
-            return {
-                "success": False,
-                "error": f"Expected pad_individual={expected_individual}, pad_packed={expected_packed}, pad_to={max_seq_len}, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        # Test 11: FP8 disabled explicitly
-        megatron_cfg = {
-            "tensor_model_parallel_size": 1,
-            "sequence_parallel": False,
-            "pipeline_model_parallel_size": 1,
-            "context_parallel_size": 1,
-            "fp8_cfg": {
-                "enabled": False,
-                "fp8": "e4m3",
-                "fp8_recipe": "blockwise",
-                "fp8_param": False,
-            },
-        }
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        if pad_individual != 1 or pad_packed != 1 or pad_to is not None:
-            return {
-                "success": False,
-                "error": f"Expected pad_individual=1, pad_packed=1, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        # Test 12: Missing fp8_cfg (should default to disabled)
-        megatron_cfg = {
-            "tensor_model_parallel_size": 1,
-            "sequence_parallel": False,
-            "pipeline_model_parallel_size": 1,
-            "context_parallel_size": 1,
-            # No fp8_cfg key
-        }
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        if pad_individual != 1 or pad_packed != 1 or pad_to is not None:
-            return {
-                "success": False,
-                "error": f"Expected pad_individual=1, pad_packed=1, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        # Test 13: Edge case - very large parallelism values
-        megatron_cfg = {
-            "tensor_model_parallel_size": 8,
-            "sequence_parallel": True,
-            "pipeline_model_parallel_size": 1,
-            "context_parallel_size": 8,
-            "fp8_cfg": {
-                "enabled": True,
-                "fp8": "e4m3",
-                "fp8_recipe": "blockwise",
-                "fp8_param": False,
-            },
-        }
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        expected_individual = 8 * 2 * 8  # cp_size * 2 * tp_size = 128
-        expected_packed = 128 * 8 * 2 * 8  # divisor * cp_size * 2 * tp_size = 16384
-        if (
-            pad_individual != expected_individual
-            or pad_packed != expected_packed
-            or pad_to is not None
-        ):
-            return {
-                "success": False,
-                "error": f"Expected pad_individual={expected_individual}, pad_packed={expected_packed}, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        # Test 14: Edge case - different max_seq_len values with PP
-        for test_seq_len in [512, 2048, 4096]:
-            megatron_cfg = {
-                "tensor_model_parallel_size": 1,
-                "sequence_parallel": False,
-                "pipeline_model_parallel_size": 2,
-                "context_parallel_size": 1,
-            }
-
-            pad_individual, pad_packed, pad_to = (
-                _get_pack_sequence_parameters_for_megatron(megatron_cfg, test_seq_len)
-            )
-
-            if pad_individual != 1 or pad_packed != 1 or pad_to != test_seq_len:
-                return {
-                    "success": False,
-                    "error": f"Expected pad_individual=1, pad_packed=1, pad_to={test_seq_len}, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-                }
-
-        # Test 15: FP8 with MXFP8 recipe
-        megatron_cfg = {
-            "tensor_model_parallel_size": 1,
-            "sequence_parallel": False,
-            "pipeline_model_parallel_size": 1,
-            "context_parallel_size": 1,
-            "fp8_cfg": {
-                "enabled": True,
-                "fp8": "e4m3",
-                "fp8_recipe": "mxfp8",
-                "fp8_param": False,
-            },
-        }
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        if pad_individual != 1 or pad_packed != 32 or pad_to is not None:
-            return {
-                "success": False,
-                "error": f"Expected pad_individual=1, pad_packed=32, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        # Test 16: FP8 with MXFP8 recipe, CP, and TP+SP
-        megatron_cfg = {
-            "tensor_model_parallel_size": 2,
-            "sequence_parallel": True,
-            "pipeline_model_parallel_size": 1,
-            "context_parallel_size": 4,
-            "fp8_cfg": {
-                "enabled": True,
-                "fp8": "e4m3",
-                "fp8_recipe": "mxfp8",
-                "fp8_param": False,
-            },
-        }
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        expected_individual = 4 * 2 * 2  # cp_size * 2 * tp_size
-        expected_packed = 32 * 4 * 2 * 2  # divisor * cp_size * 2 * tp_size
-
-        if (
-            pad_individual != expected_individual
-            or pad_packed != expected_packed
-            or pad_to is not None
-        ):
-            return {
-                "success": False,
-                "error": f"Expected pad_individual={expected_individual}, pad_packed={expected_packed}, pad_to=None, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        # Test 17: FP8 with MXFP8 recipe, CP, TP+SP, and PP
-        megatron_cfg = {
-            "tensor_model_parallel_size": 2,
-            "sequence_parallel": True,
-            "pipeline_model_parallel_size": 4,
-            "context_parallel_size": 4,
-            "fp8_cfg": {
-                "enabled": True,
-                "fp8": "e4m3",
-                "fp8_recipe": "mxfp8",
-                "fp8_param": False,
-            },
-        }
-
-        pad_individual, pad_packed, pad_to = _get_pack_sequence_parameters_for_megatron(
-            megatron_cfg, max_seq_len
-        )
-
-        expected_individual = 4 * 2 * 2  # cp_size * 2 * tp_size
-        expected_packed = 32 * 4 * 2 * 2  # divisor * cp_size * 2 * tp_size * pp_size
-
-        if (
-            pad_individual != expected_individual
-            or pad_packed != expected_packed
-            or pad_to != _round_up_to_multiple_of(max_seq_len, expected_packed)
-        ):
-            return {
-                "success": False,
-                "error": f"Expected pad_individual={expected_individual}, pad_packed={expected_packed}, pad_to={max_seq_len}, got pad_individual={pad_individual}, pad_packed={pad_packed}, pad_to={pad_to}",
-            }
-
-        return {"success": True, "error": None}
+    # (c) pad rows in the packed (pre-shard) routed buffer are arange(topk).
+    #     seq 0 has length 3 padded to pad_to_multiple, so any trailing rows are pads.
+    expected_route = torch.arange(topk, dtype=routed_packed.dtype)
+    seq0_padded_len = int(cu_seqlens_padded[1] - cu_seqlens_padded[0])
+    for pad_pos in range(int(seq_lengths[0]), seq0_padded_len):
+        for layer in range(num_layers):
+            assert torch.equal(routed_packed[0, pad_pos, layer], expected_route)
 
 
 GET_PACK_SEQUENCE_PARAMETERS_TEST_ACTOR_FQN = f"{GetPackSequenceParametersTestActor.__module__}.GetPackSequenceParametersTestActor"
@@ -1813,6 +2966,7 @@ def get_pack_sequence_parameters_setup(request):
             cluster.shutdown()
 
 
+@pytest.mark.mcore
 @pytest.mark.parametrize(
     "get_pack_sequence_parameters_setup", [1], indirect=True, ids=["cp1"]
 )
@@ -1820,12 +2974,16 @@ def test_get_pack_sequence_parameters_for_megatron(get_pack_sequence_parameters_
     """Comprehensive test of pack sequences functionality without context parallelism."""
     worker_group = get_pack_sequence_parameters_setup
 
-    # Run all tests in a single call to the actor
-    futures = worker_group.run_all_workers_single_data(
-        "run_all_get_pack_sequence_parameters_for_megatron_tests"
-    )
-    results = ray.get(futures)
+    for test_name in [
+        "run_all_get_pack_sequence_parameters_for_megatron_tests",
+        "run_all_get_pack_sequence_parameters_for_megatron_fp8_tests",
+        "run_all_get_pack_sequence_parameters_for_megatron_fp4_tests",
+        "run_all_get_pack_sequence_parameters_for_megatron_hybridep_tests",
+    ]:
+        # Run all tests in a single call to the actor
+        futures = worker_group.run_all_workers_single_data(test_name)
+        results = ray.get(futures)
 
-    # Check that all workers succeeded
-    for i, result in enumerate(results):
-        assert result["success"], f"Worker {i} failed: {result['error']}"
+        # Check that all workers succeeded
+        for i, result in enumerate(results):
+            assert result["success"], f"Worker {i} failed: {result['error']}"

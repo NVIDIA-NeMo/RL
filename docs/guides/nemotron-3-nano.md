@@ -1,6 +1,14 @@
+---
+orphan: true
+---
+
 # Nemotron 3 Nano
 
+> **Note:** This document has moved and will be deprecated here. See the new location: https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/models/nemotron/nemotron-3-nano.md
+
 This guide explains how to post-train the [Nemotron 3 Nano model](https://research.nvidia.com/labs/nemotron/files/NVIDIA-Nemotron-3-Nano-Technical-Report.pdf) using NeMo RL.
+
+**Note:** vLLM versions prior to 0.17.0 have a bug that causes logprob values to diverge between vLLM and Megatron for certain sequences, which can lead to training instability. To work around this, the recipe below sets `seq_logprob_error_threshold: 2` to mask out sequences where the logprob mismatch exceeds the threshold. This bug is fixed in vLLM 0.17.0 and will be incorporated in the Nemotron 3 Ultra release.
 
 ## Download and prepare the data
 
@@ -18,10 +26,9 @@ tail -n 1000 data/train-full.jsonl > data/val-split.jsonl
 ```
 
 ## Prepare the code
-Note that we currently require using the `nano-v3` branch to train Nemotron 3 Nano.
 ```bash
 # Checkout NeMo RL
-git clone -b nano-v3 https://github.com/NVIDIA-NeMo/RL.git
+git clone https://github.com/NVIDIA-NeMo/RL.git
 cd RL
 
 # Initialize the submodules

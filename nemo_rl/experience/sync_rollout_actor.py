@@ -1,0 +1,461 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Sync GRPO rollout actor — sibling of ``async_utils``.
+
+Houses :class:`SyncRolloutActor`, the Ray actor that owns the multi-turn
+rollout loop and post-rollout flattening and masking for a sync GRPO step.
+The driver dispatches a per-step prompt batch; the actor runs ``run_multi_turn_rollout``
+(or async / nemo_gym variants), then writes the bulk schema to TQ via
+:func:`nemo_rl.data_plane.column_io.kv_first_write`. Only a ``KVBatchMeta``
+and a small per-sample ``driver_carry`` dict (rewards, masks, lengths)
+cross back to the driver via Ray. The driver computes reward shaping and
+baseline/std. Prompt-group identities travel
+with the metadata tags.
+
+**Goal — rollout 1-hop put**: bulk tensors (input_ids, output_ids,
+attention_mask, position_ids, multi_modal_inputs, generation_logprobs,
+token_mask) stay actor-side until ``put_samples``, then live only in
+TQ. Driver never holds these bytes between rollout finish and train
+fan-out.
+
+The actor is the sync counterpart to
+:class:`nemo_rl.algorithms.async_utils.AsyncTrajectoryCollector`. It
+intentionally does not buffer or stream — sync GRPO consumes the whole
+step batch in one call.
+"""
+
+from __future__ import annotations
+
+import uuid
+from typing import Any, Optional
+
+import numpy as np
+import ray
+import torch
+
+from nemo_rl.data.multimodal_utils import (
+    encode_multimodal_for_wire,
+    multimodal_row_tags,
+)
+from nemo_rl.data_plane.column_io import kv_first_write
+from nemo_rl.data_plane.interfaces import KVBatchMeta
+from nemo_rl.data_plane.observability import is_metrics_client
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTED_EXPERTS_FIELD
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.experience.rollouts import (
+    EffortLevelsConfig,
+    get_nemo_gym_thinking_tags,
+    run_async_multi_turn_rollout,
+    run_multi_turn_rollout,
+    run_nemo_gym_rollout_sync,
+    should_mask_flagged_samples,
+)
+from nemo_rl.models.generation.interfaces import GenerationInterface
+from nemo_rl.utils.logger import should_log_nemo_gym_full_result_tables
+from nemo_rl.utils.r3_trace import trace_rollout_payload
+
+# Carry keys producible by the rollout actor only when the caller opts in.
+# These are np.ndarray(object) per-row arrays from decompose_message_log; the
+# default driver_carry omits them because BatchedDataDict.select_indices on
+# the training/dynamic-sampling path only handles tensors/lists. Validation
+# requests them explicitly to print per-sample message logs.
+OPT_IN_CARRY_KEYS: tuple[str, ...] = ("turn_roles", "turn_contents")
+
+
+def _flatten_rollout_message_log_for_tq(
+    message_logs: list[Any],
+    *,
+    pad_token_id: int,
+    make_sequence_length_divisible_by: int,
+    per_token_multimodal_fields: tuple[str, ...] = (),
+) -> tuple[BatchedDataDict[Any], torch.Tensor]:
+    """Prepare rollout message logs for the TQ payload and driver carry."""
+    # Deferred to avoid the grpo -> sync_rollout_actor import cycle.
+    from nemo_rl.algorithms.grpo import (
+        add_grpo_token_loss_masks_and_generation_logprobs,
+    )
+    from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
+    from nemo_rl.experience.rollouts import backfill_missing_routed_experts
+
+    pad = {"pad_value_dict": {"token_ids": pad_token_id}}
+    backfill_missing_routed_experts(message_logs)
+
+    add_grpo_token_loss_masks_and_generation_logprobs(
+        message_logs, per_token_multimodal_fields
+    )
+    flat, input_lengths = batched_message_log_to_flat_message(
+        message_logs,
+        **pad,
+        make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+    )
+    return flat, input_lengths
+
+
+@ray.remote  # pragma: no cover
+class SyncRolloutActor:
+    """Per-step rollout dispatcher.
+
+    Runs: rollout + flatten + mask + TQ put.
+    Returns ``(meta, driver_carry, rollout_metrics, gen_metrics)``.
+
+    Lifecycle: one instance per ``grpo_train_sync`` invocation. The driver
+    instantiates with the same handles it would normally pass to
+    ``run_multi_turn_rollout`` plus the data-plane config so the actor
+    can attach as a TQ client (``bootstrap=False`` — controller is
+    bootstrapped on the driver via ``TQPolicy``).
+    """
+
+    def __init__(
+        self,
+        policy_generation: GenerationInterface,
+        tokenizer: Any,
+        task_to_env: dict[str, EnvironmentInterface],
+        master_config: Any,
+        dp_cfg: dict[str, Any],
+        per_token_multimodal_fields: tuple[str, ...] = (),
+    ) -> None:
+        self.per_token_multimodal_fields = per_token_multimodal_fields
+        self.policy_generation = policy_generation
+        self.tokenizer = tokenizer
+        self.task_to_env = task_to_env
+        self.master_config = master_config
+
+        from nemo_rl.data_plane import build_data_plane_client
+
+        self._dp_client = build_data_plane_client(dp_cfg, bootstrap=False)
+
+    def rollout_to_tq(
+        self,
+        input_batch: BatchedDataDict[Any],
+        *,
+        partition_id: str,
+        group_size: int = 1,
+        first_iter: bool = True,
+        finish_generation: bool = True,
+        task_to_env_override: Optional[dict[str, EnvironmentInterface]] = None,
+        carry_keys: Optional[list[str]] = None,
+        apply_length_penalty: bool = False,
+    ) -> tuple[
+        KVBatchMeta,
+        dict[str, Any],
+        dict[str, Any],
+        Optional[dict[str, Any]],
+    ]:
+        """Run the full per-step generation cycle and write bulk data to TQ.
+
+        Bundles six steps into one Ray round-trip so the driver only sees
+        a single RPC instead of separate calls for each:
+
+        1. **Reset metrics** — ``policy_generation.clear_logger_metrics()``
+           clears per-step generation accumulators before the rollout.
+        2. **Rollout** — runs ``run_multi_turn_rollout`` (or the async /
+           nemo-gym variants) to produce ``final_batch``.
+        3. **Flatten + mask** — converts
+           ``message_log`` layout to flat tensors; builds token mask,
+           sample mask. The driver computes baseline/std using group tags.
+        4. **Write bulk to TQ** — ``kv_first_write`` puts every tensor
+           field in one flat ``put_samples``; the driver never touches
+           bulk bytes.
+        5. **Release GPU** — ``policy_generation.finish_generation()``
+           frees KV cache and inference state so the trainer can use the
+           GPU immediately.
+        6. **Capture metrics** — ``policy_generation.get_logger_metrics()``
+           collects generation stats (throughput, etc.) and returns them
+           to the driver in the result tuple.
+
+        The driver receives ``(meta, driver_carry, rollout_metrics,
+        generation_logger_metrics)`` and uses ``driver_carry`` for its
+        own per-row compute (rewards, advantages, dynamic sampling).
+
+        Args:
+            input_batch: Per-step prompt batch (already repeat-interleaved).
+            partition_id: TQ partition target.
+            group_size: Rollouts per original prompt. One uid is minted
+                per prompt; bulk keys are ``f"{uid}_g{i}"`` where ``i``
+                ranges over the per-prompt expansion (group × rollout
+                turns). Train passes ``num_generations_per_prompt``; val
+                passes ``1``.
+            first_iter: True on the first DS iteration of a step; drives
+                ``policy_generation.snapshot_step_metrics()`` so per-step
+                metrics align with the legacy ``grpo.grpo_train`` path.
+            finish_generation: Call ``policy_generation.finish_generation()``
+                at the tail. Default ``True`` matches the training step
+                (one rollout per step, release KV after). Validation sets
+                ``False`` so inference state survives across val batches;
+                the trainer owns the explicit ``finish_generation()`` call
+                at the end of the val pass.
+            task_to_env_override: Per-call task → env map. ``None`` uses
+                ``self.task_to_env`` (training envs supplied at construction).
+                Validation passes ``val_task_to_env`` here so val rollouts
+                run against the val env set without rebuilding the actor.
+            carry_keys: Names of per-row tensors to return in
+                ``driver_carry``. ``None`` returns every available key
+                (training uses this). Validation passes a slim list
+                (e.g. ``["total_reward"]``) to avoid wasting Ray transfer
+                on fields it doesn't consume.
+            apply_length_penalty: Forward ``grpo.length_penalty`` to the
+                NeMo-Gym rollout so training rewards get the per-prompt-group
+                length adjustments. Training passes ``True``; validation
+                keeps the default so val metrics stay on the raw env reward.
+
+        Returns:
+            ``(meta, driver_carry, rollout_metrics, generation_logger_metrics)``
+            where ``driver_carry`` is a per-row dict of tensors the driver
+            uses for compute (rewards, masks, lengths, …). Bulk tensors stay in TQ.
+        """
+        # Lazy imports keep rollout-specific dependencies off the actor startup path.
+        # ``_policy_dtype`` sizes the VLM pixel tensors below.
+        from nemo_rl.algorithms.grpo import _dynamic_sampling_valid_mask, _policy_dtype
+        from nemo_rl.algorithms.utils import get_gdpo_reward_component_keys
+        from nemo_rl.data.llm_message_utils import decompose_message_log
+        from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+        from nemo_rl.models.generation.interfaces import should_use_async_rollouts
+
+        # Per-step generation-side metric hooks: snapshot once on the
+        # first DS iter so backends with per-step deltas have a stable
+        # anchor; clear accumulators before every rollout. Mirrors
+        # legacy ``grpo_train``.
+        if self.policy_generation is not None:
+            if first_iter and hasattr(self.policy_generation, "snapshot_step_metrics"):
+                self.policy_generation.snapshot_step_metrics()
+            self.policy_generation.clear_logger_metrics()
+
+        cfg = self.master_config
+        task_to_env = (
+            task_to_env_override
+            if task_to_env_override is not None
+            else self.task_to_env
+        )
+        common = dict(
+            policy_generation=self.policy_generation,
+            input_batch=input_batch,
+            tokenizer=self.tokenizer,
+            task_to_env=task_to_env,
+            greedy=False,
+        )
+
+        # Rollout dispatch (mirrors grpo_sync.py:294-349).
+        if should_use_nemo_gym(cfg):
+            r = run_nemo_gym_rollout_sync(
+                **common,
+                max_seq_len=None,
+                max_rollout_turns=None,
+                generation_config=cfg.policy["generation"],
+                num_generations_per_prompt=group_size,
+                log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                    wandb_enabled=cfg.logger.wandb_enabled,
+                    wandb_config=cfg.logger.wandb,
+                ),
+                effort_config=EffortLevelsConfig.model_validate(
+                    cfg.env["nemo_gym"].get("effort_levels")
+                )
+                if "nemo_gym" in cfg.env
+                and cfg.env["nemo_gym"].get("effort_levels") is not None
+                else None,
+                reward_penalty_config=cfg.reward_penalties,
+                length_penalty_config=(
+                    cfg.grpo.length_penalty if apply_length_penalty else None
+                ),
+                thinking_tags=get_nemo_gym_thinking_tags(cfg.env),
+                # Honour env.should_mask_flagged_samples as the other trainers
+                # do: the driver zeroes the loss weight of every mask_sample
+                # row this actor carries, so the flag must gate the carry.
+                mask_env_flagged_samples=should_mask_flagged_samples(cfg.env),
+                deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
+                debug_payload_metrics=cfg.grpo.debug_payload_metrics,
+            )
+            final_batch, rollout_metrics = r.final_batch, r.rollout_metrics
+        else:
+            runner = (
+                run_async_multi_turn_rollout
+                if should_use_async_rollouts(cfg.policy["generation"])
+                else run_multi_turn_rollout
+            )
+            final_batch, rollout_metrics = runner(
+                **common,
+                max_seq_len=cfg.policy["max_total_sequence_length"],
+                max_rollout_turns=cfg.grpo.max_rollout_turns,
+                deduplicate_multimodal_data=cfg.grpo.deduplicate_multimodal_data,
+            )
+        fb = final_batch.to("cpu")
+        del final_batch
+
+        # Measure generated turns before flattening backfills generation_logprobs
+        # on prompt history. These decomposed fields are only for driver_carry.
+        decomposed = decompose_message_log(fb["message_log"])
+
+        # Flatten message_log → bulk tensors.
+        # GRPO masks only generated assistant turns, even if the dataset
+        # prompt itself contains assistant messages as conversation history.
+        flat, input_lengths = _flatten_rollout_message_log_for_tq(
+            fb["message_log"],
+            pad_token_id=self.tokenizer.pad_token_id,
+            make_sequence_length_divisible_by=cfg.policy[
+                "make_sequence_length_divisible_by"
+            ],
+            per_token_multimodal_fields=self.per_token_multimodal_fields,
+        )
+
+        router_replay_enabled = bool(
+            (cfg.policy.get("router_replay") or {}).get("enabled", False)
+        )
+        if router_replay_enabled and ROUTED_EXPERTS_FIELD not in flat:
+            raise RuntimeError(
+                "policy.router_replay.enabled=true requires routed_experts in "
+                "the rollout bulk payload, but rollout flattening did not "
+                "produce that field. Check vLLM routed-expert capture and the "
+                "message-log flattening path."
+            )
+
+        # TQ bulk payload — DP_TRAIN_FIELDS + multimodal extras.
+        bulk_batch = BatchedDataDict[Any](
+            {
+                "input_ids": flat["token_ids"],
+                "input_lengths": input_lengths,
+                "generation_logprobs": flat["generation_logprobs"],
+                "token_mask": flat["token_loss_mask"],
+                # Read only by the worker logprob passes, which zero logprobs
+                # outside token_mask * sample_mask under top-k/top-p filtering:
+                # the rows that vote in the advantage statistics under
+                # grpo.masked_reward_policy keep real logprobs. The loss weights
+                # travel in driver_carry; the driver writes the final training
+                # sample_mask back after computing advantages.
+                "sample_mask": _dynamic_sampling_valid_mask(fb, cfg.grpo),
+            }
+        )
+        if ROUTED_EXPERTS_FIELD in flat:
+            bulk_batch[ROUTED_EXPERTS_FIELD] = flat[ROUTED_EXPERTS_FIELD]
+        # ``pixel_dtype`` mirrors the legacy analogs (``grpo._build_async_grpo_train_data``
+        # and the sync train-data builders): cast pixels to the policy precision
+        # once here, at the same point they'd be cast in-memory. No worker
+        # re-applies it, so without this the largest column crosses the wire in
+        # fp32 where legacy shipped bf16. ``PackedTensor.to_dtype`` leaves
+        # integer segments (grid_thw / imgs_sizes / num_frames) untouched.
+        multimodal = flat.get_multimodal_dict(
+            as_tensors=False, pixel_dtype=_policy_dtype(cfg.policy)
+        )
+        for k, v in multimodal.items():
+            wire_value = encode_multimodal_for_wire(k, v)
+            if wire_value is not None:
+                bulk_batch[k] = wire_value
+        # ``content`` (raw assistant text per sample) — rides TQ as a
+        # NonTensorStack so the driver can fetch it back at jsonl time
+        # (kv_first_write wraps it via NonTensorStack).
+        if "content" in flat:
+            bulk_batch["content"] = np.asarray(flat["content"], dtype=object)
+
+        # Slice — only what the driver can't derive from a TQ slice fetch
+        # (anything containing `message_log` or per-token data would
+        # force a fetch). Driver does scale_rewards / reward_shaping /
+        # overlong filtering / baseline-std on this slice.
+        truncated = fb["truncated"]
+        if not isinstance(truncated, torch.Tensor):
+            truncated = torch.tensor(truncated, dtype=torch.bool)
+        length = fb.get("length", input_lengths)
+        if not isinstance(length, torch.Tensor):
+            length = torch.tensor(length)
+        driver_carry = {
+            "total_reward": fb["total_reward"],
+            "loss_multiplier": fb["loss_multiplier"],
+            "truncated": truncated,
+            "length": length,
+            "input_lengths": input_lengths,
+            # Computed by decompose_message_log above; feeds
+            # apply_reward_shaping on the driver without a TQ fetch.
+            "response_token_lengths": decomposed["response_token_lengths"],
+        }
+        for key in ("agent_ref", "attribution_key"):
+            if key in fb:
+                driver_carry[key] = fb[key]
+        # Pre-length-penalty env reward (present only when grpo.length_penalty
+        # ran); feeds the driver's baseline_reward/pct_* diagnostics.
+        if "env_reward" in fb:
+            driver_carry["env_reward"] = fb["env_reward"]
+        if "mask_sample" in fb:
+            driver_carry["mask_sample"] = torch.as_tensor(
+                fb["mask_sample"], dtype=torch.bool
+            )
+        # GDPO multi-reward components: scale_rewards iterates these
+        # keys driver-side and the GDPO advantage estimator reads them
+        # from ``adv_inputs``. Plumb them through ``driver_carry``
+        # rather than forcing a separate TQ fetch.
+        for k in get_gdpo_reward_component_keys(fb):
+            driver_carry[k] = fb[k]
+        if carry_keys is not None:
+            for k in OPT_IN_CARRY_KEYS:
+                if k in carry_keys:
+                    driver_carry[k] = decomposed[k]
+            missing = set(carry_keys) - driver_carry.keys()
+            if missing:
+                raise KeyError(
+                    f"rollout_to_tq: carry_keys {sorted(missing)} not produced; "
+                    f"valid keys: {sorted(driver_carry)}"
+                )
+            driver_carry = {k: driver_carry[k] for k in carry_keys}
+
+        n_samples = int(bulk_batch["sample_mask"].shape[0])
+        input_size = int(input_batch.size)
+        if group_size <= 0 or input_size % group_size != 0:
+            raise ValueError(
+                f"input_batch.size={input_size} is not divisible by group_size={group_size}"
+            )
+        n_prompts = input_size // group_size
+        if n_prompts == 0 or n_samples % n_prompts != 0:
+            raise ValueError(
+                f"bulk_batch has {n_samples} samples; not divisible by n_prompts={n_prompts}"
+            )
+        n_per_prompt = n_samples // n_prompts
+        uids = [str(uuid.uuid4()) for _ in range(n_prompts)]
+        sample_ids = [f"{uid}_g{i}" for uid in uids for i in range(n_per_prompt)]
+        tags = multimodal_row_tags(multimodal, len(sample_ids))
+        if tags is None:
+            tags = [{} for _ in sample_ids]
+        for tag, uid in zip(tags, (uid for uid in uids for _ in range(n_per_prompt))):
+            tag[GROUP_ID_TAG] = uid
+        trace_rollout_payload(keys=sample_ids, data=bulk_batch)
+        meta = kv_first_write(
+            bulk_batch,
+            sample_ids=sample_ids,
+            dp_client=self._dp_client,
+            partition_id=partition_id,
+            extra_info={"rollout_metrics": rollout_metrics},
+            # Per-row shapes the flattening removes from the payload. ``tags``
+            # is the transport's per-sample channel and is projected with the
+            # rows, so no consumer re-keys them.
+            tags=tags,
+            task_name=partition_id,
+            pad_to_multiple=int(
+                cfg.policy.get("make_sequence_length_divisible_by") or 1
+            ),
+        )
+
+        if self.policy_generation is not None:
+            if finish_generation:
+                self.policy_generation.finish_generation()
+            gen_metrics = self.policy_generation.get_logger_metrics()
+        else:
+            gen_metrics = None
+        return meta, BatchedDataDict(driver_carry), rollout_metrics, gen_metrics
+
+    def get_data_plane_snapshot(self) -> "dict[str, Any] | None":
+        if not is_metrics_client(self._dp_client):
+            return None
+        return self._dp_client.snapshot(reset_step_window=True)
+
+    def shutdown(self) -> None:
+        try:
+            self._dp_client.close()
+        except Exception:
+            pass

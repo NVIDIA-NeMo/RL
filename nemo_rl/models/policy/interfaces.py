@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,19 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from abc import ABC, abstractmethod
-from typing import Any, Optional, TypedDict
+from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
 import ray
 import torch
 
-from nemo_rl.algorithms.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.utils.timer import Timer
 
+if TYPE_CHECKING:
+    from nemo_rl.models.policy import PolicyConfig
+
 
 class LogprobOutputSpec(TypedDict):
-    """logprobs: Tensor of log probabilities."""
+    """Token log probabilities; filtered unsupported tokens retain -inf."""
 
     logprobs: torch.Tensor
 
@@ -48,6 +51,21 @@ class TopkLogitsOutputSpec(TypedDict):
     topk_indices: torch.Tensor
 
 
+class TeacherFullPayloadOutputSpec(TypedDict):
+    """Sampled-token logprobs plus the full-vocabulary MOPD teacher payload.
+
+    ``teacher_full_payload`` is ``[B, S, hidden_size]`` or ``[B, S, vocab_size]``
+    depending on ``on_policy_distillation.full.teacher_payload``. It is ``None``
+    off the last pipeline stage: the payload is far too large to broadcast, so
+    only the stage that produced it writes it back. It comes back on CPU --
+    each microbatch is moved off the device inside the forward schedule, which
+    is what bounds the resident payload to one microbatch.
+    """
+
+    logprobs: torch.Tensor
+    teacher_full_payload: Optional[torch.Tensor]
+
+
 class PolicyInterface(ABC):
     """Abstract base class defining the interface for RL policies."""
 
@@ -64,7 +82,7 @@ class PolicyInterface(ABC):
 
         Returns:
             BatchedDataDict containing:
-                - logprobs: Tensor of logprobs of actions
+                - ``logprobs``: Tensor of logprobs of actions
         """
         pass
 
@@ -82,7 +100,7 @@ class PolicyInterface(ABC):
 
         Returns:
             BatchedDataDict containing:
-                - logprobs: Tensor of logprobs of actions
+                - ``logprobs``: Tensor of logprobs of actions
         """
         pass
 
@@ -164,10 +182,24 @@ class PolicyInterface(ABC):
 
 
 class ColocatablePolicyInterface(PolicyInterface):
+    cfg: "PolicyConfig"
+
     @abstractmethod
     def init_collective(
-        self, ip: str, port: int, world_size: int, *, train_world_size: int
+        self,
+        ip: str,
+        port: int,
+        world_size: int,
+        *,
+        train_world_size: int,
+        rank_offset: int = 0,
+        nccl_peer: str = "nemo",
     ) -> list[ray.ObjectRef]:
+        pass
+
+    @abstractmethod
+    def sync_params_before_refit(self) -> None:
+        """Materialize the latest policy parameters before weight transfer."""
         pass
 
     @abstractmethod
@@ -178,34 +210,117 @@ class ColocatablePolicyInterface(PolicyInterface):
     def offload_after_refit(self) -> None:
         pass
 
+    def offload_to_cpu(self) -> None:
+        pass
+
     @abstractmethod
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         pass
 
+    def enable_refit_prequantize(
+        self, param_names: list[str]
+    ) -> Optional[dict[str, Any]]:
+        """Quantize the listed params on the trainer during refit streaming.
+
+        Returns:
+            Refit info updated with the quantized dtypes and scale entries.
+        """
+        raise NotImplementedError(
+            "enable_refit_prequantize is not implemented for this policy worker"
+        )
+
     @abstractmethod
     def stream_weights_via_ipc_zmq(
-        self, *args: Any, **kwargs: Any
+        self,
+        buffer_size_bytes: int,
+        kv_scales: Optional[dict[str, float]] = None,
     ) -> list[ray.ObjectRef]:
         pass
 
-    def stream_weights_via_http(
-        self, sglang_url_to_gpu_uuids: dict[str, list[str]]
-    ) -> list[ray.ObjectRef]:
-        """Stream model weights to SGLang servers via HTTP API.
-
-        Args:
-            sglang_url_to_gpu_uuids: Dict mapping SGLang server URL to list of GPU UUIDs it uses
-        """
+    def connect_sglang_rollout_engines(
+        self,
+        *,
+        engine_gpu_counts: list[int],
+        engine_gpu_offsets: Optional[list[int]] = None,
+    ) -> None:
         raise NotImplementedError(
-            "stream_weights_via_http is not implemented for this policy worker"
+            "connect_sglang_rollout_engines is not implemented for this policy"
+        )
+
+    def update_weights_to_sglang_colocated(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        raise NotImplementedError(
+            "update_weights_to_sglang_colocated is not implemented for this policy"
+        )
+
+    def connect_sglang_rollout_engines_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        engine_gpu_counts: list[int],
+        group_name: Optional[str] = None,
+    ) -> None:
+        raise NotImplementedError(
+            "connect_sglang_rollout_engines_distributed is not implemented "
+            "for this policy"
+        )
+
+    def update_weights_to_sglang_distributed(
+        self,
+        *,
+        rollout_engines: list[ray.actor.ActorHandle],
+        rollout_engine_lock: ray.actor.ActorHandle,
+        buffer_size_bytes: int,
+        target_precision: str = "bf16",
+        sglang_quantization_cfg: Optional[dict[str, Any]] = None,
+    ) -> list[ray.ObjectRef]:
+        raise NotImplementedError(
+            "update_weights_to_sglang_distributed is not implemented for this policy"
         )
 
     @abstractmethod
     def broadcast_weights_for_collective(
-        self, kv_scales: Optional[dict[str, float]] = None
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
+        *,
+        buffer_size_bytes: Optional[int] = None,
+        num_buffers: Optional[int] = None,
+        use_legacy_packing: bool = False,
     ) -> list[ray.ObjectRef]:
         pass
 
+    def prepare_nccl_reshard_refit_info(
+        self,
+        train_parallelism: dict[str, int],
+        gen_parallelism: dict[str, int],
+        train_world_size: int,
+        gen_world_size: int,
+    ) -> Any:
+        """Prepare per-layer param metadata for nccl_reshard-based refit."""
+        raise NotImplementedError
+
+    def nccl_reshard_refit(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+        refit_timeout_s: Optional[float] = None,
+    ) -> list[ray.ObjectRef]:
+        """Sync weights to generation workers via the NCCL-reshard path."""
+        raise NotImplementedError
+
     @abstractmethod
-    def prepare_for_lp_inference(self) -> None:
+    def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
+        """Put the policy in eval mode for logprob inference.
+
+        Args:
+            keep_train_buffers: Leave grad buffers and optimizer state on CUDA
+                because a train step is already open and its accumulated
+                gradients must survive this call.
+        """
         pass

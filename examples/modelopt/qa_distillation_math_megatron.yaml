@@ -1,0 +1,36 @@
+# On-Policy Quantization-Aware Distillation (QAD) with Megatron Backend and Model-Optimizer
+#
+# Example usage (1 node, 8 GPUs):
+#   uv run examples/run_distillation.py --config examples/modelopt/qa_distillation_math_megatron.yaml \
+#     policy.model_name=Qwen/Qwen3-1.7B \
+#     teacher.model_name=Qwen/Qwen3-1.7B
+#
+defaults: "../configs/distillation_math_megatron.yaml"
+
+policy:
+    # Quantization config applied to the student's Megatron training worker.
+    quant_cfg: "NVFP4_DEFAULT_CFG"
+    quant_calib_data: "cnn_dailymail"
+    quant_calib_size: 512
+    quant_batch_size: 1
+    quant_sequence_length: 2048
+
+    megatron_cfg:
+        # ModelOpt quantization is incompatible with gradient accumulation fusion.
+        gradient_accumulation_fusion: false
+
+    generation:
+        # Quantization config applied to the student's vLLM generation worker.
+        quant_cfg: "NVFP4_DEFAULT_CFG"
+
+checkpointing:
+    checkpoint_dir: "checkpoints/qa-distillation-megatron-${policy.model_name}"
+
+logger:
+    wandb:
+        project: "nemo-qa-distillation"
+        name: "qa-distillation-megatron-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+    tensorboard:
+        log_dir: "tb_logs-qa-distillation-megatron-${data.train.dataset_name}"
+    mlflow:
+        run_name: "qa-distillation-math-megatron-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"

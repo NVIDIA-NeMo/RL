@@ -16,6 +16,7 @@ grpo:
   async_grpo:
     enabled: false
     max_trajectory_age_steps: 1
+    max_generation_failures: 0
 
 loss_fn:
   reference_policy_kl_penalty: 0.01
@@ -35,6 +36,11 @@ checkpointing:
   keep_top_k: 3
   save_period: 10
   checkpoint_must_save_by: null
+  # pretrained_checkpoint: load weights from an existing megatron-bridge or
+  # Megatron-LM checkpoint instead of converting from HuggingFace.
+  # pretrained_checkpoint:
+  #   path: "/path/to/checkpoint"  # iter dir or checkpoint root
+  #   format: "megatron_bridge"    # or "megatron_lm"
 
 policy:
   model_name: "Qwen/Qwen2.5-1.5B"
@@ -48,7 +54,7 @@ policy:
   max_total_sequence_length: 512
   precision: "bfloat16"
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: false
 
   # See docs/design-docs/sequence-packing-and-dynamic-batching.md 
@@ -67,6 +73,7 @@ policy:
     train_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.train_micro_batch_size}}
     logprob_mb_tokens: ${mul:${policy.max_total_sequence_length}, ${policy.logprob_batch_size}}
     algorithm: "modified_first_fit_decreasing"
+    microbatch_order: "packer"
     sequence_length_round: 64
 
   max_grad_norm: 1.0
@@ -74,13 +81,44 @@ policy:
   # this is useful for sequence parallel training
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
 
-  optimizer: null # remove default FSDP optimizer
+  optimizer: null # remove default Automodel optimizer
 
   megatron_cfg:
     enabled: true
+    force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1  # 1 is the minimum recommendation for RL since we almost always need to offload before beginning generation. Setting to 0 is faster, but you are more likely to run out of GPU memory.
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
-    converter_type: "Qwen2ForCausalLM"
+    # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
+    cuda_graph_impl: "none"
+    cuda_graph_modules: []
+    cuda_graph_warmup_steps: 3
+    # Offload specific module activations to CPU. Works for both dense and MoE
+    # models and requires transformer_engine. Different from optimizer_cpu_offload,
+    # which offloads optimizer states. On TE >= 2.10,
+    # also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
+    fine_grained_activation_offloading: false
+    # Modules to offload when fine_grained_activation_offloading is true.
+    # Common examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"].
+    # Supported names depend on the pinned Megatron-LM version and are
+    # validated by MCore. "attn_proj" requires "core_attn". See the latest
+    # upstream module reference:
+    # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+    offload_modules: null
+    # recompute_granularity controls activation checkpointing depth.
+    # "full": recompute all activations (default, max memory savings).
+    # "selective": recompute only specific modules (see recompute_modules).
+    # Only takes effect when activation_checkpointing: true.
+    recompute_granularity: "full"
+    # Modules to selectively recompute when recompute_granularity="selective".
+    # MCore options: ["core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts"].
+    # Null defaults to ["core_attn"]. Full list and per-module constraints:
+    # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
+    # Use ["moe"] for MoE models to recompute expert activations only.
+    recompute_modules: null
     tensor_model_parallel_size: 1
     expert_tensor_parallel_size: 1
     expert_model_parallel_size: 1
@@ -94,12 +132,30 @@ policy:
     moe_router_dtype: "fp64"
     moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
     moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
-    moe_permute_fusion: false
+    moe_permute_fusion: true
     moe_enable_deepep: false
-    moe_token_dispatcher_type: "allgather"
+    moe_token_dispatcher_type: "alltoall"
     moe_shared_expert_overlap: false
-    #gives ~20% training perf speedup with sequence packing 
+    use_gloo_process_groups: false
+    # Collective timeout (minutes) for default, Megatron model-parallel, and
+    # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+    distributed_timeout_minutes: null
+    #gives ~20% training perf speedup with sequence packing
     apply_rope_fusion: True
+
+    peft:
+      enabled: false
+      target_modules: []
+      exclude_modules: []
+      dim: 8
+      alpha: 32
+      dropout: 0.0
+      dropout_position: "post"
+      lora_A_init_method: "xavier"
+      lora_B_init_method: "zero"
+      a2a_experimental: false
+      lora_dtype: null
+      restore_from: null  # Warm start: path to a native Megatron PEFT checkpoint (iter_XXXXXXX dir or its root) to initialize this run's LoRA weights from, e.g. a previous SFT run
     
     optimizer:
       optimizer: "adam"
@@ -146,15 +202,6 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
-    mcore_generation_config:
-      buffer_size_gb: 20  # Total GPU memory (in GB) allocated for KV cache buffers
-      num_cuda_graphs: 16  # Number of CUDA graphs to pre-compile for different batch sizes
-      block_size_tokens: 256  # Size of each KV cache block in tokens (affects memory granularity)
-      use_cuda_graphs_for_non_decode_steps: true  # Enable CUDA graphs for prefill/context processing
-      enable_chunked_prefill: false  # Split long prefills into chunks for better memory management
-      unified_memory_level: 0  # Unified memory usage level (0=disabled, higher values enable more aggressive paging)
-      max_tokens: 16384 # Maximum number of tokens to use in a single step. Analogous to vllm's max_num_batched_tokens
-      
     vllm_cfg:
       tensor_parallel_size: 1
       gpu_memory_utilization: 0.6
@@ -190,3 +237,4 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

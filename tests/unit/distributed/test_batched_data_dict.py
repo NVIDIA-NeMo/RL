@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,10 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import numpy as np
 import pytest
 import torch
 
 from nemo_rl.data.multimodal_utils import PackedTensor
+from nemo_rl.data_plane.codec import pad_field
+from nemo_rl.data_plane.schema import (
+    OPD_FULL_HIDDEN_STATES_FIELD,
+    OPD_FULL_LOGITS_FIELD,
+    OPD_FULL_TEACHER_INDEX_FIELD,
+)
 from nemo_rl.distributed.batched_data_dict import (
     BatchedDataDict,
     DynamicBatchingArgs,
@@ -45,6 +52,27 @@ def test_shard_by_batch_size_basic():
     # Verify second shard content (second elements of each chunk)
     assert torch.equal(sharded[1]["tensor_data"], torch.tensor([2, 3, 6, 7]))
     assert torch.equal(sharded[1]["other_tensor"], torch.tensor([12, 13, 16, 17]))
+
+
+def test_from_batches_flag_off_keeps_legacy_first_field_batch_size():
+    class MetadataWithoutBatchLength:
+        def __len__(self):
+            raise AssertionError("flag-off batch sizing must not scan metadata")
+
+    batches = [
+        {
+            "tokens": torch.tensor([[1], [2]]),
+            "metadata": MetadataWithoutBatchLength(),
+        },
+        {
+            "tokens": torch.tensor([[3]]),
+            "metadata": MetadataWithoutBatchLength(),
+            "extra": torch.tensor([1]),
+        },
+    ]
+
+    with pytest.raises(KeyError, match="'extra'"):
+        BatchedDataDict.from_batches(batches)
 
 
 def test_shard_by_batch_size_list_data():
@@ -327,6 +355,125 @@ def test_sequence_packing_basic():
         assert len(problem_ids_seen) == batch_size
 
 
+def test_sequence_packing_executes_bins_largest_first():
+    """Each shard keeps its assigned bins but executes them largest-first."""
+    sequence_lengths = torch.tensor([46, 24, 55, 88, 11, 14, 73, 17])
+    batch_data = BatchedDataDict(
+        {
+            "input_ids": torch.ones((len(sequence_lengths), 100), dtype=torch.long),
+            "sequence_lengths": sequence_lengths,
+            "problem_ids": torch.arange(len(sequence_lengths)),
+        }
+    )
+    sequence_packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=100,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        microbatch_order="largest_first",
+        sequence_length_pad_multiple=1,
+    )
+
+    packer_order_args = SequencePackingArgs(**sequence_packing_args)
+    packer_order_args["microbatch_order"] = "packer"
+    packer_order_shards, _ = batch_data.shard_by_batch_size(
+        shards=2,
+        sequence_packing_args=packer_order_args,
+    )
+    sharded_batches, sorted_indices = batch_data.shard_by_batch_size(
+        shards=2,
+        sequence_packing_args=sequence_packing_args,
+    )
+
+    assert [shard.micro_batch_lengths[0] for shard in sharded_batches] == [
+        [99, 96],
+        [87, 46],
+    ]
+    for packer_shard, largest_first_shard in zip(
+        packer_order_shards, sharded_batches, strict=True
+    ):
+        assert set(packer_shard["problem_ids"].tolist()) == set(
+            largest_first_shard["problem_ids"].tolist()
+        )
+        expected_lengths = sorted(packer_shard.micro_batch_lengths[0], reverse=True)
+        assert expected_lengths == largest_first_shard.micro_batch_lengths[0]
+    reconstructed = BatchedDataDict.from_batches(sharded_batches)
+    reconstructed.reorder_data(sorted_indices)
+    assert torch.equal(reconstructed["problem_ids"], batch_data["problem_ids"])
+    assert torch.equal(reconstructed["input_ids"], batch_data["input_ids"])
+    assert torch.equal(
+        reconstructed["sequence_lengths"], batch_data["sequence_lengths"]
+    )
+
+
+def test_sequence_packing_rejects_unknown_microbatch_order():
+    batch_data = BatchedDataDict(
+        {
+            "input_ids": torch.ones((2, 8), dtype=torch.long),
+            "sequence_lengths": torch.tensor([4, 5]),
+        }
+    )
+    sequence_packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=8,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        microbatch_order="unknown",  # type: ignore[typeddict-item]
+        sequence_length_pad_multiple=1,
+    )
+
+    with pytest.raises(ValueError, match="microbatch_order"):
+        batch_data.shard_by_batch_size(
+            shards=1,
+            sequence_packing_args=sequence_packing_args,
+        )
+
+
+def test_sequence_packing_largest_first_preserves_chunk_boundaries():
+    """Ordering is local to each optimizer/global-batch chunk."""
+    sequence_lengths = torch.tensor(
+        [46, 24, 55, 88, 11, 14, 73, 17, 31, 67, 19, 82, 12, 43, 58, 21]
+    )
+    batch_data = BatchedDataDict(
+        {
+            "input_ids": torch.ones((len(sequence_lengths), 100), dtype=torch.long),
+            "sequence_lengths": sequence_lengths,
+            "problem_ids": torch.arange(len(sequence_lengths)),
+        }
+    )
+    sequence_packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=100,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        microbatch_order="largest_first",
+        sequence_length_pad_multiple=1,
+    )
+
+    sharded_batches, sorted_indices = batch_data.shard_by_batch_size(
+        shards=2,
+        batch_size=8,
+        sequence_packing_args=sequence_packing_args,
+    )
+
+    for shard in sharded_batches:
+        assert len(shard.micro_batch_lengths) == 2
+        for chunk_lengths in shard.micro_batch_lengths:
+            assert chunk_lengths == sorted(chunk_lengths, reverse=True)
+
+        first_chunk_size, second_chunk_size = shard.elem_counts_per_gb
+        first_chunk_ids = shard["problem_ids"][:first_chunk_size]
+        second_chunk_ids = shard["problem_ids"][
+            first_chunk_size : first_chunk_size + second_chunk_size
+        ]
+        assert torch.all(first_chunk_ids < 8)
+        assert torch.all(second_chunk_ids >= 8)
+
+    reconstructed = BatchedDataDict.from_batches(sharded_batches)
+    reconstructed.reorder_data(sorted_indices)
+    assert torch.equal(reconstructed["problem_ids"], batch_data["problem_ids"])
+
+
 def test_sequence_packing_uniform_lengths():
     """Test sequence packing when all sequences have the same length."""
     batch_size = 16
@@ -506,6 +653,181 @@ def test_shard_by_batch_size_with_packed_multimodal():
     assert tuple(shards[1]["pixel_values"].as_tensor().shape) == (6, 3, 8, 8)
 
 
+def test_repeat_interleave_shares_only_flagged_multimodal_segments():
+    media = PackedTensor(torch.ones(1, 3, 2, 2), dim_to_pack=0)
+    batch = BatchedDataDict(
+        {
+            "message_log": [
+                [
+                    {
+                        "role": "user",
+                        "content": "look",
+                        "token_ids": torch.tensor([1, 2]),
+                        "pixel_values": media,
+                    }
+                ]
+            ]
+        }
+    )
+
+    flag_off = batch.repeat_interleave(2)
+    off_first = flag_off["message_log"][0][0]["pixel_values"]
+    off_second = flag_off["message_log"][1][0]["pixel_values"]
+    assert not off_first.deduplication_enabled
+    assert off_first.tensors[0] is not off_second.tensors[0]
+
+    flag_on = batch.repeat_interleave(2, share_immutable_media=True)
+    on_first = flag_on["message_log"][0][0]["pixel_values"]
+    on_second = flag_on["message_log"][1][0]["pixel_values"]
+    assert on_first.deduplication_enabled
+    assert on_first is not on_second
+    assert on_first.tensors[0] is on_second.tensors[0]
+    assert flag_on["message_log"][0] is not flag_on["message_log"][1]
+
+
+def test_repeat_interleave_shares_vllm_multimodal_data_leaves():
+    image = torch.ones(1, 2)
+    video = np.ones((2, 2), dtype=np.float32)
+    audio = np.ones(16, dtype=np.float32)
+    batch = BatchedDataDict(
+        {
+            "vllm_multi_modal_data": [
+                {"image": image, "video": video, "audio": (audio, 16_000)}
+            ],
+        }
+    )
+
+    flag_off = batch.repeat_interleave(2)
+    assert (
+        flag_off["vllm_multi_modal_data"][0]["image"]
+        is not flag_off["vllm_multi_modal_data"][1]["image"]
+    )
+    assert (
+        flag_off["vllm_multi_modal_data"][0]["video"]
+        is not flag_off["vllm_multi_modal_data"][1]["video"]
+    )
+    assert (
+        flag_off["vllm_multi_modal_data"][0]["audio"][0]
+        is not flag_off["vllm_multi_modal_data"][1]["audio"][0]
+    )
+
+    flag_on = batch.repeat_interleave(2, share_immutable_media=True)
+    assert (
+        flag_on["vllm_multi_modal_data"][0] is not flag_on["vllm_multi_modal_data"][1]
+    )
+    assert (
+        flag_on["vllm_multi_modal_data"][0]["image"]
+        is flag_on["vllm_multi_modal_data"][1]["image"]
+    )
+    assert (
+        flag_on["vllm_multi_modal_data"][0]["video"]
+        is flag_on["vllm_multi_modal_data"][1]["video"]
+    )
+    assert (
+        flag_on["vllm_multi_modal_data"][0]["audio"][0]
+        is flag_on["vllm_multi_modal_data"][1]["audio"][0]
+    )
+
+
+@pytest.mark.parametrize("share_immutable_media", [False, True])
+def test_repeat_interleave_rejects_top_level_packed_tensor(share_immutable_media):
+    batch = BatchedDataDict(
+        {"pixel_values": PackedTensor(torch.ones(1, 2), dim_to_pack=0)}
+    )
+
+    with pytest.raises(
+        NotImplementedError,
+        match="PackedTensor does not currently support repeat_interleave",
+    ):
+        batch.repeat_interleave(
+            2,
+            share_immutable_media=share_immutable_media,
+        )
+
+
+def test_shards_reintern_shared_segments_locally():
+    media = PackedTensor(torch.ones(1, 2), dim_to_pack=0).enable_deduplication()
+    repeated_media = PackedTensor.concat([media] * 4)
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(8).reshape(4, 2),
+            "input_lengths": torch.tensor([2, 2, 2, 2]),
+            "pixel_values": repeated_media,
+        }
+    )
+
+    shards = batch.shard_by_batch_size(shards=2)
+
+    assert [len(shard["pixel_values"]) for shard in shards] == [2, 2]
+    assert [len(shard["pixel_values"].tensors) for shard in shards] == [1, 1]
+
+
+def test_sequence_packing_reinterns_shared_segments_per_shard_for_cp_padding():
+    media = PackedTensor(torch.ones(1, 2), dim_to_pack=0).enable_deduplication()
+    repeated_media = PackedTensor.concat([media] * 8)
+    sequence_lengths = torch.tensor([5, 6, 7, 8, 9, 10, 11, 12])
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(8 * 12).reshape(8, 12),
+            "input_lengths": sequence_lengths,
+            "pixel_values": repeated_media,
+        }
+    )
+    sequence_packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=24,
+        input_key="input_ids",
+        input_lengths_key="input_lengths",
+        algorithm="modified_first_fit_decreasing",
+        # CP=2 requires sequences to be divisible by 2 * CP.
+        sequence_length_pad_multiple=4,
+    )
+
+    shards, _ = batch.shard_by_batch_size(
+        shards=2,
+        sequence_packing_args=sequence_packing_args,
+    )
+
+    assert sum(len(shard["pixel_values"]) for shard in shards) == 8
+    assert [len(shard["pixel_values"].tensors) for shard in shards] == [1, 1]
+    for shard in shards:
+        torch.testing.assert_close(
+            shard["pixel_values"].as_tensor(),
+            torch.ones(len(shard["pixel_values"]), 2),
+        )
+
+
+def test_shard_by_batch_size_allow_uneven_empty_shards_preserve_all_keys():
+    """Empty trailing shards should preserve all keys with empty values."""
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]]),
+            "pixel_values": PackedTensor(
+                [torch.randn(2, 3, 8, 8), torch.randn(1, 3, 8, 8)], dim_to_pack=0
+            ),
+            "labels": [0, 1],
+        }
+    )
+
+    # total_batch_size=2, shards=4 -> trailing two shards are empty
+    shards = batch.shard_by_batch_size(shards=4, allow_uneven_shards=True)
+    assert len(shards) == 4
+
+    # Empty trailing shards should preserve all keys and use empty values.
+    for empty_shard in shards[2:]:
+        assert empty_shard.size == 0
+        for key, original_value in batch.items():
+            assert key in empty_shard
+            shard_value = empty_shard[key]
+            if torch.is_tensor(original_value):
+                assert shard_value.shape[0] == 0
+            elif isinstance(original_value, PackedTensor):
+                assert isinstance(shard_value, PackedTensor)
+                assert len(shard_value) == 0
+                assert shard_value.as_tensor() is None
+            else:
+                assert shard_value == []
+
+
 def test_get_multimodal_dict_mixed_content_and_device_move():
     """get_multimodal_dict should include PackedTensor and optional keys, and support device movement."""
     images = [torch.randn(2, 3, 8, 8), torch.randn(1, 3, 8, 8)]
@@ -544,6 +866,69 @@ def test_get_multimodal_dict_mixed_content_and_device_move():
     assert torch.is_tensor(mm_after_move["pixel_values"]) and mm_after_move[
         "pixel_values"
     ].device.type == ("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def test_get_multimodal_dict_casts_only_pixels_without_materializing_dedup():
+    pixels = PackedTensor(
+        [torch.randn(2, 3, 8, 8, dtype=torch.float32)], dim_to_pack=0
+    ).enable_deduplication()
+    pixels = PackedTensor.concat([pixels] * 4)
+    video_pixels = PackedTensor(
+        [torch.randn(2, 3, 4, 8, 8, dtype=torch.float32)], dim_to_pack=0
+    ).enable_deduplication()
+    video_pixels = PackedTensor.concat([video_pixels] * 4)
+    image_sizes = PackedTensor(
+        [torch.tensor([[8, 8]], dtype=torch.int64)], dim_to_pack=0
+    ).enable_deduplication()
+    image_sizes = PackedTensor.concat([image_sizes] * 4)
+    video_grid = PackedTensor(
+        [torch.tensor([[4, 8, 8]], dtype=torch.int64)], dim_to_pack=0
+    ).enable_deduplication()
+    video_grid = PackedTensor.concat([video_grid] * 4)
+    original_provenance = list(pixels._segment_provenance)
+    original_video_provenance = list(video_pixels._segment_provenance)
+    batch = BatchedDataDict(
+        {
+            "pixel_values": pixels,
+            "imgs_sizes": image_sizes,
+            "pixel_values_videos": video_pixels,
+            "video_grid_thw": video_grid,
+        }
+    )
+
+    multimodal = batch.get_multimodal_dict(as_tensors=False, pixel_dtype=torch.bfloat16)
+    cast_pixels = multimodal["pixel_values"]
+    cast_video_pixels = multimodal["pixel_values_videos"]
+
+    assert isinstance(cast_pixels, PackedTensor)
+    assert isinstance(cast_video_pixels, PackedTensor)
+    assert len(cast_pixels) == 4
+    assert len(cast_video_pixels) == 4
+    assert len(cast_pixels.tensors) == 1
+    assert len(cast_video_pixels.tensors) == 1
+    assert sum(cast_pixels.logical_segment_counts_by_row()) == 4
+    assert sum(cast_video_pixels.logical_segment_counts_by_row()) == 4
+    assert cast_pixels.tensors[0].dtype == torch.bfloat16
+    assert cast_video_pixels.tensors[0].dtype == torch.bfloat16
+    assert pixels.tensors[0].dtype == torch.float32
+    assert video_pixels.tensors[0].dtype == torch.float32
+    assert cast_pixels._row_offsets == pixels._row_offsets
+    assert cast_video_pixels._row_offsets == video_pixels._row_offsets
+    assert cast_pixels._segment_indices == pixels._segment_indices
+    assert cast_video_pixels._segment_indices == video_pixels._segment_indices
+    assert cast_pixels._segment_provenance != original_provenance
+    assert cast_video_pixels._segment_provenance != original_video_provenance
+    assert multimodal["imgs_sizes"] is image_sizes
+    assert multimodal["video_grid_thw"] is video_grid
+
+    materialized = batch.get_multimodal_dict(
+        as_tensors=True, pixel_dtype=torch.bfloat16
+    )
+    assert materialized["pixel_values"].dtype == torch.bfloat16
+    assert materialized["pixel_values"].shape[0] == 8
+    assert materialized["pixel_values_videos"].dtype == torch.bfloat16
+    assert materialized["pixel_values_videos"].shape[0] == 8
+    assert materialized["video_grid_thw"].dtype == torch.int64
 
 
 def test_from_batches_pads_3d_tensors_along_sequence_dim():
@@ -614,6 +999,278 @@ def test_from_batches_pads_3d_tensors_along_sequence_dim():
     expected = torch.cat([expected_batch1, batch2["teacher_logits"]], dim=0)
 
     assert torch.equal(stacked_logits, expected)
+
+
+def test_from_batches_pads_4d_tensors_along_sequence_dim():
+    pad_value = -1
+    batch1 = BatchedDataDict(
+        {
+            "routed_experts": torch.arange(2 * 3 * 4 * 2, dtype=torch.int32).reshape(
+                2, 3, 4, 2
+            )
+        }
+    )
+    batch2 = BatchedDataDict(
+        {
+            "routed_experts": torch.arange(
+                100, 100 + 1 * 5 * 4 * 2, dtype=torch.int32
+            ).reshape(1, 5, 4, 2)
+        }
+    )
+
+    stacked = BatchedDataDict.from_batches(
+        [batch1, batch2], pad_value_dict={"routed_experts": pad_value}
+    )
+
+    routed_experts = stacked["routed_experts"]
+    assert routed_experts.shape == (3, 5, 4, 2)
+    assert torch.equal(routed_experts[:2, :3], batch1["routed_experts"])
+    assert torch.equal(
+        routed_experts[:2, 3:],
+        torch.full((2, 2, 4, 2), pad_value, dtype=torch.int32),
+    )
+    assert torch.equal(routed_experts[2:], batch2["routed_experts"])
+
+
+def test_from_batches_keeps_optional_keys_missing_only_from_empty_batches():
+    empty_batch = BatchedDataDict(
+        {
+            "output_ids": torch.zeros((0, 0), dtype=torch.long),
+            "generation_lengths": torch.zeros(0, dtype=torch.long),
+        }
+    )
+    routed_experts = torch.arange(1 * 3 * 2 * 2, dtype=torch.int32).reshape(1, 3, 2, 2)
+    non_empty_batch = BatchedDataDict(
+        {
+            "output_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "generation_lengths": torch.tensor([3], dtype=torch.long),
+            "routed_experts": routed_experts,
+        }
+    )
+
+    stacked = BatchedDataDict.from_batches(
+        [empty_batch, non_empty_batch], pad_value_dict={"output_ids": 0}
+    )
+
+    assert stacked["output_ids"].shape == (1, 3)
+    assert torch.equal(stacked["generation_lengths"], torch.tensor([3]))
+    assert torch.equal(stacked["routed_experts"], routed_experts)
+
+    non_empty_missing_optional_key = BatchedDataDict(
+        {
+            "output_ids": torch.tensor([[4, 5, 6]], dtype=torch.long),
+            "generation_lengths": torch.tensor([3], dtype=torch.long),
+        }
+    )
+    with pytest.raises(KeyError, match="non-empty batches"):
+        BatchedDataDict.from_batches([non_empty_batch, non_empty_missing_optional_key])
+
+
+def test_from_batches_keeps_keys_missing_from_empty_mapping():
+    empty_batch = BatchedDataDict()
+    routed_experts = torch.arange(1 * 3 * 2 * 2, dtype=torch.int32).reshape(1, 3, 2, 2)
+    non_empty_batch = BatchedDataDict(
+        {
+            "output_ids": torch.tensor([[1, 2, 3]], dtype=torch.long),
+            "generation_lengths": torch.tensor([3], dtype=torch.long),
+            "routed_experts": routed_experts,
+        }
+    )
+
+    stacked = BatchedDataDict.from_batches([empty_batch, non_empty_batch])
+
+    assert torch.equal(stacked["output_ids"], non_empty_batch["output_ids"])
+    assert torch.equal(stacked["generation_lengths"], torch.tensor([3]))
+    assert torch.equal(stacked["routed_experts"], routed_experts)
+
+
+def test_from_batches_can_align_optional_deduplicated_media_keys():
+    shared_pixels = PackedTensor(
+        torch.tensor([[1.0]]), dim_to_pack=0
+    ).enable_deduplication()
+    pixel_rows = PackedTensor.concat([shared_pixels] * 2)
+    distinct_image_sizes = PackedTensor(
+        [torch.tensor([[10, 20]]), torch.tensor([[30, 40]])],
+        dim_to_pack=0,
+    ).enable_deduplication()
+    audio_rows = PackedTensor(
+        torch.tensor([[5.0]]), dim_to_pack=0
+    ).enable_deduplication()
+
+    visual_batch = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2], [3, 4]]),
+            "pixel_values": pixel_rows,
+            "imgs_sizes": distinct_image_sizes,
+        }
+    )
+    audio_batch = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[5, 6]]),
+            "audio_values": audio_rows,
+        }
+    )
+
+    stacked = BatchedDataDict.from_batches(
+        [visual_batch, audio_batch],
+        allow_missing_packed_tensors=True,
+    )
+
+    assert stacked.size == 3
+    assert {
+        key: len(stacked[key]) for key in ("pixel_values", "imgs_sizes", "audio_values")
+    } == {
+        "pixel_values": 3,
+        "imgs_sizes": 3,
+        "audio_values": 3,
+    }
+    assert len(stacked["pixel_values"].tensors) == 1
+    assert len(stacked["imgs_sizes"].tensors) == 2
+    assert stacked["pixel_values"].slice([2]).as_tensor() is None
+    assert stacked["imgs_sizes"].slice([2]).as_tensor() is None
+    assert stacked["audio_values"].slice([0, 1]).as_tensor() is None
+    torch.testing.assert_close(
+        stacked["audio_values"].slice([2]).as_tensor(),
+        torch.tensor([[5.0]]),
+    )
+
+
+def test_from_batches_optional_media_rejects_cross_key_row_misalignment():
+    batch = BatchedDataDict(
+        {
+            "pixel_values": PackedTensor(
+                torch.tensor([[1.0]]), dim_to_pack=0
+            ).enable_deduplication(),
+            "input_ids": torch.tensor([[1, 2], [3, 4]]),
+        }
+    )
+
+    with pytest.raises(ValueError, match="inconsistent logical row counts"):
+        BatchedDataDict.from_batches(
+            [batch],
+            allow_missing_packed_tensors=True,
+        )
+
+
+def test_model_materialization_validates_coupled_media_segment_order():
+    pixels = PackedTensor(
+        [torch.tensor([[1.0]]), torch.tensor([[2.0]])],
+        dim_to_pack=0,
+    ).enable_deduplication()
+    image_sizes = PackedTensor(
+        [torch.tensor([[10, 20]]), torch.tensor([[30, 40]])],
+        dim_to_pack=0,
+    ).enable_deduplication()
+    valid = BatchedDataDict(
+        {
+            "pixel_values": pixels,
+            "imgs_sizes": image_sizes,
+        }
+    )
+
+    materialized = valid.get_multimodal_dict(as_tensors=True)
+    torch.testing.assert_close(
+        materialized["pixel_values"], torch.tensor([[1.0], [2.0]])
+    )
+    torch.testing.assert_close(
+        materialized["imgs_sizes"],
+        torch.tensor([[10, 20], [30, 40]]),
+    )
+
+    first_row_only = PackedTensor.merge_segments(
+        [
+            PackedTensor(
+                torch.tensor([[10, 20]]), dim_to_pack=0
+            ).enable_deduplication(),
+            PackedTensor(
+                torch.tensor([[30, 40]]), dim_to_pack=0
+            ).enable_deduplication(),
+        ]
+    )
+    missing_second_row = PackedTensor.concat(
+        [first_row_only, PackedTensor.empty_rows_like(first_row_only, 1)]
+    )
+    invalid = BatchedDataDict(
+        {
+            "pixel_values": pixels,
+            "imgs_sizes": missing_second_row,
+        }
+    )
+
+    with pytest.raises(ValueError, match="ordered per-row segment counts"):
+        invalid.get_multimodal_dict(as_tensors=True)
+
+
+def test_model_materialization_skips_coupled_scan_for_legacy_media():
+    legacy = BatchedDataDict(
+        {
+            "pixel_values": PackedTensor(
+                [torch.tensor([[1.0]]), torch.tensor([[2.0]])],
+                dim_to_pack=0,
+            ),
+            "imgs_sizes": PackedTensor(
+                torch.tensor([[10, 20]]),
+                dim_to_pack=0,
+            ),
+        }
+    )
+
+    materialized = legacy.get_multimodal_dict(as_tensors=True)
+
+    torch.testing.assert_close(
+        materialized["pixel_values"], torch.tensor([[1.0], [2.0]])
+    )
+    torch.testing.assert_close(materialized["imgs_sizes"], torch.tensor([[10, 20]]))
+
+
+def test_size_supports_packed_tensor_as_first_key_and_empty_batches():
+    media = PackedTensor(
+        [torch.tensor([[1.0]]), torch.tensor([[2.0]])],
+        dim_to_pack=0,
+    )
+    batch = BatchedDataDict(
+        {
+            "pixel_values": media,
+            "input_ids": torch.tensor([[1, 2], [3, 4]]),
+        }
+    )
+
+    assert batch.size == 2
+    assert BatchedDataDict().size == 0
+
+
+def test_deduplicated_media_survives_chunk_reorder_and_select_indices():
+    first = PackedTensor(torch.tensor([[1.0]]), dim_to_pack=0).enable_deduplication()
+    second = PackedTensor(torch.tensor([[2.0]]), dim_to_pack=0).enable_deduplication()
+    media = PackedTensor.concat(
+        [PackedTensor.concat([first] * 2), PackedTensor.concat([second] * 2)]
+    )
+    batch = BatchedDataDict(
+        {
+            "pixel_values": media,
+            "input_ids": torch.arange(8).reshape(4, 2),
+        }
+    )
+
+    first_chunk = batch.chunk(rank=0, chunks=2)
+    assert len(first_chunk["pixel_values"].tensors) == 1
+    torch.testing.assert_close(
+        first_chunk["pixel_values"].as_tensor(),
+        torch.tensor([[1.0], [1.0]]),
+    )
+
+    batch.reorder_data([3, 2, 1, 0])
+    torch.testing.assert_close(
+        batch["pixel_values"].as_tensor(),
+        torch.tensor([[2.0], [2.0], [1.0], [1.0]]),
+    )
+
+    selected = batch.select_indices([0, 3])
+    assert len(selected["pixel_values"].tensors) == 2
+    torch.testing.assert_close(
+        selected["pixel_values"].as_tensor(),
+        torch.tensor([[2.0], [1.0]]),
+    )
 
 
 @pytest.mark.parametrize("pad_to_multiple_of", [1, 32, 64, 256])
@@ -751,3 +1408,188 @@ def test_sequence_packing_microbatch_boundaries(pad_to_multiple_of):
     assert torch.all(
         reconstructed["sequence_lengths"] == batch_data["sequence_lengths"]
     )
+
+
+def test_sequence_packing_keeps_preference_pairs_atomic():
+    """Pair grouping happens before Megatron converts each microbatch to THD."""
+    sequence_lengths = torch.tensor([50, 60, 55, 65, 45, 70, 40, 75])
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(8, 128, dtype=torch.long),
+            "sequence_lengths": sequence_lengths,
+            "pair_index": torch.tensor([0, 0, 1, 1, 2, 2, 3, 3]),
+            "is_chosen": torch.tensor(
+                [True, False, True, False, True, False, True, False]
+            ),
+        }
+    )
+    packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=1024,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        sequence_length_pad_multiple=1,
+        pair_grouping_key="pair_index",
+        max_sequences_per_bin=1,
+    )
+
+    shards, _ = batch.shard_by_batch_size(shards=2, sequence_packing_args=packing_args)
+
+    seen_pairs = set()
+    for shard in shards:
+        for microbatch in shard.make_microbatch_iterator_for_packable_sequences():
+            pair_ids = torch.unique(microbatch["pair_index"]).tolist()
+            assert len(pair_ids) == 1
+            pair_id = pair_ids[0]
+            roles = microbatch["is_chosen"][
+                microbatch["pair_index"] == pair_id
+            ].tolist()
+            assert sorted(roles) == [False, True]
+            seen_pairs.add(pair_id)
+    assert seen_pairs == {0, 1, 2, 3}
+
+
+def test_sequence_packing_rejects_oversized_preference_pair():
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.zeros(4, 800, dtype=torch.long),
+            "sequence_lengths": torch.tensor([600, 600, 100, 100]),
+            "pair_index": torch.tensor([0, 0, 1, 1]),
+        }
+    )
+    packing_args = SequencePackingArgs(
+        max_tokens_per_microbatch=1024,
+        input_key="input_ids",
+        input_lengths_key="sequence_lengths",
+        algorithm="modified_first_fit_decreasing",
+        sequence_length_pad_multiple=1,
+        pair_grouping_key="pair_index",
+    )
+
+    with pytest.raises(ValueError, match="pair group 0 requires 1200 tokens"):
+        batch.shard_by_batch_size(shards=2, sequence_packing_args=packing_args)
+
+
+def test_truncate_tensors_narrows_opd_full_payloads_but_never_widens_them():
+    """The teacher payload follows the microbatch seqlen, but only downwards.
+
+    ``materialize`` leaves it at its natural width, which can already be
+    shorter than the microbatch's, so the narrow has to clamp.
+    """
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(12).reshape(2, 6),
+            # Wider than the microbatch seqlen: narrow it.
+            OPD_FULL_HIDDEN_STATES_FIELD: torch.randn(2, 6, 3),
+            # Already shorter than the microbatch seqlen: leave it alone.
+            OPD_FULL_LOGITS_FIELD: torch.randn(2, 3, 5),
+            OPD_FULL_TEACHER_INDEX_FIELD: torch.tensor([1, 0]),
+        }
+    )
+    hidden_before = batch[OPD_FULL_HIDDEN_STATES_FIELD].clone()
+    logits_before = batch[OPD_FULL_LOGITS_FIELD].clone()
+
+    batch.truncate_tensors(dim=1, truncated_len=4)
+
+    assert batch["input_ids"].shape == (2, 4)
+    assert batch[OPD_FULL_HIDDEN_STATES_FIELD].shape == (2, 4, 3)
+    assert torch.equal(batch[OPD_FULL_HIDDEN_STATES_FIELD], hidden_before[:, :4])
+    assert batch[OPD_FULL_LOGITS_FIELD].shape == (2, 3, 5)
+    assert torch.equal(batch[OPD_FULL_LOGITS_FIELD], logits_before)
+    assert batch[OPD_FULL_TEACHER_INDEX_FIELD].shape == (2,)
+
+
+def test_truncate_tensors_keeps_nested_rows():
+    rows = [torch.arange(n) for n in (2, 5, 1, 3)]
+    batch = BatchedDataDict(
+        {
+            "routes": torch.nested.as_nested_tensor(rows, layout=torch.jagged),
+            "input_ids": torch.zeros(4, 6, dtype=torch.long),
+        }
+    )
+
+    batch.truncate_tensors(dim=1, truncated_len=4)
+    assert batch["input_ids"].shape == (4, 4)
+    assert [r.tolist() for r in batch["routes"].unbind()] == [r.tolist() for r in rows]
+
+
+def _routes_batch(nested: bool) -> BatchedDataDict:
+    lengths = [5, 2, 7, 3, 6, 1]
+    width = 8
+    rows = [
+        (torch.arange(n * 4, dtype=torch.int16) + 100 * i).reshape(n, 2, 2)
+        for i, n in enumerate(lengths)
+    ]
+    if nested:
+        routes = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+    else:
+        routes = torch.full((len(rows), width, 2, 2), -1, dtype=torch.int16)
+        for i, row in enumerate(rows):
+            routes[i, : len(row)] = row
+    return BatchedDataDict(
+        {
+            "input_ids": torch.arange(len(rows) * width).reshape(len(rows), width),
+            "input_lengths": torch.tensor(lengths),
+            "routed_experts": routes,
+        }
+    )
+
+
+def _padded_routes(batch) -> torch.Tensor:
+    width = batch["input_ids"].shape[1]
+    return pad_field("routed_experts", batch["routed_experts"], -1, width)
+
+
+@pytest.mark.parametrize(
+    "transform",
+    [
+        lambda b: b.slice(1, 4),
+        lambda b: b.select_indices([4, 0, 2]),
+        lambda b: b.chunk(rank=1, chunks=2),
+        lambda b: b.select_indices([]),
+        lambda b: (b.reorder_data([5, 3, 1, 0, 2, 4]), b)[1],
+        lambda b: b.shard_by_batch_size(
+            shards=1,
+            sequence_packing_args={
+                "max_tokens_per_microbatch": 12,
+                "input_key": "input_ids",
+                "input_lengths_key": "input_lengths",
+                "algorithm": "modified_first_fit_decreasing",
+                "sequence_length_pad_multiple": 1,
+            },
+        )[0][0],
+    ],
+    ids=[
+        "slice",
+        "select_indices",
+        "chunk",
+        "select_empty",
+        "reorder_data",
+        "shard_seqpack",
+    ],
+)
+def test_nested_routes_match_padded_routes_through_row_ops(transform):
+    expected = transform(_routes_batch(nested=False))
+    got = transform(_routes_batch(nested=True))
+
+    assert torch.equal(got["input_ids"], expected["input_ids"])
+    assert torch.equal(_padded_routes(got), expected["routed_experts"])
+
+
+def test_multimodal_sharing_tolerates_dict_valued_type_key():
+    """Tool/JSON-schema payloads can have a parameter literally named "type"
+    whose value is a dict; the media-sharing walk must not crash on it."""
+    from nemo_rl.distributed.batched_data_dict import _prepare_multimodal_sharing
+
+    tool_schema_row = {
+        "role": "assistant",
+        "tool_schema": {
+            "parameters": {
+                # a parameter named "type": its schema definition is a dict
+                "type": {"type": "string", "enum": ["observation", "question"]},
+                "content": {"type": "string"},
+            }
+        },
+    }
+    shared = _prepare_multimodal_sharing(tool_schema_row)
+    assert isinstance(shared, dict)

@@ -7,11 +7,12 @@ This document describes the sequence packing and dynamic batching features imple
 1. [Problem](#problem)
 2. [Sequence Packing and Dynamic Batching](#sequence-packing-and-dynamic-batching)
 3. [Sequence Packing](#sequence-packing)
-4. [Dynamic Batching](#dynamic-batching)
-5. [Configuration](#configuration)
-6. [Integration with Training Pipeline](#integration-with-training-pipeline)
-7. [Metrics and Monitoring](#metrics-and-monitoring)
-8. [Usage](#usage)
+4. [HybridEP with Packed Sequences](#hybridep-with-packed-sequences)
+5. [Dynamic Batching](#dynamic-batching)
+6. [Configuration](#configuration)
+7. [Integration with Training Pipeline](#integration-with-training-pipeline)
+8. [Metrics and Monitoring](#metrics-and-monitoring)
+9. [Usage](#usage)
 
 ## Problem
 
@@ -87,7 +88,11 @@ We have the policy backends perform the actual packing because implementations c
 
 #### 2. Packing Algorithms (`nemo_rl/data/packing/algorithms.py`)
 
-Four packing algorithms are implemented, but we recommend you just use Modified First Fit Decreasing for the best packing efficiency:
+Six packing algorithms are implemented. Modified First Fit Decreasing is the
+default recommendation for trainer-owned packing. Energon-owned SFT supports
+all six through the same interface, and its recipes use Balanced Greedy
+Knapsack because it matched MFFD bin utilization in validation while spreading
+sequences evenly across physical packs.
 
 ##### Concatenative Packer 
 - Sequential concatenation until bin capacity is reached
@@ -105,6 +110,12 @@ Four packing algorithms are implemented, but we recommend you just use Modified 
   4. Add pairs of small items (backward pass)
   5. Greedy fit remaining items
   6. Apply FFD to leftovers
+
+##### Greedy Knapsack
+- Repeatedly selects the largest remaining sequence that fits in the current bin
+
+##### Balanced Greedy Knapsack
+- Places descending sequences into the least-full available bin
 
 ##### First Fit Decreasing (FFD)
 - Sort sequences by length (descending), place each in first fitting bin
@@ -219,12 +230,43 @@ packed:
 0 0 0 p 1 1 1 1 p p 3 3
 ```
 
-Internally, DTensor and Megatron-Core are made aware of sequence packing with either `FlashAttentionArgs` or `PackedSeqParams`, which contain `cu_seqlens_q` and `cu_seqlens_kv`, which are the cumulative sequence lengths of the sequence in the packed batch without CP.
+Internally, Automodel and Megatron-Core are made aware of sequence packing with either `FlashAttentionArgs` or `PackedSeqParams`, which contain `cu_seqlens_q` and `cu_seqlens_kv`, which are the cumulative sequence lengths of the sequence in the packed batch without CP.
 
 ### Nuances
 - With using Sequence Packing with Megatron + Pipeline Parallelism (PP), note that all packed sequences will be padded up to the maximum packed sequence length because PP requires maintaining a fixed-size batch x seqlen buffer for PP communications. In practice, however, we find that packing is _so efficient_ that this hardly makes a difference.
 
 All together, we see **speedups in the ~2-3x range** when enabling sequence packing.
+
+### HybridEP with Packed Sequences
+
+Packed sequence lengths can differ across expert-parallel ranks. HybridEP
+collectives require every participating rank to use an aligned input length;
+otherwise a run can hang when communication overlaps. For the supported
+pipeline-parallel-size-one, MTP-disabled path, enable NeMo-RL's one-time input
+pre-padding:
+
+```yaml
+policy:
+  megatron_cfg:
+    moe_token_dispatcher_type: "flex"
+    moe_flex_dispatcher_backend: "hybridep"
+    moe_hybridep_prepad_packed_inputs: true
+    pipeline_model_parallel_size: 1
+    mtp_num_layers: 0
+  sequence_packing:
+    enabled: true
+```
+
+`moe_hybridep_prepad_packed_inputs: true` aligns the packed input length across
+the HybridEP group once before the forward pass. This avoids issuing an
+additional scalar alignment collective inside every MoE layer, where it can
+interleave with expert-parameter collectives and hang.
+
+The option is not enabled by default because this NeMo-RL-owned pre-padding
+path does not currently support pipeline parallelism or MTP. NeMo-RL rejects
+unsupported combinations during setup. When the option is omitted or `false`,
+no uneven-input alignment is applied, so HybridEP with packed sequences requires
+this option.
 
 ## Dynamic Batching
 
@@ -348,8 +390,16 @@ class SequencePackingArgs(TypedDict):
     input_key: str                     # Input tensor key
     input_lengths_key: str             # Sequence lengths key
     algorithm: str                     # Packing algorithm name
+    microbatch_order: NotRequired[Literal["packer", "largest_first"]]
     sequence_length_pad_multiple: int  # CP/TP alignment factor
 ```
+
+`microbatch_order` controls only the execution order of bins already assigned to
+each data-parallel rank. `packer` (and an omitted value for backward compatibility)
+preserves the packer's order. `largest_first` executes each rank's bins by
+nonincreasing padded-token count, allowing smaller microbatches to reuse allocator
+segments established by the largest shape. It does not change bin contents, rank
+assignment, or total padded tokens.
 
 ## Integration with Training Pipeline
 
@@ -377,6 +427,7 @@ policy:
     train_mb_tokens: 2048  # Target tokens per microbatch
     logprob_mb_tokens: 2048
     algorithm: "modified_first_fit_decreasing"  # Best algorithm
+    microbatch_order: "packer"  # Or "largest_first" to reduce allocator shape churn
     sequence_length_round: 64  # Hardware alignment
   
   dynamic_batching:
@@ -400,9 +451,9 @@ policy:
 ### Framework Compatibility
 
 **Sequence Packing Requirements:**
-- Megatron or DTensor policy
+- Megatron or Automodel policy
 - FlashAttention-2 for efficient packed attention
-- If using CP with Megatron, you _must_ use sequence packing. If using CP with Dtensor, you _cannot_ yet use packing (WIP, [Issue #520](https://github.com/NVIDIA-NeMo/RL/issues/520))
+- If using CP with Megatron, you _must_ use sequence packing. If using CP with Automodel, you _cannot_ yet use packing (WIP, [Issue #520](https://github.com/NVIDIA-NeMo/RL/issues/520))
 
 **Dynamic Batching Requirements:**
 - Any policy framework

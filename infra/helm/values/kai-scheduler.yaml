@@ -1,0 +1,22 @@
+# KAI Scheduler configuration.
+defaultQueue:
+  createDefaultQueue: true
+
+# Binder handles pod-to-node binding and DRA resource claim allocation.
+# Default 200Mi is too low for large clusters (78+ nodes); OOMKill breaks DRA.
+binder:
+  resources:
+    requests:
+      cpu: 100m
+      memory: 512Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
+# GPU Operator v25.10.0+ with cdi.enabled=true installs a "nvidia" RuntimeClass
+# that triggers the management.nvidia.com CDI path. By default KAI's admission
+# webhook injects runtimeClassName: nvidia onto every GPU pod, which breaks on
+# clusters where CDI spec files aren't fully configured. Setting this to "" stops
+# the injection (requires KAI >= v0.13.0, PR #1035).
+admission:
+  gpuPodRuntimeClassName: ""

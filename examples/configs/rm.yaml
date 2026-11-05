@@ -21,6 +21,7 @@ checkpointing:
   keep_top_k: 3
   save_period: ${rm.val_period}
   checkpoint_must_save_by: null
+  save_optimizer: true
 
 policy:
   model_name: "meta-llama/Llama-3.2-1B-Instruct"
@@ -37,16 +38,25 @@ policy:
   activation_checkpointing_enabled: false
 
   offload_optimizer_for_logprob: false
+  offload_policy_before_refit: false
+  offload_optimizer_for_refit: true
 
   reward_model_cfg:
     enabled: true  # loads model as a Reward Model (do not change)
     reward_model_type: "bradley_terry"  # only "bradley_terry" is currently supported
 
-  dtensor_cfg:
+  automodel_cfg:
     enabled: true
+    checkpoint:
+      model_save_format: "safetensors"
+      # Canonical Automodel modes: "false", "final", or "every".
+      save_consolidated: "false"
+      single_rank_consolidation: false
+      consolidation_timeout_minutes: 30
     cpu_offload: false
     sequence_parallel: false
     activation_checkpointing: false
+    deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
     tensor_parallel_size: 1
     context_parallel_size: 1
     custom_parallel_plan: null
@@ -59,7 +69,7 @@ policy:
 
   # makes the training sequence length divisible by the tensor parallel size
   # this is useful for sequence parallel training
-  make_sequence_length_divisible_by: ${policy.dtensor_cfg.tensor_parallel_size}
+  make_sequence_length_divisible_by: ${policy.automodel_cfg.tensor_parallel_size}
   max_grad_norm: 1.0
 
   optimizer:
@@ -69,15 +79,26 @@ policy:
       weight_decay: 0.1
       betas: [0.9, 0.98]
       eps: 1e-5
-      # when using Dtensor, we need to set `foreach` and `fused` to false
+      # when using Automodel, we need to set `foreach` and `fused` to false
       foreach: false
       fused: false
     
   ## ignored since enabled=false, but needed for testing purposes
   megatron_cfg:
     enabled: false
+    checkpoint:
+      async_save: false
+      ckpt_assume_constant_structure: false
+      parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
+    force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
     tensor_model_parallel_size: 2
     pipeline_model_parallel_size: 2
     context_parallel_size: 1
@@ -85,6 +106,9 @@ policy:
     num_layers_in_first_pipeline_stage: null
     num_layers_in_last_pipeline_stage: null
     sequence_parallel: false
+    gradient_accumulation_fusion: false
+    use_fused_weighted_squared_relu: false
+    reuse_logits_storage: false
 
     optimizer:
       optimizer: "adam"
@@ -112,6 +136,7 @@ policy:
       # optimizer cpu offload
       optimizer_cpu_offload: false
       optimizer_offload_fraction: 0.0
+      overlap_cpu_optimizer_d2h_h2d: false
 
     scheduler:
       start_weight_decay: ${policy.megatron_cfg.optimizer.weight_decay}
@@ -188,11 +213,12 @@ data:
 
   # If you are doing checkpointing, `metric_name` should reflect the metric and validation set to be tracked. For example:
   #   checkpointing:
-  #     metric_name: "validation-<NameOfValidationDataset1>_loss"
+  #     metric_name: "val:validation-<NameOfValidationDataset1>_loss"
   #   ...
 
 logger:
   log_dir: "logs"  # Base directory for all logs
+  extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
   wandb_enabled: true # Make sure you do a ``wandb login [Your API key]'' before running
   tensorboard_enabled: true
   mlflow_enabled: false
@@ -206,6 +232,10 @@ logger:
     name: "rm-dev-${data.train.dataset_name}"
   tensorboard:
     log_dir: "tb_logs-rm-dev-${data.train.dataset_name}"
+  mlflow:
+    experiment_name: "rm-dev"
+    run_name: "rm-dev-${data.train.dataset_name}"
+    tracking_uri: "http://localhost:5000"
   gpu_monitoring:
     collection_interval: 10  # How often to collect GPU usage metrics (in seconds)
     flush_interval: 10  # How often to flush GPU usage metrics to the loggers (in seconds)
@@ -213,3 +243,4 @@ logger:
 cluster:
   gpus_per_node: 1
   num_nodes: 1
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

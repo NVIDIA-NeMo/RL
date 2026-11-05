@@ -24,7 +24,7 @@ loss_fn:
   use_importance_sampling_correction: true
 ```
 
-3. **Disable colocated inference** (required for async mode):
+3. **Disable colocated inference** (required for async mode with the vLLM backend; the Megatron backend supports colocated async — see `examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym.yaml`):
 ```yaml
 policy:
   generation:
@@ -41,8 +41,9 @@ grpo:
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1  # Maximum age, in training steps, for trajectories
+    max_generation_failures: 0  # Consecutive worker failures to tolerate
     in_flight_weight_updates: false  # Enable for faster weight synchronization
-    recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after in-flight-weight-updates
+    recompute_kv_cache_after_weight_updates: true # Recompute KV after weight updates (default)
 ```
 
 ### Complete Example Config
@@ -64,16 +65,33 @@ loss_fn:
 grpo:
   num_prompts_per_step: 32
   num_generations_per_prompt: 4
+  max_num_epochs: 1
+  max_num_steps: 1000000
   async_grpo:
     enabled: true
     max_trajectory_age_steps: 1
+    max_generation_failures: 0  # Consecutive worker failures to tolerate
     in_flight_weight_updates: false  # Enable for faster weight synchronization
-    recompute_kv_cache_after_weight_updates: false # Invalidates kv cache after in-flight-weight-updates
+    recompute_kv_cache_after_weight_updates: true # Recompute KV after weight updates (default)
 
 cluster:
   num_nodes: 2
   gpus_per_node: 4
 ```
+
+### Configure the training duration
+
+Async GRPO uses the same two training bounds as synchronous GRPO and stops at
+the first one reached:
+
+```text
+min(max_num_steps, max_num_epochs × batches_per_epoch)
+```
+
+One epoch is one complete pass over the training dataloader. The background
+trajectory collector cycles through the stateful dataloader as needed, while
+the trainer stops at the effective step limit above. Async checkpoints retain
+the collector's dataloader position for resume.
 
 ## Implementation Structure
 This section covers the internal architecture of async GRPO and includes detailed explanations of how the core components interact.
@@ -88,14 +106,14 @@ The async GRPO implementation consists of three main components:
 - Handles validation and checkpointing
 - Manages weight synchronization between training and generation
 
-#### 2. Async Trajectory Collector (`AsyncTrajectoryCollector` in `async_utils.py`)
+#### 2. Async Trajectory Collector (`AsyncTrajectoryCollector` in `async_utils/trajectory_collector.py`)
 - Runs in background Ray actor
 - Continuously generates trajectories using current policy weights
 - Manages generation scheduling and weight version tracking
 - Handles pause/resume for weight updates and validation
 - Coordinates with replay buffer for trajectory storage
 
-#### 3. Replay Buffer (`ReplayBuffer` in `async_utils.py`)
+#### 3. Replay Buffer (`ReplayBuffer` in `async_utils/replay_buffer.py`)
 - Stores generated trajectories with metadata
 - Tracks weight versions for both generation and intended training use
 - Implements age-based filtering to prevent stale trajectories
@@ -151,6 +169,47 @@ sequenceDiagram
     end
 ```
 
+## Checkpointing
+
+Async GRPO checkpoints the replay buffer alongside the rest of training state so that in-progress trajectory generation is not lost across restarts.
+
+### What is saved
+
+On each checkpoint, a `replay_buffer.pt` file is written next to the other checkpoint artifacts. It contains all trajectories currently in the buffer together with their weight and target versions, and the `last_target_weight_already_generated` watermark.
+
+The dataloader state saved alongside it is **frontier-aligned**: it captures the position of the first prompt that training has not yet consumed, rather than the collector's live cursor (which has already advanced past prompts that are still generating or sitting in the buffer). Every yielded prompt carries a monotonic ordinal, and the saved replay buffer records which ordinals its groups cover.
+
+### Restore behaviour
+
+On resume, the buffer is restored before the trajectory collector starts, then cleaned up as follows:
+
+1. **Past targets dropped** — trajectories whose target step is earlier than the resume step are removed.
+2. **Stale trajectories evicted** — if `max_trajectory_age_steps` is set, trajectories too old for their target step are removed.
+3. **Incomplete targets kept** — target steps that still lack a full batch are kept in the buffer. The collector will *gap-fill* only the missing trajectories for those targets before moving on.
+4. **Buffer truncated** — if the restored count exceeds `max_size`, the buffer is truncated, prioritising entries closest to the resume step.
+
+The dataloader then re-yields the window between the trained frontier and the old cursor. Prompts already trained or retained in the restored buffer are dropped; everything else — in-flight work lost at the save, groups evicted during cleanup — is regenerated in order, so **no prompt is skipped and none is duplicated as a result of the save/restore itself** (prompts trained above a conservatively-cut checkpoint's threshold — see the target-interleaving note below — are carried in the checkpoint and stay covered on resume).
+
+The guarantee is scoped to frontier-aligned checkpoints. A run falls back to the previous live-cursor checkpoints — which can skip prompts that were in flight at the save — under any of these conditions, each of which is logged when it occurs:
+
+- **Legacy checkpoints.** Resuming from a checkpoint written before frontier alignment disables it for the run, and because that run's checkpoints then carry no frontier metadata, for every run descended from them. A run only regains frontier alignment by starting fresh.
+- **Unstampable batches.** Prompts whose `extra_env_info` rows are not dicts cannot carry stream ordinals; the first such batch permanently disables frontier alignment for the run.
+- **Snapshot-ring eviction.** If no retained dataloader snapshot sits at or below the trained frontier, that checkpoint alone falls back to the live cursor.
+
+Independently of checkpointing, prompt groups whose generation fails a tolerated number of times (`max_generation_failures > 0`) are dropped during normal operation and are not recovered by a resume.
+
+**Target interleaving and the conservative cut.** A target refilled from later prompts — after a tolerated failure, or routinely when a resume gap-fills an incomplete restored target — interleaves targets' ordinals: training the refilled target can advance the frontier past another target's still-generating groups. Checkpoints written in that window conservatively cut below the trained frontier, at the lowest ordinal still in flight (logged when it happens), and persist the ordinals already trained at or above the cut. A resume from such a checkpoint regenerates the in-flight prompts and drops the persisted trained ones — no skip, no re-training.
+
+### Gap-filling after restore
+
+After a restore, `last_target_weight_already_generated` is reset to `current_training_step - 1` so the collector re-evaluates every target from the resume step onward. For each target it queries `get_trajectories_needed` and spawns only the workers required to complete the batch — previously buffered trajectories are reused and the collector does not regenerate them.
+
+### Disabling replay-buffer restore
+
+Set `checkpointing.load_replay_buffer: false` to skip the restore: the buffer starts empty and, on a frontier-aligned checkpoint, the whole buffered window is regenerated fresh from the rewound dataloader. This trades resume compute for an unbiased step composition — a prompt group completes only when its *longest* rollout finishes, so the groups sitting in the buffer at a save boundary systematically skew toward short rollouts; regenerating the window removes that bias. Restoration remains enabled by default and for legacy configs that omit the field. The conservative cut (target interleaving, above) also accounts for buffered-but-untrained groups — the checkpoint cut never sits above an ordinal whose only record is the buffer — so discarding the buffer is safe even on a cut-lowered checkpoint: the resume regenerates those groups from the rewound stream.
+
+If no `replay_buffer.pt` file is found in the latest checkpoint directory, training likewise starts with an empty buffer and waits for the collector to fill it before the first training step.
+
 ## Usage Tips
 
 1. **Buffer Sizing**: The replay buffer size is automatically calculated as:
@@ -162,10 +221,9 @@ sequenceDiagram
 
 3. **Resource Allocation**: Ensure sufficient GPU memory for both the training and generation clusters
 
-4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` when using `async_engine: true` for updating the weights of vLLM engine during generation. This prevents stalling training pipeline until longest generation finishes and provides significant performance benefits.
+4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` to refit without waiting for the longest in-flight generation to finish. Except for managed Dynamo, the collector requests a generation pause and resume from every async backend around the weight transfer. Async vLLM implements this contract while preserving request state. SGLang acknowledges these hooks through its weight synchronizer, which pauses, flushes KV, transfers weights, and resumes generation; its configured pause mode determines whether requests are requeued or aborted. A backend that does not implement the hook emits a warning once per backend type per process and refits without a collector-side pause or drain. Managed Dynamo always drains active trajectories before refit. vLLM requires `async_engine: true`; the Megatron backend is always async-engine.
 
-5. **Recompute KV Cache After Weight Updates**: While using in-flight weight update, user can choose whether to recompute
-KV caches after weight udpate by configuring `recompute_kv_cache_after_weight_update` configuration.
+5. **Recompute KV Cache After Weight Updates**: `recompute_kv_cache_after_weight_updates` defaults to `true` to invalidate reusable KV/prefix caches when weights change. On the native async vLLM in-flight path, caches are cleared while generation is paused, so preserved requests recompute their KV after resuming. This repeats prefill for those requests and can reduce throughput. SGLang always flushes KV inside its weight synchronizer before the transfer, regardless of this flag; on its in-flight path, the collector skips a second flush after generation resumes. Other refit paths keep their existing post-update invalidation behavior. Set the flag to `false` to retain pre-update KV caches and avoid this recomputation cost on backends that support doing so. On the Megatron generation backend, the flag must agree with `policy.generation.mcore_generation_config.kv_cache_management_mode`: use `true` with `recompute`, or explicitly set `false` with `persist`/`offload`; setup errors on a mismatch.
 
 ## Why Importance Sampling Correction Is Required for Async
 

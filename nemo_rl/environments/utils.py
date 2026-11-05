@@ -12,13 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
-from typing import Any, Dict, NotRequired, TypedDict
+from typing import Any, Dict, NotRequired, Optional, TypedDict
 
+import ray
 from hydra.utils import get_object
 
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.utils.venvs import create_local_venv_on_each_node
+
+# Teardown must be bounded: it runs in a finally block, so a hung shutdown would
+# replace a real training error with an indefinite hang.
+DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 
 
 # Environment registry entry schema.
@@ -34,6 +39,9 @@ ENV_REGISTRY: Dict[str, EnvRegistryEntry] = {
     },
     "math": {
         "actor_class_fqn": "nemo_rl.environments.math_environment.MathEnvironment",
+    },
+    "math_multi_reward": {
+        "actor_class_fqn": "nemo_rl.environments.math_environment.MathMultiRewardEnvironment",
     },
     "code": {
         "actor_class_fqn": "nemo_rl.environments.code_environment.CodeEnvironment",
@@ -113,9 +121,12 @@ def create_env(env_name: str, env_config: dict) -> EnvironmentInterface:
             actor_py_exec,
             actor_class_fqn,
         )
+        actor_py_venv = os.path.dirname(
+            os.path.dirname(actor_py_exec)
+        )  # to remove the "bin/python" suffix
         extra_env_vars = {
-            "VIRTUAL_ENV": actor_py_exec,
-            "UV_PROJECT_ENVIRONMENT": actor_py_exec,
+            "VIRTUAL_ENV": actor_py_venv,
+            "UV_PROJECT_ENVIRONMENT": actor_py_venv,
         }
     env = actor_class.options(  # type: ignore # it's wrapped with ray.remote
         runtime_env={
@@ -131,3 +142,56 @@ def register_env(env_name: str, actor_class_fqn: str) -> None:
         raise ValueError(f"Env name {env_name} already registered")
 
     ENV_REGISTRY[env_name] = {"actor_class_fqn": actor_class_fqn}
+
+
+def shutdown_environments(
+    *env_maps: Optional[Dict[str, EnvironmentInterface]],
+    timeout: float | None = DEFAULT_ENV_SHUTDOWN_TIMEOUT_SECONDS,
+) -> None:
+    """Gracefully shut down every distinct environment actor in the given maps.
+
+    Runners commonly bind the same actor — often the very same mapping — to
+    both training and validation, so each handle is asked to stop once no
+    matter how many maps contain it.
+
+    Environments must be torn down before generation workers: they may have
+    in-flight HTTP requests to the vLLM endpoints, and killing generation first
+    leaves them retrying dead connections.
+
+    An entry is either a Ray actor handle or a local object that owns actors of
+    its own (a NeMo-Gym shard set); the latter is asked to shut itself down
+    rather than killed, since only it knows what it holds.
+
+    Args:
+        env_maps: Task-name to environment mappings. ``None`` and empty
+            mappings are skipped.
+        timeout: Seconds to wait for each actor's ``shutdown()`` before killing
+            it. ``None`` waits until graceful shutdown finishes.
+    """
+    seen: set[int] = set()
+    for env_map in env_maps:
+        if not env_map:
+            continue
+        for task_name, env in env_map.items():
+            if id(env) in seen:
+                continue
+            seen.add(id(env))
+            print(f"🛑 Shutting down environment {task_name}...")
+            is_actor_handle = isinstance(env, ray.actor.ActorHandle)
+            try:
+                if is_actor_handle:
+                    ray.get(env.shutdown.remote(), timeout=timeout)
+                else:
+                    env.shutdown(timeout=timeout)
+            except Exception as e:
+                print(f"Graceful shutdown of environment {task_name} failed: {e}")
+                if not is_actor_handle:
+                    # Nothing to kill: the failure came from an owner object
+                    # that already tried, and reported, its own teardown.
+                    continue
+                try:
+                    ray.kill(env)
+                except Exception as kill_error:
+                    print(
+                        f"Error killing environment {task_name}: {kill_error}",
+                    )

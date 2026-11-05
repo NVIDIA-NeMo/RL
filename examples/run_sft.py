@@ -16,8 +16,8 @@ import argparse
 import os
 import pprint
 from functools import partial
+from typing import Any, cast
 
-from datasets import concatenate_datasets
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
 
@@ -27,15 +27,19 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.datasets import (
     AllTaskProcessedDataset,
     load_response_dataset,
+    merge_datasets,
     update_single_dataset_config,
 )
 from nemo_rl.distributed.virtual_cluster import init_ray
+from nemo_rl.models.policy import MegatronConfig, PolicyConfig
+from nemo_rl.telemetry.setup import init_telemetry_driver, shutdown_telemetry
 from nemo_rl.utils.config import (
     load_config,
     parse_hydra_overrides,
     register_omegaconf_resolvers,
 )
 from nemo_rl.utils.logger import get_next_experiment_dir
+from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 
 def parse_args():
@@ -57,15 +61,29 @@ def parse_args():
 
 
 # TODO @yukih: move to nemo_rl/data/utils.py after data processor refactored
-def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
-    assert "train" in data_config, (
-        "The dataset config structure is updated. Please refer to https://github.com/NVIDIA-NeMo/RL/blob/main/docs/guides/sft.md#datasets "
-        "and the Migrate Guide in https://github.com/NVIDIA-NeMo/RL/pull/1649 to update the dataset config."
+def _load_sft_response_dataset(dataset_config: Any, policy_config: PolicyConfig):
+    if dataset_config.get("dataset_name") != "megatron_sft_packed":
+        return load_response_dataset(dataset_config)
+    megatron_cfg = policy_config.get("megatron_cfg")
+    if megatron_cfg is None or not megatron_cfg["enabled"]:
+        raise ValueError(
+            "Direct Megatron-LM prepacked SFT requires the Megatron backend"
+        )
+    return load_response_dataset(
+        dataset_config,
+        context_parallel_size=int(
+            cast(MegatronConfig, megatron_cfg)["context_parallel_size"]
+        ),
     )
 
+
+def setup_data(
+    tokenizer: AutoTokenizer, data_config: DataConfig, policy_config: PolicyConfig
+):
     print("\n▶ Setting up data...")
     # setup train dataset
     task_data_processors = {}
+    task_data_preprocessors = {}
     data_list = []
 
     if isinstance(data_config["train"], dict):
@@ -75,7 +93,15 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
         # load dataset
         if "default" in data_config and data_config["default"] is not None:
             update_single_dataset_config(cfg, data_config["default"])
-        data = load_response_dataset(cfg)
+        data = _load_sft_response_dataset(cfg, policy_config)
+        if (
+            data.task_name == "megatron_sft_packed"
+            and data.task_name in task_data_processors
+        ):
+            raise ValueError(
+                "SFT does not support multiple megatron_sft_packed datasets "
+                "in the same training split"
+            )
         data_list.append(data)
         # bind task_name to task_data_processors
         data_processor = partial(
@@ -85,19 +111,23 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             add_generation_prompt=data_config["add_generation_prompt"],
         )
         task_data_processors[data.task_name] = (data.task_spec, data_processor)
+        if hasattr(data, "preprocessor") and data.preprocessor is not None:
+            task_data_preprocessors[data.task_name] = data.preprocessor
 
-    merged_data = concatenate_datasets([data.dataset for data in data_list])
+    merged_data = merge_datasets([data.dataset for data in data_list])
     dataset = AllTaskProcessedDataset(
         merged_data,
         tokenizer,
         None,
         task_data_processors,
+        task_data_preprocessors=task_data_preprocessors,
         max_seq_length=data_config["max_input_seq_length"],
     )
     print(f"  ✓ Training dataset loaded with {len(dataset)} samples.")
 
     # setup validation dataset
     val_task_data_processors = {}
+    val_task_data_preprocessors = {}
     val_data_list = []
 
     # validation dataset from train dataset (when train dataset's split_validation_size > 0)
@@ -107,6 +137,10 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             # bind task_name to task_data_processors
             task_name = data.task_name
             val_task_data_processors[task_name] = task_data_processors[task_name]
+            if task_name in task_data_preprocessors:
+                val_task_data_preprocessors[task_name] = task_data_preprocessors[
+                    task_name
+                ]
 
     # validation dataset from config
     if "validation" in data_config and data_config["validation"] is not None:
@@ -117,7 +151,15 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
             # load dataset
             if "default" in data_config and data_config["default"] is not None:
                 update_single_dataset_config(cfg, data_config["default"])
-            val_data = load_response_dataset(cfg)
+            val_data = _load_sft_response_dataset(cfg, policy_config)
+            if (
+                val_data.task_name == "megatron_sft_packed"
+                and val_data.task_name in val_task_data_processors
+            ):
+                raise ValueError(
+                    "SFT does not support multiple megatron_sft_packed datasets "
+                    "in the same validation split"
+                )
             val_data_list.append(val_data.dataset)
             # bind task_name to task_data_processors
             val_data_processor = partial(
@@ -130,15 +172,18 @@ def setup_data(tokenizer: AutoTokenizer, data_config: DataConfig):
                 val_data.task_spec,
                 val_data_processor,
             )
+            if hasattr(val_data, "preprocessor") and val_data.preprocessor is not None:
+                val_task_data_preprocessors[val_data.task_name] = val_data.preprocessor
 
     val_dataset = None
     if len(val_data_list) > 0:
-        merged_val_data = concatenate_datasets(val_data_list)
+        merged_val_data = merge_datasets(val_data_list)
         val_dataset = AllTaskProcessedDataset(
             merged_val_data,
             tokenizer,
             None,
             val_task_data_processors,
+            task_data_preprocessors=val_task_data_preprocessors,
             max_seq_length=data_config["max_input_seq_length"],
         )
         print(f"  ✓ Validation dataset loaded with {len(val_dataset)} samples.")
@@ -162,51 +207,72 @@ def main(is_vlm: bool = False):
         print(f"Overrides: {overrides}")
         config = parse_hydra_overrides(config, overrides)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    check_outdated_config(config)
+    config = MasterConfig(**config)
     print("Applied CLI overrides")
 
     # Print config
     print("Final config:")
     pprint.pprint(config)
 
-    config["logger"]["log_dir"] = get_next_experiment_dir(config["logger"]["log_dir"])
-    print(f"📊 Using log directory: {config['logger']['log_dir']}")
-    if config["checkpointing"]["enabled"]:
+    config.logger.log_dir = get_next_experiment_dir(config.logger.log_dir)
+    print(f"📊 Using log directory: {config.logger.log_dir}")
+    if config.checkpointing["enabled"]:
         print(
-            f"📊 Using checkpoint directory: {config['checkpointing']['checkpoint_dir']}"
+            f"📊 Using checkpoint directory: {config.checkpointing['checkpoint_dir']}"
         )
 
-    init_ray()
+    # Initialise telemetry on the driver BEFORE init_ray() so the resolved
+    # NEMO_RL_OTEL_* env is snapshotted into the Ray runtime_env and inherited
+    # by every worker. No-op unless telemetry is on.
+    init_telemetry_driver(config, algorithm="sft")
 
-    # setup tokenizer (or processor)
-    tokenizer = get_tokenizer(config["policy"]["tokenizer"], get_processor=is_vlm)
+    try:
+        init_ray()
 
-    # setup data
-    dataset, val_dataset = setup_data(tokenizer, config["data"])
+        # setup tokenizer (or processor)
+        tokenizer = get_tokenizer(config.policy["tokenizer"], get_processor=is_vlm)
 
-    (
-        policy,
-        cluster,
-        train_dataloader,
-        val_dataloader,
-        loss_fn,
-        logger,
-        checkpointer,
-        sft_save_state,
-        master_config,
-    ) = setup(config, tokenizer, dataset, val_dataset)
+        # setup data
+        if config.data.get("backend") == "energon":
+            raise ValueError(
+                "Energon backend is not supported for V1, use `run_sft_v2.py` instead."
+            )
+        else:
+            dataset, val_dataset = setup_data(tokenizer, config.data, config.policy)
 
-    sft_train(
-        policy,
-        train_dataloader,
-        val_dataloader,
-        tokenizer,
-        loss_fn,
-        master_config,
-        logger,
-        checkpointer,
-        sft_save_state,
-    )
+        (
+            policy,
+            cluster,
+            train_dataloader,
+            val_dataloader,
+            loss_fn,
+            logger,
+            checkpointer,
+            sft_save_state,
+            master_config,
+        ) = setup(config, tokenizer, dataset, val_dataset)
+
+        # The checkpointer owns background async-checkpoint finalization threads;
+        # the context manager guarantees they are flushed (rename + delete) on exit.
+        with checkpointer:
+            sft_train(
+                policy,
+                train_dataloader,
+                val_dataloader,
+                tokenizer,
+                loss_fn,
+                master_config,
+                logger,
+                checkpointer,
+                sft_save_state,
+            )
+    finally:
+        # Flush on the failure paths too, and before cluster teardown: the OTel
+        # SDK's own atexit hook is registered ahead of Ray's and so runs after
+        # it. No-op when telemetry is inactive.
+        shutdown_telemetry()
 
 
 if __name__ == "__main__":

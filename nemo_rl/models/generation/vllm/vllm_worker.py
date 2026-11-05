@@ -14,9 +14,10 @@
 
 import copy
 import gc
+import inspect
+import logging
 import os
 import sys
-from importlib.util import find_spec
 from typing import Any, Optional, cast
 
 import ray
@@ -24,17 +25,266 @@ import torch
 from transformers import AutoConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_VLLM_PORT_RANGE_LOW,
+    DEFAULT_VLLM_PORTS_PER_ENGINE,
+)
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.interfaces import (
+    ROUTED_EXPERTS_FALLBACK_DTYPE,
     GenerationDatumSpec,
     GenerationOutputSpec,
+    get_num_routed_experts,
+    resolve_routed_experts_dtype,
     verify_right_padding,
 )
-from nemo_rl.models.generation.vllm.config import VllmConfig
-from nemo_rl.models.generation.vllm.utils import format_prompt_for_vllm_generation
+from nemo_rl.models.generation.vllm.checkpoint_engine import (
+    VllmCheckpointEngineRpcMixin,
+)
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_SPARSE_REFIT_TRANSPORTS,
+    VllmConfig,
+    parse_nvfp4_pertoken_rollout,
+    resolve_vllm_video_config,
+    validate_nvfp4_pertoken_model,
+    vllm_fp32_lm_head_enabled,
+)
+from nemo_rl.models.generation.vllm.lora_utils import make_native_lora_request
+from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
+from nemo_rl.models.generation.vllm.utils import (
+    FINISHED_REASON_LABEL,
+    HISTOGRAM_COUNT_PART,
+    HISTOGRAM_SUM_PART,
+    encode_counter_key,
+    format_prompt_for_vllm_generation,
+    pad_and_align_routed_expert_indices,
+    validate_rollout_prompt,
+)
+from nemo_rl.models.generation.vllm.video_utils import (
+    register_torchcodec_vllm_video_loader,
+)
+from nemo_rl.models.generation.vllm.worker_utils import (
+    find_tokenizer_required_architectures,
+    resolve_distributed_executor_backend,
+    resolve_vllm_dp_settings,
+    resolve_vllm_dp_size,
+)
 from nemo_rl.models.huggingface.common import ModelFlag
 from nemo_rl.models.policy.utils import is_vllm_v1_engine_enabled
+from nemo_rl.telemetry.instrumentation import umbrella_trace_fn
+from nemo_rl.telemetry.setup import (
+    init_telemetry_worker,
+    shutdown_telemetry,
+    telemetry_enabled_in_env,
+    vllm_native_tracing_requested,
+)
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
+from nemo_rl.weight_sync.checkpoint_engine_config import (
+    checkpoint_engine_refit_config,
+)
+
+logger = logging.getLogger(__name__)
+
+
+def _context_capped_max_new_tokens(
+    *, configured_max_new_tokens: int, input_length: int, max_model_len: int
+) -> int:
+    """Cap generation so the training prompt and response fit the context."""
+    remaining_context = max_model_len - input_length
+    if remaining_context <= 0:
+        raise ValueError(
+            "Cannot generate from an input whose training length exhausts the "
+            f"model context: input_length={input_length}, max_model_len={max_model_len}."
+        )
+    return min(configured_max_new_tokens, remaining_context)
+
+
+def _maybe_enable_vllm_native_tracing(llm_kwargs: dict[str, Any]) -> None:
+    """Optionally enable vLLM's native OpenTelemetry tracing on the engine.
+
+    Requires both ``telemetry.enabled`` and ``telemetry.vllm_native_tracing``
+    (plus an OTLP endpoint). vLLM builds its own span exporter and picks the
+    protocol from ``OTEL_EXPORTER_OTLP_TRACES_PROTOCOL`` alone, defaulting to
+    gRPC; it does not consult the generic ``OTEL_EXPORTER_OTLP_PROTOCOL``. So an
+    ``http/protobuf`` endpoint inherited from lens needs that traces-specific
+    var set as well, or vLLM will speak gRPC at an HTTP port.
+
+    Note this only enables tracing in the engine: vLLM's *worker* processes
+    gate on ``OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`` being present in their
+    environment and never read the engine args, so they trace whenever that var
+    reaches them -- which the Ray runtime_env does for the whole cluster. This
+    switch therefore governs engine spans, not every vLLM span.
+
+    Degrades to a no-op if the installed vLLM lacks these engine args.
+    """
+    # The master switch is re-checked here because _config_to_env() exports
+    # every field before init_telemetry_driver's `enabled` check, so
+    # vllm_native_tracing would otherwise survive enabled=false and turn on
+    # per-request tracing on exactly the runs that disabled telemetry.
+    if not (telemetry_enabled_in_env() and vllm_native_tracing_requested()):
+        return
+    endpoint = (
+        os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+        or os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    )
+    if not endpoint:
+        logger.warning(
+            "nemo-lens: NEMO_RL_OTEL_VLLM_NATIVE_TRACING is set but no OTLP "
+            "endpoint is configured; skipping native vLLM tracing."
+        )
+        return
+    # Narrow: this introspects a third-party surface that moves across vLLM
+    # versions, which justifies tolerating a missing attribute or a moved
+    # module -- but not swallowing every failure inside a vLLM worker.
+    try:
+        from vllm.engine.arg_utils import EngineArgs
+
+        supported = set(getattr(EngineArgs, "__dataclass_fields__", {})) | set(
+            inspect.signature(EngineArgs.__init__).parameters
+        )
+    except (ImportError, AttributeError, ValueError, TypeError):
+        logger.warning(
+            "nemo-lens: could not introspect vLLM EngineArgs; skipping native "
+            "vLLM tracing.",
+            exc_info=True,
+        )
+        return
+    if "otlp_traces_endpoint" not in supported:
+        logger.warning(
+            "nemo-lens: installed vLLM does not support 'otlp_traces_endpoint'; "
+            "skipping native vLLM tracing."
+        )
+        return
+    llm_kwargs.setdefault("otlp_traces_endpoint", endpoint)
+    # collect_detailed_traces is deliberately left unset: vLLM documents it as
+    # "possibly costly and or blocking", and it adds per-request timing inside
+    # the engine, so it taxes generation itself and not just the exporter. A run
+    # that wants it can still pass it through vllm_kwargs.
+    logger.info(
+        "nemo-lens: enabled vLLM native OTLP tracing -> %s. This emits one span "
+        "per generation request; expect high span volume at rollout scale.",
+        endpoint,
+    )
+
+
+def _resolve_enable_prefix_caching(vllm_cfg: dict[str, Any]) -> bool:
+    enable_prefix_caching = vllm_cfg.get("enable_prefix_caching", None)
+    if enable_prefix_caching is None:
+        enable_prefix_caching = torch.cuda.get_device_capability()[0] >= 8
+    return enable_prefix_caching
+
+
+def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -> None:
+    """Merge fp8 init kwargs into ``vllm_kwargs`` in place, preserving user overrides.
+
+    ``init_fp8`` returns a nested ``hf_overrides`` (holding ``quantization_config``),
+    so a blanket ``vllm_kwargs.update(fp8_kwargs)`` would wholesale-replace any
+    user-supplied ``hf_overrides``. We pop ``hf_overrides`` before the shallow
+    update and merge it separately so that fp8's ``quantization_config`` is the
+    base while user overrides (e.g. ``max_position_embeddings``) survive and take
+    precedence. Required FP8 ignore entries are combined with user-provided ignore
+    entries so generated safety exclusions cannot be removed. This regression was
+    reintroduced once already; see #1413/#2904.
+    """
+    fp8_kwargs = dict(fp8_kwargs)
+    fp8_hf_overrides = fp8_kwargs.pop("hf_overrides", {})
+    vllm_kwargs.update(fp8_kwargs)
+    existing_hf_overrides = vllm_kwargs.get("hf_overrides") or {}
+    merged_hf_overrides = {**fp8_hf_overrides, **existing_hf_overrides}
+
+    fp8_quantization_config = fp8_hf_overrides.get("quantization_config")
+    existing_quantization_config = existing_hf_overrides.get("quantization_config")
+    if existing_quantization_config is None:
+        if fp8_quantization_config is not None:
+            merged_hf_overrides["quantization_config"] = fp8_quantization_config
+    elif not isinstance(existing_quantization_config, dict):
+        raise ValueError("hf_overrides.quantization_config must be a mapping")
+    elif isinstance(fp8_quantization_config, dict):
+        merged_quantization_config = {
+            **fp8_quantization_config,
+            **existing_quantization_config,
+        }
+        for key in ("ignore", "ignored_layers"):
+            generated_values = fp8_quantization_config.get(key, [])
+            user_values = existing_quantization_config.get(key, [])
+            if not isinstance(generated_values, list) or not isinstance(
+                user_values, list
+            ):
+                raise ValueError(f"quantization_config.{key} must be a list")
+            if generated_values or user_values:
+                merged_quantization_config[key] = list(
+                    dict.fromkeys([*generated_values, *user_values])
+                )
+        merged_hf_overrides["quantization_config"] = merged_quantization_config
+
+    vllm_kwargs["hf_overrides"] = merged_hf_overrides
+
+
+def _apply_fp32_lm_head(vllm_cfg: dict[str, Any], vllm_kwargs: dict[str, Any]) -> None:
+    """Turn on vLLM's fp32 LM head when ``vllm_cfg.fp32_lm_head`` is set.
+
+    ``head_dtype="float32"`` (vllm-project/vllm#48390) makes vLLM's
+    LogitsProcessor run the lm_head GEMM on the bf16 operands with an fp32
+    output, the same GEMM as Megatron's ``logit_dtype=float32``, for any model
+    whose lm_head is unquantized. ``vllm_kwargs["hf_overrides"]`` must be a dict.
+    """
+    if not vllm_fp32_lm_head_enabled(vllm_cfg):
+        return
+    hf_overrides = vllm_kwargs["hf_overrides"]
+    if hf_overrides.get("head_dtype", "float32") != "float32":
+        raise ValueError(
+            "vllm_cfg.fp32_lm_head=true conflicts with hf_overrides.head_dtype="
+            f"{hf_overrides['head_dtype']!r}; remove the override."
+        )
+    hf_overrides["head_dtype"] = "float32"
+
+
+def _validate_worker_extension_cls(
+    vllm_kwargs: dict[str, Any], required_worker_extension_cls: str
+) -> None:
+    """Reserve ``worker_extension_cls`` for NeMo-RL's refit protocol."""
+    if "worker_extension_cls" in vllm_kwargs:
+        raise ValueError(
+            "generation.vllm_kwargs.worker_extension_cls is not supported: "
+            "NeMo-RL's refit protocol requires "
+            f"{required_worker_extension_cls}."
+        )
+
+
+def _log_effective_quantization_ignore_patterns(
+    vllm_cfg: dict[str, Any], vllm_kwargs: dict[str, Any]
+) -> None:
+    if not vllm_cfg.get("quantization_ignore_patterns"):
+        return
+
+    effective_ignore = vllm_kwargs["hf_overrides"]["quantization_config"].get(
+        "ignore", []
+    )
+    print(f"NRL_MXFP8_EFFECTIVE_IGNORE={effective_ignore}")
+
+
+def _configure_nvfp4_pertoken_engine_kwargs(
+    cfg: VllmConfig, llm_kwargs: dict[str, Any]
+) -> None:
+    """Configure per-token NVFP4 on the standard vLLM worker when enabled."""
+    validated_config = parse_nvfp4_pertoken_rollout(cfg)
+    if validated_config is None:
+        return
+
+    # This module subclasses vLLM types and is intentionally imported only in
+    # the vLLM worker environment, not by Megatron training workers.
+    from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken import (
+        configure_nvfp4_pertoken_engine_kwargs,
+    )
+
+    configure_nvfp4_pertoken_engine_kwargs(
+        llm_kwargs,
+        validated_config.resolved_ignore(),
+        explicit_engine_kwargs=cfg.get("vllm_kwargs") or {},
+    )
 
 
 # Use a base class to share some functions to avoid code duplication.
@@ -48,8 +298,10 @@ class BaseVllmGenerationWorker:
 
     @staticmethod
     def configure_worker(
-        num_gpus: int | float, bundle_indices: Optional[tuple[int, list[int]]] = None
-    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any]]:
+        num_gpus: int | float,
+        bundle_indices: Optional[tuple[int, list[int]]] = None,
+        num_gpus_per_node: Optional[int] = None,
+    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any]]:
         """Provides complete worker configuration for vLLM tensor and pipeline parallelism.
 
         This method configures the worker based on its role in tensor and pipeline parallelism,
@@ -58,17 +310,22 @@ class BaseVllmGenerationWorker:
         Args:
             num_gpus: Original GPU allocation for this worker based on the placement group
             bundle_indices: Tuple of (node_idx, local_bundle_indices) for parallelism (if applicable)
+            num_gpus_per_node: Number of GPUs per node in the cluster. Used to map a
+                bundle id to a node-local engine slot when deriving VLLM_PORT. When
+                None, the original per-engine index is used unchanged.
 
         Returns:
             tuple with complete worker configuration:
               - 'resources': Resource allocation (e.g., num_gpus)
               - 'env_vars': Environment variables for this worker
               - 'init_kwargs': Parameters to pass to __init__ of the worker
+              - 'runtime_env': Additional runtime_env options (e.g., nsight config)
         """
         # Initialize configuration
         resources: dict[str, Any] = {"num_gpus": num_gpus}
         init_kwargs: dict[str, Any] = {}
         env_vars: dict[str, str] = {}
+        runtime_env: dict[str, Any] = {}
 
         local_bundle_indices = None
         if bundle_indices is not None:
@@ -94,7 +351,60 @@ class BaseVllmGenerationWorker:
             init_kwargs["seed"] = seed
             # Need to give each DP group its own vllm cache to address:
             # https://github.com/vllm-project/vllm/issues/18851
-            env_vars["VLLM_CACHE_ROOT"] = os.path.expanduser(f"~/.cache/vllm_{seed}")
+            env_vars["VLLM_CACHE_ROOT"] = (
+                os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
+                + f"_{seed}"
+            )
+
+            # Give each vLLM engine a deterministic starting VLLM_PORT for the
+            # TP/DP rendezvous. vLLM's _get_open_port() reads VLLM_PORT and
+            # increments it on collision, so spacing engines by
+            # DEFAULT_VLLM_PORTS_PER_ENGINE leaves headroom. See the port layout
+            # in virtual_cluster.py.
+            #
+            # The port offset must be a node-local slot. The first entry of
+            # local_bundle_indices is a bundle id within the placement group.
+            # When a single engine spans more than one node (model parallel size
+            # larger than the per-node GPU count), that id can exceed the per-node
+            # GPU count, so dividing it by mp_size gives an offset that grows with
+            # the number of engines and can push VLLM_PORT into the OS ephemeral
+            # range, causing address-in-use errors. When num_gpus_per_node is
+            # known, reduce the id modulo the per-node GPU count to get a
+            # node-local slot. When it is not provided, use the original index,
+            # which is correct for engines that fit within one node.
+            mp_size = len(local_bundle_indices)
+            if num_gpus_per_node is None:
+                engine_index_on_node = (
+                    local_bundle_indices[0]
+                    if mp_size == 1
+                    else local_bundle_indices[0] // mp_size
+                )
+            elif mp_size > num_gpus_per_node:
+                # The engine spans several nodes. Each engine's rank-0 process is
+                # on a different node, so every such engine can use node-local
+                # slot 0 without colliding.
+                #
+                # These engines are also the ones exposed to the vLLM 0.25
+                # TCPStore/MessageQueue collision within a single engine's window
+                # (see _patch_vllm_ray_executor_v2_tcpstore_port in patches.py).
+                # That is fixed by offsetting the TCPStore search, deliberately
+                # *not* by dropping VLLM_PORT: an unset VLLM_PORT sends vLLM to
+                # kernel-ephemeral ports, which is the TOCTOU contention this port
+                # layout exists to avoid (#2380, #3103). vLLM >= 0.29 binds and
+                # holds the TCPStore before publishing its port (vllm#50969), so
+                # that patch is a no-op there; this layout still governs the
+                # MessageQueue and API-server ports.
+                engine_index_on_node = 0
+            elif mp_size == 1:
+                engine_index_on_node = local_bundle_indices[0] % num_gpus_per_node
+            else:
+                engine_index_on_node = (
+                    local_bundle_indices[0] % num_gpus_per_node
+                ) // mp_size
+            env_vars["VLLM_PORT"] = str(
+                DEFAULT_VLLM_PORT_RANGE_LOW
+                + engine_index_on_node * DEFAULT_VLLM_PORTS_PER_ENGINE
+            )
 
         # Check if this worker is part of a parallel group (TP or TP+PP).
         # A worker is part of a parallel group if it's a secondary member (local_bundle_indices is None)
@@ -108,12 +418,18 @@ class BaseVllmGenerationWorker:
             resources["num_gpus"] = 0
             env_vars["RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"] = "1"
             init_kwargs["fraction_of_gpus"] = num_gpus
+        else:
+            # TP=1: profile the outer worker directly since it runs the engine in-process.
+            # When TP>1, nsight is NOT applied here to avoid interfering with Ray's compiled
+            # DAG used by the internal vLLM TP workers. Instead, ray_workers_use_nsight is
+            # set in _create_engine_from_config to profile the internal workers.
+            runtime_env = get_nsight_config_if_pattern_matches("vllm_generation_worker")
 
         env_vars["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         # Skip vllm P2P check and rely on driver to report peer to peer capability.
         env_vars["VLLM_SKIP_P2P_CHECK"] = "1"
 
-        return resources, env_vars, init_kwargs
+        return resources, env_vars, init_kwargs, runtime_env
 
     def __init__(
         self,
@@ -121,6 +437,8 @@ class BaseVllmGenerationWorker:
         bundle_indices: Optional[list[int]] = None,
         fraction_of_gpus: float = 1.0,
         seed: Optional[int] = None,
+        extra_env_vars: Optional[list[str]] = None,
+        defer_model_load: bool = False,
     ):
         """Initialize a vLLM worker for distributed inference.
 
@@ -130,9 +448,63 @@ class BaseVllmGenerationWorker:
                           Only needed for the first worker in each tied worker group.
             fraction_of_gpus: Fraction of GPUs to use for this worker
             seed: Random seed for initialization
+            extra_env_vars: Additional environment variable names to forward into
+                          the vLLM worker subprocess (e.g. for quantization configs).
+            defer_model_load: If True, skip model loading during init. Call
+                _load_model() later to perform the heavy model loading. This
+                enables overlapping vLLM model loading with NeMo Gym init.
         """
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        # Only bind single-GPU workers to their GPU's NUMA node.
+        # For TP>1 workers, the parent process spans multiple NUMA nodes;
+        # binding it would incorrectly constrain the EngineCore subprocess
+        # (which inherits sched_setaffinity + numa_set_preferred via fork).
+        # Individual TP workers get their own NUMA binding via collective_rpc
+        # in post_init / post_init_async.
+        # ray.get_gpu_ids()[0] is this worker's physical GPU index, which keys
+        # the affinity file.
+        if bundle_indices is not None and len(bundle_indices) == 1:
+            bind_to_gpu_numa(int(ray.get_gpu_ids()[0]))
+
+        # OTel providers are process-global, so the driver's setup does not
+        # reach this actor. No-op unless telemetry is enabled.
+        init_telemetry_worker()
+
+        self._init_config(
+            config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
+        )
+        self._sparse_refit_receiver: Any = None
+        if (
+            self.is_model_owner
+            and self.cfg.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS
+        ):
+            # Keep sparse receiver dependencies and threads off other refit paths.
+            from nemo_rl.models.generation.vllm.vllm_sparse_refit import (
+                VllmSparseRefitReceiver,
+            )
+
+            self._sparse_refit_receiver = VllmSparseRefitReceiver(self)
+
+        if not self.is_model_owner:
+            return
+
+        if not defer_model_load:
+            self._load_model(bundle_indices, seed)
+
+    def _init_config(
+        self,
+        config: VllmConfig,
+        bundle_indices: Optional[list[int]],
+        fraction_of_gpus: float,
+        seed: Optional[int],
+        extra_env_vars: Optional[list[str]],
+    ):
+        """Lightweight config setup. No model loading, no heavy imports."""
         self.cfg = config
         self.model_name = self.cfg["model_name"]
+        # Refined from the model's expert count in _load_model.
+        self.routed_experts_dtype = ROUTED_EXPERTS_FALLBACK_DTYPE
         self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
         self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
         self.expert_parallel_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
@@ -141,9 +513,21 @@ class BaseVllmGenerationWorker:
         self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
+        self._extra_env_vars = extra_env_vars
+        self._native_lora_request: Any = None
 
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
+
+        _apply_vllm_patches(
+            self.py_executable,
+            extra_env_vars=extra_env_vars,
+            require_moe_routed_experts_capture=bool(
+                (self.cfg.get("vllm_kwargs") or {}).get(
+                    "enable_return_routed_experts", False
+                )
+            ),
+        )
 
         # Skip model loading if we're not the model owner
         if not self.is_model_owner:
@@ -158,177 +542,28 @@ class BaseVllmGenerationWorker:
         self.rank = 0
         self.world_size = 1
 
-        # Monkey patches for vLLM behavior. We avoid importing vllm modules
-        # here to prevent side effects during initialization and instead
-        # locate the files via importlib metadata.
+    def _refit_with_reload_api_enabled(self) -> bool:
+        return bool(self.cfg["vllm_cfg"].get("refit_with_reload_api"))
 
+    @umbrella_trace_fn(RLSpanGroup.U_MODEL_INIT, "rl.vllm.load_model")
+    def _load_model(self, bundle_indices, seed):
+        """Perform the heavy model loading and engine creation.
+
+        Split out from __init__ so it can be deferred (defer_model_load=True)
+        and run after ports are reserved, overlapping with NeMo Gym init.
+        """
         from vllm.logger import init_logger
 
-        logger = init_logger("vllm_patch")
-
-        def _get_vllm_file(relative_path: str) -> str:
-            """Return absolute path to a vLLM file or raise if it cannot be found.
-
-            The relative_path should be a POSIX-style path under the vllm
-            package root, e.g. "v1/executor/ray_executor.py" or
-            "attention/layer.py".
-            """
-            spec = find_spec("vllm")
-            if spec is None or not spec.submodule_search_locations:
-                raise RuntimeError(
-                    "vLLM package not found while attempting to patch "
-                    f"'{relative_path}'. Ensure vLLM is installed and "
-                    "available in this environment."
-                )
-
-            base_dir = next(iter(spec.submodule_search_locations))
-            file_path = os.path.join(base_dir, *relative_path.split("/"))
-
-            if not os.path.exists(file_path):
-                raise RuntimeError(
-                    "Failed to locate expected vLLM file to patch. "
-                    f"Looked for '{relative_path}' at '{file_path}'. "
-                    "This likely indicates an unexpected vLLM installation "
-                    "layout or version mismatch."
-                )
-
-            return file_path
-
-        def _patch_vllm_init_workers_ray():
-            """Patch the vLLM ray_distributed_executor.py file.
-
-            1. Pass custom runtime_env in _init_workers_ray call.
-                - This allows passing custom py_executable to worker initialization.
-            2. Add NCCL_CUMEM_ENABLE and NCCL_NVLS_ENABLE to vLLM ADDITIONAL_ENV_VARS.
-                - This is a workaround to fix async vllm in some scenarios.
-                - See https://github.com/NVIDIA-NeMo/RL/pull/898 for more details.
-            """
-            file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
-
-            with open(file_to_patch, "r") as f:
-                content = f.read()
-
-            old_lines = [
-                "self._init_workers_ray(placement_group)",
-                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"}',
-            ]
-
-            new_lines = [
-                f'self._init_workers_ray(placement_group, runtime_env={{"py_executable": "{self.py_executable}"}})',
-                'ADDITIONAL_ENV_VARS = {"HF_TOKEN", "HUGGING_FACE_HUB_TOKEN", "NCCL_CUMEM_ENABLE", "NCCL_NVLS_ENABLE", "RAY_ENABLE_UV_RUN_RUNTIME_ENV"}',
-            ]
-
-            need_replace = False
-            for old_line, new_line in zip(old_lines, new_lines):
-                if new_line in content or old_line not in content:
-                    continue
-                content = content.replace(old_line, new_line)
-                need_replace = True
-
-            if not need_replace:
-                return
-
-            # Write back the patched content
-            with open(file_to_patch, "w") as f:
-                f.write(content)
-
-        def _patch_vllm_vit_flash_attn_backend():
-            """Patch vLLM vision attention backend selection logic.
-
-            Modify the CUDA branch of maybe_get_vit_flash_attn_backend in
-            vllm.attention.layer to avoid overriding the backend when it
-            is already set to XFORMERS. This avoids flash attention related
-            errors when the ViT head dimension is not a multiple of 32.
-
-            Related issues:
-            - https://github.com/vllm-project/vllm/issues/27562
-            - https://github.com/vllm-project/vllm/issues/26989
-
-            This is properly fixed in https://github.com/vllm-project/vllm/pull/28763. We can remove this patch once we upgrade to a version of vllm that contains this fix.
-            """
-            file_to_patch = _get_vllm_file("attention/layer.py")
-            with open(file_to_patch, "r") as f:
-                content = f.read()
-
-            old_snippet = (
-                "    elif current_platform.is_cuda():\n"
-                "        if (\n"
-                "            attn_backend != AttentionBackendEnum.FLASH_ATTN\n"
-                "            and check_upstream_fa_availability(torch.get_default_dtype())\n"
-                "        ):\n"
-                "            attn_backend = AttentionBackendEnum.FLASH_ATTN\n"
-                "            use_upstream_fa = True\n"
-            )
-
-            new_snippet = (
-                "    elif current_platform.is_cuda():\n"
-                "        if (\n"
-                "            attn_backend != AttentionBackendEnum.FLASH_ATTN\n"
-                "            and attn_backend != AttentionBackendEnum.XFORMERS\n"
-                "            and check_upstream_fa_availability(torch.get_default_dtype())\n"
-                "        ):\n"
-                "            attn_backend = AttentionBackendEnum.FLASH_ATTN\n"
-                "            use_upstream_fa = True\n"
-            )
-
-            # Only patch if the file still has the old snippet and
-            # hasn't been patched already.
-            if new_snippet in content or old_snippet not in content:
-                return
-
-            content = content.replace(old_snippet, new_snippet)
-
-            with open(file_to_patch, "w") as f:
-                f.write(content)
-
-        def _patch_vllm_speculative_decoding_post_step():
-            """Patch vLLM speculative decoding post_step call.
-
-            Related PR:
-            - https://github.com/vllm-project/vllm/pull/30319
-
-            This patch fixes the InprocessClient.get_output method to properly
-            call post_step with the model_executed flag from step_fn.
-            """
-            file_to_patch = _get_vllm_file("v1/engine/core_client.py")
-
-            with open(file_to_patch, "r") as f:
-                content = f.read()
-
-            old_snippet = (
-                "    def get_output(self) -> EngineCoreOutputs:\n"
-                "        outputs, _ = self.engine_core.step_fn()\n"
-                "        return outputs and outputs.get(0) or EngineCoreOutputs()"
-            )
-
-            new_snippet = (
-                "    def get_output(self) -> EngineCoreOutputs:\n"
-                "        outputs, model_executed = self.engine_core.step_fn()\n"
-                "        self.engine_core.post_step(model_executed=model_executed)\n"
-                "        return outputs and outputs.get(0) or EngineCoreOutputs()"
-            )
-
-            if new_snippet in content or old_snippet not in content:
-                return
-
-            content = content.replace(old_snippet, new_snippet)
-
-            with open(file_to_patch, "w") as f:
-                f.write(content)
-            logger.info("Successfully patched vllm speculative decoding post_step.")
-
-        _patch_vllm_init_workers_ray()
-        logger.info("Successfully patched vllm _init_workers_ray.")
-
-        _patch_vllm_vit_flash_attn_backend()
-        logger.info("Successfully patched vllm vit flash attention backend.")
-
-        _patch_vllm_speculative_decoding_post_step()
+        logger = init_logger("vllm_load_model")
+        log_gpu_memory_diagnostics(
+            label="load_model_start", worker_type="VllmGenerationWorker"
+        )
 
         try:
             import vllm
 
             self.SamplingParams = vllm.SamplingParams
+            self._native_lora_request = make_native_lora_request(self.cfg)
         except ImportError:
             raise ImportError(
                 "vLLM is not installed. Please check that the py_executable in the runtime_env of VllmGenerationWorker "
@@ -337,6 +572,37 @@ class BaseVllmGenerationWorker:
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
         vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
+        # vLLM 0.28 (vllm-project/vllm#50411) skips rescale/normalize in the HF image
+        # processor and re-applies them on the GPU in the vision tower's dtype. The
+        # policy side normalizes on the CPU in fp32 through the same HF processor, so
+        # keep generation on that path too: identical pixel preprocessing on both sides
+        # is what the token_mult_prob_error / gen_kl_error checks assume. Upstream has
+        # already shipped one silent-corruption fix for the device path
+        # (vllm-project/vllm#55370, encoder cudagraphs). Users can opt back in via
+        # policy.generation.vllm_kwargs.mm_device_do_normalize=true.
+        vllm_kwargs.setdefault("mm_device_do_normalize", False)
+        checkpoint_engine_config = checkpoint_engine_refit_config(self.cfg)
+        if checkpoint_engine_config is not None:
+            from nemo_rl.models.generation.vllm.checkpoint_engine import (
+                configure_nixl_worker,
+            )
+
+            configure_nixl_worker(self.cfg, vllm_kwargs)
+
+        # A speculative_config with num_speculative_tokens == 0 is the supported
+        # way to disable speculative decoding (e.g. MTP) from a launch script
+        # without restructuring the config. Drop it so vLLM runs without a drafter.
+        speculative_config = vllm_kwargs.get("speculative_config")
+        if (
+            isinstance(speculative_config, dict)
+            and speculative_config.get("num_speculative_tokens") == 0
+        ):
+            vllm_kwargs["speculative_config"] = None
+            if not _resolve_enable_prefix_caching(self.cfg["vllm_cfg"]):
+                logger.warning(
+                    "Speculative decoding is disabled (num_speculative_tokens=0); "
+                    "consider enabling prefix caching for better generation performance."
+                )
 
         # Calculate total parallel size (TP * PP)
         model_parallel_size = self.tensor_parallel_size * self.pipeline_parallel_size
@@ -357,45 +623,66 @@ class BaseVllmGenerationWorker:
                 f"VLLM_RAY_BUNDLE_INDICES environment variable set to: {os.environ.get('VLLM_RAY_BUNDLE_INDICES')}"
             )
 
-            # Use Ray for distributed execution in parallel mode
-            vllm_kwargs["distributed_executor_backend"] = "ray"
-        else:
-            # For non-parallel mode, explicitly set executor to None to avoid Ray issues
-            vllm_kwargs["distributed_executor_backend"] = None
+        executor_backend = resolve_distributed_executor_backend(
+            self.tensor_parallel_size,
+            self.pipeline_parallel_size,
+            self.expert_parallel_size,
+        )
+        vllm_kwargs["distributed_executor_backend"] = executor_backend
 
         os.environ["VLLM_USE_V1"] = "1" if is_vllm_v1_engine_enabled() else "0"
         os.environ["VLLM_ALLOW_INSECURE_SERIALIZATION"] = "1"
 
         # We should use vLLM DP if ep_size > tp_size since EP_SIZE = DP_SIZE * TP_SIZE in vLLM.
-        # See details in https://github.com/vllm-project/vllm/blob/main/examples/offline_inference/data_parallel.py
-        if self.expert_parallel_size > self.tensor_parallel_size:
-            # set vLLM DP rank
-            world_size = int(os.environ["VLLM_DP_SIZE"]) * model_parallel_size
-            rank = int(os.environ["RANK"]) % world_size
-            os.environ["VLLM_DP_RANK"] = str(rank // model_parallel_size)
-            os.environ["VLLM_DP_RANK_LOCAL"] = str((rank % 8) // model_parallel_size)
-            # set vLLM DP address and port
-            leader_rank = int(os.environ["RANK"]) // world_size * world_size
-            addr_list = eval(os.environ["AVAILABLE_ADDR_LIST"])
-            port_list = eval(os.environ["AVAILABLE_PORT_LIST"])
-            os.environ["VLLM_DP_MASTER_IP"] = addr_list[leader_rank]
-            os.environ["VLLM_DP_MASTER_PORT"] = str(port_list[leader_rank])
+        if (
+            resolve_vllm_dp_size(self.tensor_parallel_size, self.expert_parallel_size)
+            > 1
+        ):
+            env_updates, kwarg_updates = resolve_vllm_dp_settings(
+                rank=int(os.environ["RANK"]),
+                tensor_parallel_size=self.tensor_parallel_size,
+                pipeline_parallel_size=self.pipeline_parallel_size,
+                expert_parallel_size=self.expert_parallel_size,
+                addresses=eval(os.environ["AVAILABLE_ADDR_LIST"]),
+                ports=eval(os.environ["AVAILABLE_PORT_LIST"]),
+                async_engine=self.cfg["vllm_cfg"]["async_engine"],
+                executor_backend=executor_backend,
+            )
+            os.environ.update(env_updates)
+            vllm_kwargs.update(kwarg_updates)
 
         load_format = self.cfg["vllm_cfg"]["load_format"]
         if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
+
+        # MTP speculative decoding with load_format="dummy" gets its policy
+        # weights via refit, but the MTP draft layer is not covered by refit, so
+        # those layers are loaded directly from the checkpoint after engine init
+        # (see VllmInternalWorkerExtension.load_mtp_weights_from_disk).
+        spec_cfg = vllm_kwargs.get("speculative_config")
+        mtp_weights_from_refit = bool(self.cfg.get("_mtp_weights_from_refit"))
+        self._mtp_speculative_enabled = spec_cfg is not None and spec_cfg.get(
+            "method"
+        ) in ("deepseek_mtp", "mtp")
+        self._mtp_weights_from_refit = mtp_weights_from_refit
+        self._mtp_load_from_disk: bool = (
+            load_format == "dummy"
+            and self._mtp_speculative_enabled
+            and not mtp_weights_from_refit
+        )
 
         if (
             len(get_nsight_config_if_pattern_matches("vllm_generation_worker")) > 0
             and vllm_kwargs["distributed_executor_backend"] == "ray"
         ):
             logger.warning(
-                "Nsight profiling is enabled for vllm generation worker through the vllm ray distributed executor. "
-                "The nsight command-line args and output file names are automatically picked by the ray distributed "
-                "executor. Refer to https://github.com/vllm-project/vllm/blob/7e3a8dc90670fd312ce1e0d4eba9bf11c571e3ad/vllm/executor/ray_distributed_executor.py#L136 "
-                "for more information."
+                "Nsight profiling is enabled for vllm internal TP workers via ray_workers_use_nsight. "
+                "The outer VllmGenerationWorker is NOT profiled to avoid interfering with Ray's compiled DAG. "
+                "vLLM's default nsight config is overridden with capture-range=cudaProfilerApi so that "
+                "profiling is deferred until start_gpu_profiling() is called."
             )
             vllm_kwargs["ray_workers_use_nsight"] = True
+            self._patch_vllm_nsight_config()
 
         # Call init_fp8 when precision is fp8
         # (kv_cache_dtype can be fp8/fp8_e4m3 or auto, validated in init_fp8)
@@ -406,19 +693,24 @@ class BaseVllmGenerationWorker:
                 self.cfg["vllm_cfg"], self.model_name, model_parallel_size
             )
 
-            vllm_kwargs.update(fp8_kwargs)
+            # Merge (rather than replace) so fp8's quantization_config coexists
+            # with user-supplied hf_overrides, which take precedence.
+            _merge_fp8_kwargs(vllm_kwargs, fp8_kwargs)
             # overriden by quant config, however vllm complains if this not passed
             self.precision = "bfloat16"
 
         if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
             vllm_kwargs["hf_overrides"] = {}
-        vllm_kwargs["hf_overrides"].update(
-            self.cfg["vllm_cfg"].get("hf_overrides", {}) or {}
-        )
+        _apply_fp32_lm_head(self.cfg["vllm_cfg"], vllm_kwargs)
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
         hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+        self.routed_experts_dtype = resolve_routed_experts_dtype(
+            get_num_routed_experts(hf_config)
+        )
+        if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
+            validate_nvfp4_pertoken_model(hf_config)
         if "GptOssForCausalLM" in getattr(hf_config, "architectures", []):
             if "quantization_config" in hf_config:
                 assert load_format == "dummy", (
@@ -426,15 +718,59 @@ class BaseVllmGenerationWorker:
                 )
                 # disable quantization
                 vllm_kwargs["hf_overrides"]["quantization_config"] = {}
-        elif "Gemma3ForConditionalGeneration" in getattr(
-            hf_config, "architectures", []
+        elif detected_arch := find_tokenizer_required_architectures(
+            getattr(hf_config, "architectures", None)
         ):
             if self.cfg["vllm_cfg"]["skip_tokenizer_init"]:
                 print(
-                    "Gemma3ForConditionalGeneration models may crash when skip_tokenizer_init is True. NeMo-RL is forcing it to False for this architecture. See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
+                    f"Detected {detected_arch} which may crash when skip_tokenizer_init is True. "
+                    "NeMo-RL is forcing it to False for this architecture. "
+                    "See https://github.com/NVIDIA-NeMo/RL/issues/1681 for more details."
                 )
             self.cfg["vllm_cfg"]["skip_tokenizer_init"] = False
 
+        # Mistral 3.5 (Mistral3ForConditionalGeneration) integration.
+        if "Mistral3ForConditionalGeneration" in getattr(
+            hf_config, "architectures", []
+        ):
+            # Mistral 3.5 ships FP8 on disk, but NeMo-RL refits bf16 weights via
+            # ZMQ (load_format='dummy'). Clear the auto-detected quantization_config
+            # so vLLM allocates bf16 buffers instead of building Fp8Config.
+            if hasattr(hf_config, "quantization_config"):
+                assert load_format == "dummy", (
+                    "Loading FP8-quantized Mistral3 in vLLM is only supported "
+                    "with load_format='dummy' (NeMo-RL refits bf16 weights via "
+                    "ZMQ). Got load_format=%r." % load_format
+                )
+                # NeMo-RL refits bf16 weights, so we intentionally clear any fp8
+                # quantization here -- including the quantization="fp8" that
+                # init_fp8 set above when precision == "fp8". Warn so a
+                # precision: fp8 Mistral3 config isn't silently downgraded to bf16.
+                if self.cfg["vllm_cfg"]["precision"] == "fp8":
+                    print(
+                        "Mistral3 refits bf16 weights via ZMQ; ignoring "
+                        "precision='fp8' and running vLLM generation in bf16."
+                    )
+                vllm_kwargs["quantization"] = None
+                vllm_kwargs["hf_overrides"]["quantization_config"] = {}
+
+            # Force the HF config parser. Auto-detect picks Mistral-native format
+            # and remaps architectures to Pixtral, whose weight loader is
+            # incompatible with NeMo-RL's HF-format ZMQ refit keys.
+            vllm_kwargs["config_format"] = "hf"
+
+            # Text-only runs additionally set generation.vllm_kwargs.language_model_only
+            # in the recipe YAML to skip vLLM's multimodal preflight.
+
+        default_worker_extension_cls = (
+            "nemo_rl.models.generation.vllm.vllm_backend."
+            "VllmInternalWorkerExtensionWithCheckpointEngine"
+            if checkpoint_engine_config is not None
+            else "nemo_rl.models.generation.vllm.vllm_backend."
+            "VllmInternalWorkerExtension"
+        )
+        _validate_worker_extension_cls(vllm_kwargs, default_worker_extension_cls)
+        _log_effective_quantization_ignore_patterns(self.cfg["vllm_cfg"], vllm_kwargs)
         llm_kwargs = dict(
             model=self.model_name,
             served_model_name=self.model_name,
@@ -445,25 +781,42 @@ class BaseVllmGenerationWorker:
             pipeline_parallel_size=self.pipeline_parallel_size,
             enable_expert_parallel=self.enable_expert_parallel,
             gpu_memory_utilization=self.gpu_memory_utilization,
-            enable_prefix_caching=torch.cuda.get_device_capability()[0] >= 8,
+            enable_prefix_caching=_resolve_enable_prefix_caching(self.cfg["vllm_cfg"]),
             dtype=self.precision,
             seed=seed,
             enforce_eager=self.cfg["vllm_cfg"]["enforce_eager"],
             max_model_len=self.cfg["vllm_cfg"]["max_model_len"],
             trust_remote_code=True,
-            worker_extension_cls="nemo_rl.models.generation.vllm.vllm_backend.VllmInternalWorkerExtension",
             enable_sleep_mode=True,
             # Set disable_log_stats=False so that self.llm.get_metrics() works.
             disable_log_stats=False,
-            logprobs_mode="processed_logprobs",
             **vllm_kwargs,
         )
 
+        logprobs_mode = self.cfg["vllm_cfg"].get("logprobs_mode")
+        if logprobs_mode is not None:
+            llm_kwargs["logprobs_mode"] = logprobs_mode
+
+        video_config = resolve_vllm_video_config(self.cfg)
+        if video_config is not None:
+            register_torchcodec_vllm_video_loader(
+                sampling_style=video_config.sampling_style,
+                temporal_patch_size=video_config.temporal_patch_size,
+            )
+        _configure_nvfp4_pertoken_engine_kwargs(self.cfg, llm_kwargs)
+        llm_kwargs.setdefault("worker_extension_cls", default_worker_extension_cls)
+        _maybe_enable_vllm_native_tracing(llm_kwargs)
         self._create_engine(llm_kwargs)
+        log_gpu_memory_diagnostics(
+            label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
+        )
 
         # will be initialized in post_init
         # used in update_weights_from_ipc_handles
         self.vllm_device_ids = None
+        log_gpu_memory_diagnostics(
+            label="load_model_complete", worker_type="VllmGenerationWorker", device_id=0
+        )
 
     def llm(self):
         return self.llm
@@ -471,6 +824,32 @@ class BaseVllmGenerationWorker:
     def is_alive(self):
         """Check if the worker is alive."""
         return True
+
+    def _tokenize_prompt_with_bos(
+        self, prompt: str | dict[str, Any]
+    ) -> str | dict[str, Any]:
+        """Tokenize an explicit BOS once, before vLLM expands media placeholders."""
+        if isinstance(prompt, dict):
+            if "prompt_token_ids" in prompt or "prompt_embeds" in prompt:
+                return prompt
+            text = prompt.get("prompt")
+        else:
+            text = prompt
+        if not isinstance(text, str):
+            return prompt
+
+        tokenizer = self.llm.renderer.get_tokenizer()
+        bos = tokenizer.bos_token
+        if not bos or not text.startswith(bos):
+            return prompt
+
+        # Per-prompt tokenization preserves mixed batches: vLLM's generate()
+        # tokenization_kwargs apply to the entire synchronous batch.
+        fields = {"prompt": text} if isinstance(prompt, str) else prompt
+        return {
+            **fields,
+            "prompt_token_ids": tokenizer.encode(text, add_special_tokens=False),
+        }
 
     def _merge_stop_strings(self, batch_stop_strings):
         stop_set: set[str] = set()
@@ -510,6 +889,8 @@ class BaseVllmGenerationWorker:
             stop_token_ids=self.cfg["stop_token_ids"],
             stop=stop_strings,
             include_stop_str_in_output=True,
+            bad_words=self.cfg.get("bad_words"),
+            ignore_eos=self.cfg.get("ignore_eos", False),
         )
 
     def start_gpu_profiling(self) -> None:
@@ -524,47 +905,197 @@ class BaseVllmGenerationWorker:
         if self.llm is not None:
             self.llm.collective_rpc("stop_gpu_profiling", args=tuple())
 
-    def _get_raw_spec_counters(self) -> dict[str, float | list[float]]:
-        """Get speculative decoding metrics from the vLLM engine.
+    @staticmethod
+    def _spec_decode_max_tokens(
+        base_max_tokens: int,
+        input_len: int,
+        max_model_len: int,
+        spec_lookahead: int,
+    ) -> int:
+        """Clamp max_tokens so speculative decoding never reads past max_model_len.
 
-        Collects spec decode counters including number of drafts,
-        draft tokens, and accepted tokens for monitoring acceptance rates.
+        The drafter looks `spec_lookahead` tokens ahead, so generation must stop
+        at least `spec_lookahead + 1` tokens before the boundary.
+        """
+        return max(
+            1, min(base_max_tokens, max_model_len - input_len - (spec_lookahead + 1))
+        )
+
+    @classmethod
+    def _request_max_new_tokens(
+        cls,
+        *,
+        configured_max_new_tokens: int,
+        input_length: int,
+        max_model_len: int,
+        cap_to_context: bool,
+        spec_lookahead: int,
+    ) -> int:
+        """Apply context and speculative-decoding limits to one request."""
+        max_new_tokens = configured_max_new_tokens
+        if cap_to_context:
+            max_new_tokens = _context_capped_max_new_tokens(
+                configured_max_new_tokens=max_new_tokens,
+                input_length=input_length,
+                max_model_len=max_model_len,
+            )
+        if spec_lookahead > 0:
+            max_new_tokens = cls._spec_decode_max_tokens(
+                max_new_tokens,
+                input_length,
+                max_model_len,
+                spec_lookahead,
+            )
+        return max_new_tokens
+
+    @staticmethod
+    def _patch_vllm_nsight_config() -> None:
+        """Override vLLM's nsight config for internal TP workers to use deferred capture.
+
+        vLLM's default _configure_ray_workers_use_nsight applies an always-on nsight
+        config (no capture-range, cuda-graph-trace=node) which causes significant
+        overhead and hangs Ray's compiled DAG. This patch replaces it with NeMo RL's
+        lighter config that uses capture-range=cudaProfilerApi, deferring actual
+        tracing until start_gpu_profiling() triggers cudaProfilerStart() on each
+        internal worker via collective_rpc.
+        """
+        from nemo_rl.utils.nsys import NRL_NSYS_PROFILE_STEP_RANGE
+
+        nsight_config = {
+            "t": "cuda,cudnn,cublas,nvtx",
+            "o": f"'vllm_tp_worker_{NRL_NSYS_PROFILE_STEP_RANGE}_%p'",
+            "stop-on-exit": "true",
+            "s": "none",
+            "capture-range": "cudaProfilerApi",
+            "capture-range-end": "repeat",
+            "cuda-graph-trace": "node",
+        }
+
+        try:
+            from vllm.v1.executor.ray_executor import RayDistributedExecutor
+        except ImportError:
+            from vllm.executor.ray_distributed_executor import (
+                RayDistributedExecutor,
+            )
+
+        def _patched_configure(self, ray_remote_kwargs):
+            runtime_env = ray_remote_kwargs.setdefault("runtime_env", {})
+            runtime_env.update({"nsight": nsight_config})
+            return ray_remote_kwargs
+
+        RayDistributedExecutor._configure_ray_workers_use_nsight = _patched_configure
+
+    def _get_raw_spec_counters(self) -> dict[str, float | list[float]]:
+        """Get the vLLM engine's Prometheus counters.
+
+        Returns the engine's whole snapshot -- the spec-decode counters plus the
+        token, sequence-length and request-outcome series -- so one RPC per
+        snapshot serves every metric family the driver reports on.
+
+        Two shapes in the snapshot do not survive a plain ``{name: value}`` read
+        and so are encoded into the key instead (see
+        ``utils.encode_counter_key``): a labelled series arrives as several
+        objects sharing one ``name``, so reading by name alone would keep only
+        whichever came last, and a histogram carries ``count``/``sum``/``buckets``
+        with no scalar at all, so reading by name alone would drop it entirely.
 
         Returns:
             Dictionary mapping metric names to their values.
             Values may be floats or lists of floats (for per-position metrics).
-
-        Raises:
-            AssertionError: If called before vLLM engine is initialized.
+            Empty before the engine is initialized.
         """
         metrics: dict[str, float | list[float]] = {}
-        if self.llm is not None:
-            if hasattr(self.llm, "get_metrics"):
-                vllm_prom_metrics = self.llm.get_metrics()
-            else:
-                # The AsyncLLM API does not implement get_metrics so we need to call the prometheus API ourselves
-                from vllm.v1.metrics.reader import get_metrics_snapshot
+        if self.llm is None:
+            return metrics
 
-                vllm_prom_metrics = get_metrics_snapshot()
-            for metric in vllm_prom_metrics:
-                if hasattr(metric, "values"):
-                    metrics[metric.name] = metric.values
-                elif hasattr(metric, "value"):
-                    metrics[metric.name] = metric.value
+        if hasattr(self.llm, "get_metrics"):
+            vllm_prom_metrics = self.llm.get_metrics()
+        else:
+            # The AsyncLLM API does not implement get_metrics so we need to call the prometheus API ourselves
+            from vllm.v1.metrics.reader import get_metrics_snapshot
+
+            vllm_prom_metrics = get_metrics_snapshot()
+
+        for metric in vllm_prom_metrics:
+            name = metric.name
+            reason = (getattr(metric, "labels", None) or {}).get(FINISHED_REASON_LABEL)
+            if reason is not None:
+                name = encode_counter_key(name, f"{FINISHED_REASON_LABEL}={reason}")
+
+            if hasattr(metric, "values"):
+                metrics[name] = metric.values
+            elif hasattr(metric, "value"):
+                metrics[name] = metric.value
+            elif hasattr(metric, "count") and hasattr(metric, "sum"):
+                metrics[encode_counter_key(name, HISTOGRAM_COUNT_PART)] = metric.count
+                metrics[encode_counter_key(name, HISTOGRAM_SUM_PART)] = metric.sum
         return metrics
 
+    def report_refit_server_base_url(self) -> str | None:
+        receiver = self._sparse_refit_receiver
+        return receiver.report_refit_server_base_url() if receiver is not None else None
 
-@ray.remote(
-    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
-)  # pragma: no cover
-class VllmGenerationWorker(BaseVllmGenerationWorker):
+    def start_zmq_sparse_refit_relay(self) -> str:
+        receiver = self._sparse_refit_receiver
+        if receiver is None:
+            raise RuntimeError("Remote sparse refit is not enabled for this worker.")
+        return receiver.start_zmq_sparse_refit_relay()
+
+    def configure_zmq_sparse_refit_relay(self, relay_addresses: list[str]) -> None:
+        receiver = self._sparse_refit_receiver
+        if receiver is None:
+            raise RuntimeError("Remote sparse refit is not enabled for this worker.")
+        receiver.configure_zmq_sparse_refit_relay(relay_addresses)
+
+    def stop_zmq_sparse_refit_relay(self) -> None:
+        receiver = self._sparse_refit_receiver
+        if receiver is not None:
+            receiver.stop_zmq_sparse_refit_relay()
+
+
+class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationWorker):
+    def _generate_idle_dp_batch(self) -> None:
+        assert self.llm is not None
+        sampling_params = self.SamplingParams(
+            temperature=0.0,
+            max_tokens=self.cfg["max_new_tokens"],
+            ignore_eos=True,
+        )
+        self.llm.generate(
+            [{"prompt_token_ids": [self.cfg["_pad_token_id"]]}],
+            sampling_params,
+            use_tqdm=False,
+        )
+
     def _create_engine(self, llm_kwargs: dict[str, Any]) -> None:
         import vllm
 
         self.llm = vllm.LLM(**llm_kwargs)
 
     def post_init(self):
+        if self.llm is not None:
+            self.llm.collective_rpc("bind_numa", args=tuple())
+            if parse_nvfp4_pertoken_rollout(self.cfg) is not None:
+                target_counts = self.llm.collective_rpc(
+                    "report_nvfp4_pertoken_target_count", args=tuple()
+                )
+                if not target_counts or sum(target_counts) == 0:
+                    raise RuntimeError(
+                        "generation.nvfp4_pertoken_rollout selected no "
+                        "RoutedExperts targets across the vLLM model"
+                    )
         self.vllm_device_ids = self.report_device_id()
+        if self._mtp_speculative_enabled:
+            self.llm.collective_rpc(
+                "configure_mtp_drafter_weight_source",
+                args=(self._mtp_weights_from_refit,),
+            )
+        if self._mtp_load_from_disk:
+            self.llm.collective_rpc(
+                "load_mtp_weights_from_disk", args=(self.model_name,)
+            )
+        if self._sparse_refit_receiver is not None:
+            self._sparse_refit_receiver.start_sync_server()
 
     def init_collective(
         self,
@@ -597,13 +1128,21 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
         Returns:
             BatchedDataDict conforming to GenerationOutputSpec:
-                - output_ids: input + generated token IDs with proper padding
-                - logprobs: Log probabilities for tokens
-                - generation_lengths: Lengths of each response
-                - unpadded_sequence_lengths: Lengths of each input + generated sequence
+                - ``output_ids``: input + generated token IDs with proper padding
+                - ``logprobs``: Log probabilities for tokens
+                - ``generation_lengths``: Lengths of each response
+                - ``unpadded_sequence_lengths``: Lengths of each input + generated sequence
         """
         # Handle empty input case
         if len(data["input_ids"]) == 0:
+            if (
+                not self.cfg["vllm_cfg"]["async_engine"]
+                and resolve_vllm_dp_size(
+                    self.tensor_parallel_size, self.expert_parallel_size
+                )
+                > 1
+            ):
+                self._generate_idle_dp_batch()
             # Return empty BatchedDataDict with all required fields
             return BatchedDataDict[GenerationOutputSpec](
                 {
@@ -619,39 +1158,86 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         input_lengths = data["input_lengths"]
         batch_stop_strings: list[list[str]] = data.get("stop_strings", [])
         stop_strings = self._merge_stop_strings(batch_stop_strings)
-        sampling_params = self._build_sampling_params(
-            greedy=greedy,
-            stop_strings=stop_strings,
-        )
 
+        # vLLM Eagle3 spec decode hits a CUDA illegal memory access when a
+        # request's total length reaches max_model_len (the drafter looks ahead
+        # past the boundary). Clamp per-request max_tokens so speculative
+        # requests stop short of the boundary by the drafter lookahead.
+        spec_cfg = self.cfg.get("vllm_kwargs", {}).get("speculative_config") or {}
+        spec_lookahead = int(spec_cfg.get("num_speculative_tokens", 0))
         # verify inputs have correct padding
         verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
 
         # Original input length with padding
         padded_input_length = input_ids.size(1)
 
-        # Convert inputs to vLLM format
-        prompts = format_prompt_for_vllm_generation(data)
-
-        # Generate outputs
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        outputs = self.llm.generate(prompts, sampling_params)
+        cap_to_context = bool(self.cfg["vllm_cfg"].get("cap_max_tokens_to_context"))
+        if cap_to_context or spec_lookahead > 0:
+            max_model_len = int(self.cfg["vllm_cfg"]["max_model_len"])
+            configured_max_new_tokens = int(self.cfg["max_new_tokens"])
+            per_request_max_new_tokens = []
+            for input_length in input_lengths.tolist():
+                per_request_max_new_tokens.append(
+                    self._request_max_new_tokens(
+                        configured_max_new_tokens=configured_max_new_tokens,
+                        input_length=int(input_length),
+                        max_model_len=max_model_len,
+                        cap_to_context=cap_to_context,
+                        spec_lookahead=spec_lookahead,
+                    )
+                )
+
+            sampling_params = [
+                self._build_sampling_params(
+                    greedy=greedy,
+                    stop_strings=stop_strings,
+                    max_new_tokens=max_new_tokens,
+                )
+                for max_new_tokens in per_request_max_new_tokens
+            ]
+        else:
+            sampling_params = self._build_sampling_params(
+                greedy=greedy,
+                stop_strings=stop_strings,
+            )
+
+        # Convert inputs to vLLM format and generate outputs.
+        prompts = format_prompt_for_vllm_generation(data)
+        prompts = [self._tokenize_prompt_with_bos(prompt) for prompt in prompts]
+        use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
+        outputs = self.llm.generate(
+            prompts,
+            sampling_params,
+            use_tqdm=use_tqdm,
+            lora_request=self._native_lora_request,
+        )
 
         # Process the outputs - but preserve the original input padding structure
         output_ids_list = []
         logprobs_list = []
+        routed_experts_list = []
+        r3_missing_routes = []
+        r3_expected_routes = []
+        r3_actual_routes = []
         generation_lengths = []
         unpadded_sequence_lengths = []
         truncated_list = []  # Track if response was truncated (hit max_tokens)
         max_length = 0
+        return_routed_experts = bool(
+            self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
+        )
         for output in outputs:
             max_length = max(max_length, len(output.outputs[0].token_ids))
 
         for i, output in enumerate(outputs):
             # Extract generated tokens
             sequence_length = input_lengths[i]
+            validate_rollout_prompt(
+                input_ids[i, :sequence_length].tolist(), output.prompt_token_ids
+            )
             generation = output.outputs[0]
             generated_tokens = list(generation.token_ids)
 
@@ -675,12 +1261,15 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             full_logprobs = torch.zeros(total_length, dtype=torch.float32)
             if hasattr(generation, "logprobs") and generation.logprobs:
                 try:
-                    for idx, logprob_dict in enumerate(generation.logprobs):
+                    for idx, (token_id, logprob_dict) in enumerate(
+                        zip(generated_tokens, generation.logprobs)
+                    ):
                         if logprob_dict:
-                            position = sequence_length + idx
-                            full_logprobs[position] = next(iter(logprob_dict.items()))[
-                                1
-                            ].logprob
+                            sampled_logprob = logprob_dict.get(token_id)
+                            if sampled_logprob is not None:
+                                full_logprobs[sequence_length + idx] = (
+                                    sampled_logprob.logprob
+                                )
                 except Exception:
                     import traceback
 
@@ -689,6 +1278,28 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             logprobs_list.append(full_logprobs)
 
             response_length = sequence_length + len(generated_tokens)
+            full_routed_experts, r3_stats = pad_and_align_routed_expert_indices(
+                output,
+                generation,
+                valid_length=response_length,
+                padded_length=total_length,
+                device=input_ids.device,
+                require_complete_routed_experts=return_routed_experts,
+                return_stats=True,
+                routed_experts_dtype=self.routed_experts_dtype,
+            )
+            if return_routed_experts and full_routed_experts is None:
+                raise RuntimeError(
+                    "vLLM was asked to return routed experts but the generation output "
+                    "did not include routed_experts."
+                )
+            if return_routed_experts:
+                r3_missing_routes.append(r3_stats["missing_routes"])
+                r3_expected_routes.append(r3_stats["expected_routes"])
+                r3_actual_routes.append(r3_stats["actual_routes"])
+            if full_routed_experts is not None:
+                routed_experts_list.append(full_routed_experts)
+
             generation_lengths.append(len(generated_tokens))
             unpadded_sequence_lengths.append(response_length)
 
@@ -703,6 +1314,23 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         # Create return data conforming to GenerationOutputSpec
         output_ids = torch.stack(output_ids_list)
         logprobs = torch.stack(logprobs_list)
+        if r3_missing_routes and sum(r3_missing_routes) > 0:
+            bad_samples = [
+                f"{idx}:missing={missing},actual={actual},expected={expected}"
+                for idx, (missing, actual, expected) in enumerate(
+                    zip(r3_missing_routes, r3_actual_routes, r3_expected_routes)
+                )
+                if missing > 0
+            ][:8]
+            logger.warning(
+                "R3 router replay fallback: vLLM returned incomplete routed_experts "
+                "for %d/%d samples, missing_token_routes=%d. Megatron will use its "
+                "own router for those missing token routes. samples=[%s]",
+                sum(1 for missing in r3_missing_routes if missing > 0),
+                len(r3_missing_routes),
+                sum(r3_missing_routes),
+                "; ".join(bad_samples),
+            )
 
         return_data = BatchedDataDict[GenerationOutputSpec](
             {
@@ -717,6 +1345,18 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 "truncated": torch.tensor(truncated_list, dtype=torch.bool),
             }
         )
+        if routed_experts_list:
+            return_data["routed_experts"] = torch.stack(routed_experts_list)
+        if r3_missing_routes:
+            return_data["r3_routed_experts_missing_routes"] = torch.tensor(
+                r3_missing_routes, dtype=torch.long
+            )
+            return_data["r3_routed_experts_expected_routes"] = torch.tensor(
+                r3_expected_routes, dtype=torch.long
+            )
+            return_data["r3_routed_experts_actual_routes"] = torch.tensor(
+                r3_actual_routes, dtype=torch.long
+            )
 
         return return_data
 
@@ -739,6 +1379,16 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             raise RuntimeError(
                 "generate_text cannot be used with async_engine=True. Use generate_text_async instead."
             )
+
+        if len(data["prompts"]) == 0:
+            if (
+                resolve_vllm_dp_size(
+                    self.tensor_parallel_size, self.expert_parallel_size
+                )
+                > 1
+            ):
+                self._generate_idle_dp_batch()
+            return BatchedDataDict[GenerationOutputSpec]({"texts": []})
 
         # Extract stop_strings if provided, else use default from config
         batch_stop_strings: list[list[str] | None] = data.get(
@@ -773,7 +1423,14 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         assert self.llm is not None, (
             "Attempting to generate with either an uninitialized vLLM or non-model-owner"
         )
-        outputs = self.llm.generate(data["prompts"], sampling_params)
+        use_tqdm = self.cfg["vllm_cfg"].get("use_tqdm", True)
+        prompts = [self._tokenize_prompt_with_bos(prompt) for prompt in data["prompts"]]
+        outputs = self.llm.generate(
+            prompts,
+            sampling_params,
+            use_tqdm=use_tqdm,
+            lora_request=self._native_lora_request,
+        )
         texts = [output.outputs[0].text for output in outputs]
 
         # Convert to BatchedDataDict
@@ -798,9 +1455,24 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         )
         return cast(list[str], list_of_worker_results)
 
-    def prepare_refit_info(self, state_dict_info: dict[str, Any]) -> None:
-        """Prepare the info for refit."""
-        self.llm.collective_rpc("prepare_refit_info", args=(state_dict_info,))
+    def prepare_refit_info(
+        self, state_dict_info: dict[str, Any]
+    ) -> Optional[list[str]]:
+        """Prepare the info for refit.
+
+        Returns the parameter names the engine wants pre-quantized on the
+        trainer (vllm_cfg.refit_prequantize), or None.
+        """
+        from nemo_rl.models.generation.vllm.quantization import fp8
+
+        results = self.llm.collective_rpc(
+            "prepare_refit_info",
+            args=(state_dict_info, fp8.serialize_fp8_config()),
+        )
+        # Union across the engine's TP/PP workers: with pipeline parallelism
+        # each shard only classifies its local parameters as fp8-eligible.
+        names = sorted({name for result in results if result for name in result})
+        return names or None
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_via_ipc_zmq")
     def update_weights_via_ipc_zmq(self) -> bool:
@@ -819,11 +1491,11 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 "update_weights_via_ipc_zmq",
                 args=tuple(),
             )
-            worker_result = result_or_coro[0]
+            worker_results = cast(list[bool], result_or_coro)
 
-            if not worker_result:
+            if not worker_results or not all(worker_results):
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed to update weights. Results: {worker_results}"
                 )
                 return False
             return True
@@ -835,7 +1507,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
             return False
 
     @wrap_with_nvtx_name("vllm_genertion_worker/update_weights_from_collective")
-    def update_weights_from_collective(self) -> bool:
+    def update_weights_from_collective(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> bool:
         """Update the model weights from collective communication."""
         try:
             assert self.llm is not None, (
@@ -848,18 +1522,96 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
                 )
 
             result_or_coro = self.llm.collective_rpc(
-                "update_weights_from_collective", args=tuple()
+                "update_weights_from_collective",
+                args=(refit_timeout_s, self._refit_with_reload_api_enabled()),
+            )
+            worker_results = cast(list[bool], result_or_coro)
+
+            if not worker_results or not all(worker_results):
+                print(
+                    f"Error: Worker failed to update weights. Results: {worker_results}"
+                )
+                return False
+            return True
+        except Exception as e:
+            # Propagate a deliberate abort instead of folding it into `return False`. It
+            # is the controller's signal to rebuild over the survivors and retry; reported
+            # as a generic failure it just ends the run, which is the wedge this exists to
+            # replace.
+            #
+            # Matched by message, not by type, and that is not belt-and-braces. vLLM's
+            # EngineCore RPC stringifies the worker exception and re-raises it client-side
+            # as a bare Exception, so the RefitAborted raised inside the engine arrives
+            # here as Exception(str) and a plain `except RefitAborted` never fires. Job
+            # 6484412 is the proof: the deadline fired, the abort was named in the log, and
+            # the run still wedged at step 4 because this handler did not match.
+            if is_refit_abort(e):
+                raise RefitAborted(str(e)) from e
+            print(f"Exception during collective_rpc for weight update: {e}")
+            import traceback
+
+            traceback.print_exc()
+            return False
+
+    def init_nccl_reshard_comm_group(
+        self,
+        rank_prefix: int,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> None:
+        """Forward nccl_reshard bulk-path comm group init to vLLM backend workers."""
+        self.llm.collective_rpc(
+            "init_nccl_reshard_comm_group",
+            args=(
+                rank_prefix,
+                pp_ips,
+                pp_ports,
+                pp_size,
+                train_ranks_per_stage,
+                sub_world_size,
+            ),
+        )
+
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Forward refit info to vLLM backend workers."""
+        self.llm.collective_rpc("prepare_nccl_reshard_refit_info", args=(refit_info,))
+
+    def nccl_reshard_refit(self, refit_timeout_s: Optional[float] = None) -> bool:
+        """Receive weights from training workers via nccl_reshard (xferdtensor)."""
+        try:
+            assert self.llm is not None, (
+                "Attempting to update weights with either an uninitialized vLLM or non-model-owner"
+            )
+
+            result_or_coro = self.llm.collective_rpc(
+                "nccl_reshard_refit", args=(refit_timeout_s,)
             )
             worker_result = result_or_coro[0]
 
             if not worker_result:
                 print(
-                    f"Error: Worker failed to update weights. Result: {worker_result}"
+                    f"Error: Worker failed nccl_reshard_refit. Result: {worker_result}"
                 )
                 return False
             return True
         except Exception as e:
-            print(f"Exception during collective_rpc for weight update: {e}")
+            # Propagate a deliberate abort instead of folding it into `return False`. It
+            # is the controller's signal to rebuild over the survivors and retry; reported
+            # as a generic failure it just ends the run, which is the wedge this exists to
+            # replace.
+            #
+            # Matched by message, not by type, and that is not belt-and-braces. vLLM's
+            # EngineCore RPC stringifies the worker exception and re-raises it client-side
+            # as a bare Exception, so the RefitAborted raised inside the engine arrives
+            # here as Exception(str) and a plain `except RefitAborted` never fires. Job
+            # 6484412 is the proof: the deadline fired, the abort was named in the log, and
+            # the run still wedged at step 4 because this handler did not match.
+            if is_refit_abort(e):
+                raise RefitAborted(str(e)) from e
+            print(f"Exception during nccl_reshard_refit: {e}")
             import traceback
 
             traceback.print_exc()
@@ -893,6 +1645,16 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
 
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
         self.llm.llm_engine.reset_prefix_cache()
+        # Clear the renderer's multimodal processor cache (sender side) so it
+        # stays in sync with the receiver cache that vLLM clears internally
+        # during sleep.  Without this, the sender thinks images are already
+        # cached on the receiver and sends data=None, causing an assertion
+        # error.  We only clear the renderer (sender) cache here — the
+        # receiver and worker-level caches are reset by sleep() internally.
+        if hasattr(self.llm, "renderer") and hasattr(
+            self.llm.renderer, "clear_mm_cache"
+        ):
+            self.llm.renderer.clear_mm_cache()
         self.llm.sleep(level=1)
 
         gc.collect()
@@ -920,6 +1682,9 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
     def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            if self._sparse_refit_receiver is not None:
+                self._sparse_refit_receiver.shutdown()
+
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
                 self.llm.collective_rpc("cleanup", args=tuple())
@@ -938,3 +1703,13 @@ class VllmGenerationWorker(BaseVllmGenerationWorker):
         except Exception as e:
             print(f"Error during vLLM shutdown: {e}")
             return False
+        finally:
+            # Flush buffered spans/metrics before the actor goes away.
+            shutdown_telemetry()
+
+
+@ray.remote(
+    runtime_env={**get_nsight_config_if_pattern_matches("vllm_generation_worker")}
+)  # pragma: no cover
+class VllmGenerationWorker(VllmGenerationWorkerImpl):
+    pass

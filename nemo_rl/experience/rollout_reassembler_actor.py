@@ -1,0 +1,275 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""CPU Ray actors for metadata-only token-capture finalization."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Optional
+
+import ray
+
+from nemo_rl.data.captured_media import MediaColumnSpec
+from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
+from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.schema import forest_row_ids
+from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
+from nemo_rl.experience.rollout_reassembler import (
+    FinalizedGroup,
+    RolloutReassembler,
+    RolloutSelection,
+)
+from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+from nemo_rl.utils.rpc_guard import assert_metadata_only
+from nemo_rl.utils.venvs import make_actor_runtime_env
+
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.grpo import RewardPenaltyConfig
+    from nemo_rl.experience.rollouts import EffortLevelsConfig
+    from nemo_rl.models.policy import TokenizerConfig
+
+
+@dataclass(frozen=True)
+class ReassemblyRequest:
+    """Metadata-only input for one prompt group's finalization."""
+
+    group_id: str
+    rollout_ids: tuple[str, ...]
+    canonical_sample_ids: tuple[str, ...]
+    receipts: tuple[Optional[dict[str, Any]], ...]
+    rewards: tuple[float, ...]
+    fallback_weight_version: int
+    # Stable dataset prompt index; pack_payload stamps it on every row's tag.
+    prompt_idx: int
+    # Per-rollout advantage-stage flag the receipt path already knows at
+    # dispatch time. The finalizer publishes it with the rebuilt rows so the
+    # train pump reads the same ``mask_sample`` field as the native path
+    # (SingleController reads it unconditionally).
+    mask_sample: tuple[bool, ...]
+    # Dataset-level loss weight shared by every completion in this prompt group.
+    loss_multiplier: float = 1.0
+    logical_selections: Optional[tuple[RolloutSelection, ...]] = None
+    execution_row_multiple: int = 1
+    reward_checks: tuple[RewardChecks | None, ...] | None = None
+    reward_log_contexts: tuple[RewardLogContext | None, ...] | None = None
+    # Real agent identity for flat rows, retained for existing checkpoint readers.
+    resolved_agent_name: Optional[str] = None
+    # Taskset or flat-agent attribution, persisted with sealed receipts.
+    attribution_key: Optional[str] = None
+
+    @property
+    def capture_receipts(self) -> tuple[Optional[dict[str, Any]], ...]:
+        """Return cleanup receipts only after validating Forest capture ownership."""
+        if self.logical_selections is None:
+            return self.receipts
+        from nemo_gym.token_id_capture.staging.records import (
+            RolloutReceipt,
+            staging_key,
+        )
+
+        if len(self.logical_selections) != len(self.rollout_ids) or len(
+            self.receipts
+        ) != len(self.rollout_ids):
+            raise ValueError("Selection must cover every dispatched owner")
+        if self.canonical_sample_ids != tuple(
+            f"{self.group_id}_g{i}" for i in range(len(self.rollout_ids))
+        ):
+            raise ValueError("Canonical owners must match dispatch slots")
+        if any(
+            len(set(selection.response_ids)) != len(selection.response_ids)
+            or len(selection.action_flags) != len(selection.response_ids)
+            for selection in self.logical_selections
+        ):
+            raise ValueError("Selection must be unique and parallel to action flags")
+        for owner, receipt, selection in zip(
+            self.rollout_ids, self.receipts, self.logical_selections, strict=True
+        ):
+            parsed = RolloutReceipt.model_validate(receipt)
+            _receipt_staging_keys(receipt)
+            if not selection.response_ids and not parsed.capture_poisoned:
+                raise ValueError("Trainable capture requires a nonempty selection")
+            if parsed.capture_key != owner or any(
+                record.staging_key != staging_key(owner, record.model_call_id)
+                for record in parsed.manifest
+            ):
+                raise ValueError("Foreign capture scope in finalizer request")
+        return self.receipts
+
+    @property
+    def cleanup_sample_ids(self) -> tuple[str, ...]:
+        """Return the segment publication plan, including exact padding."""
+        if self.logical_selections is None:
+            return self.canonical_sample_ids
+        _ = self.capture_receipts  # Validate scope before exposing cleanup IDs.
+        plans = RolloutReassembler._plan_selected_calls(
+            list(self.rollout_ids), list(self.receipts), list(self.logical_selections)
+        )
+        return forest_row_ids(
+            self.group_id,
+            self.canonical_sample_ids,
+            [len(segments) for segments in plans],
+            execution_row_multiple=self.execution_row_multiple,
+        )
+
+
+@dataclass(frozen=True)
+class RolloutReassemblerActorConfig:
+    """Internal constructor values shared by every finalizer actor."""
+
+    partition_id: str
+    staging_partition: str
+    pad_token_id: int
+    router_replay_enabled: bool
+    defer_routed_experts_to_policy: bool
+    max_seq_len: int
+    # Whether the staging partition carries media columns (VLM capture).
+    capture_media: bool
+    # The pixel dtype and patch size the serving workers pinned the media
+    # column to; required with ``capture_media`` (the reassembler mints empty
+    # media rows in this geometry for groups without media), ``None`` otherwise.
+    media_columns: Optional[MediaColumnSpec]
+    top_logprobs: int
+    reward_penalty_config: RewardPenaltyConfig | None = None
+    effort_config: EffortLevelsConfig | None = None
+    # Policy tokenizer and resolved think tags, set only when
+    # penalize_malformed_think_tag needs to decode generations.
+    tokenizer_config: TokenizerConfig | None = None
+    thinking_tags: tuple[str, ...] | None = None
+
+
+@ray.remote(
+    num_cpus=1,
+    num_gpus=0,
+    max_restarts=0,
+    max_task_retries=0,
+)
+class RolloutReassemblerActor:  # pragma: no cover
+    """Own a connect-only TQ client and lightweight finalizer in one process."""
+
+    def __init__(
+        self,
+        dp_config: DataPlaneConfig,
+        config: RolloutReassemblerActorConfig,
+    ) -> None:
+        dp_client = build_data_plane_client(dp_config, bootstrap=False)
+        tokenizer = None
+        if config.tokenizer_config is not None:
+            # Deferred: loading a tokenizer pulls in transformers, which only
+            # the malformed-think-tag penalty needs here.
+            from nemo_rl.algorithms.utils import get_tokenizer
+
+            tokenizer = get_tokenizer(config.tokenizer_config)
+        self._finalizer = RolloutReassembler(
+            dp_client,
+            partition_id=config.partition_id,
+            staging_partition=config.staging_partition,
+            pad_token_id=config.pad_token_id,
+            router_replay_enabled=config.router_replay_enabled,
+            defer_routed_experts_to_policy=config.defer_routed_experts_to_policy,
+            max_seq_len=config.max_seq_len,
+            capture_media=config.capture_media,
+            media_columns=config.media_columns,
+            reward_penalty_config=config.reward_penalty_config,
+            effort_config=config.effort_config,
+            tokenizer=tokenizer,
+            thinking_tags=config.thinking_tags,
+            top_logprobs=config.top_logprobs,
+        )
+
+    def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
+        """Run an owner-local checkpoint command; return metadata, never payloads."""
+        return run_checkpoint_command(body)
+
+    def check_dependencies(self) -> None:
+        """Import the finalization API before the controller starts rollouts."""
+        # Deferred: only the actor's environment needs the optional Gym extra.
+        from nemo_gym.token_id_capture.staging.rebuild import (  # noqa: F401
+            RebuildError,
+            ReceiptVerificationError,
+            verify_and_linearize,
+        )
+        from nemo_gym.token_id_capture.staging.records import (
+            RolloutReceipt,  # noqa: F401
+        )
+
+    def finalize(self, request: ReassemblyRequest) -> FinalizedGroup:
+        """Finalize one request without allowing tensor payloads across Ray RPC."""
+        assert_metadata_only(request)
+        if not (
+            len(request.rollout_ids)
+            == len(request.canonical_sample_ids)
+            == len(request.receipts)
+            == len(request.rewards)
+            == len(request.mask_sample)
+        ):
+            raise ValueError(
+                "finalizer request rollout_ids, canonical_sample_ids, receipts, "
+                "rewards, and mask_sample must be parallel"
+            )
+        result = self._finalizer.finalize_group(
+            request.group_id,
+            list(request.rollout_ids),
+            list(request.receipts),
+            list(request.rewards),
+            mask_sample=list(request.mask_sample),
+            fallback_weight_version=request.fallback_weight_version,
+            prompt_idx=request.prompt_idx,
+            loss_multiplier=request.loss_multiplier,
+            canonical_sample_ids=list(request.canonical_sample_ids),
+            logical_selections=(
+                list(request.logical_selections)
+                if request.logical_selections is not None
+                else None
+            ),
+            execution_row_multiple=request.execution_row_multiple,
+            reward_checks=list(request.reward_checks)
+            if request.reward_checks is not None
+            else None,
+            reward_log_contexts=list(request.reward_log_contexts)
+            if request.reward_log_contexts is not None
+            else None,
+        )
+        assert_metadata_only(result)
+        return result
+
+
+def create_rollout_reassembler_actors(
+    dp_config: DataPlaneConfig,
+    config: RolloutReassemblerActorConfig,
+    *,
+    num_workers: int,
+) -> list[Any]:
+    """Construct and validate the pool after TQ partitions are registered."""
+    if num_workers <= 0:
+        raise ValueError(f"num_reassembler_workers must be positive, got {num_workers}")
+    runtime_env = make_actor_runtime_env(
+        "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor"
+    )
+    actors = [
+        RolloutReassemblerActor.options(runtime_env=runtime_env).remote(
+            dp_config, config
+        )
+        for _ in range(num_workers)
+    ]
+    try:
+        ray.get([actor.check_dependencies.remote() for actor in actors])
+    except ray.exceptions.RayError:
+        # Cleanup errors must not hide the startup failure or skip other actors.
+        for actor in actors:
+            try:
+                ray.kill(actor)
+            except Exception as error:
+                print(f"finalizer actor termination failed: {error}", flush=True)
+        raise
+    return actors

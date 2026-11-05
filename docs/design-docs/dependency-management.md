@@ -24,7 +24,7 @@ A **development workflow** is when you actively modify dependencies, submodules,
 
 - **Version mismatch**: Using a container built from commit A, but your local NeMo RL code is at commit B, where B has different submodule versions or Python dependencies than A
 - **Dependency changes**: Actively developing new features that require updated Python packages
-- **Submodule modifications**: Working with modified versions of Megatron-LM, NeMo-Automodel, or other submodules
+- **Submodule modifications**: Working with modified versions of Megatron-Bridge, NeMo-Automodel, or other submodules
 
 > [!WARNING]
 > If your container was built from commit `abc123` which used `vllm==0.9.0`, but your local checkout is at commit `def456` which requires `vllm==0.10.0`, you are in a development workflow. The container's cached environments won't match your code's requirements.
@@ -57,6 +57,12 @@ The virtual environment location depends on your runtime environment:
 - **Bare metal**: The venv defaults to `.venv/` local to your NeMo RL clone
 - **Container**: The container sets [`UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv`](https://github.com/NVIDIA-NeMo/RL/blob/main/docker/Dockerfile#L67), so the environment is synced to `/opt/nemo_rl_venv`. Note that this location is ephemeral to the container instance.
 
+> [!WARNING]
+> If you see a ray version or python version mismatch between the server and the client, it indicates
+> your container should be rebuilt since `ray` and/or `python` (and potentially several other packages)
+> have drifted between your container and code. Rebuilding the container will lead to faster startup
+> times since dependencies will not have to be synced on all the nodes simultaneously.
+
 ### 3. `source .venv/bin/activate`
 
 Activates the virtual environment, setting up the Python path and environment variables so your script runs with the correct dependencies.
@@ -88,16 +94,22 @@ Within the driver script, NeMo RL starts multiple [`RayWorkerGroup`](https://git
 - **Generation workers** (e.g., vLLM): Require `vllm` dependencies  
 - **Environment workers** (e.g., math evaluation): Use system/base dependencies
 
-Each worker type is mapped to a specific Python executable configuration in the [`ACTOR_ENVIRONMENT_REGISTRY`](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/distributed/ray_actor_environment_registry.py#L27-L46). This registry defines which virtual environment should be used for each actor type:
+Each worker type is mapped to the uv extras its virtual environment needs in `ACTOR_ENVIRONMENTS` in [`nemo_rl/distributed/actor_environments.py`](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/distributed/actor_environments.py). [`ACTOR_ENVIRONMENT_REGISTRY`](https://github.com/NVIDIA-NeMo/RL/blob/main/nemo_rl/distributed/ray_actor_environment_registry.py) is built from it at import time, and `docker/Dockerfile` runs the same module as a script to prefetch one virtual environment per worker type into the image:
 
 ```python
-ACTOR_ENVIRONMENT_REGISTRY: dict[str, str] = {
-    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": VLLM_EXECUTABLE,
-    "nemo_rl.models.policy.megatron_policy_worker.MegatronPolicyWorker": MCORE_EXECUTABLE,
-    "nemo_rl.environments.math_environment.MathEnvironment": PY_EXECUTABLES.SYSTEM,
+# nemo_rl/distributed/actor_environments.py -- None means the driver's interpreter
+ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
+    # An actor can need more than one extra: the vLLM workers also get nemo_gym
+    # because token capture imports it inside the worker.
+    "nemo_rl.models.generation.vllm.vllm_worker.VllmGenerationWorker": ["vllm", "nemo_gym"],
+    "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker": ["mcore"],
+    "nemo_rl.environments.math_environment.MathEnvironment": None,
     # ... more mappings
 }
 ```
+
+This module is deliberately dependency-free: `docker/Dockerfile` runs it as a script
+from the dependency layer, where the rest of the source tree does not exist yet.
 
 > [!NOTE]
 > For more details on how workers define and use their Python executables, see the [UV Documentation](uv.md#worker-configuration).
@@ -161,7 +173,7 @@ The rebuilt container will have all virtual environments pre-cached with your up
 
 ### Option 3: Classic Workflow - Mounting Modified Submodules
 
-For situations where you're **only changing submodules** (like nemo-automodel, NeMo Gym, Megatron-LM, or Megatron-Bridge) but **not changing Python package versions**, you can use a classic mounting approach. This workflow assumes that the non-submodule Python packages in your local checkout match what the container was built with.
+For situations where you're **only changing submodules** (like nemo-automodel, NeMo Gym, or Megatron-Bridge, or Megatron-LM which is a submodule in Megatron-Bridge) but **not changing Python package versions**, you can use a classic mounting approach. This workflow assumes that the non-submodule Python packages in your local checkout match what the container was built with.
 
 The container's NeMo RL code is located at `/opt/nemo-rl`. By mounting your local `3rdparty/` directory over the container's `/opt/nemo-rl/3rdparty/`, you can swap out submodules without rebuilding environments or containers.
 
@@ -193,7 +205,7 @@ This mounts:
 > [!IMPORTANT]
 > This workflow is **only suitable when**:
 > - Python package versions in `pyproject.toml` and `uv.lock` haven't changed
-> - You're only modifying code within submodules (nemo-automodel, NeMo Gym, Megatron-LM, Megatron-Bridge)
+> - You're only modifying code within submodules (nemo-automodel, NeMo Gym, Megatron-LM within Megatron-Bridge, Megatron-Bridge)
 > - The submodule commits/branches are compatible with the installed package versions
 
 If you've changed Python package versions or dependencies outside of submodules, use Option 1 (`NRL_FORCE_REBUILD_VENVS=true`) or Option 2 (rebuild the container) instead.
@@ -274,6 +286,10 @@ NeMo RL containers enforce environment reproducibility by automatically checking
 
 - The **md5sum of `pyproject.toml`**
 - The **md5sum of `uv.lock`**
+- The **md5sum of `nemo_rl/distributed/actor_environments.py`** (the actor → uv extras
+  table). Worker virtual environments are reused rather than rebuilt, and nothing prunes
+  them, so changing an actor's extras has to invalidate the fingerprint the same way a
+  dependency change does.
 - The **commit hashes of relevant submodules**
 
 If any of these values differ between your code and the container image, NeMo RL will alert you and show exactly what has changed:
@@ -292,6 +308,9 @@ Differences found:
   - uv.lock:
       Container: 0987f6543210
       Current:   1234abcd5678
+  - nemo_rl/distributed/actor_environments.py:
+      Container: 2b3c4d5e6f70
+      Current:   9a8b7c6d5e4f
   - submodules/3rdparty/ExampleSubmodule:
       Container: a1b2c3d4e5f6
       Current:   f6e5d4c3b2a1

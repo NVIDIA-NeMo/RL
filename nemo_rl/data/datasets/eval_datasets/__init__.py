@@ -12,12 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo_rl.data.datasets.eval_datasets.aime import AIMEDataset
+from nemo_rl.data.datasets.eval_datasets.daily_omni import DailyOmniEvalDataset
 from nemo_rl.data.datasets.eval_datasets.gpqa import GPQADataset
 from nemo_rl.data.datasets.eval_datasets.local_math_dataset import LocalMathDataset
 from nemo_rl.data.datasets.eval_datasets.math import MathDataset
+from nemo_rl.data.datasets.eval_datasets.mmau import MMAUDataset
 from nemo_rl.data.datasets.eval_datasets.mmlu import MMLUDataset
 from nemo_rl.data.datasets.eval_datasets.mmlu_pro import MMLUProDataset
+
+# Dataset names that require multimodal (VLM) processing
+MULTIMODAL_DATASETS = {"mmau", "TwinkStart/MMAU", "daily-omni"}
+
+
+def _is_multimodal_dataset(dataset_name):
+    """Check if the dataset requires multimodal processing."""
+    return dataset_name in MULTIMODAL_DATASETS
 
 
 def load_eval_dataset(data_config):
@@ -40,19 +49,6 @@ def load_eval_dataset(data_config):
             )
     elif dataset_name == "mmlu_pro":
         base_dataset = MMLUProDataset(
-            prompt_file=data_config["prompt_file"],
-            system_prompt_file=data_config["system_prompt_file"],
-        )
-    # aime
-    elif dataset_name == "aime2024":
-        base_dataset = AIMEDataset(
-            variant="2024",
-            prompt_file=data_config["prompt_file"],
-            system_prompt_file=data_config["system_prompt_file"],
-        )
-    elif dataset_name == "aime2025":
-        base_dataset = AIMEDataset(
-            variant="2025",
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
@@ -82,6 +78,23 @@ def load_eval_dataset(data_config):
             prompt_file=data_config["prompt_file"],
             system_prompt_file=data_config["system_prompt_file"],
         )
+    # mmau
+    elif dataset_name in ("mmau", "TwinkStart/MMAU"):
+        split = data_config.get("split", "v05.15.25")
+        base_dataset = MMAUDataset(
+            dataset_name="TwinkStart/MMAU",
+            split=split,
+            max_samples=data_config.get("max_samples"),
+        )
+    # daily-omni
+    elif dataset_name == "daily-omni":
+        split = data_config.get("split", "train")
+        base_dataset = DailyOmniEvalDataset(
+            split=split,
+            prompt_file=data_config.get("prompt_file"),
+            system_prompt_file=data_config.get("system_prompt_file"),
+            max_samples=data_config.get("max_samples"),
+        )
     # fall back to local dataset
     else:
         print(f"Loading dataset from {dataset_name}...")
@@ -99,10 +112,13 @@ def load_eval_dataset(data_config):
 
 
 __all__ = [
-    "AIMEDataset",
+    "DailyOmniEvalDataset",
     "GPQADataset",
     "LocalMathDataset",
     "MathDataset",
+    "MMAUDataset",
     "MMLUDataset",
     "MMLUProDataset",
+    "MULTIMODAL_DATASETS",
+    "_is_multimodal_dataset",
 ]

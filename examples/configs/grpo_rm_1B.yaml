@@ -20,8 +20,10 @@ env:
       gpus_per_node: 1
       num_nodes: 1
     # TODO: Mcore path support https://github.com/NVIDIA-NeMo/RL/issues/1154
-    dtensor_cfg:
-      _v2: true
+    automodel_cfg:
+      checkpoint:
+        model_save_format: "safetensors"
+        save_consolidated: "false"
       enabled: true
       sequence_parallel: false
       tensor_parallel_size: 1
@@ -42,3 +44,4 @@ env:
 cluster:
   gpus_per_node: 2
   num_nodes: 1
+  segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

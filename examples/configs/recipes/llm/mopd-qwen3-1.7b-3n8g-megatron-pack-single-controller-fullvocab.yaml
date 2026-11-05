@@ -1,0 +1,53 @@
+defaults: ./mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller.yaml
+
+# Full-vocabulary MOPD: the exact reverse KL over the whole vocabulary,
+#
+#   L_t = sum_v p_student(v) * (log p_student(v) - log p_teacher(v))
+#
+# i.e. the K=V limit of the top-k estimator, with no score-function tail term.
+# Student and teacher are the same Qwen3-1.7B checkpoint, so any nonzero
+# divergence means a broken payload, gather, LM-head shard, or token shift.
+on_policy_distillation:
+  full:
+    enabled: true
+    # Teacher ships pre-LM-head hidden states (hidden_size wide), so teacher and
+    # student parallelism stay decoupled. 'logits' is vocab_size wide (~74x
+    # larger here) and is a numerical reference, not a production setting.
+    teacher_payload: hidden_states
+    divergence: reverse_kl
+    payload_dtype: bfloat16
+    teacher_lm_head_lifecycle: offload
+    # Bounds the live fp32 vocabulary working set: unchunked, one 8K row would
+    # materialize ~5 GB of fp32 log-softmax.
+    chunk_size: 1024
+    # Off: the residual is an algebraic identity, not a correctness signal. All
+    # three kernels consume the same logits, and exp(s)(s-t) == exp(s)s +
+    # exp(s)(-t) holds per element before the linear all-reduce, so a corrupted
+    # teacher cancels out. Measured over seven corruptions (zeroed payload, wrong
+    # LM head, mis-sharded head, token misalignment, temperature mismatch, bad
+    # gather) the residual stays under 1e-6 while opd_full_reverse_kl moves to
+    # 0.6-1.7. It costs a second full-vocabulary log-softmax; leave it to
+    # debugging runs.
+    validate_decomposition: false
+
+loss_fn:
+  # opd_full replaces the policy-gradient objective, so the base recipe's ratio
+  # and importance-sampling knobs have no code path and are rejected at loss
+  # construction (see _validate_opd_full_loss_config in loss_functions.py).
+  use_importance_sampling_correction: false
+  truncated_importance_sampling_type: null
+  use_on_policy_kl_approximation: false
+
+policy:
+  # The payload is per-token, so the base recipe's 32K window would move ~4 GB
+  # per enrichment batch. 8K keeps this inside the top-k sibling's budget.
+  max_total_sequence_length: 8192
+
+checkpointing:
+  checkpoint_dir: results/mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller-fullvocab
+
+logger:
+  wandb:
+    name: mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller-fullvocab
+  mlflow:
+    run_name: mopd-qwen3-1.7b-3n8g-megatron-pack-single-controller-fullvocab

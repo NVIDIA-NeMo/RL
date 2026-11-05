@@ -1,0 +1,297 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for community_import."""
+
+import importlib
+import os
+import pickle
+import sys
+import time
+from types import ModuleType, SimpleNamespace
+
+import pytest
+
+from nemo_rl.models.policy import provider_override_allowed
+
+
+def _ensure_package(monkeypatch, name: str) -> ModuleType:
+    """Create a minimal package module in sys.modules for import stubbing."""
+    module = sys.modules.get(name)
+    if module is None:
+        module = ModuleType(name)
+        module.__path__ = []
+        monkeypatch.setitem(sys.modules, name, module)
+
+    if "." in name:
+        parent_name, child_name = name.rsplit(".", 1)
+        parent_module = _ensure_package(monkeypatch, parent_name)
+        setattr(parent_module, child_name, module)
+
+    return module
+
+
+def _load_community_import_module(monkeypatch):
+    """Import community_import with lightweight dependency stubs."""
+    # Stub torch symbols used at import time/type annotations.
+    fake_torch = ModuleType("torch")
+    fake_torch.dtype = type("dtype", (), {})
+    fake_torch.float32 = object()
+    fake_torch.bfloat16 = object()
+    fake_torch.float16 = object()
+    # import_model_from_hf_name guards its collectives on this; single-process
+    # tests take the non-distributed path.
+    fake_torch.distributed = SimpleNamespace(is_available=lambda: False)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    # Stub megatron imports required by the module.
+    _ensure_package(monkeypatch, "megatron")
+    _ensure_package(monkeypatch, "megatron.core")
+    megatron_bridge = ModuleType("megatron.bridge")
+    megatron_bridge.AutoBridge = type("AutoBridge", (), {})
+    monkeypatch.setitem(sys.modules, "megatron.bridge", megatron_bridge)
+    megatron_transformer = ModuleType("megatron.core.transformer")
+    megatron_transformer.ModuleSpec = type("ModuleSpec", (), {})
+    monkeypatch.setitem(sys.modules, "megatron.core.transformer", megatron_transformer)
+
+    # Stub the config type while retaining the real override policy.
+    nemo_policy = ModuleType("nemo_rl.models.policy")
+    nemo_policy.MegatronConfig = dict
+    nemo_policy.provider_override_allowed = provider_override_allowed
+    monkeypatch.setitem(sys.modules, "nemo_rl.models.policy", nemo_policy)
+
+    module_name = "nemo_rl.models.megatron.community_import"
+    sys.modules.pop(module_name, None)
+    return importlib.import_module(module_name)
+
+
+def _install_runtime_stubs_for_hf_import(monkeypatch):
+    """Install minimal megatron-core stubs needed by import_model_from_hf_name."""
+    core_module = _ensure_package(monkeypatch, "megatron.core")
+
+    parallel_state = ModuleType("megatron.core.parallel_state")
+    parallel_state.model_parallel_is_initialized = lambda: False
+    monkeypatch.setitem(sys.modules, "megatron.core.parallel_state", parallel_state)
+    core_module.parallel_state = parallel_state
+
+    rerun_state_machine = ModuleType("megatron.core.rerun_state_machine")
+    rerun_state_machine.destroy_rerun_state_machine = lambda: None
+    monkeypatch.setitem(
+        sys.modules, "megatron.core.rerun_state_machine", rerun_state_machine
+    )
+    core_module.rerun_state_machine = rerun_state_machine
+
+    tensor_parallel = ModuleType("megatron.core.tensor_parallel")
+    tensor_parallel.model_parallel_cuda_manual_seed = lambda seed: None
+    tensor_parallel_random = ModuleType("megatron.core.tensor_parallel.random")
+    tensor_parallel_random._CUDA_RNG_STATE_TRACKER = "stale"
+    tensor_parallel_random._CUDA_RNG_STATE_TRACKER_INITIALIZED = True
+    tensor_parallel.random = tensor_parallel_random
+    monkeypatch.setitem(sys.modules, "megatron.core.tensor_parallel", tensor_parallel)
+    monkeypatch.setitem(
+        sys.modules, "megatron.core.tensor_parallel.random", tensor_parallel_random
+    )
+    core_module.tensor_parallel = tensor_parallel
+
+
+def test_iter_vlm_config_overrides_yields_super35_runtime_values(monkeypatch):
+    module = _load_community_import_module(monkeypatch)
+
+    overrides = dict(
+        module.iter_vlm_config_overrides(
+            {
+                "radio_force_eval_mode": False,
+                "recompute_vision": True,
+                "vision_recompute_granularity": "full",
+                "vision_recompute_method": "block",
+                "vision_recompute_num_layers": 30,
+            }
+        )
+    )
+
+    assert overrides == {
+        "radio_force_eval_mode": False,
+        "recompute_vision": True,
+        "vision_recompute_granularity": "full",
+        "vision_recompute_method": "block",
+        "vision_recompute_num_layers": 30,
+    }
+
+
+def _stage_conversion(path) -> None:
+    """Materialize conversion config, metadata, and a nonempty tensor shard."""
+    os.makedirs(os.path.join(str(path), "iter_0000000"), exist_ok=True)
+    with open(os.path.join(str(path), "iter_0000000", "run_config.yaml"), "w") as f:
+        f.write("{}\n")
+    iteration = os.path.join(str(path), "iter_0000000")
+    with open(os.path.join(iteration, "__0_0.distcp"), "wb") as f:
+        f.write(b"checkpoint tensors")
+    metadata = SimpleNamespace(
+        storage_data={"weight": SimpleNamespace(relative_path="__0_0.distcp")}
+    )
+    with open(os.path.join(iteration, ".metadata"), "wb") as f:
+        pickle.dump(metadata, f)
+
+
+def test_import_model_from_hf_name_calls_bridge_save(monkeypatch, tmp_path):
+    module = _load_community_import_module(monkeypatch)
+    _install_runtime_stubs_for_hf_import(monkeypatch)
+    # Force this import path to stay unavailable even if real megatron modules
+    # were preloaded by earlier tests in the same process.
+    monkeypatch.setitem(
+        sys.modules, "megatron.core.dist_checkpointing.strategies.torch", None
+    )
+
+    class FakeProvider:
+        def __init__(self):
+            self.tensor_model_parallel_size = 1
+            self.pipeline_model_parallel_size = 1
+            self.context_parallel_size = 1
+            self.expert_model_parallel_size = 1
+            self.expert_tensor_parallel_size = 1
+            self.num_layers_in_first_pipeline_stage = None
+            self.num_layers_in_last_pipeline_stage = None
+            self.pipeline_dtype = "fp32"
+
+        def finalize(self):
+            pass
+
+        def initialize_model_parallel(self, seed):
+            self.seed = seed
+
+        def provide_distributed_model(self, wrap_with_ddp, post_wrap_hook):
+            config = SimpleNamespace()
+            return [SimpleNamespace(config=config)]
+
+    class FakeBridge:
+        def __init__(self):
+            self.provider = FakeProvider()
+            self.saved_model = None
+            self.saved_path = None
+
+        def to_megatron_provider(self, load_weights):
+            assert load_weights is True
+            return self.provider
+
+        def save_megatron_model(self, megatron_model, output_path):
+            self.saved_model = megatron_model
+            self.saved_path = output_path
+            # The real save materializes the checkpoint; publish needs the
+            # staged directory (and its completion marker) to exist.
+            _stage_conversion(output_path)
+
+    fake_bridge = FakeBridge()
+
+    class FakeAutoBridge:
+        @staticmethod
+        def from_hf_pretrained(hf_model_name, *args, **kwargs):
+            # Keep this test focused on bridge-save flow, not HF API defaults.
+            assert hf_model_name == "fake/hf-model"
+            return fake_bridge
+
+    monkeypatch.setattr(module, "AutoBridge", FakeAutoBridge)
+
+    output_path = tmp_path / "out"
+    module.import_model_from_hf_name("fake/hf-model", str(output_path))
+
+    assert fake_bridge.saved_model is not None
+    # The save lands in a hidden staging sibling, then is renamed into place.
+    assert os.path.basename(fake_bridge.saved_path).startswith(".out.staging-")
+    assert module.megatron_conversion_is_complete(str(output_path))
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["out"]
+
+
+@pytest.mark.parametrize(
+    ("occupant", "overwrite", "staged_wins"),
+    [
+        # The empty-target happy path is covered end to end by
+        # test_import_model_from_hf_name_calls_bridge_save.
+        # A concurrent producer's complete artifact wins; the staged copy is discarded.
+        ("complete", False, False),
+        # A stale partial occupant (bare iter_0000000/, interrupted run) is displaced.
+        ("partial", False, True),
+        # force_reconvert_from_hf replaces even a complete artifact.
+        ("complete", True, True),
+    ],
+)
+def test_publish_conversion(monkeypatch, tmp_path, occupant, overwrite, staged_wins):
+    """Publish atomically renames the staging dir, resolving occupants of the final path."""
+    module = _load_community_import_module(monkeypatch)
+    staging, final = tmp_path / ".ckpt.staging-abc", tmp_path / "ckpt"
+    _stage_conversion(staging)
+    (staging / "staged_marker").touch()
+    if occupant == "complete":
+        _stage_conversion(final)
+    elif occupant == "partial":
+        (final / "iter_0000000").mkdir(parents=True)
+
+    module.publish_megatron_conversion(str(staging), str(final), overwrite=overwrite)
+
+    assert module.megatron_conversion_is_complete(str(final))
+    assert (final / "staged_marker").exists() is staged_wins
+    # Doomed copies are deleted on a background thread; wait for it.
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline and sorted(
+        p.name for p in tmp_path.iterdir()
+    ) != ["ckpt"]:
+        time.sleep(0.01)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["ckpt"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing_metadata",
+        "invalid_metadata",
+        "empty_metadata",
+        "missing_shard",
+        "empty_shard",
+    ],
+)
+def test_conversion_requires_all_metadata_referenced_shards(
+    monkeypatch, tmp_path, failure
+):
+    module = _load_community_import_module(monkeypatch)
+    _stage_conversion(tmp_path)
+    iteration = tmp_path / "iter_0000000"
+    if failure == "missing_metadata":
+        (iteration / ".metadata").unlink()
+    elif failure == "invalid_metadata":
+        (iteration / ".metadata").write_bytes(b"invalid pickle")
+    elif failure == "empty_metadata":
+        (iteration / ".metadata").write_bytes(
+            pickle.dumps(SimpleNamespace(storage_data={}))
+        )
+    elif failure == "missing_shard":
+        (iteration / "__0_0.distcp").unlink()
+    else:
+        (iteration / "__0_0.distcp").write_bytes(b"")
+    assert not module.megatron_conversion_is_complete(str(tmp_path))
+
+
+def test_conversion_requires_every_referenced_shard(monkeypatch, tmp_path):
+    module = _load_community_import_module(monkeypatch)
+    _stage_conversion(tmp_path)
+    iteration = tmp_path / "iter_0000000"
+    (iteration / ".metadata").write_bytes(
+        pickle.dumps(
+            SimpleNamespace(
+                storage_data={
+                    "weight": SimpleNamespace(relative_path="__0_0.distcp"),
+                    "bias": SimpleNamespace(relative_path="__1_0.distcp"),
+                }
+            )
+        )
+    )
+    assert not module.megatron_conversion_is_complete(str(tmp_path))

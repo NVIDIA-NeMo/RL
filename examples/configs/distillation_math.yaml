@@ -26,8 +26,7 @@ checkpointing:
     keep_top_k: 3
     save_period: 10
     checkpoint_must_save_by: null
-    model_save_format: "safetensors"
-    save_consolidated: false
+    save_optimizer: true
 
 policy: &POLICY_BASE
     model_name: "Qwen/Qwen3-1.7B-Base"
@@ -43,13 +42,23 @@ policy: &POLICY_BASE
     logprob_chunk_size: null
 
     offload_optimizer_for_logprob: false
+    # Run the policy offload lifecycle before non-colocated refit.
+    offload_policy_before_refit: false
+    # Move optimizer state to CPU when the refit offload lifecycle runs.
+    offload_optimizer_for_refit: true
 
-    dtensor_cfg: &DTENSOR_BASE
+    automodel_cfg: &AUTOMODEL_BASE
         enabled: true
-        _v2: true
+        checkpoint:
+            model_save_format: "safetensors"
+            # Canonical Automodel modes: "false", "final", or "every".
+            save_consolidated: "false"
+            single_rank_consolidation: false
+            consolidation_timeout_minutes: 30
         cpu_offload: False
         sequence_parallel: false
         activation_checkpointing: true
+        deterministic: false  # Bitwise-reproducible policy forward/backward; slower (sets CUBLAS_WORKSPACE_CONFIG, NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)
         tensor_parallel_size: 2
         context_parallel_size: 2
         custom_parallel_plan: null
@@ -65,13 +74,14 @@ policy: &POLICY_BASE
         train_mb_tokens: ${mul:${..max_total_sequence_length}, ${..train_micro_batch_size}}
         logprob_mb_tokens: ${mul:${..max_total_sequence_length}, ${..logprob_batch_size}}
         algorithm: "modified_first_fit_decreasing"
+        microbatch_order: "packer"
         sequence_length_round: 64
 
     max_grad_norm: 1.0
     # makes the training sequence length divisible by the tensor parallel size
     # this is useful for sequence parallel training
     # must be divisible by 2*cp
-    make_sequence_length_divisible_by: ${mul:${mul:${.dtensor_cfg.tensor_parallel_size}, ${.dtensor_cfg.context_parallel_size}}, 2}
+    make_sequence_length_divisible_by: ${mul:${mul:${.automodel_cfg.tensor_parallel_size}, ${.automodel_cfg.context_parallel_size}}, 2}
     optimizer:
         name: "torch.optim.AdamW"
         kwargs:
@@ -79,16 +89,53 @@ policy: &POLICY_BASE
             weight_decay: 0.01
             betas: [0.9, 0.999]
             eps: 1e-8
-            # when using Dtensor, we need to set foreach
+            # when using Automodel, we need to set foreach
             # and fused to False
             foreach: False
             fused: False
 
     megatron_cfg: &MEGATRON_BASE
         enabled: false
+        checkpoint:
+          async_save: false
+          ckpt_assume_constant_structure: false
+          parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
+        force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
         empty_unused_memory_level: 0
+        # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+        # together every manual_gc_interval optimizer steps (a positive integer).
+        manual_gc: false
+        manual_gc_interval: 10
         activation_checkpointing: false
-        converter_type: "Qwen3ForCausalLM"
+        # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+        clear_memory_caches_before_refit: false
+        # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
+        cuda_graph_impl: "none"
+        cuda_graph_modules: []
+        cuda_graph_warmup_steps: 3
+        # Offload specific module activations to CPU. Works for both dense and MoE
+        # models and requires transformer_engine. Different from optimizer_cpu_offload,
+        # which offloads optimizer states. On TE >= 2.10,
+        # also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
+        fine_grained_activation_offloading: false
+        # Modules to offload when fine_grained_activation_offloading is true.
+        # Common examples: ["core_attn", "attn_proj", "expert_fc1", "moe_act"].
+        # Supported names depend on the pinned Megatron-LM version and are
+        # validated by MCore. "attn_proj" requires "core_attn". See the latest
+        # upstream module reference:
+        # https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#offloadable-modules
+        offload_modules: null
+        # recompute_granularity controls activation checkpointing depth.
+        # "full": recompute all activations (default, max memory savings).
+        # "selective": recompute only specific modules (see recompute_modules).
+        # Only takes effect when activation_checkpointing: true.
+        recompute_granularity: "full"
+        # Modules to selectively recompute when recompute_granularity="selective".
+        # MCore options: ["core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts"].
+        # Null defaults to ["core_attn"]. Full list and per-module constraints:
+        # https://github.com/NVIDIA/Megatron-LM/blob/d30c3ae5469fe3f6a64d4fd2e63b6e7f7844ea81/megatron/core/transformer/transformer_config.py#L483
+        # Use ["moe"] for MoE models to recompute expert activations only.
+        recompute_modules: null
         tensor_model_parallel_size: 2
         expert_tensor_parallel_size: 1
         expert_model_parallel_size: 1
@@ -102,16 +149,24 @@ policy: &POLICY_BASE
         moe_router_dtype: "fp64"
         moe_router_load_balancing_type: "none" # "seq_aux_loss" causes logprob error divergence for grpo
         moe_router_bias_update_rate: 0.0 # by default, disable bias updates for grpo
-        moe_permute_fusion: false
+        moe_permute_fusion: true
         #gives ~20% training perf speedup with sequence packing 
         apply_rope_fusion: True
+        flash_attention_version: 2
         bias_activation_fusion: True
         defer_fp32_logits: False
+        reuse_logits_storage: false
+        fp32_lm_head: false # Emit fp32 logits from Megatron's LM head; must match policy.generation.vllm_cfg.fp32_lm_head.
         moe_per_layer_logging: False
         moe_enable_deepep: false
-        moe_token_dispatcher_type: "allgather"
+        moe_token_dispatcher_type: "alltoall"
         moe_shared_expert_overlap: false
-        
+        use_gloo_process_groups: false
+        # Collective timeout (minutes) for default, Megatron model-parallel, and
+        # replica groups. null = torch / Megatron default (10). Raise for slow I/O.
+        distributed_timeout_minutes: null
+        gradient_accumulation_fusion: false
+        use_fused_weighted_squared_relu: false
         optimizer:
             optimizer: "adam"
             lr: 2.00001e-5
@@ -136,6 +191,7 @@ policy: &POLICY_BASE
             # optimizer cpu offload
             optimizer_cpu_offload: false
             optimizer_offload_fraction: 0.0
+            overlap_cpu_optimizer_d2h_h2d: false
 
             clip_grad: ${policy.max_grad_norm}
 
@@ -174,17 +230,30 @@ policy: &POLICY_BASE
         - milestones: [10]
 
     generation:
+        # Port range for vLLM HTTP servers, kept below the OS ephemeral range.
+        # See ray.sub for the full port layout.
+        port_range_low: 3000
+        port_range_high: 4999
         backend: "vllm"
         max_new_tokens: ${..max_total_sequence_length} # refer to local policy/teacher config
         temperature: 1.0
         top_p: 1.0
         top_k: null
+        val_temperature: ${.temperature}
+        val_top_p: ${.top_p}
+        val_top_k: ${.top_k}
         stop_token_ids: null
         stop_strings: null
+        # LoRA refit representation for vLLM. Use merged only as an explicit opt-in.
+        lora_refit_mode: native
         vllm_cfg:
             async_engine: false
             precision: ${...precision}
             kv_cache_dtype: "auto"
+            logprobs_mode: processed_logprobs
+            fp32_lm_head: ${...megatron_cfg.fp32_lm_head} # Compute vLLM logits with an fp32 LM head.
+            # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
+            refit_with_reload_api: false
             tensor_parallel_size: 1
             pipeline_parallel_size: 1
             expert_parallel_size: 1  # When EP > 1, EP must be a multiple of TP since vLLM's EP = DP * TP
@@ -195,6 +264,9 @@ policy: &POLICY_BASE
             num_last_layers_in_bf16: 0
             num_first_layers_in_bf16: 0
             distributed_executor_backend: null
+            flat_logprobs: false # Requires async_engine: true and expose_http_server: true. Store logprobs in vLLM's FlatLogprobs (not for requests asking for prompt logprobs); avoids long GC pauses on the generation actor under large backlogs
+            output_loop_yield_budget_ms: null # Requires async_engine: true. e.g. 20: make vLLM's output loops yield so refit/control calls are not starved under a backlog
+        vllm_kwargs: {}
 
         colocated:
             # true: generation shares training GPUs
@@ -209,8 +281,8 @@ policy: &POLICY_BASE
 teacher:
     <<: *POLICY_BASE
     model_name: "Qwen/Qwen3-4B"
-    dtensor_cfg:
-        <<: *DTENSOR_BASE
+    automodel_cfg:
+        <<: *AUTOMODEL_BASE
         context_parallel_size: 2 
         tensor_parallel_size: 4
 
@@ -237,6 +309,7 @@ env:
 logger:
     log_dir: "logs/distillation"
     num_val_samples_to_print: 5
+    extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
     wandb_enabled: true
     tensorboard_enabled: true
     mlflow_enabled: false
@@ -245,6 +318,8 @@ logger:
     wandb:
         project: "nemo-distillation"
         name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
+        # Complete Gym payloads can create very large W&B artifacts. Enable only for debugging.
+        log_nemo_gym_full_result_tables: false
     swanlab:
         project: "nemo-distillation"
         name: "distillation-${data.train.dataset_name}-${teacher.model_name}-${policy.model_name}-${loss_fn.kl_type}-${distillation.topk_logits_k}"
@@ -253,6 +328,7 @@ logger:
     mlflow:
         experiment_name: "distillation-dev"
         run_name: "distillation-math-cl-logger"
+        tracking_uri: "http://localhost:5000"
     gpu_monitoring:
         collection_interval: 10
         flush_interval: 10
@@ -260,3 +336,6 @@ logger:
 cluster:
     gpus_per_node: 8
     num_nodes: 1
+    master_port_range_low: 1400
+    master_port_range_high: 1999
+    segment_size: null  # Nodes per NVLink domain segment for topology-aware alignment; null to disable

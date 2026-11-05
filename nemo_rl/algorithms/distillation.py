@@ -13,18 +13,20 @@
 # limitations under the License.
 import os
 import warnings
-from pathlib import Path
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, fields
+from typing import Any, Optional, TypeVar, cast
 
 import numpy as np
 import ray
 import torch
+from pydantic import BaseModel
 from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoConfig, AutoTokenizer
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
-from nemo_rl.algorithms.grpo import _should_use_async_rollouts, refit_policy_generation
-from nemo_rl.algorithms.loss_functions import (
+from nemo_rl.algorithms.grpo import aggregate_rollout_metrics, refit_policy_generation
+from nemo_rl.algorithms.loss import (
     DistillationLossConfig,
     DistillationLossDataDict,
     DistillationLossFn,
@@ -38,31 +40,71 @@ from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
     get_keys_from_message_log,
 )
+from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     ClusterConfig,
     RayVirtualCluster,
+    prepare_segment_topology,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
+from nemo_rl.environments.nemo_gym import (
+    build_nemo_gym_actors,
+    set_nemo_gym_log_dir,
+    should_use_nemo_gym,
+    validate_dataset_agent_coverage,
+)
+from nemo_rl.environments.utils import shutdown_environments
 from nemo_rl.experience.rollouts import (
     run_async_multi_turn_rollout,
     run_multi_turn_rollout,
+    run_nemo_gym_rollout_sync,
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
+    should_use_async_rollouts,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
+from nemo_rl.models.generation.vllm.config import (
+    VLLM_SPARSE_REFIT_TRANSPORTS,
+    normalize_nvfp4_pertoken_policy_config,
+    normalize_vllm_refit_config,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
-from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
+from nemo_rl.models.policy.utils import configure_lora_refit
+from nemo_rl.telemetry.config import TelemetryConfig
+from nemo_rl.telemetry.instrumentation import (
+    RL_ITERATION_ATTR,
+    evaluate_span,
+    iteration_scope,
+    managed_span,
+    umbrella_span,
+    umbrella_trace_fn,
+)
+from nemo_rl.telemetry.setup import get_telemetry_handle
+from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.utils.checkpoint import (
+    CheckpointingConfig,
+    CheckpointManager,
+)
 from nemo_rl.utils.logger import (
     Logger,
     LoggerConfig,
     print_message_log_samples,
+    should_log_nemo_gym_full_result_tables,
 )
 from nemo_rl.utils.nsys import maybe_gpu_profile_step
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.weight_sync.checkpoint_engine_config import (
+    checkpoint_engine_refit_config,
+)
+from nemo_rl.weight_sync.factory import (
+    create_weight_synchronizer,
+    validate_offload_policy_before_refit,
+)
+from nemo_rl.weight_sync.interfaces import initialize_refit_metadata
 
 # ===============================================================================
 # Configuration
@@ -70,47 +112,61 @@ from nemo_rl.utils.timer import TimeoutChecker, Timer
 TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
 
 
-class DistillationConfig(TypedDict):
+class DistillationConfig(BaseModel, extra="allow"):
     # Training configuration
-    num_prompts_per_step: int
-    num_generations_per_prompt: int
-    max_rollout_turns: int  # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
-    max_num_steps: int  # maximum number of steps to train for
-    max_num_epochs: int  # maximum number of epochs to train for
-    val_batch_size: int
-    val_period: int
-    val_at_start: bool
+    num_prompts_per_step: int = 128
+    num_generations_per_prompt: int = 1
+    max_rollout_turns: int = 1  # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
+    max_num_steps: int = 1000  # maximum number of steps to train for
+    max_num_epochs: int = 10  # maximum number of epochs to train for
+    val_batch_size: int = 64
+    val_period: int = 20
+    val_at_start: bool = False
     # Whether to run validation on the last training step. Setting this to True ensures the
     # final checkpoint has validation metrics, which is required for get_best_checkpoint_path().
-    val_at_end: bool
-    max_val_samples: int
-    topk_logits_k: int
-    seed: int
+    val_at_end: bool = False
+    max_val_samples: int | None = 512  # None for NeMo-Gym compatibility
+    topk_logits_k: int = 64
+    seed: int = 42
 
 
-class DistillationSaveState(TypedDict):
+@dataclass
+class DistillationSaveState:
     total_steps: int  # Track total number of steps across all epochs
     current_epoch: int  # Track current epoch
     current_step: int  # Track step within current epoch
-    val_reward: NotRequired[
-        float
-    ]  # Can be any metric. Setted to 'accuracy' by default in validation.
+    val_reward: float  # Can be any metric; defaults to accuracy in validation
     consumed_samples: int
     total_valid_tokens: int  # Track total number of non-padding tokens during training
 
 
-def _default_distillation_save_state() -> DistillationSaveState:
-    return {
-        "current_epoch": 0,
-        "current_step": 0,
-        "total_steps": 0,
-        "val_reward": -99999999.0,  # Aligned with GRPO
-        "consumed_samples": 0,
-        "total_valid_tokens": 0,
-    }
+def _initial_distillation_save_state() -> DistillationSaveState:
+    return DistillationSaveState(
+        total_steps=0,
+        current_epoch=0,
+        current_step=0,
+        val_reward=-99999999.0,
+        consumed_samples=0,
+        total_valid_tokens=0,
+    )
 
 
-class MasterConfig(TypedDict):
+def _get_distillation_save_state(
+    loaded_state: Optional[dict[str, Any]],
+) -> DistillationSaveState:
+    if loaded_state is None:
+        return _initial_distillation_save_state()
+
+    # Start from current defaults so partial/legacy checkpoints remain loadable.
+    known_fields = {field.name for field in fields(DistillationSaveState)}
+    state_values = vars(_initial_distillation_save_state()).copy()
+    state_values.update(
+        {key: value for key, value in loaded_state.items() if key in known_fields}
+    )
+    return DistillationSaveState(**state_values)
+
+
+class MasterConfig(BaseModel, extra="allow"):
     """Main configuration structure."""
 
     policy: PolicyConfig  # Student model configuration
@@ -122,6 +178,7 @@ class MasterConfig(TypedDict):
     logger: LoggerConfig  # Logger configuration
     cluster: ClusterConfig  # Cluster configuration
     checkpointing: CheckpointingConfig  # Checkpointing configuration
+    telemetry: Optional[TelemetryConfig] = None
 
 
 # ===============================================================================
@@ -147,9 +204,9 @@ def check_vocab_equality(
         f"Effective vocab sizes differ between student and teacher. {skip_hint}"
     )
 
-    # 3) Chech model.config.vocab_size to guarantee the last dimension of the logits is the same
-    student_config = AutoConfig.from_pretrained(student_model_name)
-    teacher_config = AutoConfig.from_pretrained(teacher_model_name)
+    # 3) Compare text vocabulary sizes, including nested multimodal configs.
+    student_config = AutoConfig.from_pretrained(student_model_name).get_text_config()
+    teacher_config = AutoConfig.from_pretrained(teacher_model_name).get_text_config()
     assert student_config.vocab_size == teacher_config.vocab_size, (
         f"Model config vocab sizes differ between student and teacher. {skip_hint}"
     )
@@ -164,6 +221,7 @@ def setup(
     ColocatablePolicyInterface,  # student_policy
     ColocatablePolicyInterface,  # teacher_policy
     Optional[GenerationInterface],  # student_generation
+    Optional[EnvironmentInterface],  # nemo_gym
     StatefulDataLoader,
     Optional[StatefulDataLoader],
     DistillationLossFn,
@@ -175,83 +233,112 @@ def setup(
     """Main entry point for distillation algorithm.
 
     Returns:
-        tuple of student_policy, teacher_policy, student_generation,
+        tuple of student_policy, teacher_policy, student_generation, nemo_gym,
         train_dataloader, val_dataloader,
         loss_fn, logger, checkpointer, distillation_save_state, master_config
     """
     # Extract configuration
-    policy_config = master_config["policy"]
-    teacher_config = master_config["teacher"]
-    generation_config = master_config["policy"]["generation"]
-    loss_config = master_config["loss_fn"]
-    distillation_config = master_config["distillation"]
-    data_config = master_config["data"]
-    logger_config = master_config["logger"]
-    cluster_config = master_config["cluster"]
+    policy_config = master_config.policy
+    generation_config = policy_config["generation"]
+    teacher_config = master_config.teacher
+    loss_config = master_config.loss_fn
+    data_config = master_config.data
+    env_configs = getattr(master_config, "env", {}) or {}
+    distillation_config = master_config.distillation
+    logger_config = master_config.logger
+    cluster_config = master_config.cluster
+    checkpointing_config = master_config.checkpointing
+
+    checkpointing_pretrained = checkpointing_config.get("pretrained_checkpoint")
+    if checkpointing_pretrained is not None:
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
     )
+    checkpoint_engine_config = None
+    configure_lora_refit(policy_config)
+    if generation_config["backend"] == "vllm":
+        normalize_nvfp4_pertoken_policy_config(
+            policy_config, entry_point="distillation"
+        )
+        vllm_config = cast(VllmConfig, generation_config)
+        normalize_vllm_refit_config(vllm_config)
+        refit_transport = vllm_config.get("refit_transport")
+        if refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS:
+            raise ValueError(
+                "Remote sparse refit is currently supported only by GRPO; "
+                "distillation support is tracked in "
+                "https://github.com/NVIDIA-NeMo/RL/issues/3275."
+            )
+        checkpoint_engine_config = checkpoint_engine_refit_config(vllm_config)
 
-    # Disallow SP + packing for dtensor path
+    offload_policy_before_refit = policy_config["offload_policy_before_refit"]
+    validate_offload_policy_before_refit(
+        enabled=offload_policy_before_refit,
+        megatron_enabled=bool(
+            (policy_config.get("megatron_cfg") or {}).get("enabled", False)
+        ),
+        generation_backend=generation_config["backend"],
+        colocated=generation_config["colocated"]["enabled"],
+        refit_transport=generation_config.get("refit_transport"),
+    )
+
+    # Disallow SP + packing for the Automodel path
     for cfg, who in ((policy_config, "student"), (teacher_config, "teacher")):
-        # DTensor sequence parallel is supported; ensure CP and SP are not enabled together
-        # This incompatibility is enforced in DTensor workers during initialization.
+        # Automodel sequence parallel is supported; ensure CP and SP are not enabled together
+        # This incompatibility is enforced in Automodel workers during initialization.
         # Additionally, SP may not be compatible with sequence packing for some models.
         # Refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details.
         # Therefore, we disable SP + packing for distillation.
-        dtensor_enabled = cfg["dtensor_cfg"]["enabled"]
+        automodel_cfg = cfg.get("automodel_cfg") or {}
+        automodel_enabled = automodel_cfg.get("enabled", False)
         sequence_packing_enabled = (
             "sequence_packing" in cfg and cfg["sequence_packing"]["enabled"]
         )
-        sequence_parallel_enabled = (
-            "sequence_parallel" in cfg["dtensor_cfg"]
-            and cfg["dtensor_cfg"]["sequence_parallel"]
-        )
+        sequence_parallel_enabled = bool(automodel_cfg.get("sequence_parallel"))
 
-        if dtensor_enabled and sequence_packing_enabled and sequence_parallel_enabled:
+        if automodel_enabled and sequence_packing_enabled and sequence_parallel_enabled:
             raise AssertionError(
-                f"Distillation does not support DTensor sequence parallel + sequence packing ({who} policy). "
+                f"Distillation does not support Automodel sequence parallel + sequence packing ({who} policy). "
                 "Please refer to https://github.com/NVIDIA-NeMo/RL/issues/1178 for more details."
             )
 
     # Set random seed
-    set_seed(distillation_config["seed"])
+    set_seed(distillation_config.seed)
+    enable_nemo_gym = bool(env_configs) and should_use_nemo_gym(master_config)
 
     # ==========================
     #         Logger
     # ==========================
     logger = Logger(logger_config)
-    logger.log_hyperparams(master_config)
+    if enable_nemo_gym:
+        # Before log_hyperparams, so the logged config shows where the Gym
+        # server logs actually go.
+        set_nemo_gym_log_dir(env_configs, logger.base_log_dir)
+    logger.log_hyperparams(master_config.model_dump())
 
     # ==========================
     #      Checkpointing
     # ==========================
-    checkpointer = CheckpointManager(master_config["checkpointing"])
+    checkpointer = CheckpointManager(checkpointing_config)
     last_checkpoint_path = checkpointer.get_latest_checkpoint_path()
-    distillation_save_state: Optional[DistillationSaveState] = cast(
-        Optional[DistillationSaveState],
-        checkpointer.load_training_info(last_checkpoint_path),
-    )
-    if distillation_save_state is None:
-        distillation_save_state = _default_distillation_save_state()
+    loaded_state = checkpointer.load_training_info(last_checkpoint_path)
+    distillation_save_state = _get_distillation_save_state(loaded_state)
 
     # ==========================
     #           Data
     # ==========================
     dataloader = StatefulDataLoader(
         train_dataset,
-        batch_size=distillation_config["num_prompts_per_step"],
+        batch_size=distillation_config.num_prompts_per_step,
         shuffle=data_config["shuffle"],
         collate_fn=rl_collate_fn,
         drop_last=True,
     )
 
     if last_checkpoint_path:
-        dataloader_state_dict = torch.load(
-            os.path.join(last_checkpoint_path, "train_dataloader.pt")
-        )
-        dataloader.load_state_dict(dataloader_state_dict)
+        load_dataloader_state(dataloader, last_checkpoint_path, data_config)
 
     print(
         f"  ✓ Training dataloader loaded with {len(train_dataset)} samples", flush=True
@@ -261,16 +348,16 @@ def setup(
     val_dataloader: Optional[StatefulDataLoader] = None
     # If validation is enabled, load the validation dataloader
     if (
-        distillation_config["val_period"] > 0
-        or distillation_config["val_at_start"]
-        or distillation_config["val_at_end"]
+        distillation_config.val_period > 0
+        or distillation_config.val_at_start
+        or distillation_config.val_at_end
     ):
         assert val_dataset is not None, (
             "Validation dataset is required if validation is enabled"
         )
         val_dataloader = StatefulDataLoader(
             val_dataset,
-            batch_size=distillation_config["val_batch_size"],
+            batch_size=distillation_config.val_batch_size,
             shuffle=False,
             collate_fn=rl_collate_fn,
         )
@@ -284,22 +371,31 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
+    nemo_gym_actor: Optional[EnvironmentInterface] = None
+    segment_size = cluster_config.segment_size
 
     if colocated_inference:
+        num_nodes = cluster_config.num_nodes
+        node_resource_constraints, _, _ = prepare_segment_topology(
+            segment_size, num_nodes
+        )
         cluster = RayVirtualCluster(
             name="distillation_cluster",
-            bundle_ct_per_node_list=[cluster_config["gpus_per_node"]]
-            * cluster_config["num_nodes"],
+            bundle_ct_per_node_list=[cluster_config.gpus_per_node] * num_nodes,
             use_gpus=True,
-            num_gpus_per_node=cluster_config["gpus_per_node"],
+            num_gpus_per_node=cluster_config.gpus_per_node,
             max_colocated_worker_groups=1
             if generation_config["backend"] == "megatron"
             else 3,
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
         )
         train_cluster = cluster
         inference_cluster = cluster
         print(
-            f"  ✓ Ray cluster initialized with {cluster_config['num_nodes']} nodes",
+            f"  ✓ Ray cluster initialized with {num_nodes} nodes",
             flush=True,
         )
     else:
@@ -309,15 +405,15 @@ def setup(
         )
 
         # train resources will be updated through overall and inference resources below
-        train_gpus_per_node = cluster_config["gpus_per_node"]
-        train_nodes = cluster_config["num_nodes"]
+        train_gpus_per_node = cluster_config.gpus_per_node
+        train_nodes = cluster_config.num_nodes
 
         inference_resources = generation_config["colocated"]["resources"]
         inference_gpus_per_node = inference_resources["gpus_per_node"]
         inference_nodes = inference_resources["num_nodes"]
 
         # validate and configure resources
-        if cluster_config["num_nodes"] == 1:
+        if cluster_config.num_nodes == 1:
             assert (
                 inference_gpus_per_node is not None and inference_gpus_per_node > 0
             ), (
@@ -340,13 +436,34 @@ def setup(
             )
             assert (
                 inference_gpus_per_node is not None
-                and inference_gpus_per_node == cluster_config["gpus_per_node"]
+                and inference_gpus_per_node == cluster_config.gpus_per_node
             ), (
                 "policy.generation.colocated.resources.gpus_per_node must be explicitly set and equal to cluster.gpus_per_node "
                 "when cluster.num_nodes > 1 and inference is non-colocated, "
-                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config['gpus_per_node']}."
+                f"but got inference_gpus_per_node={inference_gpus_per_node}, cluster.gpus_per_node={cluster_config.gpus_per_node}."
             )
             train_nodes -= inference_nodes
+
+        # Topology-aware node selection for non-colocated distillation
+        node_resource_constraints = None
+        inference_node_resource_constraints = None
+        inference_segment_size = None
+        node_resource_constraints, remaining_node_ids, topology = (
+            prepare_segment_topology(segment_size, train_nodes, role="training")
+        )
+        if node_resource_constraints is not None and inference_nodes > 0:
+            nodes_per_instance = (
+                inference_gpus_per_node + cluster_config.gpus_per_node - 1
+            ) // cluster_config.gpus_per_node
+            if nodes_per_instance > 1 and inference_nodes % nodes_per_instance == 0:
+                remaining_topology = {nid: topology[nid] for nid in remaining_node_ids}
+                inference_node_resource_constraints, _, _ = prepare_segment_topology(
+                    nodes_per_instance,
+                    inference_nodes,
+                    topology=remaining_topology,
+                    role="inference",
+                )
+                inference_segment_size = nodes_per_instance
 
         # create clusters
         train_cluster = RayVirtualCluster(
@@ -355,6 +472,10 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=train_gpus_per_node,
             max_colocated_worker_groups=3,
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
+            segment_size=segment_size,
+            node_resource_constraints=node_resource_constraints,
         )
         inference_cluster = RayVirtualCluster(
             name="distillation_inference_cluster",
@@ -362,6 +483,10 @@ def setup(
             use_gpus=True,
             num_gpus_per_node=inference_gpus_per_node,
             max_colocated_worker_groups=3,
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
+            segment_size=inference_segment_size,
+            node_resource_constraints=inference_node_resource_constraints,
         )
         print(
             f"  ✓ Separate clusters created: train={train_nodes}x{train_gpus_per_node}GPUs, inference={inference_nodes}x{inference_gpus_per_node}GPUs",
@@ -384,8 +509,8 @@ def setup(
     if "megatron_cfg" in teacher_config and teacher_config["megatron_cfg"]["enabled"]:
         ## NOTE: this is equal to the total number of scheduler steps
         total_train_iters = min(
-            distillation_config["max_num_steps"],
-            distillation_config["max_num_epochs"] * len(dataloader),
+            distillation_config.max_num_steps,
+            distillation_config.max_num_epochs * len(dataloader),
         )
         teacher_config["megatron_cfg"]["train_iters"] = total_train_iters
 
@@ -413,13 +538,76 @@ def setup(
         generation_config = cast(VllmConfig, generation_config)
         if "vllm_cfg" in generation_config:
             ## make vllm hf overrides match the training policy
-            generation_config["vllm_cfg"]["hf_overrides"] = policy_config.get(
+            generation_config["vllm_kwargs"]["hf_overrides"] = policy_config.get(
                 "hf_config_overrides", {}
             )
-        student_generation = VllmGeneration(
-            cluster=inference_cluster, config=generation_config
-        )
-        student_generation.finish_generation()
+        if enable_nemo_gym:
+            deferred_vllm = VllmGeneration(
+                cluster=inference_cluster,
+                config=generation_config,
+                defer_model_load=True,
+            )
+
+            def init_vllm_deferred():
+                deferred_vllm.load_and_start()
+                deferred_vllm.finish_generation()
+                return deferred_vllm
+
+            def init_nemo_gym():
+                shard_set = build_nemo_gym_actors(
+                    env_configs,
+                    base_urls=cast(list[str], deferred_vllm.dp_openai_server_base_urls),
+                    model_name=generation_config["model_name"],
+                    tokenizer=tokenizer,
+                    # Distillation does not configure vLLM for router replay.
+                    enable_router_replay=False,
+                    use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
+                    # The workers enforce this key whenever the recipe asks for
+                    # one, so Gym's model server must send the same key.
+                    policy_api_key=deferred_vllm.http_server_api_key,
+                    turn_checkpointing_enabled=False,
+                )
+                try:
+                    validate_dataset_agent_coverage(
+                        shard_set,
+                        {"training": train_dataset, "validation": val_dataset},
+                    )
+                except BaseException:
+                    shard_set.shutdown()
+                    raise
+                return shard_set
+
+            init_tasks = {
+                "vllm": init_vllm_deferred,
+                "nemo_gym": init_nemo_gym,
+            }
+
+            print(
+                f"  ⚡ Init tasks: {', '.join(init_tasks.keys())}",
+                flush=True,
+            )
+            submitted = {}
+            try:
+                with ThreadPoolExecutor(max_workers=len(init_tasks)) as executor:
+                    submitted = {k: executor.submit(fn) for k, fn in init_tasks.items()}
+                    results = {k: f.result() for k, f in submitted.items()}
+            except BaseException:
+                if "nemo_gym" in submitted:
+                    try:
+                        completed_shard_set = submitted["nemo_gym"].result()
+                    except BaseException:
+                        pass
+                    else:
+                        completed_shard_set.shutdown()
+                raise
+
+            student_generation = cast(GenerationInterface, results["vllm"])
+            nemo_gym_actor = cast(EnvironmentInterface, results["nemo_gym"])
+        else:
+            student_generation = VllmGeneration(
+                cluster=inference_cluster, config=generation_config
+            )
+            student_generation.finish_generation()
         print(
             f"  ✓ Using vLLM backend for generation with {policy_config['model_name']}",
             flush=True,
@@ -431,18 +619,13 @@ def setup(
     print("\n▶ Setting up student policy...", flush=True)
 
     # Checkpoint paths
-    if last_checkpoint_path:
-        weights_path = Path(last_checkpoint_path) / "policy" / "weights"
-        optimizer_path = Path(last_checkpoint_path) / "policy" / "optimizer"
-    else:
-        weights_path = None
-        optimizer_path = None
+    weights_path, optimizer_path = checkpointer.get_resume_paths(last_checkpoint_path)
 
     if "megatron_cfg" in policy_config and policy_config["megatron_cfg"]["enabled"]:
         ## NOTE: this is equal to the total number of scheduler steps
         total_train_iters = min(
-            distillation_config["max_num_steps"],
-            distillation_config["max_num_epochs"] * len(dataloader),
+            distillation_config.max_num_steps,
+            distillation_config.max_num_epochs * len(dataloader),
         )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
@@ -457,12 +640,23 @@ def setup(
         init_reference_model=False,
     )
 
-    if student_generation is not None:
-        state_dict_info = student_policy.prepare_refit_info()
-        student_generation.prepare_refit_info(state_dict_info)
+    managed_refit = checkpoint_engine_config is not None or offload_policy_before_refit
+    if managed_refit:
+        assert isinstance(student_generation, VllmGeneration)
+        student_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=student_policy,
+            generation=student_generation,
+            generation_backend=backend,
+            colocated=colocated_inference,
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
+        )
+        student_generation.weight_synchronizer.init_communicator()
+    elif student_generation is not None:
+        initialize_refit_metadata(student_policy, student_generation)
 
     # if it is not colocated inference, initialize collective communication for update weights
-    if not colocated_inference:
+    if not colocated_inference and not managed_refit:
         ip, port = train_cluster.get_master_address_and_port()
         print(f"Using ip: {ip}, port: {port} for collective communication", flush=True)
         train_world_size = train_cluster.world_size()
@@ -488,6 +682,7 @@ def setup(
         student_policy,
         teacher_policy,
         student_generation,
+        nemo_gym_actor,
         dataloader,
         val_dataloader,
         loss_fn,
@@ -503,7 +698,7 @@ def setup(
 # ===============================================================================
 
 
-def distillation_train(
+def _distillation_train_impl(
     student_policy: ColocatablePolicyInterface,
     teacher_policy: ColocatablePolicyInterface,
     student_generation: Optional[GenerationInterface],
@@ -520,8 +715,10 @@ def distillation_train(
 ) -> None:
     """Run Distillation training algorithm."""
     timer = Timer()
+    _telemetry = get_telemetry_handle()
+    _tracer = _telemetry.tracer if _telemetry is not None else None
     timeout = TimeoutChecker(
-        timeout=master_config["checkpointing"]["checkpoint_must_save_by"],
+        timeout=master_config.checkpointing["checkpoint_must_save_by"],
         fit_last_save_time=True,
     )
     timeout.start_iterations()
@@ -533,34 +730,41 @@ def distillation_train(
         NEED_REFIT = False
     POLICY_GENERATION_STALE = True  # tracks if generation needs a refit before running
     assert student_generation is not None  # for mypy type check
+    use_nemo_gym = should_use_nemo_gym(master_config)
+    if use_nemo_gym:
+        print("▶ Using NeMo-Gym rollouts for distillation", flush=True)
 
     # common config/state items
-    current_epoch = distillation_save_state["current_epoch"]  # current epoch
-    current_step = distillation_save_state[
-        "current_step"
-    ]  # current step within current epoch
-    total_steps = distillation_save_state[
-        "total_steps"
-    ]  # total number of steps across all epochs
-    consumed_samples = distillation_save_state["consumed_samples"]
-    total_valid_tokens = distillation_save_state["total_valid_tokens"]
-    val_period = master_config["distillation"]["val_period"]
-    val_at_start = master_config["distillation"]["val_at_start"]
-    val_at_end = master_config["distillation"]["val_at_end"]
-    colocated_inference = master_config["policy"]["generation"]["colocated"]["enabled"]
-    max_epochs = master_config["distillation"][
-        "max_num_epochs"
-    ]  # max number of epochs to train for
-    max_steps = master_config["distillation"][
-        "max_num_steps"
-    ]  # max number of steps to train for
+    current_epoch = distillation_save_state.current_epoch  # current epoch
+    current_step = (
+        distillation_save_state.current_step
+    )  # current step within current epoch
+    total_steps = (
+        distillation_save_state.total_steps
+    )  # total number of steps across all epochs
+    consumed_samples = distillation_save_state.consumed_samples
+    total_valid_tokens = distillation_save_state.total_valid_tokens
+    val_period = master_config.distillation.val_period
+    val_at_start = master_config.distillation.val_at_start
+    val_at_end = master_config.distillation.val_at_end
+    colocated_inference = master_config.policy["generation"]["colocated"]["enabled"]
+    refit_buffer_size_gb = master_config.policy.get("refit_buffer_size_gb")
+    max_epochs = (
+        master_config.distillation.max_num_epochs
+    )  # max number of epochs to train for
+    max_steps = (
+        master_config.distillation.max_num_steps
+    )  # max number of steps to train for
 
     # Run validation at the start if configured
     if val_at_start and total_steps == 0:
         print("\n🔍 Running initial validation...", flush=True)
         if NEED_REFIT and POLICY_GENERATION_STALE:
             refit_policy_generation(
-                student_policy, student_generation, colocated_inference
+                student_policy,
+                student_generation,
+                colocated_inference,
+                _refit_buffer_size_gb=refit_buffer_size_gb,
             )
             POLICY_GENERATION_STALE = False
         else:
@@ -572,6 +776,7 @@ def distillation_train(
             val_task_to_env,
             step=total_steps,
             master_config=master_config,
+            logger=logger,
         )
         student_generation.finish_generation()
         logger.log_metrics(val_metrics, total_steps, prefix="validation")
@@ -579,6 +784,8 @@ def distillation_train(
 
     # Run distillation training (multi-epoch until reaching max_num_steps or max_num_epochs)
     batch: BatchedDataDict[DatumSpec]
+
+    ft_save_period = master_config.checkpointing.get("ft_save_period")
 
     while total_steps < max_steps and current_epoch < max_epochs:
         print(
@@ -596,14 +803,30 @@ def distillation_train(
                 maybe_gpu_profile_step(student_generation, total_steps + 1)
             val_metrics, validation_timings = None, None
 
-            with timer.time("total_step_time"):
+            with (
+                iteration_scope(total_steps + 1),
+                timer.time("total_step_time"),
+                umbrella_span(
+                    RLSpanGroup.U_STEP,
+                    "rl.distillation.step",
+                    tracer=_tracer,
+                    **{"rl.epoch": current_epoch + 1},
+                ),
+            ):
                 # Prepare batch
                 print("▶ Preparing batch...", flush=True)
-                with timer.time("data_processing"):
+                with (
+                    timer.time("data_processing"),
+                    managed_span(
+                        RLSpanGroup.DATA_PROCESSING,
+                        "rl.distillation.data_processing",
+                        tracer=_tracer,
+                    ),
+                ):
                     # Repeat batch items
                     repeated_batch: BatchedDataDict[DatumSpec] = (
                         batch.repeat_interleave(
-                            master_config["distillation"]["num_generations_per_prompt"]
+                            master_config.distillation.num_generations_per_prompt
                         )
                     )
 
@@ -618,15 +841,47 @@ def distillation_train(
                             student_policy,
                             student_generation,
                             colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                             timer=timer,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
                         student_generation.prepare_for_generation()
 
-                with timer.time("generation"):
+                with (
+                    timer.time("generation"),
+                    umbrella_span(
+                        RLSpanGroup.U_ROLLOUT,
+                        "rl.distillation.generation",
+                        tracer=_tracer,
+                    ),
+                ):
+                    # We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
+                    if use_nemo_gym:
+                        generation_config = master_config.policy["generation"]
+                        nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
+                            policy_generation=student_generation,
+                            input_batch=repeated_batch,
+                            tokenizer=tokenizer,
+                            task_to_env=task_to_env,
+                            max_seq_len=None,
+                            generation_config=generation_config,
+                            num_generations_per_prompt=(
+                                master_config.distillation.num_generations_per_prompt
+                            ),
+                            log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                                wandb_enabled=master_config.logger.wandb_enabled,
+                                wandb_config=master_config.logger.wandb,
+                            ),
+                            max_rollout_turns=None,
+                            greedy=False,
+                        )
+                        repeated_batch = nemo_gym_rollout_result.final_batch
+                        rollout_metrics = nemo_gym_rollout_result.rollout_metrics
+                        del nemo_gym_rollout_result
+
                     # Use async rollouts if vLLM async engine is enabled
-                    if _should_use_async_rollouts(master_config):
+                    elif should_use_async_rollouts(master_config.policy["generation"]):
                         (
                             repeated_batch,
                             rollout_metrics,
@@ -635,12 +890,10 @@ def distillation_train(
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
-                            max_seq_len=master_config["policy"][
+                            max_seq_len=master_config.policy[
                                 "max_total_sequence_length"
                             ],
-                            max_rollout_turns=master_config["distillation"][
-                                "max_rollout_turns"
-                            ],
+                            max_rollout_turns=master_config.distillation.max_rollout_turns,
                             greedy=False,
                         )
                     else:
@@ -649,21 +902,22 @@ def distillation_train(
                             input_batch=repeated_batch,
                             tokenizer=tokenizer,
                             task_to_env=task_to_env,
-                            max_seq_len=master_config["policy"][
+                            max_seq_len=master_config.policy[
                                 "max_total_sequence_length"
                             ],
-                            max_rollout_turns=master_config["distillation"][
-                                "max_rollout_turns"
-                            ],
+                            max_rollout_turns=master_config.distillation.max_rollout_turns,
                             greedy=False,
                         )
                     student_generation.finish_generation()
 
                 with timer.time("data_processing"):
-                    # Add loss mask and advantages to each message in LLMMessageLogType
+                    # Train on generated assistant turns, excluding prompt history.
                     for message_log in repeated_batch["message_log"]:
                         for message in message_log:
-                            if message["role"] == "assistant":
+                            if (
+                                message["role"] == "assistant"
+                                and "generation_logprobs" in message
+                            ):
                                 message["token_loss_mask"] = torch.ones_like(
                                     message["token_ids"]
                                 )
@@ -676,7 +930,7 @@ def distillation_train(
                     flat_messages, input_lengths = batched_message_log_to_flat_message(
                         repeated_batch["message_log"],
                         pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                        make_sequence_length_divisible_by=master_config["policy"][
+                        make_sequence_length_divisible_by=master_config.policy[
                             "make_sequence_length_divisible_by"
                         ],
                     )
@@ -698,13 +952,26 @@ def distillation_train(
 
                 print("▶ Preparing for teacher logprob inference...", flush=True)
                 with timer.time("teacher_logprob_inference_prep"):
+                    if not colocated_inference:
+                        # Unless policy offload was requested for refit, optimizer
+                        # state may still be on the train GPUs from the previous
+                        # step. Offload it so the teacher fits for top-k inference;
+                        # prepare_for_training() below reloads it.
+                        student_policy.offload_before_refit()
                     teacher_policy.prepare_for_lp_inference()
 
                 print("▶ Computing teacher logprobs...", flush=True)
-                with timer.time("teacher_logprob_inference"):
+                with (
+                    timer.time("teacher_logprob_inference"),
+                    managed_span(
+                        RLSpanGroup.LOGPROB,
+                        "rl.distillation.teacher_logprob_inference",
+                        tracer=_tracer,
+                    ),
+                ):
                     teacher_topk = teacher_policy.get_topk_logits(
                         train_data,
-                        k=master_config["distillation"]["topk_logits_k"],
+                        k=master_config.distillation.topk_logits_k,
                         timer=timer,
                     )
                     train_data["teacher_topk_logits"] = teacher_topk["topk_logits"]
@@ -717,7 +984,14 @@ def distillation_train(
                     POLICY_GENERATION_STALE = True
 
                 print("▶ Training policy...", flush=True)
-                with timer.time("policy_training"):
+                with (
+                    timer.time("policy_training"),
+                    managed_span(
+                        RLSpanGroup.POLICY_UPDATE,
+                        "rl.distillation.policy_training",
+                        tracer=_tracer,
+                    ),
+                ):
                     train_results = student_policy.train(
                         train_data,
                         loss_fn,
@@ -735,7 +1009,10 @@ def distillation_train(
                 ):
                     if NEED_REFIT and POLICY_GENERATION_STALE:
                         refit_policy_generation(
-                            student_policy, student_generation, colocated_inference
+                            student_policy,
+                            student_generation,
+                            colocated_inference,
+                            _refit_buffer_size_gb=refit_buffer_size_gb,
                         )
                         POLICY_GENERATION_STALE = False
                     else:
@@ -747,6 +1024,7 @@ def distillation_train(
                         val_task_to_env,
                         step=total_steps + 1,
                         master_config=master_config,
+                        logger=logger,
                     )
                     student_generation.finish_generation()
                     logger.log_metrics(
@@ -778,45 +1056,39 @@ def distillation_train(
                 total_valid_tokens += metrics["global_valid_toks"]
 
                 ## Checkpointing
-                consumed_samples += master_config["distillation"][
-                    "num_prompts_per_step"
-                ]
+                consumed_samples += master_config.distillation.num_prompts_per_step
                 timeout.mark_iteration()
 
                 should_save_by_step = (
                     is_last_step
-                    or (total_steps + 1) % master_config["checkpointing"]["save_period"]
+                    or (total_steps + 1) % master_config.checkpointing["save_period"]
                     == 0
+                    or (
+                        ft_save_period is not None
+                        and (total_steps + 1) % ft_save_period == 0
+                    )
                 )
                 # +1 because total_steps is 0-indexed
                 # Check if timeout-based checkpointing is enabled in config.
                 should_save_by_timeout = timeout.check_save()
 
-                if master_config["checkpointing"]["enabled"] and (
+                if master_config.checkpointing["enabled"] and (
                     should_save_by_step or should_save_by_timeout
                 ):
                     student_policy.prepare_for_training()
 
-                    distillation_save_state["current_epoch"] = current_epoch
-                    distillation_save_state["current_step"] = current_step + 1
-                    distillation_save_state["total_steps"] = total_steps + 1
-                    distillation_save_state["total_valid_tokens"] = total_valid_tokens
+                    distillation_save_state.current_epoch = current_epoch
+                    distillation_save_state.current_step = current_step + 1
+                    distillation_save_state.total_steps = total_steps + 1
+                    distillation_save_state.total_valid_tokens = total_valid_tokens
                     if val_metrics is not None:
-                        distillation_save_state["val_reward"] = val_metrics["accuracy"]
-                    elif "val_reward" in distillation_save_state:
-                        del distillation_save_state["val_reward"]
-                    distillation_save_state["consumed_samples"] = consumed_samples
+                        distillation_save_state.val_reward = val_metrics["accuracy"]
+                    elif hasattr(distillation_save_state, "val_reward"):
+                        delattr(distillation_save_state, "val_reward")
+                    distillation_save_state.consumed_samples = consumed_samples
 
-                    full_metric_name = master_config["checkpointing"]["metric_name"]
+                    full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
-                        assert full_metric_name.startswith(
-                            "train:"
-                        ) or full_metric_name.startswith("val:"), (
-                            f"metric_name={full_metric_name} must start with 'val:' or 'train:',\n"
-                            f'followed by the corresponding name in the "val" or "train" metrics dictionary.'
-                            f"  If you are using an old config, please updated checkpointing.metric_name to the new format, "
-                            f" e.g. 'val_reward --> 'val:accuracy'"
-                        )
                         prefix, metric_name = full_metric_name.split(":", 1)
                         metrics_source = metrics if prefix == "train" else val_metrics
                         if not metrics_source:
@@ -825,24 +1097,35 @@ def distillation_train(
                                 "This checkpoint will not be saved as top-k.",
                                 stacklevel=2,
                             )
-                            if full_metric_name in distillation_save_state:
-                                del distillation_save_state[full_metric_name]
+                            if hasattr(distillation_save_state, full_metric_name):
+                                delattr(distillation_save_state, full_metric_name)
                         elif metric_name not in metrics_source:
                             raise ValueError(
                                 f"Metric {metric_name} not found in {prefix} metrics"
                             )
                         else:
-                            distillation_save_state[full_metric_name] = metrics_source[
-                                metric_name
-                            ]
+                            setattr(
+                                distillation_save_state,
+                                full_metric_name,
+                                metrics_source[metric_name],
+                            )
 
-                    with timer.time("checkpointing"):
+                    with (
+                        timer.time("checkpointing"),
+                        managed_span(
+                            RLSpanGroup.CHECKPOINT,
+                            "rl.distillation.checkpointing",
+                            tracer=_tracer,
+                        ),
+                    ):
                         print(
                             f"Saving checkpoint for step {total_steps + 1}...",
                             flush=True,
                         )
                         checkpoint_path = checkpointer.init_tmp_checkpoint(
-                            total_steps + 1, distillation_save_state, master_config
+                            total_steps + 1,
+                            vars(distillation_save_state),
+                            master_config,
                         )
                         student_policy.save_checkpoint(
                             weights_path=os.path.join(
@@ -850,17 +1133,19 @@ def distillation_train(
                             ),
                             optimizer_path=os.path.join(
                                 checkpoint_path, "policy", "optimizer"
-                            ),
+                            )
+                            if checkpointer.save_optimizer
+                            else None,
                             tokenizer_path=os.path.join(
                                 checkpoint_path, "policy", "tokenizer"
                             ),
-                            checkpointing_cfg=master_config["checkpointing"],
+                            is_final_checkpoint=is_last_step,
                         )
-                        torch.save(
-                            dataloader.state_dict(),
-                            os.path.join(checkpoint_path, "train_dataloader.pt"),
+                        save_dataloader_state(dataloader.state_dict(), checkpoint_path)
+                        checkpointer.begin_finalization(
+                            checkpoint_path,
+                            wait_fn=student_policy.finalize_async_save,
                         )
-                        checkpointer.finalize_checkpoint(checkpoint_path)
 
             # Logging
             # Log training data
@@ -904,8 +1189,7 @@ def distillation_train(
             total_time = timing_metrics.get("total_step_time", 0)
 
             total_num_gpus = (
-                master_config["cluster"]["num_nodes"]
-                * master_config["cluster"]["gpus_per_node"]
+                master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
             metrics.update(
                 {
@@ -929,15 +1213,22 @@ def distillation_train(
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
-            logger.log_metrics(timing_metrics, total_steps + 1, prefix="timing/train")
+            logger.log_metrics(
+                timing_metrics,
+                total_steps + 1,
+                prefix="timing/train",
+                step_finished=True,
+            )
 
             timer.reset()
             current_step += 1
             total_steps += 1
             if should_save_by_timeout:
+                checkpointer.shutdown()
                 print("Timeout has been reached, stopping training early", flush=True)
                 return
             if total_steps >= max_steps:
+                checkpointer.shutdown()
                 print(
                     "Max number of steps has been reached, stopping training early",
                     flush=True,
@@ -948,6 +1239,50 @@ def distillation_train(
         current_epoch += 1
         current_step = 0  # Reset step counter for new epoch
 
+    # Flush the last checkpoint's background finalization on an epoch-bounded
+    # exit. Reaching max_epochs falls through the while loop and bypasses the
+    # inline shutdown() calls at the max_steps / timeout early returns, so
+    # without this the daemon finalization thread could be killed before the
+    # final tmp_step_N is renamed.
+    checkpointer.shutdown()
+
+
+@umbrella_trace_fn(RLSpanGroup.U_JOB, "rl.distillation.job")
+def distillation_train(
+    student_policy: ColocatablePolicyInterface,
+    teacher_policy: ColocatablePolicyInterface,
+    student_generation: Optional[GenerationInterface],
+    dataloader: StatefulDataLoader,
+    val_dataloader: Optional[StatefulDataLoader],
+    tokenizer: TokenizerType,
+    loss_fn: DistillationLossFn,
+    task_to_env: dict[str, EnvironmentInterface],
+    val_task_to_env: Optional[dict[str, EnvironmentInterface]],
+    logger: Logger,
+    checkpointer: CheckpointManager,
+    distillation_save_state: DistillationSaveState,
+    master_config: MasterConfig,
+) -> None:
+    """Run distillation training and always tear down its environments."""
+    try:
+        _distillation_train_impl(
+            student_policy=student_policy,
+            teacher_policy=teacher_policy,
+            student_generation=student_generation,
+            dataloader=dataloader,
+            val_dataloader=val_dataloader,
+            tokenizer=tokenizer,
+            loss_fn=loss_fn,
+            task_to_env=task_to_env,
+            val_task_to_env=val_task_to_env,
+            logger=logger,
+            checkpointer=checkpointer,
+            distillation_save_state=distillation_save_state,
+            master_config=master_config,
+        )
+    finally:
+        shutdown_environments(task_to_env, val_task_to_env)
+
 
 def validate(
     policy_generation: GenerationInterface,
@@ -956,6 +1291,7 @@ def validate(
     val_task_to_env: Optional[dict[str, EnvironmentInterface]],
     step: int,
     master_config: MasterConfig,
+    logger: Optional[Logger] = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Run validation on the validation dataset."""
     if val_dataloader is None:
@@ -969,8 +1305,13 @@ def validate(
         )
         return {}, {}
 
+    use_nemo_gym = should_use_nemo_gym(master_config)
+
     timer = Timer()
-    with timer.time("total_validation_time"):
+    with (
+        timer.time("total_validation_time"),
+        evaluate_span("distillation", **{RL_ITERATION_ATTR: step}),
+    ):
         print(f"▶ Starting validation at step {step}...", flush=True)
 
         total_rewards = []  # Can be any metric. Setted to 'accuracy' by default.
@@ -978,25 +1319,47 @@ def validate(
         all_message_logs = []  # Collect all message logs
 
         max_batches = (
-            master_config["distillation"]["max_val_samples"]
-            // master_config["distillation"]["val_batch_size"]
-        )
+            master_config.distillation.max_val_samples
+            + master_config.distillation.val_batch_size
+            - 1
+        ) // master_config.distillation.val_batch_size
+        validation_rollout_metrics: dict[str, list[Any]] = {}
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
 
             # Generate responses (updates the LLMMessageLogType in batch_with_msg_logs)
+            # We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
+            if use_nemo_gym:
+                generation_config = master_config.policy["generation"]
+                nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
+                    policy_generation=policy_generation,
+                    input_batch=val_batch,
+                    tokenizer=tokenizer,
+                    task_to_env=val_task_to_env,
+                    max_seq_len=None,
+                    generation_config=generation_config,
+                    num_generations_per_prompt=1,
+                    log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                        wandb_enabled=master_config.logger.wandb_enabled,
+                        wandb_config=master_config.logger.wandb,
+                    ),
+                    max_rollout_turns=None,
+                    greedy=False,
+                )
+                val_batch = nemo_gym_rollout_result.final_batch
+                gen_metrics = nemo_gym_rollout_result.rollout_metrics
+                for key, value in gen_metrics.items():
+                    validation_rollout_metrics.setdefault(key, []).append(value)
             # Use async rollouts if vLLM async engine is enabled
-            if _should_use_async_rollouts(master_config):
+            elif should_use_async_rollouts(master_config.policy["generation"]):
                 val_batch, gen_metrics = run_async_multi_turn_rollout(
                     policy_generation,
                     val_batch,
                     tokenizer,
                     val_task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["distillation"][
-                        "max_rollout_turns"
-                    ],
+                    max_seq_len=master_config.policy["max_total_sequence_length"],
+                    max_rollout_turns=master_config.distillation.max_rollout_turns,
                     greedy=False,
                 )
             else:
@@ -1005,10 +1368,8 @@ def validate(
                     val_batch,
                     tokenizer,
                     val_task_to_env,
-                    max_seq_len=master_config["policy"]["max_total_sequence_length"],
-                    max_rollout_turns=master_config["distillation"][
-                        "max_rollout_turns"
-                    ],
+                    max_seq_len=master_config.policy["max_total_sequence_length"],
+                    max_rollout_turns=master_config.distillation.max_rollout_turns,
                     greedy=False,
                 )
             rewards = val_batch["total_reward"]
@@ -1037,6 +1398,7 @@ def validate(
         val_metrics = {
             "accuracy": accuracy,
             "avg_length": avg_length,
+            **aggregate_rollout_metrics(validation_rollout_metrics),
         }
 
         # Print sample conversations only once at the end of validation
@@ -1045,7 +1407,7 @@ def validate(
                 all_message_logs,
                 total_rewards,
                 num_samples=min(
-                    master_config["logger"]["num_val_samples_to_print"],
+                    master_config.logger.num_val_samples_to_print,
                     len(all_message_logs),
                 ),
                 step=step,
@@ -1053,6 +1415,14 @@ def validate(
         except Exception as e:
             print(f"\n  ⚠️ Error displaying message samples: {str(e)}")
             print("  ⚠️ Continuing validation without displaying samples...", flush=True)
+
+    # Log validation data to JSONL file
+    if logger is not None:
+        val_log_data = {
+            "content": all_message_logs,
+            "rewards": total_rewards,
+        }
+        logger.log_batched_dict_as_jsonl(val_log_data, f"val_data_step{step}.jsonl")
 
     # Get timing metrics
     timing_metrics = timer.get_timing_metrics(reduction_op="sum")

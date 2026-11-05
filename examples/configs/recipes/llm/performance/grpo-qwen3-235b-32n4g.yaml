@@ -1,0 +1,13 @@
+defaults: ./grpo-qwen3-235b-16n4g.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-235b-32n4g
+logger:
+  log_dir: logs/grpo-qwen3-235b-32n4g
+  wandb:
+    name: grpo-qwen3-235b-32n4g
+policy:
+  generation:
+    vllm_cfg:
+      gpu_memory_utilization: 0.6
+cluster:
+  num_nodes: 32

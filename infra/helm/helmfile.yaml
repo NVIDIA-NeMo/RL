@@ -1,0 +1,63 @@
+environments:
+  kind:
+    values:
+    - gpu_backend: device-plugin   # nvkind handles toolkit/runtime, only need device plugin
+  prod:
+    values:
+    - gpu_backend: existing-nkx-gpu-operator  # managed by NKX, not by us
+
+---
+
+repositories:
+- name: nvdp
+  url: https://nvidia.github.io/k8s-device-plugin
+- name: kuberay
+  url: https://ray-project.github.io/kuberay-helm/
+
+releases:
+#
+# GPU: device plugin only (kind) — nvkind handles the rest
+#
+{{ if eq .Environment.Values.gpu_backend "device-plugin" }}
+- name: nvidia-device-plugin
+  namespace: nvidia
+  createNamespace: true
+  chart: nvdp/nvidia-device-plugin
+  wait: true
+  values:
+  - values/nvidia-device-plugin.yaml
+{{ end }}
+
+#
+# KAI Scheduler: gang scheduling + fairshare for GPU workloads
+#
+- name: kai-scheduler
+  namespace: kai-scheduler
+  createNamespace: true
+  chart: https://github.com/kai-scheduler/KAI-Scheduler/releases/download/v0.14.0/kai-scheduler-v0.14.0.tgz
+  wait: true
+  values:
+  - values/kai-scheduler.yaml
+
+#
+# KubeRay Operator: manages RayCluster/RayJob CRDs, integrated with KAI
+#
+- name: kuberay-operator
+  namespace: kuberay-system
+  createNamespace: true
+  chart: kuberay/kuberay-operator
+  version: 1.6.0
+  wait: true
+  values:
+  - values/kuberay-operator.yaml
+
+#
+# JobSet: manages groups of Jobs as a unit (alternative to KubeRay for Ray workloads)
+#
+- name: jobset
+  namespace: jobset-system
+  createNamespace: true
+  chart: oci://registry.k8s.io/jobset/charts/jobset
+  version: 0.11.1
+  wait: true
+

@@ -1,0 +1,9 @@
+defaults: ./grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym.yaml
+# Reduced mcore-lane smoke leg: 3 steps, no checkpointing, gen_kl_error-only
+# gate (see the suite). Exists so Megatron-Core/Bridge bumps exercise the 30B
+# megatron-inference stack without paying for the full nightly leg.
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-quick
+logger:
+  wandb:
+    name: grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-quick

@@ -35,5 +35,14 @@ fi
 # The workaround is we launch the job but set umask 000 so all files created as root are rwxrwxrwx.
 # We have found that 111 does not always work and can leave the filesystem permissions in a bad state.
 
+# Expose RDMA devices when the host has them, matching CI (see
+# .github/actions/test-template/action.yml). Without these the mooncake_cpu
+# fixtures skip locally while running in CI, so "passes locally" means less.
+source "$SCRIPT_DIR/scripts/detect_rdma.sh"
+RDMA_FLAGS=()
+if rdma_device_available; then
+  RDMA_FLAGS=(--device=/dev/infiniband --cap-add=IPC_LOCK)
+fi
+
 # Run the script inside the Docker container with GPU support
-docker run -u root $INTERACTIVE_FLAG --ulimit memlock=-1 --ulimit stack=67108864 --cap-add=SYS_PTRACE --rm --gpus '"device=0,1"' -v "$(realpath $SCRIPT_DIR/..):/workspace" -v $HF_HOME:/hf_home -e HF_TOKEN -e HF_HOME=/hf_home -e HOME=/tmp/ -w /workspace/tests "$CONTAINER" -- bash -x -c "umask 000 && uv run --group test bash -x ./run_unit.sh $@"
+docker run -u root $INTERACTIVE_FLAG --ulimit memlock=-1 --ulimit stack=67108864 --cap-add=SYS_PTRACE "${RDMA_FLAGS[@]}" --rm --gpus '"device=0,1"' -v "$(realpath $SCRIPT_DIR/..):/workspace" -v $HF_HOME:/hf_home -e HF_TOKEN -e HF_HOME=/hf_home -e HOME=/tmp/ -w /workspace/tests "$CONTAINER" -- bash -x -c "umask 000 && uv run --group test bash -x ./run_unit.sh $@"

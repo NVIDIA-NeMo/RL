@@ -21,6 +21,8 @@ from transformers import AutoProcessor, PreTrainedTokenizerBase
 from nemo_rl.data.datasets.utils import assert_no_double_bos
 from nemo_rl.data.interfaces import (
     DatumSpec,
+    NemoGymSourceIdentity,
+    TaskDataPreProcessFnCallable,
     TaskDataProcessFnCallable,
     TaskDataSpec,
 )
@@ -41,6 +43,8 @@ class AllTaskProcessedDataset:
         task_data_processors: Either a single TaskDataProcessFnCallable for single-task,
             or a dict mapping task names to (TaskDataSpec, TaskDataProcessFnCallable) for multi-task
         max_seq_length: Maximum sequence length for tokenized outputs
+        agent_name_sources: Stable NeMo Gym source identities the setup-time agent
+            coverage check reads instead of scanning rows.
     """
 
     def __init__(
@@ -52,13 +56,19 @@ class AllTaskProcessedDataset:
             dict[str, tuple[TaskDataSpec, TaskDataProcessFnCallable]]
             | TaskDataProcessFnCallable
         ),
+        task_data_preprocessors: Optional[
+            Union[dict[str, TaskDataPreProcessFnCallable], TaskDataPreProcessFnCallable]
+        ] = None,
         max_seq_length: Optional[int] = None,
+        agent_name_sources: frozenset[NemoGymSourceIdentity] | None = None,
     ):
         self.dataset = dataset
+        self.agent_name_sources = agent_name_sources
         self.tokenizer = tokenizer
         # TODO @yukih: will be removed once eval datasets are adapted
         self.default_task_data_spec = default_task_data_spec
         self.task_data_processors = task_data_processors
+        self.task_data_preprocessors = task_data_preprocessors
         self.max_seq_length = max_seq_length
         self._bos_checked = False
 
@@ -95,6 +105,20 @@ class AllTaskProcessedDataset:
         """Return a single prompt."""
         entry = self.dataset[idx]
 
+        # preprocessing
+        task_data_preprocessor = None
+        if self.task_data_preprocessors:
+            if isinstance(self.task_data_preprocessors, dict):
+                task_name = entry["task_name"]
+                if task_name in self.task_data_preprocessors:
+                    task_data_preprocessor = self.task_data_preprocessors[task_name]
+            else:
+                task_data_preprocessor = self.task_data_preprocessors
+
+        if task_data_preprocessor is not None:
+            entry = task_data_preprocessor(entry)
+
+        # processing
         if isinstance(self.task_data_processors, dict):
             task_name = entry["task_name"]
 

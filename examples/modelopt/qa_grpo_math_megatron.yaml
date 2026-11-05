@@ -1,0 +1,32 @@
+# Quantization-Aware GRPO (QA-GRPO) with Megatron Backend and Model-Optimizer
+#
+# Example usage (1 node, 8 GPUs):
+#   uv run examples/run_grpo.py --config examples/modelopt/qa_grpo_math_megatron.yaml \
+#     policy.model_name=Qwen/Qwen3-1.7B
+#     teacher.model_name=Qwen/Qwen3-1.7B
+#
+defaults: "../configs/grpo_math_1B_megatron.yaml"
+
+policy:
+  # Quantization config applied to the Megatron training worker.
+  quant_cfg: "NVFP4_DEFAULT_CFG"
+  quant_calib_data: "cnn_dailymail"
+  quant_calib_size: 512
+  quant_batch_size: 1
+  quant_sequence_length: 2048
+
+  megatron_cfg:
+    # ModelOpt quantization is incompatible with gradient accumulation fusion.
+    gradient_accumulation_fusion: false
+
+  generation:
+    # Quantization config applied to the vLLM generation worker.
+    quant_cfg: "NVFP4_DEFAULT_CFG"
+
+checkpointing:
+  checkpoint_dir: "results/qa_grpo_megatron"
+
+logger:
+  log_dir: "logs/qa_grpo_megatron"
+  wandb:
+    name: "qa-grpo-megatron"

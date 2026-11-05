@@ -1,0 +1,232 @@
+#!/bin/bash
+# Excluded unit tests for FAST CI mode (Lfast).
+# Source this file and append "${EXCLUDED_UNIT_TESTS[@]}" to pytest args.
+# Supports: --ignore=<path>, --ignore-glob=<pattern>, --deselect=<node_id>
+# --ignore/--ignore-glob paths are relative to tests/ (run_unit.sh cwd).
+# --deselect node IDs are relative to the pytest rootdir (the repo root), so
+# they start with "tests/". A node ID without that prefix matches nothing and
+# is ignored silently.
+#
+# Principles:
+#   - Run ALL cheap tests (<1s, pure math/mocks/tensor ops)
+#   - Only exclude tests that are genuinely expensive (spin up WorkerGroups,
+#     Policy, VllmGeneration, SglangGeneration, load HF models, multi-GPU)
+#   - For expensive test suites, keep the most comprehensive correctness
+#     checks (favor A+B over just A)
+#   - Config/recipe tests always run (marked @run_first)
+
+EXCLUDED_UNIT_TESTS=(
+    ###########################################################################
+    # ALGORITHMS
+    ###########################################################################
+
+    # Sequence packing gradients — requires multi-GPU + Ray (~73s)
+    --ignore=unit/algorithms/test_sequence_packing_gradients.py
+
+    # test_grpo.py — exclude only tests requiring Ray actors / SGLang integration
+    --deselect=tests/unit/algorithms/test_grpo.py::test_calculate_rewards_multiple_tasks
+    --deselect=tests/unit/algorithms/test_grpo.py::test_calculate_rewards_missing_environment
+    --deselect=tests/unit/algorithms/test_grpo.py::test_noncolocated_inference_requires_explicit_gpus_per_node_multi_node
+    # test_utils.py — exclude only HF gated tokenizer tests
+    --deselect=tests/unit/algorithms/test_utils.py::test_get_tokenizer_no_chat_template
+    --deselect=tests/unit/algorithms/test_utils.py::test_get_tokenizer_default_chat_template
+    --deselect=tests/unit/algorithms/test_utils.py::test_get_tokenizer_null_chat_template
+    --deselect=tests/unit/algorithms/test_utils.py::test_get_tokenizer_custom_jinja_template
+
+    ###########################################################################
+    # DISTRIBUTED
+    ###########################################################################
+
+    # test_virtual_cluster.py — exclude only the two tests over 1s; the rest are
+    # pure regex/set/mock checks (<1s), including the router-band guards.
+    --deselect=tests/unit/distributed/test_virtual_cluster.py::test_mcore_py_executable
+    --deselect=tests/unit/distributed/test_virtual_cluster.py::test_create_sorted_bundle_indices_for_unified_pg
+
+    # test_worker_groups.py — exclude 2D sharding variants (require complex Ray setup)
+    --deselect=tests/unit/distributed/test_worker_groups.py::test_run_all_workers_single_data_2d_sharding_no_filter
+    --deselect=tests/unit/distributed/test_worker_groups.py::test_run_all_workers_single_data_2d_sharding_filter_tp
+    --deselect=tests/unit/distributed/test_worker_groups.py::test_run_all_workers_single_data_2d_sharding_filter_dp_tp
+    --deselect=tests/unit/distributed/test_worker_groups.py::test_run_all_workers_sharded_data_2d_shard_dp_replicate_tp
+    --deselect=tests/unit/distributed/test_worker_groups.py::test_run_all_workers_sharded_data_2d_free_axis_dp_shard_tp
+    --deselect=tests/unit/distributed/test_worker_groups.py::test_run_all_workers_sharded_data_2d_free_axis_dummy_calls
+    --deselect=tests/unit/distributed/test_worker_groups.py::test_run_all_workers_sharded_data_2d_output_replicated
+
+    ###########################################################################
+    # DATA
+    ###########################################################################
+
+    # test_response_dataset.py — all require HF dataset loading
+    --ignore=unit/data/datasets/test_response_dataset.py
+
+    # test_data_shuffle_reproducity.py — requires HF model downloads
+    --ignore=unit/data/test_data_shuffle_reproducity.py
+
+    # test_llm_message_utils.py — exclude only HF tokenizer/multimodal tests
+    --deselect=tests/unit/data/test_llm_message_utils.py::test_get_formatted_message_log_models
+    --deselect=tests/unit/data/test_llm_message_utils.py::test_get_formatted_message_log_qwen3_enable_thinking
+    --deselect=tests/unit/data/test_llm_message_utils.py::test_formatted_message_log_empty_message
+    --deselect=tests/unit/data/test_llm_message_utils.py::test_message_log_to_flat_messages_with_packed_images
+    --deselect=tests/unit/data/test_llm_message_utils.py::test_batched_message_log_to_flat_message_with_packed_images
+    --deselect=tests/unit/data/test_llm_message_utils.py::test_get_formatted_message_log_multimodal_prompt_formatting
+
+    # test_data_processor.py — exclude HF gated tests
+    --deselect=tests/unit/data/test_data_processor.py::test_math_hf_data_processor
+    --deselect=tests/unit/data/test_data_processor.py::test_math_hf_data_processor_without_prompt
+    --deselect=tests/unit/data/test_data_processor.py::test_eval_math_hf_data_processor
+
+    ###########################################################################
+    # MODELS — Generation (run in L0_Unit_Tests_{Vllm_*,Sglang})
+    ###########################################################################
+
+    --ignore=unit/models/generation/test_vllm_large_model.py
+
+    # Chat-completions parity — builds a real engine and loads Qwen3-0.6B
+    --ignore=unit/models/generation/test_vllm_http_server_parity.py
+    --ignore=unit/models/generation/trtllm/test_trtllm_http_server_parity.py
+
+    # TRT-LLM — a real TP=2 engine under a Slurm launcher env (~1-4 min)
+    --ignore=unit/models/generation/trtllm/test_trtllm_worker_startup.py
+
+    # test_vllm_generation.py — keep 3 key expensive tests + the replace_prefix_tokens integration test
+    # Kept: test_vllm_policy_generation (basic generation correctness),
+    #        test_vllm_weight_update_and_prefix_cache_reset (weight sync),
+    #        test_vllm_generation_with_megatron_training (generation + megatron A+B),
+    #        test_VllmAsyncGenerationWorker_replace_prefix_tokens (end-to-end splice with real tokenizer)
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_missing_required_config_key
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_top_p_top_k_validation
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_worker_seed_behavior
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_policy_tensor_parallel
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generate_text
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_http_server
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_weight_update_memory
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_stop
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_non_divisible_batch_handling
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_megatron_training_moe_model
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_megatron_weight_update_memory
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_megatron_pipeline_parallel
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_megatron_weight_update_with_packing
+
+    # vLLM — aggressive fast suite exclusions
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_policy_generation_async
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_hf_training_non_colocated
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_refit_non_colocated_update_weights
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_http_server_correct_merged_tokens_matches_baseline
+
+    # vLLM weight update — exclude fp8 variants
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_weight_update_and_prefix_cache_reset[fp8-1]
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_weight_update_and_prefix_cache_reset[fp8-2]
+
+    # vLLM megatron training — keep only 1 variant (None-bfloat16-1)
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_megatron_training[None-bfloat16-2]
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_megatron_training[None-fp8-1]
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_megatron_training[None-fp8-2]
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_megatron_training[fp8-bfloat16-1]
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_megatron_training[fp8-bfloat16-2]
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_megatron_training[fp8-fp8-1]
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_megatron_training[fp8-fp8-2]
+
+    # vLLM colocated HF — keep only 1 variant for fast (True-False-bfloat16-False)
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_hf_training_colocated[False-True-bfloat16-False]
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_hf_training_colocated[True-False-fp8-False]
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_hf_training_colocated[False-True-fp8-False]
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_hf_training_colocated[False-False-bfloat16-True]
+    --deselect=tests/unit/models/generation/test_vllm_generation.py::test_vllm_generation_with_hf_training_colocated[True-False-bfloat16-True]
+
+    # test_vllm_utils.py — exclude only the @vllm-marked test (rest are cheap)
+    --deselect=tests/unit/models/generation/test_vllm_utils.py::test_vllm_speculative_decoding_patch_still_needed
+
+    # test_vllm_logprobs_mode.py — keep test_processed_logprobs_matches_manual_computation (66s, critical)
+    --deselect=tests/unit/models/generation/test_vllm_logprobs_mode.py::test_apply_top_k_top_p_matches_vllm_upstream
+
+    ###########################################################################
+    # MODELS — Policy (run in L0_Unit_Tests_{Automodel,Megatron}_Policy_*)
+    ###########################################################################
+
+    # test_automodel_worker.py — keep 3 correctness checks, exclude the other GPU tests (~52-116s each).
+    # Kept: test_single_gpu_training, test_loss_independent_of_microbatch_size_two_gpus,
+    #        test_worker_logprob_tp2_or_cp2_matches_unsharded (minus its llama variants, below).
+    # The CPU/mock tests in this file (<1s) run too.
+    # Listed one by one rather than --ignore'd on the file: the three kept checks live here too.
+
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_checkpoint_save_and_load
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::test_mixed_precision_training_and_logprobs
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestSingleGPUCluster::test_single_gpu_logprob
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_lm_policy_init
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_worker_training
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_worker_training_with_lora
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_worker_logprob_with_lora
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_tp_and_tied_model_with_custom_parallel_plan
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_policy_flops_range_check
+
+    # llama variants of the kept logprob check: setup2-4 = llama TP=2, setup11-13 = llama CP=2
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup2]
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup3]
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup4]
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup11]
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup12]
+    --deselect=tests/unit/models/policy/test_automodel_worker.py::TestTwoGPUCluster::test_worker_logprob_tp2_or_cp2_matches_unsharded[logprob_setup13]
+
+    # test_patches.py — requires model loading
+    --ignore=unit/models/policy/test_patches.py
+
+    # test_megatron_worker.py — keep 2 correctness checks (~190s total), exclude rest (~77-114s each)
+    # Kept: test_megatron_loss_independent_of_microbatch_size (loss correctness),
+    #        test_megatron_context_parallel_logprob_agreement (logprob + CP correctness)
+    --deselect=tests/unit/models/policy/test_megatron_worker.py::test_megatron_policy_training
+    --deselect=tests/unit/models/policy/test_megatron_worker.py::test_megatron_policy_generation
+    --deselect=tests/unit/models/policy/test_megatron_worker.py::test_megatron_policy_logprobs
+    --deselect=tests/unit/models/policy/test_megatron_worker.py::test_megatron_reference_policy_functionality
+    --deselect=tests/unit/models/policy/test_megatron_worker.py::test_megatron_checkpoint_save_kill_and_restore
+    --deselect=tests/unit/models/policy/test_megatron_worker.py::test_megatron_dpo_training
+    --deselect=tests/unit/models/policy/test_megatron_worker.py::test_megatron_policy_topk_logits
+    --deselect=tests/unit/models/policy/test_megatron_worker.py::test_megatron_context_parallel_topk_agreement
+    --deselect=tests/unit/models/policy/test_megatron_worker.py::test_megatron_sft_training
+    --deselect=tests/unit/models/policy/test_megatron_worker.py::test_megatron_grad_norm_invariant_to_number_of_microbatches
+    --deselect=tests/unit/models/policy/test_megatron_worker.py::test_megatron_gradient_norm_consistency_across_parallelism
+    --deselect=tests/unit/models/policy/test_megatron_worker.py::test_megatron_context_parallel_training_agreement
+
+    ###########################################################################
+    # MODELS — Other subdirectories
+    ###########################################################################
+
+    # HuggingFace — all tests require gated HF model loading
+    --ignore=unit/models/huggingface/
+
+    # Megatron — GPU-heavy data tests
+    --ignore=unit/models/megatron/test_megatron_data.py
+
+    ###########################################################################
+    # EXPERIENCE — rollout tests need vLLM setup (~67-91s each).
+    # Keep pure Python tests, plus the 3 matches_original tests that guard correctness.
+    ###########################################################################
+
+    --deselect=tests/unit/experience/test_rollouts.py::test_run_multi_step_calculator_vllm_sync
+    --deselect=tests/unit/experience/test_rollouts.py::test_run_multi_step_calculator_vllm_async
+    --deselect=tests/unit/experience/test_rollouts.py::test_max_seqlen_respected_sync
+    --deselect=tests/unit/experience/test_rollouts.py::test_max_seqlen_respected_async
+    --deselect=tests/unit/experience/test_rollouts.py::test_run_sliding_puzzle_vllm
+    --deselect=tests/unit/experience/test_rollout_manager.py::test_async_rollout_manager
+    --deselect=tests/unit/experience/test_rollout_manager.py::test_async_rollout_manager_truncation
+    --deselect=tests/unit/experience/test_rollout_manager.py::test_async_nemo_gym_rollout_manager
+
+    ###########################################################################
+    # ENVIRONMENTS
+    ###########################################################################
+
+    # Retriever — GPU + Ray + model loading (~175s)
+    --ignore=unit/environments/test_retriever.py
+
+    # Reward model environment — requires model loading (~75s)
+    --ignore=unit/environments/test_reward_model_environment.py
+
+    # Code environment — exclude vllm integration (~82s)
+    --deselect=tests/unit/environments/test_code_environment.py::test_vllm_execute_code
+
+    ###########################################################################
+    # UTILS
+    ###########################################################################
+
+    # Packed tensor — exclude stress variants
+    --deselect=tests/unit/utils/test_packed_tensor.py::test_packed_broadcast_single_large_tensor
+    --deselect=tests/unit/utils/test_packed_tensor.py::test_packed_broadcast_multiple_batches
+)

@@ -1,0 +1,254 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Shared constants and type aliases for the data-plane meta contract."""
+
+from dataclasses import dataclass
+from typing import Literal, Optional, Sequence
+
+# Materialization layout for `codec.materialize` / `read_columns` / worker fetch.
+Layout = Literal["padded", "jagged"]
+
+# Per-shard packing metadata keys in `KVBatchMeta.extra_info`.
+MICRO_BATCH_INDICES = "micro_batch_indices"
+MICRO_BATCH_LENGTHS = "micro_batch_lengths"
+ELEM_COUNTS_PER_GB = "elem_counts_per_gb"
+GLOBAL_FORWARD_PAD_SEQLEN = "global_forward_pad_seqlen"
+
+# Per-prompt-group rollout metrics: a list of one metrics dict per group.
+# Unlike the packing keys above, this is not copied to each shard: the train
+# pump pops it off the meta before dispatch. sync_rollout_actor.py writes the
+# same string with a flat-dict shape, so this constant is not a drop-in there.
+ROLLOUT_METRICS = "rollout_metrics"
+
+# Per-row key in `KVBatchMeta.tags` naming the prompt group a row was generated
+# in. The group-relative estimators key their baseline on this rather than on
+# prompt tokens, which two distinct groups can share.
+GROUP_ID_TAG = "group_id"
+
+# The per-token members of `tq_token_sink.STAGING_FIELDS` (Gym's
+# `StagedCallRecord` deltas, under the names `stage()` renames them to). Named
+# here rather than inside the sink so `nemo_rl.utils.rpc_guard` can build its
+# forbidden-key set from the list that owns these names instead of a copy.
+PER_TOKEN_STAGING_FIELDS = (
+    "token_ids_delta",
+    "token_mask_delta",
+    "generation_logprobs_delta",
+)
+
+# Skeleton field names from `shard_meta_for_dp`.
+INPUT_IDS = "input_ids"
+INPUT_LENGTHS = "input_lengths"
+SAMPLE_MASK = "sample_mask"
+MASK_SAMPLE = "mask_sample"
+TRUNCATED = "truncated"
+META_IDX = "meta_idx"
+
+# Token-aligned message-violation fields consumed by SingleController advantages.
+INVALID_TOOL_CALL_MASK = "invalid_tool_call_mask"
+MALFORMED_THINKING_MASK = "malformed_thinking_mask"
+
+# Tensor fields in the train partition. Rollout writes the input
+# subset on first put; later stages add prev_logprobs /
+# reference_policy_logprobs (workers) and advantages (driver).
+DP_TRAIN_FIELDS = (
+    "input_ids",
+    "input_lengths",
+    "generation_logprobs",
+    "prev_logprobs",
+    "reference_policy_logprobs",
+    "advantages",
+    "token_mask",
+    "sample_mask",
+)
+
+# Full-vocabulary MOPD teacher payload columns; exactly one is written per run,
+# selected by ``on_policy_distillation.full.teacher_payload``. Both are jagged-
+# packed per-token ``[N, S, D]``, with ``D`` the hidden size or vocabulary size.
+OPD_FULL_HIDDEN_STATES_FIELD = "teacher_full_hidden_states"
+OPD_FULL_LOGITS_FIELD = "teacher_full_logits"
+OPD_FULL_FIELDS = (OPD_FULL_HIDDEN_STATES_FIELD, OPD_FULL_LOGITS_FIELD)
+
+# Per-sample (not per-token) teacher identity for multi-teacher full-vocabulary
+# MOPD's hidden-state path: which loaded teacher LM head projects this row's
+# payload. Written by whichever TeacherWorkerGroup enriched the row (see
+# opd.py's teacher_index) and read back alongside OPD_FULL_HIDDEN_STATES_FIELD
+# during training. Not jagged/token-aligned -- one int per sample.
+OPD_FULL_TEACHER_INDEX_FIELD = "opd_full_teacher_index"
+
+
+# Full known tensor schema for SingleController's long-lived rollout partition.
+# The initial rollout put writes the first seven payload fields; later stages add
+# student/reference logprobs, advantages, PPO critic columns, and the MOPD teacher
+# column. Registering their names once before concurrent producers start avoids
+# TransferQueue's lazy field-name registration race.
+SC_ROLLOUT_SCHEMA_FIELDS = (
+    *DP_TRAIN_FIELDS,
+    MASK_SAMPLE,
+    TRUNCATED,
+    "prompt_ids_for_adv",
+    "total_reward",
+    "values",
+    "returns",
+    "teacher_reference_logprobs",
+    *OPD_FULL_FIELDS,
+    OPD_FULL_TEACHER_INDEX_FIELD,
+    INVALID_TOOL_CALL_MASK,
+    MALFORMED_THINKING_MASK,
+)
+
+# Core fields the logprob workers require; multimodal extras added by TQPolicy._logprob_dispatch.
+LP_SEED_FIELDS = (
+    "input_ids",
+    "input_lengths",
+    "token_mask",
+    "sample_mask",
+)
+
+# Text-only inputs fetched by frozen MOPD teachers for logprob inference.
+TEACHER_LP_FIELDS = (INPUT_IDS, INPUT_LENGTHS)
+
+# Kept out of DP_TRAIN_FIELDS: a GRPO run writes neither, and a worker fetching
+# a column nobody wrote errors out rather than reading zeros.
+PPO_VALUE_FIELDS = (
+    "values",
+    "returns",
+)
+
+DP_VALUE_TRAIN_FIELDS = (
+    "input_ids",
+    "input_lengths",
+    "token_mask",
+    "sample_mask",
+    *PPO_VALUE_FIELDS,
+)
+
+VALUE_SEED_FIELDS = LP_SEED_FIELDS
+
+# Fields requested for KV-scale calibration. Positive include-list:
+# calibration only handles seq-dim tensor inputs, so we name them
+# explicitly. Train-side deltas (logprobs/advantages/masks) and
+# wire-only message-log bulk fields are skipped by virtue of not being
+# in this list. VLM extras are not named here — they are per-batch, so
+# callers add the ones actually present via
+# ``multimodal_utils.present_multimodal_fields``.
+DP_CALIB_INPUT_FIELDS = (INPUT_IDS, INPUT_LENGTHS)
+
+ROUTED_EXPERTS_FIELD = "routed_experts"
+# Per-token fields padded per microbatch instead of per batch: field -> pad value.
+MICROBATCH_PADDED_FIELDS: dict[str, int | float] = {ROUTED_EXPERTS_FIELD: -1}
+ROUTED_LEN_FIELD = "routed_len"
+ROUTED_EXPERTS_ENCODING_FIELD = "routed_experts_encoding"
+ROUTED_EXTRAS_METADATA_FIELD = "extras_metadata_json"
+
+# Wire codes for ROUTED_EXPERTS_ENCODING_FIELD: how a staged row's route
+# payload was encoded before its extras digest was committed. Shared by the
+# staging sink/source and the route-plan executor's digest recomputation.
+ROUTE_ENCODING_NONE = 0
+ROUTE_ENCODING_ENVELOPE = 1
+ROUTE_ENCODING_LIST = 2
+ROUTE_ENCODING_TENSOR = 3
+
+# Deferred route storage. Canonical rows carry one strict encoded route plan
+# per tag; policy workers omit the absent canonical route column and assemble
+# it from staging immediately before previous-policy logprob or training.
+ROUTE_PLAN_TAG = "route_assembly_plan"
+ROUTE_PASSTHROUGH_FLAG = "route_passthrough"
+
+# Sampler top-k per generated token (policy.generation.top_logprobs > 0), consumed
+# by loss_fn.score_centering: int32 ids and float32 log-probs, both ``[..., k]``.
+# Staging rows hold one call's generated positions; canonical rows are
+# token-aligned with zeros on prompt and tool tokens.
+SAMPLER_TOPK_TOKEN_IDS_FIELD = "sampler_topk_token_ids"
+SAMPLER_TOPK_LOGPROBS_FIELD = "sampler_topk_logprobs"
+SAMPLER_TOPK_FIELDS = (SAMPLER_TOPK_TOKEN_IDS_FIELD, SAMPLER_TOPK_LOGPROBS_FIELD)
+
+
+def fields_with_optional_routed_experts(
+    fields: Sequence[str],
+    *,
+    enabled: bool,
+) -> list[str]:
+    """Return `fields` plus routed experts when router replay is enabled."""
+    out = list(fields)
+    if enabled and ROUTED_EXPERTS_FIELD not in out:
+        out.append(ROUTED_EXPERTS_FIELD)
+    return out
+
+
+def fields_with_optional_opd_full(
+    fields: Sequence[str],
+    *,
+    field: Optional[str],
+    teacher_index_field: Optional[str] = None,
+) -> list[str]:
+    """Return `fields` plus the full-vocabulary MOPD teacher payload column(s).
+
+    Added only when the run configures them: a GRPO run requesting a column
+    nobody wrote would error on read, hence not folded into ``DP_TRAIN_FIELDS``.
+
+    Args:
+        fields: Base field list.
+        field: Payload column name, or ``None`` when opd_full is off.
+        teacher_index_field: Per-sample teacher-identity column name (hidden-
+            state path only, see ``OPD_FULL_TEACHER_INDEX_FIELD``), or
+            ``None`` when opd_full is off or using the logits payload.
+
+    Returns:
+        The field list, with the payload/index columns appended when applicable.
+    """
+    out = list(fields)
+    if field is not None and field not in out:
+        out.append(field)
+    if teacher_index_field is not None and teacher_index_field not in out:
+        out.append(teacher_index_field)
+    return out
+
+
+@dataclass(frozen=True)
+class LogicalRowTag:
+    """Required ownership metadata on real and execution-padding forest rows."""
+
+    dispatch_group_id: str
+    logical_rollout_id: str | None
+    logical_slot: int | None
+    logical_group_size: int
+    segment_index: int | None
+    segment_count: int
+    is_execution_padding: bool
+
+
+def forest_segment_id(owner_id: str, segment_index: int) -> str:
+    """Canonical identity of a physical row owned by one logical rollout."""
+    return f"{owner_id}_s{segment_index}"
+
+
+def forest_row_ids(
+    group_id: str,
+    owner_ids: Sequence[str],
+    segment_counts: Sequence[int],
+    *,
+    execution_row_multiple: int,
+) -> tuple[str, ...]:
+    """One publication/cleanup plan: owner segments followed by execution padding."""
+    if type(execution_row_multiple) is not int or execution_row_multiple < 1:
+        raise ValueError("execution_row_multiple must be a positive integer")
+    real_ids = tuple(
+        forest_segment_id(owner, index)
+        for owner, count in zip(owner_ids, segment_counts, strict=True)
+        for index in range(count)
+    )
+    return real_ids + tuple(
+        f"{group_id}_pad{index}"
+        for index in range(-len(real_ids) % execution_row_multiple)
+    )

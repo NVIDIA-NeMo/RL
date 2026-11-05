@@ -1,0 +1,68 @@
+# MiniMax-M1 async lag-1 high-off-policy study (https://arxiv.org/abs/2506.13585), CISPO arm.
+# Async lag-1 recipe using 2 nodes for Megatron policy training and
+# 1 non-colocated vLLM generation node. Only the loss_fn block differs
+# across arms.
+#
+# CISPO (MiniMax-M1 §3.1) clips the IS weight as a stop-gradient
+# coefficient instead of clipping the policy ratio. Gradients flow
+# through log pi for *every* token, including the rare reflective
+# tokens ("However", "Wait", "Recheck") that GRPO/DAPO would zero out.
+#
+#   L_CISPO = -A * sg(clip(r, 1 - eps_low, 1 + eps_high)) * log pi(a)
+#
+# Per ms-swift's CISPO recipe and ScaleRL (arXiv:2510.13786), we use a
+# very loose lower clip and a much wider upper clip (eps_high = 5.0).
+defaults: ../../grpo_math_qwen30ba3b_megatron.yaml
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_num_steps: 10
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: 128
+  val_batch_size: 128
+  async_grpo:
+    enabled: true
+    in_flight_weight_updates: true
+policy:
+  train_global_batch_size: 32
+  logprob_batch_size: 1
+  sequence_packing:
+    enabled: true
+  megatron_cfg:
+    # CUDA13/vLLM0.20 image: TE cuDNN fused-attn sublibrary fails to load at
+    # runtime; force flash-attn backend (pre-baked) so MCore skips the cuDNN
+    # fused path. setup.py clears NVTE_* env vars when this is set.
+    attention_backend: flash
+    scheduler:
+      lr_decay_iters: 500
+      lr_warmup_iters: 10
+  generation:
+    vllm_cfg:
+      async_engine: true
+      # vLLM 0.20 auto-selects the FlashInfer CUTLASS/TRTLLM fused-MoE backend for
+      # MoE models (e.g. Qwen3-30B-A3B), which produces 0% accuracy / gibberish
+      # (vLLM issues #34892, #37591, #37758). Force the reference Triton MoE.
+      env_vars:
+        VLLM_USE_FLASHINFER_MOE_FP16: '0'
+        VLLM_USE_FLASHINFER_MOE_FP8: '0'
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 1
+        gpus_per_node: 8
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_min: 1.0                  # lower bound = 0; effectively unclipped
+  ratio_clip_max: 5.0                  # eps_high = 5.0 (ms-swift / ScaleRL)
+  use_importance_sampling_correction: true
+  use_cispo: true
+logger:
+  log_dir: logs/grpo-cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-3n8g-megatron-cispo
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-cispo-mm1-async-lag1-highoffpolicy-qwen3-30ba3b-3n8g-megatron-cispo
+cluster:
+  num_nodes: 3

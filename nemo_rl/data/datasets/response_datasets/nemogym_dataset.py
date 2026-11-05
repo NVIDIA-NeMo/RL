@@ -12,16 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from datasets import Dataset
+import os
 
 from nemo_rl.data.datasets.raw_dataset import RawDataset
+from nemo_rl.data.datasets.utils import load_dataset_from_path
+from nemo_rl.data.interfaces import NemoGymSourceIdentity
 
 
 class NemoGymDataset(RawDataset):
     """Simple wrapper around the Nemo Gym dataset.
 
     Args:
-        data_path: Path to the dataset JSONL file
+        data_path: Path to a JSONL file or a pre-converted Arrow/Parquet dataset.
         repeat: Number of times to repeat the dataset, default is 1
     """
 
@@ -30,17 +32,48 @@ class NemoGymDataset(RawDataset):
         if self.task_name[0] == "-":
             self.task_name = self.task_name[1:]
 
-        # load raw line from jsonl
-        # will use `json.loads` to load to dict format at `nemo_gym_data_processor` later since `Dataset` cannot handle nested structure well
-        with open(data_path) as f:
-            self.dataset = [raw_line for raw_line in f]
+        # Record a stable source identity for JSONL sources so the setup-time
+        # agent coverage check can scan agent names from the file once.
+        # Pre-converted Arrow, Parquet, and save_to_disk datasets fall back to
+        # scanning the loaded rows.
+        source_path = os.path.realpath(data_path)
+        is_jsonl_source = os.path.isfile(source_path) and data_path.lower().endswith(
+            ".jsonl"
+        )
+        if is_jsonl_source:
+            source_identity = NemoGymSourceIdentity.from_stat(
+                source_path, os.stat(source_path)
+            )
 
-        # format the dataset
-        self.dataset = Dataset.from_dict(
-            {
-                "extra_env_info": self.dataset,
-                "task_name": [self.task_name] * len(self.dataset),
-            }
+        # Preserve JSONL records as raw strings because the NeMo-Gym processor
+        # intentionally parses the nested payload later. The Hugging Face text
+        # builder materializes a reusable Arrow cache instead of retaining the
+        # entire source file as a Python list of strings. Pre-converted Arrow,
+        # Parquet, and save_to_disk datasets are accepted as well.
+        # The rows stay memory-mapped from HF_DATASETS_CACHE and pickle by file
+        # path, so every process that unpickles this dataset (e.g. the async GRPO
+        # trajectory collector actor) must see HF_DATASETS_CACHE at the same path.
+        self.dataset = load_dataset_from_path(
+            data_path, data_split=None, preserve_jsonl_rows=True
+        )
+        if is_jsonl_source and source_identity.matches(os.stat(source_path)):
+            self.agent_name_sources = frozenset({source_identity})
+        else:
+            self.agent_name_sources = None
+
+        if "extra_env_info" in self.dataset.column_names:
+            self.dataset = self.dataset.select_columns(["extra_env_info"])
+        elif "text" in self.dataset.column_names:
+            self.dataset = self.dataset.select_columns(["text"]).rename_column(
+                "text", "extra_env_info"
+            )
+        else:
+            raise ValueError(
+                "A NeMo-Gym dataset must contain an 'extra_env_info' or 'text' "
+                f"column, but {data_path!r} contains {self.dataset.column_names}."
+            )
+        self.dataset = self.dataset.add_column(
+            "task_name", [self.task_name] * len(self.dataset)
         )
 
         # repeat the dataset

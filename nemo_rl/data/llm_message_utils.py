@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,8 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import warnings
+from collections.abc import Mapping, Sequence
 from typing import Any, Optional, Union, cast
 
+import numpy as np
 import torch
 from datasets import Dataset
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
@@ -25,12 +27,34 @@ from nemo_rl.data.interfaces import (
 )
 from nemo_rl.data.multimodal_utils import (
     PackedTensor,
-    get_multimodal_keys_from_processor,
+    extract_multimodal_model_inputs,
+    get_multimodal_default_settings_from_processor,
+    load_media_from_message,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 Tensor = torch.Tensor
 TokenizerType = PreTrainedTokenizerBase
+
+
+def _validated_packed_values(key: str, values: list[Any]) -> list[PackedTensor]:
+    """Return packed values while rejecting mixed non-empty representations."""
+    if not any(isinstance(value, PackedTensor) for value in values):
+        return []
+
+    packed_values: list[PackedTensor] = []
+    invalid_types: list[str] = []
+    for value in values:
+        if isinstance(value, PackedTensor):
+            packed_values.append(value)
+        elif value is not None:
+            invalid_types.append(type(value).__name__)
+    if invalid_types:
+        raise TypeError(
+            f"Packed multimodal key {key!r} also contains non-packed "
+            f"values: {invalid_types}"
+        )
+    return packed_values
 
 
 def message_log_to_flat_messages(
@@ -111,9 +135,10 @@ def message_log_to_flat_messages(
                         f"tensors for {key=} must have same number of dimensions: {[t.shape for t in result[key]]}"
                     ) from e
                 raise
-        elif result[key] and isinstance(result[key][0], PackedTensor):
+        packed_values = _validated_packed_values(key, result[key])
+        if packed_values:
             try:
-                concat[key] = PackedTensor.concat(result[key])
+                concat[key] = PackedTensor.merge_segments(packed_values)
             except Exception as e:
                 raise RuntimeError(
                     f"Error concatenating packed multimodal data for {key=}"
@@ -173,6 +198,36 @@ def add_loss_mask_to_message_log(
                     message["token_loss_mask"] = torch.zeros_like(
                         cast(Tensor, message["token_ids"])
                     )
+
+
+def validate_precomputed_loss_masks(
+    message_logs: Sequence[Sequence[Mapping[str, Any]]],
+) -> None:
+    """Validate binary loss-mask vectors without changing the messages.
+
+    Args:
+        message_logs: Tokenized conversations with a loss mask on each message.
+
+    Raises:
+        ValueError: A mask or token vector is missing, not one-dimensional, has
+            a mismatched shape, or contains a mask value other than zero or one.
+    """
+    for message_log in message_logs:
+        for message in message_log:
+            tokens = message.get("token_ids")
+            mask = message.get("token_loss_mask")
+            if (
+                not isinstance(tokens, torch.Tensor)
+                or not isinstance(mask, torch.Tensor)
+                or tokens.ndim != 1
+                or mask.ndim != 1
+                or tokens.shape != mask.shape
+                or bool(((mask != 0) & (mask != 1)).any())
+            ):
+                raise ValueError(
+                    "Precomputed SFT masks must be binary vectors matching "
+                    "each token vector."
+                )
 
 
 def _pad_tensor(
@@ -358,19 +413,35 @@ def batched_message_log_to_flat_message(
     # Process each key
     result = BatchedDataDict()
     for key in all_keys:
-        values = [seq.get(key) for seq in sequenced_lists]
-        # if the values are PackedTensors, create a new PackedTensor from the list of values
-        if values and isinstance(values[0], PackedTensor):
-            result[key] = PackedTensor.flattened_concat(values)
+        values: list[Any] = [seq.get(key) for seq in sequenced_lists]
+        packed_values = _validated_packed_values(key, values)
+        # Preserve one logical row for conversations missing this media key.
+        # Async replay may concatenate text-only and multimodal prompt groups in
+        # either order, so the first row cannot determine the value type.
+        if packed_values:
+            template = packed_values[0]
+            aligned_values = [
+                (
+                    value
+                    if isinstance(value, PackedTensor)
+                    else PackedTensor.empty_rows_like(template, 1)
+                )
+                for value in values
+            ]
+            result[key] = PackedTensor.flattened_concat(aligned_values)
             continue
         if not values or not isinstance(values[0], Tensor):
             result[key] = values
             continue
 
         # Filter out None values and validate consistency
-        values: list[Tensor | None] = cast(list[Tensor | None], values)
-        tensors = cast(list[Tensor], [t for t in values if t is not None])
-        _validate_tensor_consistency(tensors)
+        tensor_values = cast(list[Tensor | None], values)
+        tensors = cast(list[Tensor], [t for t in tensor_values if t is not None])
+        try:
+            _validate_tensor_consistency(tensors)
+        except RuntimeError as e:
+            e.add_note(f"[key={key!r}]")
+            raise
 
         # Create zero tensors for None values
         filled_values: list[Tensor] = [
@@ -379,7 +450,7 @@ def batched_message_log_to_flat_message(
                 if v is None
                 else v
             )
-            for v in values
+            for v in tensor_values
         ]
 
         # Pad and stack tensors (always right padding)
@@ -422,22 +493,32 @@ def get_first_index_that_differs(str1: str, str2: str) -> int:
     return min(len(str1), len(str2))
 
 
-def get_images_from_message(message: dict[str, Any]) -> list[Any]:
-    """Get all images from a message log item."""
-    # Handle None or missing content (e.g., assistant messages with only tool_calls)
-    if message.get("content") is None:
-        return []
-    # Handle string content (no images)
-    if isinstance(message["content"], str):
-        return []
-    # iterate over the content list
-    images = []
-    for item in message["content"]:
-        if item["type"] == "image":
-            images.extend(list(item["image"])) if isinstance(
-                item["image"], (list, tuple)
-            ) else images.append(item["image"])
-    return images
+def _tokenize_preformatted_message_log(
+    message_log: LLMMessageLogType,
+    tokenizer: TokenizerType,
+) -> LLMMessageLogType:
+    """Encode each preformatted text turn independently, preserving token ownership."""
+    raw_tokenizer = getattr(tokenizer, "tokenizer", tokenizer)
+    raw_message_log: LLMMessageLogType = []
+    for message in message_log:
+        content = message.get("content")
+        if isinstance(content, str):
+            turn = content
+        elif isinstance(content, list) and all(
+            isinstance(part, dict) and part.get("type") == "text" for part in content
+        ):
+            turn = "".join(str(part.get("text", "")) for part in content)
+        else:
+            raise ValueError(
+                "chat_template_preapplied=True requires pre-rendered text-only turns."
+            )
+        new_message = message.copy()
+        new_message["content"] = turn
+        new_message["token_ids"] = torch.as_tensor(
+            raw_tokenizer.encode(turn, add_special_tokens=False), dtype=torch.long
+        )
+        raw_message_log.append(new_message)
+    return raw_message_log
 
 
 def get_formatted_message_log(
@@ -448,6 +529,8 @@ def get_formatted_message_log(
     add_eos_token: bool = True,
     add_generation_prompt: bool = False,
     tools: Optional[list[dict[str, Any]]] = None,
+    debug: bool = False,
+    chat_template_preapplied: bool = False,
 ) -> LLMMessageLogType:
     """Format and tokenize chat messages using the specified template.
 
@@ -458,17 +541,33 @@ def get_formatted_message_log(
         add_bos_token: Whether to add bos token to first message if it is not already present. Default: True
         add_eos_token: Whether to add eos token to last message if it is not already present. Default: True
         add_generation_prompt: Whether to include assistant's generation prompt in user messages. Default: False
+        chat_template_preapplied: Each message's text already has the chat template
+            applied upstream. Encode turns independently without applying it again.
+            The source must use the template expected at generation time and include
+            its BOS/EOS and assistant end-of-turn markers; add_bos_token and
+            add_eos_token are ignored. In blends with normal sources, include BOS
+            exactly when data.add_bos is enabled. Independent encoding can differ
+            from encoding the joined conversation at turn boundaries. Default: False.
         tools: Optional list of tool/function definitions to pass to the chat template. Default: None
+        debug: Whether to print debug information showing each message turn. Default: False
     Returns:
         The message log with updated 'token_ids' and 'content' fields.
     """
+    if chat_template_preapplied:
+        if add_generation_prompt or tools is not None or task_data_spec.prompt:
+            raise ValueError(
+                "chat_template_preapplied=True does not support add_generation_prompt, "
+                "tools, or a task_data_spec prompt: the chat template was already applied."
+            )
+        return _tokenize_preformatted_message_log(message_log, tokenizer)
+
     new_message_log: LLMMessageLogType = []
     prev_formatted_message = ""
     message_log_strs: list[dict[str, str]] = cast(
         list[dict[str, str]], message_log
     )  # we just use the str:str parts here
 
-    multimodal_keys = get_multimodal_keys_from_processor(tokenizer)
+    multimodal_load_kwargs = get_multimodal_default_settings_from_processor(tokenizer)
 
     def _format_content_helper(
         content: Union[str, list[dict[str, Any]]],
@@ -529,11 +628,10 @@ def get_formatted_message_log(
         # the assistant's generation prompt as part of the user message.
 
         # Only pass tools parameter if tools exist
-        template_kwargs = {
+        template_kwargs: dict[str, Any] = {
             "add_generation_prompt": add_generation_prompt
             and message["role"] in ["user", "tool"],
             "tokenize": False,
-            "add_special_tokens": False,
         }
         if tools is not None:
             template_kwargs["tools"] = tools
@@ -551,8 +649,8 @@ def get_formatted_message_log(
         ## pull out the chunk corresponding to the current message
         message_chunk = formatted_message[prev_message_len_no_eos:]
 
-        # Debug: Print each message turn separately (only once for the first sample)
-        if not hasattr(get_formatted_message_log, "_debug_printed"):
+        # Debug: Print each message turn separately
+        if debug:
             if i == 0:
                 # Print header only at the start of first message
                 print("\n" + "=" * 80)
@@ -568,8 +666,6 @@ def get_formatted_message_log(
             print("-" * 40)
 
             if i == len(message_log_strs) - 1:
-                # Mark as printed after processing all turns of the first sample
-                get_formatted_message_log._debug_printed = True
                 print("\n" + "=" * 80)
                 print("DEBUG: Complete formatted conversation:")
                 print("-" * 80)
@@ -606,28 +702,37 @@ def get_formatted_message_log(
                     message_chunk += tokenizer.eos_token
 
         # get images too (extend this for other modalities)
-        images_cur_message = get_images_from_message(message)
+        media_cur_message = load_media_from_message(
+            message, multimodal_load_kwargs=multimodal_load_kwargs
+        )
 
         new_message = message.copy()
         # extend this if statement to check for all(len(modality)) == 0 when adding other modalities
-        if len(images_cur_message) == 0:
+        if len(media_cur_message) == 0:
             new_message["token_ids"] = tokenizer(
                 text=message_chunk, return_tensors="pt", add_special_tokens=False
             )["input_ids"][0]
         else:
             # extend the else statement to add other modalities (in this case, tokenizer will be a processor)
+            media_kwargs = {}
+            if "image" in media_cur_message:
+                media_kwargs["images"] = media_cur_message["image"]
+            if "audio" in media_cur_message:
+                media_kwargs["audio"] = media_cur_message["audio"]
+            if "video" in media_cur_message:
+                media_kwargs["videos"] = media_cur_message["video"]
+
             processed_chunk = tokenizer(
                 text=[message_chunk],
-                images=images_cur_message,
                 return_tensors="pt",
                 add_special_tokens=False,
+                **media_kwargs,
             )
             new_message["token_ids"] = processed_chunk["input_ids"][0]
 
-            # add all vlm keys to the message
-            for key in multimodal_keys:
-                if key in processed_chunk:
-                    new_message[key] = PackedTensor(processed_chunk[key], dim_to_pack=0)
+            new_message.update(
+                extract_multimodal_model_inputs(tokenizer, dict(processed_chunk))
+            )
 
         if len(new_message["token_ids"]) == 0:
             # if there is an empty message, the empty `token_ids` tensor ends up being in fp32,
@@ -681,3 +786,138 @@ def remap_dataset_keys(
         lambda x: {v: x[k] for k, v in mapping_dict.items()},
         remove_columns=list(mapping_dict.keys()),
     )
+
+
+# ── Decomposed wire format for `message_log` ──────────────────────────
+#
+# `message_log` mixes torch.Tensor with Python objects at the per-row
+# level (`{"role": str, "content": str, "token_ids": Tensor, ...}` per
+# turn). Shipping that shape per-row through pickle serializes the
+# *underlying storage* of view-aliased tensor slices — for a vllm batched
+# output arena that's ~100 MB per row instead of the slice's ~10 KB.
+#
+# The helpers below split `message_log` into per-field arrays (role/content
+# strings as object arrays, per-turn lengths as one slim tensor) and
+# rebuild the list-of-dicts shape on the consumer from local-arena views.
+# No tensor ever reaches per-row pickle. `SyncRolloutActor` does not write
+# these fields to the data plane; they reach the driver via `driver_carry`.
+
+# Fields consumed by :func:`reconstruct_message_log` to rebuild the
+# list-of-dicts view, when a batch carries them.
+MESSAGE_LOG_BULK_FIELDS = ("turn_lengths", "turn_roles", "turn_contents")
+
+
+def decompose_message_log(
+    message_log_batch: list[LLMMessageLogType],
+) -> dict[str, Any]:
+    """Split a list-of-lists-of-dicts ``message_log`` into per-field arrays.
+
+    Returns a dict with:
+
+    - ``turn_lengths`` — ``torch.LongTensor(B, max_turns)``, zero in unused slots.
+    - ``turn_roles`` — ``np.ndarray(object, (B,))`` of ``list[str]``.
+    - ``turn_contents`` — ``np.ndarray(object, (B,))`` of ``list[str]``.
+    - ``response_token_lengths`` — ``torch.LongTensor(B,)``, total length of
+      generated assistant turns per sample (0 if none). Prompt-history assistant
+      turns lack ``generation_logprobs`` and are excluded. Consumed by
+      :func:`nemo_rl.algorithms.reward_functions.apply_reward_shaping`.
+
+    Call before loss-mask preparation backfills missing ``generation_logprobs``.
+    """
+    batch_size = len(message_log_batch)
+    max_turns = max((len(ml) for ml in message_log_batch), default=0)
+
+    turn_roles = np.empty(batch_size, dtype=object)
+    turn_contents = np.empty(batch_size, dtype=object)
+    # Build Python lists in the hot loop; one tensor allocation at the end
+    # avoids per-turn 0-d tensor writes inside the loop.
+    turn_lengths_lol: list[list[int]] = [[0] * max_turns for _ in range(batch_size)]
+    response_lengths: list[int] = [0] * batch_size
+
+    for i, ml in enumerate(message_log_batch):
+        roles: list[str] = []
+        contents: list[str] = []
+        lengths_i = turn_lengths_lol[i]
+        for t, m in enumerate(ml):
+            role = m["role"]  # required; surface bad data loudly here
+            roles.append(role)
+            contents.append(m.get("content", ""))
+            tok = m.get("token_ids")
+            if tok is None:
+                continue
+            length = int(tok.shape[0]) if isinstance(tok, torch.Tensor) else len(tok)
+            lengths_i[t] = length
+            if role == "assistant" and "generation_logprobs" in m:
+                response_lengths[i] += length
+        turn_roles[i] = roles
+        turn_contents[i] = contents
+
+    return {
+        "turn_lengths": torch.tensor(turn_lengths_lol, dtype=torch.long),
+        "turn_roles": turn_roles,
+        "turn_contents": turn_contents,
+        "response_token_lengths": torch.tensor(response_lengths, dtype=torch.long),
+    }
+
+
+def attach_message_log_view(batch: BatchedDataDict[Any]) -> None:
+    """Attach ``batch['message_log']`` in place if decomposed fields are present.
+
+    Rebuilds ``message_log`` as views into the consumer-local ``input_ids``
+    / ``generation_logprobs``. Aliasing is harmless because the local
+    tensors own their storage and consumers do not re-pickle ``message_log``.
+    No-op when the decomposed fields are absent (legacy pickle-shipped path).
+    """
+    if "input_ids" not in batch or any(k not in batch for k in MESSAGE_LOG_BULK_FIELDS):
+        return
+    batch["message_log"] = reconstruct_message_log(
+        input_ids=batch["input_ids"],
+        turn_lengths=batch["turn_lengths"],
+        turn_roles=batch["turn_roles"],
+        turn_contents=batch["turn_contents"],
+        generation_logprobs=batch.get("generation_logprobs"),
+    )
+
+
+def reconstruct_message_log(
+    input_ids: Tensor,
+    turn_lengths: Tensor,
+    turn_roles: "np.ndarray",
+    turn_contents: "np.ndarray",
+    generation_logprobs: Optional[Tensor] = None,
+) -> list[LLMMessageLogType]:
+    """Inverse of :func:`decompose_message_log`.
+
+    Per-turn ``token_ids`` and ``generation_logprobs`` are **views** into
+    the consumer-local ``input_ids`` / ``generation_logprobs`` tensors.
+    The aliasing is harmless because the local tensors own their storage
+    (decoded from the wire) and consumers do not re-pickle ``message_log``.
+    """
+    batch_size = int(input_ids.shape[0])
+    # Single host-side materialization — avoids a per-turn .item() sync.
+    turn_lengths_list = turn_lengths.tolist()
+    out: list[LLMMessageLogType] = []
+    for i in range(batch_size):
+        roles_i = turn_roles[i]
+        contents_i = turn_contents[i]
+        lengths_i = turn_lengths_list[i]
+        turns: LLMMessageLogType = []
+        offset = 0
+        for t, role in enumerate(roles_i):
+            length = lengths_i[t]
+            if length == 0:
+                turns.append({"role": role, "content": contents_i[t]})
+                continue
+            turn: dict[str, Any] = {
+                "role": role,
+                "content": contents_i[t],
+                "token_ids": input_ids[i, offset : offset + length],
+            }
+            if generation_logprobs is not None and role == "assistant":
+                turn["generation_logprobs"] = generation_logprobs[
+                    i, offset : offset + length
+                ]
+            offset += length
+            turns.append(turn)
+        out.append(turns)
+    return out

@@ -1,0 +1,273 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""NemoGym liveness surface.
+
+Two things are covered. First, health_check forwards to NeMo-Gym's own RunHelper.poll --
+the check Gym already implements and calls every 60s from `gym env start`, but which
+NeMo-RL never ran because it only calls rh.start. Without it a dead tool server shows up
+as unexplained rollout timeouts instead of a named process.
+
+Second, an actor that never spun up says so. Ray recreates a restarted actor through
+__init__ only, which does not start the Gym servers, so a restarted NemoGym reaches that
+state and previously surfaced it as an AttributeError from deep inside a rollout.
+"""
+
+import asyncio
+from collections.abc import AsyncIterator
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import MagicMock
+
+import pytest
+from ray import cloudpickle
+
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
+from nemo_rl.environments.nemo_gym import NemoGym
+
+# NemoGym is a Ray actor; grab the plain class so these run without a cluster.
+NemoGymClass = NemoGym.__ray_metadata__.modified_class
+
+
+def _unspun() -> NemoGymClass:
+    """A NemoGym exactly as Ray would recreate it after a restart."""
+    return NemoGymClass(
+        {
+            "model_name": "m",
+            "base_urls": [],
+            "initial_global_config_dict": {},
+            "checkpoint_instance": GymCheckpointInstance("nemo_gym", 0),
+            "turn_checkpointing_enabled": False,
+        }
+    )
+
+
+class _FakeRunHelper:
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.error = error
+        self.polls = 0
+        self.shutdowns = 0
+        # Read by NemoGym.shutdown() to find the servers Gym launched; none here.
+        self._processes: dict = {}
+
+    def poll(self) -> None:
+        self.polls += 1
+        if self.error is not None:
+            raise self.error
+
+    def shutdown(self) -> None:
+        self.shutdowns += 1
+
+
+class _TaskSourceResolvingRolloutHelper:
+    """Mimic Gym's synchronous task_source-to-agent_ref resolution."""
+
+    def run_examples(
+        self,
+        examples: list[dict[str, Any]],
+        head_server_config: str,
+        route_failures_to_sidecar: bool = False,
+    ) -> list[Any]:
+        assert head_server_config == "head-server"
+        # A failed /run must come back as its row so a refusal can name it.
+        assert route_failures_to_sidecar is True
+        assert all("agent_ref" not in example for example in examples)
+        for example in examples:
+            example["agent_ref"] = {
+                "type": "responses_api_agents",
+                "name": "workplace_assistant_simple_agent",
+            }
+        return []
+
+
+class _TaskSourceResolvingRolloutHelperWithResult(_TaskSourceResolvingRolloutHelper):
+    def run_examples(
+        self,
+        examples: list[dict[str, Any]],
+        head_server_config: str,
+        route_failures_to_sidecar: bool = False,
+    ) -> list[Any]:
+        super().run_examples(
+            examples,
+            head_server_config,
+            route_failures_to_sidecar=route_failures_to_sidecar,
+        )
+
+        async def completed(example):
+            return example, {}
+
+        return [completed(example) for example in examples]
+
+
+async def _drain(async_generator: AsyncIterator[Any]) -> None:
+    async for _ in async_generator:
+        pass
+
+
+class TestHealthCheck:
+    @pytest.mark.nemo_gym
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("serialize_spinup", [False, True])
+    async def test_spinup_reuses_rollout_client_and_refreshes_it_on_restart(
+        self, monkeypatch: pytest.MonkeyPatch, serialize_spinup: bool
+    ) -> None:
+        import nemo_gym.cli
+        import nemo_gym.server_utils as gym_utils
+        from omegaconf import OmegaConf
+
+        import nemo_rl.environments.nemo_gym as env_module
+
+        monkeypatch.setattr(env_module, "_get_node_ip_local", lambda: "127.0.0.1")
+        ports = iter([11000, 11001])
+        monkeypatch.setattr(env_module, "_get_free_port_local", lambda *_: next(ports))
+        monkeypatch.setattr(env_module.ray, "is_initialized", lambda: True)
+        monkeypatch.setattr(
+            env_module.ray,
+            "get_runtime_context",
+            lambda: SimpleNamespace(gcs_address="127.0.0.1:1200"),
+        )
+        start = MagicMock()
+        monkeypatch.setattr(
+            nemo_gym.cli, "RunHelper", lambda: SimpleNamespace(start=start)
+        )
+        load = MagicMock(
+            side_effect=lambda head: gym_utils.ServerClient(
+                head_server_config=head, global_config_dict=OmegaConf.create({})
+            )
+        )
+        monkeypatch.setattr(gym_utils.ServerClient, "load_from_global_config", load)
+        # Keep the real ServerClient/config-load path without opening sockets.
+        monkeypatch.setattr(gym_utils, "is_global_aiohttp_client_setup", lambda: True)
+
+        env = _unspun()
+        spinup = NemoGymClass._spinup
+        if serialize_spinup:
+            # Ray ships the method by value; annotation-only globals can be lost.
+            spinup = cloudpickle.loads(cloudpickle.dumps(spinup))
+        clients = []
+        for _ in range(2):
+            spinup(env)
+            assert load.call_count == len(clients) * 2 + 1
+            clients.append(env.rch.setup_server_client(env.head_server_config))
+            for _ in range(64):
+                assert (
+                    env.rch.setup_server_client(env.head_server_config) is clients[-1]
+                )
+                assert list(env.rch.run_examples([], env.head_server_config)) == []
+            assert load.call_count == len(clients) * 2 - 1
+            # The existing control client remains independently cached.
+            control = env._control_client()
+            assert env._control_client() is control
+        assert start.call_count == 2
+        assert load.call_count == 4
+        assert clients[0] is not clients[1]
+        assert [client.head_server_config.port for client in clients] == [11000, 11001]
+        with pytest.raises(ValueError, match="different Gym deployment"):
+            env.rch.setup_server_client(clients[0].head_server_config)
+        assert env.rch.setup_server_client() is clients[1]
+
+    def test_a_healthy_gym_polls_the_run_helper(self):
+        env = _unspun()
+        env.rh = _FakeRunHelper()
+        asyncio.run(env.health_check())
+        assert env.rh.polls == 1
+
+    def test_poll_runs_off_the_actor_event_loop(self, monkeypatch):
+        env = _unspun()
+        env.rh = _FakeRunHelper()
+        submitted = []
+
+        async def _to_thread(function):
+            submitted.append(function)
+            function()
+
+        monkeypatch.setattr(asyncio, "to_thread", _to_thread)
+        asyncio.run(env.health_check())
+
+        assert submitted == [env.rh.poll]
+
+    def test_a_dead_subprocess_server_propagates_with_its_name(self):
+        env = _unspun()
+        env.rh = _FakeRunHelper(
+            RuntimeError("Process `workplace_assistant` finished unexpectedly!")
+        )
+        with pytest.raises(RuntimeError, match="workplace_assistant"):
+            asyncio.run(env.health_check())
+
+
+class TestUnspunActor:
+    def test_health_check_explains_the_restarted_actor_state(self):
+        with pytest.raises(RuntimeError, match="_spinup\\(\\) was never called"):
+            asyncio.run(_unspun().health_check())
+
+    def test_run_rollouts_refuses_rather_than_raising_attribute_error(self):
+        env = _unspun()
+        with pytest.raises(RuntimeError, match="_spinup\\(\\) was never called"):
+            # run_rollouts is an async generator, so the guard fires on first advance.
+            gen = env.run_rollouts([{"agent_ref": {"name": "a"}}], None, "timing/x")
+            asyncio.run(anext(gen))
+
+    def test_shutdown_is_a_noop_so_teardown_does_not_mask_the_real_error(self):
+        """shutdown() runs in a finally block; it must not raise over a training error."""
+        _unspun().shutdown()
+
+    def test_shutdown_still_forwards_when_spun_up(self):
+        env = _unspun()
+        run_helper = _FakeRunHelper()
+        env.rh = run_helper
+        env.shutdown()
+        env.shutdown()
+        assert run_helper.shutdowns == 1
+        assert env.rh is None
+
+
+def test_run_rollouts_resolves_task_source_before_reading_agent_ref():
+    """Gym 0.15 collated rows are task_source-routed until run_examples."""
+    env = _unspun()
+    env.rh = _FakeRunHelper()
+    env._tokenizer = object()
+    env.head_server_config = "head-server"
+    env.rch = _TaskSourceResolvingRolloutHelper()
+
+    rows = [{"task_source": "workplace_assistant"}]
+    asyncio.run(_drain(env.run_rollouts(rows, "timing/test")))
+
+    assert rows[0]["agent_ref"]["name"] == "workplace_assistant_simple_agent"
+
+
+def test_run_rollouts_echoes_resolved_agent_ref_with_streamed_result():
+    """The caller's serialized row copy cannot observe actor-local mutation."""
+    env = _unspun()
+    env.rh = _FakeRunHelper()
+    env._tokenizer = object()
+    env.head_server_config = "head-server"
+    env.rch = _TaskSourceResolvingRolloutHelperWithResult()
+    env._postprocess_nemo_gym_to_nemo_rl_result = lambda *_args, **_kwargs: {
+        "message_log": []
+    }
+
+    async def collect():
+        return [
+            item
+            async for item in env.run_rollouts(
+                [{"task_source": "workplace_assistant", "_rowidx": 0}],
+                "timing/test",
+            )
+        ]
+
+    streamed = asyncio.run(collect())
+    assert streamed[0][1] == {
+        "type": "responses_api_agents",
+        "name": "workplace_assistant_simple_agent",
+    }

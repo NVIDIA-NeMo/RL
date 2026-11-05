@@ -17,15 +17,19 @@ dist/
 *.vscode/
 release_run*
 ckpts/
+mlruns/
 
 # Test
 coverage.json
 .coverage*
-unit_results.json
-unit_results/
 test_assets/
+actual_test_nemo_gym_sanity.json
 .nrl_remote_map.json
 .nrl_remote_state.json
+# Test biproducts
+tests/functional/*/
+tests/unit/unit_results.json
+tests/unit/unit_results/
 
 # Cache
 uv_cache/
@@ -33,10 +37,6 @@ hf_home/
 hf_datasets_cache/
 *logs/
 /datasets/
-docker/*
-!docker/Dockerfile
-!docker/Dockerfile.ngc_pytorch
-!docker/README.md
 wandb/
 checkpoints/
 results/
@@ -46,3 +46,18 @@ code_snapshots*/
 # Runtime env
 *runtime_env.yaml
 !default_runtime_env.yaml
+
+# Claude Code review memory (local only)
+.claude/review-memory/
+
+# Agent config placeholders that appear in whatever directory a tool ran in.
+# The repo's own .claude/ and .mcp.json at the root are tracked and unaffected.
+*/**/.claude/
+*/**/.mcp.json
+
+# Running a recipe .sh by hand writes its outputs to tests/test_suites/
+# <domain>/<exp_name>/ (common.env sets EXP_DIR=$SCRIPT_DIR/$EXP_NAME). ckpts/,
+# *logs/, wandb/ and *.log above already cover all of it but metrics.json.
+# Named rather than ignoring the directory shape: tests/test_suites/llm/
+# performance/ sits at that depth and is tracked.
+/tests/test_suites/**/metrics.json

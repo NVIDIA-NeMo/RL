@@ -14,18 +14,30 @@
 
 import math
 from datetime import datetime
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
 
+from nemo_rl.algorithms.grpo import AsyncGRPOConfig, GRPOConfig, MasterConfig
+from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.utils import (
+    EFFICIENCY_CATEGORIES,
+    STEP_WINDOW_WALL_CLOCK_CATEGORIES,
+    WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
+    calculate_trivial_reward_distributions,
     get_tokenizer,
     maybe_pad_last_batch,
+    print_efficiency_summary,
     print_performance_metrics,
 )
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
+from nemo_rl.data.deepseek_v4_tokenizer import get_deepseek_v4_tokenizer
+from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 
 
 @pytest.fixture
@@ -140,6 +152,157 @@ def test_get_tokenizer_custom_jinja_template(conversation_messages):
     assert formatted == expected
 
 
+def test_get_processor_custom_template_updates_processor_and_tokenizer():
+    class NemotronH_Super_Omni_Reasoning_V3Processor:
+        pass
+
+    tokenizer = MagicMock()
+    tokenizer.pad_token = "<pad>"
+    tokenizer.eos_token = "<eos>"
+    tokenizer.bos_token = "<bos>"
+    tokenizer.pad_token_id = 0
+    tokenizer.eos_token_id = 1
+    tokenizer.bos_token_id = 2
+    tokenizer.name_or_path = "test-processor"
+    processor = NemotronH_Super_Omni_Reasoning_V3Processor()
+    processor.tokenizer = tokenizer
+    processor.chat_template = "stale-template"
+
+    with patch(
+        "nemo_rl.algorithms.utils.AutoProcessor.from_pretrained",
+        return_value=processor,
+    ):
+        result = get_tokenizer(
+            {"name": "test-processor", "chat_template": "new-template"},
+            get_processor=True,
+        )
+
+    assert result is processor
+    assert tokenizer.chat_template == "new-template"
+    assert processor.chat_template == "new-template"
+
+
+def test_get_processor_custom_template_preserves_native_multimodal_template():
+    class Qwen2_5_VLProcessor:
+        pass
+
+    tokenizer = MagicMock()
+    tokenizer.pad_token = "<pad>"
+    tokenizer.eos_token = "<eos>"
+    tokenizer.bos_token = "<bos>"
+    tokenizer.pad_token_id = 0
+    tokenizer.eos_token_id = 1
+    tokenizer.bos_token_id = 2
+    tokenizer.name_or_path = "test-processor"
+    processor = Qwen2_5_VLProcessor()
+    processor.tokenizer = tokenizer
+    processor.chat_template = "native-multimodal-template"
+
+    with patch(
+        "nemo_rl.algorithms.utils.AutoProcessor.from_pretrained",
+        return_value=processor,
+    ):
+        result = get_tokenizer(
+            {"name": "test-processor", "chat_template": "new-template"},
+            get_processor=True,
+        )
+
+    assert result is processor
+    assert tokenizer.chat_template == "new-template"
+    assert processor.chat_template == "native-multimodal-template"
+
+
+def test_get_tokenizer_forwards_tokenizer_kwargs():
+    """Test get_tokenizer unpacks tokenizer_kwargs into from_pretrained."""
+    config = {
+        "name": "meta-llama/Llama-3.2-1B-Instruct",
+        "tokenizer_kwargs": {"model_max_length": 123},
+    }
+    with patch("nemo_rl.algorithms.utils.AutoTokenizer") as mock_auto_tokenizer:
+        get_tokenizer(config)
+
+    mock_auto_tokenizer.from_pretrained.assert_called_once_with(
+        "meta-llama/Llama-3.2-1B-Instruct",
+        trust_remote_code=True,
+        model_max_length=123,
+    )
+
+
+def test_get_processor_forwards_tokenizer_kwargs():
+    """Test get_tokenizer forwards tokenizer_kwargs through AutoProcessor."""
+    config = {
+        "name": "Qwen/Qwen2.5-VL-3B-Instruct",
+        "tokenizer_kwargs": {"model_max_length": 123, "use_fast": False},
+    }
+    with patch("nemo_rl.algorithms.utils.AutoProcessor") as mock_auto_processor:
+        get_tokenizer(config, get_processor=True)
+
+    mock_auto_processor.from_pretrained.assert_called_once_with(
+        "Qwen/Qwen2.5-VL-3B-Instruct",
+        trust_remote_code=True,
+        use_fast=False,
+        model_max_length=123,
+    )
+    assert config["tokenizer_kwargs"] == {
+        "model_max_length": 123,
+        "use_fast": False,
+    }
+
+
+@patch("nemo_rl.algorithms.utils.AutoTokenizer")
+@patch("nemo_rl.algorithms.utils.get_deepseek_v4_tokenizer")
+def test_get_tokenizer_uses_vllm_deepseek_v4_renderer(
+    mock_get_deepseek_v4_tokenizer, mock_auto_tokenizer, capsys
+):
+    base_tokenizer = MagicMock()
+    base_tokenizer.pad_token = "<pad>"
+    tokenizer = MagicMock()
+    mock_auto_tokenizer.from_pretrained.return_value = base_tokenizer
+    mock_get_deepseek_v4_tokenizer.return_value = tokenizer
+
+    result = get_tokenizer(
+        {
+            "name": "deepseek-ai/DeepSeek-V4-Flash-Base",
+            "chat_template": "deepseek_v4",
+            "chat_template_kwargs": {"enable_thinking": True},
+        }
+    )
+
+    assert result is tokenizer
+    mock_auto_tokenizer.from_pretrained.assert_called_once_with(
+        "deepseek-ai/DeepSeek-V4-Flash-Base", trust_remote_code=True
+    )
+    mock_get_deepseek_v4_tokenizer.assert_called_once_with(
+        base_tokenizer, {"enable_thinking": True}
+    )
+    assert "Using vLLM 0.25.1's DeepSeek V4 chat renderer" in capsys.readouterr().out
+
+
+class DummyDeepSeekV4Tokenizer:
+    vocab_size = 10
+
+    def get_added_vocab(self):
+        return {}
+
+    def encode(self, text, add_special_tokens=False, **kwargs):
+        assert add_special_tokens is False
+        return [ord(character) % 256 for character in text]
+
+
+def test_deepseek_v4_renderer_matches_single_turn_chat_format():
+    tokenizer = get_deepseek_v4_tokenizer(DummyDeepSeekV4Tokenizer())
+
+    prompt = tokenizer.apply_chat_template(
+        [{"role": "user", "content": "Solve 1+1."}],
+        tokenize=False,
+        enable_thinking=False,
+    )
+
+    assert (
+        prompt == "<｜begin▁of▁sentence｜><｜User｜>Solve 1+1.<｜Assistant｜></think>"
+    )
+
+
 def test_maybe_pad_last_batch():
     """Test maybe_pad_last_batch function for various scenarios"""
     # Test case 1: No padding needed
@@ -219,23 +382,165 @@ def test_maybe_pad_last_batch():
     assert "token_mask" not in result
     assert "reference_policy_logprobs" not in result
 
+    # Preference padding must append complete, uniquely identified pairs.
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(18).reshape(6, 3),
+            "input_lengths": torch.full((6,), 3),
+            "sample_mask": torch.ones(6),
+            "pair_index": torch.tensor([0, 0, 1, 1, 2, 2]),
+            "is_chosen": torch.tensor([True, False, True, False, True, False]),
+        }
+    )
+    result = maybe_pad_last_batch(batch, dp_size=2, mbs=2)
+    assert result.size == 8
+    assert torch.equal(result["pair_index"], torch.tensor([0, 0, 1, 1, 2, 2, 3, 3]))
+    assert torch.equal(
+        result["is_chosen"],
+        torch.tensor([True, False, True, False, True, False, True, False]),
+    )
+    assert torch.equal(result["sample_mask"][-2:], torch.zeros(2))
+
+
+def test_maybe_pad_last_batch_preserves_multimodal_rows():
+    batch_size = 17
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(batch_size * 4).reshape(batch_size, 4),
+            "input_lengths": torch.full((batch_size,), 4),
+            "sample_mask": torch.ones(batch_size),
+            "token_mask": torch.ones(batch_size, 4),
+            "mm_token_type_ids": torch.arange(batch_size * 4).reshape(batch_size, 4),
+            "pixel_values": PackedTensor(
+                [torch.full((1, 2), row) for row in range(batch_size)],
+                dim_to_pack=0,
+            ),
+            "sample_ids": list(range(batch_size)),
+        }
+    )
+
+    result = maybe_pad_last_batch(batch, dp_size=8, mbs=1)
+
+    assert result.size == 24
+    assert len(result["pixel_values"]) == 24
+    assert result["mm_token_type_ids"].shape[0] == 24
+    assert result["sample_ids"][-7:] == [batch_size - 1] * 7
+    assert torch.count_nonzero(result["sample_mask"][-7:]) == 0
+    assert torch.equal(
+        result["pixel_values"].tensors[-1],
+        result["pixel_values"].tensors[batch_size - 1],
+    )
+
+    shards = result.shard_by_batch_size(shards=8, batch_size=24)
+    assert len(shards) == 8
+    assert all(shard.size == 3 for shard in shards)
+
+
+def _single_direct_packed_validation_row() -> BatchedDataDict:
+    return BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+            "target_ids": torch.tensor([[2, 3, 4, -100]]),
+            "token_mask": torch.tensor([[1.0, 1.0, 1.0, 0.0]]),
+            "position_ids": torch.tensor([[0, 1, 2, 3]]),
+            "input_lengths": torch.tensor([4]),
+            "sample_mask": torch.tensor([1.0]),
+            "packed_cu_seqlens": torch.tensor([[0, 2, 4]], dtype=torch.int32),
+            "packed_cu_seqlens_lengths": torch.tensor([3]),
+            "packed_max_seqlen": torch.tensor([2]),
+            "idx": ["row-0"],
+            "task_name": ["sft"],
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "input_ids",
+        "target_ids",
+        "token_mask",
+        "position_ids",
+        "input_lengths",
+        "packed_cu_seqlens",
+        "packed_cu_seqlens_lengths",
+        "packed_max_seqlen",
+    ],
+)
+def test_maybe_pad_last_direct_packed_batch_duplicates_tensor_row_fields(key: str):
+    result = maybe_pad_last_batch(
+        _single_direct_packed_validation_row(), dp_size=2, mbs=1
+    )
+
+    assert torch.equal(result[key][1], result[key][0])
+
+
+@pytest.mark.parametrize("key", ["idx", "task_name"])
+def test_maybe_pad_last_direct_packed_batch_duplicates_list_row_fields(key: str):
+    result = maybe_pad_last_batch(
+        _single_direct_packed_validation_row(), dp_size=2, mbs=1
+    )
+
+    assert result[key] == [result[key][0], result[key][0]]
+
+
+def test_maybe_pad_last_direct_packed_batch_marks_padding_row_invalid():
+    result = maybe_pad_last_batch(
+        _single_direct_packed_validation_row(), dp_size=2, mbs=1
+    )
+
+    assert torch.equal(result["sample_mask"], torch.tensor([1.0, 0.0]))
+
+
+def test_maybe_pad_last_direct_packed_batch_rejects_unaligned_field():
+    batch = _single_direct_packed_validation_row()
+    batch["metadata"] = object()
+
+    with pytest.raises(TypeError, match="Unsupported type .* for index selection"):
+        maybe_pad_last_batch(batch, dp_size=2, mbs=1)
+
 
 # Performance Metrics Tests
 
 
 def _base_master_config(colocated: bool):
-    return {
-        "cluster": {"num_nodes": 2, "gpus_per_node": 8},
-        "policy": {
+    return MasterConfig.model_construct(
+        cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
+        policy={
             "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
                 "colocated": {
                     "enabled": colocated,
                     "resources": {"num_nodes": 1, "gpus_per_node": 8},
-                }
+                },
             }
         },
-        "grpo": {"num_prompts_per_step": 8, "num_generations_per_prompt": 10},
-    }
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=8, num_generations_per_prompt=10
+        ),
+    )
+
+
+def _base_ppo_master_config(colocated: bool):
+    return PPOMasterConfig.model_construct(
+        cluster=ClusterConfig(num_nodes=2, gpus_per_node=8),
+        policy={
+            "generation": {
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "top_k": None,
+                "colocated": {
+                    "enabled": colocated,
+                    "resources": {"num_nodes": 1, "gpus_per_node": 8},
+                },
+            }
+        },
+        ppo=PPOConfig.model_construct(
+            num_prompts_per_step=8, num_generations_per_prompt=10
+        ),
+    )
 
 
 def test_sync_colocated_throughput_flops_and_imbalance(capsys):
@@ -265,7 +570,13 @@ def test_sync_colocated_throughput_flops_and_imbalance(capsys):
     }
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=False,
     )
 
     # Validate key throughput metrics
@@ -307,9 +618,53 @@ def test_sync_colocated_throughput_flops_and_imbalance(capsys):
     assert "Floating Point Utilization" in out
 
 
+def test_train_elapsed_seconds_used_for_flops_calculation(capsys):
+    """train_elapsed_seconds in train_results overrides policy_training timing for TFLOPS."""
+    master_config = _base_master_config(colocated=True)
+
+    timing_metrics = {
+        "policy_and_reference_logprobs": 2.0,
+        "policy_training": 4.0,  # should be ignored when train_elapsed_seconds present
+        "total_step_time": 10.0,
+        "generation": 5.0,
+        "weight_sync": 1.0,
+    }
+
+    metrics = {
+        "total_num_tokens": 8000.0,
+        "per_worker_token_counts": {0: 2000, 1: 2000, 2: 2000, 3: 2000},
+    }
+
+    # total_tflops = total_flops / train_elapsed_seconds / 1e12 = 1e15 / 2.0 / 1e12 = 500
+    # (NOT 1e15 / 4.0 / 1e12 = 250, which would use policy_training)
+    train_results = {
+        "total_flops": 1.0e15,
+        "num_ranks": 8,
+        "train_elapsed_seconds": 2.0,
+        "theoretical_tflops": 500.0,
+    }
+
+    perf = print_performance_metrics(
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=False,
+    )
+
+    assert math.isclose(perf["train_flops_per_gpu"], 500.0 / 8, rel_tol=1e-6)
+
+    out = capsys.readouterr().out
+    assert "500.00 TFLOPS" in out
+
+
 def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
     master_config = _base_master_config(colocated=False)
-    master_config["async_grpo"] = {"enabled": True}
+    master_config.grpo.async_grpo = AsyncGRPOConfig(
+        enabled=True, max_trajectory_age_steps=1
+    )
 
     timing_metrics = {
         "policy_and_reference_logprobs": 2.0,
@@ -328,8 +683,16 @@ def test_async_non_colocated_idle_ratio_and_generation_time(capsys):
     train_results = {}
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=True,
     )
+
+    assert "training_worker_idle_time_ratio" in perf
 
     # Throughput checks
     assert math.isclose(perf["samples_per_sec_per_gpu"], 0.5, rel_tol=1e-6)
@@ -380,7 +743,13 @@ def test_minimal_inputs_no_counts_no_flops(capsys):
     train_results = {}
 
     perf = print_performance_metrics(
-        train_results, metrics, timing_metrics, master_config
+        train_results,
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=False,
     )
 
     # Core metrics exist
@@ -394,6 +763,63 @@ def test_minimal_inputs_no_counts_no_flops(capsys):
 
     out = capsys.readouterr().out
     assert "Throughputs (per GPU)" in out
+
+
+def test_empty_per_worker_token_counts_skips_imbalance(capsys):
+    master_config = _base_master_config(colocated=True)
+
+    timing_metrics = {
+        "policy_and_reference_logprobs": 1.0,
+        "policy_training": 3.0,
+        "total_step_time": 8.0,
+        "generation": 2.0,
+        "prepare_for_generation/total": 0.5,
+    }
+
+    metrics = {
+        "total_num_tokens": 1600.0,
+        "per_worker_token_counts": {},
+    }
+
+    perf = print_performance_metrics(
+        {},
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=False,
+    )
+
+    assert "average_token_imbalance" not in perf
+
+    out = capsys.readouterr().out
+    assert "No per-worker generation load data available." in out
+    assert "Throughputs (per GPU)" in out
+
+
+def test_async_ppo_metrics_use_async_flag_without_grpo_config():
+    master_config = _base_ppo_master_config(colocated=False)
+    timing_metrics = {
+        "policy_and_reference_logprobs": 2.0,
+        "policy_training": 4.0,
+        "total_step_time": 10.0,
+        "exposed_generation": 2.0,
+        "prepare_for_generation/total": 1.0,
+    }
+    metrics = {"total_num_tokens": 6050.0}
+
+    perf = print_performance_metrics(
+        {},
+        metrics,
+        timing_metrics,
+        master_config,
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=True,
+    )
+
+    assert "training_worker_idle_time_ratio" in perf
 
 
 # ============================================================================
@@ -417,7 +843,9 @@ def test_calculate_baseline_and_std_per_prompt_basic():
     )
     valid_mask = torch.ones(6)
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     expected_baseline = torch.tensor([2.5, 2.0, 1.5, 5.5, 5.0, 4.5])
     expected_std = torch.tensor(
@@ -440,7 +868,9 @@ def test_calculate_baseline_and_std_per_prompt_single_generation_per_prompt():
     )
     valid_mask = torch.ones(2)
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     # When num_valid <= 1 (single generation per prompt), baseline equals reward
     expected_baseline = torch.tensor([2.5, 4.0])
@@ -466,13 +896,96 @@ def test_calculate_baseline_and_std_per_prompt_identical_rewards():
     )
     valid_mask = torch.ones(6)
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     expected_baseline = torch.tensor([3.0, 3.0, 3.0, 7.0, 7.0, 7.0])
     expected_std = torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
     assert torch.allclose(baseline, expected_baseline, rtol=1e-5)
     assert torch.allclose(std, expected_std, rtol=1e-5)
+    assert is_trivial.all()
+
+
+def test_calculate_baseline_and_std_per_prompt_marks_trivial_leave_one_out_set():
+    """A sample's leave-one-out peers may be identical even when the full group is not."""
+    rewards = torch.tensor([0.0] + [0.95] * 7)
+    prompts = torch.zeros(8, 1, dtype=torch.long)
+    valid_mask = torch.ones(8)
+
+    baseline, _, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
+
+    torch.testing.assert_close(baseline[0], torch.tensor(0.95))
+    assert is_trivial.tolist() == [True] + [False] * 7
+
+
+def test_calculate_baseline_and_std_per_prompt_trivial_set_respects_valid_mask():
+    """An invalid peer must not count toward the leave-one-out uniqueness check."""
+    rewards = torch.tensor([0.0, 0.95, 0.95, 7.0])
+    prompts = torch.zeros(4, 1, dtype=torch.long)
+
+    _, _, masked = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, torch.tensor([1.0, 1.0, 1.0, 0.0])
+    )
+    _, _, unmasked = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, torch.ones(4)
+    )
+
+    # Index 3 is the invalid row; its flag is incidental, so it is not pinned.
+    assert masked.tolist()[:3] == [True, False, False]
+    assert unmasked.tolist()[:3] == [False, False, False]
+
+
+def test_calculate_trivial_reward_distributions_uses_full_group():
+    """A mixed prompt is non-trivial for every row, independent of LOO peers."""
+    rewards = torch.tensor([0.0] + [0.95] * 7)
+    prompts = torch.zeros(8, 1, dtype=torch.long)
+
+    is_trivial = calculate_trivial_reward_distributions(
+        prompts, rewards, torch.ones_like(rewards)
+    )
+
+    assert is_trivial.tolist() == [False] * 8
+
+
+def test_calculate_baseline_and_std_per_prompt_marks_trivial_from_std_rewards():
+    """DAPO case: triviality must be computed on std_rewards, not on rewards."""
+    rewards = torch.tensor([0.0, -0.2, -1.0, 1.0, 0.0, 1.0])
+    std_rewards = torch.tensor([0.0, 0.0, 0.0, 1.0, 0.0, 1.0])
+    prompts = torch.tensor([[0], [0], [0], [1], [1], [1]])
+    valid_mask = torch.ones(6)
+
+    _, std, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts,
+        rewards,
+        valid_mask,
+        leave_one_out_baseline=False,
+        std_rewards=std_rewards,
+    )
+
+    assert is_trivial.tolist() == [True, True, True, False, False, False]
+    assert torch.allclose(std[:3], torch.zeros(3))
+    assert (std[3:] > 0).all()
+
+
+def test_calculate_baseline_and_std_per_prompt_marks_trivial_full_group_when_not_leave_one_out():
+    """Without leave-one-out, the comparison set includes self, so an outlier's
+    own group (not just its peers) determines triviality."""
+    rewards = torch.tensor([0.0] + [0.95] * 7)
+    prompts = torch.zeros(8, 1, dtype=torch.long)
+    valid_mask = torch.ones(8)
+
+    _, _, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts,
+        rewards,
+        valid_mask,
+        leave_one_out_baseline=False,
+    )
+
+    assert is_trivial.tolist() == [False] * 8
 
 
 def test_calculate_baseline_and_std_per_prompt_mixed_prompt_sizes():
@@ -490,7 +1003,9 @@ def test_calculate_baseline_and_std_per_prompt_mixed_prompt_sizes():
     )
     valid_mask = torch.ones(5)
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     expected_baseline = torch.tensor([2.0, 1.0, 5.5, 5.0, 4.5])
     expected_std = torch.tensor([0.0, 0.0, 0.707107, 1.414214, 0.707107])
@@ -505,10 +1020,13 @@ def test_calculate_baseline_and_std_per_prompt_empty_input():
     prompts = torch.empty(0, 3, dtype=torch.long)
     valid_mask = torch.tensor([])
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     assert baseline.shape == torch.Size([0])
     assert std.shape == torch.Size([0])
+    assert is_trivial.shape == torch.Size([0])
     assert torch.equal(baseline, torch.tensor([]))
     assert torch.equal(std, torch.tensor([]))
 
@@ -531,7 +1049,9 @@ def test_calculate_baseline_and_std_per_prompt_nan_handling():
     # Mark the second sample as invalid
     valid_mask = torch.tensor([1.0, 0.0, 1.0, 1.0, 1.0, 1.0])
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     expected_baseline = torch.tensor([3.0, 4.0, 1.0, 5.5, 5.0, 4.5])
     expected_std = torch.tensor([0.0, 0.0, 0.0, 0.707107, 1.414214, 0.707107])
@@ -556,11 +1076,14 @@ def test_calculate_baseline_and_std_per_prompt_cuda_compatibility():
     ).cuda()
     valid_mask = torch.ones(4).cuda()
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, is_trivial = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     # Verify results are on CUDA and have expected values
     assert baseline.device.type == "cuda"
     assert std.device.type == "cuda"
+    assert is_trivial.device.type == "cuda"
 
     expected_baseline = torch.tensor([2.0, 1.0, 4.0, 3.0]).cuda()
     expected_std = torch.tensor([0.0, 0.0, 0.0, 0.0]).cuda()
@@ -585,7 +1108,9 @@ def test_calculate_baseline_and_std_per_prompt_numerical_precision():
     )
     valid_mask = torch.ones(6)
 
-    baseline, std = calculate_baseline_and_std_per_prompt(prompts, rewards, valid_mask)
+    baseline, std, _ = calculate_baseline_and_std_per_prompt(
+        prompts, rewards, valid_mask
+    )
 
     expected_baseline = torch.tensor([2.5e-8, 2e-8, 1.5e-8, 2.5e8, 2e8, 1.5e8])
 
@@ -593,3 +1118,129 @@ def test_calculate_baseline_and_std_per_prompt_numerical_precision():
     # Std values should be finite and not NaN
     assert torch.isfinite(std).all()
     assert not torch.isnan(std).any()
+
+
+class TestPrintEfficiencySummary:
+    def test_basic_efficiency_calculation(self, capsys):
+        """Test that efficiency is computed correctly from metrics."""
+        metrics = {
+            "init/total": 10.0,
+            "idle/buffer_starvation": 5.0,
+            "idle/refit_bubble": 3.0,
+            "idle/validation": 2.0,
+        }
+        total_wall = 100.0
+
+        result = print_efficiency_summary(metrics, total_wall, step=1)
+
+        # init/total is not waste for this step: it is a run-long constant, so
+        # only the three per-step idle categories count (5 + 3 + 2).
+        assert result["efficiency/total_waste_s"] == 10.0
+        assert result["efficiency/productive_time_s"] == 90.0
+        assert result["efficiency/efficiency_pct"] == pytest.approx(90.0)
+        assert result["efficiency/total_wall_time_s"] == 100.0
+
+        assert result["efficiency/init/total_s"] == 10.0
+        assert result["efficiency/init/total_pct"] == pytest.approx(10.0)
+        assert result["efficiency/idle/buffer_starvation_s"] == 5.0
+
+        assert result["efficiency/idle/buffer_full_backoff_s"] == 0.0
+        assert result["efficiency/wasted/failed_trajectory_s"] == 0.0
+
+        captured = capsys.readouterr()
+        assert "Efficiency Summary (Step 1)" in captured.out
+        assert "90.00%" in captured.out
+
+    def test_startup_cost_is_not_charged_to_every_step(self):
+        """init/total is republished every step, so counting it would recur.
+
+        The driver measures it once before the loop and re-supplies the same
+        value on every step so the series does not zero out. Folding it into the
+        waste aggregate would subtract the whole startup cost from every step.
+        """
+        idle_only = {"idle/refit_bubble": 4.0}
+        with_startup = {**idle_only, "init/total": 300.0}
+
+        assert print_efficiency_summary(
+            with_startup, total_wall_time_s=1000.0, step=9, step_wall_time_s=20.0
+        )["efficiency/efficiency_pct"] == pytest.approx(
+            print_efficiency_summary(
+                idle_only, total_wall_time_s=1000.0, step=9, step_wall_time_s=20.0
+            )["efficiency/efficiency_pct"]
+        )
+
+    def test_efficiency_is_a_per_step_ratio(self):
+        """The numerator is per-step, so the denominator has to be too.
+
+        Against the run's elapsed time, a fixed per-step idle cost would look
+        like it was shrinking: the same 5s of idle in a 20s step is 25% waste at
+        step 2 and 25% at step 500, but 5/1000 at step 500 if divided by the run.
+        """
+        metrics = {"idle/buffer_starvation": 5.0}
+
+        result = print_efficiency_summary(
+            metrics, total_wall_time_s=1000.0, step=50, step_wall_time_s=20.0
+        )
+
+        assert result["efficiency/efficiency_pct"] == pytest.approx(75.0)
+        # The per-category column stays a share of the run, which is what makes
+        # a cumulative denominator the right one there.
+        assert result["efficiency/idle/buffer_starvation_pct"] == pytest.approx(0.5)
+
+    def test_step_wall_time_defaults_to_the_run(self):
+        """Callers with no per-step measurement keep the old denominator."""
+        metrics = {"idle/refit_bubble": 25.0}
+
+        result = print_efficiency_summary(metrics, total_wall_time_s=100.0, step=1)
+
+        assert result["efficiency/efficiency_pct"] == pytest.approx(75.0)
+
+    def test_zero_wall_time(self):
+        """Test that zero wall time produces 100% efficiency."""
+        result = print_efficiency_summary({}, total_wall_time_s=0.0, step=0)
+        assert result["efficiency/efficiency_pct"] == 100.0
+        assert result["efficiency/total_waste_s"] == 0.0
+
+    def test_all_categories_present(self):
+        """Test that all EFFICIENCY_CATEGORIES appear in the output."""
+        metrics = {cat: 1.0 for cat in EFFICIENCY_CATEGORIES}
+        result = print_efficiency_summary(metrics, total_wall_time_s=100.0, step=5)
+
+        for cat in EFFICIENCY_CATEGORIES:
+            assert f"efficiency/{cat}_s" in result
+            assert result[f"efficiency/{cat}_s"] == 1.0
+            if cat in WALL_CLOCK_EFFICIENCY_CATEGORIES:
+                assert f"efficiency/{cat}_pct" in result
+
+        # total_waste_s reflects the per-step wall-clock categories only
+        # (3 x 1.0): collector thread-seconds are reported separately rather
+        # than folded into wall waste, and init/total is a run constant.
+        assert result["efficiency/total_waste_s"] == 3.0
+        assert result["efficiency/efficiency_pct"] == pytest.approx(97.0)
+
+    def test_efficiency_with_collector_metrics_merge(self):
+        """Test merging driver and collector metrics before computing efficiency."""
+        driver = {"init/total": 5.0, "idle/refit_bubble": 3.0}
+        collector = {"idle/buffer_full_backoff": 2.0, "wasted/failed_trajectory": 1.0}
+
+        merged = {**driver}
+        for cat, dur in collector.items():
+            merged[cat] = merged.get(cat, 0.0) + dur
+
+        result = print_efficiency_summary(merged, total_wall_time_s=50.0, step=3)
+
+        # Only the driver's per-step idle counts: refit_bubble (3.0). The
+        # collector's two categories are thread-seconds, init/total is a run
+        # constant.
+        assert result["efficiency/total_waste_s"] == 3.0
+        assert result["efficiency/thread_seconds_total_s"] == 3.0
+        assert result["efficiency/efficiency_pct"] == pytest.approx(94.0)
+
+    def test_wall_waste_clamped_to_wall_time(self):
+        """Wall-clock waste is capped so efficiency stays in [0, 100]."""
+        metrics = {cat: 30.0 for cat in STEP_WINDOW_WALL_CLOCK_CATEGORIES}
+        result = print_efficiency_summary(metrics, total_wall_time_s=60.0, step=2)
+
+        assert result["efficiency/total_waste_s"] == 60.0
+        assert result["efficiency/productive_time_s"] == 0.0
+        assert result["efficiency/efficiency_pct"] == 0.0

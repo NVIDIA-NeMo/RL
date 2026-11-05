@@ -1,0 +1,11 @@
+defaults: ./sft-nanov3-30BA3B-2n8g-automodel-lora.yaml
+logger:
+  wandb:
+    name: sft-nanov3-30BA3B-2n4g-automodel-lora
+  tensorboard:
+    log_dir: tb_logs-sft-nanov3-30BA3B-2n4g-automodel-lora
+  mlflow:
+    run_name: sft-nanov3-30BA3B-2n4g-automodel-lora
+cluster:
+  gpus_per_node: 4
+

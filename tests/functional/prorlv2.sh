@@ -20,7 +20,7 @@ mkdir -p $EXP_DIR $LOG_DIR
 cd $PROJECT_ROOT
 uv run coverage run -a --data-file=$PROJECT_ROOT/tests/.coverage --source=$PROJECT_ROOT/nemo_rl \
     $PROJECT_ROOT/examples/run_grpo.py \
-    --config $PROJECT_ROOT/examples/configs/prorlv2.yaml \
+    --config $PROJECT_ROOT/examples/configs/prorlv2.v2.yaml \
     policy.model_name=Qwen/Qwen3-0.6B \
     policy.tokenizer.name=Qwen/Qwen3-0.6B \
     grpo.num_prompts_per_step=2 \

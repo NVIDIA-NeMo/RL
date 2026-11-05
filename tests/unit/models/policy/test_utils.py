@@ -18,15 +18,22 @@ import sys
 import time
 import traceback
 import unittest.mock
+import warnings
+import weakref
 
 import pytest
 import torch
 import zmq
 
 from nemo_rl.models.policy.utils import (
+    DETERMINISTIC_ENV_VARS,
     IPCProtocol,
+    aggregate_per_sample_handles,
     calculate_aligned_size,
+    enable_deterministic_algorithms,
+    ensure_teacher_ipc_buffer,
     get_megatron_checkpoint_dir,
+    make_empty_cache_best_effort_under_expandable_segments,
     rebuild_cuda_tensor_from_ipc,
     stream_weights_via_ipc_zmq_impl,
 )
@@ -118,6 +125,254 @@ class TestGetMegatronCheckpointDir:
                 f"Using default megatron checkpoint dir: {expected_dir}" in captured.out
             )
             assert result == expected_dir
+
+
+class _FakeIpcSocket:
+    def __init__(self):
+        self.sent = []
+
+    def send_pyobj(self, payload):
+        self.sent.append(payload)
+
+    def recv(self):
+        return b""
+
+    def getsockopt(self, _option):
+        return 0
+
+
+def test_stream_weights_releases_buffers_before_complete_without_full_gc(
+    monkeypatch,
+):
+    """The final data ACK is sufficient to reclaim both acyclic IPC buffers."""
+
+    tensor = torch.ones(4, dtype=torch.float32)
+    buffer_refs = []
+    events = []
+    original_empty = torch.empty
+
+    def tracking_empty(*args, **kwargs):
+        buffer = original_empty(*args, **kwargs)
+        buffer_refs.append(weakref.ref(buffer))
+        return buffer
+
+    def ipc_collect():
+        events.append("ipc_collect")
+        assert len(buffer_refs) == 2
+        assert all(buffer_ref() is None for buffer_ref in buffer_refs)
+
+    def empty_cache():
+        events.append("empty_cache")
+        assert events == ["ipc_collect", "empty_cache"]
+        assert len(buffer_refs) == 2
+        assert all(buffer_ref() is None for buffer_ref in buffer_refs)
+
+    class ReleaseAwareSocket(_FakeIpcSocket):
+        def send_pyobj(self, payload):
+            if payload == IPCProtocol.COMPLETE:
+                assert events == ["ipc_collect", "empty_cache"]
+                assert all(buffer_ref() is None for buffer_ref in buffer_refs)
+            super().send_pyobj(payload)
+
+    monkeypatch.setattr(torch, "empty", tracking_empty)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: unittest.mock.Mock(synchronize=lambda: None),
+    )
+    monkeypatch.setattr(torch.cuda, "ipc_collect", ipc_collect)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        lambda _buffer: ("ipc-handle",),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.gc.collect",
+        lambda: pytest.fail("IPC buffer cleanup must not scan the full object graph"),
+    )
+
+    socket = ReleaseAwareSocket()
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=iter([("weight", tensor)]),
+        buffer_size_bytes=4096,
+        zmq_socket=socket,
+        rank=0,
+        worker_name="test_worker",
+    )
+
+    assert events == ["ipc_collect", "empty_cache"]
+    assert socket.sent[-1] == IPCProtocol.COMPLETE
+
+
+def test_stream_weights_collects_oversized_ipc_handle_before_empty_cache(
+    monkeypatch,
+):
+    tensor = torch.ones(2048, dtype=torch.float32)
+    events = []
+
+    def ipc_collect():
+        events.append("ipc_collect")
+
+    def empty_cache():
+        assert events[-1] == "ipc_collect"
+        events.append("empty_cache")
+
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda: unittest.mock.Mock(synchronize=lambda: None),
+    )
+    monkeypatch.setattr(torch.cuda, "ipc_collect", ipc_collect)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        lambda _buffer: ("ipc-handle",),
+    )
+
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=iter([("oversized", tensor)]),
+        buffer_size_bytes=4096,
+        zmq_socket=_FakeIpcSocket(),
+        rank=0,
+        worker_name="test_worker",
+    )
+
+    # An oversized-only stream never allocates the regular staging pair, so
+    # only the oversized transfer releases CUDA IPC storage.
+    assert events == ["ipc_collect", "empty_cache"]
+
+
+def test_stream_weights_via_ipc_zmq_uses_cuda_buffer_for_cpu_tensors(monkeypatch):
+    """CPU-exported tensors should still be packed into CUDA IPC buffers."""
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CUDA IPC buffer allocation")
+
+    tensor = torch.ones(4, dtype=torch.float32)
+    captured = {}
+
+    def fake_get_handle_from_tensor(tensor):
+        captured["buffer_device"] = tensor.device
+        return ("ipc-handle",)
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        fake_get_handle_from_tensor,
+    )
+
+    socket = _FakeIpcSocket()
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=iter([("weight", tensor)]),
+        buffer_size_bytes=4096,
+        zmq_socket=socket,
+        rank=0,
+        worker_name="test_worker",
+    )
+
+    assert captured["buffer_device"].type == "cuda"
+    payload = socket.sent[0]
+    assert payload[0] == ("ipc-handle",)
+    assert payload[1] == ["weight"]
+    assert payload[2] == calculate_aligned_size(tensor.nbytes)
+    assert socket.sent[-1] == IPCProtocol.COMPLETE
+
+
+def test_stream_weights_via_ipc_zmq_aligns_cpu_tensor_groups(monkeypatch):
+    """CPU-exported tensor groups report aligned byte offsets."""
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CUDA IPC buffer allocation")
+
+    tensors = [
+        ("weight", torch.ones(4, dtype=torch.float32)),
+        ("bias", torch.ones(3, dtype=torch.float16)),
+    ]
+    captured = {}
+
+    def fake_get_handle_from_tensor(tensor):
+        captured["buffer_device"] = tensor.device
+        return ("ipc-handle",)
+
+    monkeypatch.setattr(
+        "nemo_rl.models.policy.utils.get_handle_from_tensor",
+        fake_get_handle_from_tensor,
+    )
+
+    socket = _FakeIpcSocket()
+    stream_weights_via_ipc_zmq_impl(
+        params_generator=iter(tensors),
+        buffer_size_bytes=4096,
+        zmq_socket=socket,
+        rank=0,
+        worker_name="test_worker",
+    )
+
+    assert captured["buffer_device"].type == "cuda"
+    payload = socket.sent[0]
+    assert payload[1] == ["weight", "bias"]
+    assert payload[2] == sum(
+        calculate_aligned_size(tensor.nbytes) for _, tensor in tensors
+    )
+    assert socket.sent[-1] == IPCProtocol.COMPLETE
+
+
+def test_stream_weights_via_ipc_zmq_preserves_cpu_and_gpu_source_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CPU and GPU sources must produce identical CUDA IPC staging payloads."""
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for CUDA IPC buffer allocation")
+
+    source_tensors = [
+        ("packed.weight", torch.tensor([[0, 1], [254, 255]], dtype=torch.uint8)),
+        ("weight_scale", torch.tensor([1.0, -2.0], dtype=torch.float32)),
+        ("weight_scale_2", torch.tensor([0.5], dtype=torch.float32)),
+    ]
+
+    def capture_staging_payload(
+        tensors: list[tuple[str, torch.Tensor]],
+    ) -> tuple[list[str], int, list[torch.Tensor]]:
+        captured: dict[str, torch.Tensor] = {}
+
+        def fake_get_handle_from_tensor(buffer: torch.Tensor) -> tuple[str]:
+            captured["buffer"] = buffer.detach().cpu().clone()
+            return ("ipc-handle",)
+
+        monkeypatch.setattr(
+            "nemo_rl.models.policy.utils.get_handle_from_tensor",
+            fake_get_handle_from_tensor,
+        )
+        socket = _FakeIpcSocket()
+        stream_weights_via_ipc_zmq_impl(
+            params_generator=iter(tensors),
+            buffer_size_bytes=4096,
+            zmq_socket=socket,
+            rank=0,
+            worker_name="test_worker",
+        )
+        _, names, used_bytes = socket.sent[0]
+        offset = 0
+        tensor_bytes = []
+        for _, tensor in source_tensors:
+            tensor_bytes.append(captured["buffer"][offset : offset + tensor.nbytes])
+            offset += calculate_aligned_size(tensor.nbytes)
+        assert offset == used_bytes
+        return names, used_bytes, tensor_bytes
+
+    cpu_payload = capture_staging_payload(source_tensors)
+    gpu_payload = capture_staging_payload(
+        [(name, tensor.cuda()) for name, tensor in source_tensors]
+    )
+
+    assert cpu_payload[0] == gpu_payload[0]
+    assert cpu_payload[1] == gpu_payload[1]
+    assert all(
+        torch.equal(cpu_bytes, gpu_bytes)
+        for cpu_bytes, gpu_bytes in zip(cpu_payload[2], gpu_payload[2], strict=True)
+    )
 
 
 def server_process(
@@ -293,6 +548,38 @@ class TestStreamWeightsViaIPC:
             (name, torch.randn(*shape, dtype=dtype))
             for name, shape, dtype in tensor_specs
         ]
+        self._run_stream_weights_roundtrip(test_case, known_tensors, buffer_size_bytes)
+
+    def test_stream_weights_via_ipc_zmq_impl_non_contiguous(self):
+        """Regression: tensors yielded by the params iterator may be non-contiguous.
+
+        For example, ``Megatron-Bridge``'s ``QKVMapping.megatron_to_hf`` returns
+        Q/K/V shards via advanced indexing + ``reshape`` that can produce views
+        with non-canonical strides. Before the fix, ``pack_tensor`` called
+        ``view(-1)`` which raises ``RuntimeError: view size is not compatible
+        with input tensor's size and stride``.
+        """
+        # transpose(): non-contiguous, contains all elements
+        t1 = torch.randn(8, 16, dtype=torch.float32).t()
+        # slicing with stride: non-contiguous
+        t2 = torch.randn(40, 60, dtype=torch.float32)[:, ::2]
+        # permute on 3D: non-contiguous
+        t3 = torch.randn(4, 8, 12, dtype=torch.bfloat16).permute(2, 0, 1)
+        for t in (t1, t2, t3):
+            assert not t.is_contiguous(), "test tensor must be non-contiguous"
+
+        known_tensors = [("qkv_q_proj", t1), ("qkv_k_proj", t2), ("qkv_v_proj", t3)]
+        self._run_stream_weights_roundtrip(
+            "non_contiguous", known_tensors, buffer_size_bytes=100 * 1024
+        )
+
+    def _run_stream_weights_roundtrip(
+        self,
+        test_case: str,
+        known_tensors: list[tuple[str, torch.Tensor]],
+        buffer_size_bytes: int,
+    ) -> None:
+        """Shared driver: spawn server/client and validate the round-trip."""
         known_tensors_data = [
             (name, list(t.shape), t.dtype, t) for name, t in known_tensors
         ]
@@ -343,3 +630,141 @@ class TestStreamWeightsViaIPC:
 
             if os.path.exists(socket_path):
                 os.unlink(socket_path)
+
+
+class TestAggregatePerSampleHandles:
+    def test_orders_by_dp_rank(self):
+        out = aggregate_per_sample_handles(
+            [
+                {"dp_rank": 1, "per_sample_handles": ["b0", "b1"]},
+                {"dp_rank": 0, "per_sample_handles": ["a0", "a1"]},
+            ]
+        )
+        assert [e["teacher_shards"] for e in out] == [["a0"], ["a1"], ["b0"], ["b1"]]
+
+    def test_collects_replicas_per_sample(self):
+        out = aggregate_per_sample_handles(
+            [
+                {"dp_rank": 0, "per_sample_handles": ["r0s0", "r0s1"]},
+                {"dp_rank": 0, "per_sample_handles": ["r1s0", "r1s1"]},
+            ]
+        )
+        assert [e["teacher_shards"] for e in out] == [
+            ["r0s0", "r1s0"],
+            ["r0s1", "r1s1"],
+        ]
+
+    def test_length_mismatch_raises(self):
+        with pytest.raises(AssertionError):
+            aggregate_per_sample_handles(
+                [
+                    {"dp_rank": 0, "per_sample_handles": ["a0", "a1"]},
+                    {"dp_rank": 0, "per_sample_handles": ["b0"]},
+                ]
+            )
+
+
+class TestEnsureTeacherIpcBuffer:
+    def test_alloc_reuse_and_grow(self):
+        dev = torch.device("cpu")
+        s, h = ensure_teacher_ipc_buffer(None, None, 2, 1, 4, 8, torch.float32, dev)
+        assert s.shape == (2, 1, 4, 8) and h is not None
+        s2, h2 = ensure_teacher_ipc_buffer(s, h, 2, 1, 4, 8, torch.float32, dev)
+        assert s2 is s and h2 is h
+        s3, _ = ensure_teacher_ipc_buffer(s, h, 3, 1, 4, 8, torch.float32, dev)
+        assert s3 is not s and s3.shape == (3, 1, 4, 8)
+
+
+def test_enable_deterministic_algorithms_sets_torch_flags():
+    prev = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+        torch.backends.cudnn.deterministic,
+        torch.backends.cudnn.benchmark,
+    )
+    try:
+        enable_deterministic_algorithms()
+        assert torch.are_deterministic_algorithms_enabled()
+        assert torch.is_deterministic_algorithms_warn_only_enabled()
+        assert torch.backends.cudnn.deterministic
+        assert not torch.backends.cudnn.benchmark
+    finally:
+        torch.use_deterministic_algorithms(prev[0], warn_only=prev[1])
+        torch.backends.cudnn.deterministic = prev[2]
+        torch.backends.cudnn.benchmark = prev[3]
+
+
+def test_deterministic_env_vars_pin_cublas_and_transformer_engine():
+    assert DETERMINISTIC_ENV_VARS == {
+        "CUBLAS_WORKSPACE_CONFIG": ":4096:8",
+        "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+    }
+
+
+def test_empty_cache_guard_noops_without_expandable_segments(monkeypatch):
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    monkeypatch.setenv("NRL_BEST_EFFORT_EMPTY_CACHE", "1")
+    original = torch.cuda.empty_cache
+    try:
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is original
+    finally:
+        torch.cuda.empty_cache = original
+
+
+def test_empty_cache_guard_skips_flush_entirely_under_es(monkeypatch):
+    """The guard must warn and skip, never call the real empty_cache: the
+    failing allocator call corrupts CUDA state even when its exception is
+    caught."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setenv("NRL_BEST_EFFORT_EMPTY_CACHE", "1")
+    original = torch.cuda.empty_cache
+    calls = []
+
+    def _records():
+        calls.append(1)
+
+    try:
+        torch.cuda.empty_cache = _records
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is not _records
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            torch.cuda.empty_cache()  # must not raise, must not call through
+        assert calls == []
+        assert any("expandable_segments" in str(w.message) for w in caught)
+        # idempotent: re-applying must not double-wrap
+        wrapped = torch.cuda.empty_cache
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is wrapped
+    finally:
+        torch.cuda.empty_cache = original
+
+
+def test_empty_cache_guard_never_touches_broken_allocator(monkeypatch):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.setenv("NRL_BEST_EFFORT_EMPTY_CACHE", "1")
+    original = torch.cuda.empty_cache
+
+    def _raises_other():
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    try:
+        torch.cuda.empty_cache = _raises_other
+        make_empty_cache_best_effort_under_expandable_segments()
+        torch.cuda.empty_cache()  # must not raise because it must not call through
+    finally:
+        torch.cuda.empty_cache = original
+
+
+def test_empty_cache_guard_requires_opt_in_env(monkeypatch):
+    """Patching a global torch API is opt-in: without NRL_BEST_EFFORT_EMPTY_CACHE=1
+    the guard leaves empty_cache alone even under expandable_segments."""
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    monkeypatch.delenv("NRL_BEST_EFFORT_EMPTY_CACHE", raising=False)
+    original = torch.cuda.empty_cache
+    try:
+        make_empty_cache_best_effort_under_expandable_segments()
+        assert torch.cuda.empty_cache is original
+    finally:
+        torch.cuda.empty_cache = original

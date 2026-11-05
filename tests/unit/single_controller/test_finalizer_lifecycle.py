@@ -1,0 +1,584 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Lifecycle tests for actor-pool finalization and deferred-route ownership."""
+
+from __future__ import annotations
+
+import asyncio
+import threading
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import ANY, AsyncMock, MagicMock
+
+import pytest
+
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+    PostWriteEnrichmentError,
+    TQReplayBuffer,
+)
+from nemo_rl.algorithms.opd import TQTeacherLogprobCoordinator
+from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
+from nemo_rl.experience.reward_penalties import FinalizedReward
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup
+from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
+from nemo_rl.experience.route_plan import (
+    ROUTE_PLAN_SCHEMA_VERSION,
+    RouteAssemblyPlan,
+    RouteSpan,
+    encode_route_plan,
+)
+
+
+class _RemoteFinalize:
+    def __init__(
+        self,
+        *,
+        result: FinalizedGroup | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        self._result = result
+        self._error = error
+        self.calls: list[ReassemblyRequest] = []
+
+    def remote(self, request: ReassemblyRequest) -> Any:
+        self.calls.append(request)
+
+        async def _result():
+            if self._error is not None:
+                raise self._error
+            assert self._result is not None
+            return self._result
+
+        return _result()
+
+
+class _DataPlaneClient:
+    def __init__(self) -> None:
+        self.clear_calls: list[dict[str, Any]] = []
+
+    async def clear_samples(self, *, sample_ids: list[str], partition_id: str) -> None:
+        self.clear_calls.append(
+            {"sample_ids": list(sample_ids), "partition_id": partition_id}
+        )
+
+
+def _request(
+    resolved_agent_name: str | None = None, *, attribution_key: str | None = None
+) -> ReassemblyRequest:
+    return ReassemblyRequest(
+        group_id="group",
+        prompt_idx=17,
+        rollout_ids=("group_g0",),
+        canonical_sample_ids=("group_g0",),
+        receipts=(
+            {
+                "manifest": [
+                    {"staging_key": "group_g0/call"},
+                    {"staging_key": "group_g0/call"},
+                ]
+            },
+        ),
+        rewards=(1.0,),
+        mask_sample=(False,),
+        fallback_weight_version=3,
+        resolved_agent_name=resolved_agent_name,
+        attribution_key=attribution_key,
+    )
+
+
+def _controller(actor: object) -> Any:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._available_finalizers = asyncio.Queue()
+    ctrl._available_finalizers.put_nowait(actor)
+    ctrl._active_finalizers = 0
+    ctrl._finalizer_waiters = 0
+    ctrl._finalizer_unknown_outcomes = 0
+    ctrl._finalizer_metrics_by_group = {}
+    ctrl._finalizer_rewards_by_group = {}
+    ctrl._rollout_recovery_ledger = MagicMock()
+    ctrl._rollout_recovery_ledger.__contains__.return_value = False
+    ctrl._rollout_manager = MagicMock()
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._buffer = MagicMock()
+    ctrl._buffer.commit_finalized = AsyncMock()
+    ctrl._dp_client = _DataPlaneClient()
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._partition_id = "canonical"
+    ctrl._master_config = SimpleNamespace(
+        token_capture=SimpleNamespace(staging_partition="staging"),
+        grpo=SimpleNamespace(num_prompts_per_step=1),
+    )
+    ctrl._trainer_version = 3
+    ctrl._train_steps = 3
+    return ctrl
+
+
+@pytest.mark.parametrize(
+    ("resolved_agent_name", "attribution_key", "expected_extra_env_info"),
+    [
+        (None, None, None),
+        ("flat-agent", None, {"agent_ref": {"name": "flat-agent"}}),
+        (
+            "flat-agent",
+            "flat-agent",
+            {"agent_ref": {"name": "flat-agent"}, "attribution_key": "flat-agent"},
+        ),
+        (None, "usersim:train", {"attribution_key": "usersim:train"}),
+    ],
+)
+def test_successful_actor_finalization_returns_actor_and_transfers_ownership(
+    resolved_agent_name: str | None,
+    attribution_key: str | None,
+    expected_extra_env_info: dict[str, Any] | None,
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    result = FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={"finalize/group_ms": 1.0},
+    )
+    finalize = _RemoteFinalize(result=result)
+    actor = SimpleNamespace(finalize=finalize)
+    ctrl = _controller(actor)
+    request = _request(resolved_agent_name, attribution_key=attribution_key)
+
+    committed = asyncio.run(ctrl._finalize_with_actor(request, {}))
+
+    assert committed is result
+    assert finalize.calls == [request]
+    assert ctrl._available_finalizers.get_nowait() is actor
+    assert ctrl._active_finalizers == 0
+    assert ctrl._finalizer_unknown_outcomes == 0
+    ctrl._buffer.commit_finalized.assert_awaited_once_with(
+        ANY,
+        "group",
+        meta,
+        3,
+        3,
+        staging_keys=["group_g0/call"],
+        extra_env_info=expected_extra_env_info,
+    )
+    assert ctrl._finalizer_metrics_by_group["group"]["finalize/group_ms"] == 1.0
+
+
+def test_capture_rollout_metrics_ride_on_the_committed_meta() -> None:
+    """A capture group's rollout metrics reach the replay sidecar the train pump reads."""
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+        extra_info={"existing": 1},
+    )
+    result = FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+    )
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    metrics = {"agent/rollout_time_taken/mean": 12.5}
+
+    asyncio.run(ctrl._finalize_with_actor(_request(), metrics))
+
+    committed_meta = ctrl._buffer.commit_finalized.await_args.args[2]
+    assert committed_meta.extra_info == {"existing": 1, ROLLOUT_METRICS: [metrics]}
+    # The finalizer's own meta is not mutated.
+    assert meta.extra_info == {"existing": 1}
+
+
+def _token_metrics_result(token_metrics: dict[str, Any]) -> FinalizedGroup:
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    return FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        token_metrics=token_metrics,
+    )
+
+
+@pytest.mark.parametrize("rollout_metrics", [{"turns_per_sample/mean": 2.0}, {}])
+def test_finalizer_token_metrics_and_rollout_metrics_share_one_sidecar(
+    rollout_metrics: dict[str, float],
+) -> None:
+    """Neither source overwrites the other, including on partial-retry groups."""
+    token_metrics = {"gen_tokens_per_sample/mean": 7.0}
+    result = _token_metrics_result(token_metrics)
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+
+    asyncio.run(ctrl._finalize_with_actor(_request(), rollout_metrics))
+
+    committed_meta = ctrl._buffer.commit_finalized.await_args.args[2]
+    assert committed_meta.extra_info[ROLLOUT_METRICS] == [
+        {**rollout_metrics, **token_metrics}
+    ]
+
+
+def test_overlapping_finalizer_and_rollout_metrics_fail_the_commit() -> None:
+    result = _token_metrics_result({"gen_tokens_per_sample/mean": 7.0})
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+
+    with pytest.raises(RuntimeError, match="both report"):
+        asyncio.run(
+            ctrl._finalize_with_actor(_request(), {"gen_tokens_per_sample/mean": 1.0})
+        )
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel", "missing_route"])
+def test_captured_group_waits_for_teacher_before_readiness_or_cleanup(
+    outcome: str,
+) -> None:
+    """Exercise the real controller -> buffer -> teacher coordinator boundary."""
+
+    async def exercise() -> None:
+        meta = KVBatchMeta(
+            partition_id="canonical",
+            task_name="train",
+            sample_ids=["group_g0"],
+            fields=["input_ids", "input_lengths"],
+            sequence_lengths=[3],
+            tags=[{"weight_version": 3}],
+        )
+        result = FinalizedGroup(
+            meta=meta,
+            group_min_wv=2,
+            group_max_wv=3,
+            staging_keys=["group_g0/call"],
+        )
+        actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
+        ctrl = _controller(actor)
+        ctrl._buffer = TQReplayBuffer(
+            ctrl._dp_client,
+            partition_id="canonical",
+            staging_partition_id="staging",
+            pad_value_dict={"token_ids": 0},
+            include_message_violation_fields=False,
+        )
+        ctrl._buffer.set_data_plane_checkpoint_barrier(
+            ctrl._data_plane_checkpoint_barrier
+        )
+        ctrl._buffer.reserve(weight_version=3, group_id="group")
+        teacher_started = asyncio.Event()
+        release_teacher = threading.Event()
+        teacher_writes: list[str] = []
+        loop = asyncio.get_running_loop()
+
+        def score(received_meta: KVBatchMeta) -> None:
+            assert received_meta is meta
+            loop.call_soon_threadsafe(teacher_started.set)
+            if not release_teacher.wait(timeout=5):
+                raise TimeoutError("test did not release teacher inference")
+            # Includes a partial write in the failure case. Cleanup must happen
+            # only after this background writer has stopped, even on cancellation.
+            assert ctrl._dp_client.clear_calls == []
+            teacher_writes.extend(received_meta.sample_ids)
+            if outcome == "failure":
+                raise RuntimeError("teacher unavailable")
+
+        teacher = SimpleNamespace(
+            sharding_annotations=SimpleNamespace(get_axis_size=lambda _: 1),
+            get_logprobs_from_meta=score,
+        )
+        coordinator = TQTeacherLogprobCoordinator(
+            dp_client=ctrl._dp_client,
+            teacher_worker_groups={"vision": teacher},
+            alias_to_group_alias={"image_agent": "vision"},
+            on_policy_distillation_cfg={
+                "teacher_model_by_agent_name": {"image_agent": "/ckpt/student"},
+                "strict_agent_name_match": True,
+            },
+        )
+        ctrl._buffer.set_post_write_enricher(coordinator.enrich)
+        task = asyncio.create_task(
+            ctrl._finalize_with_actor(
+                _request(None if outcome == "missing_route" else "image_agent"),
+                {},
+            )
+        )
+        try:
+            if outcome != "missing_route":
+                await asyncio.wait_for(teacher_started.wait(), timeout=2)
+                assert ctrl._buffer.ready_list == [False]
+                assert ctrl._buffer.meta_list == [None]
+                ctrl._rollout_recovery_ledger.discard_group.assert_not_called()
+                if outcome == "cancel":
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    assert not task.done()
+                    assert ctrl._dp_client.clear_calls == []
+                release_teacher.set()
+
+            if outcome == "success":
+                assert await asyncio.wait_for(task, timeout=2) is result
+                assert ctrl._buffer.ready_list == [True]
+                assert ctrl._buffer.start_weight_list == [2]
+                assert ctrl._buffer.end_weight_list == [3]
+                assert ctrl._buffer._staging_keys_list == [["group_g0/call"]]
+                committed_meta = ctrl._buffer.meta_list[0]
+                assert committed_meta is not None
+                assert committed_meta.fields == [
+                    *meta.fields,
+                    "teacher_reference_logprobs",
+                ]
+                assert teacher_writes == ["group_g0"]
+                assert ctrl._dp_client.clear_calls == []
+                ctrl._rollout_recovery_ledger.discard_group.assert_called_once()
+                assert (
+                    coordinator.drain_metrics()[
+                        "on_policy_distillation/teacher_samples"
+                    ]
+                    == 1
+                )
+            else:
+                expected_error = (
+                    asyncio.CancelledError
+                    if outcome == "cancel"
+                    else PostWriteEnrichmentError
+                )
+                with pytest.raises(expected_error):
+                    await asyncio.wait_for(task, timeout=2)
+                assert ctrl._buffer.group_ids == ()
+                assert ctrl._dp_client.clear_calls == [
+                    {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+                    {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+                ]
+                assert teacher_writes == (
+                    [] if outcome == "missing_route" else ["group_g0"]
+                )
+                ctrl._rollout_manager.record_canonical_publication.assert_not_called()
+            assert ctrl._available_finalizers.get_nowait() is actor
+            assert ctrl._active_finalizers == 0
+            assert ctrl._finalizer_unknown_outcomes == 0
+        finally:
+            release_teacher.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(exercise())
+
+
+def test_below_threshold_group_releases_pending_finalizer_state() -> None:
+    """A committed group dropped for min_valid_fraction_per_group leaves no state."""
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    result = FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={"finalize/invalid_row_rate": 0.0},
+        reward_observations=[FinalizedReward("group_g0", "group_g0", 1.0, None)],
+    )
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    request = _request()
+
+    async def _below_threshold_branch() -> None:
+        # The same calls the rollout pump makes when
+        # valid_row_count / total_row_count < min_valid_fraction_per_group.
+        assert await ctrl._finalize_with_actor(request, {}) is result
+        assert "group" in ctrl._finalizer_metrics_by_group
+        assert "group" in ctrl._finalizer_rewards_by_group
+        await ctrl._discard_committed_group(request)
+
+    asyncio.run(_below_threshold_branch())
+
+    ctrl._buffer.abort.assert_called_once_with("group")
+    assert "group" not in ctrl._finalizer_metrics_by_group
+    assert "group" not in ctrl._finalizer_rewards_by_group
+
+
+def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:
+    finalize = _RemoteFinalize(error=RuntimeError("actor died after submission"))
+    actor = SimpleNamespace(finalize=finalize)
+    ctrl = _controller(actor)
+    request = _request()
+
+    with pytest.raises(RuntimeError, match="actor died after submission"):
+        asyncio.run(ctrl._finalize_with_actor(request, {}))
+
+    assert finalize.calls == [request]
+    assert ctrl._available_finalizers.empty()
+    assert ctrl._active_finalizers == 0
+    assert ctrl._finalizer_unknown_outcomes == 1
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+    ctrl._buffer.abort.assert_not_called()
+    assert ctrl._dp_client.clear_calls == []
+
+
+def test_missing_actor_metadata_cleans_known_canonical_and_staging_ownership() -> None:
+    result = FinalizedGroup(
+        meta=None,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+    )
+    actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
+    ctrl = _controller(actor)
+
+    with pytest.raises(RuntimeError, match="no metadata for non-dropped group"):
+        asyncio.run(ctrl._finalize_with_actor(_request(), {}))
+
+    assert ctrl._dp_client.clear_calls == [
+        {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+        {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+    ]
+    ctrl._buffer.abort.assert_called_once_with("group")
+    assert ctrl._available_finalizers.get_nowait() is actor
+
+
+def test_dropped_actor_group_cleans_ownership_and_returns_uncommitted() -> None:
+    # A finalizer-side structural drop (e.g. router replay with no routed
+    # data yet) -- not a low valid-row fraction, which the controller now
+    # decides, not the finalizer (see min_valid_fraction_per_group's removal
+    # from RolloutReassembler).
+    result = FinalizedGroup(
+        meta=None,
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        metrics={},
+        dropped=True,
+        drop_reason=(
+            "router replay on, no rollout carried routed_experts, "
+            "and (L, K) is unknown yet"
+        ),
+    )
+    actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
+    ctrl = _controller(actor)
+
+    committed = asyncio.run(ctrl._finalize_with_actor(_request(), {}))
+
+    assert committed is None
+    assert ctrl._dp_client.clear_calls == [
+        {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+        {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+    ]
+    ctrl._buffer.abort.assert_called_once_with("group")
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+    assert "group" not in ctrl._finalizer_metrics_by_group
+    assert ctrl._available_finalizers.get_nowait() is actor
+
+
+def test_post_train_cleanup_clears_canonical_rows_and_route_plan_staging_keys() -> None:
+    plan = RouteAssemblyPlan(
+        schema_version=ROUTE_PLAN_SCHEMA_VERSION,
+        staging_partition="staging",
+        spans=(
+            RouteSpan(
+                staging_key="group_g0/call",
+                carry_len=2,
+                generation_len=1,
+                staged_route_len=3,
+                extras_digest_version=1,
+                extras_digest="0" * 64,
+            ),
+        ),
+        cleanup_staging_keys=("group_g0/call", "group_g0/fork"),
+        expected_token_length=3,
+    )
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0", "group_g1"],
+        fields=["input_ids"],
+        tags=[
+            {ROUTE_PLAN_TAG: encode_route_plan(plan)},
+            {ROUTE_PLAN_TAG: encode_route_plan(plan)},
+        ],
+    )
+    ctrl = _controller(SimpleNamespace())
+
+    async def _cleanup() -> None:
+        async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
+            await ctrl._cleanup_consumed_metas_unlocked(cut, [meta])
+
+    asyncio.run(_cleanup())
+
+    assert ctrl._dp_client.clear_calls == [
+        {
+            "sample_ids": ["group_g0", "group_g1"],
+            "partition_id": "canonical",
+        },
+        {
+            "sample_ids": ["group_g0/call", "group_g0/fork"],
+            "partition_id": "staging",
+        },
+    ]
+
+
+class _SyncDataPlaneClient:
+    """Synchronous client like the production TQ adapter; records caller threads."""
+
+    def __init__(self) -> None:
+        self.clear_calls: list[dict[str, Any]] = []
+        self.clear_thread_ids: list[int] = []
+
+    def clear_samples(self, *, sample_ids: list[str], partition_id: str) -> None:
+        self.clear_thread_ids.append(threading.get_ident())
+        self.clear_calls.append(
+            {"sample_ids": list(sample_ids), "partition_id": partition_id}
+        )
+
+
+def test_known_outcome_cleanup_runs_sync_clears_off_the_event_loop() -> None:
+    ctrl = _controller(SimpleNamespace())
+    ctrl._dp_client = _SyncDataPlaneClient()
+
+    async def _main() -> int:
+        await ctrl._cleanup_known_finalization_request(_request())
+        return threading.get_ident()
+
+    loop_thread_id = asyncio.run(_main())
+
+    assert ctrl._dp_client.clear_calls == [
+        {"sample_ids": ["group_g0"], "partition_id": "canonical"},
+        {"sample_ids": ["group_g0/call"], "partition_id": "staging"},
+    ]
+    assert ctrl._dp_client.clear_thread_ids
+    assert all(tid != loop_thread_id for tid in ctrl._dp_client.clear_thread_ids)
+    ctrl._buffer.abort.assert_called_once_with("group")

@@ -15,7 +15,12 @@
 from datasets import Dataset
 
 from nemo_rl.data import PreferenceDatasetConfig, ResponseDatasetConfig
-from nemo_rl.data.interfaces import TaskDataProcessFnCallable, TaskDataSpec
+from nemo_rl.data.interfaces import (
+    NemoGymSourceIdentity,
+    TaskDataPreProcessFnCallable,
+    TaskDataProcessFnCallable,
+    TaskDataSpec,
+)
 from nemo_rl.data.processors import PROCESSOR_REGISTRY
 
 
@@ -23,13 +28,22 @@ class RawDataset:
     # change to ResponseDatasetConfig | PreferenceDatasetConfig once preference dataset is refactored
     data_config: ResponseDatasetConfig | PreferenceDatasetConfig
     dataset: Dataset
+    agent_name_sources: frozenset[NemoGymSourceIdentity] | None = None
     # `val_dataset` is used only when current dataset is used for both training and validation
     val_dataset: Dataset | None
     processor: TaskDataProcessFnCallable
     task_spec: TaskDataSpec
+    preprocessor: TaskDataPreProcessFnCallable | None = None
 
-    def split_train_validation(self, test_size: float, seed: int):
+    def split_train_validation(self, test_size: float | int, seed: int):
         if test_size > 0:
+            # train_test_split accepts a fraction in (0, 1) or an absolute row
+            # count, but the absolute form must be an int — a whole-number float
+            # (e.g. 256.0, produced when an int recipe value is merged over a
+            # float config default) is otherwise rejected as an out-of-range
+            # fraction.
+            if test_size >= 1:
+                test_size = int(test_size)
             split_dataset = self.dataset.train_test_split(
                 test_size=test_size, seed=seed
             )
@@ -53,8 +67,19 @@ class RawDataset:
         self.data_config = data_config
         system_prompt_file = self.data_config.get("system_prompt_file", None)
         prompt_file = self.data_config.get("prompt_file", None)
+        # TODO(rohitrango): Source model-specific media keys from ProcessorInterface.
         self.task_spec = TaskDataSpec(
             task_name=self.task_name,
             prompt_file=prompt_file,
             system_prompt_file=system_prompt_file,
+            num_frames=self.data_config.get("num_frames"),
+            video_sampling_style=self.data_config.get("video_sampling_style"),
+            video_target_num_patches=self.data_config.get("video_target_num_patches"),
+            video_temporal_patch_size=self.data_config.get("video_temporal_patch_size"),
+            video_maintain_aspect_ratio=self.data_config.get(
+                "video_maintain_aspect_ratio"
+            ),
+            pad_audio_to_hop_length=self.data_config.get("pad_audio_to_hop_length"),
+            min_generation_tokens=self.data_config.get("min_generation_tokens"),
+            image_max_num_tiles=self.data_config.get("image_max_num_tiles"),
         )

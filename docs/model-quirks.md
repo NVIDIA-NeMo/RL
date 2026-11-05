@@ -21,7 +21,7 @@ NeMo-RL uses the vLLM V1 runtime for both synchronous and asynchronous inference
 - Users can override to the V0 runtime by setting the environment variable `NRL_VLLM_USE_V1=0`.
 - **Important**: The async implementation always uses the V1 runtime. Users who need to use the V0 runtime must switch to synchronous inference by setting `policy.generation.vllm_cfg.async_engine=False`.
 
-### Context Parallel with FSDP2
+### Context Parallel with Automodel
 
 - NeMo-RL implemented this feature based on torch CP [implementation](https://github.com/pytorch/pytorch/blob/main/torch/distributed/tensor/experimental/_attention.py). And we inherit its limitations.
 Whether model level support CP only depends on arguments passed to `torch.nn.functional.scaled_dot_product_attention`. Current NeMo-RL passed all ones attention mask to `model.forward`. For Gemma-3, it won't ignore attention mask as result `attn_bias` is not None which is not supported by torch CP. Please see [assertion](https://github.com/pytorch/pytorch/blob/134179474539648ba7dee1317959529fbd0e7f89/torch/distributed/tensor/experimental/_attention.py#L262) .
@@ -33,7 +33,7 @@ Refer to [here](https://github.com/NVIDIA-NeMo/RL/issues/659) for more details.
 
 ## DeepScaleR Recipe Convergence Issues
 
-The DeepScaleR recipe (e.g., `examples/configs/grpo-deepscaler-1.5b-8K.yaml`) has been found to experience convergence issues when CUDA graphs are enabled in vLLM.
+The DeepScaleR recipe (e.g., `examples/configs/recipes/llm/grpo-deepscaler-1.5b-8K.yaml`) has been found to experience convergence issues when CUDA graphs are enabled in vLLM.
 
 **Special Handling:**
 - CUDA graphs must be disabled by setting `enforce_eager: True` in the vLLM configuration (https://github.com/NVIDIA-NeMo/RL/pull/857 forces eager execution by default).
@@ -47,3 +47,54 @@ export NRL_VLLM_ASYNC_TIMEOUT_SECONDS=1800  # Default: 600 (10 minutes)
 ```
 
 If you encounter timeout errors, the system will suggest doubling the current timeout value.
+
+## AutoModel Parameter Freezing (`freeze_config`)
+
+VLM/omni recipes on the Automodel backend control which sub-towers
+train via a declarative `freeze_config` under
+`policy.model_kwargs.automodel_kwargs`:
+
+```yaml
+automodel_kwargs:
+  freeze_config:
+    freeze_vision_tower: true
+    freeze_audio_tower: true
+    freeze_language_model: false
+```
+
+AutoModel applies this at build time (`apply_parameter_freezing`, before the
+optimizer is created). Note the following sharp edges:
+
+- **No default auto-freeze.** If `freeze_config` is omitted, *nothing* is
+  frozen. Earlier versions unconditionally froze the visual encoder for
+  text-only training; that implicit safety net is gone. A text-only config run
+  on a vision/audio-capable checkpoint without `freeze_config` will create
+  optimizer state for parameters that never receive gradients, which leads to
+  a **checkpoint-resume key mismatch**.
+- **Typos fail silently.** A misspelled `freeze_*` key is ignored and falls
+  back to the default (unfrozen) — no error is raised. Verify the keys exactly
+  match `freeze_vision_tower` / `freeze_audio_tower` / `freeze_language_model`.
+
+Every shipped recipe sets `freeze_config`, so in-repo recipes are unaffected.
+This matters only for custom configs.
+
+## Megatron Parameter Freezing (`freeze_config`)
+
+The Megatron backend has its own `freeze_config` at a different path
+(`policy.megatron_cfg.freeze_config`) with **different keys** than the
+AutoModel version above — the dict is forwarded to the Megatron model's
+`freeze()` method, so the keys follow that model's signature and vary
+by model family (audio-capable models add e.g. `freeze_audio_model`):
+
+```yaml
+policy:
+  megatron_cfg:
+    freeze_config:
+      freeze_vision_model: true
+      freeze_vision_projection: true
+      freeze_language_model: false
+```
+
+The two configs are not interchangeable: copying the AutoModel keys
+(`freeze_vision_tower` / `freeze_audio_tower`) here raises a `TypeError`
+from the model's `freeze()`.

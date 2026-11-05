@@ -21,6 +21,7 @@ from nemo_rl.algorithms.reward_functions import (
     apply_reward_shaping,
 )
 from nemo_rl.data.interfaces import DatumSpec
+from nemo_rl.data.llm_message_utils import decompose_message_log
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from tests.unit.algorithms.utils import create_mock_batch_with_responses
 
@@ -186,16 +187,88 @@ def test_reward_shaping_with_penalties():
     assert torch.allclose(result_batch["total_reward"], expected_rewards, atol=1e-6)
 
 
+def test_reward_shaping_preserves_unshaped_reward_overlong():
+    """Reward shaping must save the pre-shaping reward so dynamic sampling can
+    filter prompt groups on the raw task metric, not on shaped reward whose
+    std is corrupted by length-dependent overlong penalties.
+    """
+    raw_rewards = [0.0, 0.0, 0.0, 0.0]
+    batch = create_mock_batch_with_responses(
+        num_samples=4,
+        response_lengths=[10, 22, 25, 30],
+        initial_rewards=raw_rewards,
+    )
+
+    config = RewardShapingConfig(
+        enabled=True,
+        overlong_buffer_length=5,
+        overlong_buffer_penalty=0.5,
+        max_response_length=25,
+    )
+
+    result_batch = apply_reward_shaping(batch, config)
+
+    # Shaped rewards differ across the group due to length-based penalty even
+    # though all raw rewards are 0 (i.e. all responses are wrong).
+    expected_shaped = torch.tensor([0.0, -0.2, -0.5, -1.0])
+    assert torch.allclose(result_batch["total_reward"], expected_shaped, atol=1e-6)
+
+    # The unshaped reward must be retained verbatim.
+    assert "unshaped_total_reward" in result_batch
+    assert torch.allclose(
+        result_batch["unshaped_total_reward"], torch.tensor(raw_rewards)
+    )
+    # The two tensors must be independent — mutating one must not affect the other.
+    assert (
+        result_batch["unshaped_total_reward"].data_ptr()
+        != result_batch["total_reward"].data_ptr()
+    )
+
+
+def test_reward_shaping_preserves_unshaped_reward_stop_properly():
+    """The stop-properly penalty path must also preserve the raw reward."""
+    raw_rewards = [1.0, 0.8, 0.6, 0.4]
+    batch = create_mock_batch_with_responses(
+        num_samples=4,
+        response_lengths=[10, 20, 30, 40],
+        initial_rewards=raw_rewards,
+    )
+    batch["truncated"] = torch.tensor([False, True, False, True])
+
+    config = RewardShapingConfig(enabled=True, stop_properly_penalty_coef=0.5)
+    result_batch = apply_reward_shaping(batch, config)
+
+    assert "unshaped_total_reward" in result_batch
+    assert torch.allclose(
+        result_batch["unshaped_total_reward"], torch.tensor(raw_rewards)
+    )
+
+
+def test_reward_shaping_disabled_does_not_save_unshaped_reward():
+    """When shaping is disabled, the unshaped_total_reward field should not be added."""
+    batch = create_mock_batch_with_responses(
+        num_samples=3, response_lengths=[10, 20, 30], initial_rewards=[1.0, 0.5, 0.8]
+    )
+
+    config = RewardShapingConfig(
+        enabled=False,
+        overlong_buffer_length=5,
+        overlong_buffer_penalty=0.1,
+        max_response_length=25,
+    )
+
+    result_batch = apply_reward_shaping(batch, config)
+    assert "unshaped_total_reward" not in result_batch
+
+
 def test_reward_shaping_missing_config_values():
-    """Test that missing required config values raise ValueError."""
+    """Test that missing required DAPO config values raise ValueError."""
     batch = create_mock_batch_with_responses(
         num_samples=1, response_lengths=[20], initial_rewards=[1.0]
     )
 
-    # Test missing overlong_buffer_length
     config = RewardShapingConfig(
         enabled=True,
-        overlong_buffer_length=None,
         overlong_buffer_penalty=0.1,
         max_response_length=25,
     )
@@ -203,16 +276,14 @@ def test_reward_shaping_missing_config_values():
     with pytest.raises(ValueError, match="DAPO reward shaping is currently supported"):
         apply_reward_shaping(batch, config)
 
-    # Test missing overlong_buffer_penalty
-    config["overlong_buffer_length"] = 5
-    config["overlong_buffer_penalty"] = None
+    config.overlong_buffer_length = 5
+    config.overlong_buffer_penalty = None
 
     with pytest.raises(ValueError, match="DAPO reward shaping is currently supported"):
         apply_reward_shaping(batch, config)
 
-    # Test missing max_response_length
-    config["overlong_buffer_penalty"] = 0.1
-    config["max_response_length"] = None
+    config.overlong_buffer_penalty = 0.1
+    config.max_response_length = None
 
     with pytest.raises(ValueError, match="DAPO reward shaping is currently supported"):
         apply_reward_shaping(batch, config)
@@ -248,6 +319,95 @@ def test_reward_shaping_missing_assistant_response():
         apply_reward_shaping(batch, config)
 
 
+@pytest.mark.parametrize("decomposed", [False, True])
+def test_reward_shaping_counts_all_assistant_turns(decomposed: bool) -> None:
+    """Both input paths count every generated assistant turn."""
+
+    def turn(role: str, n: int) -> dict:
+        message = {
+            "role": role,
+            "content": "",
+            "token_ids": torch.zeros(n, dtype=torch.long),
+        }
+        if role == "assistant":
+            message["generation_logprobs"] = torch.zeros(n)
+        return message
+
+    message_logs = [
+        # Single turn: 15 assistant tokens, within the expected length of 20.
+        [turn("user", 5), turn("assistant", 15)],
+        # Two turns: 15 + 10 = 25 assistant tokens, 5 over the expected length.
+        [
+            turn("user", 5),
+            turn("assistant", 15),
+            turn("environment", 3),
+            turn("assistant", 10),
+        ],
+    ]
+    batch = BatchedDataDict(
+        {"message_log": message_logs, "total_reward": torch.tensor([1.0, 1.0])}
+    )
+    if decomposed:
+        batch = BatchedDataDict(
+            {
+                "response_token_lengths": decompose_message_log(message_logs)[
+                    "response_token_lengths"
+                ],
+                "total_reward": torch.tensor([1.0, 1.0]),
+            }
+        )
+
+    config = RewardShapingConfig(
+        enabled=True,
+        overlong_buffer_length=10,
+        overlong_buffer_penalty=1.0,
+        max_response_length=30,
+    )
+    result = apply_reward_shaping(batch, config)
+
+    assert torch.allclose(result["total_reward"], torch.tensor([1.0, 0.5]))
+
+
+@pytest.mark.parametrize("decomposed", [False, True])
+@pytest.mark.parametrize("history_length", [0, 100])
+def test_reward_shaping_excludes_prompt_history(
+    decomposed: bool, history_length: int
+) -> None:
+    """A long history or empty assistant placeholder must not penalize 15 new tokens."""
+    batch = create_mock_batch_with_responses(1, [15], [1.0])
+    batch["message_log"][0][1:1] = [
+        {
+            "role": "assistant",
+            "content": "prompt history",
+            "token_ids": torch.zeros(history_length, dtype=torch.long),
+        },
+        {
+            "role": "user",
+            "content": "follow-up",
+            "token_ids": torch.ones(5, dtype=torch.long),
+        },
+    ]
+    if decomposed:
+        batch = BatchedDataDict(
+            {
+                "response_token_lengths": decompose_message_log(batch["message_log"])[
+                    "response_token_lengths"
+                ],
+                "total_reward": batch["total_reward"],
+            }
+        )
+    result = apply_reward_shaping(
+        batch,
+        RewardShapingConfig(
+            enabled=True,
+            max_response_length=30,
+            overlong_buffer_length=10,
+            overlong_buffer_penalty=1.0,
+        ),
+    )
+    torch.testing.assert_close(result["total_reward"], torch.tensor([1.0]))
+
+
 def test_reward_shaping_mismatched_lengths():
     """Test that mismatched message_log and rewards lengths raise assertion error."""
     # Create batch with mismatched lengths
@@ -274,7 +434,7 @@ def test_reward_shaping_mismatched_lengths():
         apply_reward_shaping(batch, config)
 
 
-def test_stop_properly_penalty():
+def test_stop_properly_penalty(capsys):
     """Test stop_properly_penalty_coef scales rewards for truncated samples."""
     batch = create_mock_batch_with_responses(
         num_samples=4,
@@ -286,6 +446,7 @@ def test_stop_properly_penalty():
     config = RewardShapingConfig(enabled=True, stop_properly_penalty_coef=0.5)
     result_batch = apply_reward_shaping(batch, config)
 
+    assert "[WARN]" not in capsys.readouterr().out
     # Non-truncated unchanged, truncated scaled by 0.5
     expected_rewards = torch.tensor([1.0, 0.4, 0.6, 0.2])
     assert torch.allclose(result_batch["total_reward"], expected_rewards, atol=1e-6)
@@ -305,7 +466,7 @@ def test_stop_properly_penalty_boundary_coefs():
 
     # Test coef=1: no penalty applied
     batch["total_reward"] = torch.tensor([1.0, 0.5])
-    config["stop_properly_penalty_coef"] = 1.0
+    config.stop_properly_penalty_coef = 1.0
     result = apply_reward_shaping(batch, config)
     assert torch.allclose(result["total_reward"], torch.tensor([1.0, 0.5]), atol=1e-6)
 
@@ -323,10 +484,10 @@ def test_stop_properly_penalty_error_cases():
 
     # Invalid coef values
     batch["truncated"] = torch.tensor([False, True])
-    config["stop_properly_penalty_coef"] = -0.1
+    config.stop_properly_penalty_coef = -0.1
     with pytest.raises(AssertionError, match="stop_properly_penalty_coef must be in"):
         apply_reward_shaping(batch, config)
 
-    config["stop_properly_penalty_coef"] = 1.5
+    config.stop_properly_penalty_coef = 1.5
     with pytest.raises(AssertionError, match="stop_properly_penalty_coef must be in"):
         apply_reward_shaping(batch, config)

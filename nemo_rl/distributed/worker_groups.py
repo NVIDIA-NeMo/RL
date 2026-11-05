@@ -12,11 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import importlib
+import math
 import os
+import sys
 import time
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Optional, Union
+from typing import Any, Callable, Optional, Union
 
 import ray
 from ray.util.placement_group import PlacementGroup
@@ -29,9 +31,66 @@ from nemo_rl.distributed.ray_actor_environment_registry import (
 )
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
 from nemo_rl.distributed.worker_group_utils import recursive_merge_options
+from nemo_rl.telemetry.host_memory import (
+    forget_worker_group_nodes,
+    register_worker_group_placement,
+)
+from nemo_rl.telemetry.vocabulary import WORKER_GROUP_ENV
 from nemo_rl.utils.venvs import (
+    add_hf_modules_cache_to_pythonpath,
     create_local_venv_on_each_node,
 )
+
+
+@ray.remote(num_cpus=0, num_gpus=0)
+def _log_gpu_state_on_bundle(label: str, local_rank: int) -> None:
+    """Read one bundle's GPU from the node that holds it. See log_worker_gpu_state.
+
+    Module level, not defined inside the method that dispatches it: a ``@ray.remote``
+    decorator in a function body registers a new remote function with the GCS every call.
+
+    ``num_gpus=0`` deliberately. The task is pinned to the bundle, not given the device --
+    asking for the GPU would queue behind whatever is still holding it, which is precisely
+    the state being measured.
+    """
+    import os
+
+    from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
+
+    # How the helper resolves which device to read when CUDA is not initialised.
+    os.environ.setdefault("LOCAL_RANK", str(local_rank))
+    log_gpu_memory_diagnostics(
+        label=label, worker_type="generation", device_id=local_rank
+    )
+
+
+def _check_dp_leader_worker_indices(
+    requested: list[int], tied_group_leaders: list[int]
+) -> None:
+    """Reject DP leaders that are not an ascending subset of the group leaders.
+
+    A DP leader has to be a model owner -- it is the worker every shard-level
+    call is routed to. Checking against the tied group leaders turns a wrong
+    layout into a startup error instead of requests landing on a worker that
+    never built a model.
+    """
+    unknown = set(requested) - set(tied_group_leaders)
+    if unknown or requested != sorted(requested):
+        raise ValueError(
+            f"dp_leader_worker_indices {requested} must be an ascending subset "
+            f"of the tied group leaders {tied_group_leaders}."
+        )
+
+
+def _get_initializer_env_vars(env_vars: dict[str, str]) -> dict[str, str]:
+    """Build the environment needed to unpickle worker constructor arguments."""
+    initializer_env_vars = {
+        key: env_vars[key] if key in env_vars else os.environ[key]
+        for key in ("HF_HOME", "HF_MODULES_CACHE", "PYTHONPATH")
+        if key in env_vars or key in os.environ
+    }
+
+    return add_hf_modules_cache_to_pythonpath(initializer_env_vars)
 
 
 @dataclass
@@ -142,6 +201,7 @@ class RayWorkerBuilder:
             placement_group_bundle_index: int,
             num_gpus: int,
             bundle_indices: Optional[tuple] = None,
+            num_gpus_per_node: Optional[int] = None,
             **extra_options: Optional[dict[str, Any]],
         ):
             """Create a Ray worker with the specified configuration.
@@ -159,6 +219,11 @@ class RayWorkerBuilder:
                 placement_group_bundle_index: Index of the bundle in the placement group
                 num_gpus: Number of GPUs to allocate to this worker
                 bundle_indices: Tuple of (node_idx, local_bundle_indices) for tensor parallelism (if applicable)
+                num_gpus_per_node: Number of GPUs per node in the cluster. Passed to
+                    configure_worker so it can map a bundle id to a node-local index,
+                    for example when assigning ports to model-parallel engines that
+                    span more than one node. None when the caller does not supply
+                    cluster topology.
                 extra_options: Additional options to pass to the Ray actor (may be overridden by actor's configure_worker(...) method)
 
             Returns:
@@ -174,10 +239,14 @@ class RayWorkerBuilder:
 
             # Use the worker's configuration interface if available
             if hasattr(worker_class, "configure_worker"):
-                # Get complete worker configuration from the worker class
-                resources, env_vars, init_kwargs = worker_class.configure_worker(
-                    num_gpus=num_gpus,
-                    bundle_indices=bundle_indices,
+                # Get complete worker configuration from the worker class.
+                # Returns (resources, env_vars, init_kwargs, runtime_env_overrides).
+                resources, env_vars, init_kwargs, runtime_env_overrides = (
+                    worker_class.configure_worker(
+                        num_gpus=num_gpus,
+                        bundle_indices=bundle_indices,
+                        num_gpus_per_node=num_gpus_per_node,
+                    )
                 )
 
                 # Apply resource configuration
@@ -192,6 +261,14 @@ class RayWorkerBuilder:
                         options["runtime_env"]["env_vars"] = {}  # type: ignore
                     for k, v in env_vars.items():
                         options["runtime_env"]["env_vars"][k] = v  # type: ignore
+
+                # Apply runtime_env overrides (e.g., nsight config)
+                if runtime_env_overrides:
+                    if "runtime_env" not in options:
+                        options["runtime_env"] = {}
+                    options["runtime_env"] = recursive_merge_options(
+                        options["runtime_env"], runtime_env_overrides
+                    )
 
                 # Apply initialization parameters
                 if init_kwargs:
@@ -322,6 +399,7 @@ class RayWorkerGroup:
         bundle_indices_list: Optional[list[tuple[int, list[int]]]] = None,
         sharding_annotations: Optional[NamedSharding] = None,
         env_vars: dict[str, str] = {},
+        dp_leader_worker_indices: Optional[list[int]] = None,
     ):
         """Initialize a group of distributed Ray workers.
 
@@ -335,9 +413,25 @@ class RayWorkerGroup:
                                Each tuple defines a tied group of workers placed on the same node.
                                If provided, workers_per_node is ignored.
             sharding_annotations: NamedSharding object representing mapping of named axes to ranks (i.e. for TP, PP, etc.)
+            dp_leader_worker_indices: Global rank of the worker that owns each data
+                               parallel shard. Defaults to the leader of every tied
+                               group, i.e. a tied group *is* a DP shard -- true
+                               whenever one model owner serves a whole rollout shard.
+                               Pass it when the caller's DP layout is coarser than
+                               the tied groups, e.g. TRT-LLM PD disaggregation, where
+                               a replica is several engines (context + generation)
+                               and counting tied groups would overcount DP. Must be a
+                               subset of the tied group leaders, in ascending order.
         """
         self._workers: list[ray.actor.ActorHandle] = []
         self._worker_metadata: list[dict[str, Any]] = []
+        # worker_idx -> the arguments its creation call was made with, so a single
+        # worker can be rebuilt without redoing group-wide setup. Populated during
+        # creation; see _create_workers_from_bundle_indices.
+        self._worker_specs: dict[int, dict[str, Any]] = {}
+        # How many times each worker has been recreated. Only used to keep Ray actor
+        # names unique, since a dead actor's name can linger in the GCS.
+        self._worker_incarnations: dict[int, int] = {}
         self.cluster = cluster
         self.name_prefix = name_prefix
         self.sharding_annotations = sharding_annotations
@@ -401,6 +495,12 @@ class RayWorkerGroup:
             env_vars=env_vars,
         )
 
+        if dp_leader_worker_indices is not None:
+            _check_dp_leader_worker_indices(
+                dp_leader_worker_indices, self.dp_leader_worker_indices
+            )
+            self.dp_leader_worker_indices = dp_leader_worker_indices
+
     def get_dp_leader_worker_idx(self, dp_shard_idx: int) -> int:
         """Returns the index of the primary worker for a given data parallel shard."""
         if not 0 <= dp_shard_idx < len(self.dp_leader_worker_indices):
@@ -449,6 +549,10 @@ class RayWorkerGroup:
             )
         else:
             py_executable = actor_python_env
+        # Resolved interpreter for this group's workers, kept so sidecar actors
+        # that must import the same packages (e.g. the TRT-LLM disagg server)
+        # can join the venv instead of landing in the driver's environment.
+        self.py_executable = py_executable
 
         # Count total workers
         self.world_size = sum(len(indices) for _, indices in bundle_indices_list)
@@ -462,15 +566,46 @@ class RayWorkerGroup:
         placement_groups = self.cluster.get_placement_groups()
 
         # Get available address and port for each worker
-        available_addresses = []
-        available_ports = []
-        for group_idx, (pg_idx, local_bundle_indices) in enumerate(bundle_indices_list):
-            for local_rank, bundle_idx in enumerate(local_bundle_indices):
-                addr, port = self.cluster.get_available_address_and_port(
-                    pg_idx, bundle_idx
+        pg_bundle_pairs = [
+            (pg_idx, bundle_idx)
+            for pg_idx, local_bundle_indices in bundle_indices_list
+            for bundle_idx in local_bundle_indices
+        ]
+        addr_port_results = self.cluster.get_available_addresses_and_ports_batch(
+            pg_bundle_pairs
+        )
+        available_addresses = [addr for addr, _ in addr_port_results]
+        available_ports = [port for _, port in addr_port_results]
+
+        # Pool one IsolatedWorkerInitializer per unique pg_idx instead of one
+        # per worker. All workers on a node share the same py_executable, so
+        # the initializer mostly needs only that in its runtime_env — per-worker
+        # env_vars are passed through create_worker(). This reduces GCS actor
+        # registrations from N_workers to N_nodes. The initializer does unpickle
+        # constructor arguments before it can create the real worker, so the
+        # import-related variables that trust_remote_code classes need to
+        # resolve their generated modules have to travel with it.
+        unique_pg_indices = sorted({pg_idx for pg_idx, _ in bundle_indices_list})
+        initializer_env_vars = _get_initializer_env_vars(env_vars)
+        initializer_runtime_env = {}
+        if py_executable != sys.executable:
+            initializer_runtime_env["py_executable"] = py_executable
+        if initializer_env_vars:
+            initializer_runtime_env["env_vars"] = initializer_env_vars
+        self._initializer_pool: dict[int, ray.actor.ActorHandle] = {}
+        for pg_idx in unique_pg_indices:
+            # num_cpus=0 so the initializer doesn't consume a CPU slot — it
+            # sits idle after creating workers and only exists for GC lifetime.
+            self._initializer_pool[pg_idx] = (
+                RayWorkerBuilder.IsolatedWorkerInitializer.options(  # type: ignore
+                    num_cpus=0,
+                    runtime_env=initializer_runtime_env,
+                ).remote(
+                    remote_worker_builder.ray_actor_class_fqn,
+                    *remote_worker_builder.args,
+                    **remote_worker_builder.kwargs,
                 )
-                available_addresses.append(addr)
-                available_ports.append(port)
+            )
 
         for group_idx, (pg_idx, local_bundle_indices) in enumerate(bundle_indices_list):
             current_group = []
@@ -495,6 +630,10 @@ class RayWorkerGroup:
                         "NODE_RANK": str(pg_idx),
                         "AVAILABLE_ADDR_LIST": str(available_addresses),
                         "AVAILABLE_PORT_LIST": str(available_ports),
+                        # RANK is group-local, so it alone cannot tell a policy
+                        # worker from a generation worker. Observability consumers
+                        # need the group to disambiguate them.
+                        WORKER_GROUP_ENV: self.name_prefix,
                     }
                 )
                 # Preserve RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 to prevent Ray
@@ -534,28 +673,46 @@ class RayWorkerGroup:
                     else 0
                 )
 
-                # Pass these options to the remote_worker_builder
+                # Build the worker's runtime_env with per-worker env_vars
                 runtime_env = {
                     "env_vars": worker_env_vars,
                     "py_executable": py_executable,
                 }
-                runtime_env["env_vars"]["VIRTUAL_ENV"] = py_executable
-                runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_executable
+                py_venv = os.path.dirname(
+                    os.path.dirname(py_executable)
+                )  # to remove the "bin/python" suffix
+                runtime_env["env_vars"]["VIRTUAL_ENV"] = py_venv
+                runtime_env["env_vars"]["UV_PROJECT_ENVIRONMENT"] = py_venv
 
                 extra_options = {"runtime_env": runtime_env, "name": name}
 
-                # start worker creation asynchronously
-                worker_future, initializer = remote_worker_builder.create_worker_async(
-                    placement_group=pg,
-                    placement_group_bundle_index=bundle_idx,
-                    num_gpus=num_gpus,
-                    bundle_indices=worker_bundle_indices,
+                # Reuse the pooled initializer for this pg_idx
+                initializer = self._initializer_pool[pg_idx]
+                worker_future = initializer.create_worker.remote(
+                    pg,
+                    bundle_idx,
+                    num_gpus,
+                    worker_bundle_indices,
+                    num_gpus_per_node=self.cluster.num_gpus_per_node,
                     **extra_options,
                 )
 
                 # Store the future and metadata
                 worker_idx = len(worker_futures)
-                worker_futures.append((worker_future, initializer))
+                # Everything needed to build this exact worker again. Captured rather
+                # than re-derived, because re-deriving means reproducing the placement
+                # group, bundle, venv and rank bookkeeping above -- a second
+                # implementation that would drift from this one. Replaying the recorded
+                # call is the only way a restart is guaranteed to reproduce the original.
+                self._worker_specs[worker_idx] = {
+                    "pg_idx": pg_idx,
+                    "pg": pg,
+                    "bundle_idx": bundle_idx,
+                    "num_gpus": num_gpus,
+                    "worker_bundle_indices": worker_bundle_indices,
+                    "extra_options": extra_options,
+                }
+                worker_futures.append(worker_future)
                 worker_info.append(
                     {
                         "group_idx": group_idx,
@@ -574,7 +731,7 @@ class RayWorkerGroup:
 
         # Wait for all workers to initialize with timing and progress bar
         num_workers = len(worker_futures)
-        worker_refs = [future for future, _ in worker_futures]
+        worker_refs = worker_futures
 
         start_time = time.perf_counter()
 
@@ -606,8 +763,7 @@ class RayWorkerGroup:
             flush=True,
         )
 
-        for idx, (worker, (_, initializer)) in enumerate(zip(workers, worker_futures)):
-            worker._RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC = initializer
+        for idx, worker in enumerate(workers):
             self._workers.append(worker)
 
             # Get the corresponding metadata
@@ -622,6 +778,112 @@ class RayWorkerGroup:
                     "dp_shard_idx": info["group_idx"],
                 }
             )
+
+        # Here rather than anywhere in telemetry: the host-memory monitor
+        # scrapes raylets, which know about nodes and nothing about worker
+        # groups, so the only process that can relate the two is this one.
+        register_worker_group_placement(
+            self.name_prefix,
+            [(spec["pg"], spec["bundle_idx"]) for spec in self._worker_specs.values()],
+        )
+
+    def log_worker_gpu_state(
+        self, worker_idx: int, *, label: str, timeout_s: float = 30.0
+    ) -> None:
+        """Print the state of the GPU a worker's bundle holds, from that node.
+
+        For the moment *before* a restart: what is on the device decides whether the
+        attempt can succeed at all. The same reading is already taken inside the new
+        worker, at ``_load_model`` -- but that is too late to be a signal (the old actor is
+        already killed and the replacement is mid-``__init__``) and it does not happen at
+        all in the case that matters most, a bundle that never gets scheduled, because
+        ``_load_model`` is never reached.
+
+        Runs as a short-lived task pinned to the same bundle, because the caller is the
+        controller and reading NVML there would report the controller's node. Bounded and
+        non-raising for the same reason the diagnostic itself is: a probe that hangs or
+        fails the restart path is worse than no probe. Not reaching the node is itself the
+        finding, so it is printed rather than swallowed.
+        """
+        spec = self._worker_specs.get(worker_idx)
+        if spec is None:
+            print(
+                f"  [GPU_DIAG] {label}: no creation spec for worker {worker_idx}; "
+                "cannot locate its bundle",
+                flush=True,
+            )
+            return
+
+        try:
+            ref = _log_gpu_state_on_bundle.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=spec["pg"],
+                    placement_group_bundle_index=spec["bundle_idx"],
+                )
+            ).remote(label, spec["bundle_idx"])
+            ray.get(ref, timeout=timeout_s)
+        except Exception as e:  # noqa: BLE001 - a diagnostic must never fail the caller
+            print(
+                f"  [GPU_DIAG] {label}: could not read the GPU on worker "
+                f"{worker_idx}'s bundle within {timeout_s}s "
+                f"({type(e).__name__}: {e}). The node may be gone, which is itself the "
+                "answer to whether a restart can succeed.",
+                flush=True,
+            )
+
+    def recreate_worker(self, worker_idx: int) -> ray.actor.ActorHandle:
+        """Rebuild one worker in place, replaying the call that created it.
+
+        Used to bring a dead generation shard back without disturbing the rest of the
+        fleet. The placement-group bundle the old actor held is still reserved -- Ray
+        does not release a bundle when an actor dies -- so the replacement lands on the
+        same GPU.
+
+        The old actor is killed first with ``no_restart=True``. It is usually already
+        dead, but a worker can be unresponsive rather than gone, and creating its
+        replacement while it still holds the GPU would fail on memory rather than on
+        anything informative.
+
+        Returns:
+            The new actor handle, also installed at ``workers[worker_idx]``.
+        """
+        if worker_idx not in self._worker_specs:
+            raise KeyError(
+                f"no creation spec recorded for worker {worker_idx}; "
+                f"known workers: {sorted(self._worker_specs)}"
+            )
+        spec = self._worker_specs[worker_idx]
+
+        old = self._workers[worker_idx]
+        if old is not None:
+            try:
+                ray.kill(old, no_restart=True)
+            except Exception as e:  # noqa: BLE001 - already-dead actors raise variously
+                print(
+                    f"  recreate_worker({worker_idx}): old actor not killable: {e}",
+                    flush=True,
+                )
+
+        # A fresh name each incarnation: Ray rejects a duplicate named actor, and the
+        # dead one's registration can outlive the process.
+        incarnation = self._worker_incarnations.get(worker_idx, 0) + 1
+        self._worker_incarnations[worker_idx] = incarnation
+        extra_options = dict(spec["extra_options"])
+        extra_options["name"] = f"{extra_options['name']}-r{incarnation}"
+
+        initializer = self._initializer_pool[spec["pg_idx"]]
+        worker = ray.get(
+            initializer.create_worker.remote(
+                spec["pg"],
+                spec["bundle_idx"],
+                spec["num_gpus"],
+                spec["worker_bundle_indices"],
+                num_gpus_per_node=self.cluster.num_gpus_per_node,
+                **extra_options,
+            )
+        )
+        self._workers[worker_idx] = worker
+        return worker
 
     @property
     def workers(self) -> list[ray.actor.ActorHandle]:
@@ -660,7 +922,13 @@ class RayWorkerGroup:
         )
 
         worker = self.workers[worker_idx]
-        method = getattr(worker, method_name)
+        try:
+            method = getattr(worker, method_name)
+        except AttributeError as e:
+            print(
+                f"Supported methods: {list(worker._method_shells.keys())}", flush=True
+            )
+            raise e
         return method.remote(*args, **kwargs)
 
     def run_all_workers_multiple_data(
@@ -745,7 +1013,14 @@ class RayWorkerGroup:
                     break
 
             if should_run:
-                method = getattr(worker, method_name)
+                try:
+                    method = getattr(worker, method_name)
+                except AttributeError as e:
+                    print(
+                        f"Supported methods: {list(worker._method_shells.keys())}",
+                        flush=True,
+                    )
+                    raise e
                 worker_args = [arg[data_idx] for arg in args]
                 worker_kwargs = {key: value[data_idx] for key, value in kwargs.items()}
                 futures.append(
@@ -783,6 +1058,8 @@ class RayWorkerGroup:
             "See https://github.com/NVIDIA-NeMo/RL/issues/582 for more details."
         )
 
+        kwargs = {key: ray.put(value) for key, value in kwargs.items()}
+
         futures = []
 
         if run_rank_0_only_axes is None:
@@ -801,7 +1078,14 @@ class RayWorkerGroup:
                     break
 
             if should_run:
-                method = getattr(worker, method_name)
+                try:
+                    method = getattr(worker, method_name)
+                except AttributeError as e:
+                    print(
+                        f"Supported methods: {list(worker._method_shells.keys())}",
+                        flush=True,
+                    )
+                    raise e
                 futures.append(method.remote(*args, **kwargs))
 
         return futures
@@ -859,6 +1143,31 @@ class RayWorkerGroup:
             replicate_on_axes = []
         if output_is_replicated is None:
             output_is_replicated = []
+
+        replicate_degrees = math.prod(
+            [self.sharding_annotations.get_axis_size(ax) for ax in replicate_on_axes]
+        )
+        if replicate_degrees > 1:
+            # Use ray.put to serialize all the arguments. This can reduce the cost
+            # of repeated serialization when we send same arguments to multiple workers.
+            def _map_nested_value_list(
+                nested_value_list: Any, depth: int, map_fn: Callable[[Any], Any]
+            ) -> list[Any]:
+                if depth < 0:
+                    raise ValueError(f"Depth is less than 0: {depth}")
+                if depth == 0:
+                    return map_fn(nested_value_list)
+                return [
+                    _map_nested_value_list(v, depth - 1, map_fn)
+                    for v in nested_value_list
+                ]
+
+            kwargs_after_ray_put = dict()
+            for key, nested_value_list in kwargs.items():
+                kwargs_after_ray_put[key] = _map_nested_value_list(
+                    nested_value_list, len(in_sharded_axes), ray.put
+                )
+            kwargs = kwargs_after_ray_put
 
         futures = []
 
@@ -1004,36 +1313,36 @@ class RayWorkerGroup:
                 print(
                     f"Error during graceful shutdown: {e}. Falling back to force termination."
                 )
-                force = True
 
-        # Force kill any remaining workers
-        if force or cleanup_method is None:
-            initializers_to_kill = []
+        # Always kill actors to release named actor registrations and resources.
+        # Even after successful graceful cleanup, actors remain alive in Ray's registry
+        # which prevents creating new actors with the same name.
+        if True:
             for worker in self._workers:
-                if hasattr(worker, "_RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC"):
-                    # Store the initializer ref before the main worker is killed,
-                    # as killing the worker might affect accessibility of this attribute later.
-                    initializer = getattr(
-                        worker, "_RAY_INITIALIZER_ACTOR_REF_TO_AVOID_GC", None
-                    )
-                    if initializer:
-                        initializers_to_kill.append(initializer)
                 try:
                     ray.kill(worker)
                 except Exception as e:
                     success = False
                     print(f"Error killing worker: {e}")
 
-            # Now, explicitly kill the initializer actors
-            # This makes their termination more deterministic than relying solely on Ray's GC.
-            for initializer in initializers_to_kill:
-                try:
-                    ray.kill(initializer)
-                except Exception as e:
-                    print(f"Error killing initializer actor for a worker: {e}")
+            # Kill pooled initializers. These keep workers alive via Ray's owner
+            # lifecycle — kill them after the workers so workers don't get
+            # unexpectedly reaped mid-cleanup.
+            if hasattr(self, "_initializer_pool"):
+                for pg_idx, initializer in self._initializer_pool.items():
+                    try:
+                        ray.kill(initializer)
+                    except Exception as e:
+                        print(
+                            f"Error killing pooled initializer for pg_idx={pg_idx}: {e}"
+                        )
+                self._initializer_pool = {}
 
         # Clear worker lists
         self._workers = []
         self._worker_metadata = []
+        # So the host-memory monitor stops attributing nodes to a group that no
+        # longer occupies them -- a teacher group torn down mid-run, say.
+        forget_worker_group_nodes(self.name_prefix)
 
         return success

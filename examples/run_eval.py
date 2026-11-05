@@ -20,18 +20,16 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from omegaconf import OmegaConf
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.datasets import AllTaskProcessedDataset, load_eval_dataset
-from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
+from nemo_rl.data.datasets.eval_datasets import _is_multimodal_dataset
+from nemo_rl.data.datasets.response_datasets import load_response_dataset
 from nemo_rl.distributed.virtual_cluster import init_ray
-from nemo_rl.environments.math_environment import MathEnvironment
+from nemo_rl.environments.utils import create_env
 from nemo_rl.evals.eval import MasterConfig, run_env_eval, setup
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.utils.config import load_config
-
-TokenizerType = PreTrainedTokenizerBase
 
 
 def parse_args():
@@ -50,26 +48,35 @@ def parse_args():
     return args, overrides
 
 
-def setup_data(tokenizer: AutoTokenizer, data_config, env_configs):
+def setup_data(tokenizer, data_config, env_configs, is_multimodal=False):
     print("Setting up data...")
 
     # load dataset
-    base_dataset = load_eval_dataset(data_config)
-    rekeyed_ds = base_dataset.rekeyed_ds
+    # TODO(#2840): consolidate onto load_response_dataset. Migration is in
+    # progress -- remaining eval-only datasets (mmlu, gpqa, math, mmau) will
+    # move into DATASET_REGISTRY, at which point this branch collapses.
+    # DATASET_REGISTRY cannot be used as the gate yet because it also contains
+    # datasets such as daily-omni that still require an eval-specific wrapper.
+    if data_config["dataset_name"] in {"AIME2024", "AIME2025", "AIME2026"}:
+        base_dataset = load_response_dataset(data_config)
+        rekeyed_ds = base_dataset.dataset
+    else:
+        base_dataset = load_eval_dataset(data_config)
+        rekeyed_ds = base_dataset.rekeyed_ds
 
-    env = MathEnvironment.options(
-        runtime_env={
-            "py_executable": get_actor_python_env(
-                "nemo_rl.environments.math_environment.MathEnvironment"
-            )
-        }
-    ).remote(env_configs["math"])
+    # Mirrors nemo_rl/data/utils.py: use data.env_name to look up the env
+    # config block and determine the registered environment class.
+    env_key = next(iter(env_configs))
+    env_name = data_config.get("env_name", env_key)
+    registered_env_name = "vlm" if is_multimodal else env_name
+    env = create_env(env_name=registered_env_name, env_config=env_configs[env_name])
 
     dataset = AllTaskProcessedDataset(
         dataset=rekeyed_ds,
         tokenizer=tokenizer,
         default_task_data_spec=base_dataset.task_spec,
         task_data_processors=base_dataset.processor,
+        task_data_preprocessors=getattr(base_dataset, "preprocessor", None),
         max_seq_length=data_config["max_input_seq_length"],
     )
 
@@ -94,7 +101,8 @@ def main():
         print(f"Overrides: {override_conf}")
         config = OmegaConf.merge(config, override_conf)
 
-    config: MasterConfig = OmegaConf.to_container(config, resolve=True)
+    config = OmegaConf.to_container(config, resolve=True)
+    config = MasterConfig(**config)
     print("Applied CLI overrides")
 
     # Print config
@@ -104,10 +112,11 @@ def main():
     # Init ray
     init_ray()
 
-    # Setup tokenizer
-    tokenizer = get_tokenizer(config["tokenizer"])
-    config["generation"] = configure_generation_config(
-        config["generation"], tokenizer, is_eval=True
+    # Setup tokenizer — get_tokenizer handles both text-only and multimodal
+    is_multimodal = _is_multimodal_dataset(config.data["dataset_name"])
+    tokenizer = get_tokenizer(config.tokenizer, get_processor=is_multimodal)
+    config.generation = configure_generation_config(
+        config.generation, tokenizer, is_eval=True
     )
 
     # Setup data
@@ -115,7 +124,7 @@ def main():
         dataset,
         env,
         tokenizer,
-    ) = setup_data(tokenizer, config["data"], config["env"])
+    ) = setup_data(tokenizer, config.data, config.env, is_multimodal=is_multimodal)
 
     # Setup
     (

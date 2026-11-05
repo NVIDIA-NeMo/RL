@@ -13,51 +13,34 @@
 # limitations under the License.
 
 #!/bin/bash
-set -xeuo pipefail # Exit immediately if a command exits with a non-zero status
+# Shard: Catch-all for everything not in other shards
+# Covers: experience (base), utils, tools, evals, rewards, root-level tests
+# Extra-marked tests are picked up by their respective shards (Mcore, Automodel, etc.)
 
-SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
-PROJECT_ROOT=$(realpath ${SCRIPT_DIR}/../..)
+source "$(dirname "${BASH_SOURCE[0]}")/run_unit_shard_common.sh"
 
-cd ${PROJECT_ROOT}
-uv run tests/unit/prepare_unit_test_assets.py
-uv run --no-sync bash -x ./tests/run_unit.sh unit/ --ignore=unit/models/generation/ --ignore=unit/models/policy/ --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
+IGNORE=(
+    "--ignore=unit/models/"
+    "--ignore=unit/environments/"
+    "--ignore=unit/algorithms/"
+    "--ignore=unit/data/"
+    "--ignore=unit/distributed/"
+    # CPU-only config checks; the cpu-config-tests job in cicd-main.yml runs these
+    # on a GitHub-hosted runner before any GPU job starts.
+    "--ignore=unit/test_recipes_and_test_suites.py"
+    "--ignore=unit/test_config_validation.py"
+)
 
-# Check and run mcore tests
-exit_code=$(uv run --extra mcore pytest tests/unit/ --ignore=tests/unit/models/generation/ --ignore=tests/unit/models/policy/ --collect-only --hf-gated --mcore-only -q >/dev/null 2>&1; echo $?)
-if [[ $exit_code -eq 5 ]]; then
-    echo "No mcore tests to run"
-else
-    uv run --extra mcore bash -x ./tests/run_unit.sh unit/ --ignore=unit/models/generation/ --ignore=unit/models/policy/ --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --mcore-only
+uv run --no-sync bash -x ./tests/run_unit.sh "unit/" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
+
+# Skip research tests in fast mode
+if [[ "${FAST:-0}" != "1" ]]; then
+    for i in research/*/tests/unit; do
+        [[ -d "$i" ]] || continue
+        project_dir=$(dirname "$(dirname "$i")")
+        pushd "$project_dir"
+        uv sync --locked --inexact --group test
+        uv run --no-sync pytest tests/unit
+        popd
+    done
 fi
-
-# Check and run automodel tests
-exit_code=$(uv run --extra automodel pytest tests/unit/ --ignore=tests/unit/models/generation/ --ignore=tests/unit/models/policy/ --collect-only --hf-gated --automodel-only -q >/dev/null 2>&1; echo $?)
-if [[ $exit_code -eq 5 ]]; then
-    echo "No automodel tests to run"
-else
-    uv run --extra automodel bash -x ./tests/run_unit.sh unit/ --ignore=unit/models/generation/ --ignore=unit/models/policy/ --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --automodel-only
-fi
-
-# Check and run vllm tests
-exit_code=$(uv run --extra vllm pytest tests/unit/ --ignore=tests/unit/models/generation/ --ignore=tests/unit/models/policy/ --collect-only --hf-gated --vllm-only -q >/dev/null 2>&1; echo $?)
-if [[ $exit_code -eq 5 ]]; then
-    echo "No vllm tests to run"
-else
-    uv run --extra vllm bash -x ./tests/run_unit.sh unit/ --ignore=unit/models/generation/ --ignore=unit/models/policy/ --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --vllm-only
-fi
-
-# Check and run sglang tests
-exit_code=$(uv run --extra sglang pytest tests/unit/ --ignore=tests/unit/models/generation/ --ignore=tests/unit/models/policy/ --collect-only --hf-gated --sglang-only -q >/dev/null 2>&1; echo $?)
-if [[ $exit_code -eq 5 ]]; then
-    echo "No sglang tests to run"
-else
-    uv run --extra sglang bash -x ./tests/run_unit.sh unit/ --ignore=unit/models/generation/ --ignore=unit/models/policy/ --cov=nemo_rl --cov-append --cov-report=term-missing --cov-report=json --hf-gated --sglang-only
-fi
-
-# Research unit tests
-for i in research/*/tests/unit; do
-    project_dir=$(dirname $(dirname $i))
-    pushd $project_dir
-    uv run --no-sync pytest tests/unit
-    popd
-done

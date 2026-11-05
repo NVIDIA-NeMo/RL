@@ -14,7 +14,7 @@ uv run examples/run_grpo.py --config <PATH TO YAML CONFIG> {overrides}
 
 If not specified, `config` will default to [examples/configs/grpo_math_1B.yaml](../../examples/configs/grpo_math_1B.yaml).
 
-**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+**Reminder**: Do not forget to set your HF_HOME, WANDB_API_KEY, and HF_DATASETS_CACHE (if needed). You'll need to do a `hf auth login` as well for Llama models.
 
 In this guide, we'll walk through how we handle:
 
@@ -57,7 +57,7 @@ def format_data(self, data: dict[str, Any]) -> dict[str, Any]:
     }
 ```
 
-By default, NeMo RL has some built-in supported datasets (e.g., [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [Squad](../../nemo_rl/data/datasets/response_datasets/squad.py), etc.). You can see the full list [here](../../nemo_rl/data/datasets/response_datasets/__init__.py).
+By default, NeMo RL has some built-in supported datasets (e.g., [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [NuminaMath-1.5](../../nemo_rl/data/datasets/response_datasets/numinamath.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [Squad](../../nemo_rl/data/datasets/response_datasets/squad.py), etc.). You can see the full list [here](../../nemo_rl/data/datasets/response_datasets/__init__.py).
 All of these datasets are downloaded from HuggingFace and preprocessed on-the-fly, so there's no need to provide a path to any datasets on disk.
 
 We provide a [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py) class that is compatible with JSONL-formatted response datasets for loading datasets from local path or Hugging Face. You can use `input_key`, `output_key` to specify which fields in your data correspond to the question and answer respectively. Here's an example configuration:
@@ -122,8 +122,29 @@ data:
     ...
 ```
 
+`AIME2025` and `AIME2026` are registered alongside `AIME2024` and accept the same config keys (e.g. `repeat`), so any of them can drop into the `validation:` list above.
+
+##### Custom datasets defined outside NeMo RL
+
+If you want to plug in a dataset class that lives outside the `nemo_rl`
+package (so you don't have to edit the built-in registry), set
+`dataset_name` to a fully qualified dotted import path. The dispatcher
+will import the module and resolve the class. The class must accept the
+same kwargs as the built-in datasets (i.e. the full data config) and
+implement `set_task_spec` and `set_processor`.
+
+```yaml
+data:
+  default:
+    dataset_name: my_pkg.my_module.MyDataset  # importable from PYTHONPATH
+```
+
+The class must be importable — install it as a package or add its
+parent directory to `PYTHONPATH` before launching training.
+
 We support using a single dataset for both train and validation by using `split_validation_size` to set the validation ratio.
-[OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py) are supported for this feature.
+This works for any dataset class that calls `split_train_validation` in its `__init__` — which today includes most built-in datasets, among them [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [OpenR1-Math-220k](../../nemo_rl/data/datasets/response_datasets/openr1_math.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), and [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py).
+A dataset class that does not call it ignores `split_validation_size`; the dataset dispatcher emits a warning in that case, so a misconfigured run is not silent.
 If you want to support this feature for your custom datasets or other built-in datasets, you can simply add the code to the dataset like [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py).
 ```python
 # `self.val_dataset` is used (not None) only when current dataset is used for both training and validation
@@ -164,11 +185,74 @@ def my_data_processor(
 
 We have an example of this as `math_data_processor` in [processors.py](../../nemo_rl/data/processors.py).
 
+#### Multiple Dataloaders
+
+By default, NeMo RL uses a single dataloader that aggregates data from multiple datasets. For scenarios requiring fine-grained control over the number of prompts loaded from each dataset, NeMo RL provides support for multiple dataloaders.
+
+The following example demonstrates how to configure multiple dataloaders:
+
+```bash
+uv run examples/run_grpo.py \
+    --config examples/configs/grpo_multiple_datasets.yaml \
+    grpo.num_prompts_per_step=32 \
+    data.use_multiple_dataloader=true \
+    data.num_prompts_per_dataloader=16 \
+    data.custom_dataloader=examples.custom_dataloader.custom_dataloader.example_custom_dataloader
+```
+
+For example, consider using `example_custom_dataloader`, which samples data from each dataloader sequentially.
+
+Given two datasets:
+- Dataset 1: `[a, b, c, d]`
+- Dataset 2: `[1, 2, 3, 4, 5, 6, 7, 8]`
+
+With `data.use_multiple_dataloader=false` and `grpo.num_prompts_per_step=4`:
+```
+Batch 1: [a, b, c, d]
+Batch 2: [1, 2, 3, 4]
+Batch 3: [5, 6, 7, 8]
+```
+
+With `data.use_multiple_dataloader=true`, `grpo.num_prompts_per_step=4`, and `data.num_prompts_per_dataloader=2`:
+```
+Batch 1: [a, b, 1, 2]
+Batch 2: [c, d, 3, 4]
+Batch 3: [a, b, 5, 6]
+```
+
+**Custom Dataloader**
+
+The file `examples/custom_dataloader/custom_dataloader.py` provides a reference implementation that samples `data.num_prompts_per_dataloader` entries from each dataloader.
+
+When a single dataloader is exhausted, the data iterator must be reset in the custom dataloader function (as demonstrated in `examples/custom_dataloader/custom_dataloader.py`).
+This design ensures that the [MultipleDataloaderWrapper](../../nemo_rl/data/dataloader.py) operates as an infinite iterator, where `__next__()` will not raise StopIteration and `__len__()` is not supported.
+
+Additionally, custom dataloaders can access recorded metrics from the training loop. Use `wrapped_dataloader.set_records()` in `nemo_rl/algorithms/grpo.py` to store relevant information, which can then be retrieved in your custom dataloader implementation:
+
+```python
+# In nemo_rl/algorithms/grpo.py
+wrapped_dataloader.set_records({"reward": ...})
+
+# In custom_dataloader.py
+def example_custom_dataloader(
+    data_iterators: dict[str, Iterator],
+    dataloaders: dict[str, StatefulDataLoader],
+    **kwargs,
+) -> tuple[BatchedDataDict, dict[str, Iterator]]:
+    ...
+    reward = kwargs["reward"]
+    ...
+```
+
+**num_prompts_per_dataloader**
+
+This parameter specifies the number of prompts generated by each dataloader per iteration. Ensure that `grpo.num_prompts_per_step` is a multiple of `data.num_prompts_per_dataloader` to guarantee that exactly `grpo.num_prompts_per_step` prompts are available for each training step.
+
 ### Task–Dataset Mapping
 
 - task_name (unique task identifier):
   - Determines which processor, env, prompts, and dataset to use for this task.
-  - Currently, we support a single dataset and a single environment. Therefore, task_name equals the dataset_name in the config (i.e., config.data.dataset_name).
+  - Each dataset class sets its own task_name (for example, `GSM8K` uses `gsm8k`); it is not always the same as `dataset_name`. Datasets in a multi-dataset config with different task_names can use different processors, prompts, and environments.
 - task_spec (TaskDataSpec):
   - Specifies per-task system prompt and prompt.
 - task_data_processors:
@@ -248,7 +332,7 @@ For more information about environments, see the [Environments Guide](environmen
   - The environment actor for reward/evaluation, constructed using `create_env(env_name=..., env_config=...)`.
   - The environment to use is declared under the data section of the config (e.g., `data.env_name` states which env the dataset uses).
 - task_to_env:
-  - Dict mapping: task_name -> env. In the current single-task setup this typically points all tasks to the same env, but this structure enables different envs per task in future multi-task scenarios.
+  - Dict mapping: task_name -> env. With a single dataset, every task points to the same env. With multiple datasets, each task points to the env named by its dataset's `env_name`.
 
 Example (simplified):
 
@@ -271,16 +355,153 @@ This Policy object holds a [RayWorkerGroup](../../nemo_rl/distributed/worker_gro
 
 ## Fast Generation
 
-We support vLLM through the [VllmGeneration](../../nemo_rl/models/generation/vllm/vllm_generation.py) class right now.
+NeMo RL supports several generation backends, set by `policy.generation.backend`: vLLM (the default, through the [VllmGeneration](../../nemo_rl/models/generation/vllm/vllm_generation.py) class), SGLang, TensorRT-LLM, Megatron, and Dynamo (see the [Dynamo generation guide](dynamo-generation.md)). See the [Generation design doc](../design-docs/generation.md) for details.
 
 The function, [grpo_train](../../nemo_rl/algorithms/grpo.py), contains the core GRPO training loop.
+
+### Generation Sampling Parameters (temperature, top-p, top-k)
+
+GRPO uses temperature, top-p (nucleus sampling), and top-k sampling during rollout generation via vLLM; these settings are aligned with the training. For a detailed description of top-p and top-k filtering, see [Top-p and top-k filtering](#top-p-and-top-k-filtering) below.
+
+**Known issue (Qwen models):** For some Qwen-based models, a `ValueError: Token id 151708 is out of vocabulary` error may occur when the policy drifts from its initial distribution. Setting `top_p` to `0.9999` in the generation config is a recommended workaround. For details and discussion, see [#237](https://github.com/NVIDIA-NeMo/RL/issues/237).
+
+### Masked rewards in advantage statistics
+
+`grpo.masked_reward_policy` decides which rollout rows vote in the advantage
+statistics. It never changes the sample or token loss masks. It applies to
+synchronous GRPO (legacy and TransferQueue trainers), asynchronous GRPO and
+SingleController, and it covers GRPO's group baseline/std, GDPO's per-reward
+baseline/std and final batch normalization, Reinforce++'s optional group
+baseline and token-level batch normalization, the `env_baseline` behind the
+`baseline_reward/pct_*` diagnostics, and dynamic-sampling admission:
+
+- `include` (default): every row with a nonzero dataset weight votes, including
+  rows the environment flagged with `mask_sample`, truncated rows under
+  `overlong_filtering`, and rows removed by sequence-logprob-error masking.
+  Their rewards still shape their siblings' baselines although they contribute
+  no loss. Rows whose dataset-level `loss_multiplier` is `0` never vote, on any
+  trainer (see below). For the legacy and TransferQueue loops the GRPO and GDPO
+  group statistics are unchanged from earlier releases, which let every row
+  vote: a dataset-level weight is shared by a whole prompt group, so excluding
+  it moves no trainable row's baseline. SingleController previously excluded
+  all of these rows (`valid_mask=final_sample_mask`) and now lets the masked,
+  truncated and sequence-error rows vote under `include`.
+- `exclude`: only rows with a nonzero loss weight vote, using the masks known at
+  each stage: the environment, pre-existing loss-weight and overlong masks
+  before the logprob pass (dynamic-sampling admission, baseline/std,
+  `env_baseline`), and the final sample mask, including sequence-logprob-error
+  masking, at the estimator.
+
+Participation is binary. A fractional `loss_multiplier` such as `0.5` still
+weights the loss, but the row votes with full weight in the statistics; only a
+weight of exactly `0` removes it under `exclude`. For example, with rewards
+`[1, 1, 0]`, a masked last row and leave-one-out disabled, the valid rows'
+baseline is `2/3` under `include` and `1` under `exclude`; with rewards `[0, 1]`
+and loss weights `[0.5, 0.5]` the baseline is `0.5` for both rows under either
+policy.
+
+Rows whose dataset-level `loss_multiplier` is `0` never vote, on any trainer
+and under either policy. The data processors assign that weight to prompts
+that do not fit the sequence limit before any rollout happens, so their
+rollouts are unusable rows, not masked rewards; counting them would, for
+example, let their response tokens enter Reinforce++'s batch normalization,
+which earlier releases never did. SingleController reads the weight from its
+data-plane `sample_mask`, which also carries the token-capture placeholders
+(no usable tokens) that it excludes under both policies; the legacy and
+TransferQueue trainers take it from `loss_multiplier` before their own filters
+rewrite that column, and carry no placeholder rows. An environment-masked row
+with a usable rollout is a masked reward; a placeholder or an over-length
+prompt is not.
+
+The `train/baseline_reward/histogram` and `baseline_reward/pct_{0,1,mixed}`
+diagnostics of the legacy and TransferQueue trainers count the rows that vote
+under the configured policy, the same mask the estimator receives: every row
+with a nonzero dataset weight under `include`, the rows with a nonzero final
+loss weight under `exclude`. A
+non-voting row still receives a baseline entry (under the leave-one-out baseline
+it is the mean of its voting siblings' rewards, which is neither 0 nor 1), so
+counting it would report an all-correct group as mixed. When no row votes, the
+three percentages are reported as 0.
+
+Independently of the policy, the TransferQueue trainer now zeroes the loss
+weight of rows the environment flags with `mask_sample` after dynamic sampling
+and reports `num_mask_sample_filtered`, as the legacy loop does. Earlier
+releases ignored the flag in that trainer and trained those rows at full loss
+weight.
+
+The policy and reference logprob passes receive the statistics participation
+mask instead of the loss weights. Under top-k/top-p filtering the workers zero
+every policy logprob outside `token_mask * sample_mask`; the reference pass is
+computed without filtering (see
+[Top-p and top-k filtering](#top-p-and-top-k-filtering)), so its logprobs are
+always real. A loss-masked row that votes under `include` therefore keeps real
+policy logprobs, and Reinforce++'s KL-in-reward and batch normalization see
+its real KL term instead of a zeroed policy logprob against a real reference.
+Under `exclude` both masks select the same rows. Training always receives the
+loss weights.
+
+Reinforce++ normalizes over the response tokens of participating rows, never
+over prompt or padding tokens; this also applies when `minus_baseline=false`.
+GDPO normalizes over participating rows with an unbiased standard deviation and
+returns zeros when at most one row participates; Reinforce++ returns zeros when
+no token participates. Groups with at most one participating reward keep a zero
+group-relative reward difference. SingleController skips advantage computation
+when a whole chunk has no trainable tokens, under either policy.
+
+The default is a policy decision made with the post-training team, not a
+finding that `exclude` is numerically wrong, and no controlled convergence
+comparison between the two settings has been established. To run one, use the
+paired
+[exclude experiment config](../../examples/configs/experiments/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-exclude.yaml)
+and [include experiment config](../../examples/configs/experiments/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-include.yaml),
+which differ only in `grpo.masked_reward_policy`, or override that key on your
+existing config. Keep the revisions and all other settings identical.
+
+This setting does not change PPO, OPD, DPO, SFT, or reward-model training. They
+do not use these group-relative reward estimators.
 
 ## Performance Optimizations
 
 RL generations typically produce highly variable sequence lengths, which result in a significant amount of padding if approached naively. We address this with Sequence Packing and Dynamic Batching, which are techniques to reduce the amount of padding required. You can read more about these in the [design doc](../design-docs/sequence-packing-and-dynamic-batching.md).
 
+### Chunked Fused Linear Logprobs
+
+During standard GRPO training the model materializes a full logit tensor of shape `[batch_size, seq_length, vocab_size]` for the policy forward-backward pass as well as for the previous-policy and reference-policy logprob computations. This can cause out-of-memory (OOM) errors for long sequences or large vocabularies. The **chunked fused linear logprobs** path avoids this by computing the per-token log probabilities directly from the hidden states with a fused linear cross-entropy kernel: it chunks the sequence dimension, projects each chunk to logits on the fly, gathers the realized-token log probabilities, and discards the logits before moving to the next chunk. (GRPO uses the kernel only to read logprobs; it does not compute a cross-entropy loss.)
+
+This works for GRPO because [ClippedPGLossFn](../../nemo_rl/algorithms/loss/loss_functions.py) only consumes the per-token log probability of the realized token (`next_token_logprobs`), which is exactly what the fused forward returns.
+
+**Benefits:**
+
+- Extends the maximum trainable sequence length significantly by eliminating the large logit tensor from GPU memory.
+- Applies to both the training forward-backward pass and the previous/reference-policy logprob computations.
+- Produces numerically equivalent loss values to the standard path.
+
+**How to enable:**
+
+Add the following to your Megatron config in your YAML file:
+
+```yaml
+policy:
+  megatron_cfg:
+    enabled: true
+    use_fused_linear_logprobs: true
+    fused_linear_logprobs_chunk_size: 256  # tokens per chunk; smaller = less memory, larger = more throughput
+```
+
+**Notes:**
+
+- Only supported on the Megatron backend (`policy.megatron_cfg.enabled: true`).
+- Context parallelism is not supported when fused linear logprobs are enabled.
+- Sequence packing is not supported with fused linear logprobs; set `policy.sequence_packing.enabled: false`. The fused forward rolls labels over the whole packed sequence and would mix tokens across packed-sequence boundaries.
+- Online EAGLE-3 draft training (`policy.draft.enabled: true`) is not supported with fused linear logprobs: draft distillation needs the full next-token logits for the teacher distribution, which the fused path never materializes.
+- Top-k/top-p training-time filtering is not supported with fused linear logprobs (set `policy.generation.top_k: null` and `policy.generation.top_p: 1.0`), because the fused path gathers logprobs from the unfiltered logits.
+- The `fused_linear_logprobs_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.
+
 ## Loss
-We use the [ClippedPGLossFn](../../nemo_rl/algorithms/loss_functions.py) to calculate the loss for GRPO. Formally,
+For the optional correction based on the sampler's captured top-k distribution,
+see [Score Centering](score-centering.md).
+
+We use the [ClippedPGLossFn](../../nemo_rl/algorithms/loss/loss_functions.py) to calculate the loss for GRPO. Formally,
 
 $$
 L(\theta) = E_{x \sim \pi_{\theta_{\text{old}}}} \Big[ \min \Big(\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}A_t, \text{clip} \big( \frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}, 1 - \varepsilon, 1 + \varepsilon \big) A_t \Big) \Big] - \beta D_{\text{KL}} (\pi_\theta \| \pi_\text{ref})
@@ -307,6 +528,90 @@ $$
 where:
 - c is the dual-clip parameter (ratio_clip_c), which must be greater than 1 and is usually set to 3 empirically.
 - $r_t(\theta)$ is the ratio $\frac{\pi_\theta(x)}{\pi_{\theta_{\text{old}}}(x)}$ that measures how much the policy has changed.
+
+### Loss Normalization (`token_level_loss`)
+
+The formulas above are written with a bare expectation $E_t[\cdot]$, which leaves one detail unspecified: the loss is computed per token, but the optimizer needs a single number, so those per-token values have to be averaged. The `token_level_loss` parameter chooses how that average is taken. It does not change the per-token objective itself — only how the per-token values are combined into the scalar that is differentiated.
+
+There are two choices:
+
+- **`token_level_loss: true`** — average over every token in the batch. Every token counts the same, so a response contributes to the update in proportion to how many tokens it has.
+- **`token_level_loss: false`** — average within each response first, then average those per-response values. Every *response* counts the same regardless of length.
+
+Writing $\ell_{i,t}$ for the per-token objective of token $t$ in response $o_i$ — the quantity inside the expectation in the formula above — $|o_i|$ for the number of unmasked tokens in that response, and $N$ for the number of valid responses:
+
+$$
+L_{\text{token}}(\theta) = \frac{1}{\sum_{i=1}^{N} |o_i|} \sum_{i=1}^{N} \sum_{t=1}^{|o_i|} \ell_{i,t}
+\qquad\qquad
+L_{\text{seq}}(\theta) = \frac{1}{N} \sum_{i=1}^{N} \frac{1}{|o_i|} \sum_{t=1}^{|o_i|} \ell_{i,t}
+$$
+
+Both denominators — $\sum_i |o_i|$ and $N$ — are counts over the whole global batch, not over a single microbatch. Each microbatch divides by the global count and contributes a partial sum, so the microbatch losses can simply be summed to recover the global-batch loss. See [Loss Functions](../design-docs/loss-functions.md) for how that normalization factor is computed and passed in.
+
+The same choice also normalizes the KL penalty term, so `reference_policy_kl_penalty` is applied on whichever scale you select.
+
+#### An example of what this changes
+
+Consider a batch of two responses — one 10 tokens long, one 1000 tokens long — where every token happens to have the same per-token value:
+
+- Under `token_level_loss: true`, the denominator is $10 + 1000 = 1010$, so the long response accounts for about 99% of the update and the short one about 1%.
+- Under `token_level_loss: false`, each response is averaged over its own length first, so the two contribute 50% each. Per token, that means each token of the short response carries roughly 100× the weight of each token of the long response.
+
+That is arithmetic, not a recommendation — which weighting is preferable depends on the algorithm and the workload. See [Choosing a setting](#choosing-a-setting) below.
+
+#### Objectives under each setting
+
+`token_level_loss` lives on `ClippedPGLossFn`, the loss shared by the policy-gradient algorithms. The table below writes out the full objective for each one under both settings. To keep the expressions readable they show the base objective only; optional terms — the KL penalty, dual clipping (`ratio_clip_c`), and the importance-sampling correction (`use_importance_sampling_correction`) — are applied on top of it and are documented in the sections that follow.
+
+Throughout, $r_{i,t} = \frac{\pi_\theta(o_{i,t})}{\pi_{\theta_{\text{old}}}(o_{i,t})}$ is the per-token probability ratio, $A_i$ is the advantage for response $i$, $\text{sg}(\cdot)$ is the stop-gradient operator, and $\varepsilon_{\text{low}}$, $\varepsilon_{\text{high}}$ are `ratio_clip_min`/`ratio_clip_max`.
+
+| Algorithm | `token_level_loss: true` | `token_level_loss: false` |
+| --- | --- | --- |
+| **GRPO / PPO / DAPO** | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(r_{i,t} A_i,\ \text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$ |
+| **CISPO** (`use_cispo: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t \text{sg}\big(\text{clip}(r_{i,t}, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}})\big) A_i \log \pi_\theta(o_{i,t})$ | Not available — rejected at construction time, because CISPO is defined per token. |
+| **GSPO** (`sequence_level_importance_ratios: true`) | Not available — rejected at construction time, because the sequence-level ratio is mutually exclusive with token-level reduction. | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t \min\big(s_i A_i,\ \text{clip}(s_i, 1-\varepsilon_{\text{low}}, 1+\varepsilon_{\text{high}}) A_i\big)$, where $s_i = \Big(\frac{\pi_\theta(o_i)}{\pi_{\theta_{\text{old}}}(o_i)}\Big)^{1/\lvert o_i\rvert}$ |
+| **REINFORCE / RLOO** (`disable_ppo_ratio: true`) | $\frac{1}{\sum_i \lvert o_i\rvert} \sum_i \sum_t A_i \log \pi_\theta(o_{i,t})$ | $\frac{1}{N} \sum_i \frac{1}{\lvert o_i\rvert} \sum_t A_i \log \pi_\theta(o_{i,t})$ |
+
+Two notes on the table:
+
+- The "not available" cells are enforced by assertions in `ClippedPGLossFn.__init__`, so an incompatible config fails immediately rather than training with a silently different objective.
+- In the GSPO row, $s_i$ does not depend on $t$, so the inner $\frac{1}{\lvert o_i\rvert} \sum_t$ collapses and the objective reduces to one clipped term per response.
+
+#### Losses that do not expose this parameter
+
+`token_level_loss` is a field of `ClippedPGLossConfig` only. Every other loss fixes its normalization as a class attribute, so setting `token_level_loss` in, say, an SFT config has no effect:
+
+| Loss function | Used by | Normalization |
+| --- | --- | --- |
+| `NLLLossFn` | SFT | Token-level |
+| `PreferenceLossFn` / `DPOLossFn` | DPO, RM | Sequence-level |
+| `DistillationLossFn` | On-policy distillation | Token-level |
+| `MseValueLossFn` | PPO critic | Token-level |
+| `CrossTokenizerDistillationLossFn` | Cross-tokenizer distillation | Token-level |
+| `DraftCrossEntropyLossFn` | Eagle3 draft training | Token-level |
+
+#### How metrics are normalized
+
+Some of the metrics logged during training follow `token_level_loss`, and some do not. This matters when comparing runs: switching `token_level_loss` changes the scale of `loss` and `kl_penalty`, but leaves the token-normalized diagnostics directly comparable.
+
+The table below covers the metrics reported by `ClippedPGLossFn` (the GRPO/PPO family). Other algorithms report a different, generally smaller set.
+
+| Behavior | Metrics |
+| --- | --- |
+| **Follows `token_level_loss`** — token-normalized when `true`, sequence-normalized when `false` | `loss`, `kl_penalty` |
+| **Always token-normalized**, regardless of the setting | `probs_ratio`, `probs_ratio_clamped`, `token_mult_prob_error`, `gen_kl_error`, `policy_kl_error`, `js_divergence_error`, `approx_entropy` |
+| **Keyed on a different parameter** | `sampling_importance_ratio` follows `sequence_level_importance_ratios`; `is_oob_ratio` is sequence-normalized only for `truncated_importance_sampling_type: seq-mask-tis` |
+| **Not normalized** — raw counts, per-microbatch means, or extrema combined with min/max | `num_valid_samples`, `positive_nll_loss`, `probs_ratio_min`, `probs_ratio_max`, `probs_ratio_clamped_min`, `probs_ratio_clamped_max`, `num_masked_seqs_by_logprob_error`, `seq_logprob_error_valid_tokens`, `seq_logprob_error_valid_seqs` |
+
+The authoritative list is the [`metric_normalizations` table in `ClippedPGLossFn`](https://github.com/NVIDIA-NeMo/RL/blob/1343b2f6fb92b4cced5e515e404595dcac627d98/nemo_rl/algorithms/loss/loss_functions.py#L372-L394), which is kept in sync with the metrics the loss returns.
+
+#### Choosing a setting
+
+For CISPO and GSPO there is nothing to choose — each admits only one setting, as shown above. For vanilla GRPO (and PPO) both are available, and the tradeoff is the weighting described in the example above.
+
+The argument most often made for token-level normalization comes from the [DAPO paper](https://arxiv.org/abs/2503.14476) (§3.3, "Token-Level Policy Gradient Loss"), in the context of long chain-of-thought training. Their reasoning is that under sequence-level normalization, "since all samples are assigned the same weight in the loss calculation, tokens within longer responses (which contain more tokens) may have a disproportionately lower contribution to the overall loss." They argue this cuts both ways: for high-quality long responses, "this effect can impede the model's ability to learn reasoning-relevant patterns within them." For low-quality ones, "excessively long samples often exhibit low-quality patterns such as gibberish and repetitive words. Thus, sample-level loss calculation, due to its inability to effectively penalize those undesirable patterns in long samples, leads to an unhealthy increase in entropy and response length."
+
+This is one reported result on one class of workloads, not a settled rule. The original [GRPO paper](https://arxiv.org/abs/2402.03300) formulates the loss at the sequence level. If response lengths in your workload are fairly uniform, the two settings differ little; the gap widens as the length distribution spreads out. Treat it as a hyperparameter worth sweeping rather than a setting with a known-correct value, and if you change it mid-project, expect the absolute scale of `loss` and `kl_penalty` to shift even when nothing else has.
 
 ### Improvements to the GRPO Loss Formulation for Stability and Accuracy
 
@@ -349,6 +654,57 @@ By multiplying the first term of the loss function by the importance weights $\f
 
 To enable the importance sampling correction, set the config `use_importance_sampling_correction=True` in the `ClippedPGLossConfig`. By default, we set this config to False to align with standard GRPO.
 
+##### Adaptive PPO clip
+
+`truncated_importance_sampling_type: adaptive-ppo-clip` filters tokens by importance weight $w$ according to the sign of their advantage, with an upper bound that adapts to policy entropy. It is intended for async RL and requires `force_on_policy_ratio: true`. It also requires `metrics_level: full` (the default), because the trainer reads `approx_entropy` to update the bound:
+
+```yaml
+loss_fn:
+  use_importance_sampling_correction: true
+  force_on_policy_ratio: true
+  truncated_importance_sampling_type: adaptive-ppo-clip
+  truncated_importance_sampling_ratio: 2.5      # base upper bound for A > 0
+  truncated_importance_sampling_ratio_min: 0.4  # lower bound for A < 0
+  truncated_importance_sampling_adaptive_target_entropy: 0.3
+  truncated_importance_sampling_adaptive_k_step: 0.25
+  truncated_importance_sampling_adaptive_k_max: 1.0
+  truncated_importance_sampling_adaptive_outer_bound: 50.0
+  sequence_level_importance_ratios: false
+```
+
+The loss zeroes the weight of negative-advantage tokens with $w$ below `truncated_importance_sampling_ratio_min`, positive-advantage tokens with $w$ above `truncated_importance_sampling_ratio + k`, and every token with $w$ above `truncated_importance_sampling_adaptive_outer_bound`. `is_oob_ratio` reports the fraction of filtered tokens.
+
+The offset $k$ starts at 0. After each training step, the trainer compares the step's `approx_entropy` with `truncated_importance_sampling_adaptive_target_entropy`: entropy above the target lowers $k$ by `truncated_importance_sampling_adaptive_k_step`, and entropy below the target raises it by the same amount. $k$ is clamped between 0 and `truncated_importance_sampling_adaptive_k_max`. The legacy GRPO trainers and the single controller log `cur_adaptive_ppo_clip_k`, the $k$ each step trained with, and save the updated $k$ in checkpoints so a resumed run continues from the same bound. The legacy PPO trainer rejects this mode. Sequence-level importance ratios are not supported. [Score centering](score-centering.md) composes with this mode, filtering its sampler-expected correction with the same bounds. See the [MAI-1 paper](https://microsoft.ai/pdf/mai-thinking-1.pdf) for more details.
+
+
+#### Single-forward sequence-logprob filtering
+
+For non-streaming Megatron GRPO, enable `loss_fn.seq_logprob_error_in_loss` to apply the absolute sequence-logprob error threshold inside the training loss. This avoids the standalone policy-logprob forward even when `grpo.seq_logprob_error_threshold` is set:
+
+```yaml
+grpo:
+  seq_logprob_error_threshold: 2.0
+  skip_reference_policy_logprobs_calculation: true
+loss_fn:
+  seq_logprob_error_in_loss: true
+  force_on_policy_ratio: true
+  token_level_loss: true
+  reference_policy_kl_penalty: 0.0
+```
+
+The default is `false`, retaining the existing pre-training check. This mode requires the `grpo` advantage estimator and one optimizer update per rollout batch (`force_on_policy_ratio`'s existing constraint). It supports synchronous and legacy asynchronous training, including synchronous data-plane training, sequence packing, and gradient accumulation. SingleController is rejected because its advantage baselines depend on the earlier filtering decision. Automodel, KL-in-reward, MTP, draft training, positive-example NLL, and distillation are not supported by this mode. A reference-model forward is still needed if reference KL is enabled; the example disables it. Existing recipes using MTP (such as the NeMo-Gym Nemotron recipes), distillation (`mopd`), or Automodel must first satisfy these constraints; setting the flag alone does not make them compatible.
+
+The [Qwen2.5-Math-1.5B single-forward recipe](../../examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-forward.yaml) provides a complete configuration for one node with eight GPUs. The comparison below used two GB300 nodes with four GPUs each, with overrides `cluster.num_nodes=2 cluster.gpus_per_node=4 cluster.segment_size=2`. The reported step times therefore do not describe the recipe's default topology and also depend on the benchmark hardware and runtime.
+
+The loss computes the same mean `exp(abs(policy_logprob - generation_logprob))` over valid response tokens, using detached logprobs from the training forward. Both seq_logprob_error_in_loss true and false ignore nonfinite logprobs at masked-out positions. Rejected sequences contribute zero loss but are still processed by the batched forward/backward. The worker sums survivor counts over every microbatch and DP rank, then rescales accumulated gradients before gradient clipping and the optimizer step. Thus the denominator excludes threshold-rejected tokens, regardless of how sequences were packed. Existing `seq-mask-tis` remains active: TIS-only failures still count in that denominator. An optimizer batch with no surviving response tokens raises an error before the optimizer or scheduler updates.
+
+Loss-local filtering does not alter the rollout tensors or reward-group advantages. Because it evaluates the training forward rather than a separate inference forward, FP8 scale history, packing, and other numerical differences can change which sequences pass. Bitwise equivalence is not expected. The training metrics report `num_masked_seqs_by_logprob_error`, `seq_logprob_error_valid_tokens`, and `seq_logprob_error_valid_seqs`; separate-pass sequence-error summary metrics are omitted rather than reported as placeholders. In this mode, all three counts are weighted by `sample_mask`: the masked sequence metric sums the weights of newly rejected sequences, and the valid token and sequence metrics sum surviving weights. With fractional sample weights, `num_masked_seqs_by_logprob_error` can therefore be fractional, unlike the integer count emitted by the separate-forward filter.
+
+Measure end-to-end step time and reward/gradient-norm trajectories on the target recipe when comparing the modes. The avoided policy-logprob forward must be weighed against the device synchronization before gradient rescaling and the forward/backward work on rejected sequences. The rescaling restores normalization over surviving tokens before clipping; it does not introduce a different clipping threshold.
+
+The following Qwen2.5-Math-1.5B comparison shows both modes over 450 steps with seed 42 on eight GB300 GPUs (two nodes). The reward curves closely track, with a 17.8% reduction in mean step time over steps 51–450 (6.69 seconds with in-loss filtering versus 8.14 seconds with separate-forward filtering).
+
+![Train reward, token multiplicative probability error, step time, and gradient norm for single-forward versus separate-forward sequence-logprob filtering.](../assets/grpo-qwen-single-forward-comparison.png)
 
 #### Overlong Filtering
 
@@ -377,7 +733,7 @@ $$
 L_{\text{effective}} = \sum_{i} m_i \cdot L_i
 $$
 
-where $L_i$ is the per-sample loss. Truncated samples contribute 0 to the gradient update while remaining in the batch for reward baseline calculations.
+where $L_i$ is the per-sample loss. Truncated samples contribute 0 to the gradient update. Under the default `grpo.masked_reward_policy: include` they remain in the batch for reward baseline calculations; `exclude` removes them from the statistics as well (see [Masked rewards in advantage statistics](#masked-rewards-in-advantage-statistics)).
 
 To configure:
 ```yaml
@@ -387,8 +743,93 @@ grpo:
 
 Set `overlong_filtering` to true when training on tasks where truncation at the maximum sequence length is expected, such as long-form reasoning or mathematical proofs.
 
+#### Advantage Clipping
+
+After advantage normalization, per-token advantages can become very large when the per-prompt reward standard deviation is small. The optional `advantage_clip_low` and `advantage_clip_high` parameters clamp normalized advantages to a bounded range before policy training.
+
+When both values are `null` (the default), no clipping is applied. When set, advantages are clamped after normalization:
+
+$$
+A_{\text{clipped}} = \text{clamp}(A,\ \text{advantage\_clip\_low},\ \text{advantage\_clip\_high})
+$$
+
+To configure:
+```yaml
+grpo:
+  advantage_clip_low: null   # default: no lower bound
+  advantage_clip_high: null  # default: no upper bound
+```
+
+Set explicit bounds (for example, `-5.0` and `5.0`) when small reward variance produces extreme normalized advantages that destabilize training.
+
+#### Top-p and top-k filtering
+
+The implementation aligns with vLLM’s top-p and top-k filtering by applying an equivalent process to the logits.
+
+When top-p or top-k filtering is enabled, the following conventions apply:
+
+- **`curr_logprobs` and `prev_logprobs`** are computed *with* filtering applied, for compatibility with the actor loss.
+- **`reference_policy_logprobs`** is computed *without* filtering (see the `use_reference_model` in the policy worker).
+- **KL divergence** uses `curr_logprobs_unfiltered`(`curr_logprobs` *without* filtering) so that it is consistent with the reference policy logprobs.
+- **Invalid policy support** caused by disagreement on the top-k/top-p filtered set is excluded from actor ratios, actor-loss reduction, KL-in-reward, OPD advantages, and sequence-error checks. Excluded positions still count toward global token/sequence normalization. The shared `token_mask` stays unchanged so the unfiltered reference KL still uses valid response tokens. Diagnostic JSONL dumps represent nonfinite log probabilities as `null`; the training tensors retain their original values.
+
+Under tensor parallelism (TP), enabling top-p or top-k adds communication overhead. The vocabulary is sharded across GPUs (vocab-parallel), while top-p and top-k require full-vocabulary probabilities. A naive all-gather of logits would require large additional memory. The implementation therefore switches to a batch–sequence-parallel layout via all-to-all communication, applies filtering over the full vocabulary, then switches back, avoiding materialization of the full vocabulary on any single rank.
+
+## Advantage Estimation
+
+### Leave-one-out baseline and reward normalization
+
+For a prompt with $N$ rollouts and rewards $r_1 \dots r_N$, `use_leave_one_out_baseline: true`
+gives rollout $i$ the baseline
+
+$$
+b_i = \frac{1}{N-1} \sum_{j \neq i} r_j
+$$
+
+and `normalize_rewards: true` divides by the spread of that same set:
+
+$$
+A_i = \frac{r_i - b_i}{\sigma_i + \epsilon}
+$$
+
+where:
+
+- $\sigma_i$ is the sample standard deviation of $\{ r_j \}_{j \neq i}$
+- $\epsilon = 10^{-6}$
+- both $b_i$ and $\sigma_i$ use the other $N-1$ rollouts, never $r_i$
+
+If those $N-1$ rewards are all equal, their true standard deviation is zero and there
+is no meaningful scale for normalization. NeMo RL skips the division for that rollout:
+
+$$
+A_i = r_i - b_i \quad \text{when} \quad \min_{j \neq i} r_j = \max_{j \neq i} r_j
+$$
+
+So for $r = [0,\ 0.95,\ 0.95,\ 0.95,\ 0.95,\ 0.95,\ 0.95,\ 0.95]$, rollout 1 gets
+$A_1 = -0.95$. The `std` division is manually skipped to avoid dividing by FP32
+rounding errors from computing the difference between the square of the mean and
+the mean of the square.
+
+Two consequences:
+
+- $A_i$ is on the raw reward scale while its peers are on the normalized scale.
+- Only groups that have exactly the same reward (after LOO) will skip normalization.
+Small `std` that is not a consequence of rounding errors will not be skipped.
+
+Dynamic sampling uses a separate whole-group test, $\min_j r_j = \max_j r_j$ over all $N$,
+so a prompt group is kept or dropped together, independently of leave-one-out baseline
+semantics.
+
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
+
+`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described
+below. Set it to `minimal` to skip optional diagnostic kernels; the loss
+and objective bookkeeping remain unchanged. Both modes report
+`token_mult_prob_error` to monitor training–generation logprob mismatch.
+`loss_fn.enable_torch_compile` can
+be enabled separately to compile the tensor-only actor objective (it is opt-in
+because backend and distributed-layout support should be validated first).
 
 ### Multiplicative Token Probability Error
 This feature is controlled by the parameter `token_mult_prob_error`. It measures the error introduced when token probabilities are scaled multiplicatively, which can affect model calibration and output consistency. This is equal to the 'Logprob consistency metric' defined in [Adding New Models](../adding-new-models.md#importance-of-log-probability-consistency-in-training-and-inference):
@@ -435,7 +876,7 @@ This is simply $\frac{1}{|T|}\sum_{t \in \text{tokens}}\text{exp}(\text{log}(\pi
 
 Similar to [Multiplicative Token Probability Error](#multiplicative-token-probability-error), this is a measure of how far off your inference backend is from your training framework. However, this metric is meant to find the bias in that error, rather than the variance, as it does not take the absolute value of the error. With some noise, this should hover around 1.
 
-This metric is always calculated and the per-token version (without the mean) is used in the loss function when [Importance Sampling Correction](#importance-sampling-correction) is enabled.
+This metric is always reported when `loss_fn.metrics_level` is `full`. In `minimal` mode, it is only reported when `use_importance_sampling_correction` is enabled. The per-token version (without the mean) is used in the loss function when [Importance Sampling Correction](#importance-sampling-correction) is enabled.
 
 ### Entropy
 This feature is controlled by the parameter `approx_entropy`. It estimates the entropy of the policy distribution, which can be used to encourage exploration and prevent premature convergence during training. We roughly approximate the entropy of the LLM's distribution throughout training by calculating:
@@ -448,19 +889,98 @@ This expectation is estimated using the rollouts in each global training batch a
 
 We use this to track if our models are experiencing entropy collapse too quickly during training (as is quite common). This is a fairly rough Monte Carlo approximation, so we wouldn't recommend using this directly for an entropy bonus or otherwise backpropagating through this. You can take a look at NeMo Aligner's [implementation](https://github.com/NVIDIA/NeMo-Aligner/blob/main/nemo_aligner/utils/distributed.py#L351) of a full entropy calculation if you're interested (work-in-progress efficient calculation in NeMo RL).
 
+### GDPO: Group reward-Decoupled Normalization Policy Optimization for Multi-reward RL Optimization
+GDPO is a reinforcement learning optimization method designed for multi-reward training. While existing approaches commonly apply Group Relative Policy Optimization (GRPO) in multi-reward settings, the authors show that this leads to reward advantages collapse, reducing training signal resolution and causing unstable or failed convergence. GDPO resolves this issue by decoupling reward normalization across individual rewards, preserving their relative differences and enabling more faithful preference optimization. 
 
+For a group of  \\( N \\) rewards and  \\( G \\) samples per group, GDPO normalizes each reward independently:
 
+$$
+A_n^{(i,j)} = \frac{r_n^{(i,j)} - \text{mean}\{r_n^{(i,1)}, \ldots, r_n^{(i,G)}\}}{\text{std}\{r_n^{(i,1)}, \ldots, r_n^{(i,G)}\} + \epsilon}
+$$
+
+The normalized group advantage is then aggregated across rewards:
+
+$$
+A^{(i,j)} = \sum_{n=1}^{N} w_n A_n^{(i,j)}
+$$
+
+The final per-batch normalization produces:
+
+$$
+\hat{A}^{(i,j)} = \frac{A^{(i,j)} - \text{mean}_{i',j'}\{A^{(i',j')}\}}{\text{std}_{i',j'}\{A^{(i',j')}\} + \epsilon}
+$$
+
+Here,  \\( \text{mean}_{i',j'}\{A^{(i',j')}\} \\) and  \\( \text{std}_{i',j'}\{A^{(i',j')}\} \\) denote statistics over all groups in the batch.
+
+To enable GDPO for multi-reward RL training, simply set:
+```
+grpo:
+  adv_estimator:
+    name: "gdpo"
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+```
+Note that this method only has an effect when training involves more than one reward function.
+
+#### Per-reward weights
+
+The aggregation weights \\( w_n \\) in \\( A^{(i,j)} = \sum_{n=1}^{N} w_n A_n^{(i,j)} \\)
+are configurable via `reward_weights`, an optional list with one entry per reward
+component, ordered alphabetically by component name (matching the sorted `reward/<name>`
+keys). When omitted, all weights default to `1.0` (equal weighting). For example, to
+down-weight the second and third rewards:
+```
+grpo:
+  adv_estimator:
+    name: "gdpo"
+    normalize_rewards: true
+    use_leave_one_out_baseline: false
+    reward_weights: [1.0, 0.5, 0.25]
+```
+The number of weights must equal the number of reward components, or a `ValueError` is raised.
+
+#### Comparing GDPO against a GRPO baseline
+
+The clearest way to see GDPO's effect is a matched comparison on the same multi-reward environment, changing only the advantage estimator. `examples/configs/gdpo_math_1B.yaml` runs GDPO; the GRPO control is the same config with `adv_estimator.name=grpo` (plus a separate checkpoint dir and logger run name so the two runs don't clobber each other):
+
+```
+# GDPO
+uv run examples/run_grpo.py --config examples/configs/gdpo_math_1B.yaml
+# GRPO control on the SAME multi-reward env — only the advantage estimator changes
+uv run examples/run_grpo.py --config examples/configs/gdpo_math_1B.yaml \
+    grpo.adv_estimator.name=grpo \
+    checkpointing.checkpoint_dir=results/grpo_math_1B_control \
+    logger.wandb.name=grpo-math-1b-control
+```
+
+For intuition on why this matters, see the advantage-collapse example in the [GDPO paper](https://arxiv.org/abs/2601.05242): two responses with the same total reward but different composition (e.g. `(1, 0)` vs. `(0, 1)`) receive an identical advantage under GRPO but distinct advantages under GDPO.
+
+#### What to measure
+
+The headline metric is per-reward convergence, not just aggregate reward. NeMo-RL does not log per-component rewards out of the box (only `total_reward` aggregates are logged), but the components are available as `reward/<name>` keys (e.g. `reward/correctness`) in the rollout batch — add your own logging for them and compare the GDPO and GRPO curves:
+
+- Under GRPO, expect components to move together, or low-variance components to stall as their signal is swamped by the dominant term in the sum.
+- Under GDPO, expect each component to improve on its own schedule.
+- Watch the per-prompt advantage spread: if distinct reward combinations produce near-identical advantages under GRPO, that is the collapse GDPO is meant to fix.
+
+#### Practical notes
+
+- **Reward scaling applies per component.** `reward_scaling` rescales each `reward/<name>` component as well as `total_reward`, so keep components on comparable scales or rely on GDPO's per-component normalization.
+- **Final batch normalization always runs.** In `GDPOAdvantageEstimator`, the final per-batch normalization applies regardless of `normalize_rewards` (which only gates the per-component std division). Account for this when reasoning about advantage magnitudes.
 
 ## LoRA Configuration
 
-### DTensor Backend
+GRPO supports LoRA on both the Automodel and Megatron backends. To enable LoRA on the default Automodel backend:
 
-GRPO supports LoRA on the NeMoRL DTensor backend. The LoRA settings live under `policy.dtensor_cfg.lora_cfg`, and the fields follow the SFT LoRA configuration. For DTensor parameter details, see [SFT LoRA: DTensor Configuration Parameters](./sft.md#dtensor-configuration-parameters). To enable LoRA, set `policy.dtensor_cfg.lora_cfg.enabled=true`, then configure target modules, rank, alpha, and dropout as needed.
+```bash
+uv run examples/run_grpo.py policy.automodel_cfg.lora_cfg.enabled=true
+```
 
-Our DTensor LoRA path uses a merge-weight approach: during generation, LoRA adapter weights are merged into the base linear weights. This improves performance, with a small training-inference mismatch that we consider acceptable. If you require strict training-inference parity, use the [split-weight variant branch](https://github.com/NVIDIA-NeMo/RL/tree/ruit/lora_grpo_async), which may trade off some performance. For a comparison between merge-weight and split-weight, see [PR 1797: Support lora in dtensor grpo workflow by merging weight](https://github.com/NVIDIA-NeMo/RL/pull/1797).
+Automodel GRPO with synchronous vLLM uses native A/B adapter refit by default. Set
+`policy.generation.lora_refit_mode=merged` to switch to merged refit.
 
-We already provide a DTensor-based Nano v3 GRPO LoRA recipe. See [grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml](../../examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n8g-fsdp2-lora.yaml) for an end-to-end example.
+For the full reference — backend support, the Automodel vs Megatron schema comparison, config examples, parameter details, and example recipes — see the dedicated [LoRA guide](lora.md).
 
 ## Evaluate the Trained Model
 
-Upon completion of the training process, you can refer to our [evaluation guide](eval.md) to assess model capabilities.
+Upon completion of the training process, see the [evaluation overview](../about/evaluation.md) to assess model capabilities.
