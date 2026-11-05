@@ -400,6 +400,8 @@ def test_generation_config_allows_no_worker_extension(
 ) -> None:
     config = deepcopy(basic_vllm_test_config)
     config["backend"] = backend
+    if backend == "trtllm":
+        config["trtllm_cfg"] = {}
     if include_null:
         config["worker_extension_cls_fqn"] = None
 
