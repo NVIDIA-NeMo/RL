@@ -53,6 +53,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
+    logprob_passes_required,
     validate_single_controller_config,
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
@@ -1146,3 +1147,42 @@ class TestTrainClusterSizesForTheCritic:
         else:
             # The critic never lands on the inference cluster.
             assert inference.kwargs["max_colocated_worker_groups"] == 1
+
+
+def _in_loss_ppo_config(*, streaming: bool = False) -> MasterConfig:
+    mc = _ppo_master_config(
+        megatron_enabled=True,
+        min_groups_for_streaming_train=1 if streaming else _NUM_PROMPTS_PER_STEP,
+    )
+    mc.ppo.ppo_epochs = 1
+    mc.ppo.seq_logprob_error_threshold = 2.0
+    mc.loss_fn.seq_logprob_error_in_loss = True
+    mc.loss_fn.force_on_policy_ratio = True
+    mc.loss_fn.token_level_loss = True
+    return mc
+
+
+class TestInLossSeqFilterForPPO:
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_accepts_one_policy_epoch_and_skips_policy_logprobs(
+        self, streaming: bool
+    ) -> None:
+        mc = _in_loss_ppo_config(streaming=streaming)
+
+        validate_single_controller_config(mc)
+        policy_pass, _ = logprob_passes_required(mc, mc.ppo)
+        assert not policy_pass
+
+    def test_rejects_multiple_policy_epochs(self) -> None:
+        mc = _in_loss_ppo_config()
+        mc.ppo.ppo_epochs = 4
+
+        with pytest.raises(ValueError, match="requires ppo.ppo_epochs=1"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_kl_in_reward(self) -> None:
+        mc = _in_loss_ppo_config()
+        mc.loss_fn.use_kl_in_reward = True
+
+        with pytest.raises(ValueError, match="without use_kl_in_reward"):
+            validate_single_controller_config(mc)
