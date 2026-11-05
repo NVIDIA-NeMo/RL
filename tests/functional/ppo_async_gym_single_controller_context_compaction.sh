@@ -62,6 +62,8 @@ TRAIN_CMD=(
     policy.max_total_sequence_length=16384
     value.sequence_packing.enabled=false
     value.dynamic_batching.enabled=false
+    value.train_micro_batch_size=2
+    ++token_capture.forest_padding_scope=step
     ++policy.generation.vllm_cfg.http_server_serving_chat_kwargs.reasoning_parser=deepseek_r1
     env.nemo_gym.policy_model.responses_api_models.vllm_model.uses_reasoning_parser=true
     env.nemo_gym.policy_model.responses_api_models.vllm_model.extra_body.chat_template_kwargs.enable_thinking=true
@@ -122,6 +124,7 @@ if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
             'max(data["train/global_valid_seqs"]) > 8' \
             'len(data["train/critic/loss"]) == 2' \
             "len(data[\"train/loss\"]) == ${expected_policy_steps}" \
+            'max(data["train/critic/loss"]) < 1.5' \
             'min(data["train/critic/loss"]) >= 0' \
             'max(data["train/token_mult_prob_error"]) < 1.05'
     done
