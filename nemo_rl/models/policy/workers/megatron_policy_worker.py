@@ -5101,6 +5101,11 @@ class MegatronPolicyWorkerImpl(
                 self.mcore_state.train_state.consumed_train_samples = (
                     self.scheduler.num_steps
                 )
+
+            # Free cached CUDA blocks to avoid OOM at checkpoint save.
+            gc.collect()
+            torch.cuda.empty_cache()
+
             save_checkpoint(
                 state=self.mcore_state,
                 model=[self.model],

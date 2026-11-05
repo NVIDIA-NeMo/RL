@@ -237,6 +237,12 @@ def configure_generation_config(
                 config["vllm_cfg"]["skip_tokenizer_init"] = True
 
     elif config["backend"] == "trtllm":
+        # Resolve loading before the role engines copy the shared config.
+        trtllm_cfg = cast(TrtllmConfig, config)["trtllm_cfg"]
+        trtllm_cfg.setdefault(
+            "load_format",
+            "dummy" if trtllm_cfg.get("precision") == "fp8" or not is_eval else "auto",
+        )
         config = resolve_role_overrides(cast(TrtllmConfig, config))
 
     return config
