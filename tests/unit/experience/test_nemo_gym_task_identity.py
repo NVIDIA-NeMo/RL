@@ -14,6 +14,7 @@
 
 from types import SimpleNamespace
 
+import orjson
 import pytest
 import torch
 
@@ -37,7 +38,8 @@ def test_prepare_legacy_gym_rows_supplies_task_indices(existing_indices):
     if existing_indices is not None:
         assert indices == existing_indices
     else:
-        assert all(type(index) is int and index >= 0 for index in indices)
+        assert orjson.loads(orjson.dumps(rows)) == rows
+        assert all(type(index) is int and 0 <= index < (1 << 63) for index in indices)
         assert indices[0] == indices[1]
         assert indices[2] == indices[3]
         assert indices[0] != indices[2]

@@ -2416,7 +2416,7 @@ def _prepare_nemo_gym_rows(
     fallback_task_indices: dict[int, int] = {}
     for group_index, group_start in enumerate(range(0, len(rows), num_generations)):
         group_rows = rows[group_start : group_start + num_generations]
-        fallback_task_indices[group_index] = uuid.uuid4().int
+        fallback_task_indices[group_index] = uuid.uuid4().int % (1 << 63)
         existing_group_ids = {
             row[NEMO_GYM_GROUP_ID_KEY]
             for row in group_rows
