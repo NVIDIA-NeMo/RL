@@ -1,0 +1,108 @@
+# Version-point gradients (docs/guides/vpg.md): Qwen3-8B-Base zero-RL on MATH levels 3-5, async GRPO with max
+# trajectory age 8 at lr 1e-5, 1 node (2 trainer + 2 generation GPUs, non-colocated). Plain "User:/Assistant:" prompt,
+# hf_math_verify reward, validation on AIME 2024 + AIME 2025 + MATH-500 (4 samples each), 16 prompts x 16 samples =
+# one optimizer step, no reference KL. Batch-invariant kernels on trainer and generator make the trainer's log-probs
+# at the generation weights bitwise equal to the generator's, so every IS weight is exactly 1 on version-point steps.
+# Set grpo.async_grpo.version_point_gradient=false for the IS-corrected baseline at the same lag.
+defaults: ../../grpo_math_1B_megatron.yaml
+grpo:
+  num_prompts_per_step: 16
+  max_num_steps: 300
+  val_at_start: true
+  max_val_samples: 560
+  val_batch_size: 560
+  val_num_generations_per_prompt: 4
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 8
+    recompute_kv_cache_after_weight_updates: false
+    version_point_gradient: true
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+checkpointing:
+  enabled: true
+  save_period: 25
+  metric_name: null
+  keep_top_k: 1
+policy:
+  model_name: Qwen/Qwen3-8B-Base
+  tokenizer:
+    name: Qwen/Qwen3-8B-Base
+    chat_template: '{% for message in messages %}{% if message[''role''] == ''user''
+      %}User: {{ message[''content''] }}
+
+      Assistant:{% else %}{{ message[''content''] }}{% endif %}{% endfor %}'
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 2
+  max_total_sequence_length: 9216
+  make_sequence_length_divisible_by: 64
+  sequence_packing:
+    enabled: false
+  megatron_cfg:
+    batch_invariant_mode: true
+    batch_invariant_backend: te_native
+    batch_invariant_collective: ordered
+    attention_backend: flash
+    flash_attention_version: 4
+    env_vars:
+      PYTORCH_ALLOC_CONF: expandable_segments:True
+      CUBLASLT_WORKSPACE_SIZE: '0'
+      CUBLAS_WORKSPACE_CONFIG: :0:0
+    optimizer:
+      lr: 1.0e-05
+      min_lr: 1.0e-05
+    checkpoint:
+      async_save: false
+  generation:
+    backend: megatron
+    refit_transport: mcore
+    max_new_tokens: 8192
+    stop_strings:
+    - 'User:'
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 2
+    mcore_generation_config:
+      refit_backend: nccl
+      kv_cache_management_mode: persist
+      logprobs_mode: raw_logprobs
+      buffer_size_gb: 80
+      max_tokens: 65536
+      max_model_len: 9216
+data:
+  _override_: true
+  max_input_seq_length: 1024
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    dataset_name: ResponseDataset
+    data_path: hf://datasets/hkust-nlp/SimpleRL-Zoo-Data/simplelr_qwen_level3to5/train.parquet
+    input_key: question
+    output_key: gt_answer
+    split: train
+    split_validation_size: 0
+  validation:
+  - dataset_name: AIME2024
+  - dataset_name: AIME2025
+  - dataset_name: ResponseDataset
+    data_path: HuggingFaceH4/MATH-500
+    split: test
+    input_key: problem
+    output_key: answer
+  default:
+    prompt_file: examples/prompts/qwen_math_boxed.txt
+    system_prompt_file: null
+    processor: math_hf_data_processor
+    env_name: math
+env:
+  math:
+    num_workers: 16
+logger:
+  log_dir: logs/grpo-qwen3-8b-base-1n4g-megatron-async-vpg
+  tensorboard_enabled: true
+cluster:
+  gpus_per_node: 4

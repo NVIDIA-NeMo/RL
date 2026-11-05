@@ -221,6 +221,8 @@ If no `replay_buffer.pt` file is found in the latest checkpoint directory, train
 
 5. **Recompute KV Cache After Weight Updates**: `recompute_kv_cache_after_weight_updates` defaults to `true` to invalidate reusable KV/prefix caches when weights change. On the native async vLLM in-flight path, caches are cleared while generation is paused, so preserved requests recompute their KV after resuming. This repeats prefill for those requests and can reduce throughput. SGLang always flushes KV inside its weight synchronizer before the transfer, regardless of this flag; on its in-flight path, the collector skips a second flush after generation resumes. Other refit paths keep their existing post-update invalidation behavior. Set the flag to `false` to retain pre-update KV caches and avoid this recomputation cost on backends that support doing so. On the Megatron generation backend, the flag must agree with `policy.generation.mcore_generation_config.kv_cache_management_mode`: use `true` with `recompute`, or explicitly set `false` with `persist`/`offload`; setup errors on a mismatch.
 
+6. **Version-Point Gradients**: With a large `max_trajectory_age_steps`, set `version_point_gradient: true` (Megatron policy) to compute each batch's gradient at the weights that generated it, where the IS weight is 1, instead of IS-correcting it at the current weights. See [Version-Point Gradients](vpg.md).
+
 ## Why Importance Sampling Correction Is Required for Async
 
 ### The GRPO Objective

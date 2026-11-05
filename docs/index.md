@@ -339,6 +339,7 @@ guides/deepseek.md
 guides/models/index.md
 model-quirks.md
 guides/async-grpo.md
+guides/vpg.md
 guides/single-controller.md
 guides/context-compaction.md
 guides/quantization-aware-rl.md
