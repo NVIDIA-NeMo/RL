@@ -54,7 +54,7 @@ rollout manager updates it as rollouts run.
 
 ## How the Controller Uses It
 
-The controller builds one `RolloutParts` in `__init__` and hands it to both halves:
+The controller builds one `RolloutParts` and hands it to both halves:
 
 ```python
 rollout_parts = RolloutParts(master_config=..., dp_client=..., buffer=..., dataloader=...,
@@ -70,18 +70,8 @@ self._rollout_restorer = RolloutRestorer(rollout_parts, algo_cfg=..., buffer_cap
 ```
 
 The two halves share only these parts, of which only `runtime_state` changes, and never
-call each other. Every call the controller makes:
-
-| Where | Call |
-|---|---|
-| `_run_pumps`, before the pumps start | `environment_checkpoint.check_startup()`, the weight sync, then `_rollout_restorer.restore()`; if it returns `True`, the controller turns on ledger-recorded dispatch |
-| `_run_pumps` | `_rollout_snapshots.run()` as a background task when `snapshot_attempt_interval_s` is set, and `stop_requested` when it returns |
-| Rollout pump, before the dataloader | `_rollout_restorer.redispatch_restored(launch, admit)` when dispatch records prompt groups |
-| Train pump | `begin_optimizer_commit(drain_snapshot=...)` where the model update lands, `end_optimizer_commit()` once the step's TQ cleanup and counters publish |
-| `_save_checkpoint` | `async with _rollout_snapshots.trainer_checkpoint():` around the whole trainer save, after publishing any save still pending |
-| `_save_checkpoint_impl`, under the exclusive cut | `_rollout_snapshots.capture(cut, path, "trainer_checkpoint")`, then `write_controller_sidecars(path, captured)` before `_publish_when_policy_write_done` |
-| `_finish_pending_save` | `async with _rollout_snapshots.trainer_checkpoint():` around publishing a save that `defer_async_checkpoint_finalize` left pending |
-| `_publish_when_policy_write_done`, `_finish_pending_save` | `_rollout_snapshots.trainer_checkpoint_published()` once a trainer checkpoint is published |
+call each other. The controller calls only their public methods; see the
+`RolloutSnapshotter` and `RolloutRestorer` docstrings.
 
 Neither half reads controller fields. They read the training counters through the
 `read_progress` callback, which returns the controller's live values on every call, and
@@ -183,18 +173,12 @@ on a checkpoint to start new work.
 
 ## The Environment Interface
 
-An environment backend that keeps rollout state between turns implements
-`EnvironmentCheckpoint`:
-
-| Member | Purpose |
-|---|---|
-| `holds_rollout_state` | Whether rollout snapshots must capture this backend. |
-| `check_startup()` | Refuse, or warn about, a deployment that cannot recover as configured. Gym: restart-only servers. |
-| `snapshot(path)` | Pause the backend, save its rollouts and yield an `EnvironmentSnapshot`; resume on exit. |
-| `EnvironmentSnapshot.check_against_cut(cut)` | Under the TQ cut, require the backend's rollouts to match the ledger. |
-| `EnvironmentSnapshot.metrics(paused_seconds)` | Backend metrics logged with the snapshot. |
-| `restored(path)` | Restore the backend's rollouts and yield the attempts it continued and the staging rows they reference; drop them if the rest of restore fails. |
-| `is_unavailable(error)` | Whether a failed snapshot only met a briefly unreachable backend, so the next attempt can retry. |
+An environment backend that keeps rollout state between turns implements the
+`EnvironmentCheckpoint` protocol in
+[`interfaces.py`](../../nemo_rl/environments/checkpointing/interfaces.py); its method
+docstrings describe each member, and
+[`GymEnvironmentCheckpoint`](../../nemo_rl/environments/checkpointing/nemo_gym.py) is the
+Gym implementation.
 
 `NoEnvironmentCheckpoint` is the backend that keeps nothing. `build_environment_checkpoint`
 picks Gym when `rollout_recovery.target_level` is `turn`. A new backend implements the
@@ -210,7 +194,8 @@ original names (`gym_instance_id`, `gym_attempt`), so older checkpoints restore.
   that names an environment backend's concepts belongs in that backend's module, behind
   `EnvironmentCheckpoint`.
 - New rollout-checkpointing behavior goes in this package and is reached through the
-  calls listed above, not through new controller methods or new branches in the pumps.
+  snapshotter's and restorer's public methods, not through new controller methods or new
+  branches in the pumps.
 - State that the pumps change and checkpoints save belongs in `RolloutRuntimeState`.
 - Changing what a checkpoint saves changes its format: bump the relevant schema version
   and keep reading the previous one.
