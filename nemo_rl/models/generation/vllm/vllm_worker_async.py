@@ -50,6 +50,10 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.experience.interfaces import (
+    NEMO_GYM_MODEL_SAMPLING_HEADER,
+    NEMO_GYM_MODEL_SAMPLING_NULL,
+)
 from nemo_rl.experience.route_assembly import boundary_route_rows
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -1638,13 +1642,6 @@ class VllmAsyncGenerationWorkerImpl(
         async def create_chat_completion(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
-            # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
-            # Right now we explicitly assert set this to -1.
-            assert request.top_k in (None, -1), (
-                f"Top k sampling parameter must be unset, empty, or -1. Got `{request.top_k}`"
-            )
-            request.top_k = -1
-
             # The request sampling params need to exactly match those as are set in NeMo RL.
             # If they do not match, the inference will be off policy and destroy training
             # stability. Validation rollouts are the one exception: they are stamped with
@@ -1653,31 +1650,42 @@ class VllmAsyncGenerationWorkerImpl(
             # caller that constructs a non-train GenerationSamplingParams. Multi-turn
             # agents issue their own requests, so this server-side check is the one
             # chokepoint they all pass.
-            # vLLM resolves an unset top_p from the model's generation_config.json
-            # (ModelConfig.generation_config defaults to "auto"), NOT to 1.0, so a
-            # request omitting it would sample off-policy while passing this check.
-            assert request.top_p is not None, (
-                "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
-                "resolved by vLLM from the model's generation_config.json and would "
-                "bypass the on-policy sampling check."
-            )
-            request_top_p = request.top_p
-            is_train_sampling = (
-                request.temperature == generation_config["temperature"]
-                and request_top_p == generation_config["top_p"]
-            )
-            is_val_sampling = (
-                request.temperature == generation_config["val_temperature"]
-                and request_top_p == generation_config["val_top_p"]
-            )
-            assert is_train_sampling or is_val_sampling, (
-                f"request sampling (temperature={request.temperature}, "
-                f"top_p={request.top_p}) matches neither the train sampling params "
-                f"(temperature={generation_config['temperature']}, "
-                f"top_p={generation_config['top_p']}) nor the validation sampling "
-                f"params (val_temperature={generation_config['val_temperature']}, "
-                f"val_top_p={generation_config['val_top_p']})"
-            )
+            # Gym marks an untrained caller's call, such as an LLM judge's, which keeps its own sampling.
+            if (
+                raw_request.headers.get(NEMO_GYM_MODEL_SAMPLING_HEADER)
+                != NEMO_GYM_MODEL_SAMPLING_NULL
+            ):
+                # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
+                # Right now we explicitly assert set this to -1.
+                assert request.top_k in (None, -1), (
+                    f"Top k sampling parameter must be unset, empty, or -1. Got `{request.top_k}`"
+                )
+                request.top_k = -1
+                # vLLM resolves an unset top_p from the model's generation_config.json
+                # (ModelConfig.generation_config defaults to "auto"), NOT to 1.0, so a
+                # request omitting it would sample off-policy while passing this check.
+                assert request.top_p is not None, (
+                    "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
+                    "resolved by vLLM from the model's generation_config.json and would "
+                    "bypass the on-policy sampling check."
+                )
+                request_top_p = request.top_p
+                is_train_sampling = (
+                    request.temperature == generation_config["temperature"]
+                    and request_top_p == generation_config["top_p"]
+                )
+                is_val_sampling = (
+                    request.temperature == generation_config["val_temperature"]
+                    and request_top_p == generation_config["val_top_p"]
+                )
+                assert is_train_sampling or is_val_sampling, (
+                    f"request sampling (temperature={request.temperature}, "
+                    f"top_p={request.top_p}) matches neither the train sampling params "
+                    f"(temperature={generation_config['temperature']}, "
+                    f"top_p={generation_config['top_p']}) nor the validation sampling "
+                    f"params (val_temperature={generation_config['val_temperature']}, "
+                    f"val_top_p={generation_config['val_top_p']})"
+                )
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(
