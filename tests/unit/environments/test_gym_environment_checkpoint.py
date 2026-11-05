@@ -94,15 +94,11 @@ def test_turn_checkpoint_drains_on_wire_reply_before_tq_cut(tmp_path: Path) -> N
                 )
 
         completion = asyncio.create_task(complete_on_wire_reply())
-        async with snapshot_commit(
-            gym,
-            tmp_path,
-            checkpoint_id="save-1",
-        ) as gym_commit:
-            assert gym_commit is not None
-            assert gym_commit.manifest.instances == {"tools/replica-0": ()}
+        async with gym.snapshot(tmp_path, checkpoint_id="save-1") as snapshot:
+            assert snapshot is not None
+            assert snapshot.commit.manifest.instances == {"tools/replica-0": ()}
             async with barrier.checkpoint() as cut:
-                await gym.validate_cut(cut, gym_commit, checkpoint_path=tmp_path)
+                await snapshot.check_against_cut(cut)
                 assert ledger.expected_staging_keys() == {"on-wire/call-0"}
                 actor.mark("tq-cut")
         await asyncio.wait_for(completion, _ASYNC_TEST_TIMEOUT_S)
@@ -461,14 +457,10 @@ def test_turn_checkpoint_leaves_gym_restarts_out_and_records_them(
         actor = FakeGymActor(live={saved, restart}, restarts=(restart,))
         gym = gym_environment_checkpoint(gym_coordinator(actor), ledger)
 
-        async with snapshot_commit(
-            gym,
-            tmp_path,
-            checkpoint_id="save-1",
-        ) as gym_commit:
-            assert gym_commit is not None
+        async with gym.snapshot(tmp_path, checkpoint_id="save-1") as snapshot:
+            assert snapshot is not None
             async with barrier.checkpoint() as cut:
-                await gym.validate_cut(cut, gym_commit, checkpoint_path=tmp_path)
+                await snapshot.check_against_cut(cut)
 
         (commit,) = [call for call in actor.calls if call[0] == "commit"]
         assert commit[1][2] == (saved,)
@@ -493,14 +485,10 @@ def test_turn_checkpoint_rejects_missing_gym_staging_key(tmp_path: Path) -> None
         gym = gym_environment_checkpoint(gym_coordinator(actor), ledger)
 
         with pytest.raises(RuntimeError, match="staging rows missing"):
-            async with snapshot_commit(
-                gym,
-                tmp_path,
-                checkpoint_id="save-1",
-            ) as gym_commit:
-                assert gym_commit is not None
+            async with gym.snapshot(tmp_path, checkpoint_id="save-1") as snapshot:
+                assert snapshot is not None
                 async with barrier.checkpoint() as cut:
-                    await gym.validate_cut(cut, gym_commit, checkpoint_path=tmp_path)
+                    await snapshot.check_against_cut(cut)
 
         assert actor.operations()[-1] == "resume"
 
@@ -785,10 +773,10 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
     async def _save(
         gym: Any, barrier: DataPlaneCheckpointBarrier, tmp_path: Path
     ) -> None:
-        async with snapshot_commit(gym, tmp_path, checkpoint_id="save-1") as gym_commit:
-            assert gym_commit is not None
+        async with gym.snapshot(tmp_path, checkpoint_id="save-1") as snapshot:
+            assert snapshot is not None
             async with barrier.checkpoint() as cut:
-                await gym.validate_cut(cut, gym_commit, checkpoint_path=tmp_path)
+                await snapshot.check_against_cut(cut)
 
     @staticmethod
     def _assert_restorable(
@@ -920,18 +908,14 @@ class TestARowDroppedDuringACheckpointDoesNotFailIt:
             coordinator = gym_coordinator(FakeGymActor(live={row_0, row_1}))
             gym = gym_environment_checkpoint(coordinator, ledger)
 
-            async with snapshot_commit(
-                gym, tmp_path, checkpoint_id="save-1"
-            ) as gym_commit:
-                assert gym_commit is not None
+            async with gym.snapshot(tmp_path, checkpoint_id="save-1") as snapshot:
+                assert snapshot is not None
                 await self._drop(ledger, barrier, group.group_id, [0])
                 # Take the drop off the retire queue, as if RL never queued it.
                 ledger.mark_environment_retired({"tools/replica-0": [row_0]})
                 async with barrier.checkpoint() as cut:
                     with pytest.raises(RuntimeError, match="ownership changed"):
-                        await gym.validate_cut(
-                            cut, gym_commit, checkpoint_path=tmp_path
-                        )
+                        await snapshot.check_against_cut(cut)
 
         asyncio.run(exercise())
 

@@ -129,9 +129,78 @@ class GymEnvironmentSnapshot:
         return sum(len(episodes) for episodes in self.commit.manifest.restarts.values())
 
     async def check_against_cut(self, cut: DataPlaneMutationCut) -> None:
-        await self.checkpoint.validate_cut(
-            cut, self.commit, checkpoint_path=self.checkpoint_path
-        )
+        """Require Gym ownership and referenced staging rows to match this cut.
+
+        Gym may have exported episodes RL dropped while it was prepared: it
+        refuses their retire until resume, so they are still queued for one.
+        They and their staged rows are left out of the saved manifest, since
+        restore requires it to match RL's inventory and RL no longer continues
+        them; a dropped group may already have cleaned those rows up.
+        """
+        cut.require_live()
+        checkpoint, commit = self.checkpoint, self.commit
+        coordinator = checkpoint.coordinator
+        actual = checkpoint.inventory()
+        expected = commit.manifest.instances
+        dropped = checkpoint._queued_retirements()
+        mismatches = {}
+        kept: dict[str, tuple[GymCheckpointEpisode, ...]] = {}
+        kept_restarts: dict[str, tuple[GymCheckpointEpisode, ...]] = {}
+        for instance_id in coordinator.instance_ids:
+            owned = set(actual[instance_id])
+            exported = set(expected[instance_id])
+            restarted = set(commit.manifest.restarts[instance_id])
+            if (
+                owned - exported - restarted
+                or not exported - owned <= dropped[instance_id]
+            ):
+                mismatches[instance_id] = {
+                    "expected": sorted(exported, key=repr),
+                    "restarts": sorted(restarted, key=repr),
+                    "actual": sorted(owned, key=repr),
+                }
+            kept[instance_id] = tuple(
+                episode for episode in expected[instance_id] if episode in owned
+            )
+            # A restart that finished during the snapshot is no longer RL's.
+            kept_restarts[instance_id] = tuple(
+                episode
+                for episode in commit.manifest.restarts[instance_id]
+                if episode in owned
+            )
+        if mismatches:
+            raise RuntimeError(
+                "Gym episode ownership changed after commit and before the TQ cut: "
+                f"{mismatches!r}"
+            )
+        staging_keys = {
+            instance_id: staging_keys_of(
+                commit.instances[instance_id], kept[instance_id]
+            )
+            for instance_id in coordinator.instance_ids
+        }
+        if kept != expected or kept_restarts != commit.manifest.restarts:
+            await asyncio.to_thread(
+                write_gym_checkpoint_manifest,
+                self.checkpoint_path,
+                replace(
+                    commit.manifest,
+                    instances=kept,
+                    staging_keys=staging_keys,
+                    restarts=kept_restarts,
+                ),
+            )
+
+        expected_staging_keys = {key for keys in staging_keys.values() for key in keys}
+        if not expected_staging_keys:
+            return
+        actual_staging_keys = set(await checkpoint._list_staging_keys())
+        missing = sorted(expected_staging_keys - actual_staging_keys)
+        if missing:
+            raise RuntimeError(
+                "Gym checkpoint references staging rows missing from live TQ state: "
+                f"missing={missing[:10]!r} (total={len(missing)})"
+            )
 
     def metrics(self, paused_seconds: float) -> dict[str, float]:
         return {
@@ -427,85 +496,6 @@ class GymEnvironmentCheckpoint:
                 self._rollout_manager.resume_request_deadlines(
                     _GYM_CHECKPOINT_DEADLINE_HOLDER
                 )
-
-    async def validate_cut(
-        self,
-        cut: DataPlaneMutationCut,
-        commit: GymCheckpointCommitResult,
-        *,
-        checkpoint_path: Path,
-    ) -> None:
-        """Require Gym ownership and referenced staging rows to match this cut.
-
-        Gym may have exported episodes RL dropped while it was prepared: it
-        refuses their retire until resume, so they are still queued for one.
-        They and their staged rows are left out of the saved manifest, since
-        restore requires it to match RL's inventory and RL no longer continues
-        them; a dropped group may already have cleaned those rows up.
-        """
-        cut.require_live()
-        coordinator = self.coordinator
-        actual = self.inventory()
-        expected = commit.manifest.instances
-        dropped = self._queued_retirements()
-        mismatches = {}
-        kept: dict[str, tuple[GymCheckpointEpisode, ...]] = {}
-        kept_restarts: dict[str, tuple[GymCheckpointEpisode, ...]] = {}
-        for instance_id in coordinator.instance_ids:
-            owned = set(actual[instance_id])
-            exported = set(expected[instance_id])
-            restarted = set(commit.manifest.restarts[instance_id])
-            if (
-                owned - exported - restarted
-                or not exported - owned <= dropped[instance_id]
-            ):
-                mismatches[instance_id] = {
-                    "expected": sorted(exported, key=repr),
-                    "restarts": sorted(restarted, key=repr),
-                    "actual": sorted(owned, key=repr),
-                }
-            kept[instance_id] = tuple(
-                episode for episode in expected[instance_id] if episode in owned
-            )
-            # A restart that finished during the snapshot is no longer RL's.
-            kept_restarts[instance_id] = tuple(
-                episode
-                for episode in commit.manifest.restarts[instance_id]
-                if episode in owned
-            )
-        if mismatches:
-            raise RuntimeError(
-                "Gym episode ownership changed after commit and before the TQ cut: "
-                f"{mismatches!r}"
-            )
-        staging_keys = {
-            instance_id: staging_keys_of(
-                commit.instances[instance_id], kept[instance_id]
-            )
-            for instance_id in coordinator.instance_ids
-        }
-        if kept != expected or kept_restarts != commit.manifest.restarts:
-            await asyncio.to_thread(
-                write_gym_checkpoint_manifest,
-                Path(checkpoint_path),
-                replace(
-                    commit.manifest,
-                    instances=kept,
-                    staging_keys=staging_keys,
-                    restarts=kept_restarts,
-                ),
-            )
-
-        expected_staging_keys = {key for keys in staging_keys.values() for key in keys}
-        if not expected_staging_keys:
-            return
-        actual_staging_keys = set(await self._list_staging_keys())
-        missing = sorted(expected_staging_keys - actual_staging_keys)
-        if missing:
-            raise RuntimeError(
-                "Gym checkpoint references staging rows missing from live TQ state: "
-                f"missing={missing[:10]!r} (total={len(missing)})"
-            )
 
     # ── restore ───────────────────────────────────────────────────────────
 
