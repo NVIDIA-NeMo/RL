@@ -335,7 +335,8 @@ def _fp8_kv_worker() -> Any:
         export_hf_weights=MagicMock(return_value=iter(()))
     )
     worker.cfg = {
-        "generation": {"backend": "vllm", "vllm_cfg": {"kv_cache_dtype": "fp8_e4m3"}}
+        "megatron_cfg": {"pipeline_model_parallel_size": 1},
+        "generation": {"backend": "vllm", "vllm_cfg": {"kv_cache_dtype": "fp8_e4m3"}},
     }
     return worker
 
@@ -417,6 +418,42 @@ def test_fp8_kv_scales_are_not_emitted_without_refittable_scales(
             {},
             id="mla",
         ),
+        pytest.param(
+            [
+                _bridge_task(
+                    "decoder.layers.0.self_attention.linear_qkv.weight",
+                    {p: f"model.layers.0.self_attn.{p}_proj.weight" for p in "qkv"},
+                ),
+                # FP8 export adds a scale task beside each FP8 weight.
+                _bridge_task(
+                    "decoder.layers.0.self_attention.linear_qkv.weight_scale_inv",
+                    {p: f"model.layers.0.self_attn.{p}_proj.weight" for p in "qkv"},
+                ),
+                _bridge_task(
+                    "decoder.layers.0.mlp.linear_fc2.weight",
+                    "model.layers.0.mlp.down_proj.weight",
+                ),
+                _bridge_task(
+                    "mtp.layers.0.mtp_model_layer.self_attention.linear_qkv.weight",
+                    {p: f"mtp.layers.0.self_attn.{p}_proj.weight" for p in "qkv"},
+                ),
+            ],
+            {
+                "decoder.layers.0.self_attention": "model.layers.0.self_attn",
+                "mtp.layers.0.mtp_model_layer.self_attention": "mtp.layers.0.self_attn",
+            },
+            id="dense",
+        ),
+        pytest.param(
+            [
+                _bridge_task(
+                    "decoder.layers.0.self_attention.linear_qkv.to_wrap.weight",
+                    {p: f"model.layers.0.self_attn.{p}_proj.weight" for p in "qkv"},
+                ),
+            ],
+            {"decoder.layers.0.self_attention": "model.layers.0.self_attn"},
+            id="lora",
+        ),
     ],
 )
 def test_hf_attention_prefixes_cover_only_language_model_qkv_attention(
@@ -427,6 +464,14 @@ def test_hf_attention_prefixes_cover_only_language_model_qkv_attention(
     )
 
     assert get_hf_attention_prefixes(tasks) == expected
+
+
+def test_fp8_kv_scales_reject_pipeline_parallelism() -> None:
+    worker = _fp8_kv_worker()
+    worker.cfg["megatron_cfg"]["pipeline_model_parallel_size"] = 2
+
+    with pytest.raises(NotImplementedError, match="pipeline_model_parallel_size=1"):
+        list(worker._iter_params_with_optional_kv_scales())
 
 
 @pytest.mark.parametrize("include_q", [True, False])
@@ -501,7 +546,8 @@ def test_calibrate_qkv_fp8_scales_keys_hybrid_and_mtp_attention(
         )
 
     worker = _fp8_kv_worker()
-    worker.model = model
+    # DDP(Float16Module(model)) names modules "module.module.decoder...".
+    worker.model = torch.nn.ModuleDict({"module": model})
     worker.get_logprobs = get_logprobs
 
     result = worker.calibrate_qkv_fp8_scales(data=None, margin=1.0, include_q=include_q)
@@ -518,6 +564,25 @@ def test_calibrate_qkv_fp8_scales_keys_hybrid_and_mtp_attention(
     assert result["layers"].keys() == expected.keys()
     for name, value in expected.items():
         assert result["layers"][name] == pytest.approx(value)
+
+
+def test_calibrate_qkv_fp8_scales_rejects_unhooked_attention() -> None:
+    core = torch.nn.Identity()
+    worker = _fp8_kv_worker()
+    # The map also has the MTP attention, which this model lacks.
+    worker.model = SimpleNamespace(
+        eval=lambda: None,
+        named_modules=lambda: [
+            ("module.module.decoder.layers.4.self_attention.core_attention", core)
+        ],
+    )
+    worker.get_logprobs = MagicMock()
+
+    with pytest.raises(ValueError, match="no core_attention"):
+        worker.calibrate_qkv_fp8_scales(data=None, include_q=True)
+
+    worker.get_logprobs.assert_not_called()
+    assert not core._forward_pre_hooks
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])

@@ -188,9 +188,11 @@ def get_vllm_qkv_scale_names(attention_prefix: str) -> dict[str, str]:
     Returns:
         Dictionary mapping 'q_scale', 'k_scale' and 'v_scale' to the scales of
         the vLLM ``Attention`` submodule (``attn``) under ``attention_prefix``.
-        These are vLLM's own parameter names, so the cache-scale remapping in
-        ``maybe_remap_kv_scale_name`` leaves them unchanged; the model's
-        HF-to-vLLM mapper still rewrites the root prefix (e.g. ``backbone``).
+        These are vLLM's own parameter names, so vLLM's KV-scale remapping
+        (``QuantizationConfig.get_cache_scale_mapper`` in ``AutoWeightsLoader``,
+        or ``maybe_remap_kv_scale_name`` in hand-written loaders) leaves them
+        unchanged; the model's HF-to-vLLM mapper still rewrites the root prefix
+        (e.g. ``backbone``).
 
     Example:
         >>> get_vllm_qkv_scale_names("backbone.layers.4.mixer")
@@ -212,14 +214,17 @@ def get_hf_attention_prefixes(conversion_tasks: Iterable[Any]) -> dict[str, str]
     The Megatron-Bridge mapping of ``<module>.linear_qkv.weight`` names the HF
     Q (or fused QKV) projection, whose parent is the HF attention module:
     ``decoder.layers.4.self_attention`` -> ``backbone.layers.4.mixer`` for
-    NemotronH, ``model.layers.4.self_attn`` for Llama/Qwen, and MTP layers map
-    to their own ``mtp.*`` names. Only language-model attention layers appear:
-    hybrid models get no entries for Mamba or MoE layers, multimodal models none
-    for their encoders, and MLA models (no ``linear_qkv``) none at all.
+    NemotronH and ``model.layers.4.self_attn`` for Llama/Qwen. MTP layers keep
+    the HF name the bridge gives them (``mtp.layers.0.mixer`` for NemotronH,
+    ``model.layers.<num_layers + i>.self_attn`` for GLM-4.5). Only
+    language-model attention layers appear: hybrid models get no entries for
+    Mamba or MoE layers, multimodal models none for their encoders, and MLA
+    models (no ``linear_qkv``) none at all.
 
     Args:
-        conversion_tasks: Megatron-Bridge ``WeightConversionTask`` objects;
-            ``None`` entries (parameters owned by other ranks) are skipped.
+        conversion_tasks: Megatron-Bridge ``WeightConversionTask`` objects.
+            Tasks for parameters on other pipeline stages are present too (with
+            no local module), so every rank gets the full map.
 
     Returns:
         Dictionary from the unwrapped global Megatron module name to the HF
@@ -227,15 +232,17 @@ def get_hf_attention_prefixes(conversion_tasks: Iterable[Any]) -> dict[str, str]
     """
     prefixes = {}
     for task in conversion_tasks:
-        if (
-            task is None
-            or not task.global_param_name.endswith(_ATTENTION_QKV_SUFFIX)
-            or not _LANGUAGE_ATTENTION_PREFIX.match(task.global_param_name)
-        ):
+        if task is None:
+            continue
+        # LoRA keeps the wrapped base weight as "<module>.linear_qkv.to_wrap.weight".
+        megatron_name = task.global_param_name.replace(".to_wrap.", ".")
+        if not megatron_name.endswith(
+            _ATTENTION_QKV_SUFFIX
+        ) or not _LANGUAGE_ATTENTION_PREFIX.match(megatron_name):
             continue
         hf_param = task.mapping.hf_param
         hf_name = hf_param["q"] if isinstance(hf_param, dict) else hf_param
-        megatron_prefix = task.global_param_name.removesuffix(_ATTENTION_QKV_SUFFIX)
+        megatron_prefix = megatron_name.removesuffix(_ATTENTION_QKV_SUFFIX)
         prefixes[megatron_prefix] = hf_name.rsplit(".", 2)[0]
     return prefixes
 

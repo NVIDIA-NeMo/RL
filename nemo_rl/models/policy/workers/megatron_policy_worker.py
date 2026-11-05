@@ -3690,6 +3690,11 @@ class MegatronPolicyWorkerImpl(
                 get_hf_attention_prefixes,
             )
 
+            # Calibration hooks see each stage's local layer names; the map uses global ones.
+            if self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1:
+                raise NotImplementedError(
+                    "FP8 KV cache scales require pipeline_model_parallel_size=1."
+                )
             conversion_tasks = self.refit_conversion_tasks
             if conversion_tasks is None:
                 conversion_tasks = self.megatron_bridge.get_conversion_tasks(
@@ -3700,7 +3705,9 @@ class MegatronPolicyWorkerImpl(
                 raise ValueError(
                     "FP8 KV cache needs per-layer attention scales, but no "
                     "language-model 'self_attention.linear_qkv' weight was found "
-                    "in the Megatron-Bridge conversion tasks of this model."
+                    "in the Megatron-Bridge conversion tasks of this model. MLA "
+                    "attention has no per-tensor KV-scale refit; use "
+                    "kv_cache_dtype='auto'."
                 )
             self._fp8_kv_attention_prefixes = prefixes
         return self._fp8_kv_attention_prefixes
@@ -5343,13 +5350,7 @@ class MegatronPolicyWorkerImpl(
         def _extract_layer_key(module_name: str) -> str:
             # Language-model (or MTP) core attention -> the HF attention module
             # that owns its vLLM scales.
-            megatron_prefix = _megatron_attention_prefix(module_name)
-            if megatron_prefix not in attention_prefixes:
-                raise ValueError(
-                    f"No HF attention module for {module_name!r}; known Megatron "
-                    f"attention modules: {sorted(attention_prefixes)}"
-                )
-            return attention_prefixes[megatron_prefix]
+            return attention_prefixes[_megatron_attention_prefix(module_name)]
 
         # Hook to capture q/k/v after q/k norm and RoPE
         def _pre_hook_builder_core_attention(module_name: str):
@@ -5401,6 +5402,14 @@ class MegatronPolicyWorkerImpl(
         # Calibration batches are prompt-only model inputs, not rollout replay
         # batches, so they intentionally do not carry routed_experts.
         try:
+            hooked = {
+                _megatron_attention_prefix(name) for name, _, _ in matched_modules
+            }
+            if missing := sorted(set(attention_prefixes) - hooked):
+                # An unhooked attention layer would silently keep scale 1.0.
+                raise ValueError(
+                    f"FP8 KV calibration found no core_attention for {missing}."
+                )
             _ = self.get_logprobs(
                 data=data,
                 micro_batch_size=micro_batch_size,
