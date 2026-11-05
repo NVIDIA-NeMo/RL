@@ -2249,6 +2249,7 @@ def setup_single_controller(
             token_capture_cfg.staging_partition,
             capture_media=capture_media,
             top_logprobs=master_config.policy["generation"]["top_logprobs"],
+            invalidate_rewritten_history=token_capture_cfg.invalidate_rewritten_history,
         )
         if capture_media and media_columns is None:
             raise RuntimeError(
@@ -2330,6 +2331,10 @@ def setup_single_controller(
                 capture_media=capture_media,
                 media_columns=media_columns,
                 forest_penalty_scope=token_capture_cfg.forest_penalty_scope,
+                owner_failure_scope=token_capture_cfg.owner_failure_scope,
+                invalid_group_policy=token_capture_cfg.invalid_group_policy,
+                mask_retried_roots=token_capture_cfg.mask_retried_roots,
+                forest_truncation_scope=token_capture_cfg.forest_truncation_scope,
                 effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config

@@ -649,6 +649,7 @@ class MegatronGeneration(GenerationInterface):
         *,
         capture_media: bool = False,
         top_logprobs: int = 0,
+        invalidate_rewritten_history: bool = False,
     ) -> "Optional[MediaColumnSpec]":
         """Install MInf's canonical prompt and completion capture hooks.
 
@@ -658,6 +659,10 @@ class MegatronGeneration(GenerationInterface):
         if top_logprobs != 0:
             raise NotImplementedError(
                 "Megatron generation does not capture sampler top-k"
+            )
+        if invalidate_rewritten_history:
+            raise NotImplementedError(
+                "token_capture.invalidate_rewritten_history requires vLLM generation"
             )
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
             raise ValueError(

@@ -1152,6 +1152,12 @@ class NemoGym(EnvironmentInterface):
         self._selection_policy = (
             capture_config["selection_policy"] if self._forest_training else None
         )
+        self._max_rows_per_rollout = (
+            capture_config["max_rows_per_rollout"] if self._forest_training else None
+        )
+        self._unserved_call_failure = (
+            capture_config["unserved_call_failure"] if self._forest_training else None
+        )
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
         # actually happened instead of an AttributeError from deep inside a rollout.
@@ -2105,10 +2111,18 @@ Depending on your data shape, you may want to change these values."""
         """Select capture paths while retaining the scored terminal's identity."""
         # Optional Gym dependencies remain confined to the Gym adapter.
         from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
-        from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
+        from nemo_gym.token_id_capture import (
+            UNCOMMITTED_CALL_REASON,
+            UNSERVED_CALL_FAILURE_REASONS,
+        )
         from nemo_gym.token_id_capture.staging.records import RolloutManifest
 
-        from nemo_rl.environments.call_selection import resolve_selection_policy
+        from nemo_rl.environments.call_selection import (
+            TerminalNotIdentified,
+            cap_selected_roots,
+            resolve_scored_terminal,
+            resolve_selection_policy,
+        )
         from nemo_rl.experience.reward_penalties import scored_text_checks
         from nemo_rl.experience.rollout_reassembler import (
             ActionOutputFlags,
@@ -2133,15 +2147,26 @@ Depending on your data shape, you may want to change these values."""
         by_call = {r.model_call_id: r for r in parsed.records}
         # Cancellation can follow a durable commit. Only that settled failure
         # may reach selection; pending writes and missing custody still mask.
+        # unserved_call_failure=ignore also lets calls that served nothing reach it.
+        ignored_reasons = (
+            UNSERVED_CALL_FAILURE_REASONS
+            if self._unserved_call_failure == "ignore"
+            else frozenset()
+        )
         capture_failed = bool(
             parsed.pending_call_ids
             or any(
-                f.reason != UNCOMMITTED_CALL_REASON or f.model_call_id not in by_call
+                f.reason not in ignored_reasons
+                and (
+                    f.reason != UNCOMMITTED_CALL_REASON
+                    or f.model_call_id not in by_call
+                )
                 for f in parsed.failures
             )
         )
         selected = []
         terminal_response_id = None
+        terminal_failure = None
         if not capture_failed:
             try:
                 assert self._selection_policy is not None
@@ -2161,6 +2186,16 @@ Depending on your data shape, you may want to change these values."""
                 if any(f.model_call_id in selected_call_ids for f in parsed.failures):
                     capture_failed = True
                     selected = []
+                elif self._max_rows_per_rollout is not None:
+                    selected = cap_selected_roots(
+                        selected, terminal_response_id, self._max_rows_per_rollout
+                    )
+            except TerminalNotIdentified as error:
+                # Mask the owner rather than fail the run; reported per step.
+                print(f"⚠️ Rollout {owner!r} masked: {error}", file=sys.stderr)
+                terminal_failure = str(error)
+                selected = []
+                terminal_response_id = None
             except ValueError as error:
                 raise ValueError(f"Rollout {owner!r}: {error}") from error
         if any(r.response_status is None for r in selected):
@@ -2190,10 +2225,34 @@ Depending on your data shape, you may want to change these values."""
             manifest,
             terminal_response_id=terminal_response_id,
             reward=float(reward),
+            ignored_failure_reasons=ignored_reasons,
         )
         selected_call_ids = {r.model_call_id for r in selected}
+        if selected:
+            # The receipt sees the selection's terminal as declared; record the
+            # stage that actually named it when the policy chose the same call.
+            try:
+                named, terminal_selection, attribution_reason = resolve_scored_terminal(
+                    list(parsed.records), result
+                )
+            except TerminalNotIdentified:
+                named = None
+            if named is not None and named.response_id == terminal_response_id:
+                receipt.update(
+                    terminal_selection=terminal_selection,
+                    terminal_attribution_reason=attribution_reason or None,
+                )
         if capture_failed:
             receipt.update(capture_poisoned=True, failure_reason="capture_incomplete")
+        elif terminal_failure is not None:
+            receipt.update(
+                capture_poisoned=True,
+                failure_reason="terminal_not_identified",
+                terminal_selection=(
+                    "declared" if result.get("terminal_response_id") else "heuristic"
+                ),
+                terminal_attribution_reason=terminal_failure,
+            )
         elif any(
             r.response_status in ("failed", "unknown")
             or (
@@ -2256,6 +2315,7 @@ Depending on your data shape, you may want to change these values."""
         terminal_response_id: Optional[str],
         scored_response: Optional[dict] = None,
         reward: float,
+        ignored_failure_reasons: frozenset[str] = frozenset(),
     ) -> dict:
         """Build the token-free RolloutReceipt payload from a ledger manifest.
 
@@ -2360,10 +2420,12 @@ Depending on your data shape, you may want to change these values."""
                     terminal_record = deduped[selection.terminal_model_call_id]
                 else:
                     selection_reason = selection.reason
+        # Forest's unserved_call_failure=ignore passes the unserved reasons here.
         poisoning_failures = [
             failure
             for failure in failures
             if str(failure.get("reason") or "") != UNCOMMITTED_CALL_REASON
+            and str(failure.get("reason") or "") not in ignored_failure_reasons
         ]
         failure_reason = None
         if poisoning_failures:

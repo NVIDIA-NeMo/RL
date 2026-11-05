@@ -316,6 +316,8 @@ def test_real_collector_streams_episode_and_flat_http_results(
                         "enabled": token_capture,
                         "forest_training": forest_training,
                         "selection_policy": "returned_history",
+                        "max_rows_per_rollout": None,
+                        "unserved_call_failure": "poison",
                     }
                 }
             )
@@ -489,10 +491,9 @@ def test_real_collector_streams_episode_and_flat_http_results(
                 assert result["receipt"]["capture_key"] == capture_key
                 assert result["receipt"]["reward"] == reward
                 assert result["receipt"]["terminal_model_call_id"] == "call-1"
+                # Forest receipts record the stage that named the scored call.
                 assert result["receipt"]["terminal_selection"] == (
-                    "declared"
-                    if forest_training or (multi_agent and index < 2)
-                    else "response_id"
+                    "declared" if multi_agent and index < 2 else "response_id"
                 )
                 assert result["receipt"]["capture_poisoned"] is False
                 if forest_training:
