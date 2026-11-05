@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""MegatronGeneration with policy.generation.dynamo=true: the prefill/decode engines."""
+"""MegatronDynamoGeneration: the prefill/decode engines and their refit side."""
 
 import asyncio
 import copy
@@ -26,6 +26,7 @@ from ray.exceptions import GetTimeoutError
 
 import nemo_rl.models.generation.megatron.dynamo_generation as generation_module
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation import resolve_generation_class
 from nemo_rl.models.generation.megatron.dynamo_config import (
     dynamo_enabled,
     engine_width,
@@ -41,6 +42,8 @@ from tests.unit.models.generation.test_megatron_dynamo_config import (
     MEGATRON_POLICY,
     _megatron_config,
 )
+
+pytestmark = pytest.mark.mcore
 
 # The default config: one prefill and two decode engines per replica, TP 2 each.
 _ROLES = ["prefill", "decode", "decode"]
@@ -262,8 +265,7 @@ class _Env:
 
         make_engine.init_cluster_placement_groups = init_cluster_placement_groups
 
-        # The per-engine MegatronGeneration is looked up by name at build time;
-        # the subclass's own base is untouched.
+        # The per-engine MegatronGeneration is looked up by name at build time.
         monkeypatch.setattr(generation_module, "MegatronGeneration", make_engine)
         monkeypatch.setattr(generation_module, "RayVirtualCluster", make_cluster)
         monkeypatch.setattr(generation_module, "cluster_node_ip", _NodeIpTask())
@@ -497,6 +499,7 @@ def test_engine_config_builds_a_plain_engine_of_its_own_width(role):
 
     assert not dynamo_enabled(engine_config["generation"])
     assert dynamo_enabled(shared["generation"])
+    assert resolve_generation_class(engine_config["generation"]) is MegatronGeneration
     assert MegatronGeneration.nvlink_domain_span(engine_config) == engine_width(
         shared, role
     )
@@ -759,8 +762,8 @@ def test_collective_fans_out_in_record_order_with_rank_prefixes(
     assert full.shard_prefixes == dict(enumerate(prefixes))
     assert full.workers_per_shard == shard_widths
     generation.check_full_fleet(full)
+    # The full fleet is the one membership set_refit_membership accepts.
     generation.set_refit_membership(full)
-    assert generation._refit_membership is full
 
     assert generation.prepare_refit_info({"w": ((1,), "float32")}) is None
     futures = generation.init_collective(

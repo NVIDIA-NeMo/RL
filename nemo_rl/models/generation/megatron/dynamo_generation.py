@@ -50,6 +50,7 @@ from nemo_rl.models.generation.megatron.dynamo_config import (
     validate_megatron_dynamo_generation,
 )
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
+from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.membership import RefitMembership, desired_membership
@@ -154,6 +155,19 @@ class MegatronDynamoEngine:
         instance_id: str,
         node_ip: str,
     ) -> "MegatronDynamoEngine":
+        """The record of a running engine, read off the ``MegatronGeneration`` that owns it.
+
+        Args:
+            generation: The engine's owning object; its worker group supplies
+                the handles.
+            role: ``prefill`` or ``decode``.
+            world_size: Ranks the engine spans.
+            instance_id: ``<role>-<ordinal>``, the engine's name in logs and errors.
+            node_ip: The node every rank of the engine sits on.
+
+        Returns:
+            A record holding the workers in rank order and the single DP shard's leader.
+        """
         group = generation.worker_group
         workers = tuple(group.workers)
         return cls(
@@ -238,7 +252,9 @@ class MegatronDynamoGeneration(GenerationInterface):
     in engine order. Rank placement comes from the shared ``RefitMembership``
     arithmetic: engine ``i`` starts at the trainers plus the widths of the
     engines before it, so a prefill engine at TP 4 may sit next to decode
-    engines at TP 2. The object owns no policy and no worker group of its own.
+    engines at TP 2. After a failed suspend the fleet attempts a best-effort
+    resume of every engine and the original error still propagates. The object
+    owns no policy and no worker group of its own.
 
     Pickling keeps the engine records (plain data plus the workers' actor
     handles) and drops the owning objects, so the SingleController actor's copy
@@ -253,13 +269,21 @@ class MegatronDynamoGeneration(GenerationInterface):
         """Refuse ``policy.generation.dynamo=true`` until rollouts are served.
 
         The Megatron backend's checks run first, then the engines' config is checked
-        so a shape the engines could never serve is named as such; any config is
-        then refused, because the prefill/decode engines are built and refit but
-        no frontend serves rollouts from them yet, and the run would otherwise
-        fail at its first generation.
+        so a shape the engines could never serve is named as such. Router replay
+        is refused next: the KV handoff moves a prompt's cache from a prefill to
+        a decode engine but not its routing-replay buffers. Any config is then
+        refused, because the prefill/decode engines are built and refit but no
+        frontend serves rollouts from them yet, and the run would otherwise fail
+        at its first generation.
         """
         MegatronGeneration.validate_settings(master_config)
         validate_megatron_dynamo_generation(master_config.policy["generation"])
+        if router_replay_enabled(master_config.policy):
+            raise ValueError(
+                "policy.router_replay.enabled must be false when "
+                "policy.generation.dynamo=true: the KV handoff does not transfer "
+                "the prompt's routing-replay buffers."
+            )
         raise NotImplementedError(
             "policy.generation.dynamo=true is not served by MegatronGeneration yet: "
             "the Megatron prefill/decode engines are built and refit, but no "
@@ -320,7 +344,6 @@ class MegatronDynamoGeneration(GenerationInterface):
         self.dp_openai_server_base_urls: list[Optional[str]] = []
         # Installed by setup via create_weight_synchronizer.
         self.weight_synchronizer: Optional[WeightSynchronizer] = None
-        self._refit_membership: Optional[RefitMembership] = None
         self._tokenizer: Optional[PreTrainedTokenizerBase] = tokenizer
         # The engines take the policy config as-is; MegatronGeneration types it.
         self._dynamo_cfg: MegatronDynamoCfg = megatron_dynamo_cfg(self.cfg)
@@ -390,10 +413,12 @@ class MegatronDynamoGeneration(GenerationInterface):
 
     @property
     def inference_world_size(self) -> int:
+        """Ranks across all engines: their widths summed."""
         return sum(self.shard_widths)
 
     @property
     def num_engines(self) -> int:
+        """How many engines run, each a refit shard of its own."""
         return len(self._engine_records)
 
     def get_inference_world_size(self) -> int | None:
@@ -511,9 +536,12 @@ class MegatronDynamoGeneration(GenerationInterface):
         )
 
     def set_refit_membership(self, membership: RefitMembership) -> None:
-        """Record the membership; the engine set is fixed, so it must be every engine."""
+        """Check the membership; the engine set is fixed, so it must be every engine.
+
+        Nothing is stored: every refit call recomputes the full-fleet membership
+        from the engine records, so there is no per-call membership to keep.
+        """
         self.check_full_fleet(membership)
-        self._refit_membership = membership
 
     def init_collective(
         self,
@@ -606,10 +634,10 @@ class MegatronDynamoGeneration(GenerationInterface):
         The caller prepares the weights afterwards, as the Megatron weight
         synchronizer does for one dedicated engine.
 
-        If any step fails or the deadline passes, every engine is resumed
-        before the error propagates, so a failed suspend leaves the engines
-        serving rather than half stopped. Errors from that restore are added to
-        the original error as notes.
+        If any step fails or the deadline passes, the fleet attempts a
+        best-effort resume of every engine and the original error still
+        propagates, with any resume failures added to it as notes. A worker
+        that failed mid-transition may need the next refit to recover.
 
         Args:
             timeout_s: One deadline for the whole suspend; ``None`` uses
@@ -688,6 +716,7 @@ class MegatronDynamoGeneration(GenerationInterface):
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
+        """Not served yet: the engines register with no frontend."""
         raise NotImplementedError(
             "Megatron engines behind Dynamo do not serve rollouts yet; the "
             "engines register with no frontend."
@@ -696,6 +725,7 @@ class MegatronDynamoGeneration(GenerationInterface):
     async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
+        """Not served yet: the engines register with no frontend."""
         raise NotImplementedError(
             "Megatron engines behind Dynamo do not serve rollouts yet; the "
             "engines register with no frontend."
@@ -710,6 +740,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         capture_media: bool = False,
         top_logprobs: int = 0,
     ) -> "Optional[MediaColumnSpec]":
+        """Not served yet: token capture rides on NeMo-Gym rollouts through the frontend."""
         raise NotImplementedError(
             "Token capture needs NeMo-Gym rollouts, which are not yet served "
             "through the Dynamo frontend."

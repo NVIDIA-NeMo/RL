@@ -24,6 +24,8 @@ from nemo_rl.models.generation.megatron.dynamo_worker_mixin import (
 )
 from nemo_rl.models.generation.megatron.megatron_worker import MegatronGenerationMixin
 
+pytestmark = pytest.mark.mcore
+
 
 class _Worker(MegatronDynamoGenerationMixin, MegatronGenerationMixin):
     """MegatronDynamoPolicyWorker's generation bases, in the order it composes them."""

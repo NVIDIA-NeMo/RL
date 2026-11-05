@@ -235,6 +235,16 @@ class MegatronGeneration(GenerationInterface):
                 "colocated generation shares the training policy's worker group."
             )
 
+        # The role is written into each prefill/decode engine's own config by
+        # MegatronDynamoGeneration; those derived configs never come back
+        # through here, so a role in the user's config is always a stray one
+        # that would hand the trainer's policy the Dynamo engine worker.
+        if "_dynamo_role" in policy_config["generation"]:
+            raise ValueError(
+                "policy.generation._dynamo_role is set per engine by "
+                "MegatronDynamoGeneration; remove it from the config"
+            )
+
         mcore_cfg = cast(MCoreGenerationConfig, policy_config["generation"])[
             "mcore_generation_config"
         ]

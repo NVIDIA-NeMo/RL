@@ -73,7 +73,7 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
         "nemo_gym",
     ],
     # A prefill or decode engine served through Dynamo: a MegatronPolicyWorker
-    # with the Dynamo engine hooks, so the same extras (mcore carries ai-dynamo).
+    # with the Dynamo engine hooks, so the same extras as its base.
     "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronDynamoPolicyWorker": [
         "mcore",
         "nemo_gym",

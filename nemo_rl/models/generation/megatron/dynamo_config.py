@@ -213,11 +213,6 @@ def validate_megatron_dynamo_generation(generation_cfg: Mapping[str, Any]) -> No
     """
     assert generation_cfg["backend"] == "megatron" and dynamo_enabled(generation_cfg)
     megatron_dynamo_cfg(generation_cfg)
-    if "_dynamo_role" in generation_cfg:
-        raise ValueError(
-            "policy.generation._dynamo_role is set per engine by "
-            "MegatronDynamoGeneration; remove it from the config"
-        )
     disaggregation = disaggregation_cfg(generation_cfg)
     if not disaggregation.enabled:
         raise ValueError(

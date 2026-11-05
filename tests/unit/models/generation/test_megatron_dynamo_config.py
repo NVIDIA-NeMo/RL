@@ -37,6 +37,8 @@ from nemo_rl.models.generation.megatron.dynamo_config import (
     validate_megatron_dynamo_generation,
 )
 
+pytestmark = pytest.mark.mcore
+
 _DELETE = object()
 MEGATRON_POLICY = {
     "model_name": "Qwen/Qwen3-0.6B",
@@ -136,7 +138,7 @@ def test_dynamo_switch_is_refused_for_non_megatron_backends(backend) -> None:
         resolve_generation_class({"backend": backend, "dynamo": True})
 
 
-def test_dynamo_switch_resolves_to_the_dynamo_subclass() -> None:
+def test_dynamo_switch_resolves_to_the_sibling_class() -> None:
     assert resolve_generation_class(_megatron_config()) is MegatronDynamoGeneration
     assert issubclass(MegatronDynamoGeneration, GenerationInterface)
     assert not issubclass(MegatronDynamoGeneration, MegatronGeneration)
@@ -302,11 +304,6 @@ def test_engine_width_must_hold_the_expert_parallel_grid(layout, decode, match) 
             "expose_http_server",
             id="http_server",
         ),
-        pytest.param(
-            _set("_dynamo_role", value="prefill"),
-            "set per engine by MegatronDynamoGeneration",
-            id="engine_role",
-        ),
     ],
 )
 def test_validation_rejects_unsupported_shapes(mutate, match) -> None:
@@ -347,3 +344,30 @@ def test_megatron_generation_names_an_unservable_shape_first() -> None:
         resolve_generation_class(generation).validate_settings(
             _master_config(generation)
         )
+
+
+@pytest.mark.parametrize("dynamo", [True, False], ids=["dynamo_on", "dynamo_off"])
+def test_a_user_supplied_engine_role_is_refused_by_both_classes(dynamo) -> None:
+    """The role is written per engine; a stray one in the user's config is refused.
+
+    The check lives in MegatronGeneration.validate_settings, which both classes
+    run, so the role is caught with Dynamo on and off; the derived per-engine
+    configs that carry a role never pass through validate_settings.
+    """
+    generation = {**_megatron_config(), "dynamo": dynamo, "_dynamo_role": "prefill"}
+    with pytest.raises(ValueError, match="set per engine by MegatronDynamoGeneration"):
+        resolve_generation_class(generation).validate_settings(
+            _master_config(generation)
+        )
+
+
+def test_megatron_generation_refuses_router_replay_behind_dynamo() -> None:
+    """The KV handoff carries no routing-replay buffers, so the switch refuses router replay."""
+    generation = _megatron_config()
+    master_config = _master_config(generation)
+    master_config.policy["router_replay"] = {"enabled": True}
+    with pytest.raises(
+        ValueError,
+        match="router_replay.enabled must be false when policy.generation.dynamo=true",
+    ):
+        resolve_generation_class(generation).validate_settings(master_config)
