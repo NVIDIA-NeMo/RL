@@ -389,6 +389,9 @@ class MegatronCheckpointConfig(TypedDict, total=False):
     ckpt_fully_parallel_save_process_group: str  # "dp" | "ep_dp"
     ckpt_fully_parallel_load_process_group: str  # "dp" | "ep_dp"
     ckpt_fully_parallel_load_exchange_algo: str  # "broadcast" | "gather_rounds"
+    # Applied by NeMo RL, not passed to Bridge: threads per rank reading torch_dist
+    # checkpoint files on load (nemo_rl/models/megatron/ckpt_parallel_read.py); 1 = off.
+    parallel_read_threads: int
 
 
 class MegatronConfig(TypedDict):
@@ -610,6 +613,14 @@ class MegatronConfig(TypedDict):
     # sequence lengths (rope cache) or for MoE models with activation recompute
     # (dispatcher reference cycles).
     clear_memory_caches_before_refit: NotRequired[bool]
+    # When True, the chunked logprob backward on the fused sequence-packing path
+    # writes its grad into the packed logits' storage instead of a new buffer,
+    # saving one logits-sized allocation. Requires sequence_packing.enabled,
+    # sequence_packing.fuse_loss and a positive logprob_chunk_size; default false.
+    # The chunked logprob must be the logits' only consumer: any feature that reads
+    # them again (e.g. loss_fn.score_centering) must be rejected alongside this flag
+    # in the setup checks.
+    reuse_logits_storage: NotRequired[bool]
     # FP8 quantization settings for the Megatron training backend.
     fp8_cfg: NotRequired[Fp8Config]
     # TE NVFP4 training settings. Unknown keys are rejected by Fp4Config so

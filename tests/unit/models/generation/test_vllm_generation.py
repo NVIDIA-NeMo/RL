@@ -400,6 +400,8 @@ def test_generation_config_allows_no_worker_extension(
 ) -> None:
     config = deepcopy(basic_vllm_test_config)
     config["backend"] = backend
+    if backend == "trtllm":
+        config["trtllm_cfg"] = {}
     if include_null:
         config["worker_extension_cls_fqn"] = None
 
@@ -4276,7 +4278,7 @@ async def test_vllm_refit_non_colocated_update_weights(
 @pytest.mark.timeout(600)
 @pytest.mark.parametrize("tensor_parallel_size", [1, 2])
 @pytest.mark.parametrize("vllm_precision", ["bfloat16", "fp8"])
-@pytest.mark.parametrize("kv_cache_dtype", [None, "fp8"])
+@pytest.mark.parametrize("kv_cache_dtype", [None, "fp8", "fp8_per_token_head"])
 def test_vllm_generation_with_megatron_training(
     cluster, tokenizer, tensor_parallel_size, vllm_precision, kv_cache_dtype
 ):
@@ -4284,12 +4286,12 @@ def test_vllm_generation_with_megatron_training(
 
     This test validates that vLLM and Megatron policies can work together.
     """
-    if vllm_precision == "fp8":
+    if vllm_precision == "fp8" and kv_cache_dtype != "fp8_per_token_head":
+        # The per-token-head case uses Triton instead of the default backend.
         skip_fp8_known_failures()
 
-    # Skip invalid configurations: kv_cache_dtype=fp8 requires precision=fp8
-    if kv_cache_dtype == "fp8" and vllm_precision != "fp8":
-        pytest.skip("kv_cache_dtype='fp8' requires precision='fp8'")
+    if kv_cache_dtype in ("fp8", "fp8_per_token_head") and vllm_precision != "fp8":
+        pytest.skip("FP8 KV cache requires precision='fp8'")
 
     if cluster.num_gpus_per_node < tensor_parallel_size:
         pytest.skip(f"Need at least {tensor_parallel_size} GPUs for this test")
@@ -4308,6 +4310,15 @@ def test_vllm_generation_with_megatron_training(
     vllm_config["vllm_cfg"]["precision"] = vllm_precision
     if kv_cache_dtype is not None:
         vllm_config["vllm_cfg"]["kv_cache_dtype"] = kv_cache_dtype
+    if kv_cache_dtype == "fp8_per_token_head":
+        vllm_config["max_new_tokens"] = 8
+        vllm_config["ignore_eos"] = True
+        vllm_config["vllm_kwargs"].update(
+            attention_backend="TRITON_ATTN",
+            max_num_batched_tokens=256,
+            max_num_seqs=4,
+            kv_cache_memory_bytes=64 * 1024 * 1024,
+        )
     vllm_config = configure_generation_config(vllm_config, test_tokenizer)
 
     # Megatron config with same model
@@ -4431,6 +4442,18 @@ def test_vllm_generation_with_megatron_training(
         assert "output_ids" in final_generation, (
             "Final generation should contain output_ids"
         )
+
+        if kv_cache_dtype == "fp8_per_token_head":
+            assert not vllm_policy.requires_kv_scale_sync
+            # Both generations must write the cache and read it in subsequent decode steps.
+            for output in (generation_results, final_generation):
+                assert output["generation_lengths"].tolist() == [8] * len(prompts)
+                for index, input_length in enumerate(input_lengths.tolist()):
+                    generated_logprobs = output["logprobs"][
+                        index, input_length : input_length + 8
+                    ]
+                    assert generated_logprobs.numel() == 8
+                    assert torch.isfinite(generated_logprobs).all(), generated_logprobs
 
         print("Successfully demonstrated vLLM generation + Megatron training workflow!")
 

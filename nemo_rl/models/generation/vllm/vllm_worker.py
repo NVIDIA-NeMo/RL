@@ -48,7 +48,7 @@ from nemo_rl.models.generation.vllm.config import (
     parse_nvfp4_pertoken_rollout,
     resolve_vllm_video_config,
     validate_nvfp4_pertoken_model,
-    vllm_nemotron_h_fp32_lm_head_enabled,
+    vllm_fp32_lm_head_enabled,
 )
 from nemo_rl.models.generation.vllm.lora_utils import make_native_lora_request
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
@@ -221,6 +221,25 @@ def _merge_fp8_kwargs(vllm_kwargs: dict[str, Any], fp8_kwargs: dict[str, Any]) -
         merged_hf_overrides["quantization_config"] = merged_quantization_config
 
     vllm_kwargs["hf_overrides"] = merged_hf_overrides
+
+
+def _apply_fp32_lm_head(vllm_cfg: dict[str, Any], vllm_kwargs: dict[str, Any]) -> None:
+    """Turn on vLLM's fp32 LM head when ``vllm_cfg.fp32_lm_head`` is set.
+
+    ``head_dtype="float32"`` (vllm-project/vllm#48390) makes vLLM's
+    LogitsProcessor run the lm_head GEMM on the bf16 operands with an fp32
+    output, the same GEMM as Megatron's ``logit_dtype=float32``, for any model
+    whose lm_head is unquantized. ``vllm_kwargs["hf_overrides"]`` must be a dict.
+    """
+    if not vllm_fp32_lm_head_enabled(vllm_cfg):
+        return
+    hf_overrides = vllm_kwargs["hf_overrides"]
+    if hf_overrides.get("head_dtype", "float32") != "float32":
+        raise ValueError(
+            "vllm_cfg.fp32_lm_head=true conflicts with hf_overrides.head_dtype="
+            f"{hf_overrides['head_dtype']!r}; remove the override."
+        )
+    hf_overrides["head_dtype"] = "float32"
 
 
 def _validate_worker_extension_cls(
@@ -500,11 +519,9 @@ class BaseVllmGenerationWorker:
         # Store the Python executable being used by this worker
         self.py_executable = sys.executable
 
-        vllm_cfg = self.cfg["vllm_cfg"]
         _apply_vllm_patches(
             self.py_executable,
             extra_env_vars=extra_env_vars,
-            nemotron_h_fp32_lm_head=vllm_nemotron_h_fp32_lm_head_enabled(vllm_cfg),
             require_moe_routed_experts_capture=bool(
                 (self.cfg.get("vllm_kwargs") or {}).get(
                     "enable_return_routed_experts", False
@@ -684,6 +701,7 @@ class BaseVllmGenerationWorker:
 
         if not isinstance(vllm_kwargs.get("hf_overrides"), dict):
             vllm_kwargs["hf_overrides"] = {}
+        _apply_fp32_lm_head(self.cfg["vllm_cfg"], vllm_kwargs)
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
