@@ -383,6 +383,7 @@ def test_hotload_only_commits_verified_weights(
         with pytest.raises(TimeoutError):
             sync.sync_weights()
         assert sync.is_stale
+        assert not (tmp_path / "state" / "served_identity").exists()
         with pytest.raises(adapter.RolloutError, match="verified checkpoint"):
             gen._cache_salt()
 
@@ -392,3 +393,61 @@ def test_no_sampling_before_verified_checkpoint(adapter):
 
     with pytest.raises(RolloutError, match="verified checkpoint"):
         generation(adapter)._cache_salt()
+
+
+def gym_master_config(tmp_path):
+    """A synchronous policy and Gym endpoint sharing the checkpoint record."""
+    generation_config = config(state_dir=str(tmp_path))
+    return SimpleNamespace(
+        policy={
+            "generation": generation_config,
+            "automodel_cfg": {"enabled": True},
+            "megatron_cfg": {"enabled": False},
+            "tokenizer": {"name": "/shared/model"},
+            "offload_policy_before_refit": False,
+        },
+        grpo=SimpleNamespace(async_grpo=SimpleNamespace(enabled=False)),
+        data_plane=None,
+        env={
+            "should_use_nemo_gym": True,
+            "nemo_gym": {
+                "config_paths": [
+                    "responses_api_models/external_model/configs/external_model_for_training.yaml"
+                ],
+                "policy_tokenizer_path": "/shared/model",
+                "policy_max_model_len": 16,
+                "policy_served_identity_file": str(tmp_path / "served_identity"),
+                "policy_api_key_file": None,
+            },
+        },
+    )
+
+
+def test_gym_accepts_matching_external_endpoint(adapter, tmp_path):
+    master = gym_master_config(tmp_path)
+    adapter.CoreWeaveGeneration.validate_settings(master)
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("policy_tokenizer_path", "/different/model"),
+        ("policy_max_model_len", 17),
+        ("policy_served_identity_file", "/different/served_identity"),
+        ("policy_api_key_file", "/different/key"),
+    ],
+)
+def test_gym_rejects_inconsistent_endpoint_metadata(adapter, tmp_path, key, value):
+    master = gym_master_config(tmp_path)
+    master.env["nemo_gym"][key] = value
+    with pytest.raises(ValueError, match=key):
+        adapter.CoreWeaveGeneration.validate_settings(master)
+
+
+def test_gym_requires_exact_token_adapter(adapter, tmp_path):
+    master = gym_master_config(tmp_path)
+    master.env["nemo_gym"]["config_paths"] = [
+        "responses_api_models/vllm_model/configs/vllm_model_for_training.yaml"
+    ]
+    with pytest.raises(ValueError, match="external_model"):
+        adapter.CoreWeaveGeneration.validate_settings(master)

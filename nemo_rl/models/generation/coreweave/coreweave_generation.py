@@ -15,12 +15,13 @@
 """Exact-token rollouts from CoreWeave Dedicated Inference."""
 
 import math
+from pathlib import Path
 from typing import Any
 
 from cwtrain.integrations.nemo_rl.generation import (
     CoreWeaveGeneration as CookbookGeneration,
 )
-from cwtrain.integrations.nvext import as_cache_salt
+from cwtrain.integrations.nvext import SERVED_IDENTITY_FILE, as_cache_salt
 from cwtrain.integrations.rollout import Completion, CompletionSampler, RolloutError
 
 from nemo_rl.models.generation.coreweave.config import CoreWeaveConfig
@@ -59,9 +60,25 @@ class CoreWeaveGeneration(CookbookGeneration):
         if not (policy.get("automodel_cfg") or {}).get("enabled"):
             raise ValueError("CoreWeave requires policy.automodel_cfg.enabled=true")
         if master_config.env.get("should_use_nemo_gym"):
-            raise ValueError(
-                "CoreWeave NeMo-Gym wiring is tracked by the companion Gym PR"
-            )
+            gym = master_config.env["nemo_gym"]
+            model_config = "responses_api_models/external_model/configs/external_model_for_training.yaml"
+            if model_config not in gym["config_paths"]:
+                raise ValueError(
+                    "CoreWeave Gym requires the external_model training config"
+                )
+            expected = {
+                "policy_tokenizer_path": policy["tokenizer"]["name"],
+                "policy_max_model_len": config.max_model_len,
+                "policy_served_identity_file": str(
+                    Path(config.state_dir).resolve() / SERVED_IDENTITY_FILE
+                ),
+                "policy_api_key_file": config.api_key_file,
+            }
+            for key, value in expected.items():
+                if gym[key] != value:
+                    raise ValueError(
+                        f"CoreWeave Gym {key} must match the policy configuration"
+                    )
         if master_config.data_plane is not None and master_config.data_plane["enabled"]:
             raise ValueError("CoreWeave currently requires data_plane.enabled=false")
         if policy.get("worker_extension_cls_fqn") is not None:

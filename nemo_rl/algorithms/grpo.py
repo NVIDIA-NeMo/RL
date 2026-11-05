@@ -1050,6 +1050,18 @@ def setup(
         ``http_server_api_key``), or None when the server checks none.
         """
         t0 = time.perf_counter()
+        runtime_env = None
+        if generation_config["backend"] == "coreweave":
+            from cwtrain.integrations.launch import is_secret_env_var
+
+            from nemo_rl.environments.nemo_gym import NEMO_GYM_ACTOR_FQN
+
+            runtime_env = make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
+            runtime_env["env_vars"] = {
+                key: value
+                for key, value in runtime_env["env_vars"].items()
+                if not is_secret_env_var(key)
+            }
         shard_set = build_nemo_gym_actors(
             env_configs,
             base_urls=base_urls,
@@ -1058,6 +1070,7 @@ def setup(
             enable_router_replay=router_replay_enabled(policy_config),
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
             policy_api_key=policy_api_key,
+            runtime_env=runtime_env,
             turn_checkpointing_enabled=False,
         )
         train_splits = (
@@ -2010,6 +2023,13 @@ def setup(
             colocated=False,
         )
         policy_generation.weight_synchronizer.init_communicator()
+
+        if enable_nemo_gym:
+            nemo_gym_actor, gym_time = _spinup_nemo_gym(
+                [policy_generation.rollout_config.base_url],
+                policy_generation.rollout_config.model,
+            )
+            setup_timing_metrics.nemo_gym_init_time_s = gym_time
 
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time

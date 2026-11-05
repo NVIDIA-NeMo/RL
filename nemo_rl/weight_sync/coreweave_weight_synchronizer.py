@@ -17,6 +17,7 @@
 from typing import Any
 
 from cwtrain.integrations.nemo_rl.weight_sync import HotLoadWeightSynchronizer
+from cwtrain.integrations.nvext import SERVED_IDENTITY_FILE, write_served_identity
 
 from nemo_rl.models.generation.coreweave.config import CoreWeaveConfig
 
@@ -39,4 +40,5 @@ class CoreWeaveHotLoadWeightSynchronizer(HotLoadWeightSynchronizer):
     ) -> dict[str, float]:
         """Block sampling from a failed update, including after an earlier success."""
         self._stale = True
+        write_served_identity(self.state_dir / SERVED_IDENTITY_FILE, None)
         return super().sync_weights(timer=timer, kv_scales=kv_scales)

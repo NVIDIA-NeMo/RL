@@ -2767,7 +2767,9 @@ async def run_async_nemo_gym_rollout(
     assert max_rollout_turns is None, (
         "`max_rollout_turns` is not supported in NeMo-Gym path!"
     )
-    if "vllm_cfg" in policy_generation.cfg:
+    if policy_generation.cfg["backend"] == "coreweave":
+        engine_max_model_len = policy_generation.cfg["coreweave_cfg"]["max_model_len"]
+    elif "vllm_cfg" in policy_generation.cfg:
         engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
     elif "mcore_generation_config" in policy_generation.cfg:
         engine_max_model_len = policy_generation.cfg["mcore_generation_config"][
@@ -3273,7 +3275,11 @@ def _postprocess_single_nemo_gym_group(
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
-        if "vllm_cfg" in policy_generation.cfg:
+        if policy_generation.cfg["backend"] == "coreweave":
+            max_total_tokens_per_sample = policy_generation.cfg["coreweave_cfg"][
+                "max_model_len"
+            ]
+        elif "vllm_cfg" in policy_generation.cfg:
             max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"][
                 "max_model_len"
             ]
