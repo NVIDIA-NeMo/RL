@@ -12,10 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Restore the rollout state a resumed checkpoint saved.
+"""Restore the rollout parts of a resumed checkpoint.
 
-Runs once before the pumps start; it fills the shared runtime state and
-the recovery ledger, and the rollout pump then redispatches what it loaded.
+Restores the replay index (``replay_buffer_metadata.pt``), the recovery ledger
+(``rollout_recovery.pt``), the spare-prompt pool (``replacement_reserve.pt``) and,
+for turn-level groups from a rollout snapshot, the environment's rollouts. Setup
+restores the TQ rows themselves before this runs. Runs once before the pumps
+start; the rollout pump then redispatches what it loaded.
 """
 
 from __future__ import annotations
@@ -158,7 +161,7 @@ async def read_recovery_sidecar(
 
 
 class RolloutRestorer(_UsesRolloutParts):
-    """Restore the rollout state a resumed checkpoint saved, then redispatch it."""
+    """Restore the parts listed in the module docstring, then redispatch them."""
 
     def __init__(
         self,
@@ -187,12 +190,12 @@ class RolloutRestorer(_UsesRolloutParts):
         self._requires_recovery_dispatch = False
 
     async def restore(self) -> bool:
-        """Restore the rollout state the resumed checkpoint saved.
+        """Restore the parts listed in the module docstring.
 
         Call it once, after the weights are in sync and before the pumps start.
-        Restores the replay buffer, the recovery ledger and the spare prompts
-        into the shared runtime state, checks the sampler cursor against them
-        and logs restore timings.
+        Restores the replay buffer, the recovery ledger, the spare prompts and the
+        environment's rollouts (turn-level only), checks the sampler cursor against
+        them and logs restore timings.
 
         Returns:
             Whether restore queued groups only ledger-recorded dispatch can
