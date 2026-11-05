@@ -30,6 +30,10 @@ policy:
     mtp_use_repeated_layer: true
     mtp_detach_heads: true
     mtp_loss_scaling_factor: 0.3
+    # MoE recompute leaves dispatcher reference cycles; free them before vLLM wakes.
+    clear_memory_caches_before_refit: true
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False,max_split_size_mb:512,garbage_collection_threshold:0.8,per_process_memory_fraction:0.9
     optimizer:
       lr: 1.0e-06
       min_lr: 1.0e-06
@@ -46,6 +50,7 @@ policy:
       precision: fp8
       kv_cache_dtype: fp8
       tensor_parallel_size: 4
+      gpu_memory_utilization: 0.5
       quantization_ignored_layer_kws:
       - mixer.in_proj
       - mixer.out_proj
