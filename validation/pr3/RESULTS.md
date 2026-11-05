@@ -21,7 +21,8 @@ in source-evidence.json and dependency-runtime.json. Product dependency pins unc
 | Stronger cancellation | Audit v4 passed: four dispatches on full steps, cancel after two completed partial dispatches at version2, drain then abort. Durable snapshot: 3 ready and 5 in-flight groups; restored and completed through step6. Receipt checks passed (`integration-audit-check-v4.log`). |
 | Qwen3.5 EP16 + recipe FusedAdam | **FAILED** job21330640 on the first token-level preclip gradient comparison: observed rank relativeL2 about1.1–1.5%, exceeding1%; some cosine values also below.9999. Original limits unchanged. See ep16-failure.json; raw node logs retained. This was synthetic-input replay, not saved real-GRPO-input replay. |
 | Qwen3.5 streaming LA0 300 steps | **NOT STARTED.** Jobs21330687–21330690 cancelled on failed qualification dependency. No extra full-batch convergence run. |
-| Normalizer-placement diagnostic | Tiny EP2/FusedAdam/AC passed exact preclip-gradient/model/public+raw-optimizer/scales/scheduler comparison between full-input numerator backward and streaming. Ordinary-V1 versus numerator-only difference ~.91% on tiny. Qwen3.5 EP16 job21331026 running. Diagnostic cannot release training and does not relax original limits. |
+| Normalizer-placement diagnostic | **PASSED** tiny EP2 and Qwen3.5 EP16 job21331026, both objectives, one update each. All16 ranks match the independent full-input numerator reference exactly in preclip gradients/model/public+raw optimizer/scales/scheduler. Global original-normalizer differences: token1.343%, sequence1.322%; original gate remains failed. See normalizer-control-ep16-summary.json. |
+| Additional convergence evidence | Separate exploratory LA0 recipe prepared with identical training configuration and separate output/W&B identity. This research lane uses the exact numerator control and records original qualification failure; it does not redefine the1% gate or establish completed acceptance. |
 
 Numerical snapshots include preclip normalized gradient shards, every parameter
 and registered buffer, complete optimizer state_dict, scheduler state and exact
@@ -50,9 +51,10 @@ positive-example NLL. LA1, CPU offload, HSDP, LoRA, packing, dynamic batching, V
 PPO and distillation remain rejected. Online validation/acc remains unavailable.
 
 Submitted jobs and the intended W&B run identity are recorded in jobs.json.
-Qualification must succeed and worker/harness source hashes must still match
-before the guarded training launcher starts. The original contract has not passed
-on Qwen3.5; no training dependency remains active. The deterministic
+The default training launcher requires original qualification and matching source
+hashes; Qwen3.5 has not passed that contract. The explicit exploratory-train mode
+checks the completed exact numerator control plus source hashes and uses a distinct
+run identity to collect additional authorized convergence evidence. The deterministic
 watch_10min.sh process records queue/accounting/progress every ten minutes in
 slurm/watch.log and marks observed terminal failures in slurm/FAILURE_DETECTED.
 It performs status collection only; it does not retry experiments or send chat notifications.
@@ -68,4 +70,6 @@ moved from backward to clip entry, and SC streaming from identical state/RNG.
 The latter two must match exactly. This isolates normalization rounding from
 dispatch/LP state; it records original-gradient error separately and writes
 normalizer-control.json with releases_training:false, never a qualifying parity.json.
-Run it with --normalizer-control --steps1; its EP16 launcher uses a separate output folder.
+Run it with --normalizer-control --steps 1; its EP16 launcher uses a separate output folder.
+The diagnostic started from an uncommitted worktree at HEADad5582855; tested source
+hashes match the committed files in2cc30b16a. The numerical worker is unchanged.

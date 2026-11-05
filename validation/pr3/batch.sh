@@ -17,12 +17,17 @@ export BASE_LOG_DIR="$PR3_REPO/validation/pr3/slurm"
 export GPUS_PER_NODE=8 CPUS_PER_WORKER=128 OMP_NUM_THREADS=4
 export ENROOT_ROOTFS_WRITABLE=1
 export PR3_MODE="${PR3_MODE:-train}"
-if [[ "$PR3_MODE" == train ]]; then
+if [[ "$PR3_MODE" == train || "$PR3_MODE" == exploratory-train ]]; then
+  export PR3_CHECKPOINT_ROOT=validation/pr3/results/yuekaiz-qwen35-streaming-la0-300/checkpoints
+  if [[ "$PR3_MODE" == exploratory-train ]]; then
+    export PR3_CHECKPOINT_ROOT=validation/pr3/results/yuekaiz-qwen35-streaming-la0-300-exploratory/checkpoints
+  fi
   # Metadata-only check before starting containers for a continuation segment.
   if python3 - <<'PY'
 import json
+import os
 from pathlib import Path
-root = Path('validation/pr3/results/yuekaiz-qwen35-streaming-la0-300/checkpoints')
+root = Path(os.environ['PR3_CHECKPOINT_ROOT'])
 completed = any(json.loads(path.read_text()).get('total_steps', 0) >= 300
                 for path in root.glob('step_*/training_info.json'))
 raise SystemExit(0 if completed else 1)

@@ -1,0 +1,41 @@
+{
+  "passed": true,
+  "contract": "normalizer_placement_diagnostic_only",
+  "releases_training": false,
+  "source_sha": "ad5582855d96c617ac0180f2a4c7ea18f3175070",
+  "source_file_sha256": {
+    "tests/functional/automodel_sc_full_batch_parity.py": "ccb26bda2ad5a1408cbbd125cf2aec5a119d232ecaa1777bebbce0071c0dc399",
+    "nemo_rl/models/policy/workers/automodel_policy_worker.py": "7f59824258aafb13f5540810776dfa18c86a623856c9c89e4c6e26881259f74d"
+  },
+  "original_bf16_gradient_gate_passed": false,
+  "global_sharded_vector_differences": [
+    {
+      "relative_l2": 0.013431341759904476,
+      "cosine": 0.9999100426554662,
+      "norm_relative_error": 0.0006131391827727783
+    },
+    {
+      "relative_l2": 0.013224032938811957,
+      "cosine": 0.9999135586982711,
+      "norm_relative_error": 0.0013277424939559296
+    }
+  ],
+  "rank_reports": [
+    "normalizer-control-rank0.json",
+    "normalizer-control-rank1.json",
+    "normalizer-control-rank2.json",
+    "normalizer-control-rank3.json",
+    "normalizer-control-rank4.json",
+    "normalizer-control-rank5.json",
+    "normalizer-control-rank6.json",
+    "normalizer-control-rank7.json",
+    "normalizer-control-rank8.json",
+    "normalizer-control-rank9.json",
+    "normalizer-control-rank10.json",
+    "normalizer-control-rank11.json",
+    "normalizer-control-rank12.json",
+    "normalizer-control-rank13.json",
+    "normalizer-control-rank14.json",
+    "normalizer-control-rank15.json"
+  ]
+}

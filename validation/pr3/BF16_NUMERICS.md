@@ -55,6 +55,17 @@ backward with placeholder denominators and independent clip-entry normalization
 must match SC streaming in preclip gradients, parameters, public/raw optimizer
 state and scheduler exactly. Its ordinary early-normalization reference still
 records the unchanged1%/.9999/1% gates. This diagnostic passed tiny EP2/FusedAdam
-with activation checkpointing and both objectives; EP16 diagnostic21331026 is in
-progress. Its output explicitly does not release training. Global sharded-vector
-statistics are additional measurements, not a replacement for failed rank gates.
+with activation checkpointing and both objectives. EP16 diagnostic21331026 also
+passed all16 ranks and both objectives (one update each): gradients, parameters,
+public/raw FusedAdam state/scales and scheduler match exactly. Global original
+normalization differences are1.343% token-level and1.322% sequence-level, so the
+original1% limit remains failed even when measured on the full sharded vector.
+Its output does not qualify the default training launcher. Global statistics are
+additional measurements, not a replacement for failed rank gates.
+
+The fixed-input result isolates normalization placement: the independent reference
+does not split the batch yet reproduces the streaming gradient and update exactly.
+This rules out a dispatch/LP/optimizer-lifecycle discrepancy for the tested inputs;
+it does not prove the two BF16 trajectories converge identically. A separate,
+explicit exploratory-train lane collects the already-requested300-step LA0 evidence
+under a distinct W&B identity, preserving the failed gate. No tolerance is raised.

@@ -1,5 +1,5 @@
 {
-  "observed_at": "2026-11-05T04:41:00-08:00",
+  "observed_at": "2026-11-05T04:52:00-08:00",
   "code_and_recipes_commit": "ad5582855",
   "image": "containers/nemo_rl.1030.sqsh",
   "qualification": {
@@ -27,11 +27,13 @@
   ],
   "normalizer_placement_diagnostic": {
     "job_id": 21331026,
-    "state": "RUNNING",
+    "state": "COMPLETED",
     "nodes": 2,
     "gpus_per_node": 8,
     "releases_training": false,
-    "tiny_ep2_exact_control_passed": true
+    "tiny_ep2_exact_control_passed": true,
+    "ep16_exact_control_passed": true,
+    "original_gradient_gate_still_failed": true
   },
   "previous_attempts": [
     {
