@@ -82,9 +82,10 @@ class SimulatorSettings:
         train_time_s: Seconds the mock trainer holds each step where
             ``policy.train()`` would run. Generation keeps serving during the
             hold, as it does beside a non-colocated trainer. The hold ends early
-            once no rollout is in flight, because nothing on the rollout side
-            can change until the version advances; the skipped seconds are
-            logged so the e2e step time can still be read off the run.
+            once no rollout is in flight, because dispatch waits on the trainer
+            version (or, for ``windowed``, on buffer capacity released at step
+            cleanup) and neither moves until the train step ends; the skipped
+            seconds are logged so the e2e step time can still be read off the run.
         refit_time_s: Seconds the mock weight transfer holds inside the refit
             pause, where the real transfer would keep generation frozen.
         num_nodes: Inference nodes of this allocation; overrides the recipe's

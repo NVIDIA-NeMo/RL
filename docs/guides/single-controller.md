@@ -525,7 +525,7 @@ The SC path splits the async-GRPO loop across a rollout pump and a train pump th
 
 ## Rollout-Only Simulator
 
-`examples/run_single_controller_simulator.py` runs one side of the SC loop with the other side mocked, on the same pumps, data plane, sampler and refit lifecycle as a training run. Only `--mode rollout_only` is implemented: generation, the environments (NeMo-Gym or native) and the TransferQueue data plane are real, while the trainer is a `CpuTrainer` (`--train-backend cpu`) that uses no GPU. There is no training cluster: the inference cluster is sized from the recipe's generation node count, or from `--num-nodes`, which gives every node of the allocation to generation.
+`examples/run_single_controller_simulator.py` runs one side of the SC loop with the other side mocked, on the same pumps, data plane, sampler and refit lifecycle as a training run. Only `--mode rollout_only` is implemented: generation, the environments (NeMo-Gym or native) and the TransferQueue data plane are real, while the trainer is a `CpuTrainer` (`--train-backend cpu`) that uses no GPU. There is no training cluster: the inference cluster is sized from the recipe's generation node count, or from `--num-nodes`, which gives every node of the allocation to generation. Because every GPU node serves rollouts, a Ray head node with GPUs hosts a vLLM rank next to the driver, the `SingleControllerActor` and the generation router, which have no placement rule of their own; on a training run the head may be a train node instead. Launch from a CPU-only head node, or expect the head's rollout rank to share CPUs with those processes, when comparing against a training run.
 
 ```bash
 uv run examples/run_single_controller_simulator.py --config <your-sc.yaml> \
@@ -537,7 +537,7 @@ The recipe is used as-is and must be an SC recipe (`data_plane.enabled: true`, `
 
 What the stand-ins do, per step:
 
-- The rollout pump, `RolloutManager`, `TQReplayBuffer` and the configured sampler run unchanged, so admission is gated on the trainer version exactly as in training.
+- The rollout pump, `RolloutManager`, `TQReplayBuffer` and the configured sampler run unchanged, so admission is gated exactly as in training: on the trainer version, or on buffer capacity for the `windowed` sampler.
 - The train pump selects the step's groups and runs the advantage stage; the `CpuTrainer` copies `generation_logprobs` into `prev_logprobs` / `reference_policy_logprobs` (so the advantage stage runs unchanged and the training/generation logprob ratio is exactly 1: `train/max_seq_mult_prob_error` reads 1.0), accepts the chunk, and holds `--train-time-s` where `policy.train()` would run. Generation keeps serving during the hold. The hold ends early once no rollout is in flight; `train/simulated_train_idle_skipped_s` reports how much was skipped, so the e2e step time is `total_step_time + simulated_train_idle_skipped_s`.
 - `_sync_weights` runs its full lifecycle -- dispatch gate, `pause_generation_for_refit(clear_cache=recompute_kv_cache_after_weight_updates)`, resume -- around a `NoOpWeightSynchronizer` that moves nothing and holds `--refit-time-s`. The trainer version advances, which releases the sampler's next target.
 

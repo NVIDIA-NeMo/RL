@@ -3140,7 +3140,8 @@ class SingleControllerActor:
         Holds ``simulator.train_time_s`` where ``policy.train()`` would run, so
         generation is paced as it is beside a non-colocated trainer. The hold
         ends early once no rollout is in flight: dispatch is gated on the
-        trainer version, which only advances after this returns, so the rest of
+        trainer version, or (``windowed``) on buffer capacity released at step
+        cleanup, and neither moves until this returns, so the rest of
         the wait is idle on both sides and a rollout-only run continues
         identically after it. The skipped seconds are reported so the e2e step
         time is still recoverable as held + skipped.
