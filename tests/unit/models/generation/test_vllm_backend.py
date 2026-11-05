@@ -4411,3 +4411,38 @@ def test_vllm_exposes_the_tied_embedding_detector_the_refit_filter_relies_on():
     )
 
     assert hasattr(AutoWeightsLoader, "_check_skipped_aliases")
+
+
+@pytest.mark.vllm
+def test_release_kv_transfer_pins_expires_every_pinned_request(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend as backend
+
+    ext = backend.VllmInternalWorkerExtension.__new__(
+        backend.VllmInternalWorkerExtension
+    )
+    pins = {"req-a": 1.0e9, "req-b": 2.0e9}
+    connector = SimpleNamespace(connector_worker=SimpleNamespace(_reqs_to_send=pins))
+    monkeypatch.setattr(backend, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(backend, "get_kv_transfer_group", lambda: connector)
+
+    assert ext.release_kv_transfer_pins() == 2
+    # Deadlines in the past: the connector's next get_finished reports both as
+    # sent, in their original order.
+    assert pins == {"req-a": 0.0, "req-b": 0.0}
+
+
+@pytest.mark.vllm
+def test_release_kv_transfer_pins_rejects_engines_without_a_pin_table(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend as backend
+
+    ext = backend.VllmInternalWorkerExtension.__new__(
+        backend.VllmInternalWorkerExtension
+    )
+    monkeypatch.setattr(backend, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(backend, "get_kv_transfer_group", lambda: SimpleNamespace())
+    with pytest.raises(RuntimeError, match="_reqs_to_send"):
+        ext.release_kv_transfer_pins()
+
+    monkeypatch.setattr(backend, "has_kv_transfer_group", lambda: False)
+    with pytest.raises(RuntimeError, match="has none"):
+        ext.release_kv_transfer_pins()

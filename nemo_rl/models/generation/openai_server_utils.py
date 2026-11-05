@@ -22,9 +22,30 @@ token-in/token-out via ``generate(input_ids)`` and never re-templates messages,
 so it has no retokenization drift to correct.
 """
 
+import base64
+import os
 from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
+
+import numpy as np
+
+# Sampling rate at which the prefill (context) leg shadow-validates the prompt
+# ids a frontend supplied under ``frontend_tokenize``: the engine renders the
+# messages it also received and logs a mismatch. Cheap insurance while
+# frontend_tokenize is young; 0 disables. One variable for every backend, like
+# the ``frontend_tokenize`` field itself.
+TOKENIZE_SHADOW_RATE_ENV = "NRL_TOKENIZE_SHADOW_RATE"
+
+
+def tokenize_shadow_rate() -> float:
+    """The frontend-tokenize shadow-validation rate, from ``NRL_TOKENIZE_SHADOW_RATE``.
+
+    Returns:
+        The rate the variable holds, or 0 (no shadow validation) when it is
+        unset or empty.
+    """
+    return float(os.environ.get(TOKENIZE_SHADOW_RATE_ENV, "0") or 0)
 
 
 @dataclass(frozen=True)
@@ -193,3 +214,20 @@ def splice_prefix_tokens(
         model_cut_end,
         template_cut_start,
     )
+
+
+def encode_token_ids_b64(token_ids: Collection[int]) -> str:
+    """Token ids as one base64 int32 string.
+
+    The relay encoding of the PD-disaggregation paths (TRT-LLM's
+    ``prompt_token_ids_b64`` and the vLLM frontend's ``decode_tokids_b64``): a
+    30k-token prompt becomes one string to parse instead of 30k JSON integers.
+    """
+    return base64.b64encode(
+        np.asarray(list(token_ids), dtype=np.int32).tobytes()
+    ).decode("ascii")
+
+
+def decode_token_ids_b64(encoded: str) -> list[int]:
+    """Inverse of :func:`encode_token_ids_b64`."""
+    return np.frombuffer(base64.b64decode(encoded), dtype=np.int32).tolist()

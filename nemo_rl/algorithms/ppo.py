@@ -100,6 +100,7 @@ from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
+    validate_vllm_disaggregation_for_refit,
 )
 from nemo_rl.models.policy import MegatronConfig, PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -394,6 +395,19 @@ def setup(
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="ppo")
         vllm_config = cast(VllmConfig, generation_config)
         normalize_vllm_refit_config(vllm_config)
+        async_ppo = ppo_config.async_ppo
+        validate_vllm_disaggregation_for_refit(
+            vllm_config,
+            in_flight_weight_updates=bool(
+                async_ppo is not None
+                and async_ppo.enabled
+                and async_ppo.in_flight_weight_updates
+            ),
+            recompute_kv_cache_after_weight_updates=bool(
+                async_ppo is not None
+                and async_ppo.recompute_kv_cache_after_weight_updates
+            ),
+        )
         refit_transport = vllm_config.get("refit_transport")
         if refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS:
             raise ValueError(

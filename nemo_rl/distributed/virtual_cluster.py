@@ -167,6 +167,10 @@ def uv_py_executable(extras: Sequence[str]) -> str:
 #   [8300, 8556) PD-disagg frontends             (generation.disaggregation.frontend_base_port;
 #                                                 carved out of the vLLM band like SGLang below,
 #                                                 256 = the replicas * frontends cap)
+#   [8556, 8572) PD-disagg KV handshake          (vLLM KV connector side channel, one port per
+#                                                 engine on a node; VLLM_NIXL_SIDE_CHANNEL_PORT)
+#   [8572, 8588) PD-disagg KV events             (vLLM --kv-events-config publisher, one port per
+#                                                 prefill engine on a node; kv_cache_aware router)
 #   8600-8799    SGLang router                   (DEFAULT_SGLANG_ROUTER_PORT_RANGE_*, hard-coded;
 #                                                 carved out of the vLLM band — only one rollout
 #                                                 backend runs at a time)
@@ -194,11 +198,23 @@ DEFAULT_VLLM_PORTS_PER_ENGINE = 100
 # clear of the Ray dashboard carve-out at 8265 (see ray.sub).
 # PD-disagg frontend ports: deterministic, base + replica_idx *
 # num_frontend_workers + frontend_idx, so a restarted frontend re-binds the URL
-# Gym holds. Carved out of the vLLM band (TRT-LLM is the only backend with
-# disaggregation) above the Ray dashboard at 8265; 256 ports is the
-# replicas * frontends cap that TRT-LLM's request ids impose.
+# Gym holds. Carved out of the vLLM band above the Ray dashboard at 8265; 256
+# ports is the replicas * frontends cap (TRT-LLM's request ids impose it, the
+# vLLM frontends inherit it as the band's size).
 DEFAULT_DISAGG_FRONTEND_PORT_RANGE_LOW = 8300
 DEFAULT_DISAGG_FRONTEND_PORT_RANGE_HIGH = 8556
+# vLLM PD disaggregation: a KV connector's handshake listener binds
+# VLLM_NIXL_SIDE_CHANNEL_PORT + data_parallel_index, i.e. one port per *host*
+# in vLLM's own deployments. NeMo RL packs several independent engines onto a
+# node, each with data_parallel_index 0, so the driver hands every engine its
+# own port from this band (node-local slot = engine ordinal on the node). The
+# KV-events band is the same idea for the optional kv_cache_aware router, which
+# subscribes to each prefill engine's block-stored events. Both are sized for
+# the most engines a node can hold (one per GPU).
+DEFAULT_DISAGG_KV_SIDE_CHANNEL_PORT_RANGE_LOW = 8556
+DEFAULT_DISAGG_KV_SIDE_CHANNEL_PORT_RANGE_HIGH = 8572
+DEFAULT_DISAGG_KV_EVENTS_PORT_RANGE_LOW = 8572
+DEFAULT_DISAGG_KV_EVENTS_PORT_RANGE_HIGH = 8588
 DEFAULT_SGLANG_ROUTER_PORT_RANGE_LOW = 8600
 DEFAULT_SGLANG_ROUTER_PORT_RANGE_HIGH = 8799
 DEFAULT_SGLANG_PROMETHEUS_PORT_RANGE_LOW = 8800

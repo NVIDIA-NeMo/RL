@@ -29,7 +29,6 @@ Under PD disaggregation this endpoint is *leg-aware*. A replica's
 import asyncio
 import functools
 import logging
-import os
 import random
 import threading
 import time
@@ -41,7 +40,10 @@ if TYPE_CHECKING:
     from fastapi import FastAPI, Request
 
 from nemo_rl.models.generation.openai_server_utils import (
+    decode_token_ids_b64,
+    encode_token_ids_b64,
     replace_prefix_tokens,
+    tokenize_shadow_rate,
 )
 
 logger = logging.getLogger(__name__)
@@ -176,11 +178,9 @@ async def build_spliced_prompt_ids(
 
 # Sampling rate for shadow-validating frontend-supplied prompt ids on the
 # context leg: the ctx adapter recomputes the ids from the messages it also
-# received and logs a mismatch. Cheap insurance while frontend_tokenize is
-# young; 0 disables.
-_TOKENIZE_SHADOW_RATE = float(
-    os.environ.get("NRL_TRTLLM_TOKENIZE_SHADOW_RATE", "0") or 0
-)
+# received and logs a mismatch (NRL_TOKENIZE_SHADOW_RATE, one variable for
+# every backend; see openai_server_utils).
+_TOKENIZE_SHADOW_RATE = tokenize_shadow_rate()
 
 
 def _parse_disaggregated_params(raw: Optional[dict[str, Any]]) -> tuple[Any, bool]:
@@ -258,13 +258,7 @@ def _context_leg_response(
     # The orchestrator asks for the base64 int32 buffer when it wants to relay a
     # string instead of materialising the int list on its event loop.
     if return_prompt_token_ids_b64:
-        import base64
-
-        import numpy as np
-
-        response["prompt_token_ids_b64"] = base64.b64encode(
-            np.asarray(prompt_token_ids, dtype=np.int32).tobytes()
-        ).decode("ascii")
+        response["prompt_token_ids_b64"] = encode_token_ids_b64(prompt_token_ids)
     else:
         response["prompt_token_ids"] = prompt_token_ids
 
@@ -452,13 +446,7 @@ def create_app(
         supplied = body.get("prompt_token_ids") or body.get("prompt_token_ids_b64")
         if isinstance(supplied, str):
             # Same int32 buffer encoding openai_server.py uses on this hop.
-            import base64
-
-            import numpy as np
-
-            supplied = np.frombuffer(
-                base64.b64decode(supplied), dtype=np.int32
-            ).tolist()
+            supplied = decode_token_ids_b64(supplied)
 
         if supplied:
             adj_prompt = list(supplied)

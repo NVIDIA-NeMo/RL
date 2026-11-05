@@ -143,7 +143,10 @@ from nemo_rl.models.generation.megatron.megatron_generation import MegatronGener
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    uses_vllm_disagg_frontends,
+)
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -841,6 +844,9 @@ def _spinup_gym(
         policy_api_key=policy_api_key,
         turn_checkpointing_enabled=(
             master_config.rollout_recovery.turn_checkpointing_enabled
+        ),
+        forward_session_id_as_conversation_id=uses_vllm_disagg_frontends(
+            generation_config
         ),
         # Capture transport config includes the generation request's candidate count.
         token_capture=(

@@ -18,6 +18,7 @@ import inspect
 import logging
 import os
 import sys
+from collections.abc import Mapping
 from typing import Any, Optional, cast
 
 import ray
@@ -29,8 +30,10 @@ from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_VLLM_PORT_RANGE_LOW,
     DEFAULT_VLLM_PORTS_PER_ENGINE,
+    _get_node_ip_local,
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
+from nemo_rl.models.generation.disagg_layout import deep_merge, engine_key
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_FALLBACK_DTYPE,
     GenerationDatumSpec,
@@ -49,6 +52,8 @@ from nemo_rl.models.generation.vllm.config import (
     resolve_vllm_video_config,
     validate_nvfp4_pertoken_model,
     vllm_fp32_lm_head_enabled,
+    vllm_kv_transfer_config_for_role,
+    vllm_role_engine_config,
 )
 from nemo_rl.models.generation.vllm.lora_utils import make_native_lora_request
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
@@ -288,6 +293,56 @@ def _configure_nvfp4_pertoken_engine_kwargs(
 
 
 # Use a base class to share some functions to avoid code duplication.
+def _resolve_disagg_engine(
+    cfg: VllmConfig,
+    bundle_pg_idx: Optional[int],
+    bundle_indices: Optional[list[int]],
+) -> dict[str, Any]:
+    """This engine's entry in the driver-built ``vllm_cfg._engine_roles`` map.
+
+    Keyed by ``(placement group index, local bundle indices)`` -- the same tuple
+    ``VllmGeneration`` used to create this worker, so the two sides agree
+    without per-worker init kwargs. ``{}`` for uniform runs, which carry no map
+    at all, and for the non-owner workers of a TP group, which build no engine.
+    """
+    engine_roles = cfg["vllm_cfg"].get("_engine_roles")
+    if not engine_roles or bundle_indices is None:
+        return {}
+    if bundle_pg_idx is None:
+        raise RuntimeError(
+            "vllm_cfg._engine_roles is set but the worker received no "
+            "bundle_pg_idx; configure_worker and the driver are out of sync."
+        )
+    key = engine_key(bundle_pg_idx, bundle_indices)
+    entry = engine_roles.get(key)
+    if entry is None:
+        raise RuntimeError(
+            f"No engine role entry for {key!r}. Known keys: {sorted(engine_roles)}. "
+            "VllmGeneration._config_with_engine_roles() and this lookup must stay "
+            "in sync."
+        )
+    return entry
+
+
+def effective_vllm_kwargs(
+    cfg: Mapping[str, Any], engine_cfg: Mapping[str, Any], *, disaggregated: bool
+) -> dict[str, Any]:
+    """The ``vllm_kwargs`` this engine is built with.
+
+    Without disaggregation that is the shared block. Under it, a role's block
+    was deep-merged over the shared one when the roles were resolved
+    (``resolve_vllm_role_overrides``, inside ``configure_generation_config``);
+    keys the driver adds to the shared block *after* that -- ``grpo.setup``
+    writes ``hf_overrides`` there, router replay its own kwargs -- would be
+    missing from that snapshot, so the shared block as it stands now is merged
+    underneath it again. Role values keep precedence.
+    """
+    shared = copy.deepcopy(dict(cfg.get("vllm_kwargs") or {}))
+    if not disaggregated:
+        return shared
+    return deep_merge(shared, copy.deepcopy(dict(engine_cfg.get("vllm_kwargs") or {})))
+
+
 class BaseVllmGenerationWorker:
     def __repr__(self) -> str:
         """Customizes the actor's prefix in the Ray logs.
@@ -332,6 +387,12 @@ class BaseVllmGenerationWorker:
             node_idx = bundle_indices[0]
             local_bundle_indices = bundle_indices[1]
             init_kwargs["bundle_indices"] = local_bundle_indices
+            # The placement-group index completes the engine's identity, which
+            # a PD-disaggregated worker uses to find its own entry in
+            # vllm_cfg._engine_roles (see disagg_layout.engine_key). Local
+            # bundle indices alone are ambiguous across per-node PGs, which
+            # each restart numbering at 0.
+            init_kwargs["bundle_pg_idx"] = node_idx
 
             """
             compute a unique seed from the node_idx and bundle_indices:
@@ -439,6 +500,7 @@ class BaseVllmGenerationWorker:
         seed: Optional[int] = None,
         extra_env_vars: Optional[list[str]] = None,
         defer_model_load: bool = False,
+        bundle_pg_idx: Optional[int] = None,
     ):
         """Initialize a vLLM worker for distributed inference.
 
@@ -453,6 +515,10 @@ class BaseVllmGenerationWorker:
             defer_model_load: If True, skip model loading during init. Call
                 _load_model() later to perform the heavy model loading. This
                 enables overlapping vLLM model loading with NeMo Gym init.
+            bundle_pg_idx: Index of the placement group the bundles belong to.
+                With bundle_indices it identifies the engine; a PD-disaggregated
+                worker reads its role and endpoints from vllm_cfg._engine_roles
+                under that key.
         """
         from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
 
@@ -472,7 +538,12 @@ class BaseVllmGenerationWorker:
         init_telemetry_worker()
 
         self._init_config(
-            config, bundle_indices, fraction_of_gpus, seed, extra_env_vars
+            config,
+            bundle_indices,
+            fraction_of_gpus,
+            seed,
+            extra_env_vars,
+            bundle_pg_idx=bundle_pg_idx,
         )
         self._sparse_refit_receiver: Any = None
         if (
@@ -499,17 +570,37 @@ class BaseVllmGenerationWorker:
         fraction_of_gpus: float,
         seed: Optional[int],
         extra_env_vars: Optional[list[str]],
+        *,
+        bundle_pg_idx: Optional[int] = None,
     ):
         """Lightweight config setup. No model loading, no heavy imports."""
         self.cfg = config
         self.model_name = self.cfg["model_name"]
         # Refined from the model's expert count in _load_model.
         self.routed_experts_dtype = ROUTED_EXPERTS_FALLBACK_DTYPE
-        self.tensor_parallel_size = self.cfg["vllm_cfg"]["tensor_parallel_size"]
-        self.pipeline_parallel_size = self.cfg["vllm_cfg"]["pipeline_parallel_size"]
-        self.expert_parallel_size = self.cfg["vllm_cfg"]["expert_parallel_size"]
+        # PD disaggregation: the driver stamps every engine's role, ordinal and
+        # node-local endpoints into vllm_cfg._engine_roles exactly when
+        # disaggregation is enabled (VllmGeneration._config_with_engine_roles);
+        # {} otherwise, and for the non-owner workers of a TP group.
+        self._disagg_engine = _resolve_disagg_engine(
+            self.cfg, bundle_pg_idx, bundle_indices
+        )
+        self._disagg_role = self._disagg_engine.get("role")
+        # This engine's config: its role's block, which resolve_vllm_role_overrides
+        # already merged over the shared vllm_cfg, or vllm_cfg itself without
+        # disaggregation. Everything that describes the engine must read this,
+        # never the raw vllm_cfg, or a role's overrides apply to some settings
+        # and not others.
+        self.engine_cfg: dict[str, Any] = (
+            vllm_role_engine_config(self.cfg, self._disagg_role)
+            if self._disagg_role is not None
+            else dict(self.cfg["vllm_cfg"])
+        )
+        self.tensor_parallel_size = self.engine_cfg["tensor_parallel_size"]
+        self.pipeline_parallel_size = self.engine_cfg["pipeline_parallel_size"]
+        self.expert_parallel_size = self.engine_cfg["expert_parallel_size"]
         self.enable_expert_parallel = self.expert_parallel_size > 1
-        self.gpu_memory_utilization = self.cfg["vllm_cfg"]["gpu_memory_utilization"]
+        self.gpu_memory_utilization = self.engine_cfg["gpu_memory_utilization"]
         self.precision = self.cfg["vllm_cfg"]["precision"]
         self.fraction_of_gpus = fraction_of_gpus
         self.is_model_owner = bundle_indices is not None
@@ -571,7 +662,11 @@ class BaseVllmGenerationWorker:
                 "This error can also happen if the venv creation was aborted or errored out in the middle. In that case, "
                 "please run at least once with the environment variable NRL_FORCE_REBUILD_VENVS=true set to force the rebuild of the environment."
             )
-        vllm_kwargs: dict[str, Any] = copy.deepcopy(self.cfg.get("vllm_kwargs", {}))
+        vllm_kwargs: dict[str, Any] = effective_vllm_kwargs(
+            self.cfg, self.engine_cfg, disaggregated=self._disagg_role is not None
+        )
+        if self._disagg_role is not None:
+            seed = self._apply_disagg_engine_identity(seed)
         # vLLM 0.28 (vllm-project/vllm#50411) skips rescale/normalize in the HF image
         # processor and re-applies them on the GPU in the vision tower's dtype. The
         # policy side normalizes on the CPU in fp32 through the same HF processor, so
@@ -682,7 +777,13 @@ class BaseVllmGenerationWorker:
                 "profiling is deferred until start_gpu_profiling() is called."
             )
             vllm_kwargs["ray_workers_use_nsight"] = True
-            self._patch_vllm_nsight_config()
+            # Under disaggregation every engine's inner workers would write
+            # reports distinguishable only by pid; tag them with the role.
+            self._patch_vllm_nsight_config(
+                name_tag=""
+                if self._disagg_role is None
+                else f"{self._disagg_role}{self._disagg_engine['ordinal']}_"
+            )
 
         # Call init_fp8 when precision is fp8
         # (kv_cache_dtype can be fp8/fp8_e4m3 or auto, validated in init_fp8)
@@ -806,6 +907,8 @@ class BaseVllmGenerationWorker:
         _configure_nvfp4_pertoken_engine_kwargs(self.cfg, llm_kwargs)
         llm_kwargs.setdefault("worker_extension_cls", default_worker_extension_cls)
         _maybe_enable_vllm_native_tracing(llm_kwargs)
+        if self._disagg_role is not None:
+            self._add_disagg_engine_kwargs(llm_kwargs)
         self._create_engine(llm_kwargs)
         log_gpu_memory_diagnostics(
             label="after_engine_create", worker_type="VllmGenerationWorker", device_id=0
@@ -817,6 +920,53 @@ class BaseVllmGenerationWorker:
         log_gpu_memory_diagnostics(
             label="load_model_complete", worker_type="VllmGenerationWorker", device_id=0
         )
+
+    def _apply_disagg_engine_identity(self, seed: Optional[int]) -> Optional[int]:
+        """Take over the per-engine identity the driver assigned under disaggregation.
+
+        ``configure_worker`` derives the engine's seed, VLLM_PORT slot and vLLM
+        cache dir from its bundle indices divided by its own width, which is
+        only unique while every engine on a node has the same width. A
+        disaggregated node mixes widths, so the driver computes these per
+        engine instead, together with the KV connector's handshake endpoint,
+        and this applies them before the engine (and the subprocesses it
+        spawns, which inherit this environment) comes up.
+        """
+        entry = self._disagg_engine
+        for name, value in entry["env"].items():
+            os.environ[name] = str(value)
+        host_env = entry.get("side_channel_host_env")
+        if host_env:
+            # The connector advertises this host in its handshake; the default
+            # ("localhost") would send the peer engine to itself.
+            os.environ[host_env] = _get_node_ip_local()
+        os.environ["VLLM_CACHE_ROOT"] = (
+            os.environ.get("VLLM_CACHE_ROOT", os.path.expanduser("~/.cache/vllm"))
+            + f"_pd{entry['engine_index']}"
+        )
+        return int(entry["seed"])
+
+    def _add_disagg_engine_kwargs(self, llm_kwargs: dict[str, Any]) -> None:
+        """The KV connector (and KV-event publisher) of a disaggregated engine."""
+        # Deferred: vLLM lives in the generation venv only.
+        from vllm.config import KVEventsConfig, KVTransferConfig
+
+        entry = self._disagg_engine
+        llm_kwargs["kv_transfer_config"] = KVTransferConfig(
+            **vllm_kv_transfer_config_for_role(
+                self.cfg, self._disagg_role, engine_id=entry["engine_id"]
+            )
+        )
+        kv_events_port = entry.get("kv_events_port")
+        if kv_events_port is not None:
+            # The kv_cache_aware frontend router subscribes to this engine's
+            # block-stored events; only prefill engines get a port.
+            llm_kwargs["kv_events_config"] = KVEventsConfig(
+                enable_kv_cache_events=True,
+                publisher="zmq",
+                endpoint=f"tcp://*:{kv_events_port}",
+                topic=entry["kv_events_topic"],
+            )
 
     def llm(self):
         return self.llm
@@ -949,7 +1099,7 @@ class BaseVllmGenerationWorker:
         return max_new_tokens
 
     @staticmethod
-    def _patch_vllm_nsight_config() -> None:
+    def _patch_vllm_nsight_config(name_tag: str = "") -> None:
         """Override vLLM's nsight config for internal TP workers to use deferred capture.
 
         vLLM's default _configure_ray_workers_use_nsight applies an always-on nsight
@@ -963,7 +1113,7 @@ class BaseVllmGenerationWorker:
 
         nsight_config = {
             "t": "cuda,cudnn,cublas,nvtx",
-            "o": f"'vllm_tp_worker_{NRL_NSYS_PROFILE_STEP_RANGE}_%p'",
+            "o": f"'vllm_tp_worker_{NRL_NSYS_PROFILE_STEP_RANGE}_{name_tag}%p'",
             "stop-on-exit": "true",
             "s": "none",
             "capture-range": "cudaProfilerApi",
@@ -1617,8 +1767,11 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             traceback.print_exc()
             return False
 
-    def reset_prefix_cache(self):
-        """Reset the prefix cache of vLLM engine."""
+    def reset_prefix_cache(self) -> bool:
+        """Reset the prefix cache of vLLM engine; returns vLLM's verdict.
+
+        False while any KV block is still allocated, which vLLM only warns about.
+        """
         assert self.llm is not None, (
             "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
         )
@@ -1628,9 +1781,10 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 "reset_prefix_cache can only be used with async_engine=False. Use reset_prefix_cache_async instead."
             )
 
-        self.llm.llm_engine.reset_prefix_cache()
+        reset = self.llm.llm_engine.reset_prefix_cache()
         gc.collect()
         torch.cuda.empty_cache()
+        return reset
 
     def sleep(self):
         """Put the vLLM engine to sleep."""

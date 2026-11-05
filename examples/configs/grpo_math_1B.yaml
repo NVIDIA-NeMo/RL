@@ -68,7 +68,7 @@ grpo:
     # when transient generation errors are expected and acceptable to drop.
     max_generation_failures: 0
     in_flight_weight_updates: false # Set to true to enable in-flight weight updates
-    recompute_kv_cache_after_weight_updates: true # Set false to retain pre-update KV caches (avoids repeated prefill).
+    recompute_kv_cache_after_weight_updates: true # Set false to retain pre-update KV caches (avoids repeated prefill). Must be false under policy.generation.disaggregation with in-flight updates on the vLLM backend.
 
 # Reward-zeroing penalties applied to NeMo-Gym rollout results.
 reward_penalties:
@@ -604,6 +604,67 @@ policy:
       reset_encoder_cache_after_weight_update: false # Invalidate cached multimodal encoder outputs after a successful async refit. Only safe when generation is quiesced (grpo.async_grpo.in_flight_weight_updates=false).
       http_refit_server_port: null # Optional fixed port for Kubernetes targetPorts.
       zmq_refit_server_port: null # Optional fixed ZeroMQ relay port for Kubernetes targetPorts.
+      # Prefill/decode disaggregation (generation.disaggregation.enabled);
+      # read only then, inert otherwise. Per-role engine overrides: these win
+      # over the shared values above for that role's engines. Overridable set
+      # is VllmEngineArgs (tensor_parallel_size, gpu_memory_utilization,
+      # vllm_kwargs, the last deep-merged over generation.vllm_kwargs).
+      # Interpolated rather than pinned, so a recipe that raises the shared TP
+      # and enables disaggregation gets that TP on both roles.
+      prefill_engine:
+        tensor_parallel_size: ${..tensor_parallel_size}
+      decode_engine:
+        tensor_parallel_size: ${..tensor_parallel_size}
+      # What the replica's frontends do: the vLLM counterpart of
+      # trtllm_cfg.disagg_server. Defaults live on VllmDisaggFrontendConfig.
+      disagg_frontend:
+        # Which prefill engine serves a turn. conversation keeps a trajectory
+        # on the engine holding its prefix; kv_cache_aware routes by the block
+        # hashes the engines publish (needs disaggregation.frontend_tokenize);
+        # round_robin is stateless.
+        prefill_router: conversation
+        # Which decode engine serves a turn: load_balancing | round_robin |
+        # conversation. A decode engine receives KV freshly on every turn, so
+        # the stateless choices are the default.
+        decode_router: load_balancing
+        # Let the prefill engine pull the previous turn's KV (the tokens the
+        # decode engine generated) back from the decode engine instead of
+        # recomputing it (NixlConnector only). Off by default: the decode
+        # engine then pins each finished conversation's blocks until the next
+        # turn, its decoder_kv_blocks_ttl or the cache reset between steps,
+        # which competes with new requests for its KV pool; the trade-off
+        # depends on the workload.
+        bidirectional_kv_xfer: false
+        # Thin the prefill->decode relay: token ids as one base64 int32 string
+        # instead of a 30k-int JSON array, and drop the redundant message
+        # history (the relayed ids carry the whole prefix).
+        decode_tokids_b64: false
+        decode_strip_message_history: false
+        # bidirectional_kv_xfer only: seconds a frontend remembers a
+        # conversation's decode-side blocks; keep below the decode engine's
+        # decoder_kv_blocks_ttl so it never offers blocks already freed.
+        conversation_cache_ttl_s: 450.0
+        # Per-leg HTTP timeout: a turn can prefill tens of thousands of tokens
+        # and decode for minutes behind other requests.
+        request_timeout_s: 1800
+        # Conversations the conversation router remembers per frontend (LRU).
+        prefill_router_table_size: 100000
+        # Handshake protocol of a custom connector; built-in ones need none.
+        connector_profile: null
+      # The KV connector every engine of a replica is built with: the vLLM
+      # counterpart of trtllm_kwargs.cache_transceiver_config. kv_role follows
+      # the engine's role (prefill -> kv_producer, decode -> kv_consumer).
+      # kv_connector_extra_config is passed through to vLLM (NixlConnector:
+      # backends, kv_lease_duration, kv_recompute_threshold,
+      # decoder_kv_blocks_ttl). Defaults live on VllmKvTransferConfig.
+      kv_transfer:
+        kv_connector: NixlConnector
+        # Module path of a connector not built into vLLM; null for built-ins.
+        kv_connector_module_path: null
+        kv_connector_extra_config: {}
+        kv_load_failure_policy: fail
+        # Where the connector stages KV: cuda (GPU to GPU) or cpu.
+        kv_buffer_device: cuda
     vllm_kwargs: {}
     colocated:
       # true: generation shares training GPUs
