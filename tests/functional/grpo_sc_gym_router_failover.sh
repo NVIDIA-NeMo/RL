@@ -29,8 +29,14 @@ git config --global --add safe.directory "$PROJECT_ROOT"
 
 set -eou pipefail
 
+KILL_TARGET=${KILL_TARGET:-worker}
+# quarantine checks shard isolation; survival also requires training to complete.
+EXPECT=${EXPECT:-quarantine}
+case "$KILL_TARGET" in worker|frontend) ;; *) echo "Invalid KILL_TARGET=$KILL_TARGET"; exit 1 ;; esac
+case "$EXPECT" in quarantine|survival) ;; *) echo "Invalid EXPECT=$EXPECT"; exit 1 ;; esac
+COMPLETION_DEADLINE_S=${COMPLETION_DEADLINE_S:-1800}
 EXP_NAME=$(basename "$0" .sh)
-EXP_DIR=$SCRIPT_DIR/$EXP_NAME
+EXP_DIR=$SCRIPT_DIR/$EXP_NAME/$KILL_TARGET-$EXPECT
 LOG_DIR=$EXP_DIR/logs
 JSON_METRICS=$EXP_DIR/metrics.json
 RUN_LOG=$EXP_DIR/run.log
@@ -52,16 +58,6 @@ export PYTHONPATH=${PROJECT_ROOT}:${PYTHONPATH:-}
 KILL_AFTER_STEPS=${KILL_AFTER_STEPS:-3}
 # Ceiling on that wait. Generous: it covers Gym data prep, engine load and spinup.
 STEADY_STATE_WAIT_S=${STEADY_STATE_WAIT_S:-1800}
-# What this run is allowed to prove, which differs by where in the stack it runs.
-#   quarantine (default) -- the ledger condemns the dead shard and the router's serving
-#                           set shrinks, i.e. NeMo-Gym stops being handed the corpse.
-#                           That is everything fleet health + the router deliver.
-#   survival             -- and the run then continues to completion. That needs the
-#                           communicator rebuild from the elastic-recovery part of the
-#                           stack: without it the next weight refit broadcasts to a rank
-#                           that no longer exists and hangs inside NCCL, so the run wedges
-#                           with the stall watchdog warning (observed: job 6258553).
-EXPECT=${EXPECT:-quarantine}
 # How long to wait for the ledger to condemn the killed shard.
 QUARANTINE_WAIT_S=${QUARANTINE_WAIT_S:-300}
 # Watchdog ticks to let pass so the post-quarantine metrics are published and flushed.
@@ -141,6 +137,7 @@ PYTHONUNBUFFERED=1 uv run "$PROJECT_ROOT/examples/run_grpo_single_controller.py"
     policy.megatron_cfg.sequence_parallel=false \
     policy.generation.vllm_cfg.tensor_parallel_size=1 \
     policy.generation.vllm_cfg.async_engine=true \
+    ++policy.generation.vllm_cfg.http_api_server_count=8 \
     policy.max_total_sequence_length=512 \
     policy.generation.colocated.enabled=false \
     policy.generation.colocated.resources.num_nodes=1 \
@@ -178,6 +175,8 @@ PYTHONUNBUFFERED=1 uv run "$PROJECT_ROOT/examples/run_grpo_single_controller.py"
     ++async_rl.generation_fleet_health.enabled=true \
     ++async_rl.generation_router.enabled=true \
     ++async_rl.generation_fleet_health.min_healthy_shards=1 \
+    ++async_rl.generation_fleet_health.restart_dead_shards=false \
+    ++token_capture.enabled=false \
     "$@" \
     > "$RUN_LOG" 2>&1 &
 TRAIN_PID=$!
@@ -258,8 +257,32 @@ if [[ -n "$TOTAL_STEPS" ]] && (( STEPS > TOTAL_STEPS - 5 )); then
 fi
 
 VICTIM=${ACTORS[0]}
-echo "[failover] killing generation actor $VICTIM"
-kill -9 "$VICTIM" 2>/dev/null || true
+if [[ "$KILL_TARGET" == "frontend" ]]; then
+    OWNER_PID=$VICTIM
+    VICTIM=$(uv run --no-sync python - "$RUN_LOG" "$OWNER_PID" <<'PYCODE'
+import re
+import sys
+from pathlib import Path
+
+pattern = rf"NRL HTTP frontend ready: owner_pid={int(sys.argv[2])} index=1 pid=(\d+)"
+matches = re.findall(pattern, Path(sys.argv[1]).read_text())
+if not matches:
+    raise SystemExit("No frontend PID recorded for the selected Ray owner")
+print(matches[-1])
+PYCODE
+    )
+    if [[ "$(awk '/^PPid:/{print $2}' "/proc/$VICTIM/status")" != "$OWNER_PID" ]]; then
+        echo "[failover] FAIL: frontend $VICTIM is not a child of $OWNER_PID"
+        exit 1
+    fi
+fi
+STEPS_AT_KILL=$(grep -cE "train step [0-9]+/" "$RUN_LOG" || true)
+echo "[failover] killing $KILL_TARGET pid=$VICTIM"
+kill -9 "$VICTIM"
+COMPLETION_END=$((SECONDS + COMPLETION_DEADLINE_S))
+if [[ "$KILL_TARGET" == "frontend" ]]; then
+    kill -0 "$OWNER_PID" || { echo "[failover] FAIL: owner died with the frontend"; exit 1; }
+fi
 
 # The ledger condemning the shard is the first thing to establish either way: without it
 # the kill landed somewhere irrelevant and nothing below means anything.
@@ -284,6 +307,16 @@ grep -oE "gen_fleet: shard [0-9]+ [a-z]+ -> [a-z]+" "$RUN_LOG" | sed 's/^/[failo
 
 if [[ "$EXPECT" == "survival" ]]; then
     echo "[failover] EXPECT=survival: waiting for the run to finish on the survivor..."
+    FINISHED=0
+    while (( SECONDS < COMPLETION_END )); do
+        if ! kill -0 "$TRAIN_PID" 2>/dev/null; then FINISHED=1; break; fi
+        sleep 1
+    done
+    if (( FINISHED == 0 )); then
+        echo "[failover] FAIL: training did not complete within ${COMPLETION_DEADLINE_S}s after the fault"
+        tail -80 "$RUN_LOG"
+        exit 1
+    fi
     set +e
     wait $TRAIN_PID
     RUN_RC=$?
@@ -324,6 +357,11 @@ COMMON_CHECKS=(
 )
 
 if [[ "$EXPECT" == "survival" ]]; then
+    STEPS_AFTER_RUN=$(grep -cE "train step [0-9]+/" "$RUN_LOG" || true)
+    if (( STEPS_AFTER_RUN <= STEPS_AT_KILL )); then
+        echo "[failover] FAIL: no training step completed after the fault"
+        exit 1
+    fi
     uv run tests/check_metrics.py "$JSON_METRICS" \
         "${COMMON_CHECKS[@]}" \
         'max(data["train/reward"]) > 0'
@@ -331,4 +369,4 @@ else
     uv run tests/check_metrics.py "$JSON_METRICS" "${COMMON_CHECKS[@]}"
 fi
 
-echo "[failover] PASS (EXPECT=$EXPECT)"
+echo "[failover] PASS (EXPECT=$EXPECT, KILL_TARGET=$KILL_TARGET)"

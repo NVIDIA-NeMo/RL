@@ -47,6 +47,7 @@ class MultiAPIServerPool:
         self.engine_manager: Any = None
         self.coordinator: Any = None
         self._command_lock = asyncio.Lock()
+        self._failed = False
 
     def create_engine(self, engine_args: Any, stat_loggers: list[Any]) -> Any:
         # vLLM and Ray are optional outside generation workers.
@@ -146,8 +147,12 @@ class MultiAPIServerPool:
                 parent_thread.start()
                 launch.watched_frontend_processes = self.children
             engine = parent_result.result(timeout=600)
-            for connection in self.connections:
-                receive_reply(connection)
+            for index, connection in enumerate(self.connections, 1):
+                pid = receive_reply(connection)
+                print(
+                    f"NRL HTTP frontend ready: owner_pid={os.getpid()} index={index} pid={pid}",
+                    flush=True,
+                )
             print(f"NRL HTTP API pool ready: {self.count} processes, one engine")
             return engine
         except BaseException:
@@ -160,15 +165,20 @@ class MultiAPIServerPool:
             if parent_thread is not None:
                 parent_thread.join(timeout=1)
 
+    def check_health(self) -> None:
+        """Raise if an HTTP frontend exited or the pool already failed."""
+        if self._failed:
+            raise RuntimeError("HTTP API pool failed")
+        for process in self.children:
+            if not process.is_alive():
+                raise RuntimeError(f"HTTP API process {process.name} exited")
+
     async def command(self, name: str, *args: Any) -> None:
         async with self._command_lock:
-            for process, connection in zip(
-                self.children, self.connections, strict=True
-            ):
-                if not process.is_alive():
-                    raise RuntimeError(f"HTTP API process {process.name} exited")
-                connection.send((name, args))
             try:
+                self.check_health()
+                for _, connection in zip(self.children, self.connections, strict=True):
+                    connection.send((name, args))
                 await asyncio.gather(
                     *(
                         asyncio.to_thread(receive_reply, connection)
@@ -176,6 +186,7 @@ class MultiAPIServerPool:
                     )
                 )
             except BaseException:
+                self._failed = True
                 self.stop_children()
                 self.close_engines()
                 raise

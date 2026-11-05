@@ -88,6 +88,8 @@ run_test      uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failov
 # The Gym-path counterpart of grpo_sc_generation_shard_recovery.sh, which covers the same
 # recovery on the native path.
 run_test      env EXPECT=survival uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
+# A frontend exit must be detected even while its owning Ray worker stays alive.
+run_test      env EXPECT=survival KILL_TARGET=frontend uv run --no-sync bash ./tests/functional/grpo_sc_gym_router_failover.sh
 # Full mode only: kills a generation shard and asserts the run carries on. Needs >= 3
 # GPUs so that losing a shard still leaves a fleet, and self-skips below that rather
 # than passing vacuously.

@@ -352,6 +352,12 @@ class VllmAsyncGenerationWorkerImpl(
         # API server pool for multiple HTTP API servers
         self._api_server_pool = None
 
+    def is_alive(self) -> bool:
+        """Report HTTP frontend exits to the generation fleet's liveness probe."""
+        if self._api_server_pool is not None:
+            self._api_server_pool.check_health()
+        return True
+
     async def start_gpu_profiling(self) -> None:
         """Start GPU profiling on the inner TP workers.
 
