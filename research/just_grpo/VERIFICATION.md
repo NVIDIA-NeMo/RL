@@ -31,6 +31,21 @@ The lock selects PyTorch 2.13 and TE 2.18; a full rebuild of that environment
 has not been verified. TP>1 diffusion training, CP>1 diffusion training,
 checkpoint resume, and reward convergence are not established by these checks.
 
-Two-GPU Standard and Fast Sudoku smoke results will be recorded here after
-completion. Historical results for RL #4258 and Bridge #6771 remain in those
-branches and are not evidence for this variant.
+## Sudoku smokes (2026-11-05)
+
+Job **21344700** completed successfully on two H100s with TP=1/DP=2.
+Standard (microbatch 4) and Fast (microbatch 1) each completed three updates,
+using 2 prompts x 4 generations, 512 generated tokens, context limit 1536,
+block size 16, and initial/final validation. Both passed the functional metric
+checker with finite nonzero gradients and matched generation/training scores.
+
+| Run | Maximum generation/training KL | Validation before / after |
+| --- | --- | --- |
+| Standard | 0.000167075 | 0.200000 / 0.273810 |
+| Fast | 0.000395882 | 0.200000 / 0.240476 |
+
+These are execution and score-alignment checks, not convergence evidence.
+Artifacts and exact commands are in
+`/lustre/fsw/portfolios/coreai/users/snorouzi/runs/diffusion_rl/pr_blockmask_20261105/`.
+Historical results for RL #4258 and Bridge #6771 remain in those branches and
+are not evidence for this variant.
