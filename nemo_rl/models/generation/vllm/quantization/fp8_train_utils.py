@@ -16,6 +16,7 @@
 import functools
 import importlib.util
 import os
+import re
 import shutil
 from typing import Any, Iterable
 
@@ -26,6 +27,11 @@ MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
 MXFP8_SCALE_SUFFIX = "_scale_from_checkpoint"
 _ATTENTION_QKV_SUFFIX = ".linear_qkv.weight"
+# Language-model (decoder or MTP) attention, optionally under a multimodal root;
+# encoder attention (e.g. vision) also uses linear_qkv but has no KV cache.
+_LANGUAGE_ATTENTION_PREFIX = re.compile(
+    r"^(?:(?:\w+\.)*language_model\.)?(?:decoder|mtp)\.layers\."
+)
 
 
 def canonicalize_mxfp8_refit_output(
@@ -207,8 +213,9 @@ def get_hf_attention_prefixes(conversion_tasks: Iterable[Any]) -> dict[str, str]
     Q (or fused QKV) projection, whose parent is the HF attention module:
     ``decoder.layers.4.self_attention`` -> ``backbone.layers.4.mixer`` for
     NemotronH, ``model.layers.4.self_attn`` for Llama/Qwen, and MTP layers map
-    to their own ``mtp.*`` names. Only attention layers appear, so hybrid
-    models get no entries for Mamba or MoE layers.
+    to their own ``mtp.*`` names. Only language-model attention layers appear:
+    hybrid models get no entries for Mamba or MoE layers, multimodal models none
+    for their encoders, and MLA models (no ``linear_qkv``) none at all.
 
     Args:
         conversion_tasks: Megatron-Bridge ``WeightConversionTask`` objects;
@@ -220,7 +227,11 @@ def get_hf_attention_prefixes(conversion_tasks: Iterable[Any]) -> dict[str, str]
     """
     prefixes = {}
     for task in conversion_tasks:
-        if task is None or not task.global_param_name.endswith(_ATTENTION_QKV_SUFFIX):
+        if (
+            task is None
+            or not task.global_param_name.endswith(_ATTENTION_QKV_SUFFIX)
+            or not _LANGUAGE_ATTENTION_PREFIX.match(task.global_param_name)
+        ):
             continue
         hf_param = task.mapping.hf_param
         hf_name = hf_param["q"] if isinstance(hf_param, dict) else hf_param

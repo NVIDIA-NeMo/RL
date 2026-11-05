@@ -80,6 +80,7 @@ from nemo_rl.models.generation.megatron.megatron_worker import (
     _configure_inference_optimized_layer_spec,
 )
 from nemo_rl.models.generation.vllm.config import (
+    REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
 )
@@ -3698,8 +3699,8 @@ class MegatronPolicyWorkerImpl(
             if not prefixes:
                 raise ValueError(
                     "FP8 KV cache needs per-layer attention scales, but no "
-                    "'self_attention.linear_qkv' weight was found in the "
-                    "Megatron-Bridge conversion tasks of this model."
+                    "language-model 'self_attention.linear_qkv' weight was found "
+                    "in the Megatron-Bridge conversion tasks of this model."
                 )
             self._fp8_kv_attention_prefixes = prefixes
         return self._fp8_kv_attention_prefixes
@@ -3761,7 +3762,8 @@ class MegatronPolicyWorkerImpl(
             for name, tensor in draft_weights:
                 yield f"draft.{name}", tensor
 
-        # Check whether FP8 KV cache is enabled.
+        # Only per-tensor FP8 caches have scales to refit, as in
+        # VllmGeneration.requires_kv_scale_sync (not fp8_ds_mla or per-token-head).
         use_fp8_kv_cache = False
         if (
             "generation" in self.cfg
@@ -3772,7 +3774,8 @@ class MegatronPolicyWorkerImpl(
             use_fp8_kv_cache = (
                 "vllm_cfg" in generation_cfg
                 and "kv_cache_dtype" in generation_cfg["vllm_cfg"]
-                and generation_cfg["vllm_cfg"]["kv_cache_dtype"].startswith("fp8")
+                and generation_cfg["vllm_cfg"]["kv_cache_dtype"]
+                in REFITTABLE_FP8_KV_CACHE_DTYPES
             )
 
         if not use_fp8_kv_cache:
@@ -5330,12 +5333,17 @@ class MegatronPolicyWorkerImpl(
 
         attention_prefixes = self._get_fp8_kv_attention_prefixes()
 
-        def _extract_layer_key(module_name: str) -> str:
-            # "module.module.decoder.layers.4.self_attention.core_attention" (or an
-            # MTP layer) -> the HF attention module that owns its vLLM scales.
-            megatron_prefix = re.sub(r"^(module\.)+", "", module_name).removesuffix(
+        def _megatron_attention_prefix(module_name: str) -> str:
+            # "module.module.decoder.layers.4.self_attention.core_attention"
+            # -> "decoder.layers.4.self_attention"
+            return re.sub(r"^(module\.)+", "", module_name).removesuffix(
                 ".core_attention"
             )
+
+        def _extract_layer_key(module_name: str) -> str:
+            # Language-model (or MTP) core attention -> the HF attention module
+            # that owns its vLLM scales.
+            megatron_prefix = _megatron_attention_prefix(module_name)
             if megatron_prefix not in attention_prefixes:
                 raise ValueError(
                     f"No HF attention module for {module_name!r}; known Megatron "
@@ -5371,7 +5379,10 @@ class MegatronPolicyWorkerImpl(
         matched_modules = []
         # Try to register forward_pre_hook on core_attention first
         for name, module in self.model.named_modules():
-            if name.endswith("self_attention.core_attention"):
+            # Skip encoder attention (e.g. a vision tower): it has no KV cache.
+            if name.endswith("self_attention.core_attention") and (
+                _megatron_attention_prefix(name) in attention_prefixes
+            ):
                 try:
                     handle = module.register_forward_pre_hook(
                         _pre_hook_builder_core_attention(name)

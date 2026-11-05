@@ -285,19 +285,26 @@ def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
     assert not isinstance(megatron_forwarded, list)
 
 
-def _hybrid_attention_tasks() -> list[Any]:
-    """Bridge tasks of a NemotronH-like model: Mamba layer 0, attention layer 4, MTP."""
+def _bridge_task(global_param_name: str, hf_param: Any) -> SimpleNamespace:
+    return SimpleNamespace(
+        global_param_name=global_param_name,
+        mapping=SimpleNamespace(hf_param=hf_param),
+    )
 
-    def task(global_param_name: str, hf_param: Any) -> SimpleNamespace:
-        return SimpleNamespace(
-            global_param_name=global_param_name,
-            mapping=SimpleNamespace(hf_param=hf_param),
-        )
+
+def _hybrid_attention_tasks() -> list[Any]:
+    """Bridge tasks of a NemotronH-like model: Mamba layer 0, attention layer 4, MTP,
+    plus a vision encoder layer (fused QKV) that has no KV cache."""
+    task = _bridge_task
 
     def qkv(layer: str) -> dict[str, str]:
         return {p: f"{layer}.mixer.{p}_proj.weight" for p in "qkv"}
 
     return [
+        task(
+            "vision_model.decoder.layers.0.self_attention.linear_qkv.weight",
+            "model.visual.blocks.0.attn.qkv.weight",
+        ),
         task(
             "decoder.layers.0.mixer.in_proj.weight",
             "backbone.layers.0.mixer.in_proj.weight",
@@ -342,8 +349,9 @@ def test_fp8_kv_scales_are_emitted_only_for_hybrid_attention_layers() -> None:
         for name, tensor in worker._iter_params_with_optional_kv_scales(kv_scales)
     }
 
-    # vLLM's own Attention parameter names, only for attention layers (no Mamba
-    # layer 0); MTP attention keeps its own HF namespace.
+    # vLLM's own Attention parameter names, only for language-model attention
+    # layers (no Mamba layer 0, no vision encoder); MTP attention keeps its own
+    # HF namespace.
     assert emitted == {
         "backbone.layers.4.mixer.attn.q_scale": 1.0,
         "backbone.layers.4.mixer.attn.k_scale": 0.5,
@@ -352,6 +360,73 @@ def test_fp8_kv_scales_are_emitted_only_for_hybrid_attention_layers() -> None:
         "mtp.layers.0.mixer.attn.k_scale": 1.0,
         "mtp.layers.0.mixer.attn.v_scale": 1.0,
     }
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8_ds_mla", "fp8_per_token_head"])
+def test_fp8_kv_scales_are_not_emitted_without_refittable_scales(
+    kv_cache_dtype: str,
+) -> None:
+    worker = _fp8_kv_worker()
+    worker.cfg["generation"]["vllm_cfg"]["kv_cache_dtype"] = kv_cache_dtype
+    # An MLA model has no linear_qkv, so looking up scale owners would fail.
+    worker.refit_conversion_tasks = [
+        _bridge_task(
+            "decoder.layers.0.self_attention.linear_q_proj.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+        )
+    ]
+
+    assert list(worker._iter_params_with_optional_kv_scales()) == []
+
+
+@pytest.mark.parametrize(
+    ("tasks", "expected"),
+    [
+        pytest.param(
+            [
+                _bridge_task(
+                    "language_model.decoder.layers.1.self_attention.linear_qkv.weight",
+                    {
+                        p: f"model.language_model.layers.1.self_attn.{p}_proj.weight"
+                        for p in "qkv"
+                    },
+                ),
+                _bridge_task(
+                    "llava_model.vision_model.decoder.layers.0.self_attention.linear_qkv.weight",
+                    "vision_tower.blocks.0.attn.qkv.weight",
+                ),
+            ],
+            {
+                "language_model.decoder.layers.1.self_attention": (
+                    "model.language_model.layers.1.self_attn"
+                )
+            },
+            id="multimodal",
+        ),
+        pytest.param(
+            [
+                _bridge_task(
+                    "decoder.layers.0.self_attention.linear_q_proj.weight",
+                    "model.layers.0.self_attn.q_proj.weight",
+                ),
+                _bridge_task(
+                    "decoder.layers.0.self_attention.linear_kv_down_proj.weight",
+                    "model.layers.0.self_attn.kv_a_proj_with_mqa.weight",
+                ),
+            ],
+            {},
+            id="mla",
+        ),
+    ],
+)
+def test_hf_attention_prefixes_cover_only_language_model_qkv_attention(
+    tasks: list[Any], expected: dict[str, str]
+) -> None:
+    from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+        get_hf_attention_prefixes,
+    )
+
+    assert get_hf_attention_prefixes(tasks) == expected
 
 
 @pytest.mark.parametrize("include_q", [True, False])
@@ -367,11 +442,23 @@ def test_calibrate_qkv_fp8_scales_keys_hybrid_and_mtp_attention(
             {"self_attention": torch.nn.ModuleDict({"core_attention": CoreAttention()})}
         )
 
-    # Mirrors Megatron's wrapped module tree: module.decoder.layers.<i> and the MTP block.
+    # Mirrors Megatron's wrapped module tree: module.decoder.layers.<i>, the MTP
+    # block and a vision encoder.
     model = torch.nn.ModuleDict(
         {
             "module": torch.nn.ModuleDict(
                 {
+                    "vision_model": torch.nn.ModuleDict(
+                        {
+                            "decoder": torch.nn.ModuleDict(
+                                {
+                                    "layers": torch.nn.ModuleDict(
+                                        {"0": attention_block()}
+                                    )
+                                }
+                            )
+                        }
+                    ),
                     "decoder": torch.nn.ModuleDict(
                         {"layers": torch.nn.ModuleDict({"4": attention_block()})}
                     ),
@@ -400,6 +487,10 @@ def test_calibrate_qkv_fp8_scales_keys_hybrid_and_mtp_attention(
     )
 
     def get_logprobs(**_: Any) -> None:
+        vision = model["module"]["vision_model"]["decoder"]["layers"]["0"]
+        vision["self_attention"]["core_attention"](
+            torch.full((2,), 100.0), torch.full((2,), 100.0), torch.full((2,), 100.0)
+        )
         core = model["module"]["decoder"]["layers"]["4"]["self_attention"]
         core["core_attention"](
             torch.full((2,), 4.48), torch.full((2,), 8.96), torch.ones(2)
