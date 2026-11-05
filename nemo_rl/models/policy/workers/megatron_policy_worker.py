@@ -1319,7 +1319,9 @@ class MegatronPolicyWorkerImpl(
             # Finish any overlap on the comm stream before touching the reduced
             # gradient buffers (including distributed-optimizer gradient shards).
             torch.cuda.synchronize()
-            self.model.scale_gradients(token_factor)
+            self.model.scale_gradients(
+                torch.tensor(token_factor, device=kept_toks.device)
+            )
         metrics = [
             rescale_loss_metrics(
                 m,
@@ -2302,7 +2304,7 @@ class MegatronPolicyWorkerImpl(
         # below sees the rescaled grads; for all_reduce the result is the
         # global mean grad; for reduce_scatter (dist-opt) it's the shard.
         # Either way, opt.step sees the right-normalized gradient.
-        self.model.scale_gradients(inv_n)
+        self.model.scale_gradients(torch.tensor(inv_n, device=n_safe.device))
         if draft_step_state.active:
             draft_step_state.correct_main_grads(
                 self.model.parameters(),

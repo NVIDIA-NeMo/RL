@@ -1,0 +1,84 @@
+# Zero train/generation KL sibling of the SingleController token-capture nightly, with
+# per-token NVFP4 routed experts on FlashInfer. Training and refit stay BF16; generation
+# quantizes the experts to NVFP4, and each training MoE forward runs the same kernel on
+# the same quantization (moe_training_matches_inference). Training runs TP2 x EP4 on one
+# node; generation runs TP2 x EP4 on the other.
+#
+# Needs Megatron-LM PRs #7798 and #8691 and flashinfer-python>=0.7.0 (the per-token
+# NVFP4 Relu2 MoE kernels).
+# Launch with:
+#   uv run examples/run_grpo_single_controller.py \
+#     --config examples/configs/recipes/llm/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-async-gym-single-controller-token_capture-zero-kl-nvfp4-flashinfer.yaml
+defaults: ./grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-async-gym-single-controller-token_capture-zero-kl-nvfp4-flashinfer
+
+policy:
+  hf_config_overrides:
+    router_aux_loss_coef: 0
+  make_sequence_length_divisible_by: 128
+  megatron_cfg:
+    zero_train_gen_mismatch: true
+    batch_invariant_mode: true
+    batch_invariant_backend: te_native
+    batch_invariant_collective: ordered
+    attention_backend: flash
+    flash_attention_version: 4
+    moe_permute_fusion: false
+    env_vars:
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:False
+      CUBLASLT_WORKSPACE_SIZE: '0'
+      CUBLAS_WORKSPACE_CONFIG: :0:0
+      MAMBA_DETERMINISTIC: '1'
+      TRITON_CACHE_AUTOTUNING: '1'
+    tensor_model_parallel_size: 2
+    context_parallel_size: 1
+    expert_model_parallel_size: 4
+    sequence_parallel: true
+    moe_router_dtype: fp32
+    defer_fp32_logits: true
+    use_fused_weighted_squared_relu: true
+    transformer_impl: inference_optimized
+    inference_grouped_gemm_backend: flashinfer
+    inference_moe_token_dispatcher_type: nvls
+    inference_moe_nvfp4_recipe: per_token
+    moe_training_matches_inference: true
+    activation_checkpointing: true
+    recompute_granularity: selective
+    recompute_modules:
+      - moe
+  generation:
+    mcore_generation_config:
+      transformer_impl: inference_optimized
+      inference_grouped_gemm_backend: flashinfer
+      inference_moe_token_dispatcher_type: nvls
+      tensor_model_parallel_size: 2
+      expert_model_parallel_size: 4
+      sequence_parallel: true
+      moe_router_dtype: fp32
+      logprobs_mode: raw_logprobs
+      mamba_inference_ssm_states_dtype: float32
+      # 8 prompts x 16 generations over two TP2 engines is ~64 requests per engine.
+      max_requests: 64
+      inference_flashinfer_mxfp8_token_capacity: 256
+      moe_pad_experts_for_cuda_graph_inference: false
+    colocated:
+      resources:
+        gpus_per_node: ${cluster.gpus_per_node}
+        num_nodes: 1
+
+# Rollouts from an older policy version cannot match the training forward, so stay
+# strictly on-policy.
+async_rl:
+  sampler:
+    max_lookahead_versions: 0
+
+logger:
+  log_dir: logs/grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-async-gym-single-controller-token_capture-zero-kl-nvfp4-flashinfer
+  wandb:
+    name: grpo-nanov3-30BA3B-2n4g-megatron_generation-noncolocated-async-gym-single-controller-token_capture-zero-kl-nvfp4-flashinfer
+
+cluster:
+  gpus_per_node: 4
+  num_nodes: 2
