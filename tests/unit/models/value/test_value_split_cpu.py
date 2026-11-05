@@ -35,6 +35,7 @@ import torch
 from nemo_rl.algorithms.loss.interfaces import LossType, MetricNormalizer
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.value.utils import gather_and_right_shift_values
 
 
 @pytest.fixture
@@ -93,6 +94,7 @@ def worker_type(monkeypatch):
         "defaultdict": defaultdict,
         "LossType": LossType,
         "MetricNormalizer": MetricNormalizer,
+        "gather_and_right_shift_values": gather_and_right_shift_values,
         "parallel_state": SimpleNamespace(get_data_parallel_group=lambda: None),
         "get_pg_collection": lambda model: SimpleNamespace(mp=None),
         "reduce_max_stat_across_model_parallel_group": lambda x, **kw: x,

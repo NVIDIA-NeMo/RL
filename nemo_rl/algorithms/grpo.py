@@ -563,8 +563,8 @@ class MasterConfig(BaseModel, extra="allow"):
 def _validate_val_sampling(master_config: MasterConfig) -> None:
     """Reject validation sampling params that rollouts cannot honor.
 
-    Validation-only sampling is honored only on the NeMo-Gym vLLM rollout path;
-    everywhere else validation must sample exactly like training.
+    Validation-only sampling is honored only on the NeMo-Gym vLLM and TRT-LLM
+    rollout paths; everywhere else validation must sample exactly like training.
     """
     generation_config = master_config.policy["generation"]
     val_sampling_overridden = (
@@ -574,21 +574,23 @@ def _validate_val_sampling(master_config: MasterConfig) -> None:
     )
     if not val_sampling_overridden:
         return
-    assert generation_config["backend"] == "vllm" and should_use_nemo_gym(
+    assert generation_config["backend"] in ("vllm", "trtllm") and should_use_nemo_gym(
         master_config
     ), (
         "generation.val_temperature/val_top_p/val_top_k differing from the "
-        "train sampling params is only supported for vLLM NeMo-Gym rollouts."
+        "train sampling params is only supported for vLLM and TRT-LLM "
+        "NeMo-Gym rollouts."
     )
-    # NeMo-Gym requests carry only temperature/top_p; the vLLM server pins top_k
-    # to the train or validation profile, telling them apart by those two.
+    # NeMo-Gym requests carry only temperature/top_p; the vLLM and TRT-LLM
+    # servers pin top_k to the train or validation profile, telling them apart
+    # by those two.
     assert (
         generation_config["val_top_k"] == generation_config["top_k"]
         or generation_config["val_temperature"] != generation_config["temperature"]
         or generation_config["val_top_p"] != generation_config["top_p"]
     ), (
         "generation.val_top_k differs from top_k while val_temperature/val_top_p "
-        "equal the train values: the vLLM server cannot tell validation requests "
+        "equal the train values: the Gym server cannot tell validation requests "
         "apart and would sample them with top_k. Change val_temperature or "
         "val_top_p too, or keep val_top_k equal to top_k."
     )
@@ -4938,15 +4940,20 @@ def validate(
         )
 
         total_rewards = []
-        total_lengths = []
+        # Sum of per-batch mean length x rollouts, so a partial batch weighs less.
+        total_length_tokens = 0.0
         all_message_logs = []  # Collect all message logs
 
-        max_batches = (
-            master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
-        )
+        max_val_samples = master_config.grpo.max_val_samples
+        val_batch_size = master_config.grpo.val_batch_size
+        # Include the partial final batch, then trim it to the prompt cap.
+        max_batches = -(-max_val_samples // val_batch_size)
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
+            num_left = max_val_samples - batch_idx * val_batch_size
+            if val_batch.size > num_left:
+                val_batch = val_batch.slice(0, num_left)
 
             if val_num_generations_per_prompt > 1:
                 val_batch = val_batch.repeat_interleave(val_num_generations_per_prompt)
@@ -5032,8 +5039,11 @@ def validate(
                     ),
                 )
 
-            total_rewards.extend(val_batch["total_reward"].tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+            batch_rewards = val_batch["total_reward"].tolist()
+            total_rewards.extend(batch_rewards)
+            total_length_tokens += gen_metrics["mean_gen_tokens_per_sample"] * len(
+                batch_rewards
+            )
 
             # Collect message logs for later display
             to_env = [
@@ -5068,9 +5078,7 @@ def validate(
         else:
             accuracy = 0.0
 
-        avg_length = (
-            sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
-        )
+        avg_length = total_length_tokens / num_samples if num_samples > 0 else 0.0
 
         val_metrics = {
             "accuracy": accuracy,

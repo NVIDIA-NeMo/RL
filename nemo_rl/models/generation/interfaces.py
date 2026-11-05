@@ -264,7 +264,9 @@ class GenerationConfig(TypedDict):
     # Validation-only sampling. The exemplar YAMLs default these to the train
     # values above via interpolation (${.temperature}, ...), so validation
     # samples exactly like training unless overridden. Only honored on the
-    # NeMo-Gym vLLM rollout path (guarded in grpo.setup()).
+    # NeMo-Gym vLLM and TRT-LLM rollout paths (guarded in grpo.setup()); a
+    # val_top_k override also needs val_temperature or val_top_p to differ, since
+    # the server tells validation requests apart by those two.
     val_temperature: float
     val_top_p: float
     val_top_k: int | None
