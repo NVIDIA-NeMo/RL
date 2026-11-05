@@ -21,7 +21,10 @@ import pytest
 import torch
 from tensordict import TensorDict
 
-from nemo_rl.algorithms.async_utils.replay_buffer import TQReplayBuffer
+from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DataPlaneCheckpointBarrier,
+    TQReplayBuffer,
+)
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler, InOrderSampler
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import AdvantageComputer
 from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
@@ -441,6 +444,40 @@ def test_full_batch_ppo_trains_every_forest_row_per_epoch(monkeypatch):
     ctrl._sync_weights.assert_awaited_once()
     assert ctrl._trainer_version == ctrl._train_steps == 1
     assert ctrl._consumed_samples == 2
+    assert not ctrl._dp_client.list_sample_ids("train")
+
+
+@pytest.mark.parametrize("streaming", [False, True])
+def test_forest_step_padding_trains_and_clears_copies(monkeypatch, streaming):
+    """Step padding: both models see the copies; step cleanup deletes them."""
+    ctrl, _, _ = _ppo_setup(monkeypatch, streaming=streaming, padding=False)
+    ctrl._master_config.token_capture = TokenCaptureConfig(
+        enabled=True, forest_training=True, forest_padding_scope="step"
+    )
+    # Groups hold 3 and 5 real rows: full batch pads 8 to 9, streaming pads 5 to 6.
+    ctrl._forest_step_row_multiple = 3
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+
+    def get_values_from_meta(meta):
+        # The real critic writes values for every row it is given, copies included.
+        pad_ids = [sid for sid in meta.sample_ids if "_pad" in sid]
+        if not pad_ids:
+            return
+        values = TensorDict(
+            {"values": torch.zeros(len(pad_ids), 3)}, batch_size=[len(pad_ids)]
+        )
+        ctrl._dp_client.put_samples(pad_ids, "train", values)
+
+    ctrl._value.get_values_from_meta = get_values_from_meta
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+    submitted = [
+        call.args[0]
+        for call in ctrl._trainer.train_microbatches_from_meta.call_args_list
+    ]
+    assert any("_pad" in sid for meta in submitted for sid in meta.sample_ids)
+    assert all(meta.size % 3 == 0 for meta in submitted)
+    for call in _critic_calls(ctrl):
+        assert call.kwargs["gbs"] == sum(meta.size for meta in submitted)
     assert not ctrl._dp_client.list_sample_ids("train")
 
 
