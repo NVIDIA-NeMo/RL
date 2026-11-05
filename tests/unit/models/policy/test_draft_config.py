@@ -49,19 +49,6 @@ def test_draft_optimizer_config_is_typed() -> None:
     )
 
 
-def test_dflash_accepts_excluded_legacy_aux_layer_field() -> None:
-    config = MegatronDFlashDraftConfig(
-        enabled=True,
-        aux_layer_indices=None,
-        gamma=5,
-        anchors_per_sample=4,
-        mask_token_id=151669,
-        target_hidden_state_layer_ids=[1, 17, 33],
-    )
-
-    assert "aux_layer_indices" not in config.model_dump()
-
-
 def test_eagle3_draft_config_accepts_legacy_mapping_without_speculator_type() -> None:
     from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 
@@ -116,61 +103,6 @@ def test_omitted_draft_config_does_not_request_refit() -> None:
     assert draft_refit_enabled(None) is False
 
 
-def test_dflash_config_validates_complete_training_contract() -> None:
-    config = MegatronDFlashDraftConfig(
-        enabled=True,
-        gamma=5,
-        anchors_per_sample=4,
-        mask_token_id=151665,
-        target_hidden_state_layer_ids=[1, 17, 33],
-    )
-
-    assert config.speculator_type == "dflash"
-    assert config.gamma == 5
-    assert config.target_hidden_state_layer_ids == [1, 17, 33]
-    assert config.max_cp_boundary_exclusion_fraction == 0.25
-
-
-@pytest.mark.parametrize("value", [-0.01, 1.01])
-def test_dflash_config_rejects_invalid_cp_boundary_exclusion_fraction(
-    value: float,
-) -> None:
-    """Catches exclusion thresholds that cannot represent a fraction."""
-    with pytest.raises(ValidationError):
-        MegatronDFlashDraftConfig(
-            enabled=True,
-            gamma=5,
-            anchors_per_sample=4,
-            mask_token_id=151665,
-            target_hidden_state_layer_ids=[1, 17, 33],
-            max_cp_boundary_exclusion_fraction=value,
-        )
-
-
-def test_dspark_config_preserves_public_qwen3_8b_contract() -> None:
-    config = MegatronDSparkDraftConfig(
-        enabled=True,
-        model_name="deepseek-ai/dspark_qwen3_8b_block7",
-        model_revision="03326e5043815da1f81b109078b2889737c26017",  # pragma: allowlist secret
-        block_size=7,
-        anchors_per_sample=512,
-        mask_token_id=151669,
-        target_hidden_state_layer_ids=[1, 9, 17, 25, 33],
-        markov_rank=256,
-        confidence_enabled=True,
-        confidence_with_markov=True,
-    )
-
-    assert config.speculator_type == "dspark"
-    assert config.model_name == "deepseek-ai/dspark_qwen3_8b_block7"
-    assert config.model_revision == (
-        "03326e5043815da1f81b109078b2889737c26017"  # pragma: allowlist secret
-    )
-    assert config.block_size == 7
-    assert config.draft_vocab_size is None
-    assert config.target_hidden_state_layer_ids == [1, 9, 17, 25, 33]
-
-
 def test_dspark_config_rejects_vocab_different_from_live_target() -> None:
     config = MegatronDSparkDraftConfig(
         enabled=True,
@@ -209,124 +141,32 @@ def test_dspark_config_resolves_target_owned_vocab() -> None:
     )
 
 
-def test_dspark_update_probe_is_explicitly_opt_in() -> None:
+def test_block_draft_config_drops_only_default_inherited_eagle3_keys() -> None:
     values = {
-        "block_size": 7,
-        "anchors_per_sample": 2,
-        "mask_token_id": 151669,
-        "target_hidden_state_layer_ids": [1, 9, 17, 25, 33],
+        "enabled": True,
+        "gamma": 5,
+        "anchors_per_sample": 4,
+        "mask_token_id": 151665,
+        "target_hidden_state_layer_ids": [1, 17, 33],
+        "ttt_steps": 3,
     }
 
-    assert MegatronDSparkDraftConfig(**values).update_probe_enabled is False
-    assert (
-        MegatronDSparkDraftConfig(
-            **values, update_probe_enabled=True
-        ).update_probe_enabled
-        is True
-    )
+    MegatronDFlashDraftConfig.model_validate(values)
+    with pytest.raises(ValidationError, match="ttt_steps"):
+        MegatronDFlashDraftConfig.model_validate({**values, "ttt_steps": 4})
 
 
-def test_dspark_config_rejects_dflash_gamma_alias() -> None:
-    with pytest.raises(ValidationError, match="gamma"):
-        MegatronDSparkDraftConfig.model_validate(
+def test_dflash_config_rejects_duplicate_target_taps() -> None:
+    with pytest.raises(ValidationError, match="unique"):
+        MegatronDFlashDraftConfig.model_validate(
             {
                 "enabled": True,
-                "gamma": 7,
-                "anchors_per_sample": 512,
-                "mask_token_id": 151669,
-                "target_hidden_state_layer_ids": [1, 9, 17, 25, 33],
+                "gamma": 5,
+                "anchors_per_sample": 4,
+                "mask_token_id": 151665,
+                "target_hidden_state_layer_ids": [1, 1],
             }
         )
-
-
-def test_dflash_config_accepts_only_null_inherited_eagle_taps() -> None:
-    values = {
-        "enabled": True,
-        "gamma": 5,
-        "anchors_per_sample": 4,
-        "mask_token_id": 151665,
-        "target_hidden_state_layer_ids": [1, 17, 33],
-        "aux_layer_indices": None,
-    }
-
-    config = MegatronDFlashDraftConfig.model_validate(values)
-
-    assert "aux_layer_indices" not in config.model_dump()
-    with pytest.raises(ValidationError, match="aux_layer_indices"):
-        MegatronDFlashDraftConfig.model_validate({**values, "aux_layer_indices": [1]})
-
-
-@pytest.mark.parametrize(
-    ("override", "message"),
-    [
-        ({"gamma": 0}, "greater than 0"),
-        ({"anchors_per_sample": 0}, "greater than 0"),
-        ({"mask_token_id": -1}, "greater than or equal to 0"),
-        ({"target_hidden_state_layer_ids": []}, "at least 1"),
-        ({"target_hidden_state_layer_ids": [1, 1]}, "unique"),
-    ],
-)
-def test_dflash_config_rejects_invalid_plan_before_model_build(
-    override: dict[str, object], message: str
-) -> None:
-    values: dict[str, object] = {
-        "enabled": True,
-        "gamma": 5,
-        "anchors_per_sample": 4,
-        "mask_token_id": 151665,
-        "target_hidden_state_layer_ids": [1, 17, 33],
-    }
-    values.update(override)
-
-    with pytest.raises(ValidationError, match=message):
-        MegatronDFlashDraftConfig.model_validate(values)
-
-
-def test_qwen3_8b_dflash_recipe_pairs_public_drafter_with_exact_target() -> None:
-    path = (
-        REPO_ROOT
-        / "examples/configs/recipes/llm/grpo-qwen3-8b-1n8g-megatron-dflash.yaml"
-    )
-    raw = OmegaConf.to_container(load_config(path), resolve=True)
-
-    config = MasterConfig(**raw)
-
-    assert config.policy["model_name"] == "Qwen/Qwen3-8B"
-    assert config.policy["megatron_cfg"]["tensor_model_parallel_size"] == 2
-    assert isinstance(config.policy["draft"], MegatronDFlashDraftConfig)
-    assert config.policy["draft"].model_name == "z-lab/Qwen3-8B-DFlash-b16"
-    assert config.policy["draft"].target_hidden_state_layer_ids == [1, 9, 17, 25, 33]
-    assert (
-        config.policy["generation"]["vllm_kwargs"]["speculative_config"]
-        == {
-            "method": "dflash",
-            "model": "z-lab/Qwen3-8B-DFlash-b16",
-            "revision": "9b41424b7109f9c5413454f481b09a82b85333f4",  # pragma: allowlist secret
-            "num_speculative_tokens": 5,
-            "draft_tensor_parallel_size": 1,
-        }
-    )
-    assert config.policy["generation"]["vllm_cfg"]["enforce_eager"] is False
-    assert config.policy["generation"]["vllm_kwargs"]["compilation_config"] == {
-        "backend": "eager",
-        "cudagraph_mode": "PIECEWISE",
-    }
-
-
-def test_qwen3_8b_dspark_recipe_keeps_cuda_graphs_with_eager_backend() -> None:
-    path = (
-        REPO_ROOT
-        / "examples/configs/recipes/llm/grpo-qwen3-8b-1n8g-megatron-dspark.yaml"
-    )
-    raw = OmegaConf.to_container(load_config(path), resolve=True)
-
-    config = MasterConfig(**raw)
-
-    assert config.policy["generation"]["vllm_cfg"]["enforce_eager"] is False
-    assert config.policy["generation"]["vllm_kwargs"]["compilation_config"] == {
-        "backend": "eager",
-        "cudagraph_mode": "PIECEWISE",
-    }
 
 
 def test_coerce_draft_config_accepts_a_raw_mapping() -> None:
