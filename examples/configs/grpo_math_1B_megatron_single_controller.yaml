@@ -232,6 +232,12 @@ token_capture:
   forest_training: false
   # returned_history (default) or all_captured, including discarded attempts.
   selection_policy: returned_history
+  # Forest only. Keep execution padding and borrowed inputs out of MoE expert-bias statistics.
+  exclude_padding_from_router_stats: false
+  # Forest only. Pad each published group (group) or each training batch once (step).
+  forest_padding_scope: group
+  # Step padding only. Rows the padding copies: row0 or cyclic.
+  forest_pad_source: row0
   staging_partition: rollout_staging
 
 
