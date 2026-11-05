@@ -32,11 +32,11 @@ import asyncio
 import contextlib
 import hashlib
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional, TypeVar, cast
+from typing import Any, TypeVar, cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -61,15 +61,11 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
-from nemo_rl.environments.checkpointing.nemo_gym import (
-    GymEnvironmentCheckpoint,
-)
 from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointEpisode,
 )
 from nemo_rl.environments.gym_checkpoint_coordinator import (
     GYM_CHECKPOINT_SCHEMA_VERSION,
-    GymCheckpointCoordinator,
     GymCheckpointManifest,
     write_gym_checkpoint_manifest,
 )
@@ -90,7 +86,6 @@ from tests.unit.environments.gym_checkpoint_fakes import (
     deadline_pausing_manager,
     gym_coordinator,
     gym_environment_checkpoint,
-    no_staging_keys,
     snapshot_commit,
 )
 from tests.unit.single_controller._checkpoint_scenarios import (
@@ -289,43 +284,6 @@ class _RecoveryRolloutManager:
 
     def record_recovery_siblings(self, *, reused: int, redispatched: int) -> None:
         del reused, redispatched
-
-
-def _controller_for(
-    coordinator: GymCheckpointCoordinator,
-    ledger: Optional[RolloutRecoveryLedger] = None,
-    *,
-    manager: Optional[Any] = None,
-    list_staging_keys: Callable[[], Awaitable[list[str]]] = no_staging_keys,
-    allow_restart_only_servers: bool = False,
-) -> Any:
-    """A bare controller wired for Gym checkpoint coordination, and nothing else."""
-    controller = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
-    controller._rollout_manager = (
-        manager if manager is not None else deadline_pausing_manager()
-    )
-    controller._rollout_recovery_ledger = (
-        ledger if ledger is not None else RolloutRecoveryLedger()
-    )
-    controller._environment_checkpoint = gym_environment_checkpoint(
-        coordinator,
-        controller._rollout_recovery_ledger,
-        manager=controller._rollout_manager,
-        list_staging_keys=list_staging_keys,
-        allow_restart_only_servers=allow_restart_only_servers,
-    )
-    return controller
-
-
-def _gym_environment_for(
-    controller: Any, coordinator: GymCheckpointCoordinator
-) -> GymEnvironmentCheckpoint:
-    """The Gym checkpoint a turn-level controller builds, over ``coordinator``."""
-    return gym_environment_checkpoint(
-        coordinator,
-        controller._rollout_manager.recovery_ledger,
-        manager=controller._rollout_manager,
-    )
 
 
 class _BlockingRolloutManager:
@@ -730,8 +688,10 @@ def test_turn_trainer_checkpoint_leaves_gym_state_to_the_rollout_snapshot(
         )
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
         controller = controller_cls(config, actor_args, SetupTimingMetrics())
-        controller._environment_checkpoint = _gym_environment_for(
-            controller, gym_coordinator(gym_actor)
+        controller._environment_checkpoint = gym_environment_checkpoint(
+            gym_coordinator(gym_actor),
+            controller._rollout_manager.recovery_ledger,
+            manager=controller._rollout_manager,
         )
         attach_rollout_checkpointing(controller)
         try:
@@ -763,7 +723,13 @@ def test_gym_phase_stops_when_a_train_step_starts_committing(
 
     async def exercise() -> None:
         actor = FakeGymActor(exported_episodes=(), block_commit=True)
-        controller = _controller_for(gym_coordinator(actor))
+        controller = object.__new__(
+            SingleControllerActor.__ray_metadata__.modified_class
+        )
+        controller._rollout_manager = deadline_pausing_manager()
+        controller._environment_checkpoint = gym_environment_checkpoint(
+            gym_coordinator(actor), manager=controller._rollout_manager
+        )
         attach_rollout_checkpointing(controller)
         async with contextlib.AsyncExitStack() as stack:
             phase = asyncio.create_task(
@@ -1311,8 +1277,10 @@ async def _turn_recovery_restart(
     controller._sampler = _CountingInOrderSampler()
     controller._rollout_manager = rollout_manager
     controller._rollout_recovery_ledger = rollout_manager.recovery_ledger
-    controller._environment_checkpoint = _gym_environment_for(
-        controller, gym_coordinator(gym_actor)
+    controller._environment_checkpoint = gym_environment_checkpoint(
+        gym_coordinator(gym_actor),
+        rollout_manager.recovery_ledger,
+        manager=rollout_manager,
     )
     controller._master_config = SimpleNamespace(
         token_capture=SimpleNamespace(enabled=False, forest_training=False)
