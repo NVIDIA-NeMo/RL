@@ -2683,6 +2683,7 @@ def build_nemo_gym_config(
     turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
+    forward_session_id_as_conversation_id: bool = False,
 ) -> NemoGymConfig:
     """Build the ``NemoGymConfig`` for a single, unsharded NeMo-Gym actor.
 
@@ -2705,6 +2706,10 @@ def build_nemo_gym_config(
         policy_api_key: The bearer token the generation server requires on its
             OpenAI routes (VllmGeneration.http_server_api_key), or None when it
             checks none.
+        forward_session_id_as_conversation_id: Have Gym's policy model send its
+            per-rollout session id as ``conversation_params.conversation_id``
+            on every request; the vLLM disaggregation frontends route and
+            cache on it. A config that turns the Gym knob off is rejected.
 
     Returns:
         A ``NemoGymConfig`` with NeMo-RL fields at the top level and the
@@ -2738,6 +2743,21 @@ def build_nemo_gym_config(
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
+        forward_session_id_as_conversation_id=forward_session_id_as_conversation_id,
+    )
+
+
+def _vllm_model_overrides(nemo_gym_dict: dict[str, Any]) -> dict[str, Any]:
+    """The ``policy_model.responses_api_models.vllm_model`` block, safe to write to.
+
+    ``nemo_gym_dict`` is a shallow copy of the caller's mapping, so the block is
+    deep-copied into it first and the caller's ``policy_model`` stays untouched.
+    """
+    nemo_gym_dict["policy_model"] = copy.deepcopy(nemo_gym_dict.get("policy_model", {}))
+    return (
+        nemo_gym_dict["policy_model"]
+        .setdefault("responses_api_models", {})
+        .setdefault("vllm_model", {})
     )
 
 
@@ -2752,6 +2772,7 @@ def _build_gym_actor_config(
     turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
+    forward_session_id_as_conversation_id: bool = False,
 ) -> NemoGymConfig:
     """Turn one already-resolved Gym config mapping into a ``NemoGymConfig``.
 
@@ -2831,16 +2852,20 @@ def _build_gym_actor_config(
             "lease_grace_seconds": 3.0
             * float(instance_token_capture.get("control_timeout_s") or 60.0),
         }
-        # The copy above is shallow; keep the caller's policy_model untouched.
-        nemo_gym_dict["policy_model"] = copy.deepcopy(
-            nemo_gym_dict.get("policy_model", {})
-        )
-        policy_overrides = (
-            nemo_gym_dict.setdefault("policy_model", {})
-            .setdefault("responses_api_models", {})
-            .setdefault("vllm_model", {})
-        )
-        policy_overrides["checkpoint"] = {"policy": True}
+        _vllm_model_overrides(nemo_gym_dict)["checkpoint"] = {"policy": True}
+
+    if forward_session_id_as_conversation_id:
+        vllm_model = _vllm_model_overrides(nemo_gym_dict)
+        if vllm_model.get("forward_session_id_as_conversation_id") is False:
+            raise ValueError(
+                "env.nemo_gym.policy_model.responses_api_models.vllm_model."
+                "forward_session_id_as_conversation_id=false cannot be combined "
+                "with vLLM prefill/decode disaggregation: the frontends route a "
+                "trajectory's turns, and cache its decode-side KV, on the "
+                "conversation id Gym derives from its session id. Remove the "
+                "key or set it to true."
+            )
+        vllm_model["forward_session_id_as_conversation_id"] = True
 
     return NemoGymConfig(
         model_name=model_name,
@@ -3087,6 +3112,7 @@ def build_nemo_gym_actors(
     turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
+    forward_session_id_as_conversation_id: bool = False,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
     spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS,
 ) -> NemoGymShardSet:
@@ -3103,6 +3129,7 @@ def build_nemo_gym_actors(
             per rollout call. See ``NemoGym.set_tokenizer`` for why.
         turn_checkpointing_enabled: Install and discover one Gym v2 checkpoint
             coordinator per actor without triggering checkpoint saves.
+        forward_session_id_as_conversation_id: See :func:`build_nemo_gym_config`.
 
     Returns:
         A :class:`NemoGymShardSet` whose actors are all running and validated.
@@ -3126,6 +3153,7 @@ def build_nemo_gym_actors(
             turn_checkpointing_enabled=turn_checkpointing_enabled,
             token_capture=token_capture,
             policy_api_key=policy_api_key,
+            forward_session_id_as_conversation_id=forward_session_id_as_conversation_id,
         )
 
     return _build_sharded_gym_actors(
@@ -3139,6 +3167,7 @@ def build_nemo_gym_actors(
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
+        forward_session_id_as_conversation_id=forward_session_id_as_conversation_id,
         pg_ready_timeout=pg_ready_timeout,
         spinup_timeout=spinup_timeout,
     )
@@ -3155,6 +3184,7 @@ def _build_single_gym_actor(
     turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
+    forward_session_id_as_conversation_id: bool = False,
 ) -> NemoGymShardSet:
     """The pre-sharding path: one actor and no placement group.
 
@@ -3174,6 +3204,7 @@ def _build_single_gym_actor(
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
+        forward_session_id_as_conversation_id=forward_session_id_as_conversation_id,
     )
 
     actor_options: dict[str, Any] = {
@@ -3213,6 +3244,7 @@ def _build_sharded_gym_actors(
     turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
+    forward_session_id_as_conversation_id: bool = False,
     pg_ready_timeout: float,
     spinup_timeout: float,
 ) -> NemoGymShardSet:
@@ -3302,6 +3334,7 @@ def _build_sharded_gym_actors(
                     turn_checkpointing_enabled=turn_checkpointing_enabled,
                     token_capture=token_capture,
                     policy_api_key=policy_api_key,
+                    forward_session_id_as_conversation_id=forward_session_id_as_conversation_id,
                 )
             )
             shard_set.handles.setdefault(shard.name, []).append(actor)

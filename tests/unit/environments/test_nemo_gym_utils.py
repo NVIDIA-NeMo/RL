@@ -1086,6 +1086,84 @@ def test_build_nemo_gym_actors_hands_every_actor_the_policy_api_key(
     assert all(cfg["policy_api_key"] == "per-job-key" for cfg in cluster.actor_configs)
 
 
+def test_build_nemo_gym_actors_turns_on_gyms_conversation_ids_when_asked(
+    detected_uv_dirs,
+):
+    """The vLLM disaggregation frontends route on Gym's session id, so the
+    builder sets the Gym knob that sends it, inside the caller's own
+    policy_model overrides and without touching the caller's mapping."""
+    cluster = _FakeGymCluster()
+    env_configs = _env_configs(
+        policy_model={"responses_api_models": {"vllm_model": {"max_tokens": 7}}}
+    )
+    env_configs_before = copy.deepcopy(env_configs)
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            env_configs,
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+            forward_session_id_as_conversation_id=True,
+        )
+
+    [config] = cluster.actor_configs
+    vllm_model = config["initial_global_config_dict"]["policy_model"][
+        "responses_api_models"
+    ]["vllm_model"]
+    assert vllm_model == {
+        "max_tokens": 7,
+        "forward_session_id_as_conversation_id": True,
+    }
+    assert env_configs == env_configs_before
+
+
+def test_build_nemo_gym_actors_leaves_gyms_conversation_ids_alone_by_default(
+    detected_uv_dirs,
+):
+    cluster = _FakeGymCluster()
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            _env_configs(),
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+        )
+    [config] = cluster.actor_configs
+    assert "policy_model" not in config["initial_global_config_dict"]
+
+
+def test_build_nemo_gym_actors_rejects_gyms_conversation_ids_turned_off(
+    detected_uv_dirs,
+):
+    """An explicit false would silently route every sample of a prompt alike."""
+    env_configs = _env_configs(
+        policy_model={
+            "responses_api_models": {
+                "vllm_model": {"forward_session_id_as_conversation_id": False}
+            }
+        }
+    )
+    with _patched_cluster(_FakeGymCluster()):
+        with pytest.raises(ValueError, match="forward_session_id_as_conversation_id"):
+            nemo_gym_mod.build_nemo_gym_actors(
+                env_configs,
+                base_urls=["http://vllm-0"],
+                model_name="test-model",
+                tokenizer=_TOKENIZER,
+                enable_router_replay=False,
+                use_fastokens=False,
+                turn_checkpointing_enabled=False,
+                forward_session_id_as_conversation_id=True,
+            )
+
+
 def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs):
     cluster = _FakeGymCluster()
     token_capture = {

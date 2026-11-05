@@ -66,6 +66,10 @@ logger = logging.getLogger(__name__)
 
 try:
     import vllm  # noqa: F401
+    from vllm.distributed.kv_transfer import (
+        get_kv_transfer_group,
+        has_kv_transfer_group,
+    )
     from vllm.distributed.parallel_state import get_pp_group
     from vllm.v1.worker.gpu_worker import Worker as VllmWorker
 except ImportError:
@@ -954,6 +958,37 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
     def report_node_hostname(self) -> str:
         """Return the host shared by worker processes on this node."""
         return socket.gethostname()
+
+    def release_kv_transfer_pins(self) -> int:
+        """Expire every KV block the connector still pins for a remote reader.
+
+        A finished request's blocks stay allocated while the NIXL connector
+        waits for the other side to read them: a prefill engine's until its
+        decode engine has pulled them, and under ``bidirectional_kv_xfer`` a
+        decode engine's until the conversation's next turn or
+        ``decoder_kv_blocks_ttl`` (vLLM default 480 s). vLLM frees them only on
+        that read or on expiry, and refuses a prefix-cache reset while any
+        block is allocated. Zeroing the deadlines makes the connector report
+        every pin as sent at its next ``get_finished``, after which the
+        scheduler frees the blocks. Meant for the gap between steps, when no
+        reader is left and the frontends have dropped their handshakes to
+        these blocks. Returns the number of pins expired on this rank.
+        """
+        if not has_kv_transfer_group():
+            raise RuntimeError(
+                "release_kv_transfer_pins needs a KV connector; this engine has none"
+            )
+        connector = get_kv_transfer_group()
+        connector_worker = getattr(connector, "connector_worker", None)
+        pins = getattr(connector_worker, "_reqs_to_send", None)
+        if pins is None:
+            raise RuntimeError(
+                f"{type(connector).__name__} keeps no NIXL-style _reqs_to_send "
+                "table; NeMo RL cannot release its pinned KV blocks"
+            )
+        for req_id in list(pins):
+            pins[req_id] = 0.0
+        return len(pins)
 
     def get_zmq_address(self):
         """Get the ZMQ address for the current device."""

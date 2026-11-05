@@ -626,8 +626,9 @@ policy:
         # decode engine generated) back from the decode engine instead of
         # recomputing it (NixlConnector only). Off by default: the decode
         # engine then pins each finished conversation's blocks until the next
-        # turn or its decoder_kv_blocks_ttl, which competes with new requests
-        # for its KV pool; the trade-off depends on the workload.
+        # turn, its decoder_kv_blocks_ttl or the cache reset between steps,
+        # which competes with new requests for its KV pool; the trade-off
+        # depends on the workload.
         bidirectional_kv_xfer: false
         # Thin the prefill->decode relay: token ids as one base64 int32 string
         # instead of a 30k-int JSON array, and drop the redundant message

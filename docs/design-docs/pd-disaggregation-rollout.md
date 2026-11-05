@@ -270,7 +270,14 @@ vLLM-specific requirements, checked at setup: `colocated.enabled: false`,
 (`grpo.async_grpo.in_flight_weight_updates`, or any SingleController run), neither
 `bidirectional_kv_xfer` nor `recompute_kv_cache_after_weight_updates`: vLLM's cache
 reset at the pause raises while a decode request still holds blocks for KV in transit,
-so in-flight requests keep their KV and the prefix caches are left to eviction.
+so in-flight requests keep their KV and the prefix caches are left to eviction. Between
+steps (`finish_generation`, and `invalidate_kv_cache` after a drained update) the
+frontends drop their remembered handshakes first, then every engine expires the blocks
+its connector still pins for a remote reader (prefill leases, and under
+`bidirectional_kv_xfer` the finished turns the decode engines keep for
+`decoder_kv_blocks_ttl`) and resets its prefix cache. vLLM refuses that reset while any
+block is allocated, so a reset that still fails stops the step rather than letting the
+next one reuse KV computed under the previous weights.
 SingleController additionally refuses `token_capture.enabled` (the prefill leg never
 sees the ledger prefix the decode leg splices in). Which layer types a connector can
 move, and at which TP ratios, is vLLM's own check at engine start. Engines get
@@ -282,11 +289,13 @@ bands from `virtual_cluster.py`: the NIXL side channel (8556-8571) and the KV-ev
 publishers of the `kv_cache_aware` router (8572-8587), one port per engine on a node.
 
 The `conversation` and `kv_cache_aware` prefill routers (and the bidirectional
-conversation cache) key on `conversation_params.conversation_id`, which NeMo-Gym's model
-server sends when `forward_session_id_as_conversation_id: true` (see the vLLM recipe's
-`env.nemo_gym.initial_global_config_dict`). Without it routing falls back to a hash of the
+conversation cache) key on `conversation_params.conversation_id`, NeMo-Gym's per-rollout
+session id. NeMo RL turns the Gym knob that sends it,
+`policy_model.responses_api_models.vllm_model.forward_session_id_as_conversation_id`, on
+whenever the vLLM frontends are in use (`build_nemo_gym_actors`) and refuses a config that
+sets it to false. A request without the id (another client) is routed by a hash of the
 conversation's opening exchange (system prompt plus first user turn; the samples of one
-prompt share it) and the bidirectional cache stays empty; the frontend warns once.
+prompt share it) and gets nothing from the bidirectional cache; the frontend warns once.
 
 Colocated generation is not supported yet; set `colocated.enabled: false`.
 

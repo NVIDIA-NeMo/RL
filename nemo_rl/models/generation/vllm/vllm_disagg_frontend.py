@@ -974,11 +974,11 @@ class FrontendRelay:
                 self._warned_no_conversation_id = True
                 logger.warning(
                     "requests reach the disaggregation frontend without "
-                    "conversation_params.conversation_id; routing falls back to "
-                    "hashing each conversation's opening exchange and "
-                    "bidirectional_kv_xfer caches nothing. Set "
-                    "forward_session_id_as_conversation_id: true on NeMo-Gym's "
-                    "model server for per-rollout keys."
+                    "conversation_params.conversation_id, which NeMo RL has "
+                    "NeMo-Gym's policy model send "
+                    "(forward_session_id_as_conversation_id); routing falls "
+                    "back to hashing each conversation's opening exchange and "
+                    "bidirectional_kv_xfer caches nothing."
                 )
         # Decode-side handshakes are keyed by Gym's conversation id only: the
         # opening-exchange fallback would let one sample's blocks seed another

@@ -96,21 +96,6 @@ policy:
       enable_chunked_prefill: true
       max_num_batched_tokens: 16384
 
-env:
-  nemo_gym:
-    initial_global_config_dict:
-      policy_model:
-        responses_api_models:
-          vllm_model:
-            # Gym's session id (one per rollout) rides every request as
-            # conversation_params.conversation_id. The frontends route a
-            # trajectory's turns to one prefill engine on it (and, with
-            # bidirectional_kv_xfer, cache decode-side handshakes per
-            # conversation). Without it they hash the conversation's opening
-            # exchange instead, which cannot tell the samples of one prompt
-            # apart.
-            forward_session_id_as_conversation_id: true
-
 logger:
   log_dir: logs/grpo-qwen3-1.7b-2n4g-megatron-vllm-disagg-swe1
   wandb:

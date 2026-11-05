@@ -94,6 +94,11 @@ from nemo_rl.telemetry.setup import shutdown_telemetry
 
 LOGGER = logging.getLogger(__name__)
 
+# How long reset_prefix_cache_async(release_kv_transfer_pins=True) waits for the
+# scheduler to free the pins the workers expired before giving up.
+_KV_PIN_RELEASE_TIMEOUT_S = 30.0
+_KV_PIN_RELEASE_POLL_S = 0.05
+
 # PD disaggregation: sampling rate for shadow-validating frontend-supplied
 # prompt ids on the prefill leg. The engine recomputes the ids from the
 # messages it also received and logs a mismatch. Cheap insurance while
@@ -2823,8 +2828,19 @@ class VllmAsyncGenerationWorkerImpl(
             traceback.print_exc()
             return False
 
-    async def reset_prefix_cache_async(self):
-        """Async version of reset_prefix_cache."""
+    async def reset_prefix_cache_async(
+        self, *, release_kv_transfer_pins: bool = False
+    ) -> bool:
+        """Async version of reset_prefix_cache; returns vLLM's verdict.
+
+        vLLM refuses the reset while any KV block is allocated. With
+        ``release_kv_transfer_pins`` (disaggregation, between steps) every
+        worker first expires the blocks its KV connector pins for a remote
+        reader (``VllmInternalWorkerExtension.release_kv_transfer_pins``) and
+        the reset is retried until the scheduler has freed them. A reset that
+        still fails raises: the next step would otherwise reuse KV computed
+        under the previous weights.
+        """
         assert self.llm is not None, (
             "Attempting to reset prefix cache with either an uninitialized vLLM or non-model-owner"
         )
@@ -2834,9 +2850,24 @@ class VllmAsyncGenerationWorkerImpl(
                 "reset_prefix_cache_async can only be used with async_engine=True. Use reset_prefix_cache instead."
             )
 
-        await self.llm.reset_prefix_cache()
+        if release_kv_transfer_pins:
+            released = await resolve_collective_rpc_result(
+                self.llm.collective_rpc("release_kv_transfer_pins", args=())
+            )
+            deadline = time.monotonic() + _KV_PIN_RELEASE_TIMEOUT_S
+            while not (reset := await self.llm.reset_prefix_cache()):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(
+                        f"vLLM still holds KV blocks {_KV_PIN_RELEASE_TIMEOUT_S:.0f}s "
+                        f"after its workers expired {sum(released)} connector "
+                        "pins; the prefix cache was not reset"
+                    )
+                await asyncio.sleep(_KV_PIN_RELEASE_POLL_S)
+        else:
+            reset = await self.llm.reset_prefix_cache()
         gc.collect()
         torch.cuda.empty_cache()
+        return reset
 
     async def pause_generation_async(self, *, clear_cache: bool) -> bool:
         """Pause vLLM generation for an in-flight weight update."""

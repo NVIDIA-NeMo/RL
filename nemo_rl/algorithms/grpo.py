@@ -148,6 +148,7 @@ from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
+    uses_vllm_disagg_frontends,
     validate_vllm_disaggregation_for_refit,
     vllm_replica_width,
 )
@@ -1066,6 +1067,9 @@ def setup(
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
             policy_api_key=policy_api_key,
             turn_checkpointing_enabled=False,
+            forward_session_id_as_conversation_id=uses_vllm_disagg_frontends(
+                generation_config
+            ),
         )
         train_splits = (
             {f"train[{name}]": split for name, split in dataset.items()}

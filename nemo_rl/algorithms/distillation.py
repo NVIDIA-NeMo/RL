@@ -69,6 +69,7 @@ from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
+    uses_vllm_disagg_frontends,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
@@ -566,6 +567,9 @@ def setup(
                     # one, so Gym's model server must send the same key.
                     policy_api_key=deferred_vllm.http_server_api_key,
                     turn_checkpointing_enabled=False,
+                    forward_session_id_as_conversation_id=uses_vllm_disagg_frontends(
+                        generation_config
+                    ),
                 )
                 try:
                     validate_dataset_agent_coverage(
