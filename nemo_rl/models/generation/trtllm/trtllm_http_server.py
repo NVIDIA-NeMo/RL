@@ -29,7 +29,6 @@ Under PD disaggregation this endpoint is *leg-aware*. A replica's
 import asyncio
 import functools
 import logging
-import os
 import random
 import threading
 import time
@@ -43,6 +42,7 @@ from nemo_rl.models.generation.openai_server_utils import (
     decode_token_ids_b64,
     encode_token_ids_b64,
     replace_prefix_tokens,
+    tokenize_shadow_rate,
 )
 
 logger = logging.getLogger(__name__)
@@ -169,11 +169,9 @@ async def build_spliced_prompt_ids(
 
 # Sampling rate for shadow-validating frontend-supplied prompt ids on the
 # context leg: the ctx adapter recomputes the ids from the messages it also
-# received and logs a mismatch. Cheap insurance while frontend_tokenize is
-# young; 0 disables.
-_TOKENIZE_SHADOW_RATE = float(
-    os.environ.get("NRL_TRTLLM_TOKENIZE_SHADOW_RATE", "0") or 0
-)
+# received and logs a mismatch (NRL_TOKENIZE_SHADOW_RATE, one variable for
+# every backend; see openai_server_utils).
+_TOKENIZE_SHADOW_RATE = tokenize_shadow_rate()
 
 
 def _parse_disaggregated_params(raw: Optional[dict[str, Any]]) -> tuple[Any, bool]:

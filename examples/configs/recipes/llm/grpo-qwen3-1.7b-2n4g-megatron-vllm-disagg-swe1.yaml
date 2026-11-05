@@ -52,7 +52,7 @@ policy:
       # Below 9000, in virtual_cluster's disagg frontend band.
       frontend_base_port: 8300
       # Render and splice on the frontends; the prefill engines shadow-check a
-      # sample of the supplied ids (NRL_VLLM_TOKENIZE_SHADOW_RATE below).
+      # sample of the supplied ids (NRL_TOKENIZE_SHADOW_RATE below).
       frontend_tokenize: true
     vllm_cfg:
       # Per-role widths are identical here, so the top-level TP is also the
@@ -81,16 +81,16 @@ policy:
           # engine from completing an in-flight-refit pause -- for one lease.
         kv_load_failure_policy: fail
       env_vars:
-        # NIXL transfers over UCX; NCCL's variables do not apply to it.
-        UCX_TLS: all
-        UCX_NET_DEVICES: all
+        # NIXL transfers over UCX, so NCCL's variables do not steer it, and
+        # UCX_TLS / UCX_NET_DEVICES are cluster-specific: set them in the
+        # launch environment if NIXL needs them, not in the recipe.
         # NCCL_NET_PLUGIN=none is set on the engines by VllmGeneration under
         # disaggregation (HPC-X's NCCL plugin would load a UCX without CUDA
         # support into the TP>1 engines; see the design doc). Override here
         # only to put it back.
         # Shadow-validate 10% of the frontend-rendered prompts on the prefill
         # engines against a full engine-side render.
-        NRL_VLLM_TOKENIZE_SHADOW_RATE: "0.1"
+        NRL_TOKENIZE_SHADOW_RATE: "0.1"
     vllm_kwargs:
       # Required, not a tuning knob: this dataset's prompts run to ~37k tokens.
       enable_chunked_prefill: true

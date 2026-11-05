@@ -16,7 +16,6 @@ import asyncio
 import copy
 import gc
 import logging
-import os
 import random
 import secrets
 import threading
@@ -89,6 +88,7 @@ from nemo_rl.models.generation.openai_server_utils import (
     decode_token_ids_b64,
     encode_token_ids_b64,
     splice_prefix_tokens,
+    tokenize_shadow_rate,
 )
 from nemo_rl.telemetry.setup import shutdown_telemetry
 
@@ -101,9 +101,9 @@ _KV_PIN_RELEASE_POLL_S = 0.05
 
 # PD disaggregation: sampling rate for shadow-validating frontend-supplied
 # prompt ids on the prefill leg. The engine recomputes the ids from the
-# messages it also received and logs a mismatch. Cheap insurance while
-# frontend_tokenize is young; 0 disables.
-_TOKENIZE_SHADOW_RATE = float(os.environ.get("NRL_VLLM_TOKENIZE_SHADOW_RATE", "0") or 0)
+# messages it also received and logs a mismatch (NRL_TOKENIZE_SHADOW_RATE, one
+# variable for every backend; see openai_server_utils).
+_TOKENIZE_SHADOW_RATE = tokenize_shadow_rate()
 
 
 def _gym_prefix_from_messages(messages: Any) -> Optional[list[int]]:

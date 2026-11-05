@@ -411,7 +411,7 @@ def _build_frontend_tokenizer(
     ``build_spliced_prompt_ids`` -- the ids must be bit-identical to what the
     ctx adapter would compute, since a divergence silently trains on
     off-policy tokens (the adapter shadow-validates a sample under
-    NRL_TRTLLM_TOKENIZE_SHADOW_RATE).
+    NRL_TOKENIZE_SHADOW_RATE).
     """
     from transformers import AutoConfig, AutoTokenizer
 

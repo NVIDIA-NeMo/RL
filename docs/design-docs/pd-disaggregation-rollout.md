@@ -46,7 +46,7 @@ i.e. GPUs.
 Disaggregation makes a cheaper place available. `frontend_tokenize` moves the rendering
 and tokenization onto the frontends, which attach `prompt_token_ids_b64` to the prefill
 leg so the adapter does no template work at all (a sample is shadow-validated prefill-side
-under `NRL_TRTLLM_TOKENIZE_SHADOW_RATE` / `NRL_VLLM_TOKENIZE_SHADOW_RATE`, since the ids have to be bit-identical to what
+under `NRL_TOKENIZE_SHADOW_RATE`, since the ids have to be bit-identical to what
 the adapter would have produced). Frontends are CPU-only actors with no GPU in their
 budget, so raising F spreads the tokenization cost over F processes at no GPU cost — this
 is what F is for, and what to size it against.
