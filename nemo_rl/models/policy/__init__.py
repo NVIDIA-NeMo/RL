@@ -50,7 +50,12 @@ def _patch_transformers_tokenizer_class_set():
     import transformers
     from packaging.version import Version as PkgVersion
 
-    # Transformers 5.16.1 still ships both registry entries, so the patch remains
+    # Transformers 5.15 honors explicit trust_remote_code for blocklisted models
+    # and bypasses the class-mismatch fallback when auto_map is present.
+    if PkgVersion(transformers.__version__) >= PkgVersion("5.15.0"):
+        return
+
+    # Transformers 5.12.1 still ships both registry entries, so the patch remains
     # load-bearing across the currently supported backend environments.
     # TODO: remove this patch (and the assert below) once the deepseek_v3
     # entries actually disappear upstream.
