@@ -49,8 +49,9 @@ Rows with ``sample_mask == 0`` (token-capture placeholders, environment
 mask_sample, overlong filter, sequence-logprob-error masking) are excluded
 from every per-sample statistic, matching what the advantage estimator trains
 on. The ``groups/*`` block is computed over the rows the estimator's
-baseline/std saw instead (``baseline_mask``): the same rows by default, plus
-the incomplete rows ``grpo.masked_sample_rewards_in_baseline`` reinstates.
+baseline/std saw instead (``baseline_mask``), which ``grpo.masked_reward_policy``
+selects: under ``include`` (the default) masked rows with a nonzero dataset
+weight vote too.
 """
 
 from __future__ import annotations

@@ -33,16 +33,15 @@ placeholder rows are reported but do not dilute the fractions.
   with no gradient, for any reason; ``masking/trained_rows`` / ``trained_frac``:
   rows that train.
 * ``masking/baseline_rows``: rows whose reward enters the group baseline/std;
-  ``masking/reinstated_rows``: incomplete rows kept in the baseline by
-  ``grpo.masked_sample_rewards_in_baseline``.
+  ``masking/reinstated_rows``: masked rows that still vote there, which
+  ``grpo.masked_reward_policy: include`` (the default) allows.
 * ``masking/reward_mean_{trained,env_flag,truncated,masked}``: mean reward of
   each population, omitted when the population is empty, so the effect of
   masking on the reward signal is visible.
 * ``masking/groups``, ``masking/groups_lt2_trained_frac``: GRPO groups in the
-  step and the fraction left with fewer than two trained rows. With
-  ``grpo.masked_sample_rewards_in_baseline`` off those groups get no gradient;
-  with it on, a lone trained row can still be scored against reinstated
-  siblings.
+  step and the fraction left with fewer than two trained rows. Under
+  ``grpo.masked_reward_policy: exclude`` those groups get no gradient; under
+  ``include`` a lone trained row can still be scored against masked siblings.
 """
 
 from __future__ import annotations
