@@ -2468,6 +2468,7 @@ def _prepare_nemo_gym_rows(
             else configured_max_tokens
         )
         row["_rowidx"] = row_index
+        row.setdefault(NEMO_GYM_TASK_INDEX_KEY, group_index)
         row[NEMO_GYM_GROUP_ID_KEY] = group_ids[group_index]
         row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempts[group_index]
         row[NEMO_GYM_ROLLOUT_INDEX_KEY] = rollout_index
@@ -3520,16 +3521,18 @@ def _postprocess_single_nemo_gym_group(
         validate_reward_components_match_scalar([r["full_result"] for r in results])
 
     group_task_index = None
-    if nemo_gym_rows and NEMO_GYM_TASK_INDEX_KEY in nemo_gym_rows[0]:
-        group_task_index = int(nemo_gym_rows[0][NEMO_GYM_TASK_INDEX_KEY])
-        task_indices = [row.get(NEMO_GYM_TASK_INDEX_KEY) for row in nemo_gym_rows]
-        if any(
-            task_index is None or int(task_index) != group_task_index
-            for task_index in task_indices
-        ):
-            raise ValueError(
-                f"Expected one _ng_task_index per prompt group, got {task_indices}"
-            )
+    prompt_group_size = group_size if group_size is not None else len(nemo_gym_rows)
+    for start in range(0, len(nemo_gym_rows), prompt_group_size):
+        group_rows = nemo_gym_rows[start : start + prompt_group_size]
+        if NEMO_GYM_TASK_INDEX_KEY in group_rows[0]:
+            task_index = int(group_rows[0][NEMO_GYM_TASK_INDEX_KEY])
+            task_indices = [row.get(NEMO_GYM_TASK_INDEX_KEY) for row in group_rows]
+            if any(index is None or int(index) != task_index for index in task_indices):
+                raise ValueError(
+                    f"Expected one _ng_task_index per prompt group, got {task_indices}"
+                )
+            if len(nemo_gym_rows) == prompt_group_size:
+                group_task_index = task_index
 
     return NemoGymRolloutResult(
         input_ids=input_ids,
