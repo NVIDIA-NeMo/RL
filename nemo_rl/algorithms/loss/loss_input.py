@@ -476,6 +476,7 @@ def prepare_packed_loss_input(
     context_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
     chunk_size: Optional[int] = None,
+    reuse_logits_storage: bool = False,
 ) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
     """Prepare loss input from packed logits in a single fused pass.
 
@@ -500,6 +501,9 @@ def prepare_packed_loss_input(
         chunk_size: Sequence-dim chunk size for the logprob computation
             (policy.logprob_chunk_size); avoids materializing full-size
             float32 logits during training.
+        reuse_logits_storage: Let the chunked logprob write its grad into the
+            logits' storage (policy.megatron_cfg.reuse_logits_storage). Takes
+            effect only with chunking; the logits must have no other consumer.
 
     Returns:
         tuple(loss_input, maybe_updated_data)
@@ -571,6 +575,9 @@ def prepare_packed_loss_input(
         chunk_size=chunk_size if use_chunking else None,
         target_is_pre_rolled=not input_is_prepacked,
         return_packed_layout=input_is_prepacked,
+        # The grad may overwrite these logits only on the chunked path. The
+        # unfiltered KL call below reads them again, but only with chunking off.
+        reuse_logits_storage=reuse_logits_storage and use_chunking,
     )
 
     # Match prepare_loss_input behavior for top-k/top-p filtered training:

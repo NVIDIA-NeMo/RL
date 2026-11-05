@@ -11,7 +11,11 @@ tests/test_suites/llm/grpo-gemma3-1b-it-1n4g-automodel.sh
 tests/test_suites/llm/grpo-qwen2.5-7b-instruct-4n4g-automodel-tp2.v3.sh
 
 # Megatron
+tests/test_suites/llm/grpo-qwen2.5-0.5b-1n4g-megatron-tp2-fp8-per-token-head-quick.sh
 tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n4g-megatron.sh
+# Fused sequence-packing loss with a chunked logprob that writes its grad into
+# the packed logits' storage (policy.megatron_cfg.reuse_logits_storage=true)
+tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n4g-megatron-reuse-logits.sh
 tests/test_suites/llm/grpo-qwen3-1.7b-1n4g-megatron-eagle3.sh
 # Packed target sequence-parallel co-training (TP2 x CP2): DFlash then DSpark
 # share one four-GPU allocation and the same Hugging Face/uv caches.

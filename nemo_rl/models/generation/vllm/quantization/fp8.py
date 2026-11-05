@@ -16,7 +16,7 @@ import os
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import patch
 
 import ray
@@ -32,7 +32,10 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
-from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
+from nemo_rl.models.generation.vllm.config import (
+    REFITTABLE_FP8_KV_CACHE_DTYPES,
+    resolve_vllm_kv_cache_dtype,
+)
 from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
     MXFP8_SCALE_SUFFIX,
     canonicalize_mxfp8_refit_output,
@@ -297,10 +300,24 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     if vllm_cfg.get("is_mx") and not use_fp8_weights:
         raise ValueError("is_mx=True requires precision='fp8'")
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
+    kv_cache_dtype = resolve_vllm_kv_cache_dtype(vllm_cfg)
+    if kv_cache_dtype == "fp8_per_token_head":
+        # vLLM is an optional dependency outside generation workers.
+        from vllm.config.cache import CacheDType
+
+        if kv_cache_dtype not in get_args(CacheDType):
+            raise ValueError(
+                "fp8_per_token_head requires vLLM with fp8_per_token_head support"
+            )
 
     # Validate configuration: kv_cache_dtype
-    supported_kv_cache_dtypes = ["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]
+    supported_kv_cache_dtypes = [
+        "auto",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_ds_mla",
+        "fp8_per_token_head",
+    ]
     if kv_cache_dtype not in supported_kv_cache_dtypes:
         raise ValueError(
             f"kv_cache_dtype must be one of {supported_kv_cache_dtypes}, but got {kv_cache_dtype}"
@@ -481,7 +498,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "kv_cache_dtype": kv_cache_dtype,
         "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
     }
-
     return vllm_kwargs
 
 

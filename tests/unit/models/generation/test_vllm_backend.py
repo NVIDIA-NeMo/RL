@@ -817,7 +817,13 @@ def test_postprocess_failure_is_recovered_by_next_refit(monkeypatch):
 @pytest.mark.vllm
 @pytest.mark.parametrize(
     ("cache_dtype", "expected"),
-    [("fp8", True), ("fp8_e4m3", True), ("fp8_ds_mla", False), ("auto", False)],
+    [
+        ("fp8", True),
+        ("fp8_e4m3", True),
+        ("fp8_ds_mla", False),
+        ("fp8_per_token_head", False),
+        ("auto", False),
+    ],
 )
 def test_uses_fp8_kv_cache_excludes_deepseek_mla(cache_dtype, expected):
     from nemo_rl.models.generation.vllm.vllm_backend import (
@@ -837,13 +843,23 @@ def test_uses_fp8_kv_cache_excludes_deepseek_mla(cache_dtype, expected):
 @pytest.mark.vllm
 @pytest.mark.parametrize(
     ("cache_dtype", "expected"),
-    [("fp8", True), ("fp8_e4m3", True), ("fp8_ds_mla", False), ("auto", False)],
+    [
+        ("fp8", True),
+        ("fp8_e4m3", True),
+        ("fp8_ds_mla", False),
+        ("fp8_per_token_head", False),
+        ("auto", False),
+    ],
 )
-def test_generation_kv_scale_sync_excludes_deepseek_mla(cache_dtype, expected):
+def test_generation_kv_scale_sync_excludes_dynamic_cache(cache_dtype, expected):
     from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
 
     generation = VllmGeneration.__new__(VllmGeneration)
-    generation.cfg = {"vllm_cfg": {"kv_cache_dtype": cache_dtype}}
+    generation.cfg = {
+        "vllm_cfg": {
+            "kv_cache_dtype": cache_dtype,
+        }
+    }
     generation.weight_synchronizer = None
     generation.worker_group = SimpleNamespace(shutdown=lambda **_kwargs: True)
 
