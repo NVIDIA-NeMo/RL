@@ -25,6 +25,7 @@ from cwtrain.integrations.nvext import SERVED_IDENTITY_FILE, as_cache_salt
 from cwtrain.integrations.rollout import Completion, CompletionSampler, RolloutError
 
 from nemo_rl.models.generation.coreweave.config import CoreWeaveConfig
+from nemo_rl.models.policy.draft_config import draft_refit_enabled
 
 
 class CoreWeaveGeneration(CookbookGeneration):
@@ -51,7 +52,7 @@ class CoreWeaveGeneration(CookbookGeneration):
             raise ValueError(
                 "CoreWeave checkpoint export does not support quantization or LoRA"
             )
-        if (policy.get("draft") or {}).get("enabled") or (
+        if draft_refit_enabled(policy.get("draft")) or (
             policy.get("router_replay") or {}
         ).get("enabled"):
             raise ValueError(

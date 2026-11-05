@@ -436,6 +436,23 @@ def test_gym_accepts_matching_external_endpoint(adapter, tmp_path):
     adapter.CoreWeaveGeneration.validate_settings(master)
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("validated", [False, True])
+def test_gym_handles_draft_config_models(adapter, tmp_path, enabled, validated):
+    # Import inside the fixture's package tree to avoid optional policy dependencies.
+    from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
+
+    master = gym_master_config(tmp_path)
+    master.policy["draft"] = (
+        Eagle3DraftConfig(enabled=enabled) if validated else {"enabled": enabled}
+    )
+    if enabled:
+        with pytest.raises(ValueError, match="draft training"):
+            adapter.CoreWeaveGeneration.validate_settings(master)
+    else:
+        adapter.CoreWeaveGeneration.validate_settings(master)
+
+
 @pytest.mark.parametrize(
     "key,value",
     [
