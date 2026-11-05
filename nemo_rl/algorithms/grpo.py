@@ -2013,9 +2013,16 @@ def setup(
             CoreWeaveGeneration,
         )
 
-        policy, policy_time = init_policy()
-        setup_timing_metrics.policy_init_time_s = policy_time
-        policy_generation = CoreWeaveGeneration(generation_config, tokenizer)
+        def init_coreweave() -> tuple[CoreWeaveGeneration, float]:
+            t0 = time.perf_counter()
+            generation = CoreWeaveGeneration(generation_config, tokenizer)
+            return generation, time.perf_counter() - t0
+
+        policy_generation, policy = initialize_generation_with_policy(
+            init_generation_fn=init_coreweave,
+            colocated_inference=False,
+            setup_timing_metrics=setup_timing_metrics,
+        )
         policy_generation.weight_synchronizer = create_weight_synchronizer(
             policy=policy,
             generation=policy_generation,
