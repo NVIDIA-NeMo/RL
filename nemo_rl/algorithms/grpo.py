@@ -135,7 +135,11 @@ from nemo_rl.models.generation.interfaces import (
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
-from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.config import (
+    SGLangConfig,
+    sglang_replica_width,
+    validate_sglang_disaggregation,
+)
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
 from nemo_rl.models.generation.trtllm.config import (
@@ -763,25 +767,38 @@ def setup(
         policy_config["generation"] = generation_config
 
     # generation.disaggregation is written in backend-agnostic terms, but only
-    # the TRT-LLM and vLLM backends implement it: every other backend would
-    # silently ignore the block and serve aggregated, so refuse to start.
-    if resolve_disagg_layout(generation_config).enabled and generation_config[
-        "backend"
-    ] not in ("trtllm", "vllm"):
+    # the TRT-LLM, vLLM and SGLang backends implement it: every other backend
+    # would silently ignore the block and serve aggregated, so refuse to start.
+    disaggregated = resolve_disagg_layout(generation_config).enabled
+    if disaggregated and generation_config["backend"] not in (
+        "trtllm",
+        "vllm",
+        "sglang",
+    ):
         raise ValueError(
             "policy.generation.disaggregation.enabled is only supported for "
-            f"backend='trtllm' or 'vllm', got '{generation_config['backend']}'. "
-            "Set it to false, or switch the backend."
+            "backend='trtllm', 'vllm' or 'sglang', got "
+            f"'{generation_config['backend']}'. Set it to false, or switch the "
+            "backend."
         )
-    # The disagg frontends are only reachable over HTTP, so without NeMo-Gym
-    # the whole fleet would come up and fail at the first rollout instead.
-    if resolve_disagg_layout(generation_config).enabled and not should_use_nemo_gym(
-        master_config
+    # The TRT-LLM and vLLM disagg frontends are only reachable over HTTP, so
+    # without NeMo-Gym the whole fleet would come up and fail at the first
+    # rollout instead. SGLang is the other way round: its PD path is the native
+    # /generate route of the built-in rollout, which NeMo-Gym does not use.
+    if (
+        disaggregated
+        and generation_config["backend"] in ("trtllm", "vllm")
+        and not should_use_nemo_gym(master_config)
     ):
         raise ValueError(
             "policy.generation.disaggregation.enabled requires NeMo-Gym "
             "rollouts (env.should_use_nemo_gym=true). Set it to false, or run "
             "through the NeMo-Gym entrypoint."
+        )
+    if disaggregated and generation_config["backend"] == "sglang":
+        validate_sglang_disaggregation(
+            cast(SGLangConfig, generation_config),
+            use_nemo_gym=should_use_nemo_gym(master_config),
         )
 
     _validate_multimodal_dedup_capability(master_config)
@@ -1291,9 +1308,9 @@ def setup(
                 # so cross-node all-reduce uses NVLink, not InfiniBand.
                 #
                 # For vLLM: total GPUs per instance = TP * PP (separate dimensions).
-                # For SGLang: gpus_per_server already includes all parallelism
-                #   dimensions (TP, DP-attention, PP are internal subdivisions),
-                #   so we use it directly without multiplying by pp_size.
+                # For SGLang: num_gpus_per_engine already includes all parallelism
+                #   dimensions (TP, DP-attention, PP are internal subdivisions);
+                #   under PD disaggregation the unit is the whole replica.
                 # For Megatron: the NVLink-domain span of the parallelism the
                 #   generation workers actually run with.
                 if generation_config["backend"] == "megatron":
@@ -1317,8 +1334,9 @@ def setup(
                         generation_config
                     ).engine_world_size
                 else:
-                    sglang_cfg = generation_config.get("sglang_cfg", {})
-                    gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
+                    gpus_per_instance = sglang_replica_width(
+                        cast(SGLangConfig, generation_config)
+                    )
                 nodes_per_instance = (
                     gpus_per_instance + inference_gpus_per_node - 1
                 ) // inference_gpus_per_node

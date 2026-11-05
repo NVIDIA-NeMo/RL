@@ -1,0 +1,62 @@
+defaults: ../../grpo_math_1B_sglang.yaml
+# Prefill/decode disaggregation on the SGLang backend, non-colocated: one
+# 8-GPU inference node runs two replicas of one TP2 prefill engine plus one
+# TP2 decode engine, each replica behind its own sglang router in PD mode.
+grpo:
+  max_num_steps: 450
+checkpointing:
+  checkpoint_dir: results/grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang-pd-disagg
+policy:
+  model_name: Qwen/Qwen2.5-Math-1.5B-Instruct
+  tokenizer:
+    name: Qwen/Qwen2.5-Math-1.5B-Instruct
+  optimizer: null
+  megatron_cfg:
+    enabled: true
+    scheduler:
+      lr_warmup_iters: 50
+  automodel_cfg:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  sequence_packing:
+    enabled: false
+  make_sequence_length_divisible_by: 1
+  generation:
+    max_new_tokens: 512
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+    disaggregation:
+      enabled: true
+      num_prefill_engines: 1
+      num_decode_engines: 1
+    sglang_cfg:
+      tp_size: 2
+      sglang_server_config:
+        num_gpus: 8
+        # SGLang refuses retract in PD mode; refits run between steps on idle
+        # engines, so abort has nothing to drop.
+        pause_generation_mode: abort
+      sglang_router_config:
+        use_distributed_post: true
+      prefill_engine: {}
+      decode_engine: {}
+      disagg:
+        router_scope: replica
+        transfer_backend: mooncake
+        prefill_policy: cache_aware
+        decode_policy: round_robin
+data:
+  max_input_seq_length: 512
+logger:
+  log_dir: logs/grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang-pd-disagg
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang-pd-disagg
+cluster:
+  gpus_per_node: 8
+  num_nodes: 2

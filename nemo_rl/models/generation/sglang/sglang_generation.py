@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+from collections.abc import Mapping
 from typing import Any, AsyncGenerator, Optional
 
 import ray
@@ -38,16 +39,30 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.sglang.config import (
     SGLangConfig,
+    SGLangDisaggConfig,
     SGLangFaultToleranceConfig,
+    resolve_sglang_disagg_config,
+    resolve_sglang_disagg_layout,
+    resolve_sglang_role_overrides,
+    sglang_disagg_server_kwargs,
+    sglang_engine_width,
+    sglang_role_engine_config,
+    validate_sglang_disaggregation,
 )
 from nemo_rl.models.generation.sglang.fault_tolerance import RolloutHealthMonitor
 from nemo_rl.models.generation.sglang.sglang_router import _start_router
 from nemo_rl.models.generation.sglang.sglang_worker import SGLangGenerationWorker
 from nemo_rl.models.generation.sglang.utils.async_utils import AsyncLoopThread
+from nemo_rl.models.generation.sglang.utils.disagg_dispatch import ReplicaDispatcher
 from nemo_rl.models.generation.sglang.utils.http_utils import HttpClient
 from nemo_rl.models.generation.sglang.utils.ip_port_utils import (
+    _allocate_disagg_engine_addr_and_ports,
     _allocate_rollout_engine_addr_and_ports_normal,
     _format_v6_uri,
+)
+from nemo_rl.models.generation.sglang.utils.layout import (
+    SGLangEngineSpec,
+    plan_sglang_engines,
 )
 from nemo_rl.models.generation.sglang.utils.ray_utils import (
     NOSET_VISIBLE_DEVICES_ENV_VARS_LIST,
@@ -62,6 +77,47 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
+# Present when the nvidia-peermem kernel module is loaded, which Mooncake's
+# default GPU-memory registration (ibv_reg_mr) relies on.
+NVIDIA_PEERMEM_MODULE = "/sys/module/nvidia_peermem"
+
+
+def disagg_transport_env(
+    pd_cfg: SGLangDisaggConfig,
+    environ: Mapping[str, str],
+    *,
+    peermem_loaded: bool | None = None,
+) -> dict[str, str]:
+    """Engine environment the configured KV transport needs on this host.
+
+    A value already present in ``environ`` is kept, so an operator can override
+    either default.
+
+    * ``nixl``: ``NCCL_NET_PLUGIN=none``. HPC-X's NCCL plugin loads a UCX
+      without CUDA support into TP>1 engines, which breaks NIXL's VRAM
+      registration; the same default the vLLM NIXL path uses.
+    * ``mooncake``: ``WITH_NVIDIA_PEERMEM=0`` when nvidia-peermem is not
+      loaded. Mooncake then registers GPU memory for RDMA through DMA-BUF
+      instead of ``ibv_reg_mr``, which without the module fails with
+      "Failed to register memory ...: Bad address" on every engine (GB200
+      containers, for one) and turns every KV transfer into an error.
+
+    Args:
+        pd_cfg: The resolved ``sglang_cfg.disagg`` block.
+        environ: The process environment to take overrides from.
+        peermem_loaded: Whether nvidia-peermem is loaded; probed from
+            :data:`NVIDIA_PEERMEM_MODULE` when None.
+    """
+    env: dict[str, str] = {}
+    if pd_cfg.transfer_backend == "nixl":
+        env["NCCL_NET_PLUGIN"] = environ.get("NCCL_NET_PLUGIN", "none")
+    elif pd_cfg.transfer_backend == "mooncake":
+        if peermem_loaded is None:
+            peermem_loaded = os.path.exists(NVIDIA_PEERMEM_MODULE)
+        if not peermem_loaded:
+            env["WITH_NVIDIA_PEERMEM"] = environ.get("WITH_NVIDIA_PEERMEM", "0")
+    return env
+
 
 class SGLangGeneration(GenerationInterface):
     """The class to run rollout and convert rollout data to training data.
@@ -71,8 +127,14 @@ class SGLangGeneration(GenerationInterface):
     The former ``ServerGroup`` dataclass has been folded in so there is a
     single source of truth for engine state.
 
-    TODO: one sglang router(router ip, router port) --> different server group(eg: PD, different tp size, ...; each server group multiple engines/servsers with same settings)
-    router + [[p, ..., p] [d, ..., d]] or router + [[tp = 2, ... tp = 2], ..., [tp = 8, ..., tp = 8]]
+    Prefill/decode disaggregation (``generation.disaggregation``) lays the
+    engines out as replicas of M prefill plus K decode engines
+    (:mod:`utils.layout`), starts the sglang router in PD mode, one per replica
+    or one for the fleet (``sglang_cfg.disagg.router_scope``), and spreads the
+    rollout's requests over the routers (:mod:`utils.disagg_dispatch`). The
+    router is the disagg server: it pairs each request with one prefill and
+    one decode engine and relays the decode output, so the rollout keeps
+    posting token ids to ``/generate`` exactly as without disaggregation.
     """
 
     def __init__(
@@ -89,11 +151,24 @@ class SGLangGeneration(GenerationInterface):
         self._http_client: HttpClient | None = None
         self.all_engines: list = []
         self._router_actor: ray.actor.ActorHandle | None = None
+        self._router_actors: list[ray.actor.ActorHandle] = []
+        self._router_endpoints: list[tuple[str, int]] = []
+        self._engine_specs: list[SGLangEngineSpec] = []
+        self._bootstrap_ports: dict[int, int] = {}
+        self._dispatcher: ReplicaDispatcher | None = None
         self.rollout_engine_lock: ray.actor.ActorHandle | None = None
 
         fault_tolerance_config = SGLangFaultToleranceConfig.model_validate(
             sglang_cfg["sglang_cfg"]["sglang_fault_tolerance_config"]
         )
+        # Prefill/decode disaggregation: refuse what cannot run before any
+        # allocation (the NeMo-Gym gate is grpo.setup's), then resolve the
+        # per-role engine configs once; everything below reads the resolved
+        # config. Both are no-ops without disaggregation.
+        validate_sglang_disaggregation(sglang_cfg, use_nemo_gym=False)
+        self._disagg_cfg = resolve_sglang_disagg_layout(sglang_cfg)
+        self._pd_cfg = resolve_sglang_disagg_config(sglang_cfg)
+        sglang_cfg = resolve_sglang_role_overrides(sglang_cfg)
         self.cluster = cluster
         self.sglang_cfg = sglang_cfg
         # GenerationInterface consumers (create_weight_synchronizer, the refit
@@ -115,15 +190,46 @@ class SGLangGeneration(GenerationInterface):
         sglang_server_cfg = sglang_cfg["sglang_cfg"]["sglang_server_config"]
         gpus_per_engine = sglang_server_cfg["num_gpus_per_engine"]
         num_gpus_per_node = cluster.num_gpus_per_node
-        num_gpu_per_engine_local = min(gpus_per_engine, num_gpus_per_node)
-        num_engines = sglang_server_cfg["num_gpus"] // num_gpu_per_engine_local
+        if self._disagg_cfg.enabled:
+            prefill_width = sglang_engine_width(
+                sglang_role_engine_config(sglang_cfg, "prefill")
+            )
+            decode_width = sglang_engine_width(
+                sglang_role_engine_config(sglang_cfg, "decode")
+            )
+        else:
+            prefill_width = decode_width = gpus_per_engine
+        # One spec per logical engine: role, width, GPUs, actor slots, replica
+        # and router group. ``all_engines`` holds one actor per slot (one per
+        # node of a multi-node engine), in spec order.
+        self._engine_specs, self.num_replicas, num_routers = plan_sglang_engines(
+            num_gpus=sglang_server_cfg["num_gpus"],
+            gpus_per_node=num_gpus_per_node,
+            layout=self._disagg_cfg,
+            aggregated_width=gpus_per_engine,
+            prefill_width=prefill_width,
+            decode_width=decode_width,
+            router_scope=self._pd_cfg.router_scope,
+        )
+        num_slots = sum(spec.num_slots for spec in self._engine_specs)
+        if self._disagg_cfg.enabled:
+            logger.info(
+                "SGLang prefill/decode layout: %d replica(s) of %d prefill x %d GPUs "
+                "+ %d decode x %d GPUs behind %d router(s)",
+                self.num_replicas,
+                self._disagg_cfg.num_prefill_engines,
+                prefill_width,
+                self._disagg_cfg.num_decode_engines,
+                decode_width,
+                num_routers,
+            )
 
         self.num_gpus_per_engine: int = gpus_per_engine
         self.num_gpus_per_node: int = num_gpus_per_node
-        self.all_engines = [None] * num_engines
+        self.all_engines = [None] * num_slots
         # Keep endpoints outside actors so a dead or wedged actor can still be
         # removed from the router. Entries follow all_engines, including peers.
-        self._engine_urls: list[str | None] = [None] * num_engines
+        self._engine_urls: list[str | None] = [None] * num_slots
         # It will be useful for future features which involve pd disaggregation, mixture sglang config setup
         self.rank_offset: int = 0
         self.gpu_offset: int = 0
@@ -137,18 +243,36 @@ class SGLangGeneration(GenerationInterface):
         self.pause_generation_mode: str = sglang_server_cfg["pause_generation_mode"]
 
         # --- Router bootstrap --------------------------------------------
-        # Resolved router endpoint is held only on the instance; we don't
-        # mutate the caller's config dict. Workers receive these as explicit
+        # Resolved router endpoints are held only on the instance; we don't
+        # mutate the caller's config dict. Workers receive theirs as explicit
         # ``router_ip`` / ``router_port`` kwargs in ``init.remote(...)``.
-        router_ip, router_port, router_actor = _start_router(
-            sglang_cfg["sglang_cfg"].get("sglang_router_config") or {}
-        )
-        self.router_ip: str = router_ip
-        self.router_port: int = router_port
-        # Only set when ``_start_router`` actually spawned the router (i.e.
-        # sglang_router_ip was not already configured). Kept so ``shutdown``
-        # can terminate it cleanly.
-        self._router_actor = router_actor
+        # Without disaggregation there is one router; with it, one per router
+        # group (replica or fleet), started in PD mode with empty pools that
+        # the engines join as they come up. Routers start one after another:
+        # each picks a free port on its node, and a router that is already
+        # listening cannot collide with the next one's choice.
+        router_cfg = sglang_cfg["sglang_cfg"].get("sglang_router_config") or {}
+        pd_args = None
+        if self._disagg_cfg.enabled:
+            pd_args = {
+                "prefill_policy": self._pd_cfg.prefill_policy,
+                "decode_policy": self._pd_cfg.decode_policy,
+            }
+        for _ in range(num_routers):
+            router_ip, router_port, router_actor = _start_router(
+                router_cfg, pd_args=pd_args
+            )
+            self._router_endpoints.append((router_ip, router_port))
+            # Only set when ``_start_router`` actually spawned the router (i.e.
+            # sglang_router_ip was not already configured). Kept so ``shutdown``
+            # can terminate it cleanly.
+            if router_actor is not None:
+                self._router_actors.append(router_actor)
+        self.router_ip: str
+        self.router_port: int
+        self.router_ip, self.router_port = self._router_endpoints[0]
+        self._router_actor = self._router_actors[0] if self._router_actors else None
+        self._dispatcher = ReplicaDispatcher(num_routers)
 
         # --- Start engines -----------------------------------------------
         init_handles, _ = self._start_engines({})
@@ -169,12 +293,42 @@ class SGLangGeneration(GenerationInterface):
     # ------------------------------------------------------------------
     @property
     def nodes_per_engine(self) -> int:
+        """Actors per engine when every engine has the shared width."""
         return max(1, self.num_gpus_per_engine // self.num_gpus_per_node)
+
+    @property
+    def engine_specs(self) -> list[SGLangEngineSpec]:
+        """One spec per logical engine, in ``all_engines`` order.
+
+        An instance whose engines were assigned directly (tests, partial
+        construction) has no planned specs; it is read as the uniform layout
+        the properties below always assumed: ``nodes_per_engine`` actors per
+        engine, every engine ``num_gpus_per_engine`` wide, one router.
+        """
+        specs = getattr(self, "_engine_specs", None)
+        if specs:
+            return specs
+        all_engines = getattr(self, "all_engines", None) or []
+        width = getattr(self, "num_gpus_per_engine", 1)
+        nodes_per_engine = max(1, width // getattr(self, "num_gpus_per_node", width))
+        return [
+            SGLangEngineSpec(
+                index=i,
+                role="aggregated",
+                width=width,
+                gpu_offset=i * width,
+                first_slot=i * nodes_per_engine,
+                num_slots=nodes_per_engine,
+                replica=i,
+                router=0,
+            )
+            for i in range(len(all_engines) // nodes_per_engine)
+        ]
 
     @property
     def engines(self) -> list:
         """Node-0 engines only (one entry per logical engine)."""
-        return self.all_engines[:: self.nodes_per_engine]
+        return [self.all_engines[spec.first_slot] for spec in self.engine_specs]
 
     @property
     def rollout_engines(self) -> list:
@@ -184,29 +338,83 @@ class SGLangGeneration(GenerationInterface):
     @property
     def engine_gpu_counts(self) -> list[int]:
         """Per-engine GPU count, parallel to ``engines``."""
-        return [self.num_gpus_per_engine for _ in self.engines]
+        return [spec.width for spec in self.engine_specs]
 
     @property
     def engine_gpu_offsets(self) -> list[int]:
-        return [
-            self.gpu_offset + j * self.num_gpus_per_engine
-            for j in range(len(self.engines))
-        ]
+        return [self.gpu_offset + spec.gpu_offset for spec in self.engine_specs]
 
-    def _start_engines(
-        self, port_cursors: dict[int, int] | None = None
-    ) -> tuple[list, dict[int, int]]:
+    def engine_slot_range(self, engine_idx: int) -> range:
+        """Indices in ``all_engines`` of the actors driving engine ``engine_idx``."""
+        return self.engine_specs[engine_idx].slots
+
+    def engine_index_of_slot(self, slot: int) -> int:
+        """The logical engine whose actor sits at ``all_engines[slot]``."""
+        for spec in self.engine_specs:
+            if slot in spec.slots:
+                return spec.index
+        raise IndexError(f"all_engines has no slot {slot}")
+
+    def engine_url(self, engine_idx: int) -> str | None:
+        """Cached HTTP endpoint of engine ``engine_idx`` (its node-0 server)."""
+        return self._engine_urls[self.engine_specs[engine_idx].first_slot]
+
+    def router_endpoint_for_engine(self, engine_idx: int) -> tuple[str, int]:
+        """``(ip, port)`` of the router that fronts engine ``engine_idx``."""
+        endpoints = getattr(self, "_router_endpoints", None)
+        if not endpoints:
+            return self.router_ip, self.router_port
+        return endpoints[self.engine_specs[engine_idx].router]
+
+    def _engine_sglang_cfg(self, spec: SGLangEngineSpec) -> SGLangConfig:
+        """The config an engine of ``spec`` is built from: its role's resolved block."""
+        if spec.role not in ("prefill", "decode"):
+            return self.sglang_cfg
+        return {
+            **self.sglang_cfg,
+            "sglang_cfg": sglang_role_engine_config(self.sglang_cfg, spec.role),
+        }
+
+    def _engine_groups(self, order: tuple[str, ...]) -> list[list]:
+        """Live node-0 engines grouped by role, groups in ``order``.
+
+        Roles outside ``order`` (the aggregated engines) form one leading
+        group, so a non-disaggregated fleet is addressed all at once.
+        """
+        specs = self.engine_specs
+        engines = self.engines
+        groups = [
+            [
+                engine
+                for spec, engine in zip(specs, engines)
+                if spec.role not in order and engine is not None
+            ]
+        ]
+        for role in order:
+            groups.append(
+                [
+                    engine
+                    for spec, engine in zip(specs, engines)
+                    if spec.role == role and engine is not None
+                ]
+            )
+        return [group for group in groups if group]
+
+    def _start_engines(self, port_cursors: dict | None = None) -> tuple[list, dict]:
         """Create Ray actors, allocate ports, and fire ``engine.init()`` without waiting.
 
+        Walks the engine specs: every slot (one actor per node of an engine)
+        whose entry in ``all_engines`` is empty gets a new actor on its GPUs.
         Returns ``(init_handles, port_cursors)`` where *init_handles* is a list
-        of Ray ObjectRefs and *port_cursors* maps node index -> next free port.
+        of Ray ObjectRefs and *port_cursors* maps a node (its index, or its
+        host under disaggregation) to its next free port.
         """
         if port_cursors is None:
             port_cursors = {}
-        num_gpu_per_engine = min(self.num_gpus_per_engine, self.num_gpus_per_node)
         pg = self.pg
         reordered_bundle_indices = self.pg_reordered_bundle_indices
         reordered_gpu_ids = self.pg_reordered_gpu_ids
+        disaggregated = self._disagg_cfg.enabled
 
         # Resolve the SGLang venv ONCE (mirrors the once-per-node RayWorkerBuilder path).
         sglang_runtime_env_base = make_actor_runtime_env(
@@ -217,77 +425,91 @@ class SGLangGeneration(GenerationInterface):
         )
 
         local_all_engines = []
-        for i in range(len(self.all_engines)):
-            if self.all_engines[i] is not None:
-                continue
+        local_specs: dict[int, SGLangEngineSpec] = {}
+        for spec in self.engine_specs:
+            for node_rank, slot in enumerate(spec.slots):
+                if self.all_engines[slot] is not None:
+                    continue
 
-            global_rank = self.rank_offset + i
-            num_gpus = min(0.2, 1 / self.cluster.max_colocated_worker_groups)
-            num_cpus = num_gpus
+                global_rank = self.rank_offset + slot
+                num_gpus = min(0.2, 1 / self.cluster.max_colocated_worker_groups)
+                num_cpus = num_gpus
 
-            gpu_index = self.gpu_offset + i * num_gpu_per_engine
-            base_gpu_id = int(reordered_gpu_ids[gpu_index])
+                gpu_index = self.gpu_offset + spec.slot_gpu_index(node_rank)
+                base_gpu_id = int(reordered_gpu_ids[gpu_index])
 
-            scheduling_strategy = PlacementGroupSchedulingStrategy(
-                placement_group=pg,
-                placement_group_capture_child_tasks=True,
-                placement_group_bundle_index=reordered_bundle_indices[gpu_index],
-            )
+                scheduling_strategy = PlacementGroupSchedulingStrategy(
+                    placement_group=pg,
+                    placement_group_capture_child_tasks=True,
+                    placement_group_bundle_index=reordered_bundle_indices[gpu_index],
+                )
 
-            env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
-                key: os.environ.get(key, default_val)
-                for key, default_val in {
-                    "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
-                    "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-                    "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
-                    "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
-                    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
-                    "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
-                    "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
-                }.items()
-            }
+                env_vars = {
+                    name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
+                } | {
+                    key: os.environ.get(key, default_val)
+                    for key, default_val in {
+                        "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "false",
+                        "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+                        "SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK": "true",
+                        "SGLANG_MEMORY_SAVER_CUDA_GRAPH": "true",
+                        "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "true",
+                        "SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION": "false",
+                        "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE": "false",
+                    }.items()
+                }
 
-            # Trainer and engine must agree on the NCCL transport; sglang's
-            # scheduler subprocess defaults to NCCL_CUMEM_ENABLE=0.
-            env_vars["NCCL_CUMEM_ENABLE"] = "0"
+                # Trainer and engine must agree on the NCCL transport; sglang's
+                # scheduler subprocess defaults to NCCL_CUMEM_ENABLE=0.
+                env_vars["NCCL_CUMEM_ENABLE"] = "0"
 
-            # Explicitly pass CUDA_VISIBLE_DEVICES through to the engine actor so
-            # all engines see the same global value (Ray would otherwise remap it
-            # because we set the NOSET_* flags above).
-            global_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
-            if global_cvd:
-                env_vars["CUDA_VISIBLE_DEVICES"] = global_cvd
+                if disaggregated:
+                    # What the KV transport needs from the engine environment on
+                    # this host (NIXL: no HPC-X NCCL plugin; Mooncake: DMA-BUF
+                    # registration without nvidia-peermem); the environment wins.
+                    env_vars.update(disagg_transport_env(self._pd_cfg, os.environ))
 
-            # Resolve the SGLang venv on every node and pin VIRTUAL_ENV /
-            # UV_PROJECT_ENVIRONMENT so the actor (and its spawned children)
-            # actually run inside the sglang venv instead of inheriting the
-            # raylet's base venv (e.g. /opt/nemo_rl_venv inside the container).
-            sglang_runtime_env = {
-                **sglang_runtime_env_base,
-                "env_vars": {**sglang_runtime_env_base["env_vars"], **env_vars},
-            }
+                # Explicitly pass CUDA_VISIBLE_DEVICES through to the engine actor so
+                # all engines see the same global value (Ray would otherwise remap it
+                # because we set the NOSET_* flags above).
+                global_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", None)
+                if global_cvd:
+                    env_vars["CUDA_VISIBLE_DEVICES"] = global_cvd
 
-            actor_options = {
-                "num_cpus": num_cpus,
-                "num_gpus": num_gpus,
-                "scheduling_strategy": scheduling_strategy,
-                "runtime_env": sglang_runtime_env,
-            }
-            init_args = (self.num_gpus_per_node, self.sglang_cfg)
-            init_kwargs = {
-                "rank": global_rank,
-                "base_gpu_id": base_gpu_id,
-                "num_gpus_per_engine": self.num_gpus_per_engine,
-            }
+                # Resolve the SGLang venv on every node and pin VIRTUAL_ENV /
+                # UV_PROJECT_ENVIRONMENT so the actor (and its spawned children)
+                # actually run inside the sglang venv instead of inheriting the
+                # raylet's base venv (e.g. /opt/nemo_rl_venv inside the container).
+                sglang_runtime_env = {
+                    **sglang_runtime_env_base,
+                    "env_vars": {**sglang_runtime_env_base["env_vars"], **env_vars},
+                }
 
-            # Create worker actor directly — sglang_worker.py uses lazy imports
-            # so it's importable in SYSTEM env; the actor runs in sglang env.
-            engine = SGLangGenerationWorker.options(**actor_options).remote(
-                *init_args, **init_kwargs
-            )
+                actor_options = {
+                    "num_cpus": num_cpus,
+                    "num_gpus": num_gpus,
+                    "scheduling_strategy": scheduling_strategy,
+                    "runtime_env": sglang_runtime_env,
+                }
+                # A disaggregated engine is built from its role's resolved block.
+                init_args = (self.num_gpus_per_node, self._engine_sglang_cfg(spec))
+                init_kwargs = {
+                    "rank": global_rank,
+                    "base_gpu_id": base_gpu_id,
+                    "num_gpus_per_engine": spec.width,
+                    "node_rank": node_rank,
+                    "disagg_role": spec.role if disaggregated else None,
+                }
 
-            local_all_engines.append((global_rank, engine))
-            self.all_engines[i] = engine
+                # Create worker actor directly — sglang_worker.py uses lazy imports
+                # so it's importable in SYSTEM env; the actor runs in sglang env.
+                engine = SGLangGenerationWorker.options(**actor_options).remote(
+                    *init_args, **init_kwargs
+                )
+
+                local_all_engines.append((global_rank, engine))
+                local_specs[global_rank] = spec
+                self.all_engines[slot] = engine
 
         self.num_new_engines = len(local_all_engines)
 
@@ -296,22 +518,39 @@ class SGLangGeneration(GenerationInterface):
 
         # SGLang engine server/NCCL/dist_init ports come from the reserved
         # generation band (3000-4999 by default), below the ephemeral floor;
-        # see the port layout in virtual_cluster.py.
+        # see the port layout in virtual_cluster.py. Under disaggregation a
+        # prefill engine's bootstrap port comes from the same band.
         gen_port_low = self.sglang_cfg.get("port_range_low")
         if gen_port_low is None:
             gen_port_low = DEFAULT_GENERATION_PORT_RANGE_LOW
         gen_port_high = self.sglang_cfg.get("port_range_high")
         if gen_port_high is None:
             gen_port_high = DEFAULT_GENERATION_PORT_RANGE_HIGH
-        addr_and_ports, port_cursors = _allocate_rollout_engine_addr_and_ports_normal(
-            gpus_per_node=self.num_gpus_per_node,
-            sglang_cfg=self.sglang_cfg,
-            local_all_engines=local_all_engines,
-            rank_offset=self.rank_offset,
-            port_range_low=gen_port_low,
-            port_range_high=gen_port_high,
-            node_port_cursor=port_cursors,
-        )
+        if disaggregated:
+            addr_and_ports, bootstrap_ports, port_cursors = (
+                _allocate_disagg_engine_addr_and_ports(
+                    specs=self.engine_specs,
+                    local_all_engines=local_all_engines,
+                    rank_offset=self.rank_offset,
+                    sglang_dp_size=self.sglang_cfg["sglang_cfg"]["dp_size"],
+                    port_range_low=gen_port_low,
+                    port_range_high=gen_port_high,
+                    host_port_cursor=port_cursors,
+                )
+            )
+            self._bootstrap_ports.update(bootstrap_ports)
+        else:
+            addr_and_ports, port_cursors = (
+                _allocate_rollout_engine_addr_and_ports_normal(
+                    gpus_per_node=self.num_gpus_per_node,
+                    sglang_cfg=self.sglang_cfg,
+                    local_all_engines=local_all_engines,
+                    rank_offset=self.rank_offset,
+                    port_range_low=gen_port_low,
+                    port_range_high=gen_port_high,
+                    node_port_cursor=port_cursors,
+                )
+            )
 
         for rank, _engine in local_all_engines:
             address = addr_and_ports[rank]
@@ -319,14 +558,18 @@ class SGLangGeneration(GenerationInterface):
                 f"http://{_format_v6_uri(address['host'])}:{address['port']}"
             )
 
-        init_handles = [
-            engine.init.remote(
-                **(addr_and_ports[rank]),
-                router_ip=self.router_ip,
-                router_port=self.router_port,
+        init_handles = []
+        for rank, engine in local_all_engines:
+            spec = local_specs[rank]
+            router_ip, router_port = self._router_endpoints[spec.router]
+            init_kwargs = dict(
+                addr_and_ports[rank], router_ip=router_ip, router_port=router_port
             )
-            for rank, engine in local_all_engines
-        ]
+            if disaggregated:
+                init_kwargs["disagg_server_kwargs"] = sglang_disagg_server_kwargs(
+                    spec.role, self._pd_cfg, self._bootstrap_ports.get(spec.index)
+                )
+            init_handles.append(engine.init.remote(**init_kwargs))
         return init_handles, port_cursors
 
     # ------------------------------------------------------------------
@@ -418,20 +661,20 @@ class SGLangGeneration(GenerationInterface):
     def pause_generation(self, mode: str) -> None:
         """Pause generation on every node-0 engine.
 
+        Under disaggregation the prefill engines pause first, so no new KV
+        handshake starts while the decode engines drain, then the decode
+        engines. Aggregated engines pause all at once.
+
         Args:
             mode: Pause mode forwarded to every engine.
         """
-        engines = [e for e in self.engines if e is not None]
-        if not engines:
-            return
-        ray.get([e.pause_generation.remote(mode=mode) for e in engines])
+        for group in self._engine_groups(("prefill", "decode")):
+            ray.get([e.pause_generation.remote(mode=mode) for e in group])
 
     def continue_generation(self) -> None:
-        """Resume generation on every node-0 engine."""
-        engines = [e for e in self.engines if e is not None]
-        if not engines:
-            return
-        ray.get([e.continue_generation.remote() for e in engines])
+        """Resume generation on every node-0 engine, decode engines first."""
+        for group in self._engine_groups(("decode", "prefill")):
+            ray.get([e.continue_generation.remote() for e in group])
 
     def pause_generation_for_refit(
         self, *, clear_cache: bool, timeout_s: Optional[float] = None
@@ -501,14 +744,19 @@ class SGLangGeneration(GenerationInterface):
                 ok = False
             self.all_engines = [None] * len(self.all_engines)
 
-        if self._router_actor is not None:
+        router_actors = list(getattr(self, "_router_actors", None) or [])
+        legacy_router_actor = getattr(self, "_router_actor", None)
+        if legacy_router_actor is not None and legacy_router_actor not in router_actors:
+            router_actors.append(legacy_router_actor)
+        for router_actor in router_actors:
             try:
-                ray.get(self._router_actor.stop.remote())
-                ray.kill(self._router_actor)
+                ray.get(router_actor.stop.remote())
+                ray.kill(router_actor)
             except Exception as e:
                 logger.warning(f"Router terminate failed: {e}")
                 ok = False
-            self._router_actor = None
+        self._router_actors = []
+        self._router_actor = None
 
         if self._http_client is not None:
             try:
@@ -958,6 +1206,11 @@ class SGLangGeneration(GenerationInterface):
         """Sleep workers and reset prefix cache."""
         if self._health_monitor:
             self._health_monitor.pause()
+        dispatcher = getattr(self, "_dispatcher", None)
+        if dispatcher is not None:
+            # Nothing is in flight between steps; forget where this step's
+            # prompts went so the next step spreads its own afresh.
+            dispatcher.reset()
         if not self.needs_offload:
             return
         tags = kwargs.get("tags", None)
@@ -994,8 +1247,21 @@ class SGLangGeneration(GenerationInterface):
         input_ids,
         index: int,
     ):
-        """Generate using traditional SGLang router with token-based workflow."""
-        url = f"http://{self.router_ip}:{self.router_port}/generate"
+        """Generate using traditional SGLang router with token-based workflow.
+
+        With several routers (one per replica under disaggregation) the
+        dispatcher picks one: the samples of a prompt share a router, and a
+        new prompt goes to the router with the fewest requests in flight.
+        """
+        dispatcher = getattr(self, "_dispatcher", None)
+        endpoints = getattr(self, "_router_endpoints", None)
+        if dispatcher is not None and endpoints:
+            target = dispatcher.acquire(ReplicaDispatcher.prompt_key(input_ids))
+            router_ip, router_port = endpoints[target]
+        else:
+            target = None
+            router_ip, router_port = self.router_ip, self.router_port
+        url = f"http://{router_ip}:{router_port}/generate"
 
         # Prepare payload for sglang server
         payload = {
@@ -1004,7 +1270,11 @@ class SGLangGeneration(GenerationInterface):
             "input_ids": input_ids,
         }
 
-        output = await self._http_client.post(url, payload)
+        try:
+            output = await self._http_client.post(url, payload)
+        finally:
+            if target is not None:
+                dispatcher.release(target)
 
         if "output_token_logprobs" in output["meta_info"]:
             response_tokens = [

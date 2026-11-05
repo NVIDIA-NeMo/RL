@@ -22,7 +22,9 @@ from pydantic import (
     PositiveInt,
 )
 
-from nemo_rl.models.generation.interfaces import GenerationConfig
+from nemo_rl.models.generation import disagg_layout
+from nemo_rl.models.generation.disagg_layout import Role
+from nemo_rl.models.generation.interfaces import DisaggConfig, GenerationConfig
 
 
 class SglangQuantizationConfig(TypedDict):
@@ -130,6 +132,74 @@ class SGLangFaultToleranceConfig(
     rollout_max_restart_attempts: NonNegativeInt = 3
 
 
+class SGLangRoleEngineArgs(TypedDict, total=False):
+    """Keys a ``sglang_cfg.{prefill,decode}_engine`` block may set.
+
+    Only the knobs that may legitimately differ between a prefill engine and a
+    decode engine of the same replica: the engine's width (``tp_size`` with
+    ``ep_size``), its memory and scheduling budgets, and its CUDA-graph
+    capture. The model, dtype, context length and the server/router/fault
+    tolerance blocks are shared by the whole replica and are rejected here.
+    """
+
+    tp_size: int
+    ep_size: int
+    mem_fraction_static: float | None
+    max_running_requests: int | None
+    chunked_prefill_size: int | None
+    max_prefill_tokens: int
+    schedule_policy: str
+    schedule_conservativeness: float
+    num_continuous_decode_steps: int
+    disable_cuda_graph: bool
+    disable_cuda_graph_padding: bool
+    cuda_graph_backend_decode: str
+    cuda_graph_backend_prefill: str
+    cuda_graph_max_bs_decode: int | None
+    cuda_graph_max_bs_prefill: int | None
+    cuda_graph_bs_decode: list[int] | None
+    cuda_graph_bs_prefill: list[int] | None
+
+
+SGLangRouterPolicy = Literal["random", "round_robin", "cache_aware", "power_of_two"]
+
+
+class SGLangDisaggConfig(BaseModel, extra="forbid", strict=True):
+    """How SGLang implements ``generation.disaggregation``.
+
+    The sglang router's PD mode is the disagg server: it pairs every request
+    with one prefill and one decode engine and relays the decode output. These
+    are the knobs of that implementation; the layout itself (engines per
+    replica) is the backend-agnostic ``generation.disaggregation`` block.
+    """
+
+    # "replica": one router per replica, so a request's prefill and decode
+    # engines always sit in the same replica and the KV cache never leaves
+    # the replica's placement domain; NeMo RL spreads prompt groups across the
+    # routers. "global": one router pools every engine of the fleet and pairs
+    # freely, which balances decode load fleet-wide at the price of
+    # cross-replica (often cross-node) KV transfers.
+    router_scope: Literal["replica", "global"] = "replica"
+    # SGLang's prefill->decode KV transport (``--disaggregation-transfer-backend``).
+    # mooncake is SGLang's own default and does not go through UCX; nixl is the
+    # transport the vLLM path uses. fake moves no KV and only exercises the
+    # control plane.
+    transfer_backend: Literal["mooncake", "nixl", "mooncake_tcp", "fake"] = "mooncake"
+    # ``--disaggregation-ib-device``: comma-separated IB devices for the
+    # transport; None lets the transport pick.
+    ib_device: str | None = None
+    # Per-role router policies (``--prefill-policy`` / ``--decode-policy``).
+    # cache_aware keeps the samples of one prompt on the prefill engine that
+    # holds their prefix. power_of_two is refused: sglang-router 0.3.2 checks
+    # it against the workers configured at startup, and NeMo RL registers its
+    # engines after the router is up.
+    prefill_policy: SGLangRouterPolicy = "cache_aware"
+    decode_policy: SGLangRouterPolicy = "round_robin"
+    # ``--disaggregation-decode-enable-radix-cache``: SGLang marks it
+    # experimental; off, decode engines use the chunk cache.
+    decode_enable_radix_cache: bool = False
+
+
 class SglangSpecificArgs(TypedDict):
     """SGLang-specific configuration arguments.
 
@@ -143,6 +213,16 @@ class SglangSpecificArgs(TypedDict):
     sglang_router_config: SGLangRouterConfig
     sglang_http_client_config: NotRequired[SGLangHttpClientConfig]
     sglang_fault_tolerance_config: SGLangFaultToleranceConfig
+
+    # Prefill/decode disaggregation (generation.disaggregation.enabled); read
+    # only then, inert otherwise. A role block names only what differs from the
+    # shared values in this block for that role's engines, limited to
+    # SGLangRoleEngineArgs; resolve_sglang_role_overrides replaces each with
+    # the role's complete engine config, which is all a worker reads.
+    prefill_engine: NotRequired[SGLangRoleEngineArgs]
+    decode_engine: NotRequired[SGLangRoleEngineArgs]
+    # How SGLang implements the layout: KV transport and router policies.
+    disagg: NotRequired[SGLangDisaggConfig]
 
     # Weight precision for rollout/refit.
     quantization: SglangQuantizationConfig
@@ -289,3 +369,179 @@ class SGLangConfig(GenerationConfig):
 
     sglang_cfg: SglangSpecificArgs
     sglang_kwargs: NotRequired[dict[str, Any]]
+
+
+# ---------------------------------------------------------------------------
+# Prefill/decode disaggregation
+# ---------------------------------------------------------------------------
+# The role-override machinery is shared with the TRT-LLM and vLLM backends
+# (nemo_rl/models/generation/disagg_layout.py); these bind it to the SGLang
+# block names.
+SGLANG_ROLE_ENGINE_ARG_KEYS = frozenset(
+    SGLangRoleEngineArgs.__required_keys__ | SGLangRoleEngineArgs.__optional_keys__
+)
+SGLANG_NON_ENGINE_KEYS = frozenset({"prefill_engine", "decode_engine", "disagg"})
+# ``sglang_kwargs`` is the shared helper's kwargs channel. The SGLang worker
+# builds ServerArgs from the typed keys only, so the merged block is inert; a
+# role block may not set it (it is outside SGLANG_ROLE_ENGINE_ARG_KEYS).
+_SGLANG_KWARGS_KEY = "sglang_kwargs"
+# Under disaggregation the sglang-miles scheduler refuses ``retract`` ("not
+# supported in PD disaggregation mode yet") and NeMo RL already refuses
+# ``in_place`` for refit, which leaves ``abort``. SGLang refits run between
+# steps on idle engines, so abort has nothing to drop.
+SGLANG_DISAGG_PAUSE_MODE = "abort"
+
+
+def resolve_sglang_disagg_layout(config: SGLangConfig) -> DisaggConfig:
+    """``generation.disaggregation`` as its schema; see :func:`disagg_layout.resolve_disagg_layout`."""
+    return disagg_layout.resolve_disagg_layout(config)
+
+
+def resolve_sglang_disagg_config(config: SGLangConfig) -> SGLangDisaggConfig:
+    """``sglang_cfg.disagg`` as its schema, defaults filled in; absent is all-defaults."""
+    raw = config["sglang_cfg"].get("disagg")
+    if isinstance(raw, SGLangDisaggConfig):
+        return raw
+    return SGLangDisaggConfig.model_validate(disagg_layout.as_dict(raw))
+
+
+def resolve_sglang_role_overrides(config: SGLangConfig) -> SGLangConfig:
+    """Resolve ``sglang_cfg.{prefill,decode}_engine`` into complete engine configs.
+
+    See :func:`disagg_layout.resolve_role_overrides` for the rule. A role may
+    only name the :class:`SGLangRoleEngineArgs` keys. Returns ``config`` itself
+    without disaggregation.
+    """
+    return disagg_layout.resolve_role_overrides(
+        config,
+        backend_cfg_key="sglang_cfg",
+        allowed_keys=SGLANG_ROLE_ENGINE_ARG_KEYS,
+        excluded_keys=SGLANG_NON_ENGINE_KEYS,
+        kwargs_key=_SGLANG_KWARGS_KEY,
+    )
+
+
+def sglang_role_engine_config(config: SGLangConfig, role: Role) -> dict[str, Any]:
+    """The whole ``sglang_cfg`` block of one engine of ``role``; ``config`` must be role-resolved."""
+    return disagg_layout.role_engine_config(config, role, backend_cfg_key="sglang_cfg")
+
+
+def sglang_engine_width(engine_cfg: dict[str, Any]) -> int:
+    """GPUs one SGLang engine spans: ``tp_size * pp_size`` (DP-attention and EP subdivide them)."""
+    return int(engine_cfg["tp_size"]) * int(engine_cfg["pp_size"])
+
+
+def sglang_replica_width(config: SGLangConfig) -> int:
+    """GPUs one rollout replica spans.
+
+    Without disaggregation a replica is one engine of
+    ``sglang_server_config.num_gpus_per_engine`` GPUs. Under it, a replica is
+    its prefill engines plus its decode engines, the unit to keep inside one
+    NVLink domain because the KV cache crosses from prefill to decode on every
+    request. Accepts a raw or a role-resolved config.
+    """
+    layout = resolve_sglang_disagg_layout(config)
+    sglang_cfg = config["sglang_cfg"]
+    if not layout.enabled:
+        return int(sglang_cfg["sglang_server_config"]["num_gpus_per_engine"])
+    resolved = resolve_sglang_role_overrides(config)
+    return layout.num_prefill_engines * sglang_engine_width(
+        sglang_role_engine_config(resolved, "prefill")
+    ) + layout.num_decode_engines * sglang_engine_width(
+        sglang_role_engine_config(resolved, "decode")
+    )
+
+
+def sglang_disagg_server_kwargs(
+    role: Role, pd_cfg: SGLangDisaggConfig, bootstrap_port: int | None
+) -> dict[str, Any]:
+    """The ``ServerArgs`` keys that make an engine a prefill or a decode engine.
+
+    The bootstrap server (the prefill side of the KV handshake) binds
+    ``bootstrap_port`` on the prefill engine's host, so every prefill engine
+    needs its own; a decode engine learns its partner's port from each
+    request, which the router stamps on.
+    """
+    kwargs: dict[str, Any] = {
+        "disaggregation_mode": role,
+        "disaggregation_transfer_backend": pd_cfg.transfer_backend,
+    }
+    if pd_cfg.ib_device is not None:
+        kwargs["disaggregation_ib_device"] = pd_cfg.ib_device
+    if role == "prefill":
+        assert bootstrap_port is not None, "a prefill engine needs a bootstrap port"
+        kwargs["disaggregation_bootstrap_port"] = int(bootstrap_port)
+    else:
+        kwargs["disaggregation_decode_enable_radix_cache"] = (
+            pd_cfg.decode_enable_radix_cache
+        )
+    return kwargs
+
+
+def validate_sglang_disaggregation(config: SGLangConfig, *, use_nemo_gym: bool) -> None:
+    """Refuse a disaggregated SGLang config that cannot run as written.
+
+    Silent without disaggregation. With it, every check here would otherwise
+    surface only after the fleet is up: SGLang's own ``retract`` refusal, the
+    router's startup validation, or a rollout path that never reaches the
+    router.
+    """
+    layout = resolve_sglang_disagg_layout(config)
+    if not layout.enabled:
+        return
+    sglang_cfg = config["sglang_cfg"]
+    pd_cfg = resolve_sglang_disagg_config(config)
+    # Resolving also rejects a role block that names a shared key.
+    resolve_sglang_role_overrides(config)
+
+    if use_nemo_gym:
+        raise ValueError(
+            "policy.generation.disaggregation with backend='sglang' runs on "
+            "SGLang's native /generate path, which the NeMo-Gym rollout does not "
+            "use; set env.should_use_nemo_gym=false."
+        )
+    if config["colocated"]["enabled"]:
+        raise ValueError(
+            "policy.generation.disaggregation with backend='sglang' requires "
+            "colocated.enabled=false: colocated prefill/decode engines are not "
+            "supported yet."
+        )
+    defaults = DisaggConfig()
+    frontend_keys = ("num_frontend_workers", "frontend_tokenize", "frontend_base_port")
+    changed = [
+        key for key in frontend_keys if getattr(layout, key) != getattr(defaults, key)
+    ]
+    if changed:
+        raise ValueError(
+            f"policy.generation.disaggregation.{changed} only apply to the TRT-LLM "
+            "and vLLM frontends; the sglang router is the frontend of the SGLang "
+            "path and takes no frontend settings. Leave them at their defaults."
+        )
+    pause_mode = sglang_cfg["sglang_server_config"]["pause_generation_mode"]
+    if pause_mode != SGLANG_DISAGG_PAUSE_MODE:
+        raise ValueError(
+            "sglang_cfg.sglang_server_config.pause_generation_mode must be "
+            f"'{SGLANG_DISAGG_PAUSE_MODE}' under disaggregation, got {pause_mode!r}: "
+            "SGLang refuses 'retract' in PD mode and NeMo RL refuses 'in_place' "
+            "for refit."
+        )
+    if sglang_cfg["sglang_router_config"].get("use_external_router"):
+        raise ValueError(
+            "sglang_cfg.sglang_router_config.use_external_router is not supported "
+            "under disaggregation: NeMo RL starts the PD routers itself, one per "
+            "replica or one for the fleet (sglang_cfg.disagg.router_scope)."
+        )
+    if int(sglang_cfg["pp_size"]) != 1:
+        raise ValueError(
+            "sglang_cfg.pp_size must be 1 under disaggregation; SGLang's PD path "
+            "runs tensor-parallel engines only."
+        )
+    for role in ("prefill", "decode"):
+        policy = getattr(pd_cfg, f"{role}_policy")
+        if policy == "power_of_two":
+            raise ValueError(
+                f"sglang_cfg.disagg.{role}_policy='power_of_two' cannot start: "
+                "sglang-router 0.3.2 validates it against the workers configured "
+                "at startup (at least two of the role), and NeMo RL registers its "
+                "engines after the router is up. Use round_robin or cache_aware."
+            )

@@ -47,6 +47,32 @@ policy:
         # Total client POST attempts, including the first; also applies with an
         # external router. Distributed dispatch and local fallback each use it.
         max_retries: 3
+      # Prefill/decode disaggregation (policy.generation.disaggregation.enabled);
+      # read only then, inert otherwise. Per-role engine overrides: a role block
+      # names only what differs from the shared values above for that role's
+      # engines (SGLangRoleEngineArgs: tp_size, ep_size, memory and scheduling
+      # budgets, CUDA-graph capture). PD requires pause_generation_mode: abort,
+      # colocated.enabled: false and no external router.
+      prefill_engine: {}
+      decode_engine: {}
+      # How SGLang implements the layout. The sglang router's PD mode is the
+      # disagg server; defaults live on SGLangDisaggConfig.
+      disagg:
+        # replica: one router per replica, KV never leaves the replica;
+        # global: one router pools every engine of the fleet.
+        router_scope: replica
+        # mooncake (SGLang default, no UCX) | nixl | mooncake_tcp | fake (test only).
+        # Engines get WITH_NVIDIA_PEERMEM=0 (DMA-BUF registration) under mooncake
+        # when nvidia-peermem is not loaded, and NCCL_NET_PLUGIN=none under nixl;
+        # values already set in the environment win.
+        transfer_backend: mooncake
+        # Comma-separated IB devices for the transport; null lets it pick.
+        ib_device: null
+        # Router policy per role; power_of_two cannot start with zero workers.
+        prefill_policy: cache_aware
+        decode_policy: round_robin
+        # Decode engines use the chunk cache; SGLang marks radix there experimental.
+        decode_enable_radix_cache: false
       # Fault tolerance: probe serving health during generation and check engine
       # liveness before refit, restarting hung/dead engines at that refit.
       sglang_fault_tolerance_config:

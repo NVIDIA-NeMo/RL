@@ -140,7 +140,10 @@ from nemo_rl.models.generation.generation_router import (
 )
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
-from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.config import (
+    SGLangConfig,
+    sglang_replica_width,
+)
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.generation.vllm.config import VllmConfig
@@ -546,8 +549,9 @@ def _build_clusters(
                     generation_config_dict
                 ).engine_world_size
             elif backend == "sglang":
-                gpus_per_instance = generation_config_dict["sglang_cfg"].get(
-                    "gpus_per_server", 1
+                # One engine's width, or the whole replica under PD disaggregation.
+                gpus_per_instance = sglang_replica_width(
+                    cast(SGLangConfig, generation_config_dict)
                 )
             elif backend == "megatron":
                 gpus_per_instance = MegatronGeneration.nvlink_domain_span(

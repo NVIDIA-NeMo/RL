@@ -92,6 +92,8 @@ class _FakeEngine:
 
 
 class _FakeGeneration:
+    """The slice of SGLangGeneration the monitor reads: a uniform layout."""
+
     def __init__(self, engines, nodes_per_engine=1):
         self.all_engines = list(engines)
         self.nodes_per_engine = nodes_per_engine
@@ -102,6 +104,21 @@ class _FakeGeneration:
     @property
     def engines(self):
         return self.all_engines[:: self.nodes_per_engine]
+
+    def engine_slot_range(self, engine_idx):
+        return range(
+            engine_idx * self.nodes_per_engine,
+            (engine_idx + 1) * self.nodes_per_engine,
+        )
+
+    def engine_index_of_slot(self, slot):
+        return slot // self.nodes_per_engine
+
+    def engine_url(self, engine_idx):
+        return self._engine_urls[engine_idx * self.nodes_per_engine]
+
+    def router_endpoint_for_engine(self, engine_idx):
+        return self.router_ip, self.router_port
 
 
 class _RecordingMonitor:

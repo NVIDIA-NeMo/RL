@@ -17,7 +17,7 @@ import multiprocessing
 import os
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import ray
 import requests
@@ -56,6 +56,30 @@ def _launch_server_with_parent_guard(
     launch_server(server_args)
 
 
+def router_registration_payload(
+    server_base_url: str,
+    disagg_role: str | None,
+    disagg_server_kwargs: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """The ``POST /workers`` body that registers one engine with the sglang router.
+
+    An aggregated engine registers as a ``regular`` worker. Under prefill/decode
+    disaggregation the router needs the engine's role and, for a prefill
+    engine, its bootstrap port, which it stamps on every request it pairs so
+    the decode engine knows where to fetch the KV cache; left out, the router
+    would assume SGLang's default port and every handshake would fail.
+    """
+    payload: dict[str, Any] = {
+        "url": server_base_url,
+        "worker_type": disagg_role or "regular",
+    }
+    if disagg_role == "prefill":
+        payload["bootstrap_port"] = int(
+            (disagg_server_kwargs or {})["disaggregation_bootstrap_port"]
+        )
+    return payload
+
+
 @ray.remote  # pragma: no cover
 class SGLangGenerationWorker:
     def __init__(
@@ -65,6 +89,8 @@ class SGLangGenerationWorker:
         rank: int,
         base_gpu_id: int | None = None,
         num_gpus_per_engine: int | None = None,
+        node_rank: int | None = None,
+        disagg_role: str | None = None,
     ):
         _apply_sglang_compat_patches()
         self.gpus_per_node = gpus_per_node
@@ -72,6 +98,12 @@ class SGLangGenerationWorker:
         self.rank = rank
         self.base_gpu_id = base_gpu_id
         self.num_gpus_per_engine = num_gpus_per_engine
+        # Node rank within a multi-node engine. Derived from ``rank`` when
+        # absent, which is only right while every engine has the same width.
+        self.explicit_node_rank = node_rank
+        # "prefill" / "decode" under disaggregation, else None (aggregated).
+        self.disagg_role = disagg_role
+        self.disagg_server_kwargs: dict[str, Any] | None = None
 
     def init(
         self,
@@ -81,9 +113,13 @@ class SGLangGenerationWorker:
         host,
         router_ip,
         router_port,
+        disagg_server_kwargs: dict[str, Any] | None = None,
     ):
         self.router_ip = router_ip
         self.router_port = router_port
+        # ServerArgs keys that make this engine a prefill or decode engine
+        # (see config.sglang_disagg_server_kwargs); None when aggregated.
+        self.disagg_server_kwargs = disagg_server_kwargs
 
         host = _format_v6_uri(host)
         ip_part, port_part = dist_init_addr.rsplit(":", 1)
@@ -129,10 +165,9 @@ class SGLangGenerationWorker:
         self.process = p
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
-            payload = {
-                "url": self.server_base_url,
-                "worker_type": "regular",
-            }
+            payload = router_registration_payload(
+                self.server_base_url, self.disagg_role, self.disagg_server_kwargs
+            )
             response = requests.post(
                 f"http://{self.router_ip}:{self.router_port}/workers",
                 json=payload,
@@ -482,7 +517,14 @@ class SGLangGenerationWorker:
             f"// pp_size ({pp_size})"
         )
         nnodes = max(1, _gpus_per_engine // self.gpus_per_node)
-        node_rank = self.rank % nnodes
+        node_rank = (
+            self.explicit_node_rank
+            if self.explicit_node_rank is not None
+            else self.rank % nnodes
+        )
+        assert 0 <= node_rank < nnodes, (
+            f"node_rank {node_rank} outside the {nnodes}-node engine"
+        )
         local_gpu_id = self._to_local_gpu_id(self.base_gpu_id)
         cache_policy = SGLangOutlinesCachePolicy.model_validate(
             {
@@ -546,6 +588,9 @@ class SGLangGenerationWorker:
         ]:
             if key in sglang_cfg_inner:
                 kwargs[key] = sglang_cfg_inner[key]
+
+        if self.disagg_server_kwargs:
+            kwargs.update(self.disagg_server_kwargs)
 
         return kwargs
 
