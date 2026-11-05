@@ -10,8 +10,15 @@ for (( poll=0; poll<288; poll++ )); do
   ids=$(cut -f2 validation/pr3/slurm/submitted.tsv | paste -sd, -)
   {
     date --iso-8601=seconds
-    squeue -j "$ids" -o '%.16i %.28j %.12T %.12M %.35R'
-    states=$(sacct -X -n -j "$ids" --format=JobIDRaw,State,ExitCode,Elapsed -P)
+    # Slurm can purge a completed job from its live controller before the
+    # next poll. Accounting remains authoritative for those terminal jobs.
+    if ! squeue -j "$ids" -o '%.16i %.28j %.12T %.12M %.35R'; then
+      echo 'Live queue lookup failed; consult accounting below.'
+    fi
+    if ! states=$(sacct -X -n -j "$ids" --format=JobIDRaw,State,ExitCode,Elapsed -P); then
+      states=ACCOUNTING_UNAVAILABLE
+      date --iso-8601=seconds >validation/pr3/slurm/MONITOR_ERROR
+    fi
     printf '%s\n' "$states"
     if [[ "$states" =~ FAILED|CANCELLED|TIMEOUT|NODE_FAIL|OUT_OF_MEMORY|BOOT_FAIL ]]; then
       printf '%s\n' "$states" >validation/pr3/slurm/FAILURE_DETECTED

@@ -22,7 +22,7 @@ in source-evidence.json and dependency-runtime.json. Product dependency pins unc
 | Qwen3.5 EP16 + recipe FusedAdam | **FAILED** job21330640 on the first token-level preclip gradient comparison: observed rank relativeL2 about1.1–1.5%, exceeding1%; some cosine values also below.9999. Original limits unchanged. See ep16-failure.json; raw node logs retained. This was synthetic-input replay, not saved real-GRPO-input replay. |
 | Qwen3.5 streaming LA0 300 steps | **NOT STARTED.** Jobs21330687–21330690 cancelled on failed qualification dependency. No extra full-batch convergence run. |
 | Normalizer-placement diagnostic | **PASSED** tiny EP2 and Qwen3.5 EP16 job21331026, both objectives, one update each. All16 ranks match the independent full-input numerator reference exactly in preclip gradients/model/public+raw optimizer/scales/scheduler. Global original-normalizer differences: token1.343%, sequence1.322%; original gate remains failed. See normalizer-control-ep16-summary.json. |
-| Additional convergence evidence | Separate exploratory LA0 recipe prepared with identical training configuration and separate output/W&B identity. This research lane uses the exact numerator control and records original qualification failure; it does not redefine the1% gate or establish completed acceptance. |
+| Additional convergence evidence | **RUNNING**, exploratory LA0 job21331883; continuations21331884/85/21331930 target the same300-update run. At05:11PST,3updates committed,2dispatches/step,lag0. Third grad_norm.20889 and gen_kl_error.0008469. Original1% qualification stays failed; convergence/performance conclusions are pending. |
 
 Numerical snapshots include preclip normalized gradient shards, every parameter
 and registered buffer, complete optimizer state_dict, scheduler state and exact
@@ -58,6 +58,8 @@ run identity to collect additional authorized convergence evidence. The determin
 watch_10min.sh process records queue/accounting/progress every ten minutes in
 slurm/watch.log and marks observed terminal failures in slurm/FAILURE_DETECTED.
 It performs status collection only; it does not retry experiments or send chat notifications.
+Expired completed job IDs in Slurm's live controller do not stop monitoring;
+the collector falls back to accounting and records query failures explicitly.
 
 First qualification attempt21329914 failed at the launcher before model initialization:
 Ray services started before run.sh's exports, so remote tasks lacked PR3_PYTHON.
@@ -73,3 +75,9 @@ normalizer-control.json with releases_training:false, never a qualifying parity.
 Run it with --normalizer-control --steps 1; its EP16 launcher uses a separate output folder.
 The diagnostic started from an uncommitted worktree at HEADad5582855; tested source
 hashes match the committed files in2cc30b16a. The numerical worker is unchanged.
+
+Exploratory run: https://wandb.ai/yuekaiz/nemo-rl-automodel-sc/runs/yuekaiz5090explorela0s42
+The first update had all samples truncated and reward0; the second had reward.25
+but no within-group gradient signal. A nonzero gradient appears on update3,
+reward.21875. Initial step times include cold initialization/JIT and are not
+steady throughput. No300-step completion or convergence equivalence is claimed.

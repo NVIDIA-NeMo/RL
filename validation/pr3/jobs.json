@@ -1,5 +1,5 @@
 {
-  "observed_at": "2026-11-05T04:52:00-08:00",
+  "observed_at": "2026-11-05T05:11:00-08:00",
   "code_and_recipes_commit": "ad5582855",
   "image": "containers/nemo_rl.1030.sqsh",
   "qualification": {
@@ -34,6 +34,21 @@
     "tiny_ep2_exact_control_passed": true,
     "ep16_exact_control_passed": true,
     "original_gradient_gate_still_failed": true
+  },
+  "exploratory_streaming_la0": {
+    "segment_job_ids": [21331883, 21331884, 21331885, 21331930],
+    "source_and_recipe_commit": "1154fbb1f",
+    "nodes": 3,
+    "gpus_per_node": 8,
+    "target_steps": 300,
+    "state": "RUNNING",
+    "observed_committed_steps": 3,
+    "same_checkpoint_and_run_id_across_segments": true,
+    "original_numerical_qualification_passed": false,
+    "wandb_entity": "yuekaiz",
+    "wandb_project": "nemo-rl-automodel-sc",
+    "wandb_run_id": "yuekaiz5090explorela0s42",
+    "wandb_url": "https://wandb.ai/yuekaiz/nemo-rl-automodel-sc/runs/yuekaiz5090explorela0s42"
   },
   "previous_attempts": [
     {
