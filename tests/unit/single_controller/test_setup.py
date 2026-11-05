@@ -3587,10 +3587,12 @@ def test_forest_ppo_validates_policy_and_critic_before_rollout_manager(
     ):
         setup_single_controller(mc, MagicMock(pad_token_id=0))
     assert events == [trainer_check, value_check, ("rollout_manager", 3)]
-    for consumer in (trainer, value):
+    for consumer, method in (
+        (trainer, "validate_forest_execution_padding"),
+        (value, "configure_forest_router_padding"),
+    ):
         consumer.worker_group.run_all_workers_single_data.assert_called_once_with(
-            "validate_forest_execution_padding",
-            exclude_padding_from_router_stats=exclude_router_stats,
+            method, exclude_padding_from_router_stats=exclude_router_stats
         )
 
 

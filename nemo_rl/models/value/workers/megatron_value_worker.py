@@ -517,17 +517,17 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
             self.optimizer,
         )
 
-        # Set by validate_forest_execution_padding when Forest padding is
+        # Set by configure_forest_router_padding when Forest padding is
         # excluded from router statistics; otherwise the critic keeps them.
         self._forest_router_padding_mask = False
 
         print(f"MegatronValueWorker initialized on rank {self.rank}")
         self._maybe_enable_manual_gc()
 
-    def validate_forest_execution_padding(
+    def configure_forest_router_padding(
         self, *, exclude_padding_from_router_stats: bool
     ) -> None:
-        """Apply the policy's Forest router checks to the critic."""
+        """Run the policy's Forest router checks; set the critic's padding mask flag."""
         validate_forest_routers(self.model)
         if exclude_padding_from_router_stats:
             self._forest_router_padding_mask = require_router_padding_exclusion(

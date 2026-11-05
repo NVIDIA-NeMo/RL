@@ -117,7 +117,7 @@ def test_forest_router_exclusion_is_checked_only_when_requested(
             _policy_like_cfg=packing,
             _forest_router_padding_mask=False,
         )
-        validate = value.MegatronValueWorkerImpl.validate_forest_execution_padding
+        validate = value.MegatronValueWorkerImpl.configure_forest_router_padding
     else:
         worker = SimpleNamespace(model=object(), cfg=packing)
         validate = policy.MegatronPolicyWorkerImpl.validate_forest_execution_padding
@@ -146,7 +146,7 @@ def test_forest_critic_masks_router_padding_when_requested(monkeypatch, needs_ma
         _forest_router_padding_mask=False,
     )
 
-    value.MegatronValueWorkerImpl.validate_forest_execution_padding(
+    value.MegatronValueWorkerImpl.configure_forest_router_padding(
         worker, exclude_padding_from_router_stats=True
     )
 
