@@ -18,15 +18,33 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any
 
-from nemo_rl.algorithms.rollout_checkpointing.restore import RolloutRestorer
-from nemo_rl.algorithms.rollout_checkpointing.snapshots import RolloutSnapshotter
 from nemo_rl.algorithms.rollout_checkpointing.state import (
     ResumeSource,
-    RolloutParts,
     RolloutRuntimeState,
-    TrainingProgress,
 )
+from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
+
+# Parts a bare controller may lack, and what stands in for each.
+_BARE_CONTROLLER_PARTS = {
+    "_dp_client": lambda: None,
+    "_partition_id": lambda: "",
+    "_buffer": lambda: None,
+    "_dataloader": lambda: None,
+    "_sampler": lambda: None,
+    "_data_plane_checkpoint_barrier": lambda: None,
+    "_environment_checkpoint": NoEnvironmentCheckpoint,
+    "_rollout_runtime": RolloutRuntimeState,
+    "_checkpointer": lambda: None,
+    "_timeout": lambda: None,
+    "_teacher_coordinator": lambda: None,
+    "_rollout_recovery_enabled": lambda: False,
+    "_algo_cfg": lambda: None,
+    "_buffer_capacity": lambda: asyncio.Semaphore(0),
+    "_train_steps": lambda: 0,
+    "_trainer_version": lambda: 0,
+    "_current_epoch": lambda: 0,
+}
 
 
 def attach_rollout_checkpointing(controller: Any) -> None:
@@ -36,54 +54,26 @@ def attach_rollout_checkpointing(controller: Any) -> None:
     environment checkpoint; parts a bare controller lacks are left empty, and
     state the previous snapshotter and restorer held carries over.
     """
-    rollout_manager = getattr(controller, "_rollout_manager", None)
     snapshots = getattr(controller, "_rollout_snapshots", None)
     restorer = getattr(controller, "_rollout_restorer", None)
-    master_config = getattr(controller, "_master_config", SimpleNamespace())
-    if not hasattr(master_config, "async_rl"):
+    for name, stand_in in _BARE_CONTROLLER_PARTS.items():
+        if not hasattr(controller, name):
+            setattr(controller, name, stand_in())
+    if not hasattr(controller, "_master_config"):
+        controller._master_config = SimpleNamespace()
+    if not hasattr(controller._master_config, "async_rl"):
         # Bare controllers carry their async config on the controller.
-        master_config = SimpleNamespace(
-            **vars(master_config), async_rl=getattr(controller, "_async_cfg", None)
-        )
-    if not hasattr(controller, "_rollout_runtime"):
-        controller._rollout_runtime = RolloutRuntimeState()
-    parts = RolloutParts(
-        master_config=master_config,
-        dp_client=getattr(controller, "_dp_client", None),
-        partition_id=getattr(controller, "_partition_id", ""),
-        buffer=getattr(controller, "_buffer", None),
-        dataloader=getattr(controller, "_dataloader", None),
-        sampler=getattr(controller, "_sampler", None),
+        controller._master_config.async_rl = getattr(controller, "_async_cfg", None)
+    rollout_manager = getattr(controller, "_rollout_manager", None)
+    if rollout_manager is None:
         # A stand-in without a ledger only needs the commit window and lock.
-        rollout_manager=rollout_manager
-        if hasattr(rollout_manager, "recovery_ledger")
-        else SimpleNamespace(recovery_ledger=None),
-        data_plane_barrier=getattr(controller, "_data_plane_checkpoint_barrier", None),
-        environment_checkpoint=getattr(
-            controller, "_environment_checkpoint", NoEnvironmentCheckpoint()
-        ),
-        runtime_state=controller._rollout_runtime,
-        read_progress=lambda: TrainingProgress(
-            train_steps=getattr(controller, "_train_steps", 0),
-            trainer_version=getattr(controller, "_trainer_version", 0),
-            current_epoch=getattr(controller, "_current_epoch", 0),
-        ),
-        log_metrics=controller._log_telemetry_metrics,
-    )
-    controller._rollout_snapshots = RolloutSnapshotter(
-        parts,
-        checkpointer=getattr(controller, "_checkpointer", None),
-        timeout=getattr(controller, "_timeout", None),
+        controller._rollout_manager = SimpleNamespace(recovery_ledger=None)
+    elif not hasattr(rollout_manager, "recovery_ledger"):
+        rollout_manager.recovery_ledger = None
+    build = SingleControllerActor.__ray_metadata__.modified_class._build_rollout_checkpointing
+    controller._rollout_snapshots, controller._rollout_restorer = build(
+        controller,
         bootstrap_identity=snapshots._bootstrap_identity if snapshots else None,
-        teacher_coordinator=getattr(controller, "_teacher_coordinator", None),
-        records_prompt_groups=lambda: getattr(
-            controller, "_rollout_recovery_enabled", False
-        ),
-    )
-    controller._rollout_restorer = RolloutRestorer(
-        parts,
-        algo_cfg=getattr(controller, "_algo_cfg", None),
-        buffer_capacity=getattr(controller, "_buffer_capacity", asyncio.Semaphore(0)),
         # A test sets what the run resumed from on the controller; otherwise
         # keep what the restorer was built with.
         resume=getattr(

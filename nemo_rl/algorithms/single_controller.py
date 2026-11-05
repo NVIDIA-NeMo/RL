@@ -95,6 +95,9 @@ from nemo_rl.algorithms.metric_utils import (
     SetupTimingMetrics,
 )
 from nemo_rl.algorithms.ppo import _compute_critic_metrics
+from nemo_rl.algorithms.rollout_checkpointing.manifest import (
+    BootstrapCompatibilityIdentity,
+)
 from nemo_rl.algorithms.rollout_checkpointing.restore import RolloutRestorer
 from nemo_rl.algorithms.rollout_checkpointing.snapshots import (
     RolloutSnapshotter,
@@ -713,44 +716,17 @@ class SingleControllerActor:
             self._async_cfg.max_buffered_rollouts
         )
 
-        # Saving and restoring rollout state share these parts; neither reads
-        # controller fields. Built after every part they are given.
-        rollout_parts = RolloutParts(
-            master_config=master_config,
-            dp_client=self._dp_client,
-            partition_id=self._partition_id,
-            buffer=self._buffer,
-            dataloader=self._dataloader,
-            sampler=self._sampler,
-            rollout_manager=self._rollout_manager,
-            data_plane_barrier=self._data_plane_checkpoint_barrier,
-            environment_checkpoint=self._environment_checkpoint,
-            runtime_state=self._rollout_runtime,
-            read_progress=self._training_progress,
-            log_metrics=self._log_telemetry_metrics,
-        )
-        # Rollout snapshots, the TQ part of trainer checkpoints, the lock between
-        # them and the optimizer-commit window.
-        self._rollout_snapshots = RolloutSnapshotter(
-            rollout_parts,
-            checkpointer=self._checkpointer,
-            timeout=self._timeout,
-            bootstrap_identity=actor_args.bootstrap_identity,
-            teacher_coordinator=self._teacher_coordinator,
-            records_prompt_groups=lambda: self._rollout_recovery_enabled,
-        )
-        # Restore fills the shared runtime state and takes one replay-capacity
-        # permit per restored group.
-        self._rollout_restorer = RolloutRestorer(
-            rollout_parts,
-            algo_cfg=self._algo_cfg,
-            buffer_capacity=self._buffer_capacity,
-            resume=ResumeSource(
-                path=actor_args.last_checkpoint_path,
-                from_rollout_snapshot=actor_args.restored_from_rollout_snapshot,
-                data_plane_metadata=data_plane_checkpoint_metadata,
-                load_metrics=actor_args.rollout_checkpoint_load_metrics,
-            ),
+        # Built after every part they are given.
+        self._rollout_snapshots, self._rollout_restorer = (
+            self._build_rollout_checkpointing(
+                bootstrap_identity=actor_args.bootstrap_identity,
+                resume=ResumeSource(
+                    path=actor_args.last_checkpoint_path,
+                    from_rollout_snapshot=actor_args.restored_from_rollout_snapshot,
+                    data_plane_metadata=data_plane_checkpoint_metadata,
+                    load_metrics=actor_args.rollout_checkpoint_load_metrics,
+                ),
+            )
         )
 
         self._trainer_version: int = restored_trainer_version
@@ -969,6 +945,47 @@ class SingleControllerActor:
             trainer_version=self._trainer_version,
             current_epoch=self._current_epoch,
         )
+
+    def _build_rollout_checkpointing(
+        self,
+        *,
+        bootstrap_identity: Optional[BootstrapCompatibilityIdentity],
+        resume: ResumeSource,
+    ) -> tuple[RolloutSnapshotter, RolloutRestorer]:
+        """Build the rollout snapshotter and restorer, which share the controller's parts."""
+        rollout_parts = RolloutParts(
+            master_config=self._master_config,
+            dp_client=self._dp_client,
+            partition_id=self._partition_id,
+            buffer=self._buffer,
+            dataloader=self._dataloader,
+            sampler=self._sampler,
+            rollout_manager=self._rollout_manager,
+            data_plane_barrier=self._data_plane_checkpoint_barrier,
+            environment_checkpoint=self._environment_checkpoint,
+            runtime_state=self._rollout_runtime,
+            read_progress=self._training_progress,
+            log_metrics=self._log_telemetry_metrics,
+        )
+        # Rollout snapshots, the TQ part of trainer checkpoints, the lock between
+        # them and the optimizer-commit window.
+        snapshots = RolloutSnapshotter(
+            rollout_parts,
+            checkpointer=self._checkpointer,
+            timeout=self._timeout,
+            bootstrap_identity=bootstrap_identity,
+            teacher_coordinator=self._teacher_coordinator,
+            records_prompt_groups=lambda: self._rollout_recovery_enabled,
+        )
+        # Restore fills the shared runtime state and takes one replay-capacity
+        # permit per restored group.
+        restorer = RolloutRestorer(
+            rollout_parts,
+            algo_cfg=self._algo_cfg,
+            buffer_capacity=self._buffer_capacity,
+            resume=resume,
+        )
+        return snapshots, restorer
 
     def _log_telemetry_metrics(
         self, metrics: dict[str, float], *, step: int, prefix: str
