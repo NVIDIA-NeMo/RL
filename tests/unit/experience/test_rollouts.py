@@ -3533,7 +3533,7 @@ def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
             )
 
     impl._stream_rows = fake_stream_rows
-    impl._results_to_completions = lambda _results: ([object()], {})
+    impl._results_to_completions = lambda _results, **_: ([object()], {}, ({}, {}, 0))
     impl._compute_rollout_metrics = lambda *_args, **_kwargs: {}
     impl._compute_reward_penalty_metrics = lambda *_args: {}
     owner = GymCheckpointInstance("tools", 1).instance_id

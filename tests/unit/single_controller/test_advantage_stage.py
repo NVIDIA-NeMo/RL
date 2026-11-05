@@ -890,7 +890,7 @@ def test_failed_actor_rpc_raises_and_retires_the_actor(capsys) -> None:
     assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1
 
 
-# ── grpo.masked_sample_rewards_in_baseline ────────────────────────────────
+# ── grpo.masked_reward_policy ──────────────────────────────────────────────
 
 
 class _RecordingEstimator:
@@ -904,9 +904,10 @@ class _RecordingEstimator:
         return torch.zeros_like(mask)
 
 
-@pytest.mark.parametrize("keep_in_baseline", [False, True])
-def test_masked_rows_enter_the_baseline_only_when_enabled(keep_in_baseline) -> None:
-    """An env-flagged (incomplete) row never trains; the flag decides its baseline weight."""
+@pytest.mark.parametrize("policy", ["exclude", "include"])
+def test_masked_rows_enter_the_baseline_only_under_include(policy) -> None:
+    """An env-flagged row never trains; masked_reward_policy decides its baseline weight."""
+    keep_in_baseline = policy == "include"
     meta = _meta_for_group_sizes([4])
     rewards = [1.0, 1.0, 1.0, 0.0]
     rows = {
@@ -928,7 +929,7 @@ def test_masked_rows_enter_the_baseline_only_when_enabled(keep_in_baseline) -> N
             algo=GRPOConfig(
                 num_generations_per_prompt=4,
                 seq_logprob_error_threshold=None,
-                masked_sample_rewards_in_baseline=keep_in_baseline,
+                masked_reward_policy=policy,
             )
         ),
         advantage_estimator=estimator,
@@ -939,7 +940,7 @@ def test_masked_rows_enter_the_baseline_only_when_enabled(keep_in_baseline) -> N
     # The flagged row never contributes a gradient either way.
     assert call["mask"][3].sum() == 0
     assert call["mask"][:3].bool().all()
-    # Only the flag decides whether its reward counts in the group baseline.
+    # Only the policy decides whether its reward counts in the group baseline.
     expected = [1.0, 1.0, 1.0, 1.0 if keep_in_baseline else 0.0]
     assert call["valid_mask"].tolist() == expected
 

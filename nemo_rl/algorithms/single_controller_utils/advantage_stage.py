@@ -678,7 +678,7 @@ class AdvantageComputer:
             token_mask=token_mask,
             truncated=truncated,
             seq_lens=tensor_field(data, INPUT_LENGTHS),
-            baseline_mask=baseline_mask,
+            baseline_mask=advantage_valid_mask,
         )
         metric_rows = (
             owner_batch.representative_rows if owner_batch is not None else slice(None)

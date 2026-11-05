@@ -1895,6 +1895,7 @@ class AsyncNemoGymRolloutImpl:
                     k: v for k, v in instance_config.items() if k != MASK_SAMPLE
                 }
             return extras
+
         # Operator rules (env.mask_sample_rules) set the same flag from fields the
         # Gym response already carries. The flag is added to each completion's
         # env_extras after the gate above, so an explicit rule is honored even
