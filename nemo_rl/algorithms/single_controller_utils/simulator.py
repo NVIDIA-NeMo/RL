@@ -65,6 +65,9 @@ TrainBackend = Literal["cpu", "automodel", "mcore"]
 
 SIMULATOR_MODES: tuple[str, ...] = ("rollout_only", "train_only", "train_rollout")
 TRAIN_BACKENDS: tuple[str, ...] = ("cpu", "automodel", "mcore")
+# Generation backends validated under the SC refit lifecycle with the trainer
+# stubbed out; build_simulated_weight_synchronizer dispatches on the same set.
+SIMULATOR_GENERATION_BACKENDS: tuple[str, ...] = ("vllm", "sglang")
 
 # Columns the CpuTrainer fills in place of the policy / reference forwards.
 GENERATION_LOGPROBS_FIELD = "generation_logprobs"
@@ -244,28 +247,43 @@ def validate_simulator_config(
         )
     generation_config = cast(dict[str, Any], master_config.policy["generation"])
     backend = generation_config["backend"]
-    if backend != "vllm":
+    if backend not in SIMULATOR_GENERATION_BACKENDS:
         raise NotImplementedError(
-            "rollout_only currently supports policy.generation.backend='vllm' "
-            f"only; got {backend!r}. Megatron generation serves the trainer's own "
-            "weights, so it cannot run without one; trtllm, sglang and dynamo "
-            "have not been validated under the SingleController refit "
-            "lifecycle this run drives."
+            "rollout_only supports policy.generation.backend in "
+            f"{SIMULATOR_GENERATION_BACKENDS}; got {backend!r}. Megatron "
+            "generation serves the trainer's own weights, so it cannot run "
+            "without one; trtllm and dynamo have not been validated under the "
+            "SingleController refit lifecycle this run drives."
         )
     reject_online_quantization(master_config.policy["generation"])
-    if generation_config["vllm_cfg"].get("load_format") == "dummy":
-        raise ValueError(
-            "rollout_only cannot run with vllm_cfg.load_format='dummy': no refit "
-            "follows to replace the dummy weights, so the engine would serve "
-            "random weights for the whole run. Drop the override; the driver "
-            "defaults load_format to 'auto'."
-        )
-    kv_cache_dtype = generation_config["vllm_cfg"].get("kv_cache_dtype")
-    if kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
-        raise NotImplementedError(
-            f"vllm_cfg.kv_cache_dtype={kv_cache_dtype!r} calibrates its KV scales "
-            "on the trainer at every refit, which rollout_only has no trainer for."
-        )
+    if backend == "vllm":
+        if generation_config["vllm_cfg"].get("load_format") == "dummy":
+            raise ValueError(
+                "rollout_only cannot run with vllm_cfg.load_format='dummy': no "
+                "refit follows to replace the dummy weights, so the engine would "
+                "serve random weights for the whole run. Drop the override; the "
+                "driver defaults load_format to 'auto'."
+            )
+        kv_cache_dtype = generation_config["vllm_cfg"].get("kv_cache_dtype")
+        if kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
+            raise NotImplementedError(
+                f"vllm_cfg.kv_cache_dtype={kv_cache_dtype!r} calibrates its KV "
+                "scales on the trainer at every refit, which rollout_only has no "
+                "trainer for."
+            )
+    elif backend == "sglang":
+        pause_mode = generation_config["sglang_cfg"]["sglang_server_config"][
+            "pause_generation_mode"
+        ]
+        if pause_mode == "in_place":
+            # Same rule as the SGLang weight synchronizers: the simulated refit
+            # clears the KV cache like a real one, which in_place cannot.
+            raise ValueError(
+                "rollout_only cannot run with sglang_server_config."
+                "pause_generation_mode='in_place': the refit pause must clear "
+                "the KV cache, as the SGLang weight synchronizers require. Use "
+                "'abort' or 'retract'."
+            )
     if master_config.checkpointing["enabled"]:
         raise ValueError(
             "rollout_only requires checkpointing.enabled=false: the cpu train "
@@ -306,11 +324,14 @@ def validate_simulator_config(
 class NoOpWeightSynchronizer(WeightSynchronizer):
     """A refit that moves no weights.
 
-    The engine already serves the checkpoint (``load_format: auto``), so there
-    is nothing to deliver: ``is_stale`` is False from construction and the
-    SingleController skips its startup sync. ``sync_weights`` holds
-    ``refit_time_s`` so the generation pause around it lasts as long as a real
-    transfer would.
+    The engine already serves the checkpoint (vLLM ``load_format: auto``, or
+    SGLang's ``model_path``), so there is nothing to deliver: ``is_stale`` is
+    False from construction and the SingleController skips its startup sync.
+    ``sync_weights`` holds ``refit_time_s`` so the generation pause around it
+    lasts as long as a real transfer would. The SingleController owns that
+    pause for vLLM (``pause_generation_for_refit`` / ``resume_generation_after_refit``);
+    see :class:`SGLangNoOpWeightSynchronizer` for the backend that pauses inside
+    the synchronizer instead.
     """
 
     def __init__(self, *, refit_time_s: float = 0.0) -> None:
@@ -347,6 +368,70 @@ class NoOpWeightSynchronizer(WeightSynchronizer):
 
     def shutdown(self) -> None:
         """No transport, so nothing to release."""
+
+
+class SGLangNoOpWeightSynchronizer(NoOpWeightSynchronizer):
+    """The no-op refit for SGLang, which pauses inside the synchronizer.
+
+    ``SGLangGeneration.pause_generation_for_refit`` is an acknowledgement only:
+    the SGLang weight synchronizers pause, clear the KV cache, transfer and
+    resume as one lifecycle inside ``sync_weights``. This stand-in keeps the
+    pause and the cache flush and skips only the transfer and its
+    ``begin_weight_update`` / ``end_weight_update`` session, so the refit
+    bubble a rollout-only run measures is the one a real refit would leave.
+    """
+
+    def __init__(self, *, generation: Any, refit_time_s: float = 0.0) -> None:
+        super().__init__(refit_time_s=refit_time_s)
+        self._generation = generation
+
+    def sync_weights(
+        self,
+        *,
+        timer: Optional[Timer] = None,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> Optional[dict[str, float]]:
+        """Pause, clear the KV cache, hold, resume; nothing is transferred."""
+        try:
+            self._generation.pause_generation(
+                mode=self._generation.pause_generation_mode
+            )
+            if not self._generation.invalidate_kv_cache():
+                raise RuntimeError(
+                    "SGLang KV cache invalidation failed before the simulated refit."
+                )
+            return super().sync_weights(timer=timer, kv_scales=kv_scales)
+        finally:
+            # Resume on every path, as the SGLang synchronizers do, so a failed
+            # hold leaves the engines serving instead of paused for the run.
+            self._generation.continue_generation()
+
+
+def build_simulated_weight_synchronizer(
+    *, generation_backend: str, generation: Any, refit_time_s: float
+) -> NoOpWeightSynchronizer:
+    """Pick the no-op refit for the generation backend.
+
+    Args:
+        generation_backend: ``policy.generation.backend`` of the recipe; one of
+            ``SIMULATOR_GENERATION_BACKENDS`` (validate_simulator_config ran).
+        generation: The built generation object.
+        refit_time_s: Seconds each refit holds inside the generation pause.
+
+    Returns:
+        ``NoOpWeightSynchronizer`` for vLLM, whose pause the SingleController
+        drives; ``SGLangNoOpWeightSynchronizer`` for SGLang, which pauses itself.
+    """
+    if generation_backend == "sglang":
+        return SGLangNoOpWeightSynchronizer(
+            generation=generation, refit_time_s=refit_time_s
+        )
+    if generation_backend == "vllm":
+        return NoOpWeightSynchronizer(refit_time_s=refit_time_s)
+    raise NotImplementedError(
+        f"no simulated refit for policy.generation.backend={generation_backend!r}; "
+        f"supported: {SIMULATOR_GENERATION_BACKENDS}"
+    )
 
 
 class CpuTrainer(TQDriverMixin):

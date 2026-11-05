@@ -1,0 +1,53 @@
+# SingleController GRPO on the native math env with SGLang generation.
+# The Megatron SC exemplar with the generation block of grpo_math_1B_sglang.yaml,
+# non-colocated: one trainer GPU plus one SGLang engine GPU on a 2-GPU allocation,
+# so the engine owns its memory and no offload runs around the refit.
+# SGLang fault tolerance is not supported on the SingleController (setup rejects it).
+defaults: grpo_math_1B_megatron_single_controller.yaml
+
+policy:
+  generation:
+    backend: "sglang"
+    sglang_cfg:
+      quantization:
+        scheme: bf16
+      model_path: ${policy.model_name}
+      dtype: ${policy.precision}
+      context_length: 512
+      allow_auto_truncate: true
+      tp_size: 1
+      dp_size: 1
+      pp_size: 1
+      ep_size: 1
+      random_seed: 42
+      max_running_requests: null
+      mem_fraction_static: 0.6
+      skip_server_warmup: true
+      disable_outlines_disk_cache: true
+      cuda_graph_backend_prefill: disabled
+      disable_cuda_graph: false
+      sglang_server_config:
+        # Non-colocated: the engine owns its GPU, no offload around refit.
+        needs_offload: false
+        cpu_weight_backup: false
+        sglang_server_concurrency: 1024
+        pause_generation_mode: retract
+        num_gpus: 1
+        num_gpus_per_engine: ${policy.generation.sglang_cfg.tp_size}
+      sglang_router_config:
+        use_external_router: false
+        retry_max_retries: 5
+        cb_failure_threshold: 10
+      sglang_http_client_config:
+        max_retries: 3
+      sglang_fault_tolerance_config:
+        use_fault_tolerance: false
+        rollout_health_check_interval: 60
+        rollout_health_check_timeout: 60
+        rollout_health_check_first_wait: 60
+        rollout_max_restart_attempts: 3
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 1
+        num_nodes: 1

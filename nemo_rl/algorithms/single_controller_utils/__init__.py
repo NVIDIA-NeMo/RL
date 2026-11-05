@@ -31,8 +31,10 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
 from nemo_rl.algorithms.single_controller_utils.simulator import (
     CpuTrainer,
     NoOpWeightSynchronizer,
+    SGLangNoOpWeightSynchronizer,
     SimulatorSettings,
     apply_simulator_overrides,
+    build_simulated_weight_synchronizer,
     validate_simulator_config,
 )
 
@@ -44,11 +46,13 @@ __all__ = [
     "NoOpWeightSynchronizer",
     "RolloutCheckpointConfig",
     "RolloutFailureConfig",
+    "SGLangNoOpWeightSynchronizer",
     "SimulatorSettings",
     "SingleControllerActorArgs",
     "WatchdogConfig",
     "algo_config",
     "apply_simulator_overrides",
+    "build_simulated_weight_synchronizer",
     "is_ppo_run",
     "setup_single_controller",
     "validate_simulator_config",

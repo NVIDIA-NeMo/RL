@@ -40,8 +40,10 @@ from nemo_rl.algorithms.single_controller_utils.simulator import (
     REFERENCE_LOGPROBS_FIELD,
     CpuTrainer,
     NoOpWeightSynchronizer,
+    SGLangNoOpWeightSynchronizer,
     SimulatorSettings,
     apply_simulator_overrides,
+    build_simulated_weight_synchronizer,
     reject_online_quantization,
     validate_simulator_config,
 )
@@ -181,6 +183,7 @@ def _master_config(
     tis_type: str | None = None,
     defer_routes: bool = False,
     forest_training: bool = False,
+    sglang_pause_mode: str = "retract",
 ) -> MasterConfig:
     generation: dict[str, Any] = {
         "backend": backend,
@@ -188,6 +191,10 @@ def _master_config(
         "vllm_cfg": dict(vllm_cfg or {}),
         **(generation_extra or {}),
     }
+    if backend == "sglang":
+        generation["sglang_cfg"] = {
+            "sglang_server_config": {"pause_generation_mode": sglang_pause_mode}
+        }
     return MasterConfig.model_construct(
         policy={"generation": generation},
         checkpointing={"enabled": checkpointing_enabled},
@@ -212,10 +219,25 @@ def test_validate_rejects_ppo() -> None:
         validate_simulator_config(_master_config(ppo=True), SimulatorSettings())
 
 
-@pytest.mark.parametrize("backend", ["megatron", "trtllm", "sglang", "dynamo"])
-def test_validate_rejects_non_vllm_backends(backend: str) -> None:
+@pytest.mark.parametrize("backend", ["megatron", "trtllm", "dynamo"])
+def test_validate_rejects_unsupported_backends(backend: str) -> None:
     with pytest.raises(NotImplementedError, match="vllm"):
         validate_simulator_config(_master_config(backend=backend), SimulatorSettings())
+
+
+def test_validate_accepts_sglang_rollout_only_recipe() -> None:
+    # No vllm_cfg at all: the vLLM-only checks must not be reached.
+    master_config = _master_config(backend="sglang")
+    del master_config.policy["generation"]["vllm_cfg"]
+    validate_simulator_config(master_config, SimulatorSettings(refit_time_s=5.0))
+
+
+def test_validate_rejects_sglang_in_place_pause() -> None:
+    with pytest.raises(ValueError, match="in_place"):
+        validate_simulator_config(
+            _master_config(backend="sglang", sglang_pause_mode="in_place"),
+            SimulatorSettings(),
+        )
 
 
 def test_validate_rejects_dummy_load_format() -> None:
@@ -318,6 +340,67 @@ def test_noop_weight_synchronizer_is_never_stale_and_holds_the_refit_time() -> N
 def test_noop_weight_synchronizer_rejects_negative_hold() -> None:
     with pytest.raises(ValueError):
         NoOpWeightSynchronizer(refit_time_s=-1.0)
+
+
+class _FakeSGLangGeneration:
+    """Records the refit lifecycle calls an SGLang synchronizer makes."""
+
+    def __init__(self, *, invalidate_ok: bool = True) -> None:
+        self.pause_generation_mode = "retract"
+        self.calls: list[tuple[str, Any]] = []
+        self._invalidate_ok = invalidate_ok
+
+    def pause_generation(self, mode: str) -> None:
+        self.calls.append(("pause_generation", mode))
+
+    def invalidate_kv_cache(self) -> bool:
+        self.calls.append(("invalidate_kv_cache", None))
+        return self._invalidate_ok
+
+    def continue_generation(self) -> None:
+        self.calls.append(("continue_generation", None))
+
+
+def test_sglang_noop_synchronizer_pauses_flushes_holds_and_resumes() -> None:
+    gen = _FakeSGLangGeneration()
+    synchronizer = SGLangNoOpWeightSynchronizer(generation=gen, refit_time_s=0.05)
+    assert synchronizer.is_stale is False
+    started = time.perf_counter()
+    assert synchronizer.sync_weights(kv_scales=None) is None
+    assert time.perf_counter() - started >= 0.05
+    assert gen.calls == [
+        ("pause_generation", "retract"),
+        ("invalidate_kv_cache", None),
+        ("continue_generation", None),
+    ]
+    assert synchronizer.sync_count == 1
+
+
+def test_sglang_noop_synchronizer_resumes_when_the_flush_fails() -> None:
+    gen = _FakeSGLangGeneration(invalidate_ok=False)
+    synchronizer = SGLangNoOpWeightSynchronizer(generation=gen, refit_time_s=0.0)
+    with pytest.raises(RuntimeError, match="KV cache"):
+        synchronizer.sync_weights(kv_scales=None)
+    assert gen.calls[-1] == ("continue_generation", None)
+    assert synchronizer.sync_count == 0
+
+
+def test_build_simulated_weight_synchronizer_dispatches_on_the_backend() -> None:
+    gen = _FakeSGLangGeneration()
+    vllm_sync = build_simulated_weight_synchronizer(
+        generation_backend="vllm", generation=gen, refit_time_s=1.0
+    )
+    assert type(vllm_sync) is NoOpWeightSynchronizer
+    assert vllm_sync.refit_time_s == 1.0
+    sglang_sync = build_simulated_weight_synchronizer(
+        generation_backend="sglang", generation=gen, refit_time_s=2.0
+    )
+    assert isinstance(sglang_sync, SGLangNoOpWeightSynchronizer)
+    assert sglang_sync.refit_time_s == 2.0
+    with pytest.raises(NotImplementedError, match="megatron"):
+        build_simulated_weight_synchronizer(
+            generation_backend="megatron", generation=gen, refit_time_s=0.0
+        )
 
 
 # ── CpuTrainer ──────────────────────────────────────────────────────────────

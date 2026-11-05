@@ -83,6 +83,9 @@ class SGLangGeneration(GenerationInterface):
         # __del__ also runs when validation or resource allocation fails.
         # Establish inert cleanup state before either can raise.
         self._health_monitor: RolloutHealthMonitor | None = None
+        # The instance built here owns the engines, router and lock; a copy
+        # unpickled in another process (see ``__getstate__``) does not.
+        self._owns_engines: bool = True
         # Set by ``grpo.setup``; ``refit_policy_generation`` dispatches on it.
         self.weight_synchronizer: WeightSynchronizer | None = None
         self._async_loop: AsyncLoopThread | None = None
@@ -473,6 +476,9 @@ class SGLangGeneration(GenerationInterface):
         ray.get([e.end_weight_update.remote() for e in engines])
 
     def shutdown(self) -> bool:
+        if not self._owns_engines:
+            return self._shutdown_client_copy()
+
         ok = True
         if self._health_monitor:
             self._health_monitor.stop()
@@ -533,6 +539,60 @@ class SGLangGeneration(GenerationInterface):
 
     def __del__(self) -> None:
         self.shutdown()
+
+    def _shutdown_client_copy(self) -> bool:
+        """Release only what this process created: the loop and HTTP client.
+
+        The engines, router, lock and distributed POST actors belong to the
+        driver's instance, whose ``shutdown`` terminates them.
+        """
+        ok = True
+        if self._http_client is not None:
+            try:
+                if self._async_loop is not None:
+                    self._async_loop.run(self._http_client.aclose_local())
+            except Exception as e:
+                logger.warning(f"HTTP client shutdown failed: {e}")
+                ok = False
+            self._http_client = None
+        if self._async_loop is not None:
+            try:
+                self._async_loop.close()
+            except Exception as e:
+                logger.warning(f"AsyncLoopThread close failed: {e}")
+                ok = False
+            self._async_loop = None
+        return ok
+
+    # ------------------------------------------------------------------
+    # Pickling -- the SingleController ships the generation handle into
+    # its actor; the copy drives the same engines over fresh local clients.
+    # ------------------------------------------------------------------
+    def __getstate__(self) -> dict[str, Any]:
+        """Drop the driver's event-loop thread; the copy does not own the engines.
+
+        The engine, router and lock actor handles, the placement group and
+        the config pickle as they are. ``HttpClient`` drops its own
+        loop-bound ``httpx`` client. The health monitor cannot cross
+        processes: its thread would keep restarting engines in this
+        process while the copy still holds the dead handles.
+        """
+        if self._health_monitor is not None:
+            raise NotImplementedError(
+                "SGLangGeneration cannot be pickled with fault tolerance enabled: "
+                "the RolloutHealthMonitor thread and the engines it restarts would "
+                "stay in the driver process while the copy drives stale handles. "
+                "Set sglang_fault_tolerance_config.use_fault_tolerance to false."
+            )
+        state = self.__dict__.copy()
+        state["_async_loop"] = None
+        state["_owns_engines"] = False
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restore a client copy with its own event-loop thread."""
+        self.__dict__.update(state)
+        self._async_loop = AsyncLoopThread()
 
     def _merge_stop_strings(self, batch_stop_strings) -> list[list[str]]:
         """Merge stop strings from config and batch.

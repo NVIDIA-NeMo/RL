@@ -86,8 +86,8 @@ from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
 )
 from nemo_rl.algorithms.single_controller_utils.simulator import (
     CpuTrainer,
-    NoOpWeightSynchronizer,
     SimulatorSettings,
+    build_simulated_weight_synchronizer,
     validate_simulator_config,
 )
 from nemo_rl.algorithms.utils import set_seed
@@ -146,7 +146,10 @@ from nemo_rl.models.generation.generation_router import (
 )
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
-from nemo_rl.models.generation.sglang.config import SGLangConfig
+from nemo_rl.models.generation.sglang.config import (
+    SGLangConfig,
+    SGLangFaultToleranceConfig,
+)
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.generation.vllm.config import VllmConfig
@@ -741,6 +744,18 @@ def _build_generation(
             "defer_model_load is only supported for the vllm backend"
         )
         sglang_config = cast(SGLangConfig, generation_config)
+        # The handle is pickled into the SingleControllerActor; the health
+        # monitor's thread cannot follow it (SGLangGeneration.__getstate__), so
+        # reject the combination here, before any engine starts.
+        fault_tolerance = SGLangFaultToleranceConfig.model_validate(
+            sglang_config["sglang_cfg"]["sglang_fault_tolerance_config"]
+        )
+        if fault_tolerance.use_fault_tolerance:
+            raise NotImplementedError(
+                "SGLang fault tolerance is not supported on the SingleController: "
+                "set policy.generation.sglang_cfg.sglang_fault_tolerance_config."
+                "use_fault_tolerance to false."
+            )
         sglang_config["sglang_cfg"].setdefault(
             "model_path", master_config.policy["model_name"]
         )
@@ -1218,8 +1233,9 @@ def setup_single_controller(
             (examples/run_single_controller_simulator.py), or None for a
             training run. With the ``cpu`` train backend no trainer is built:
             every node is an inference node, a ``CpuTrainer`` bootstraps the
-            data plane and stands in for the train step, and the refit is a
-            ``NoOpWeightSynchronizer``.
+            data plane and stands in for the train step, and the refit is the
+            backend's ``NoOpWeightSynchronizer`` (see
+            ``build_simulated_weight_synchronizer``).
 
     Returns:
         A tuple of (pre-built SC actor args, driver-side per-phase timings
@@ -2364,11 +2380,13 @@ def setup_single_controller(
     if weight_synchronizer is None:
         t0 = time.perf_counter()
         if cpu_trainer:
-            # The engine loaded the checkpoint itself (is_eval), so the refit
-            # moves nothing; it only holds for the simulated transfer time.
+            # The engine loaded the checkpoint itself, so the refit moves
+            # nothing; it only holds for the simulated transfer time.
             assert simulator is not None
-            weight_synchronizer = NoOpWeightSynchronizer(
-                refit_time_s=simulator.refit_time_s
+            weight_synchronizer = build_simulated_weight_synchronizer(
+                generation_backend=generation_config["backend"],
+                generation=generation,
+                refit_time_s=simulator.refit_time_s,
             )
         else:
             weight_synchronizer = create_weight_synchronizer(

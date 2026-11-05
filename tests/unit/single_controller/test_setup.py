@@ -71,6 +71,7 @@ from nemo_rl.algorithms.single_controller_utils import (
     CpuTrainer,
     MasterConfig,
     NoOpWeightSynchronizer,
+    SGLangNoOpWeightSynchronizer,
     SimulatorSettings,
     SingleControllerActorArgs,
     setup_single_controller,
@@ -352,7 +353,9 @@ def test_build_generation_passes_sglang_config():
     """SGLangGeneration receives the complete generation config by keyword."""
     master_config = _make_master_config(backend="sglang")
     master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
-    master_config.policy["generation"]["sglang_cfg"] = {}
+    master_config.policy["generation"]["sglang_cfg"] = {
+        "sglang_fault_tolerance_config": {"use_fault_tolerance": False}
+    }
     inference_cluster = MagicMock(name="inference_cluster")
 
     with patch.object(sc_setup_mod, "SGLangGeneration") as mock_sglang:
@@ -369,6 +372,25 @@ def test_build_generation_passes_sglang_config():
         "Qwen/Qwen3-0.6B"
     )
     generation.finish_generation.assert_called_once_with()
+
+
+def test_build_generation_rejects_sglang_fault_tolerance_before_any_engine_starts():
+    """The health monitor cannot follow the handle into the SC actor."""
+    master_config = _make_master_config(backend="sglang")
+    master_config.policy["model_name"] = "Qwen/Qwen3-0.6B"
+    master_config.policy["generation"]["sglang_cfg"] = {
+        "sglang_fault_tolerance_config": {"use_fault_tolerance": True}
+    }
+
+    with (
+        patch.object(sc_setup_mod, "SGLangGeneration") as mock_sglang,
+        pytest.raises(NotImplementedError, match="fault tolerance"),
+    ):
+        sc_setup_mod._build_generation(
+            MagicMock(name="inference_cluster"), master_config
+        )
+
+    mock_sglang.assert_not_called()
 
 
 def _make_forest_master_config() -> MasterConfig:
@@ -4788,6 +4810,41 @@ class TestSimulatorRolloutOnlySetup:
             patched_factories["build_data_plane_client"].return_value
         )
 
+    def test_sglang_recipe_gets_the_self_pausing_noop_refit(
+        self, patched_factories, monkeypatch
+    ):
+        mc = _make_master_config(backend="sglang", colocated=False)
+        mc.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 8,
+            "num_nodes": 2,
+        }
+        mc.policy["generation"]["sglang_cfg"] = {
+            "sglang_server_config": {"pause_generation_mode": "retract"},
+            "sglang_fault_tolerance_config": {"use_fault_tolerance": False},
+        }
+        monkeypatch.setattr(
+            sc_setup_mod,
+            "_build_inference_only_cluster",
+            MagicMock(return_value=(MagicMock(name="inference_cluster"), None)),
+        )
+        monkeypatch.setattr(
+            sc_simulator_mod,
+            "build_data_plane_client",
+            patched_factories["build_data_plane_client"],
+        )
+
+        actor_args, _ = setup_single_controller(
+            mc, MagicMock(pad_token_id=0), simulator=SimulatorSettings(refit_time_s=2.0)
+        )
+
+        patched_factories["create_weight_synchronizer"].assert_not_called()
+        synchronizer = actor_args.weight_synchronizer
+        assert isinstance(synchronizer, SGLangNoOpWeightSynchronizer)
+        assert synchronizer.refit_time_s == 2.0
+        # The stand-in pauses the engine it was built beside.
+        assert synchronizer._generation is patched_factories["fake_gen"]
+        assert patched_factories["fake_gen"].weight_synchronizer is synchronizer
+
     def test_rejects_checkpointing_before_any_factory_runs(self, patched_factories):
         mc = self._rollout_only_config()
         mc.checkpointing["enabled"] = True
@@ -4801,10 +4858,10 @@ class TestSimulatorRolloutOnlySetup:
         patched_factories["_build_clusters"].assert_not_called()
         patched_factories["build_data_plane_client"].assert_not_called()
 
-    def test_rejects_non_vllm_generation_before_any_factory_runs(
+    def test_rejects_unsupported_generation_before_any_factory_runs(
         self, patched_factories
     ):
-        mc = _make_master_config(colocated=False, backend="sglang")
+        mc = _make_master_config(colocated=False, backend="trtllm")
 
         with pytest.raises(NotImplementedError, match="vllm"):
             setup_single_controller(
