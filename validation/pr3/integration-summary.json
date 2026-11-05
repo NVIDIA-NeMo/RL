@@ -1,0 +1,24 @@
+{
+  "sample_receipts_passed": true,
+  "resume_steps": [
+    2,
+    3,
+    4,
+    5
+  ],
+  "checkpoint_ready_groups": 3,
+  "checkpoint_inflight_groups": 5,
+  "dispatches_per_step": {
+    "9655d015d49747d8a54e66f12fe2bbed:0": 4,
+    "9655d015d49747d8a54e66f12fe2bbed:1": 4,
+    "9655d015d49747d8a54e66f12fe2bbed:2": 2,
+    "4af1d7c4c8344f71a5c65bdbd0e824b6:2": 2,
+    "4af1d7c4c8344f71a5c65bdbd0e824b6:3": 2,
+    "4af1d7c4c8344f71a5c65bdbd0e824b6:4": 1,
+    "4af1d7c4c8344f71a5c65bdbd0e824b6:5": 2
+  },
+  "overlapping_synchronized_gpu_regions": 472,
+  "maximum_region_overlap_ms": 9.494872,
+  "kernel_trace_verified": false,
+  "overlap_limitation": "Regions synchronize CUDA boundaries and record nonzero event duration; exact concurrent kernels require a device trace."
+}
