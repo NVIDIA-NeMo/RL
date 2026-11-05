@@ -104,11 +104,33 @@ if __name__ == "__main__":
     source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     report = Path("validation/pr3/results/ep16-fixed-input/parity.json")
     report.unlink(missing_ok=True)
+    # Ray services start before run.sh sources the driver environment. Remote
+    # tasks inherit those services' environment, not later driver exports.
+    task_environment = {
+        name: os.environ[name]
+        for name in (
+            "PR3_REPO",
+            "PR3_PYTHON",
+            "PYTHONPATH",
+            "PATH",
+            "HF_HOME",
+            "HF_DATASETS_CACHE",
+            "HF_HUB_OFFLINE",
+            "TRANSFORMERS_OFFLINE",
+            "NEMO_RL_VENV_DIR",
+            "NRL_IGNORE_VERSION_MISMATCH",
+            "OMP_NUM_THREADS",
+            "UV_NO_SYNC",
+            "UV_NO_PROGRESS",
+            "NCCL_DEBUG",
+        )
+    }
     futures = [
         run_rank.options(
+            runtime_env={"env_vars": task_environment},
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node["NodeID"], soft=False
-            )
+            ),
         ).remote(index, nodes[0]["NodeManagerAddress"], source)
         for index, node in enumerate(nodes)
     ]
