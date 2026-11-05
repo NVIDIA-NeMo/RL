@@ -75,7 +75,11 @@ from nemo_rl.algorithms.utils import (
 )
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
-from nemo_rl.data.dataloader import CyclingDataLoader, MultipleDataloaderWrapper
+from nemo_rl.data.dataloader import (
+    CyclingDataLoader,
+    MultipleDataloaderWrapper,
+    shutdown_dataloader_workers,
+)
 from nemo_rl.data.datasets import AllTaskProcessedDataset
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, VLMMessageLogType
 from nemo_rl.data.llm_message_utils import (
@@ -4934,6 +4938,7 @@ def validate(
         max_batches = -(-max_val_samples // val_batch_size)
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
+                shutdown_dataloader_workers(val_dataloader)
                 break
             num_left = max_val_samples - batch_idx * val_batch_size
             if val_batch.size > num_left:

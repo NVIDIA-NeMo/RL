@@ -91,6 +91,7 @@ from nemo_rl.algorithms.utils import (
     log_generation_metrics,
     print_performance_metrics,
 )
+from nemo_rl.data.dataloader import shutdown_dataloader_workers
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import batched_message_log_to_flat_message
 from nemo_rl.data.multimodal_utils import (
@@ -313,6 +314,7 @@ def validate_sync(
         max_batches = -(-max_val_samples // val_batch_size)
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
+                shutdown_dataloader_workers(val_dataloader)
                 break
             num_left = max_val_samples - batch_idx * val_batch_size
             if val_batch.size > num_left:
