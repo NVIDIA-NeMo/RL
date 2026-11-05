@@ -115,6 +115,7 @@ from nemo_rl.experience.interfaces import (
     RETAINED_TASK_INDICES_KEY,
     TRAINED_TASK_INDICES_KEY,
 )
+from nemo_rl.experience.mask_sample_rules import ENV_MASK_SAMPLE_RULES_KEY
 from nemo_rl.experience.metric_utils import is_histogram_metric
 from nemo_rl.experience.rollouts import (
     EffortLevelsConfig,
@@ -1033,6 +1034,7 @@ def setup(
     _raise_if_length_penalty_enabled_without_nemo_gym(
         master_config, enable_nemo_gym=enable_nemo_gym
     )
+    _raise_if_mask_sample_rules_set(master_config)
     nemo_gym_actor = None
 
     def _spinup_nemo_gym(base_urls, model_name, policy_api_key=None):
@@ -2523,6 +2525,20 @@ def _raise_if_length_penalty_enabled_without_nemo_gym(
         "(env.should_use_nemo_gym=true); it is not supported with the native "
         "generation path."
     )
+
+
+def _raise_if_mask_sample_rules_set(master_config: MasterConfig) -> None:
+    """Reject ``env.mask_sample_rules`` on this driver.
+
+    Only the SingleController applies the rules; here they would silently do
+    nothing, so a run expecting timed-out rollouts to be masked would train on
+    them instead.
+    """
+    if master_config.env.get(ENV_MASK_SAMPLE_RULES_KEY):
+        raise ValueError(
+            f"env.{ENV_MASK_SAMPLE_RULES_KEY} is only supported by the SingleController "
+            "driver (examples/run_grpo_single_controller.py)."
+        )
 
 
 def _apply_message_level_advantage_penalties(

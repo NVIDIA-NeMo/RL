@@ -60,6 +60,7 @@ from nemo_rl.experience.interfaces import (
     Completion,
     PromptGroupRecord,
 )
+from nemo_rl.experience.mask_sample_rules import parse_mask_sample_rules
 from nemo_rl.experience.rollout_manager import (
     AsyncNemoGymRolloutImpl,
     AsyncRolloutImpl,
@@ -1011,6 +1012,7 @@ def _nemo_gym_impl(
     reward_penalty_config=None,
     *,
     log_full_result_tables=False,
+    mask_sample_rules=(),
 ):
     return AsyncNemoGymRolloutImpl(
         tokenizer=None,
@@ -1027,6 +1029,7 @@ def _nemo_gym_impl(
             "top_k": None,
         },
         mask_env_flagged_samples=mask_env_flagged_samples,
+        mask_sample_rules=mask_sample_rules,
         log_full_result_tables=log_full_result_tables,
         reward_penalty_config=reward_penalty_config,
     )
@@ -1097,6 +1100,61 @@ def test_result_to_completion_drops_mask_flag_when_gate_off():
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
 
+def _eval_incomplete_rules():
+    return parse_mask_sample_rules(
+        {
+            "mask_sample_rules": [
+                {
+                    "name": "eval_incomplete",
+                    "field": "evaluation_completed",
+                    "equals": False,
+                }
+            ]
+        }
+    )
+
+
+def _rule_result(*, evaluation_completed, env_flag):
+    result = _mask_gate_result()
+    full_result = result["full_result"]
+    full_result["evaluation_completed"] = evaluation_completed
+    if not env_flag:
+        del full_result["mask_sample"]
+        del full_result["instance_config"]["mask_sample"]
+    return result
+
+
+@pytest.mark.parametrize("gate", [True, False])
+def test_mask_sample_rules_survive_gate_and_count_group_hits_once(gate):
+    """A rule's flag survives the env-flag gate, and only the group conversion
+    records hits."""
+    impl = _nemo_gym_impl(gate, mask_sample_rules=_eval_incomplete_rules())
+    # Only the rule can flag this row; the environment did not.
+    flagged = _rule_result(evaluation_completed=False, env_flag=False)
+    # Only the environment flags this row; the gate decides whether it counts.
+    env_only = _rule_result(evaluation_completed=True, env_flag=True)
+
+    # The streamed per-row conversion masks the row but records nothing.
+    (row,), _, _ = impl._results_to_completions([flagged])
+    assert row.env_extras["instance_config"]["mask_sample"] is True
+    assert impl.pop_mask_rule_metrics() == {}
+
+    completions, _, (counts, _, any_count) = impl._results_to_completions(
+        [flagged, env_only], record_rule_hits=True
+    )
+    assert counts == {"eval_incomplete": 1} and any_count == 1
+    assert completions[0].env_extras["instance_config"]["mask_sample"] is True
+    assert ("mask_sample" in completions[1].env_extras["instance_config"]) is gate
+    metrics = impl.pop_mask_rule_metrics()
+    assert metrics["mask_rules/rollouts_seen"] == 2.0
+    assert metrics["mask_rules/eval_incomplete_count"] == 1.0
+    assert impl.pop_mask_rule_metrics() == {}
+
+
+def test_native_rollout_has_no_mask_rule_metrics():
+    assert AsyncRolloutImpl.pop_mask_rule_metrics(object()) == {}  # type: ignore[arg-type]
+
+
 def test_gate_off_keeps_the_mask_flag_in_the_per_agent_metrics():
     """Dropping the flag from the completions must not drop it from the metrics:
     the gate-off mode exists for flags too coarse to honor, which is when the
@@ -1104,7 +1162,7 @@ def test_gate_off_keeps_the_mask_flag_in_the_per_agent_metrics():
     still holds, not the completions."""
     impl = _nemo_gym_impl(False)
     result = _mask_gate_result()
-    completions, _ = impl._results_to_completions([result])
+    completions, _, _ = impl._results_to_completions([result])
     assert "mask_sample" not in completions[0].env_extras
     # The caller's result is untouched by the gate.
     assert result["full_result"]["mask_sample"] is True
@@ -1439,7 +1497,7 @@ def test_nemo_gym_reward_penalties_match_legacy_rewards_counts_and_metrics(
     impl = _nemo_gym_impl(True, reward_penalty_config)
     result = _reward_penalty_result(output, assistant_overrides, assistant_tokens)
 
-    completions, penalty_counts = impl._results_to_completions([result])
+    completions, penalty_counts, _ = impl._results_to_completions([result])
 
     assert completions[0].reward == 0.0
     assert penalty_counts[count_key] == 1
@@ -2849,7 +2907,7 @@ def test_capture_completion_preserves_checks_and_raw_reward_until_finalization()
         "input_message_log": [],
         "full_result": {"reward": -2.0, "response": {"output": []}},
     }
-    completions, counts = impl._results_to_completions([result])
+    completions, counts, _ = impl._results_to_completions([result])
     assert completions[0].reward == -2.0
     assert completions[0].env_extras["ng_reward_checks"] == checks
     assert sum(counts.values()) == 0
@@ -2901,7 +2959,7 @@ def test_capture_manager_seals_checks_and_forwards_them_to_reassembly(
 def test_receipt_raw_metrics_preserve_mask_but_defer_reward(honor_mask: bool) -> None:
     impl = _nemo_gym_impl(honor_mask)
     result = _mask_gate_receipt_result()
-    completions, _ = impl._results_to_completions([result])
+    completions, _, _ = impl._results_to_completions([result])
     metrics = impl._compute_rollout_metrics(
         completions, "agent", full_results=[result["full_result"]]
     )
