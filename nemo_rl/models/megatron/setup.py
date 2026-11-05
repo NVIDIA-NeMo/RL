@@ -1374,7 +1374,17 @@ def _apply_moe_config(model_cfg: Any, config: PolicyConfig) -> None:
         "moe_router_bias_update_rate"
     ]
 
-    model_cfg.moe_enable_deepep = config["megatron_cfg"]["moe_enable_deepep"]
+    # MCore deprecated moe_enable_deepep; a saved True breaks single-rank (allgather) loads such as HF export.
+    if config["megatron_cfg"]["moe_enable_deepep"]:
+        backend = config["megatron_cfg"].get("moe_flex_dispatcher_backend")
+        if backend not in (None, "deepep"):
+            raise ValueError(
+                "megatron_cfg.moe_enable_deepep=True conflicts with "
+                f"megatron_cfg.moe_flex_dispatcher_backend={backend!r}; set only "
+                "moe_flex_dispatcher_backend."
+            )
+        model_cfg.moe_flex_dispatcher_backend = "deepep"
+    model_cfg.moe_enable_deepep = False
     model_cfg.moe_token_dispatcher_type = config["megatron_cfg"][
         "moe_token_dispatcher_type"
     ]
