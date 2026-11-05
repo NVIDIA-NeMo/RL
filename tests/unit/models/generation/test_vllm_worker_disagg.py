@@ -21,7 +21,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from nemo_rl.models.generation.vllm import vllm_worker
+from nemo_rl.models.generation.vllm import vllm_worker, vllm_worker_async
 from nemo_rl.models.generation.vllm.config import resolve_vllm_role_overrides
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
@@ -267,3 +267,66 @@ def test_shadow_check_never_fails_serving(caplog):
     )
 
     assert "shadow recompute failed" in caplog.text
+
+
+# -------------------------------------------------------------------------- #
+#  Prefix-cache reset between steps
+# -------------------------------------------------------------------------- #
+
+
+class _FakeAsyncLLM:
+    """``reset_prefix_cache`` answers ``verdicts`` in turn, repeating the last."""
+
+    def __init__(self, verdicts, released=(2, 1)):
+        self.verdicts = list(verdicts)
+        self.released = list(released)
+        self.rpcs = []
+        self.resets = 0
+
+    async def collective_rpc(self, method, args=()):
+        self.rpcs.append((method, args))
+        return self.released
+
+    async def reset_prefix_cache(self):
+        verdict = self.verdicts[min(self.resets, len(self.verdicts) - 1)]
+        self.resets += 1
+        return verdict
+
+
+def _reset_worker(llm):
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.cfg = {"vllm_cfg": {"async_engine": True}}
+    worker.llm = llm
+    return worker
+
+
+def test_reset_prefix_cache_async_returns_vllms_verdict_without_touching_pins():
+    llm = _FakeAsyncLLM([False])
+    assert asyncio.run(_reset_worker(llm).reset_prefix_cache_async()) is False
+    assert llm.rpcs == [] and llm.resets == 1
+
+
+def test_reset_prefix_cache_async_releases_pins_and_retries_until_the_reset_lands(
+    monkeypatch,
+):
+    monkeypatch.setattr(vllm_worker_async, "_KV_PIN_RELEASE_POLL_S", 0.0)
+    llm = _FakeAsyncLLM([False, False, True])
+    worker = _reset_worker(llm)
+    assert (
+        asyncio.run(worker.reset_prefix_cache_async(release_kv_transfer_pins=True))
+        is True
+    )
+    # One expiry broadcast, then the reset is polled until the scheduler has
+    # freed the blocks.
+    assert llm.rpcs == [("release_kv_transfer_pins", ())]
+    assert llm.resets == 3
+
+
+def test_reset_prefix_cache_async_raises_when_blocks_stay_allocated(monkeypatch):
+    monkeypatch.setattr(vllm_worker_async, "_KV_PIN_RELEASE_POLL_S", 0.0)
+    monkeypatch.setattr(vllm_worker_async, "_KV_PIN_RELEASE_TIMEOUT_S", 0.05)
+    llm = _FakeAsyncLLM([False])
+    with pytest.raises(RuntimeError, match="expired 3 connector pins"):
+        asyncio.run(
+            _reset_worker(llm).reset_prefix_cache_async(release_kv_transfer_pins=True)
+        )

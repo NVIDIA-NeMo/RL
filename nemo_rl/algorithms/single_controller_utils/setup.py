@@ -146,7 +146,10 @@ from nemo_rl.models.generation.sglang.config import (
 )
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    uses_vllm_disagg_frontends,
+)
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -845,6 +848,9 @@ def _spinup_gym(
         policy_api_key=policy_api_key,
         turn_checkpointing_enabled=(
             master_config.rollout_recovery.turn_checkpointing_enabled
+        ),
+        forward_session_id_as_conversation_id=uses_vllm_disagg_frontends(
+            generation_config
         ),
         # Capture transport config includes the generation request's candidate count.
         token_capture=(
@@ -2287,6 +2293,11 @@ def setup_single_controller(
             create_rollout_reassembler_actors,
         )
 
+        # Set by the resolver only when the think-tag penalty is on.
+        thinking_tags = None
+        if master_config.reward_penalties.penalize_malformed_think_tag:
+            assert resolved_reward_penalty_config is not None
+            thinking_tags = resolved_reward_penalty_config["thinking_tags"]
         finalizer_actors = create_rollout_reassembler_actors(
             dp_config,
             RolloutReassemblerActorConfig(
@@ -2302,6 +2313,12 @@ def setup_single_controller(
                 reward_penalty_config=RewardPenaltyConfig.model_validate(
                     resolved_reward_penalty_config
                 ),
+                tokenizer_config=(
+                    policy_config["tokenizer"]
+                    if master_config.reward_penalties.penalize_malformed_think_tag
+                    else None
+                ),
+                thinking_tags=thinking_tags,
                 top_logprobs=master_config.policy["generation"]["top_logprobs"],
             ),
             num_workers=token_capture_cfg.num_reassembler_workers,

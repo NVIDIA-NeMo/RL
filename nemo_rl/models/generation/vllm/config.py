@@ -174,9 +174,10 @@ class VllmDisaggFrontendConfig(BaseModel, extra="forbid"):
     # Let the prefill engine pull the previous turn's KV (the tokens the decode
     # engine generated) back from the decode engine instead of recomputing it.
     # The frontend then keeps per-conversation state, and the decode engine pins
-    # a finished conversation's blocks until the next turn or the TTL. Off by
-    # default: that pinning competes with new requests for the decode engine's
-    # KV pool, and the trade-off depends on the workload.
+    # a finished conversation's blocks until the next turn, the TTL or the cache
+    # reset between steps. Off by default: that pinning competes with new
+    # requests for the decode engine's KV pool, and the trade-off depends on
+    # the workload.
     bidirectional_kv_xfer: bool = False
     # bidirectional_kv_xfer: seconds the frontend remembers a conversation's
     # decode-side blocks. Keep below the decode engine's decoder_kv_blocks_ttl
@@ -216,9 +217,10 @@ class VllmSpecificArgs(TypedDict):
     # with generation-time processors should request ``raw_logprobs`` when
     # comparing generation and policy logprobs.
     logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
-    # Nemotron-H only: compute vLLM Nemotron-H logits with an fp32 LM head.
-    # Pair this with policy.megatron_cfg.fp32_lm_head when using a Megatron
-    # trainer.
+    # Compute the logits with an fp32 LM head: bf16 operands, fp32 GEMM output,
+    # via vLLM's head_dtype="float32" hf_override (any model whose lm_head is
+    # unquantized). Pair this with policy.megatron_cfg.fp32_lm_head when using
+    # a Megatron trainer.
     fp32_lm_head: NotRequired[bool]
     # Cap each request's generated tokens so the training prompt plus response
     # fits within max_model_len. This is needed when multimodal processing makes
@@ -314,10 +316,15 @@ class VllmSpecificArgs(TypedDict):
     kv_transfer: NotRequired[VllmKvTransferConfig]
 
 
-def vllm_nemotron_h_fp32_lm_head_enabled(
+# Read by the removed Nemotron-H fp32 LM-head source patch. Rejected in configs
+# so recipes that still set it fail instead of silently running a bf16 head.
+LEGACY_VLLM_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
+
+
+def vllm_fp32_lm_head_enabled(
     vllm_cfg: VllmSpecificArgs | dict[str, Any],
 ) -> bool:
-    """Return whether vLLM should run Nemotron-H logits with an fp32 head."""
+    """Return whether vLLM should compute logits with an fp32 LM head."""
     return bool(vllm_cfg.get("fp32_lm_head"))
 
 
@@ -789,6 +796,14 @@ def resolve_vllm_disagg_layout(config: VllmConfig) -> DisaggConfig:
     return disagg_layout.resolve_disagg_layout(config)
 
 
+def uses_vllm_disagg_frontends(generation_config: GenerationConfig) -> bool:
+    """Whether rollouts of ``generation_config`` go through the vLLM disaggregation frontends."""
+    return (
+        generation_config["backend"] == "vllm"
+        and resolve_vllm_disagg_layout(cast(VllmConfig, generation_config)).enabled
+    )
+
+
 def resolve_vllm_role_overrides(config: VllmConfig) -> VllmConfig:
     """Resolve ``vllm_cfg.{prefill,decode}_engine`` into complete engine configs.
 
@@ -910,7 +925,9 @@ def validate_vllm_disaggregation_for_refit(
       finished turn's blocks for ``decoder_kv_blocks_ttl`` (vLLM default
       480 s) so the next turn's prefill can pull them back, and vLLM offers
       no call to release them early, so the pause would block for up to that
-      TTL on every update.
+      TTL on every update. NeMo RL expires those pins itself only between
+      steps, once no conversation continues
+      (``VllmGeneration._reset_disagg_caches``).
     """
     if not in_flight_weight_updates:
         return

@@ -16,9 +16,11 @@
 import pytest
 
 from nemo_rl.models.generation.openai_server_utils import (
+    TOKENIZE_SHADOW_RATE_ENV,
     PrefixSplice,
     replace_prefix_tokens,
     splice_prefix_tokens,
+    tokenize_shadow_rate,
 )
 
 
@@ -220,3 +222,14 @@ def test_replace_prefix_tokens_qwen3_think_shift_picks_assistant_eos_not_user_eo
 
     assert result == [11, 12, 99, 99, 99, 55, 2, 70, 71, 2, 40, 41]
     assert 70 in result and 71 in result
+
+
+def test_tokenize_shadow_rate_is_one_variable_for_every_backend(monkeypatch):
+    """vLLM and TRT-LLM read the same ``NRL_TOKENIZE_SHADOW_RATE``; unset or empty means off."""
+    assert TOKENIZE_SHADOW_RATE_ENV == "NRL_TOKENIZE_SHADOW_RATE"
+    monkeypatch.delenv(TOKENIZE_SHADOW_RATE_ENV, raising=False)
+    assert tokenize_shadow_rate() == 0.0
+    monkeypatch.setenv(TOKENIZE_SHADOW_RATE_ENV, "")
+    assert tokenize_shadow_rate() == 0.0
+    monkeypatch.setenv(TOKENIZE_SHADOW_RATE_ENV, "0.25")
+    assert tokenize_shadow_rate() == 0.25

@@ -1306,6 +1306,27 @@ class VllmGeneration(GenerationInterface):
             ]
         )
 
+    def _reset_disagg_caches(self) -> list[bool]:
+        """Forget every pre-update block: the frontends' handshakes, then the engines' caches.
+
+        The frontends go first so no remembered decode-side handshake can point
+        at blocks the engines are about to free. Each engine then expires the
+        blocks its KV connector still pins for a remote reader (prefill leases,
+        and under ``bidirectional_kv_xfer`` the finished turns the decode
+        engines keep for ``decoder_kv_blocks_ttl``) and resets its prefix
+        cache, which vLLM refuses while any block is allocated; see
+        ``reset_prefix_cache_async``. The readiness RPC rides along for a
+        frontend Ray restarted since the last one. Returns the engines'
+        verdicts in engine order.
+        """
+        self._invalidate_frontend_conversation_caches()
+        self._remark_frontends_ready()
+        return ray.get(
+            self._run_on_engines(
+                "reset_prefix_cache_async", release_kv_transfer_pins=True
+            )
+        )
+
     # ------------------------------------------------------------------ #
 
     def _report_device_id(self) -> list[list[str]]:
@@ -2165,14 +2186,16 @@ class VllmGeneration(GenerationInterface):
                 method_name = (
                     "sleep_async" if self.cfg["vllm_cfg"]["async_engine"] else "sleep"
                 )
+                results = ray.get(self._fan_out(method_name))
+            elif self._disagg_cfg.enabled:
+                results = self._reset_disagg_caches()
             else:
                 method_name = (
                     "reset_prefix_cache_async"
                     if self.cfg["vllm_cfg"]["async_engine"]
                     else "reset_prefix_cache"
                 )
-            # Wait for all futures to complete
-            results = ray.get(self._fan_out(method_name))
+                results = ray.get(self._fan_out(method_name))
             return all(result for result in results if result is not None)
         except Exception as e:
             print(f"Error during policy preparation: {e}")
@@ -2515,18 +2538,19 @@ class VllmGeneration(GenerationInterface):
         """Invalidate reusable caches in vLLM (e.g., prefix/KV cache) after weight updates.
 
         For async_engine, calls reset_prefix_cache_async on workers. For sync, calls reset_prefix_cache.
+        Under disaggregation see ``_reset_disagg_caches``.
         Returns True if all workers report success.
         """
         try:
-            method_name = (
-                "reset_prefix_cache_async"
-                if self.cfg["vllm_cfg"]["async_engine"]
-                else "reset_prefix_cache"
-            )
-            results = ray.get(self._fan_out(method_name))
-            # Blocks remembered for bidirectional KV transfer were computed
-            # under the old weights too.
-            self._invalidate_frontend_conversation_caches()
+            if self._disagg_cfg.enabled:
+                results = self._reset_disagg_caches()
+            else:
+                method_name = (
+                    "reset_prefix_cache_async"
+                    if self.cfg["vllm_cfg"]["async_engine"]
+                    else "reset_prefix_cache"
+                )
+                results = ray.get(self._fan_out(method_name))
             return all(result for result in results if result is not None)
         except Exception as e:
             print(f"Error invalidating vLLM caches: {e}")

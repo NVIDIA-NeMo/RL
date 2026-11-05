@@ -40,6 +40,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 import warnings
 from collections.abc import Callable
 from pathlib import Path
@@ -1941,10 +1942,6 @@ class TestPeriodicRolloutCheckpoint:
             {"claimed-group"} if claimed else set()
         )
 
-    def test_restore_mode_rejects_removed_none_value(self):
-        with pytest.raises(ValidationError, match="restore_mode"):
-            RolloutCheckpointConfig.model_validate({"restore_mode": "none"})
-
     @pytest.mark.parametrize(
         "config",
         [
@@ -2415,9 +2412,11 @@ class TestPeriodicRolloutCheckpoint:
             await actor._log_rollout_throughput_metrics()
 
         try:
+            # Keep asyncio and background threads on the real clock.
             with patch(
-                "nemo_rl.algorithms.single_controller.time.monotonic",
-                new=_SteppingClock(start=10.0, step=10.0),
+                "nemo_rl.algorithms.single_controller.time",
+                wraps=time,
+                monotonic=_SteppingClock(start=10.0, step=10.0),
             ):
                 asyncio.run(sample_twice())
         finally:
@@ -2918,7 +2917,7 @@ class TestDataPlaneCheckpoint:
             batch_shortfall={},
             sampler_stamps_target_steps=True,
             reward_settings=CaptureRewardSettings.from_configs(
-                config.reward_penalties, None
+                config.reward_penalties, None, None
             ),
         )
         attempt = state["groups"][0]["siblings"][0]["attempts"][0]

@@ -408,23 +408,79 @@ def test_pause_for_refit_times_out_per_phase(monkeypatch):
         gen.pause_generation_for_refit(clear_cache=True, timeout_s=0.1)
 
 
-def test_invalidate_kv_cache_also_clears_the_frontends(monkeypatch):
-    gen = _bare_generation(_config(_DISAGG), world_size=6)
-    cleared = []
+def _cache_reset_harness(gen, monkeypatch, *, engine_results=None):
+    """Record a cache reset's frontend RPCs and engine calls, in order.
+
+    Engine calls arrive at ray.get as the kwargs dicts ``_bare_generation``'s
+    worker group returns; ``engine_results`` is what the engines answer.
+    """
+    events = []
     gen._disagg_actors = [
         SimpleNamespace(
             invalidate_conversation_cache=SimpleNamespace(
-                remote=lambda: cleared.append(1) or 0
-            )
+                remote=lambda: events.append("frontend-clear") or 0
+            ),
+            mark_engines_ready=SimpleNamespace(
+                remote=lambda **kw: events.append("frontend-remark") or True
+            ),
         )
     ]
-    monkeypatch.setattr(
-        vg.ray,
-        "get",
-        lambda refs, **kw: [True] * len(refs) if isinstance(refs, list) else refs,
-    )
+    gen._frontends_marked_ready = True
+
+    def fake_get(refs, **kw):
+        if isinstance(refs, list) and refs and isinstance(refs[0], dict):
+            events.extend(
+                (f["method_name"], f["worker_idx"], f["release_kv_transfer_pins"])
+                for f in refs
+            )
+            return list(engine_results or [True] * len(refs))
+        return refs
+
+    monkeypatch.setattr(vg.ray, "get", fake_get)
+    return events
+
+
+def test_finish_generation_under_disaggregation_resets_frontends_then_engines(
+    monkeypatch,
+):
+    gen = _bare_generation(_config(_DISAGG), world_size=6)
+    events = _cache_reset_harness(gen, monkeypatch)
+    assert gen.finish_generation() is True
+    # Handshakes go before the blocks they point at; every engine releases its
+    # connector pins and must report a successful reset.
+    assert events == [
+        "frontend-clear",
+        "frontend-remark",
+        ("reset_prefix_cache_async", 0, True),
+        ("reset_prefix_cache_async", 2, True),
+        ("reset_prefix_cache_async", 4, True),
+    ]
+    gen.worker_group.run_all_workers_single_data.assert_not_called()
+
+
+def test_invalidate_kv_cache_under_disaggregation_runs_the_same_reset(monkeypatch):
+    gen = _bare_generation(_config(_DISAGG), world_size=6)
+    events = _cache_reset_harness(gen, monkeypatch)
     assert gen.invalidate_kv_cache() is True
-    assert cleared == [1]
+    assert events[:2] == ["frontend-clear", "frontend-remark"]
+    assert [e[2] for e in events[2:]] == [True, True, True]
+
+
+def test_disagg_cache_reset_reports_an_engine_whose_reset_failed(monkeypatch):
+    gen = _bare_generation(_config(_DISAGG), world_size=6)
+    _cache_reset_harness(gen, monkeypatch, engine_results=[True, False, True])
+    assert gen.finish_generation() is False
+    assert gen.invalidate_kv_cache() is False
+
+
+def test_finish_generation_without_disaggregation_keeps_the_grid_reset(monkeypatch):
+    gen = _bare_generation(_config(), world_size=8)
+    monkeypatch.setattr(vg.ray, "get", lambda refs, **kw: [True] * len(refs))
+    assert gen.finish_generation() is True
+    gen.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "reset_prefix_cache_async",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
 
 
 # -------------------------------------------------------------------------- #

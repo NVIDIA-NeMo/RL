@@ -152,6 +152,7 @@ from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
+    uses_vllm_disagg_frontends,
     validate_vllm_disaggregation_for_refit,
     vllm_replica_width,
 )
@@ -1083,6 +1084,9 @@ def setup(
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
             policy_api_key=policy_api_key,
             turn_checkpointing_enabled=False,
+            forward_session_id_as_conversation_id=uses_vllm_disagg_frontends(
+                generation_config
+            ),
         )
         train_splits = (
             {f"train[{name}]": split for name, split in dataset.items()}
@@ -4702,6 +4706,8 @@ def _grpo_train_impl(
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
+                if "attribution_key" in repeated_batch:
+                    log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages["content"]
                 log_data["rewards"] = rewards.tolist()
                 if master_config.grpo.use_dynamic_sampling:
@@ -6676,6 +6682,8 @@ def async_grpo_train(
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
+                if "attribution_key" in repeated_batch:
+                    log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages_content
                 log_data["rewards"] = rewards.tolist()
                 if master_config.grpo.use_dynamic_sampling:

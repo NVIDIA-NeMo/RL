@@ -23,11 +23,29 @@ so it has no retokenization drift to correct.
 """
 
 import base64
+import os
 from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+
+# Sampling rate at which the prefill (context) leg shadow-validates the prompt
+# ids a frontend supplied under ``frontend_tokenize``: the engine renders the
+# messages it also received and logs a mismatch. Cheap insurance while
+# frontend_tokenize is young; 0 disables. One variable for every backend, like
+# the ``frontend_tokenize`` field itself.
+TOKENIZE_SHADOW_RATE_ENV = "NRL_TOKENIZE_SHADOW_RATE"
+
+
+def tokenize_shadow_rate() -> float:
+    """The frontend-tokenize shadow-validation rate, from ``NRL_TOKENIZE_SHADOW_RATE``.
+
+    Returns:
+        The rate the variable holds, or 0 (no shadow validation) when it is
+        unset or empty.
+    """
+    return float(os.environ.get(TOKENIZE_SHADOW_RATE_ENV, "0") or 0)
 
 
 @dataclass(frozen=True)
