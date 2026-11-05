@@ -4348,17 +4348,22 @@ def test_setup_megatron_kv_consistency_only_applies_to_async_grpo(
 
 
 @pytest.mark.parametrize(
-    ("kv_cache_dtype", "precision", "error"),
+    ("kv_cache_dtype", "precision", "calibrate_kv_cache_scales", "error"),
     [
-        ("fp8", "fp8", "Automodel backend is not supported"),
-        ("fp8_e4m3", "fp8", "Automodel backend is not supported"),
-        ("fp8_ds_mla", "fp8", None),
-        ("fp8_ds_mla", "bfloat16", "requires precision='fp8'"),
-        ("auto", "bfloat16", None),
+        ("fp8", "fp8", True, "Automodel backend does not support"),
+        ("fp8_e4m3", "fp8", True, "Automodel backend does not support"),
+        ("fp8_e4m3", "fp8", False, None),
+        ("fp8_ds_mla", "fp8", True, None),
+        ("auto", "bfloat16", True, None),
     ],
 )
 def test_setup_automodel_fp8_kv_cache_guard(
-    mock_grpo_components, monkeypatch, kv_cache_dtype, precision, error
+    mock_grpo_components,
+    monkeypatch,
+    kv_cache_dtype,
+    precision,
+    calibrate_kv_cache_scales,
+    error,
 ):
     import nemo_rl.algorithms.grpo as grpo_mod
 
@@ -4372,7 +4377,10 @@ def test_setup_automodel_fp8_kv_cache_guard(
         megatron_cfg={"enabled": False},
     )
     master_config.policy["generation"]["vllm_cfg"].update(
-        async_engine=False, precision=precision, kv_cache_dtype=kv_cache_dtype
+        async_engine=False,
+        precision=precision,
+        kv_cache_dtype=kv_cache_dtype,
+        calibrate_kv_cache_scales=calibrate_kv_cache_scales,
     )
     checkpointer = MagicMock()
     checkpointer.get_latest_checkpoint_path.return_value = None

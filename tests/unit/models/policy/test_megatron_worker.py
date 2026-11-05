@@ -357,7 +357,13 @@ def _fp8_kv_worker() -> Any:
     )
     worker.cfg = {
         "megatron_cfg": {"pipeline_model_parallel_size": 1},
-        "generation": {"backend": "vllm", "vllm_cfg": {"kv_cache_dtype": "fp8_e4m3"}},
+        "generation": {
+            "backend": "vllm",
+            "vllm_cfg": {
+                "kv_cache_dtype": "fp8_e4m3",
+                "calibrate_kv_cache_scales": True,
+            },
+        },
     }
     return worker
 
@@ -383,12 +389,24 @@ def test_fp8_kv_scales_are_emitted_only_for_hybrid_attention_layers() -> None:
     }
 
 
-@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8_ds_mla", "fp8_per_token_head"])
-def test_fp8_kv_scales_are_not_emitted_without_refittable_scales(
+@pytest.mark.parametrize(
+    ("kv_cache_dtype", "calibrate_kv_cache_scales"),
+    [
+        ("auto", True),
+        ("fp8_ds_mla", True),
+        ("fp8_per_token_head", True),
+        ("fp8_e4m3", False),
+    ],
+)
+def test_fp8_kv_scales_are_not_emitted_without_calibrated_scales(
     kv_cache_dtype: str,
+    calibrate_kv_cache_scales: bool,
 ) -> None:
     worker = _fp8_kv_worker()
-    worker.cfg["generation"]["vllm_cfg"]["kv_cache_dtype"] = kv_cache_dtype
+    worker.cfg["generation"]["vllm_cfg"].update(
+        kv_cache_dtype=kv_cache_dtype,
+        calibrate_kv_cache_scales=calibrate_kv_cache_scales,
+    )
     # An MLA model has no linear_qkv, so looking up scale owners would fail.
     worker.refit_conversion_tasks = _mla_tasks()
 
@@ -501,7 +519,7 @@ def test_fp8_kv_scales_reject_mla_attention() -> None:
     # MLA has no linear_qkv, so it has no per-tensor K/V scales to refit.
     worker.refit_conversion_tasks = _mla_tasks()
 
-    with pytest.raises(ValueError, match="kv_cache_dtype='auto'"):
+    with pytest.raises(ValueError, match="calibrate_kv_cache_scales=false"):
         list(worker._iter_params_with_optional_kv_scales())
 
 

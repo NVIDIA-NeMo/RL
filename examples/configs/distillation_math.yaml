@@ -249,6 +249,9 @@ policy: &POLICY_BASE
             async_engine: false
             precision: ${...precision}
             kv_cache_dtype: "auto"
+            # Only read with kv_cache_dtype fp8/fp8_e4m3. true: calibrate q/k/v scales on the
+            # training batch and refit them (Megatron, MHA/GQA); false: fixed 1.0 scales.
+            calibrate_kv_cache_scales: false
             logprobs_mode: processed_logprobs
             fp32_lm_head: ${...megatron_cfg.fp32_lm_head} # Compute vLLM logits with an fp32 LM head.
             # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.

@@ -98,6 +98,11 @@ class VllmSpecificArgs(TypedDict):
     kv_cache_dtype: Literal[
         "auto", "fp8", "fp8_e4m3", "fp8_ds_mla", "fp8_per_token_head"
     ]
+    # Required when kv_cache_dtype is fp8 or fp8_e4m3 (per-tensor scales).
+    # true: the Megatron policy calibrates q/k/v scales on each step's training
+    # batch and sends them with every refit. false: no calibration or scale refit;
+    # every q/k/v scale is 1.0, for any attention type (MHA/GQA or MLA).
+    calibrate_kv_cache_scales: NotRequired[bool]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
     # Collect vLLM request, cache, and cumulative token counters in a model-owner
@@ -169,6 +174,14 @@ def vllm_fp32_lm_head_enabled(
 ) -> bool:
     """Return whether vLLM should compute logits with an fp32 LM head."""
     return bool(vllm_cfg.get("fp32_lm_head"))
+
+
+def calibrates_fp8_kv_cache_scales(vllm_cfg: VllmSpecificArgs) -> bool:
+    """Return whether the trainer calibrates and refits per-tensor FP8 KV scales."""
+    return (
+        vllm_cfg["kv_cache_dtype"] in REFITTABLE_FP8_KV_CACHE_DTYPES
+        and vllm_cfg["calibrate_kv_cache_scales"]
+    )
 
 
 class VllmDeltaCompressionConfig(BaseModel, extra="allow"):
@@ -325,6 +338,26 @@ def validate_vllm_quantization_config(config: VllmConfig) -> None:
             "policy.generation.vllm_cfg.refit_prequantize is not supported with "
             "refit_with_reload_api; prequantized refit uses receiver scale names "
             "that are not accepted by vLLM's native reload path."
+        )
+    kv_cache_dtype = vllm_cfg.get("kv_cache_dtype")
+    # The KV-cache dtype reaches vLLM only through the FP8 weight setup.
+    if (
+        kv_cache_dtype is not None
+        and kv_cache_dtype.startswith("fp8")
+        and vllm_cfg.get("precision") != "fp8"
+    ):
+        raise ValueError(
+            f"policy.generation.vllm_cfg.kv_cache_dtype={kv_cache_dtype!r} "
+            "requires policy.generation.vllm_cfg.precision='fp8'."
+        )
+    if kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES and not isinstance(
+        vllm_cfg.get("calibrate_kv_cache_scales"), bool
+    ):
+        raise ValueError(
+            f"policy.generation.vllm_cfg.kv_cache_dtype={kv_cache_dtype!r} "
+            "requires policy.generation.vllm_cfg.calibrate_kv_cache_scales to be "
+            "true (calibrate and refit the scales; Megatron policy, MHA/GQA "
+            "attention) or false (fixed 1.0 scales)."
         )
 
 

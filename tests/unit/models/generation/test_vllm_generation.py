@@ -1721,7 +1721,13 @@ def test_nvfp4_pertoken_rejects_standalone_eval():
         {"colocated": {"enabled": False}},
         {"vllm_cfg": {"pipeline_parallel_size": 2}},
         {"vllm_cfg": {"expert_parallel_size": 2}},
-        {"vllm_cfg": {"kv_cache_dtype": "fp8"}},
+        {
+            "vllm_cfg": {
+                "kv_cache_dtype": "fp8",
+                "precision": "fp8",
+                "calibrate_kv_cache_scales": False,
+            }
+        },
         {"vllm_cfg": {"precision": "fp8"}},
     ],
 )
@@ -3119,6 +3125,8 @@ async def test_vllm_generation_with_hf_training_non_colocated(
     vllm_config["colocated"]["enabled"] = False
     if vllm_precision == "fp8":
         vllm_config["vllm_cfg"]["kv_cache_dtype"] = "fp8"
+        # Automodel policies do not calibrate KV-cache scales.
+        vllm_config["vllm_cfg"]["calibrate_kv_cache_scales"] = False
     vllm_config = configure_generation_config(vllm_config, tokenizer)
     vllm_policy = VllmGeneration(generation_cluster_separate, vllm_config)
     vllm_policy.finish_generation()
@@ -4308,6 +4316,8 @@ def test_vllm_generation_with_megatron_training(
     vllm_config["vllm_cfg"]["precision"] = vllm_precision
     if kv_cache_dtype is not None:
         vllm_config["vllm_cfg"]["kv_cache_dtype"] = kv_cache_dtype
+    if kv_cache_dtype == "fp8":
+        vllm_config["vllm_cfg"]["calibrate_kv_cache_scales"] = True
     if kv_cache_dtype == "fp8_per_token_head":
         vllm_config["max_new_tokens"] = 8
         vllm_config["ignore_eos"] = True

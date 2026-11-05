@@ -44,7 +44,7 @@ from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
     resolve_nvfp4_real_quant_mode,
 )
-from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
+from nemo_rl.models.generation.vllm.config import calibrates_fp8_kv_cache_scales
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
@@ -508,7 +508,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             for name, tensor in export_eagle_weights_to_hf(self.draft_model):
                 yield f"draft.{name}", tensor
 
-        if vllm_cfg["kv_cache_dtype"] not in REFITTABLE_FP8_KV_CACHE_DTYPES:
+        if not calibrates_fp8_kv_cache_scales(vllm_cfg):
             return
 
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (

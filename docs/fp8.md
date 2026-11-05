@@ -215,6 +215,37 @@ and both `fp8_cfg.enabled` and `fp8_cfg.fp8_param` true; otherwise use
 `fp8_cfg.fp8_param`. Per-module `fp4_param: true` remains unsupported.
 Matched BF16 blocks may leave both parameter-storage flags unset.
 
+### FP8 KV cache
+
+`policy.generation.vllm_cfg.kv_cache_dtype: fp8` (or `fp8_e4m3`) stores the vLLM
+KV cache in FP8 with per-tensor scales and requires `precision: fp8`. How the
+scales are set is a separate choice:
+
+| Key | Value | Behavior |
+|-----|-------|----------|
+| `policy.generation.vllm_cfg.calibrate_kv_cache_scales` | `true` | The Megatron policy calibrates q/k/v scales on each step's training batch and sends them with every refit. Requires the Megatron backend with `pipeline_model_parallel_size: 1`, MHA/GQA attention, and an attention backend other than FlashInfer. |
+| | `false` | No calibration or scale refit; every q/k/v scale is 1.0. Works with any policy backend and with MLA attention. |
+
+The key is required with `fp8`/`fp8_e4m3` and ignored otherwise. The base
+configs set it to `false`; set `true` explicitly to calibrate.
+
+With `calibrate_kv_cache_scales: false`, FlashInfer can keep the query in BF16
+and quantize only K/V; other attention backends quantize the query to FP8 as
+well:
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      precision: fp8
+      kv_cache_dtype: fp8_e4m3
+      calibrate_kv_cache_scales: false
+    vllm_kwargs:
+      attention_backend: FLASHINFER
+      attention_config:
+        disable_flashinfer_q_quantization: true
+```
+
 ## Compatibility Note for DeepSeek-Style FP8 Training
 
 The TransformerEngine implementation for this recipe requires **CUDA version ≥ 12.9**. The current NeMo RL container uses CUDA 13.2 (via `docker/Dockerfile`), which satisfies this requirement. Users on older setups should check out the latest code and build the container from `docker/Dockerfile` ([instructions](docker.md)).

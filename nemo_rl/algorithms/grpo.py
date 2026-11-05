@@ -144,8 +144,8 @@ from nemo_rl.models.generation.trtllm.config import (
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
 from nemo_rl.models.generation.vllm.config import (
-    REFITTABLE_FP8_KV_CACHE_DTYPES,
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    calibrates_fp8_kv_cache_scales,
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
@@ -1768,22 +1768,15 @@ def setup(
             assert loss_config.use_importance_sampling_correction, (
                 "Importance sampling must be enabled for vLLM FP8 generation for good convergence!"
             )
-        kv_cache_dtype = generation_config["vllm_cfg"]["kv_cache_dtype"]
-        if kv_cache_dtype.startswith("fp8"):
-            # FP8 KV cache requires FP8 model precision
-            assert generation_config["vllm_cfg"]["precision"] == "fp8", (
-                f"kv_cache_dtype='{kv_cache_dtype}' requires precision='fp8'. "
-                "FP8 KV cache can only be used together with FP8 model weights."
-            )
-        if kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
+        if calibrates_fp8_kv_cache_scales(generation_config["vllm_cfg"]):
             assert not (policy_config.get("automodel_cfg") or {}).get("enabled"), (
-                "Automodel backend is not supported with kv cache fp8 enabled."
+                "Automodel backend does not support calibrate_kv_cache_scales=true."
             )
             assert not should_use_async_rollouts(generation_config), (
-                "Async rollouts is not supported with kv cache fp8 enabled."
+                "Async rollouts do not support calibrate_kv_cache_scales=true."
             )
             assert policy_config["megatron_cfg"]["pipeline_model_parallel_size"] == 1, (
-                "Currently when using FP8 KV cache in generation, then in megatron we only support pipeline_model_parallel_size=1. We will add more support in future."
+                "calibrate_kv_cache_scales=true requires Megatron pipeline_model_parallel_size=1."
             )
 
         configure_vllm_for_router_replay(policy_config)
