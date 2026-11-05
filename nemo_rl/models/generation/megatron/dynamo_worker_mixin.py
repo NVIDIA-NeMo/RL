@@ -31,6 +31,10 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_node_ip_local,
 )
 from nemo_rl.models.generation.megatron.dynamo_config import DYNAMO_COMPONENT_BY_ROLE
+from nemo_rl.models.generation.megatron.megatron_worker import _http_sampling_defaults
+
+# Bound on the NeMo-Gym proxy server answering its health check after it starts.
+GYM_PROXY_START_TIMEOUT_S = 300.0
 
 if TYPE_CHECKING:
     from megatron.core.inference.contexts.dynamic_context import (
@@ -79,6 +83,8 @@ class MegatronDynamoGenerationMixin:
      - _inference_loop: the engine's asyncio loop.
      - _inference_engine_initialized: whether the engine is built.
      - _start_inference_loop_thread(): starts the loop when it is not up yet.
+     - megatron_tokenizer, inference_wrapped_model, _reserved_http_server_port:
+       what the NeMo-Gym proxy server is built from.
     """
 
     cfg: dict[str, Any]
@@ -87,6 +93,15 @@ class MegatronDynamoGenerationMixin:
     coordinator_addr: Optional[str]
     _inference_loop: Optional[asyncio.AbstractEventLoop]
     _inference_engine_initialized: bool
+    megatron_tokenizer: Any
+    inference_wrapped_model: Any
+    _reserved_http_server_port: Optional[int]
+    # Where NeMo-Gym's proxy server sends completions, once the owner has
+    # started the frontend (configure_dynamo_gym_proxy). Survives engine
+    # rebuilds, so it is not reset with the engine state.
+    _dynamo_gym_frontend: Optional[dict[str, Any]] = None
+    # Rank zero only: the proxy server task on the inference loop.
+    _dynamo_gym_proxy_future: Optional[ConcurrentFuture] = None
 
     @property
     def _dynamo_role(self) -> str:
@@ -381,17 +396,113 @@ class MegatronDynamoGenerationMixin:
             return None
         return dict(self._dynamo_endpoint_metadata)
 
+    def configure_dynamo_gym_proxy(
+        self, *, frontend_url: str, request_timeout_s: Optional[float]
+    ) -> None:
+        """Tell this worker where its NeMo-Gym proxy server sends completions.
+
+        Called by the owner once the frontend runs, before the first refit
+        builds the engine; the proxy itself starts with the engine's HTTP
+        server (``_setup_openai_api_server``), on the rank that would host
+        Megatron-LM's server without Dynamo.
+
+        Args:
+            frontend_url: The frontend's ``/v1`` URL.
+            request_timeout_s: Deadline for one completion through the
+                frontend; None waits as long as generation takes.
+        """
+        self._dynamo_gym_frontend = {
+            "frontend_url": frontend_url,
+            "request_timeout_s": request_timeout_s,
+        }
+
+    def _setup_openai_api_server(self) -> str:
+        """Start NeMo-Gym's OpenAI server: Megatron-LM's endpoints over the frontend.
+
+        Replaces the base class's server, which would call this engine's
+        coordinator directly and bypass the prefill/decode split. The server
+        runs on the inference loop and adopts the port the driver reserved for
+        this rank, so the URL NeMo-Gym was handed resolves here.
+
+        Raises:
+            RuntimeError: The owner never passed the frontend URL
+                (``configure_dynamo_gym_proxy``), or the server died at start.
+        """
+        # Deferred: Quart and hypercorn are Megatron-LM's server dependencies.
+        from nemo_rl.distributed.held_port import receive_held_socket
+        from nemo_rl.models.generation.megatron.dynamo_gym_proxy import (
+            FrontendInferenceClient,
+            bind_server_socket,
+            build_gym_proxy_app,
+            serve_app,
+            wait_until_healthy,
+        )
+
+        frontend = self._dynamo_gym_frontend
+        if frontend is None:
+            raise RuntimeError(
+                "mcore_generation_config.expose_http_server=true with "
+                "policy.generation.dynamo=true needs the frontend URL before the "
+                "engine starts; MegatronDynamoGeneration passes it with "
+                "configure_dynamo_gym_proxy"
+            )
+        if self._inference_loop is None:
+            raise RuntimeError("the inference loop must run before the proxy server")
+        reserved_port = self._reserved_http_server_port
+        if reserved_port is not None:
+            # Adopt the driver's reservation: bind into its reuse group first,
+            # then take (and drop) the holder's socket, so the port is never
+            # free in between.
+            sock = bind_server_socket(reserved_port)
+            receive_held_socket(reserved_port).close()
+        else:
+            sock = bind_server_socket(0)
+        port = sock.getsockname()[1]
+        generation_cfg = self.cfg["generation"]
+        mcore_cfg = generation_cfg["mcore_generation_config"]
+        client = FrontendInferenceClient(
+            frontend_url=frontend["frontend_url"],
+            model_name=str(generation_cfg["model_name"]),
+            request_timeout_s=frontend["request_timeout_s"],
+        )
+        app = build_gym_proxy_app(
+            client,
+            tokenizer=self.megatron_tokenizer,
+            parsers=mcore_cfg["parsers"],
+            multimodal_prompt_config=self.inference_wrapped_model.multimodal_prompt_config,
+            **_http_sampling_defaults(generation_cfg),
+        )
+        self._dynamo_gym_proxy_future = asyncio.run_coroutine_threadsafe(
+            serve_app(app, sock), self._inference_loop
+        )
+        base_url = f"http://{_get_node_ip_local()}:{port}/v1"
+        wait_until_healthy(
+            base_url,
+            server=self._dynamo_gym_proxy_future,
+            timeout_s=GYM_PROXY_START_TIMEOUT_S,
+        )
+        print(
+            f"[Rank {self.rank}] NeMo-Gym proxy serving {base_url} over the Dynamo "
+            f"frontend {frontend['frontend_url']}",
+            flush=True,
+        )
+        return base_url
+
     def stop_dynamo_endpoint(self) -> None:
         """Cancel the Dynamo endpoint task and stop the engine's event reporter.
 
         Cancelling drops Dynamo's ``Worker.run`` without its graceful path: no
         request drain and no adapter cleanup. The engine's discovery entry
         lapses when this process exits, so callers stop the engine next. The
-        stopped task stays recorded, so a later start is refused.
+        stopped task stays recorded, so a later start is refused. The NeMo-Gym
+        proxy server, if this rank runs one, stops with it.
         """
         future = self._dynamo_endpoint_future
         if future is not None:
             future.cancel()
+        proxy = self._dynamo_gym_proxy_future
+        if proxy is not None:
+            proxy.cancel()
         # Only rank zero's reporter runs a thread; stopping it closes the
         # socket to the adapter.
         reporter = self._dynamo_event_reporter

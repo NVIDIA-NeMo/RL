@@ -39,6 +39,7 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.data_plane.interfaces import storage_unit_placement
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.held_port import RemoteHeldPortReservation
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, _get_node_ip_local
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     ManagedDynamoRuntime,
@@ -120,6 +121,62 @@ def role_policy_config(
         }
     config["generation"] = generation
     return config
+
+
+def engine_node_pins(
+    roles: Sequence[MegatronDynamoRole],
+    widths: Mapping[MegatronDynamoRole, int],
+    *,
+    num_gpus_per_node: int,
+    num_pinned_nodes: int | None,
+) -> list[int]:
+    """Which pinned inference node each engine takes, in launch order.
+
+    Engines tile the pinned nodes in launch order, each engine wholly on one
+    node: an engine that does not fit in the GPUs the earlier engines left on
+    the current node starts the next one. With one width this is
+    ``engine_index // engines_per_node``. ``num_pinned_nodes`` None (an
+    unpinned cluster) skips the node-count check.
+
+    Raises:
+        ValueError: On an engine wider than a node, or more engines than the
+            pinned nodes hold.
+    """
+    roles = list(roles)
+    # Distinct roles in first-seen order; typed so the lookups keep the literal.
+    distinct_roles: list[MegatronDynamoRole] = []
+    for role in roles:
+        if role not in distinct_roles:
+            distinct_roles.append(role)
+    for role in distinct_roles:
+        if widths[role] > num_gpus_per_node:
+            raise ValueError(
+                f"A Megatron {role} engine spans {widths[role]} GPUs "
+                f"but nodes have {num_gpus_per_node}; multi-node "
+                "engines are not supported behind Dynamo. Lower "
+                f"policy.generation.dynamo_cfg.{role}_engine or "
+                "mcore_generation_config tensor_model_parallel_size x "
+                "pipeline_model_parallel_size."
+            )
+    pins: list[int] = []
+    node_index = 0
+    used_on_node = 0
+    for role in roles:
+        width = widths[role]
+        if used_on_node + width > num_gpus_per_node:
+            node_index += 1
+            used_on_node = 0
+        pins.append(node_index)
+        used_on_node += width
+    nodes_needed = node_index + 1
+    if num_pinned_nodes is not None and nodes_needed > num_pinned_nodes:
+        widths_by_role = {role: widths[role] for role in distinct_roles}
+        raise ValueError(
+            f"{len(roles)} Megatron engines of widths {widths_by_role} GPUs tile "
+            f"{nodes_needed} nodes of {num_gpus_per_node} GPUs, more "
+            f"than the {num_pinned_nodes} pinned inference nodes."
+        )
+    return pins
 
 
 @ray.remote(num_cpus=0)
@@ -322,19 +379,31 @@ class MegatronDynamoGeneration(GenerationInterface):
         """Reject what prefill/decode engines behind the Dynamo frontend cannot serve."""
         MegatronGeneration.validate_settings(master_config)
         policy_config = master_config.policy
-        # The raw flag: should_use_nemo_gym() asserts the HTTP server is exposed,
-        # which this mode never does, so it cannot answer the question. Checked
-        # before the generation block so a Gym config is told about Gym, not
-        # about expose_http_server.
-        if master_config.env.get("should_use_nemo_gym"):
-            # Gym needs a server URL before generation is built; the frontend's
-            # is known only once the runtime is up.
+        if master_config.token_capture.enabled:
+            # The capture admission reaches the engine as request metadata,
+            # which a completion through the frontend does not carry; the
+            # proxy refuses such requests, so refuse the run up front.
             raise NotImplementedError(
-                "NeMo-Gym rollouts are not yet served through the Dynamo frontend "
-                "with policy.generation.dynamo=true; set env.should_use_nemo_gym="
-                "false or leave policy.generation.dynamo false."
+                "token_capture.enabled=true is not yet supported with "
+                "policy.generation.dynamo=true: the capture admission does not "
+                "travel through the Dynamo frontend to the engines. Disable "
+                "token capture, or leave policy.generation.dynamo false."
             )
         validate_megatron_dynamo_generation(policy_config["generation"])
+        if (
+            master_config.env.get("should_use_nemo_gym")
+            and not (
+                policy_config["generation"]["mcore_generation_config"][
+                    "expose_http_server"
+                ]
+            )
+        ):
+            raise ValueError(
+                "env.should_use_nemo_gym=true with policy.generation.dynamo=true "
+                "needs mcore_generation_config.expose_http_server=true: each "
+                "engine's rank zero serves NeMo-Gym from that server, over the "
+                "Dynamo frontend."
+            )
         if policy_config.get("is_vlm"):
             raise ValueError(
                 "policy.is_vlm=true is not supported with policy.generation.dynamo="
@@ -361,6 +430,65 @@ class MegatronDynamoGeneration(GenerationInterface):
                 "on 'train' instead."
             )
 
+    @classmethod
+    def reserve_http_server_addresses(
+        cls,
+        cluster: RayVirtualCluster,
+        config: PolicyConfig,
+    ) -> tuple[list[str], dict[int, int], list[ray.actor.ActorHandle]]:
+        """Reserve one NeMo-Gym server address per engine before any engine exists.
+
+        The counterpart of ``MegatronGeneration.reserve_http_server_addresses``
+        for engines behind Dynamo: each engine's rank zero serves NeMo-Gym from
+        a proxy over the frontend, so one port is held per engine, on the
+        pinned node that engine will take (``engine_node_pins``, the tiling
+        ``_start_engines`` applies). The inference cluster must carry node pins;
+        without them the node an engine lands on is not known up front.
+
+        Args:
+            cluster: The inference cluster the engines take the place of.
+            config: The full ``PolicyConfig``.
+
+        Returns:
+            Tuple of (server base URLs, {engine index: reserved port},
+            port-holder actor handles). The caller keeps the handles until the
+            engines' workers have adopted the sockets, then ``ray.kill``s them.
+
+        Raises:
+            ValueError: The cluster has no node pins, or the engines do not fit
+                the pinned nodes.
+        """
+        generation_cfg = cast(MCoreGenerationConfig, config["generation"])
+        validate_megatron_dynamo_generation(generation_cfg)
+        constraints = cluster.node_resource_constraints
+        if constraints is None:
+            raise ValueError(
+                "NeMo-Gym with policy.generation.dynamo=true needs an inference "
+                "cluster with node pins (the SingleController's dedicated inference "
+                "nodes): each engine's server address is reserved on the node the "
+                "engine will take."
+            )
+        widths = engine_widths(config)
+        roles = engine_roles(
+            disaggregation_cfg(generation_cfg), cluster.world_size(), widths
+        )
+        pins = engine_node_pins(
+            roles,
+            widths,
+            num_gpus_per_node=cluster.num_gpus_per_node,
+            num_pinned_nodes=len(constraints),
+        )
+        # A holder per engine on that engine's node (num_cpus=0, so it schedules
+        # on a full node); the engine's rank zero adopts the live socket later.
+        holders = [
+            RemoteHeldPortReservation.options(resources=dict(constraints[pin])).remote()
+            for pin in pins
+        ]
+        addresses = ray.get([holder.address.remote() for holder in holders])
+        urls = [f"http://{node_ip}:{port}/v1" for node_ip, port in addresses]
+        ports = {index: port for index, (_, port) in enumerate(addresses)}
+        return urls, ports, holders
+
     def __init__(
         self,
         config: PolicyConfig,
@@ -384,9 +512,11 @@ class MegatronDynamoGeneration(GenerationInterface):
         each engine gets its own one-node cluster. Its placement groups stay
         unmaterialized, or the engines' GPUs would be booked twice. ``policy``
         (colocation) and ``processor`` (VLM prompts) are refused;
-        ``name_prefix``, ``skip_weight_load`` and ``reserved_http_server_ports``
-        do not apply, since every engine is built with ``skip_weight_load=True``
-        and serves no HTTP server of its own.
+        ``name_prefix`` and ``skip_weight_load`` do not apply, since every engine
+        is built with ``skip_weight_load=True``. ``reserved_http_server_ports``
+        are NeMo-Gym's server ports, one per engine index as
+        :meth:`reserve_http_server_addresses` returned them; each engine's rank
+        zero serves NeMo-Gym there, over the frontend, once the engine runs.
 
         Args:
             config: PolicyConfig for the Megatron model.
@@ -396,7 +526,9 @@ class MegatronDynamoGeneration(GenerationInterface):
             name_prefix: Unused; each engine names its own worker group.
             processor: Must be None; the frontend serves text prompts only.
             skip_weight_load: Unused; every engine defers its weights to the refit.
-            reserved_http_server_ports: Unused; the engines expose no HTTP server.
+            reserved_http_server_ports: NeMo-Gym server ports keyed by engine
+                index, from :meth:`reserve_http_server_addresses`; None when
+                NeMo-Gym is not used.
 
         Raises:
             ValueError: On an engine wider than a node, or more engines than
@@ -416,8 +548,14 @@ class MegatronDynamoGeneration(GenerationInterface):
         # The state the weight synchronizer and setup read off a generation object.
         self._policy_config = config
         self.cfg: MCoreGenerationConfig = config["generation"]
-        # The frontend URL once the engines serve; the engines expose no HTTP server.
+        # NeMo-Gym's server URLs, one per engine, once the engines serve
+        # (mcore_generation_config.expose_http_server); empty otherwise.
         self.dp_openai_server_base_urls: list[Optional[str]] = []
+        self._reserved_http_server_ports: dict[int, int] = (
+            {}
+            if reserved_http_server_ports is None
+            else dict(reserved_http_server_ports)
+        )
         # Installed by setup via create_weight_synchronizer.
         self.weight_synchronizer: Optional[WeightSynchronizer] = None
         self._tokenizer: Optional[PreTrainedTokenizerBase] = tokenizer
@@ -470,8 +608,13 @@ class MegatronDynamoGeneration(GenerationInterface):
         self._dynamo_namespace = runtime.namespace
         self._dynamo_engine_env = runtime.engine_env
         self._dynamo_frontend_url = runtime.frontend_url
-        self.dp_openai_server_base_urls = [runtime.frontend_url]
         print(f"  [Dynamo] Forwarding rollouts to {runtime.frontend_url}", flush=True)
+        if self.cfg["mcore_generation_config"]["expose_http_server"]:
+            try:
+                self._configure_gym_proxies()
+            except Exception:
+                self.shutdown()
+                raise
 
     # ------------------------------------------------------------------
     # Pickling: the SingleController actor gets a handles-only copy
@@ -1002,7 +1145,45 @@ class MegatronDynamoGeneration(GenerationInterface):
             what=f"prepare_for_generation({list(tags)})",
             deadline=time.monotonic() + timeout_s,
         )
+        self._collect_gym_proxy_urls(deadline=time.monotonic() + timeout_s)
         return True
+
+    def _configure_gym_proxies(self) -> None:
+        """Hand every engine's rank zero the frontend URL its NeMo-Gym server posts to."""
+        deadline = time.monotonic() + self._control_timeout_s
+        self._call_engines(
+            range(self.num_engines),
+            lambda record: [
+                record.leader.configure_dynamo_gym_proxy.remote(
+                    frontend_url=self._dynamo_frontend_url,
+                    request_timeout_s=self._dynamo_cfg.request_timeout_s,
+                )
+            ],
+            what="configure_dynamo_gym_proxy",
+            deadline=deadline,
+        )
+
+    def _collect_gym_proxy_urls(self, *, deadline: float) -> None:
+        """Record NeMo-Gym's server URLs once every engine's rank zero serves one.
+
+        As ``MegatronGeneration.prepare_for_generation`` does after its workers
+        start the HTTP server; the engines come up at the first refit, so the
+        list stays empty until then.
+        """
+        if (
+            self.dp_openai_server_base_urls
+            or not (self.cfg["mcore_generation_config"]["expose_http_server"])
+        ):
+            return
+        urls = ray.get(
+            [
+                record.leader.report_dp_openai_server_base_url.remote()
+                for record in self._engine_records
+            ],
+            timeout=_seconds_left(deadline),
+        )
+        if all(url is not None for url in urls):
+            self.dp_openai_server_base_urls = list(urls)
 
     def resume_after_refit(self, *, timeout_s: float | None = None) -> None:
         """Resume every engine in one wave; the first resume is also the startup.
@@ -1153,7 +1334,7 @@ class MegatronDynamoGeneration(GenerationInterface):
             return
         output = await generate_through_frontend(
             self.cfg,
-            frontend_url=self.dp_openai_server_base_urls[0] or "",
+            frontend_url=self._dynamo_frontend_url,
             data=data,
             greedy=greedy,
             request_timeout_s=self._dynamo_cfg.request_timeout_s,
@@ -1171,8 +1352,9 @@ class MegatronDynamoGeneration(GenerationInterface):
     ) -> "Optional[MediaColumnSpec]":
         """Not served yet: token capture rides on NeMo-Gym rollouts through the frontend."""
         raise NotImplementedError(
-            "Token capture needs NeMo-Gym rollouts, which are not yet served "
-            "through the Dynamo frontend."
+            "Token capture is not yet supported for Megatron engines behind Dynamo: "
+            "the capture admission does not travel through the frontend to the "
+            "engines."
         )
 
     # ------------------------------------------------------------------
@@ -1204,40 +1386,16 @@ class MegatronDynamoGeneration(GenerationInterface):
         for role in roles:
             if role not in distinct_roles:
                 distinct_roles.append(role)
-        for role in distinct_roles:
-            if widths[role] > self._num_gpus_per_node:
-                raise ValueError(
-                    f"A Megatron {role} engine spans {widths[role]} GPUs "
-                    f"but nodes have {self._num_gpus_per_node}; multi-node "
-                    "engines are not supported behind Dynamo. Lower "
-                    f"policy.generation.dynamo_cfg.{role}_engine or "
-                    "mcore_generation_config tensor_model_parallel_size x "
-                    "pipeline_model_parallel_size."
-                )
         # Which pinned inference node each engine takes, when the shared
-        # inference cluster has node pins. Engines tile the pinned nodes in
-        # launch order, each engine wholly on one node: an engine that does not
-        # fit in the GPUs the earlier engines left on the current node starts
-        # the next one. With one width this is engine_index // engines_per_node.
+        # inference cluster has node pins; the same tiling the NeMo-Gym server
+        # reservation used, so a reserved port sits on its engine's node.
         constraints = self._node_resource_constraints
-        pin_index_by_engine: list[int] = []
-        node_index = 0
-        used_on_node = 0
-        for role in roles:
-            width = widths[role]
-            if used_on_node + width > self._num_gpus_per_node:
-                node_index += 1
-                used_on_node = 0
-            pin_index_by_engine.append(node_index)
-            used_on_node += width
-        nodes_needed = node_index + 1
-        if constraints is not None and nodes_needed > len(constraints):
-            widths_by_role = {role: widths[role] for role in distinct_roles}
-            raise ValueError(
-                f"{len(roles)} Megatron engines of widths {widths_by_role} GPUs tile "
-                f"{nodes_needed} nodes of {self._num_gpus_per_node} GPUs, more "
-                f"than the {len(constraints)} pinned inference nodes."
-            )
+        pin_index_by_engine = engine_node_pins(
+            roles,
+            widths,
+            num_gpus_per_node=self._num_gpus_per_node,
+            num_pinned_nodes=None if constraints is None else len(constraints),
+        )
         # Each role's engines are built from the policy config with that
         # role and its layout overrides.
         policy_config_by_role: dict[str, dict[str, Any]] = {}
@@ -1274,12 +1432,18 @@ class MegatronDynamoGeneration(GenerationInterface):
                 cluster, engine_policy_config
             )
             node_ip = self._engine_node_ip(cluster, instance_id)
+            # The engine's rank zero (its single model-parallel coordinator)
+            # serves NeMo-Gym on the port reserved for this engine, if any.
+            reserved_port = self._reserved_http_server_ports.get(engine_index)
             engine = MegatronGeneration(
                 config=engine_policy_config,
                 tokenizer=self._tokenizer,
                 cluster=cluster,
                 name_prefix=f"dynamo_{instance_id}",
                 skip_weight_load=True,
+                reserved_http_server_ports=(
+                    None if reserved_port is None else {0: reserved_port}
+                ),
             )
             self._engines.append(engine)
             self._engine_records.append(
