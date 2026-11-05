@@ -605,17 +605,25 @@ class CheckpointManager:
             if self.metric_name is None:
                 periodic_history.sort(key=lambda x: x[0], reverse=True)
             else:
-                # sort by metric value first, then by step number (for equal metrics, prefer more recent)
+                # sort by metric value first, then by step number (for equal metrics, prefer more recent).
+                # A missing or NaN metric ranks worst. NaN compares False against everything,
+                # so letting it into the sort key would scramble the whole order.
                 if self.higher_is_better:
                     # For higher_is_better=True: higher metric values first, then higher step numbers
                     periodic_history.sort(
-                        key=lambda x: (x[2].get(self.metric_name, -float("inf")), x[0]),
+                        key=lambda x: (
+                            _metric_or(x[2], self.metric_name, -float("inf")),
+                            x[0],
+                        ),
                         reverse=True,
                     )
                 else:
                     # For higher_is_better=False: lower metric values first, then higher step numbers for equal values
                     periodic_history.sort(
-                        key=lambda x: (x[2].get(self.metric_name, float("inf")), -x[0]),
+                        key=lambda x: (
+                            _metric_or(x[2], self.metric_name, float("inf")),
+                            -x[0],
+                        ),
                     )
             protected_steps.update(s for s, _, _ in periodic_history[: self.keep_top_k])
         else:
@@ -636,8 +644,9 @@ class CheckpointManager:
         """Get the path to the best checkpoint based on the metric.
 
         Returns the path to the checkpoint with the best metric value. If no checkpoints
-        exist, returns None. If some checkpoints are missing the metric, they are filtered
-        out with a warning. If no checkpoints have the metric, returns the latest checkpoint.
+        exist, returns None. If some checkpoints are missing the metric or have a NaN value
+        for it, they are filtered out with a warning. If no checkpoints have a usable value
+        for the metric, returns the latest checkpoint.
 
         Returns:
             Optional[str]: Path to the best checkpoint, or None if no checkpoints exist.
@@ -646,18 +655,24 @@ class CheckpointManager:
         if len(checkpoint_history) == 0:
             return None
 
-        # Filter checkpoints that have the metric
-        valid_checkpoints = [c for c in checkpoint_history if self.metric_name in c[2]]
+        # Filter checkpoints that have a usable (present and non-NaN) metric value
+        valid_checkpoints = [
+            c
+            for c in checkpoint_history
+            if _metric_or(c[2], self.metric_name, None) is not None
+        ]
         ignored_count = len(checkpoint_history) - len(valid_checkpoints)
 
         if ignored_count > 0:
             ignored_steps = [
-                c[0] for c in checkpoint_history if self.metric_name not in c[2]
+                c[0]
+                for c in checkpoint_history
+                if _metric_or(c[2], self.metric_name, None) is None
             ]
             warnings.warn(
                 f"Ignoring {ignored_count} checkpoint(s) at step(s) {ignored_steps} that do not have "
-                f"metric '{self.metric_name}'. Consider enabling val_at_end or adjusting val_period "
-                f"to align with max_steps."
+                f"metric '{self.metric_name}' or have a NaN value for it. Consider enabling val_at_end "
+                f"or adjusting val_period to align with max_steps."
             )
 
         if len(valid_checkpoints) == 0:
@@ -707,6 +722,14 @@ class CheckpointManager:
             return None
         with open_path(str(checkpoint_path) + "/training_info.json") as f:
             return json.load(f)
+
+
+def _metric_or(info: dict[str, Any], metric_name: Optional[str], default: Any) -> Any:
+    """Return ``info[metric_name]``, or ``default`` if it is missing, None or NaN."""
+    value = info.get(metric_name) if metric_name is not None else None
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return default
+    return value
 
 
 def _load_checkpoint_history(
