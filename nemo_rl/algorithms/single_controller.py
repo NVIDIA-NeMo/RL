@@ -4531,10 +4531,7 @@ class SingleControllerActor:
             await asyncio.to_thread(
                 self._gen.set_rollout_weight_version, self._trainer_version
             )
-        if self._rollout_trace.enabled:
-            self._rollout_trace.emit(
-                "weights_synced", weight_version=self._trainer_version
-            )
+        self._rollout_trace.emit("weights_synced", weight_version=self._trainer_version)
         self._rollout_permitted.set()
         self._rollout_manager.resume_request_deadlines()
         return aborted_stale_inflight_groups

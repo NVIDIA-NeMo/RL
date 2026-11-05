@@ -221,13 +221,14 @@ class RolloutRestorer(_UsesRolloutParts):
             recovery_prepare_seconds=recovery_prepare_seconds,
             restored_replay_groups=restored_replay_groups,
         )
-        self._trace.emit(
-            "restore_finished",
-            replay_groups=restored_replay_groups,
-            unfinished_groups=[
-                group.group_id for group in self._rollout_recovery_ledger.groups()
-            ],
-        )
+        if self._trace.enabled:
+            self._trace.emit(
+                "restore_finished",
+                replay_groups=restored_replay_groups,
+                unfinished_groups=[
+                    group.group_id for group in self._rollout_recovery_ledger.groups()
+                ],
+            )
         return self._requires_recovery_dispatch
 
     def _log_restore_metrics(

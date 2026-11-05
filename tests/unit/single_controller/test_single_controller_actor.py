@@ -1075,6 +1075,7 @@ def test_sync_weights_sglang_flushes_only_while_paused(
     ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
+    ctrl._trainer_version = 1
     ctrl._master_config = SimpleNamespace(
         env={}, token_capture=SimpleNamespace(enabled=False)
     )
@@ -1138,6 +1139,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._timer = Timer()
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
+    ctrl._trainer_version = 1
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
     ctrl._master_config = SimpleNamespace(
