@@ -2720,7 +2720,9 @@ class TestSetup:
             assert actor_config.reward_penalty_config == mc.reward_penalties
             assert actor_config.tokenizer_config is None
             assert actor_config.thinking_tags is None
-        assert actor_kwargs == {"num_workers": 3}
+        assert actor_kwargs == {
+            "num_workers": 3,
+        }
         assert actor_args.finalizer_actors == fake_actors
         assert actor_args.tq_buffer._per_token_multimodal_fields == ()
         assert not hasattr(actor_args.rollout_manager, "_finalizer")
