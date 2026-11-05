@@ -2539,9 +2539,14 @@ class TestGenerateForFinalizationFlow:
             raise RuntimeError("rollout exploded")
 
         mgr = _make_capture_manager(buf, on_run=_boom)
+        events = []
+        mgr.recovery_ledger.set_event_sink(
+            lambda event, **fields: events.append((event, fields.get("reason")))
+        )
         with pytest.raises(RuntimeError, match="rollout exploded"):
             _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
         assert len(buf.abort_calls) == 1
+        assert ("attempt_abandoned", "failed") in events
 
     def test_failure_after_rollout_aborts_the_reservation(self, monkeypatch):
         buf = _FakeCaptureBuffer()

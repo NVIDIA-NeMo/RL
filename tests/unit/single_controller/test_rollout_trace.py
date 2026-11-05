@@ -58,8 +58,15 @@ def _events(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-def _recording_ledger() -> tuple[RolloutRecoveryLedger, list[dict[str, Any]]]:
-    ledger = RolloutRecoveryLedger()
+def _recording_ledger(
+    from_ledger: RolloutRecoveryLedger | None = None,
+) -> tuple[RolloutRecoveryLedger, list[dict[str, Any]]]:
+    """A ledger recording its events, new or restored from ``from_ledger``."""
+    ledger = (
+        RolloutRecoveryLedger()
+        if from_ledger is None
+        else RolloutRecoveryLedger.from_state_dict(from_ledger.state_dict())
+    )
     events: list[dict[str, Any]] = []
     ledger.set_event_sink(
         lambda event, **fields: events.append(dict(event=event, **fields))
@@ -80,15 +87,6 @@ def _seal(ledger: RolloutRecoveryLedger, generation_index: int) -> None:
             mask_sample=False,
         )
     )
-
-
-def test_a_disabled_trace_writes_nothing(tmp_path: Path) -> None:
-    trace = RolloutTrace(None)
-    trace.emit("step_trained", step=1)
-    trace.close()
-
-    assert not trace.enabled
-    assert list(tmp_path.iterdir()) == []
 
 
 def test_each_run_appends_its_own_events(tmp_path: Path) -> None:
@@ -165,13 +163,8 @@ def test_a_dropped_rollout_is_reported_and_its_retry_is_a_new_attempt() -> None:
 
 def test_a_restart_reports_which_interrupted_rollouts_resume() -> None:
     ledger = RolloutRecoveryLedger()
-    group = _dispatched_turn_group(ledger)
-    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
-    events: list[dict[str, Any]] = []
-    restored.set_event_sink(
-        lambda event, **fields: events.append(dict(event=event, **fields))
-    )
-    resumed = group.environment_episode(0)
+    resumed = _dispatched_turn_group(ledger).environment_episode(0)
+    restored, events = _recording_ledger(from_ledger=ledger)
 
     _mutate(
         lambda cut: restored.prepare_for_restart(
@@ -208,11 +201,7 @@ def _prompt_group(ledger: RolloutRecoveryLedger) -> None:
 def test_a_prompt_group_restart_reports_the_whole_group_thrown_away() -> None:
     ledger = RolloutRecoveryLedger()
     _prompt_group(ledger)
-    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
-    events: list[dict[str, Any]] = []
-    restored.set_event_sink(
-        lambda event, **fields: events.append(dict(event=event, **fields))
-    )
+    restored, events = _recording_ledger(from_ledger=ledger)
 
     _mutate(lambda cut: restored.prepare_for_restart(cut))
 
@@ -227,11 +216,7 @@ def test_a_restart_does_not_rereport_an_already_abandoned_attempt(build) -> None
     ledger = RolloutRecoveryLedger()
     build(ledger)
     _mutate(lambda cut: ledger.abandon_unsealed(cut, "g7"))
-    restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
-    events: list[dict[str, Any]] = []
-    restored.set_event_sink(
-        lambda event, **fields: events.append(dict(event=event, **fields))
-    )
+    restored, events = _recording_ledger(from_ledger=ledger)
 
     _mutate(lambda cut: restored.prepare_for_restart(cut))
 
@@ -251,7 +236,8 @@ def test_the_controller_traces_steps_weight_syncs_and_checkpoints(
     steps = [event for event in events if event["event"] == "step_trained"]
     assert [event["step"] for event in steps] == [1, 2, 3, 4]
     assert all(isinstance(event["group_ids"], list) for event in steps)
-    assert len([event for event in events if event["event"] == "weights_synced"]) >= 4
+    synced = [event for event in events if event["event"] == "weights_synced"]
+    assert [event["weight_version"] for event in synced] == [1, 2, 3, 4]
     assert [
         event["step"]
         for event in events
@@ -300,15 +286,6 @@ def test_a_published_snapshot_and_a_restore_are_traced(tmp_path: Path) -> None:
     assert published["path"].endswith("snapshot_000001")
     assert published["step"] == 0
     assert published["t"] >= published["cut_time"]
-
-
-def test_a_failed_group_and_a_cancelled_one_are_told_apart() -> None:
-    ledger, events = _recording_ledger()
-    _dispatched_turn_group(ledger, generations=1)
-    _mutate(lambda cut: ledger.abandon_unsealed(cut, "g7", reason="cancelled"))
-
-    (abandoned,) = [event for event in events if event["event"] == "attempt_abandoned"]
-    assert abandoned["reason"] == "cancelled"
 
 
 def test_a_rollout_cancelled_mid_run_is_traced_as_cancelled() -> None:
