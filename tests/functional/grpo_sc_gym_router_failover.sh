@@ -110,6 +110,11 @@ jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/da
 jq -c '.responses_create_params.tools |= (.[0:1])' 3rdparty/Gym-workspace/Gym/data/workplace_assistant/validation.jsonl > "$VALIDATION_PATH"
 
 cleanup() {
+    local exit_code=$?
+    if (( exit_code != 0 )) && [[ -f "$RUN_LOG" ]]; then
+        echo "[failover] training log at failure:"
+        cat "$RUN_LOG"
+    fi
     kill -9 $TRAIN_PID 2>/dev/null || true
     # vLLM runs its engine in a child that outlives the actor this test kills on purpose,
     # and it holds tens of GB of device memory. A leak makes the NEXT run fail in
