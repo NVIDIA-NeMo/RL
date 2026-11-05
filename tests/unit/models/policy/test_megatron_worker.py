@@ -15,6 +15,7 @@ import __future__
 
 import ast
 import asyncio
+import importlib
 import math
 import os
 import tempfile
@@ -283,6 +284,336 @@ def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
     ]
     # Megatron generation gets the materializing generator instead.
     assert not isinstance(megatron_forwarded, list)
+
+
+# One MTP block of an attention layer and an MoE layer.
+_NEMOTRON_H_MTP_CONFIG = SimpleNamespace(
+    num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*E"
+)
+
+
+def _bridge_tasks(
+    bridge_path: str, megatron_names: list[str | None], hf_config: Any = None
+) -> list[Any]:
+    """Conversion tasks for `megatron_names` with the mappings the bridge really uses."""
+    from megatron.bridge.models.conversion.model_bridge import WeightConversionTask
+
+    module, bridge_cls = bridge_path.rsplit(".", 1)
+    bridge = getattr(
+        importlib.import_module(f"megatron.bridge.models.{module}"), bridge_cls
+    )()
+    bridge.hf_config = hf_config
+    registry = bridge.mapping_registry()
+    tasks = []
+    for name in megatron_names:
+        if name is None:
+            tasks.append(None)
+            continue
+        # Bridge looks up LoRA and FP8-export tasks by their base weight's name.
+        base_name = name.replace(".to_wrap.", ".").removesuffix("_scale_inv")
+        mapping = registry.megatron_to_hf_lookup(base_name)
+        assert mapping is not None, f"{bridge_cls} has no {base_name}"
+        tasks.append(
+            WeightConversionTask(
+                param_name=name, global_param_name=name, mapping=mapping
+            )
+        )
+    return tasks
+
+
+def _mla_tasks() -> list[Any]:
+    return _bridge_tasks(
+        "deepseek.deepseek_v3_bridge.DeepSeekV3Bridge",
+        ["decoder.layers.0.self_attention.linear_q_proj.weight"],
+    )
+
+
+def _hybrid_attention_tasks() -> list[Any]:
+    """NemotronH tasks: Mamba layer 0, attention layer 4 and MTP attention."""
+    return _bridge_tasks(
+        "nemotronh.nemotron_h_bridge.NemotronHBridge",
+        [
+            "decoder.layers.0.mixer.in_proj.weight",
+            "decoder.layers.4.self_attention.linear_qkv.weight",
+            None,
+            "mtp.layers.0.mtp_model_layer.layers.0.self_attention.linear_qkv.weight",
+        ],
+        _NEMOTRON_H_MTP_CONFIG,
+    )
+
+
+def _fp8_kv_worker() -> Any:
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.model = object()
+    worker.draft_model = None
+    worker.refit_conversion_tasks = _hybrid_attention_tasks()
+    worker._fp8_kv_attention_prefixes = None
+    worker.megatron_bridge = SimpleNamespace(
+        export_hf_weights=MagicMock(return_value=iter(()))
+    )
+    worker.cfg = {
+        "megatron_cfg": {"pipeline_model_parallel_size": 1},
+        "generation": {"backend": "vllm", "vllm_cfg": {"kv_cache_dtype": "fp8_e4m3"}},
+    }
+    return worker
+
+
+def test_fp8_kv_scales_are_emitted_only_for_hybrid_attention_layers() -> None:
+    worker = _fp8_kv_worker()
+    kv_scales = {"backbone.layers.4.mixer.attn.k_scale": 0.5}
+
+    emitted = {
+        name: tensor.item()
+        for name, tensor in worker._iter_params_with_optional_kv_scales(kv_scales)
+    }
+
+    # vLLM's own Attention parameter names, only for attention layers (no Mamba
+    # layer 0); MTP attention keeps its own HF namespace.
+    assert emitted == {
+        "backbone.layers.4.mixer.attn.q_scale": 1.0,
+        "backbone.layers.4.mixer.attn.k_scale": 0.5,
+        "backbone.layers.4.mixer.attn.v_scale": 1.0,
+        "mtp.layers.0.mixer.attn.q_scale": 1.0,
+        "mtp.layers.0.mixer.attn.k_scale": 1.0,
+        "mtp.layers.0.mixer.attn.v_scale": 1.0,
+    }
+
+
+@pytest.mark.parametrize("kv_cache_dtype", ["auto", "fp8_ds_mla", "fp8_per_token_head"])
+def test_fp8_kv_scales_are_not_emitted_without_refittable_scales(
+    kv_cache_dtype: str,
+) -> None:
+    worker = _fp8_kv_worker()
+    worker.cfg["generation"]["vllm_cfg"]["kv_cache_dtype"] = kv_cache_dtype
+    # An MLA model has no linear_qkv, so looking up scale owners would fail.
+    worker.refit_conversion_tasks = _mla_tasks()
+
+    assert list(worker._iter_params_with_optional_kv_scales()) == []
+
+
+@pytest.mark.parametrize(
+    ("bridge_path", "hf_config", "megatron_names", "expected"),
+    [
+        pytest.param(
+            "llama.llama_bridge.LlamaBridge",
+            None,
+            [
+                "decoder.layers.0.self_attention.linear_qkv.weight",
+                # FP8 export adds a scale task beside each FP8 weight.
+                "decoder.layers.0.self_attention.linear_qkv.weight_scale_inv",
+                "decoder.layers.0.mlp.linear_fc2.weight",
+            ],
+            {"decoder.layers.0.self_attention": "model.layers.0.self_attn"},
+            id="llama",
+        ),
+        pytest.param(
+            "llama.llama_bridge.LlamaBridge",
+            None,
+            ["decoder.layers.0.self_attention.linear_qkv.to_wrap.weight"],
+            {"decoder.layers.0.self_attention": "model.layers.0.self_attn"},
+            id="llama-lora",
+        ),
+        pytest.param(
+            "nemotronh.nemotron_h_bridge.NemotronHBridge",
+            _NEMOTRON_H_MTP_CONFIG,
+            [
+                "decoder.layers.0.mixer.in_proj.weight",
+                "decoder.layers.4.self_attention.linear_qkv.weight",
+                "mtp.layers.0.mtp_model_layer.layers.0.self_attention.linear_qkv.weight",
+            ],
+            {
+                "decoder.layers.4.self_attention": "backbone.layers.4.mixer",
+                "mtp.layers.0.mtp_model_layer.layers.0.self_attention": (
+                    "mtp.layers.0.mixer"
+                ),
+            },
+            id="nemotron-h-mtp",
+        ),
+        pytest.param(
+            "qwen.qwen3_next_bridge.Qwen3NextBridge",
+            None,
+            [
+                "decoder.layers.0.self_attention.out_proj.weight",
+                "decoder.layers.3.self_attention.linear_qkv.weight",
+                "mtp.layers.0.mtp_model_layer.self_attention.linear_qkv.weight",
+            ],
+            {
+                "decoder.layers.3.self_attention": "model.layers.3.self_attn",
+                "mtp.layers.0.mtp_model_layer.self_attention": "mtp.layers.0.self_attn",
+            },
+            id="qwen3-next-mtp",
+        ),
+        pytest.param(
+            "qwen_vl.qwen3_vl_bridge.Qwen3VLBridge",
+            None,
+            [
+                "language_model.decoder.layers.1.self_attention.linear_qkv.weight",
+                "vision_model.decoder.layers.0.self_attention.linear_qkv.weight",
+            ],
+            {
+                "language_model.decoder.layers.1.self_attention": (
+                    "model.language_model.layers.1.self_attn"
+                )
+            },
+            id="qwen3-vl",
+        ),
+        pytest.param(
+            "deepseek.deepseek_v3_bridge.DeepSeekV3Bridge",
+            None,
+            [
+                "decoder.layers.0.self_attention.linear_q_proj.weight",
+                "decoder.layers.0.self_attention.linear_kv_down_proj.weight",
+            ],
+            {},
+            id="deepseek-v3-mla",
+        ),
+    ],
+)
+def test_hf_attention_prefixes_follow_bridge_mappings(
+    bridge_path: str,
+    hf_config: Any,
+    megatron_names: list[str],
+    expected: dict[str, str],
+) -> None:
+    from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+        get_hf_attention_prefixes,
+    )
+
+    tasks = _bridge_tasks(bridge_path, megatron_names, hf_config)
+
+    assert get_hf_attention_prefixes(tasks) == expected
+
+
+def test_fp8_kv_scales_reject_pipeline_parallelism() -> None:
+    worker = _fp8_kv_worker()
+    worker.cfg["megatron_cfg"]["pipeline_model_parallel_size"] = 2
+
+    with pytest.raises(NotImplementedError, match="pipeline_model_parallel_size=1"):
+        list(worker._iter_params_with_optional_kv_scales())
+
+
+def test_fp8_kv_scales_reject_mla_attention() -> None:
+    worker = _fp8_kv_worker()
+    # MLA has no linear_qkv, so it has no per-tensor K/V scales to refit.
+    worker.refit_conversion_tasks = _mla_tasks()
+
+    with pytest.raises(ValueError, match="kv_cache_dtype='auto'"):
+        list(worker._iter_params_with_optional_kv_scales())
+
+
+@pytest.mark.parametrize("include_q", [True, False])
+def test_calibrate_qkv_fp8_scales_keys_hybrid_and_mtp_attention(
+    include_q: bool,
+) -> None:
+    class CoreAttention(torch.nn.Module):
+        def forward(self, q, k, v):
+            return q
+
+    def attention_block() -> torch.nn.Module:
+        return torch.nn.ModuleDict(
+            {"self_attention": torch.nn.ModuleDict({"core_attention": CoreAttention()})}
+        )
+
+    # Mirrors Megatron's wrapped module tree: module.decoder.layers.<i>, the MTP
+    # block and a vision encoder.
+    model = torch.nn.ModuleDict(
+        {
+            "module": torch.nn.ModuleDict(
+                {
+                    "vision_model": torch.nn.ModuleDict(
+                        {
+                            "decoder": torch.nn.ModuleDict(
+                                {
+                                    "layers": torch.nn.ModuleDict(
+                                        {"0": attention_block()}
+                                    )
+                                }
+                            )
+                        }
+                    ),
+                    "decoder": torch.nn.ModuleDict(
+                        {"layers": torch.nn.ModuleDict({"4": attention_block()})}
+                    ),
+                    "mtp": torch.nn.ModuleDict(
+                        {
+                            "layers": torch.nn.ModuleDict(
+                                {
+                                    "0": torch.nn.ModuleDict(
+                                        {
+                                            "mtp_model_layer": torch.nn.ModuleDict(
+                                                {
+                                                    "layers": torch.nn.ModuleDict(
+                                                        {"0": attention_block()}
+                                                    )
+                                                }
+                                            )
+                                        }
+                                    )
+                                }
+                            )
+                        }
+                    ),
+                }
+            )
+        }
+    )
+
+    def get_logprobs(**_: Any) -> None:
+        vision = model["module"]["vision_model"]["decoder"]["layers"]["0"]
+        vision["self_attention"]["core_attention"](
+            torch.full((2,), 100.0), torch.full((2,), 100.0), torch.full((2,), 100.0)
+        )
+        core = model["module"]["decoder"]["layers"]["4"]["self_attention"]
+        core["core_attention"](
+            torch.full((2,), 4.48), torch.full((2,), 8.96), torch.ones(2)
+        )
+        mtp = model["module"]["mtp"]["layers"]["0"]["mtp_model_layer"]["layers"]["0"]
+        mtp["self_attention"]["core_attention"](
+            torch.ones(2), torch.ones(2), torch.full((2,), 44.8)
+        )
+
+    worker = _fp8_kv_worker()
+    # DDP(Float16Module(model)) names modules "module.module.decoder...".
+    worker.model = torch.nn.ModuleDict({"module": model})
+    worker.get_logprobs = get_logprobs
+
+    result = worker.calibrate_qkv_fp8_scales(data=None, margin=1.0, include_q=include_q)
+
+    expected = {
+        "backbone.layers.4.mixer.attn.k_scale": 0.02,
+        "backbone.layers.4.mixer.attn.v_scale": 1 / 448,
+        "mtp.layers.0.mixer.attn.k_scale": 1 / 448,
+        "mtp.layers.0.mixer.attn.v_scale": 0.1,
+    }
+    if include_q:
+        expected["backbone.layers.4.mixer.attn.q_scale"] = 0.01
+        expected["mtp.layers.0.mixer.attn.q_scale"] = 1 / 448
+    assert result["layers"].keys() == expected.keys()
+    for name, value in expected.items():
+        assert result["layers"][name] == pytest.approx(value)
+
+
+def test_calibrate_qkv_fp8_scales_rejects_unhooked_attention() -> None:
+    core = torch.nn.Identity()
+    worker = _fp8_kv_worker()
+    # The map also has the MTP attention, which this model lacks.
+    worker.model = SimpleNamespace(
+        eval=lambda: None,
+        named_modules=lambda: [
+            ("module.module.decoder.layers.4.self_attention.core_attention", core)
+        ],
+    )
+    worker.get_logprobs = MagicMock()
+
+    with pytest.raises(ValueError, match="no core_attention"):
+        worker.calibrate_qkv_fp8_scales(data=None, include_q=True)
+
+    worker.get_logprobs.assert_not_called()
+    assert not core._forward_pre_hooks
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])

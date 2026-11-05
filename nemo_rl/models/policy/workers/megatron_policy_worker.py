@@ -80,6 +80,7 @@ from nemo_rl.models.generation.megatron.megatron_worker import (
     _configure_inference_optimized_layer_spec,
 )
 from nemo_rl.models.generation.vllm.config import (
+    REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
 )
@@ -1169,6 +1170,8 @@ class MegatronPolicyWorkerImpl(
         self.refit_conversion_tasks = None
         self.refit_conversion_tasks_current_index = None
         self.refit_param_info_mcore = None
+        # Megatron attention module -> HF attention module; names the FP8 KV scales.
+        self._fp8_kv_attention_prefixes: Optional[dict[str, str]] = None
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
@@ -3680,6 +3683,35 @@ class MegatronPolicyWorkerImpl(
             self.zmq_socket.setsockopt(zmq.SNDTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
             self.zmq_socket.setsockopt(zmq.RCVTIMEO, NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS)
 
+    def _get_fp8_kv_attention_prefixes(self) -> dict[str, str]:
+        """Return the Megatron -> HF attention module names that own FP8 KV scales."""
+        if self._fp8_kv_attention_prefixes is None:
+            from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+                get_hf_attention_prefixes,
+            )
+
+            # Calibration hooks see each stage's local layer names; the map uses global ones.
+            if self.cfg["megatron_cfg"]["pipeline_model_parallel_size"] > 1:
+                raise NotImplementedError(
+                    "FP8 KV cache scales require pipeline_model_parallel_size=1."
+                )
+            conversion_tasks = self.refit_conversion_tasks
+            if conversion_tasks is None:
+                conversion_tasks = self.megatron_bridge.get_conversion_tasks(
+                    [self.model]
+                )
+            prefixes = get_hf_attention_prefixes(conversion_tasks)
+            if not prefixes:
+                raise ValueError(
+                    "FP8 KV cache needs per-layer attention scales, but no "
+                    "language-model 'self_attention.linear_qkv' weight was found "
+                    "in the Megatron-Bridge conversion tasks of this model. MLA "
+                    "attention has no per-tensor KV-scale refit; use "
+                    "kv_cache_dtype='auto'."
+                )
+            self._fp8_kv_attention_prefixes = prefixes
+        return self._fp8_kv_attention_prefixes
+
     def _iter_params_with_optional_kv_scales(
         self,
         kv_scales: Optional[dict[str, float]] = None,
@@ -3737,7 +3769,8 @@ class MegatronPolicyWorkerImpl(
             for name, tensor in draft_weights:
                 yield f"draft.{name}", tensor
 
-        # Check whether FP8 KV cache is enabled.
+        # Only per-tensor FP8 caches have scales to refit, as in
+        # VllmGeneration.requires_kv_scale_sync (not fp8_ds_mla or per-token-head).
         use_fp8_kv_cache = False
         if (
             "generation" in self.cfg
@@ -3748,18 +3781,17 @@ class MegatronPolicyWorkerImpl(
             use_fp8_kv_cache = (
                 "vllm_cfg" in generation_cfg
                 and "kv_cache_dtype" in generation_cfg["vllm_cfg"]
-                and generation_cfg["vllm_cfg"]["kv_cache_dtype"].startswith("fp8")
+                and generation_cfg["vllm_cfg"]["kv_cache_dtype"]
+                in REFITTABLE_FP8_KV_CACHE_DTYPES
             )
 
         if not use_fp8_kv_cache:
             return
 
         # Append KV (and potentially Q) scale entries to match metadata.
-        num_layers = self.megatron_bridge.transformer_config.num_layers
         keys: list[str] = []
-        for layer_idx in range(num_layers):
-            scale_names = get_vllm_qkv_scale_names(layer_idx)
-            keys.extend(scale_names.values())
+        for attention_prefix in self._get_fp8_kv_attention_prefixes().values():
+            keys.extend(get_vllm_qkv_scale_names(attention_prefix).values())
 
         for param_name in keys:
             if kv_scales and param_name in kv_scales:
@@ -5281,7 +5313,9 @@ class MegatronPolicyWorkerImpl(
 
         Returns:
             { "format": "fp8", "percentile": float, "margin": float,
-              "layers": { layer_name: {"k_scale": float, "v_scale": float[, "q_scale": float] } } }
+              "layers": { vllm_scale_param_name: float } }, keyed by
+            ``fp8_train_utils.get_vllm_qkv_scale_names`` for every attention layer
+            (MTP included).
         """
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
             convert_calibration_to_vllm_format,
@@ -5309,12 +5343,19 @@ class MegatronPolicyWorkerImpl(
         layer_to_samples_v: dict[str, list[float]] = defaultdict(list)
         hook_handles = []
 
+        attention_prefixes = self._get_fp8_kv_attention_prefixes()
+
+        def _megatron_attention_prefix(module_name: str) -> str:
+            # "module.module.decoder.layers.4.self_attention.core_attention"
+            # -> "decoder.layers.4.self_attention"
+            return re.sub(r"^(module\.)+", "", module_name).removesuffix(
+                ".core_attention"
+            )
+
         def _extract_layer_key(module_name: str) -> str:
-            # Expected format: "module.decoder.layers.<idx>.self_attention.query_key_value"
-            m = re.search(r"module\.decoder\.layers\.(\d+)", module_name)
-            if m is not None:
-                return f"layer_{m.group(1)}"
-            return module_name
+            # Language-model (or MTP) core attention -> the HF attention module
+            # that owns its vLLM scales.
+            return attention_prefixes[_megatron_attention_prefix(module_name)]
 
         # Hook to capture q/k/v after q/k norm and RoPE
         def _pre_hook_builder_core_attention(module_name: str):
@@ -5344,7 +5385,10 @@ class MegatronPolicyWorkerImpl(
         matched_modules = []
         # Try to register forward_pre_hook on core_attention first
         for name, module in self.model.named_modules():
-            if "self_attention.core_attention" in name:
+            # Skip encoder attention (e.g. a vision tower): it has no KV cache.
+            if name.endswith("self_attention.core_attention") and (
+                _megatron_attention_prefix(name) in attention_prefixes
+            ):
                 try:
                     handle = module.register_forward_pre_hook(
                         _pre_hook_builder_core_attention(name)
@@ -5363,6 +5407,14 @@ class MegatronPolicyWorkerImpl(
         # Calibration batches are prompt-only model inputs, not rollout replay
         # batches, so they intentionally do not carry routed_experts.
         try:
+            hooked = {
+                _megatron_attention_prefix(name) for name, _, _ in matched_modules
+            }
+            if missing := sorted(set(attention_prefixes) - hooked):
+                # An unhooked attention layer would silently keep scale 1.0.
+                raise ValueError(
+                    f"FP8 KV calibration found no core_attention for {missing}."
+                )
             _ = self.get_logprobs(
                 data=data,
                 micro_batch_size=micro_batch_size,

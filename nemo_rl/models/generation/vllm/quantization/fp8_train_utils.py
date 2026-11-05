@@ -16,7 +16,9 @@
 import functools
 import importlib.util
 import os
+import re
 import shutil
+from typing import Any, Iterable
 
 import torch
 
@@ -24,6 +26,12 @@ MXFP8_BLOCK_SIZE = 32
 MXFP8_VALUE_DTYPE = torch.float8_e4m3fn
 MXFP8_SCALE_DTYPE = torch.uint8
 MXFP8_SCALE_SUFFIX = "_scale_from_checkpoint"
+_ATTENTION_QKV_SUFFIX = ".linear_qkv.weight"
+# Language-model (decoder or MTP) attention, optionally under a multimodal root;
+# encoder attention (e.g. vision) also uses linear_qkv but has no KV cache.
+_LANGUAGE_ATTENTION_PREFIX = re.compile(
+    r"^(?:(?:\w+\.)*language_model\.)?(?:decoder|mtp)\.layers\."
+)
 
 
 def canonicalize_mxfp8_refit_output(
@@ -170,39 +178,73 @@ def mxfp8_e4m3_quantize_for_refit(
     return canonicalize_mxfp8_refit_output(x.shape, x_q, x_scales)
 
 
-def get_vllm_qkv_scale_names(layer_idx: int) -> dict[str, str]:
-    """Get vLLM-compatible parameter names for Q/K/V FP8 scales.
-
-    This function centralizes the naming convention for Q/K/V scale parameters
-    that vLLM expects. These names must match vLLM's internal parameter structure.
+def get_vllm_qkv_scale_names(attention_prefix: str) -> dict[str, str]:
+    """Get vLLM-compatible parameter names for one attention layer's Q/K/V FP8 scales.
 
     Args:
-        layer_idx: The transformer layer index (0-based)
+        attention_prefix: HF name of the module that owns the layer's Q/K/V
+            projections, as returned by ``get_hf_attention_prefixes``.
 
     Returns:
-        Dictionary mapping scale types to vLLM parameter names:
-        - 'q_scale': Q activation scale name
-        - 'k_scale': K activation scale name
-        - 'v_scale': V activation scale name
-
-    Note:
-        The q_scale has an extra '.attn.' component compared to k_scale/v_scale.
-        This matches vLLM's parameter remapping logic in:
-        vllm.model_executor.model_loader.weight_utils.maybe_remap_kv_scale_name
+        Dictionary mapping 'q_scale', 'k_scale' and 'v_scale' to the scales of
+        the vLLM ``Attention`` submodule (``attn``) under ``attention_prefix``.
+        These are vLLM's own parameter names, so vLLM's KV-scale remapping
+        (``QuantizationConfig.get_cache_scale_mapper`` in ``AutoWeightsLoader``,
+        or ``maybe_remap_kv_scale_name`` in hand-written loaders) leaves them
+        unchanged; the model's HF-to-vLLM mapper still rewrites the root prefix
+        (e.g. ``backbone``).
 
     Example:
-        >>> get_vllm_qkv_scale_names(0)
+        >>> get_vllm_qkv_scale_names("backbone.layers.4.mixer")
         {
-            'q_scale': 'model.layers.0.self_attn.attn.q_scale',
-            'k_scale': 'model.layers.0.self_attn.k_scale',
-            'v_scale': 'model.layers.0.self_attn.v_scale'
+            'q_scale': 'backbone.layers.4.mixer.attn.q_scale',
+            'k_scale': 'backbone.layers.4.mixer.attn.k_scale',
+            'v_scale': 'backbone.layers.4.mixer.attn.v_scale'
         }
     """
     return {
-        "q_scale": f"model.layers.{layer_idx}.self_attn.attn.q_scale",
-        "k_scale": f"model.layers.{layer_idx}.self_attn.k_scale",
-        "v_scale": f"model.layers.{layer_idx}.self_attn.v_scale",
+        scale: f"{attention_prefix}.attn.{scale}"
+        for scale in ("q_scale", "k_scale", "v_scale")
     }
+
+
+def get_hf_attention_prefixes(conversion_tasks: Iterable[Any]) -> dict[str, str]:
+    """Map each Megatron attention module to the HF name of the same module.
+
+    The Megatron-Bridge mapping of ``<module>.linear_qkv.weight`` names the HF
+    Q (or fused QKV) projection, whose parent is the HF attention module:
+    ``decoder.layers.4.self_attention`` -> ``backbone.layers.4.mixer`` for
+    NemotronH and ``model.layers.4.self_attn`` for Llama/Qwen. MTP layers keep
+    the HF name the bridge gives them (``mtp.layers.0.mixer`` for NemotronH,
+    ``model.layers.<num_layers + i>.self_attn`` for GLM-4.5). Only
+    language-model attention layers appear: hybrid models get no entries for
+    Mamba or MoE layers, multimodal models none for their encoders, and MLA
+    models (no ``linear_qkv``) none at all.
+
+    Args:
+        conversion_tasks: Megatron-Bridge ``WeightConversionTask`` objects.
+            Tasks for parameters on other pipeline stages are present too (with
+            no local module), so every rank gets the full map.
+
+    Returns:
+        Dictionary from the unwrapped global Megatron module name to the HF
+        attention module name.
+    """
+    prefixes = {}
+    for task in conversion_tasks:
+        if task is None:
+            continue
+        # LoRA keeps the wrapped base weight as "<module>.linear_qkv.to_wrap.weight".
+        megatron_name = task.global_param_name.replace(".to_wrap.", ".")
+        if not megatron_name.endswith(
+            _ATTENTION_QKV_SUFFIX
+        ) or not _LANGUAGE_ATTENTION_PREFIX.match(megatron_name):
+            continue
+        hf_param = task.mapping.hf_param
+        hf_name = hf_param["q"] if isinstance(hf_param, dict) else hf_param
+        megatron_prefix = megatron_name.removesuffix(_ATTENTION_QKV_SUFFIX)
+        prefixes[megatron_prefix] = hf_name.rsplit(".", 2)[0]
+    return prefixes
 
 
 def convert_calibration_to_vllm_format(
@@ -210,44 +252,27 @@ def convert_calibration_to_vllm_format(
 ) -> dict[str, float]:
     """Convert NeMo-RL calibration results to vLLM parameter format.
 
-    Currently only used by megatron policy worker.
-    After FP8 KV cache is supported by the Automodel path, this function can be reused.
-
-    This function transforms the calibration output format (with layer_N keys)
-    into the flat dictionary format that vLLM expects for parameter loading.
-
     Args:
-        calibration_results: Dict with keys like "layer_0", "layer_1", etc.
-            Each value is a dict with keys: "q_scale", "k_scale", "v_scale"
-            and corresponding float scale values.
+        calibration_results: Dict keyed by HF attention prefix (see
+            ``get_hf_attention_prefixes``). Each value maps "k_scale",
+            "v_scale" and optionally "q_scale" to its float scale.
 
     Returns:
-        Flat dictionary mapping vLLM parameter names to scale values.
-        Keys follow vLLM's naming convention as defined in get_vllm_qkv_scale_names.
+        Flat dictionary mapping vLLM parameter names (see
+        ``get_vllm_qkv_scale_names``) to scale values.
 
     Example:
-        >>> calib = {
-        ...     "layer_0": {"q_scale": 1.0, "k_scale": 2.0, "v_scale": 3.0},
-        ...     "layer_1": {"q_scale": 1.5, "k_scale": 2.5, "v_scale": 3.5}
-        ... }
-        >>> convert_calibration_to_vllm_format(calib)
+        >>> convert_calibration_to_vllm_format(
+        ...     {"backbone.layers.4.mixer": {"k_scale": 2.0, "v_scale": 3.0}}
+        ... )
         {
-            'model.layers.0.self_attn.attn.q_scale': 1.0,
-            'model.layers.0.self_attn.k_scale': 2.0,
-            'model.layers.0.self_attn.v_scale': 3.0,
-            'model.layers.1.self_attn.attn.q_scale': 1.5,
-            'model.layers.1.self_attn.k_scale': 2.5,
-            'model.layers.1.self_attn.v_scale': 3.5
+            'backbone.layers.4.mixer.attn.k_scale': 2.0,
+            'backbone.layers.4.mixer.attn.v_scale': 3.0
         }
     """
     vllm_scales = {}
-    for layer_key, scales in calibration_results.items():
-        # Extract layer index from "layer_N" format
-        layer_idx = int(layer_key.split("_")[1])
-        param_names = get_vllm_qkv_scale_names(layer_idx)
-
-        vllm_scales[param_names["q_scale"]] = scales["q_scale"]
-        vllm_scales[param_names["k_scale"]] = scales["k_scale"]
-        vllm_scales[param_names["v_scale"]] = scales["v_scale"]
-
+    for attention_prefix, scales in calibration_results.items():
+        param_names = get_vllm_qkv_scale_names(attention_prefix)
+        for scale, value in scales.items():
+            vllm_scales[param_names[scale]] = value
     return vllm_scales
