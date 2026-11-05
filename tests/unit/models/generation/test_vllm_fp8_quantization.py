@@ -2085,6 +2085,58 @@ def test_dynamic_cache_skips_static_kv_scale_patch(
     assert not any("BaseKVCacheMethod" in path for path in patched_paths)
 
 
+def _vllm_fp8_kv_attention_layer() -> torch.nn.Module:
+    """Carry vLLM's own KV-scale buffers and parameters, as an Attention layer does."""
+    from vllm.model_executor.layers.attention.attention import (
+        set_default_quant_scales,
+    )
+    from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+
+    layer = torch.nn.Module()
+    layer.kv_cache_dtype = "fp8_e4m3"
+    set_default_quant_scales(layer, register_buffer=True)
+    BaseKVCacheMethod(None).create_weights(layer)
+    return layer
+
+
+def test_uncalibrated_fp8_kv_scales_ignore_dummy_loaded_values(fp8_module):
+    from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+
+    fp8 = fp8_module
+    layer = _vllm_fp8_kv_attention_layer()
+    # load_format: dummy fills every parameter, scales included, from
+    # uniform(-1e-3, 1e-3); vLLM's own processing would use a positive value as is.
+    for scale in (layer.q_scale, layer.k_scale, layer.v_scale, layer.prob_scale):
+        scale.data.fill_(5e-4)
+    method = BaseKVCacheMethod(None)
+
+    fp8.process_weights_after_loading_kv_unit_scales(method, layer)
+    # Refit runs post-load processing again after vLLM deleted the parameters.
+    fp8.process_weights_after_loading_kv_unit_scales(method, layer)
+
+    assert not hasattr(layer, "k_scale")
+    assert (layer._q_scale_float, layer._k_scale_float, layer._v_scale_float) == (
+        1.0,
+        1.0,
+        1.0,
+    )
+    for buffer in (layer._q_scale, layer._k_scale, layer._v_scale, layer._prob_scale):
+        assert buffer.item() == 1.0
+
+
+def test_calibrated_fp8_kv_scales_reject_flashinfer(fp8_module):
+    flashinfer_backend = pytest.importorskip(
+        "vllm.v1.attention.backends.flashinfer"
+    ).FlashInferBackend
+    from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
+
+    layer = _vllm_fp8_kv_attention_layer()
+    layer.attn_backend = flashinfer_backend
+
+    with pytest.raises(NotImplementedError, match="FlashInfer"):
+        fp8_module.process_weights_after_loading_kv(BaseKVCacheMethod(None), layer)
+
+
 @pytest.mark.parametrize("per_token", [False, True])
 def test_init_fp8_accepts_dynamic_cache(fp8_module, monkeypatch, per_token):
     fp8 = fp8_module

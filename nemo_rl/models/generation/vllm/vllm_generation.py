@@ -49,8 +49,8 @@ from nemo_rl.models.generation.interfaces import (
     agreed_media_columns,
 )
 from nemo_rl.models.generation.vllm.config import (
-    REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
+    calibrates_fp8_kv_cache_scales,
     validate_vllm_async_actor_settings,
     validate_vllm_quantization_config,
 )
@@ -1868,10 +1868,5 @@ class VllmGeneration(GenerationInterface):
 
     @property
     def requires_kv_scale_sync(self) -> bool:
-        """Check if KV cache scales should be synchronized during refit.
-
-        Only traditional per-tensor FP8 caches expose separately refittable
-        k_scale/v_scale parameters.
-        """
-        kv_cache_dtype = self.cfg["vllm_cfg"].get("kv_cache_dtype")
-        return kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES
+        """Check if KV cache scales should be calibrated and synchronized during refit."""
+        return calibrates_fp8_kv_cache_scales(self.cfg["vllm_cfg"])

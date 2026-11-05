@@ -655,22 +655,26 @@ def test_uses_fp8_kv_cache_excludes_deepseek_mla(cache_dtype, expected):
 
 @pytest.mark.vllm
 @pytest.mark.parametrize(
-    ("cache_dtype", "expected"),
+    ("cache_dtype", "calibrate", "expected"),
     [
-        ("fp8", True),
-        ("fp8_e4m3", True),
-        ("fp8_ds_mla", False),
-        ("fp8_per_token_head", False),
-        ("auto", False),
+        ("fp8", True, True),
+        ("fp8_e4m3", True, True),
+        ("fp8_e4m3", False, False),
+        ("fp8_ds_mla", True, False),
+        ("fp8_per_token_head", True, False),
+        ("auto", True, False),
     ],
 )
-def test_generation_kv_scale_sync_excludes_dynamic_cache(cache_dtype, expected):
+def test_generation_kv_scale_sync_excludes_dynamic_cache(
+    cache_dtype, calibrate, expected
+):
     from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
 
     generation = VllmGeneration.__new__(VllmGeneration)
     generation.cfg = {
         "vllm_cfg": {
             "kv_cache_dtype": cache_dtype,
+            "calibrate_kv_cache_scales": calibrate,
         }
     }
     generation.weight_synchronizer = None

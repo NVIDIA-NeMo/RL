@@ -509,6 +509,7 @@ policy:
       # auto, fp8, fp8_e4m3, fp8_ds_mla, or fp8_per_token_head.
       # fp8_per_token_head requires precision=fp8 and a compatible backend (TRITON_ATTN).
       kv_cache_dtype: "auto"
+      calibrate_kv_cache_scales: false
       logprobs_mode: processed_logprobs
       fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head}
       # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.

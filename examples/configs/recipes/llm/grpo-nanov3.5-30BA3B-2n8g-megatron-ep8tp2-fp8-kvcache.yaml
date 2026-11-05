@@ -53,6 +53,7 @@ policy:
     vllm_cfg:
       precision: fp8
       kv_cache_dtype: fp8
+      calibrate_kv_cache_scales: true
       tensor_parallel_size: 4
       gpu_memory_utilization: 0.5
       # R3 needs vLLM to return routes for every prompt token, not cached prefixes.

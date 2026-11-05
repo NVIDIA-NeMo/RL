@@ -27,6 +27,7 @@ from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.utils import replace_parameter
 from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
@@ -34,6 +35,7 @@ from vllm.v1.engine.utils import CoreEngineProcManager
 
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
+    calibrates_fp8_kv_cache_scales,
     resolve_vllm_kv_cache_dtype,
 )
 from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
@@ -53,6 +55,11 @@ from nemo_rl.models.generation.vllm.quantization.utils import (
 from nemo_rl.models.generation.vllm.utils import is_grouped_moe_expert_weight_name
 
 logger = init_logger(__name__)
+
+# Captured before apply_fp8_patches replaces it.
+VLLM_KV_CACHE_PROCESS_WEIGHTS_AFTER_LOADING = (
+    BaseKVCacheMethod.process_weights_after_loading
+)
 
 FP8_BLOCK_QUANT_KWARGS = {
     "activation_scheme": "dynamic",
@@ -77,6 +84,7 @@ class FP8Config:
     num_last_layers_in_bf16: int = 0
     model_parallel_size: int = None
     kv_cache_dtype: str = "auto"
+    calibrate_kv_cache_scales: bool = False
     use_fp8_weights: bool = True  # Whether model weights are quantized to FP8
     is_mx: bool = False
     # Weights arrive from the trainer already MXFP8-quantized (E4M3 data plus
@@ -244,14 +252,19 @@ def apply_fp8_patches(self, fp8_config):
                     )
                 )
 
-            # Static scales mode: patch process_weights_after_loading to preserve
-            # k_scale/v_scale for manual updates.
+            # Calibrated scales keep k_scale/v_scale for refit; uncalibrated ones
+            # are fixed at 1.0.
             if global_fp8_config.kv_cache_dtype in REFITTABLE_FP8_KV_CACHE_DTYPES:
                 func5_path = (
                     "vllm.model_executor.layers.quantization.kv_cache."
                     "BaseKVCacheMethod.process_weights_after_loading"
                 )
-                patcher5 = patch(func5_path, process_weights_after_loading_kv)
+                patcher5 = patch(
+                    func5_path,
+                    process_weights_after_loading_kv
+                    if global_fp8_config.calibrate_kv_cache_scales
+                    else process_weights_after_loading_kv_unit_scales,
+                )
                 fp8_state.vllm_patches.append(patcher5)
 
         # These patches add support for pow2, e8 dynamic activation scalings factors which are believed to have higher
@@ -391,6 +404,7 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "num_last_layers_in_bf16": num_last_layers_in_bf16,
         "model_parallel_size": model_parallel_size,
         "kv_cache_dtype": kv_cache_dtype,
+        "calibrate_kv_cache_scales": calibrates_fp8_kv_cache_scales(vllm_cfg),
         "use_fp8_weights": use_fp8_weights,
         "is_deepseek_v4": getattr(config, "model_type", None) == "deepseek_v4",
         "refit_with_reload_api": bool(vllm_cfg.get("refit_with_reload_api")),
@@ -1815,6 +1829,21 @@ def apply_monolithic_mxfp8_moe(
     return output[..., :unpadded_hidden_size].contiguous()
 
 
+def process_weights_after_loading_kv_unit_scales(self, layer) -> None:
+    """BaseKVCacheMethod.process_weights_after_loading with every scale fixed at 1.0.
+
+    Used when FP8 KV scales are not calibrated, so no refit overwrites them.
+    Resets the loaded q/k/v/prob scales to vLLM's "not loaded" sentinel and lets
+    vLLM's own processing fall back to 1.0. This discards checkpoint scales and
+    the random values that ``load_format: dummy`` writes into the scales.
+    """
+    # Refit runs this again after vLLM deleted the scale parameters.
+    if hasattr(layer, "q_scale"):
+        for scale in (layer.q_scale, layer.k_scale, layer.v_scale, layer.prob_scale):
+            scale.data.fill_(-1.0)
+    VLLM_KV_CACHE_PROCESS_WEIGHTS_AFTER_LOADING(self, layer)
+
+
 def process_weights_after_loading_kv(self, layer) -> None:
     """Modified version of BaseKVCacheMethod.process_weights_after_loading.
 
@@ -1828,10 +1857,21 @@ def process_weights_after_loading_kv(self, layer) -> None:
     ``BaseKVCacheMethod.process_weights_after_loading`` in
     ``vllm/model_executor/layers/quantization/kv_cache.py`` minus the parameter
     deletion.
+
+    Rejects the FlashInfer backend: it takes the scales as Python floats, which
+    the decode CUDA graphs captured at startup freeze, so decode would keep the
+    startup scales and never use the calibrated scales that refit sends.
     """
     from vllm.platforms import current_platform
     from vllm.utils.torch_utils import is_quantized_kv_cache
     from vllm.v1.kv_cache_interface import kv_cache_uses_per_token_head_scales
+
+    if layer.attn_backend.get_name() == "FLASHINFER":
+        raise NotImplementedError(
+            "calibrate_kv_cache_scales=true is not supported with the FlashInfer "
+            "attention backend; set calibrate_kv_cache_scales=false or use "
+            "another attention backend."
+        )
 
     # Per-token-head quantized KV cache: scales are computed dynamically per
     # (token, head) in the kernel at cache-write time. Nothing to refit here.

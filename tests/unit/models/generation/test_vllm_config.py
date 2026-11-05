@@ -32,7 +32,11 @@ from nemo_rl.models.generation.vllm.config import (
     "cache_dtype", ["auto", "fp8", "fp8_e4m3", "fp8_ds_mla", "fp8_per_token_head"]
 )
 def test_kv_cache_dtype_is_preserved(cache_dtype: str) -> None:
-    cfg = {"precision": "fp8", "kv_cache_dtype": cache_dtype}
+    cfg = {
+        "precision": "fp8",
+        "kv_cache_dtype": cache_dtype,
+        "calibrate_kv_cache_scales": False,
+    }
     assert resolve_vllm_kv_cache_dtype(cfg) == cache_dtype
     validate_vllm_quantization_config({"vllm_cfg": cfg})
 
@@ -211,6 +215,42 @@ def test_refit_prequantize_validation_allows_omitted_vllm_cfg() -> None:
     generation_config = cast(VllmConfig, {"quant_cfg": None})
 
     validate_vllm_quantization_config(generation_config)
+
+
+@pytest.mark.parametrize(
+    ("vllm_cfg", "error"),
+    [
+        (
+            {
+                "precision": "bfloat16",
+                "kv_cache_dtype": "fp8_e4m3",
+                "calibrate_kv_cache_scales": False,
+            },
+            "requires policy.generation.vllm_cfg.precision='fp8'",
+        ),
+        (
+            {"precision": "fp8", "kv_cache_dtype": "fp8"},
+            "requires policy.generation.vllm_cfg.calibrate_kv_cache_scales",
+        ),
+        (
+            {
+                "precision": "fp8",
+                "kv_cache_dtype": "fp8_e4m3",
+                "calibrate_kv_cache_scales": False,
+            },
+            None,
+        ),
+        ({"precision": "fp8", "kv_cache_dtype": "fp8_ds_mla"}, None),
+    ],
+)
+def test_fp8_kv_cache_validation(vllm_cfg: dict, error: str | None) -> None:
+    generation_config = cast(VllmConfig, {"vllm_cfg": vllm_cfg})
+
+    if error is None:
+        validate_vllm_quantization_config(generation_config)
+    else:
+        with pytest.raises(ValueError, match=error):
+            validate_vllm_quantization_config(generation_config)
 
 
 def test_configure_generation_config_validates_refit_prequantize() -> None:

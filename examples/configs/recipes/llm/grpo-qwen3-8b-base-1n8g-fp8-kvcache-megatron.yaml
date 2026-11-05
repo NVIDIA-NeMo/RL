@@ -33,6 +33,7 @@ policy:
     vllm_cfg:
       precision: fp8
       kv_cache_dtype: fp8
+      calibrate_kv_cache_scales: true
       use_deep_gemm: true
 data:
   max_input_seq_length: 2048

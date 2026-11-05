@@ -226,6 +226,7 @@ policy: &POLICY_BASE
             async_engine: false
             precision: ${...precision}
             kv_cache_dtype: "auto"
+            calibrate_kv_cache_scales: false
             logprobs_mode: processed_logprobs
             fp32_lm_head: ${...megatron_cfg.fp32_lm_head}
             # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.

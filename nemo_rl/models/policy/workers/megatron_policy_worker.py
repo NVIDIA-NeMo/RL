@@ -80,8 +80,8 @@ from nemo_rl.models.generation.megatron.megatron_worker import (
     _configure_inference_optimized_layer_spec,
 )
 from nemo_rl.models.generation.vllm.config import (
-    REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
+    calibrates_fp8_kv_cache_scales,
     parse_nvfp4_pertoken_rollout,
 )
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
@@ -3706,8 +3706,8 @@ class MegatronPolicyWorkerImpl(
                     "FP8 KV cache needs per-layer attention scales, but no "
                     "language-model 'self_attention.linear_qkv' weight was found "
                     "in the Megatron-Bridge conversion tasks of this model. MLA "
-                    "attention has no per-tensor KV-scale refit; use "
-                    "kv_cache_dtype='auto'."
+                    "attention has no per-tensor KV-scale refit; set "
+                    "calibrate_kv_cache_scales=false to run with 1.0 scales."
                 )
             self._fp8_kv_attention_prefixes = prefixes
         return self._fp8_kv_attention_prefixes
@@ -3769,8 +3769,7 @@ class MegatronPolicyWorkerImpl(
             for name, tensor in draft_weights:
                 yield f"draft.{name}", tensor
 
-        # Only per-tensor FP8 caches have scales to refit, as in
-        # VllmGeneration.requires_kv_scale_sync (not fp8_ds_mla or per-token-head).
+        # Same condition as VllmGeneration.requires_kv_scale_sync.
         use_fp8_kv_cache = False
         if (
             "generation" in self.cfg
@@ -3781,8 +3780,7 @@ class MegatronPolicyWorkerImpl(
             use_fp8_kv_cache = (
                 "vllm_cfg" in generation_cfg
                 and "kv_cache_dtype" in generation_cfg["vllm_cfg"]
-                and generation_cfg["vllm_cfg"]["kv_cache_dtype"]
-                in REFITTABLE_FP8_KV_CACHE_DTYPES
+                and calibrates_fp8_kv_cache_scales(generation_cfg["vllm_cfg"])
             )
 
         if not use_fp8_kv_cache:
