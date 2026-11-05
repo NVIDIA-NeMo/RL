@@ -1,0 +1,12 @@
+defaults: grpo-qwen3-8b-base-1n8g-fp8-kvcache-megatron.yaml
+checkpointing:
+  checkpoint_dir: results/grpo_qwen3_8b_fp8_kvcache_flashinfer
+policy:
+  generation:
+    vllm_cfg:
+      calibrate_kv_cache_scales: false
+    vllm_kwargs:
+      attention_backend: FLASHINFER
+      # Keep queries in BF16; only K/V are stored in FP8.
+      attention_config:
+        disable_flashinfer_q_quantization: true
