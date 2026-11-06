@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -142,6 +142,8 @@ from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
+from nemo_rl.models.generation.trtllm import TrtllmConfig, TrtllmGeneration
+from nemo_rl.models.generation.trtllm.config import replica_width
 from nemo_rl.models.generation.vllm import VllmGeneration
 from nemo_rl.models.generation.vllm.config import VllmConfig
 from nemo_rl.models.megatron.router_replay import (
@@ -541,6 +543,12 @@ def _build_clusters(
                 gpus_per_instance = vllm_cfg["tensor_parallel_size"] * vllm_cfg.get(
                     "pipeline_parallel_size", 1
                 )
+            elif backend == "trtllm":
+                # Under PD disaggregation the unit to keep inside one NVLink
+                # domain is the whole replica, not one engine (as in grpo.setup).
+                gpus_per_instance = replica_width(
+                    cast(TrtllmConfig, generation_config_dict)
+                )
             elif backend == "dynamo":
                 gpus_per_instance = DynamoConfig.model_validate(
                     generation_config_dict
@@ -556,7 +564,7 @@ def _build_clusters(
             else:
                 raise ValueError(
                     "single_controller_utils.setup only supports vllm, sglang, "
-                    f"megatron, or dynamo generation; got {backend!r}"
+                    f"trtllm, megatron, or dynamo generation; got {backend!r}"
                 )
             nodes_per_instance = (
                 gpus_per_instance + inference_gpus_per_node - 1
@@ -619,7 +627,7 @@ def _build_generation(
     tokenizer: Optional[PreTrainedTokenizerBase] = None,
     processor: Optional[AutoProcessor] = None,
 ) -> tuple[Any, float]:
-    """Spin up the generation backend (vLLM, SGLang, Megatron, or managed Dynamo).
+    """Spin up the generation backend (vLLM, SGLang, TRT-LLM, Megatron, or managed Dynamo).
 
     Args:
         inference_cluster: Ray virtual cluster the generation workers run on.
@@ -632,8 +640,8 @@ def _build_generation(
 
     Returns:
         A tuple of (generation object, wall time spent in this call). The
-        generation object is a VllmGeneration, SGLangGeneration, MegatronGeneration,
-        or DynamoGeneration.
+        generation object is a VllmGeneration, SGLangGeneration, TrtllmGeneration,
+        MegatronGeneration, or DynamoGeneration.
     """
     t0 = time.perf_counter()
     generation_config = master_config.policy["generation"]
@@ -650,6 +658,15 @@ def _build_generation(
             cluster=inference_cluster,
             config=vllm_config,
             defer_model_load=defer_model_load,
+        )
+
+    elif backend == "trtllm":
+        assert not defer_model_load, (
+            "defer_model_load is only supported for the vllm backend"
+        )
+        gen = TrtllmGeneration(
+            cluster=inference_cluster,
+            config=cast(TrtllmConfig, generation_config),
         )
 
     elif backend == "sglang":
@@ -696,8 +713,8 @@ def _build_generation(
 
     else:
         raise ValueError(
-            "single_controller_utils.setup only supports vllm, sglang, megatron, or "
-            f"dynamo generation; got {backend!r}"
+            "single_controller_utils.setup only supports vllm, sglang, trtllm, "
+            f"megatron, or dynamo generation; got {backend!r}"
         )
 
     if not defer_model_load:
@@ -855,16 +872,54 @@ def _spinup_gym(
     return shard_set, time.perf_counter() - t0
 
 
+def _spinup_gym_after_generation(
+    master_config: MasterConfig,
+    tokenizer: PreTrainedTokenizerBase,
+    generation_future: Future,
+) -> tuple[NemoGymShardSet, float]:
+    """Spin up NeMo-Gym once a backend that cannot reserve URLs has started.
+
+    TRT-LLM reports its OpenAI server (or PD frontend) URLs only after its
+    engines are up. Waiting here, on a build-pool thread, lets that startup
+    overlap trainer initialization instead of running ahead of it.
+
+    Args:
+        master_config: SC MasterConfig.
+        tokenizer: Forwarded to :func:`_spinup_gym`.
+        generation_future: Future of the ``_build_generation`` task. A failed
+            build re-raises here, so Gym never starts against missing engines.
+
+    Returns:
+        A tuple of (NeMo-Gym shard set, wall time spent in Gym spinup only).
+    """
+    generation, _ = generation_future.result()
+    base_urls = list(generation.dp_openai_server_base_urls or [])
+    if not base_urls or not all(base_urls):
+        raise ValueError(
+            "NeMo-Gym needs an OpenAI server URL from every generation shard; "
+            f"got {base_urls!r}. For TRT-LLM set trtllm_cfg.expose_http_server=true."
+        )
+    # TRT-LLM's OpenAI servers and PD frontends do not check an API key.
+    return _spinup_gym(
+        master_config=master_config,
+        base_urls=base_urls,
+        tokenizer=tokenizer,
+        policy_api_key=None,
+    )
+
+
 def _generation_max_seq_len(generation_config) -> int:
     """Return the per-backend max sequence length.
 
     vllm and dynamo (which manages vLLM workers) use vllm_cfg.max_model_len;
-    sglang uses sglang_cfg.context_length; megatron uses
-    mcore_generation_config.max_model_len.
+    trtllm uses trtllm_cfg.max_model_len; sglang uses sglang_cfg.context_length;
+    megatron uses mcore_generation_config.max_model_len.
     """
     backend = generation_config["backend"]
     if backend in ("vllm", "dynamo"):
         return generation_config["vllm_cfg"]["max_model_len"]
+    if backend == "trtllm":
+        return generation_config["trtllm_cfg"]["max_model_len"]
     if backend == "sglang":
         return generation_config["sglang_cfg"]["context_length"]
     if backend == "megatron":
@@ -1399,9 +1454,9 @@ def setup_single_controller(
                 "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
-        if generation_config["backend"] not in ("vllm", "megatron"):
+        if generation_config["backend"] not in ("vllm", "megatron", "trtllm"):
             raise NotImplementedError(
-                "token_capture.enabled supports vllm or megatron; got "
+                "token_capture.enabled supports vllm, megatron or trtllm; got "
                 f"{generation_config['backend']!r}"
             )
         if (
@@ -1615,9 +1670,13 @@ def setup_single_controller(
     use_nemo_gym = should_use_nemo_gym(master_config)
     data_tokenizer = processor if processor is not None else tokenizer
     is_vlm = processor is not None
-    if use_nemo_gym and generation_config["backend"] not in ("vllm", "megatron"):
+    if use_nemo_gym and generation_config["backend"] not in (
+        "vllm",
+        "megatron",
+        "trtllm",
+    ):
         raise NotImplementedError(
-            "SC NeMo-Gym integration currently supports the vllm and megatron backends only; got "
+            "SC NeMo-Gym integration supports the vllm, megatron, and trtllm backends; got "
             f"{generation_config['backend']!r}"
         )
     # Backend settings checks are pure config: run them before anything builds.
@@ -1759,6 +1818,9 @@ def setup_single_controller(
     generation = None
     defer_generation_model_load = False
     gen_reserve_time = 0.0
+    # True when the Gym spinup needs URLs only a finished generation build reports
+    # (TRT-LLM); the Gym task then waits on that build instead of reserving ahead.
+    gym_waits_for_generation = False
     # Started inside the use_nemo_gym branch below, not here: main's parallel-build
     # restructure leaves `generation` as None at this point, and the router needs a
     # live generation to front. None is also the correct value whenever the router
@@ -1933,6 +1995,15 @@ def setup_single_controller(
                 flush=True,
             )
             gym_base_urls: list[Optional[str]] = list(megatron_reserved_urls)
+        elif generation_config["backend"] == "trtllm":
+            # TRT-LLM publishes its server (or PD frontend) URLs only after engine
+            # startup and has no vLLM-style deferred load. The generation build is
+            # submitted with the trainer below, and the Gym task waits on that
+            # build's future for the URLs, so engine startup overlaps trainer init.
+            # TrtllmGeneration.validate_settings rejects the generation router,
+            # so no router URL is needed up front.
+            gym_waits_for_generation = True
+            gym_base_urls = []
         else:
             # defer generation, only get base_urls for nemo_gym spinup
             generation, gen_reserve_time = _build_generation(
@@ -1958,17 +2029,25 @@ def setup_single_controller(
                 ray.kill(megatron_port_holder)
             raise
         # add nemo_gym spinup task
-        build_tasks["nemo_gym"] = partial(
-            _spinup_gym,
-            master_config=master_config,
-            base_urls=cast(list[str], gym_spinup_base_urls),
-            tokenizer=tokenizer,
-            # Only the deferred vLLM backend exists at this point and can carry a
-            # key; a Megatron generation server is built later and checks none.
-            policy_api_key=(
-                generation.http_server_api_key if generation is not None else None
-            ),
-        )
+        if gym_waits_for_generation:
+            # Bound to the generation build's future at submission time below.
+            build_tasks["nemo_gym"] = partial(
+                _spinup_gym_after_generation,
+                master_config=master_config,
+                tokenizer=tokenizer,
+            )
+        else:
+            build_tasks["nemo_gym"] = partial(
+                _spinup_gym,
+                master_config=master_config,
+                base_urls=cast(list[str], gym_spinup_base_urls),
+                tokenizer=tokenizer,
+                # Only the deferred vLLM backend exists at this point and can carry
+                # a key; a Megatron generation server is built later and checks none.
+                policy_api_key=(
+                    generation.http_server_api_key if generation is not None else None
+                ),
+            )
 
     if megatron_backend and colocated:
         # Colocated Megatron generation wraps the trainer's worker group,
@@ -2004,7 +2083,17 @@ def setup_single_controller(
     nemo_gym_shards = None
     try:
         with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
-            submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
+            for name, fn in build_tasks.items():
+                if name == "nemo_gym" and gym_waits_for_generation:
+                    continue
+                submitted[name] = executor.submit(fn)
+            if gym_waits_for_generation:
+                # Its own pool thread blocks on the generation build, never the
+                # trainer's, so the two still come up in parallel.
+                submitted["nemo_gym"] = executor.submit(
+                    build_tasks["nemo_gym"],
+                    generation_future=submitted["generation"],
+                )
             if preloaded_training_data is not None:
                 dataset, _val_dataset, env_handles, dataloader = preloaded_training_data
             else:

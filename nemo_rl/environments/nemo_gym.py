@@ -797,13 +797,15 @@ def _reject_typed_environment_servers(global_config: Mapping[str, Any]) -> None:
 def _external_staging_backend(token_capture: Dict[str, Any]) -> str:
     """Map the setup-derived generation backend to Gym's capture backend."""
     generation_backend = token_capture.get("generation_backend")
-    if generation_backend == "vllm":
+    # The TRT-LLM PD frontends host capture over the vLLM-worker wire
+    # (trtllm/token_capture.py).
+    if generation_backend in ("vllm", "trtllm"):
         return "vllm_worker"
     if generation_backend == "megatron":
         return "megatron_worker"
     raise ValueError(
         "token_capture.enabled requires setup-derived generation_backend to be "
-        f"'vllm' or 'megatron'; got {generation_backend!r}"
+        f"'vllm', 'megatron' or 'trtllm'; got {generation_backend!r}"
     )
 
 

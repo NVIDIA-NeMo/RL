@@ -432,6 +432,7 @@ def test_the_frontend_tokenizer_renders_the_history_tool_calls(monkeypatch):
         template_kwargs,
         eos_token_ids,
         chat_template=None,
+        required_prefix_ids=None,
     ):
         rendered["messages"] = messages
         return [1, 2, 3]

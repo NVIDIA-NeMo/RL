@@ -22,7 +22,7 @@ to time-multiplex GPU memory between training and inference phases.
 import asyncio
 import os
 from collections import defaultdict
-from typing import Any, AsyncGenerator, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union, cast
 
 import numpy as np
 import ray
@@ -46,9 +46,76 @@ from nemo_rl.models.generation.trtllm.config import (
     role_tensor_parallel_size,
 )
 
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data_plane.interfaces import DataPlaneConfig
+
 
 class TrtllmGeneration(GenerationInterface):
     """TRT-LLM generation backend (requires trtllm_cfg.async_engine=true)."""
+
+    @classmethod
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
+        """Reject SingleController options TRT-LLM has no backend support for.
+
+        SC drives TRT-LLM as a fixed, non-colocated fleet over the existing
+        HTTP (and PD frontend) and collective weight-update paths. Per-shard
+        quarantine/restart and the generation router need backend hooks
+        TRT-LLM does not implement, and token capture is hosted only by the PD
+        frontends, so these fail here, before any worker reserves GPUs, rather
+        than at the first refit or rollout.
+        """
+        generation = cast(TrtllmConfig, master_config.policy["generation"])
+        trtllm_cfg = generation["trtllm_cfg"]
+        if not trtllm_cfg.get("async_engine"):
+            raise ValueError("SC TRT-LLM requires trtllm_cfg.async_engine=true")
+        if generation["colocated"]["enabled"]:
+            raise ValueError("SC TRT-LLM requires non-colocated generation")
+        fleet = master_config.async_rl.generation_fleet_health
+        if fleet.enabled or fleet.restart_dead_shards:
+            raise NotImplementedError(
+                "SC TRT-LLM requires a fixed fleet: disable "
+                "async_rl.generation_fleet_health.enabled and restart_dead_shards"
+            )
+        reject_unenforceable_refit_deadline("SC TRT-LLM", fleet.refit_timeout_s)
+        if master_config.token_capture.enabled:
+            # Deferred: router_replay imports nemo_rl.models.policy, which
+            # imports this package.
+            from nemo_rl.models.megatron.router_replay import router_replay_enabled
+
+            disagg = resolve_disagg_layout(generation)
+            if not (disagg.enabled and disagg.frontend_tokenize):
+                raise NotImplementedError(
+                    "SC TRT-LLM token capture is hosted by the PD disagg frontends: "
+                    "set policy.generation.disaggregation.enabled=true and "
+                    "frontend_tokenize=true"
+                )
+            if generation.get("top_logprobs"):
+                raise NotImplementedError(
+                    "SC TRT-LLM token capture does not stage sampler top-k "
+                    "log-probs; set policy.generation.top_logprobs=0"
+                )
+            if router_replay_enabled(master_config.policy):
+                raise NotImplementedError(
+                    "SC TRT-LLM does not report routed experts; disable "
+                    "policy.router_replay"
+                )
+        if master_config.async_rl.generation_router.enabled:
+            raise NotImplementedError(
+                "SC TRT-LLM serves NeMo-Gym through its own servers (PD frontends "
+                "under disaggregation); disable async_rl.generation_router"
+            )
+        # Read the raw flag, not should_use_nemo_gym(): that helper asserts on
+        # the HTTP-server prerequisites, and this check owns those messages.
+        use_nemo_gym = bool(master_config.env.get("should_use_nemo_gym"))
+        if resolve_disagg_layout(generation).enabled and not use_nemo_gym:
+            raise ValueError(
+                "SC TRT-LLM PD disaggregation requires the NeMo-Gym HTTP rollout "
+                "path (env.should_use_nemo_gym=true): the direct token path "
+                "would bypass the disagg frontends"
+            )
+        if use_nemo_gym and not trtllm_cfg.get("expose_http_server"):
+            raise ValueError("SC NeMo-Gym requires trtllm_cfg.expose_http_server=true")
 
     @staticmethod
     def init_cluster_placement_groups(
@@ -991,6 +1058,50 @@ class TrtllmGeneration(GenerationInterface):
           * ``NcclExtension.update_weights_via_ipc_zmq`` (IPC-ZMQ path)
         """
         return True
+
+    def setup_token_capture(
+        self,
+        dp_cfg: "DataPlaneConfig",
+        staging_partition: str,
+        *,
+        capture_media: bool = False,
+        top_logprobs: int = 0,
+    ) -> None:
+        """Install token capture on every PD disagg frontend.
+
+        The frontends are where Gym's capture admissions enter and finished
+        responses leave, so they stage each call's token delta to
+        TransferQueue (see :mod:`nemo_rl.models.generation.trtllm.token_capture`).
+        Text-only; returns ``None`` (no media column spec).
+        """
+        if capture_media:
+            raise NotImplementedError("TRT-LLM token capture is text-only")
+        if top_logprobs:
+            raise NotImplementedError(
+                "TRT-LLM token capture does not stage sampler top-k log-probs "
+                "(policy.generation.top_logprobs)"
+            )
+        if not self._disagg_actors:
+            raise NotImplementedError(
+                "TRT-LLM token capture is hosted by the PD disagg frontends; "
+                "enable policy.generation.disaggregation"
+            )
+        ray.get(
+            [
+                actor.setup_token_capture.remote(dp_cfg, staging_partition)
+                for actor in self._disagg_actors
+            ]
+        )
+        return None
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Rotate the weight version the frontends stamp on captured calls."""
+        ray.get(
+            [
+                actor.set_rollout_weight_version.remote(version)
+                for actor in self._disagg_actors
+            ]
+        )
 
     def clear_logger_metrics(self) -> None:
         """No-op: TRT-LLM rollout telemetry is not yet wired up.

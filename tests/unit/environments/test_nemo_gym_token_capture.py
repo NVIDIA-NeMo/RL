@@ -193,7 +193,11 @@ def test_capture_stream_stops_receipt_waits_and_closes_collection(
 
 @pytest.mark.parametrize(
     ("generation_backend", "expected"),
-    [("vllm", "vllm_worker"), ("megatron", "megatron_worker")],
+    [
+        ("vllm", "vllm_worker"),
+        ("trtllm", "vllm_worker"),
+        ("megatron", "megatron_worker"),
+    ],
 )
 def test_external_staging_backend_maps_generation_backend(
     generation_backend: str, expected: str

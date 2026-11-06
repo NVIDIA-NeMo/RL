@@ -119,11 +119,17 @@ async def build_spliced_prompt_ids(
     template_kwargs: dict[str, Any],
     eos_token_ids: Collection[int] | None = None,
     chat_template: str | None = None,
+    required_prefix_ids: list[int] | None = None,
 ) -> list[int]:
     """Render the chat template and splice in the on-policy prefix.
 
     ``eos_token_ids`` is every token that can end a turn (see
     :func:`resolve_eos_token_ids`); ``None`` means only ``tokenizer.eos_token_id``.
+
+    ``required_prefix_ids`` is the exact prefix the prompt must start with.
+    ``None`` takes it from the last assistant message's ``prompt_token_ids`` +
+    ``generation_token_ids``; token capture passes the prefix it resolved from
+    the staged chain instead, and ``[]`` for a text root (no splice).
 
     The single source of truth for turning a conversation into engine prompt
     ids -- shared by the engine adapter's route and the disagg frontend's
@@ -155,7 +161,7 @@ async def build_spliced_prompt_ids(
             chat_template=chat_template,
         )
         # Empty required_prefix_ids on turn one returns the template unchanged.
-        required_prefix_ids, template_prefix_ids = _compute_splice_inputs(
+        message_prefix_ids, template_prefix_ids = _compute_splice_inputs(
             messages,
             conversation,
             tokenizer,
@@ -165,7 +171,11 @@ async def build_spliced_prompt_ids(
         )
         return replace_prefix_tokens(
             tokenizer=tokenizer,
-            model_prefix_token_ids=required_prefix_ids,
+            model_prefix_token_ids=(
+                message_prefix_ids
+                if required_prefix_ids is None
+                else required_prefix_ids
+            ),
             template_prefix_token_ids=template_prefix_ids,
             template_token_ids=prompt_token_ids,
             eos_token_id=eos_token_ids or None,
@@ -181,6 +191,15 @@ async def build_spliced_prompt_ids(
 _TOKENIZE_SHADOW_RATE = float(
     os.environ.get("NRL_TRTLLM_TOKENIZE_SHADOW_RATE", "0") or 0
 )
+
+
+def decode_prompt_token_ids_b64(encoded: str) -> list[int]:
+    """Decode ``prompt_token_ids_b64``: an int32 buffer, as openai_server.py encodes it."""
+    import base64
+
+    import numpy as np
+
+    return np.frombuffer(base64.b64decode(encoded), dtype=np.int32).tolist()
 
 
 def _parse_disaggregated_params(raw: Optional[dict[str, Any]]) -> tuple[Any, bool]:
@@ -498,14 +517,7 @@ def create_app(
         # b64 when gen_tokids_ctxbytes is set, an int array otherwise.
         supplied = body.get("prompt_token_ids") or body.get("prompt_token_ids_b64")
         if isinstance(supplied, str):
-            # Same int32 buffer encoding openai_server.py uses on this hop.
-            import base64
-
-            import numpy as np
-
-            supplied = np.frombuffer(
-                base64.b64decode(supplied), dtype=np.int32
-            ).tolist()
+            supplied = decode_prompt_token_ids_b64(supplied)
 
         if supplied:
             adj_prompt = list(supplied)

@@ -21,6 +21,7 @@ import dataclasses
 import json
 import threading
 import warnings
+from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional
@@ -542,7 +543,7 @@ def test_generation_max_seq_len_reads_dynamo_vllm_cfg():
 
 def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
     """Topology planning reports the supported SC backends instead of KeyError."""
-    master_config = _make_master_config(colocated=False, backend="trtllm")
+    master_config = _make_master_config(colocated=False, backend="unknown_backend")
     master_config.cluster = ClusterConfig(num_nodes=2, gpus_per_node=8, segment_size=1)
     master_config.policy["generation"]["colocated"]["resources"] = {
         "gpus_per_node": 8,
@@ -563,7 +564,10 @@ def test_build_clusters_rejects_unsupported_topology_backend(monkeypatch):
 
     with pytest.raises(
         ValueError,
-        match="only supports vllm, sglang, megatron, or dynamo generation; got 'trtllm'",
+        match=(
+            "only supports vllm, sglang, trtllm, megatron, or dynamo generation; "
+            "got 'unknown_backend'"
+        ),
     ):
         sc_setup_mod._build_clusters(master_config)
 
@@ -4503,3 +4507,219 @@ def test_generation_top_logprobs_requires_score_centering_or_replay():
     mc.policy["generation"]["top_logprobs"] = 4
     with pytest.raises(ValueError, match="only read by loss_fn.score_centering"):
         validate_single_controller_config(mc)
+
+
+def _trtllm_sc_config():
+    mc = _make_master_config(backend="trtllm", env={"should_use_nemo_gym": True})
+    mc.policy["model_name"] = "test-model"
+    mc.policy["generation"].update(
+        {
+            "model_name": "test-model",
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": None,
+            "disaggregation": {
+                "enabled": True,
+                "num_prefill_engines": 1,
+                "num_decode_engines": 1,
+            },
+            "trtllm_cfg": {
+                "async_engine": True,
+                "expose_http_server": True,
+                "max_model_len": 65536,
+                "tensor_parallel_size": 4,
+                # Role-resolved, as configure_generation_config leaves it.
+                "prefill_engine": {"tensor_parallel_size": 2},
+                "decode_engine": {"tensor_parallel_size": 4},
+            },
+        }
+    )
+    mc.async_rl.generation_fleet_health.refit_timeout_s = None
+    return mc
+
+
+def test_build_generation_passes_trtllm_config():
+    mc = _trtllm_sc_config()
+    cluster = MagicMock()
+    with patch.object(sc_setup_mod, "TrtllmGeneration") as constructor:
+        generation, _ = _REAL_BUILD_GENERATION(cluster, mc)
+    constructor.assert_called_once_with(cluster=cluster, config=mc.policy["generation"])
+    generation.finish_generation.assert_called_once_with()
+    with pytest.raises(AssertionError, match="defer_model_load"):
+        _REAL_BUILD_GENERATION(cluster, mc, defer_model_load=True)
+
+
+def test_trtllm_max_sequence_length():
+    generation_config = _trtllm_sc_config().policy["generation"]
+    assert sc_setup_mod._generation_max_seq_len(generation_config) == 65536
+
+
+def test_trtllm_pd_gym_builds_generation_once_before_gym(patched_factories):
+    """Gym gets the PD frontend URLs the single TRT-LLM build reports."""
+    mc = _trtllm_sc_config()
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    fake_gen = patched_factories["fake_gen"]
+    fake_gen.dp_openai_server_base_urls = ["http://pd1:8000/v1", "http://pd2:8000/v1"]
+    events = []
+
+    def build(*args, **kwargs):
+        assert not kwargs.get("defer_model_load")
+        events.append("generation")
+        return fake_gen, 3.0
+
+    def gym(**kwargs):
+        assert events == ["generation"]
+        assert kwargs["base_urls"] == fake_gen.dp_openai_server_base_urls
+        assert kwargs["policy_api_key"] is None
+        events.append("gym")
+        return MagicMock(name="gym_shards"), 2.0
+
+    patched_factories["_build_generation"].side_effect = build
+    with patch.object(sc_setup_mod, "_spinup_gym", side_effect=gym):
+        args, timing = setup_single_controller(mc, MagicMock(pad_token_id=0))
+    assert events == ["generation", "gym"]
+    patched_factories["_build_generation"].assert_called_once()
+    fake_gen.load_and_start.assert_not_called()
+    assert args.gen_handle is fake_gen
+    assert timing.generation_init_time_s == 3.0
+    sync_kwargs = patched_factories["create_weight_synchronizer"].call_args.kwargs
+    assert sync_kwargs["generation_backend"] == "trtllm"
+    assert sync_kwargs["refit_timeout_s"] is None
+
+
+def test_trtllm_gym_generation_build_overlaps_trainer(patched_factories):
+    """TRT-LLM engine startup runs concurrently with trainer init, not before it.
+
+    The generation build blocks until the trainer build has started; a serial
+    setup would never start the trainer, so the wait would time out.
+    """
+    mc = _trtllm_sc_config()
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+    fake_gen = patched_factories["fake_gen"]
+    fake_gen.dp_openai_server_base_urls = ["http://pd1:8000/v1"]
+    trainer_started = threading.Event()
+    generation_done = threading.Event()
+
+    def build_generation(*args, **kwargs):
+        assert trainer_started.wait(timeout=10), "trainer build did not overlap"
+        generation_done.set()
+        return fake_gen, 3.0
+
+    def build_trainer(*args, **kwargs):
+        trainer_started.set()
+        return MagicMock(name="policy"), 0.0
+
+    def gym(**kwargs):
+        assert generation_done.is_set()
+        return MagicMock(name="gym_shards"), 2.0
+
+    patched_factories["_build_generation"].side_effect = build_generation
+    patched_factories["_build_trainer"].side_effect = build_trainer
+    with patch.object(sc_setup_mod, "_spinup_gym", side_effect=gym) as spinup:
+        args, timing = setup_single_controller(mc, MagicMock(pad_token_id=0))
+    spinup.assert_called_once()
+    assert args.gen_handle is fake_gen
+    assert timing.generation_init_time_s == 3.0
+    assert timing.nemo_gym_init_time_s == 2.0
+
+
+def test_spinup_gym_after_generation_rejects_missing_urls():
+    """Gym never starts against a shard that reported no OpenAI server URL."""
+    generation = MagicMock(dp_openai_server_base_urls=["http://a:1/v1", None])
+    future: Future = Future()
+    future.set_result((generation, 1.0))
+    with (
+        patch.object(sc_setup_mod, "_spinup_gym") as spinup,
+        pytest.raises(ValueError, match="expose_http_server"),
+    ):
+        sc_setup_mod._spinup_gym_after_generation(
+            master_config=_trtllm_sc_config(),
+            tokenizer=MagicMock(),
+            generation_future=future,
+        )
+    spinup.assert_not_called()
+
+
+def test_spinup_gym_after_generation_propagates_build_failure():
+    """A failed generation build surfaces from the Gym task instead of hanging it."""
+    future: Future = Future()
+    future.set_exception(RuntimeError("engine failed"))
+    with (
+        patch.object(sc_setup_mod, "_spinup_gym") as spinup,
+        pytest.raises(RuntimeError, match="engine failed"),
+    ):
+        sc_setup_mod._spinup_gym_after_generation(
+            master_config=_trtllm_sc_config(),
+            tokenizer=MagicMock(),
+            generation_future=future,
+        )
+    spinup.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "fleet",
+        "restart",
+        "deadline",
+        "capture_without_frontend_tokenize",
+        "capture_top_logprobs",
+        "capture_router_replay",
+        "router",
+        "sync_engine",
+        "http",
+        "native_pd",
+    ],
+)
+def test_trtllm_unsupported_options_fail_before_resources(patched_factories, option):
+    mc = _trtllm_sc_config()
+    if option == "fleet":
+        mc.async_rl.generation_fleet_health.enabled = True
+    elif option == "restart":
+        mc.async_rl.generation_fleet_health.restart_dead_shards = True
+    elif option == "deadline":
+        mc.async_rl.generation_fleet_health.refit_timeout_s = 300
+    elif option == "capture_without_frontend_tokenize":
+        mc.token_capture.enabled = True
+    elif option == "capture_top_logprobs":
+        mc.token_capture.enabled = True
+        mc.policy["generation"]["disaggregation"]["frontend_tokenize"] = True
+        mc.policy["generation"]["top_logprobs"] = 4
+        mc.loss_fn.score_centering = True
+    elif option == "capture_router_replay":
+        mc.token_capture.enabled = True
+        mc.policy["generation"]["disaggregation"]["frontend_tokenize"] = True
+        mc.policy["router_replay"] = {"enabled": True}
+    elif option == "router":
+        mc.async_rl.generation_router.enabled = True
+    elif option == "sync_engine":
+        mc.policy["generation"]["trtllm_cfg"]["async_engine"] = False
+    elif option == "http":
+        mc.policy["generation"]["trtllm_cfg"]["expose_http_server"] = False
+    elif option == "native_pd":
+        mc.env["should_use_nemo_gym"] = False
+    with pytest.raises((AssertionError, ValueError, NotImplementedError)):
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+    for name in [
+        "_build_clusters",
+        "_build_generation",
+        "_build_trainer",
+    ]:
+        patched_factories[name].assert_not_called()
+
+
+def test_trtllm_token_capture_is_hosted_by_the_pd_frontends():
+    mc = _trtllm_sc_config()
+    mc.token_capture.enabled = True
+    mc.policy["generation"]["disaggregation"]["frontend_tokenize"] = True
+
+    trtllm_generation_cls = sc_setup_mod.TrtllmGeneration
+    trtllm_generation_cls.validate_settings(mc)
+
+    generation = trtllm_generation_cls.__new__(trtllm_generation_cls)
+    generation._disagg_actors = []
+    with pytest.raises(NotImplementedError, match="PD disagg frontends"):
+        generation.setup_token_capture({}, "staging")
+    generation._disagg_actors = [MagicMock()]
+    with pytest.raises(NotImplementedError, match="text-only"):
+        generation.setup_token_capture({}, "staging", capture_media=True)
