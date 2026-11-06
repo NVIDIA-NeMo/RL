@@ -5012,6 +5012,9 @@ def validate(
                         master_config.grpo.deduplicate_multimodal_data
                     ),
                     debug_payload_metrics=master_config.grpo.debug_payload_metrics,
+                    # RL does not train on validation rollouts, so Gym captures none of their
+                    # model calls: a token-capture run stages nothing for them.
+                    skip_token_capture=True,
                 )
                 val_batch = nemo_gym_rollout_result.final_batch
                 gen_metrics = nemo_gym_rollout_result.rollout_metrics

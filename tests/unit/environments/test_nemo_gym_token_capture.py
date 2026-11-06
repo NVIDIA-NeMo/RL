@@ -25,6 +25,7 @@ import pytest
 
 from nemo_rl.environments.nemo_gym import NemoGym, _external_staging_backend
 from nemo_rl.experience.failures import GymTransportError
+from nemo_rl.experience.interfaces import NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY
 
 # Receipt assembly imports nemo_gym at call time (resolve_terminal etc.), so
 # these tests must run in the Nemo_Gym shard, not the base-env Environments one.
@@ -65,6 +66,49 @@ def _capture_stream_env(
         run_examples=lambda **kwargs: [completed(row) for row in kwargs["examples"]]
     )
     return env, rows
+
+
+def test_the_skip_token_capture_key_matches_gym() -> None:
+    """RL copies Gym's key name, because the driver runs without nemo_gym; they must not drift."""
+    from nemo_gym.config import SKIP_TOKEN_CAPTURE_KEY_NAME
+
+    assert NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY == SKIP_TOKEN_CAPTURE_KEY_NAME
+
+
+def test_capture_stream_reads_no_manifest_for_a_rollout_rl_skipped() -> None:
+    gym_result = {"reward": 0.5, "response": {"output": []}}
+
+    async def completed(row: dict) -> tuple[dict, dict]:
+        return row, dict(gym_result)
+
+    env, rows = _capture_stream_env(False, completed)
+    rows[1][NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY] = True
+    rows[1]["_ng_rollout_id"] = "val-1"
+    receipt_rows: list[int] = []
+
+    async def postprocess(row: dict, result: dict) -> dict:
+        receipt_rows.append(row["_rowidx"])
+        return {"owner": row["_rowidx"], **result}
+
+    env._postprocess_receipt_mode = postprocess
+
+    async def collect() -> list:
+        return [item async for item in env.run_rollouts(rows, "test")]
+
+    results = {item[0]: item[2] for item in asyncio.run(collect())}
+
+    # Only the captured rollout's manifest is read; the other keeps its reward and text.
+    assert receipt_rows == [0]
+    assert results[0] == {"owner": 0, **gym_result, "attribution_key": "agent"}
+    assert results[1] == {
+        "message_log": [],
+        "input_message_log": [],
+        "full_result": gym_result,
+        "rollout_id": "val-1",
+        "receipt": None,
+        "skip_token_capture": True,
+        "attribution_key": "agent",
+    }
 
 
 @pytest.mark.parametrize("forest_training", [False, True])

@@ -65,6 +65,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     Completion,
     PromptGroupRecord,
@@ -1244,6 +1245,8 @@ class AsyncNemoGymRolloutImpl:
         # this is NOT the prompt's dataloader position. Do not mutate the source
         # sample. Row-level redispatch reuses these rows and keeps the same ID.
         template_row[NEMO_GYM_TASK_INDEX_KEY] = task_index
+        # This path trains on every rollout it collects, so none skips capture.
+        template_row.pop(NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY, None)
 
         # We do not translate max_seq_len into row-level max_tokens here because that would
         # change semantics from "total sequence length" to "max new tokens".

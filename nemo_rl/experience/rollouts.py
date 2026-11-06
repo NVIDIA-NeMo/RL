@@ -78,6 +78,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
@@ -2414,8 +2415,15 @@ def _prepare_nemo_gym_rows(
     generation_config: GenerationConfig,
     sampling_params: GenerationSamplingParams,
     num_generations: int,
+    *,
+    skip_token_capture: bool = False,
 ) -> None:
-    """Apply NeMo-RL sampling parameters and stable row indices in place."""
+    """Apply NeMo-RL sampling parameters and stable row indices in place.
+
+    ``skip_token_capture=True`` marks rows RL does not train on, such as
+    validation rows, so Gym captures none of their model calls. Otherwise any
+    earlier mark is removed: a row RL trains on never skips capture.
+    """
     if num_generations <= 0 or len(rows) % num_generations != 0:
         raise ValueError("NeMo-Gym rows must contain complete prompt groups")
 
@@ -2481,6 +2489,10 @@ def _prepare_nemo_gym_rows(
         row[NEMO_GYM_GROUP_ID_KEY] = group_ids[group_index]
         row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempts[group_index]
         row[NEMO_GYM_ROLLOUT_INDEX_KEY] = rollout_index
+        if skip_token_capture:
+            row[NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY] = True
+        else:
+            row.pop(NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY, None)
 
 
 def _bucket_nemo_gym_rows_by_instance(
@@ -2697,6 +2709,7 @@ async def run_async_nemo_gym_rollout(
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
     identity_num_generations: Optional[int] = None,
+    skip_token_capture: bool = False,
 ) -> AsyncGenerator[NemoGymRolloutResult, None]:
     """Stream complete NeMo-Gym prompt groups in group-completion order.
 
@@ -2744,6 +2757,9 @@ async def run_async_nemo_gym_rollout(
             prompt-group identity. Defaults to ``num_generations``. Synchronous
             callers set this independently because they collect the full batch as
             one result while preserving per-prompt GenRM cohort identities.
+        skip_token_capture: ``True`` for rows RL does not train on, such as
+            validation rows: Gym then captures none of their model calls, so a
+            token-capture run stages nothing for them in TransferQueue.
 
     Yields:
         ``NemoGymRolloutResult`` objects in prompt-group completion order. Rows
@@ -2850,6 +2866,7 @@ async def run_async_nemo_gym_rollout(
             generation_config,
             sampling_params,
             identity_num_generations,
+            skip_token_capture=skip_token_capture,
         )
         accumulator = _NemoGymStreamAccumulator(
             rows=nemo_gym_rows,
@@ -2963,6 +2980,7 @@ def run_nemo_gym_rollout_sync(
     mask_env_flagged_samples: bool = True,
     deduplicate_multimodal_data: bool = False,
     debug_payload_metrics: bool = False,
+    skip_token_capture: bool = False,
 ) -> NemoGymRolloutResult:
     """Run and return one complete NeMo-Gym batch synchronously.
 
@@ -3001,6 +3019,8 @@ def run_nemo_gym_rollout_sync(
         deduplicate_multimodal_data: Omit initial policy-ready media from the
             remote Gym return and restore it from the input batch.
         debug_payload_metrics: Emit exact Gym Ray-boundary media payload metrics.
+        skip_token_capture: ``True`` for rows RL does not train on, such as
+            validation rows; see :func:`run_async_nemo_gym_rollout`.
 
     Returns:
         The fully postprocessed NeMo-Gym rollout batch in input-row order.
@@ -3039,6 +3059,7 @@ def run_nemo_gym_rollout_sync(
             sampling_params=sampling_params,
             deduplicate_multimodal_data=deduplicate_multimodal_data,
             debug_payload_metrics=debug_payload_metrics,
+            skip_token_capture=skip_token_capture,
         ):
             pass
         if rollout_result is None:

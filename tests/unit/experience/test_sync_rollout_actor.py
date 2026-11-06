@@ -144,3 +144,44 @@ def test_actor_stamps_distinct_groups_and_preserves_multimodal_tags(
 def test_empty_group_index_column_has_row_key_shape():
     assert group_index_column([]).shape == (0, 1)
     assert group_index_column([]).dtype == torch.long
+
+
+@pytest.mark.parametrize(
+    ("call_kwargs", "skip_token_capture"),
+    [({}, False), ({"skip_token_capture": True}, True)],
+)
+def test_actor_forwards_the_token_capture_setting_to_the_gym_rollout(
+    monkeypatch, call_kwargs, skip_token_capture
+):
+    cls = actor_mod.SyncRolloutActor.__ray_metadata__.modified_class
+    actor = object.__new__(cls)
+    actor.policy_generation = MagicMock()
+    actor.tokenizer = SimpleNamespace(pad_token_id=0)
+    actor.task_to_env = {}
+    actor.master_config = SimpleNamespace(
+        policy={"generation": {}},
+        logger=SimpleNamespace(wandb_enabled=False, wandb={}),
+        env={},
+        reward_penalties=None,
+        grpo=SimpleNamespace(
+            deduplicate_multimodal_data=False, debug_payload_metrics=False
+        ),
+    )
+    monkeypatch.setattr(
+        "nemo_rl.environments.nemo_gym.should_use_nemo_gym", lambda _: True
+    )
+    calls = []
+
+    class StopAfterTheRollout(Exception):
+        pass
+
+    def rollout(**kwargs):
+        calls.append(kwargs)
+        raise StopAfterTheRollout
+
+    monkeypatch.setattr(actor_mod, "run_nemo_gym_rollout_sync", rollout)
+
+    with pytest.raises(StopAfterTheRollout):
+        actor.rollout_to_tq(BatchedDataDict({}), partition_id="val", **call_kwargs)
+
+    assert calls[0]["skip_token_capture"] is skip_token_capture

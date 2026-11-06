@@ -8128,6 +8128,11 @@ class TestValidateFunction:
 
         scored_sizes = [c.args[0] for c in policy.prepare_val_partition.call_args_list]
         assert scored_sizes == expected_sizes
+        # Validation rows skip token capture.
+        assert all(
+            c.kwargs["skip_token_capture"] is True
+            for c in rollout_actor.rollout_to_tq.remote.call_args_list
+        )
         # avg_length weighs each wave's mean by its rollout count.
         expected_avg_length = sum(
             10.0 * (i + 1) * n for i, n in enumerate(expected_sizes)
@@ -8196,6 +8201,8 @@ class TestValidateFunction:
         assert sampling_params.temperature == pytest.approx(0.1)
         assert sampling_params.top_p == pytest.approx(0.9)
         assert sampling_params.top_k is None
+        # RL does not train on validation rollouts, so Gym must not capture them.
+        assert mock_rollout.call_args.kwargs["skip_token_capture"] is True
         assert val_metrics["accuracy"] == pytest.approx(0.25)
         assert val_metrics["pass_k"] == pytest.approx(0.5)
 
