@@ -109,7 +109,7 @@ settings. The launcher does not allocate nodes or start the cluster for you.
   checkpoint. Only the lookup table is frozen; Engram projections and gates
   remain trainable. Selected rows are decoded on CPU and transferred to GPU.
   The table is excluded from trainer refit payloads.
-- **Streaming optimizer**: `policy.dtensor_cfg.cpu_offload: true` is required by
+- **Streaming optimizer**: `policy.automodel_cfg.cpu_offload: true` is required by
   `BF16CPUAdamW`. Selecting this optimizer enables GPU gradient accumulation,
   scaling and clipping, followed by chunked CPU updates. Separate gradient
   offload, norm and streaming environment switches are not required.

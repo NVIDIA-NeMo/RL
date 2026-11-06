@@ -71,7 +71,10 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
     prepare_model_forward,
 )
-from nemo_rl.models.automodel.utils import release_moe_dispatcher_state
+from nemo_rl.models.automodel.utils import (
+    presize_hybrid_ep_buffer,
+    release_moe_dispatcher_state,
+)
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -711,6 +714,17 @@ class AutomodelPolicyWorkerImpl(
                 "needs an MoE model whose Automodel class builds its gates from "
                 "moe_overrides (enable_routing_replay), with "
                 "automodel_kwargs.backend.fake_balanced_gate off."
+            )
+
+        hybridep_max_tokens = self.cfg["automodel_cfg"].get(
+            "hybridep_max_tokens_per_rank"
+        )
+        if hybridep_max_tokens is not None and not presize_hybrid_ep_buffer(
+            self.model, hybridep_max_tokens
+        ):
+            raise ValueError(
+                "automodel_cfg.hybridep_max_tokens_per_rank is set, but the model has "
+                "no HybridEP dispatcher"
             )
 
         # Initialize reference model if requested. With deferred loading the
