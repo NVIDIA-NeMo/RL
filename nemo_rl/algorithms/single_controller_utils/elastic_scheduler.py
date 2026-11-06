@@ -27,8 +27,14 @@ transition and reports back when it has finished, so each rule is testable witho
 cluster. Nothing in the SingleController drives it yet.
 
 The rules implement equations 3-6 of the QwenGyre paper (arXiv 2609.33848, section 4).
-All capacities and counters are in *execution* units: one rollout execution occupies one
-slot of a cell's rollout capacity from launch until it terminates.
+
+Units: capacities and the ``d``/``p``/``f`` counters are in *execution* units, where one
+rollout execution occupies one slot of a cell's rollout capacity from launch until it
+terminates. The SingleController admits, launches and commits whole prompt *groups* of
+``group_size`` executions, so it uses the ``*_groups`` methods, and
+:meth:`ElasticSchedulerPolicy.executions` is the one place groups become executions.
+Supply (``ready_groups``, ``groups_needed``) and ``batch_groups`` stay in groups, as in
+the paper.
 """
 
 from __future__ import annotations
@@ -71,8 +77,9 @@ class ElasticSchedulerPolicy:
         min_supply_fraction: ``rho_min`` in (0, 1], the fraction of ``B`` that ready,
             unassigned groups must cover before a cell may move to training.
         supply_hold_s: ``tau``, seconds the supply condition must hold continuously.
-        burst_dispatch: ``mu * N * B``, executions dispatched after each burst's weight
-            publication. Only the core-retention rule (eq. 6) reads it.
+        group_size: ``N``, executions per prompt group.
+        steps_per_burst: ``mu``, training steps per weight publication. Only the
+            core-retention rule (eq. 6) reads it, through :attr:`burst_dispatch`.
     """
 
     num_cells: int
@@ -81,7 +88,19 @@ class ElasticSchedulerPolicy:
     batch_groups: int
     min_supply_fraction: float
     supply_hold_s: float
-    burst_dispatch: int
+    group_size: int
+    steps_per_burst: int = 1
+
+    @property
+    def burst_dispatch(self) -> int:
+        """``mu * N * B``: executions dispatched after each burst's weight publication."""
+        return self.executions(self.steps_per_burst * self.batch_groups)
+
+    def executions(self, groups: int) -> int:
+        """Convert a count of prompt groups into executions, ``groups * N``."""
+        if groups < 0:
+            raise ValueError(f"group count must be >= 0, got {groups}")
+        return groups * self.group_size
 
     def __post_init__(self) -> None:
         if self.num_cells < 1:
@@ -100,8 +119,12 @@ class ElasticSchedulerPolicy:
             )
         if self.supply_hold_s < 0:
             raise ValueError(f"supply_hold_s must be >= 0, got {self.supply_hold_s}")
-        if self.burst_dispatch < 0:
-            raise ValueError(f"burst_dispatch must be >= 0, got {self.burst_dispatch}")
+        if self.group_size < 1:
+            raise ValueError(f"group_size must be >= 1, got {self.group_size}")
+        if self.steps_per_burst < 1:
+            raise ValueError(
+                f"steps_per_burst must be >= 1, got {self.steps_per_burst}"
+            )
 
 
 @dataclass(frozen=True)
@@ -350,6 +373,30 @@ class ElasticScheduler:
                 f"cannot finish {count} execution(s) with only {self.running} running"
             )
         self._finished += count
+
+    # Group-unit entry points for the SingleController, which admits, launches and
+    # commits whole prompt groups. Each converts through policy.executions, so the
+    # counters stay in executions and a group is never split across a decision.
+
+    def launchable_groups(self) -> int:
+        """Whole groups that fit eq. 4 now, ``launchable() // N``.
+
+        A remainder smaller than one group stays unlaunched rather than starting part
+        of a group, so ``C_e`` that is not a multiple of ``N`` leaves slots unused.
+        """
+        return self.launchable() // self._policy.group_size
+
+    def record_dispatch_groups(self, groups: int) -> None:
+        """Count prompt groups admitted to the rollout queue."""
+        self.record_dispatch(self._policy.executions(groups))
+
+    def record_launch_groups(self, groups: int) -> None:
+        """Count queued prompt groups whose executions have all started."""
+        self.record_launch(self._policy.executions(groups))
+
+    def record_finish_groups(self, groups: int) -> None:
+        """Count launched prompt groups that terminated, committed or dropped."""
+        self.record_finish(self._policy.executions(groups))
 
     def open_batch(self) -> None:
         """Open a training batch's joining window and restart the supply timer."""

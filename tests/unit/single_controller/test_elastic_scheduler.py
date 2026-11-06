@@ -44,7 +44,8 @@ def _policy(
     batch_groups: int = 4,
     min_supply_fraction: float = 0.5,
     supply_hold_s: float = 5.0,
-    burst_dispatch: int = 16,
+    group_size: int = 4,
+    steps_per_burst: int = 1,
 ) -> ElasticSchedulerPolicy:
     return ElasticSchedulerPolicy(
         num_cells=num_cells,
@@ -53,7 +54,8 @@ def _policy(
         batch_groups=batch_groups,
         min_supply_fraction=min_supply_fraction,
         supply_hold_s=supply_hold_s,
-        burst_dispatch=burst_dispatch,
+        group_size=group_size,
+        steps_per_burst=steps_per_burst,
     )
 
 
@@ -100,7 +102,8 @@ class TestPolicyValidation:
             {"min_supply_fraction": 0.0},
             {"min_supply_fraction": 1.5},
             {"supply_hold_s": -1.0},
-            {"burst_dispatch": -1},
+            {"group_size": 0},
+            {"steps_per_burst": 0},
         ],
     )
     def test_rejects_out_of_range_parameters(self, overrides):
@@ -160,6 +163,81 @@ class TestLaunches:
             scheduler.record_dispatch(-1)
 
 
+class TestGroupUnits:
+    """The SingleController counts prompt groups; the policy counts executions."""
+
+    def test_executions_is_the_one_conversion(self):
+        policy = _policy(group_size=8)
+        assert policy.executions(0) == 0
+        assert policy.executions(3) == 24
+        with pytest.raises(ValueError):
+            policy.executions(-1)
+
+    def test_burst_dispatch_is_mu_n_b(self):
+        assert _policy(batch_groups=4, group_size=8).burst_dispatch == 32
+        policy = _policy(batch_groups=4, group_size=8, steps_per_burst=3)
+        assert policy.burst_dispatch == 96
+
+    def test_group_counters_record_whole_groups_of_executions(self):
+        scheduler, _ = _scheduler(num_cells=2, cell_capacity=16, group_size=4)
+        scheduler.record_dispatch_groups(5)
+        assert (scheduler.dispatched, scheduler.queued) == (20, 20)
+        scheduler.record_launch_groups(3)
+        assert (scheduler.launched, scheduler.running) == (12, 12)
+        scheduler.record_finish_groups(2)
+        assert (scheduler.finished, scheduler.waterlevel) == (8, 12)
+
+    def test_launchable_groups_never_splits_a_group(self):
+        # C_R = 2 * 10 = 20 executions holds five groups of four, not five and a half.
+        scheduler, _ = _scheduler(num_cells=2, cell_capacity=10, group_size=4)
+        scheduler.record_dispatch_groups(8)
+        assert scheduler.launchable() == 20
+        assert scheduler.launchable_groups() == 5
+        scheduler.record_launch_groups(4)
+        # 4 slots left: exactly one more group.
+        assert scheduler.launchable_groups() == 1
+        scheduler.record_launch_groups(1)
+        assert scheduler.launchable() == 0
+
+    def test_a_cell_smaller_than_a_group_launches_nothing(self):
+        scheduler, _ = _scheduler(num_cells=1, cell_capacity=3, group_size=4)
+        scheduler.record_dispatch_groups(1)
+        assert scheduler.launchable() == 3
+        assert scheduler.launchable_groups() == 0
+
+    def test_group_launch_is_checked_in_executions(self):
+        scheduler, _ = _scheduler(num_cells=1, cell_capacity=10, group_size=4)
+        scheduler.record_dispatch_groups(3)
+        with pytest.raises(ValueError, match="cannot launch 12"):
+            scheduler.record_launch_groups(3)
+        scheduler.record_launch_groups(2)
+        with pytest.raises(ValueError, match="cannot finish 12"):
+            scheduler.record_finish_groups(3)
+        with pytest.raises(ValueError):
+            scheduler.record_dispatch_groups(-1)
+
+    def test_eq6_reads_the_burst_dispatch_of_every_step_in_the_burst(self):
+        """mu = 2 doubles the post-publication dispatch eq. 6 must cover."""
+        for steps_per_burst, core_stays in ((1, True), (2, False)):
+            scheduler, clock = _scheduler(
+                num_cells=2,
+                cell_capacity=16,
+                batch_groups=2,
+                group_size=4,
+                steps_per_burst=steps_per_burst,
+            )
+            _run(scheduler, dispatched=8, finished=8)
+            scheduler.open_batch()
+            for cell in range(2):
+                assert _hold_supply(scheduler, clock) == cell
+                _move_to_training(scheduler, cell)
+            scheduler.close_batch()
+            # w = 0; retained capacity C_e = 16; mu N B = 8 * mu.
+            scheduler.record_dispatch(8)
+            plan = scheduler.plan_burst_end(ready_groups=2)
+            assert plan.core_stays_in_training is core_stays
+
+
 class TestTransitionToTraining:
     def test_waterlevel_must_fit_in_the_capacity_left_behind(self):
         """Eq. 5, at its boundary: w == C_R - C_e is enough, one more is not."""
@@ -184,7 +262,7 @@ class TestTransitionToTraining:
 
     def test_single_cell_without_standalone_waits_for_every_execution(self):
         """K=1 and C_s=0 degenerates to Colocate: the pool switches only when empty."""
-        scheduler, clock = _scheduler(num_cells=1, cell_capacity=10, burst_dispatch=0)
+        scheduler, clock = _scheduler(num_cells=1, cell_capacity=10)
         _run(scheduler, dispatched=10, finished=9)
         scheduler.open_batch()
         assert _hold_supply(scheduler, clock) is None
@@ -290,13 +368,13 @@ class TestTransitionToTraining:
 
 class TestBurstEnd:
     def _all_training(
-        self, *, standalone_capacity: int = 0, burst_dispatch: int = 16
+        self, *, standalone_capacity: int = 0, group_size: int = 4
     ) -> tuple[ElasticScheduler, _Clock]:
         scheduler, clock = _scheduler(
             num_cells=4,
             cell_capacity=10,
             standalone_capacity=standalone_capacity,
-            burst_dispatch=burst_dispatch,
+            group_size=group_size,
         )
         _run(scheduler, dispatched=20, finished=20)
         scheduler.open_batch()
@@ -314,7 +392,7 @@ class TestBurstEnd:
 
     def test_core_stays_when_capacity_covers_outstanding_and_pending_work(self):
         """Eq. 6 at its boundary: w + mu N B == C_s + (K - 1) C_e."""
-        scheduler, _ = self._all_training(standalone_capacity=4, burst_dispatch=20)
+        scheduler, _ = self._all_training(standalone_capacity=4, group_size=5)
         scheduler.record_dispatch(14)
         assert scheduler.plan_burst_end(ready_groups=4).core_stays_in_training
         scheduler.record_dispatch(1)
@@ -328,7 +406,7 @@ class TestBurstEnd:
         assert scheduler.plan_burst_end(ready_groups=2).core_stays_in_training
 
     def test_single_cell_always_returns_its_core(self):
-        scheduler, clock = _scheduler(num_cells=1, cell_capacity=10, burst_dispatch=4)
+        scheduler, clock = _scheduler(num_cells=1, cell_capacity=10, group_size=1)
         scheduler.open_batch()
         assert _hold_supply(scheduler, clock) == 0
         _move_to_training(scheduler, 0)
@@ -415,7 +493,6 @@ def _simulate(workload: _Workload) -> _SimResult:
     """
     rng = random.Random(workload.seed)
     clock = _Clock()
-    burst_executions = workload.batch_groups * workload.group_size
     scheduler = ElasticScheduler(
         policy=ElasticSchedulerPolicy(
             num_cells=workload.num_cells,
@@ -424,7 +501,7 @@ def _simulate(workload: _Workload) -> _SimResult:
             batch_groups=workload.batch_groups,
             min_supply_fraction=0.5,
             supply_hold_s=5.0,
-            burst_dispatch=burst_executions,
+            group_size=workload.group_size,
         ),
         clock=clock,
     )
