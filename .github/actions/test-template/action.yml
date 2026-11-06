@@ -165,10 +165,17 @@ runs:
         # which sets it only on a RoCE-only fabric. Passing it here overrides that
         # gate (an already-set value is left alone) and also covers processes that
         # never run the data-plane factory, e.g. a bare pytest invocation.
+        # NEMO_RL_REQUIRE_NIXL turns the nixl tests' skip into a failure.
+        # UCX_IB_ROCE_REACHABILITY_MODE=all: this container sees the mlx5
+        # devices but not their RoCE netdevs (gpuNrdma0), so UCX's default
+        # "route" check fails on if_nametoindex and nixl finds no transport
+        # (NIXL_ERR_BACKEND). Mooncake reads the netdev name from sysfs only.
         if [[ "${{ inputs.is_doc_test }}" != "true" ]] && rdma_device_available; then
           RDMA_FLAGS=(--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1
                       --env NEMO_RL_REQUIRE_MOONCAKE=1
-                      --env MC_ENABLE_DEST_DEVICE_AFFINITY=1)
+                      --env MC_ENABLE_DEST_DEVICE_AFFINITY=1
+                      --env NEMO_RL_REQUIRE_NIXL=1
+                      --env UCX_IB_ROCE_REACHABILITY_MODE=all)
         fi
         echo -e "\033[1;34m│  rdma      : ${RDMA_FLAGS[*]:-none}\033[0m"
         echo -e "\033[1;34m└──────────────────────────────────────────────────────────────────────────┘\033[0m"
