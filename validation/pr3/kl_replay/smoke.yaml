@@ -1,0 +1,15 @@
+defaults: ../streaming_smoke.yaml
+grpo:
+  max_num_steps: 1
+checkpointing:
+  enabled: false
+logger:
+  wandb_enabled: false
+  tensorboard_enabled: false
+  log_dir: validation/pr3/kl_replay/results/smoke/logs
+policy:
+  generation:
+    max_new_tokens: 256
+  max_total_sequence_length: 768
+data:
+  max_input_seq_length: 512

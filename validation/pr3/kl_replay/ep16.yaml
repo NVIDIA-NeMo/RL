@@ -1,0 +1,12 @@
+defaults: ../streaming_qwen35.yaml
+grpo:
+  max_num_steps: 212
+checkpointing:
+  enabled: false
+  load_replay_buffer: false
+  checkpoint_dir: validation/pr3/kl_replay/results/capture-unused-checkpoints
+  checkpoint_must_save_by: null
+logger:
+  wandb_enabled: false
+  tensorboard_enabled: false
+  log_dir: validation/pr3/kl_replay/results/capture-logs
