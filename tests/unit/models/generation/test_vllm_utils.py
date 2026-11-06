@@ -1553,15 +1553,19 @@ def test_remap_multimodal_placeholders_rebuilds_real_vllm_placeholder_range():
         (0.0, 0.9, -1, None),  # validation profile
         (0.7, 1.0, None, "matches neither"),
         (1.0, None, None, "top_p must be set explicitly"),
-        (1.0, 1.0, 5, "Top k sampling parameter"),
+        (1.0, 1.0, 5, "must be unset or match the configured top_k \\(20\\)"),
+        (1.0, 1.0, 20, None),  # the train profile pins top_k=20
+        (0.0, 0.9, 20, "must be unset or match the configured top_k \\(-1\\)"),
     ],
 )
 def test_check_sampling_param(temperature, top_p, top_k, error) -> None:
     generation_config = {
         "temperature": 1.0,
         "top_p": 1.0,
+        "top_k": 20,
         "val_temperature": 0.0,
         "val_top_p": 0.9,
+        "val_top_k": None,
     }
     with (
         contextlib.nullcontext()

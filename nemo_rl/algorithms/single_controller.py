@@ -222,6 +222,7 @@ from nemo_rl.experience.rollouts import get_effort_config, get_nemo_gym_thinking
 from nemo_rl.experience.route_plan import decode_route_plan
 from nemo_rl.models.generation.engine_supervisor import EngineSupervisor
 from nemo_rl.models.generation.fleet_health import ShardState
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
@@ -381,7 +382,7 @@ def _train_fields_for_step(
     *,
     policy_logprobs_required: bool,
     reference_logprobs_required: bool,
-    score_centering: bool,
+    sampler_head_required: bool,
 ) -> tuple[str, ...]:
     """Return only the data-plane columns produced for this train step."""
     fields = tuple(
@@ -390,7 +391,7 @@ def _train_fields_for_step(
         if (policy_logprobs_required or field != "prev_logprobs")
         and (reference_logprobs_required or field != "reference_policy_logprobs")
     )
-    if score_centering:
+    if sampler_head_required:
         fields += SAMPLER_TOPK_FIELDS
     return fields
 
@@ -507,10 +508,13 @@ class SingleControllerActor:
         self._train_fields = _train_fields_for_step(
             policy_logprobs_required=self._policy_logprobs_required,
             reference_logprobs_required=self._reference_logprobs_required,
-            score_centering=master_config.loss_fn.score_centering,
+            # Score centering and sampler replay both read the captured head.
+            sampler_head_required=master_config.loss_fn.score_centering
+            or sampler_replay_enabled(master_config.policy["generation"]),
         )
         self._dp_client = actor_args.dp_client
-        if master_config.data_plane["backend"] == "mooncake_cpu":
+        self._dp_backend = master_config.data_plane["backend"]
+        if self._dp_backend == "mooncake_cpu":
             if actor_args.last_checkpoint_path is not None or (
                 master_config.checkpointing["enabled"]
                 and master_config.checkpointing.get("save_data_plane")
@@ -2410,7 +2414,19 @@ class SingleControllerActor:
         finalizer, advantage, generation, critic and teacher sources into one
         cluster view. The fan-out blocks on ``ray.get``, so it runs off the
         event loop.
+
+        nixl's unit metrics (retired memory, SSD spills) are logged even with
+        observability off: a leak only shows over a long run, in the runs that
+        need it.
         """
+        if self._dp_backend == "nixl":
+            from nemo_rl.data_plane.adapters.tq_nixl import unit_metrics
+
+            unit = unit_metrics()
+            if unit:
+                self._logger.log_metrics(
+                    unit, self._train_steps, prefix="data_plane/nixl"
+                )
         result = await asyncio.to_thread(
             self._trainer.get_data_plane_step_metrics,
             total_step_time,

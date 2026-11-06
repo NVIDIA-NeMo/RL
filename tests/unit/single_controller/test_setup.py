@@ -95,6 +95,7 @@ from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.nemo_gym import validate_dataset_agent_coverage
 from nemo_rl.experience.rollout_recovery import RecoveryTargetLevel
 from nemo_rl.experience.rollouts import EffortLevelsConfig
+from nemo_rl.models.generation.interfaces import SamplerReplayConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.utils.config import (
     load_config,
@@ -698,22 +699,71 @@ def test_token_capture_top_logprobs_rejects_megatron_generation():
         validate_single_controller_config(mc)
 
 
-def test_score_centering_requires_top_logprobs_and_unfiltered_sampling():
+def test_score_centering_requires_top_logprobs():
     mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
 
     with pytest.raises(ValueError, match="policy.generation.top_logprobs > 0"):
         validate_single_controller_config(mc)
 
+
+def test_score_centering_with_filtered_sampling_requires_head_covering_top_k():
+    """The captured head must be at least top_k wide to hold the sampler's kept set."""
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
     mc.token_capture.enabled = True
-    mc.policy["generation"]["top_logprobs"] = 4
-    mc.policy["generation"]["vllm_kwargs"] = {"max_logprobs": 4}
-    mc.policy["generation"]["top_p"] = 0.9
-    mc.policy["generation"]["temperature"] = 1.0
-    mc.policy["generation"]["top_k"] = None
-    with pytest.raises(ValueError, match="unfiltered sampling"):
+    generation = mc.policy["generation"]
+    generation.update(
+        top_logprobs=4,
+        vllm_kwargs={"max_logprobs": 20},
+        temperature=1.0,
+        top_p=0.9,
+        top_k=20,
+        sampler_replay=SamplerReplayConfig(enabled=True),
+    )
+    generation.setdefault("vllm_cfg", {})["logprobs_mode"] = "processed_logprobs"
+    for top_logprobs in (4, 19):
+        generation["top_logprobs"] = top_logprobs
+        with pytest.raises(ValueError, match="top_logprobs >= policy.generation.top_k"):
+            validate_single_controller_config(mc)
+
+    generation["top_logprobs"] = 20
+    validate_single_controller_config(mc)
+
+
+def test_score_centering_with_filtered_sampling_requires_sampler_support_replay():
+    """Centering under filters is exact only over the sampler's realized support."""
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+    mc.token_capture.enabled = True
+    generation = mc.policy["generation"]
+    generation.update(
+        top_logprobs=20,
+        vllm_kwargs={"max_logprobs": 20},
+        temperature=1.0,
+        top_p=0.9,
+        top_k=20,
+    )
+    generation.setdefault("vllm_cfg", {})["logprobs_mode"] = "processed_logprobs"
+    with pytest.raises(ValueError, match="sampler_replay.enabled=true"):
         validate_single_controller_config(mc)
 
-    mc.policy["generation"]["top_p"] = 1.0
+
+def test_sampler_support_replay_without_score_centering():
+    """Replay alone reads the captured head, which must hold the whole kept set."""
+    mc = _make_master_config()
+    mc.token_capture.enabled = True
+    generation = mc.policy["generation"]
+    generation.update(
+        top_logprobs=19,
+        vllm_kwargs={"max_logprobs": 20},
+        temperature=1.0,
+        top_p=0.9,
+        top_k=20,
+        sampler_replay=SamplerReplayConfig(enabled=True),
+    )
+    generation.setdefault("vllm_cfg", {})["logprobs_mode"] = "processed_logprobs"
+    with pytest.raises(ValueError, match="top_logprobs >= policy.generation.top_k"):
+        validate_single_controller_config(mc)
+
+    generation["top_logprobs"] = 20
     validate_single_controller_config(mc)
 
 
@@ -2332,7 +2382,12 @@ class TestSetup:
         patched_factories["_build_trainer"].side_effect = _build_trainer
         patched_factories["setup_response_data"].side_effect = _setup_response_data
 
-        with self._gym_patches():
+        # Longer than the load's 30 s wait below: a trainer with no Megatron
+        # train_iters must not wait for the dataset at all.
+        with (
+            self._gym_patches(),
+            patch.object(sc_setup_mod, "_TRAINER_BUILD_DATASET_WAIT_S", 60.0),
+        ):
             actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert actor_args.dataloader is patched_factories["dataloader"]
@@ -2385,26 +2440,37 @@ class TestSetup:
         fake_policy.shutdown.assert_not_called()
         assert mc.policy["megatron_cfg"]["train_iters"] == 2
 
-    def test_gym_vllm_rebuilds_trainer_when_clamp_binds(
+    def test_gym_vllm_rebuilds_trainer_when_a_slow_load_shows_the_clamp_binds(
         self, patched_factories, capsys
     ):
-        """More steps than the data holds: the speculative trainer is replaced."""
+        """The dataset outlasts the trainer's wait and the data holds fewer steps than
+        asked for: the speculative trainer is replaced."""
         mc = self._gym_vllm_config(
             megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
         )
-        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
         train_iters_at_build: list[int] = []
         stale_policy = MagicMock(name="stale_policy")
         final_policy = patched_factories["fake_policy"]
         policies = iter([stale_policy, final_policy])
+        trainer_started = threading.Event()
 
         def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
             train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            trainer_started.set()
             return next(policies), 0.0
 
-        patched_factories["_build_trainer"].side_effect = _build_trainer
+        def _setup_response_data(*args: Any, **kwargs: Any) -> tuple[list[int], None]:
+            # Slow: not done until the speculative trainer has started.
+            assert trainer_started.wait(timeout=30)
+            return list(range(8)), None
 
-        with self._gym_patches():
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+        patched_factories["setup_response_data"].side_effect = _setup_response_data
+
+        with (
+            self._gym_patches(),
+            patch.object(sc_setup_mod, "_TRAINER_BUILD_DATASET_WAIT_S", 0.0),
+        ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
@@ -2414,6 +2480,34 @@ class TestSetup:
         assert mc.grpo.max_num_steps == 8
         assert mc.policy["megatron_cfg"]["train_iters"] == 8
         assert "Rebuilding the trainer" in capsys.readouterr().out
+
+    def test_gym_vllm_builds_trainer_once_when_the_dataset_arrives_in_time(
+        self, patched_factories, capsys
+    ):
+        """More steps than the data holds, but the dataset is ready within the
+        trainer's wait: the trainer is built once, for the clamped count."""
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
+        )
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        train_iters_at_build: list[int] = []
+        fake_policy = patched_factories["fake_policy"]
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            return fake_policy, 0.0
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+
+        with self._gym_patches():
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # patched dataloader has len() == 4 -> 2 * 4 = 8 < 1000.
+        assert train_iters_at_build == [8]
+        fake_policy.shutdown.assert_not_called()
+        assert mc.grpo.max_num_steps == 8
+        assert mc.policy["megatron_cfg"]["train_iters"] == 8
+        assert "Rebuilding the trainer" not in capsys.readouterr().out
 
     def test_gym_vllm_dataset_load_failure_shuts_down_gym(self, patched_factories):
         mc = self._gym_vllm_config()
@@ -2428,6 +2522,28 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+        fake_gym_shards.shutdown.assert_called_once()
+
+    def test_gym_vllm_dataset_load_failure_before_trainer_starts_shuts_down_gym(
+        self, patched_factories
+    ):
+        """The load fails while the Megatron trainer waits for it: the trainer is
+        never built, and Gym is still shut down."""
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
+        )
+        fake_gym_shards = MagicMock(name="nemo_gym_shards")
+        patched_factories["setup_response_data"].side_effect = RuntimeError(
+            "bad data path"
+        )
+
+        with (
+            self._gym_patches(fake_gym_shards),
+            pytest.raises(RuntimeError, match="bad data path"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_trainer"].assert_not_called()
         fake_gym_shards.shutdown.assert_called_once()
 
     def test_gym_vllm_resume_builds_trainer_once_with_clamped_train_iters(
@@ -4447,7 +4563,7 @@ def test_score_centering_rejects_invalid_top_logprobs(count):
         validate_single_controller_config(mc)
 
 
-def test_generation_top_logprobs_requires_score_centering():
+def test_generation_top_logprobs_requires_score_centering_or_replay():
     mc = _make_master_config()
     mc.token_capture.enabled = True
     mc.policy["generation"]["top_logprobs"] = 4

@@ -242,6 +242,19 @@ def _apply_fp32_lm_head(vllm_cfg: dict[str, Any], vllm_kwargs: dict[str, Any]) -
     hf_overrides["head_dtype"] = "float32"
 
 
+def _use_vllm_sampling_defaults(llm_kwargs: dict[str, Any]) -> None:
+    """Keep vLLM from taking sampling defaults from the model's generation_config.json.
+
+    With ``generation_config="vllm"``, a request that leaves a sampling field
+    unset gets vLLM's neutral value instead of the model file's (for example
+    Qwen2.5-Instruct's ``repetition_penalty: 1.05``), which the trainer does not
+    replay, and a request without ``max_tokens`` is no longer limited by the
+    model file's ``max_new_tokens``. EOS ids still load from the model file. A
+    ``generation_config`` set in ``vllm_kwargs`` is kept.
+    """
+    llm_kwargs.setdefault("generation_config", "vllm")
+
+
 def _validate_worker_extension_cls(
     vllm_kwargs: dict[str, Any], required_worker_extension_cls: str
 ) -> None:
@@ -804,6 +817,7 @@ class BaseVllmGenerationWorker:
                 temporal_patch_size=video_config.temporal_patch_size,
             )
         _configure_nvfp4_pertoken_engine_kwargs(self.cfg, llm_kwargs)
+        _use_vllm_sampling_defaults(llm_kwargs)
         llm_kwargs.setdefault("worker_extension_cls", default_worker_extension_cls)
         _maybe_enable_vllm_native_tracing(llm_kwargs)
         self._create_engine(llm_kwargs)
