@@ -36,11 +36,15 @@
   "all_rank_reports_verified": 112,
   "findings": "EP16_FINDINGS.md",
   "production_layout_followup": {
-    "state": "PREPARED",
+    "job_id": 21391011,
+    "state": "RUNNING",
+    "submitted_at": "2026-11-06T06:54:35-08:00",
+    "code_commit": "756c5eb77",
     "nodes": 2,
     "gpus_per_node": 8,
     "partition": "interactive",
     "max_allocation_hours": 4,
+    "result_directory": "results/production-layout-21391011",
     "new_rollouts": false,
     "product_code_changed": false
   },

@@ -1,7 +1,40 @@
 # Streaming KL/performance investigation handoff
 
 User authorized completing same-checkpoint/same-rollout KL, numerical state and
-fixed-workload/actual-overlap diagnosis. Keep the separate300-step run running.
+fixed-workload/actual-overlap diagnosis. The separate300-step run is complete;
+preserve checkpoint300 and do not launch a continuation.
+
+Latest verified2026-11-06 06:55PST (supersedes historical status below):
+
+- Original300 and refreshed8plots COMPLETE, pushed5dd1a2735; no continuation.
+- Diagnostic21373254 COMPLETED0:0,53m32s; all13source hashes matched at end.
+  Sourcec7ddf1035. Seven cases/112rank files verified, archived ep16-summary.json,
+  ep16-native-capture-check.json,ep16-rank-manifest.json,ep16-source-hashes.txt.
+  Read EP16_FINDINGS.md. Original1%BF16 gate staysFAILED.
+- Stored-input genKL full/split differs5.5e-13, independentK3error3.8e-9.
+  Fullrepeat exactall16; fixedshardstream matches independentnumerator reference
+  exactly in grads/model/public+rawoptimizer. Originalnormalizergradgap1.20855%.
+  NEW production DP placement30.6616%global gradientdifference; recomputedLP
+  full/split20.2634%. Needslayoutcontrol, doNOTdismissas1%rounding/declarebugfixed.
+- Fixedworker medianfull5.452882s/split8.692046s (3alternatingpairs). No rollout/
+  Ray/TQnetwork included. Nativefull/streamtokens differ despite sameprompts/IDs.
+  Warmungated traces intersect26.77363ms/8108intervals, buthistoricalcrossnode
+  clock-offsetboundmissing: provisional; notthroughput. Profileexportadds220s.
+- Followup21391011 RUNNING onpool0-[00148,01102],2nodes16H100,interactive4hmax,
+  image1030, auto-exit/release. No newrollout/300run. Reuses SAME saved32responses
+  and pinned210. Entrypoint run_layout.sh->distributed.py --replay-script
+  production_layout.py. Code committed/PUSHED756c5eb77. Worker,oldparityharness
+  AND replay.py unchanged. Wrappermakes full-inputcontrols useproductionDP
+  microbatches too; validatesfetchedvalid-tokenfields/dtypes, recordsinitial
+  optimizer/schedulercounters. Exactmatchproductionstream-vs-numeratorwould
+  narrow30%findingtoexecutionlayout; mismatchrequiresstateinvestigation.
+- New10minwatcher uvPID1876913 (--result-prefix production-layout) resumesTHIS
+  same thread on start/terminal/stall. Logwatch-layout.log; main300notice already
+  seededhandled. Olddedicatedwatcherendednormallyafter21373254COMPLETED.
+  CheckcurrentlivePIDs/logs. No agents/newthreads/duplicateallocations.
+- Freeze diagnosticpy/sh/yaml afterfollowupsource-hashes capture. Keep pin210
+  and originalcaptures untilfollowup/retriesfinish. Productsourcehashes still
+  7f598242.../ccb26bda...; noold900/MCore/siblingRL-pr4963changes.
 
 Latest verified 2026-11-06 06:04 PST: original streaming LA0 reached300,
 checkpoint300 durable; final21331930 COMPLETED0:0. Do not launch any continuation.
