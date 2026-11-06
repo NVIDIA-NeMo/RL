@@ -318,6 +318,18 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
                 "nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker",
                 config,
             )
+            if (config.get("generation") or {}).get("_dynamo_role") is not None:
+                # One half of a prefill/decode pair behind Dynamo: the worker
+                # class that builds the state-handoff engine.
+                if config.get("quant_cfg") is not None:
+                    raise ValueError(
+                        "policy.quant_cfg is not supported for a Megatron engine "
+                        "served through Dynamo (policy.generation._dynamo_role)."
+                    )
+                worker_builder_cls_fqn = (
+                    "nemo_rl.models.policy.workers.megatron_policy_worker."
+                    "MegatronDynamoPolicyWorker"
+                )
             tp_size = config["megatron_cfg"]["tensor_model_parallel_size"]
             pp_size = config["megatron_cfg"]["pipeline_model_parallel_size"]
             cp_size = config["megatron_cfg"]["context_parallel_size"]

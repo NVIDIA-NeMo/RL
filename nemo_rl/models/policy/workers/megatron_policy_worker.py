@@ -74,6 +74,10 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.experience.route_assembly import RouteLayout
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.generation.megatron.dynamo_worker_mixin import (
+    MegatronDynamoGenerationMixin,
+    require_megatron_dynamo_integration,
+)
 from nemo_rl.models.generation.megatron.megatron_worker import (
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
@@ -5467,3 +5471,22 @@ class MegatronPolicyWorkerImpl(
 )  # pragma: no cover
 class MegatronPolicyWorker(MegatronPolicyWorkerImpl):
     pass
+
+
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
+)  # pragma: no cover
+class MegatronDynamoPolicyWorker(
+    MegatronDynamoGenerationMixin, MegatronPolicyWorkerImpl
+):
+    """A prefill or decode engine served through Dynamo.
+
+    ``Policy`` picks this class over ``MegatronPolicyWorker`` when the engine's
+    config carries ``generation._dynamo_role``; the mixin's engine-build hooks
+    then override the plain ones unconditionally.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Before the model loads, not at the first refit that builds the engine.
+        require_megatron_dynamo_integration()
+        super().__init__(*args, **kwargs)

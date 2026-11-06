@@ -41,7 +41,6 @@ from nemo_rl.models.generation.megatron.dynamo_config import (
     dynamo_enabled,
     engine_widths,
     replica_width,
-    validate_megatron_dynamo_generation,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
@@ -236,6 +235,16 @@ class MegatronGeneration(GenerationInterface):
                 "colocated generation shares the training policy's worker group."
             )
 
+        # The role is written into each prefill/decode engine's own config by
+        # MegatronDynamoGeneration; those derived configs never come back
+        # through here, so a role in the user's config is always a stray one
+        # that would hand the trainer's policy the Dynamo engine worker.
+        if "_dynamo_role" in policy_config["generation"]:
+            raise ValueError(
+                "policy.generation._dynamo_role is set per engine by "
+                "MegatronDynamoGeneration; remove it from the config"
+            )
+
         mcore_cfg = cast(MCoreGenerationConfig, policy_config["generation"])[
             "mcore_generation_config"
         ]
@@ -259,24 +268,6 @@ class MegatronGeneration(GenerationInterface):
                 "async_rl.generation_fleet_health.enabled=true is not supported "
                 f"for the {cls.__name__} generation backend"
             )
-        if dynamo_enabled(policy_config["generation"]):
-            cls._validate_dynamo_settings(master_config)
-
-    @classmethod
-    def _validate_dynamo_settings(cls, master_config: "MasterConfig") -> None:
-        """Reject ``policy.generation.dynamo=true`` until the engine fleet exists.
-
-        The config is checked first so a shape the fleet could never serve is
-        named as such; any config is then refused, because nothing builds
-        prefill/decode engines yet and the run would otherwise train plain
-        aggregated engines.
-        """
-        validate_megatron_dynamo_generation(master_config.policy["generation"])
-        raise NotImplementedError(
-            "policy.generation.dynamo=true is not served by MegatronGeneration yet: "
-            "the Megatron prefill/decode engine fleet is not built. Remove "
-            "policy.generation.dynamo."
-        )
 
     @classmethod
     def verify_served_addresses(
