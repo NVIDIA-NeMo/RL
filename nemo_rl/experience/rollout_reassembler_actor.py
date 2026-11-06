@@ -24,6 +24,10 @@ from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.schema import forest_row_ids
+from nemo_rl.distributed.actor_environments import (
+    NEMO_GYM_ACTOR_FQN,
+    ROLLOUT_REASSEMBLER_ACTOR_FQN,
+)
 from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 from nemo_rl.experience.rollout_reassembler import (
     FinalizedGroup,
@@ -253,8 +257,14 @@ def create_rollout_reassembler_actors(
     """Construct and validate the pool after TQ partitions are registered."""
     if num_workers <= 0:
         raise ValueError(f"num_reassembler_workers must be positive, got {num_workers}")
+    # Deferred: the registry loads driver-only virtual-cluster dependencies.
+    from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
+
+    same_env = get_actor_python_env(
+        ROLLOUT_REASSEMBLER_ACTOR_FQN
+    ) == get_actor_python_env(NEMO_GYM_ACTOR_FQN)
     runtime_env = make_actor_runtime_env(
-        "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor"
+        NEMO_GYM_ACTOR_FQN if same_env else ROLLOUT_REASSEMBLER_ACTOR_FQN
     )
     actors = [
         RolloutReassemblerActor.options(runtime_env=runtime_env).remote(

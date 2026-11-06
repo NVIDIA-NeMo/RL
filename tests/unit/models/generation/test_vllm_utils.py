@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import math
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -34,6 +35,7 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    check_sampling_param,
     compute_engine_step_metrics,
     compute_spec_decode_metrics,
     encode_counter_key,
@@ -1542,3 +1544,37 @@ def test_remap_multimodal_placeholders_rebuilds_real_vllm_placeholder_range():
     assert isinstance(moved, PlaceholderRange)
     assert (moved.offset, moved.length) == (3, 3)
     assert moved.is_embed is is_embed
+
+
+@pytest.mark.parametrize(
+    ("temperature", "top_p", "top_k", "error"),
+    [
+        (1.0, 1.0, None, None),  # train profile
+        (0.0, 0.9, -1, None),  # validation profile
+        (0.7, 1.0, None, "matches neither"),
+        (1.0, None, None, "top_p must be set explicitly"),
+        (1.0, 1.0, 5, "must be unset or match the configured top_k \\(20\\)"),
+        (1.0, 1.0, 20, None),  # the train profile pins top_k=20
+        (0.0, 0.9, 20, "must be unset or match the configured top_k \\(-1\\)"),
+    ],
+)
+def test_check_sampling_param(temperature, top_p, top_k, error) -> None:
+    generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 20,
+        "val_temperature": 0.0,
+        "val_top_p": 0.9,
+        "val_top_k": None,
+    }
+    with (
+        contextlib.nullcontext()
+        if error is None
+        else pytest.raises(ValueError, match=error)
+    ):
+        check_sampling_param(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            generation_config=generation_config,
+        )

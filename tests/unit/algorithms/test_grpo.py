@@ -74,6 +74,7 @@ from nemo_rl.algorithms.grpo import (
     _validate_multimodal_dedup_capability,
     _validate_seq_logprob_error_in_loss,
     _validate_use_kl_in_reward_compat,
+    _validate_val_sampling,
     aggregate_rollout_metrics,
     async_grpo_train,
     compute_and_apply_seq_logprob_error_masking,
@@ -127,7 +128,10 @@ from nemo_rl.experience.interfaces import (
 from nemo_rl.experience.rollouts import calculate_rewards
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo import DynamoConfig
-from nemo_rl.models.generation.interfaces import should_use_async_rollouts
+from nemo_rl.models.generation.interfaces import (
+    SamplerReplayConfig,
+    should_use_async_rollouts,
+)
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
@@ -9018,17 +9022,57 @@ class TestValidateFunction:
         self, mock_grpo_components, backend
     ):
         master_config = mock_grpo_components["master_config"]
-        # val_top_k trips the check right after the backend/Gym one, so
-        # reaching it proves this backend was accepted.
-        master_config.policy["generation"].update(
-            {"backend": backend, "val_temperature": 0.1, "val_top_k": 5}
+        # A val_top_k change alone trips the check right after the backend/Gym
+        # one, so reaching it proves this backend was accepted.
+        generation_config = master_config.policy["generation"]
+        generation_config.update(
+            {"backend": backend, "val_top_k": (generation_config["top_k"] or 0) + 5}
         )
 
         with (
             patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True),
-            pytest.raises(AssertionError, match="val_top_k is not supported"),
+            pytest.raises(AssertionError, match="val_top_k differs from top_k"),
         ):
             setup(master_config, MagicMock(), MagicMock(), None)
+
+    def test_setup_rejects_sampler_support_replay(self, mock_grpo_components):
+        """Replay reads the captured sampler head, which only SingleController stages."""
+        master_config = mock_grpo_components["master_config"]
+        master_config.policy["generation"]["sampler_replay"] = SamplerReplayConfig(
+            enabled=True
+        )
+
+        with pytest.raises(ValueError, match="sampler_replay.*legacy GRPO"):
+            setup(master_config, MagicMock(), MagicMock(), None)
+
+    @pytest.mark.parametrize(
+        "val_temperature,val_top_k,rejected",
+        [
+            (0.1, 50, False),  # val_top_k inherits top_k (${.top_k})
+            (0.1, None, False),  # the server tells validation apart by temperature
+            (1.0, None, True),  # same temperature and top_p: val_top_k is ignored
+        ],
+    )
+    def test_val_top_k_on_the_gym_path(
+        self, mock_grpo_components, val_temperature, val_top_k, rejected
+    ):
+        """The vLLM server pins top_k per sampling profile, told apart by temperature/top_p."""
+        config = mock_grpo_components["master_config"]
+        config.policy["generation"].update(
+            backend="vllm",
+            temperature=1.0,
+            top_p=1.0,
+            top_k=50,
+            val_temperature=val_temperature,
+            val_top_p=1.0,
+            val_top_k=val_top_k,
+        )
+        with patch("nemo_rl.algorithms.grpo.should_use_nemo_gym", return_value=True):
+            if rejected:
+                with pytest.raises(AssertionError, match="val_top_k"):
+                    _validate_val_sampling(config)
+            else:
+                _validate_val_sampling(config)
 
     def test_validate_returns_empty_when_no_dataloader(self, mock_grpo_components):
         """Test that validate returns empty dicts when no dataloader is provided."""
