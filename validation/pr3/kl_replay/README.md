@@ -86,3 +86,12 @@ streaming. It validates actual fetched columns and records initial resumed
 optimizer/scheduler counters. submit_layout.sh adapts debug.sh to two interactive
 nodes/image1030; COMMAND mode releases both nodes when run_layout.sh finishes.
 It reuses the first saved capture, without new rollouts, W&B or checkpoint writes.
+Follow-up21391011 completed: the large placement-dependent gradient gap falls to
+about1.19%(stored LP) or1.13%(recomputed LP) with identical microbatches, still
+above the original1%contract. See production-layout-summary.json and the full
+all-rank/input/counter audit in production-layout-rank-manifest.json.
+
+compare_saved_logprobs.sh runs a CPU-only check of saved valid-token LP tensors
+across the two completed jobs, without new model inference or training. It writes
+lp-comparison.json under the follow-up result directory. Source tensor file
+hashes and comparison-script hash are included in that artifact.

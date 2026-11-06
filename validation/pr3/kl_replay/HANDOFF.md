@@ -4,7 +4,36 @@ User authorized completing same-checkpoint/same-rollout KL, numerical state and
 fixed-workload/actual-overlap diagnosis. The separate300-step run is complete;
 preserve checkpoint300 and do not launch a continuation.
 
-Latest verified2026-11-06 06:55PST (supersedes historical status below):
+Latest verified2026-11-06 07:34PST (supersedes all historical status below):
+
+- Original300,8plots,21373254,21391011 andCPU21392643 ALLCOMPLETED0:0.
+  No activePR3training/diagnosticjob and no continuation needed. Preserve300.
+- Followup21391011 source756c5eb77,22m08s,all16sourcehashes matched;112rank
+  files/all16counter210/inputIDs+validcolumns/dtypes/layouts verified. Initial
+  rawmomentsBF16/scalespresent, LR1e-6. Exactfullrepeat; fixedsplit matches
+  independentnumeratorgrad/model/public+rawoptimizer onALL16ranks.
+- MatchingproductionDPmicrobatches reduces30.6616%stored-LPgradientgap to
+  1.18555%, and20.2634%recomputedpipelinegap to1.13169%. Original1%BF16
+  qualification STAYSFAILED; don't relabelpass. This supportslayout-dependent
+  execution plusnormalizerrounding; exactoperator and300stepcausalKLgapunknown.
+- Newfull/recomputedproductionevalLPmaxdiff0. CPU21392643(3m07s)checksold
+  productionLPvsnewunifiedfull: ALL38413validtokens bitexact acrossallocations.
+  Oldfullvsunifiedfullmax.676,p99.15555. Postupdatenumerator/fixedsplit/prodsplit
+  savedLPsbitexact too; directraw-statecomparisonprod-vs-numeratorNOTrecorded.
+  DoNOTinferthatmissingcomparisonwasexecuted. Normalization-onlypostupdate
+  maxLPdiff4.2069,p99.2161,3tokens>1; thisusesoldrollout, notnextliveLA0genKL.
+- Unifiedlayoutfixedworkerfull5.630319s/split8.732814s median3pairs (excludes
+  rollout/networkRayTQ), noendtoendspeedupestablished. Earlierwarmungated26.77ms
+  traceintersectionremainsprovisionalwithoutcapture-timehostclockoffsetbound.
+- Archivedproduction-layout-summary.json, -rank-manifest.json, -source-hashes.txt,
+  -lp-comparison.json. EP16_FINDINGS.md andRESULTS.md explainfindings/limits.
+  CPUcomparisonpy/sh onlypostprocesssavedtensors; nosubagents/newthreads,
+  no900/MCore/siblingexperimentchanges. Preservepin210/rawcapturesforfollowup.
+- Dedicatedwatch1876913/1876993endednormallyafterterminalnotice. Oldread-only
+  watch3727915wasverifiedasTHISrepo'sandstoppedafterallPR3jobscompleted; logsretained.
+  No autorerun needed; anyfuturedebugmustreuseevidence/explicitremainingquestion.
+
+Historical status2026-11-06 06:55PST (superseded):
 
 - Original300 and refreshed8plots COMPLETE, pushed5dd1a2735; no continuation.
 - Diagnostic21373254 COMPLETED0:0,53m32s; all13source hashes matched at end.

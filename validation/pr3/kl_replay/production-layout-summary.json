@@ -1,0 +1,412 @@
+{
+  "source_sha": "756c5eb77e5120d181f1a387bbd83d63ddcb4387",
+  "kind": "real_rollout_diagnostic_only",
+  "releases_training": false,
+  "capture_version": 210,
+  "sample_count": 32,
+  "sample_ids": [
+    "6b84cce8-a3c3-40c4-8791-639e2e0460b0_g0",
+    "6b84cce8-a3c3-40c4-8791-639e2e0460b0_g1",
+    "6b84cce8-a3c3-40c4-8791-639e2e0460b0_g2",
+    "6b84cce8-a3c3-40c4-8791-639e2e0460b0_g3",
+    "329799f0-2f47-4636-bb2d-816cf30fcf0c_g0",
+    "329799f0-2f47-4636-bb2d-816cf30fcf0c_g1",
+    "329799f0-2f47-4636-bb2d-816cf30fcf0c_g2",
+    "329799f0-2f47-4636-bb2d-816cf30fcf0c_g3",
+    "52e76c17-b5f5-4fcf-a37b-015878fa03fd_g0",
+    "52e76c17-b5f5-4fcf-a37b-015878fa03fd_g1",
+    "52e76c17-b5f5-4fcf-a37b-015878fa03fd_g2",
+    "52e76c17-b5f5-4fcf-a37b-015878fa03fd_g3",
+    "74fccd23-7342-4fe4-aabc-3c5acc29d4ae_g0",
+    "74fccd23-7342-4fe4-aabc-3c5acc29d4ae_g1",
+    "74fccd23-7342-4fe4-aabc-3c5acc29d4ae_g2",
+    "74fccd23-7342-4fe4-aabc-3c5acc29d4ae_g3",
+    "3ad2cddf-c214-4f0c-aa67-40f2ba7396e4_g0",
+    "3ad2cddf-c214-4f0c-aa67-40f2ba7396e4_g1",
+    "3ad2cddf-c214-4f0c-aa67-40f2ba7396e4_g2",
+    "3ad2cddf-c214-4f0c-aa67-40f2ba7396e4_g3",
+    "43916112-a359-4510-ada1-bdaee59b265d_g0",
+    "43916112-a359-4510-ada1-bdaee59b265d_g1",
+    "43916112-a359-4510-ada1-bdaee59b265d_g2",
+    "43916112-a359-4510-ada1-bdaee59b265d_g3",
+    "cc98c6fd-056e-4d40-8a2b-f5496515efbf_g0",
+    "cc98c6fd-056e-4d40-8a2b-f5496515efbf_g1",
+    "cc98c6fd-056e-4d40-8a2b-f5496515efbf_g2",
+    "cc98c6fd-056e-4d40-8a2b-f5496515efbf_g3",
+    "ebe170eb-80f5-4e9b-9be4-8ce74a7037b9_g0",
+    "ebe170eb-80f5-4e9b-9be4-8ce74a7037b9_g1",
+    "ebe170eb-80f5-4e9b-9be4-8ce74a7037b9_g2",
+    "ebe170eb-80f5-4e9b-9be4-8ce74a7037b9_g3"
+  ],
+  "input_hash": "0b31ce4715589295e757cdd9cf4bd9bda6699b317c95544f79f5016a8b1df4ce",
+  "world": 16,
+  "ep": 16,
+  "direct_captured_gen_kl": 0.0011291237654963173,
+  "cases": {
+    "full": {
+      "metrics": {
+        "gen_kl_error": 0.0011291275454823335,
+        "policy_kl_error": 0.0011596097615438339,
+        "grad_norm": 0.4238157272338867,
+        "loss": 0.05153190344572067,
+        "global_valid_toks": 38413.0,
+        "global_valid_seqs": 32.0
+      },
+      "gradient_vs_full": {
+        "relative_l2": 0.0,
+        "cosine": 1.0,
+        "norm_relative_error": 0.0,
+        "local_max_abs": 0.0,
+        "exact": true
+      },
+      "model_vs_full": {
+        "exact": true
+      },
+      "optimizer_vs_full": {
+        "exact": true
+      },
+      "raw_optimizer_vs_full": {
+        "exact": true
+      },
+      "scheduler_vs_full": {
+        "exact": true
+      },
+      "eval_lp_max_abs_vs_full": 0.0,
+      "post_update_eval_lp_max_abs_vs_full": 0.0,
+      "all_ranks_exact": {
+        "gradient_vs_full": true,
+        "model_vs_full": true,
+        "optimizer_vs_full": true,
+        "raw_optimizer_vs_full": true,
+        "scheduler_vs_full": true
+      },
+      "gen_kl_with_recomputed_eval_lp": 0.0011176547356880303,
+      "logged_gen_kl_abs_error_vs_direct": 3.7799860162519155e-09,
+      "one_update_kl_on_fixed_old_rollout": 0.0012722488135172765
+    },
+    "full_repeat": {
+      "metrics": {
+        "gen_kl_error": 0.0011291275454823335,
+        "policy_kl_error": 0.0011596097615438339,
+        "grad_norm": 0.4238157272338867,
+        "loss": 0.05153190344572067,
+        "global_valid_toks": 38413.0,
+        "global_valid_seqs": 32.0
+      },
+      "gradient_vs_full": {
+        "relative_l2": 0.0,
+        "cosine": 1.0,
+        "norm_relative_error": 0.0,
+        "local_max_abs": 0.0,
+        "exact": true
+      },
+      "model_vs_full": {
+        "exact": true
+      },
+      "optimizer_vs_full": {
+        "exact": true
+      },
+      "raw_optimizer_vs_full": {
+        "exact": true
+      },
+      "scheduler_vs_full": {
+        "exact": true
+      },
+      "eval_lp_max_abs_vs_full": 0.0,
+      "post_update_eval_lp_max_abs_vs_full": 0.0,
+      "all_ranks_exact": {
+        "gradient_vs_full": true,
+        "model_vs_full": true,
+        "optimizer_vs_full": true,
+        "raw_optimizer_vs_full": true,
+        "scheduler_vs_full": true
+      },
+      "gen_kl_with_recomputed_eval_lp": 0.0011176547356880303,
+      "logged_gen_kl_abs_error_vs_direct": 3.7799860162519155e-09,
+      "one_update_kl_on_fixed_old_rollout": 0.0012722488135172765
+    },
+    "numerator_full": {
+      "metrics": {
+        "gen_kl_error": 0.0011291275460311723,
+        "policy_kl_error": 0.0011596097683747042,
+        "grad_norm": 0.42425525188446045,
+        "loss": 0.05153190154588373,
+        "global_valid_toks": 38413.0,
+        "global_valid_seqs": 32.0
+      },
+      "gradient_vs_full": {
+        "relative_l2": 0.011855523819901903,
+        "cosine": 0.9999297750546946,
+        "norm_relative_error": 0.0002591471478774187,
+        "local_max_abs": 0.0001373291015625,
+        "exact": false
+      },
+      "model_vs_full": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 478 / 31784960 (0.0%)\nGreatest absolute difference: 6.103515625e-05 at index (383, 859)\nGreatest relative difference: 11.6875 at index (745, 680)"
+      },
+      "optimizer_vs_full": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 784696 / 31784960 (2.5%)\nGreatest absolute difference: 7.62939453125e-06 at index (16, 803)\nGreatest relative difference: inf at index (2225, 86)"
+      },
+      "raw_optimizer_vs_full": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 784696 / 31784960 (2.5%)\nGreatest absolute difference: 7.62939453125e-06 at index (16, 803)\nGreatest relative difference: inf at index (2225, 86)"
+      },
+      "scheduler_vs_full": {
+        "exact": true
+      },
+      "eval_lp_max_abs_vs_full": 0.0,
+      "post_update_eval_lp_max_abs_vs_full": 4.20689582824707,
+      "all_ranks_exact": {
+        "gradient_vs_full": false,
+        "model_vs_full": false,
+        "optimizer_vs_full": false,
+        "raw_optimizer_vs_full": false,
+        "scheduler_vs_full": true
+      },
+      "gen_kl_with_recomputed_eval_lp": 0.0011176547356880303,
+      "logged_gen_kl_abs_error_vs_direct": 3.780534855004139e-09,
+      "one_update_kl_on_fixed_old_rollout": 0.0011980265156800855
+    },
+    "split_fixed_shards": {
+      "metrics": {
+        "gen_kl_error": 0.0011291275460311723,
+        "policy_kl_error": 0.0011596097683747042,
+        "grad_norm": 0.42425525188446045,
+        "loss": 0.05153190154588373,
+        "global_valid_toks": 38413.0,
+        "global_valid_seqs": 32.0
+      },
+      "gradient_vs_full": {
+        "relative_l2": 0.011855523819901903,
+        "cosine": 0.9999297750546946,
+        "norm_relative_error": 0.0002591471478774187,
+        "local_max_abs": 0.0001373291015625,
+        "exact": false
+      },
+      "model_vs_full": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 478 / 31784960 (0.0%)\nGreatest absolute difference: 6.103515625e-05 at index (383, 859)\nGreatest relative difference: 11.6875 at index (745, 680)"
+      },
+      "optimizer_vs_full": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 784696 / 31784960 (2.5%)\nGreatest absolute difference: 7.62939453125e-06 at index (16, 803)\nGreatest relative difference: inf at index (2225, 86)"
+      },
+      "raw_optimizer_vs_full": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 784696 / 31784960 (2.5%)\nGreatest absolute difference: 7.62939453125e-06 at index (16, 803)\nGreatest relative difference: inf at index (2225, 86)"
+      },
+      "scheduler_vs_full": {
+        "exact": true
+      },
+      "eval_lp_max_abs_vs_full": 0.0,
+      "gradient_vs_numerator": {
+        "relative_l2": 0.0,
+        "cosine": 1.0,
+        "norm_relative_error": 0.0,
+        "local_max_abs": 0.0,
+        "exact": true
+      },
+      "model_vs_numerator": {
+        "exact": true
+      },
+      "optimizer_vs_numerator": {
+        "exact": true
+      },
+      "raw_optimizer_vs_numerator": {
+        "exact": true
+      },
+      "post_update_eval_lp_max_abs_vs_full": 4.20689582824707,
+      "all_ranks_exact": {
+        "gradient_vs_full": false,
+        "model_vs_full": false,
+        "optimizer_vs_full": false,
+        "raw_optimizer_vs_full": false,
+        "scheduler_vs_full": true,
+        "gradient_vs_numerator": true,
+        "model_vs_numerator": true,
+        "optimizer_vs_numerator": true,
+        "raw_optimizer_vs_numerator": true
+      },
+      "gen_kl_with_recomputed_eval_lp": 0.0011176547356880303,
+      "logged_gen_kl_abs_error_vs_direct": 3.780534855004139e-09,
+      "one_update_kl_on_fixed_old_rollout": 0.0011980265156800855
+    },
+    "split_production_shards": {
+      "metrics": {
+        "gen_kl_error": 0.0011291275460311723,
+        "policy_kl_error": 0.0011596097683747042,
+        "grad_norm": 0.42425525188446045,
+        "loss": 0.05153190154588373,
+        "global_valid_toks": 38413.0,
+        "global_valid_seqs": 32.0
+      },
+      "gradient_vs_full": {
+        "relative_l2": 0.011855523819901903,
+        "cosine": 0.9999297750546946,
+        "norm_relative_error": 0.0002591471478774187,
+        "local_max_abs": 0.0001373291015625,
+        "exact": false
+      },
+      "model_vs_full": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 478 / 31784960 (0.0%)\nGreatest absolute difference: 6.103515625e-05 at index (383, 859)\nGreatest relative difference: 11.6875 at index (745, 680)"
+      },
+      "optimizer_vs_full": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 784696 / 31784960 (2.5%)\nGreatest absolute difference: 7.62939453125e-06 at index (16, 803)\nGreatest relative difference: inf at index (2225, 86)"
+      },
+      "raw_optimizer_vs_full": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 784696 / 31784960 (2.5%)\nGreatest absolute difference: 7.62939453125e-06 at index (16, 803)\nGreatest relative difference: inf at index (2225, 86)"
+      },
+      "scheduler_vs_full": {
+        "exact": true
+      },
+      "eval_lp_max_abs_vs_full": 0.0,
+      "post_update_eval_lp_max_abs_vs_full": 4.20689582824707,
+      "all_ranks_exact": {
+        "gradient_vs_full": false,
+        "model_vs_full": false,
+        "optimizer_vs_full": false,
+        "raw_optimizer_vs_full": false,
+        "scheduler_vs_full": true
+      },
+      "gen_kl_with_recomputed_eval_lp": 0.0011176547356880303,
+      "logged_gen_kl_abs_error_vs_direct": 3.780534855004139e-09,
+      "one_update_kl_on_fixed_old_rollout": 0.0011980265156800855
+    },
+    "full_recompute": {
+      "metrics": {
+        "gen_kl_error": 0.0011176587984209618,
+        "policy_kl_error": 0.0011526827715897525,
+        "grad_norm": 0.4278348386287689,
+        "loss": 0.05146095156669617,
+        "global_valid_toks": 38413.0,
+        "global_valid_seqs": 32.0
+      },
+      "gradient_vs_full": {
+        "relative_l2": 0.22496332483134485,
+        "cosine": 0.9751125575921512,
+        "norm_relative_error": 0.013230761813751551,
+        "local_max_abs": 0.004791259765625,
+        "exact": false
+      },
+      "model_vs_full": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 3882 / 31784960 (0.0%)\nGreatest absolute difference: 6.103515625e-05 at index (39, 1429)\nGreatest relative difference: 233.0 at index (745, 680)"
+      },
+      "optimizer_vs_full": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 1001474 / 31784960 (3.2%)\nGreatest absolute difference: 4.38690185546875e-05 at index (17, 803)\nGreatest relative difference: inf at index (2225, 86)"
+      },
+      "raw_optimizer_vs_full": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 1001474 / 31784960 (3.2%)\nGreatest absolute difference: 4.38690185546875e-05 at index (17, 803)\nGreatest relative difference: inf at index (2225, 86)"
+      },
+      "scheduler_vs_full": {
+        "exact": true
+      },
+      "eval_lp_max_abs_vs_full": 0.0,
+      "post_update_eval_lp_max_abs_vs_full": 4.206783294677734,
+      "all_ranks_exact": {
+        "gradient_vs_full": false,
+        "model_vs_full": false,
+        "optimizer_vs_full": false,
+        "raw_optimizer_vs_full": false,
+        "scheduler_vs_full": true
+      },
+      "gen_kl_with_recomputed_eval_lp": 0.0011176547356880303,
+      "logged_gen_kl_abs_error_vs_direct": 4.0627329315427035e-09,
+      "one_update_kl_on_fixed_old_rollout": 0.0012458253911120107
+    },
+    "split_production_recompute": {
+      "metrics": {
+        "gen_kl_error": 0.0011176587862237047,
+        "policy_kl_error": 0.0011526827710109865,
+        "grad_norm": 0.4277992248535156,
+        "loss": 0.05146095312225436,
+        "global_valid_toks": 38413.0,
+        "global_valid_seqs": 32.0
+      },
+      "gradient_vs_full": {
+        "relative_l2": 0.2254460621537409,
+        "cosine": 0.9750087899919665,
+        "norm_relative_error": 0.013324159000064416,
+        "local_max_abs": 0.004791259765625,
+        "exact": false
+      },
+      "model_vs_full": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 3923 / 31784960 (0.0%)\nGreatest absolute difference: 6.103515625e-05 at index (39, 1429)\nGreatest relative difference: 233.0 at index (745, 680)"
+      },
+      "optimizer_vs_full": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 1018231 / 31784960 (3.2%)\nGreatest absolute difference: 4.482269287109375e-05 at index (17, 803)\nGreatest relative difference: inf at index (2225, 86)"
+      },
+      "raw_optimizer_vs_full": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 1018231 / 31784960 (3.2%)\nGreatest absolute difference: 4.482269287109375e-05 at index (17, 803)\nGreatest relative difference: inf at index (2225, 86)"
+      },
+      "scheduler_vs_full": {
+        "exact": true
+      },
+      "eval_lp_max_abs_vs_full": 0.0,
+      "gradient_vs_full_recompute": {
+        "relative_l2": 0.011316929347752115,
+        "cosine": 0.9999359737052154,
+        "norm_relative_error": 9.217760635857333e-05,
+        "local_max_abs": 0.0001220703125,
+        "exact": false
+      },
+      "model_vs_full_recompute": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 484 / 31784960 (0.0%)\nGreatest absolute difference: 6.103515625e-05 at index (919, 377)\nGreatest relative difference: 0.251953125 at index (2302, 1717)"
+      },
+      "optimizer_vs_full_recompute": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 780376 / 31784960 (2.5%)\nGreatest absolute difference: 3.814697265625e-06 at index (11, 567)\nGreatest relative difference: inf at index (2225, 1312)"
+      },
+      "raw_optimizer_vs_full_recompute": {
+        "exact": false,
+        "first_difference": "Tensor-likes are not equal!\n\nMismatched elements: 780376 / 31784960 (2.5%)\nGreatest absolute difference: 3.814697265625e-06 at index (11, 567)\nGreatest relative difference: inf at index (2225, 1312)"
+      },
+      "post_update_eval_lp_max_abs_vs_full": 3.8634026050567627,
+      "all_ranks_exact": {
+        "gradient_vs_full": false,
+        "model_vs_full": false,
+        "optimizer_vs_full": false,
+        "raw_optimizer_vs_full": false,
+        "scheduler_vs_full": true,
+        "gradient_vs_full_recompute": false,
+        "model_vs_full_recompute": false,
+        "optimizer_vs_full_recompute": false,
+        "raw_optimizer_vs_full_recompute": false
+      },
+      "gen_kl_with_recomputed_eval_lp": 0.0011176547356880303,
+      "logged_gen_kl_abs_error_vs_direct": 4.050535674449476e-09,
+      "one_update_kl_on_fixed_old_rollout": 0.0012140116242195047
+    }
+  },
+  "timing": {
+    "full": [
+      5.7470692824572325,
+      5.630319322983269,
+      5.4776551790419035
+    ],
+    "split_fixed_shards": [
+      8.812953426968306,
+      8.426817750558257,
+      8.732813514012378
+    ]
+  },
+  "timing_medians_seconds": {
+    "full": 5.630319322983269,
+    "split_fixed_shards": 8.732813514012378
+  },
+  "complete": true,
+  "note": "Fixed worker workload includes LP/preparation/backward/commit; no rollout GPU or TQ/Ray dispatch latency. Not end-to-end throughput.",
+  "layout_control": "Identical production DP microbatches in every case",
+  "input_validation": "Exact valid-token columns/dtypes checked once per metadata fetch; no tensor validation in timing repeats"
+}
