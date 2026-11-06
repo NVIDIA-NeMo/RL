@@ -17,6 +17,7 @@ import copy
 import json
 import math
 import os
+import pickle
 import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -40,6 +41,11 @@ from nemo_rl.models.generation.vllm.config import (
 )
 from nemo_rl.utils.checkpoint_latency import CheckpointLatencyConfig
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
+from tools.model_diagnostics.prefix_cut_token_volume import (
+    token_match_report,
+    wait_for_token_volume,
+)
+from tools.model_diagnostics.turn_checkpoint_benchmark import run_turn_snapshot
 
 
 def worker_pipeline_config(
@@ -69,6 +75,7 @@ class Call:
     rollout_id: str
     model_call_id: str
     admitted_at: float
+    request_index: int = 0
 
 
 def inventories_for_calls(
@@ -119,7 +126,7 @@ class StorageService:
     def save(self, path: str) -> float:
         started = time.monotonic()
         self.client.save_checkpoint(
-            path, metadata={"benchmark": "prefix_cut_without_training"}
+            path, metadata={"benchmark": "generation_checkpoint_without_training"}
         )
         metadata = json.loads((Path(path) / "metadata.json").read_text())
         if metadata.get("storage_saved") is not True:
@@ -135,6 +142,19 @@ class StorageService:
             )
         return len(set(keys))
 
+    def verify_saved_turn_keys(self, path: str, keys: list[str], partition: str) -> int:
+        """Verify selected completed rows in this benchmark's own controller file."""
+        with (Path(path) / "controller_state.pkl").open("rb") as handle:
+            state = pickle.load(handle)
+        saved = state["partitions"].get(partition)
+        present = set(saved.keys_mapping) if saved is not None else set()
+        missing = sorted(set(keys) - present)
+        if missing:
+            raise RuntimeError(
+                f"Saved controller is missing {len(missing)} completed turn rows"
+            )
+        return len(set(keys))
+
 
 class Load:
     """Keep a bounded number of ordinary captured HTTP calls outstanding."""
@@ -146,12 +166,18 @@ class Load:
         model: str,
         api_key: str,
         name: str,
+        *,
+        max_output_tokens: int | None = None,
+        checkpoint_level: str = "prefix",
     ) -> None:
         self.session = session
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.name = name
+        self.max_output_tokens = max_output_tokens
+        self.checkpoint_level = checkpoint_level
+        self.completed_turns: dict[str, dict[str, Any]] = {}
         self.allow_new = asyncio.Event()
         self.allow_new.set()
         self.active: dict[str, Call] = {}
@@ -172,11 +198,13 @@ class Load:
             self.next_id += 1
             index = self.next_id
             identifier = f"{self.name}-call-{index}"
-            call = Call(identifier, identifier, time.time())
+            call = Call(identifier, identifier, time.time(), index)
             self.active[identifier] = call
             # Mix short completions with long-lived calls so final formatting
             # and cuts contend naturally, including while the fence is closed.
-            max_tokens = (256, 1024, 8192, 16384, 32768)[index % 5]
+            max_tokens = (
+                self.max_output_tokens or (256, 1024, 8192, 16384, 32768)[index % 5]
+            )
             prompt = (
                 f"Problem {index}: Derive and explain mathematical identities, "
                 "checking each step carefully. Continue with numbered examples.\n"
@@ -220,6 +248,25 @@ class Load:
                         raise RuntimeError(
                             "Captured generation response has no staging coordinates"
                         )
+                    if self.checkpoint_level == "turn":
+                        coords = body["ng_commit_coords"]
+                        if coords.get("disposition") != "staged" or not coords.get(
+                            "staging_key"
+                        ):
+                            raise RuntimeError(
+                                "Completed turn has no durable staging coordinates"
+                            )
+                        if (
+                            coords["model_call_id"] != identifier
+                            or coords["rollout_id"] != identifier
+                        ):
+                            raise RuntimeError(
+                                "Completed turn coordinates name another call"
+                            )
+                        self.completed_turns[identifier] = {
+                            "request_index": index,
+                            "commit_coords": coords,
+                        }
                     self.output_tokens += body.get("usage", {}).get(
                         "completion_tokens", 0
                     )
@@ -376,15 +423,18 @@ async def run_snapshot(
             )
         )
         fence_started = time.monotonic()
+
+        async def acquire_fence(generation: Any) -> float:
+            worker_started = time.monotonic()
+            await asyncio.to_thread(
+                generation.begin_token_capture_snapshot_fence,
+                timeout_s=180,
+                checkpoint_id=checkpoint_id,
+            )
+            return time.monotonic() - worker_started
+
         fence_results = await asyncio.gather(
-            *(
-                asyncio.to_thread(
-                    generation.begin_token_capture_snapshot_fence,
-                    timeout_s=180,
-                    checkpoint_id=checkpoint_id,
-                )
-                for generation in generations
-            ),
+            *(acquire_fence(generation) for generation in generations),
             return_exceptions=True,
         )
         for result in fence_results:
@@ -519,13 +569,14 @@ async def run_snapshot(
             )
     timings["total_s"] = time.monotonic() - started
     compact = []
-    for load, inventories, receipts, status in zip(
-        loads, all_inventories, results, statuses, strict=True
+    for load, inventories, receipts, status, fence_seconds in zip(
+        loads, all_inventories, results, statuses, fence_results, strict=True
     ):
         compact.append(
             {
                 "name": load.name,
                 "slots": status["slots"],
+                "fence_acquire_s": fence_seconds,
                 "inventories": len(inventories),
                 "calls": sum(
                     len(inventory.active_prefixes) for inventory in inventories
@@ -572,7 +623,9 @@ async def exercise(
                 generation.dp_openai_server_base_urls[0],
                 config["policy"]["model_name"],
                 generation.http_server_api_key,
-                f"engine-{index}-slots-{slots}",
+                f"{args.engine_labels[index]}-slots-{slots}",
+                max_output_tokens=args.max_output_tokens,
+                checkpoint_level=args.checkpoint_level,
             )
             for index, (generation, slots) in enumerate(
                 zip(generations, args.slots, strict=True)
@@ -609,24 +662,111 @@ async def exercise(
                     json.dumps({"label": "warmup", "workers": statuses}, indent=2)
                 )
             for index in range(args.rounds):
+                target_observation = None
+                if args.capture_token_targets:
+
+                    async def collect_volumes() -> list[dict[str, int]]:
+                        return await asyncio.gather(
+                            *(
+                                asyncio.to_thread(
+                                    worker_call, generation, "benchmark_token_volume"
+                                )
+                                for generation in generations
+                            )
+                        )
+
+                    def check_loads() -> None:
+                        for load in loads:
+                            load.check_healthy()
+
+                    def report_target(observation: dict[str, Any]) -> None:
+                        (output / f"token-target-{index:03d}.json").write_text(
+                            json.dumps(observation, indent=2)
+                        )
+                        print(
+                            json.dumps(
+                                {
+                                    "event": "token_target_progress",
+                                    "round": index,
+                                    **observation,
+                                }
+                            ),
+                            flush=True,
+                        )
+
+                    target_observation = await wait_for_token_volume(
+                        collect_volumes,
+                        cumulative_tokens=args.capture_token_targets[index],
+                        new_token_positions=args.capture_new_token_targets[index],
+                        timeout_s=args.target_wait_seconds,
+                        poll_s=10.0,
+                        check_healthy=check_loads,
+                        report=report_target,
+                    )
                 for load in loads:
                     load.check_healthy()
                 if any(load.errors > max(10, load.completed) for load in loads):
                     raise RuntimeError(
                         f"Generation load is failing: {[load.summary() for load in loads]}"
                     )
-                result = await run_snapshot(
-                    generations,
-                    loads,
-                    storage,
-                    session,
-                    auth_token=auth_token,
-                    round_index=index,
-                    inventory_count=args.inventories,
-                    output=output,
-                    cut_budget=args.cut_budget,
-                    staging_partition=config["token_capture"]["staging_partition"],
-                )
+                if args.checkpoint_level == "turn":
+                    result = await run_turn_snapshot(
+                        generations,
+                        loads,
+                        storage,
+                        round_index=index,
+                        output=output,
+                        worker_call=worker_call,
+                        staging_partition=config["token_capture"]["staging_partition"],
+                    )
+                else:
+                    result = await run_snapshot(
+                        generations,
+                        loads,
+                        storage,
+                        session,
+                        auth_token=auth_token,
+                        round_index=index,
+                        inventory_count=args.inventories,
+                        output=output,
+                        cut_budget=args.cut_budget,
+                        staging_partition=config["token_capture"]["staging_partition"],
+                    )
+                if target_observation is not None:
+                    matches = []
+                    for worker in result["workers"]:
+                        volumes = (
+                            worker["diagnostics"]
+                            .get("saved_token_volumes", {})
+                            .get(result["checkpoint_id"], {})
+                        )
+                        match = token_match_report(
+                            volumes,
+                            cumulative_tokens=args.capture_token_targets[index],
+                            new_token_positions=args.capture_new_token_targets[index],
+                            tolerance=args.token_volume_tolerance,
+                        )
+                        worker["token_volume_match"] = match
+                        matches.append(match["matched"])
+                    result["token_target_observation"] = target_observation
+                    result["token_volume_matched"] = all(matches)
+                    (output / f"round-{index:03d}.json").write_text(
+                        json.dumps(result, indent=2)
+                    )
+                    if index == args.rounds - 1:
+                        (output / "token-match-result.json").write_text(
+                            json.dumps(
+                                {
+                                    "matched": all(matches),
+                                    "round": index,
+                                    "workers": [
+                                        worker["token_volume_match"]
+                                        for worker in result["workers"]
+                                    ],
+                                },
+                                indent=2,
+                            )
+                        )
                 print(
                     json.dumps(
                         {
@@ -656,6 +796,20 @@ async def exercise(
                         "durable_prefixes"
                     ]
                     log_values[f"benchmark/{name}/calls"] = worker["calls"]
+                    if "token_volume_match" in worker:
+                        match = worker["token_volume_match"]
+                        log_values[f"benchmark/{name}/token_volume_matched"] = int(
+                            match["matched"]
+                        )
+                        for key, value in match["actual"].items():
+                            log_values[f"benchmark/{name}/{key}"] = value
+                    if args.checkpoint_level == "turn":
+                        log_values[f"benchmark/{name}/completed_turns"] = worker[
+                            "completed_turns"
+                        ]
+                        log_values[f"benchmark/{name}/pending_calls_to_regenerate"] = (
+                            worker["pending_calls_to_regenerate"]
+                        )
                     for phase, values in worker["diagnostics"]["phases"].items():
                         log_values[f"benchmark/{name}/{phase}/max_s"] = values["max_s"]
                     for key, value in (
@@ -693,6 +847,12 @@ def main() -> None:
     parser.add_argument("--reference-config", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument(
+        "--checkpoint-level",
+        choices=("prefix", "turn"),
+        default="prefix",
+        help="Turn mode saves completed model-call rows and restarts unfinished calls; excludes Gym agent state",
+    )
+    parser.add_argument(
         "--slots",
         type=int,
         nargs=2,
@@ -700,6 +860,28 @@ def main() -> None:
         default=[2, 4],
         help="Admission slots on each of the two generation engines",
     )
+    parser.add_argument(
+        "--capture-token-targets",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Per-round live cumulative generated tokens required on every engine",
+    )
+    parser.add_argument(
+        "--capture-new-token-targets",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Per-round unstaged token positions required on every engine",
+    )
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=None,
+        help="Use long-lived calls with this completion limit instead of the mixed default",
+    )
+    parser.add_argument("--target-wait-seconds", type=float, default=1800.0)
+    parser.add_argument("--token-volume-tolerance", type=float, default=0.1)
     parser.add_argument("--outstanding", type=int, default=2048)
     parser.add_argument("--inventories", type=int, default=64)
     parser.add_argument(
@@ -739,6 +921,7 @@ def main() -> None:
         action="store_true",
         help="Build text prefix batches directly without per-record tensors",
     )
+    parser.add_argument("--prefix-writer-actor", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--copy-decoded-arrays",
@@ -769,6 +952,17 @@ def main() -> None:
         action="store_true",
         help="Stream all inventories through byte-bounded preparation and concurrent writes",
     )
+    comparisons = parser.add_mutually_exclusive_group()
+    comparisons.add_argument(
+        "--compare-cut-pipeline",
+        action="store_true",
+        help="Engine 0 uses the shared pipeline; engine 1 uses per-inventory writes",
+    )
+    comparisons.add_argument(
+        "--compare-latency-diagnostics",
+        action="store_true",
+        help="Enable detailed latency probes on engine 0 and disable them on engine 1",
+    )
     parser.add_argument(
         "--compact-queue-max-bytes", type=int, default=2 * 1024 * 1024 * 1024
     )
@@ -785,11 +979,46 @@ def main() -> None:
         help="Collect router arrays for prefix checkpoints (default: enabled)",
     )
     args = parser.parse_args()
+    if args.checkpoint_level == "turn" and (
+        args.cut_pipeline
+        or args.batch_inventory_writes
+        or args.group_pending_inventories
+        or args.direct_prefix_batch_encoding
+        or args.compare_cut_pipeline
+        or args.compare_latency_diagnostics
+    ):
+        parser.error("Turn-only mode cannot enable prefix-cut machinery or comparisons")
     if args.gil_switch_interval_ms is not None and (
         not math.isfinite(args.gil_switch_interval_ms / 1000)
         or args.gil_switch_interval_ms / 1000 <= 0
     ):
         parser.error("GIL switch interval must be finite and positive")
+    if bool(args.capture_token_targets) != bool(args.capture_new_token_targets):
+        parser.error("Both cumulative and new-token target lists are required")
+    if args.capture_token_targets:
+        if (
+            len(args.capture_token_targets) != args.rounds
+            or len(args.capture_new_token_targets) != args.rounds
+        ):
+            parser.error("Token target lists must have one value per round")
+        if (
+            min(args.capture_token_targets) <= 0
+            or min(args.capture_new_token_targets) < 0
+        ):
+            parser.error(
+                "Cumulative targets must be positive; new-token targets nonnegative"
+            )
+        if not args.cut_pipeline:
+            parser.error("Token-volume measurements require --cut-pipeline")
+    if args.max_output_tokens is not None and args.max_output_tokens <= 0:
+        parser.error("Maximum output tokens must be positive")
+    if not math.isfinite(args.target_wait_seconds) or args.target_wait_seconds <= 0:
+        parser.error("Token-target deadline must be finite and positive")
+    if (
+        not math.isfinite(args.token_volume_tolerance)
+        or not 0 < args.token_volume_tolerance < 1
+    ):
+        parser.error("Token-volume tolerance must lie between zero and one")
     if args.outstanding < args.inventories or args.rounds < 1 or args.cut_budget <= 0:
         parser.error(
             "Need outstanding >= inventories >= 1, rounds >= 1, and positive cut budget"
@@ -810,9 +1039,28 @@ def main() -> None:
         parser.error(
             "Cut pipeline replaces --group-pending-inventories and --batch-inventory-writes"
         )
+    if args.prefix_writer_actor and (
+        not args.cut_pipeline or not args.direct_prefix_batch_encoding
+    ):
+        parser.error(
+            "Prefix writer actor requires --cut-pipeline and --direct-prefix-batch-encoding"
+        )
+    if args.compare_cut_pipeline and (
+        args.cut_pipeline
+        or args.batch_inventory_writes
+        or args.group_pending_inventories
+    ):
+        parser.error("Pipeline comparison chooses its own pipeline and batching modes")
+    if (args.compare_cut_pipeline or args.compare_latency_diagnostics) and args.slots[
+        0
+    ] != args.slots[1]:
+        parser.error("Comparisons require equal --slots to change only one factor")
     config = yaml.safe_load(Path(args.reference_config).read_text())
     check_outdated_config(config)
     generation_config = copy.deepcopy(config["policy"]["generation"])
+    if args.checkpoint_level == "turn":
+        config["rollout_recovery"]["target_level"] = "turn"
+        config["rollout_recovery"]["generation_prefix_cleanup"]["enabled"] = False
     control_config = generation_config.get("generation_cut_control")
     raw_latency_config = (
         control_config.get("latency_diagnostics")
@@ -827,6 +1075,30 @@ def main() -> None:
         latency_config = type(latency_config).model_validate(
             latency_config.model_dump()
         )
+
+    pipeline_modes = (
+        [True, False] if args.compare_cut_pipeline else [args.cut_pipeline] * 2
+    )
+    batching_modes = (
+        [False, False]
+        if args.compare_cut_pipeline
+        else [args.batch_inventory_writes] * 2
+    )
+    latency_configs = [
+        latency_config.model_copy(update={"enabled": enabled})
+        for enabled in (
+            [True, False]
+            if args.compare_latency_diagnostics
+            else [latency_config.enabled] * 2
+        )
+    ]
+    args.engine_labels = (
+        ["engine-0-pipeline", "engine-1-per-inventory"]
+        if args.compare_cut_pipeline
+        else ["engine-0-diagnostics-on", "engine-1-diagnostics-off"]
+        if args.compare_latency_diagnostics
+        else ["engine-0", "engine-1"]
+    )
 
     if args.gil_switch_interval_ms is not None:
         generation_config["_benchmark_gil_switch_interval_ms"] = (
@@ -853,6 +1125,9 @@ def main() -> None:
         "max_queued_messages": 32768,
         "frontend_timings": args.frontend_timings,
     }
+    generation_config["_benchmark_token_volume_targets"] = bool(
+        args.capture_token_targets
+    )
     generation_config["_mtp_weights_from_refit"] = False
     generation_config["_draft_weights_from_refit"] = False
     generation_config["worker_extension_cls_fqn"] = G_WORKER_FQN
@@ -872,6 +1147,13 @@ def main() -> None:
     dp_config["simple"]["storage_unit_placement"] = None
     plan = {
         "nodes": 4,
+        "checkpoint_level": args.checkpoint_level,
+        "generation_prefix_cuts_enabled": args.checkpoint_level == "prefix",
+        "generation_fence_used": args.checkpoint_level == "prefix",
+        "generation_prefix_cleanup": config["rollout_recovery"][
+            "generation_prefix_cleanup"
+        ],
+        "checkpoint_scope": "generation/TQ proxy; no Gym agent graph or trainer",
         "generation_nodes": 2,
         "trainer_nodes": 0,
         "slots": args.slots,
@@ -885,6 +1167,11 @@ def main() -> None:
         "load_format": "auto",
         "reference_config": args.reference_config,
         "model": config["policy"]["model_name"],
+        "capture_token_targets": args.capture_token_targets,
+        "capture_new_token_targets": args.capture_new_token_targets,
+        "max_output_tokens": args.max_output_tokens,
+        "target_wait_seconds": args.target_wait_seconds,
+        "token_volume_tolerance": args.token_volume_tolerance,
         "warmup_seconds": args.warmup_seconds,
         "rounds": args.rounds,
         "interval_seconds": args.interval_seconds,
@@ -893,6 +1180,13 @@ def main() -> None:
         "batch_inventory_writes": args.batch_inventory_writes,
         "group_pending_inventories": args.group_pending_inventories,
         "cut_pipeline": args.cut_pipeline,
+        "compare_cut_pipeline": args.compare_cut_pipeline,
+        "compare_latency_diagnostics": args.compare_latency_diagnostics,
+        "engine_labels": args.engine_labels,
+        "batch_inventory_writes_per_worker": batching_modes,
+        "latency_diagnostics_per_worker": [
+            item.model_dump() for item in latency_configs
+        ],
         "pipeline": worker_pipeline_config(
             generation_config,
             enabled=args.cut_pipeline,
@@ -900,12 +1194,13 @@ def main() -> None:
         ).model_dump(),
         "pipeline_per_worker": [
             worker_pipeline_config(
-                generation_config, enabled=args.cut_pipeline, write_concurrency=slots
+                generation_config, enabled=enabled, write_concurrency=slots
             ).model_dump()
-            for slots in args.slots
+            for slots, enabled in zip(args.slots, pipeline_modes, strict=True)
         ],
         "checkpoint_latency_diagnostics": latency_config.model_dump(),
         "direct_prefix_batch_encoding": args.direct_prefix_batch_encoding,
+        "prefix_writer_actor": args.prefix_writer_actor,
         "copy_decoded_arrays": args.copy_decoded_arrays,
         "production_decoder_copy": generation_config["vllm_cfg"]["copy_decoded_arrays"],
         "heap_census": args.heap_census,
@@ -996,13 +1291,16 @@ def main() -> None:
         per_worker = copy.deepcopy(generation_config)
         per_worker["generation_cut_control"] = {
             "max_workers": slots,
-            "latency_diagnostics": latency_config.model_dump(),
+            "latency_diagnostics": latency_configs[index].model_dump(),
             "pipeline": worker_pipeline_config(
-                generation_config, enabled=args.cut_pipeline, write_concurrency=slots
+                generation_config,
+                enabled=pipeline_modes[index],
+                write_concurrency=slots,
             ).model_dump(),
-            "batch_inventory_writes": args.batch_inventory_writes,
+            "batch_inventory_writes": batching_modes[index],
             "group_pending_inventories": args.group_pending_inventories,
             "direct_prefix_batch_encoding": args.direct_prefix_batch_encoding,
+            "prefix_writer_actor": args.prefix_writer_actor,
         }
         cluster = RayVirtualCluster(
             [4],
@@ -1018,7 +1316,7 @@ def main() -> None:
         generation.setup_token_capture(
             dp_config,
             config["token_capture"]["staging_partition"],
-            generation_prefix_cuts_enabled=True,
+            generation_prefix_cuts_enabled=args.checkpoint_level == "prefix",
             generation_cut_control_token=auth_token,
             generation_cut_control_timeout_s=120,
             generation_prefix_batch_size=config["rollout_recovery"][
@@ -1039,7 +1337,7 @@ def main() -> None:
         entity="nvidia",
         project="nano35-bf16-prefix-router-replay",
         name=output.name,
-        job_type="generation-only-prefix-cut-benchmark",
+        job_type=f"generation-only-{args.checkpoint_level}-checkpoint-benchmark",
         config=plan,
         dir=str(output),
     )
@@ -1053,7 +1351,7 @@ def main() -> None:
             )
         asyncio.run(exercise(generations, storage, config, args, auth_token, run))
         (output / "COMPLETE").write_text(
-            "All requested prefix-cut snapshots committed.\n"
+            f"All requested {args.checkpoint_level} snapshots committed.\n"
         )
         completed = True
     finally:

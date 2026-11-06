@@ -13,21 +13,29 @@ import math
 import os
 import resource
 import sys
+import threading
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import ray
 from vllm.logprobs import FlatLogprobs
 
+from nemo_rl.models.generation.generation_cut_pipeline import CutSteps
 from nemo_rl.models.generation.vllm import vllm_worker_async as worker_module
 from nemo_rl.models.generation.vllm.packed_logprobs import PackedSelectedLogprobs
 from nemo_rl.models.generation.vllm.utils import install_owned_numpy_array_decode
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
 )
+from nemo_rl.utils.prefix_cut_diagnostics import current_prefix_cut_probe
 from tools.model_diagnostics.prefix_cut_benchmark_diagnostics import (
     BenchmarkDiagnostics,
     ObservedStateLock,
+)
+from tools.model_diagnostics.prefix_cut_token_volume import (
+    CaptureTokenHeader,
+    count_engine_token_volume,
 )
 
 
@@ -76,6 +84,8 @@ class PrefixCutBenchmarkWorker(VllmAsyncGenerationWorkerImpl):  # pragma: no cov
         self._bench_engine_heartbeat: asyncio.Task[None] | None = None
         self._bench_http_heartbeat: asyncio.Task[None] | None = None
         self._bench_decoder_copy_stats: dict[str, int] = {}
+        self._bench_token_volume_lock = threading.Lock()
+        self._bench_token_volume_records: dict[tuple[str, str], dict[str, int]] = {}
         super().__init__(*args, **kwargs)
 
     async def post_init_async(self) -> None:
@@ -158,6 +168,92 @@ class PrefixCutBenchmarkWorker(VllmAsyncGenerationWorkerImpl):  # pragma: no cov
         with self._bench_diagnostics.phase("http.observe_final_capture"):
             return super()._observe_request_capture(request, request_output)
 
+    def _checkpoint_generation_cut_pipeline_steps(
+        self,
+        inventory: Any,
+        *,
+        deadline: float | None,
+    ) -> CutSteps:
+        try:
+            return (
+                yield from super()._checkpoint_generation_cut_pipeline_steps(
+                    inventory, deadline=deadline
+                )
+            )
+        finally:
+            if self.cfg.get("_benchmark_token_volume_targets", False):
+                probe = current_prefix_cut_probe()
+                if probe is not None:
+                    with probe.lock:
+                        counts = {
+                            name: probe.counts.get(name, 0)
+                            for name in (
+                                "batch_token_positions",
+                                "cumulative_generation_tokens",
+                                "new_chunk_tokens",
+                                "delta_route_bytes",
+                            )
+                        }
+                    with self._bench_token_volume_lock:
+                        key = (inventory.checkpoint_id, inventory.inventory_digest)
+                        self._bench_token_volume_records[key] = counts
+                        while len(self._bench_token_volume_records) > 256:
+                            self._bench_token_volume_records.pop(
+                                next(iter(self._bench_token_volume_records))
+                            )
+
+    async def benchmark_token_volume(self) -> dict[str, int]:
+        """Read lengths at low frequency; never extract arrays or stage data."""
+        client = self._http_engine_client
+        if client is None:
+            raise RuntimeError("Token-volume sampling requires the HTTP engine client")
+
+        def capture_headers() -> list[CaptureTokenHeader]:
+            with self._capture_registry_lock:
+                states = list(self._capture_calls_by_model_call_id.values())
+            headers = []
+            for state in states:
+                with state.lock:
+                    if state.terminal_started:
+                        continue
+                    if (
+                        state.call.admission.mode != "text"
+                        or state.call.generation_cut is not None
+                    ):
+                        raise ValueError(
+                            "Token-volume benchmark supports fresh root calls only"
+                        )
+                    headers.append(
+                        CaptureTokenHeader(
+                            state.engine_request_id,
+                            len(state.prompt_token_ids) - state.call.admission.prev_len,
+                            state.staged_token_count,
+                            bool(state.generation_cut_staging_keys),
+                        )
+                    )
+            return headers
+
+        headers = await asyncio.to_thread(capture_headers)
+
+        async def sample() -> dict[str, int]:
+            with client._token_snapshot_lock, client._route_retention_lock:
+                return count_engine_token_volume(
+                    headers,
+                    client._engine_client.output_processor,
+                    client._completed_token_states,
+                )
+
+        return await client._run_on_engine_loop(sample)
+
+    def _benchmark_saved_token_volumes(self) -> dict[str, dict[str, int]]:
+        with self._bench_token_volume_lock:
+            result: dict[str, Counter[str]] = {}
+            for (checkpoint_id, _), counts in self._bench_token_volume_records.items():
+                result.setdefault(checkpoint_id, Counter()).update(counts)
+            return {
+                checkpoint_id: dict(counts) for checkpoint_id, counts in result.items()
+            }
+
     async def benchmark_status(self) -> dict[str, Any]:
         assert self._bench_diagnostics is not None
         with self._capture_registry_lock:
@@ -170,6 +266,7 @@ class PrefixCutBenchmarkWorker(VllmAsyncGenerationWorkerImpl):  # pragma: no cov
             active_inventories=len(self._generation_cut_control._active),
             pending_inventories=len(self._generation_cut_control._pending),
             slots=self._generation_cut_control._max_workers,
+            saved_token_volumes=self._benchmark_saved_token_volumes(),
             decoder_copy=dict(self._bench_decoder_copy_stats),
             logprob_detachment=(
                 self._logprob_buffer_detachment.stats()

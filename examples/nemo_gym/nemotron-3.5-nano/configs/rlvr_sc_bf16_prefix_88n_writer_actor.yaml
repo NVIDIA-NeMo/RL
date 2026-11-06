@@ -1,0 +1,38 @@
+# Validated 88-node workload: 32 train + 32 generation + 4 Gym + 20 judges.
+# 8192 inflight prompt groups x 16 trajectories = 131072 outstanding rollouts.
+# Runtime and Gym must come from matching commits; see the benchmark README.
+defaults: rlvr_sc_bf16_009_prefix_checkpoint_sharded_88n_direct_tokens_slots4.yaml
+policy:
+  generation:
+    vllm_cfg:
+      copy_decoded_arrays: false
+      flat_logprobs: true
+      output_loop_yield_budget_ms: 20
+      compact_output:
+        enabled: false
+        numeric_capture_logprobs: true
+        packed_capture_logprobs: true
+        detach_queued_logprobs: true
+        frontend_timings: true
+        frontend_timing_sample_every: 64
+    vllm_kwargs:
+      max_num_seqs: 512
+    generation_cut_control:
+      group_pending_inventories: false
+      batch_inventory_writes: false
+      direct_prefix_batch_encoding: true
+      prefix_writer_actor: true
+      latency_diagnostics:
+        enabled: true
+        progress_interval_s: 5.0
+        slow_call_s: 1.0
+        max_events: 256
+        tq_internal_phases: true
+        gc_intervals: true
+      pipeline:
+        enabled: true
+        max_pending_inventories: 128
+        max_buffered_payload_bytes: 2147483648
+        max_batch_payload_bytes: 268435456
+        write_concurrency: 4
+        coalesce_wait_seconds: 0.25
