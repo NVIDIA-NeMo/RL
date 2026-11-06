@@ -73,6 +73,7 @@ Not every entry point is wired up: `run_eval.py`, `run_grpo_sliding_puzzle.py`, 
 | RM | `examples/run_rm.py` | `rl.rm.step` |
 | Distillation | `examples/run_distillation.py` | `rl.distillation.step`, `rl.distillation.generation`, `rl.distillation.teacher_logprob_inference`, `rl.distillation.policy_training` |
 | SingleController (GRPO + PPO) | `examples/run_grpo_single_controller.py` | `rl.sc.step`, `rl.sc.generate_and_push`, `rl.sc.policy_and_reference_logprobs`, `rl.sc.advantage_calculation`, `rl.sc.policy_training`, `rl.data_plane.*` |
+| SingleController simulator (rollout-only) | `examples/run_single_controller_simulator.py` | the SingleController spans above, from the same actor; `rl.sc.policy_optimizer_step` wraps the held stand-in train step instead of a GPU step |
 | vLLM generation | `nemo_rl/models/generation/vllm/vllm_generation.py` | `rl.vllm.generate`, `rl.vllm.generate_text` |
 
 The SingleController path differs in where the spans come from. Its driver only builds resources and launches `SingleControllerActor`, so the actor opens the job and step spans and flushes its own telemetry; the entrypoint still calls `init_telemetry_driver` before `init_ray()`, because that is what puts the resolved settings in the environment the actor inherits.
