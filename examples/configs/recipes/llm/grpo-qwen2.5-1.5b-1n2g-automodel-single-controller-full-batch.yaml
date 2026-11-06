@@ -8,7 +8,6 @@ grpo:
   seq_logprob_error_threshold: 1000
 
 policy:
-  model_name: Qwen/Qwen2.5-1.5B
   train_micro_batch_size: 1
   max_total_sequence_length: 1024
   generation:
@@ -22,7 +21,6 @@ data:
 checkpointing:
   enabled: true
   checkpoint_dir: results/grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch
-  save_period: 10
 
 logger:
   log_dir: logs/grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch
