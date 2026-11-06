@@ -119,6 +119,9 @@ def test_external_pools_submit_a_heterogeneous_job(repo):
     record = repo.parent / "sbatch"
     args = (record.with_suffix(".args")).read_text().split("\n")
     assert args[args.index(":") + 1] == "--nodes=1"
+    # sbatch reads no dependency from the environment, so the singleton default
+    # that ray.sub carries must be on the first component's command line.
+    assert "--dependency=singleton" in args[: args.index(":")]
     assert args[-2] == "tools/external_gym_vllm/run_in_allocation.sh"
     assert (record.with_suffix(".pools")).read_text().strip() == "JUDGE"
     command = (record.with_suffix(".command")).read_text()

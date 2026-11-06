@@ -227,6 +227,7 @@ for SCRIPT in $SCRIPTS; do
         COMMAND_ARG="uv run $rel_script ${script_args[@]}"
         POOL_SETUP=""
         HET_ARGS=""
+        DEPENDENCY_ARG=""
         BATCH_SCRIPT=ray.sub
         if [[ -n "$rel_pools" ]]; then
             # The pools file registers each pool and may append Hydra overrides that
@@ -248,6 +249,9 @@ export EXTERNAL_VLLM_POOLS
 COMMAND=\"uv run $rel_script ${script_args[@]} \$EXTERNAL_VLLM_SCRIPT_ARGS \$EXTERNAL_SERVICE_READINESS_PLACEHOLDER\"
 validate_external_vllm_submission \"\$COMMAND\" $NUM_EXTERNAL_SERVICE_NODES
 "
+            # run_in_allocation.sh has no #SBATCH lines. Pass ray.sub's singleton
+            # dependency here, so runs with the same job name do not overlap.
+            DEPENDENCY_ARG="--dependency=singleton "
             HET_ARGS=": --nodes=$NUM_EXTERNAL_SERVICE_NODES ${EXTERNAL_SEGMENT_ARG}--account=$ACCOUNT --job-name=$ACCOUNT:${JOB_NAME}${SLURM_JOB_SUFFIX:-} --partition=$PARTITION --time=0:${NUM_MINUTES}:0 ${GRES_ARG}${COMMENT_ARG}"
             BATCH_SCRIPT=tools/external_gym_vllm/run_in_allocation.sh
         fi
@@ -272,7 +276,7 @@ sbatch \\
     --account=$ACCOUNT \\
     --job-name=$ACCOUNT:${JOB_NAME}${SLURM_JOB_SUFFIX:-} \\
     --partition=$PARTITION \\
-    --time=0:${NUM_MINUTES}:0 ${GRES_ARG}${COMMENT_ARG}\\
+    --time=0:${NUM_MINUTES}:0 ${GRES_ARG}${COMMENT_ARG}${DEPENDENCY_ARG}\\
     --output=slurm-${NOW}-%j-${JOB_NAME}-${i}.${NUM_RUNS}.out \\
     ${HET_ARGS}${BATCH_SCRIPT}
 EOF
