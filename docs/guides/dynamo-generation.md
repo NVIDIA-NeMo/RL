@@ -54,7 +54,7 @@ shows them all:
 | `worker_args.tool_call_parser`, `reasoning_parser` | null | Dynamo's built-in parser names. null follows the native server's settings; see [NeMo-Gym](#nemo-gym) |
 | `worker_args.custom_jinja_template` | null | A chat template that replaces the model's own. null follows the native server's |
 | `frontend_args.router_mode` | `kv` | Frontend routing policy |
-| `frontend_args.session_affinity_ttl_secs` | 300 | Keeps a NeMo-Gym token-capture rollout on one engine while it is idle for up to this many seconds; null disables it. Dynamo keeps at most 65,536 sessions and answers a new one past that with HTTP 529 |
+| `frontend_args.session_affinity_ttl_secs` | 300 | Keeps a NeMo-Gym rollout on one engine while it is idle for up to this many seconds; null disables it. Dynamo keeps at most 65,536 sessions and answers a new one past that with HTTP 529 |
 | `frontend_args.extra_cli_args` | `[]` | Extra `dynamo.frontend` flags |
 
 The etcd and nats-server binaries are found in `NEMO_RL_DYNAMO_BIN_DIR` when it
@@ -108,6 +108,11 @@ With `token_capture.enabled`, Gym uses its `dynamo_worker` capture backend. The
 same vLLM workers stage each call's tokens, log probabilities, routed experts and
 processed media from their own process, exactly as the native endpoint does, and
 only the commit coordinates travel back through the frontend.
+
+Gym names each call's rollout, and the frontend keeps a rollout on one engine
+(`session_affinity_ttl_secs`), as the native backend pins each Gym session to
+one server. The engine splices the echoed prefix after the frontend has routed
+the call, so the KV router alone cannot see where that prefix is cached.
 
 The native server's chat settings carry over:
 
