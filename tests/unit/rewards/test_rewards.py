@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import numpy as np
 from numpy.testing import assert_allclose
 
 from nemo_rl.environments.rewards import (
@@ -224,6 +225,43 @@ def test_exact_answer_alphanumeric_reward_combined():
     reward, is_correct = combined_reward(ground_truth, incorrect_format_response)
     assert_allclose(reward, 0.0, atol=1e-6)
     assert is_correct is False
+
+
+def test_bbox_giou_reward_rejects_invalid_boxes():
+    ground_truth = "[400, 400, 700, 700]"
+
+    # Reversed corners, empty boxes and non-finite coordinates get no reward.
+    for box in [
+        "[600, 600, 300, 300]",  # a wrong box with its corners swapped (scored 1.0 before)
+        "[700, 700, 400, 400]",  # the gold box with its corners swapped
+        "[1000, 1000, 0, 0]",  # an image-independent constant (scored 11.1 here before)
+        "[400, 400, 400, 700]",  # zero width
+        "[nan, 400, 700, 700]",
+        "[400, 400, inf, 700]",
+        "[-1e200, -1e200, 1e200, 1e200]",  # finite, but the area overflows
+    ]:
+        reward, is_correct = bbox_giou_reward(ground_truth, f"<answer>{box}</answer>")
+        assert reward == 0.0, box
+        assert is_correct is False, box
+
+    # The same wrong box with its corners in order keeps its low GIoU.
+    reward, is_correct = bbox_giou_reward(
+        ground_truth, "<answer>[300, 300, 600, 600]</answer>"
+    )
+    assert 0.0 < reward < 0.5
+    assert is_correct is False
+
+
+def test_bbox_giou_reward_is_bounded():
+    rng = np.random.default_rng(0)
+    for _ in range(2000):
+        g = np.sort(rng.uniform(0, 1000, size=(2, 2)), axis=0).ravel()  # x1, y1, x2, y2
+        r = rng.uniform(0, 1000, size=4)
+        reward, _ = bbox_giou_reward(
+            f"[{g[0]}, {g[1]}, {g[2]}, {g[3]}]",
+            f"<answer>[{r[0]}, {r[1]}, {r[2]}, {r[3]}]</answer>",
+        )
+        assert -1.0 <= reward <= 1.0
 
 
 def test_bbox_giou_reward_combined():
