@@ -101,6 +101,10 @@ Completed attempt receipts retain unselected records for cleanup. Before publica
 
 ## Configuration and supported scope
 
+For a coordinator/child configuration with a paired-runtime 20-step validation, see the
+[Claude Code subagent-training example](../../examples/nemo_gym/subagent_training/README.md).
+Its README lists the required Gym prerequisites and runtime qualification status.
+
 Enable `token_capture.enabled: true` and `token_capture.forest_training: true` on the SingleController GRPO configuration. The former `token_capture.context_compaction` key is rejected with a migration message; rename it while keeping its value. For the included example, select Gym's `simple_agent_with_compaction` and configure its `context_history` policy/guards. RL sets Gym's internal `parent_resolution: source_history` with external `vllm_worker` staging and `rebuild_response: false`.
 
 `token_capture.selection_policy` controls training membership:
