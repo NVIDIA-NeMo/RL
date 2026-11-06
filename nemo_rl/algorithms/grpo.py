@@ -5974,6 +5974,14 @@ def async_grpo_train(
                 if hasattr(policy_generation, "snapshot_step_metrics"):
                     policy_generation.snapshot_step_metrics()
 
+                # DAPO reward scaling is a per-sample affine map of total_reward (and of
+                # the reward/<name> components). Each trajectory is sampled from the
+                # replay buffer once, so applying it here, before the advantage
+                # computation, matches the synchronous loop.
+                repeated_batch = scale_rewards(
+                    repeated_batch, master_config.grpo.reward_scaling
+                )
+
                 print("▶ Processing rewards...")
                 with (
                     timer.time("reward_calculation"),
