@@ -74,6 +74,10 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
     # Entries are allocated as sessions start and reaped after the TTL, so the cap
     # only bounds memory; Dynamo's own 65,536 is below NT4-scale concurrency.
     session_affinity_max_entries: PositiveInt = 16_777_216
+    # Frontends, spread round-robin over the generation nodes, each with its own
+    # router. More than one adds --router-replica-sync, so every router sees the
+    # requests the others have in flight. NeMo-Gym keeps each session on one.
+    num_frontends: PositiveInt = 1
     extra_cli_args: list[str] = Field(default_factory=list)
 
 

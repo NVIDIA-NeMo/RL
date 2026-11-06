@@ -40,6 +40,9 @@ policy:
         session_affinity_ttl_secs: 300
         # Most sessions the frontends hold at once, across all of them.
         session_affinity_max_entries: 16777216
+        # Frontends, spread over the generation nodes; more than one syncs their
+        # routers' in-flight load.
+        num_frontends: 1
         extra_cli_args: []
 
 logger:
