@@ -145,6 +145,7 @@ automodel = [
   "torch==2.13.0",
   "torchvision==0.28.0",
   "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "apache-tvm-ffi==0.1.11",
   "nemo-automodel[moe]",
   # Automodel's FLA kernels require this TileLang version on Hopper.
   # Keep this scoped to the automodel fork; sglang intentionally pins TileLang 0.1.8.
@@ -167,6 +168,7 @@ vllm = [
   "torch==2.13.0",
   "torchvision==0.28.0",
   "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "apache-tvm-ffi==0.1.11",
   "transformers==5.12.1",
   "tilelang==0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "cuda-python",
@@ -190,6 +192,7 @@ sglang = [
   "torch==2.11.0",
   "torchvision==0.26.0",
   "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "apache-tvm-ffi==0.1.11",
   # sgl-project/sglang branch `sglang-miles` (based on v0.5.16). Needed for the
   # begin_weight_update / end_weight_update refit session: quantized weights
   # carry derived scales (swizzled blockscales, g1/g2 alphas) that have to be
@@ -233,8 +236,10 @@ mcore = [
   "flash-attn==2.8.1",
   # FlashAttention-4 (CuTe DSL). Required by megatron_cfg.flash_attention_version=4, which
   # zero_train_gen_mismatch / batch_invariant_mode pins on both train and generation.
-  # Pinned to b19: b20+ need apache-tvm-ffi>=0.1.12, but the shared override keeps 0.1.11.
-  "flash-attn-4==4.0.0b19 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # b27 supports QuACK's current packed-subtraction API and CUTLASS >=4.6.2.
+  "flash-attn-4==4.0.0b27 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # FA4 needs >=0.1.12; keep the older backends' TVM-FFI pin in their own extras.
+  "apache-tvm-ffi==0.1.13.post2",
   # Core's tool.uv constraint is not inherited by downstream projects. Older
   # Quack releases use CuTe APIs moved by the required CUTLASS 4.8 runtime.
   "quack-kernels>=0.6.5 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
@@ -459,9 +464,10 @@ override-dependencies = [
     "flashinfer-jit-cache-sm110a==0.7.2.post1+cu130; platform_machine == 'aarch64'",
     "flashinfer-jit-cache-sm121a==0.7.2.post1+cu130; platform_machine == 'aarch64'",
   ] },
-  # Preserve TRT-LLM's existing frontend override without constraining Megatron.
+  # Preserve TRT-LLM's existing frontend and TVM-FFI overrides without constraining Megatron.
   { package = { name = "tensorrt-llm" }, dependencies = [
     "nvidia-cudnn-frontend==1.25.0",
+    "apache-tvm-ffi==0.1.11",
   ] },
   "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
@@ -492,12 +498,6 @@ override-dependencies = [
   # xgrammar.normalize_tool_choice (vLLM requires xgrammar>=0.2.1,<1.0.0; the
   # override would otherwise force an incompatible downgrade).
   "xgrammar>=0.2.1,<1.0.0",
-  # tensorrt-llm 1.3.0rc28 pins apache-tvm-ffi==0.1.13.post2, while xgrammar needs
-  # >=0.1.9. The binding ceiling is nemo-automodel[cuda] (apache-tvm-ffi<=0.1.11)
-  # together with tilelang 0.1.12 (<=0.1.11); tilelang 0.1.11 itself accepts
-  # ~=0.1.0 and would admit 0.1.13.post2. Keep the shared override at 0.1.11 so
-  # the automodel venv stays resolvable; the trtllm venv inherits it.
-  "apache-tvm-ffi==0.1.11",
   # Override dependencies to address CVEs
   "mlflow>=3.13.0",
   # Override langchain-core to address CVE GHSA-qh6h-p6c9-ff54 (path traversal in load_prompt)
