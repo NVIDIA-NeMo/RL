@@ -30,7 +30,10 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     TQReplayBuffer,
 )
 from nemo_rl.algorithms.opd import TQTeacherLogprobCoordinator
-from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller import (
+    RolloutRuntimeState,
+    SingleControllerActor,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
 from nemo_rl.experience.reward_penalties import FinalizedReward
@@ -77,7 +80,9 @@ class _DataPlaneClient:
         )
 
 
-def _request(resolved_agent_name: str | None = None) -> ReassemblyRequest:
+def _request(
+    resolved_agent_name: str | None = None, *, attribution_key: str | None = None
+) -> ReassemblyRequest:
     return ReassemblyRequest(
         group_id="group",
         prompt_idx=17,
@@ -95,19 +100,19 @@ def _request(resolved_agent_name: str | None = None) -> ReassemblyRequest:
         mask_sample=(False,),
         fallback_weight_version=3,
         resolved_agent_name=resolved_agent_name,
+        attribution_key=attribution_key,
     )
 
 
 def _controller(actor: object) -> Any:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._available_finalizers = asyncio.Queue()
     ctrl._available_finalizers.put_nowait(actor)
     ctrl._active_finalizers = 0
     ctrl._finalizer_waiters = 0
     ctrl._finalizer_unknown_outcomes = 0
-    ctrl._finalizer_metrics_by_group = {}
-    ctrl._finalizer_rewards_by_group = {}
     ctrl._rollout_recovery_ledger = MagicMock()
     ctrl._rollout_recovery_ledger.__contains__.return_value = False
     ctrl._rollout_manager = MagicMock()
@@ -126,7 +131,24 @@ def _controller(actor: object) -> Any:
     return ctrl
 
 
-def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -> None:
+@pytest.mark.parametrize(
+    ("resolved_agent_name", "attribution_key", "expected_extra_env_info"),
+    [
+        (None, None, None),
+        ("flat-agent", None, {"agent_ref": {"name": "flat-agent"}}),
+        (
+            "flat-agent",
+            "flat-agent",
+            {"agent_ref": {"name": "flat-agent"}, "attribution_key": "flat-agent"},
+        ),
+        (None, "usersim:train", {"attribution_key": "usersim:train"}),
+    ],
+)
+def test_successful_actor_finalization_returns_actor_and_transfers_ownership(
+    resolved_agent_name: str | None,
+    attribution_key: str | None,
+    expected_extra_env_info: dict[str, Any] | None,
+) -> None:
     meta = KVBatchMeta(
         partition_id="canonical",
         task_name="train",
@@ -145,7 +167,7 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
     finalize = _RemoteFinalize(result=result)
     actor = SimpleNamespace(finalize=finalize)
     ctrl = _controller(actor)
-    request = _request()
+    request = _request(resolved_agent_name, attribution_key=attribution_key)
 
     committed = asyncio.run(ctrl._finalize_with_actor(request, {}))
 
@@ -161,9 +183,12 @@ def test_successful_actor_finalization_returns_actor_and_transfers_ownership() -
         3,
         3,
         staging_keys=["group_g0/call"],
-        extra_env_info=None,
+        extra_env_info=expected_extra_env_info,
     )
-    assert ctrl._finalizer_metrics_by_group["group"]["finalize/group_ms"] == 1.0
+    assert (
+        ctrl._rollout_runtime.finalizer_metrics_by_group["group"]["finalize/group_ms"]
+        == 1.0
+    )
 
 
 def test_capture_rollout_metrics_ride_on_the_committed_meta() -> None:
@@ -400,15 +425,15 @@ def test_below_threshold_group_releases_pending_finalizer_state() -> None:
         # The same calls the rollout pump makes when
         # valid_row_count / total_row_count < min_valid_fraction_per_group.
         assert await ctrl._finalize_with_actor(request, {}) is result
-        assert "group" in ctrl._finalizer_metrics_by_group
-        assert "group" in ctrl._finalizer_rewards_by_group
+        assert "group" in ctrl._rollout_runtime.finalizer_metrics_by_group
+        assert "group" in ctrl._rollout_runtime.finalizer_rewards_by_group
         await ctrl._discard_committed_group(request)
 
     asyncio.run(_below_threshold_branch())
 
     ctrl._buffer.abort.assert_called_once_with("group")
-    assert "group" not in ctrl._finalizer_metrics_by_group
-    assert "group" not in ctrl._finalizer_rewards_by_group
+    assert "group" not in ctrl._rollout_runtime.finalizer_metrics_by_group
+    assert "group" not in ctrl._rollout_runtime.finalizer_rewards_by_group
 
 
 def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:
@@ -480,7 +505,7 @@ def test_dropped_actor_group_cleans_ownership_and_returns_uncommitted() -> None:
     ]
     ctrl._buffer.abort.assert_called_once_with("group")
     ctrl._buffer.commit_finalized.assert_not_awaited()
-    assert "group" not in ctrl._finalizer_metrics_by_group
+    assert "group" not in ctrl._rollout_runtime.finalizer_metrics_by_group
     assert ctrl._available_finalizers.get_nowait() is actor
 
 
