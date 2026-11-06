@@ -12,7 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""A fake NeMo-Gym actor to drive the real ``GymCheckpointCoordinator`` in tests.
+"""A fake NeMo-Gym actor to drive the real ``GymCheckpointCoordinator`` in tests,
+and builders for the real ``GymEnvironmentCheckpoint`` over it.
 
 Tests set the per-test Gym behavior (a commit that blocks, a restore that fails,
 a prepare that is not ready, sessions Gym keeps until retired) on the actor, so
@@ -22,16 +23,25 @@ the coordinator under test is always the real one.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+import contextlib
+from collections.abc import AsyncIterator, Awaitable, Callable
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Optional
 
+from nemo_rl.environments.checkpointing.nemo_gym import GymEnvironmentCheckpoint
 from nemo_rl.environments.gym_checkpoint_adapter import (
     GymCheckpointCommitSummary,
     GymCheckpointEpisode,
     GymCheckpointPrepareSummary,
 )
-from nemo_rl.environments.gym_checkpoint_coordinator import GymCheckpointCoordinator
+from nemo_rl.environments.gym_checkpoint_coordinator import (
+    GymCheckpointCommitResult,
+    GymCheckpointCoordinator,
+)
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.experience.rollout_manager import RequestDeadlineRegistry
+from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
 
 INSTANCE_ID = "tools/replica-0"
 
@@ -211,3 +221,45 @@ def gym_coordinator(
         control_timeout_s=control_timeout_s,
         prepare_timeout_s=prepare_timeout_s,
     )
+
+
+async def no_staging_keys() -> list[str]:
+    return []
+
+
+def deadline_pausing_manager(
+    registry: Optional[RequestDeadlineRegistry] = None,
+) -> SimpleNamespace:
+    """Rollout-manager stand-in for the deadline pause a Gym checkpoint takes."""
+    registry = registry if registry is not None else RequestDeadlineRegistry()
+    return SimpleNamespace(
+        suspend_request_deadlines=registry.suspend,
+        resume_request_deadlines=registry.resume,
+    )
+
+
+def gym_environment_checkpoint(
+    coordinator: GymCheckpointCoordinator,
+    ledger: Optional[RolloutRecoveryLedger] = None,
+    *,
+    manager: Optional[Any] = None,
+    list_staging_keys: Callable[[], Awaitable[list[str]]] = no_staging_keys,
+    allow_restart_only_servers: bool = False,
+) -> GymEnvironmentCheckpoint:
+    """Gym's checkpoint over ``coordinator``, with a stand-in rollout manager."""
+    return GymEnvironmentCheckpoint(
+        coordinator,
+        ledger=ledger if ledger is not None else RolloutRecoveryLedger(),
+        rollout_manager=manager if manager is not None else deadline_pausing_manager(),
+        list_staging_keys=list_staging_keys,
+        allow_restart_only_servers=allow_restart_only_servers,
+    )
+
+
+@contextlib.asynccontextmanager
+async def snapshot_commit(
+    gym: GymEnvironmentCheckpoint, checkpoint_path: Path, *, checkpoint_id: str
+) -> AsyncIterator[GymCheckpointCommitResult]:
+    """Gym's commit for one snapshot, while Gym is parked."""
+    async with gym.snapshot(checkpoint_path, checkpoint_id=checkpoint_id) as snapshot:
+        yield snapshot.commit

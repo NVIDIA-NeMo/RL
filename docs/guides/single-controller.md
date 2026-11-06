@@ -90,7 +90,7 @@ uv run examples/run_grpo_single_controller.py --config <your-sc.yaml>
       use_importance_sampling_correction: true
     ```
 
-5. **Save the data plane for replay recovery.** When Single-Controller checkpointing is enabled, all built-in samplers require `checkpointing.save_data_plane: true` so completed, unconsumed rollout groups survive a restart. Native TQ checkpointing supports both `simple` and `mooncake_cpu` through these same checkpoint settings; no backend-specific switch is needed. For multi-node runs, `checkpoint_dir` must be on a durable filesystem visible at the same path from every node.
+5. **Save the data plane for replay recovery.** When Single-Controller checkpointing is enabled, all built-in samplers require `checkpointing.save_data_plane: true` so completed, unconsumed rollout groups survive a restart. Native TQ checkpointing supports `simple`, `mooncake_cpu` and `nixl` through these same checkpoint settings; no backend-specific switch is needed. For multi-node runs, `checkpoint_dir` must be on a durable filesystem visible at the same path from every node.
 
     ```yaml
     checkpointing:
@@ -115,6 +115,7 @@ reward_penalties:
   penalize_duplicated_reasoning: true
   penalize_empty_final_answer: true
   penalize_unwanted_tokens: true
+  penalize_malformed_think_tag: true
   token_ids:
     unwanted: [12345]  # Replace with IDs from your model's tokenizer.
 env:
@@ -134,6 +135,13 @@ checked across all selected generated spans, including terminal tokens; prompt,
 tool, and abandoned-branch tokens do not count. The final-function-call exception
 for empty answers is preserved. Token IDs, logprobs, and training masks keep their
 existing behavior.
+
+The malformed think-tag check runs on each generated span. When think-tag IDs are
+configured or each tag is a single token, the tag counts must match the thinking mode
+set by the prompt; the decoded text must also contain no open tag and at most one
+close tag. Gym's message-level `has_malformed_thinking` flag is not used with
+capture. Non-finite generation logprobs are rejected at staging, and the rollout is
+masked as `capture_poisoned`.
 
 Both paths share the classification, text checks, token membership check, and
 shaping formula. For low-effort prompts:
@@ -166,8 +174,8 @@ reward substituted after shaping and penalties. This retains one reward
 observation per valid row, plus optional table data, in pending checkpoint state.
 Existing low/high effort means and exact length medians are preserved; `mean_reward_low`
 measures the shaped reward before penalties. Pending statistics survive recovery
-and are consumed once. Malformed-thinking penalties and message-level advantage
-overrides remain unsupported with capture and fail at setup.
+and are consumed once. Message-level advantage overrides remain unsupported with
+capture and fail at setup.
 
 ## Checkpointing and Replay Recovery
 
@@ -273,20 +281,11 @@ on the original run as well as its restart.
 Periodic snapshots currently require all of the following:
 
 - `checkpointing.enabled: true` and `checkpointing.save_data_plane: true`.
-- `data_plane.backend: simple` or `data_plane.backend: mooncake_cpu`, because native TQ save/load is required.
+- `data_plane.backend: simple`, `mooncake_cpu` or `nixl`, because native TQ save/load is required.
 - `token_capture.enabled: true`.
 - A replay-recoverable sampler with training-claim ownership. All built-in
   samplers qualify. A custom sampler must explicitly declare both
   `supports_buffer_checkpoint = True` and `supports_training_claims = True`.
-
-With `data_plane.backend: mooncake_cpu`, data-plane checkpointing also requires
-`async_rl.generation_fleet_health.restart_dead_shards: false`. Setup rejects
-automatic shard restarts because replacing a generation worker can discard
-its owned Mooncake payload and leave stale checkpoint worker handles. This
-restriction applies to both trainer-step checkpoints and periodic rollout
-snapshots; restarting the whole job from a saved checkpoint is still supported.
-Support for live shard restarts is tracked in
-[NVIDIA-NeMo/RL#4178](https://github.com/NVIDIA-NeMo/RL/issues/4178).
 
 Each trainer or bootstrap anchor has a `rollout_snapshots/` directory. A
 published `snapshot_NNNNNN/` contains the native TQ snapshot and matching
@@ -408,7 +407,11 @@ is available before Gym resolves the concrete agent and SC reserves the recovery
 group. When a row already carries an `agent_ref`, a matching
 `agent_target_level_overrides` entry wins over a matching task-source entry,
 mirroring Gym's concrete-route precedence. Otherwise the task-source override,
-then the global default, applies. The agent map also keeps datasets collated
+then the global default, applies. A materialized Gym task row carries no agent,
+so its `task_id.taskset` is looked up in `task_source_granularity_overrides`
+instead, and `agent_granularity_overrides` does not apply. Set taskset keys in
+YAML: a command-line override cannot express a key that contains `:`, such as
+`weather:train`. The agent map also keeps datasets collated
 before Gym recorded `task_source` working, although re-collating them is
 recommended. Overrides may only select a coarser level than the global target,
 and are not supported with `turn` yet: a checkpointing Gym deployment exports
@@ -426,7 +429,7 @@ generation in the group has finished.
 
 When a sampler does not support replay recovery, a requested data-plane checkpoint is written in `shadow` mode. The TQ snapshot is retained, but no authoritative replay index is written and its rows are not restored into the training replay buffer.
 
-Native TQ save/load works with both `data_plane.backend: "simple"` and `data_plane.backend: "mooncake_cpu"`, using the existing `checkpointing.enabled: true` and `checkpointing.save_data_plane: true` settings. A failure while saving or validating the TQ snapshot prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
+Native TQ save/load works with `data_plane.backend: "simple"`, `"mooncake_cpu"` and `"nixl"`, using the existing `checkpointing.enabled: true` and `checkpointing.save_data_plane: true` settings. A failure while saving or validating the TQ snapshot prevents the incomplete checkpoint bundle from becoming the latest resumable checkpoint.
 
 ## Async-RL Knobs and Sampler Modes
 
