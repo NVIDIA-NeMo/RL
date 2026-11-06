@@ -574,6 +574,31 @@ def _get_gpu_id_info() -> tuple[int, str, int]:  # pragma: no cover
     return gpu_id, nvlink_domain, topo_rank
 
 
+@ray.remote(num_gpus=1)
+def _get_gpu_id() -> int:  # pragma: no cover
+    """Return the GPU id Ray assigned to the current task's bundle."""
+    return int(ray.get_gpu_ids()[0])
+
+
+def get_bundle_gpu_id(pg: PlacementGroup, bundle_index: int) -> int:
+    """Return the GPU id Ray assigned to one placement-group bundle.
+
+    Same probe as ``get_reordered_bundle``: a short task with a small GPU share (so it
+    also fits next to colocated workers) scheduled into the bundle. This is the id a
+    worker in that bundle gets from ``ray.get_gpu_ids()``.
+    """
+    return ray.get(
+        _get_gpu_id.options(
+            num_cpus=0,
+            num_gpus=0.01,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_bundle_index=bundle_index,
+            ),
+        ).remote()
+    )
+
+
 def get_reordered_bundle(
     pg: PlacementGroup,
     segment_size: int | None = None,
