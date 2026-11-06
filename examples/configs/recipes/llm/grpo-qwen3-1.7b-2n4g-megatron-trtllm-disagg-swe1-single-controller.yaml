@@ -1,15 +1,17 @@
 # SingleController sibling of grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1:
 # the same TRT-LLM prefill/decode disaggregation behind NeMo-Gym, driven by
-# examples/run_grpo_single_controller.py instead of the legacy async-GRPO loop.
+# examples/run_grpo_single_controller.py instead of the legacy async-GRPO loop,
+# with ledger-authoritative token capture and the ready_first sampler.
 #
 # Resource layout (2 nodes x 4 GPUs), unchanged from the parent:
 #   - node 0: policy training, Megatron CP4
 #   - node 1: one disagg replica -- 1 prefill engine (TP2) + 1 decode engine
-#     (TP2) fronted by 2 disagg servers. NeMo-Gym talks to the frontends.
+#     (TP2) fronted by 2 disagg servers. NeMo-Gym talks to the frontends,
+#     which also host token capture (they stage each call to TransferQueue).
 #
 # SC drives TRT-LLM as a fixed, non-colocated fleet: generation fleet health,
-# the generation router, token capture and a refit deadline are unsupported
-# and rejected at setup (TrtllmGeneration.validate_settings).
+# the generation router and a refit deadline are unsupported and rejected at
+# setup (TrtllmGeneration.validate_settings).
 
 defaults: ./grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1.yaml
 
@@ -26,6 +28,15 @@ grpo:
   val_period: 0
   val_at_start: false
   val_at_end: false
+  # The token-capture finalizer does not emit the per-message violation masks
+  # these advantages read (validate_single_controller_config rejects them).
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+
+loss_fn:
+  # ready_first trains groups from mixed weight versions, so the PPO ratio
+  # must be the real one (the sampler's setup check).
+  force_on_policy_ratio: false
 
 policy:
   generation:
@@ -35,6 +46,9 @@ policy:
       # with async_rl here.
       in_flight_weight_updates: true
       recompute_kv_cache_after_weight_updates: ${async_rl.recompute_kv_cache_after_weight_updates}
+
+token_capture:
+  enabled: true
 
 data_plane:
   enabled: true
@@ -52,9 +66,9 @@ async_rl:
     # TRT-LLM's refit has no worker-side abort hook for a deadline.
     refit_timeout_s: null
   sampler:
-    name: in_order
-    # One-step-off-policy, matching the parent's max_trajectory_age_steps.
-    max_lookahead_versions: 1
+    name: ready_first
+    # Generation may run one dispatch batch ahead of the trainer.
+    max_staleness_versions: 1
   min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
   max_inflight_prompts: ${grpo.num_prompts_per_step}
   max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, 2}

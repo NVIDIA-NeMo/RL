@@ -27,6 +27,11 @@ from typing import Any, Optional
 
 import ray
 
+from nemo_rl.models.generation.trtllm.token_capture import (
+    TokenCaptureMiddleware,
+    TrtllmCaptureHost,
+)
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -308,6 +313,7 @@ def _build_adaptor_class() -> type:
 
         def __init__(self, *args: Any, **kwargs: Any) -> None:
             self._tokenize_fn = kwargs.pop("tokenize_fn", None)
+            self._capture_host = kwargs.pop("capture_host", None)
             super().__init__(*args, **kwargs)
             self._uvicorn: Any = None
             self._install_request_adaptor()
@@ -344,6 +350,14 @@ def _build_adaptor_class() -> type:
             self.app.add_middleware(
                 _DropGymOnlyRequestFields, tokenize_fn=self._tokenize_fn
             )
+            # Added last, so outermost: capture pins the prompt ids before the
+            # middleware above would render them.
+            if self._capture_host is not None:
+                self.app.add_middleware(
+                    TokenCaptureMiddleware,
+                    host=self._capture_host,
+                    tokenize_fn=self._tokenize_fn,
+                )
 
         # -------------------------------------------------------------- #
         #  Errors
@@ -435,7 +449,9 @@ def _build_frontend_tokenizer(
         generation_eos = None
     eos_token_ids = resolve_eos_token_ids(tokenizer, None, generation_eos)
 
-    async def _tokenize(payload: dict[str, Any]) -> str:
+    async def _tokenize(
+        payload: dict[str, Any], *, required_prefix_ids: Optional[list[int]] = None
+    ) -> str:
         # The ctx adapter renders these ids verbatim, so normalize exactly as
         # it would have before rendering: tools reach the template as
         # {"type": "function", "function": ...}, not in Gym's key order.
@@ -452,6 +468,7 @@ def _build_frontend_tokenizer(
             effective,
             eos_token_ids,
             chat_template=chat_template,
+            required_prefix_ids=required_prefix_ids,
         )
         return base64.b64encode(np.asarray(ids, dtype=np.int32).tobytes()).decode()
 
@@ -464,8 +481,15 @@ def start_server(
     port: int = 0,
     req_timeout_secs: int = 1800,
     tokenize_fn: Any = None,
+    capture_host: Optional[TrtllmCaptureHost] = None,
 ) -> "tuple[threading.Thread, str, Any]":
-    """Start the disagg server in a daemon thread and return (thread, base_url, server)."""
+    """Start the disagg server in a daemon thread and return (thread, base_url, server).
+
+    ``capture_host`` installs token capture around the chat route; it needs
+    ``tokenize_fn``, which renders the exact prompt the capture admits.
+    """
+    if capture_host is not None and tokenize_fn is None:
+        raise ValueError("token capture on the disagg frontend requires tokenize_fn")
     import asyncio
 
     from nemo_rl.distributed.virtual_cluster import (
@@ -497,6 +521,7 @@ def start_server(
         req_timeout_secs=req_timeout_secs,
         coordinator_url=None,
         tokenize_fn=tokenize_fn,
+        capture_host=capture_host,
     )
 
     def _run() -> None:
@@ -556,6 +581,8 @@ class DisaggServerActorImpl:
         self._thread: Optional[threading.Thread] = None
         self._server = None
         self._base_url: Optional[str] = None
+        # Present only with frontend_tokenize, which renders the prompts it admits.
+        self._capture: Optional[TrtllmCaptureHost] = None
         # Serving from the constructor is what makes crash recovery work: Ray
         # re-runs __init__ on actor restart but never replays method calls, so
         # with a hard node pin and a deterministic port the restarted frontend
@@ -598,9 +625,30 @@ class DisaggServerActorImpl:
             tokenize_fn = _build_frontend_tokenizer(
                 model_name, default_chat_template_kwargs or {}, chat_template
             )
+            self._capture = TrtllmCaptureHost()
         self._thread, self._base_url, self._server = start_server(
-            config, port=self._port, tokenize_fn=tokenize_fn
+            config, port=self._port, tokenize_fn=tokenize_fn, capture_host=self._capture
         )
+
+    def setup_token_capture(self, dp_cfg: Any, staging_partition: str) -> None:
+        """Install token capture on this frontend's chat route.
+
+        Args:
+            dp_cfg: Data-plane config for the frontend's TransferQueue client.
+            staging_partition: Partition that captured calls are staged in.
+        """
+        if self._capture is None:
+            raise RuntimeError(
+                "TRT-LLM token capture requires "
+                "policy.generation.disaggregation.frontend_tokenize=true"
+            )
+        self._capture.setup(dp_cfg, staging_partition)
+
+    def set_rollout_weight_version(self, version: int) -> None:
+        """Stamp calls this frontend admits from now on with ``version``."""
+        if self._capture is None:
+            raise RuntimeError("token capture is not set up on this frontend")
+        self._capture.set_rollout_weight_version(version)
 
     def start(self) -> str:
         """Wait for the server to answer and return the URL NeMo-Gym will talk to.

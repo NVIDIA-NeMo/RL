@@ -1454,9 +1454,9 @@ def setup_single_controller(
                 "(env.should_use_nemo_gym=true) — the ledger lives in Gym's "
                 "policy model server"
             )
-        if generation_config["backend"] not in ("vllm", "megatron"):
+        if generation_config["backend"] not in ("vllm", "megatron", "trtllm"):
             raise NotImplementedError(
-                "token_capture.enabled supports vllm or megatron; got "
+                "token_capture.enabled supports vllm, megatron or trtllm; got "
                 f"{generation_config['backend']!r}"
             )
         if (

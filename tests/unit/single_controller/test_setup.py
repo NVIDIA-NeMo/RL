@@ -4507,6 +4507,7 @@ def test_trtllm_max_sequence_length():
 def test_trtllm_pd_gym_builds_generation_once_before_gym(patched_factories):
     """Gym gets the PD frontend URLs the single TRT-LLM build reports."""
     mc = _trtllm_sc_config()
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
     fake_gen = patched_factories["fake_gen"]
     fake_gen.dp_openai_server_base_urls = ["http://pd1:8000/v1", "http://pd2:8000/v1"]
     events = []
@@ -4543,6 +4544,7 @@ def test_trtllm_gym_generation_build_overlaps_trainer(patched_factories):
     setup would never start the trainer, so the wait would time out.
     """
     mc = _trtllm_sc_config()
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
     fake_gen = patched_factories["fake_gen"]
     fake_gen.dp_openai_server_base_urls = ["http://pd1:8000/v1"]
     trainer_started = threading.Event()
@@ -4610,7 +4612,9 @@ def test_spinup_gym_after_generation_propagates_build_failure():
         "fleet",
         "restart",
         "deadline",
-        "token_capture",
+        "capture_without_frontend_tokenize",
+        "capture_top_logprobs",
+        "capture_router_replay",
         "router",
         "sync_engine",
         "http",
@@ -4625,8 +4629,17 @@ def test_trtllm_unsupported_options_fail_before_resources(patched_factories, opt
         mc.async_rl.generation_fleet_health.restart_dead_shards = True
     elif option == "deadline":
         mc.async_rl.generation_fleet_health.refit_timeout_s = 300
-    elif option == "token_capture":
+    elif option == "capture_without_frontend_tokenize":
         mc.token_capture.enabled = True
+    elif option == "capture_top_logprobs":
+        mc.token_capture.enabled = True
+        mc.policy["generation"]["disaggregation"]["frontend_tokenize"] = True
+        mc.policy["generation"]["top_logprobs"] = 4
+        mc.loss_fn.score_centering = True
+    elif option == "capture_router_replay":
+        mc.token_capture.enabled = True
+        mc.policy["generation"]["disaggregation"]["frontend_tokenize"] = True
+        mc.policy["router_replay"] = {"enabled": True}
     elif option == "router":
         mc.async_rl.generation_router.enabled = True
     elif option == "sync_engine":
@@ -4643,3 +4656,20 @@ def test_trtllm_unsupported_options_fail_before_resources(patched_factories, opt
         "_build_trainer",
     ]:
         patched_factories[name].assert_not_called()
+
+
+def test_trtllm_token_capture_is_hosted_by_the_pd_frontends():
+    mc = _trtllm_sc_config()
+    mc.token_capture.enabled = True
+    mc.policy["generation"]["disaggregation"]["frontend_tokenize"] = True
+
+    trtllm_generation_cls = sc_setup_mod.TrtllmGeneration
+    trtllm_generation_cls.validate_settings(mc)
+
+    generation = trtllm_generation_cls.__new__(trtllm_generation_cls)
+    generation._disagg_actors = []
+    with pytest.raises(NotImplementedError, match="PD disagg frontends"):
+        generation.setup_token_capture({}, "staging")
+    generation._disagg_actors = [MagicMock()]
+    with pytest.raises(NotImplementedError, match="text-only"):
+        generation.setup_token_capture({}, "staging", capture_media=True)
