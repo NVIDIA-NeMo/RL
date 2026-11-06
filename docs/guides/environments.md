@@ -2,6 +2,30 @@
 
 GRPO includes multiple environments, each offering a standard interface for reward computation and evaluation.
 
+## NeMo Gym Environments
+
+[NeMo Gym](https://docs.nvidia.com/nemo/gym/) is the recommended path for NeMo RL workflows that need reusable environments, tool execution, custom verification, or multi-step and multi-turn agent interactions. NeMo Gym manages the environment and rollout orchestration, while NeMo RL serves the model and trains it from the returned rewards. For lightweight in-process reward computation, use the NeMo RL-native environments documented below.
+
+Enable NeMo Gym with an asynchronous vLLM HTTP server and select the NeMo Gym environment configuration:
+
+```yaml
+policy:
+  generation:
+    backend: vllm
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+```
+
+Keep `vllm_model_for_training.yaml` first, then add the resource-server and agent configurations needed by your environment. For complete GRPO and on-policy distillation runners and configurations, see [`examples/nemo_gym/`](../../examples/nemo_gym/). See the [NeMo Gym integration guide](../design-docs/nemo-gym-integration.md) for architecture and configuration details, and the [NeMo Gym documentation](https://docs.nvidia.com/nemo/gym/) for available environments and environment authoring.
+
 ## Math Environment
 
 The Math Environment is designed for mathematical reasoning tasks. It evaluates responses to math problems using `math-verify` and provides rewards based on correctness.
