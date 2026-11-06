@@ -1,0 +1,142 @@
+# Policy and ASR reward actor environment.
+#
+# NeMo Speech and Automodel main need transformers 5.18 and TransformerEngine
+# 2.19, which the root lock does not admit, so this project has its own lock.
+# Torch, CUDA libraries and indexes follow the root pyproject.toml so that
+# colocated refits share vLLM's Torch ABI; build sources for packages Automodel
+# main moved follow Automodel's pyproject.toml.
+
+[project]
+name = "speechlm-gspo-policy-env"
+version = "0.1.0"
+requires-python = ">=3.13.14,<3.14"
+dependencies = [
+  "nemo-rl",
+  "speechlm-gspo",
+  "nemo-automodel[moe]",
+  "nemo-toolkit[speechlm2]",
+  "nemo-skills",
+  "torch==2.13.0",
+  "torchvision==0.28.0",
+  "transformers==5.18.0",
+  "transformer-engine[pytorch,core_cu13]==2.19.0",
+  "mamba-ssm",
+  "causal-conv1d==1.6.0",
+  "deep_ep",
+  "megatron-fsdp",
+  # Automodel's FLA kernels require this TileLang version on Hopper.
+  "tilelang==0.1.11; platform_machine == 'x86_64'",
+]
+
+[dependency-groups]
+build = [
+  "setuptools",
+  "packaging",
+  "einops",
+  "ninja",
+  "psutil",
+  "pybind11",
+  "wheel",
+]
+
+[tool.uv]
+managed = true
+package = false
+environments = [
+  "python_version == '3.13' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "python_version == '3.13' and sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+preview = true
+default-groups = ["build"]
+link-mode = "copy"
+no-build-isolation-package = [
+  "transformer-engine-torch",
+  "mamba-ssm",
+  "causal-conv1d",
+  "deep_ep",
+]
+override-dependencies = [
+  # nemo-rl's base range stops at 5.16.1; Automodel main requires 5.18.0.
+  "transformers==5.18.0",
+  # Speech pins an Automodel revision without FreezeConfig.unfreeze_parameters.
+  "nemo-automodel[moe] @ git+https://github.com/NVIDIA-NeMo/Automodel.git@752a71ebf731f84b19ca9af5e7c242be003082bd",
+  "transformer-engine[pytorch,core_cu13]==2.19.0",
+  "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
+  "nvidia-cudnn-cu13==9.26.0.51; sys_platform != 'darwin'",
+  "nvidia-nccl-cu13==2.30.7",
+  "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
+  "opencv-python-headless; sys_platform == 'never'",
+  "av; sys_platform == 'never'",
+  "timm<=1.0.22",
+  "setuptools>=80.10.2",
+  "apache-tvm-ffi==0.1.11",
+  "numpy>=2.1.0,<2.5",
+  "nemo-lens[sdk,aiohttp] @ git+https://github.com/NVIDIA-NeMo/Lens.git@4d045c03186b90afdc815db46b671f6a21bc7e98",
+]
+
+[tool.uv.sources]
+nemo-rl = { path = "../../../..", editable = true }
+speechlm-gspo = { path = "../..", editable = true }
+nemo-automodel = { git = "https://github.com/NVIDIA-NeMo/Automodel.git", rev = "752a71ebf731f84b19ca9af5e7c242be003082bd" }
+nemo-toolkit = { git = "https://github.com/NVIDIA-NeMo/Speech.git", rev = "979cc6c6a3ba7a07195b441b3854b918d08bd2c2" }
+nemo-skills = { git = "https://github.com/NVIDIA-NeMo/Skills.git", rev = "5ea1990a2d818b29d00f13fee437416343b0d344" }
+mamba-ssm = { git = "https://github.com/akoumpa/cute-mamba.git", rev = "a8b8882fa03668613f7b06831950d504a03b647a" }
+deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "96e3d1fc77be942438673e88b07be21d454af8a9" }
+megatron-fsdp = { git = "https://github.com/yuhezhang-ai/Megatron-LM.git", rev = "455389c480af6b3acdca74c7830c68b3274eb083", subdirectory = "megatron/core/distributed/fsdp/src" }
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+triton = { index = "pytorch-cu130" }
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.extra-build-dependencies]
+deep_ep = [{ requirement = "torch", match-runtime = true }]
+transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
+mamba-ssm = [{ requirement = "torch", match-runtime = true }]
+causal-conv1d = [{ requirement = "torch", match-runtime = true }]
+
+[tool.uv.extra-build-variables]
+deep_ep = { CPLUS_INCLUDE_PATH = "/usr/local/cuda/include/cccl" }
+transformer-engine-torch = { CPLUS_INCLUDE_PATH = "/usr/local/cuda/include:/usr/local/cuda/include/cccl", NVTE_BUILD_USE_NVIDIA_WHEELS = "1", NVTE_WITH_NCCL_EP = "0" }
+
+[[tool.uv.dependency-metadata]]
+name = "deep_ep"
+version = "1.2.1+96e3d1f"
+requires-dist = ["torch", "packaging", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "mamba-ssm"
+version = "2.3.0"
+requires-dist = [
+  "torch",
+  "triton",
+  "ninja",
+  "einops",
+  "transformers",
+  "packaging",
+  "setuptools>=61.0.0",
+]
+
+# The ASR reward imports only Skills' audio evaluator; Skills' declared
+# requirements add its serving, pipeline and benchmark stacks.
+[[tool.uv.dependency-metadata]]
+name = "nemo-skills"
+version = "0.7.0"
+requires-dist = [
+  "jiwer>=3.1.0,<4.0.0",
+  "math-verify[antlr4_9_3]",
+  "numpy",
+  "omegaconf",
+  "pyyaml",
+  "rich",
+  "tqdm",
+  "whisper-normalizer",
+]

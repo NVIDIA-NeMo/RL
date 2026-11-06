@@ -1,0 +1,104 @@
+# vLLM generation actor environment.
+#
+# NeMo RL's vLLM stack plus NeMo Speech, whose `nemo_speechlm` vLLM plugin
+# serves the native checkpoint. Speech is not in the root lock, so this project
+# has its own lock; the vLLM stack, indexes and build settings follow the root
+# pyproject.toml.
+
+[project]
+name = "speechlm-gspo-generation-env"
+version = "0.1.0"
+requires-python = ">=3.13.14,<3.14"
+dependencies = [
+  "nemo-rl[vllm]",
+  "speechlm-gspo",
+  "nemo-toolkit[asr]",
+  # Imported by nemo.collections.speechlm2 models, which the plugin loads.
+  "peft>=0.18.1",
+]
+
+[dependency-groups]
+build = [
+  "setuptools",
+  "packaging",
+  "einops",
+  "ninja",
+  "psutil",
+  "pybind11",
+  "wheel",
+]
+
+[tool.uv]
+managed = true
+package = false
+environments = [
+  "python_version == '3.13' and sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "python_version == '3.13' and sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+preview = true
+default-groups = ["build"]
+link-mode = "copy"
+no-build-isolation-package = ["deep_gemm", "deep_ep"]
+override-dependencies = [
+  "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
+  "nvidia-cudnn-cu13==9.26.0.51; sys_platform != 'darwin'",
+  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-nccl-cu13==2.30.7",
+  "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
+  "opencv-python-headless; sys_platform == 'never'",
+  "av; sys_platform == 'never'",
+  "timm<=1.0.22",
+  "fastapi[standard]>=0.133.0,<0.137.0",
+  "instanttensor>=0.1.9; platform_machine == 'x86_64'",
+  "llguidance>=1.7.0,<1.8.0",
+  "setuptools>=80.10.2",
+  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
+  "xgrammar>=0.2.1,<1.0.0",
+  "apache-tvm-ffi==0.1.11",
+  "numpy>=2.1.0,<2.5",
+  "nemo-lens[sdk,aiohttp] @ git+https://github.com/NVIDIA-NeMo/Lens.git@4d045c03186b90afdc815db46b671f6a21bc7e98",
+]
+
+[tool.uv.sources]
+nemo-rl = { path = "../../../..", editable = true }
+speechlm-gspo = { path = "../..", editable = true }
+nemo-toolkit = { git = "https://github.com/NVIDIA-NeMo/Speech.git", rev = "979cc6c6a3ba7a07195b441b3854b918d08bd2c2" }
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+triton = { index = "pytorch-cu130" }
+flashinfer-cubin = { index = "flashinfer" }
+flashinfer-jit-cache = { index = "flashinfer-cu130" }
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer"
+url = "https://flashinfer.ai/whl/"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-cu130"
+url = "https://flashinfer.ai/whl/cu130"
+explicit = true
+
+[tool.uv.extra-build-dependencies]
+deep_ep = [{ requirement = "torch", match-runtime = true }]
+deep_gemm = [{ requirement = "torch", match-runtime = true }]
+
+[[tool.uv.dependency-metadata]]
+name = "deep_ep"
+version = "1.2.1+17cfb81"
+requires-dist = ["torch", "packaging", "ninja"]
+
+[[tool.uv.dependency-metadata]]
+name = "deep_gemm"
+version = "2.5.0"
+requires-dist = ["torch", "packaging", "ninja"]
