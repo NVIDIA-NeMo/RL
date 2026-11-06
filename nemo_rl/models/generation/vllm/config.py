@@ -68,10 +68,11 @@ class VllmSpecificArgs(TypedDict):
     video: NotRequired[VllmVideoConfig]
     load_format: NotRequired[str]
     precision: NotRequired[str]
-    # Whether vLLM returns logprobs before or after generation-time logit
-    # processors. RL policy recomputation uses raw model logits, so recipes
-    # with generation-time processors should request ``raw_logprobs`` when
-    # comparing generation and policy logprobs.
+    # Whether vLLM returns logprobs before or after temperature, top-k/top-p
+    # filtering and other generation-time logit processors. The trainer replays
+    # top-k/top-p (not penalties, logit bias or bad words) on its
+    # temperature-scaled logits, so training with a filter requires
+    # ``processed_logprobs``.
     logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
     # Compute the logits with an fp32 LM head: bf16 operands, fp32 GEMM output,
     # via vLLM's head_dtype="float32" hf_override (any model whose lm_head is
@@ -271,6 +272,17 @@ class VllmConfig(GenerationConfig):
     # be combined with quant_cfg. Its runtime environment must already be in
     # ACTOR_ENVIRONMENT_REGISTRY.
     worker_extension_cls_fqn: NotRequired[str | None]
+
+
+def resolve_vllm_logprobs_mode(config: VllmConfig) -> str | None:
+    """The engine's logprobs_mode; vllm_cfg overrides vllm_kwargs as in the worker.
+
+    None means vLLM's default, raw_logprobs.
+    """
+    logprobs_mode = (config.get("vllm_cfg") or {}).get("logprobs_mode")
+    if logprobs_mode is None:
+        logprobs_mode = (config.get("vllm_kwargs") or {}).get("logprobs_mode")
+    return logprobs_mode
 
 
 def resolve_vllm_kv_cache_dtype(vllm_cfg: VllmSpecificArgs) -> str:

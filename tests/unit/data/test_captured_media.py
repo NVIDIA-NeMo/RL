@@ -1402,7 +1402,13 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
     worker.__dict__.update(state.__dict__)
     worker.cfg = dict(
-        temperature=1.0, top_p=1.0, val_temperature=0.0, val_top_p=1.0, vllm_cfg={}
+        temperature=1.0,
+        top_p=1.0,
+        top_k=None,
+        val_temperature=0.0,
+        val_top_p=1.0,
+        val_top_k=None,
+        vllm_cfg={},
     )
     worker.token_capture = MagicMock(adapter=VLLMCaptureAdapter())
     worker._capture_calls = {}
@@ -1429,6 +1435,11 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     handler = dict(app.routes)["/v1/chat/completions"]
     request = SimpleNamespace(
         top_k=-1,
+        min_p=None,
+        repetition_penalty=None,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        logit_bias=None,
         top_p=1.0,
         temperature=1.0,
         ng_capture=admission.model_dump(),

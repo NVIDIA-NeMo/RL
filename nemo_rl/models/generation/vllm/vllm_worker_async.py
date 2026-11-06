@@ -1644,14 +1644,38 @@ class VllmAsyncGenerationWorkerImpl(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
             # Accept train and validation profiles; reject off-policy requests.
-            check_sampling_param(
+            # vLLM fills an unset top_k/min_p/repetition_penalty from
+            # generation_config.json when vllm_kwargs sets generation_config="auto",
+            # so pin top_k to the matched profile's (as
+            # vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params does)
+            # and disable min_p and the repetition penalty. vLLM applies these and
+            # the presence/frequency penalties and logit bias before sampling; the
+            # trainer replays none of them, so a request may not set them.
+            top_k = check_sampling_param(
                 temperature=request.temperature,
                 top_p=request.top_p,
                 top_k=request.top_k,
                 generation_config=generation_config,
             )
-            # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
-            request.top_k = -1
+            assert request.min_p in (None, 0.0), (
+                f"request min_p={request.min_p} is not supported; leave it unset"
+            )
+            assert request.repetition_penalty in (None, 1.0), (
+                f"request repetition_penalty={request.repetition_penalty} is not "
+                "supported; leave it unset"
+            )
+            assert request.presence_penalty in (None, 0.0), (
+                f"request presence_penalty={request.presence_penalty} is not "
+                "supported; leave it unset"
+            )
+            assert request.frequency_penalty in (None, 0.0), (
+                f"request frequency_penalty={request.frequency_penalty} is not "
+                "supported; leave it unset"
+            )
+            assert not request.logit_bias, "request logit_bias is not supported"
+            request.top_k = top_k
+            request.min_p = 0.0
+            request.repetition_penalty = 1.0
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(

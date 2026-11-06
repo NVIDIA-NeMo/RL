@@ -350,6 +350,7 @@ guides/refit.md
 guides/checkpoint-engine-refit.md
 guides/dynamo-generation.md
 guides/router-replay.md
+guides/sampler-replay.md
 guides/muon-optimizer.md
 guides/automodel-tp-accuracy.md
 guides/ft-launcher-guide.md
