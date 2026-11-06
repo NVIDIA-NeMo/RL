@@ -20,24 +20,6 @@ import pytest
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 
-@pytest.mark.parametrize("value", [None, 0, 8])
-def test_dynamic_sampling_reserve_requires_removal(value: int | None) -> None:
-    with pytest.raises(
-        ValueError, match="dynamic_sampling_reserve_prompts was removed. Delete it"
-    ):
-        check_outdated_config({"grpo": {"dynamic_sampling_reserve_prompts": value}})
-
-
-@pytest.mark.parametrize(
-    "config",
-    [{}, {"grpo": None}, {"grpo": {}}, {"grpo": {"use_dynamic_sampling": True}}],
-)
-def test_automatic_dynamic_sampling_reserve_needs_no_config(
-    config: dict[str, Any],
-) -> None:
-    check_outdated_config(config)
-
-
 @pytest.mark.parametrize("value", [True, False, None])
 @pytest.mark.parametrize("new_key", [{}, {"forest_training": True}])
 def test_context_compaction_key_requires_explicit_migration(value, new_key):

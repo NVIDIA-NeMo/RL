@@ -251,17 +251,6 @@ def reject_outdated_rollout_recovery_granularity(config: dict[str, Any]) -> None
     raise ValueError(message)
 
 
-def reject_outdated_dynamic_sampling_reserve(config: dict[str, Any]) -> None:
-    """Reject the removed user-controlled dynamic-sampling pool size."""
-    grpo = config.get("grpo")
-    if isinstance(grpo, dict) and "dynamic_sampling_reserve_prompts" in grpo:
-        raise ValueError(
-            "grpo.dynamic_sampling_reserve_prompts was removed. Delete it: "
-            "SingleController reserves one num_prompts_per_step batch and refills "
-            "on demand. dynamic_sampling_max_gen_batches still limits generation."
-        )
-
-
 def check_outdated_config(config: dict[str, Any]) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
@@ -281,4 +270,3 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     reject_outdated_dynamo_router_reset_states(config)
     reject_outdated_context_compaction(config)
     reject_outdated_rollout_recovery_granularity(config)
-    reject_outdated_dynamic_sampling_reserve(config)

@@ -185,7 +185,7 @@ With `checkpointing.save_data_plane: true`, each Single-Controller checkpoint co
 - A native TQ snapshot containing rollout tensor payloads and TQ state.
 - A metadata-only replay index describing the completed rollout groups stored in TQ.
 - A `rollout_recovery.pt` ownership ledger describing unfinished prompt groups that must be redispatched after a restart.
-- A `replacement_reserve.pt` sidecar containing prompts held for dropped-rollout replacement, including an empty list when none are held. Schema-3 checkpoints may omit an empty reserve.
+- A `replacement_reserve.pt` sidecar containing a dictionary with independent `replacement` (fault tolerance) and `filtered` (dynamic sampling) prompt pools, including empty lists for empty pools. The reader also accepts the legacy single-list format; schema-3 checkpoints may omit an empty reserve.
 - The sampler dispatch position needed to continue scheduling from the correct point.
 
 The TQ snapshot and replay index are captured under the same checkpoint barrier. Generation may continue while the snapshot is written, but completed-group commits and destructive TQ clears wait at the barrier. This ensures that the TQ snapshot and replay index describe the same set of groups.
@@ -504,7 +504,7 @@ Expect fewer training steps than `grpo.max_num_steps`. Replacements are ordinary
 | `unfiltered_reward` | Mean reward over every generated group, kept or dropped; the progress signal to watch under dynamic sampling. |
 | `first_attempt_reward` | Mean reward over each slot's first attempt only (replacements excluded). |
 | `generated_prompt_groups` | Groups generated for the step, including dropped ones. |
-| `zero_variance_prompt_groups` / `zero_variance_fraction` | Count and fraction of generated groups whose rewards were all equal. |
+| `zero_variance_prompt_groups` / `zero_variance_fraction` | Count and fraction of generated groups whose participating rewards carry no signal: zero or one participating reward, or all participating rewards equal. |
 | `rollout/zero_variance_groups_total` | Running total of dropped groups. |
 
 The reward totals are kept in memory only, so after a checkpoint resume the in-flight step's reward metrics cover just the groups generated after the resume.

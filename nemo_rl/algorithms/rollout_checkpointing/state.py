@@ -74,6 +74,7 @@ class RolloutRuntimeState:
     replacement_reserve: deque[DatumSpec] = field(default_factory=deque)
     # Independent raw supply for dynamic-sampling replacements.
     filtered_reserve: deque[DatumSpec] = field(default_factory=deque)
+    # Exhausted steps use the final train-or-skip floor instead of failing early.
     steps_allowed_short: set[int] = field(default_factory=set)
     # Prompts dropped from each stamped target step. A stamping sampler will
     # only ever select num_prompts_per_step groups carrying that stamp, so a

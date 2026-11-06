@@ -43,7 +43,7 @@ from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryCon
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.failures import RolloutDataFailure
-from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import (
     RolloutManager,
     RolloutRetryPolicy,
@@ -258,8 +258,6 @@ def _controller(
     controller._rollout_runtime.filtered_reserve = deque()
     controller._filtered_prompts_by_step = {}
     controller._rollout_runtime.steps_allowed_short = set()
-    controller._filtered_refill_wanted = asyncio.Event()
-    controller._filtered_pool_cv = asyncio.Condition()
     controller._dataloader_exhausted = False
     controller._restored_replay_groups_to_regenerate = []
     controller._rollout_runtime.batch_shortfall = {}
@@ -447,3 +445,76 @@ def test_borrow_and_repayment_survive_controller_checkpoint_restore(
 ) -> None:
     """A saved sampler cursor preserves every prompt after borrow and repayment."""
     asyncio.run(_exercise_round_trip(tmp_path, monkeypatch))
+
+
+@pytest.mark.parametrize("reserved", [False, True])
+def test_restored_empty_filter_pool_refills_before_slot_or_admission_wait(
+    monkeypatch: pytest.MonkeyPatch, reserved: bool
+) -> None:
+    """Restored work must make progress with an empty pool and one generation slot."""
+    monkeypatch.setattr(
+        scenarios._rb, "record_to_train_batch", scenarios._stub_converter
+    )
+
+    class Generation(_Generation):
+        async def run_rollout(self, input_sample: dict[str, Any]) -> PromptGroupRecord:
+            record = await super().run_rollout(input_sample)
+            rewards = [1.0, 1.0] if input_sample["idx"] < 10 else [0.0, 1.0]
+            record.completions = [
+                Completion(message_log=[], env_extras=None, truncated=False, reward=r)
+                for r in rewards
+            ]
+            return record
+
+    async def exercise() -> None:
+        dataset = {i: _prompt(i) for i in [0, 1, 10, 11, 12]}
+        controller = _controller(
+            client=_client(register=True),
+            loader=_Loader([_batch([10, 11, 12])], dataset),
+            generation=Generation(),
+            dispatch_index=0 if reserved else 1,
+        )
+        controller._async_cfg.max_inflight_prompts = 1
+        controller._async_cfg.rollout_failure.on_dropped_prompt = "shrink"
+        controller._sampler.set_gate_window(0 if reserved else 3)
+        controller._dynamic_sampling_enabled = True
+        controller._filtered_prompt_budget = 30
+        manager = controller._rollout_manager
+        manager._filter_zero_variance_groups = True
+        barrier = controller._data_plane_checkpoint_barrier
+        async with barrier.mutation() as cut:
+            manager.reserve_prompt_group(cut, _prompt(0), target_step=0, admitted=True)
+            manager.reserve_prompt_group(
+                cut,
+                _prompt(1),
+                target_step=None if reserved else 1,
+                admitted=not reserved,
+                admission_id="restored-reserved" if reserved else None,
+            )
+            saved = manager.recovery_ledger.state_dict()
+            manager._recovery_ledger = RolloutRecoveryLedger()
+            manager.recovery_ledger.load_state_dict(cut, saved)
+            for group in manager.recovery_ledger.groups():
+                manager.recovery_ledger.bind_runtime_prompt(
+                    cut, group.group_id, _prompt(int(group.prompt_id))
+                )
+        assert not controller._rollout_runtime.filtered_reserve
+
+        async def advance_trainer() -> None:
+            if reserved:
+                while manager.stats.committed < 1:
+                    await asyncio.sleep(0.01)
+                controller._trainer_version = 1
+
+        await asyncio.wait_for(
+            asyncio.gather(controller._rollout_pump(), advance_trainer()), timeout=5
+        )
+        assert manager.stats.zero_variance_groups == 2
+        assert manager.stats.committed == 2
+        assert controller._filtered_prompts_by_step == {0: 1, 1: 1}
+        assert controller._rollout_runtime.batch_shortfall == {}
+        assert controller._dataloader_exhausted
+        assert controller._rollout_exhausted.is_set()
+        assert controller._buffer_capacity._value == _CAPACITY - 2
+
+    asyncio.run(exercise())

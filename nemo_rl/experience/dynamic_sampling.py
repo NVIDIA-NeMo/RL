@@ -22,6 +22,15 @@ from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.experience.interfaces import PromptGroupRecord
 
 
+def mask_sample_flagged(extra: dict[str, Any] | None) -> bool:
+    """Read both mask flags, since Gym may default the first-class flag to false."""
+    extra = extra or {}
+    return bool(
+        extra.get(MASK_SAMPLE)
+        or (extra.get("instance_config") or {}).get(MASK_SAMPLE, False)
+    )
+
+
 def rewards_carry_no_signal(rewards: Sequence[float]) -> bool:
     """Whether a group's participating rewards leave every row zero advantage.
 
@@ -70,23 +79,9 @@ def participating_rewards(
     return [
         completion.reward
         for completion in record.completions
-        if not _mask_sample_flagged(completion.env_extras)
+        if not mask_sample_flagged(completion.env_extras)
         and not (overlong_filtering and completion.truncated)
     ]
-
-
-def _mask_sample_flagged(extra: Optional[dict[str, Any]]) -> bool:
-    """Whether the environment asked for this row to be masked from the loss.
-
-    Both reads are consulted for the reason ``rollouts._mask_sample_flags`` gives:
-    Gym serializes ``mask_sample: false`` on every response, so an environment that
-    flags only the nested ``instance_config`` one carries a false first-class field
-    beside the true nested one.
-    """
-    extra = extra or {}
-    if extra.get(MASK_SAMPLE):
-        return True
-    return bool((extra.get("instance_config") or {}).get(MASK_SAMPLE, False))
 
 
 @dataclass

@@ -2993,11 +2993,7 @@ class TestStepRewardMetrics:
         assert metrics["unfiltered_reward"] == 0.0
 
     def test_zero_variance_drop_clears_the_consecutive_drop_run(self):
-        # A dropped zero-variance group is a healthy generation, not an infra failure,
-        # so it must reset the consecutive-drop counter just as a commit does -- and as
-        # the finalizer path already does on a successful generation. Otherwise an
-        # earlier infra drop's run carries across it and can prematurely trip
-        # max_consecutive_dropped_prompts while the fleet is answering every prompt.
+        # Healthy filtered rollouts must reset consecutive infrastructure failures.
         buf = _FakeBuffer()
         mgr = _make_manager(buf, _FakeImpl(record=_scored_record(0.0, 0.0, 0.0, 0.0)))
         mgr._filter_zero_variance_groups = True

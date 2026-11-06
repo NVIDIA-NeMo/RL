@@ -487,7 +487,9 @@ def test_discard_yields_to_a_group_the_train_pump_already_claimed() -> None:
         side_effect=ValueError("unknown group_ids=['group']")
     )
     request = _request()
-    ctrl._rollout_runtime.finalizer_metrics_by_group["group"] = {"finalize/invalid_row_rate": 0.0}
+    ctrl._rollout_runtime.finalizer_metrics_by_group["group"] = {
+        "finalize/invalid_row_rate": 0.0
+    }
     ctrl._rollout_runtime.finalizer_rewards_by_group["group"] = []
 
     assert asyncio.run(ctrl._discard_committed_group(request)) is False

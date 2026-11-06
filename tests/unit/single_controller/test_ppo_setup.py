@@ -604,8 +604,7 @@ def _dynamic_sampling_config(
     sampler: str = "in_order",
     num_generations_per_prompt: int = _NUM_GENERATIONS_PER_PROMPT,
     max_gen_batches: int = 10,
-    # A full batch, the size setup stops warning at: the pool is a low-water mark
-    # checked once per dataloader batch, so anything smaller can empty in between.
+    # This reserve controls rollout-failure replacements, not dynamic sampling.
     replacement_reserve_prompts: int = _NUM_PROMPTS_PER_STEP,
 ) -> MasterConfig:
     """A GRPO SC config with dynamic sampling on and the knobs it validates."""
@@ -679,9 +678,7 @@ class TestDynamicSamplingValidation:
             validate_single_controller_config(mc)
 
     def test_accepts_shrink_because_filtering_replaces_regardless(self):
-        # on_dropped_prompt governs rollout failures only. Training on a uniform group
-        # is never right, so a filtered group is replaced out of its own budget even
-        # when infra drops are configured to shrink the step.
+        # Filtering replaces uniform groups even when rollout failures shrink.
         validate_single_controller_config(
             _dynamic_sampling_config(on_dropped_prompt="shrink")
         )
@@ -744,10 +741,7 @@ class TestDynamicSamplingValidation:
             validate_single_controller_config(mc)
 
     def test_ppo_rejects_dynamic_sampling_even_when_grpo_requirements_are_met(self):
-        # The replace + stamping-sampler combo GRPO accepts must still be rejected for
-        # PPO: a dropped group shortens the step and breaks critic sharding (#2625).
-        # Without the explicit guard this config would slip through, since the PPO
-        # drop-budget check does not count dynamic-sampling drops.
+        # PPO advantages depend on the critic, so uniform rewards can still train.
         mc = _ppo_master_config()
         mc.ppo.use_dynamic_sampling = True
         mc.async_rl = AsyncRLConfig(
