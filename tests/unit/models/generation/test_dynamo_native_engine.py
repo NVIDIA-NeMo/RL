@@ -437,12 +437,14 @@ def test_every_worker_arg_reaches_the_dynamo_worker_config(
 
     assert config.namespace == "ns"
     assert config.endpoint_types == "chat"
-    assert config.structural_tag_mode == "on"
+    assert config.structural_tag == {"scope": "always", "schema": "strict"}
     with open(config.custom_jinja_template) as template_file:
         assert template_file.read() == "{{ messages }}"
     for key in worker_args.keys() - {
         "endpoint_types",
         "enable_structural_tag",
+        "structural_tag_scope",
+        "structural_tag_schema",
         "custom_jinja_template",
     }:
         assert getattr(config, key) == worker_args[key], key

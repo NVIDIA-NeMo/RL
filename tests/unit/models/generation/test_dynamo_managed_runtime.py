@@ -254,7 +254,7 @@ def test_engines_are_ready_once_registered_and_the_model_is_served(
     assert (
         urls
         == [
-            "http://127.0.0.1:3000/health",
+            "http://127.0.0.1:3000/health?instances=true",
             "http://127.0.0.1:3000/v1/models",
         ]
         * 2

@@ -910,9 +910,15 @@ def start_dynamo_endpoint(
         exclude_tools_when_tool_choice_none=(
             worker_args.exclude_tools_when_tool_choice_none
         ),
-        structural_tag_mode="on" if worker_args.enable_structural_tag else "off",
-        structural_tag_scope=worker_args.structural_tag_scope,
-        structural_tag_schema=worker_args.structural_tag_schema,
+        # A policy turns structural tags on; None leaves them off.
+        structural_tag=(
+            {
+                "scope": worker_args.structural_tag_scope,
+                "schema": worker_args.structural_tag_schema,
+            }
+            if worker_args.enable_structural_tag
+            else None
+        ),
     )
     return asyncio.get_running_loop().create_task(
         Worker(NativeVllmEngine(host, leader_worker_idx), config).run()

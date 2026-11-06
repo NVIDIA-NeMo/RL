@@ -195,10 +195,11 @@ class ManagedDynamoRuntime:
             "NATS_SERVER": f"nats://{self._host}:{self._nats_port}",
             "DYN_NAMESPACE": self._namespace,
             "DYN_DISCOVERY_BACKEND": "etcd",
-            # Dynamo's legacy tool jail rebuilds response chunks with nvext=None.
-            # Its v2 parser path preserves engine_data, which NeMo-Gym needs for
-            # exact token IDs and log probabilities.
-            "DYN_ENABLE_EXPERIMENTAL_PARSERS_V2": "1",
+            # Parse with Dynamo's unified v2 parsers wherever the parser pair has
+            # a v2 family; they preserve engine_data, which NeMo-Gym needs for
+            # exact token IDs and log probabilities. Other pairs (e.g. hermes)
+            # keep the v1 parsers, as with 1.5.1's experimental flag.
+            "DYN_PARSER_VERSION": "auto",
             "DYN_REQUEST_PLANE": "tcp",
             "DYN_EVENT_PLANE": "nats",
             # NeMo-Gym sends media inline: raise the frontend's 45 MB HTTP body
@@ -360,7 +361,7 @@ class ManagedDynamoRuntime:
         ``check_engines`` runs on every poll and raises when an engine exited or
         its endpoint stopped, so a failed registration fails at once.
         """
-        health_url = f"http://127.0.0.1:{self._frontend_port}/health"
+        health_url = f"http://127.0.0.1:{self._frontend_port}/health?instances=true"
         models_url = f"http://127.0.0.1:{self._frontend_port}/v1/models"
         deadline = time.monotonic() + self._dynamo_cfg.startup_timeout_s
         registered = 0

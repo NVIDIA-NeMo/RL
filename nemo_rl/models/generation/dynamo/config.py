@@ -59,7 +59,6 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
     router_mode: Literal[
         "round-robin",
         "random",
-        "power-of-two",
         "kv",
         "least-loaded",
         "device-aware-weighted",

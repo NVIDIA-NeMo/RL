@@ -182,8 +182,10 @@ vllm = [
   # Dynamo serving (policy.generation.dynamo=true) hosts these vLLM workers behind
   # dynamo.frontend through Dynamo's engine-agnostic backend SDK. Only the base
   # package: its [vllm] extra pins Dynamo's own vLLM, which NeMo RL never runs.
-  "ai-dynamo==1.5.1",
-  "ai-dynamo-runtime==1.5.1",
+  # A 1.7.0 nightly, for its configurable session-affinity cap; pin 1.7.0 once
+  # it is on PyPI.
+  "ai-dynamo==1.7.0.dev20261105",
+  "ai-dynamo-runtime==1.7.0.dev20261105",
 ]
 sglang = [
   # sglang-miles (3003d70f) and sglang-kernel 0.4.5 are built against torch 2.11;
