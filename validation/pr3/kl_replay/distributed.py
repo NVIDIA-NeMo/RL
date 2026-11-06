@@ -14,6 +14,7 @@
 
 """Launch the real-input EP16 replay on two nodes in the diagnostic allocation."""
 
+import argparse
 import os
 import signal
 import subprocess
@@ -24,7 +25,9 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 
 @ray.remote(num_cpus=8, num_gpus=8)
-def replay_node(index: int, master: str, source: str) -> int:  # pragma: no cover
+def replay_node(
+    index: int, master: str, source: str, replay_script: str
+) -> int:  # pragma: no cover
     root = Path(os.environ["PR3_KL_ROOT"])
     output = root / "replay"
     output.mkdir(exist_ok=True)
@@ -42,7 +45,7 @@ def replay_node(index: int, master: str, source: str) -> int:  # pragma: no cove
         f"--node-rank={index}",
         f"--master-addr={master}",
         "--master-port=29675",
-        "validation/pr3/kl_replay/replay.py",
+        replay_script,
         "--recipe",
         "validation/pr3/kl_replay/ep16.yaml",
         "--capture",
@@ -69,6 +72,9 @@ def replay_node(index: int, master: str, source: str) -> int:  # pragma: no cove
 if __name__ == "__main__":
     if os.environ["USER"] != "root" or not os.environ.get("SLURM_JOB_ID"):
         raise RuntimeError("Requires the diagnostic Slurm allocation")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--replay-script", default="validation/pr3/kl_replay/replay.py")
+    args = parser.parse_args()
     ray.init(address="auto")
     nodes = sorted(
         [
@@ -106,7 +112,7 @@ if __name__ == "__main__":
             scheduling_strategy=NodeAffinitySchedulingStrategy(
                 node["NodeID"], soft=False
             ),
-        ).remote(index, nodes[0]["NodeManagerAddress"], source)
+        ).remote(index, nodes[0]["NodeManagerAddress"], source, args.replay_script)
         for index, node in enumerate(nodes)
     ]
     ray.wait(refs, num_returns=2, fetch_local=False)

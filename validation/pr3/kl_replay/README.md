@@ -76,4 +76,13 @@ recipe,16train+8rollout GPUs and the step210 policy; inspect actual advantages.
 
 Entrypoint: run.sh inside one three-node ray.sub allocation. Preserve raw
 failures/source hashes; diagnostic completion does not mean numerical acceptance.
-Large-model results are pending until that allocation actually executes.
+Large-model job21373254 has completed. See EP16_FINDINGS.md and ep16-summary.json:
+same-input genKL aggregation agrees, but production-placement gradients remain
+an unresolved numerical finding and original qualification is still failed.
+
+The follow-up production_layout.py reuses replay.py unchanged while making its
+full-input controls receive exactly the same per-rank microbatches as production
+streaming. It validates actual fetched columns and records initial resumed
+optimizer/scheduler counters. submit_layout.sh adapts debug.sh to two interactive
+nodes/image1030; COMMAND mode releases both nodes when run_layout.sh finishes.
+It reuses the first saved capture, without new rollouts, W&B or checkpoint writes.
