@@ -122,6 +122,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageOutcome,
     AdvantageRequest,
     AdvantageStageConfig,
+    relabel_rollout_normalized_metrics,
     row_group_ids,
     split_meta_by_prompt_group,
 )
@@ -3925,6 +3926,13 @@ class SingleControllerActor:
                 step_metrics.update(
                     reduce_advantage_pump_metrics(**self._step_log_dict)
                 )
+                if (
+                    self._master_config.token_capture.forest_loss_normalization
+                    == "rollout"
+                ):
+                    relabel_rollout_normalized_metrics(
+                        step_metrics, self._step_log_dict["advantage_partials"]
+                    )
                 per_group_rollout_metrics: dict[str, list[Any]] = {}
                 for group_metrics in selected_rollout_metrics:
                     for metric_name, value in group_metrics.items():

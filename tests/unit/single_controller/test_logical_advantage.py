@@ -29,7 +29,7 @@ from nemo_rl.algorithms.advantage_estimator import (
 )
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.grpo import GRPOConfig
-from nemo_rl.algorithms.loss import ClippedPGLossConfig
+from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageComputer,
@@ -42,6 +42,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from tests.unit.single_controller.test_advantage_stage import _InlineActor, _RowStore
 
 
@@ -127,7 +128,13 @@ def test_forest_selection_config(policy):
 
 
 def _controller(
-    meta, data, *, grpo=None, loss=None, policy_logprobs_required: bool = False
+    meta,
+    data,
+    *,
+    grpo=None,
+    loss=None,
+    policy_logprobs_required: bool = False,
+    rollout_loss_normalization: bool = False,
 ):
     settings = dict(
         num_generations_per_prompt=2,
@@ -175,6 +182,7 @@ def _controller(
         message_level_advantage_penalties_enabled=ctrl._message_level_advantage_penalties_enabled,
         shardable=True,
         train_data_dump_dir=None,
+        rollout_loss_normalization=rollout_loss_normalization,
     )
     ctrl._advantage_computer = AdvantageComputer(
         ctrl._dp_client,
@@ -784,3 +792,211 @@ def test_unsupported_forest_estimator_or_objective_is_rejected(grpo, loss):
     with pytest.raises(ValueError, match="Forest"):
         asyncio.run(ctrl._advantage_stage(meta))
     assert not ctrl._dp_client.puts
+
+
+def _ragged_batch(
+    groups: list[tuple[str, list[tuple[float, int]]]], lengths: list[int]
+) -> tuple[KVBatchMeta, TensorDict]:
+    """``_batch`` with padding, where row ``i`` trains ``lengths[i]`` tokens."""
+    meta, data = _batch(groups, padding=True)
+    data["token_mask"] = torch.zeros(meta.size, max(lengths) + 1)
+    for row, length in enumerate(lengths):
+        data["token_mask"][row, 1 : length + 1] = 1
+    return meta, data
+
+
+def _owner_mass(meta: KVBatchMeta, data: TensorDict) -> dict[str | None, float]:
+    """Loss-mask mass per logical rollout, as the workers count it."""
+    row_mass = (data["token_mask"][:, 1:] * data["sample_mask"][:, None]).sum(-1)
+    mass: dict[str | None, float] = defaultdict(float)
+    for row, tag in enumerate(meta.tags):
+        mass[tag["logical_rollout_id"]] += row_mass[row].item()
+    return dict(mass)
+
+
+def test_rollout_normalization_requires_forest_training():
+    TokenCaptureConfig(forest_training=True, forest_loss_normalization="rollout")
+    with pytest.raises(ValueError, match="requires forest_training"):
+        TokenCaptureConfig(forest_loss_normalization="rollout")
+
+
+@pytest.mark.parametrize("reorder", [False, True])
+def test_rollout_normalization_gives_each_valid_rollout_unit_mass(reorder: bool):
+    groups = [("a", [(0.0, 3), (1.0, 1), (3.0, 2)])]
+    meta, data = _ragged_batch(groups, [2, 5, 1, 4, 3, 3, 0])
+    # One flagged segment masks its whole rollout.
+    data["mask_sample"][4] = True
+    if reorder:
+        order = [6, 2, 4, 0, 5, 1, 3]
+        meta, data = meta.subset(order), data[order]
+    token_data = data.clone()
+    asyncio.run(_controller(meta, token_data)._advantage_stage(meta))
+    ctrl = _controller(meta, data, rollout_loss_normalization=True)
+    # A restored unfinished step sends already-weighted rows through again.
+    for _ in range(2):
+        _, valid = asyncio.run(ctrl._advantage_stage(meta))
+        assert valid
+        mass = _owner_mass(meta, data)
+        assert mass["a_g0"] == pytest.approx(1.0)
+        assert mass["a_g1"] == pytest.approx(1.0)
+        assert mass["a_g2"] == 0 and mass[None] == 0
+        torch.testing.assert_close(
+            data["advantages"], token_data["advantages"], rtol=0, atol=0
+        )
+    # Token-mode masks are binary: zero for a_g2 and padding.
+    owner_tokens = {"a_g0": 8.0, "a_g1": 4.0, "a_g2": 6.0, None: 1.0}
+    for row, tag in enumerate(meta.tags):
+        expected = (
+            token_data["sample_mask"][row] / owner_tokens[tag["logical_rollout_id"]]
+        )
+        assert data["sample_mask"][row].item() == pytest.approx(expected.item())
+
+
+@pytest.mark.parametrize("segments", [1, 3])
+@pytest.mark.parametrize("rollout", [False, True])
+def test_extra_segments_do_not_grow_a_rollouts_weight(segments: int, rollout: bool):
+    meta, data = _ragged_batch(
+        [("a", [(0.0, segments), (1.0, 1)])], [2] * segments + [3, 0]
+    )
+    ctrl = _controller(meta, data, rollout_loss_normalization=rollout)
+    asyncio.run(ctrl._advantage_stage(meta))
+    mass = _owner_mass(meta, data)
+    share = mass["a_g0"] / (mass["a_g0"] + mass["a_g1"])
+    # Token normalization weights the branched rollout by its 2 * segments
+    # tokens; rollout normalization gives both rollouts half the step.
+    expected = 0.5 if rollout else 2 * segments / (2 * segments + 3)
+    assert share == pytest.approx(expected)
+
+
+def _rollout_normalized_training_batch() -> tuple[
+    KVBatchMeta, BatchedDataDict, torch.Tensor
+]:
+    """Two groups of ragged, branched rollouts after the real advantage stage.
+
+    Returns the metadata, the training batch and on-policy-adjacent current
+    log-probabilities whose ratios stay inside the PPO clip range.
+    """
+    groups = [
+        ("a", [(0.0, 3), (1.0, 1), (4.0, 2)]),
+        ("b", [(2.0, 1), (0.0, 2), (5.0, 2)]),
+    ]
+    lengths = [3, 1, 4, 5, 2, 2, 1, 3, 4, 2, 6, 0]
+    meta, data = _ragged_batch(groups, lengths)
+    data["mask_sample"][10] = True
+    asyncio.run(
+        _controller(meta, data, rollout_loss_normalization=True)._advantage_stage(meta)
+    )
+    generator = torch.Generator().manual_seed(7)
+    shape = data["token_mask"].shape
+    prev = -1.0 - torch.rand(shape, generator=generator, dtype=torch.float64)
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.arange(shape[0] * shape[1]).reshape(shape),
+            "input_lengths": torch.full((shape[0],), shape[1]),
+            "token_mask": data["token_mask"].double(),
+            "sample_mask": data["sample_mask"].double(),
+            "advantages": data["advantages"].double(),
+            "prev_logprobs": prev,
+            "generation_logprobs": prev,
+            "row_index": torch.arange(shape[0]),
+        }
+    )
+    offset = 0.1 * (2 * torch.rand(shape, generator=generator) - 1)
+    return meta, batch, (prev + offset.double())[:, 1:]
+
+
+def _pg_loss(
+    logprobs: torch.Tensor, data: BatchedDataDict, normalizer: torch.Tensor
+) -> torch.Tensor:
+    loss, _ = ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.0))(
+        logprobs,
+        data,
+        global_valid_seqs=data["sample_mask"].sum(),
+        global_valid_toks=normalizer,
+    )
+    return loss
+
+
+def test_rollout_normalized_loss_averages_tokens_then_rollouts():
+    meta, batch, curr = _rollout_normalized_training_batch()
+    curr.requires_grad_()
+    normalizer = (batch["token_mask"][:, 1:] * batch["sample_mask"][:, None]).sum()
+    # Five valid rollouts; b_g2 is masked and padding owns nothing.
+    torch.testing.assert_close(normalizer, torch.tensor(5.0, dtype=torch.float64))
+    loss = _pg_loss(curr, batch, normalizer)
+    loss.backward()
+
+    ratio = (curr - batch["prev_logprobs"][:, 1:]).exp().detach()
+    advantages = batch["advantages"][:, 1:]
+    trained = batch["token_mask"][:, 1:].bool()
+    owners: dict[str, list[int]] = defaultdict(list)
+    for row, tag in enumerate(meta.tags):
+        if tag["logical_rollout_id"] not in (None, "b_g2"):
+            owners[tag["logical_rollout_id"]].append(row)
+    expected_loss = torch.zeros((), dtype=torch.float64)
+    expected_grad = torch.zeros_like(curr)
+    for rows in owners.values():
+        tokens = trained[rows]
+        surrogate = -(advantages[rows] * ratio[rows])[tokens]
+        expected_loss += surrogate.mean() / len(owners)
+        grad = expected_grad[rows]
+        grad[tokens] = surrogate / (len(owners) * tokens.sum())
+        expected_grad[rows] = grad
+    torch.testing.assert_close(loss, expected_loss)
+    torch.testing.assert_close(curr.grad, expected_grad)
+
+
+@pytest.mark.parametrize(
+    "dp_size,micro_batch_size,packing",
+    [(1, 12, False), (2, 1, False), (2, 3, False), (3, 2, False), (2, None, True)],
+)
+def test_rollout_normalization_is_invariant_to_dp_and_microbatch_split(
+    dp_size: int, micro_batch_size: int | None, packing: bool
+):
+    _, batch, curr = _rollout_normalized_training_batch()
+    reference_curr = curr.clone().requires_grad_()
+    normalizer = (batch["token_mask"][:, 1:] * batch["sample_mask"][:, None]).sum()
+    reference = _pg_loss(reference_curr, batch, normalizer)
+    reference.backward()
+
+    if packing:
+        shards, _ = batch.shard_by_batch_size(
+            dp_size,
+            batch_size=batch.size,
+            sequence_packing_args={
+                "algorithm": "modified_first_fit_decreasing",
+                "input_key": "input_ids",
+                "input_lengths_key": "input_lengths",
+                "sequence_length_pad_multiple": 1,
+                "max_tokens_per_microbatch": 14,
+            },
+        )
+        microbatches = [
+            mb
+            for shard in shards
+            for mb in shard.make_microbatch_iterator_for_packable_sequences()
+        ]
+        assert any(mb.size > 1 for mb in microbatches)
+    else:
+        microbatches = [
+            mb
+            for shard in batch.shard_by_batch_size(dp_size, batch_size=batch.size)
+            for mb in shard.make_microbatch_iterator(micro_batch_size)
+        ]
+    assert sorted(i for mb in microbatches for i in mb["row_index"].tolist()) == list(
+        range(batch.size)
+    )
+    # The split workers sum unnormalized microbatch losses and divide once by
+    # the all-reduced local loss-mask mass.
+    split_curr = curr.clone().requires_grad_()
+    placeholder = torch.tensor(1.0, dtype=torch.float64)
+    split_loss = torch.zeros((), dtype=torch.float64)
+    local_mass = torch.zeros((), dtype=torch.float64)
+    for mb in microbatches:
+        local_mass += (mb["token_mask"][:, 1:] * mb["sample_mask"][:, None]).sum()
+        mb_loss = _pg_loss(split_curr[mb["row_index"]], mb, placeholder)
+        mb_loss.backward()
+        split_loss += mb_loss.detach()
+    torch.testing.assert_close(local_mass, normalizer)
+    torch.testing.assert_close(split_loss / local_mass, reference)
+    torch.testing.assert_close(split_curr.grad / local_mass, reference_curr.grad)

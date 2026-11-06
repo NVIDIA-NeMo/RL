@@ -41,6 +41,17 @@ class LogicalOwnerBatch:
         """Broadcast one scalar per owner, with zero for ownerless padding."""
         return values[self.row_owner.clamp_min(0)] * (self.row_owner >= 0)
 
+    def inverse_owner_mass(self, row_mass: torch.Tensor) -> torch.Tensor:
+        """Give each row one over its owner's total mass across all its rows.
+
+        Padding and owners without mass get zero.
+        """
+        owned = self.row_owner >= 0
+        owner_mass = torch.zeros(
+            self.valid_mask.shape, dtype=torch.float64, device=row_mass.device
+        ).index_add_(0, self.row_owner[owned], row_mass[owned].double())
+        return self.fanout(torch.where(owner_mass > 0, owner_mass.reciprocal(), 0.0))
+
 
 def validate_logical_owner_metadata(
     meta: KVBatchMeta, *, expected_group_size: int

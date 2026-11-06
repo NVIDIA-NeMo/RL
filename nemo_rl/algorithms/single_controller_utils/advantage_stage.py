@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Optional, cast
 
@@ -117,6 +118,9 @@ class AdvantageStageConfig:
     # computation moved here.
     train_data_dump_dir: Optional[str]
     filtering_on: bool = False
+    # token_capture.forest_loss_normalization == "rollout": weight each forest
+    # row by one over its logical rollout's trainable tokens.
+    rollout_loss_normalization: bool = False
     # Which writer the dump uses; ignored while train_data_dump_dir is None.
     debug_writer: DebugWriterConfig = field(default_factory=DebugWriterConfig)
 
@@ -162,6 +166,9 @@ class AdvantageStageConfig:
                 or algo_cfg.malformed_thinking_advantage is not None
             ),
             shardable=algo_cfg.adv_estimator.name in SHARD_INVARIANT_ESTIMATORS,
+            rollout_loss_normalization=(
+                master_config.token_capture.forest_loss_normalization == "rollout"
+            ),
             # Use the resolved logger config shared by controller and pool.
             train_data_dump_dir=(
                 master_config.logger.log_dir
@@ -274,6 +281,24 @@ def split_meta_by_prompt_group(
         for begin in range(0, num_groups, groups_per_shard)
     ]
     return shards if len(shards) > 1 else None
+
+
+def relabel_rollout_normalized_metrics(
+    step_metrics: dict[str, Any], partials: Sequence[AdvantagePartial]
+) -> None:
+    """Restore token-count metrics after a rollout-normalized step.
+
+    Rollout weights make the workers' token mass the valid rollout count and
+    their row mass a sum of fractional weights, so neither is a count of tokens
+    or rows any more.
+    """
+    if "global_valid_toks" not in step_metrics:
+        return
+    step_metrics["global_valid_rollouts"] = step_metrics.pop("global_valid_toks")
+    step_metrics.pop("global_valid_seqs", None)
+    step_metrics["global_valid_toks"] = float(
+        sum(partial.count for partial in partials)
+    )
 
 
 @dataclass(frozen=True)
@@ -389,6 +414,10 @@ class AdvantageComputer:
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
+        if logical and cfg.rollout_loss_normalization:
+            # Rows restored from an unfinished step still carry this stage's
+            # rollout weights; forest dataset weights are always unit.
+            sample_mask = _binary_participation(sample_mask)
         mask_sample = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.mask_sample_field)
         ).bool()
@@ -670,6 +699,16 @@ class AdvantageComputer:
             advantages = _clip_grpo_advantages(advantages, cfg.algo)
             response_advantages = torch.masked_select(advantages, mask.bool())
         advantage_partial = AdvantagePartial.from_values(response_advantages)
+
+        if owner_batch is not None and cfg.rollout_loss_normalization:
+            # Each rollout's trainable tokens now sum to one, so the workers'
+            # global token normalizer becomes the step's valid rollout count.
+            final_sample_mask = (
+                final_sample_mask
+                * owner_batch.inverse_owner_mass(
+                    (token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1)
+                )
+            ).to(final_sample_mask.dtype)
 
         train_data_dump_s = 0.0
         train_data_dump_receipt = None

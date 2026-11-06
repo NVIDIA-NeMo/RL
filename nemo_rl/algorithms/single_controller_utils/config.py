@@ -704,6 +704,11 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # all_captured includes every captured call, including abandoned attempts.
     # Custom policies use an importable package.module:function path.
     selection_policy: str = "returned_history"
+    # How a forest step weights its trainable tokens. token (default) averages
+    # every token in the step, so a rollout's weight grows with its segments
+    # and length. rollout averages each logical rollout's tokens, then averages
+    # the valid rollouts in the step.
+    forest_loss_normalization: Literal["token", "rollout"] = "token"
 
     @model_validator(mode="after")
     def validate_selection_policy(self) -> "TokenCaptureConfig":
@@ -711,6 +716,15 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
         if self.selection_policy != "returned_history" and not self.forest_training:
             raise ValueError(
                 f"selection_policy={self.selection_policy} requires forest_training=true"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def validate_forest_loss_normalization(self) -> "TokenCaptureConfig":
+        if self.forest_loss_normalization != "token" and not self.forest_training:
+            raise ValueError(
+                f"forest_loss_normalization={self.forest_loss_normalization} "
+                "requires forest_training=true"
             )
         return self
 
