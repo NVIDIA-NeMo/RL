@@ -471,12 +471,72 @@ The shipped exemplars cover three of the five modes:
 
 Field definitions:
 
-- `max_buffered_rollouts` — hard cap on unconsumed rollout groups buffered in the data plane. Validated at setup against the gated sampler's required capacity; a value too small deadlocks the rollout pump, so setup raises instead of silently blocking. Sized from the widest window the run ever uses, so `warmup_lookahead_versions` rather than `max_lookahead_versions` when it is set.
+- `max_buffered_rollouts` — hard cap on unconsumed rollout groups buffered in the data plane. Validated at setup against the gated sampler's required capacity; a value too small deadlocks the rollout pump, so setup raises instead of silently blocking. Sized from the widest window the run ever uses, so `warmup_lookahead_versions` rather than `max_lookahead_versions` when it is set. For `in_order` the capacity grows with [`optimizer_steps_per_refit`](#multi-step-bursts-optimizer_steps_per_refit).
 - `min_groups_for_streaming_train` — minimum ready groups the trainer waits for before dispatching a chunk; the sampler may select more. Set to `num_prompts_per_step` for full-batch execution; lower for streaming. PPO streaming requires `ppo.ppo_epochs: 1`: value/policy/reference forwards, GAE and policy backward run per chunk, followed by one policy optimizer update and refit. Each critic epoch is one optimizer update over the same samples, assembled for `whole_batch` or replayed chunk by chunk for `split`. The minimum must be at least the setup-computed policy/value prompt-group multiple; static batching includes both training and inference microbatch sizes. Full-batch PPO also permits multiple policy epochs.
 - `sampler.warmup_lookahead_versions` (PPO, `in_order` only) — lookahead used while `ppo.policy_training_start_step` critic warmup is in progress, shrinking back to `max_lookahead_versions` afterwards. The SC equivalent of `ppo.async_ppo.warmup_generation_lead_steps`.
 - `num_advantage_workers` — CPU Ray actors that run the advantage stage. `0` (the default) keeps it in the controller process, which is correct but both holds a whole cohort's advantage inputs in the controller's heap and blocks the controller's event loop for the duration of the computation — long enough at Ultra scale to miss Ray's actor liveness ping. A positive value moves both costs onto dedicated actors, placed off the dedicated Ray head so their host-memory peak does not land beside the controller. Only `grpo` and `opd` are sharded across the pool: every other `adv_estimator` also reduces over the whole batch, which a shard is not, so those run as one call on one actor and a larger pool buys them nothing. Each stage logs `advantage stage: N row(s) over M shard(s), pool=P` with the reason whenever `M` is 1. Under `data_plane.backend: mooncake_cpu` each actor is its own TransferQueue client and mounts a full `global_segment_size + local_buffer_size`, like each token-capture finalizer, so budget it on top of `gpus_per_node × (segment + buffer)`.
 - `log_full_train_data` — writes every consumed sample to `train_data_step<N>.jsonl` in the log dir. The advantage stage is what holds the untruncated tensors, so the stage writes the dump wherever it runs: with a pool each shard writes its own `train_data_step<N>.jsonl.part-<shard>` and the controller merges them in shard order on a completed optimizer step, assigning `idx` across the merged file. That requires the pool to share a filesystem with the controller: the log dir was controller-only before this, so a node-local one worked and now would not. The controller checks the merged row count against what the shards reported and fails the step rather than publishing a dump that is short a shard. The JSON serialization is the expensive part and scales with batch size × sequence length, so a pool also moves that cost off the controller; it is reported back per call and still shows up under the `train_data_dump` timer. Debug-only — leave it `false` for production runs.
 - `defer_async_checkpoint_finalize` — with `policy.megatron_cfg.checkpoint.async_save: true`, finalizes an async policy checkpoint at a later step boundary, once every rank's background write is done, instead of from a background thread whose blocking finalize holds the policy workers until the write lands. The train pump polls at the top of each step, before the step's first policy-worker call; the next save and training exit still finalize blocking, and so does teardown after a failure. `tmp_step_N` is renamed to `step_N` only after that finalize, and resume reads only `step_N`, so a crash in that window — typically one step — resumes from the previous checkpoint. It cannot be combined with rollout snapshots (`rollout_checkpointing.snapshot_attempt_interval_s`), and setup rejects that combination: a snapshot anchors on `step_N`, which a deferred finalize publishes only after training has moved past step N. Only non-colocated generation gains: a colocated refit, and PPO's per-chunk critic handoff, block on the finalize anyway. Time spent finalizing at a step boundary is reported as `timing/train/checkpoint_finalize`. Leave it `false` (the default) when `async_save` is off; setup rejects that combination.
+
+### Multi-step bursts (`optimizer_steps_per_refit`)
+
+`async_rl.optimizer_steps_per_refit` (μ, default `1`) makes the train pump take μ consecutive optimizer steps between refits of the generation fleet. Such an interval is a *burst*: μ steps, then one weight publication. With μ = 1, the default, the pump refits after every step. A larger value spreads one refit over μ steps. That helps when the refit is a large share of step time, for example with a 120B policy. It also costs staleness: rollouts admitted mid-burst still come from the published weights, which are up to μ − 1 steps older than the trainer.
+
+```yaml
+async_rl:
+  optimizer_steps_per_refit: 3
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+  # (max_lookahead_versions + optimizer_steps_per_refit) x num_prompts_per_step
+  max_buffered_rollouts: 256  # with num_prompts_per_step: 64
+```
+
+**Versioning.**
+- The trainer version still advances once per optimizer step, so policy versions and staleness are counted in optimizer steps.
+- Generation serves the *published* version p: the trainer version at the last refit. Rollouts are stamped with p as their `start_weight`.
+- During a burst the trainer moves from p to p + μ − 1 while p stays fixed. `weight_version_lag` therefore counts the optimizer steps between the weights that generated a sample and the step that trains on it.
+- Importance-sampling correction is unchanged: the generation logprobs come from the published weights, and the trainer recomputes `prev_logprobs` at its current weights.
+- The admission gates of the gated samplers (`in_order`, `weight_fifo`, `ready_first`) are measured from p, not from the trainer version. A custom sampler's `admit` also receives p through `trainer_version_fn`.
+- Eviction and selection still use the trainer version.
+
+**Staleness and queue depth.** Let d be a group's scheduling staleness: the trainer version of the step that consumes it, minus the published version when it was admitted. Let φ be the number of extra dispatched batches. Following QwenGyre (arXiv 2609.33848, §2.2, Eqs. 1–2), with B = `num_prompts_per_step`:
+
+```
+Q_b  = (φ + μ) · B            # target queue depth: groups admitted but not yet trained
+E[d] = φ + (μ − 1) / 2        # steady-state mean scheduling staleness
+```
+
+The term (μ − 1)/2 is the mean position of a step within its burst, counting from zero. Each sampler maps φ as follows:
+
+| `sampler.name` | Gate (from the published version) | φ | d per group | Buffer capacity validated at setup | Constraint |
+| -------------- | --------------------------------- | - | ----------- | ---------------------------------- | ---------- |
+| `in_order` | `max_lookahead_versions + μ − 1` batches. Each refit admits the next burst's μ batches. | `max_lookahead_versions` | `max_lookahead_versions` to `max_lookahead_versions + μ − 1` | `B × (max_lookahead_versions + μ)` | none |
+| `weight_fifo` | `max_staleness_versions` batches | `max_staleness_versions − μ + 1` | at most `max_staleness_versions` | `B × (max_staleness_versions + 1)` | `max_staleness_versions ≥ μ − 1` |
+| `ready_first` | `max_staleness_versions` batches | `max_staleness_versions − μ + 1` | at most `max_staleness_versions` at admission. Never evicted. | `B × (max_staleness_versions + 1)` | `max_staleness_versions ≥ μ − 1` |
+| `windowed` | ungated | n/a | at most `max_staleness_versions`. Older groups are evicted. | `min_groups_for_streaming_train` | `max_staleness_versions ≥ μ − 1` |
+
+For example, `in_order` with `max_lookahead_versions: 1` and μ = 3 gives E[d] = 2, against E[d] = 1 at μ = 1. To keep E[d] fixed while raising μ, lower the lookahead, or use `weight_fifo` and keep `max_staleness_versions` at the bound you want.
+
+Setup validation:
+- A `max_staleness_versions` below μ − 1 is rejected. `windowed` and `weight_fifo` would evict the rollouts generated after the last refit before the burst's final steps could use them. `weight_fifo` and `ready_first` would also never admit the batches those steps need. Either way the trainer stalls before the refit that would unblock it.
+- `max_buffered_rollouts` is checked against the capacities in the table.
+
+**Checkpointing and resume.**
+- A step that saves a checkpoint always ends the burst, so the saved policy is the one generation serves.
+- On resume the controller publishes the restored weights before the pumps start, so a resumed run starts a fresh burst. The burst position is not checkpointed.
+- A timeout-triggered save also ends the burst.
+- Rollout snapshots anchor on a checkpoint step, so they too are taken at a burst boundary.
+
+**Validation.** The SC path has no validation loop yet (setup rejects `val_period`, `val_at_start` and `val_at_end`), so no evaluation runs on the generation fleet. If one is added, it should run at a burst boundary, where generation holds the trainer's weights.
+
+**Limitations.**
+- GRPO only: PPO runs are rejected.
+- Non-colocated generation only: a colocated engine is woken every step, and the wake is the refit.
+- A generation shard that restarts mid-burst rejoins at the next refit, up to μ steps later rather than one.
+- FP8 KV-scale calibration at a refit uses the batches of the burst's last step.
+- Each step still trains on its own batch, as at μ = 1. Data is not shuffled across the steps of a burst.
+- The paper's gain from bursts (E0 against E1 in Table 1: μ = 1 was 10.9% slower than μ = 3 at the same E[d]) was measured with elastic training and rollout cells. With a fixed train/rollout split, the same change (A2 against A0) was slower. Measure the refit share of your own step time before raising μ.
 
 ## Implementation Structure
 
@@ -520,9 +580,9 @@ The SC path splits the async-GRPO loop across a rollout pump and a train pump th
 
 1. **Driver setup**: `setup_single_controller` builds the worker groups, virtual cluster, dp client, dataloader, `TQReplayBuffer`, `RolloutManager`, and weight synchronizer, and packs them into a `SingleControllerActorArgs` that the entrypoint cloudpickles into the actor.
 2. **Actor startup**: `SingleControllerActor` launches `_rollout_pump` and `_train_pump` concurrently as asyncio tasks; both share the same `TQReplayBuffer` and `StalenessSampler`.
-3. **Rollout pump loop**: `sampler.admit` gates dispatch against the current trainer version (returning a `target_step` for `in_order`); the pump then reserves a buffer slot, drives `RolloutManager.generate_and_push`, and commits with the observed `start_weight` / `end_weight`.
+3. **Rollout pump loop**: `sampler.admit` gates dispatch against the published policy version, which is the current trainer version unless [`optimizer_steps_per_refit`](#multi-step-bursts-optimizer_steps_per_refit) > 1 (returning a `target_step` for `in_order`); the pump then reserves a buffer slot, drives `RolloutManager.generate_and_push`, and commits with the observed `start_weight` / `end_weight`.
 4. **Train pump loop**: `sampler.evict` removes out-of-window groups, and `sampler.select` chooses the next chunk. For PPO, `_value_stage` computes critic values and `_advantage_stage` computes advantages. TQPolicy then updates the policy: full-batch PPO uses `ppo.ppo_epochs` updates, while streaming PPO accumulates gradients across chunks for one update. Streaming PPO refits the updated policy before `_value_train_epochs` performs `ppo.critic_ppo_epochs` critic updates, using the assembled batch in `whole_batch` mode or replaying chunks in `split` mode. GRPO uses one TQPolicy optimizer step per RL step.
-5. **Weight sync**: after each optimizer step the pump bumps the trainer version, clears rollout permission, asks the generation backend to pause in-flight work, calls the weight synchronizer, resumes generation, and re-opens the rollout pump for the next version. vLLM's native pause preserves active request state; backends without pause support warn and retain their existing refit behavior. In streaming PPO, it does the weight sync as soon as the policy training is finished, which is before the critic model training starts. This allows new batch generation with the updated policy weight overlapping with the critic training epochs.
+5. **Weight sync**: after each optimizer step the pump bumps the trainer version; at the end of each burst of `optimizer_steps_per_refit` steps (every step by default, and always on a checkpoint step) it clears rollout permission, asks the generation backend to pause in-flight work, calls the weight synchronizer, resumes generation, and re-opens the rollout pump for the next version. vLLM's native pause preserves active request state; backends without pause support warn and retain their existing refit behavior. In streaming PPO, it does the weight sync as soon as the policy training is finished, which is before the critic model training starts. This allows new batch generation with the updated policy weight overlapping with the critic training epochs.
 
    For non-colocated vLLM, freezing a request does not stop its end-to-end generation timeout. Size `NRL_VLLM_ASYNC_TIMEOUT_SECONDS` and, when the generation router is enabled, `async_rl.generation_router.backend_timeout_s` to cover the longest expected generation plus time spent paused for refit, including membership recovery and a possible retry. With a finite `async_rl.generation_fleet_health.refit_timeout_s`, pause, each transfer attempt, and resume each use that timeout plus a 60 s grace; these are separate call budgets, not a single total refit budget. When `refit_timeout_s` is `null`, pause and resume retain a 360 s budget each, but the collective transfer wait is unbounded, so no finite worst-case total pause duration is guaranteed.
 

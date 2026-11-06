@@ -186,7 +186,12 @@ class _RecordingRolloutManager:
         # weight_fifo gates but does not stamp target_step.
         (lambda buf: WeightFifoSampler(buf, max_staleness_versions=1), [None, None]),
         # in_order stamps the dispatch index as target_step.
-        (lambda buf: InOrderSampler(buf, max_lookahead_versions=1), [0, 1]),
+        (
+            lambda buf: InOrderSampler(
+                buf, max_lookahead_versions=1, optimizer_steps_per_refit=1
+            ),
+            [0, 1],
+        ),
     ],
 )
 def test_rollout_pump_stamps_target_steps(
@@ -223,6 +228,7 @@ def test_rollout_pump_stamps_target_steps(
     ctrl._inflight_by_group_id = {}
     ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = 0
+    ctrl._steps_since_refit = 0
     ctrl._current_epoch = 0
     _init_pump_ledgers(ctrl)
 
@@ -279,6 +285,7 @@ def test_rollout_pump_releases_capacity_only_for_uncommitted_prompts(
     ctrl._inflight_rollouts = 0
     ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = 0
+    ctrl._steps_since_refit = 0
     ctrl._current_epoch = 0
     ctrl._inflight_by_group_id = {}
     _init_pump_ledgers(ctrl)
@@ -301,8 +308,11 @@ def test_reserved_admission_rejects_an_occupied_target_step() -> None:
         mark_prompt_group_admitted=MagicMock(),
         discard_prompt_group=MagicMock(),
     )
-    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
+    ctrl._sampler = InOrderSampler(
+        buffer, max_lookahead_versions=0, optimizer_steps_per_refit=1
+    )
     ctrl._trainer_version = 0
+    ctrl._steps_since_refit = 0
     ctrl._sampler_stamps_target_steps = False
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
 
@@ -323,8 +333,11 @@ def test_non_recovery_reserve_drain_rejects_an_occupied_target_step() -> None:
     ctrl._buffer = buffer
     ctrl._replacement_reserve = deque([{"idx": 0}])
     ctrl._rollout_recovery_enabled = False
-    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
+    ctrl._sampler = InOrderSampler(
+        buffer, max_lookahead_versions=0, optimizer_steps_per_refit=1
+    )
     ctrl._trainer_version = 0
+    ctrl._steps_since_refit = 0
     launched: list[Any] = []
 
     async def launch(*args: Any) -> None:
@@ -356,7 +369,12 @@ class _SkippingRolloutManager:
         # in_order matches a batch to one step exactly, so a group that is never
         # generated leaves that step permanently short. Without the credit the train
         # pump waits on it forever, turning a tolerated drop into a hung run.
-        (lambda buf: InOrderSampler(buf, max_lookahead_versions=1), {0: 1, 1: 1}),
+        (
+            lambda buf: InOrderSampler(
+                buf, max_lookahead_versions=1, optimizer_steps_per_refit=1
+            ),
+            {0: 1, 1: 1},
+        ),
         # weight_fifo does not stamp a step: the batch fills from whatever is ready, so
         # a drop costs throughput and strands nothing. Crediting here would shrink an
         # unrelated step.
@@ -392,6 +410,7 @@ def test_rollout_pump_credits_shortfall_only_for_stamped_prompts(
     ctrl._inflight_by_group_id = {}
     ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = 0
+    ctrl._steps_since_refit = 0
     ctrl._current_epoch = 0
     _init_pump_ledgers(ctrl)
 
@@ -459,7 +478,9 @@ def _pump_controller(
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = manager
-    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=1)
+    ctrl._sampler = InOrderSampler(
+        buffer, max_lookahead_versions=1, optimizer_steps_per_refit=1
+    )
     ctrl._dataloader = dataloader
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
@@ -469,6 +490,7 @@ def _pump_controller(
     ctrl._inflight_by_group_id = {}
     ctrl._dispatched_rollouts = set()
     ctrl._trainer_version = trainer_version
+    ctrl._steps_since_refit = 0
     ctrl._current_epoch = 0
     _init_pump_ledgers(ctrl)
     ctrl._sampler_stamps_target_steps = False
@@ -813,6 +835,7 @@ def test_abort_stale_inflight_cancels_only_out_of_window_rollouts() -> None:
         ctrl = object.__new__(controller_cls)
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
         ctrl._trainer_version = 5
+        ctrl._steps_since_refit = 0
         ctrl._inflight_by_group_id = {"fresh": (fresh, 5), "stale": (stale, 1)}
         ctrl._rollout_recovery_enabled = True
         ctrl._data_plane_checkpoint_barrier = barrier
@@ -859,6 +882,7 @@ def test_abort_stale_inflight_rechecks_registry_after_checkpoint_wait() -> None:
         ctrl = object.__new__(controller_cls)
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
         ctrl._trainer_version = 5
+        ctrl._steps_since_refit = 0
         ctrl._inflight_by_group_id = {"completed": (completed, 1)}
         ctrl._rollout_recovery_enabled = True
         ctrl._data_plane_checkpoint_barrier = barrier
@@ -908,6 +932,7 @@ def test_checkpoint_observes_stale_abort_ledger_discard() -> None:
         ctrl = object.__new__(controller_cls)
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=2)
         ctrl._trainer_version = 5
+        ctrl._steps_since_refit = 0
         ctrl._inflight_by_group_id = {"stale": (stale, 1)}
         ctrl._rollout_recovery_enabled = True
         ctrl._data_plane_checkpoint_barrier = barrier
@@ -954,6 +979,7 @@ def test_abort_stale_inflight_aggregates_cleanup_failures() -> None:
         ctrl = object.__new__(controller_cls)
         ctrl._sampler = WindowedSampler(None, max_staleness_versions=0)
         ctrl._trainer_version = 5
+        ctrl._steps_since_refit = 0
         ctrl._inflight_by_group_id = {"g": (task, 0)}
         ctrl._rollout_recovery_enabled = False
 
@@ -1029,6 +1055,7 @@ def test_rollout_pump_failure_cancels_sibling_and_releases_capacity() -> None:
         ctrl._inflight_by_group_id = {}
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
+        ctrl._steps_since_refit = 0
         ctrl._current_epoch = 0
         _init_pump_ledgers(ctrl)
 
@@ -1112,6 +1139,7 @@ def test_rollout_pump_releases_permits_when_child_never_starts(monkeypatch) -> N
         ctrl._inflight_by_group_id = {}
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
+        ctrl._steps_since_refit = 0
         ctrl._current_epoch = 0
         _init_pump_ledgers(ctrl)
 
@@ -1192,6 +1220,7 @@ def test_min_valid_fraction_counts_rollouts_independently_of_segments(
         ctrl._inflight_by_group_id = {}
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
+        ctrl._steps_since_refit = 0
         ctrl._current_epoch = 0
 
         await ctrl._rollout_pump()
@@ -1284,6 +1313,7 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
         ctrl._inflight_by_group_id = {}
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
+        ctrl._steps_since_refit = 0
         ctrl._current_epoch = 0
 
         pump = asyncio.create_task(ctrl._rollout_pump())
@@ -1396,6 +1426,7 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         ctrl._inflight_by_group_id = {}
         ctrl._dispatched_rollouts = set()
         ctrl._trainer_version = 0
+        ctrl._steps_since_refit = 0
         ctrl._current_epoch = 0
         ctrl._sampler_stamps_target_steps = False
         ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()

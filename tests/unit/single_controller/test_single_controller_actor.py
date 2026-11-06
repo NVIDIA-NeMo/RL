@@ -2382,6 +2382,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._async_cfg = SimpleNamespace(
         min_groups_for_streaming_train=1,
+        optimizer_steps_per_refit=1,
         rollout_failure=SimpleNamespace(min_step_batch_fraction=0.9),
         sampler=SimpleNamespace(
             max_lookahead_versions=1,
@@ -2434,6 +2435,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
+    ctrl._steps_since_refit = 0
     ctrl._train_steps = 0
     ctrl._checkpoint_save_lock = asyncio.Lock()
     ctrl._optimizer_commit_in_progress = False
@@ -3762,7 +3764,9 @@ def test_streaming_ppo_tail_aware_wait_preserves_prep_and_full_batch_update(
             self.owned.clear()
 
     buffer = ClaimBuffer()
-    sampler = InOrderSampler(buffer, max_lookahead_versions=1)
+    sampler = InOrderSampler(
+        buffer, max_lookahead_versions=1, optimizer_steps_per_refit=1
+    )
     ctrl._buffer = buffer
     ctrl._sampler = sampler
     select = sampler.select

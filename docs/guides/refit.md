@@ -76,6 +76,7 @@ refit workload.
 |---|---|---|
 | `policy.generation.vllm_cfg.refit_prequantize` | Megatron policy with MXFP8 vLLM rollout | Quantizes supported weights before transfer. See [Optional trainer-side MXFP8 refit](../fp8.md#optional-trainer-side-mxfp8-refit) for requirements and exclusions. |
 | `policy.refit_buffer_size_gb` | Refit paths that stage weights in buffers | Sets a fixed buffer size in GiB. NCCL broadcast uses the same size on both sides to keep chunk boundaries equal. |
+| `async_rl.optimizer_steps_per_refit` | SingleController GRPO with non-colocated generation | Refits once every N optimizer steps instead of after every step. This spreads the refit cost over N steps, and rollouts become up to N − 1 steps staler. See [Multi-step bursts](single-controller.md#multi-step-bursts-optimizer_steps_per_refit). |
 
 ### TensorRT-LLM Routed-Expert FP8
 

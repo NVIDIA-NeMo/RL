@@ -733,6 +733,7 @@ class SingleControllerActor:
             self._buffer,
             self._async_cfg.sampler,
             min_groups_for_streaming_train=self._async_cfg.min_groups_for_streaming_train,
+            optimizer_steps_per_refit=self._async_cfg.optimizer_steps_per_refit,
         )
         restored_dispatch_index = actor_args.save_state.sampler_dispatch_index
         # The saved dispatch index counts groups dispatched ahead of training, which
@@ -869,6 +870,10 @@ class SingleControllerActor:
         )
 
         self._trainer_version: int = restored_trainer_version
+        # Optimizer steps taken since generation last received weights. Not
+        # checkpointed: every checkpoint step refits, and startup publishes the
+        # restored weights, so a resumed run always starts a fresh burst.
+        self._steps_since_refit: int = 0
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
@@ -1711,7 +1716,7 @@ class SingleControllerActor:
 
         if isinstance(self._sampler, TransactionalAdmissionSampler):
             await self._sampler.wait_until_admissible(
-                trainer_version_fn=lambda: self._trainer_version
+                trainer_version_fn=self._published_policy_version
             )
             async with self._data_plane_checkpoint_barrier.mutation(
                 "prompt_reservations"
@@ -1729,7 +1734,7 @@ class SingleControllerActor:
             "prompt_reservations"
         ) as cut:
             target_step = await self._sampler.admit(
-                trainer_version_fn=lambda: self._trainer_version
+                trainer_version_fn=self._published_policy_version
             )
             return _commit(cut, target_step)
 
@@ -2839,7 +2844,7 @@ class SingleControllerActor:
                         if self._divert_batch_to_reserve(prompt_batch):
                             continue
                         target_step = await self._sampler.admit(
-                            trainer_version_fn=lambda: self._trainer_version
+                            trainer_version_fn=self._published_policy_version
                         )
                         if target_step is not None:
                             self._sampler_stamps_target_steps = True
@@ -3008,7 +3013,7 @@ class SingleControllerActor:
                 self._replacement_reserve.popleft() for _ in range(num_prompts_per_step)
             ]
             target_step = await self._sampler.admit(
-                trainer_version_fn=lambda: self._trainer_version
+                trainer_version_fn=self._published_policy_version
             )
             self._require_unoccupied_target_step(target_step)
             print(
@@ -4043,12 +4048,26 @@ class SingleControllerActor:
                     and self._gen.blocks_training()
                     and self._gen.wake_carries_weight_updates()
                 )
+                # A checkpoint step always ends the burst, so a resume, which
+                # publishes the restored weights, keeps the same refit cadence.
+                ends_burst = (
+                    will_save_checkpoint
+                    or self._steps_since_refit + 1
+                    >= self._async_cfg.optimizer_steps_per_refit
+                )
+                if not early_refit_done:
+                    self._steps_since_refit = (
+                        0 if ends_burst else self._steps_since_refit + 1
+                    )
 
                 # ---- 6. Refit the model ----
                 # Critic warmup doesn't need a refit and the version still advances.
                 # But a colocated engine that was stood down still needs to be woken up via reshard.
-                if not early_refit_done and (
-                    is_policy_training_step or self._gen.blocks_training()
+                # Mid-burst steps keep generation on the last published weights.
+                if (
+                    not early_refit_done
+                    and ends_burst
+                    and (is_policy_training_step or self._gen.blocks_training())
                 ):
                     if defer_refit_for_save:
                         # Refit-deferral (colocated): the engine is about to be saved; let it sleep.
@@ -4074,7 +4093,7 @@ class SingleControllerActor:
                             aborted_stale_inflight_groups = await self._sync_weights(
                                 calibration_data=calibration_data,
                             )
-                if not early_refit_done:
+                if not early_refit_done and ends_burst:
                     self._retune_lookahead_versions()
                     self._rollout_manager.set_weight_version(self._trainer_version)
                 step_metrics.update(
@@ -6679,6 +6698,16 @@ class SingleControllerActor:
             self._train_data_dump_receipts.append(outcome.train_data_dump_receipt)
 
     # ── utility helpers ────────────────────────────────────────────────────
+
+    def _published_policy_version(self) -> int:
+        """Trainer version whose weights the generation fleet is serving.
+
+        Lags ``_trainer_version`` by the optimizer steps taken since the last
+        refit, so it differs only when ``optimizer_steps_per_refit > 1``. The
+        samplers gate admission on it: a batch admitted mid-burst is generated
+        by these weights, not by the trainer's.
+        """
+        return self._trainer_version - self._steps_since_refit
 
     def _retune_lookahead_versions(self) -> None:
         """Widen the sampler's lookahead while the policy is frozen, then shrink it back.

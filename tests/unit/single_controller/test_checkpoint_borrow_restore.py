@@ -203,7 +203,9 @@ def _controller(
     controller._partition_id = scenarios.PARTITION
     controller._rollout_manager = _manager(buffer, barrier, generation)
     controller._teacher_coordinator = None
-    controller._sampler = InOrderSampler(buffer, max_lookahead_versions=2)
+    controller._sampler = InOrderSampler(
+        buffer, max_lookahead_versions=2, optimizer_steps_per_refit=1
+    )
     if dispatch_index is not None:
         controller._sampler.restore_dispatch_index(dispatch_index)
     elif checkpoint_path is not None:
@@ -239,6 +241,7 @@ def _controller(
     controller._inflight_by_group_id = {}
     controller._dispatched_rollouts = set()
     controller._trainer_version = 0
+    controller._steps_since_refit = 0
     controller._train_steps = 0
     controller._current_epoch = 0
     controller._sampler_stamps_target_steps = False

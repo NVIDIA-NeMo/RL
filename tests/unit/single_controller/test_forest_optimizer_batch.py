@@ -204,7 +204,9 @@ def test_complete_logical_batch_streams_all_segments_but_steps_once(
                     cut, group_id, meta, min(row_versions), max(row_versions)
                 )
         ctrl._buffer = buffer
-        ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=2)
+        ctrl._sampler = InOrderSampler(
+            buffer, max_lookahead_versions=2, optimizer_steps_per_refit=1
+        )
         await asyncio.wait_for(ctrl._train_pump(), timeout=3)
         assert buffer.meta_list == []
 

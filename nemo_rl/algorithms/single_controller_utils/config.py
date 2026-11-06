@@ -34,6 +34,8 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
     SamplerConfig,
+    WeightFifoSamplerConfig,
+    WindowedSamplerConfig,
     required_buffer_capacity_for_config,
 )
 from nemo_rl.algorithms.grpo import (
@@ -526,6 +528,12 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     recompute_kv_cache_after_weight_updates: bool = True
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
+    # Optimizer steps per weight publication (mu): the trainer takes this many
+    # consecutive steps before refitting the generation fleet, amortizing the
+    # refit's cost over a burst. The policy version still advances per step, so
+    # staleness counts optimizer steps; a checkpoint step always refits. 1 refits
+    # after every step. GRPO with non-colocated generation only.
+    optimizer_steps_per_refit: PositiveInt = 1
     # Cap on in-flight generate_and_push calls in the rollout pump.
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
@@ -1574,6 +1582,48 @@ def resolve_ppo_chunk_alignment(
     return group_multiple, min_remaining_groups
 
 
+def _validate_optimizer_steps_per_refit(master_config: MasterConfig) -> None:
+    """Reject burst settings the train pump cannot honour or would deadlock on.
+
+    Within a burst of ``mu`` steps rollouts carry the published version ``p``
+    while the trainer reaches ``p + mu - 1``, so a staleness window narrower
+    than ``mu - 1`` drops the burst's own rollouts (windowed, weight_fifo) or
+    gates off the batches the burst still has to train on (weight_fifo,
+    ready_first); either way the refit that would unblock it is never reached.
+    """
+    async_config = master_config.async_rl
+    steps_per_refit = async_config.optimizer_steps_per_refit
+    if steps_per_refit == 1:
+        return
+    if is_ppo_run(master_config):
+        raise ValueError(
+            f"async_rl.optimizer_steps_per_refit={steps_per_refit} is GRPO-only: "
+            "the PPO path refits before the critic step and retunes its "
+            "lookahead per refit. Set it to 1."
+        )
+    if master_config.policy["generation"]["colocated"]["enabled"]:
+        raise ValueError(
+            f"async_rl.optimizer_steps_per_refit={steps_per_refit} requires "
+            "non-colocated generation: a colocated engine is stood down for "
+            "every step and its wake is the refit, so there is no refit to skip."
+        )
+    sampler_config = async_config.sampler
+    if isinstance(
+        sampler_config,
+        (WindowedSamplerConfig, WeightFifoSamplerConfig, ReadyFirstSamplerConfig),
+    ):
+        if sampler_config.max_staleness_versions < steps_per_refit - 1:
+            raise ValueError(
+                f"async_rl.sampler.max_staleness_versions="
+                f"{sampler_config.max_staleness_versions} is below "
+                f"optimizer_steps_per_refit - 1 ({steps_per_refit - 1}): the "
+                f"{sampler_config.name} sampler would drop or never admit the "
+                "rollouts the last steps of each burst train on, and stall "
+                "before the refit. Raise max_staleness_versions to at least "
+                f"{steps_per_refit - 1}."
+            )
+
+
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     if master_config.loss_fn.seq_logprob_error_in_loss:
@@ -1735,10 +1785,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "supported on the SC split path."
         )
 
+    _validate_optimizer_steps_per_refit(master_config)
     required_capacity = required_buffer_capacity_for_config(
         async_config.sampler,
         algo_cfg.num_prompts_per_step,
         min_groups_for_streaming_train=async_config.min_groups_for_streaming_train,
+        optimizer_steps_per_refit=async_config.optimizer_steps_per_refit,
     )
     validate_sampler_buffer_capacity(
         async_config,
