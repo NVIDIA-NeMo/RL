@@ -15,16 +15,20 @@
 """Bursts of ``async_rl.optimizer_steps_per_refit`` optimizer steps per refit.
 
 The trainer version advances per optimizer step while generation keeps serving
-the last published weights, so these pin three things: the train pump refits
-once per burst (and on every checkpoint step), the samplers gate admission on
-the published version without stalling or evicting a burst's own rollouts, and
-setup rejects the combinations that would deadlock.
+the last published weights, so these pin: the train pump refits once per burst,
+and early on a checkpoint step or a shard rejoining STALE; it logs each step's
+burst position and refit share; FP8 KV scales are calibrated at the published
+weights; the samplers gate admission on the published version without stalling
+or evicting a burst's own rollouts, and custom samplers written before bursts
+still build; and setup rejects the combinations that would deadlock.
 """
 
 import asyncio
+from typing import Callable
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import torch
 
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
@@ -41,6 +45,12 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.models.generation.fleet_health import (
+    FleetHealthPolicy,
+    GenerationFleetHealth,
+    ShardState,
+)
 from tests.unit.single_controller.test_ppo_setup import _ppo_master_config
 from tests.unit.single_controller.test_resiliency_config import _master_config
 from tests.unit.single_controller.test_sampler_interface import FakeBuffer, _run
@@ -51,6 +61,7 @@ from tests.unit.single_controller.test_single_controller_actor import (
 )
 
 _GATE_CLOSED_TIMEOUT_S = 0.05
+_REFIT_S = 0.01
 
 
 def _admit_until_gate_closes(sampler, published_version: int) -> list[int]:
@@ -223,9 +234,12 @@ class _EveryStepSampler(_EmptySampler):
     def __init__(self, ctrl_ref: list) -> None:
         self._ctrl_ref = ctrl_ref
         self.versions_at_select: list[tuple[int, int]] = []
+        # Runs as each step selects its batch, to inject events mid-burst.
+        self.on_select: Callable[[int], None] = lambda step_index: None
 
     async def select(self, **kwargs):
         ctrl = self._ctrl_ref[0]
+        self.on_select(len(self.versions_at_select))
         self.versions_at_select.append(
             (kwargs["current_train_weight"], ctrl._published_policy_version())
         )
@@ -250,17 +264,34 @@ def _burst_controller(monkeypatch, *, steps_per_refit: int, max_num_steps: int):
     # Not exhausted, so only max_num_steps is the last step and saves follow
     # save_period alone.
     ctrl._rollout_exhausted.clear()
+    ctrl._gen_fleet = None
     published: list[int] = []
+    calibrated_reads: list[list[int]] = []
 
-    async def sync_weights(**kwargs) -> int:
-        del kwargs
+    async def sync_weights(*, calibration_data) -> int:
         published.append(ctrl._trainer_version)
+        if calibration_data is not None:
+            calibrated_reads.append(calibration_data["read"].tolist())
+        # Stands in for the real refit's fleet bookkeeping, which is what
+        # returns a STALE shard to service.
+        ctrl._record_refit_landed(ctrl._refit_participants())
+        # Long enough to register in the weight_sync timer.
+        await asyncio.sleep(_REFIT_S)
         return 0
 
     ctrl._sync_weights = AsyncMock(side_effect=sync_weights)
     ctrl._logger = MagicMock()
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    ctrl.calibrated_reads = calibrated_reads
     return ctrl, sampler, published
+
+
+def _train_metrics(ctrl, name: str) -> list:
+    return [
+        call.args[0][name]
+        for call in ctrl._logger.log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    ]
 
 
 class TestTrainPumpBursts:
@@ -289,13 +320,102 @@ class TestTrainPumpBursts:
             (5, 3),
             (6, 6),
         ]
-        lags = [
-            call.args[0]["weight_version_lag"]
-            for call in ctrl._logger.log_metrics.call_args_list
-            if call.kwargs.get("prefix") == "train"
-        ]
         # Every sample is tagged version 0, so the lag counts optimizer steps.
-        assert lags == list(range(7))
+        assert _train_metrics(ctrl, "weight_version_lag") == list(range(7))
+
+    def test_each_step_logs_its_burst_position_and_refit_share(self, monkeypatch):
+        ctrl, _, _ = _burst_controller(monkeypatch, steps_per_refit=3, max_num_steps=7)
+
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=2.0))
+
+        assert _train_metrics(ctrl, "steps_since_refit") == [1, 2, 0, 1, 2, 0, 1]
+        assert _train_metrics(ctrl, "published_policy_version") == [
+            0,
+            0,
+            3,
+            3,
+            3,
+            6,
+            6,
+        ]
+        refit_steps = [
+            step
+            for step, fraction in enumerate(
+                _train_metrics(ctrl, "refit_time_fraction"), start=1
+            )
+            if fraction > 0
+        ]
+        assert refit_steps == [3, 6]
+        assert all(
+            0 < fraction <= 1
+            for fraction in _train_metrics(ctrl, "refit_time_fraction")
+            if fraction > 0
+        )
+
+    def test_a_shard_rejoining_mid_burst_ends_the_burst(self, monkeypatch):
+        ctrl, sampler, published = _burst_controller(
+            monkeypatch, steps_per_refit=3, max_num_steps=7
+        )
+        fleet = GenerationFleetHealth(shard_count=2, policy=FleetHealthPolicy())
+        ctrl._gen_fleet = fleet
+
+        def restart_shard_1(step_index: int) -> None:
+            if step_index == 1:
+                fleet.record_actor_death(1, error="injected")
+                fleet.mark_restarting(1)
+                fleet.mark_loaded(1)
+
+        sampler.on_select = restart_shard_1
+
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=2.0))
+
+        # Shard 1 rejoined STALE during step 2, so step 2 refits instead of
+        # step 3 and the next burst runs its full length from there.
+        assert published == [2, 5]
+        assert fleet.state_of(1) is ShardState.HEALTHY
+        assert _train_metrics(ctrl, "steps_since_refit") == [1, 0, 1, 2, 0, 1, 2]
+
+    def test_a_restart_still_in_progress_does_not_end_the_burst(self, monkeypatch):
+        ctrl, sampler, published = _burst_controller(
+            monkeypatch, steps_per_refit=3, max_num_steps=6
+        )
+        fleet = GenerationFleetHealth(shard_count=2, policy=FleetHealthPolicy())
+        ctrl._gen_fleet = fleet
+
+        def kill_shard_1(step_index: int) -> None:
+            if step_index == 1:
+                fleet.record_actor_death(1, error="injected")
+                fleet.mark_restarting(1)
+
+        sampler.on_select = kill_shard_1
+
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=2.0))
+
+        # A RESTARTING shard cannot take weights yet, so refitting early
+        # would buy nothing.
+        assert published == [3, 6]
+        assert fleet.state_of(1) is ShardState.RESTARTING
+
+    def test_fp8_kv_scales_are_calibrated_on_the_burst_final_step(self, monkeypatch):
+        ctrl, _, published = _burst_controller(
+            monkeypatch, steps_per_refit=3, max_num_steps=6
+        )
+        ctrl._gen.requires_kv_scale_sync = True
+        reads: list[int] = []
+
+        def read_from_dataplane(meta, *, select_fields):
+            del meta, select_fields
+            reads.append(len(reads))
+            return BatchedDataDict({"read": torch.tensor([reads[-1]])})
+
+        ctrl._trainer.read_from_dataplane = read_from_dataplane
+
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=2.0))
+
+        # Calibration runs inside the refit, at the weights being published,
+        # on the batch of the step that ends the burst.
+        assert published == [3, 6]
+        assert ctrl.calibrated_reads == [[2], [5]]
 
     def test_a_checkpoint_step_ends_the_burst(self, monkeypatch):
         ctrl, sampler, published = _burst_controller(

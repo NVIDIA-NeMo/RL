@@ -4058,6 +4058,7 @@ class SingleControllerActor:
                     will_save_checkpoint
                     or self._steps_since_refit + 1
                     >= self._async_cfg.optimizer_steps_per_refit
+                    or self._fleet_has_stale_shard()
                 )
                 if not early_refit_done:
                     self._steps_since_refit = (
@@ -4178,6 +4179,16 @@ class SingleControllerActor:
                     continue
                 percent = (v / total_time * 100) if total_time > 0 else 0.0
                 print(f"  • {k}: {v:.2f}s ({percent:.1f}%)")
+
+            # Per-step burst state. refit_time_fraction is 0 mid-burst, so its
+            # mean over a run is the share of wall-clock spent refitting.
+            step_metrics["steps_since_refit"] = self._steps_since_refit
+            step_metrics["published_policy_version"] = self._published_policy_version()
+            step_metrics["refit_time_fraction"] = (
+                timing_metrics.get("weight_sync", 0.0) / total_time
+                if total_time > 0
+                else 0.0
+            )
 
             # min sample version refers to the version each consumed sample was
             # generated with; lag = training version - oldest sample version.
@@ -6712,6 +6723,20 @@ class SingleControllerActor:
         by these weights, not by the trainer's.
         """
         return self._trainer_version - self._steps_since_refit
+
+    def _fleet_has_stale_shard(self) -> bool:
+        """Whether a generation shard is loaded but held out of service until a refit.
+
+        A restarted shard rejoins as STALE through ``mark_loaded``, and an aborted
+        refit leaves its receivers STALE. Only the next refit returns them to the
+        serving set, so the train pump ends a burst early rather than leave them idle
+        for the rest of it.
+        """
+        if self._gen_fleet is None:
+            return False
+        return any(
+            health.state is ShardState.STALE for health in self._gen_fleet.snapshot()
+        )
 
     def _retune_lookahead_versions(self) -> None:
         """Widen the sampler's lookahead while the policy is frozen, then shrink it back.
