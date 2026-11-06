@@ -1008,9 +1008,12 @@ class TestNcclReshardWeightSynchronizer:
             {"tp_size": 4, "ep_size": 1, "etp_size": 4, "pp_size": 1},
             2,
             4,
+            layout_index=0,
         )
         gen.prepare_nccl_reshard_refit_info.assert_called_once()
-        (shipped,), _ = gen.prepare_nccl_reshard_refit_info.call_args
+        (shipped_plans,), _ = gen.prepare_nccl_reshard_refit_info.call_args
+        assert len(shipped_plans) == 1
+        shipped = shipped_plans[0]
         for params in shipped["per_layer_params"].values():
             for p in params:
                 assert isinstance(p["src_mesh_info"], dict)
@@ -1449,12 +1452,15 @@ class TestFactory:
 
         assert isinstance(sync, MegatronWeightSynchronizer)
         assert isinstance(sync._transport, NcclReshardWeightSynchronizer)
-        assert sync._transport._gen_parallelism() == {
-            "tp_size": 8,
-            "ep_size": 2,
-            "etp_size": 8,
-            "pp_size": 1,
-        }
+        assert sync._transport._gen_layouts() == [
+            {
+                "tp_size": 8,
+                "ep_size": 2,
+                "etp_size": 8,
+                "pp_size": 1,
+                "world_size": None,
+            }
+        ]
 
     @pytest.mark.parametrize(("configured", "expected_calls"), [(False, 0), (True, 1)])
     @patch("nemo_rl.weight_sync.collective_weight_synchronizer.ray")
@@ -1509,8 +1515,8 @@ class TestFactory:
                 None,
                 "requires non-colocated vLLM or Megatron",
             ),
-            # TensorRT-LLM has no shard-to-shard refit transport.
-            ("trtllm", False, "nccl_reshard", "TensorRT-LLM generation"),
+            # mcore refit is Megatron-generation only.
+            ("trtllm", False, "mcore", "TensorRT-LLM generation"),
         ],
     )
     def test_refit_memory_release_rejects_unsupported_transport(
@@ -1533,8 +1539,9 @@ class TestFactory:
             )
 
     @patch("nemo_rl.weight_sync.nccl_reshard_weight_synchronizer.ray")
-    def test_non_colocated_vllm_nccl_reshard_propagates_refit_memory_release(
-        self, mock_ray
+    @pytest.mark.parametrize("backend", [VLLM_BACKEND, "trtllm"])
+    def test_non_colocated_nccl_reshard_propagates_refit_memory_release(
+        self, mock_ray, backend
     ):
         mock_ray.get.return_value = [True]
         policy = _mock_policy()
@@ -1546,7 +1553,7 @@ class TestFactory:
         sync = create_weight_synchronizer(
             policy=policy,
             generation=generation,
-            generation_backend=VLLM_BACKEND,
+            generation_backend=backend,
             colocated=False,
             train_cluster=_mock_cluster(),
             inference_cluster=_mock_cluster(),
