@@ -424,7 +424,7 @@ def test_prev_logprob_dispatch_ships_the_sampler_head_under_replay(monkeypatch, 
     )
     captured: dict[str, KVBatchMeta] = {}
     pol = _stub_tq_policy(monkeypatch, captured)
-    pol.cfg = {"generation": {"sampler_replay": {"enabled": replay}}}
+    pol.cfg["generation"] = {"sampler_replay": {"enabled": replay}}
 
     pol.get_logprobs_from_meta(meta)
     pol.get_reference_policy_logprobs_from_meta(meta)
