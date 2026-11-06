@@ -209,7 +209,11 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         gen_handle=SimpleNamespace(
             worker_group=SimpleNamespace(workers=[], dp_leader_worker_indices=[])
         ),
-        trainer_handle=SimpleNamespace(worker_group=SimpleNamespace(workers=[])),
+        trainer_handle=SimpleNamespace(
+            worker_group=SimpleNamespace(workers=[]),
+            add_data_plane_snapshot_source=lambda actor: None,
+            add_data_plane_snapshot_fn=lambda fn: None,
+        ),
         value_handle=None,
         teacher_worker_groups=None,
         dataloader=None,
