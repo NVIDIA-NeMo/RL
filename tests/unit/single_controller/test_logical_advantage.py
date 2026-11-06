@@ -103,6 +103,7 @@ def _batch(
             "prompt_ids_for_adv": torch.tensor([[17, 42]] * n),
             "total_reward": torch.tensor(rewards),
             "token_mask": torch.tensor([[0.0, 1.0, 1.0]] * n),
+            "input_lengths": torch.full((n,), 3),
             "sample_mask": torch.ones(n),
             "mask_sample": torch.zeros(n, dtype=torch.bool),
             "truncated": torch.zeros(n, dtype=torch.bool),
