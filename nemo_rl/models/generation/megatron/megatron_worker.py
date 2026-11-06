@@ -803,11 +803,13 @@ class MegatronGenerationMixin:
         """Resume + unpause the engine. No-op if already awake."""
         if not self._inference_engine_asleep:
             return
+        # Rank 0's resume reaches every rank's engine: wait until every rank has
+        # finished its local weight update, and issue no collective after it.
+        torch.distributed.barrier()
         future = asyncio.run_coroutine_threadsafe(
             self._wake_engine(), self._inference_loop
         )
         future.result()
-        torch.distributed.barrier()
         self._inference_engine_asleep = False
         print(f"[Rank {self.rank}] resumed inference engine")
 
