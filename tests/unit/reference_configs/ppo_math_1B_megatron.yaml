@@ -159,6 +159,7 @@ policy:
     checkpoint:
       async_save: false
       ckpt_assume_constant_structure: false
+      parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
     empty_unused_memory_level: 1
     # Megatron-style manual GC: disable automatic Python GC and collect on every rank
     # together every manual_gc_interval optimizer steps (a positive integer).
@@ -198,6 +199,7 @@ policy:
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
+    reuse_logits_storage: false
     fp32_lm_head: false
     moe_per_layer_logging: False
 
@@ -371,6 +373,7 @@ value:
     checkpoint:
       async_save: false
       ckpt_assume_constant_structure: false
+      parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
     empty_unused_memory_level: 1
     # Megatron-style manual GC: disable automatic Python GC and collect on every rank
     # together every manual_gc_interval optimizer steps (a positive integer).

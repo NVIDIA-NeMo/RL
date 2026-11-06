@@ -251,8 +251,9 @@ class GenerationConfig(TypedDict):
     ]  # Sampler candidates per token; 0 disables collection.
     # Validation-only sampling. The exemplar YAMLs default these to the train
     # values above via interpolation (${.temperature}, ...), so validation
-    # samples exactly like training unless overridden. Only honored on the
-    # NeMo-Gym vLLM rollout path (guarded in grpo.setup()).
+    # samples exactly like training unless overridden. val_temperature and
+    # val_top_p are honored on the NeMo-Gym vLLM and TRT-LLM rollout paths
+    # (guarded in grpo.setup()); a val_top_k override is not supported.
     val_temperature: float
     val_top_p: float
     val_top_k: int | None
