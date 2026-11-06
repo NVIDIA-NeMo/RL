@@ -724,7 +724,9 @@ class SingleControllerActor:
                     path=actor_args.last_checkpoint_path,
                     from_rollout_snapshot=actor_args.restored_from_rollout_snapshot,
                     data_plane_metadata=data_plane_checkpoint_metadata,
-                    load_metrics=actor_args.rollout_checkpoint_load_metrics,
+                    rollout_checkpoint_load_metrics=(
+                        actor_args.rollout_checkpoint_load_metrics
+                    ),
                 ),
             )
         )

@@ -226,9 +226,9 @@ class RolloutRestorer(_UsesRolloutParts):
         restored_replay_groups: int,
     ) -> None:
         """Log rollout restore phases after the controller is ready to dispatch."""
-        if self._resume.load_metrics is None:
+        if self._resume.rollout_checkpoint_load_metrics is None:
             return
-        load_metrics = dict(self._resume.load_metrics)
+        load_metrics = dict(self._resume.rollout_checkpoint_load_metrics)
         load_metrics["replay_metadata_load_seconds"] = replay_metadata_load_seconds
         load_metrics["recovery_prepare_seconds"] = recovery_prepare_seconds
         # At this point, load_metrics contains restore-phase timers only. Sum by

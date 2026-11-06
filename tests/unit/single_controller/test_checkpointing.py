@@ -2431,7 +2431,7 @@ class TestPeriodicRolloutCheckpoint:
         actor = self._actor(tmp_path)
         actor._logger = MagicMock()
         actor._resume = ResumeSource(
-            load_metrics={
+            rollout_checkpoint_load_metrics={
                 "snapshot_resolution_seconds": 0.5,
                 "dataloader_load_seconds": 1.0,
                 "tq_load_seconds": 2.0,

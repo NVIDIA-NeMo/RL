@@ -133,8 +133,9 @@ class ResumeSource:
     path: Optional[str] = None
     from_rollout_snapshot: bool = False
     data_plane_metadata: Optional[DataPlaneCheckpointMetadata] = None
-    # Setup's load timings, logged with the restore timings.
-    load_metrics: Optional[dict[str, float]] = None
+    # Setup's load timings, logged with the restore timings. Named as setup names
+    # it, so the telemetry source-drift test can follow the dict across files.
+    rollout_checkpoint_load_metrics: Optional[dict[str, float]] = None
 
 
 @dataclass(frozen=True)
