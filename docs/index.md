@@ -411,6 +411,7 @@ design-docs/media-token-validity-mask.md
 design-docs/automodel-context-parallel.md
 design-docs/token-capture-ledger.md
 design-docs/dflash-draft-body.md
+design-docs/single-controller-rollout-checkpointing.md
 ```
 
 ```{toctree}
