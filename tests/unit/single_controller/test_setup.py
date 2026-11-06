@@ -4496,7 +4496,15 @@ def test_score_centering_rejects_unsupported_trainer_logits(backend_cfg):
     validate_single_controller_config(mc)
     for name, cfg in backend_cfg.items():
         mc.policy[name] = {**(mc.policy.get(name) or {}), **cfg}
-    with pytest.raises(ValueError, match="loss_fn.score_centering"):
+    # Exercise the shared score-centering guard independently of AutoModel's
+    # narrower full-batch capabilities, covered by test_automodel_config.
+    with (
+        patch(
+            "nemo_rl.algorithms.single_controller_utils.config."
+            "_validate_automodel_single_controller_config"
+        ),
+        pytest.raises(ValueError, match="loss_fn.score_centering"),
+    ):
         validate_single_controller_config(mc)
 
 
