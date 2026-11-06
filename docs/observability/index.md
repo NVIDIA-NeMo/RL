@@ -4,7 +4,9 @@ NeMo RL is instrumented with [OpenTelemetry](https://opentelemetry.io/) via the 
 
 Telemetry exports OTLP and works with any OTLP-compatible backend or an OpenTelemetry Collector (e.g. Jaeger, Grafana Tempo, or an OpenTelemetry Collector that fans out to your backend of choice).
 
-Telemetry is **off by default**. nemo-lens ships as a base dependency, so it reaches every worker venv, and `telemetry.enabled` is the single switch: while it is false every instrumentation site is a ~0-cost no-op.
+Telemetry is **on by default wherever an OTLP endpoint is configured**. nemo-lens ships as a base dependency, so it reaches every worker venv, and `telemetry.enabled` is the single switch: while it is false every instrumentation site is a ~0-cost no-op.
+
+So a run on a cluster that already sets `OTEL_EXPORTER_OTLP_ENDPOINT` is instrumented with no config changes, and a run with no endpoint set stays a no-op instead of exporting into a refused connection. See [Default on, but only where there is somewhere to send it](configuration.md#default-on-but-only-where-there-is-somewhere-to-send-it).
 
 ## What's in this section
 
