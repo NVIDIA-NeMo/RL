@@ -50,7 +50,7 @@ def worker(monkeypatch):
     worker.optimizer = torch.optim.SGD(worker.model.parameters(), lr=0.1, momentum=0.9)
     worker.scheduler = torch.optim.lr_scheduler.StepLR(worker.optimizer, 1, gamma=0.5)
     worker.max_grad_norm = 1.0
-    worker.device_mesh = worker.moe_mesh = worker.cp_mesh = None
+    worker.device_mesh = worker.moe_mesh = worker.cp_mesh = worker.tp_mesh = None
     worker.dp_mesh = Mock()
     worker.timer = Timer()
     worker.tokenizer = SimpleNamespace(pad_token_id=0)

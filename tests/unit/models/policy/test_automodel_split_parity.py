@@ -61,13 +61,17 @@ def tiny_moe_model_path(tiny_llama_model_path, tmp_path):
 @pytest.mark.hf_gated
 @pytest.mark.timeout(660)
 @pytest.mark.parametrize("expert_parallel_size", [1, 2])
-def test_full_batch_split_parity(request, expert_parallel_size, tmp_path):
+@pytest.mark.parametrize("logprob_chunk_size", [None, 16])
+def test_full_batch_split_parity(
+    request, expert_parallel_size, logprob_chunk_size, tmp_path
+):
     """Exercise real FSDP gradients, updates, metadata fetch, and abort on two ranks.
 
     Reuse the standalone numerical harness so CI and larger model qualification
     execute the same assertions. Two updates per loss normalization exercise
     optimizer/scheduler progression, with two microbatches per rank and a masked
-    sample. Network TQ, Ray dispatch, and live refits are covered by L1.
+    sample, with and without chunked training logprobs. Network TQ, Ray dispatch,
+    and live refits are covered by L1.
     """
     if torch.cuda.device_count() < 2:
         pytest.skip("Requires two CUDA GPUs")
@@ -77,6 +81,7 @@ def test_full_batch_split_parity(request, expert_parallel_size, tmp_path):
     )
     register_omegaconf_resolvers()
     config = load_config("examples/configs/grpo_math_1B.yaml")
+    config.policy.logprob_chunk_size = logprob_chunk_size
     config.policy.automodel_cfg.expert_parallel_size = expert_parallel_size
     if expert_parallel_size > 1:
         config.policy.automodel_cfg.automodel_kwargs.backend = {
