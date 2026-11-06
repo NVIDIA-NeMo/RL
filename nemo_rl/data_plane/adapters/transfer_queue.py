@@ -55,7 +55,7 @@ from tensordict import TensorDict
 from nemo_rl.data_plane.adapters import mooncake_ssd_offload
 from nemo_rl.data_plane.adapters.tq_controller_patch import configure_controller_patch
 from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
-from nemo_rl.data_plane.codec import timed_codec
+from nemo_rl.data_plane.codec import check_put_dtypes, timed_codec
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
     DataPlaneConfig,
@@ -1529,6 +1529,7 @@ class TQDataPlaneClient(DataPlaneClient):
         wire_fields: TensorDict | None = None
         field_names: list[str] | None = None
         if fields is not None:
+            check_put_dtypes(fields)
             # No ``.contiguous()``: under tensordict==0.12.2 it strips
             # non-tensor leaves (NonTensorStack stored as LinkedList) to empty
             # TDs. TQ's encoder forces ``.contiguous()`` per tensor leaf
