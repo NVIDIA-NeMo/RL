@@ -6,11 +6,19 @@ replica as the rollout workload drains, instead of keeping a fixed rollout/train
 split (async) or switching the whole pool at once (colocate). It follows section 4 of
 the QwenGyre paper (arXiv 2609.33848).
 
-Only the scheduling policy exists today:
-`nemo_rl/algorithms/single_controller_utils/elastic_scheduler.py`. It is a pure state
-machine with no Ray, GPU or asyncio dependency, and **nothing in the SC calls it
-yet**. There is no config key and no change in behavior. The rest of this document is
-the plan for wiring it in.
+Two pieces exist today:
+
+- The scheduling policy,
+  `nemo_rl/algorithms/single_controller_utils/elastic_scheduler.py`. It is a pure
+  state machine with no Ray, GPU or asyncio dependency.
+- Its first consumer, `tools/elastic_scheduler_replay.py`. It replays the rollout
+  durations a real SC run recorded through the policy and projects step time and idle
+  GPU time for elastic cells, a fixed split and colocate. This is the go/no-go
+  measurement for the rest of the plan (see
+  [Measuring before building](#measuring-before-building-offline-replay)).
+
+**No training path calls the policy yet.** There is no config key and no change in
+training behavior. The rest of this document is the plan for wiring it in.
 
 ## Problem
 
@@ -82,15 +90,21 @@ Rules:
   burst's dispatch can be served without the core, and the core has work to start.
   Satellites always return, in descending order.
 
-### What the Phase-1 module provides
+### What the policy module provides
 
 `ElasticScheduler(policy=ElasticSchedulerPolicy(...), clock=...)`:
 
-- Counters: `record_dispatch`, `record_launch` (refuses more than `launchable()`), and
-  `record_finish` (refuses more than are running). Derived values are `queued`,
-  `running`, `waterlevel` and `rollout_capacity`.
+- Counters, in two unit systems with one conversion between them (see
+  [Units](#units-groups-at-the-boundary-executions-inside)):
+  - Group units, for the SC: `record_dispatch_groups`, `record_launch_groups`,
+    `record_finish_groups` and `launchable_groups()`.
+  - Execution units, for a caller that sees single executions:
+    `record_dispatch`, `record_launch` (refuses more than `launchable()`) and
+    `record_finish` (refuses more than are running).
+  - Derived values are `queued`, `running`, `waterlevel` and `rollout_capacity`.
 - Decisions:
-  - `launchable()` implements eq. 4.
+  - `launchable()` implements eq. 4, and `launchable_groups()` rounds it down to
+    whole groups.
   - `next_training_cell(ready_groups=, groups_needed=)` implements eq. 5 with the
     supply hold. It returns a cell index or `None`.
   - `plan_burst_end(ready_groups=)` implements eq. 6 and returns a `BurstEndPlan`.
@@ -109,6 +123,104 @@ requests must not land back on it.
 The policy is a frozen dataclass, the same shape as `FleetHealthPolicy`. The
 user-facing BaseModel is deferred to the phase that consumes it, because a config key
 with no reader is dead configuration.
+
+### Units: groups at the boundary, executions inside
+
+The paper's capacities and counters are in executions: `C_e` is how many concurrent
+executions an engine serves. The SC admits, launches and commits whole prompt groups
+of `N` executions. Mixing the two silently would be off by a factor of `N`, so the
+boundary is explicit:
+
+- `ElasticSchedulerPolicy` carries `group_size` (`N`) and `steps_per_burst` (`mu`).
+  `ElasticSchedulerPolicy.executions(groups)` is the only place groups become
+  executions, and `burst_dispatch` (`mu N B`) is derived from it rather than passed
+  in.
+- The SC calls only the `*_groups` methods. `launchable_groups()` is
+  `launchable() // N`, so a launch decision never splits a group. If `C_e` is not a
+  multiple of `N`, the remainder slots stay unused rather than starting part of a
+  group.
+- Supply (`ready_groups`, `groups_needed`) and `B` stay in groups, as in the paper's
+  eq. 5.
+
+Group-level accounting holds a group's `N` slots until its last execution ends, which
+is conservative: cells move to training later than per-execution accounting would
+allow. Per-execution counting needs a per-execution completion signal from NeMo-Gym,
+which the SC does not receive today. The execution-unit methods are kept for that
+caller.
+
+## Measuring before building: offline replay
+
+`tools/elastic_scheduler_replay.py` answers "would elastic cells help this workload?"
+from a run that already happened, before any controller or worker change.
+
+**Input.** An SC run records one `rl.sc.generate_and_push` span per dispatch attempt
+when telemetry includes the `per_prompt` span group. The span covers one prompt
+group's generation and data-plane commit. The tool reads these spans from either
+source the repo already supports:
+
+- OTLP/JSON lines, for example an OpenTelemetry Collector `file` exporter placed in
+  front of the usual backend.
+- The stdout of `telemetry.exporter: console`. Interleaved log lines are skipped.
+
+```yaml
+telemetry:
+  enabled: true
+  span_groups: per_step,per_prompt
+```
+
+The aggregated `rollout/throughput/group_completion_seconds_{mean,p50,p95}` metrics are not
+enough, because the policy reacts to the shape of the tail, not to its quantiles.
+
+**Run.**
+
+```bash
+uv run python tools/elastic_scheduler_replay.py --trace spans.jsonl \
+    --num-cells 8 --cell-capacity 144 --group-size 16 --batch-groups 64 \
+    --train-step-s 3600 --num-steps 12
+```
+
+`--train-step-s` is the time *one cell* needs for one optimizer step. Derive it from
+the recorded `timing/train/policy_and_reference_logprobs` plus
+`timing/train/policy_training`, multiplied by the number of cells' worth of GPUs that
+trained in the recorded run. `--to-training-s` and `--to-rollout-s` default to the
+paper's 8.52 s and 3.46 s, and `--refit-s` is the fixed split's weight-sync time.
+
+**Output.** For each strategy on the same `K` cells: total and mean step time, idle
+cell-seconds as a fraction, and switching overhead. A rollout cell is idle in
+proportion to its unused concurrency, and a training cell is idle while it has no
+micro-step. The strategies are:
+
+- `elastic`: every role decision comes from `ElasticScheduler`, with `mu = 1`.
+- `fixed_split`: a fixed number of training cells (every split is tried unless
+  `--fixed-split-train-cells` is given), with `--max-lookahead-steps` of off-policy
+  lookahead.
+- `colocate`: the full batch, then all cells train.
+
+**What it assumes.**
+
+- Group durations do not depend on which engine runs them or how loaded it is.
+  Durations recorded under different contention replay as-is.
+- Groups hold their slots until the whole group ends (see Units).
+- The fixed split's refit pauses only the trainers. In the SC, refit also pauses
+  generation, so the fixed split is projected optimistically.
+- Training time scales linearly with the number of training cells.
+
+**Example (synthetic).** 400 Pareto(1.2) group durations (scale 60 s, capped at
+1800 s; p50 109 s, p95 897 s), `K = 4`, `C_e = 24`, `N = 4`, `B = 8`, 960 s of
+one-cell training per step, 6 steps:
+
+| Strategy | Hours | Idle |
+|---|---|---|
+| elastic | 0.77 | 28.8% |
+| fixed split, 3 training cells, 1 step of lookahead | 0.72 | 25.3% |
+| fixed split, 3 training cells, no lookahead | 1.69 | 69.0% |
+| colocate | 1.56 | 65.1% |
+
+On this trace, elastic halves colocate's time and roughly matches a well-tuned
+off-policy fixed split. It does so while staying within half a step of on-policy,
+which is the regime where a fixed split degrades to 1.69 h. That is the kind of
+answer Phase 2 must produce on real traces before Phase 3 starts. A workload where
+the best fixed split already wins clearly is a no-go.
 
 ## Mapping onto the SingleController
 
@@ -156,7 +268,9 @@ Reused:
   to cells. "Atomic claim" is free because the asyncio loop is single-threaded.
 - The generation router's `set_serving_backends` serves as the rerouting switch.
   Aborting a backend's in-flight calls returns 500, and NeMo-Gym's bounded retry
-  re-sends the call to a remaining backend.
+  re-sends the call to a remaining backend. See
+  [Router and colocation constraints](#router-and-colocation-constraints) for what
+  works with MInf cells today.
 - Fleet health (`fleet_health.py`): returned cells take the existing STALE-then-refit
   path.
 - Refit membership (`weight_sync/membership.py`) handles reconciliation when the
@@ -176,9 +290,9 @@ New:
 - A `LENT` fleet-health state. It means "removed from serving on purpose; not
   failed". It must not trip the DEAD-then-STALE rule or count as a failure.
 - Router destination priority (standalone first, then rollout cells in descending
-  order) in place of pure least-outstanding.
-- Router and fleet-health support for MInf. Today only vLLM implements
-  `attach_fleet_health`, and the router is vLLM-only.
+  order) as a tiebreak inside load-normalized least-outstanding.
+- The controller pushing the router's serving set directly, without fleet health,
+  plus an engine-side abort of a cell's in-flight calls on MInf.
 - Per-request retry on the native (non-Gym) rollout path.
 - The capacity gate in `_rollout_pump`, and global token normalization across cells.
 
@@ -228,8 +342,96 @@ cells `0..m` in training:
    new weights back over `G_{m,r}`.
 
 Training cells are always a prefix, so these `K-1` sets cover every membership with
-no communicator creation on the hot path. The cost is NCCL memory for `(K-1) x
-DP x TP x PP` extra communicators, which is listed under risks.
+no communicator creation on the hot path. Their cost is NCCL buffer memory,
+estimated next.
+
+#### Memory per communicator
+
+NCCL allocates buffers per *channel* per *connected peer*. The defaults per
+connection are:
+
+- Simple: `NCCL_BUFFSIZE` = 4 MiB.
+- LL: 512 KiB.
+- LL128: about 4.7 MiB (120 elements x 640 threads x 8 steps x 8 bytes).
+
+That is about **9.2 MiB per channel per peer**. A ring connects one peer per channel,
+and a tree up to three. Since NCCL 2.22, connections are made lazily on first use
+(`NCCL_RUNTIME_CONNECT=1`), so an algorithm that is never used allocates nothing.
+
+`G_{m,r}` spans nodes, because cells are node-aligned, so NCCL picks network channels.
+On an 8-NIC H100 node that is typically 16 channels. For ring-only traffic:
+
+```
+per communicator ~= 16 channels x 1 peer x 9.2 MiB ~= 150 MiB per GPU
+(ring and tree both used: up to ~4 peers ~= 600 MiB)
+```
+
+Core rank `r` belongs to all `K-1` sets, and satellite `c` to `K-c` of them, so the
+core GPUs are the worst case. With `K = 8`, that is 7 x 150 MiB ~= 1.0 GiB per core GPU
+(up to ~4 GiB with trees). This is on top of the core's training state, at the
+moment the core needs the most memory.
+
+These are estimates from NCCL's default buffer sizes, not measurements. Phase 6
+measures them with `torch.cuda.mem_get_info()` before and after each communicator's
+first reduction.
+
+#### Alternatives
+
+| Option | Extra memory on a core GPU | Cost |
+|---|---|---|
+| A. `K-1` prefix communicators (paper) | `(K-1) x M` (~1-4 GiB at `K = 8`) | None at runtime |
+| B. One parent communicator over rank `r` of all `K` cells, split into prefix children with `ncclCommSplit(config.splitShare = 1)` | ~`1 x M` | Children share the parent's buffers, so their collectives serialize; only one prefix is used per step, so nothing is lost. The split is collective over the parent, so it runs once at startup, while every cell is idle. With `splitShare` set, children share the parent's abort flag; the abort path in `stateless_process_group.py` assumes it is unset and must be revisited |
+| C. One communicator over all `K` cells; non-training cells contribute zeros | `1 x M` | Every reduction involves the cells serving rollouts: they launch a kernel, stream a gradient-sized buffer of zeros, and gate the core on their inference schedule. Rejected except as a debugging fallback |
+| D. Build `G_{m,r}` lazily with `new_group(use_local_synchronization=True)`, keep an LRU of `L` | `L x M` | One `ncclCommInitRank` over `m+1` ranks per new membership. Hidden by starting the build when cell `m` *begins* its 8.5 s move to training, so it is off the critical path |
+| E. Point-to-point `send`/`recv` on one communicator, with a ring reduce-scatter written over the prefix only | per connected peer, only for peers used | Non-members make no call. Hand-written reduction instead of NCCL's tuned one |
+
+Cap channels per communicator with `ncclConfig_t.maxCTAs` (via
+`ProcessGroupNCCL.Options.config`). Satellite-to-core reduction runs once per step and
+is not latency-critical, so 4 channels instead of 16 cuts each estimate by 4x.
+
+**Recommendation.** Start Phase 6 with B, since it costs one communicator's memory and
+keeps NCCL's tuned collectives. Use D if `splitShare` conflicts with the existing
+abort and rebuild code. Use A only where the measured `(K-1) x M` fits. All options
+share one interface (`reduce_to_core(prefix_len)`), so switching between them does
+not touch the scheduler.
+
+### Router and colocation constraints
+
+The constraints as they stand in the code:
+
+- **The router is URL-based, not vLLM-specific.** `_maybe_start_generation_router`
+  already fronts the per-model-parallel-group OpenAI URLs that MInf reserves
+  (`MegatronGeneration.reserve_http_server_addresses`). What is vLLM-only is fleet
+  health: only `VllmGeneration` implements `attach_fleet_health`, and fleet health is
+  today the only caller of `set_serving_backends`. Elastic cells therefore need no
+  router port to MInf. They need:
+  1. The controller calling `set_serving_backends` with the URLs of the cells in
+     rollout plus the standalone pool. This is a full-set push, so it is idempotent.
+     The controller is the membership authority for lent cells, and fleet health,
+     when enabled, intersects its own view with the controller's.
+  2. A map from cell to URLs, which is static: a cell is a fixed set of
+     model-parallel groups.
+  3. An engine-side "abort all in-flight calls" on the removed cell's MInf servers.
+     Removing a URL from the serving set only stops *new* calls; in-flight calls must
+     fail so the router returns 500 and Gym retries elsewhere.
+  4. Priority as a tiebreak: pick by `(inflight / capacity, tier, url)` instead of
+     `(inflight, url)`, with the standalone pool in tier 0 and higher-numbered cells
+     in lower tiers. Strict priority would pile every call onto the standalone pool,
+     and the capacity gate already bounds the total.
+- **Native (non-Gym) rollouts** have no router. Elastic cells require NeMo-Gym until
+  per-request retry exists on the native path.
+- **Colocation.** SC accepts `colocated.enabled` only for `backend: megatron`, and
+  then requires `min_groups_for_streaming_train == num_prompts_per_step`. The reason
+  for the second rule is that a colocated engine must stand down before its GPUs
+  train, and with one engine that means after the last rollout. With cells, the rule
+  becomes per cell: *a cell trains only after its own engine has stood down*. Other
+  cells keep generating, so streaming is legal. Phase 5 replaces the global check
+  with this per-cell one when `elastic_scheduler.enabled`, and keeps the global check
+  otherwise.
+- **vLLM.** SC rejects colocated vLLM because `RolloutManager.generate_and_push`
+  needs the disaggregated async engine. Elastic cells do not need colocated vLLM:
+  cells are MInf, and the standalone pool is a normal non-colocated engine. It should
+  also be MInf, to avoid a vLLM/MInf numerics mismatch between pools (see Staleness).
 
 ### Training to rollout
 
@@ -311,8 +513,8 @@ DP x TP x PP` extra communicators, which is listed under risks.
 
 | Phase | Scope | Exit criterion |
 |---|---|---|
-| 1 (this PR) | Pure policy (eqs. 3-6, supply hold, serial core-first order), unit tests, a discrete-event simulation (DES) test, this doc. No wiring, no config | Unit tests pass |
-| 2 | Offline replay: feed recorded per-execution durations and train times (or the #4914 rollout-only simulator) through the policy, and compare against async and colocate | Projected win on a real NeMo RL workload; go/no-go |
+| 1 (this PR) | Pure policy (eqs. 3-6, supply hold, serial core-first order, group-unit boundary), unit tests, a discrete-event simulation (DES) test, this doc. No wiring, no config | Unit tests pass |
+| 2 (tool in this PR) | `tools/elastic_scheduler_replay.py`: replay recorded `rl.sc.generate_and_push` durations through the policy against a fixed split and colocate. Remaining work is running it on real traces. The #4914 rollout-only simulator is a cheap way to record a trace for a new recipe without a trainer | Projected win over the best fixed split on a real NeMo RL workload; go/no-go |
 | 3 | Counters and the capacity gate in `_rollout_pump`, plus metrics (`w`, `C_R`, cell roles, supply). `async_rl.elastic_scheduler` BaseModel, opt-in and off by default, with the gate as its first consumer | No behavior change when disabled; parity when `K = 1` |
 | 4 | `LENT` fleet-health state, router destination priority, per-cell drain/abort rerouting, router and fleet-health support for MInf | Cells removed from and restored to serving with no lost executions |
 | 5 | Core-only switching (the paper's C2): the core moves to training on eq. 5 instead of waiting for the full batch. This lifts the colocated full-batch requirement | Matches or beats today's colocated SC |
@@ -325,19 +527,26 @@ measures at 1.21x over plain Colocate (C0).
 
 ## Open questions and risks
 
-- **Cell engine.** MInf is the only colocated engine the SC supports. Elastic cells
-  with vLLM would need SC support for colocated vLLM with sleep/wake.
+- **Cell engine.** MInf is the only colocated engine the SC supports, so cells are
+  MInf (see [Router and colocation constraints](#router-and-colocation-constraints)).
+  vLLM cells would need SC support for colocated vLLM with sleep/wake, which is not
+  planned.
 - **Routing versus prefix cache.** The router is least-outstanding and not sticky, so
   multi-turn calls already lose prefix-cache locality. Priority routing does not fix
   that.
-- **Units.** The SC admits and trains in groups, while the paper counts executions.
-  The gate launches whole groups and keeps capacity in executions. Partial groups
-  never launch.
-- **Communicator memory.** `K-1` prefix sets per core rank may not fit at large `K`
-  and DP. A fallback is to build `G_{m,r}` lazily at the step boundary when membership
-  changes.
+- **Units.** Resolved at the boundary (see
+  [Units](#units-groups-at-the-boundary-executions-inside)). The remaining cost is
+  that group-level accounting is conservative until Gym reports per-execution
+  completion.
+- **Communicator memory.** Estimated at ~150 MiB per prefix communicator per GPU
+  (ring, 16 channels). The paper's `K-1` sets cost ~1 GiB on each core GPU at
+  `K = 8`. Splitting with shared resources (option B) brings this to one
+  communicator's worth. Unmeasured until Phase 6.
+- **Replay fidelity.** The replay ignores load-dependent durations and generation
+  pauses during refit. It is a go/no-go filter, not a speedup promise.
 - **Scope.** GRPO/GSPO-style group algorithms with the Megatron backend only. PPO with
   a critic, DTensor and per-role layouts from #4801 (mixed widths, `worker_offset`)
   are out of scope until a satellite layout story exists.
-- **Value without phases 2-6.** The Phase-1 module has no production consumer. Its
-  value depends on Phase 2 confirming a win on our workloads.
+- **Value without phases 3-6.** In this PR the policy's only consumer is the replay
+  tool. Training benefits only once Phase 2 shows a win on our workloads and
+  Phases 3-6 land.
