@@ -22,7 +22,7 @@ to time-multiplex GPU memory between training and inference phases.
 import asyncio
 import os
 from collections import defaultdict
-from typing import Any, AsyncGenerator, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union, cast
 
 import numpy as np
 import ray
@@ -46,21 +46,26 @@ from nemo_rl.models.generation.trtllm.config import (
     role_tensor_parallel_size,
 )
 
+if TYPE_CHECKING:
+    from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+
 
 class TrtllmGeneration(GenerationInterface):
     """TRT-LLM generation backend (requires trtllm_cfg.async_engine=true)."""
 
     @classmethod
-    def validate_settings(cls, master_config: Any) -> None:
-        """Reject SC options that require unsupported TRT-LLM lifecycle APIs.
+    def validate_settings(cls, master_config: "MasterConfig") -> None:
+        """Reject SingleController options TRT-LLM has no backend support for.
 
-        SC can use the existing fixed-fleet PD HTTP and weight-update paths.
-        Per-replica quarantine/restart and token capture require additional
-        backend APIs and must fail before workers reserve any GPUs.
+        SC drives TRT-LLM as a fixed, non-colocated fleet over the existing
+        HTTP (and PD frontend) and collective weight-update paths. Per-shard
+        quarantine/restart, token capture and the generation router need
+        backend hooks TRT-LLM does not implement, so they fail here, before
+        any worker reserves GPUs, rather than at the first refit or rollout.
         """
-        generation = master_config.policy["generation"]
+        generation = cast(TrtllmConfig, master_config.policy["generation"])
         trtllm_cfg = generation["trtllm_cfg"]
-        if not trtllm_cfg["async_engine"]:
+        if not trtllm_cfg.get("async_engine"):
             raise ValueError("SC TRT-LLM requires trtllm_cfg.async_engine=true")
         if generation["colocated"]["enabled"]:
             raise ValueError("SC TRT-LLM requires non-colocated generation")
@@ -75,17 +80,19 @@ class TrtllmGeneration(GenerationInterface):
             raise NotImplementedError("SC TRT-LLM does not support token_capture")
         if master_config.async_rl.generation_router.enabled:
             raise NotImplementedError(
-                "SC TRT-LLM uses its own PD frontends; disable async_rl.generation_router"
+                "SC TRT-LLM serves NeMo-Gym through its own servers (PD frontends "
+                "under disaggregation); disable async_rl.generation_router"
             )
-        if (trtllm_cfg.get("disaggregation") or {}).get("enabled"):
-            if not master_config.env.get("should_use_nemo_gym"):
-                raise ValueError(
-                    "SC TRT-LLM PD requires the NeMo-Gym HTTP rollout path"
-                )
-        if (
-            master_config.env.get("should_use_nemo_gym")
-            and not trtllm_cfg["expose_http_server"]
-        ):
+        # Read the raw flag, not should_use_nemo_gym(): that helper asserts on
+        # the HTTP-server prerequisites, and this check owns those messages.
+        use_nemo_gym = bool(master_config.env.get("should_use_nemo_gym"))
+        if resolve_disagg_layout(generation).enabled and not use_nemo_gym:
+            raise ValueError(
+                "SC TRT-LLM PD disaggregation requires the NeMo-Gym HTTP rollout "
+                "path (env.should_use_nemo_gym=true): the direct token path "
+                "would bypass the disagg frontends"
+            )
+        if use_nemo_gym and not trtllm_cfg.get("expose_http_server"):
             raise ValueError("SC NeMo-Gym requires trtllm_cfg.expose_http_server=true")
 
     @staticmethod

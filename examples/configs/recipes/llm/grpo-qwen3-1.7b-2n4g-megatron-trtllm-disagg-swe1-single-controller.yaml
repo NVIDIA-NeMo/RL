@@ -1,0 +1,65 @@
+# SingleController sibling of grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1:
+# the same TRT-LLM prefill/decode disaggregation behind NeMo-Gym, driven by
+# examples/run_grpo_single_controller.py instead of the legacy async-GRPO loop.
+#
+# Resource layout (2 nodes x 4 GPUs), unchanged from the parent:
+#   - node 0: policy training, Megatron CP4
+#   - node 1: one disagg replica -- 1 prefill engine (TP2) + 1 decode engine
+#     (TP2) fronted by 2 disagg servers. NeMo-Gym talks to the frontends.
+#
+# SC drives TRT-LLM as a fixed, non-colocated fleet: generation fleet health,
+# the generation router, token capture and a refit deadline are unsupported
+# and rejected at setup (TrtllmGeneration.validate_settings).
+
+defaults: ./grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1-single-controller
+  # SC checkpoints carry the data plane so a resume replays buffered rollouts.
+  metric_name: null
+  save_data_plane: true
+
+grpo:
+  # SC replaces the legacy async-GRPO loop; its knobs live under async_rl.
+  async_grpo: null
+  # SC does not support validation yet (setup raises when it is enabled).
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+
+policy:
+  generation:
+    trtllm_cfg:
+      # The parent interpolates these from grpo.async_grpo, which SC nulls.
+      # TrtllmGeneration reads them from its own config, so keep them in step
+      # with async_rl here.
+      in_flight_weight_updates: true
+      recompute_kv_cache_after_weight_updates: ${async_rl.recompute_kv_cache_after_weight_updates}
+
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
+
+async_rl:
+  # As the parent's async_grpo: refit lands on live disagg engines, and the
+  # in-flight requests recompute their KV under the new weights.
+  recompute_kv_cache_after_weight_updates: true
+  generation_fleet_health:
+    # TRT-LLM's refit has no worker-side abort hook for a deadline.
+    refit_timeout_s: null
+  sampler:
+    name: in_order
+    # One-step-off-policy, matching the parent's max_trajectory_age_steps.
+    max_lookahead_versions: 1
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, 2}
+
+logger:
+  log_dir: logs/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1-single-controller
+  wandb:
+    name: grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1-single-controller
