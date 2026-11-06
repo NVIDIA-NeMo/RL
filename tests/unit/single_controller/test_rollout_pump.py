@@ -186,12 +186,7 @@ class _RecordingRolloutManager:
         # weight_fifo gates but does not stamp target_step.
         (lambda buf: WeightFifoSampler(buf, max_staleness_versions=1), [None, None]),
         # in_order stamps the dispatch index as target_step.
-        (
-            lambda buf: InOrderSampler(
-                buf, max_lookahead_versions=1, optimizer_steps_per_refit=1
-            ),
-            [0, 1],
-        ),
+        (lambda buf: InOrderSampler(buf, max_lookahead_versions=1), [0, 1]),
     ],
 )
 def test_rollout_pump_stamps_target_steps(
@@ -308,9 +303,7 @@ def test_reserved_admission_rejects_an_occupied_target_step() -> None:
         mark_prompt_group_admitted=MagicMock(),
         discard_prompt_group=MagicMock(),
     )
-    ctrl._sampler = InOrderSampler(
-        buffer, max_lookahead_versions=0, optimizer_steps_per_refit=1
-    )
+    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
     ctrl._trainer_version = 0
     ctrl._steps_since_refit = 0
     ctrl._sampler_stamps_target_steps = False
@@ -333,9 +326,7 @@ def test_non_recovery_reserve_drain_rejects_an_occupied_target_step() -> None:
     ctrl._buffer = buffer
     ctrl._replacement_reserve = deque([{"idx": 0}])
     ctrl._rollout_recovery_enabled = False
-    ctrl._sampler = InOrderSampler(
-        buffer, max_lookahead_versions=0, optimizer_steps_per_refit=1
-    )
+    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
     ctrl._trainer_version = 0
     ctrl._steps_since_refit = 0
     launched: list[Any] = []
@@ -369,12 +360,7 @@ class _SkippingRolloutManager:
         # in_order matches a batch to one step exactly, so a group that is never
         # generated leaves that step permanently short. Without the credit the train
         # pump waits on it forever, turning a tolerated drop into a hung run.
-        (
-            lambda buf: InOrderSampler(
-                buf, max_lookahead_versions=1, optimizer_steps_per_refit=1
-            ),
-            {0: 1, 1: 1},
-        ),
+        (lambda buf: InOrderSampler(buf, max_lookahead_versions=1), {0: 1, 1: 1}),
         # weight_fifo does not stamp a step: the batch fills from whatever is ready, so
         # a drop costs throughput and strands nothing. Crediting here would shrink an
         # unrelated step.
@@ -478,9 +464,7 @@ def _pump_controller(
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._rollout_manager = manager
-    ctrl._sampler = InOrderSampler(
-        buffer, max_lookahead_versions=1, optimizer_steps_per_refit=1
-    )
+    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=1)
     ctrl._dataloader = dataloader
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()

@@ -498,6 +498,7 @@ async_rl:
 - During a burst the trainer moves from p to p + μ − 1 while p stays fixed. `weight_version_lag` therefore counts the optimizer steps between the weights that generated a sample and the step that trains on it.
 - Importance-sampling correction is unchanged: the generation logprobs come from the published weights, and the trainer recomputes `prev_logprobs` at its current weights.
 - The admission gates of the gated samplers (`in_order`, `weight_fifo`, `ready_first`) are measured from p, not from the trainer version. A custom sampler's `admit` also receives p through `trainer_version_fn`.
+- The controller hands μ to `in_order` through `InOrderSampler.set_optimizer_steps_per_refit` after construction, so the constructor and `create_sampler` signatures are unchanged. A custom sampler that subclasses `InOrderSampler` gets the widened gate with no code change. Any other custom sampler has to admit at least μ − 1 batches past p by itself; setup cannot check that.
 - Eviction and selection still use the trainer version.
 
 **Staleness and queue depth.** Let d be a group's scheduling staleness: the trainer version of the step that consumes it, minus the published version when it was admitted. Let φ be the number of extra dispatched batches. Following QwenGyre (arXiv 2609.33848, §2.2, Eqs. 1–2), with B = `num_prompts_per_step`:

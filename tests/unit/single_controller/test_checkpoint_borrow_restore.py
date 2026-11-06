@@ -203,9 +203,7 @@ def _controller(
     controller._partition_id = scenarios.PARTITION
     controller._rollout_manager = _manager(buffer, barrier, generation)
     controller._teacher_coordinator = None
-    controller._sampler = InOrderSampler(
-        buffer, max_lookahead_versions=2, optimizer_steps_per_refit=1
-    )
+    controller._sampler = InOrderSampler(buffer, max_lookahead_versions=2)
     if dispatch_index is not None:
         controller._sampler.restore_dispatch_index(dispatch_index)
     elif checkpoint_path is not None:

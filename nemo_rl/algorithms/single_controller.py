@@ -91,6 +91,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     validate_forest_checkpoint_metadata,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    InOrderSampler,
     ReadyFirstSamplerConfig,
     TransactionalAdmissionSampler,
     create_sampler,
@@ -733,8 +734,11 @@ class SingleControllerActor:
             self._buffer,
             self._async_cfg.sampler,
             min_groups_for_streaming_train=self._async_cfg.min_groups_for_streaming_train,
-            optimizer_steps_per_refit=self._async_cfg.optimizer_steps_per_refit,
         )
+        if isinstance(self._sampler, InOrderSampler):
+            self._sampler.set_optimizer_steps_per_refit(
+                self._async_cfg.optimizer_steps_per_refit
+            )
         restored_dispatch_index = actor_args.save_state.sampler_dispatch_index
         # The saved dispatch index counts groups dispatched ahead of training, which
         # only a data-plane snapshot can give back. Without one (e.g. msc://), those

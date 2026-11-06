@@ -3764,9 +3764,7 @@ def test_streaming_ppo_tail_aware_wait_preserves_prep_and_full_batch_update(
             self.owned.clear()
 
     buffer = ClaimBuffer()
-    sampler = InOrderSampler(
-        buffer, max_lookahead_versions=1, optimizer_steps_per_refit=1
-    )
+    sampler = InOrderSampler(buffer, max_lookahead_versions=1)
     ctrl._buffer = buffer
     ctrl._sampler = sampler
     select = sampler.select

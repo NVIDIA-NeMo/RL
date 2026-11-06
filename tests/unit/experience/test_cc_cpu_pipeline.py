@@ -91,9 +91,7 @@ async def ready_controller(
             cut, group_id, meta, group_min_wv=0, group_max_wv=0, staging_keys=[]
         )
     ctrl._buffer = buffer
-    ctrl._sampler = InOrderSampler(
-        buffer, max_lookahead_versions=0, optimizer_steps_per_refit=1
-    )
+    ctrl._sampler = InOrderSampler(buffer, max_lookahead_versions=0)
     return ctrl
 
 

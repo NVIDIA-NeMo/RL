@@ -145,7 +145,7 @@ class _CountingInOrderSampler(InOrderSampler):
     """Real in-order sampler with observable admission calls."""
 
     def __init__(self) -> None:
-        super().__init__(None, max_lookahead_versions=1, optimizer_steps_per_refit=1)
+        super().__init__(None, max_lookahead_versions=1)
         self.admit_calls = 0
         self.admission_commits = 0
 

@@ -28,11 +28,13 @@ import pytest
 
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    CustomSamplerConfig,
     InOrderSampler,
     InOrderSamplerConfig,
     ReadyFirstSamplerConfig,
     WeightFifoSamplerConfig,
     WindowedSamplerConfig,
+    create_sampler,
     required_buffer_capacity_for_config,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -72,9 +74,8 @@ def _admit_until_gate_closes(sampler, published_version: int) -> list[int]:
 
 class TestInOrderBurstGate:
     def test_each_refit_admits_the_next_burst(self):
-        sampler = InOrderSampler(
-            FakeBuffer(), max_lookahead_versions=1, optimizer_steps_per_refit=3
-        )
+        sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+        sampler.set_optimizer_steps_per_refit(3)
 
         assert _admit_until_gate_closes(sampler, published_version=0) == [0, 1, 2, 3]
         steady_state = _admit_until_gate_closes(sampler, published_version=3)
@@ -116,11 +117,46 @@ class TestInOrderBurstGate:
         )
 
     def test_instance_capacity_matches_the_config_capacity(self):
-        sampler = InOrderSampler(
-            FakeBuffer(), max_lookahead_versions=1, optimizer_steps_per_refit=3
-        )
+        sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+        sampler.set_optimizer_steps_per_refit(3)
 
         assert sampler.required_buffer_capacity(groups_per_step=4) == 16
+
+
+class PreBurstInOrderSampler(InOrderSampler):
+    """A custom sampler written against the constructor that predates bursts."""
+
+    def __init__(self, buffer, *, max_lookahead_versions: int) -> None:
+        super().__init__(buffer, max_lookahead_versions=max_lookahead_versions)
+
+
+class TestCustomSamplerCompatibility:
+    def _build(self):
+        return create_sampler(
+            FakeBuffer(),
+            CustomSamplerConfig(
+                target=f"{__name__}:PreBurstInOrderSampler",
+                max_lookahead_versions=1,
+            ),
+        )
+
+    def test_a_pre_burst_subclass_keeps_its_refit_every_step_gate(self):
+        sampler = self._build()
+
+        assert isinstance(sampler, PreBurstInOrderSampler)
+        assert _admit_until_gate_closes(sampler, published_version=0) == [0, 1]
+
+    def test_the_controller_setter_widens_a_pre_burst_subclass(self):
+        sampler = self._build()
+
+        sampler.set_optimizer_steps_per_refit(3)
+
+        assert _admit_until_gate_closes(sampler, published_version=0) == [0, 1, 2, 3]
+        assert sampler.required_buffer_capacity(groups_per_step=4) == 16
+
+    def test_a_non_positive_burst_is_rejected(self):
+        with pytest.raises(ValueError, match="must be positive"):
+            self._build().set_optimizer_steps_per_refit(0)
 
 
 class TestValidation:
