@@ -440,9 +440,13 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="requires ppo.ppo_epochs=1"):
             validate_single_controller_config(mc)
 
-    def test_ready_first_accepts_forced_ratio_with_one_policy_epoch(self) -> None:
+    @pytest.mark.parametrize("ready_first", [False, True])
+    def test_accepts_forced_ratio_with_one_policy_epoch(
+        self, ready_first: bool
+    ) -> None:
         mc = _ppo_master_config()
-        mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        if ready_first:
+            mc.async_rl.sampler = ReadyFirstSamplerConfig()
         mc.loss_fn.use_importance_sampling_correction = True
         mc.loss_fn.force_on_policy_ratio = True
         mc.ppo.ppo_epochs = 1

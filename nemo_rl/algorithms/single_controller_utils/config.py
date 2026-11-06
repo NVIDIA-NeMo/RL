@@ -1425,15 +1425,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "carry TQWorkerMixin, so it has no data-plane setup to call (#2625)."
         )
 
-    # A forced ratio equals the true one only on the first optimizer step taken
-    # on a batch; later epochs would train without any trust region.
-    if master_config.loss_fn.force_on_policy_ratio and algo_cfg.ppo_epochs != 1:
-        raise ValueError(
-            "loss_fn.force_on_policy_ratio=true requires ppo.ppo_epochs=1, got "
-            f"ppo.ppo_epochs={algo_cfg.ppo_epochs}. Set "
-            "loss_fn.force_on_policy_ratio=false to run multiple policy epochs."
-        )
-
     policy_megatron_cfg = master_config.policy.get("megatron_cfg")
     if async_config.min_groups_for_streaming_train < algo_cfg.num_prompts_per_step:
         # Policy chunks accumulate into one optimizer update; critic epochs
@@ -1481,6 +1472,15 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "batch. Changing chunk boundaries can change normalized advantages.",
                 stacklevel=2,
             )
+
+    # A forced ratio equals the true one only on the first optimizer step taken
+    # on a batch; later epochs would train without any trust region.
+    if master_config.loss_fn.force_on_policy_ratio and algo_cfg.ppo_epochs != 1:
+        raise ValueError(
+            "loss_fn.force_on_policy_ratio=true requires ppo.ppo_epochs=1, got "
+            f"ppo.ppo_epochs={algo_cfg.ppo_epochs}. Set "
+            "loss_fn.force_on_policy_ratio=false to run multiple policy epochs."
+        )
 
     failure_config = async_config.rollout_failure
     drop_budget = (
