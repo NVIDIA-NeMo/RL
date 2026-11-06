@@ -152,7 +152,7 @@ def extract_flat_score_centering_samples(
 
     With flat logprobs vLLM stores ``num_candidates + 1`` entries per generated
     position: the sampled token first, then the top-k head by rank (a sampled
-    token inside the head appears twice). Slicing the flat lists replaces the
+    token inside the head appears twice). Reshaping the flat lists replaces the
     per-position dict walk and applies the same checks to whole tensors.
 
     Args:
@@ -169,34 +169,26 @@ def extract_flat_score_centering_samples(
         raise ValueError("Score-centering candidate count must be positive")
     flat = output.logprobs
     num_generated = len(output.token_ids)
-    if len(flat.start_indices) != num_generated:
-        raise RuntimeError("Sampler top-k rows must match the generated token count")
     width = num_candidates + 1
-    first = flat.start_indices[0] if num_generated else 0
-    last = first + num_generated * width
-    if num_generated and (
-        flat.end_indices[-1] != last
-        or any(
-            end - start != width
-            for start, end in zip(flat.start_indices, flat.end_indices)
-        )
+    if (
+        len(flat.start_indices) != num_generated
+        or len(flat.token_ids) != num_generated * width
     ):
         raise RuntimeError(
             "vLLM returned a log-prob row other than the sampled token plus top_k "
             "while extracting score-centering samples: "
             f"choice_idx={output.index}, top_k={num_candidates}."
         )
-    token_ids = torch.tensor(
-        flat.token_ids[first:last], dtype=torch.int64, device="cpu"
-    ).view(num_generated, width)
-    logprobs = torch.tensor(
-        flat.logprobs[first:last], dtype=torch.float64, device="cpu"
-    ).view(num_generated, width)
+    token_ids = torch.tensor(flat.token_ids, dtype=torch.int64, device="cpu").view(
+        num_generated, width
+    )
+    logprobs = torch.tensor(flat.logprobs, dtype=torch.float32, device="cpu").view(
+        num_generated, width
+    )
     if (
         (token_ids < 0).any()
         or (token_ids > torch.iinfo(torch.int32).max).any()
         or not torch.isfinite(logprobs).all()
-        or (logprobs < torch.finfo(torch.float32).min).any()
         or (logprobs > 1e-5).any()
     ):
         raise ValueError("Invalid sampler top-k token id or log probability")
@@ -212,4 +204,4 @@ def extract_flat_score_centering_samples(
         raise ValueError("Sampler top-k token ids must be unique")
     if (head_logprobs.exp().sum(dim=1) > 1.0001).any():
         raise ValueError("Sampler top-k probabilities exceed unit mass")
-    return head_ids.to(torch.int32), head_logprobs.to(torch.float32)
+    return head_ids.to(torch.int32), head_logprobs
