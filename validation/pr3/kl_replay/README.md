@@ -39,10 +39,10 @@ without the rollout recovery ledger and leaves the convergence job untouched.
 | split_production_recompute | Production placement plus newly recomputed policy LPs. |
 
 Compare valid-token LPs, independent token-weighted K3 versus logged metrics,
-with outer padding held fixed in these worker controls. The production-sharding
+normalized preclip gradients, model/public+raw optimizer and scheduler, with outer
+padding held fixed in these worker controls. The production-sharding
 case changes DP row placement, not every native execution detail; native captures
-include the real per-dispatch padding.
-normalized preclip gradients, model/public+raw optimizer and scheduler. Per-rank
+include the real per-dispatch padding. Per-rank
 reports are retained and global exact flags require all ranks. New LPs in the
 last case are injected into the materialized microbatch: the local adapter
 permits only one put per partition; real TQ delta writes occur in native capture.
