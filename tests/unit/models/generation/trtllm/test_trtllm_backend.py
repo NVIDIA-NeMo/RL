@@ -184,6 +184,31 @@ def test_collective_refit_runs_at_async_engine_boundary(
     engine.reset_prefix_cache.assert_called_once_with()
 
 
+def test_reset_prefix_cache_does_not_drain():
+    from nemo_rl.models.generation.trtllm import trtllm_backend as backend
+
+    extension, *_, engine = _extension(backend)
+    call_order = []
+
+    @contextlib.contextmanager
+    def control_action(**kwargs):
+        call_order.append(("enter", kwargs))
+        yield
+        call_order.append(("exit", kwargs))
+
+    engine.control_action.side_effect = control_action
+    engine.reset_prefix_cache.side_effect = lambda: call_order.append("reset")
+
+    extension.reset_prefix_cache()
+
+    # Inside a non-draining control action, i.e. at a scheduler step boundary.
+    assert call_order == [
+        ("enter", {"drain": False}),
+        "reset",
+        ("exit", {"drain": False}),
+    ]
+
+
 def test_collective_refit_requires_metadata():
     from nemo_rl.models.generation.trtllm import trtllm_backend as backend
 
