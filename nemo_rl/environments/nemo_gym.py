@@ -200,6 +200,10 @@ DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS = 180.0
 DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS = 1800.0
 DEFAULT_SHARD_DRAIN_TIMEOUT_SECONDS = NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S
 
+# Concurrency slots kept free on each NemoGym actor for its control calls
+# (_spinup, health_check, shutdown) once rollout calls fill the rest.
+NEMO_GYM_CONTROL_CONCURRENCY_HEADROOM = 8
+
 # Kept local so the Gym actor does not depend on model-config dtype resolution.
 # Must cover every name resolve_routed_experts_dtype can produce.
 _ROUTED_EXPERTS_DTYPES = {
@@ -3474,6 +3478,7 @@ def build_nemo_gym_actors(
     turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
+    rollout_fan_in: Optional[int] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
     spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS,
 ) -> NemoGymShardSet:
@@ -3490,6 +3495,12 @@ def build_nemo_gym_actors(
             per rollout call. See ``NemoGym.set_tokenizer`` for why.
         turn_checkpointing_enabled: Install and discover one Gym v2 checkpoint
             coordinator per actor without triggering checkpoint saves.
+        rollout_fan_in: Most ``run_rollouts`` calls the caller keeps in flight.
+            Every actor, each shard replica included, gets a Ray
+            ``max_concurrency`` of this plus
+            ``NEMO_GYM_CONTROL_CONCURRENCY_HEADROOM``, because routing is by
+            agent name and one replica can receive nearly all of it. None keeps
+            Ray's async-actor default of 1000; calls past it queue without error.
 
     Returns:
         A :class:`NemoGymShardSet` whose actors are all running and validated.
@@ -3501,6 +3512,10 @@ def build_nemo_gym_actors(
     """
     nemo_gym_dict = dict(env_configs["nemo_gym"])
     plan = parse_shard_plan(nemo_gym_dict)
+    max_concurrency = None
+    if rollout_fan_in is not None:
+        max_concurrency = rollout_fan_in + NEMO_GYM_CONTROL_CONCURRENCY_HEADROOM
+        print(f"Each NeMo-Gym actor admits {max_concurrency} concurrent calls.")
 
     if plan is None:
         return _build_single_gym_actor(
@@ -3513,6 +3528,7 @@ def build_nemo_gym_actors(
             turn_checkpointing_enabled=turn_checkpointing_enabled,
             token_capture=token_capture,
             policy_api_key=policy_api_key,
+            max_concurrency=max_concurrency,
         )
 
     return _build_sharded_gym_actors(
@@ -3526,6 +3542,7 @@ def build_nemo_gym_actors(
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
+        max_concurrency=max_concurrency,
         pg_ready_timeout=pg_ready_timeout,
         spinup_timeout=spinup_timeout,
     )
@@ -3542,6 +3559,7 @@ def _build_single_gym_actor(
     turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
+    max_concurrency: Optional[int],
 ) -> NemoGymShardSet:
     """Start one actor and read its resolved taskset routes."""
     actor_config = _build_gym_actor_config(
@@ -3562,6 +3580,8 @@ def _build_single_gym_actor(
     actor_options: dict[str, Any] = {
         "runtime_env": make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
     }
+    if max_concurrency is not None:
+        actor_options["max_concurrency"] = max_concurrency
     if nemo_gym_dict.get("num_gpu_nodes", 0):
         actor_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
             node_id=ray.get_runtime_context().get_node_id(),
@@ -3606,6 +3626,7 @@ def _build_sharded_gym_actors(
     turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
+    max_concurrency: Optional[int],
     pg_ready_timeout: float,
     spinup_timeout: float,
 ) -> NemoGymShardSet:
@@ -3675,13 +3696,16 @@ def _build_sharded_gym_actors(
                 shard.name,
                 replica_index=replica if shard.replicas > 1 else None,
             )
-            actor = NemoGym.options(
-                runtime_env=actor_runtime_env,
-                scheduling_strategy=PlacementGroupSchedulingStrategy(
+            actor_options: dict[str, Any] = {
+                "runtime_env": actor_runtime_env,
+                "scheduling_strategy": PlacementGroupSchedulingStrategy(
                     placement_group=pg,
                     placement_group_bundle_index=bundle_index,
                 ),
-            ).remote(
+            }
+            if max_concurrency is not None:
+                actor_options["max_concurrency"] = max_concurrency
+            actor = NemoGym.options(**actor_options).remote(
                 _build_gym_actor_config(
                     instance_gym_dict,
                     base_urls=base_urls,
