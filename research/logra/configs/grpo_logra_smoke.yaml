@@ -1,0 +1,17 @@
+# The requested validation starts directly at 7B.
+defaults: grpo_logra_7b.yaml
+grpo:
+  num_prompts_per_step: 2
+  num_generations_per_prompt: 4
+  max_num_steps: 2
+  val_period: -1
+  val_at_start: false
+  val_at_end: false
+policy:
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+data:
+  train:
+    dataset_name: gsm8k
+checkpointing:
+  enabled: false

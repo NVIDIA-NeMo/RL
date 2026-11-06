@@ -65,7 +65,18 @@ def _entrypoints() -> list[Path]:
 
 
 def _call_lines(tree: ast.AST, name: str) -> list[int]:
-    """Lines calling name, as name(...) or name.anything(...)."""
+    """Lines calling name, as name(...) or name.anything(...).
+
+    A class defined in the module that subclasses ``name`` counts as ``name``:
+    research entrypoints extend MasterConfig with project fields and build the
+    subclass instead.
+    """
+    names = {name}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and any(
+            isinstance(base, ast.Name) and base.id == name for base in node.bases
+        ):
+            names.add(node.name)
     lines = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Call):
@@ -73,7 +84,7 @@ def _call_lines(tree: ast.AST, name: str) -> list[int]:
         func = node.func
         if isinstance(func, ast.Attribute):
             func = func.value
-        if isinstance(func, ast.Name) and func.id == name:
+        if isinstance(func, ast.Name) and func.id in names:
             lines.append(node.lineno)
     return sorted(lines)
 
