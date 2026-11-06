@@ -1152,6 +1152,14 @@ class NemoGym(EnvironmentInterface):
         self._selection_policy = (
             capture_config["selection_policy"] if self._forest_training else None
         )
+        self._max_rows_per_rollout = (
+            capture_config["max_rows_per_rollout"] if self._forest_training else None
+        )
+        self._row_cap_rule = (
+            capture_config["row_cap_rule"]
+            if self._max_rows_per_rollout is not None
+            else None
+        )
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
         # actually happened instead of an AttributeError from deep inside a rollout.
@@ -2108,7 +2116,11 @@ Depending on your data shape, you may want to change these values."""
         from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
         from nemo_gym.token_id_capture.staging.records import RolloutManifest
 
-        from nemo_rl.environments.call_selection import resolve_selection_policy
+        from nemo_rl.environments.call_selection import (
+            ROW_CAP_RULES,
+            count_selected_rows,
+            resolve_selection_policy,
+        )
         from nemo_rl.experience.rollout_reassembler import (
             ActionOutputFlags,
             RolloutSelection,
@@ -2180,10 +2192,6 @@ Depending on your data shape, you may want to change these values."""
             for r in selected
         ):
             raise ValueError("Selected capture is missing output validation evidence")
-        truncated = any(
-            r.finish_reason in ("length", "max_tokens", "max_output_tokens")
-            for r in selected
-        )
         receipt = self._assemble_receipt(
             owner,
             manifest,
@@ -2191,6 +2199,8 @@ Depending on your data shape, you may want to change these values."""
             reward=float(reward),
         )
         selected_call_ids = {r.model_call_id for r in selected}
+        prompt_response_id = None
+        row_cap_dropped_rows = row_cap_dropped_calls = 0
         if capture_failed:
             receipt.update(capture_poisoned=True, failure_reason="capture_incomplete")
         elif any(
@@ -2210,6 +2220,34 @@ Depending on your data shape, you may want to change these values."""
         ):
             # Preserve selection membership; reject this owner before row planning.
             receipt.update(capture_poisoned=True, failure_reason="selection_not_closed")
+        elif self._max_rows_per_rollout is not None:
+            # Only a trainable selection is capped, so the cap cannot unmask one.
+            assert terminal_response_id is not None and self._row_cap_rule is not None
+            try:
+                capped = ROW_CAP_RULES[self._row_cap_rule](
+                    selected,
+                    terminal_response_id,
+                    self._max_rows_per_rollout,
+                    records=parsed.records,
+                    result=result,
+                )
+            except ValueError as error:
+                raise ValueError(f"Rollout {owner!r}: {error}") from error
+            capped_ids = {r.model_call_id for r in capped}
+            # The first selected root supplies the grouping prompt; keep it when
+            # the cap drops that root's rows (for example, before a compaction).
+            prompt_root = next(r for r in selected if r.parent_call_id is None)
+            if prompt_root.model_call_id not in capped_ids:
+                prompt_response_id = prompt_root.response_id
+            row_cap_dropped_rows = count_selected_rows(selected) - count_selected_rows(
+                capped
+            )
+            row_cap_dropped_calls = len(selected) - len(capped)
+            selected = capped
+        truncated = any(
+            r.finish_reason in ("length", "max_tokens", "max_output_tokens")
+            for r in selected
+        )
         selection = RolloutSelection(
             response_ids=tuple(r.response_id for r in selected),
             action_flags=tuple(
@@ -2225,6 +2263,9 @@ Depending on your data shape, you may want to change these values."""
                 for r in selected
             ),
             truncated=truncated,
+            prompt_response_id=prompt_response_id,
+            row_cap_dropped_rows=row_cap_dropped_rows,
+            row_cap_dropped_calls=row_cap_dropped_calls,
         )
         full_result: dict[str, Any] = {
             key: value
