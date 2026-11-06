@@ -310,8 +310,10 @@ the fleet standing in for one dedicated engine:
   running until every pin on prefill has cleared, then suspends prefill, then
   decode, all within `dynamo_cfg.control_timeout_s`. If the pins do not clear
   in time the prefill engines are unpaused again and the refit fails rather
-  than leaving the fleet half stopped. Resume brings decode back first, then
-  prefill, because decode is the reader of prefill's KV.
+  than leaving the fleet half stopped. Resume brings every engine back in one
+  wave: the engines keep their KV on the GPU across suspend and resume, and a
+  handoff that reaches a decode engine still waking is queued, so no role
+  order is needed.
 - The collective is one NCCL group over the trainers plus all engines. The
   engines receive logical (unfused) weights, as the Megatron backend does.
 - Shutdown stops decode engines first, confirms their termination to every

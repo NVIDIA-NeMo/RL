@@ -74,7 +74,7 @@ uv run --no-sync coverage run -a \
   2>&1 | tee "${RUN_LOG}"
 
 # Every weight sync after the first suspends both engines (prefill first) and
-# resumes them (decode first). The first sync only builds the engines: they
+# resumes them in one wave. The first sync only builds the engines: they
 # start unpaused, so it logs neither a pause nor a resume.
 sync_count=$(grep -Fc "_sync_weights: sync done" "${RUN_LOG}" || true)
 pause_count=$(grep -Fc "paused inference engine" "${RUN_LOG}" || true)
