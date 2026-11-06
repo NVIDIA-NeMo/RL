@@ -19,7 +19,6 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import json
-import math
 import threading
 import warnings
 from pathlib import Path
@@ -30,6 +29,7 @@ from unittest.mock import ANY, MagicMock, patch
 import pytest
 import torch
 from omegaconf import OmegaConf
+from pydantic import ValidationError
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
 from nemo_rl.algorithms.advantage_estimator import (
@@ -77,7 +77,6 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutCheckpointConfig,
     TokenCaptureConfig,
-    _validate_algo_settings,
     _validate_opd_full_config,
     forest_execution_row_multiple,
     validate_single_controller_config,
@@ -4077,103 +4076,28 @@ class TestOPDFullValidation:
             _validate_opd_full_config(config, config.on_policy_distillation)
 
 
-class TestRewardScalingValidation:
-    """The bounds feed a divisor, so setup checks them before training does.
+@pytest.mark.parametrize(
+    ("algorithm", "recipe"),
+    [
+        ("grpo", "examples/configs/grpo_math_1B_megatron_single_controller.yaml"),
+        ("ppo", "examples/configs/ppo_math_1B_megatron_single_controller.yaml"),
+    ],
+)
+def test_master_config_reports_the_reward_scaling_field_path(
+    algorithm: str, recipe: str
+) -> None:
+    register_omegaconf_resolvers()
+    config = OmegaConf.to_container(load_config(recipe), resolve=True)
+    config[algorithm]["reward_scaling"] = {
+        "enabled": True,
+        "source_min": 1.0,
+        "source_max": 1.0,
+    }
 
-    ``scale_rewards`` maps through ``(r - source_min) / (source_max -
-    source_min)`` without guarding it, and the advantage stage calls that on
-    every batch. An empty, inverted or non-finite interval would surface as
-    inf/nan or sign-flipped advantages a whole rollout later, with nothing
-    naming the config key that caused it.
-    """
+    with pytest.raises(ValidationError) as error:
+        MasterConfig(**config)
 
-    def test_accepts_the_recipe_interval(self) -> None:
-        # [0, 1] -> [-1, 1], what every dapo-* recipe sets.
-        config = _make_master_config()
-        scaling = config.grpo.reward_scaling
-        scaling.enabled = True
-        scaling.target_min = -1.0
-
-        validate_single_controller_config(config)
-
-    @pytest.mark.parametrize(
-        ("source_min", "source_max"),
-        [(1.0, 1.0), (1.0, 0.0)],
-        ids=["empty_interval", "inverted_interval"],
-    )
-    def test_rejects_a_source_interval_that_cannot_be_divided_by(
-        self, source_min: float, source_max: float
-    ) -> None:
-        config = _make_master_config()
-        scaling = config.grpo.reward_scaling
-        scaling.enabled = True
-        scaling.source_min = source_min
-        scaling.source_max = source_max
-
-        with pytest.raises(ValueError, match="reward_scaling.source_min"):
-            validate_single_controller_config(config)
-
-    @pytest.mark.parametrize(
-        "bound",
-        ["source_min", "source_max", "target_min", "target_max"],
-    )
-    @pytest.mark.parametrize(
-        "value",
-        [math.nan, math.inf, -math.inf],
-        ids=["nan", "inf", "neg_inf"],
-    )
-    def test_rejects_a_non_finite_bound(self, bound: str, value: float) -> None:
-        # Neither reaches the interval check: an infinite source bound orders
-        # fine and divides inf by inf, and a nan one compares False against
-        # everything. Both reach training and return nan for every reward.
-        config = _make_master_config()
-        scaling = config.grpo.reward_scaling
-        scaling.enabled = True
-        setattr(scaling, bound, value)
-
-        with pytest.raises(ValueError, match="bounds must be finite"):
-            validate_single_controller_config(config)
-
-    @pytest.mark.parametrize(
-        ("target_min", "target_max"),
-        [(1.0, 1.0), (1.0, -1.0)],
-        ids=["constant_target", "reversed_target"],
-    )
-    def test_accepts_any_finite_target_interval(
-        self, target_min: float, target_max: float
-    ) -> None:
-        # Only the source interval is a divisor. A constant or reversed target
-        # is a legal remap, so the finite check must not order these.
-        config = _make_master_config()
-        scaling = config.grpo.reward_scaling
-        scaling.enabled = True
-        scaling.target_min = target_min
-        scaling.target_max = target_max
-
-        validate_single_controller_config(config)
-
-    def test_the_bounds_are_read_off_the_ppo_block_on_a_ppo_run(self) -> None:
-        # algo_config picks `ppo` over `grpo`, so a PPO run is held to the same
-        # bounds. Calls the algo validator directly because the rest of
-        # validate_single_controller_config wants a critic this config has not
-        # got -- and those checks come after this one.
-        config = _make_master_config()
-        config.ppo = PPOConfig.model_construct(**dict(config.grpo))
-        config.grpo = None
-        config.ppo.reward_scaling.enabled = True
-        config.ppo.reward_scaling.source_max = math.inf
-
-        with pytest.raises(ValueError, match="bounds must be finite"):
-            _validate_algo_settings(config)
-
-    def test_ignores_the_bounds_while_disabled(self) -> None:
-        """Nothing divides by them, so stale bounds are not a reason to stop."""
-        config = _make_master_config()
-        config.grpo.reward_scaling.source_min = 1.0
-        config.grpo.reward_scaling.source_max = 1.0
-        config.grpo.reward_scaling.target_max = math.inf
-
-        validate_single_controller_config(config)
+    assert error.value.errors()[0]["loc"] == (algorithm, "reward_scaling")
 
 
 class _FakeTeacherGroup:
