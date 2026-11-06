@@ -118,6 +118,17 @@ def test_frontend_argv_rejects_repeated_options() -> None:
     cfg = MegatronDynamoCfg(frontend_args={"extra_cli_args": ["--router_mode=kv"]})
     with pytest.raises(ValueError, match="--router-mode is set by both"):
         frontend_argv(host="0.0.0.0", port=3000, namespace="ns", dynamo_cfg=cfg)
+    # Spellings that differ only in "_" vs "-" are the same option.
+    cfg = MegatronDynamoCfg(
+        frontend_args={
+            "extra_cli_args": [
+                "--kv-overlap-score-weight=1",
+                "--kv_overlap_score_weight=2",
+            ]
+        }
+    )
+    with pytest.raises(ValueError, match="--kv-overlap-score-weight is repeated"):
+        frontend_argv(host="0.0.0.0", port=3000, namespace="ns", dynamo_cfg=cfg)
 
 
 def test_service_env_is_runtime_owned(monkeypatch) -> None:

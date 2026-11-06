@@ -95,13 +95,22 @@ def frontend_argv(
         dynamo_cfg.frontend_args.router_mode,
     ]
     extra = dynamo_cfg.frontend_args.extra_cli_args
+    seen: set[str] = set()
     for token in extra:
         flag = token.split("=", 1)[0].replace("_", "-")
-        if flag.startswith("--") and flag in argv:
+        if not flag.startswith("--"):
+            continue
+        if flag in argv:
             raise ValueError(
                 f"Dynamo frontend option {flag} is set by both the managed runtime "
                 "and dynamo_cfg.frontend_args.extra_cli_args."
             )
+        if flag in seen:
+            raise ValueError(
+                f"Dynamo frontend option {flag} is repeated in "
+                "dynamo_cfg.frontend_args.extra_cli_args."
+            )
+        seen.add(flag)
     return argv + list(extra)
 
 
