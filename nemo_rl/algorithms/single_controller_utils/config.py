@@ -48,6 +48,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
+from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
@@ -1008,12 +1009,8 @@ def logprob_passes_required(
 ) -> tuple[bool, bool]:
     """Return policy/reference forward requirements for both setup and execution."""
     return (
-        not (
-            master_config.loss_fn.force_on_policy_ratio
-            and (
-                algo_cfg.seq_logprob_error_threshold is None
-                or master_config.loss_fn.seq_logprob_error_in_loss
-            )
+        not skips_policy_logprob_pass(
+            master_config.loss_fn, algo_cfg.seq_logprob_error_threshold
         ),
         bool(
             master_config.loss_fn.reference_policy_kl_penalty > 0

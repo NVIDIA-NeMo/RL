@@ -19,7 +19,10 @@ import torch
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
-from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
+from nemo_rl.algorithms.loss.utils import (
+    rescale_loss_metrics,
+    skips_policy_logprob_pass,
+)
 from nemo_rl.algorithms.loss.wrapper import SequencePackingLossWrapper
 from nemo_rl.algorithms.utils import compute_seq_logprob_errors
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -145,7 +148,6 @@ def test_accumulated_loss_and_gradients_match_upstream_mask(
             loss_fn.metric_normalizations,
             token_factor=6 / kept_toks,
             sequence_factor=3 / kept_seqs,
-            gradient_factor=6 / kept_toks,
         )
         for m in metrics
     ]
@@ -219,7 +221,6 @@ def test_split_api_survivor_division_matches_upstream_mask(
             loss_fn.metric_normalizations,
             token_factor=1 / kept_toks,
             sequence_factor=1 / kept_seqs,
-            gradient_factor=1 / kept_toks,
         )
         for m in metrics
     ]
@@ -233,10 +234,9 @@ def test_split_api_survivor_division_matches_upstream_mask(
         assert sum(m[key] for m in rescaled) == pytest.approx(expected_metrics[key])
 
 
-def test_rescale_loss_metrics_uses_gradient_factor_for_unadvertised_metrics():
-    """Unadvertised metrics follow the gradient denominator; extrema stay put."""
+def test_rescale_loss_metrics_scales_listed_metrics():
     rescaled = rescale_loss_metrics(
-        {"tok": 2.0, "seq": 2.0, "raw": 2.0, "other": 2.0, "other_max": 2.0},
+        {"tok": 2.0, "seq": 2.0, "raw": 2.0},
         {
             "tok": MetricNormalizer.TOKENS,
             "seq": MetricNormalizer.SEQUENCES,
@@ -244,15 +244,29 @@ def test_rescale_loss_metrics_uses_gradient_factor_for_unadvertised_metrics():
         },
         token_factor=3.0,
         sequence_factor=5.0,
-        gradient_factor=7.0,
     )
-    assert rescaled == {
-        "tok": 6.0,
-        "seq": 10.0,
-        "raw": 2.0,
-        "other": 14.0,
-        "other_max": 2.0,
-    }
+    assert rescaled == {"tok": 6.0, "seq": 10.0, "raw": 2.0}
+
+
+def test_rescale_loss_metrics_rejects_unlisted_metric():
+    with pytest.raises(ValueError, match="'other' is missing"):
+        rescale_loss_metrics({"other": 2.0}, {}, token_factor=3.0, sequence_factor=5.0)
+
+
+@pytest.mark.parametrize(
+    ("forced", "threshold", "in_loss", "expected"),
+    [
+        (False, None, False, False),
+        (True, None, False, True),
+        (True, 2.0, False, False),
+        (True, 2.0, True, True),
+    ],
+)
+def test_skips_policy_logprob_pass(forced, threshold, in_loss, expected):
+    loss_cfg = ClippedPGLossConfig.model_construct(
+        force_on_policy_ratio=forced, seq_logprob_error_in_loss=in_loss
+    )
+    assert skips_policy_logprob_pass(loss_cfg, threshold) is expected
 
 
 @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -float("inf")])
