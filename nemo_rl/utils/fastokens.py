@@ -48,6 +48,16 @@ def normalize_fastokens_env() -> None:
     os.environ[_VLLM_ENV_VAR] = "1" if nrl_value == "1" else "0"
 
 
+def vllm_uses_fastokens() -> bool:
+    """Whether vLLM tokenizes with fastokens, once ``NRL_USE_FASTOKENS`` is mirrored.
+
+    For another tokenizer serving the same requests, such as the Dynamo
+    frontend's, to follow vLLM's switch.
+    """
+    normalize_fastokens_env()
+    return os.environ.get(_VLLM_ENV_VAR) == "1"
+
+
 def maybe_patch_fastokens(enabled: bool) -> None:
     """Apply the fastokens monkey-patch when enabled.
 

@@ -253,8 +253,8 @@ def reject_outdated_dynamo_backend(config: dict[str, Any]) -> None:
                 if key in frontend_args:
                     problems.append(
                         f"policy.generation.dynamo_cfg.frontend_args.{key} was "
-                        "removed: NeMo RL's rollouts send token IDs, which the "
-                        "frontend never tokenizes."
+                        "removed: the frontend tokenizes with fastokens when "
+                        "vLLM does (NRL_USE_FASTOKENS)."
                     )
         worker_args = dynamo_cfg.get("worker_args")
         if isinstance(worker_args, dict) and "extra_cli_args" in worker_args:

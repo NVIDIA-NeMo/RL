@@ -34,6 +34,7 @@ def _runtime(**frontend_args) -> ManagedDynamoRuntime:
         ),
         model_name="model",
         frontend_python="/venvs/vllm/bin/python",
+        fastokens=False,
     )
 
 

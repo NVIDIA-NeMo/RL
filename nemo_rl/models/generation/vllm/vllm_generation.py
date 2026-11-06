@@ -81,7 +81,7 @@ from nemo_rl.telemetry.instrumentation import trace_fn
 from nemo_rl.telemetry.metrics import record_rl_metrics, warn_once
 from nemo_rl.telemetry.setup import get_telemetry_handle
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-from nemo_rl.utils.fastokens import normalize_fastokens_env
+from nemo_rl.utils.fastokens import normalize_fastokens_env, vllm_uses_fastokens
 from nemo_rl.utils.multimodal_payload_metrics import (
     collect_multimodal_payload_metrics,
     collect_sharded_multimodal_payload_metrics,
@@ -770,6 +770,7 @@ class VllmGeneration(GenerationInterface):
             # The workers' venv carries ai-dynamo, so the frontend runs the same
             # release as every engine.
             frontend_python=self.worker_group.py_executable,
+            fastokens=vllm_uses_fastokens(),
         )
         runtime.start()
         self._dynamo_runtime = runtime

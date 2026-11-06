@@ -113,6 +113,7 @@ Gym names each call's rollout, and the frontend keeps a rollout on one engine
 (`session_affinity_ttl_secs`), as the native backend pins each Gym session to
 one server. The engine splices the echoed prefix after the frontend has routed
 the call, so the KV router alone cannot see where that prefix is cached.
+The frontend tokenizes Gym chat with fastokens when vLLM does (`NRL_USE_FASTOKENS=1`).
 
 The native server's chat settings carry over:
 

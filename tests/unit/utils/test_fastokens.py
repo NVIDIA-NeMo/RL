@@ -157,6 +157,25 @@ def test_nrl_env_overrides_explicit_vllm_env(monkeypatch):
     assert os.environ["VLLM_USE_FASTOKENS"] == "1"
 
 
+@pytest.mark.parametrize(
+    ("nrl", "vllm", "expected"),
+    [
+        (None, None, False),
+        (None, "1", True),
+        ("1", None, True),
+        ("0", "1", False),
+    ],
+)
+def test_vllm_uses_fastokens_follows_the_mirrored_switch(
+    monkeypatch, nrl, vllm, expected
+):
+    for name, value in (("NRL_USE_FASTOKENS", nrl), ("VLLM_USE_FASTOKENS", vllm)):
+        if value is not None:
+            monkeypatch.setenv(name, value)
+
+    assert fastokens_util.vllm_uses_fastokens() is expected
+
+
 def test_missing_package_is_non_fatal(monkeypatch):
     # A ``None`` entry in sys.modules makes ``import fastokens`` raise ImportError.
     monkeypatch.setitem(sys.modules, "fastokens", None)
