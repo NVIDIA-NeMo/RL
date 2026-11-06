@@ -1043,8 +1043,8 @@ def test_first_resume_starts_the_endpoints_and_awaits_the_frontend(env):
     env.log.clear()
     generation.resume_after_refit()
     # The first resume is the engines' startup: the refit built them, so their
-    # endpoints start now, and the frontend must list both components. Decode
-    # resumes before prefill, the reader before the writer.
+    # endpoints start now, and the frontend must list both components. Every
+    # engine resumes in one wave, in record order.
     assert env.log == _RESUMED + [
         line
         for name, role in zip(_IDS, _ROLES)
@@ -1101,11 +1101,13 @@ def test_pickled_copy_awaits_the_frontend_over_http(env, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# The refit side: fan-out, rank placement, ordered pause and resume
+# The refit side: fan-out, rank placement, ordered pause, one-wave resume
 # ---------------------------------------------------------------------------
 
 
-_RESUMED = ["d0.resume", "d1.resume", "p0.resume"]
+# Every engine resumes in one wave, in record order: the kv_cache refit phase
+# already woke them all at once, and persist-mode engines need no role order.
+_RESUMED = [f"{name}.resume" for name in _NAMES]
 
 
 def test_records_hold_only_worker_handles_never_the_generation(env):
@@ -1277,7 +1279,8 @@ def test_any_suspend_failure_resumes_every_engine_it_reached(
         generation.suspend_for_refit()
     instance_id = env.engine(engine).name
     assert f"failed on engine {instance_id}" in "".join(caught.value.__notes__)
-    # Decode engines are resumed before prefill, as after a refit.
+    # Every engine the suspend reached is resumed, in record order, as after a
+    # refit.
     assert [entry for entry in env.log if entry.endswith(".resume")] == restored
 
 

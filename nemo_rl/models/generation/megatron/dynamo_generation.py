@@ -500,11 +500,11 @@ class MegatronDynamoGeneration(GenerationInterface):
             if record.role == "prefill"
         ]
 
-    def _non_prefill_indices(self) -> list[int]:
+    def _decode_indices(self) -> list[int]:
         return [
             i
             for i, record in enumerate(self._engine_records)
-            if record.role != "prefill"
+            if record.role == "decode"
         ]
 
     def expected_components(self) -> dict[str, int]:
@@ -799,17 +799,15 @@ class MegatronDynamoGeneration(GenerationInterface):
             time.sleep(min(self._idle_poll_interval_s, _seconds_left(deadline)))
 
     def _restore_engines(self, indices: Sequence[int], *, deadline: float) -> list[str]:
-        """Resume ``indices`` (decode engines first); return the failures."""
-        wanted = set(indices)
+        """Resume ``indices`` in one wave, in record order; return the failures."""
         errors: list[str] = []
-        for phase in (self._non_prefill_indices(), self._prefill_indices()):
-            self._attempt(
-                [index for index in phase if index in wanted],
-                lambda record: record.resume_after_refit(),
-                what="resume_after_refit",
-                deadline=deadline,
-                errors=errors,
-            )
+        self._attempt(
+            list(indices),
+            lambda record: record.resume_after_refit(),
+            what="resume_after_refit",
+            deadline=deadline,
+            errors=errors,
+        )
         return errors
 
     def suspend_for_refit(self, *, timeout_s: float | None = None) -> None:
@@ -836,7 +834,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         timeout_s = self._control_timeout_s if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout_s
         prefill = self._prefill_indices()
-        rest = self._non_prefill_indices()
+        decode = self._decode_indices()
         # Every engine a suspend step was sent to, even one whose call failed:
         # the call may have taken effect anyway.
         reached = list(prefill)
@@ -854,9 +852,9 @@ class MegatronDynamoGeneration(GenerationInterface):
                 what="suspend_for_refit",
                 deadline=deadline,
             )
-            reached.extend(rest)
+            reached.extend(decode)
             self._call_engines(
-                rest,
+                decode,
                 lambda record: record.suspend_for_refit(),
                 what="suspend_for_refit",
                 deadline=deadline,
@@ -896,11 +894,17 @@ class MegatronDynamoGeneration(GenerationInterface):
         return True
 
     def resume_after_refit(self, *, timeout_s: float | None = None) -> None:
-        """Resume serving, decode engines first, then prefill; the first resume is also the startup.
+        """Resume every engine in one wave; the first resume is also the startup.
 
-        Decode is the reader of prefill's KV, so it is back before prefill can
-        hand anything off. Every engine is attempted even if another fails, so
-        one bad engine does not keep the rest down. The first refit built the engines, so only
+        No role order is needed on the way back up. The engines keep their KV on
+        the GPU across suspend and resume (the persist cache mode the handoff
+        requires), and a handoff that reaches a decode engine still waking is
+        queued and read into buffers the resume does not touch, so prefill may
+        serve again before decode does. In the weight synchronizer's sequence the
+        ``kv_cache`` phase has already woken every engine at once, so this call
+        usually finds them serving and resumes only what that phase did not
+        reach. Every engine is attempted even if another fails, so one bad
+        engine does not keep the rest down. The first refit built the engines, so only
         now do their endpoints start and register with the frontend (as vLLM
         engines do once they serve), and this waits until the frontend routes
         the model before returning.
