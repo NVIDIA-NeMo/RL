@@ -51,13 +51,9 @@ LOGGER = logging.getLogger(__name__)
 
 
 def frontend_argv(
-    *, host: str, port: int, namespace: str, dynamo_cfg: DynamoCfg, fastokens: bool
+    *, host: str, port: int, namespace: str, dynamo_cfg: DynamoCfg
 ) -> list[str]:
-    """The ``dynamo.frontend`` arguments; ``extra_cli_args`` may not repeat one.
-
-    ``fastokens`` selects the fastokens tokenizer: the frontend tokenizes NeMo-Gym
-    chat, which native vLLM tokenizes with fastokens when vLLM's switch is on.
-    """
+    """The ``dynamo.frontend`` arguments; ``extra_cli_args`` may not repeat one."""
     argv = [
         "--http-host",
         host,
@@ -79,8 +75,6 @@ def frontend_argv(
             "--router-session-affinity-ttl-secs",
             str(dynamo_cfg.frontend_args.session_affinity_ttl_secs),
         ]
-    if fastokens:
-        argv += ["--tokenizer", "fastokens"]
     extra = dynamo_cfg.frontend_args.extra_cli_args
     for token in extra:
         flag = token.split("=", 1)[0].replace("_", "-")
@@ -125,12 +119,7 @@ class ManagedDynamoRuntime:
     """Own etcd, NATS and the frontend that NeMo RL's vLLM engines register with."""
 
     def __init__(
-        self,
-        *,
-        dynamo_cfg: DynamoCfg,
-        model_name: str,
-        frontend_python: str,
-        fastokens: bool,
+        self, *, dynamo_cfg: DynamoCfg, model_name: str, frontend_python: str
     ) -> None:
         """Describe the services; nothing starts until :meth:`start`.
 
@@ -139,13 +128,10 @@ class ManagedDynamoRuntime:
             model_name: The served model; the frontend is ready once it lists it.
             frontend_python: An interpreter whose environment has ``ai-dynamo``:
                 the vLLM workers' own.
-            fastokens: Whether the frontend tokenizes with fastokens, as the vLLM
-                workers do.
         """
         self._dynamo_cfg = dynamo_cfg
         self._model_name = model_name
         self._frontend_python = frontend_python
-        self._fastokens = fastokens
         self._namespace = _managed_namespace()
         self._host = ""
         self._etcd_port = 0
@@ -345,7 +331,6 @@ class ManagedDynamoRuntime:
             port=self._frontend_port,
             namespace=self._namespace,
             dynamo_cfg=self._dynamo_cfg,
-            fastokens=self._fastokens,
         )
         command = [
             self._frontend_python,

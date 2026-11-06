@@ -137,45 +137,25 @@ def test_frontend_argv_is_runtime_owned() -> None:
     cfg = DynamoCfg.model_validate(
         {"frontend_args": {"router_mode": "kv", "extra_cli_args": ["--foo", "1"]}}
     )
-    argv = frontend_argv(
-        host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=cfg, fastokens=False
-    )
+    argv = frontend_argv(host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=cfg)
     assert argv[argv.index("--router-mode") + 1] == "kv"
-    # Gym names every call's session; keep the session on one engine.
+    # Gym names a token-capture call's session; keep the session on one engine.
     assert argv[argv.index("--router-session-affinity-ttl-secs") + 1] == "300"
-    assert "--tokenizer" not in argv
     assert argv[-2:] == ["--foo", "1"]
     no_affinity = DynamoCfg.model_validate(
         {"frontend_args": {"session_affinity_ttl_secs": None}}
     )
     assert "--router-session-affinity-ttl-secs" not in frontend_argv(
-        host="0.0.0.0",
-        port=3001,
-        namespace="nemo-rl",
-        dynamo_cfg=no_affinity,
-        fastokens=False,
+        host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=no_affinity
     )
-    # The frontend tokenizes Gym chat as vLLM does: with fastokens when vLLM's is on.
-    fast = frontend_argv(
-        host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=cfg, fastokens=True
-    )
-    assert fast[fast.index("--tokenizer") + 1] == "fastokens"
 
-    for extra, fastokens, flag in (
-        (["--http-port", "9"], False, "--http-port"),
-        (["--tokenizer", "default"], True, "--tokenizer"),
-    ):
-        clashing = DynamoCfg.model_validate(
-            {"frontend_args": {"extra_cli_args": extra}}
+    clashing = DynamoCfg.model_validate(
+        {"frontend_args": {"extra_cli_args": ["--http-port", "9"]}}
+    )
+    with pytest.raises(ValueError, match="--http-port is set by both"):
+        frontend_argv(
+            host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=clashing
         )
-        with pytest.raises(ValueError, match=f"{flag} is set by both"):
-            frontend_argv(
-                host="0.0.0.0",
-                port=3001,
-                namespace="nemo-rl",
-                dynamo_cfg=clashing,
-                fastokens=fastokens,
-            )
 
 
 def _serving(**serving_chat_kwargs) -> dict:
