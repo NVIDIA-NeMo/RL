@@ -639,6 +639,10 @@ class MegatronGenerationMixin:
         # an explicit True there.
         if getattr(model_config, "batch_invariant_mode", False):
             use_flashinfer_fused_rope = False
+        if (
+            getattr(model_config, "batch_invariant_mode", False)
+            or getattr(model_config, "flash_attention_version", None) == 4
+        ):
             allow_installed_flash_attn_4()
 
         image_preprocessing_config = self._build_image_preprocessing_config(
