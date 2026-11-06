@@ -20,6 +20,7 @@ from tests.unit.telemetry.conftest import algorithms_utils_categories
 
 _REPO = Path(__file__).resolve().parents[3]
 _ALGORITHMS = _REPO / "nemo_rl" / "algorithms"
+_ENVIRONMENT_CHECKPOINTING = _REPO / "nemo_rl" / "environments" / "checkpointing"
 
 # Efficiency timers are driver-side only, but spans are not: rl.vllm.* is
 # emitted from the generation worker, rl.policy.* / rl.value.* from the training
@@ -859,13 +860,15 @@ def _logged_rollout_checkpoint_keys() -> set[str]:
 
     The restore dict is assembled across processes and files -- started in
     setup.py, carried to the controller on its actor args, then extended and
-    totalled there -- so a key added at any of those sites is followed.
+    totalled by the restorer in ``rollout_checkpointing`` -- so a key added at
+    any of those sites is followed.
     """
     trees = [
         ast.parse(source.read_text())
         for source in (
             _ALGORITHMS / "single_controller.py",
             _ALGORITHMS / "single_controller_utils" / "setup.py",
+            *sorted((_ALGORITHMS / "rollout_checkpointing").glob("*.py")),
         )
     ]
     keys: set[str] = set()
@@ -876,7 +879,10 @@ def _logged_rollout_checkpoint_keys() -> set[str]:
             for call in ast.walk(function):
                 if not (
                     isinstance(call, ast.Call)
-                    and getattr(call.func, "attr", None) == "_log_telemetry_metrics"
+                    # The controller logs through _log_telemetry_metrics, and
+                    # the rollout_checkpointing classes through _log_metrics.
+                    and getattr(call.func, "attr", None)
+                    in {"_log_telemetry_metrics", "_log_metrics"}
                     and _keyword_string(call, "prefix") in _ROLLOUT_CHECKPOINT_PREFIXES
                     and call.args
                 ):
@@ -898,6 +904,20 @@ def _logged_rollout_checkpoint_keys() -> set[str]:
                 for source in _copied_dict_sources(function, name):
                     for other in trees:
                         keys |= _dict_keys_assigned_to(other, source)
+    # A rollout snapshot also logs its environment backend's own metrics, merged
+    # in from EnvironmentSnapshot.metrics(), which each backend returns as a dict.
+    for source in sorted(_ENVIRONMENT_CHECKPOINTING.glob("*.py")):
+        for function in ast.walk(ast.parse(source.read_text())):
+            if isinstance(function, ast.FunctionDef) and function.name == "metrics":
+                for node in ast.walk(function):
+                    if isinstance(node, ast.Return) and isinstance(
+                        node.value, ast.Dict
+                    ):
+                        keys |= {
+                            key.value
+                            for key in node.value.keys
+                            if isinstance(key, ast.Constant)
+                        }
     return keys
 
 
