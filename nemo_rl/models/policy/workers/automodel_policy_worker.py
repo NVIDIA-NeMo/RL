@@ -1010,6 +1010,7 @@ class AutomodelPolicyWorkerImpl(
                 enable_seq_packing=self.enable_seq_packing,
                 sampling_params=self.sampling_params,
                 draft_runtime=None,
+                tp_mesh=self.tp_mesh,
             )
             empty_cache_steps = self.cfg["automodel_cfg"].get(
                 "clear_cache_every_n_steps"
@@ -1043,7 +1044,6 @@ class AutomodelPolicyWorkerImpl(
                 padding_token_id=self.tokenizer.pad_token_id or 0,
                 autocast_context_factory=self._autocast_context,
                 forward_only=False,
-                is_reward_model=self._is_reward_model,
                 allow_flash_attn_args=self.allow_flash_attn_args,
                 global_valid_seqs=global_valid_seqs,
                 global_valid_toks=global_valid_toks,
