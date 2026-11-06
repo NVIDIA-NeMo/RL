@@ -925,6 +925,41 @@ class TestApplyMoeConfig:
         assert model_cfg.moe_token_dispatcher_type == "alltoall"
         assert model_cfg.moe_shared_expert_overlap is True
 
+    def test_moe_enable_deepep_is_passed_as_flex_backend(self):
+        """The deprecated MCore flag is not forwarded; the flex backend selects DeepEP instead.
+
+        The flag is saved into the checkpoint config, and single-rank loads (Megatron->HF export) fall back to the
+        allgather dispatcher, which MCore rejects while moe_enable_deepep is True.
+        """
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        model_cfg = MagicMock()
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg.update(
+            moe_enable_deepep=True,
+            moe_token_dispatcher_type="flex",
+            moe_shared_expert_overlap=False,
+        )
+
+        _apply_moe_config(model_cfg, {"megatron_cfg": megatron_cfg})
+
+        assert model_cfg.moe_enable_deepep is False
+        assert model_cfg.moe_flex_dispatcher_backend == "deepep"
+        assert model_cfg.moe_token_dispatcher_type == "flex"
+
+    def test_moe_enable_deepep_conflicting_flex_backend_raises(self):
+        from nemo_rl.models.megatron.setup import _apply_moe_config
+
+        megatron_cfg = self._base_moe_megatron_cfg()
+        megatron_cfg.update(
+            moe_enable_deepep=True,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="hybridep",
+        )
+
+        with pytest.raises(ValueError, match="moe_enable_deepep=True conflicts"):
+            _apply_moe_config(MagicMock(), {"megatron_cfg": megatron_cfg})
+
     @staticmethod
     def _base_moe_megatron_cfg() -> dict:
         return {
