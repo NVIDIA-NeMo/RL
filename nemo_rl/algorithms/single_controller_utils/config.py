@@ -905,6 +905,12 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     periodic-checkpoint failures are tolerated before the controller aborts the
     run. A successful or skipped attempt resets the counter; checkpoint
     invariant failures still fail immediately.
+
+    ``trace=True`` appends one JSON line per rollout event to
+    ``rollout_trace.jsonl`` in the log directory, to check what a stop and
+    restore cost. Per-rollout events need ``rollout_recovery`` dispatch. It does
+    not enable checkpointing. The events are listed in
+    ``nemo_rl/algorithms/rollout_checkpointing/trace.py``.
     """
 
     snapshot_attempt_interval_s: Annotated[Optional[float], Field(gt=0)] = None
@@ -913,6 +919,7 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     keep_latest_k: Annotated[int, Field(ge=1)] = 2
     restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
     extra_fingerprint_excluded_paths: list[str] = Field(default_factory=list)
+    trace: bool = False
 
     @model_validator(mode="after")
     def validate_extra_fingerprint_excluded_paths(self) -> "RolloutCheckpointConfig":

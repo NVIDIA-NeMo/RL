@@ -201,6 +201,11 @@ class RolloutRestorer(_UsesRolloutParts):
             Whether restore queued groups only ledger-recorded dispatch can
             launch, so the rollout pump must record prompt groups.
         """
+        self._trace.emit(
+            "restore_started",
+            path=self._resume.path,
+            from_rollout_snapshot=self._resume.from_rollout_snapshot,
+        )
         replay_restore_started = time.monotonic()
         restored_replay_groups = await self._restore_replay_buffer()
         replay_restore_seconds = time.monotonic() - replay_restore_started
@@ -216,6 +221,14 @@ class RolloutRestorer(_UsesRolloutParts):
             recovery_prepare_seconds=recovery_prepare_seconds,
             restored_replay_groups=restored_replay_groups,
         )
+        if self._trace.enabled:
+            self._trace.emit(
+                "restore_finished",
+                replay_groups=restored_replay_groups,
+                unfinished_groups=[
+                    group.group_id for group in self._rollout_recovery_ledger.groups()
+                ],
+            )
         return self._requires_recovery_dispatch
 
     def _log_restore_metrics(
