@@ -34,6 +34,7 @@ from typing import Any
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.data_plane.codec import check_put_dtypes
 from nemo_rl.data_plane.codec import stack_or_nest as _stack_or_nest
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 
@@ -177,6 +178,7 @@ class NoOpDataPlaneClient(DataPlaneClient):
         rec = self._partitions[partition_id]
         if fields is not None:
             _reject_non_tensor_leaves(fields)
+            check_put_dtypes(fields)
             for i, sid in enumerate(sample_ids):
                 row = rec.rows.setdefault(sid, {})
                 for fname in fields.keys():
