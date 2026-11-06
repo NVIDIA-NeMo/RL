@@ -50,7 +50,7 @@ SEQ_LEN = 64
 VOCAB_SIZE = 32000
 
 
-def _make_policy(model_name: str, tp: int, cluster_name: str):
+def _make_policy(model_name: str, tp: int, cluster_name: str, pp: int = 1):
     cluster = RayVirtualCluster(
         name=cluster_name,
         bundle_ct_per_node_list=[NUM_GPUS],
@@ -58,7 +58,7 @@ def _make_policy(model_name: str, tp: int, cluster_name: str):
         num_gpus_per_node=NUM_GPUS,
         max_colocated_worker_groups=1,
     )
-    config = create_megatron_test_config(model_name=model_name, tp=tp, pp=1)
+    config = create_megatron_test_config(model_name=model_name, tp=tp, pp=pp)
     tokenizer = get_tokenizer(config["tokenizer"])
     config["generation"] = configure_generation_config(config["generation"], tokenizer)
     policy = Policy(
@@ -217,6 +217,96 @@ def test_split_train_matches_sync_train(tp, tiny_llama_model_path):
             f"sync-only={set(sync_mb) - set(split_mb)}, "
             f"split-only={set(split_mb) - set(sync_mb)}"
         )
+        for key in sorted(sync_mb):
+            sync_val = _reduce_metric(key, sync_mb[key])
+            split_val = _reduce_metric(key, split_mb[key])
+            assert split_val == pytest.approx(sync_val, rel=1e-3, abs=1e-5), (
+                f"step {step}: metric {key!r} diverged "
+                f"(sync={sync_val}, split={split_val})"
+            )
+
+
+# Rows whose generation logprobs are far from any policy's: exp(|error|) is
+# ~1e21, while the other rows stay far below the threshold.
+REJECTED_ROWS = (1, 6)
+IN_LOSS_THRESHOLD = 1e12
+
+
+def _make_in_loss_batch(batch_size: int) -> BatchedDataDict:
+    data = _make_grpo_batch(batch_size)
+    data["generation_logprobs"] = torch.full((batch_size, SEQ_LEN), -12.0)
+    data["generation_logprobs"][list(REJECTED_ROWS)] = -60.0
+    return data
+
+
+def _assert_steps_match(expected: list[dict], actual: list[dict], label: str):
+    for step, (exp_r, act_r) in enumerate(zip(expected, actual)):
+        for key in ("loss", "grad_norm"):
+            torch.testing.assert_close(
+                act_r[key].float(),
+                exp_r[key].float(),
+                rtol=1e-3,
+                atol=1e-5,
+                msg=f"{label} step {step}: {key} diverged "
+                f"(expected={exp_r[key]}, actual={act_r[key]})",
+            )
+
+
+@pytest.mark.hf_gated
+@pytest.mark.timeout(900)
+@pytest.mark.parametrize(("tp", "pp"), [(1, 1), (1, 2)], ids=["2gpu_dp2", "2gpu_pp2"])
+def test_in_loss_filter_matches_prefiltering(tp, pp, tiny_llama_model_path):
+    """In-loss filtering on both trainers equals dropping rows before training.
+
+    PP=2 exercises the regular trainer's survivor-count broadcast from the
+    last pipeline stage and the split API's per-stage metric reduce.
+    """
+    in_loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            force_on_policy_ratio=True,
+            seq_logprob_error_in_loss=True,
+            reference_policy_kl_penalty=0.1,
+        ),
+        seq_logprob_error_threshold=IN_LOSS_THRESHOLD,
+    )
+    prefilter_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(force_on_policy_ratio=True, reference_policy_kl_penalty=0.1)
+    )
+
+    def run(name: str, fn) -> list[dict]:
+        policy, cluster, config = _make_policy(
+            tiny_llama_model_path, tp, f"in-loss-{name}-tp{tp}-pp{pp}", pp=pp
+        )
+        gbs = config["train_global_batch_size"]
+        data = _make_in_loss_batch(batch_size=gbs)
+        try:
+            if name == "prefilter":
+                data["sample_mask"][list(REJECTED_ROWS)] = 0
+                return _run_sync(policy, data, prefilter_fn)
+            if name == "sync":
+                return _run_sync(policy, data, in_loss_fn)
+            return _run_split(
+                policy,
+                data,
+                in_loss_fn,
+                gbs=gbs,
+                mbs=config["train_micro_batch_size"],
+            )
+        finally:
+            policy.shutdown()
+            cluster.shutdown()
+
+    prefilter_results = run("prefilter", prefilter_fn)
+    sync_results = run("sync", in_loss_fn)
+    split_results = run("split", in_loss_fn)
+
+    _assert_steps_match(prefilter_results, sync_results, "sync vs prefilter")
+    _assert_steps_match(prefilter_results, split_results, "split vs prefilter")
+    for step, (sync_r, split_r) in enumerate(zip(sync_results, split_results)):
+        sync_mb = sync_r["all_mb_metrics"]
+        split_mb = split_r["all_mb_metrics"]
+        assert sum(sync_mb["num_masked_seqs_by_logprob_error"]) == len(REJECTED_ROWS)
+        assert set(split_mb) == set(sync_mb)
         for key in sorted(sync_mb):
             sync_val = _reduce_metric(key, sync_mb[key])
             split_val = _reduce_metric(key, split_mb[key])

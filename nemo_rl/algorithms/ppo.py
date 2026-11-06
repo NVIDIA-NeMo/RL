@@ -384,7 +384,7 @@ def setup(
     if loss_config.seq_logprob_error_in_loss:
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss is not supported by PPO. "
-            "Use the non-streaming GRPO trainer."
+            "Use a GRPO trainer (legacy or SingleController)."
         )
 
     assert generation_config is not None, (
