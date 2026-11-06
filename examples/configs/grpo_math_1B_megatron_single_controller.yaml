@@ -232,6 +232,9 @@ token_capture:
   forest_training: false
   # returned_history (default) or all_captured, including discarded attempts.
   selection_policy: returned_history
+  # global_token_mean (default): mean over every trainable token in the step.
+  # rollout_token_mean: mean over each logical rollout's tokens, then over rollouts.
+  forest_loss_normalization: global_token_mean
   staging_partition: rollout_staging
 
 
