@@ -4454,6 +4454,7 @@ def test_streaming_ppo_advantage_stage_normalizes_each_chunk_independently(
                 "token_mask": torch.tensor([[0.0, 1.0], [0.0, 1.0]]),
                 "sample_mask": torch.ones(2),
                 "values": torch.zeros(2, 2),
+                "input_lengths": torch.full((2,), 2),
                 "mask_sample": torch.zeros(2, dtype=torch.bool),
                 "truncated": torch.zeros(2, dtype=torch.bool),
             },

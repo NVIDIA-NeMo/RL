@@ -3513,6 +3513,7 @@ def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
     }
     impl._tokenizer = None
     impl._effort_config = None
+    impl._mask_sample_rules = ()
 
     async def fake_stream_rows(environment, pending, results, shaping, *_a, **_k):
         selected.append(environment)
