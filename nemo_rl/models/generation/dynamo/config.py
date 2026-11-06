@@ -79,6 +79,11 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
     # requests the others have in flight. NeMo-Gym keeps each session on one.
     num_frontends: PositiveInt = 1
     extra_cli_args: list[str] = Field(default_factory=list)
+    # Extra environment for every frontend, for settings Dynamo reads only from
+    # the environment, e.g. DYN_TOKENIZER_CACHE_BYTES (the tokenizer's prefix
+    # cache; Dynamo's default is 1/16 of the cgroup memory limit up to 8 GiB, or
+    # 64 MiB without a limit). It may not set a variable the runtime manages.
+    extra_env: dict[str, str] = Field(default_factory=dict)
 
 
 class DynamoCfg(BaseModel, extra="forbid"):

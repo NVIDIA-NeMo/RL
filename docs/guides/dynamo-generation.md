@@ -59,6 +59,7 @@ shows them all:
 | `frontend_args.session_affinity_max_entries` | 16,777,216 | Most sessions the frontends hold at once, across all of them; a new one past it gets HTTP 529. Entries are allocated as sessions start, so a high cap costs nothing until it is used |
 | `frontend_args.num_frontends` | 1 | Frontends, each with its own router, spread round-robin over the generation nodes. More than one adds `--router-replica-sync`, so each router sees the requests the others have in flight; NeMo-Gym keeps each session on one frontend, and NeMo RL's own rollouts pick one at random |
 | `frontend_args.extra_cli_args` | `[]` | Extra `dynamo.frontend` flags |
+| `frontend_args.extra_env` | `{}` | Extra frontend environment, for settings Dynamo reads only from the environment. For example, `DYN_TOKENIZER_CACHE_BYTES` sizes the tokenizer's prefix cache for NeMo-Gym chat; Dynamo's default is 1/16 of the cgroup memory limit, up to 8 GiB, or 64 MiB without a limit. Variables the runtime manages are rejected |
 
 The etcd and nats-server binaries are found in `NEMO_RL_DYNAMO_BIN_DIR` when it
 is set (the image sets it to `/opt/dynamo/bin`), and on `PATH` otherwise.

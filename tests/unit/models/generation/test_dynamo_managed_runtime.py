@@ -323,6 +323,56 @@ def test_engine_wait_fails_immediately_when_an_engine_or_frontend_stops(
         runtime.wait_for_engines(1, check_engines=check_engines)
 
 
+class _FakeFrontendHostActor:
+    """Records where each frontend is placed and what it is started with."""
+
+    def __init__(self):
+        self.node_ids: list[str] = []
+        self.envs: list[dict[str, str]] = []
+
+    def options(self, scheduling_strategy):
+        self.node_ids.append(scheduling_strategy.node_id)
+        return self
+
+    def remote(self):
+        actor = self
+
+        class _Host:
+            class start:
+                @staticmethod
+                def remote(**kwargs):
+                    actor.envs.append(kwargs["env"])
+                    return f"http://frontend-{len(actor.envs)}/v1"
+
+        return _Host()
+
+
+def test_frontends_spread_over_the_nodes_with_the_extra_environment(
+    monkeypatch, fake_ray
+) -> None:
+    hosts = _FakeFrontendHostActor()
+    monkeypatch.setattr(managed_runtime, "_FrontendHostActor", hosts)
+    runtime = _runtime(
+        num_frontends=3, extra_env={"DYN_TOKENIZER_CACHE_BYTES": str(1 << 30)}
+    )
+    runtime._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
+
+    node_a, node_b = "a" * 56, "b" * 56  # Ray node IDs are hex
+    runtime._start_frontends([node_a, node_b])
+
+    assert hosts.node_ids == [node_a, node_b, node_a]
+    assert runtime._frontend_urls == [f"http://frontend-{i}/v1" for i in (1, 2, 3)]
+    for env in hosts.envs:
+        assert env["DYN_TOKENIZER_CACHE_BYTES"] == str(1 << 30)
+        assert env["DYN_NAMESPACE"] == "nemo-rl-test"
+        assert env["VIRTUAL_ENV"] == "/venvs/vllm"
+
+    clashing = _runtime(extra_env={"DYN_NAMESPACE": "mine"})
+    clashing._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
+    with pytest.raises(ValueError, match=r"\['DYN_NAMESPACE'\] is set by both"):
+        clashing._start_frontends([node_a])
+
+
 def test_frontend_host_serves_on_a_free_port_of_its_node(monkeypatch) -> None:
     launched = []
     monkeypatch.setattr(

@@ -398,6 +398,13 @@ class ManagedDynamoRuntime:
             "VIRTUAL_ENV": dynamo_venv,
             "UV_PROJECT_ENVIRONMENT": dynamo_venv,
         }
+        extra_env = self._dynamo_cfg.frontend_args.extra_env
+        if clashing := sorted(extra_env.keys() & env.keys()):
+            raise ValueError(
+                f"Dynamo frontend environment {clashing} is set by both the managed "
+                "runtime and dynamo_cfg.frontend_args.extra_env."
+            )
+        env.update(extra_env)
         for index in range(self._dynamo_cfg.frontend_args.num_frontends):
             node_id = node_ids[index % len(node_ids)]
             self._frontend_hosts.append(
