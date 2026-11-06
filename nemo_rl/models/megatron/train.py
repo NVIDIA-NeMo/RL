@@ -750,6 +750,9 @@ class LossPostProcessor:
                     prepare_packed_loss_input,
                     sampling_params=self.sampling_params,
                     chunk_size=logprob_chunk_size,
+                    reuse_logits_storage=bool(
+                        self.cfg["megatron_cfg"].get("reuse_logits_storage")
+                    ),
                 )
             else:
                 wrapper_cls = SequencePackingLossWrapper

@@ -15,6 +15,7 @@
 import os
 import types
 from dataclasses import dataclass
+from typing import Literal
 
 import pytest
 import torch
@@ -2055,7 +2056,10 @@ def test_multi_gpu_fp8_patches_before_model_load(fp8_module, monkeypatch, use_ra
         ]
 
 
-def test_fp8_ds_mla_skips_static_kv_scale_patch(fp8_module, monkeypatch):
+@pytest.mark.parametrize("cache_dtype", ["fp8_ds_mla", "fp8_per_token_head"])
+def test_dynamic_cache_skips_static_kv_scale_patch(
+    fp8_module, monkeypatch, cache_dtype
+):
     fp8 = fp8_module
     patched_paths = []
 
@@ -2074,14 +2078,15 @@ def test_fp8_ds_mla_skips_static_kv_scale_patch(fp8_module, monkeypatch):
         fp8.FP8Config(
             use_fp8_weights=True,
             model_parallel_size=1,
-            kv_cache_dtype="fp8_ds_mla",
+            kv_cache_dtype=cache_dtype,
         ),
     )
 
     assert not any("BaseKVCacheMethod" in path for path in patched_paths)
 
 
-def test_init_fp8_accepts_fp8_ds_mla(fp8_module, monkeypatch):
+@pytest.mark.parametrize("per_token", [False, True])
+def test_init_fp8_accepts_dynamic_cache(fp8_module, monkeypatch, per_token):
     fp8 = fp8_module
 
     monkeypatch.setattr(
@@ -2094,15 +2099,36 @@ def test_init_fp8_accepts_fp8_ds_mla(fp8_module, monkeypatch):
     vllm_kwargs = fp8.init_fp8(
         {
             "precision": "fp8",
-            "kv_cache_dtype": "fp8_ds_mla",
+            "kv_cache_dtype": "fp8_per_token_head" if per_token else "fp8_ds_mla",
             "async_engine": False,
         },
         "dummy-model",
         model_parallel_size=1,
     )
 
-    assert vllm_kwargs["kv_cache_dtype"] == "fp8_ds_mla"
-    assert fp8.global_fp8_config.kv_cache_dtype == "fp8_ds_mla"
+    expected = "fp8_per_token_head" if per_token else "fp8_ds_mla"
+    assert vllm_kwargs["kv_cache_dtype"] == expected
+    assert fp8.global_fp8_config.kv_cache_dtype == expected
+    assert "attention_backend" not in vllm_kwargs
+
+
+def test_init_fp8_rejects_unsupported_per_token_head_cache(fp8_module, monkeypatch):
+    import vllm.config.cache
+
+    monkeypatch.setattr(vllm.config.cache, "CacheDType", Literal["auto", "fp8"])
+    monkeypatch.setattr(
+        fp8_module.AutoConfig,
+        "from_pretrained",
+        lambda *_args, **_kwargs: types.SimpleNamespace(num_hidden_layers=4),
+    )
+    with pytest.raises(
+        ValueError, match="requires vLLM with fp8_per_token_head support"
+    ):
+        fp8_module.init_fp8(
+            {"precision": "fp8", "kv_cache_dtype": "fp8_per_token_head"},
+            "dummy-model",
+            model_parallel_size=1,
+        )
 
 
 def test_init_fp8_uses_explicit_e8m0_for_dsv4(fp8_module, monkeypatch):

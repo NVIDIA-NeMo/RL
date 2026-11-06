@@ -1694,6 +1694,11 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "loss_fn.score_centering needs vocabulary logits; disable "
                 "policy.megatron_cfg.use_fused_linear_logprobs"
             )
+        if megatron_cfg.get("enabled") and megatron_cfg.get("reuse_logits_storage"):
+            raise ValueError(
+                "loss_fn.score_centering reads the packed logits again; disable "
+                "policy.megatron_cfg.reuse_logits_storage"
+            )
 
     if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:
         raise ValueError(

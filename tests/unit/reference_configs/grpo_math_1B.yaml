@@ -220,6 +220,7 @@ policy:
     checkpoint:
       async_save: true
       ckpt_assume_constant_structure: true
+      parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
     use_fused_linear_logprobs: false
     fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
@@ -267,6 +268,7 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    reuse_logits_storage: false
     fp32_lm_head: false
     moe_per_layer_logging: False
     moe_enable_deepep: false
@@ -505,6 +507,8 @@ policy:
       precision: ${policy.precision}
       # MXFP8 + Megatron only: quantize on trainer and stream E4M3 values plus scales.
       refit_prequantize: false
+      # auto, fp8, fp8_e4m3, fp8_ds_mla, or fp8_per_token_head.
+      # fp8_per_token_head requires precision=fp8 and a compatible backend (TRITON_ATTN).
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
       fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head}
