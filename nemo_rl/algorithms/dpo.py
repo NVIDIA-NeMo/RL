@@ -653,6 +653,7 @@ def dpo_train(
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
 
         for batch in add_ref_logprobs_to_data(train_dataloader, policy, master_config):
+            checkpointer.raise_if_finalization_failed()
             print(
                 f"\n{'=' * 25} Step {current_step + 1}/{min(len(train_dataloader), master_config.dpo.max_num_steps)} {'=' * 25}"
             )

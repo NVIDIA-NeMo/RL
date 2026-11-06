@@ -444,7 +444,9 @@ class CheckpointManager:
         finish), renames tmp_step_N to step_N, then queues old-checkpoint
         deletion. All writes to checkpoint_path must be complete before calling
         this. If a previous finalization is still active, blocks until it
-        completes.
+        completes. A failure is raised by raise_if_finalization_failed() at the
+        next step boundary once it has happened, and otherwise by the next
+        finalize_pending() or shutdown().
 
         Args:
             checkpoint_path: Path to tmp_step_N directory from init_tmp_checkpoint().
@@ -504,6 +506,22 @@ class CheckpointManager:
             err = self._finalize_error
             self._finalize_error = None
             raise RuntimeError("Background checkpoint finalization failed") from err
+
+    def raise_if_finalization_failed(self) -> None:
+        """Re-raise a background finalization failure without blocking.
+
+        Training loops call this at the start of every step. Unlike
+        finalize_pending(), it never waits for an in-flight finalization, so
+        async checkpoint writes keep overlapping with training. A save that has
+        already failed stops the run at the next step boundary instead of at
+        the next save, which can be many steps later. No-op if nothing failed.
+
+        Raises:
+            RuntimeError: If the background finalization has already failed.
+                The original exception is chained as its cause.
+        """
+        if self._finalize_error is not None:
+            self.finalize_pending()
 
     def shutdown(self) -> None:
         """Block until rename + all queued deletions complete. Call at training exit.
