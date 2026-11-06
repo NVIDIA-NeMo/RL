@@ -20,6 +20,7 @@ import warnings
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import ray
 import torch
@@ -51,6 +52,9 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
 )
+
+if TYPE_CHECKING:
+    from megatron.bridge.models.conversion.modelopt_utils import ModelOptExportPlan
 
 
 def _quant_checkpoint_cache_suffix(config: Mapping[str, object]) -> str:
@@ -462,6 +466,29 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             and bool(generation_cfg.get("real_quant"))
         )
 
+    def _build_refit_conversion_tasks(self) -> list:
+        if not self._use_real_quant_refit():
+            # Weight quantizers are folded locally; input scales retain HF mappings.
+            return super()._build_refit_conversion_tasks(
+                exclude_param_patterns=("*weight_quantizer*",)
+            )
+
+        return self._get_modelopt_export_plan().conversion_tasks
+
+    def _get_modelopt_export_plan(self) -> "ModelOptExportPlan":
+        plan = getattr(self, "_modelopt_export_plan", None)
+        if plan is not None:
+            return plan
+
+        from nemo_rl.models.megatron.draft import draft_model_detached
+
+        # The canonical planner reads scales from the owning weights and excludes
+        # quantizer modules before Bridge validates the HF parameter mappings.
+        with draft_model_detached([self.model]):
+            plan = self.megatron_bridge.build_hf_modelopt_export_plan([self.model])
+        self._modelopt_export_plan = plan
+        return plan
+
     def _get_real_quant_mode(self) -> str:
         """Resolve and cross-check the training and rollout quantization modes."""
         cached_mode = getattr(self, "_real_quant_mode", None)
@@ -498,9 +525,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             ignore = DEFAULT_NVFP4_IGNORE
         mode = self._get_real_quant_mode()
         export_cpu_offload = generation_cfg["real_quant_export_cpu_offload"]
-        plan = self.megatron_bridge.build_hf_modelopt_export_plan(
-            [self.model], conversion_tasks=self.refit_conversion_tasks
-        )
+        plan = self._get_modelopt_export_plan()
         expected_algo = "NVFP4" if mode == "w4a4" else "W4A16_NVFP4"
         if plan.quantization_config["quant_algo"] != expected_algo:
             raise ValueError(

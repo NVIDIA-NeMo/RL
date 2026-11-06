@@ -85,14 +85,14 @@ class _FakeModelOptBridge:
         self.calls = []
         self.plan_calls = []
         self.quant_algo = "W4A16_NVFP4"
+        self.conversion_tasks = []
 
     def build_hf_modelopt_export_plan(self, model, conversion_tasks=None):
+        tasks = self.conversion_tasks if conversion_tasks is None else conversion_tasks
         plan = SimpleNamespace(
-            conversion_tasks=conversion_tasks,
+            conversion_tasks=tasks,
             quantization_config={"quant_algo": self.quant_algo},
-            quantized_params=frozenset(
-                task.global_param_name for task in conversion_tasks
-            ),
+            quantized_params=frozenset(task.global_param_name for task in tasks),
         )
         self.plan_calls.append((model, conversion_tasks, plan))
         return plan
@@ -143,6 +143,7 @@ def _make_real_quant_worker():
         )
     ]
     worker.megatron_bridge = _FakeModelOptBridge()
+    worker.megatron_bridge.conversion_tasks = worker.refit_conversion_tasks
     worker.rank = 0
     return worker
 
@@ -316,8 +317,61 @@ def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
     assert kwargs["show_progress"] is False
     model, tasks, plan = worker.megatron_bridge.plan_calls[0]
     assert model == [worker.model]
-    assert tasks == worker.refit_conversion_tasks
+    assert tasks is None
+    assert plan.conversion_tasks is worker.refit_conversion_tasks
     assert kwargs["export_plan"] is plan
+
+
+@requires_weight_folding
+@pytest.mark.parametrize("planning_error", [False, True])
+def test_real_quant_refit_reuses_plan_and_restores_draft(monkeypatch, planning_error):
+    worker = _make_real_quant_worker()
+    worker.model = nn.Linear(4, 4)
+    draft = nn.Linear(4, 4)
+    worker.model.draft_model = draft
+    build_plan = worker.megatron_bridge.build_hf_modelopt_export_plan
+
+    def plan_without_draft(model):
+        assert not hasattr(model[0], "draft_model")
+        if planning_error:
+            raise ValueError("invalid quantization")
+        return build_plan(model)
+
+    monkeypatch.setattr(
+        worker.megatron_bridge, "build_hf_modelopt_export_plan", plan_without_draft
+    )
+    if planning_error:
+        with pytest.raises(ValueError, match="invalid quantization"):
+            worker._build_refit_conversion_tasks()
+        assert getattr(worker, "_modelopt_export_plan", None) is None
+    else:
+        worker.refit_conversion_tasks = worker._build_refit_conversion_tasks()
+        # EP expert mappings have already been adapted; never re-plan them.
+        list(worker._iter_real_quant_refit_params())
+        list(worker._iter_real_quant_refit_params())
+        assert len(worker.megatron_bridge.plan_calls) == 1
+        plan = worker.megatron_bridge.plan_calls[0][2]
+        assert all(
+            call[1]["export_plan"] is plan for call in worker.megatron_bridge.calls
+        )
+    assert worker.model.draft_model is draft
+
+
+@requires_weight_folding
+def test_fake_quant_refit_excludes_weight_quantizers_before_mapping_validation():
+    from unittest.mock import MagicMock
+
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["real_quant"] = False
+    worker.fp8_cfg = None
+    tasks = worker.refit_conversion_tasks
+    worker.megatron_bridge.get_conversion_tasks = MagicMock(return_value=[None, *tasks])
+
+    assert worker._build_refit_conversion_tasks() == tasks
+    worker.megatron_bridge.get_conversion_tasks.assert_called_once_with(
+        [worker.model], exclude_param_patterns=("*weight_quantizer*",)
+    )
+    assert not worker.megatron_bridge.plan_calls
 
 
 @requires_weight_folding
