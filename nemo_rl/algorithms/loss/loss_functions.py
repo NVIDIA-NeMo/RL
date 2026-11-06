@@ -1078,6 +1078,9 @@ class ClippedPGLossFn(LossFunction):
                 importance_sampling_mode=self._score_centering_is_mode,
                 is_bounds=self._get_score_centering_is_bounds(),
                 token_mask=mask,
+                # Score centering under top-k/top-p always replays the sampler's
+                # support; only filtering supplies policy_support_mask.
+                sampler_replay=policy_support_mask is not None,
                 adaptive_ppo_clip_advantages=advantages,
                 adaptive_ppo_clip_outer_bound=self.truncated_importance_sampling_adaptive_outer_bound,
             )

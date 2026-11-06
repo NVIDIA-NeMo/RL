@@ -34,6 +34,7 @@ from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.models.generation.interfaces import SamplerReplayConfig
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.utils.logger import LoggerConfig
 
@@ -1776,6 +1777,22 @@ def test_ppo_rejects_in_loss_filter_before_cluster_creation(
     config.loss_fn.seq_logprob_error_in_loss = True
 
     with pytest.raises(ValueError, match="seq_logprob_error_in_loss.*PPO"):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+def test_ppo_rejects_sampler_support_replay_before_cluster_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replay reads the captured sampler head, which only SingleController stages."""
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config()
+    config.policy["generation"]["sampler_replay"] = SamplerReplayConfig(enabled=True)
+
+    with pytest.raises(ValueError, match="sampler_replay.*legacy PPO trainer"):
         ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
 
     cluster_cls.assert_not_called()
