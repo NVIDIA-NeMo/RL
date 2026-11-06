@@ -429,8 +429,8 @@ class NixlStorageUnit:  # pragma: no cover
                 # the client tries another unit.
                 del self.blobs[b]
                 self.ssd_stats["spill_failures"] += 1
-            if fd is not None and not (ok and not gone):
-                _close(fd)  # under the lock: a failed put is never visible with its fd still open
+        if fd is not None and not (ok and not gone):
+            _close(fd)
 
     def _new_file(self) -> int:
         """Open a fresh file in the SSD dir and unlink it at once; the fd keeps it.
