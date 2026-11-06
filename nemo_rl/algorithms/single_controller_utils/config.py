@@ -1324,6 +1324,104 @@ def _validate_failure_settings(
         )
 
 
+def _vlm_architecture_signature(
+    model_name: str, hf_config_overrides: Mapping[str, Any] | None
+) -> tuple[Any, ...]:
+    """Return the VLM structure that determines packed-media compatibility."""
+    from transformers import AutoConfig
+
+    config = AutoConfig.from_pretrained(
+        model_name,
+        trust_remote_code=True,
+        **dict(hf_config_overrides or {}),
+    )
+    get_text_config = getattr(config, "get_text_config", None)
+    text_config = get_text_config() if callable(get_text_config) else None
+    vision_config = getattr(config, "vision_config", None)
+    media_token_fields = (
+        "image_token_id",
+        "video_token_id",
+        "vision_start_token_id",
+        "vision_end_token_id",
+    )
+    return (
+        getattr(config, "model_type", None),
+        tuple(getattr(config, "architectures", None) or ()),
+        getattr(text_config, "model_type", None),
+        getattr(vision_config, "model_type", None),
+        tuple((name, getattr(config, name, None)) for name in media_token_fields),
+    )
+
+
+def _vlm_tokenizer_signature(
+    tokenizer_config: Mapping[str, Any], fallback_name: str
+) -> tuple[Any, ...]:
+    """Fingerprint the token-to-id contract consumed by the critic."""
+    import hashlib
+
+    from transformers import AutoTokenizer
+
+    tokenizer_name = tokenizer_config.get("name") or fallback_name
+    tokenizer = AutoTokenizer.from_pretrained(
+        tokenizer_name,
+        trust_remote_code=True,
+        **dict(tokenizer_config.get("tokenizer_kwargs") or {}),
+    )
+    vocab = tokenizer.get_vocab()
+    digest = hashlib.sha256()
+    for token, token_id in sorted(vocab.items()):
+        token_bytes = token.encode("utf-8", errors="surrogatepass")
+        digest.update(len(token_bytes).to_bytes(8, "big"))
+        digest.update(token_bytes)
+        digest.update(int(token_id).to_bytes(8, "big", signed=True))
+    special_token_ids = tuple(
+        getattr(tokenizer, f"{name}_token_id", None)
+        for name in ("bos", "eos", "pad", "unk", "sep", "cls", "mask")
+    )
+    return len(vocab), digest.hexdigest(), special_token_ids
+
+
+def _validate_vlm_critic_compatibility(
+    policy_config: Mapping[str, Any], value_config: Mapping[str, Any]
+) -> None:
+    """Allow distinct checkpoints only when their media and token contracts match."""
+    policy_model_name = policy_config.get("model_name")
+    value_model_name = value_config.get("model_name")
+    if not policy_model_name or not value_model_name:
+        raise ValueError(
+            "Multimodal PPO requires model_name for both the policy and critic."
+        )
+
+    policy_hf_overrides = policy_config.get("hf_config_overrides") or {}
+    value_hf_overrides = value_config.get("hf_config_overrides") or {}
+    if (
+        policy_model_name != value_model_name
+        or policy_hf_overrides != value_hf_overrides
+    ) and _vlm_architecture_signature(
+        policy_model_name, policy_hf_overrides
+    ) != _vlm_architecture_signature(value_model_name, value_hf_overrides):
+        raise ValueError(
+            "Multimodal PPO requires compatible policy and critic VLM "
+            f"architectures; got {policy_model_name!r} and {value_model_name!r}."
+        )
+
+    policy_tokenizer_config = policy_config.get("tokenizer") or {}
+    value_tokenizer_config = value_config.get("tokenizer") or {}
+    policy_tokenizer_name = policy_tokenizer_config.get("name") or policy_model_name
+    value_tokenizer_name = value_tokenizer_config.get("name") or value_model_name
+    if (
+        policy_tokenizer_name != value_tokenizer_name
+        or (policy_tokenizer_config.get("tokenizer_kwargs") or {})
+        != (value_tokenizer_config.get("tokenizer_kwargs") or {})
+    ) and _vlm_tokenizer_signature(
+        policy_tokenizer_config, policy_model_name
+    ) != _vlm_tokenizer_signature(value_tokenizer_config, value_model_name):
+        raise ValueError(
+            "Multimodal PPO requires compatible policy and critic tokenizers; "
+            f"got {policy_tokenizer_name!r} and {value_tokenizer_name!r}."
+        )
+
+
 def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
@@ -1512,12 +1610,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     value_config = master_config.value
     assert value_config is not None
     if master_config.policy.get("is_vlm", False):
-        policy_model_name = master_config.policy.get("model_name")
-        if not policy_model_name or value_config.get("model_name") != policy_model_name:
-            raise ValueError(
-                "Multimodal PPO requires the policy and critic to use the same VLM: "
-                "set value.model_name to policy.model_name."
-            )
+        _validate_vlm_critic_compatibility(master_config.policy, value_config)
 
     # Only megatron_value_worker mixes in TQWorkerMixin; TQValue fans out
     # setup_data_plane unconditionally, so an Automodel critic dies in Ray with the

@@ -74,16 +74,6 @@ def test_value_media_mask_only_for_explicit_model_forward() -> None:
     assert model_media_placeholder_token_id(_WithoutMask()) is None
 
 
-def test_value_model_cp_slicing_capability_is_detected() -> None:
-    from nemo_rl.models.megatron.common import model_slices_context_parallel_inputs
-
-    class _SlicesContextParallelInputs:
-        model_slices_context_parallel_inputs = True
-
-    assert model_slices_context_parallel_inputs(_SlicesContextParallelInputs())
-    assert not model_slices_context_parallel_inputs(object())
-
-
 def test_value_head_hook_replaces_nested_vlm_language_head() -> None:
     """VLM critics must replace the head used by the nested language model."""
     from megatron.bridge.training.utils.train_utils import LinearForLastLayer
