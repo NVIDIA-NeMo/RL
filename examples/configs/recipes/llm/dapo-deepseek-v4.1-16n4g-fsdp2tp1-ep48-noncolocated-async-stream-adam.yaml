@@ -14,7 +14,7 @@ grpo:
     in_flight_weight_updates: false   # ten clean steps with true; left off pending a longer run
 policy:
   dtensor_cfg:
-    expert_parallel_size: 48          # 12 training nodes x 4 GPUs
+    expert_parallel_size: 48          # 12 training nodes x 4 GPUs; checkpointing needs 16 training nodes (EP64), see the guide
   generation:
     vllm_cfg:
       async_engine: true              # required by async GRPO with the vLLM backend
