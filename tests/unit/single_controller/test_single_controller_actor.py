@@ -48,6 +48,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
+    RewardScalingConfig,
     _create_advantage_estimator,
     _initial_grpo_save_state,
 )
@@ -4407,9 +4408,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
     ctrl._is_ppo = True
-    # model_construct, not a SimpleNamespace: it fills every default the stage
-    # reads -- including the three this test wants -- without validating, so a
-    # field added later does not raise AttributeError here.
+    # Populate stage-read defaults without validating this partial PPO stub.
     ctrl._master_config = SimpleNamespace(ppo=PPOConfig.model_construct())
     ctrl._algo_cfg = ctrl._master_config.ppo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -4443,6 +4442,75 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     )
     assert "returns" in (result_meta.fields or [])
     assert "advantages" in (result_meta.fields or [])
+
+
+def test_advantage_stage_scales_rewards_off_the_ppo_block_before_gae() -> None:
+    """Scaled PPO rewards must reach the real GAE critic targets."""
+    batch_size, sequence_length = 2, 4
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([1.0, 0.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.ones(batch_size),
+            "values": torch.zeros(batch_size, sequence_length),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    ppo = PPOConfig.model_construct(
+        reward_scaling=RewardScalingConfig(
+            enabled=True,
+            source_min=0.0,
+            source_max=1.0,
+            target_min=-1.0,
+            target_max=1.0,
+        ),
+        adv_estimator=GAEConfig(normalize_advantages=False, gae_gamma=1.0),
+    )
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = GeneralizedAdvantageEstimator(
+        ppo.adv_estimator, ClippedPGLossConfig()
+    )
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._train_data_dump = None
+    ctrl._is_ppo = True
+    ctrl._master_config = SimpleNamespace(ppo=ppo)
+    ctrl._algo_cfg = ppo
+    ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl, shardable=False)
+    ctrl._step_log_dict = {
+        "reward_partials": [],
+        "advantage_partials": [],
+        "sequence_lengths": [],
+        "num_mask_sample_filtered": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    returns = data_plane.written_fields["returns"]
+    torch.testing.assert_close(returns[:, -1], torch.tensor([1.0, -1.0]))
+    partial = ctrl._step_log_dict["reward_partials"][0]
+    assert partial.weighted_total / partial.weight == pytest.approx(0.0)
+    torch.testing.assert_close(data["total_reward"], torch.tensor([1.0, 0.0]))
 
 
 @pytest.mark.parametrize("dump_enabled", [False, True])
