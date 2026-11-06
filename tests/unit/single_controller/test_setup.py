@@ -2392,6 +2392,7 @@ class TestSetup:
             # The vLLM server's bearer token, handed to the Gym model server.
             policy_api_key=patched_factories["fake_gen"].http_server_api_key,
             token_capture=None,
+            rollout_fan_in=mc.async_rl.max_inflight_prompts,
         )
         mock_validate.assert_called_once_with(
             fake_gym_shards,

@@ -835,6 +835,8 @@ def _spinup_gym(
             if master_config.token_capture.enabled
             else None
         ),
+        # Each in-flight prompt holds one run_rollouts call on a Gym actor.
+        rollout_fan_in=master_config.async_rl.max_inflight_prompts,
     )
     return shard_set, time.perf_counter() - t0
 
