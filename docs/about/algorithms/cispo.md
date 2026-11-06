@@ -23,7 +23,7 @@ CISPO uses the same GRPO training path and `ClippedPGLossFn` as GRPO. Enable it 
 ```yaml
 loss_fn:
   use_cispo: true
-  token_level_loss: true
+  normalization: global_token_mean
   sequence_level_importance_ratios: false
   force_on_policy_ratio: false
   ratio_clip_min: 1.0

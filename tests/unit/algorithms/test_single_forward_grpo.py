@@ -144,6 +144,7 @@ def test_accumulated_loss_and_gradients_match_upstream_mask(
             loss_fn.metric_normalizations,
             token_factor=6 / kept_toks,
             sequence_factor=3 / kept_seqs,
+            loss_divisor_factor=6 / kept_toks,
         )
         for m in metrics
     ]

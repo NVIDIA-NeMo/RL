@@ -545,6 +545,7 @@ class SingleControllerActor:
                     save_state=actor_args.save_state,
                     partition_id=self._partition_id,
                     sampler_name=master_config.async_rl.sampler.name,
+                    loss_normalization=master_config.loss_fn.resolved_normalization,
                     opd_full_teacher_checkpoints=(
                         opd_module.opd_full_teacher_checkpoints_by_index(master_config)
                     ),
@@ -2017,6 +2018,7 @@ class SingleControllerActor:
             "single_controller_epoch": current_epoch,
             "partition_id": self._partition_id,
             "sampler_name": self._async_cfg.sampler.name,
+            "loss_normalization": self._master_config.loss_fn.resolved_normalization,
             "mode": "authoritative" if replay_metadata is not None else "shadow",
             "forest_training": self._master_config.token_capture.forest_training,
             "forest_execution_row_multiple": (

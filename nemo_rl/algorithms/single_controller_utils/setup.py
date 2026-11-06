@@ -216,6 +216,41 @@ class SingleControllerActorArgs:
     ppo_min_remaining_groups: int = 0
 
 
+# Checkpoints written before loss_normalization was recorded could only have
+# been trained under one of these.
+_PRE_METADATA_LOSS_NORMALIZATIONS = ("global_token_mean", "sequence_mean")
+
+
+def _validate_checkpoint_loss_normalization(
+    metadata: DataPlaneCheckpointMetadata, loss_normalization: str
+) -> None:
+    """Reject resuming buffered rollouts under a different loss normalization.
+
+    The restored rows were prepared for the normalization they were written
+    under, so resuming in the same checkpoint_dir keeps it. A new stage that
+    only initializes from a checkpoint's weights does not restore rows and is
+    not affected.
+    """
+    saved = metadata.get("loss_normalization")
+    if saved is None:
+        if loss_normalization in _PRE_METADATA_LOSS_NORMALIZATIONS:
+            return
+        saved_description = (
+            "an unrecorded normalization (one of "
+            f"{', '.join(_PRE_METADATA_LOSS_NORMALIZATIONS)})"
+        )
+    elif saved == loss_normalization:
+        return
+    else:
+        saved_description = repr(saved)
+    raise ValueError(
+        "Native TQ checkpoint was written under loss_fn.normalization="
+        f"{saved_description}, but this run uses {loss_normalization!r}. "
+        "Resume with the original normalization, or start a new run in a new "
+        "checkpoint_dir that initializes from this checkpoint's weights."
+    )
+
+
 def _maybe_restore_native_data_plane_checkpoint(
     *,
     load_checkpoint: Callable[[str | Path], dict[str, Any]],
@@ -223,6 +258,7 @@ def _maybe_restore_native_data_plane_checkpoint(
     save_state: GRPOSaveState,
     partition_id: str,
     sampler_name: str,
+    loss_normalization: str,
     opd_full_teacher_checkpoints: Optional[list[str]] = None,
 ) -> Optional[DataPlaneCheckpointMetadata]:
     """Load and validate an authoritative native TQ checkpoint when present.
@@ -305,6 +341,7 @@ def _maybe_restore_native_data_plane_checkpoint(
             f"{metadata.get('opd_full_teacher_checkpoints')!r}, this run would "
             f"number them {opd_full_teacher_checkpoints!r}."
         )
+    _validate_checkpoint_loss_normalization(metadata, loss_normalization)
     manifest_digest = metadata.get("replay_manifest_digest")
     if not isinstance(manifest_digest, str) or not manifest_digest:
         raise ValueError(
@@ -2167,6 +2204,7 @@ def setup_single_controller(
             save_state=save_state,
             partition_id=partition_id,
             sampler_name=master_config.async_rl.sampler.name,
+            loss_normalization=master_config.loss_fn.resolved_normalization,
             opd_full_teacher_checkpoints=(
                 opd_module.opd_full_teacher_checkpoints_by_index(master_config)
             ),
