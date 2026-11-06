@@ -3602,7 +3602,9 @@ class MegatronPolicyWorkerImpl(
         """Return True if the train side stores weights as TE blockwise FP8."""
         return is_blockwise_fp8_param_storage(self.fp8_cfg)
 
-    def _build_refit_conversion_tasks(self) -> list:
+    def _build_refit_conversion_tasks(
+        self, *, exclude_param_patterns: tuple[str, ...] = ()
+    ) -> list:
         """Keep the general/misc export format expected by each backend."""
         # Deferred import to avoid circular import issues.
         from nemo_rl.models.megatron.draft import draft_model_detached
@@ -3610,11 +3612,13 @@ class MegatronPolicyWorkerImpl(
         with draft_model_detached([self.model]):
             if self._is_fp8_export() and not self._generation_needs_logical_weights():
                 return self.megatron_bridge.get_export_fp8_tasks(self.model)
-            return [
-                task
-                for task in self.megatron_bridge.get_conversion_tasks([self.model])
-                if task is not None
-            ]
+            if exclude_param_patterns:
+                tasks = self.megatron_bridge.get_conversion_tasks(
+                    [self.model], exclude_param_patterns=exclude_param_patterns
+                )
+            else:
+                tasks = self.megatron_bridge.get_conversion_tasks([self.model])
+            return [task for task in tasks if task is not None]
 
     def _generation_needs_logical_weights(self) -> bool:
         """Megatron's existing non-bulk export consumes logical model weights."""
