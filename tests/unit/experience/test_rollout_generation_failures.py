@@ -62,6 +62,7 @@ from nemo_rl.experience.rollout_manager import (
     _LedgerDispatchRecorder,
 )
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from nemo_rl.experience.rollouts import _mask_sample_flags
 from nemo_rl.utils.timer import Timer
 
 
@@ -844,6 +845,198 @@ class TestPartialGymRedispatch:
         )
         with pytest.raises(RolloutTimeout, match="NeMo-Gym prompt group"):
             asyncio.run(impl._run_rollouts(_gym_rows(2), Timer(), "timing/rollout"))
+
+
+def _scorable_rows(count: int, **metadata: str) -> list[dict]:
+    """Rows carrying the Responses parameters a harness budget is stamped into."""
+    rows = _gym_rows(count)
+    for row in rows:
+        row["responses_create_params"] = {"metadata": dict(metadata)}
+    return rows
+
+
+def _handed_budget(row: dict) -> str | None:
+    return row["responses_create_params"].get("metadata", {}).get("agent_timeout_sec")
+
+
+async def _scored_result(rowidx: int, reward: float | None):
+    """A verified result; ``None`` is an assessment the verifier could not make."""
+    full_result = {"reward": 0.0 if reward is None else reward}
+    if reward is None:
+        full_result["mask_sample"] = True
+    return (
+        rowidx,
+        {"name": "agent"},
+        {
+            "input_message_log": [{"role": "user", "token_ids": [1]}],
+            "message_log": [{"role": "assistant", "token_ids": [2]}],
+            "full_result": full_result,
+        },
+        None,
+    )
+
+
+class _BudgetHonoringGym:
+    """Gym whose harnesses stop at the handed ``agent_timeout_sec`` and verify what they kept.
+
+    Without a handed budget every harness runs to its own ``ceiling_s``. The rows of
+    one dispatch run concurrently, as they do in Gym.
+    """
+
+    def __init__(self, rewards: list[float | None], ceiling_s: float = 60.0) -> None:
+        self._rewards = rewards
+        self._ceiling_s = ceiling_s
+        self.budgets: list[dict[int, str | None]] = []
+
+    def options(self, **kwargs):
+        del kwargs
+        return self
+
+    def remote(self, inputs, timer_prefix, per_prompt=False):
+        del timer_prefix, per_prompt
+        self.budgets.append({row["_rowidx"]: _handed_budget(row) for row in inputs})
+        return self._stream(inputs)
+
+    async def _stream(self, inputs):
+        handed = [_handed_budget(row) for row in inputs]
+        await asyncio.sleep(
+            min([self._ceiling_s, *(float(b) for b in handed if b is not None)])
+        )
+        for row in inputs:
+            yield _scored_result(row["_rowidx"], self._rewards[row["_rowidx"]])
+
+
+class TestAgentTimeoutHandOff:
+    """agent_timeout_margin_s turns the group deadline into a budget the harness scores at.
+
+    Without it, a rollout that outlives rollout_timeout_s is dropped with all of its
+    work. With it, each harness is told when to stop, verifies what it kept, and the
+    group trains on those scores; an assessment that failed stays masked rather than
+    becoming a zero reward.
+    """
+
+    def test_a_harness_that_honors_the_budget_is_scored_instead_of_dropped(self):
+        gym = _BudgetHonoringGym(rewards=[0.5, 0.0, None])
+        impl = _make_gym_impl(
+            gym,
+            num_generations=3,
+            timeouts=RolloutTimeouts(rollout_s=0.6, agent_margin_s=0.3),
+        )
+
+        completions, _, _ = asyncio.run(
+            impl._run_rollouts(_scorable_rows(3), Timer(), "timing/rollout")
+        )
+
+        (budgets,) = gym.budgets
+        assert all(0.2 < float(budget) <= 0.3 for budget in budgets.values())
+        assert [completion.reward for completion in completions] == [0.5, 0.0, 0.0]
+        # The valid zero trains; only the failed assessment is masked.
+        assert _mask_sample_flags(
+            [completion.env_extras for completion in completions]
+        ).tolist() == [0.0, 0.0, 1.0]
+
+    def test_without_a_margin_the_same_harness_is_cut_off(self):
+        gym = _BudgetHonoringGym(rewards=[0.5, 0.0])
+        impl = _make_gym_impl(gym, timeouts=RolloutTimeouts(rollout_s=0.3))
+
+        with pytest.raises(RolloutTimeout, match="NeMo-Gym prompt group"):
+            asyncio.run(
+                impl._run_rollouts(_scorable_rows(2), Timer(), "timing/rollout")
+            )
+        assert gym.budgets == [{0: None, 1: None}]
+
+    def test_a_re_dispatched_row_gets_only_what_is_left(self):
+        class _DiesAfterTheFirstRow(_PartialGymMethod):
+            def __init__(self) -> None:
+                super().__init__(fail_after_rows=1, failures_before_success=1)
+                self.budgets: list[list[float]] = []
+
+            def remote(self, inputs, timer_prefix, per_prompt=False):
+                self.budgets.append([float(_handed_budget(row)) for row in inputs])
+                return super().remote(inputs, timer_prefix, per_prompt)
+
+            async def _stream(self, inputs, attempt):
+                if attempt == 0:
+                    await asyncio.sleep(0.2)
+                async for item in super()._stream(inputs, attempt):
+                    yield item
+
+        method = _DiesAfterTheFirstRow()
+        impl = _make_gym_impl(
+            method,
+            num_generations=2,
+            row_attempts=2,
+            timeouts=RolloutTimeouts(rollout_s=2.0, agent_margin_s=0.5),
+        )
+
+        asyncio.run(impl._run_rollouts(_scorable_rows(2), Timer(), "timing/rollout"))
+
+        first, second = method.budgets
+        assert first == [pytest.approx(1.5, abs=0.05)] * 2
+        assert second[0] <= first[0] - 0.2
+
+    def test_a_smaller_budget_carried_by_the_task_is_kept(self):
+        gym = _BudgetHonoringGym(rewards=[1.0, 1.0])
+        impl = _make_gym_impl(
+            gym, timeouts=RolloutTimeouts(rollout_s=30.0, agent_margin_s=5.0)
+        )
+        rows = _scorable_rows(2, agent_timeout_sec="0.1", harbor_step="build")
+
+        asyncio.run(impl._run_rollouts(rows, Timer(), "timing/rollout"))
+
+        assert gym.budgets == [{0: "0.100", 1: "0.100"}]
+
+    def test_the_source_rows_are_left_for_a_group_retry_to_budget_afresh(self):
+        gym = _BudgetHonoringGym(rewards=[1.0, 1.0])
+        impl = _make_gym_impl(
+            gym, timeouts=RolloutTimeouts(rollout_s=30.0, agent_margin_s=5.0)
+        )
+        rows = _scorable_rows(2, harbor_step="build")
+
+        asyncio.run(impl._run_rollouts(rows, Timer(), "timing/rollout"))
+
+        assert all(float(budget) > 24.0 for budget in gym.budgets[0].values())
+        assert [row["responses_create_params"] for row in rows] == [
+            {"metadata": {"harbor_step": "build"}}
+        ] * 2
+
+    def test_no_budget_left_ends_the_group_without_a_re_dispatch(self):
+        class _SlowThenDies(_PartialGymMethod):
+            async def _stream(self, inputs, attempt):
+                await asyncio.sleep(0.6)
+                async for item in super()._stream(inputs, attempt):
+                    yield item
+
+        method = _SlowThenDies(fail_after_rows=1, failures_before_success=1)
+        impl = _make_gym_impl(
+            method,
+            num_generations=2,
+            row_attempts=3,
+            timeouts=RolloutTimeouts(rollout_s=1.0, agent_margin_s=0.5),
+        )
+
+        with pytest.raises(RolloutTimeout, match="no harness can run"):
+            asyncio.run(
+                impl._run_rollouts(_scorable_rows(2), Timer(), "timing/rollout")
+            )
+        assert method.dispatched == [[0, 1]]
+
+    def test_materialized_tasks_are_rejected(self):
+        gym = _BudgetHonoringGym(rewards=[1.0])
+        impl = _make_gym_impl(
+            gym,
+            num_generations=1,
+            timeouts=RolloutTimeouts(rollout_s=30.0, agent_margin_s=5.0),
+        )
+        task_row = {
+            "_rowidx": 0,
+            "task_id": {"taskset": "harbor:train"},
+            "task_input": {"responses_create_params": {}},
+        }
+
+        with pytest.raises(ValueError, match="materialized NeMo-Gym tasks"):
+            asyncio.run(impl._run_rollouts([task_row], Timer(), "timing/rollout"))
+        assert gym.budgets == []
 
 
 class TestClassifyGenerationFailure:

@@ -47,6 +47,7 @@ from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
 from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
     get_nemo_gym_task_input,
+    is_nemo_gym_task,
 )
 from nemo_rl.experience.failures import (
     FailureClass,
@@ -180,6 +181,81 @@ class ReplacedRows:
 # per consecutive refusal; the prompt group's rollout deadline bounds the total.
 _PARKED_REDISPATCH_BACKOFF_S = 0.5
 _MAX_PARKED_REDISPATCH_BACKOFF_S = 5.0
+
+# Gym's AGENT_TIMEOUT_METADATA_KEY (nemo_gym.agent_utils.task_timeout): the harness
+# budget a row carries in responses_create_params.metadata.
+_NEMO_GYM_AGENT_TIMEOUT_KEY = "agent_timeout_sec"
+
+
+def _hand_agent_timeout(
+    rows: list[dict], *, remaining_s: Optional[float], margin_s: float
+) -> list[dict]:
+    """Copy rows with a harness budget: the group's remaining time minus the margin.
+
+    Gym harnesses read ``metadata.agent_timeout_sec`` through
+    ``resolve_agent_timeout``, stop when it runs out, and verify the work they kept,
+    so the row comes back scored rather than being cut off by the group deadline. A
+    smaller budget the row already carries, such as the task's own, is kept. The
+    source rows are left as they are, so a retried group is budgeted afresh.
+
+    Args:
+        rows: Rows about to be dispatched.
+        remaining_s: Budget left on the prompt group's deadline.
+        margin_s: Seconds kept back for verification and the result's return.
+
+    Returns:
+        The rows to dispatch, each with its own copy of the Responses metadata.
+
+    Raises:
+        RolloutTimeout: Nothing is left beyond the margin, so a harness could not
+            run and be scored before the group deadline.
+        ValueError: There is no group deadline, or a row is a materialized
+            Environment Server task, whose server sets the harness budget itself.
+    """
+    if remaining_s is None:
+        raise ValueError(
+            "agent_timeout_margin_s is measured back from the prompt group's "
+            "rollout_timeout_s, which is unset"
+        )
+    budget_s = remaining_s - margin_s
+    if budget_s <= 0:
+        raise RolloutTimeout(
+            f"NeMo-Gym prompt group has {remaining_s:.1f}s of its rollout deadline "
+            f"left, within agent_timeout_margin_s={margin_s}; no harness can run and "
+            "be scored in time"
+        )
+    handed = []
+    for row in rows:
+        if is_nemo_gym_task(row):
+            raise ValueError(
+                "agent_timeout_margin_s does not apply to materialized NeMo-Gym "
+                "tasks: their Environment Server sets the harness budget from the task"
+            )
+        params = row.get("responses_create_params")
+        if not isinstance(params, dict):
+            raise TypeError(
+                "agent_timeout_margin_s requires each NeMo-Gym row to carry a "
+                "responses_create_params dict"
+            )
+        metadata = params.get("metadata")
+        if metadata is None:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            raise TypeError("responses_create_params.metadata must be a dict")
+        metadata = dict(metadata)
+        try:
+            carried_s = float(metadata.get(_NEMO_GYM_AGENT_TIMEOUT_KEY, math.inf))
+        except (TypeError, ValueError):
+            carried_s = math.inf
+        # Gym ignores a non-positive or non-finite budget, so this one does not cap.
+        if not 0 < carried_s < math.inf:
+            carried_s = math.inf
+        # Metadata values are strings in the Responses API.
+        metadata[_NEMO_GYM_AGENT_TIMEOUT_KEY] = f"{min(carried_s, budget_s):.3f}"
+        handed.append(
+            {**row, "responses_create_params": {**params, "metadata": metadata}}
+        )
+    return handed
 
 
 def _nemo_gym_metric_namespace(row: Mapping[str, Any]) -> str:
@@ -380,15 +456,18 @@ class RolloutStats:
 class RolloutTimeouts:
     """Deadlines for the blocking waits inside one rollout.
 
-    Resolved from ``async_rl.rollout_failure.nemo_gym.rollout_timeout_s`` and
-    ``async_rl.rollout_failure.native.{generation,env}_timeout_s``, which own the
-    user-facing defaults. ``None`` means no deadline,
+    Resolved from ``async_rl.rollout_failure.nemo_gym.{rollout_timeout_s,
+    agent_timeout_margin_s}`` and ``async_rl.rollout_failure.native.{generation,
+    env}_timeout_s``, which own the user-facing defaults. ``None`` means no deadline,
     reproducing the historical behaviour of waiting indefinitely.
+    ``agent_margin_s`` is the part of ``rollout_s`` kept back from the budget handed
+    to each NeMo-Gym harness; ``None`` hands the harness nothing.
     """
 
     rollout_s: Optional[float] = None
     generation_s: Optional[float] = None
     env_s: Optional[float] = None
+    agent_margin_s: Optional[float] = None
 
 
 def _classify_generation_failure(
@@ -549,6 +628,17 @@ class _Deadline:
             raise RolloutTimeout(
                 f"{self._description} exceeded {self._seconds}s"
             ) from timeout_error
+
+    def remaining(self) -> Optional[float]:
+        """Seconds of budget left, banked or live; ``None`` when disabled."""
+        if self._remaining is not None:
+            return self._remaining
+        if self._timeout is None:
+            return None
+        when = self._timeout.when()
+        if when is None:
+            return None
+        return max(0.0, when - asyncio.get_running_loop().time())
 
     def suspend(self) -> None:
         """Disarm the clock, banking whatever budget is left."""
@@ -1319,6 +1409,7 @@ class AsyncNemoGymRolloutImpl:
         dispatch_recorder: Optional[RolloutDispatchRecorder] = None,
         admission_closed_rows: Optional[set[int]] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
+        group_deadline: Optional[_Deadline] = None,
     ) -> Optional[dict[str, Any]]:
         """Dispatch ``pending`` rows and fill their slots in ``results`` as they land.
 
@@ -1340,6 +1431,8 @@ class AsyncNemoGymRolloutImpl:
                 ``dispatch_recorder``.
             recovery_granularity: Whether a failed row is re-sent on its own or
                 its whole prompt group is replaced.
+            group_deadline: The prompt group's deadline; with an agent margin
+                configured, each dispatch hands its harness what is left of it.
 
         Returns:
             The environment's timing metrics, or None if the stream ended without them.
@@ -1368,6 +1461,15 @@ class AsyncNemoGymRolloutImpl:
                         _PARKED_REDISPATCH_BACKOFF_S * 2 ** min(refusal_streak - 1, 16),
                         _MAX_PARKED_REDISPATCH_BACKOFF_S,
                     )
+                )
+            if self._timeouts.agent_margin_s is not None:
+                # Stamped per dispatch: a re-sent row gets only what is left.
+                pending_rows = _hand_agent_timeout(
+                    pending_rows,
+                    remaining_s=None
+                    if group_deadline is None
+                    else group_deadline.remaining(),
+                    margin_s=self._timeouts.agent_margin_s,
                 )
             dispatched = {row["_rowidx"] for row in pending_rows}
             inputs_by_rowidx = {row["_rowidx"]: row for row in pending_rows}
@@ -1669,7 +1771,7 @@ class AsyncNemoGymRolloutImpl:
                 self._timeouts.rollout_s,
                 "NeMo-Gym prompt group",
                 registry=self._deadline_registry,
-            ):
+            ) as group_deadline:
                 # Rows Gym refuses at checkpoint admission are re-sent inside
                 # _stream_rows; only a lost or failed row spends an attempt.
                 attempt = 1
@@ -1701,6 +1803,7 @@ class AsyncNemoGymRolloutImpl:
                             dispatch_recorder=dispatch_recorder,
                             admission_closed_rows=admission_closed_rows,
                             recovery_granularity=recovery_granularity,
+                            group_deadline=group_deadline,
                         )
                     except Exception as error:
                         last_error = error
@@ -1708,6 +1811,8 @@ class AsyncNemoGymRolloutImpl:
                         # prompt NeMo-Gym cannot serve fails the same way every time.
                         resend = (
                             classify_rollout_failure(error) is FailureClass.INFRA
+                            # Only _hand_agent_timeout raises it in here: no budget left.
+                            and not isinstance(error, RolloutTimeout)
                             and attempt < max_row_attempts
                         )
                         if not resend:

@@ -104,6 +104,30 @@ Set these keys in a YAML file, where a key such as `weather:train` needs no quot
 
 An Environment Server can report a failed episode as terminal, meaning a retry cannot succeed. The single controller does not retry such a prompt, and under the default `async_rl.rollout_failure.max_skipped_prompts: 0` the run stops. Non-terminal failures, such as an unavailable model server, are retried as infrastructure failures.
 
+### Score rollouts that reach the deadline
+
+`async_rl.rollout_failure.nemo_gym.rollout_timeout_s` is a backstop for the whole prompt group: when it fires, the group is retried or dropped and every row's work is lost. Set `agent_timeout_margin_s` to hand the deadline to the harness instead. Each dispatched row then carries the group's remaining time minus the margin as `responses_create_params.metadata.agent_timeout_sec`, the per-row budget Gym harnesses read through `resolve_agent_timeout`. A harness that honors it stops at that budget, verifies the work it kept, and returns a scored result that trains like any other.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `async_rl.rollout_failure.nemo_gym.agent_timeout_margin_s` | `null` (off) | Seconds of `rollout_timeout_s` kept back for verification and the result's return. Requires `rollout_timeout_s`, and must be smaller than it. |
+
+```yaml
+async_rl:
+  rollout_failure:
+    nemo_gym:
+      rollout_timeout_s: 3600
+      agent_timeout_margin_s: 300   # harnesses stop after at most 3300 s and are scored
+```
+
+- A smaller `agent_timeout_sec` already in the row's metadata is kept. A re-dispatched row gets only the time the group has left.
+- A re-dispatch with no time left beyond the margin ends the group with `RolloutTimeout`, which is then retried or dropped by the prompt-group retry policy.
+- The scored result follows the usual rules: a valid reward, including zero, trains. A verifier that sets `mask_sample` keeps the row masked when `env.should_mask_flagged_samples` is on, and a failed `/run` or `/verify` request is a row failure, not a zero reward.
+- With token capture, only model calls that completed before the harness stopped train. A call still in flight at the budget is excluded from the trained chain.
+- Only harnesses that read `agent_timeout_sec` benefit, for example `opencode`, `claude_code`, `codex`, `miniswe_sandboxed` and `terminus_2_sandboxed`. Other agents run on their own limits and still meet the backstop.
+- The budget is wall-clock time, while `rollout_timeout_s` pauses during Gym checkpoints. A harness parked by a checkpoint can therefore stop earlier than necessary.
+- Setup rejects the margin with colocated generation, whose rollout clock pauses for every train step. Materialized taskset rows are rejected at dispatch, because an Environment Server takes the harness budget from its task configuration rather than from row metadata.
+
 ### Shard NeMo Gym across nodes
 
 NeMo RL normally starts one NeMo Gym actor for a job. That actor runs every configured Gym server on one node. Use `env.nemo_gym.shards` when the combined environments need more capacity than one node can provide.
