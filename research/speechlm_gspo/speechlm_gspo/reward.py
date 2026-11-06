@@ -34,7 +34,15 @@ def asr_reward(reference: str, hypothesis: str, metadata: dict[str, Any]) -> flo
     """Return unbounded ``1-error_rate`` with metadata-driven Mandarin CER."""
     language = str(metadata.get("language") or metadata.get("lang") or "").lower()
     metric = metadata.get("reward_metric") or "wer"
-    if (
+    if metric == "mer":
+        # Match Speech's ASCEND evaluation: Chinese characters / English words.
+        from nemo.collections.speechlm2.parts.metrics.mer import mer_tokens
+
+        ref, hyp = mer_tokens(reference).split(), mer_tokens(hypothesis).split()
+        if not ref:
+            raise ValueError("MER requires a nonempty normalized reference")
+        error = _edit_distance(ref, hyp) / len(ref)
+    elif (
         language in ("zh", "cmn", "cmn_hans_cn", "zh-cn", "zh_cn")
         and metadata.get("task") == "ordinary_asr"
     ):

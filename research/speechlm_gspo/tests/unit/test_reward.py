@@ -57,3 +57,13 @@ def test_mandarin_cer():
     assert asr_reward("今 天 use AI", "今天use AI", MANDARIN_CER) == 1
     with pytest.raises(ValueError):
         asr_reward("", "你好", MANDARIN_CER)
+
+
+def test_ascend_mer():
+    pytest.importorskip("nemo.collections.speechlm2.parts.metrics.mer")
+    metadata = {"reward_metric": "mer"}
+    assert asr_reward("你好 world", "你好 world", metadata) == 1
+    assert asr_reward("你好 world", "你好 word", metadata) == pytest.approx(2 / 3)
+    assert asr_reward("你好 world", "world", metadata) == pytest.approx(1 / 3)
+    with pytest.raises(ValueError, match="nonempty"):
+        asr_reward("", "你好", metadata)
