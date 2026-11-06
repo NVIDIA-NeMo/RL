@@ -395,6 +395,16 @@ def _train_fields_for_step(
     return fields
 
 
+def _worker_group_snapshots(worker_group: Any) -> Callable[[], list[dict[str, Any]]]:
+    """Snapshot source reading every rank's data-plane counters in one fan-out."""
+
+    def fan_out() -> list[dict[str, Any]]:
+        futures = worker_group.run_all_workers_single_data("get_data_plane_snapshot")
+        return [s for s in ray.get(futures) if s]
+
+    return fan_out
+
+
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
 class SingleControllerActor:
     """CPU-only Ray actor that orchestrates the RL training loop.
@@ -658,6 +668,14 @@ class SingleControllerActor:
             self._buffer.set_post_write_enricher(self._teacher_coordinator.enrich)
         else:
             self._teacher_coordinator = None
+        if self._value is not None:
+            self._trainer.add_data_plane_snapshot_fn(
+                _worker_group_snapshots(self._value.worker_group)
+            )
+        for teacher in teacher_worker_groups.values():
+            self._trainer.add_data_plane_snapshot_fn(
+                _worker_group_snapshots(teacher.worker_group)
+            )
         # Only with fleet health: without a ledger nothing ever reaches DEAD, so there
         # is nothing for a supervisor to restart.
         _fleet_health_cfg = master_config.async_rl.generation_fleet_health
@@ -2385,11 +2403,13 @@ class SingleControllerActor:
     async def _log_data_plane_metrics_impl(self, total_step_time: float) -> None:
         """Log this step's data-plane cost. No-op unless observability is enabled.
 
-        This client issues only the advantage stage's get, the advantage put and
-        the post-train clear; the bulk traffic is in the trainer workers' own
-        clients. The trainer merges this client's counters with its worker
-        ranks' into one cluster view. The fan-out blocks on ``ray.get``, so it
-        runs off the event loop.
+        This client's share depends on the configuration: it writes the rollout
+        rows unless token capture moves that to the finalizer actors, and it
+        issues the advantage get and put unless advantage workers take them.
+        The trainer merges this client's counters with its worker ranks', the
+        finalizer, advantage, generation, critic and teacher sources into one
+        cluster view. The fan-out blocks on ``ray.get``, so it runs off the
+        event loop.
         """
         result = await asyncio.to_thread(
             self._trainer.get_data_plane_step_metrics,
