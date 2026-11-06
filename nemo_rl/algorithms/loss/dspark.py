@@ -730,7 +730,10 @@ def dspark_tiled_objective(
     shard beginning at ``draft_vocab_start_index``. ``hard_labels`` contains the
     sampled target tokens mapped into that global selected-vocabulary ordering.
 
-    The returned numerators combine CE, TV, and confidence with ``loss_weights``.
+    The returned ``DraftLossStats`` numerators combine CE, TV, and confidence
+    with ``loss_weights``. A zero weight skips its term, so that term adds no
+    gradient path. A nonzero confidence weight without ``confidence_logits``
+    raises ``ValueError``.
     Numerators and counts remain additive across data-parallel ranks. Reduce
     counts externally before calling ``normalized``. Detached
     ``slot_weights`` scale both numerator contributions and the global valid-slot
@@ -809,10 +812,15 @@ def dspark_tiled_objective(
             confidence_rows.reshape(-1) * valid_mask.reshape(-1).float(),
         )
 
+    # Zero-weight terms are skipped so they add no gradient path and no 0 * inf.
+    numerators = torch.zeros_like(ce_numerators)
+    for weight, component in zip(
+        loss_weights, (ce_numerators, tv_numerators, confidence_numerators)
+    ):
+        if weight != 0:
+            numerators = numerators + weight * component
     return DraftLossStats(
-        numerators=loss_weights[0] * ce_numerators
-        + loss_weights[1] * tv_numerators
-        + loss_weights[2] * confidence_numerators,
+        numerators=numerators,
         counts=counts,
         weights=resolved_slot_weights,
     )
