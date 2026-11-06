@@ -225,7 +225,16 @@ class NoOpDataPlaneClient(DataPlaneClient):
                     )
                 out[f].append(row[f])
 
-        stacked = {f: _stack_or_nest(out[f]) for f in select_fields}
+        # Deferred: multimodal_utils loads optional processor dependencies.
+        from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
+
+        # Match TQ: even a single media row must retain its wire row boundary.
+        stacked = {
+            f: torch.nested.as_nested_tensor(out[f], layout=torch.jagged)
+            if f in PACKED_MULTIMODAL_FIELDS
+            else _stack_or_nest(out[f])
+            for f in select_fields
+        }
         return TensorDict(stacked, batch_size=(len(sample_ids),))
 
     def list_sample_ids(self, partition_id: str) -> list[str]:

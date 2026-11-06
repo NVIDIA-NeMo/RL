@@ -2890,6 +2890,38 @@ class TestPeriodicRolloutCheckpoint:
 
 
 class TestDataPlaneCheckpoint:
+    def test_saves_canonical_custom_field_declaration(self, tmp_path):
+        client = _FakeDPClient()
+        actor = SimpleNamespace(
+            _dp_client=client,
+            _partition_id="rollout_data",
+            _async_cfg=SimpleNamespace(sampler=SimpleNamespace(name="in_order")),
+            _teacher_coordinator=None,
+            _master_config=SimpleNamespace(
+                token_capture=SimpleNamespace(forest_training=False),
+                data_plane={
+                    "packed_multimodal_fields": [
+                        "z_features",
+                        "a_features",
+                        "z_features",
+                    ],
+                },
+            ),
+        )
+        asyncio.run(
+            _ACTOR_CLS._save_data_plane_checkpoint(
+                actor,
+                str(tmp_path),
+                train_steps=3,
+                trainer_version=3,
+                current_epoch=0,
+            )
+        )
+        assert client.save_calls[0]["metadata"]["packed_multimodal_fields"] == [
+            "a_features",
+            "z_features",
+        ]
+
     @pytest.mark.nemo_gym
     @pytest.mark.parametrize(
         "damage",
@@ -3024,6 +3056,7 @@ class TestDataPlaneCheckpoint:
         metadata = dp_client.save_calls[0]["metadata"]
         assert metadata["single_controller_train_steps"] == 3
         assert metadata["single_controller_trainer_version"] == 7
+        assert metadata["packed_multimodal_fields"] == []
         assert metadata["single_controller_epoch"] == 2
         assert metadata["forest_training"] is forest_training
         assert metadata["forest_execution_row_multiple"] == (
