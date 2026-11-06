@@ -188,7 +188,7 @@ def extract_flat_score_centering_samples(
     if (
         (token_ids < 0).any()
         or (token_ids > torch.iinfo(torch.int32).max).any()
-        or not torch.isfinite(logprobs).all()
+        or logprobs.isnan().any()
         or (logprobs > 1e-5).any()
     ):
         raise ValueError("Invalid sampler top-k token id or log probability")

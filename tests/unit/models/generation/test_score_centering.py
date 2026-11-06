@@ -204,16 +204,18 @@ def _flat_output(token_ids, rows):
 def test_flat_score_centering_matches_per_position_extraction():
     # Each flat row holds the sampled token, then the head by rank.
     flat = _flat_output(
-        [9, 3],
+        [9, 3, 5],
         [
             [(9, -3.0), (1, -0.3), (2, -1.8)],
             # A sampled token inside the head appears twice.
             [(3, -0.1), (3, -0.1), (4, -10000.0)],
+            # Top-k/top-p sampling gives filtered candidates -inf.
+            [(5, 0.0), (5, 0.0), (6, -float("inf"))],
         ],
     )
     nested = SimpleNamespace(
         index=0,
-        token_ids=[9, 3],
+        token_ids=[9, 3, 5],
         logprobs=[
             {
                 9: SimpleNamespace(rank=7, logprob=-3.0),
@@ -223,6 +225,10 @@ def test_flat_score_centering_matches_per_position_extraction():
             {
                 3: SimpleNamespace(rank=1, logprob=-0.1),
                 4: SimpleNamespace(rank=2, logprob=-10000.0),
+            },
+            {
+                5: SimpleNamespace(rank=1, logprob=0.0),
+                6: SimpleNamespace(rank=2, logprob=-float("inf")),
             },
         ],
     )
