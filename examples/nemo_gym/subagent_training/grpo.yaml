@@ -1,0 +1,166 @@
+# Nano Omni text-only subagent-training example; run from the NeMo-RL root.
+defaults: ../grpo_nanov3.yaml
+grpo:
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 4
+  val_num_generations_per_prompt: 1
+  max_rollout_turns: 1
+  max_num_epochs: 40
+  max_num_steps: 20
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  overlong_filtering: false
+  seq_logprob_error_threshold: 1.05
+  async_grpo: null
+checkpointing:
+  enabled: true
+  save_data_plane: true
+  metric_name: null
+  checkpoint_dir: ${oc.env:SUBAGENT_RUN_DIR,logs/subagent-training}/checkpoints
+  save_period: 5
+  keep_top_k: 1
+  checkpoint_must_save_by: 00:03:40:00
+policy:
+  model_name: ${oc.env:SUBAGENT_MODEL}
+  is_vlm: true
+  tokenizer:
+    name: ${policy.model_name}
+    chat_template: ${oc.env:SUBAGENT_CHAT_TEMPLATE}
+    chat_template_kwargs:
+      enable_thinking: false
+      truncate_history_thinking: false
+  train_global_batch_size: 4
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 65536
+  logprob_chunk_size: null
+  make_sequence_length_divisible_by: 8
+  router_replay:
+    enabled: true
+  sequence_packing:
+    enabled: true
+    fuse_loss: false
+    train_mb_tokens: 65536
+    logprob_mb_tokens: 65536
+  dynamic_batching:
+    enabled: false
+  megatron_cfg:
+    tensor_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    expert_model_parallel_size: 16
+    pipeline_model_parallel_size: 1
+    virtual_pipeline_model_parallel_size: null
+    context_parallel_size: 1
+    sequence_parallel: true
+    activation_checkpointing: true
+    radio_force_cpe_eval_mode: true
+    clear_memory_caches_before_refit: true
+    freeze_moe_router: true
+    moe_router_enable_expert_bias: true
+    moe_router_bias_update_rate: 0.0
+    distributed_data_parallel_config:
+      overlap_grad_reduce: false
+      overlap_param_gather: false
+    scheduler:
+      lr_warmup_iters: 0
+  generation:
+    max_new_tokens: 2048
+    bad_words:
+    - <image>
+    - <img>
+    - </img>
+    mcore_generation_config:
+      refit_backend: null
+      parsers: []
+    vllm_cfg:
+      tensor_parallel_size: 2
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      gpu_memory_utilization: 0.5
+      max_model_len: 65536
+      enforce_eager: true
+      enable_prefix_caching: false
+      skip_tokenizer_init: false
+      load_format: dummy
+      logprobs_mode: raw_logprobs
+      reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nano_v3
+        chat_template_content_format: string
+        chat_template: ${policy.tokenizer.chat_template}
+        default_chat_template_kwargs:
+          enable_thinking: false
+          truncate_history_thinking: false
+    vllm_kwargs:
+      max_num_seqs: 4
+      limit_mm_per_prompt:
+        image: 20
+      mm_processor_cache_gb: 0
+      max_num_batched_tokens: 65536
+      mamba_ssm_cache_dtype: float32
+      enable_chunked_prefill: false
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 1
+data:
+  max_input_seq_length: 65536
+  train:
+    data_path: ${oc.env:SUBAGENT_EXAMPLE_DIR}/data/train.jsonl
+  validation:
+    data_path: ${data.train.data_path}
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  nemo_gym:
+    model_endpoint_readiness_timeout_seconds: 2400
+    is_trajectory_collection: false
+    skip_venv_if_present: false
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - ${oc.env:SUBAGENT_EXAMPLE_DIR}/gym.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+token_capture:
+  enabled: true
+  forest_training: true
+  selection_policy: all_captured
+  defer_routed_experts_to_policy: false
+  num_reassembler_workers: 1
+data_plane:
+  enabled: true
+  impl: transfer_queue
+  backend: simple
+  claim_meta_poll_interval_s: 0.5
+  simple:
+    num_storage_units: ${mul:2, ${cluster.num_nodes}}
+async_rl:
+  log_full_train_data: true
+  sampler:
+    name: in_order
+    max_lookahead_versions: 0
+  min_groups_for_streaming_train: 1
+  max_inflight_prompts: 1
+  max_buffered_rollouts: 4
+  rollout_failure:
+    min_step_batch_fraction: 1
+logger:
+  log_dir: ${oc.env:SUBAGENT_RUN_DIR,logs/subagent-training}
+  wandb_enabled: true
+  wandb:
+    project: nemo-rl-subagent-training
+    name: ${oc.env:SUBAGENT_RUN_NAME,claude-code-foreground}
+    log_nemo_gym_full_result_tables: false
+  tensorboard_enabled: false
+  monitor_gpus: true
+cluster:
+  gpus_per_node: 8
+  num_nodes: 3
