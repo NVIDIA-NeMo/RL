@@ -92,7 +92,7 @@ grpo:
     in_flight_weight_updates: false
     recompute_kv_cache_after_weight_updates: false
 
-# Omega ignores this block (no ratio, clipping, TIS or KL term). Kept identical to grpo_birdbench.yaml;
+# Omega ignores this block (no ratio, clipping, TIS or KL term). Kept identical to grpo_birdbench_upd1.yaml;
 # only force_on_policy_ratio matters and must stay false (Omega needs real prev_logprobs).
 # Vanilla GRPO by default. Flip use_cispo: true (and keep ratio_clip_min/max)
 # to switch to CISPO -- same run_grpo.py entrypoint, config-only change.
