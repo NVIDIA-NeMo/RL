@@ -4506,6 +4506,7 @@ def test_streaming_ppo_filtered_single_token_has_finite_loss_and_gradients() -> 
         {
             "total_reward": torch.tensor([2.0, 7.0]),
             "token_mask": torch.tensor([[0.0, 1.0, 0.0, 0.0], [0.0, 1.0, 1.0, 1.0]]),
+            "input_lengths": torch.tensor([2, 4]),
             "sample_mask": torch.ones(2),
             "values": torch.zeros(2, 4),
             "mask_sample": torch.tensor([False, True]),
@@ -4870,6 +4871,7 @@ def test_advantage_stage_statistics_participation_is_binary(policy: str) -> None
             "prompt_ids_for_adv": torch.zeros(batch_size, 1, dtype=torch.long),
             "total_reward": torch.tensor([1.0, 0.0, 5.0]),
             "token_mask": torch.ones(batch_size, sequence_length),
+            "input_lengths": torch.full((batch_size,), sequence_length),
             # Row 0 trains at half weight; row 2 is a token-capture placeholder.
             "sample_mask": torch.tensor([0.5, 1.0, 0.0]),
             "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
@@ -5038,6 +5040,7 @@ def test_advantage_stage_over_length_prompts_never_vote(policy: str) -> None:
             "prompt_ids_for_adv": torch.tensor([[0], [0], [1], [1]]),
             "total_reward": torch.tensor([1.0, 0.0, 0.0, 0.0]),
             "token_mask": token_mask,
+            "input_lengths": torch.full((4,), token_mask.shape[1]),
             "sample_mask": torch.tensor([1.0, 1.0, 0.0, 0.0]),
             "mask_sample": torch.zeros(4, dtype=torch.bool),
             "truncated": torch.zeros(4, dtype=torch.bool),
@@ -5144,6 +5147,7 @@ def test_advantage_stage_placeholders_never_vote(
                 "reward/a": rewards.clone(),
                 "reward/b": 2 * rewards,
                 "token_mask": tokens,
+                "input_lengths": torch.full((n,), tokens.shape[1]),
                 "sample_mask": torch.tensor([1.0] * 3 + [0.0] * (n - 3)),
                 "mask_sample": torch.tensor([False, False, True] + [False] * (n - 3)),
                 "truncated": torch.zeros(n, dtype=torch.bool),
