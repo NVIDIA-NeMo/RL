@@ -86,6 +86,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     NvFp4PerTokenRolloutConfig,
 )
 from nemo_rl.models.megatron.common import (
+    _unwrapped_chunks,
     clear_transient_megatron_caches,
     get_aux_loss_track_names,
     get_moe_metrics,
@@ -240,14 +241,6 @@ def _model_self_packs_mtp_loss_mask(model: Any) -> bool:
         bool(getattr(chunk, "model_owns_mtp_loss_mask_packing", False))
         for chunk in chunks
     )
-
-
-def _unwrapped_chunks(model: Any) -> list[Any]:
-    """Model chunks as a flat list, whatever wrapping the caller handed us."""
-    from megatron.core.utils import unwrap_model
-
-    unwrapped = unwrap_model(model)
-    return list(unwrapped) if isinstance(unwrapped, (list, tuple)) else [unwrapped]
 
 
 def _model_has_chunkwise_cp(model: Any) -> bool:

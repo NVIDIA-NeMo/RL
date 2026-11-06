@@ -235,7 +235,7 @@ class TQValue(TQDriverMixin, Value):
             meta,
             fields=list(DP_VALUE_TRAIN_FIELDS),
             task_name="value_train",
-            include_multimodal=False,
+            include_multimodal=self.cfg["megatron_cfg"]["enabled"],
         )
         with timer.time("value_training/shard_meta") if timer else nullcontext():
             metas, _ = shard_meta_for_dp(

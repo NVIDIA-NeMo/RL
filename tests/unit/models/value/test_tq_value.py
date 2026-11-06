@@ -147,7 +147,7 @@ class TestTQValueFanout:
         # logprob_mb_tokens rather than the (larger) train budget.
         assert mock_packing.call_args.args[0] == "logprob_mb_tokens"
 
-    @pytest.mark.parametrize("dispatch", ["get_values", "train"])
+    @pytest.mark.parametrize("dispatch", ["get_values", "train", "split"])
     @pytest.mark.parametrize(
         ("megatron_enabled", "expects_media"),
         [(True, True), (False, False)],
@@ -184,9 +184,15 @@ class TestTQValueFanout:
             if dispatch == "get_values":
                 v.get_values_from_meta(meta)
                 static_fields = set(VALUE_SEED_FIELDS)
-            else:
+                expected_worker_call = "get_values_presharded"
+            elif dispatch == "train":
                 v.train_from_meta(meta, loss_fn="LF")
                 static_fields = set(DP_VALUE_TRAIN_FIELDS)
+                expected_worker_call = "train_presharded"
+            else:
+                v.train_microbatches_from_meta(meta)
+                static_fields = set(DP_VALUE_TRAIN_FIELDS)
+                expected_worker_call = "train_microbatch_presharded"
 
         dispatched_fields = set(mock_shard.call_args.args[0].fields)
         media_fields = {"pixel_values", "image_grid_thw"}
@@ -196,6 +202,7 @@ class TestTQValueFanout:
             assert media_fields.isdisjoint(dispatched_fields)
         assert static_fields <= dispatched_fields
         assert "content" not in dispatched_fields
+        assert wg.run_all_workers_sharded_data.call_args.args[0] == expected_worker_call
 
     def test_train_from_meta_requests_the_value_train_columns(self):
         v, wg = _make_tq_value()
