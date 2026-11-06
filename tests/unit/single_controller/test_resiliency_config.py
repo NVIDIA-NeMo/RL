@@ -108,8 +108,12 @@ def test_single_forward_threshold_rejected_for_ppo() -> None:
 
 def test_single_forward_threshold_rejected_for_forest_training() -> None:
     cfg = _single_forward_config()
-    cfg.token_capture = TokenCaptureConfig.model_construct(forest_training=True)
-    with pytest.raises(ValueError, match="forest_training"):
+    # enabled=True so the "forest_training requires token_capture.enabled"
+    # check cannot stand in for the in-loss rejection.
+    cfg.token_capture = TokenCaptureConfig.model_construct(
+        enabled=True, forest_training=True
+    )
+    with pytest.raises(ValueError, match="seq_logprob_error_in_loss"):
         validate_single_controller_config(cfg)
 
 

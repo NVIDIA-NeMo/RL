@@ -987,6 +987,8 @@ def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> No
         == "seq-mask-tis",
         "loss_fn.use_kl_in_reward": loss.use_kl_in_reward,
         "loss_fn.positive_example_nll_weight": loss.positive_example_nll_weight != 0,
+        # The loss filters physical rows; forest training masks whole owners.
+        "loss_fn.seq_logprob_error_in_loss": loss.seq_logprob_error_in_loss,
         "grpo.use_dynamic_sampling": grpo.use_dynamic_sampling,
         "grpo.reward_shaping.enabled": grpo.reward_shaping.enabled,
         "grpo.reward_scaling.enabled": grpo.reward_scaling.enabled,
@@ -1580,12 +1582,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     if master_config.loss_fn.seq_logprob_error_in_loss:
         if is_ppo_run(master_config):
             raise ValueError("loss_fn.seq_logprob_error_in_loss requires GRPO")
-        # The loss filters physical rows; forest training masks whole owners.
-        if master_config.token_capture.forest_training:
-            raise ValueError(
-                "loss_fn.seq_logprob_error_in_loss does not support "
-                "token_capture.forest_training"
-            )
         _validate_seq_logprob_error_in_loss(master_config)
     _validate_algo_settings(master_config)
 
