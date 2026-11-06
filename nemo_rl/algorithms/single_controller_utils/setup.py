@@ -2412,12 +2412,12 @@ def setup_single_controller(
     # All finish before the rollout manager is built, so the pools exist before any checkpoint participant or restore.
     tail_started = time.perf_counter()
     with ThreadPoolExecutor(
-        max_workers=2, thread_name_prefix="setup-tail"
+        max_workers=3, thread_name_prefix="setup-tail"
     ) as tail_executor:
         finalizer_future = tail_executor.submit(_create_finalizers)
         advantage_future = tail_executor.submit(_create_advantage)
         if communicator_future is None:
-            # Not started with the builds: the Megatron-generation path, which synchronizes earlier.
+            # Not started with the builds: Megatron generation (synchronized earlier) or colocated generation.
             communicator_future = tail_executor.submit(_init_communicator)
     weight_synchronizer = communicator_future.result()
     finalizer_actors = finalizer_future.result()

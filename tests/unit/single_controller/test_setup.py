@@ -2755,13 +2755,15 @@ class TestSetup:
         assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
         fake_gym_shards.shutdown.assert_not_called()
 
+    @pytest.mark.parametrize("colocated", [False, True])
     def test_setup_tail_starts_communicator_and_actor_pools_together(
-        self, patched_factories
+        self, patched_factories, colocated: bool
     ):
         """The refit communicator rendezvous and both actor pools have no shared
         state, so setup starts them together: each waits here for the other two,
-        which a serial order could never satisfy."""
-        mc = _make_master_config(backend="vllm")
+        which a serial order could never satisfy. Colocated generation starts the
+        communicator in the tail; non-colocated vLLM starts it with the builds."""
+        mc = _make_master_config(backend="vllm", colocated=colocated)
         mc.policy["generation"].update(
             {
                 "model_name": "test-model",
