@@ -99,10 +99,10 @@ loss_fn:
   use_on_policy_kl_approximation: false
   # Corrects the vLLM-vs-Megatron logprob mismatch (largest for MoE routing). TIS clamps the per-token weight
   # pi_train/pi_vllm to [0.2, 5]; same values as the Lightning RLVR reference (nemotron-3.5-lightning/rlvr.yaml).
-  use_importance_sampling_correction: false
+  use_importance_sampling_correction: false # true
   truncated_importance_sampling_type: null # tis
-  truncated_importance_sampling_ratio: 5
-  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_ratio: null # 5
+  truncated_importance_sampling_ratio_min: null # 0.2
   token_level_loss: true
   use_cispo: false
   # ratio_clip_min: 1.0     # uncomment + set use_cispo: true for CISPO
@@ -124,11 +124,10 @@ policy:
     name: ${policy.model_name}
     chat_template_kwargs: null
 
-  # ONE optimizer update per rollout (same in grpo_birdbench.yaml and omega_birdbench.yaml for a side-by-side comparison):
-  # gbs == num_prompts_per_step x num_generations_per_prompt = 32 x 16 = 512. Omega requires this (its group weights come from
-  # the policy at the start of the step); for GRPO it makes the PPO ratio 1, so clipping is inactive and TIS still applies.
+  # 4 optimizer updates per rollout (matches omega_birdbench.yaml): each step generates 32 x 16 = 512 responses and
+  # trains on them in 512 / 128 = 4 minibatches (PPO ratio vs the rollout-start policy, so clipping/TIS are active).
   # Don't set loss_fn.force_on_policy_ratio: Omega needs real prev_logprobs (keep it off in both for parity).
-  train_global_batch_size: 512
+  train_global_batch_size: 128
   train_micro_batch_size: 1  # as in the Lightning RLVR reference (packing, not the micro-batch, sets token count)
   logprob_batch_size: ${policy.train_micro_batch_size}  # keep equal to train_micro_batch_size for TP >= 4 numerical consistency
 

@@ -38,15 +38,17 @@ grpo:
   loss_function: omega
   omega_loss:
     h: inverse_length  # h(x,y) = 1/|y|; register new choices in H_FUNCTIONS
-    form: per_sequence  # packing/CP compatible (this recipe needs packing); exact with ONE optimizer update per rollout
+    form: per_sequence  # packing/CP compatible (this recipe needs packing); weights recomputed before every update
   max_num_epochs: 20
-  num_prompts_per_step: 32
+  # A step is ONE optimizer update here (GRPO: one rollout), so step counts below are 4x grpo_birdbench.yaml's.
+  num_prompts_per_step: 8  # prompts per update; 4 x 8 = 32 prompts per rollout, as in GRPO
+  rollout_batch_multiplier: 4  # updates per rollout (buffered rollouts)
   num_generations_per_prompt: 16
   max_rollout_turns: 1  # bird_sql is single-turn (no tool calls)
-  max_num_steps: 2000
+  max_num_steps: 8000  # = 2000 rollouts
   normalize_rewards: false
   use_leave_one_out_baseline: false  # plain group-mean baseline (code default is true); as in a working 4-node run
-  val_period: 10
+  val_period: 40  # = every 10 rollouts
   val_start_at: -1
   val_at_start: false
   val_at_end: true
@@ -107,8 +109,8 @@ loss_fn:
   # pi_train/pi_vllm to [0.2, 5]; same values as the Lightning RLVR reference (nemotron-3.5-lightning/rlvr.yaml).
   use_importance_sampling_correction: false
   truncated_importance_sampling_type: null # tis
-  truncated_importance_sampling_ratio: 5
-  truncated_importance_sampling_ratio_min: 0.2
+  truncated_importance_sampling_ratio: null # 5
+  truncated_importance_sampling_ratio_min: null # 0.2
   token_level_loss: true
   use_cispo: false
   # ratio_clip_min: 1.0     # uncomment + set use_cispo: true for CISPO
@@ -120,7 +122,7 @@ checkpointing:
   metric_name: "val:accuracy"
   higher_is_better: true
   keep_top_k: 3
-  save_period: 10
+  save_period: 40  # = every 10 rollouts
   checkpoint_must_save_by: "00:03:50:00"
   save_optimizer: true
 
@@ -130,11 +132,11 @@ policy:
     name: ${policy.model_name}
     chat_template_kwargs: null
 
-  # ONE optimizer update per rollout (same in grpo_birdbench.yaml and omega_birdbench.yaml for a side-by-side comparison):
-  # gbs == num_prompts_per_step x num_generations_per_prompt = 32 x 16 = 512. Omega requires this (its group weights come from
-  # the policy at the start of the step); for GRPO it makes the PPO ratio 1, so clipping is inactive and TIS still applies.
+  # 4 optimizer updates per rollout (matches grpo_birdbench.yaml): grpo.rollout_batch_multiplier=4 generates 4 x 8 x 16 = 512
+  # responses at once, then takes 4 steps of 8 x 16 = 128. Omega requires gbs == num_prompts_per_step x num_generations_per_prompt;
+  # its weights are recomputed from the current policy before each update.
   # Don't set loss_fn.force_on_policy_ratio: Omega needs real prev_logprobs (keep it off in both for parity).
-  train_global_batch_size: 512
+  train_global_batch_size: 128
   train_micro_batch_size: 1  # as in the Lightning RLVR reference (packing, not the micro-batch, sets token count)
   logprob_batch_size: ${policy.train_micro_batch_size}  # keep equal to train_micro_batch_size for TP >= 4 numerical consistency
 
