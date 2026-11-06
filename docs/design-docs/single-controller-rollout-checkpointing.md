@@ -177,34 +177,21 @@ backend must use it.
 
 The metrics above are averages and counts. To check a stop and restore rollout by
 rollout, set `rollout_checkpointing.trace: true`. The controller then appends one
-JSON line per event to `rollout_trace.jsonl` in the log directory. Events are
-queued as they happen and a background thread writes them, so tracing never
-blocks the controller; a run that is killed loses only the last few
-milliseconds of events. Every line has the wall-clock time `t`, a `run` ID
-that is new for each process, and `event`.
-
-| Event | Written by | Fields besides `t`, `run` and `event` |
-|---|---|---|
-| `group_reserved`, `group_admitted` | Recovery ledger | `group_id`, `prompt_id`, `admission_id`, `target_step`, `restore_level` |
-| `attempt_dispatched`, `attempt_sealed`, `attempt_refused` | Recovery ledger | `group_id`, `prompt_id`, `generation_index`, `attempt`, `environment_attempt`, `environment_instance_id` |
-| `attempt_abandoned` | Recovery ledger | as above, plus `reason`: `dropped`, `failed`, `cancelled` (for example, by the run ending) or `restart`, and `whole_group` when prompt-group recovery threw the whole group away |
-| `attempt_resumed` | Recovery ledger, on restart | as above; `environment_attempt` is the environment's next attempt |
-| `group_sealed`, `group_discarded` | Recovery ledger | `group_id`, `prompt_id` |
-| `step_trained` | Train pump | `step`, `trainer_version`, `group_ids` |
-| `weights_synced` | Weight sync | `weight_version` |
-| `trainer_checkpoint_published` | Snapshotter | `step` |
-| `snapshot_published` | Snapshotter | `path`, `step`, `trainer_version`, `cut_time` (when the saved state was captured) |
-| `restore_started`, `restore_finished` | Restorer | `path`, `from_rollout_snapshot`; `replay_groups`, `unfinished_groups` |
+JSON line per event to `rollout_trace.jsonl` in the log directory; a run that is
+killed loses only the last few milliseconds of events. Each line has the
+wall-clock time `t`, a `run` ID that is new for each process, the `event` name
+and that event's fields. The events are listed in
+`nemo_rl/algorithms/rollout_checkpointing/trace.py`. Per-rollout events need
+ledger dispatch, so they appear only with rollout recovery.
 
 Rows match across runs by `prompt_id` (the dataset index) and `generation_index`;
-group and attempt IDs are new in every run. Per-rollout events need ledger
-dispatch, so they appear only with rollout recovery. From these events, a stop's
-thrown-away time is, for each attempt abandoned with `reason: restart`, the time
-from its last `attempt_dispatched` to the restored snapshot's `cut_time`; its
-lost progress is how much later the groups running at the stop reached
-`group_sealed` than the same prompts in runs that never stopped. A model call
-redone after a turn-level resume is not visible here: that needs the time
-the environment parked each rollout, which it does not report yet.
+group and attempt IDs are new in every run. A stop's thrown-away time is, for
+each attempt abandoned with `reason: restart`, the time from its last
+`attempt_dispatched` to the restored snapshot's `cut_time`; its lost progress is
+how much later the groups running at the stop reached `group_sealed` than the
+same prompts in runs that never stopped. A model call redone after a turn-level
+resume is not visible here: that needs the time the environment parked each
+rollout, which it does not report yet.
 
 ## Rules for New Code
 
