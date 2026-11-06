@@ -244,6 +244,7 @@ project-includes = [
   "nemo_rl/models/generation/dynamo/dynamo_generation.py",
   "nemo_rl/models/generation/dynamo/dynamo_worker.py",
   "nemo_rl/models/generation/dynamo/http_client.py",
+  "nemo_rl/models/generation/dynamo/legacy_managed_runtime.py",
   "nemo_rl/models/generation/dynamo/managed_runtime.py",
   "nemo_rl/models/generation/dynamo/metrics.py",
   "nemo_rl/models/generation/dynamo/refit.py",

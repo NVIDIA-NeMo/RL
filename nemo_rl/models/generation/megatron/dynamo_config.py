@@ -31,6 +31,10 @@ from nemo_rl.models.generation.interfaces import DisaggConfig
 # disaggregated: an aggregated Megatron engine is plain ``backend: megatron``.
 MegatronDynamoRole = Literal["prefill", "decode"]
 
+# Dynamo component each role registers under: the frontend's prefill router
+# sends the prefill leg to "prefill" and the decode leg to "backend".
+DYNAMO_COMPONENT_BY_ROLE: dict[str, str] = {"prefill": "prefill", "decode": "backend"}
+
 
 class EngineLayoutOverrides(BaseModel, extra="forbid"):
     """Parallel layout a prefill or decode engine uses instead of the shared one.

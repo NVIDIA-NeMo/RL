@@ -6,7 +6,7 @@ Kubernetes, DGD, multi-node engine-group, or non-vLLM mode.
 
 ## Ownership and placement
 
-Constructing `ManagedDynamoRuntime` is inert. Its explicit `start()` method
+Constructing `LegacyManagedDynamoRuntime` (`legacy_managed_runtime.py`) is inert. Its explicit `start()` method
 allocates ports, launches etcd and NATS JetStream, creates one Ray-managed
 `dynamo.vllm` process per model-parallel group, and starts the frontend. A
 worker group must fit on one node. Its world size is derived from vLLM tensor

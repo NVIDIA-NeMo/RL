@@ -62,7 +62,7 @@ A Dynamo upgrade must update and reverify these coupled locations:
   keys `nvext.engine_data.{prompt_token_ids,completion_token_ids,completion_logprobs}`;
   reverify them against real Dynamo output because unit tests validate only the
   expected local response shape
-- `nemo_rl/models/generation/dynamo/managed_runtime.py`: the managed
+- `nemo_rl/models/generation/dynamo/legacy_managed_runtime.py`: the managed
   `DYN_ENABLE_EXPERIMENTAL_PARSERS_V2=1` setting. Dynamo 1.3.0's legacy tool
   jail removes `nvext.engine_data`; remove this setting only after an upgraded
   Dynamo preserves the token metadata for `tool_choice=auto`

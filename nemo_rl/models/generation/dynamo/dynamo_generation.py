@@ -28,7 +28,9 @@ from nemo_rl.models.generation.dynamo.http_client import (
     async_http_post_json,
     format_dynamo_error,
 )
-from nemo_rl.models.generation.dynamo.managed_runtime import ManagedDynamoRuntime
+from nemo_rl.models.generation.dynamo.legacy_managed_runtime import (
+    LegacyManagedDynamoRuntime,
+)
 from nemo_rl.models.generation.dynamo.metrics import DynamoMetricsSampler
 from nemo_rl.models.generation.dynamo.refit import DynamoRefitChannel
 from nemo_rl.models.generation.dynamo.token_wrapper import DynamoTokenWrapperServer
@@ -240,9 +242,8 @@ class DynamoGeneration(GenerationInterface):
             raise RuntimeError(
                 "Managed Dynamo requires a non-colocated inference RayVirtualCluster."
             )
-        self._managed_runtime: Optional[ManagedDynamoRuntime] = ManagedDynamoRuntime(
-            cluster=cluster,
-            config=self.cfg,
+        self._managed_runtime: Optional[LegacyManagedDynamoRuntime] = (
+            LegacyManagedDynamoRuntime(cluster=cluster, config=self.cfg)
         )
         self._token_wrapper_server: Optional[DynamoTokenWrapperServer] = None
         self._dynamo_frontend_base_url = ""
