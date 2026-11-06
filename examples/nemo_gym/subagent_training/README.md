@@ -138,7 +138,6 @@ The paired-runtime validation on November 5, 2026 passed:
 | Maximum whole-rollout TMPE | 1.01936 |
 | Maximum physical-row TMPE | 1.16357; whole-rollout masking uses the pooled value above |
 
-[W&B validation run](https://wandb.ai/nvidia/nemo-rl-subagent-training/runs/kat6fu2v).
 The training job completed all steps; its original audit hit a deleted temporary
 child-output symlink. A corrected audit ran separately on the same saved tensors,
 lineage manifests and persistent native observations and passed. Training was not
