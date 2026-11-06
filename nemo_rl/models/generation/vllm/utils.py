@@ -796,14 +796,14 @@ def attach_sampler_topk_logprobs_to_chat_response_choices(
     outputs_by_index = {
         output.index: output for output in getattr(final_request_output, "outputs", [])
     }
-    from vllm.logprobs import FlatLogprobs
-
     for choice in getattr(response, "choices", []):
         output = outputs_by_index[choice.index]
+        # vLLM stores sample logprobs as a list of per-position dicts, or as
+        # FlatLogprobs when the request set flat_logprobs.
         extract = (
-            extract_flat_score_centering_samples
-            if isinstance(output.logprobs, FlatLogprobs)
-            else extract_score_centering_samples
+            extract_score_centering_samples
+            if output.logprobs is None or isinstance(output.logprobs, list)
+            else extract_flat_score_centering_samples
         )
         (
             choice.message.sampler_topk_token_ids,

@@ -459,12 +459,6 @@ class VllmAsyncGenerationWorkerImpl(
             install_output_loop_yield(
                 self.llm, reader_budget_s=output_loop_yield_budget_ms / 1000
             )
-        if self.cfg["vllm_cfg"].get("flat_logprobs"):
-            from nemo_rl.models.generation.vllm.patches import (
-                install_flat_logprobs_ids_only,
-            )
-
-            install_flat_logprobs_ids_only()
 
         # vLLM Metrics Logger
         # Metrics logger only enabled for per-actor, model-owner only

@@ -186,12 +186,12 @@ def extract_flat_score_centering_samples(
             "while extracting score-centering samples: "
             f"choice_idx={output.index}, top_k={num_candidates}."
         )
-    token_ids = torch.tensor(flat.token_ids[first:last], dtype=torch.int64).view(
-        num_generated, width
-    )
-    logprobs = torch.tensor(flat.logprobs[first:last], dtype=torch.float64).view(
-        num_generated, width
-    )
+    token_ids = torch.tensor(
+        flat.token_ids[first:last], dtype=torch.int64, device="cpu"
+    ).view(num_generated, width)
+    logprobs = torch.tensor(
+        flat.logprobs[first:last], dtype=torch.float64, device="cpu"
+    ).view(num_generated, width)
     if (
         (token_ids < 0).any()
         or (token_ids > torch.iinfo(torch.int32).max).any()
@@ -201,7 +201,8 @@ def extract_flat_score_centering_samples(
     ):
         raise ValueError("Invalid sampler top-k token id or log probability")
     if not torch.equal(
-        token_ids[:, 0], torch.tensor(output.token_ids, dtype=torch.int64)
+        token_ids[:, 0],
+        torch.tensor(output.token_ids, dtype=torch.int64, device="cpu"),
     ):
         raise RuntimeError("vLLM flat logprobs do not start with the sampled tokens")
     head_ids = token_ids[:, 1:]
