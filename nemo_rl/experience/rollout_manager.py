@@ -51,6 +51,7 @@ from nemo_rl.environments.nemo_gym_task import (
 from nemo_rl.experience.dynamic_sampling import (
     StepRewardStats,
     drain_step_reward_metrics,
+    mask_sample_flagged,
     participating_rewards,
     record_group_rewards,
     rewards_carry_no_signal,
@@ -3090,12 +3091,7 @@ class RolloutManager:
                     f"receipt={receipt.get('capture_key')!r}, "
                     f"expected={gate_rollout_id!r}"
                 )
-            mask_sample = bool(
-                (completion.env_extras or {}).get(MASK_SAMPLE)
-                or ((completion.env_extras or {}).get("instance_config") or {}).get(
-                    MASK_SAMPLE, False
-                )
-            )
+            mask_sample = mask_sample_flagged(completion.env_extras)
 
             if recovery_group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                 result = SiblingSealResult(

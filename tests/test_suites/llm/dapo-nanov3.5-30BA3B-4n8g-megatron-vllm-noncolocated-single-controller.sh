@@ -66,7 +66,7 @@ uv run tests/check_metrics.py $JSON_METRICS \
     'median(data["train/token_mult_prob_error"]) < 1.02' \
     'max(data["train/token_mult_prob_error"]) < 1.025' \
     'median(data["train/unfiltered_reward"]) > 0.48' \
-    'min(data["train/zero_variance_prompt_groups"]) > 0' \
+    'max(data["rollout/zero_variance_groups_total"]) >= 50' \
     'min(data["train/skipped_step"]) == max(data["train/skipped_step"]) == 0' \
     'min(data["train/dropped_prompt_groups"]) == max(data["train/dropped_prompt_groups"]) == 0' \
     'median(data["timing/train/total_step_time"]) < 700' \

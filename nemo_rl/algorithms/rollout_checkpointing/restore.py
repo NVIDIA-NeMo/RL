@@ -424,7 +424,9 @@ class RolloutRestorer(_UsesRolloutParts):
                     )
 
                 self._rollout_runtime.batch_shortfall = parsed_state.batch_shortfall
-                self._rollout_runtime.steps_allowed_short = parsed_state.steps_allowed_short
+                self._rollout_runtime.steps_allowed_short = (
+                    parsed_state.steps_allowed_short
+                )
                 canonical_state = self._buffer.metadata_state_dict(
                     saved_capacity=self._async_cfg.max_buffered_rollouts
                 )
@@ -794,9 +796,15 @@ class RolloutRestorer(_UsesRolloutParts):
             load_checkpoint_object, reserve_path, weights_only=False
         )
         if isinstance(reserve_state, dict):
-            self._rollout_runtime.replacement_reserve.extend(reserve_state.get("replacement", []))
-            self._rollout_runtime.filtered_reserve.extend(reserve_state.get("filtered", []))
-            reserve_state = list(self._rollout_runtime.replacement_reserve) + list(self._rollout_runtime.filtered_reserve)
+            self._rollout_runtime.replacement_reserve.extend(
+                reserve_state.get("replacement", [])
+            )
+            self._rollout_runtime.filtered_reserve.extend(
+                reserve_state.get("filtered", [])
+            )
+            reserve_state = list(self._rollout_runtime.replacement_reserve) + list(
+                self._rollout_runtime.filtered_reserve
+            )
         else:
             self._rollout_runtime.replacement_reserve.extend(reserve_state)
         print(

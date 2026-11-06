@@ -236,10 +236,8 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     # race the iteration order that checkpoint/resume accounting depends on. Diverting
     # happens before admit(), so a diverted batch never burns a target step.
     #
-    # Read when on_dropped_prompt="replace", and whenever dynamic sampling is on --
-    # filtering draws on the same pool under "shrink" too. Borrowing draws on it as
-    # well: a group is only ever taken from a later step when a spare is in hand to
-    # repay that step.
+    # Read when on_dropped_prompt="replace"; dynamic sampling uses its own pool.
+    # Fault-tolerance borrowing uses this pool to repay the later step.
     replacement_reserve_prompts: NonNegativeInt = 1
     # ── path-specific ──
     native: NativeRolloutFTConfig = Field(default_factory=NativeRolloutFTConfig)
