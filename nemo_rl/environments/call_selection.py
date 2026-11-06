@@ -37,17 +37,6 @@ type SelectionPolicy = Callable[
     [list[CallRecord], dict[str, Any]], tuple[list[CallRecord], str | None]
 ]
 
-_LENGTH_FINISH_REASONS = ("length", "max_tokens", "max_output_tokens")
-
-
-def _unusable(record: CallRecord) -> bool:
-    """Whether a call's completion cannot train (a failure, or a non-length stop)."""
-    return record.response_status in ("failed", "unknown") or (
-        record.response_status == "incomplete"
-        and bool(record.finish_reason)
-        and record.finish_reason not in _LENGTH_FINISH_REASONS
-    )
-
 
 def _output_items(
     result: dict[str, Any], *, captured_response_ids: set[str]
@@ -320,8 +309,14 @@ def select_all_captured(
     parents = {record.parent_call_id for record in records}
     selected = []
     for record in records:
+        unusable = record.response_status in ("failed", "unknown") or (
+            record.response_status == "incomplete"
+            and bool(record.finish_reason)
+            and record.finish_reason
+            not in ("length", "max_tokens", "max_output_tokens")
+        )
         if (
-            not _unusable(record)
+            not unusable
             or record.model_call_id == attribution.model_call_id
             or record.model_call_id in parents
         ):
@@ -375,6 +370,13 @@ def cap_selected_rows(
     ``delta_len`` its path adds outside the kept calls, then its whole path is
     kept. Draws stop at ``max_rows`` kept leaves or when no candidate remains.
 
+    ``delta_len`` counts every token a call appends, so a call's carried input
+    (a root's prompt, a child's tool results) weighs like its generation. The
+    token-free manifest has no exact generated count: the split between carried
+    and generated tokens exists only in the staged token masks, which selection
+    does not read, and a harness reports usage only for the responses it
+    returns, not for every captured call.
+
     The draw is seeded by the selection's call IDs, so one attempt always keeps
     the same rows. The selection must be closed (every parent selected); callers
     cap only selections that passed the completion and failure checks, so the
@@ -382,7 +384,7 @@ def cap_selected_rows(
     order, with each call moved after its kept parent.
     """
     by_call = {record.model_call_id: record for record in selected}
-    parents = {record.parent_call_id for record in selected}
+    parents = _parent_ids(selected)
     # Draws walk leaves by call ID, so the result ignores the selection's order.
     leaves = sorted(
         (record for record in selected if record.model_call_id not in parents),
@@ -437,6 +439,44 @@ def cap_selected_rows(
                     emitted.add(ancestor.model_call_id)
                     ordered.append(ancestor)
     return ordered
+
+
+def _parent_ids(selected: list[CallRecord]) -> set[str | None]:
+    return {record.parent_call_id for record in selected}
+
+
+def count_selected_rows(selected: list[CallRecord]) -> int:
+    """Count a closed selection's leaves, one training row each."""
+    parents = _parent_ids(selected)
+    return sum(record.model_call_id not in parents for record in selected)
+
+
+def cap_priority_sampled(
+    selected: list[CallRecord],
+    terminal_response_id: str,
+    max_rows: int,
+    *,
+    records: list[CallRecord],
+    result: dict[str, Any],
+) -> list[CallRecord]:
+    """``priority_sampled``: ``cap_selected_rows`` by the harness's priorities."""
+    return cap_selected_rows(
+        selected,
+        terminal_response_id,
+        max_rows=max_rows,
+        priorities=read_selection_priorities(result, records),
+    )
+
+
+# A row cap rule ``(selected, terminal_response_id, max_rows, *, records, result)``
+# returns a closed subset of a trainable selection that keeps the scored call's
+# path. ``records`` is every captured call of the attempt; ``result`` is the
+# harness result. ``token_capture.row_cap_rule`` names the rule.
+type RowCapRule = Callable[..., list[CallRecord]]
+
+ROW_CAP_RULES: dict[str, RowCapRule] = {
+    "priority_sampled": cap_priority_sampled,
+}
 
 
 SELECTION_POLICIES: dict[str, SelectionPolicy] = {

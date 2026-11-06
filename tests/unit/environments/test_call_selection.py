@@ -12,8 +12,10 @@ import pytest
 
 from nemo_rl.algorithms.single_controller_utils.config import TokenCaptureConfig
 from nemo_rl.environments.call_selection import (
+    ROW_CAP_RULES,
     SelectionPolicy,
     cap_selected_rows,
+    count_selected_rows,
     read_selection_priorities,
     resolve_selection_policy,
     select_all_captured,
@@ -283,3 +285,31 @@ def test_row_cap_requires_forest_training() -> None:
     TokenCaptureConfig(forest_training=True, max_rows_per_rollout=1)
     with pytest.raises(ValueError, match="requires forest_training"):
         TokenCaptureConfig(max_rows_per_rollout=1)
+
+
+def test_row_cap_rule_names_a_built_in_rule() -> None:
+    assert TokenCaptureConfig().row_cap_rule == "priority_sampled"
+    assert set(ROW_CAP_RULES) == {"priority_sampled"}
+    with pytest.raises(ValueError, match="row_cap_rule"):
+        TokenCaptureConfig(forest_training=True, row_cap_rule="first_roots")
+
+
+def test_priority_sampled_rule_reads_harness_priorities() -> None:
+    calls = forest(SUBAGENTS)
+    kept = ROW_CAP_RULES["priority_sampled"](
+        calls,
+        "resp-C",
+        2,
+        records=calls,
+        result={"selection_priorities": {"resp-H": 0}},
+    )
+    assert [c.model_call_id for c in kept] == ["A", "B", "C", "F", "H"]
+    assert (count_selected_rows(calls), count_selected_rows(kept)) == (4, 2)
+    with pytest.raises(ValueError, match="outside this capture"):
+        ROW_CAP_RULES["priority_sampled"](
+            calls,
+            "resp-C",
+            2,
+            records=calls,
+            result={"selection_priorities": {"resp-other": 0}},
+        )

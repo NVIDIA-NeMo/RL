@@ -169,6 +169,7 @@ for any selection policy:
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `token_capture.max_rows_per_rollout` | `null` | Maximum rows (root-to-leaf paths) per logical rollout. `null` trains every selected path. Requires `forest_training: true`. |
+| `token_capture.row_cap_rule` | `priority_sampled` | How the cap picks the rows it keeps. `priority_sampled`, described below, is the only rule. |
 
 | Harness result field | Meaning |
 |----------------------|---------|
@@ -178,11 +179,16 @@ When a selection has more leaves than the cap, the scored terminal's path is kep
 first. Each later draw takes the highest-priority class that still has a leaf
 outside the kept calls. Within that class, it draws one leaf with probability
 proportional to the tokens its path adds outside the kept calls, then keeps the
-whole path. Draws stop at the cap or when every leaf is kept. The weights use the
-manifest's `delta_len`, which counts each call's new input as well as its
-generated tokens, because the token-free manifest has no loss masks. Shared
-ancestors are counted once, so a leaf that shares most of its context with kept
-paths has a low weight.
+whole path. Draws stop at the cap or when every leaf is kept. Shared ancestors
+are counted once, so a leaf that shares most of its context with kept paths has
+a low weight.
+
+The weights use the manifest's `delta_len`, the number of tokens each call
+appends. That counts a call's new input, such as a root's prompt or a child's
+tool results, as well as its generated tokens. Selection has no exact generated
+count to use instead. The split between carried and generated tokens exists only
+in the staged loss masks, which selection does not read. A harness reports usage
+only for the responses it returns, not for every captured call.
 
 Without `selection_priorities`, all leaves other than the scored path form one
 class. Capture records carry no agent role, so a harness that knows its roles
@@ -199,6 +205,19 @@ never makes it trainable. Truncation, action-output flags, and turn counts use
 the capped selection, so a length-limited leaf that the cap drops does not
 truncate the rollout. The rollout keeps one reward and advantage however many
 rows it trains.
+
+The grouping prompt stays the first selected root's prompt, as without the cap.
+When the cap drops every row through that root, for example the main agent's
+context before a compaction, the selection still names the root and
+finalization reads the prompt from its staged call.
+
+Each finalized group reports what the cap removed:
+
+| Metric | Meaning |
+|--------|---------|
+| `finalize/row_cap_capped_rollouts` | Rollouts with more selected leaves than the cap. |
+| `finalize/row_cap_dropped_rows` | Selected leaves the cap left untrained. |
+| `finalize/row_cap_dropped_calls` | Selected calls the cap left untrained. |
 
 For a SingleController configuration that otherwise supports Gym token capture, set these overrides together:
 
