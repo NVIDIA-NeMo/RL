@@ -1,5 +1,7 @@
 # BF16CPUAdamW automatically retains/scales/clips GPU gradients and streams CPU updates.
 # Requires compatible CUDA/AutoModel/vLLM dependencies and the integrated source.
+# The HybridEP dispatcher needs all 48 EP ranks inside one NVLink domain: on GB200
+# NVL72, allocate the 12 nodes from a single rack (e.g. Slurm --segment=12).
 defaults: ../../grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 24
@@ -94,6 +96,12 @@ policy:
     context_parallel_size: 1
     expert_parallel_size: 48
     activation_checkpointing: true
+    # Leave room for HybridEP's first-use JIT and in-step TileLang compiles, during
+    # which other ranks wait in collectives longer than the 10-minute NCCL default.
+    distributed_timeout_minutes: 45
+    # Allocate the HybridEP buffer once for the largest micro-batch (the dynamic
+    # batching token budget) instead of reallocating it mid-step.
+    hybridep_max_tokens_per_rank: 3072
     env_vars:
       NRL_REFIT_SERIAL_COLLECTIVES: '1'
       NRL_REFIT_BUFFER_MEMORY_RATIO: '0.3'
@@ -108,7 +116,7 @@ policy:
         linear: torch
         rms_norm: torch_fp32
         experts: torch_mm
-        dispatcher: torch
+        dispatcher: hybridep
         rope_fusion: false
         gate_precision: float32
         enable_hf_state_dict_adapter: true
@@ -139,7 +147,7 @@ policy:
       tensor_parallel_size: 8
       expert_parallel_size: 8
       gpu_memory_utilization: 0.75
-      enforce_eager: true
+      enforce_eager: false
       max_model_len: ${policy.max_total_sequence_length}
       enable_prefix_caching: false
       use_deep_gemm: true
@@ -160,7 +168,10 @@ policy:
       language_model_only: true
       max_num_batched_tokens: 2048
       enable_chunked_prefill: true
-      max_num_seqs: 8
+      max_num_seqs: 32
+      # Capture CUDA graphs without Inductor compilation.
+      compilation_config:
+        backend: eager
     colocated:
       enabled: true
       resources:

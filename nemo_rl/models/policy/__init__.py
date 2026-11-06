@@ -194,6 +194,13 @@ class MoEParallelizerOptions(TypedDict):
 class DTensorConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
+    # Collective timeout (minutes) for the default process group and the FSDP2 /
+    # expert-parallel groups derived from it. None = torch default (10 for NCCL).
+    distributed_timeout_minutes: NotRequired[float | None]
+    # Allocate the HybridEP dispatch buffer for this many tokens per rank before the
+    # first forward instead of growing it at run time (set to the micro-batch token
+    # budget). Unset keeps Automodel's size-on-first-dispatch behavior.
+    hybridep_max_tokens_per_rank: NotRequired[int]
     _v2: NotRequired[bool]
     # Distributed parallelism sizes
     # data_parallel_size is derived from world_size / (tp * cp * ep)

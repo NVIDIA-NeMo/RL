@@ -42,6 +42,10 @@ from nemo_rl.models.automodel.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.automodel.moe_dispatch import (
+    presize_hybrid_ep_buffer,
+    release_moe_dispatcher_state,
+)
 from nemo_rl.models.automodel.router_replay import (
     configure_router_replay,
     router_replay_context,
@@ -441,6 +445,16 @@ class DTensorPolicyWorkerV2Impl(
         ) = model_and_optimizer_state
 
         configure_router_replay(self.model, self.cfg)
+        hybridep_max_tokens = self.cfg["dtensor_cfg"].get(
+            "hybridep_max_tokens_per_rank"
+        )
+        if hybridep_max_tokens is not None and not presize_hybrid_ep_buffer(
+            self.model, hybridep_max_tokens
+        ):
+            raise ValueError(
+                "dtensor_cfg.hybridep_max_tokens_per_rank is set, but the model has "
+                "no HybridEP dispatcher"
+            )
         if init_reference_model and (self.cfg.get("router_replay") or {}).get("enabled"):
             raise ValueError("AutoModel router replay does not yet support a reference policy")
 
@@ -1422,6 +1436,9 @@ class DTensorPolicyWorkerV2Impl(
         if self.optimizer is not None:
             self.move_optimizer_to_device("cpu")
 
+        # Release recompute activations that MoE dispatch state keeps alive;
+        # otherwise they pin cached segments and empty_cache() cannot free them.
+        release_moe_dispatcher_state(self.model)
         gc.collect()
         torch.cuda.empty_cache()
 
