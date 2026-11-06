@@ -1952,6 +1952,8 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
     assert len(dump_timings) == 1
     assert math.isfinite(dump_timings[0]) and dump_timings[0] > 0
 
+    # The stage writes in the background; the controller flushes before merging.
+    ctrl._advantage_computer.flush_train_data_dump()
     ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_receipts)
     dumped = [
         json.loads(line)
@@ -4475,6 +4477,9 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
         # The chunk above stands in for the stage's write, so stand in for the
         # receipt it would have reported alongside it too.
         ctrl._train_data_dump_receipts = [receipt]
+        # ...and for the in-process stage the commit flushes before merging.
+        ctrl._advantage_actors = []
+        ctrl._advantage_computer = SimpleNamespace(flush_train_data_dump=lambda: None)
 
     def finish_training() -> dict:
         assert not final.exists()
