@@ -30,6 +30,7 @@ from nemo_rl.distributed.worker_groups import (
     RayWorkerGroup,
     _check_dp_leader_worker_indices,
     _get_initializer_env_vars,
+    _merge_process_environment,
 )
 
 
@@ -46,6 +47,28 @@ def test_dp_leaders_may_be_an_ascending_subset_of_the_group_leaders():
 def test_dp_leaders_outside_the_group_leaders_are_rejected(requested):
     with pytest.raises(ValueError, match="ascending subset"):
         _check_dp_leader_worker_indices(requested, tied_group_leaders=[0, 2, 4, 6])
+
+
+def test_merge_process_environment_does_not_mutate_caller_mapping(monkeypatch):
+    # Regression for #3384: the caller's dict is a live reference into the
+    # master config, which CheckpointManager later writes to config.yaml.
+    monkeypatch.setenv("NRL_TEST_SECRET", "sk-must-not-leak")
+    env_vars = {"FOO": "bar"}
+
+    merged = _merge_process_environment(env_vars)
+
+    assert env_vars == {"FOO": "bar"}
+    assert merged is not env_vars
+    assert merged["FOO"] == "bar"
+    assert merged["NRL_TEST_SECRET"] == "sk-must-not-leak"
+
+
+def test_merge_process_environment_prefers_explicit_entries(monkeypatch):
+    monkeypatch.setenv("NRL_TEST_SHARED", "from-process")
+
+    merged = _merge_process_environment({"NRL_TEST_SHARED": "from-config"})
+
+    assert merged["NRL_TEST_SHARED"] == "from-config"
 
 
 def test_initializer_env_adds_hf_modules_cache_to_pythonpath(monkeypatch):
@@ -460,10 +483,17 @@ def test_custom_environment_variables(register_test_actor, virtual_cluster):
         cluster=virtual_cluster,
         remote_worker_builder=builder,
         workers_per_node=2,
-        env_vars=custom_env_vars.copy(),
+        env_vars=custom_env_vars,
     )
 
     assert len(worker_group.workers) == 2
+    # The caller's dict must not absorb the launcher's os.environ (#3384).
+    assert custom_env_vars == {
+        "CUSTOM_VAR_1": "test_value_1",
+        "CUSTOM_VAR_2": "test_value_2",
+        "NEMO_TEST_ENV": "nemo_test_value",
+        "DUMMY_TEST_VAR": "/custom/test/path",
+    }
 
     # Check that all workers have the custom environment variables set
     for i, worker in enumerate(worker_group.workers):
