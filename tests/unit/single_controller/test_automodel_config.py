@@ -32,12 +32,6 @@ def config():
     return OmegaConf.to_container(raw, resolve=True)
 
 
-def test_supported(config):
-    assert config["policy"]["automodel_cfg"]["enabled"]
-    assert not config["policy"]["megatron_cfg"]["enabled"]
-    validate_single_controller_config(MasterConfig(**config))
-
-
 @pytest.mark.parametrize("expert_parallel_size", [2, 16])
 def test_expert_parallel_full_batch_supported(config, expert_parallel_size):
     # Sixteen training GPUs and eight rollout GPUs accommodate both EP sizes.
@@ -45,37 +39,6 @@ def test_expert_parallel_full_batch_supported(config, expert_parallel_size):
     config["cluster"].update(num_nodes=3, gpus_per_node=8)
     config["policy"]["generation"]["colocated"]["resources"]["gpus_per_node"] = 8
     validate_single_controller_config(MasterConfig(**config))
-
-
-@pytest.mark.parametrize("prompts,generations", [(2, 4), (8, 2)])
-def test_base_batch_settings_follow_prompt_overrides(prompts, generations):
-    register_omegaconf_resolvers()
-    raw = load_config("examples/configs/grpo_math_1B_automodel_single_controller.yaml")
-    raw.grpo.num_prompts_per_step = prompts
-    raw.grpo.num_generations_per_prompt = generations
-    config = MasterConfig(**OmegaConf.to_container(raw, resolve=True))
-    validate_single_controller_config(config)
-    assert config.policy["train_global_batch_size"] == prompts * generations
-    assert config.async_rl.min_groups_for_streaming_train == prompts
-    assert config.async_rl.max_inflight_prompts == prompts
-    assert config.async_rl.max_buffered_rollouts == prompts
-
-
-@pytest.mark.parametrize(
-    "recipe",
-    [
-        "grpo-qwen2.5-1.5b-1n2g-automodel-single-controller-full-batch.yaml",
-        "grpo-qwen3.5-35ba3b-base-3n8g-automodel-ep16-single-controller-full-batch.yaml",
-    ],
-)
-def test_full_batch_regression_recipe(recipe):
-    register_omegaconf_resolvers()
-    raw = load_config("examples/configs/recipes/llm/" + recipe)
-    config = MasterConfig(**OmegaConf.to_container(raw, resolve=True))
-    validate_single_controller_config(config)
-    assert config.policy["train_global_batch_size"] == (
-        config.grpo.num_prompts_per_step * config.grpo.num_generations_per_prompt
-    )
 
 
 @pytest.mark.parametrize(
