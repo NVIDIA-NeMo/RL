@@ -1,0 +1,35 @@
+# Asynchronous, non-colocated variant of dapo-deepseek-v4.1-12n4g-fsdp2tp1-ep48-colocated-stream-adam.yaml.
+# Same algorithm (DAPO loss, reward scaling and shaping, sampling, learning rate, router replay, frozen Engram,
+# BF16 rollout). The trainer keeps the reference 12-node EP48 topology; generation moves to 4 dedicated nodes
+# (two vLLM TP8/EP8 engines, one engine per two GB200 nodes) with one step of trajectory staleness.
+# Measured on 16 GB200 nodes x 4 GPUs (see docs/guides/models/deepseek/deepseek-v4.1-flash.md): 48 steps,
+# AIME-2024 accuracy 0.4792 / 0.5042 / 0.5750 / 0.6333 at steps 10 / 20 / 30 / 40 (colocated synchronous run on
+# the same prompts: 0.4792 / 0.4958 / 0.5792 / 0.6125), generation-KL error 0.0005-0.0006, 127-644 s per step.
+# Requires the DAPO reward scaling / shaping calls in async_grpo_train (this branch's nemo_rl/algorithms/grpo.py).
+defaults: dapo-deepseek-v4.1-12n4g-fsdp2tp1-ep48-colocated-stream-adam.yaml
+grpo:
+  async_grpo:
+    enabled: true
+    max_trajectory_age_steps: 1
+    in_flight_weight_updates: false   # ten clean steps with true; left off pending a longer run
+policy:
+  dtensor_cfg:
+    expert_parallel_size: 48          # 12 training nodes x 4 GPUs; checkpointing needs 16 training nodes (EP64), see the guide
+  generation:
+    vllm_cfg:
+      async_engine: true              # required by async GRPO with the vLLM backend
+      enforce_eager: false            # CUDA graphs: vLLM owns the generation GPUs
+      gpu_memory_utilization: 0.90    # ~1.27 M KV-cache tokens per engine at max_model_len 3072
+    vllm_kwargs:
+      max_num_seqs: 96                # 192 samples per step over two engines in one wave
+      compilation_config:
+        backend: eager                # CUDA graphs without Inductor (the measured setting)
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 4                  # generation nodes; the trainer gets cluster.num_nodes - 4
+        gpus_per_node: 4
+cluster:
+  num_nodes: 16
+  gpus_per_node: 4
+  segment_size: 2                     # each two-node vLLM engine stays inside one NVLink domain

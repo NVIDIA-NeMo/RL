@@ -5201,6 +5201,17 @@ def async_grpo_train(
                 if hasattr(policy_generation, "snapshot_step_metrics"):
                     policy_generation.snapshot_step_metrics()
 
+                # DAPO reward scaling and overlong reward shaping, applied where the
+                # synchronous loop applies them (before the reward / advantage
+                # processing). Each trajectory is sampled from the replay buffer once.
+                repeated_batch = scale_rewards(
+                    repeated_batch, master_config.grpo.reward_scaling
+                )
+                if master_config.grpo.reward_shaping.enabled:
+                    repeated_batch = apply_reward_shaping(
+                        repeated_batch, master_config.grpo.reward_shaping
+                    )
+
                 print("▶ Processing rewards...")
                 with (
                     timer.time("reward_calculation"),

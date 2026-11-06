@@ -78,9 +78,13 @@ dataset download access. Configure W&B externally, or disable it at launch.
 | Model | Algorithm | Deployment | Recipe |
 | --- | --- | --- | --- |
 | DeepSeek V4.1 Flash | DAPO | Colocated AutoModel + vLLM | [Streaming CPU Adam recipe](../../../../examples/configs/recipes/llm/dapo-deepseek-v4.1-12n4g-fsdp2tp1-ep48-colocated-stream-adam.yaml) |
+| DeepSeek V4.1 Flash | DAPO | Asynchronous, non-colocated AutoModel + vLLM (one-step staleness) | [Async non-colocated recipe](../../../../examples/configs/recipes/llm/dapo-deepseek-v4.1-16n4g-fsdp2tp1-ep48-noncolocated-async-stream-adam.yaml) |
 
-Provision resources matching the YAML. Training and generation share devices;
-review both parallel layouts before changing resource counts.
+Provision resources matching the YAML. In the colocated recipe training and
+generation share devices; in the asynchronous variant
+`policy.generation.colocated.resources.num_nodes` generation nodes are carved
+out of `cluster.num_nodes`. Review both parallel layouts before changing
+resource counts.
 
 ### 3. Launch
 
@@ -129,6 +133,59 @@ settings. The launcher does not allocate nodes or start the cluster for you.
   optimizer state, but not the external frozen Engram table. Restore requires
   the same table source and compatible optimizer shard layout.
 
+## Asynchronous Non-Colocated Variant
+
+`dapo-deepseek-v4.1-16n4g-fsdp2tp1-ep48-noncolocated-async-stream-adam.yaml`
+runs the same DAPO recipe with asynchronous generation on dedicated nodes:
+
+- **Layout**: 12 training nodes (EP48, the reference trainer topology) plus
+  4 generation nodes, 16 GB200 nodes with 4 GPUs each. One vLLM TP8/EP8 engine
+  needs more than 1 TiB of HBM, i.e. two GB200 nodes, and
+  `cluster.segment_size: 2` keeps each engine inside one NVLink domain.
+- **Keys that differ from the reference recipe**: `grpo.async_grpo.enabled: true`
+  with `max_trajectory_age_steps: 1`, `policy.generation.colocated.enabled: false`
+  (`resources.num_nodes` is the number of generation nodes) and
+  `policy.generation.vllm_cfg.async_engine: true`. Generation runs with CUDA
+  graphs (`enforce_eager: false`, no Inductor), `gpu_memory_utilization: 0.90`
+  and `max_num_seqs: 96`, because two engines serve all 192 samples of a step.
+  `loss_fn.use_importance_sampling_correction` is already `true`.
+- **Reward scaling and shaping**: `async_grpo_train` on this branch applies
+  `scale_rewards` and `apply_reward_shaping` before the advantage computation,
+  at the same point as the synchronous loop, so the DAPO settings of the
+  reference recipe stay in effect and `examples/run_grpo.py` no longer rejects
+  them in async mode. Dynamic sampling remains unsupported in async mode.
+- **Refit**: weights reach vLLM through the collective refit path. With FSDP
+  CPU offload each rank onloads its shard, broadcasts it and offloads it again,
+  about 14 s per step on GB200.
+- **Measured** on 16 x 4 GB200 at branch commit `8e056c2f`, 48 steps at GBS 192,
+  validation every 10 steps on the same prompts as the colocated run:
+
+  | Step | Asynchronous non-colocated | Colocated synchronous |
+  | --- | --- | --- |
+  | 10 | 0.4792 | 0.4792 |
+  | 20 | 0.5042 | 0.4958 |
+  | 30 | 0.5750 | 0.5792 |
+  | 40 | 0.6333 | 0.6125 |
+
+  The generation-KL error stays at 0.0005 to 0.0006. A step takes 127 to 644 s
+  (median about 220 s, training plus logprob recomputation; exposed generation
+  at most 1.4 s, weight sync about 14 s) against 857 to 1283 s per step for the
+  colocated recipe as shipped. Ten further steps with
+  `in_flight_weight_updates: true` ran clean (step-10 accuracy 0.4500); the
+  switch stays off in the recipe pending a longer run.
+- **Checkpointing**: the 12 training nodes of this layout cannot write a
+  checkpoint — the save copies the CPU-offloaded optimizer state on top of a
+  650–708 GB host-memory steady state and the nodes run out of memory, as the
+  colocated 12-node recipe does. With 16 training nodes
+  (`policy.dtensor_cfg.expert_parallel_size: 64`, `cluster.num_nodes: 18`,
+  generation `resources.num_nodes: 2`, `max_num_seqs: 192`) the same recipe ran
+  all 50 steps with a checkpoint and a validation every 10 steps in one
+  3 h 47 min job: AIME-2024 0.4417 / 0.5125 / 0.5625 / 0.6250 / 0.6500 at
+  steps 10–50, five 4.4 TB saves in 82–133 s that include `replay_buffer.pt`,
+  training-node host peak 689 GB, exposed generation still below 1 s with one
+  engine. A resume from `step_50` restored the replay buffer and trained two
+  further steps.
+
 ## Reference Training Curves
 
 The following panels show raw, unsmoothed W&B metrics through training step 47
@@ -146,8 +203,9 @@ Validation markers show the recorded evaluation points only.
   50 steps at a 3K-token context length. Multi-turn training, longer contexts
   and long-run stability have not been established by this validation.
 - This guide covers text-only AutoModel training with synchronous, colocated
-  vLLM generation. It does not establish support for Megatron training,
-  SGLang generation, multimodal inputs or other deployment layouts.
+  vLLM generation and the asynchronous non-colocated variant above. It does
+  not establish support for Megatron training, SGLang generation, multimodal
+  inputs or other deployment layouts.
 - AutoModel router replay currently rejects sequence packing, training TP/CP
   greater than one and a separate reference policy.
 - Frozen host Engram requires BF16 rollout and does not support full-model FP8
