@@ -4111,6 +4111,12 @@ def _grpo_train_impl(
 
                 ## Checkpointing
                 consumed_samples += master_config.grpo.num_prompts_per_step
+                # Common W&B x-axis across algorithms: rollouts trained on so far. A step is one rollout
+                # for GRPO but one of rollout_batch_multiplier updates for buffered Omega (fractional here).
+                metrics["rollouts_seen"] = consumed_samples / (
+                    master_config.grpo.num_prompts_per_step
+                    * master_config.grpo.rollout_batch_multiplier
+                )
                 timeout.mark_iteration()
 
                 # +1 because step is 0-indexed
