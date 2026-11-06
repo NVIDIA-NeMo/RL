@@ -190,16 +190,9 @@ class CollectiveWeightSynchronizer(WeightSynchronizer):
     ) -> Optional[RefitMembership]:
         """The membership to track, or None for a backend that owns no DP worker group.
 
-        NOT every GenerationInterface has one. vLLM and TRT-LLM do; Megatron and SGLang
-        do not, and the interface declares nothing either way -- so reading
-        ``self._generation.worker_group`` assumes a vLLM shape that this synchronizer is
-        not entitled to assume.
-
-        That assumption once broke L1_Functional_Tests_Dynamo on the plain grpo.py path,
-        under the since-removed managed Dynamo backend:
-
-            grpo.py:1747  policy_generation.weight_synchronizer.init_communicator()
-            AttributeError: 'DynamoGeneration' object has no attribute 'worker_group'
+        NOT every GenerationInterface has one, and the interface declares nothing either
+        way -- so reading ``self._generation.worker_group`` assumes a vLLM shape that
+        this synchronizer is not entitled to assume.
 
         None means "this backend has no shards to track", which is the same thing an
         unrecorded membership already meant: every reconcile falls through to "nothing to

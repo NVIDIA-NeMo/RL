@@ -14,10 +14,10 @@
 """Dynamo stays out of NeMo RL's vLLM engines.
 
 The engines run NeMo RL's own vLLM and use Dynamo only through its
-engine-agnostic backend SDK, so a vLLM bump can break Dynamo serving only where
-it also breaks native vLLM. These guards fail if NeMo RL starts importing
-Dynamo's vLLM integration (or any other Dynamo module), or if the SDK itself
-starts importing vLLM.
+engine-agnostic backend SDK, so a vLLM bump can break Dynamo serving only in
+NeMo RL's own adapter (``dynamo/native_engine.py``). These guards fail if
+NeMo RL starts importing Dynamo's vLLM integration (or any other Dynamo
+module), or if the SDK itself starts importing vLLM.
 """
 
 import ast

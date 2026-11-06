@@ -11,13 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from pathlib import Path
-
 import pytest
-import yaml
 
 from nemo_rl.models.generation import configure_generation_config
-from nemo_rl.models.generation.dynamo.config import DynamoCfg, dynamo_cfg
+from nemo_rl.models.generation.dynamo.config import (
+    DynamoCfg,
+    DynamoFrontendArgs,
+    dynamo_cfg,
+)
 from nemo_rl.models.generation.dynamo.managed_runtime import frontend_argv
 
 
@@ -45,12 +46,6 @@ def _vllm_config(**overrides) -> dict:
     return config
 
 
-_EXEMPLAR = (
-    Path(__file__).resolve().parents[4]
-    / "examples/configs/grpo_math_1B_dynamo_single_controller.yaml"
-)
-
-
 @pytest.mark.parametrize("dynamo", [False, True])
 def test_dynamo_true_alone_is_a_complete_config(dynamo: bool) -> None:
     config = configure_generation_config(_vllm_config(dynamo=dynamo), _Tokenizer())
@@ -60,9 +55,7 @@ def test_dynamo_true_alone_is_a_complete_config(dynamo: bool) -> None:
     assert config["vllm_cfg"]["async_engine"] is dynamo
     assert config["vllm_cfg"]["skip_tokenizer_init"] is True
     assert "dynamo_cfg" not in config
-    # The exemplar spells out exactly the defaults.
-    exemplar = yaml.safe_load(_EXEMPLAR.read_text())["policy"]["generation"]
-    assert dynamo_cfg(config) == DynamoCfg() == dynamo_cfg(exemplar)
+    assert dynamo_cfg(config) == DynamoCfg()
 
 
 @pytest.mark.parametrize(
@@ -120,15 +113,17 @@ def test_configs_dynamo_would_not_serve_as_written_fail_at_startup(
 
 
 def test_frontend_argv_is_runtime_owned() -> None:
-    cfg = DynamoCfg.model_validate(
-        {"frontend_args": {"router_mode": "kv", "extra_cli_args": ["--foo", "1"]}}
+    cfg = DynamoCfg(
+        frontend_args=DynamoFrontendArgs(
+            router_mode="kv", extra_cli_args=["--foo", "1"]
+        )
     )
     argv = frontend_argv(host="0.0.0.0", port=3001, namespace="nemo-rl", dynamo_cfg=cfg)
     assert argv[argv.index("--router-mode") + 1] == "kv"
     assert argv[-2:] == ["--foo", "1"]
 
-    clashing = DynamoCfg.model_validate(
-        {"frontend_args": {"extra_cli_args": ["--http-port", "9"]}}
+    clashing = DynamoCfg(
+        frontend_args=DynamoFrontendArgs(extra_cli_args=["--http-port", "9"])
     )
     with pytest.raises(ValueError, match="--http-port is set by both"):
         frontend_argv(

@@ -17,8 +17,11 @@ The host is a real ``VllmAsyncGenerationWorkerImpl`` built without its
 constructor, so rollouts are sampled by the native worker's own helpers.
 """
 
+import ast
 import asyncio
+import importlib.util
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -32,6 +35,10 @@ vllm = pytest.importorskip("vllm")
 from dynamo.llm.exceptions import InvalidArgument  # noqa: E402
 
 from nemo_rl.models.generation.dynamo import native_engine  # noqa: E402
+from nemo_rl.models.generation.dynamo.config import (  # noqa: E402
+    DynamoCfg,
+    DynamoFrontendArgs,
+)
 from nemo_rl.models.generation.dynamo.rollout_client import (  # noqa: E402
     ROLLOUT_ANNOTATION,
 )
@@ -156,6 +163,24 @@ def test_rollouts_are_served_like_generate_async() -> None:
     }
 
 
+def test_a_cancelled_rollout_aborts_the_vllm_request_it_runs() -> None:
+    llm = _FakeLLM([_output([1, 2, 3], _completion([10], "stop"))])
+    aborted = []
+
+    async def abort(request_id):
+        aborted.append(request_id)
+
+    llm.abort = abort
+    engine = native_engine.NativeVllmEngine(_host(llm), leader_worker_idx=0)
+
+    _collect(engine, _rollout_request([1, 2, 3]))
+    # Dynamo's worker calls abort() when the frontend cancels a request.
+    asyncio.run(engine.abort(_Context()))
+
+    ((_, _, request_id),) = llm.calls
+    assert aborted == [request_id]
+
+
 def test_router_replay_routes_reach_rollouts_as_natively() -> None:
     routes = np.arange(5 * 2 * 2, dtype=np.int16).reshape(5, 2, 2)
     final = _output(
@@ -225,7 +250,11 @@ def _start_worker_config(monkeypatch, host) -> native_engine.WorkerConfig:
 
     async def start():
         await native_engine.start_dynamo_endpoint(
-            host, namespace="ns", engine_env=env, leader_worker_idx=0
+            host,
+            model_path="/snapshots/model",
+            namespace="ns",
+            engine_env=env,
+            leader_worker_idx=0,
         )
 
     asyncio.run(start())
@@ -237,6 +266,11 @@ def test_engines_register_for_rollouts_on_completions_only(monkeypatch) -> None:
     config = _start_worker_config(monkeypatch, _host(_FakeLLM()))
 
     assert config.namespace == "ns"
+    # Registered from the weight-free snapshot, served under the model's name.
+    assert (config.model_name, config.served_model_name) == (
+        "/snapshots/model",
+        "model",
+    )
     # NeMo RL's rollouts go to /v1/completions; no chat surface is registered.
     assert config.endpoint_types == "completions"
 
@@ -249,6 +283,20 @@ def test_requests_other_than_rollouts_are_refused() -> None:
         _collect(engine, {"token_ids": [1, 2, 3, 4]})
 
     assert llm.calls == []
+
+
+def test_an_engine_error_reaches_the_driver_with_its_cause() -> None:
+    host = _host(_FakeLLM())
+
+    async def serve_rollout(*args, **kwargs):
+        raise RuntimeError("the generation output did not include routed_experts")
+
+    host._serve_rollout = serve_rollout
+    engine = native_engine.NativeVllmEngine(host, leader_worker_idx=0)
+
+    # A 5xx would reach the driver as "Internal server error".
+    with pytest.raises(InvalidArgument, match="RuntimeError: .*routed_experts"):
+        _collect(engine, _rollout_request([1, 2, 3]))
 
 
 def test_an_endpoint_that_stops_serving_reports_why() -> None:
@@ -306,9 +354,7 @@ def test_engines_register_the_block_size_kv_events_are_hashed_with() -> None:
 def test_engines_publish_kv_events_only_where_the_kv_router_can_use_them(
     router_mode, prefix_caching, publishes
 ) -> None:
-    cfg = native_engine.DynamoCfg.model_validate(
-        {"frontend_args": {"router_mode": router_mode}}
-    )
+    cfg = DynamoCfg(frontend_args=DynamoFrontendArgs(router_mode=router_mode))
 
     config = native_engine.dynamo_kv_events_config(cfg, prefix_caching=prefix_caching)
 
@@ -319,3 +365,21 @@ def test_engines_publish_kv_events_only_where_the_kv_router_can_use_them(
         # A per-engine abstract socket, which vLLM's publisher binds and Dynamo's
         # source connects to: no port for two engines on a node to collide on.
         assert config["endpoint"].startswith("ipc://@")
+        other = native_engine.dynamo_kv_events_config(cfg, prefix_caching=True)
+        assert other["endpoint"] != config["endpoint"]
+
+
+def test_main_attention_kinds_match_dynamos() -> None:
+    # Read from source: importing dynamo.vllm would import Dynamo's vLLM integration.
+    spec = importlib.util.find_spec("dynamo.vllm.cache_info")
+    tree = ast.parse(Path(spec.origin).read_text())
+    (dynamos,) = [
+        ast.literal_eval(node.value)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            getattr(t, "id", None) == "MAIN_ATTENTION_KV_CACHE_KINDS"
+            for t in node.targets
+        )
+    ]
+    assert {kind.value for kind in native_engine._MAIN_ATTENTION_KINDS} == dynamos

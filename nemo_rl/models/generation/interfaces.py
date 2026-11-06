@@ -597,8 +597,7 @@ class GenerationInterface(ABC):
         Which Ray worker leads shard N depends on how shards are laid out across workers,
         which is the backend's business. Asking for it by shard index keeps that here
         rather than in the control loop, where the same arithmetic had a second copy that
-        also assumed every backend has a ``worker_group`` -- an assumption that has already
-        broken a lane once (``'DynamoGeneration' object has no attribute 'worker_group'``).
+        also assumed every backend has a ``worker_group``.
         """
         raise NotImplementedError
 
