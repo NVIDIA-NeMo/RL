@@ -48,6 +48,7 @@ import json
 import logging
 import math
 import os
+import re
 import shutil
 import statistics
 import threading
@@ -64,6 +65,7 @@ from typing import (
     Any,
     Awaitable,
     Callable,
+    Literal,
     Optional,
     Union,
     cast,
@@ -75,7 +77,6 @@ from ray.exceptions import RayActorError
 from wandb import Table
 
 from nemo_rl.algorithms import opd as opd_module
-from nemo_rl.algorithms.advantage_estimator import GRPOAdvantageEstimator
 from nemo_rl.algorithms.async_utils.replay_buffer import (
     CHECKPOINT_MUTATION_KINDS,
     DATA_PLANE_CHECKPOINT_DIR,
@@ -96,7 +97,6 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     create_sampler,
 )
 from nemo_rl.algorithms.grpo import (
-    GRPOConfig,
     GRPOSaveState,
     _save_adaptive_loss_state,
     _update_adaptive_loss_state,
@@ -124,6 +124,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageStageConfig,
     row_group_ids,
     split_meta_by_prompt_group,
+    validate_forest_estimator,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
@@ -178,8 +179,10 @@ from nemo_rl.data_plane.observability import (
 from nemo_rl.data_plane.schema import (
     DP_CALIB_INPUT_FIELDS,
     DP_TRAIN_FIELDS,
+    DP_VALUE_TRAIN_FIELDS,
     ROLLOUT_METRICS,
     ROUTE_PLAN_TAG,
+    ROUTER_EXCLUDED_ROWS,
     SAMPLER_TOPK_FIELDS,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -304,6 +307,22 @@ def _summarize_gym_episodes(episodes_by_instance: Mapping[str, Iterable[Any]]) -
             + (f" and {more} more" if more else "")
         )
     return "; ".join(parts) or "none"
+
+
+# Sample IDs _pad_forest_step_rows gives the copies it writes for one step.
+_STEP_PADDING_ID = re.compile(r"(.+)_pad\d+")
+
+
+def _step_padding_sample_ids(
+    sample_ids: set[str], expected_sample_ids: set[str]
+) -> set[str]:
+    """Return the step padding copies of expected rows among ``sample_ids``."""
+    return {
+        sample_id
+        for sample_id in sample_ids
+        if (match := _STEP_PADDING_ID.fullmatch(sample_id)) is not None
+        and match.group(1) in expected_sample_ids
+    }
 
 
 @dataclass(frozen=True)
@@ -503,6 +522,15 @@ class SingleControllerActor:
             sampler_head_required=master_config.loss_fn.score_centering
             or sampler_replay_enabled(master_config.policy["generation"]),
         )
+        # Workers mask these rows out of expert-bias statistics only when fetched.
+        self._router_excluded_fields: tuple[str, ...] = (
+            (ROUTER_EXCLUDED_ROWS,)
+            if master_config.token_capture.forest_training
+            and master_config.token_capture.exclude_padding_from_router_stats
+            else ()
+        )
+        self._train_fields += self._router_excluded_fields
+        self._forest_step_row_multiple = actor_args.forest_step_row_multiple
         self._dp_client = actor_args.dp_client
         self._dp_backend = master_config.data_plane["backend"]
         if self._dp_backend == "mooncake_cpu":
@@ -1243,7 +1271,15 @@ class SingleControllerActor:
             expected_group_size=self._algo_cfg.num_generations_per_prompt,
             expected_manifest_digest=expected_manifest_digest_value,
         )
-        await self._validate_replay_inventory(buffer_state)
+        # A rollout snapshot may hold a streamed step's padding copies.
+        await self._validate_replay_inventory(
+            buffer_state,
+            step_padding=(
+                "clear"
+                if self._master_config.token_capture.forest_padding_scope == "step"
+                else "reject"
+            ),
+        )
 
         if self._master_config.checkpointing.get("load_replay_buffer") is False:
             # Validate and load the native snapshot before discarding it. This keeps
@@ -1835,13 +1871,20 @@ class SingleControllerActor:
         )
 
     async def _validate_replay_inventory(
-        self, replay_metadata: TQReplayMetadataState
+        self,
+        replay_metadata: TQReplayMetadataState,
+        *,
+        step_padding: Literal["reject", "allow", "clear"] = "reject",
     ) -> None:
         """Require the canonical TQ keys to match the SC replay index exactly.
 
         Live checkpoint callers must hold the exclusive data-plane barrier so
         commits and clears cannot race this inventory read. Restore calls are
         also safe before the rollout and train pumps start any live writers.
+
+        With forest_padding_scope=step, a rollout snapshot taken mid-step also
+        holds that step's padding copies, which no replay group lists:
+        ``step_padding="allow"`` accepts them and ``"clear"`` deletes them.
         """
         expected_sample_ids = {
             sample_id
@@ -1856,6 +1899,17 @@ class SingleControllerActor:
                 partition_id=self._partition_id,
             )
         )
+        if step_padding != "reject":
+            padding_ids = _step_padding_sample_ids(
+                actual_sample_ids - expected_sample_ids, expected_sample_ids
+            )
+            if padding_ids and step_padding == "clear":
+                await self._call_dp(
+                    "clear_samples",
+                    sample_ids=sorted(padding_ids),
+                    partition_id=self._partition_id,
+                )
+            actual_sample_ids -= padding_ids
         missing_sample_ids = sorted(expected_sample_ids - actual_sample_ids)
         unexpected_sample_ids = sorted(actual_sample_ids - expected_sample_ids)
         if missing_sample_ids or unexpected_sample_ids:
@@ -3449,6 +3503,14 @@ class SingleControllerActor:
                         self._rollout_manager.suspend_request_deadlines()
                         await asyncio.to_thread(self._gen.finish_generation)
 
+                    if self._master_config.token_capture.forest_padding_scope == "step":
+                        with self._timer.time("data_processing"):
+                            train_meta, pad_meta = await self._pad_forest_step_rows(
+                                train_meta
+                            )
+                        if pad_meta is not None:
+                            consumed_metas.append(pad_meta)
+
                     # ---- 2. Prepare the batch ----
                     if self._is_ppo:
                         # Doing value inference first keeps each chunk to one visit
@@ -3773,6 +3835,16 @@ class SingleControllerActor:
                     groups_dispatched,
                 )
 
+                if forest_training and (
+                    groups_dispatched
+                    != self._target_groups_for_step(version_during_step)
+                    or len(logical_owners)
+                    != groups_dispatched * self._algo_cfg.num_generations_per_prompt
+                ):
+                    raise ValueError(
+                        "Forest optimizer step requires complete retained logical groups"
+                    )
+
                 if self._is_ppo:
                     if not step_has_valid_training_tokens:
                         raise RuntimeError(
@@ -3861,15 +3933,6 @@ class SingleControllerActor:
                             num_epochs=self._critic_ppo_epochs,
                         )
                 else:
-                    if forest_training and (
-                        groups_dispatched
-                        != self._target_groups_for_step(version_during_step)
-                        or len(logical_owners)
-                        != groups_dispatched * self._algo_cfg.num_generations_per_prompt
-                    ):
-                        raise ValueError(
-                            "Forest optimizer step requires complete retained logical groups"
-                        )
                     if not step_open:
                         raise RuntimeError(
                             "SingleController has no valid response tokens after "
@@ -4890,7 +4953,15 @@ class SingleControllerActor:
             saved_capacity=self._async_cfg.max_buffered_rollouts,
             additional_groups=training_owned_groups,
         )
-        await self._validate_replay_inventory(replay_metadata)
+        # Training may hold step padding copies; restore deletes them.
+        await self._validate_replay_inventory(
+            replay_metadata,
+            step_padding=(
+                "allow"
+                if self._master_config.token_capture.forest_padding_scope == "step"
+                else "reject"
+            ),
+        )
         replay_row_count = sum(
             len(group["meta"].sample_ids) for group in replay_metadata["groups"]
         )
@@ -6505,6 +6576,73 @@ class SingleControllerActor:
         await asyncio.to_thread(self._value.finish_inference)
         return meta.with_fields([self._advantage_cfg.values_field])
 
+    async def _pad_forest_step_rows(
+        self, meta: KVBatchMeta
+    ) -> tuple[KVBatchMeta, Optional[KVBatchMeta]]:
+        """Pad a Forest training batch once to the policy and critic row multiple.
+
+        Used with ``token_capture.forest_padding_scope: step``. Pad rows copy
+        real rows under new sample IDs with ``sample_mask`` zeroed;
+        ``forest_pad_source`` picks the copies. Returns the padded meta and the
+        pad rows' meta for post-step cleanup, or ``(meta, None)``.
+        """
+        num_pad = -meta.size % self._forest_step_row_multiple
+        if num_pad == 0:
+            return meta, None
+        assert meta.tags is not None
+        if self._master_config.token_capture.forest_pad_source == "row0":
+            sources = [0] * num_pad
+        else:
+            sources = [index % meta.size for index in range(num_pad)]
+        pad_ids = [
+            f"{meta.sample_ids[source]}_pad{index}"
+            for index, source in enumerate(sources)
+        ]
+        fields = await self._call_dp(
+            "get_samples",
+            sample_ids=[meta.sample_ids[source] for source in sources],
+            partition_id=meta.partition_id,
+            select_fields=list(meta.fields or []),
+        )
+        fields["sample_mask"] = torch.zeros_like(fields["sample_mask"])
+        if ROUTER_EXCLUDED_ROWS in fields.keys():
+            fields[ROUTER_EXCLUDED_ROWS] = torch.ones_like(fields[ROUTER_EXCLUDED_ROWS])
+        # Ownerless padding of the source's dispatch group, as in per-group padding.
+        tags = [
+            dict(meta.tags[source])
+            | {
+                "logical_rollout_id": None,
+                "logical_slot": None,
+                "segment_index": None,
+                "segment_count": 0,
+                "is_execution_padding": True,
+                "uses_borrowed_input": True,
+            }
+            | {key: 0 for key in VIOLATION_TAG_KEYS if key in meta.tags[source]}
+            for source in sources
+        ]
+        async with self._data_plane_checkpoint_barrier.mutation("other"):
+            await self._call_dp(
+                "put_samples",
+                sample_ids=pad_ids,
+                partition_id=meta.partition_id,
+                fields=fields,
+                tags=tags,
+            )
+        pad_meta = KVBatchMeta(
+            partition_id=meta.partition_id,
+            task_name=meta.task_name,
+            sample_ids=pad_ids,
+            fields=list(meta.fields or []),
+            sequence_lengths=(
+                [meta.sequence_lengths[source] for source in sources]
+                if meta.sequence_lengths is not None
+                else None
+            ),
+            tags=tags,
+        )
+        return meta.concat(pad_meta), pad_meta
+
     async def _value_train_epochs(
         self, metas: list[KVBatchMeta], *, num_epochs: int
     ) -> dict[str, Any]:
@@ -6513,18 +6651,31 @@ class SingleControllerActor:
         if value_loss_fn is None:
             raise RuntimeError("PPO value training requires a value loss function")
         await asyncio.to_thread(self._value.prepare_for_training)
+        # Forest steps carry a variable number of physical rows; the critic
+        # takes all of them as one optimizer step, like the policy.
+        gbs = sum(m.size for m in metas) if has_logical_owners(metas[0]) else None
         result: dict[str, Any] | None = None
         if self._algo_cfg.value_training_mode == "whole_batch":
             full_meta = metas[0].concat(*metas[1:])
             for _ in range(num_epochs):
                 result = await asyncio.to_thread(
-                    self._value.train_from_meta, full_meta, value_loss_fn
+                    self._value.train_from_meta,
+                    full_meta,
+                    value_loss_fn,
+                    gbs=gbs,
+                    train_fields=(
+                        *DP_VALUE_TRAIN_FIELDS,
+                        *self._router_excluded_fields,
+                    ),
                 )
         else:
             # Split prepares the API for per-chunk value streaming in a later PR;
-            # this controller still trains the critic after policy refit.
+            # this controller still trains the critic after policy refit. Forest,
+            # the only source of router-excluded rows, requires whole_batch.
             for _ in range(num_epochs):
-                await asyncio.to_thread(self._value.begin_train_step, value_loss_fn)
+                await asyncio.to_thread(
+                    self._value.begin_train_step, value_loss_fn, gbs=gbs
+                )
                 for meta in metas:
                     await asyncio.to_thread(
                         self._value.train_microbatches_from_meta, meta
@@ -6553,15 +6704,9 @@ class SingleControllerActor:
 
         logical = has_logical_owners(meta)
         if logical:
-            if (
-                self._is_ppo
-                or not isinstance(self._algo_cfg, GRPOConfig)
-                or self._algo_cfg.adv_estimator.name != "grpo"
-                or not isinstance(self._advantage_estimator, GRPOAdvantageEstimator)
-            ):
-                raise ValueError(
-                    "Forest logical owners require the standard GRPO estimator"
-                )
+            validate_forest_estimator(
+                self._algo_cfg, self._advantage_estimator, is_ppo=self._is_ppo
+            )
             validate_forest_objective(self._algo_cfg, self._master_config.loss_fn)
         if self._advantage_estimator is None:
             return meta, True

@@ -2549,6 +2549,48 @@ def test_legacy_ppo_entrypoint_rejects_split_value_training(
 
 
 @pytest.mark.parametrize(
+    "adv_estimator",
+    [
+        {"normalize_over": "all_rows", "whiten_execution_padding": False},
+        {"normalize_over": "all_rows", "whiten_execution_padding": True},
+    ],
+)
+def test_legacy_ppo_entrypoint_rejects_forest_whitening_options(
+    adv_estimator: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from examples import run_ppo
+
+    init_ray = MagicMock()
+    monkeypatch.setattr(run_ppo, "register_omegaconf_resolvers", MagicMock())
+    monkeypatch.setattr(
+        run_ppo,
+        "parse_args",
+        lambda: (SimpleNamespace(config="test.yaml"), []),
+    )
+    monkeypatch.setattr(run_ppo, "load_config", lambda _: {})
+    monkeypatch.setattr(run_ppo.OmegaConf, "to_container", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(run_ppo, "check_outdated_config", MagicMock())
+    monkeypatch.setattr(
+        run_ppo,
+        "MasterConfig",
+        lambda **_: SimpleNamespace(
+            ppo=SimpleNamespace(
+                async_ppo={},
+                value_training_mode="whole_batch",
+                adv_estimator=SimpleNamespace(**adv_estimator),
+            )
+        ),
+    )
+    monkeypatch.setattr(run_ppo, "init_ray", init_ray)
+
+    with pytest.raises(ValueError, match="normalize_over.*SingleController"):
+        run_ppo.main()
+
+    init_ray.assert_not_called()
+
+
+@pytest.mark.parametrize(
     ("mutate", "message"),
     [
         (

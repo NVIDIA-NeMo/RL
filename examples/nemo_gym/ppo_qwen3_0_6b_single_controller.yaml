@@ -1,0 +1,90 @@
+# PPO (GAE with a Megatron critic) on the NeMo-Gym workplace-assistant environment via
+# the SingleController path. Smoke-test scale: Qwen3-0.6B policy and critic on one node
+# with 2 GPUs (1 training, shared by the policy and the critic, + 1 vLLM generation).
+# tests/functional/ppo_async_gym_single_controller_context_compaction.sh loads this file
+# and adds Forest training, test data paths, checkpointing and logging.
+defaults:
+  # The PPO, critic and value-loss blocks; the Gym file below then supplies the
+  # policy, generation, data and environment sections.
+  - "../configs/ppo_math_1B_megatron_single_controller.yaml"
+  - "grpo_qwen3_30ba3b_instruct.yaml"
+
+# The Gym base is a GRPO config; the `ppo` block selects PPO.
+grpo: null
+
+ppo:
+  # SC requires one optimizer step per RL step:
+  # num_prompts_per_step * num_generations_per_prompt == policy.train_global_batch_size
+  num_prompts_per_step: 4
+  num_generations_per_prompt: 2
+  max_num_steps: 10  # short demo; raise for a real run
+  skip_reference_policy_logprobs_calculation: false
+
+# Token-level PPO clipping; the Gym base uses GSPO settings.
+loss_fn:
+  reference_policy_kl_penalty: 0.01
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.2
+  ratio_clip_c: null
+  use_importance_sampling_correction: true
+  sequence_level_importance_ratios: false
+  token_level_loss: true
+
+policy:
+  model_name: Qwen/Qwen3-0.6B
+  train_global_batch_size: 8
+  train_micro_batch_size: 1
+  # Full workplace-assistant prompts (all tools attached) run past 4k tokens.
+  max_total_sequence_length: 8192
+
+  automodel_cfg:
+    enabled: false
+  megatron_cfg:
+    enabled: true
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+
+  generation:
+    vllm_cfg:
+      # One generation GPU; the Gym base shards vLLM over 4.
+      tensor_parallel_size: 1
+      async_engine: true
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 1
+        gpus_per_node: 1
+
+value:
+  model_name: ${policy.model_name}
+  train_global_batch_size: ${policy.train_global_batch_size}
+  train_micro_batch_size: 1
+  max_total_sequence_length: ${policy.max_total_sequence_length}
+
+  megatron_cfg:
+    tensor_model_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    expert_model_parallel_size: 1
+    context_parallel_size: 1
+    sequence_parallel: false
+    scheduler:
+      # Allow resuming with a different max_num_steps.
+      override_opt_param_scheduler: true
+
+data:
+  # The Gym files carry the prompts; the math datasets of the PPO base do not apply.
+  train:
+    dataset_name: NemoGymDataset
+  validation:
+    dataset_name: NemoGymDataset
+
+env:
+  # Only the Gym environment runs; drop the PPO base's math environment.
+  math: null
+
+cluster:
+  gpus_per_node: 2
+  num_nodes: 1

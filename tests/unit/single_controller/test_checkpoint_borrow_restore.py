@@ -37,7 +37,10 @@ from nemo_rl.algorithms.single_controller import (
     DATA_PLANE_CHECKPOINT_DIR,
     SingleControllerActor,
 )
-from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
+from nemo_rl.algorithms.single_controller_utils.config import (
+    RolloutRecoveryConfig,
+    TokenCaptureConfig,
+)
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.failures import RolloutDataFailure
@@ -228,7 +231,7 @@ def _controller(
     controller._master_config = SimpleNamespace(
         grpo=controller._algo_cfg,
         checkpointing={"load_replay_buffer": True},
-        token_capture=SimpleNamespace(enabled=False, forest_training=False),
+        token_capture=TokenCaptureConfig(),
     )
     controller._dataloader = loader
     controller._rollout_permitted = asyncio.Event()

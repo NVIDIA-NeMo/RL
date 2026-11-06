@@ -3,7 +3,8 @@
 
 """Same-evidence per-call versus segment loss/gradient conservation on CPU.
 
-Uses real staging, finalization, controller advantages, and policy-gradient loss.
+Uses real staging, finalization, controller advantages, policy-gradient loss,
+and the PPO critic's value loss.
 Generation/storage are doubles; the order-sensitive toy model does not qualify
 Megatron, multimodal/router execution, or compaction versus no-compaction parity.
 """
@@ -23,7 +24,12 @@ pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 from nemo_gym.token_id_capture.staging.capture import ActiveCall, RolloutTokenCapture
 from nemo_gym.token_id_capture.staging.records import CommitCoords
 
+from nemo_rl.algorithms.advantage_estimator import (
+    GAEConfig,
+    GeneralizedAdvantageEstimator,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
@@ -34,7 +40,11 @@ from tests.unit.experience.test_logical_owner_finalization import (
     finalize,
     gym_harness,
 )
-from tests.unit.single_controller.test_logical_advantage import _batch, _controller
+from tests.unit.single_controller.test_logical_advantage import (
+    _batch,
+    _controller,
+    _ppo_controller,
+)
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -306,6 +316,242 @@ def test_same_calls_as_segments_preserve_loss_and_gradients(
     elif corruption == "denominator":
         denominator = 3  # Incorrect physical-row normalization.
     actual = _loss_gradient(model, merged, denominator=denominator)
+    if corruption is None:
+        for observed, wanted in zip(actual, expected, strict=True):
+            torch.testing.assert_close(observed, wanted, rtol=1e-9, atol=1e-12)
+    else:
+        assert not torch.allclose(actual[0], expected[0], rtol=1e-6, atol=1e-12)
+        assert not torch.allclose(actual[1], expected[1], rtol=1e-6, atol=1e-12)
+
+
+class _CausalValueModel(nn.Module):
+    """The recurrent toy above with a scalar value head at every position."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(1024, 8)
+        self.recurrent = nn.GRU(8, 8, batch_first=True)
+        self.head = nn.Linear(8, 1)
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        hidden, _ = self.recurrent(self.embedding(tokens))
+        return self.head(hidden)  # [B, S, 1]; the value loss squeezes it.
+
+
+def _value_loss_gradient(
+    model: nn.Module,
+    data: BatchedDataDict,
+    *,
+    denominator: int,
+    cliprange: float | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    model = deepcopy(model)
+    loss, _ = MseValueLossFn(MseValueLossConfig(cliprange=cliprange))(
+        model(data["input_ids"]),
+        data,
+        global_valid_seqs=data["sample_mask"].sum(),
+        global_valid_toks=torch.tensor(float(denominator)),
+    )
+    loss.backward()
+    gradients = torch.cat(
+        [parameter.grad.flatten() for parameter in model.parameters()]
+    )
+    assert torch.isfinite(loss) and torch.isfinite(gradients).all()
+    assert gradients.norm() > 1e-8, "zero gradients cannot establish conservation"
+    return loss.detach(), gradients
+
+
+def _old_values(model: nn.Module, input_ids: torch.Tensor) -> torch.Tensor:
+    """Frozen critic evidence; predictions stay inside a 0.2 clip range of it."""
+    with torch.no_grad():
+        return model(input_ids).squeeze(-1) - 0.05
+
+
+@pytest.mark.parametrize("dp_size", [1, 2])
+@pytest.mark.parametrize("filter_owner", [False, True])
+@pytest.mark.parametrize("cliprange", [None, 0.2])
+def test_packing_bins_preserve_forest_value_loss_accounting(
+    dp_size: int, filter_owner: bool, cliprange: float | None
+) -> None:
+    """Critic counterpart of the policy bin test: real PPO stage, real value loss."""
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 2), (3.0, 1)])], padding=True)
+    lengths = torch.tensor([3, 3, 2, 3, 2, 3])
+    data["token_mask"][lengths == 2, 2] = 0
+    if filter_owner:
+        data["mask_sample"][1] = True
+    input_ids = torch.arange(10, 28).reshape(6, 3)
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(11)
+        model = _CausalValueModel().double()
+    # Per-row GAE runs over the same old values the clipped loss reads.
+    data["values"] = _old_values(model, input_ids).float()
+    ctrl = _ppo_controller(meta, data)
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid
+    # A flagged segment drops every row of its owner.
+    assert data["sample_mask"][:2].sum() == (0 if filter_owner else 2)
+    batch = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": lengths,
+            "values": data["values"].double(),
+            "returns": data["returns"].double(),
+            "token_mask": data["token_mask"],
+            "sample_mask": data["sample_mask"],
+            "row_index": torch.arange(6),
+        }
+    )
+    shards, _ = batch.shard_by_batch_size(
+        dp_size,
+        batch_size=6,
+        sequence_packing_args={
+            "algorithm": "modified_first_fit_decreasing",
+            "input_key": "input_ids",
+            "input_lengths_key": "input_lengths",
+            "sequence_length_pad_multiple": 1,
+            "max_tokens_per_microbatch": 8,
+        },
+    )
+    microbatches = [
+        mb
+        for shard in shards
+        for mb in shard.make_microbatch_iterator_for_packable_sequences()
+    ]
+    seen = []
+    for mb in microbatches:
+        indices = mb["row_index"]
+        seen.extend(indices.tolist())
+        for field in batch:
+            torch.testing.assert_close(mb[field], batch[field][indices])
+    assert sorted(seen) == list(range(6)), "packing must retain each row exactly once"
+    assert any(mb.size > 1 for mb in microbatches)
+    denominator = int((batch["token_mask"] * batch["sample_mask"][:, None]).sum())
+    reference_loss, reference_grad = _value_loss_gradient(
+        model, batch, denominator=denominator, cliprange=cliprange
+    )
+    packed_loss, packed_grad = (
+        torch.zeros_like(reference_loss),
+        torch.zeros_like(reference_grad),
+    )
+    for mb in microbatches:
+        if not (mb["token_mask"] * mb["sample_mask"][:, None]).any():
+            continue
+        loss, grad = _value_loss_gradient(
+            model, mb, denominator=denominator, cliprange=cliprange
+        )
+        packed_loss += loss
+        packed_grad += grad
+    torch.testing.assert_close(packed_loss, reference_loss)
+    torch.testing.assert_close(packed_grad, reference_grad)
+
+
+# (owner, prompt, generated). The second call continues the first; the third is
+# a rewritten root of the same owner; the fourth is a sibling owner.
+_CRITIC_CALLS = [
+    ("g0", [10, 11], [1001, 1002]),
+    ("g0", [10, 11, 1001, 1002, 20], [1003]),
+    ("g0", [12, 13], [1004]),
+    ("g1", [10, 11], [1005]),
+]
+_CRITIC_REWARDS = {"g0": 1.0, "g1": 2.0}
+
+
+def _critic_rows(segments: list[list[int]]) -> BatchedDataDict:
+    """One row per segment: the last call's full input, every call's tokens trained."""
+    input_ids, token_masks, rewards = [], [], []
+    for calls in segments:
+        owner, prompt, generated = _CRITIC_CALLS[calls[-1]]
+        tokens = prompt + generated
+        mask = [0.0] * len(tokens)
+        for call in calls:
+            call_owner, call_prompt, call_generated = _CRITIC_CALLS[call]
+            end = len(call_prompt) + len(call_generated)
+            assert call_owner == owner and tokens[:end] == call_prompt + call_generated
+            mask[len(call_prompt) : end] = [1.0] * len(call_generated)
+        input_ids.append(torch.tensor(tokens))
+        token_masks.append(torch.tensor(mask, dtype=torch.float64))
+        rewards.append(_CRITIC_REWARDS[owner])
+    return BatchedDataDict(
+        {
+            "input_ids": pad_sequence(input_ids, batch_first=True),
+            "token_mask": pad_sequence(token_masks, batch_first=True),
+            "sample_mask": torch.ones(len(segments), dtype=torch.float64),
+            "total_reward": torch.tensor(rewards, dtype=torch.float64),
+        }
+    )
+
+
+def _critic_targets(data: BatchedDataDict) -> dict[int, tuple[list[int], float]]:
+    """Each trained token's full conditioning and return target."""
+    targets = {}
+    for row in range(data.size):
+        for position in (data["token_mask"][row] * data["sample_mask"][row]).nonzero():
+            index = position.item()
+            token = data["input_ids"][row, index].item()
+            assert token not in targets, "sampled token owned twice in this fixture"
+            targets[token] = (
+                data["input_ids"][row, :index].tolist(),
+                round(data["returns"][row, index].item(), 9),
+            )
+    return targets
+
+
+@pytest.mark.parametrize("cliprange", [None, 0.2])
+@pytest.mark.parametrize(
+    "corruption", [None, "reordered_history", "duplicate_loss", "denominator"]
+)
+def test_same_calls_as_segments_preserve_value_loss_and_gradients(
+    cliprange: float | None, corruption: str | None
+) -> None:
+    """Per-call rows and Forest segments of the same calls train the critic alike.
+
+    GAE runs per physical row; with lambda = gamma = 1 every trained token's
+    return is its owner's reward however the calls are split into rows.
+    """
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(11)
+        model = _CausalValueModel().double()
+    estimator = GeneralizedAdvantageEstimator(
+        GAEConfig(gae_lambda=1.0, gae_gamma=1.0, normalize_advantages=False),
+        ClippedPGLossConfig(),
+    )
+    batches = [
+        _critic_rows([[0], [1], [2], [3]]),
+        _critic_rows([[0, 1], [2], [3]]),
+    ]
+    for batch in batches:
+        batch["values"] = _old_values(model, batch["input_ids"])
+        _, batch["returns"] = estimator.compute_advantage(
+            prompt_ids=None,
+            rewards=batch["total_reward"],
+            mask=batch["token_mask"],
+            values=batch["values"],
+        )
+    assert _critic_targets(batches[0]) == _critic_targets(batches[1])
+    assert {
+        token: target for token, (_, target) in _critic_targets(batches[1]).items()
+    } == {1001: 1.0, 1002: 1.0, 1003: 1.0, 1004: 1.0, 1005: 2.0}
+    for batch in batches:
+        assert (batch["token_mask"] * batch["sample_mask"][:, None]).sum() == 5
+
+    expected = _value_loss_gradient(
+        model, batches[0], denominator=5, cliprange=cliprange
+    )
+    merged = batches[1]
+    denominator = 5
+    if corruption == "reordered_history":
+        merged["input_ids"][0, :2] = merged["input_ids"][0, :2].flip(0)
+    elif corruption == "duplicate_loss":
+        merged = BatchedDataDict(
+            {key: torch.cat([value, value[:1]]) for key, value in merged.items()}
+        )
+        with pytest.raises(AssertionError, match="owned twice"):
+            _critic_targets(merged)
+    elif corruption == "denominator":
+        denominator = 3
+    actual = _value_loss_gradient(
+        model, merged, denominator=denominator, cliprange=cliprange
+    )
     if corruption is None:
         for observed, wanted in zip(actual, expected, strict=True):
             torch.testing.assert_close(observed, wanted, rtol=1e-9, atol=1e-12)
