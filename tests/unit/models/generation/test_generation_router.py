@@ -50,6 +50,8 @@ class _Backend:
         self.status = status
         self.body = body
         self.requests: list[tuple[str, str, bytes]] = []
+        self.request_seen = asyncio.Event()
+        self.release_response: asyncio.Event | None = None
         self._runner: web.AppRunner | None = None
         self.port = _free_port()
 
@@ -62,6 +64,9 @@ class _Backend:
 
         async def _handle(request: web.Request) -> web.Response:
             self.requests.append((request.method, request.path, await request.read()))
+            self.request_seen.set()
+            if self.release_response is not None:
+                await self.release_response.wait()
             return web.Response(
                 status=self.status,
                 body=self.body,
@@ -220,6 +225,43 @@ class TestBackendSelection:
         assert harness.router._pick_backend() is not None
 
 
+class TestRouterMetrics:
+    def test_outstanding_requests_tracks_live_backend_calls(self):
+        async def _main():
+            backend = _Backend("b0")
+            backend.release_response = asyncio.Event()
+            async with _Harness([backend]) as harness:
+                assert harness.router.metrics()["router/requests_outstanding"] == 0.0
+
+                call = asyncio.create_task(harness.call("/v1/chat/completions"))
+                await asyncio.wait_for(backend.request_seen.wait(), timeout=2.0)
+                assert harness.router.metrics()["router/requests_outstanding"] == 1.0
+
+                backend.release_response.set()
+                status, _, _ = await asyncio.wait_for(call, timeout=2.0)
+                assert status == 200
+                assert harness.router.metrics()["router/requests_outstanding"] == 0.0
+                assert harness.router.metrics()["router/dispatches_total"] == 1.0
+
+        asyncio.run(_main())
+
+    def test_outstanding_requests_is_released_after_backend_timeout(self):
+        async def _main():
+            backend = _Backend("b0")
+            backend.release_response = asyncio.Event()
+            async with _Harness([backend], backend_timeout_s=0.1) as harness:
+                call = asyncio.create_task(harness.call("/v1/chat/completions"))
+                await asyncio.wait_for(backend.request_seen.wait(), timeout=2.0)
+                assert harness.router.metrics()["router/requests_outstanding"] == 1.0
+
+                await asyncio.wait_for(call, timeout=2.0)
+                assert harness.router.metrics()["router/requests_outstanding"] == 0.0
+                assert harness.router.metrics()["router/backend_error_total"] == 1.0
+                backend.release_response.set()
+
+        asyncio.run(_main())
+
+
 class TestNoHealthyBackend:
     def test_the_status_stays_outside_gyms_retry_set(self):
         """This is the whole ballgame.
@@ -252,6 +294,8 @@ class TestNoHealthyBackend:
                 assert (
                     harness.router.metrics()["router/no_healthy_backend_total"] == 1.0
                 )
+                assert harness.router.metrics()["router/requests_total"] == 1.0
+                assert harness.router.metrics()["router/dispatches_total"] == 0.0
 
         asyncio.run(_main())
 
