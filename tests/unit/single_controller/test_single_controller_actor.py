@@ -52,6 +52,7 @@ from nemo_rl.algorithms.grpo import (
     _initial_grpo_save_state,
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss.interfaces import make_objective_reduction
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import (
@@ -80,6 +81,7 @@ from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import (
     DP_TRAIN_FIELDS,
     GROUP_ID_TAG,
+    GROUP_TOKEN_MEAN_WEIGHT,
     ROLLOUT_METRICS,
     SAMPLER_TOPK_FIELDS,
 )
@@ -358,6 +360,7 @@ def _stamp_advantage_stage_config(
         opd_full_enabled=opd_full_enabled,
         message_level_advantage_penalties_enabled=penalties_enabled,
         shardable=shardable,
+        objective_reduction=make_objective_reduction("global_token_mean"),
         train_data_dump_dir=str(dump.log_dir) if dump is not None else None,
     )
     ctrl._advantage_computer = AdvantageComputer(
@@ -698,6 +701,41 @@ def test_reference_logprobs_required_only_when_kl_enabled(
     assert (
         "reference_policy_logprobs" in controller._train_fields
     ) is expected_reference_required
+
+
+@pytest.mark.parametrize("normalization", ["global_token_mean", "group_token_mean"])
+def test_train_fields_carry_the_reducer_columns(
+    monkeypatch, tmp_path, normalization
+) -> None:
+    monkeypatch.setattr(single_controller, "Logger", lambda _: MagicMock())
+    master_config = MasterConfig.model_construct(
+        data_plane=_data_plane_config(),
+        policy={
+            "train_global_batch_size": 8,
+            "generation": {
+                "top_k": None,
+                "top_p": 1.0,
+                "colocated": {"enabled": False},
+            },
+        },
+        grpo=GRPOConfig.model_construct(
+            num_prompts_per_step=2,
+            num_generations_per_prompt=4,
+            skip_reference_policy_logprobs_calculation=False,
+        ),
+        loss_fn=ClippedPGLossConfig(normalization=normalization),
+        async_rl=AsyncRLConfig(
+            min_groups_for_streaming_train=1,
+            max_buffered_rollouts=4,
+        ),
+        logger=LoggerConfig.model_construct(),
+        env={},
+        checkpointing=_checkpointing_config(tmp_path),
+    )
+    controller = _init_controller(master_config, _actor_args_for_init())
+    assert (GROUP_TOKEN_MEAN_WEIGHT in controller._train_fields) is (
+        normalization == "group_token_mean"
+    )
 
 
 @pytest.mark.parametrize("with_critic", [True, False], ids=["ppo", "grpo"])

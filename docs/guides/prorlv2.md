@@ -115,7 +115,7 @@ ProRLv2 enables token-level loss:
 
 ```yaml
 loss_fn:
-  token_level_loss: true
+  normalization: global_token_mean
 ```
 
 This computes the policy gradient loss per token (under masking) instead of aggregating per sequence, which is often helpful for long CoT/variable-length rollouts.
