@@ -698,6 +698,31 @@ def test_async_ppo_metrics_use_async_flag_without_grpo_config():
     assert "training_worker_idle_time_ratio" in perf
 
 
+@pytest.mark.parametrize("generated,seconds", [(24000, 5.0), (0, None)])
+def test_buffered_generation_throughput_counts_only_new_tokens(generated, seconds):
+    timing = {"policy_training": 4.0, "total_step_time": 10.0}
+    if seconds is not None:
+        timing["generation"] = seconds
+    metrics = {
+        "total_num_tokens": 8000.0,
+        "rollout/generated_tokens": generated,
+        "rollout/generated_sequences": 240 if generated else 0,
+    }
+    perf = print_performance_metrics(
+        {},
+        metrics,
+        timing,
+        _base_master_config(colocated=True),
+        num_prompts_per_step=8,
+        num_generations_per_prompt=10,
+        is_async_rl=False,
+    )
+    assert perf["generation_tokens_per_sec_per_gpu"] == (
+        generated / seconds / 16 if seconds else 0
+    )
+    assert perf["policy_training_tokens_per_sec_per_gpu"] == 8000 / 4 / 16
+
+
 # ============================================================================
 # Tests for calculate_baseline_and_std_per_prompt function
 # ============================================================================

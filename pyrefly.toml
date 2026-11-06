@@ -66,6 +66,7 @@ project-includes = [
   "nemo_rl/algorithms/mpo.py",
   "nemo_rl/algorithms/opd.py",
   "nemo_rl/algorithms/reward_functions.py",
+  "nemo_rl/algorithms/rollout_buffer.py",
   "nemo_rl/algorithms/single_controller.py",
   "nemo_rl/algorithms/single_controller_utils/__init__.py",
   "nemo_rl/algorithms/single_controller_utils/config.py",

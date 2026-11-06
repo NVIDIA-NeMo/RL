@@ -69,6 +69,7 @@ from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
 )
+from nemo_rl.algorithms.rollout_buffer import BUFFER_VERSION, RolloutBuffer
 from nemo_rl.algorithms.utils import (
     WALL_CLOCK_EFFICIENCY_CATEGORIES,
     calculate_baseline_and_std_per_prompt,
@@ -340,6 +341,9 @@ class GRPOConfig(BaseModel, extra="allow"):
     # Policy loss: "clipped_pg" (GRPO/PPO family) or "omega" (private softmax-weighted loss).
     loss_function: Literal["clipped_pg", "omega"] = "clipped_pg"
     omega_loss: OmegaLossConfig = OmegaLossConfig()
+    # Positive integer: collect this many update batches before generating again.
+    # Values >1 require synchronous, per-sequence Omega.
+    rollout_batch_multiplier: int = Field(default=1, ge=1, strict=True)
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
     max_num_epochs: int = 1
@@ -428,6 +432,8 @@ class GRPOSaveState:
     # SingleController only: exact last admitted dispatch batch. None preserves
     # compatibility with checkpoints that only recorded the trainer version.
     sampler_dispatch_index: Optional[int] = None
+    # Presence requires the synchronous rollout sidecar on resume.
+    rollout_buffer_version: Optional[int] = None
 
 
 def _initial_grpo_save_state() -> GRPOSaveState:
@@ -481,6 +487,25 @@ class MasterConfig(BaseModel, extra="allow"):
 # ===============================================================================
 # Setup & Initialization
 # ===============================================================================
+
+
+def _validate_rollout_buffer_config(master_config: MasterConfig) -> None:
+    if master_config.grpo.rollout_batch_multiplier == 1:
+        return
+    grpo = master_config.grpo
+    if grpo.loss_function != "omega" or grpo.omega_loss.form != "per_sequence":
+        raise ValueError(
+            "grpo.rollout_batch_multiplier > 1 requires per_sequence Omega"
+        )
+    validate_omega_setup(master_config)
+    if master_config.data["use_multiple_dataloader"]:
+        raise ValueError(
+            "Buffered rollouts currently require a single stateful dataloader"
+        )
+    if opd_module.is_opd_enabled(master_config):
+        raise ValueError(
+            "Buffered Omega rollouts do not support on-policy distillation"
+        )
 
 
 def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
@@ -659,6 +684,7 @@ def setup(
         policy_config["generation"] = generation_config
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
+    _validate_rollout_buffer_config(master_config)
 
     # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
     # path; everywhere else validation must sample exactly like training.
@@ -3096,6 +3122,31 @@ def _grpo_train_impl(
     total_valid_tokens = (
         grpo_save_state.total_valid_tokens
     )  # total valid tokens processed across all epochs
+    rollout_buffer = None
+    if master_config.grpo.rollout_batch_multiplier > 1:
+        _validate_rollout_buffer_config(master_config)
+        rollout_buffer = RolloutBuffer(
+            prompts_per_update=master_config.grpo.num_prompts_per_step,
+            responses_per_prompt=master_config.grpo.num_generations_per_prompt,
+            multiplier=master_config.grpo.rollout_batch_multiplier,
+        )
+        if total_steps:
+            if grpo_save_state.rollout_buffer_version != BUFFER_VERSION:
+                raise ValueError(
+                    "Buffered resume requires a compatible rollout-buffer checkpoint"
+                )
+            rollout_buffer.restore(
+                checkpointer.get_latest_checkpoint_path(), completed_steps=total_steps
+            )
+            print(
+                f"Restored {rollout_buffer.remaining_updates} buffered optimizer batches",
+                flush=True,
+            )
+    elif grpo_save_state.rollout_buffer_version is not None:
+        raise ValueError(
+            "Cannot disable rollout buffering when resuming a buffered checkpoint"
+        )
+
     val_at_start = master_config.grpo.val_at_start
     val_at_end = master_config.grpo.val_at_end
     val_period = master_config.grpo.val_period
@@ -3184,7 +3235,19 @@ def _grpo_train_impl(
         dynamic_sampling_num_gen_batches = 0
 
         # Run grpo/dapo training loop (single-turn)
-        for batch in wrapped_dataloader:
+        prompt_batches = (
+            wrapped_dataloader
+            if rollout_buffer is None
+            else rollout_buffer.prompt_batches(
+                wrapped_dataloader, max_num_steps - total_steps
+            )
+        )
+        for batch in prompt_batches:
+            collected_rollouts = (
+                rollout_buffer is None or not rollout_buffer.remaining_updates
+            )
+            rollout_metrics = {}
+            generation_logger_metrics = {}
             refit_metrics: dict[str, float] = {}
             # A central place to store logging data that won't be deleted until the loop ends
             metrics_logging_data = dict()
@@ -3215,215 +3278,250 @@ def _grpo_train_impl(
                     **{"rl.iteration": total_steps + 1, "rl.epoch": current_epoch + 1},
                 ),
             ):
-                # Prepare batch
-                print("▶ Preparing batch...", flush=True)
-                with (
-                    timer.time("data_processing"),
-                    managed_span(
-                        RLSpanGroup.DATA_PROCESSING,
-                        "rl.grpo.data_processing",
-                        tracer=_tracer,
-                    ),
-                ):
-                    if (
-                        master_config.grpo.deduplicate_multimodal_data
-                        and should_use_nemo_gym(master_config)
+                if collected_rollouts:
+                    # Prepare batch
+                    print("▶ Preparing batch...", flush=True)
+                    with (
+                        timer.time("data_processing"),
+                        managed_span(
+                            RLSpanGroup.DATA_PROCESSING,
+                            "rl.grpo.data_processing",
+                            tracer=_tracer,
+                        ),
                     ):
-                        attach_initial_nemo_gym_image_payloads(
-                            batch,
-                            processor,
-                            env_config=master_config.env,
+                        if (
+                            master_config.grpo.deduplicate_multimodal_data
+                            and should_use_nemo_gym(master_config)
+                        ):
+                            attach_initial_nemo_gym_image_payloads(
+                                batch,
+                                processor,
+                                env_config=master_config.env,
+                            )
+                        # Repeat batch items
+                        repeated_batch: BatchedDataDict[DatumSpec] = (
+                            batch.repeat_interleave(
+                                master_config.grpo.num_generations_per_prompt,
+                                share_immutable_media=(
+                                    master_config.grpo.deduplicate_multimodal_data
+                                ),
+                            )
                         )
-                    # Repeat batch items
-                    repeated_batch: BatchedDataDict[DatumSpec] = (
-                        batch.repeat_interleave(
-                            master_config.grpo.num_generations_per_prompt,
-                            share_immutable_media=(
-                                master_config.grpo.deduplicate_multimodal_data
-                            ),
+                        print_multimodal_payload_metrics(
+                            collect_multimodal_payload_metrics(
+                                repeated_batch,
+                                "prompt_repeat",
+                                enabled=master_config.grpo.debug_payload_metrics,
+                            )
                         )
-                    )
-                    print_multimodal_payload_metrics(
-                        collect_multimodal_payload_metrics(
-                            repeated_batch,
-                            "prompt_repeat",
-                            enabled=master_config.grpo.debug_payload_metrics,
+                        # Convert LLMMessageLogType to FlatMessagesType for generation
+                        batched_flat, input_lengths = (
+                            batched_message_log_to_flat_message(
+                                repeated_batch["message_log"],
+                                pad_value_dict={"token_ids": tokenizer.pad_token_id},
+                            )
                         )
-                    )
-                    # Convert LLMMessageLogType to FlatMessagesType for generation
-                    batched_flat, input_lengths = batched_message_log_to_flat_message(
-                        repeated_batch["message_log"],
-                        pad_value_dict={"token_ids": tokenizer.pad_token_id},
-                    )
-                    input_ids = batched_flat["token_ids"]
+                        input_ids = batched_flat["token_ids"]
 
-                # Generate responses - this updates the LLMMessageLogType in repeated_batch
-                memory_tracker.snapshot_start_of_stage("Generation", dir())
-                print(
-                    f"▶ Generating responses for batch of size {repeated_batch.size}...",
-                    flush=True,
-                )
-                with timer.time("prepare_for_generation/total"):
-                    if POLICY_GENERATION_STALE:
-                        # Compute KV scales if needed for FP8 quantization
-                        if sync_kv_scales and kv_scales_cache is None:
-                            print("▶ Computing KV cache scales...", flush=True)
-                            policy.prepare_for_lp_inference()
-                            # Align with training data processing to ensure parallel training compatibility
-                            calib_flat, calib_input_lengths = (
-                                batched_message_log_to_flat_message(
-                                    repeated_batch["message_log"],
-                                    pad_value_dict={
-                                        "token_ids": tokenizer.pad_token_id
-                                    },
-                                    make_sequence_length_divisible_by=master_config.policy[
-                                        "make_sequence_length_divisible_by"
-                                    ],
+                    # Generate responses - this updates the LLMMessageLogType in repeated_batch
+                    memory_tracker.snapshot_start_of_stage("Generation", dir())
+                    print(
+                        f"▶ Generating responses for batch of size {repeated_batch.size}...",
+                        flush=True,
+                    )
+                    with timer.time("prepare_for_generation/total"):
+                        if POLICY_GENERATION_STALE:
+                            # Compute KV scales if needed for FP8 quantization
+                            if sync_kv_scales and kv_scales_cache is None:
+                                print("▶ Computing KV cache scales...", flush=True)
+                                policy.prepare_for_lp_inference()
+                                # Align with training data processing to ensure parallel training compatibility
+                                calib_flat, calib_input_lengths = (
+                                    batched_message_log_to_flat_message(
+                                        repeated_batch["message_log"],
+                                        pad_value_dict={
+                                            "token_ids": tokenizer.pad_token_id
+                                        },
+                                        make_sequence_length_divisible_by=master_config.policy[
+                                            "make_sequence_length_divisible_by"
+                                        ],
+                                    )
                                 )
-                            )
-                            # Create calibration data from flattened messages
-                            calibration_data = BatchedDataDict[ClippedPGLossDataDict](
-                                {
-                                    "input_ids": calib_flat["token_ids"],
-                                    "input_lengths": calib_input_lengths,
-                                }
-                            )
-                            calibration_data.update(
-                                calib_flat.get_multimodal_dict(
-                                    as_tensors=False,
-                                    pixel_dtype=_policy_dtype(master_config.policy),
+                                # Create calibration data from flattened messages
+                                calibration_data = BatchedDataDict[
+                                    ClippedPGLossDataDict
+                                ](
+                                    {
+                                        "input_ids": calib_flat["token_ids"],
+                                        "input_lengths": calib_input_lengths,
+                                    }
                                 )
+                                calibration_data.update(
+                                    calib_flat.get_multimodal_dict(
+                                        as_tensors=False,
+                                        pixel_dtype=_policy_dtype(master_config.policy),
+                                    )
+                                )
+                                calibration_data.to("cpu")
+                                kv_scales_cache = policy.calibrate_qkv_fp8_scales(
+                                    calibration_data, include_q=True
+                                )["layers"]
+
+                            refit_metrics = refit_policy_generation(
+                                policy,
+                                policy_generation,
+                                colocated_inference,
+                                _refit_buffer_size_gb=refit_buffer_size_gb,
+                                timer=timer,
+                                kv_scales=kv_scales_cache if sync_kv_scales else None,
                             )
-                            calibration_data.to("cpu")
-                            kv_scales_cache = policy.calibrate_qkv_fp8_scales(
-                                calibration_data, include_q=True
-                            )["layers"]
+                            POLICY_GENERATION_STALE = False
+                        else:
+                            if colocated_inference:
+                                policy.offload_after_refit()  # unload optimizer to make space for generation
+                            policy_generation.prepare_for_generation()
 
-                        refit_metrics = refit_policy_generation(
-                            policy,
-                            policy_generation,
-                            colocated_inference,
-                            _refit_buffer_size_gb=refit_buffer_size_gb,
-                            timer=timer,
-                            kv_scales=kv_scales_cache if sync_kv_scales else None,
-                        )
-                        POLICY_GENERATION_STALE = False
-                    else:
-                        if colocated_inference:
-                            policy.offload_after_refit()  # unload optimizer to make space for generation
-                        policy_generation.prepare_for_generation()
+                    dynamic_sampling_num_gen_batches += 1
+                    if dynamic_sampling_num_gen_batches == 1 and hasattr(
+                        policy_generation, "snapshot_step_metrics"
+                    ):
+                        policy_generation.snapshot_step_metrics()
+                    with (
+                        timer.time("generation"),
+                        umbrella_span(
+                            RLSpanGroup.U_ROLLOUT,
+                            "rl.grpo.generation",
+                            tracer=_tracer,
+                            **{
+                                "rl.num_generations_per_prompt": master_config.grpo.num_generations_per_prompt,
+                            },
+                        ),
+                    ):
+                        # Clear logger metrics for each generation step
+                        if policy_generation is not None:
+                            policy_generation.clear_logger_metrics()
+                        # Use NeMo-Gym rollouts if enabled. We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
+                        if should_use_nemo_gym(master_config):
+                            # configure_generation_config auto-fills stop_token_ids from the EOS
+                            # token, but run_async_nemo_gym_rollout asserts these are unset because
+                            # NeMo-Gym manages its own stop criteria. Clear them here so the
+                            # assertion reflects user intent (null in YAML) rather than the auto-fill.
+                            generation_config: GenerationConfig = {
+                                **master_config.policy["generation"],
+                                "stop_token_ids": None,
+                                "stop_strings": None,
+                            }
+                            nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
+                                policy_generation=policy_generation,
+                                input_batch=repeated_batch,
+                                tokenizer=tokenizer,
+                                task_to_env=task_to_env,
+                                max_seq_len=master_config.policy[
+                                    "max_total_sequence_length"
+                                ],
+                                generation_config=generation_config,
+                                num_generations_per_prompt=(
+                                    master_config.grpo.num_generations_per_prompt
+                                ),
+                                log_full_result_tables=should_log_nemo_gym_full_result_tables(
+                                    wandb_enabled=master_config.logger["wandb_enabled"],
+                                    wandb_config=master_config.logger["wandb"],
+                                ),
+                                max_rollout_turns=None,
+                                greedy=False,
+                                effort_config=_get_effort_config(master_config),
+                                reward_penalty_config=master_config.reward_penalties,
+                                thinking_tags=get_nemo_gym_thinking_tags(
+                                    master_config.env
+                                ),
+                                mask_env_flagged_samples=should_mask_flagged_samples(
+                                    master_config.env
+                                ),
+                                deduplicate_multimodal_data=(
+                                    master_config.grpo.deduplicate_multimodal_data
+                                ),
+                                debug_payload_metrics=(
+                                    master_config.grpo.debug_payload_metrics
+                                ),
+                            )
+                            input_ids = nemo_gym_rollout_result.input_ids
+                            repeated_batch = nemo_gym_rollout_result.final_batch
+                            rollout_metrics = nemo_gym_rollout_result.rollout_metrics
+                            del nemo_gym_rollout_result
 
-                dynamic_sampling_num_gen_batches += 1
-                if dynamic_sampling_num_gen_batches == 1 and hasattr(
-                    policy_generation, "snapshot_step_metrics"
-                ):
-                    policy_generation.snapshot_step_metrics()
-                with (
-                    timer.time("generation"),
-                    umbrella_span(
-                        RLSpanGroup.U_ROLLOUT,
-                        "rl.grpo.generation",
-                        tracer=_tracer,
-                        **{
-                            "rl.num_generations_per_prompt": master_config.grpo.num_generations_per_prompt,
-                        },
-                    ),
-                ):
-                    # Clear logger metrics for each generation step
-                    if policy_generation is not None:
-                        policy_generation.clear_logger_metrics()
-                    # Use NeMo-Gym rollouts if enabled. We cascade NeMo-Gym first since NeMo-Gym requires async rollouts.
-                    if should_use_nemo_gym(master_config):
-                        # configure_generation_config auto-fills stop_token_ids from the EOS
-                        # token, but run_async_nemo_gym_rollout asserts these are unset because
-                        # NeMo-Gym manages its own stop criteria. Clear them here so the
-                        # assertion reflects user intent (null in YAML) rather than the auto-fill.
-                        generation_config: GenerationConfig = {
-                            **master_config.policy["generation"],
-                            "stop_token_ids": None,
-                            "stop_strings": None,
-                        }
-                        nemo_gym_rollout_result = run_nemo_gym_rollout_sync(
-                            policy_generation=policy_generation,
-                            input_batch=repeated_batch,
-                            tokenizer=tokenizer,
-                            task_to_env=task_to_env,
-                            max_seq_len=master_config.policy[
-                                "max_total_sequence_length"
-                            ],
-                            generation_config=generation_config,
-                            num_generations_per_prompt=(
-                                master_config.grpo.num_generations_per_prompt
-                            ),
-                            log_full_result_tables=should_log_nemo_gym_full_result_tables(
-                                wandb_enabled=master_config.logger["wandb_enabled"],
-                                wandb_config=master_config.logger["wandb"],
-                            ),
-                            max_rollout_turns=None,
-                            greedy=False,
-                            effort_config=_get_effort_config(master_config),
-                            reward_penalty_config=master_config.reward_penalties,
-                            thinking_tags=get_nemo_gym_thinking_tags(master_config.env),
-                            mask_env_flagged_samples=should_mask_flagged_samples(
-                                master_config.env
-                            ),
-                            deduplicate_multimodal_data=(
-                                master_config.grpo.deduplicate_multimodal_data
-                            ),
-                            debug_payload_metrics=(
-                                master_config.grpo.debug_payload_metrics
-                            ),
-                        )
-                        input_ids = nemo_gym_rollout_result.input_ids
-                        repeated_batch = nemo_gym_rollout_result.final_batch
-                        rollout_metrics = nemo_gym_rollout_result.rollout_metrics
-                        del nemo_gym_rollout_result
+                        # Use async rollouts when enabled by config/backend defaults.
+                        elif should_use_async_rollouts(
+                            master_config.policy["generation"]
+                        ):
+                            (
+                                repeated_batch,
+                                rollout_metrics,
+                            ) = run_async_multi_turn_rollout(
+                                policy_generation=policy_generation,
+                                input_batch=repeated_batch,
+                                tokenizer=tokenizer,
+                                task_to_env=task_to_env,
+                                max_seq_len=master_config.policy[
+                                    "max_total_sequence_length"
+                                ],
+                                max_rollout_turns=master_config.grpo.max_rollout_turns,
+                                greedy=False,
+                                deduplicate_multimodal_data=(
+                                    master_config.grpo.deduplicate_multimodal_data
+                                ),
+                            )
+                        else:
+                            repeated_batch, rollout_metrics = run_multi_turn_rollout(
+                                policy_generation=policy_generation,
+                                input_batch=repeated_batch,
+                                tokenizer=tokenizer,
+                                task_to_env=task_to_env,
+                                max_seq_len=master_config.policy[
+                                    "max_total_sequence_length"
+                                ],
+                                max_rollout_turns=master_config.grpo.max_rollout_turns,
+                                greedy=False,
+                                deduplicate_multimodal_data=(
+                                    master_config.grpo.deduplicate_multimodal_data
+                                ),
+                            )
+                        # Collect generation logger metrics for performance reporting after each generation step
+                        # inflight batch sizes and num pending samples are collected from each worker
+                        if policy_generation is not None:
+                            generation_logger_metrics = (
+                                policy_generation.get_logger_metrics()
+                            )
 
-                    # Use async rollouts when enabled by config/backend defaults.
-                    elif should_use_async_rollouts(master_config.policy["generation"]):
-                        (
-                            repeated_batch,
-                            rollout_metrics,
-                        ) = run_async_multi_turn_rollout(
-                            policy_generation=policy_generation,
-                            input_batch=repeated_batch,
-                            tokenizer=tokenizer,
-                            task_to_env=task_to_env,
-                            max_seq_len=master_config.policy[
-                                "max_total_sequence_length"
-                            ],
-                            max_rollout_turns=master_config.grpo.max_rollout_turns,
-                            greedy=False,
-                            deduplicate_multimodal_data=(
-                                master_config.grpo.deduplicate_multimodal_data
-                            ),
+                        metrics_logging_data[MEAN_GEN_TOKENS_PER_SAMPLE_KEY] = (
+                            rollout_metrics[MEAN_GEN_TOKENS_PER_SAMPLE_KEY]
                         )
-                    else:
-                        repeated_batch, rollout_metrics = run_multi_turn_rollout(
-                            policy_generation=policy_generation,
-                            input_batch=repeated_batch,
-                            tokenizer=tokenizer,
-                            task_to_env=task_to_env,
-                            max_seq_len=master_config.policy[
-                                "max_total_sequence_length"
-                            ],
-                            max_rollout_turns=master_config.grpo.max_rollout_turns,
-                            greedy=False,
-                            deduplicate_multimodal_data=(
-                                master_config.grpo.deduplicate_multimodal_data
-                            ),
-                        )
-                    # Collect generation logger metrics for performance reporting after each generation step
-                    # inflight batch sizes and num pending samples are collected from each worker
-                    if policy_generation is not None:
-                        generation_logger_metrics = (
-                            policy_generation.get_logger_metrics()
+                        logger.log_metrics(
+                            rollout_metrics, total_steps + 1, prefix="train"
                         )
 
-                    metrics_logging_data[MEAN_GEN_TOKENS_PER_SAMPLE_KEY] = (
+                    if rollout_buffer is not None:
+                        rollout_buffer.fill(repeated_batch, input_ids, step=total_steps)
+
+                if rollout_buffer is not None:
+                    metrics["rollout/generated_sequences"] = (
+                        rollout_buffer.remaining_updates * rollout_buffer.update_size
+                        if collected_rollouts
+                        else 0
+                    )
+                    metrics["rollout/generated_tokens"] = (
                         rollout_metrics[MEAN_GEN_TOKENS_PER_SAMPLE_KEY]
+                        * metrics["rollout/generated_sequences"]
+                        if collected_rollouts
+                        else 0
                     )
-                    logger.log_metrics(rollout_metrics, total_steps + 1, prefix="train")
+                    metrics["rollout/collection_step"] = rollout_buffer.collection_step
+                    metrics["rollout/age_updates"] = (
+                        total_steps - rollout_buffer.collection_step
+                    )
+                    metrics["rollout/remaining_updates"] = (
+                        rollout_buffer.remaining_updates - 1
+                    )
+                    repeated_batch, input_ids = rollout_buffer.peek()
 
                 repeated_batch = scale_rewards(
                     repeated_batch, master_config.grpo.reward_scaling
@@ -3529,19 +3627,22 @@ def _grpo_train_impl(
                     baseline = repeated_batch["baseline"]
                     std = repeated_batch["std"]
 
-                    with timer.time("generation_finalize"):
-                        policy_generation.finish_generation(
-                            discard_weights=(
-                                discard_weights_on_sleep and is_batch_complete
+                    if collected_rollouts:
+                        with timer.time("generation_finalize"):
+                            policy_generation.finish_generation(
+                                discard_weights=(
+                                    discard_weights_on_sleep and is_batch_complete
+                                )
                             )
-                        )
 
                     # If the current batch is not enough to fill the buffer during dynamic sampling, we update the cache and process the next batch.
                     if not is_batch_complete:
                         continue
 
                     gen_step_metrics = {}
-                    if hasattr(policy_generation, "get_step_metrics"):
+                    if collected_rollouts and hasattr(
+                        policy_generation, "get_step_metrics"
+                    ):
                         gen_step_metrics = policy_generation.get_step_metrics()
 
                     # Save baseline for logging (before deletion)
@@ -3614,6 +3715,11 @@ def _grpo_train_impl(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    if rollout_buffer is not None:
+                        metrics_logging_data[MEAN_GEN_TOKENS_PER_SAMPLE_KEY] = float(
+                            train_data["token_mask"][:, 1:].sum(-1).float().mean()
+                        )
+
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
@@ -3833,6 +3939,9 @@ def _grpo_train_impl(
                         timer=timer,
                     )
 
+                if rollout_buffer is not None:
+                    rollout_buffer.commit()
+
                 # Recompute KV scales after policy training if needed
                 if sync_kv_scales:
                     with timer.time("recompute_kv_scales"):
@@ -4035,6 +4144,8 @@ def _grpo_train_impl(
                     elif hasattr(grpo_save_state, "val_reward"):
                         delattr(grpo_save_state, "val_reward")
                     grpo_save_state.consumed_samples = consumed_samples
+                    if rollout_buffer is not None:
+                        grpo_save_state.rollout_buffer_version = BUFFER_VERSION
 
                     full_metric_name = master_config.checkpointing["metric_name"]
                     if full_metric_name is not None:
@@ -4110,6 +4221,10 @@ def _grpo_train_impl(
                             torch.save(
                                 wrapped_dataloader.state_dict(),
                                 os.path.join(checkpoint_path, "train_dataloader.pt"),
+                            )
+                        if rollout_buffer is not None:
+                            rollout_buffer.save(
+                                checkpoint_path, completed_steps=total_steps + 1
                             )
                         # Finalize in the background. The directory rename is
                         # deferred until any async write completes (via wait_fn);

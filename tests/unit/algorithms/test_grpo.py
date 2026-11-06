@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import math
 import os
 from concurrent.futures import Future
@@ -70,6 +71,8 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.grpo_sync import _train_fields_for_step, grpo_train_sync
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
+from nemo_rl.algorithms.loss.omega_loss import OmegaLossConfig, OmegaPerSequenceLossFn
+from nemo_rl.algorithms.rollout_buffer import BUFFER_FILENAME
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -594,6 +597,7 @@ def test_get_grpo_save_state_handles_legacy_checkpoint_and_filters_metrics():
         "sampler_name": None,
         "trainer_version": None,
         "sampler_dispatch_index": None,
+        "rollout_buffer_version": None,
     }
     assert "total_valid_tokens" not in loaded_state
     assert not hasattr(save_state, "val:accuracy")
@@ -6931,3 +6935,214 @@ def test_grpo_train_sync_logs_data_plane_metrics_before_committing_the_step(
         if f"data_plane/{scope}/breakdown" in c.args
     ], "the per-op breakdown table was not logged"
     client.close()
+
+
+@pytest.mark.parametrize("with_validation", [False, True])
+@pytest.mark.parametrize("multiplier", [1, 3])
+@pytest.mark.parametrize("resume", [False, True])
+def test_buffered_grpo_updates_and_resume(
+    mock_grpo_components, tmp_path, multiplier, resume, with_validation
+):
+    """Real driver processing/coefficients and stateful loader; mocked GPU calls."""
+    parts = mock_grpo_components
+    config = parts["master_config"]
+    config.grpo.loss_function = "omega"
+    config.grpo.omega_loss = OmegaLossConfig(form="per_sequence")
+    config.grpo.rollout_batch_multiplier = multiplier
+    config.grpo.num_generations_per_prompt = 2
+    config.grpo.max_num_steps = 5
+    config.grpo.max_num_epochs = 1
+    config.grpo.val_period = 2 if with_validation else 0
+    config.grpo.skip_reference_policy_logprobs_calculation = True
+    config.grpo.adv_estimator.normalize_rewards = False
+    config.loss_fn.force_on_policy_ratio = False
+    config.loss_fn.reference_policy_kl_penalty = 0
+    config.policy["train_global_batch_size"] = 2
+    config.policy["sequence_packing"] = {"enabled": True}
+    config.policy["dynamic_batching"] = {"enabled": False}
+    config.checkpointing.update(enabled=True, metric_name=None, save_period=1)
+    config.logger["wandb_enabled"] = False
+    loss_fn = OmegaPerSequenceLossFn(gen_kl_type="k3")
+    generation = _mock_policy_generation()
+    policy = parts["policy"]
+    collected, trained, scored, checkpoint_states = [], [], [], {}
+
+    def collate(rows):
+        batch = copy.deepcopy(next(iter(parts["train_dataloader"])))
+        batch["idx"] = torch.tensor(rows)
+        batch["message_log"][0][0]["token_ids"][0] = 10 + rows[0]
+        return batch
+
+    def loader():
+        return StatefulDataLoader(
+            list(range(10)), batch_size=1, collate_fn=collate, drop_last=True
+        )
+
+    def rollout(**kwargs):
+        batch = kwargs["input_batch"]
+        collected.append(batch["idx"].tolist())
+        for row, log in enumerate(batch["message_log"]):
+            log.append(
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "token_ids": torch.tensor([4, 5 + row % 2]),
+                    "generation_logprobs": torch.tensor([-0.4, -0.6]),
+                }
+            )
+        batch["total_reward"] = torch.arange(batch.size).remainder(2).float()
+        return batch, {"mean_gen_tokens_per_sample": 2.0}
+
+    def logprobs(data, **kwargs):
+        # Log probabilities change after *every* update, including cached ones.
+        version = len(trained)
+        scored.append((version, data["input_ids"].clone()))
+        values = torch.full_like(data["input_ids"], -0.5, dtype=torch.float32)
+        values[:, -1] = -(version + 1) * torch.tensor([0.1, 0.3])
+        return {"logprobs": values}
+
+    train_result = policy.train.return_value
+
+    def train(data, loss_fn, **kwargs):
+        trained.append(copy.deepcopy(data))
+        assert data.size == 2
+        assert "omega_coef" in data
+        assert data["omega_coef"].abs().sum() > 0
+        assert scored[-1][0] == len(trained) - 1
+        assert torch.equal(data["input_ids"], scored[-1][1])
+        return train_result
+
+    def init_checkpoint(step, state, config):
+        path = tmp_path / str(step)
+        path.mkdir()
+        checkpoint_states[step] = copy.deepcopy(state)
+        return str(path)
+
+    policy.get_logprobs.side_effect = logprobs
+    policy.train.side_effect = train
+    checkpointer = parts["checkpointer"]
+    checkpointer.init_tmp_checkpoint.side_effect = init_checkpoint
+    checkpointer.checkpoint_dir = str(tmp_path)
+    checkpointer.save_optimizer = True
+    dataloader = loader()
+
+    def run(dataloader, state):
+        grpo_train(
+            policy,
+            generation,
+            dataloader,
+            None,
+            parts["tokenizer"],
+            loss_fn,
+            parts["task_to_env"],
+            None,
+            parts["logger"],
+            checkpointer,
+            state,
+            config,
+        )
+
+    with (
+        patch("nemo_rl.algorithms.grpo.run_multi_turn_rollout", side_effect=rollout),
+        patch(
+            "nemo_rl.algorithms.grpo.run_async_multi_turn_rollout", side_effect=rollout
+        ),
+        patch("nemo_rl.algorithms.grpo.TimeoutChecker") as timeout,
+        patch(
+            "nemo_rl.algorithms.grpo.validate", return_value=({"accuracy": 0.5}, {})
+        ) as validate_mock,
+    ):
+        timeout.return_value.check_save.side_effect = [resume] + [False] * 10
+        run(dataloader, _initial_grpo_save_state())
+        if resume:
+            assert len(trained) == 1
+            if multiplier > 1:
+                saved = torch.load(tmp_path / "1" / BUFFER_FILENAME, weights_only=False)
+                assert saved["batch"]["idx"].tolist() == [1, 1, 2, 2]
+            dataloader = loader()
+            dataloader.load_state_dict(
+                torch.load(tmp_path / "1" / "train_dataloader.pt", weights_only=False)
+            )
+            checkpointer.get_latest_checkpoint_path.return_value = str(tmp_path / "1")
+            run(dataloader, _get_grpo_save_state(checkpoint_states[1]))
+
+    assert len(trained) == len(scored) == 5
+    assert [int(batch["input_ids"][0, 0]) for batch in trained] == list(range(10, 15))
+    assert collected == (
+        [[0, 0], [1, 1], [2, 2], [3, 3], [4, 4]]
+        if multiplier == 1
+        else [[0, 0, 1, 1, 2, 2], [3, 3, 4, 4]]
+    )
+    assert validate_mock.call_count == (2 if with_validation else 0)
+    assert (
+        generation.finish_generation.call_count
+        == len(collected) + validate_mock.call_count
+    )
+    assert not torch.equal(trained[0]["omega_coef"], trained[1]["omega_coef"])
+    for batch in trained:
+        torch.testing.assert_close(
+            batch["generation_logprobs"][:, -2:],
+            torch.tensor([[-0.4, -0.6], [-0.4, -0.6]]),
+        )
+    assert checkpoint_states[5]["consumed_samples"] == 5
+    assert checkpoint_states[5]["total_steps"] == 5
+    if multiplier > 1:
+        assert (
+            torch.load(tmp_path / "5" / BUFFER_FILENAME, weights_only=False)["batch"]
+            is None
+        )
+        metrics = [
+            call.args[0]
+            for call in parts["logger"].log_metrics.call_args_list
+            if call.kwargs.get("prefix") == "train"
+            and "rollout/generated_sequences" in call.args[0]
+        ]
+        assert [m["rollout/generated_sequences"] for m in metrics] == [6, 0, 0, 4, 0]
+        assert [m["rollout/age_updates"] for m in metrics] == [0, 1, 2, 0, 1]
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, True, "3"])
+def test_buffered_grpo_rejects_invalid_multiplier(value):
+    with pytest.raises(ValueError):
+        GRPOConfig(rollout_batch_multiplier=value)
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        "clipped_pg",
+        "group",
+        "async",
+        "data_plane",
+        "dynamic_sampling",
+        "multi_dataloader",
+        "batch_size",
+        "force_ratio",
+    ],
+)
+def test_buffered_grpo_rejects_unsupported_configs(mock_grpo_components, unsupported):
+    cfg = mock_grpo_components["master_config"]
+    cfg.grpo.rollout_batch_multiplier = 3
+    cfg.grpo.loss_function = "omega"
+    cfg.grpo.omega_loss = OmegaLossConfig(form="per_sequence")
+    cfg.grpo.num_generations_per_prompt = 2
+    cfg.policy["train_global_batch_size"] = 2
+    cfg.loss_fn.force_on_policy_ratio = False
+    if unsupported == "clipped_pg":
+        cfg.grpo.loss_function = "clipped_pg"
+    elif unsupported == "group":
+        cfg.grpo.omega_loss.form = "group"
+    elif unsupported == "async":
+        cfg.grpo.async_grpo.enabled = True
+    elif unsupported == "data_plane":
+        cfg.data_plane = {"enabled": True}
+    elif unsupported == "dynamic_sampling":
+        cfg.grpo.use_dynamic_sampling = True
+    elif unsupported == "multi_dataloader":
+        cfg.data["use_multiple_dataloader"] = True
+    elif unsupported == "batch_size":
+        cfg.policy["train_global_batch_size"] = 4
+    elif unsupported == "force_ratio":
+        cfg.loss_fn.force_on_policy_ratio = True
+    with pytest.raises((ValueError, AssertionError)):
+        grpo_mod._validate_rollout_buffer_config(cfg)
