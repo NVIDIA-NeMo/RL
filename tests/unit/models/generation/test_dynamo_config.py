@@ -30,6 +30,8 @@ def _vllm_config(**overrides) -> dict:
     config = {
         "backend": "vllm",
         "model_name": "Qwen/Qwen3-0.6B",
+        "top_p": 1.0,
+        "top_k": None,
         "stop_token_ids": None,
         "stop_strings": None,
         "vllm_cfg": {
