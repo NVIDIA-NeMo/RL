@@ -95,7 +95,12 @@ def test_build_async_grpo_train_data_preserves_routed_experts_for_r3(
         }
     )
     input_lengths = torch.tensor([3])
-    repeated_batch = BatchedDataDict({"loss_multiplier": torch.tensor([1.0])})
+    repeated_batch = BatchedDataDict(
+        {
+            "loss_multiplier": torch.tensor([1.0]),
+            "draft_sample_ids": torch.tensor([137], dtype=torch.int64),
+        }
+    )
 
     train_data = _build_async_grpo_train_data(
         flat_messages,
@@ -111,6 +116,9 @@ def test_build_async_grpo_train_data_preserves_routed_experts_for_r3(
     )
     assert torch.equal(train_data["token_mask"], flat_messages["token_loss_mask"])
     assert torch.equal(train_data["sample_mask"], repeated_batch["loss_multiplier"])
+    assert torch.equal(
+        train_data["draft_sample_ids"], repeated_batch["draft_sample_ids"]
+    )
 
     if expect_routed_experts:
         assert torch.equal(train_data["routed_experts"], routes)

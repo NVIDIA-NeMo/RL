@@ -22,6 +22,8 @@ from nemo_rl.algorithms.grpo import MasterConfig
 from nemo_rl.models.policy.draft_config import (
     DraftOptimizerConfig,
     Eagle3DraftConfig,
+    MegatronDFlashDraftConfig,
+    MegatronDSparkDraftConfig,
 )
 from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 
@@ -84,10 +86,87 @@ def test_grpo_master_config_parses_nested_draft_model() -> None:
     assert config.policy["draft"].speculator_type == "eagle3"
 
 
+def test_grpo_master_config_preserves_legacy_missing_method_discriminator() -> None:
+    path = REPO_ROOT / "examples/configs/grpo_math_1B.yaml"
+    raw = OmegaConf.to_container(load_config(path), resolve=True)
+    del raw["policy"]["draft"]["speculator_type"]
+
+    config = MasterConfig(**raw)
+
+    assert isinstance(config.policy["draft"], Eagle3DraftConfig)
+    assert config.policy["draft"].speculator_type == "eagle3"
+
+
 def test_omitted_draft_config_does_not_request_refit() -> None:
     from nemo_rl.models.policy.draft_config import draft_refit_enabled
 
     assert draft_refit_enabled(None) is False
+
+
+def test_dspark_config_rejects_vocab_different_from_live_target() -> None:
+    config = MegatronDSparkDraftConfig(
+        enabled=True,
+        block_size=7,
+        anchors_per_sample=2,
+        mask_token_id=151669,
+        target_hidden_state_layer_ids=[1, 9, 17, 25, 33],
+        draft_vocab_size=32_000,
+    )
+
+    with pytest.raises(ValueError, match="must match the live target vocabulary"):
+        config.resolve_draft_vocab_size(target_vocab_size=151_936)
+
+
+def test_dspark_config_resolves_target_owned_vocab() -> None:
+    values = {
+        "enabled": True,
+        "block_size": 7,
+        "anchors_per_sample": 2,
+        "mask_token_id": 151669,
+        "target_hidden_state_layer_ids": [1, 9, 17, 25, 33],
+    }
+
+    assert (
+        MegatronDSparkDraftConfig(**values).resolve_draft_vocab_size(
+            target_vocab_size=151_936
+        )
+        == 151_936
+    )
+    assert (
+        MegatronDSparkDraftConfig(
+            **values,
+            draft_vocab_size=151_936,
+        ).resolve_draft_vocab_size(target_vocab_size=151_936)
+        == 151_936
+    )
+
+
+def test_block_draft_config_drops_only_default_inherited_eagle3_keys() -> None:
+    values = {
+        "enabled": True,
+        "gamma": 5,
+        "anchors_per_sample": 4,
+        "mask_token_id": 151665,
+        "target_hidden_state_layer_ids": [1, 17, 33],
+        "ttt_steps": 3,
+    }
+
+    MegatronDFlashDraftConfig.model_validate(values)
+    with pytest.raises(ValidationError, match="ttt_steps"):
+        MegatronDFlashDraftConfig.model_validate({**values, "ttt_steps": 4})
+
+
+def test_dflash_config_rejects_duplicate_target_taps() -> None:
+    with pytest.raises(ValidationError, match="unique"):
+        MegatronDFlashDraftConfig.model_validate(
+            {
+                "enabled": True,
+                "gamma": 5,
+                "anchors_per_sample": 4,
+                "mask_token_id": 151665,
+                "target_hidden_state_layer_ids": [1, 1],
+            }
+        )
 
 
 def test_coerce_draft_config_accepts_a_raw_mapping() -> None:

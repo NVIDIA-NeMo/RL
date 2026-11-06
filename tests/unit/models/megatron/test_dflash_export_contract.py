@@ -55,3 +55,29 @@ def test_dflash_export_checks_components_instead_of_substrings() -> None:
     }
 
     validate_dflash_export_state_dict(allowed)
+
+
+def test_dflash_body_export_is_logical_and_excludes_target_owned_weights() -> None:
+    from nemo_rl.models.megatron.draft.dflash import DFlashBody, DFlashBodyConfig
+    from nemo_rl.models.megatron.draft.utils import export_dflash_weights_to_hf
+
+    body = DFlashBody(
+        DFlashBodyConfig(
+            hidden_size=16,
+            intermediate_size=32,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=1,
+            head_dim=8,
+            num_target_taps=2,
+        )
+    )
+
+    exported = dict(export_dflash_weights_to_hf(body))
+
+    assert set(exported) == set(body.state_dict())
+    assert not any("lm_head" in name for name in exported)
+    assert not any("embedding" in name for name in exported)
+    assert not any("mask_token" in name for name in exported)
+    for name, tensor in body.state_dict().items():
+        torch.testing.assert_close(exported[name], tensor)
