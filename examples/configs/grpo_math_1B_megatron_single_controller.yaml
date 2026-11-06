@@ -232,6 +232,8 @@ token_capture:
   forest_training: false
   # returned_history (default) or all_captured, including discarded attempts.
   selection_policy: returned_history
+  # Optional cap on forest rows per rollout; the scored path is always kept.
+  max_rows_per_rollout: null
   staging_partition: rollout_staging
 
 

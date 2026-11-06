@@ -704,6 +704,11 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # all_captured includes every captured call, including abandoned attempts.
     # Custom policies use an importable package.module:function path.
     selection_policy: str = "returned_history"
+    # Cap on training rows (root-to-leaf paths) per logical rollout, applied to
+    # the selection policy's output. The scored path is always kept; other leaves
+    # are drawn by the harness's selection_priorities, then in proportion to the
+    # tokens they add. None trains every selected path.
+    max_rows_per_rollout: Optional[PositiveInt] = None
 
     @model_validator(mode="after")
     def validate_selection_policy(self) -> "TokenCaptureConfig":
@@ -712,6 +717,8 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
             raise ValueError(
                 f"selection_policy={self.selection_policy} requires forest_training=true"
             )
+        if self.max_rows_per_rollout is not None and not self.forest_training:
+            raise ValueError("max_rows_per_rollout requires forest_training=true")
         return self
 
 

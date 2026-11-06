@@ -1152,6 +1152,9 @@ class NemoGym(EnvironmentInterface):
         self._selection_policy = (
             capture_config["selection_policy"] if self._forest_training else None
         )
+        self._max_rows_per_rollout = (
+            capture_config["max_rows_per_rollout"] if self._forest_training else None
+        )
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
         # actually happened instead of an AttributeError from deep inside a rollout.
@@ -2108,7 +2111,11 @@ Depending on your data shape, you may want to change these values."""
         from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
         from nemo_gym.token_id_capture.staging.records import RolloutManifest
 
-        from nemo_rl.environments.call_selection import resolve_selection_policy
+        from nemo_rl.environments.call_selection import (
+            cap_selected_rows,
+            read_selection_priorities,
+            resolve_selection_policy,
+        )
         from nemo_rl.experience.rollout_reassembler import (
             ActionOutputFlags,
             RolloutSelection,
@@ -2180,10 +2187,6 @@ Depending on your data shape, you may want to change these values."""
             for r in selected
         ):
             raise ValueError("Selected capture is missing output validation evidence")
-        truncated = any(
-            r.finish_reason in ("length", "max_tokens", "max_output_tokens")
-            for r in selected
-        )
         receipt = self._assemble_receipt(
             owner,
             manifest,
@@ -2210,6 +2213,22 @@ Depending on your data shape, you may want to change these values."""
         ):
             # Preserve selection membership; reject this owner before row planning.
             receipt.update(capture_poisoned=True, failure_reason="selection_not_closed")
+        elif self._max_rows_per_rollout is not None:
+            # Only a trainable selection is capped, so the cap cannot unmask one.
+            assert terminal_response_id is not None
+            try:
+                selected = cap_selected_rows(
+                    selected,
+                    terminal_response_id,
+                    max_rows=self._max_rows_per_rollout,
+                    priorities=read_selection_priorities(result, parsed.records),
+                )
+            except ValueError as error:
+                raise ValueError(f"Rollout {owner!r}: {error}") from error
+        truncated = any(
+            r.finish_reason in ("length", "max_tokens", "max_output_tokens")
+            for r in selected
+        )
         selection = RolloutSelection(
             response_ids=tuple(r.response_id for r in selected),
             action_flags=tuple(
