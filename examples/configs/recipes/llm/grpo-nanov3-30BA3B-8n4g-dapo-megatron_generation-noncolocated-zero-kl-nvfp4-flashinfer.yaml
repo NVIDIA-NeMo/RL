@@ -1,0 +1,104 @@
+# The batch-invariant GRPO run of the Megatron inference paper's fig:rl_bi (MXFP8, wdykas
+# experiments/rl_bi_nemorl/grpo_nano3_dapo_bi.yaml) with per-token NVFP4 FlashInfer experts
+# instead of MXFP8: Nano-3.5 SFT checkpoint, DAPO-Math-17k, fully on-policy GRPO (32 prompts x
+# 8 generations = one optimizer step per batch), 8192-token sequences, TP2/SP + EP8 + ETP1 on
+# both training and generation, 4 training + 4 generation nodes.
+# The trainer runs the engine's NVFP4 expert kernel, so rollout and training log-probs should
+# match bitwise. Dense layers stay BF16 (NVFP4 experts cannot be combined with FP8 linears).
+# The default-kernel arm is ...-dapo-megatron_generation-noncolocated-nvfp4-flashinfer-default.yaml.
+#
+# Needs Megatron-LM PRs #7798 and flashinfer-python>=0.7.0 (per-token NVFP4 Relu2 MoE kernels).
+defaults: grpo-nanov3-30BA3B-3n4g-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer-cp4.yaml
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 8
+  max_num_steps: 300
+  max_num_epochs: 100
+  seed: 42
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  ratio_clip_min: 0.2
+  ratio_clip_max: 0.28
+checkpointing:
+  enabled: true
+  checkpoint_dir: results/grpo-nanov3-30BA3B-8n4g-dapo-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer
+  metric_name: null
+  keep_top_k: 3
+  save_period: 10
+  checkpoint_must_save_by: "00:23:20:00"
+policy:
+  model_name: /lustre/fsw/portfolios/llmservice/users/wdykas/huggingface/hub/models--nvidia--NVIDIA-Nemotron-3-Nano-30B-A3B-BF16/snapshots/bf77c3174f68ad409e1c2aa60daeb46e32d1c606
+  tokenizer:
+    name: /lustre/fs1/portfolios/llmservice/projects/llmservice_fm_text/users/wdykas/models/nemotron-3-nano-30b/iter_0000000/tokenizer
+  pretrained_checkpoint:
+    format: megatron_lm
+    path: /lustre/fsw/portfolios/llmservice/users/venkats/training_actual_0603/nano_n3_post/checkpoints/nano-3.5-sft-v10-robustfix-upsampled-true-from-base-lr2e-5-n4/iter_0006000
+  train_global_batch_size: 256
+  train_micro_batch_size: 1
+  logprob_batch_size: 4
+  max_total_sequence_length: 8192
+  make_sequence_length_divisible_by: 128
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    sequence_parallel: true
+    expert_model_parallel_size: 8
+    expert_tensor_parallel_size: 1
+    pipeline_model_parallel_size: 1
+    context_parallel_size: 1
+    optimizer:
+      lr: 2.0e-6
+      min_lr: 2.0e-6
+      weight_decay: 0.01
+      adam_beta1: 0.9
+      adam_beta2: 0.999
+    scheduler:
+      lr_decay_style: constant
+      lr_warmup_iters: 10
+      lr_warmup_init: 2.0e-7
+  generation:
+    max_new_tokens: 8192
+    temperature: 1.0
+    top_p: 1.0
+    top_k: null
+    mcore_generation_config:
+      tensor_model_parallel_size: 2
+      sequence_parallel: true
+      expert_model_parallel_size: 8
+      expert_tensor_parallel_size: 1
+      max_requests: 32
+      max_tokens: 2048
+      # Decode-only steps process max_requests x EP rows instead of the full dispatch buffer.
+      inference_flashinfer_mxfp8_token_capacity: 256
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+        num_nodes: 4
+data:
+  max_input_seq_length: 2048
+  shuffle: true
+  train:
+    dataset_name: DAPOMath17K
+    split_validation_size: 0
+  validation: null
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  log_dir: logs/grpo-nanov3-30BA3B-8n4g-dapo-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: true
+  wandb:
+    name: grpo-nanov3-30BA3B-8n4g-dapo-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer
+cluster:
+  gpus_per_node: 4
+  num_nodes: 8
+  # EP8 spans two 4-GPU nodes; the NVLS dispatcher needs them in one NVLink domain.
+  segment_size: 2

@@ -1,0 +1,47 @@
+# Default-kernel arm of ...-8n4g-dapo-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer.yaml
+# (the NVFP4 counterpart of the "Default" run in the paper's fig:rl_bi). Both arms use the same
+# precision: per-token NVFP4 routed experts, with attention, Mamba and shared experts in BF16.
+# Generation is unchanged (FlashInfer per-token NVFP4 experts, FA4). Training runs TE per-token
+# NVFP4 experts instead of generation's kernel, without batch-invariant mode, so the
+# train/generation KL is small but nonzero.
+#
+# The batch-invariant env vars are inherited and nested keys cannot be deleted from YAML, so
+# launch with:
+#   '~policy.megatron_cfg.env_vars.MAMBA_DETERMINISTIC' '~policy.megatron_cfg.env_vars.TRITON_CACHE_AUTOTUNING'
+#   '~policy.megatron_cfg.env_vars.CUBLASLT_WORKSPACE_SIZE' '~policy.megatron_cfg.env_vars.CUBLAS_WORKSPACE_CONFIG'
+defaults: grpo-nanov3-30BA3B-8n4g-dapo-megatron_generation-noncolocated-zero-kl-nvfp4-flashinfer.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-nanov3-30BA3B-8n4g-dapo-megatron_generation-noncolocated-nvfp4-flashinfer-default
+policy:
+  megatron_cfg:
+    zero_train_gen_mismatch: false
+    batch_invariant_mode: false
+    moe_training_matches_inference: false
+    transformer_impl: transformer_engine
+    # Read by training too, where it requires transformer_impl=inference_optimized.
+    inference_moe_nvfp4_recipe: null
+    attention_backend: auto
+    flash_attention_version: null
+    fp4_cfg:
+      enabled: true
+    te_precision_config_file: examples/te_precision/attn_bf16_mlp_nvfp4.yaml
+    env_vars:
+      NVTE_NVFP4_ROW_SCALED_ACTIVATION: '1'
+      NVTE_NVFP4_DISABLE_RHT: '1'
+      NVTE_NVFP4_DISABLE_2D_QUANTIZATION: '1'
+      NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING: '1'
+      NVTE_BACKWARD_OVERRIDE: dequantized
+  generation:
+    mcore_generation_config:
+      inference_moe_nvfp4_recipe: per_token
+      attention_backend: flash
+      flash_attention_version: 4
+      # Training's TE FP4 setup is merged into generation otherwise; the inference
+      # model quantizes its BF16 experts itself.
+      fp4_cfg:
+        enabled: false
+      te_precision_config_file: null
+logger:
+  log_dir: logs/grpo-nanov3-30BA3B-8n4g-dapo-megatron_generation-noncolocated-nvfp4-flashinfer-default
+  wandb:
+    name: grpo-nanov3-30BA3B-8n4g-dapo-megatron_generation-noncolocated-nvfp4-flashinfer-default
