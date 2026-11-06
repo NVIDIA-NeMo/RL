@@ -1254,7 +1254,9 @@ class TestTQReplayBufferStateDict:
                 expected_group_size=_N_GENS,
                 expected_manifest_digest=state["manifest_digest"],
             )
-            sampler = InOrderSampler(restored, max_lookahead_versions=1)
+            sampler = InOrderSampler(
+                restored, max_lookahead_versions=1, optimizer_steps_per_refit=1
+            )
             sampler.restore_dispatch_index(1)
 
             borrowed, borrowed_count = await sampler.select(

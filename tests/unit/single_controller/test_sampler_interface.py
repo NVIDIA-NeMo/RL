@@ -114,7 +114,9 @@ class TestBuiltinsImplementInterface:
             WindowedSampler(FakeBuffer(), max_staleness_versions=1),
             ReadyFirstSampler(FakeBuffer(), max_staleness_versions=1),
             WeightFifoSampler(FakeBuffer(), max_staleness_versions=1),
-            InOrderSampler(FakeBuffer(), max_lookahead_versions=1),
+            InOrderSampler(
+                FakeBuffer(), max_lookahead_versions=1, optimizer_steps_per_refit=1
+            ),
         ],
     )
     def test_isinstance_protocol(self, sampler):
@@ -124,7 +126,9 @@ class TestBuiltinsImplementInterface:
 
 class TestAdmission:
     def test_wait_does_not_advance_gated_dispatch_cursor(self):
-        sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+        sampler = InOrderSampler(
+            FakeBuffer(), max_lookahead_versions=1, optimizer_steps_per_refit=1
+        )
 
         _run(sampler.wait_until_admissible(trainer_version_fn=lambda: 0))
 
@@ -138,7 +142,9 @@ class TestAdmission:
         assert sampler.dispatch_index == 0
 
     def test_expired_cut_cannot_advance_gated_dispatch_cursor(self):
-        sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+        sampler = InOrderSampler(
+            FakeBuffer(), max_lookahead_versions=1, optimizer_steps_per_refit=1
+        )
 
         async def commit_after_cut_expires() -> None:
             async with DataPlaneCheckpointBarrier().mutation() as cut:
@@ -157,7 +163,9 @@ class TestAdmission:
         assert _run(s.admit(trainer_version_fn=lambda: 0)) is None
 
     def test_in_order_stamps_monotonic_dispatch_index(self):
-        s = InOrderSampler(FakeBuffer(), max_lookahead_versions=5)
+        s = InOrderSampler(
+            FakeBuffer(), max_lookahead_versions=5, optimizer_steps_per_refit=1
+        )
         assert _run(s.admit(trainer_version_fn=lambda: 10)) == 0
         assert _run(s.admit(trainer_version_fn=lambda: 10)) == 1
 
@@ -204,7 +212,7 @@ class TestInOrderEvictMatchesSelect:
         buf = FakeBuffer()
         # weight far below the window, but target_step is still upcoming.
         buf.add("g", weight=0, ready=True, target_step=2)
-        s = InOrderSampler(buf, max_lookahead_versions=1)
+        s = InOrderSampler(buf, max_lookahead_versions=1, optimizer_steps_per_refit=1)
         removed = _run(s.evict(current_train_weight=2))
         assert removed == 0  # target_step 2 == current, not past -> kept
         assert len(buf.target_step_list) == 1
@@ -212,14 +220,14 @@ class TestInOrderEvictMatchesSelect:
     def test_past_target_ready_slot_is_evicted(self):
         buf = FakeBuffer()
         buf.add("g", weight=0, ready=True, target_step=1)
-        s = InOrderSampler(buf, max_lookahead_versions=1)
+        s = InOrderSampler(buf, max_lookahead_versions=1, optimizer_steps_per_refit=1)
         removed = _run(s.evict(current_train_weight=3))  # target 1 < 3 -> stale
         assert removed == 1
 
     def test_unready_slot_is_never_evicted(self):
         buf = FakeBuffer()
         buf.add("g", weight=0, ready=False, target_step=1)
-        s = InOrderSampler(buf, max_lookahead_versions=1)
+        s = InOrderSampler(buf, max_lookahead_versions=1, optimizer_steps_per_refit=1)
         # past target, but unready -> skipped to avoid the commit race.
         assert _run(s.evict(current_train_weight=5)) == 0
 
@@ -227,7 +235,9 @@ class TestInOrderEvictMatchesSelect:
         buffer = FakeBuffer()
         for group_index in range(127):
             buffer.add(f"g{group_index}", weight=0, target_step=0)
-        sampler = InOrderSampler(buffer, max_lookahead_versions=1)
+        sampler = InOrderSampler(
+            buffer, max_lookahead_versions=1, optimizer_steps_per_refit=1
+        )
 
         first_meta, first_count = _run(
             sampler.select(
@@ -285,19 +295,27 @@ class TestFactory:
 
     def test_windowed_config_builds_windowed(self):
         s = create_sampler(
-            FakeBuffer(), WindowedSamplerConfig(max_staleness_versions=3)
+            FakeBuffer(),
+            WindowedSamplerConfig(max_staleness_versions=3),
+            optimizer_steps_per_refit=1,
         )
         assert isinstance(s, WindowedSampler)
         assert s.max_staleness_versions == 3
 
     def test_in_order_config_builds_in_order(self):
-        s = create_sampler(FakeBuffer(), InOrderSamplerConfig(max_lookahead_versions=2))
+        s = create_sampler(
+            FakeBuffer(),
+            InOrderSamplerConfig(max_lookahead_versions=2),
+            optimizer_steps_per_refit=1,
+        )
         assert isinstance(s, InOrderSampler)
         assert s.max_lookahead_versions == 2
 
     def test_weight_fifo_config_builds_weight_fifo(self):
         s = create_sampler(
-            FakeBuffer(), WeightFifoSamplerConfig(max_staleness_versions=4)
+            FakeBuffer(),
+            WeightFifoSamplerConfig(max_staleness_versions=4),
+            optimizer_steps_per_refit=1,
         )
         assert isinstance(s, WeightFifoSampler)
         assert s.max_staleness_versions == 4
@@ -310,6 +328,7 @@ class TestFactory:
                 CustomSamplerConfig(
                     target=f"{__name__}:PropertyCapabilitySampler",
                 ),
+                optimizer_steps_per_refit=1,
             )
         assert not PropertyCapabilitySampler.constructed
 
@@ -340,6 +359,7 @@ class TestFactory:
         s = create_sampler(
             FakeBuffer(),
             ReadyFirstSamplerConfig(max_staleness_versions=3),
+            optimizer_steps_per_refit=1,
         )
         assert isinstance(s, ReadyFirstSampler)
         assert s.max_staleness_versions == 3
@@ -389,13 +409,19 @@ class TestReadyFirstConfig:
     ):
         assert (
             required_buffer_capacity_for_config(
-                cfg, groups_per_step=4, min_groups_for_streaming_train=3
+                cfg,
+                groups_per_step=4,
+                min_groups_for_streaming_train=3,
+                optimizer_steps_per_refit=1,
             )
             == expected
         )
         if instance_expected is not _SKIP_INSTANCE:
             sampler = create_sampler(
-                FakeBuffer(), cfg, min_groups_for_streaming_train=3
+                FakeBuffer(),
+                cfg,
+                min_groups_for_streaming_train=3,
+                optimizer_steps_per_refit=1,
             )
             assert (
                 sampler.required_buffer_capacity(groups_per_step=4) == instance_expected
@@ -413,11 +439,14 @@ class TestWarmupLookaheadWindow:
         # Steady state alone would be 4*(1+1)=8; the warmup peak needs 4*(3+1)=16.
         assert (
             required_buffer_capacity_for_config(
-                cfg, groups_per_step=4, min_groups_for_streaming_train=1
+                cfg,
+                groups_per_step=4,
+                min_groups_for_streaming_train=1,
+                optimizer_steps_per_refit=1,
             )
             == 16
         )
-        sampler = create_sampler(FakeBuffer(), cfg)
+        sampler = create_sampler(FakeBuffer(), cfg, optimizer_steps_per_refit=1)
         assert sampler.required_buffer_capacity(groups_per_step=4) == 16
 
     def test_capacity_is_unchanged_without_a_warmup_window(self):
@@ -425,17 +454,23 @@ class TestWarmupLookaheadWindow:
 
         assert (
             required_buffer_capacity_for_config(
-                cfg, groups_per_step=4, min_groups_for_streaming_train=1
+                cfg,
+                groups_per_step=4,
+                min_groups_for_streaming_train=1,
+                optimizer_steps_per_refit=1,
             )
             == 8
         )
-        sampler = create_sampler(FakeBuffer(), cfg)
+        sampler = create_sampler(FakeBuffer(), cfg, optimizer_steps_per_refit=1)
         assert sampler.required_buffer_capacity(groups_per_step=4) == 8
 
     def test_capacity_does_not_shrink_when_the_gate_is_retuned(self):
         """Retuning must not let the reported requirement follow the live window."""
         sampler = InOrderSampler(
-            FakeBuffer(), max_lookahead_versions=1, warmup_lookahead_versions=3
+            FakeBuffer(),
+            max_lookahead_versions=1,
+            warmup_lookahead_versions=3,
+            optimizer_steps_per_refit=1,
         )
 
         sampler.set_gate_window(1)
@@ -445,7 +480,10 @@ class TestWarmupLookaheadWindow:
     def test_retuning_the_gate_reopens_admission(self):
         """The live window is what admit gates on, so widening it admits more."""
         s = InOrderSampler(
-            FakeBuffer(), max_lookahead_versions=1, warmup_lookahead_versions=3
+            FakeBuffer(),
+            max_lookahead_versions=1,
+            warmup_lookahead_versions=3,
+            optimizer_steps_per_refit=1,
         )
 
         # dispatch_index starts at -1; window 1 admits the live batch and one
@@ -470,7 +508,9 @@ class TestWarmupLookaheadWindow:
             _run(asyncio.wait_for(s.admit(trainer_version_fn=lambda: 2), timeout=0.05))
 
     def test_set_gate_window_rejects_a_negative_window(self):
-        sampler = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+        sampler = InOrderSampler(
+            FakeBuffer(), max_lookahead_versions=1, optimizer_steps_per_refit=1
+        )
 
         with pytest.raises(ValueError, match="gate_window must be non-negative"):
             sampler.set_gate_window(-1)
@@ -511,6 +551,7 @@ class TestCustomFqnSampler:
                 CustomSamplerConfig(
                     target=f"{__name__}:NOT_A_SAMPLER_CLASS",
                 ),
+                optimizer_steps_per_refit=1,
             )
 
     def test_custom_target_loads_out_of_repo_sampler(self):
@@ -518,8 +559,11 @@ class TestCustomFqnSampler:
         s = create_sampler(
             FakeBuffer(),
             CustomSamplerConfig(
-                target=f"{__name__}:EchoSampler", max_lookahead_versions=1
+                target=f"{__name__}:EchoSampler",
+                max_lookahead_versions=1,
+                optimizer_steps_per_refit=1,
             ),
+            optimizer_steps_per_refit=1,
         )
         assert isinstance(s, EchoSampler)
         assert isinstance(s, PromptGroupSampler)
@@ -714,7 +758,7 @@ class TestInOrderSelect:
         buf = FakeBuffer()
         # weight far outside any window, but target_step == trainer version.
         buf.add("g", weight=100, target_step=5)
-        s = InOrderSampler(buf, max_lookahead_versions=1)
+        s = InOrderSampler(buf, max_lookahead_versions=1, optimizer_steps_per_refit=1)
         meta, n = _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
         )
@@ -723,7 +767,7 @@ class TestInOrderSelect:
     def test_non_matching_target_not_selected(self):
         buf = FakeBuffer()
         buf.add("g", weight=5, target_step=6)
-        s = InOrderSampler(buf, max_lookahead_versions=1)
+        s = InOrderSampler(buf, max_lookahead_versions=1, optimizer_steps_per_refit=1)
         assert _run(
             s.select(current_train_weight=5, min_prompt_groups=1, max_prompt_groups=8)
         ) == (None, 0)
@@ -740,7 +784,7 @@ class TestInOrderSelect:
 )
 def aligned_sampler(request: pytest.FixtureRequest):
     buffer = FakeBuffer()
-    return create_sampler(buffer, request.param), buffer
+    return create_sampler(buffer, request.param, optimizer_steps_per_refit=1), buffer
 
 
 class TestGroupAlignedSelection:
@@ -1014,7 +1058,9 @@ class TestTailAwareSelection:
 
     def test_tail_aware_does_not_fill_current_tail_with_future_batch(self):
         buffer = FakeBuffer()
-        sampler = InOrderSampler(buffer, max_lookahead_versions=1)
+        sampler = InOrderSampler(
+            buffer, max_lookahead_versions=1, optimizer_steps_per_refit=1
+        )
         for index in range(32):
             buffer.add(f"current-{index}", weight=0, target_step=0)
         for index in range(8):
@@ -1059,7 +1105,9 @@ class TestDispatchCursorRestore:
     """Checkpoint resume restores the exact last admitted dispatch batch."""
 
     def test_resumed_in_order_stamps_after_exact_cursor(self):
-        s = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+        s = InOrderSampler(
+            FakeBuffer(), max_lookahead_versions=1, optimizer_steps_per_refit=1
+        )
         s.restore_dispatch_index(6)
         assert s.dispatch_index == 6
         assert _run(s.admit(trainer_version_fn=lambda: 7)) == 7
@@ -1076,7 +1124,9 @@ class TestDispatchCursorRestore:
             _run(asyncio.wait_for(s.admit(trainer_version_fn=lambda: 7), timeout=0.05))
 
     def test_fresh_start_is_a_noop_seed(self):
-        s = InOrderSampler(FakeBuffer(), max_lookahead_versions=1)
+        s = InOrderSampler(
+            FakeBuffer(), max_lookahead_versions=1, optimizer_steps_per_refit=1
+        )
         s.set_dispatch_index(0)
         assert _run(s.admit(trainer_version_fn=lambda: 0)) == 0
 
@@ -1094,8 +1144,11 @@ class TestDispatchCursorRestore:
         s = create_sampler(
             FakeBuffer(),
             CustomSamplerConfig(
-                target=f"{__name__}:EchoSampler", max_lookahead_versions=1
+                target=f"{__name__}:EchoSampler",
+                max_lookahead_versions=1,
+                optimizer_steps_per_refit=1,
             ),
+            optimizer_steps_per_refit=1,
         )
         s.restore_dispatch_index(5)
         assert _run(s.admit(trainer_version_fn=lambda: 6)) == 6
@@ -1121,7 +1174,9 @@ class TestInflightAbortPolicy:
         "sampler",
         [
             WeightFifoSampler(FakeBuffer(), max_staleness_versions=1),
-            InOrderSampler(FakeBuffer(), max_lookahead_versions=1),
+            InOrderSampler(
+                FakeBuffer(), max_lookahead_versions=1, optimizer_steps_per_refit=1
+            ),
         ],
     )
     def test_gated_samplers_never_abort_inflight(self, sampler):

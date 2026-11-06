@@ -338,7 +338,9 @@ async def _round_trip(
     dp_a = _fresh_client(register=True)
     buf_a = _new_buffer(dp_a)
     await _fill(buf_a, scenario)
-    sampler_a = create_sampler(buf_a, sampler_config(sampler_name, scenario.lag))
+    sampler_a = create_sampler(
+        buf_a, sampler_config(sampler_name, scenario.lag), optimizer_steps_per_refit=1
+    )
 
     # Mirrors SingleControllerActor._save_checkpoint: the sidecar is written
     # only when the sampler says it can restore one.
@@ -404,7 +406,9 @@ async def _round_trip(
     dp_b = _fresh_client(register=False)  # load_checkpoint demands a clean client
     dp_b.load_checkpoint(tmp_path / "data_plane")
     buf_b = _new_buffer(dp_b)
-    sampler_b = create_sampler(buf_b, sampler_config(sampler_name, scenario.lag))
+    sampler_b = create_sampler(
+        buf_b, sampler_config(sampler_name, scenario.lag), optimizer_steps_per_refit=1
+    )
 
     # Mirrors SingleControllerActor._maybe_restore_replay_buffer.
     if sidecar is not None and sampler_b.supports_buffer_checkpoint:

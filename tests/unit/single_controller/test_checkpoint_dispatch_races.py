@@ -145,7 +145,7 @@ class _CountingInOrderSampler(InOrderSampler):
     """Real in-order sampler with observable admission calls."""
 
     def __init__(self) -> None:
-        super().__init__(None, max_lookahead_versions=1)
+        super().__init__(None, max_lookahead_versions=1, optimizer_steps_per_refit=1)
         self.admit_calls = 0
         self.admission_commits = 0
 
@@ -1622,6 +1622,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
         )
         controller._buffer_capacity = asyncio.Semaphore(4)
         controller._trainer_version = 7
+        controller._steps_since_refit = 0
         controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         controller._dataloader = SimpleNamespace(
             dataset={70: dataset_prompt},
@@ -1740,6 +1741,7 @@ async def _turn_recovery_restart(
     )
     controller._buffer_capacity = asyncio.Semaphore(4)
     controller._trainer_version = 7
+    controller._steps_since_refit = 0
     controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     controller._dataloader = SimpleNamespace(
         dataset={70: dataset_prompt},
@@ -2070,6 +2072,7 @@ def test_recovery_readmits_one_reserved_batch_only_once(tmp_path) -> None:
         )
         controller._buffer_capacity = asyncio.Semaphore(4)
         controller._trainer_version = 7
+        controller._steps_since_refit = 0
         controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         controller._dataloader = SimpleNamespace(
             dataset={
@@ -2146,6 +2149,7 @@ def test_recovery_launches_admitted_groups_before_waiting_to_readmit() -> None:
         controller._sampler = sampler
         controller._rollout_manager = rollout_manager
         controller._trainer_version = 6
+        controller._steps_since_refit = 0
         controller._data_plane_checkpoint_barrier = barrier
         controller._buffer = SimpleNamespace(
             count_for_target_step=lambda _target_step: 0,
