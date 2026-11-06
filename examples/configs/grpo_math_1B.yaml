@@ -1,6 +1,8 @@
 # GRPO Algorithm Configuration
 grpo:
   num_prompts_per_step: 32
+  # Positive integer; >1 buffers this many update batches (synchronous per-sequence Omega only).
+  rollout_batch_multiplier: 1
   num_generations_per_prompt: 16
   max_rollout_turns: 1 # for multi-turn rollouts. Math Environments just have 1 turn (answering the question)
   max_num_epochs: 1
@@ -11,7 +13,7 @@ grpo:
   loss_function: clipped_pg
   omega_loss:
     h: inverse_length  # exponent h(x,y) on pi(y|x); inverse_length = 1/|y|
-    form: group  # "group" (exact, no sequence packing) or "per_sequence" (packing-compatible, 1 update per rollout)
+    form: group  # "group" (exact, no sequence packing) or "per_sequence" (packing-compatible, 1 update per prepared batch)
   val_period: 10
   val_start_at: -1  # First step eligible for periodic validation; -1 disables the delay
   val_at_start: false

@@ -1,0 +1,117 @@
+# Same parameters as native-resume attempt 004, using the native YAML loader.
+defaults: ../../examples/configs/grpo_math_1B_megatron.yaml
+
+grpo:
+  loss_function: omega
+  omega_loss:
+    form: per_sequence
+    h: inverse_length
+  rollout_batch_multiplier: 3
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 8
+  max_num_steps: 5
+  max_num_epochs: 1
+  normalize_rewards: false
+  use_leave_one_out_baseline: false
+  val_period: 0
+  val_at_start: false
+  val_at_end: false
+  skip_reference_policy_logprobs_calculation: true
+
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+  force_on_policy_ratio: false
+
+policy:
+  model_name: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_reasoning/users/siddjain/my_models/Qwen3-1.7B-verified-20261021
+  train_global_batch_size: 64
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 40960
+  make_sequence_length_divisible_by: 8
+  dtensor_cfg:
+    enabled: false
+  sequence_packing:
+    fuse_loss: true
+  megatron_cfg:
+    tensor_model_parallel_size: 2
+    context_parallel_size: 2
+    sequence_parallel: true
+    activation_checkpointing: true
+    use_fused_linear_logprobs: false
+    bias_activation_fusion: true
+    attention_backend: auto
+    env_vars:
+      CUDA_DEVICE_MAX_CONNECTIONS: '1'
+      NVTE_DEBUG: '1'
+      NVTE_DEBUG_LEVEL: '2'
+    optimizer:
+      lr: 1.0e-6
+      min_lr: 1.0e-6
+      weight_decay: 0.0
+    scheduler:
+      lr_warmup_iters: 0
+      lr_warmup_init: 1.0e-6
+  generation:
+    max_new_tokens: 39936
+    temperature: 1.0
+    vllm_cfg:
+      tensor_parallel_size: 2
+      async_engine: true
+      enforce_eager: false
+      enable_prefix_caching: true
+      enable_expert_parallel: false
+      expert_parallel_size: 1
+      use_deep_gemm: false
+    vllm_kwargs:
+      compilation_config:
+        backend: inductor
+        cudagraph_mode: FULL_AND_PIECEWISE
+        cudagraph_capture_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64]
+      moe_backend: auto
+      async_scheduling: true
+      enable_chunked_prefill: true
+      max_num_seqs: 64
+      max_num_batched_tokens: 8192
+      kv_cache_dtype: auto
+
+data:
+  _override_: true
+  max_input_seq_length: 1025
+  shuffle: true
+  num_workers: 1
+  use_multiple_dataloader: false
+  train:
+    dataset_name: ResponseDataset
+    data_path: /lustre/fsw/portfolios/llmservice/projects/llmservice_nemo_reasoning/users/siddjain/nemo-run/output/eiwor/math/qwen3-1.7b/polaris/nemo-rl/stage1-training/attempts/002/data/train.jsonl
+    input_key: input
+    output_key: output
+    split_validation_size: 0
+  validation: null
+  default:
+    prompt_file: null
+    system_prompt_file: null
+    processor: math_hf_data_processor
+    env_name: math
+
+env:
+  math:
+    num_workers: 8
+
+logger:
+  log_dir: ${oc.env:SMOKE_ROOT}/logs
+  wandb_enabled: false
+  tensorboard_enabled: true
+  monitor_gpus: false
+
+checkpointing:
+  enabled: true
+  checkpoint_dir: ${oc.env:SMOKE_ROOT}/checkpoints
+  save_optimizer: true
+  save_period: 1
+  keep_top_k: 5
+  metric_name: null
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8

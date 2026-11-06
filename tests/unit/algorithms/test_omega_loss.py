@@ -306,3 +306,70 @@ def test_both_forms_report_generation_mismatch_metrics_like_grpo():
         for i in range(B * K)
     )
     assert abs(total - ref) < 1e-4
+
+
+def test_successive_updates_match_direct_objective_and_detect_stale_coefficients():
+    """Five disjoint frozen response batches, with a shared changing policy."""
+    generator = torch.Generator().manual_seed(13)
+    features = [torch.randn(B * K, T - 1, 7, generator=generator) for _ in range(5)]
+    batches = [_make(seed=seed)[1] for seed in range(5)]
+    exact_parameter = torch.nn.Parameter(torch.randn(7, generator=generator))
+    packed_parameter = torch.nn.Parameter(exact_parameter.detach().clone())
+    exact_optimizer = torch.optim.Adam([exact_parameter], lr=0.03)
+    packed_optimizer = torch.optim.Adam([packed_parameter], lr=0.03)
+    exact_loss_fn = OmegaLossFn(OmegaLossConfig(), K, gen_kl_type="k3")
+    packed_loss_fn = OmegaPerSequenceLossFn(gen_kl_type="k3")
+    frozen_coefficients = [
+        _coef(
+            torch.nn.functional.logsigmoid(x @ packed_parameter), data, _prompt_ids()
+        )[0]
+        for x, data in zip(features, batches)
+    ]
+    stale_differences = []
+    for step, (x, data) in enumerate(zip(features, batches)):
+        exact_optimizer.zero_grad()
+        packed_optimizer.zero_grad()
+        exact_logp = torch.nn.functional.logsigmoid(x @ exact_parameter)
+        direct_loss, _ = exact_loss_fn(exact_logp, data, torch.tensor(float(B * K)))
+        direct_loss.backward()
+
+        logp = torch.nn.functional.logsigmoid(x @ packed_parameter)
+        coef, _ = _coef(logp, data, _prompt_ids())
+        data["omega_coef"] = coef
+        # Reorder and split siblings across microbatches, just as packing can.
+        permutation = torch.randperm(B * K, generator=generator)
+        loss = 0
+        for rows in permutation.split(3):
+            microbatch = BatchedDataDict(
+                {key: value[rows] for key, value in data.items()}
+            )
+            term, _ = packed_loss_fn(logp[rows], microbatch, torch.tensor(float(B * K)))
+            loss = loss + term
+        stale_loss = -(
+            frozen_coefficients[step] * (logp * data["token_mask"][:, 1:]).sum(-1)
+        ).sum() / (B * K)
+        stale_gradient = torch.autograd.grad(
+            stale_loss, packed_parameter, retain_graph=True
+        )[0]
+        loss.backward()
+        torch.testing.assert_close(
+            packed_parameter.grad, exact_parameter.grad, rtol=1e-5, atol=1e-7
+        )
+        assert packed_parameter.grad.norm() > 0
+        stale_differences.append(
+            float((stale_gradient - exact_parameter.grad).abs().max())
+        )
+        exact_optimizer.step()
+        packed_optimizer.step()
+        torch.testing.assert_close(
+            packed_parameter, exact_parameter, rtol=1e-5, atol=1e-7
+        )
+        for key in ["exp_avg", "exp_avg_sq", "step"]:
+            torch.testing.assert_close(
+                packed_optimizer.state[packed_parameter][key],
+                exact_optimizer.state[exact_parameter][key],
+                rtol=1e-5,
+                atol=1e-7,
+            )
+    assert stale_differences[0] < 1e-7
+    assert all(difference > 1e-6 for difference in stale_differences[1:])

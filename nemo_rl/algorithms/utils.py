@@ -811,7 +811,10 @@ def print_performance_metrics(
     )
     if "generation" in timing_metrics:  # Sync
         generation_time = timing_metrics["generation"]
-    else:  # Async
+    elif metrics.get("rollout/generated_sequences") == 0:
+        # A cached synchronous update performs no generation.
+        generation_time = 0
+    else:  # Async / data-plane timing
         # If the training time is greater than the generation time, we include the idle time caused by training as part of the generation time.
         # if training time > generation time, generation time = training time
         # if training time < generation time, generation time = training time + exposed generation time
@@ -899,7 +902,9 @@ def print_performance_metrics(
         else 0
     )
     generation_tokens_per_sec_per_gpu = (
-        total_num_tokens / generation_time / generation_num_gpus
+        metrics.get("rollout/generated_tokens", total_num_tokens)
+        / generation_time
+        / generation_num_gpus
         if generation_time > 0
         else 0
     )

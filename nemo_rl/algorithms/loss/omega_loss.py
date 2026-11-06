@@ -116,10 +116,10 @@ class OmegaLossConfig(BaseModel, extra="allow"):
     h: str = "inverse_length"
     # "group": the loss computes the softmax itself; each microbatch must hold
     #   whole groups (no sequence packing); any number of updates per rollout.
-    # "per_sequence": group weights are computed once per rollout from the
+    # "per_sequence": group weights are recomputed before each update from the
     #   current policy's logprobs (``compute_omega_coefficients``) and the loss
     #   is a per-sequence term, so sequence packing / CP work. Exact only with
-    #   ONE optimizer update per rollout (train_global_batch_size ==
+    #   ONE optimizer update per prepared batch (train_global_batch_size ==
     #   num_prompts_per_step * num_generations_per_prompt).
     form: Literal["group", "per_sequence"] = "group"
 
@@ -254,7 +254,7 @@ def compute_omega_coefficients(
     so ``coef_j = w_j (A_j - Abar_w) h_j`` (no grad) turns the loss into the
     per-sequence term ``-coef_j * log pi(y_j)`` that packing handles like any
     other sequence-level loss. The logprobs must come from the weights that
-    are about to be differentiated (one update per rollout).
+    are about to be differentiated (one update per prepared batch).
 
     Groups are found by prompt content (like GRPO's baseline), not by row
     position. Invalid rows (sample_mask == 0) and rows with no generated
@@ -424,11 +424,11 @@ def validate_omega_setup(master_config: Any) -> None:
             f"must be a multiple of grpo.num_generations_per_prompt ({k})"
         )
     else:
-        # w is computed once per rollout from prev_logprobs, so it is only the
-        # exact current-policy weight for the first (and only) optimizer update.
+        # Each prepared slice recomputes w from the current policy. It must
+        # contain exactly one optimizer update, even when rollouts are buffered.
         assert policy["train_global_batch_size"] == grpo.num_prompts_per_step * k, (
             "omega_loss.form=per_sequence needs exactly one optimizer update per "
-            f"rollout: set policy.train_global_batch_size={grpo.num_prompts_per_step * k} "
+            f"prepared batch: set policy.train_global_batch_size={grpo.num_prompts_per_step * k} "
             "(= num_prompts_per_step * num_generations_per_prompt)"
         )
         assert not master_config.loss_fn.force_on_policy_ratio, (
