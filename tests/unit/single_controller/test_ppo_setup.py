@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -280,6 +281,88 @@ class TestPPOValidation:
         mc = _make_master_config(value=_value_config())
 
         with pytest.raises(ValueError, match="the `ppo` block is absent"):
+            validate_single_controller_config(mc)
+
+    def test_vlm_architecture_signature_uses_media_structure(self):
+        from nemo_rl.algorithms.single_controller_utils.config import (
+            _vlm_architecture_signature,
+        )
+
+        config = SimpleNamespace(
+            model_type="qwen2_5_vl",
+            architectures=["Qwen2_5_VLForConditionalGeneration"],
+            get_text_config=lambda: SimpleNamespace(model_type="qwen2"),
+            vision_config=SimpleNamespace(model_type="qwen2_5_vl_vision"),
+            image_token_id=151655,
+            video_token_id=151656,
+            vision_start_token_id=151652,
+            vision_end_token_id=151653,
+        )
+        with patch(
+            "transformers.AutoConfig.from_pretrained", return_value=config
+        ) as load:
+            signature = _vlm_architecture_signature(
+                "/models/policy", {"revision": "validated"}
+            )
+
+        load.assert_called_once_with(
+            "/models/policy", trust_remote_code=True, revision="validated"
+        )
+        assert signature == (
+            "qwen2_5_vl",
+            ("Qwen2_5_VLForConditionalGeneration",),
+            "qwen2",
+            "qwen2_5_vl_vision",
+            (
+                ("image_token_id", 151655),
+                ("video_token_id", 151656),
+                ("vision_start_token_id", 151652),
+                ("vision_end_token_id", 151653),
+            ),
+        )
+
+    def test_vlm_tokenizer_signature_uses_vocab_and_special_tokens(self):
+        from nemo_rl.algorithms.single_controller_utils.config import (
+            _vlm_tokenizer_signature,
+        )
+
+        tokenizer = SimpleNamespace(
+            get_vocab=lambda: {"<image>": 2, "answer": 1},
+            bos_token_id=10,
+            eos_token_id=11,
+            pad_token_id=12,
+            unk_token_id=13,
+            sep_token_id=None,
+            cls_token_id=None,
+            mask_token_id=None,
+        )
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
+        ) as load:
+            signature = _vlm_tokenizer_signature(
+                {
+                    "name": "/tokenizers/policy",
+                    "tokenizer_kwargs": {"use_fast": False},
+                },
+                "/models/fallback",
+            )
+
+        load.assert_called_once_with(
+            "/tokenizers/policy", trust_remote_code=True, use_fast=False
+        )
+        assert signature[0] == 2
+        assert len(signature[1]) == 64
+        assert signature[2] == (10, 11, 12, 13, None, None, None)
+
+    def test_rejects_vlm_ppo_without_both_model_names(self):
+        mc = _ppo_master_config()
+        mc.policy["is_vlm"] = True
+        assert mc.value is not None
+        mc.value["model_name"] = ""
+
+        with pytest.raises(
+            ValueError, match="requires model_name for both the policy and critic"
+        ):
             validate_single_controller_config(mc)
 
     def test_rejects_vlm_policy_with_a_different_critic_model(self):
