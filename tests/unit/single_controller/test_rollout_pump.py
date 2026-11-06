@@ -43,7 +43,10 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
-from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller import (
+    SingleControllerActor,
+    _BelowValidFraction,
+)
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
@@ -1134,7 +1137,6 @@ def test_min_valid_fraction_counts_rollouts_independently_of_segments(
     row_counts: tuple[int, int],
     threshold: float | None,
     forest_training: bool,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     valid_rows, total_rows = row_counts
     # Three of four owners verified, regardless of how many rows they produced.
@@ -1155,8 +1157,33 @@ def test_min_valid_fraction_counts_rollouts_independently_of_segments(
             else {}
         ),
     )
-    fraction = 0.75 if forest_training else valid_rows / total_rows
-    dropped = threshold is not None and fraction < threshold
+    counts = (3, 4) if forest_training else row_counts
+    dropped = threshold is not None and counts[0] / counts[1] < threshold
+    ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+    ctrl._master_config = SimpleNamespace(
+        token_capture=SimpleNamespace(
+            min_valid_fraction_per_group=threshold, forest_training=forest_training
+        ),
+    )
+
+    assert ctrl._valid_fraction_counts(finalized) == (counts if dropped else None)
+
+
+@pytest.mark.parametrize("has_spare", [False, True])
+def test_below_valid_fraction_outcome_substitutes_or_closes_short(
+    has_spare: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The pump acts on the finalize cut's decision instead of re-deciding it."""
+    spare = {"message_log": [[{"role": "user", "content": "spare"}]], "idx": 1}
+    rejected = _BelowValidFraction(
+        valid_count=3,
+        total_count=4,
+        replacement=spare if has_spare else None,
+        lineage_group_id="spare-group" if has_spare else None,
+    )
+    committed = FinalizedGroup(
+        meta=None, group_min_wv=0, group_max_wv=0, staging_keys=[]
+    )
 
     async def run() -> None:
         ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
@@ -1166,7 +1193,7 @@ def test_min_valid_fraction_counts_rollouts_independently_of_segments(
         ctrl._master_config = SimpleNamespace(
             grpo=GRPOConfig.model_construct(max_num_epochs=1),
             token_capture=SimpleNamespace(
-                min_valid_fraction_per_group=threshold, forest_training=forest_training
+                min_valid_fraction_per_group=0.8, forest_training=False
             ),
         )
         ctrl._algo_cfg = ctrl._master_config.grpo
@@ -1178,9 +1205,11 @@ def test_min_valid_fraction_counts_rollouts_independently_of_segments(
         )
         _init_pump_ledgers(ctrl)
         ctrl._finalizer_actors = [object()]
-        ctrl._finalize_with_actor = AsyncMock(return_value=finalized)
-        ctrl._discard_committed_group = AsyncMock()
-        ctrl._sampler = WindowedSampler(None, max_staleness_versions=1)
+        ctrl._finalize_with_actor = AsyncMock(side_effect=[rejected, committed])
+        # in_order stamps the batch for step 0, so the step the finalize cut
+        # replaces into (or credits short) is visible.
+        ctrl._buffer = _RecordingBuffer()
+        ctrl._sampler = InOrderSampler(ctrl._buffer, max_lookahead_versions=1)
         ctrl._dataloader = [
             BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
         ]
@@ -1196,20 +1225,30 @@ def test_min_valid_fraction_counts_rollouts_independently_of_segments(
 
         await ctrl._rollout_pump()
 
-        assert ctrl._rollout_manager.stats.committed == int(not dropped)
-        assert ctrl._buffer_capacity._value == int(dropped)
-        assert ctrl._inflight_rollouts == 0
+        # The finalize cut decides replacement and shortfall from these, so the
+        # pump must pass the stamped step and its replacement count.
+        assert [call.kwargs for call in ctrl._finalize_with_actor.await_args_list] == [
+            {"target_step": 0, "replacements_used": 0}
+        ] + ([{"target_step": 0, "replacements_used": 1}] if has_spare else [])
+        # The finalize cut owns the shortfall credit; the pump adds none.
+        assert ctrl._batch_shortfall == {}
         assert ctrl._rollout_exhausted.is_set()
-        if dropped:
-            ctrl._discard_committed_group.assert_awaited_once_with(request)
-            ctrl._rollout_manager.record_finalizer_dropped_prompt.assert_called_once()
-        else:
-            ctrl._discard_committed_group.assert_not_awaited()
+        assert ctrl._rollout_manager.stats.committed == int(has_spare)
+        assert ctrl._buffer_capacity._value == int(not has_spare)
+        assert ctrl._inflight_rollouts == 0
+        generate = ctrl._rollout_manager.generate_for_finalization
+        if has_spare:
+            # The spare runs under the lineage reserved inside the finalize cut.
+            assert generate.await_count == 2
+            assert generate.await_args.args == (spare,)
+            assert generate.await_args.kwargs["lineage_group_id"] == "spare-group"
             ctrl._rollout_manager.record_finalizer_dropped_prompt.assert_not_called()
+        else:
+            assert generate.await_count == 1
+            ctrl._rollout_manager.record_finalizer_dropped_prompt.assert_called_once()
 
     asyncio.run(run())
-    if dropped and forest_training:
-        assert "(3/4 < 0.8)" in capsys.readouterr().out
+    assert "(3/4 < 0.8)" in capsys.readouterr().out
 
 
 def test_actor_path_releases_generation_permit_before_finalization() -> None:
@@ -1242,6 +1281,7 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
             rollout_metrics: dict[str, Any],
             *,
             target_step: int | None = None,
+            replacements_used: int = 0,
         ) -> bool:
             nonlocal finalizers_started
             del request, rollout_metrics, target_step
@@ -1406,6 +1446,7 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
         async def _finalize(
             request: Any,
             rollout_metrics: dict[str, Any],
+            **_: Any,
         ) -> Any:
             async with ctrl._data_plane_checkpoint_barrier.mutation() as cut:
                 manager.recovery_ledger.discard_group(cut, request.group_id)
