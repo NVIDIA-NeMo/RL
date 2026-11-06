@@ -63,8 +63,28 @@ def _load_objective_without_poisoning_packages() -> ModuleType:
 
 
 _OBJECTIVE = _load_objective_without_poisoning_packages()
-DSparkLossBins = _OBJECTIVE.DSparkLossBins
+DraftLossStats = _OBJECTIVE.DraftLossStats
 dspark_tiled_objective = _OBJECTIVE.dspark_tiled_objective
+
+_COMPONENT_WEIGHTS = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+
+
+def _component_stats(**inputs: object) -> tuple[DraftLossStats, ...]:
+    """Evaluate CE, TV, and confidence bins through unit loss weights."""
+    inputs.pop("loss_weights", None)
+    return tuple(
+        dspark_tiled_objective(**inputs, loss_weights=weights)
+        for weights in _COMPONENT_WEIGHTS
+    )
+
+
+def _sum_stats(*stats: DraftLossStats) -> DraftLossStats:
+    return DraftLossStats(
+        numerators=sum(item.numerators for item in stats),
+        counts=sum(item.counts for item in stats),
+        weights=stats[0].weights,
+    )
+
 
 _SPECULATORS_DSPARK_METRICS_REVISION = (
     "ba4cc76e4e75102660d0bb954e299725f3092d58"  # pragma: allowlist secret
@@ -245,7 +265,7 @@ def _inputs() -> dict[str, object]:
     }
 
 
-def _dense_oracle(inputs: dict[str, object]) -> tuple[DSparkLossBins, ...]:
+def _dense_oracle(inputs: dict[str, object]) -> tuple[DraftLossStats, ...]:
     target_logits = inputs["target_logits"]
     draft_hidden = inputs["draft_hidden"]
     target_output_weight = inputs["target_output_weight"]
@@ -298,7 +318,7 @@ def _dense_oracle(inputs: dict[str, object]) -> tuple[DSparkLossBins, ...]:
             rows.reshape(-1) * valid_mask.reshape(-1),
         )
         components.append(
-            DSparkLossBins(
+            DraftLossStats(
                 numerators=numerators,
                 counts=counts,
                 weights=torch.ones_like(counts),
@@ -342,7 +362,7 @@ def test_hard_ce_uses_explicit_label_and_matches_gradient() -> None:
     reference_loss.backward()
 
     stats = dspark_tiled_objective(**inputs)
-    loss = stats.ce.normalized(normalization_counts=stats.ce.counts)
+    loss = stats.normalized(normalization_counts=stats.counts)
     loss.backward()
 
     torch.testing.assert_close(loss, reference_loss)
@@ -364,7 +384,7 @@ def test_hard_ce_uses_explicit_sampled_labels_instead_of_teacher_argmax() -> Non
     reference_loss.backward()
 
     stats = dspark_tiled_objective(**{**inputs, "hard_labels": torch.tensor([[2]])})
-    loss = stats.ce.normalized(normalization_counts=stats.ce.counts)
+    loss = stats.normalized(normalization_counts=stats.counts)
     loss.backward()
 
     torch.testing.assert_close(loss, reference_loss)
@@ -397,7 +417,7 @@ def test_dspark_objective_matches_dense_component_oracles(
     actual = dspark_tiled_objective(**inputs, loss_weights=loss_weights)
 
     for actual_component, expected_component in zip(
-        (actual.ce, actual.tv, actual.confidence),
+        _component_stats(**inputs),
         (expected_ce, expected_tv, expected_confidence),
         strict=True,
     ):
@@ -413,8 +433,8 @@ def test_dspark_objective_matches_dense_component_oracles(
             strict=True,
         )
     )
-    torch.testing.assert_close(actual.combined.numerators, expected_combined)
-    torch.testing.assert_close(actual.combined.counts, expected_ce.counts)
+    torch.testing.assert_close(actual.numerators, expected_combined)
+    torch.testing.assert_close(actual.counts, expected_ce.counts)
 
 
 def test_dspark_objective_stops_teacher_but_trains_all_draft_inputs() -> None:
@@ -425,7 +445,7 @@ def test_dspark_objective_stops_teacher_but_trains_all_draft_inputs() -> None:
         loss_weights=(1.5, 0.75, 2.0),
     )
 
-    actual.combined.normalized(normalization_counts=actual.combined.counts).backward()
+    actual.normalized(normalization_counts=actual.counts).backward()
 
     target_logits = inputs["target_logits"]
     assert isinstance(target_logits, torch.Tensor)
@@ -456,10 +476,10 @@ def test_tiled_gradients_match_dense_reference_with_markov_and_confidence() -> N
     assert markov_w1.abs().sum() > 0
 
     actual = dspark_tiled_objective(**inputs, loss_weights=loss_weights)
-    actual.combined.normalized(normalization_counts=actual.combined.counts).backward()
+    actual.normalized(normalization_counts=actual.counts).backward()
 
     reference_components = _dense_oracle(reference_inputs)
-    reference_combined = DSparkLossBins(
+    reference_combined = DraftLossStats(
         numerators=sum(
             weight * component.numerators
             for weight, component in zip(
@@ -551,9 +571,9 @@ def test_invalid_nonfinite_rows_are_excluded_before_probability_math() -> None:
         **inputs,
         loss_weights=(1.0, 1.0, 1.0),
     )
-    actual.combined.normalized(normalization_counts=actual.combined.counts).backward()
+    actual.normalized(normalization_counts=actual.counts).backward()
 
-    for component in (actual.ce, actual.tv, actual.confidence, actual.combined):
+    for component in (*_component_stats(**inputs), actual):
         assert torch.isfinite(component.numerators).all()
     for name in ("draft_hidden", "confidence_logits"):
         tensor = inputs[name]
@@ -571,7 +591,7 @@ def test_empty_or_all_invalid_slots_return_zero_raw_bins(num_blocks: int) -> Non
     num_slots, vocab_size = 3, 5
     shape = (num_blocks, num_slots, vocab_size)
     logits_shape = (num_blocks, num_slots)
-    actual = dspark_tiled_objective(
+    empty_inputs: dict[str, object] = dict(
         target_logits=torch.full(shape, torch.nan, requires_grad=True),
         draft_hidden=torch.full(
             (num_blocks, num_slots, 4), torch.inf, requires_grad=True
@@ -589,8 +609,9 @@ def test_empty_or_all_invalid_slots_return_zero_raw_bins(num_blocks: int) -> Non
         draft_vocab_start_index=0,
         tp_group=None,
     )
+    actual = dspark_tiled_objective(**empty_inputs)
 
-    for component in (actual.ce, actual.tv, actual.confidence, actual.combined):
+    for component in (*_component_stats(**empty_inputs), actual):
         torch.testing.assert_close(component.numerators, torch.zeros(num_slots))
         torch.testing.assert_close(component.counts, torch.zeros(num_slots))
         torch.testing.assert_close(
@@ -626,36 +647,38 @@ def test_raw_stats_add_across_dp_splits_with_one_zero_rank() -> None:
         if block_index == 1:
             rank_inputs["valid_mask"] = torch.zeros_like(rank_inputs["valid_mask"])
         rank_stats.append(
-            dspark_tiled_objective(
-                **rank_inputs,
-                loss_weights=(1.25, 0.5, 2.0),
+            (
+                *_component_stats(**rank_inputs),
+                dspark_tiled_objective(
+                    **rank_inputs,
+                    loss_weights=(1.25, 0.5, 2.0),
+                ),
             )
         )
     first_rank_inputs = dict(inputs)
     for name, value in tuple(first_rank_inputs.items()):
         if name in per_block_inputs and isinstance(value, torch.Tensor):
             first_rank_inputs[name] = value[:1]
-    expected_nonzero_rank = dspark_tiled_objective(
-        **first_rank_inputs,
-        loss_weights=(1.25, 0.5, 2.0),
+    expected_nonzero_rank = (
+        *_component_stats(**first_rank_inputs),
+        dspark_tiled_objective(
+            **first_rank_inputs,
+            loss_weights=(1.25, 0.5, 2.0),
+        ),
     )
 
-    combined = rank_stats[0] + rank_stats[1]
+    combined = tuple(
+        _sum_stats(first, second)
+        for first, second in zip(rank_stats[0], rank_stats[1], strict=True)
+    )
     for actual_component, expected_component in zip(
-        (combined.ce, combined.tv, combined.confidence, combined.combined),
-        (
-            expected_nonzero_rank.ce,
-            expected_nonzero_rank.tv,
-            expected_nonzero_rank.confidence,
-            expected_nonzero_rank.combined,
-        ),
-        strict=True,
+        combined, expected_nonzero_rank, strict=True
     ):
         torch.testing.assert_close(
             actual_component.numerators, expected_component.numerators
         )
         torch.testing.assert_close(actual_component.counts, expected_component.counts)
-    assert not torch.equal(full.combined.counts, combined.combined.counts)
+    assert not torch.equal(full.counts, combined[-1].counts)
 
 
 def test_raw_stats_add_across_two_nonempty_dp_splits() -> None:
@@ -685,20 +708,24 @@ def test_raw_stats_add_across_two_nonempty_dp_splits() -> None:
             for name, value in inputs.items()
         }
         rank_stats.append(
-            dspark_tiled_objective(**rank_inputs, loss_weights=(1.25, 0.5, 2.0))
+            (
+                *_component_stats(**rank_inputs),
+                dspark_tiled_objective(**rank_inputs, loss_weights=(1.25, 0.5, 2.0)),
+            )
         )
 
-    combined = rank_stats[0] + rank_stats[1]
-    for name in ("ce", "tv", "confidence", "combined"):
-        actual = getattr(combined, name)
-        expected = getattr(full, name)
+    expected_stats = (*_component_stats(**inputs), full)
+    for first, second, expected in zip(
+        rank_stats[0], rank_stats[1], expected_stats, strict=True
+    ):
+        actual = _sum_stats(first, second)
         torch.testing.assert_close(actual.numerators, expected.numerators)
         torch.testing.assert_close(actual.counts, expected.counts)
-    local = rank_stats[0].combined
-    assert not torch.equal(local.counts, full.combined.counts)
+    local = rank_stats[0][-1]
+    assert not torch.equal(local.counts, full.counts)
     assert not torch.allclose(
         local.normalized(normalization_counts=local.counts),
-        local.normalized(normalization_counts=full.combined.counts),
+        local.normalized(normalization_counts=full.counts),
     )
 
 
@@ -729,9 +756,7 @@ def test_probability_core_uses_one_normalizer_pass_and_saves_no_probabilities(
             loss_weights=(1.0, 1.0, 1.0),
         )
         assert tile_sizes == [2, 2, 2]
-        actual.combined.normalized(
-            normalization_counts=actual.combined.counts
-        ).backward()
+        actual.normalized(normalization_counts=actual.counts).backward()
 
     target_logits = inputs["target_logits"]
     assert isinstance(target_logits, torch.Tensor)
@@ -744,7 +769,7 @@ def test_probability_core_uses_one_normalizer_pass_and_saves_no_probabilities(
 
 
 def test_confidence_can_be_disabled_without_changing_ce_or_tv() -> None:
-    """A runtime without confidence still exposes explicit zero confidence bins."""
+    """A runtime without confidence keeps CE/TV bins and rejects a confidence weight."""
     inputs = _inputs()
     enabled = dspark_tiled_objective(
         **inputs,
@@ -756,30 +781,25 @@ def test_confidence_can_be_disabled_without_changing_ce_or_tv() -> None:
         loss_weights=(1.25, 0.5, 0.0),
     )
 
-    for name in ("ce", "tv", "combined"):
-        actual = getattr(disabled, name)
-        expected = getattr(enabled, name)
-        torch.testing.assert_close(actual.numerators, expected.numerators)
-        torch.testing.assert_close(actual.counts, expected.counts)
-    torch.testing.assert_close(disabled.confidence.numerators, torch.zeros(3))
-    torch.testing.assert_close(disabled.confidence.counts, torch.zeros(3))
+    torch.testing.assert_close(disabled.numerators, enabled.numerators)
+    torch.testing.assert_close(disabled.counts, enabled.counts)
+    with pytest.raises(ValueError, match="confidence weight must be zero"):
+        dspark_tiled_objective(**inputs, loss_weights=(1.25, 0.5, 1.0))
 
 
 def test_confidence_targets_survive_a_permuted_dense_valid_mask() -> None:
     inputs = _inputs()
-    contiguous = dspark_tiled_objective(**inputs, loss_weights=(1.0, 1.0, 1.0))
+    contiguous = _component_stats(**inputs)[2]
 
     permuted = _inputs()
     valid_mask = permuted["valid_mask"]
     assert isinstance(valid_mask, torch.Tensor)
     permuted["valid_mask"] = valid_mask.t().contiguous().t()
     assert not permuted["valid_mask"].is_contiguous()
-    actual = dspark_tiled_objective(**permuted, loss_weights=(1.0, 1.0, 1.0))
+    actual = _component_stats(**permuted)[2]
 
-    assert contiguous.confidence.numerators.abs().sum() > 0
-    torch.testing.assert_close(
-        actual.confidence.numerators, contiguous.confidence.numerators
-    )
+    assert contiguous.numerators.abs().sum() > 0
+    torch.testing.assert_close(actual.numerators, contiguous.numerators)
 
 
 def test_confidence_uses_detached_selected_vocab_acceptance_overlap() -> None:
@@ -830,14 +850,14 @@ def test_confidence_uses_detached_selected_vocab_acceptance_overlap() -> None:
         reduction="none",
     ).reshape(-1)
     torch.testing.assert_close(
-        stats.confidence.numerators,
+        stats.numerators,
         expected,
         msg=lambda message: (
             f"Speculators@{_SPECULATORS_DSPARK_METRICS_REVISION}: {message}"
         ),
     )
 
-    stats.confidence.normalized(normalization_counts=stats.confidence.counts).backward()
+    stats.normalized(normalization_counts=stats.counts).backward()
     assert full_target_logits.grad is None
     assert draft_hidden.grad is None
     torch.testing.assert_close(
@@ -873,7 +893,7 @@ def test_objective_rejects_ambiguous_metadata(
 def test_normalized_requires_externally_reduced_counts() -> None:
     """A DP-local count must never silently define the optimizer gradient scale."""
     local_numerator = torch.tensor([6.0], requires_grad=True)
-    stats = DSparkLossBins(
+    stats = DraftLossStats(
         numerators=local_numerator,
         counts=torch.tensor([2.0]),
         weights=torch.ones(1),
@@ -886,29 +906,6 @@ def test_normalized_requires_externally_reduced_counts() -> None:
     torch.testing.assert_close(local_numerator.grad, torch.tensor([1.0 / 3.0]))
 
 
-def test_slot_weights_normalize_weighted_numerators_by_weighted_global_count() -> None:
-    """Position decay applies to both the numerator and global denominator."""
-    local_numerators = torch.tensor([1.0, 1.0], requires_grad=True)
-    slot_weights = torch.tensor([1.0, 0.25], requires_grad=True)
-    stats = DSparkLossBins(
-        numerators=local_numerators,
-        counts=torch.tensor([1.0, 1.0]),
-        weights=slot_weights,
-    )
-    global_counts = torch.tensor([1.0, 1.0])
-
-    loss = stats.normalized(normalization_counts=global_counts)
-    torch.testing.assert_close(loss, torch.tensor(1.0))
-    loss.backward()
-
-    assert not stats.weights.requires_grad
-    assert slot_weights.grad is None
-    torch.testing.assert_close(
-        local_numerators.grad,
-        torch.tensor([0.8, 0.2]),
-    )
-
-
 def test_objective_carries_typed_detached_slot_weights() -> None:
     inputs = _inputs()
     slot_weights = torch.tensor([1.0, 0.5, 0.125], requires_grad=True)
@@ -919,10 +916,9 @@ def test_objective_carries_typed_detached_slot_weights() -> None:
         slot_weights=slot_weights,
     )
 
-    for component in (stats.ce, stats.tv, stats.confidence, stats.combined):
-        torch.testing.assert_close(component.weights, slot_weights.detach())
-        assert not component.weights.requires_grad
-    stats.combined.normalized(normalization_counts=stats.combined.counts).backward()
+    torch.testing.assert_close(stats.weights, slot_weights.detach())
+    assert not stats.weights.requires_grad
+    stats.normalized(normalization_counts=stats.counts).backward()
     assert slot_weights.grad is None
 
 
@@ -955,7 +951,7 @@ def test_split_vocab_uses_mapped_draft_rows_and_independent_id_bounds() -> None:
     }
 
     stats = dspark_tiled_objective(**common)
-    assert torch.isfinite(stats.combined.numerators).all()
+    assert torch.isfinite(stats.numerators).all()
 
     with pytest.raises(ValueError, match="previous_token_ids"):
         dspark_tiled_objective(
@@ -980,7 +976,7 @@ def test_invalid_slots_may_carry_out_of_range_sentinel_tokens() -> None:
     hard_labels[~valid_mask] = -999
 
     stats = dspark_tiled_objective(**inputs, loss_weights=(1.0, 1.0, 1.0))
-    assert torch.isfinite(stats.combined.numerators).all()
+    assert torch.isfinite(stats.numerators).all()
 
 
 @pytest.mark.parametrize(
@@ -1043,7 +1039,7 @@ def test_backward_never_casts_a_full_large_vocab_weight_to_float32() -> None:
     recorder = _FloatCastRecorder()
     with recorder:
         stats = dspark_tiled_objective(**inputs)
-        stats.combined.normalized(normalization_counts=stats.combined.counts).backward()
+        stats.normalized(normalization_counts=stats.counts).backward()
 
     assert (local_vocab_size, 2) not in recorder.float_cast_shapes
     assert (local_vocab_size, 1) not in recorder.float_cast_shapes
@@ -1100,6 +1096,6 @@ def test_selected_slots_do_not_retain_long_context_backing_storage() -> None:
             draft_vocab_start_index=0,
             tp_group=None,
         )
-        stats.combined.normalized(normalization_counts=stats.combined.counts).backward()
+        stats.normalized(normalization_counts=stats.counts).backward()
 
     assert retained_long_storages == []

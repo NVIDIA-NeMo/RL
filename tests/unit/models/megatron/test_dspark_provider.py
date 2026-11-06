@@ -151,7 +151,7 @@ def _run_requested_none_group_drift(
 
         if rank == 0:
             stats = provider.objective_stats(**inputs)
-            assert torch.isfinite(stats.combined.numerators).all()
+            assert torch.isfinite(stats.numerators).all()
         else:
             with pytest.raises(ValueError, match="objective TP group must match"):
                 provider.objective_stats(**inputs)
@@ -245,7 +245,7 @@ def test_provider_uses_live_head_without_owning_or_training_it() -> None:
     inputs = _provider_inputs()
 
     stats = provider.objective_stats(**inputs)
-    stats.combined.normalized(normalization_counts=stats.combined.counts).backward()
+    stats.normalized(normalization_counts=stats.counts).backward()
 
     target_output_weight = inputs["target_output_weight"]
     target_logits = inputs["target_logits"]
@@ -276,7 +276,7 @@ def test_duplicate_markov_tokens_accumulate_into_one_replicated_w1_row() -> None
     )
     inputs = _provider_inputs()
     stats = provider.objective_stats(**inputs)
-    stats.combined.normalized(normalization_counts=stats.combined.counts).backward()
+    stats.normalized(normalization_counts=stats.counts).backward()
 
     gradient = provider.markov_head.markov_w1.weight.grad
     assert gradient is not None
@@ -285,7 +285,7 @@ def test_duplicate_markov_tokens_accumulate_into_one_replicated_w1_row() -> None
 
 
 def test_confidence_disabled_provider_has_no_confidence_parameters() -> None:
-    """A confidence-disabled capability returns explicit zero raw confidence bins."""
+    """A confidence-disabled capability rejects a nonzero confidence weight."""
     provider = build_dspark_provider(
         body=_CheckpointIdentity(),
         target_vocab_size=9,
@@ -303,8 +303,9 @@ def test_confidence_disabled_provider_has_no_confidence_parameters() -> None:
 
     assert provider.confidence_head is None
     assert not any("confidence" in name for name, _ in provider.named_parameters())
-    torch.testing.assert_close(stats.confidence.numerators, torch.zeros(3))
-    torch.testing.assert_close(stats.confidence.counts, torch.zeros(3))
+    assert torch.isfinite(stats.numerators).all()
+    with pytest.raises(ValueError, match="confidence weight must be zero"):
+        provider.objective_stats(**{**inputs, "loss_weights": (1.0, 1.0, 1.0)})
 
 
 def test_provider_rejects_mismatched_tp_head_and_objective_group() -> None:

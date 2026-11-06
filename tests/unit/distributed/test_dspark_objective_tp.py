@@ -212,29 +212,30 @@ def _run_tp_provider_objective(rank: int, world_size: int) -> None:
     local_target_logits = (
         target_logits[..., vocab_start:vocab_end].clone().requires_grad_()
     )
-    stats = provider.objective_stats(
-        draft_hidden=actual_hidden,
-        target_output_weight=local_output_weight,
-        target_logits=local_target_logits,
-        hard_labels=hard_labels,
-        previous_token_ids=previous_token_ids,
-        valid_mask=valid_mask,
-        slot_bins=slot_bins,
-        loss_weights=loss_weights,
-        token_chunk_size=2,
-        tp_group=tp_group,
-    )
-    actual_loss = stats.combined.normalized(normalization_counts=stats.combined.counts)
+    objective_inputs: dict[str, Any] = {
+        "draft_hidden": actual_hidden,
+        "target_output_weight": local_output_weight,
+        "target_logits": local_target_logits,
+        "hard_labels": hard_labels,
+        "previous_token_ids": previous_token_ids,
+        "valid_mask": valid_mask,
+        "slot_bins": slot_bins,
+        "token_chunk_size": 2,
+        "tp_group": tp_group,
+    }
+    stats = provider.objective_stats(**objective_inputs, loss_weights=loss_weights)
+    actual_loss = stats.normalized(normalization_counts=stats.counts)
     actual_loss.backward()
+    with torch.no_grad():
+        component_numerators = tuple(
+            provider.objective_stats(
+                **objective_inputs, loss_weights=weights
+            ).numerators
+            for weights in ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+        )
 
     for actual, expected in zip(
-        (
-            stats.ce.numerators,
-            stats.tv.numerators,
-            stats.confidence.numerators,
-            stats.combined.numerators,
-            stats.combined.counts,
-        ),
+        (*component_numerators, stats.numerators, stats.counts),
         expected_stats,
         strict=True,
     ):
@@ -303,7 +304,7 @@ def _run_dp2_raw_additive_stats(
         draft_vocab_start_index=0,
         tp_group=None,
     )
-    local = torch.stack((stats.combined.numerators, stats.combined.counts))
+    local = torch.stack((stats.numerators, stats.counts))
     gathered = [torch.empty_like(local) for _ in range(world_size)]
     torch.distributed.all_gather(gathered, local, group=dp_group)
     reduced = local.clone()
@@ -317,10 +318,10 @@ def _run_dp2_raw_additive_stats(
     torch.testing.assert_close(reduced[1], expected_counts)
     if zero_rank:
         return
-    assert not torch.equal(reduced[1], stats.combined.counts)
+    assert not torch.equal(reduced[1], stats.counts)
     assert not torch.allclose(
-        stats.combined.normalized(normalization_counts=reduced[1]),
-        stats.combined.normalized(normalization_counts=stats.combined.counts),
+        stats.normalized(normalization_counts=reduced[1]),
+        stats.normalized(normalization_counts=stats.counts),
     )
 
 
@@ -427,7 +428,7 @@ def _run_tp_tv_only_gradient(rank: int, world_size: int) -> None:
         token_chunk_size=1,
         tp_group=tp_group,
     )
-    stats.tv.normalized(normalization_counts=stats.tv.counts).backward()
+    stats.normalized(normalization_counts=stats.counts).backward()
     torch.testing.assert_close(
         actual_hidden.grad,
         expected_hidden_gradient.reshape_as(actual_hidden).to(
@@ -450,7 +451,7 @@ def _run_tp_tv_only_gradient(rank: int, world_size: int) -> None:
         token_chunk_size=1,
         tp_group=tp_group,
     )
-    empty_stats.tv.normalized(normalization_counts=empty_stats.tv.counts).backward()
+    empty_stats.normalized(normalization_counts=empty_stats.counts).backward()
     torch.testing.assert_close(empty_hidden.grad, torch.zeros_like(empty_hidden))
 
 
@@ -493,9 +494,9 @@ def _run_tp_global_acceptance_overlap(rank: int, world_size: int) -> None:
         global_acceptance.reshape(1, 1),
         reduction="none",
     ).reshape(-1)
-    torch.testing.assert_close(stats.confidence.numerators, expected)
+    torch.testing.assert_close(stats.numerators, expected)
 
-    stats.confidence.normalized(normalization_counts=stats.confidence.counts).backward()
+    stats.normalized(normalization_counts=stats.counts).backward()
     assert draft_hidden.grad is None
     torch.testing.assert_close(
         confidence_logits.grad,
@@ -548,7 +549,7 @@ def _run_tp_split_vocab_mapping_and_bounds(rank: int, world_size: int) -> None:
     }
 
     stats = provider.objective_stats(**common)
-    assert torch.isfinite(stats.combined.numerators).all()
+    assert torch.isfinite(stats.numerators).all()
     with pytest.raises(ValueError, match="previous_token_ids"):
         provider.objective_stats(
             **{
@@ -579,10 +580,10 @@ def _run_dp2_global_normalization_gradient(rank: int, world_size: int) -> None:
         requires_grad=True,
     )
     differentiable_numerator = numerator_source * local_count
-    slot_weights = torch.tensor([1.0, 0.25], device=device, requires_grad=True)
-    from nemo_rl.algorithms.loss.dspark import DSparkLossBins
+    slot_weights = torch.tensor([1.0, 0.25], device=device)
+    from nemo_rl.algorithms.loss.draft import DraftLossStats
 
-    bins = DSparkLossBins(differentiable_numerator, local_count, slot_weights)
+    bins = DraftLossStats(differentiable_numerator, local_count, slot_weights)
     local_loss = bins.normalized(normalization_counts=global_count)
     global_loss = local_loss.detach().clone()
     torch.distributed.all_reduce(global_loss, group=dp_group)
@@ -599,7 +600,6 @@ def _run_dp2_global_normalization_gradient(rank: int, world_size: int) -> None:
         if rank == 0
         else torch.tensor([1.0, 0.25], device=device) / 2.25,
     )
-    assert slot_weights.grad is None
 
 
 def _run_tp_provider_checkpoint(
@@ -716,7 +716,7 @@ def _run_tp_explicit_sampled_label(rank: int, world_size: int) -> None:
         draft_vocab_start_index=vocab_start,
         tp_group=tp_group,
     )
-    actual_loss = stats.ce.normalized(normalization_counts=stats.ce.counts)
+    actual_loss = stats.normalized(normalization_counts=stats.counts)
     actual_loss.backward()
 
     reference_hidden = hidden.detach().clone().requires_grad_()
