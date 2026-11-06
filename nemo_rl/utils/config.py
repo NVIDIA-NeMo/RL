@@ -192,6 +192,13 @@ def parse_hydra_overrides(cfg: DictConfig, overrides: list[str]) -> DictConfig:
         raise OverridesError(f"Failed to parse Hydra overrides: {str(e)}") from e
 
 
+def _exact_int_div(a: int, b: int) -> int:
+    """Integer division for config arithmetic (e.g. batch sizes); refuses remainders."""
+    if a % b:
+        raise ValueError(f"idiv: {a} is not divisible by {b}")
+    return a // b
+
+
 def register_omegaconf_resolvers() -> None:
     """Register shared OmegaConf resolvers used in configs."""
     if not OmegaConf.has_resolver("add"):
@@ -200,5 +207,7 @@ def register_omegaconf_resolvers() -> None:
         OmegaConf.register_new_resolver("mul", lambda a, b: a * b)
     if not OmegaConf.has_resolver("div"):
         OmegaConf.register_new_resolver("div", lambda a, b: a / b)
+    if not OmegaConf.has_resolver("idiv"):
+        OmegaConf.register_new_resolver("idiv", _exact_int_div)
     if not OmegaConf.has_resolver("max"):
         OmegaConf.register_new_resolver("max", lambda a, b: max(a, b))
