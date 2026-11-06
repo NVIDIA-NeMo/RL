@@ -225,3 +225,68 @@ def test_checkpoint_state_is_independent_and_restores_after_serialization() -> N
     attempt["reward_checks"]["low_effort"] = False
     attempt["reward_log_context"]["agent_name"] = "changed"
     assert ledger.state_dict() == expected_ledger
+
+
+def test_canonical_group_receipts_are_filtered_before_copy(monkeypatch) -> None:
+    from nemo_rl.experience import rollout_recovery as recovery
+
+    ledger = RolloutRecoveryLedger()
+
+    async def populate():
+        async with DataPlaneCheckpointBarrier().mutation() as cut:
+            for idx, name in enumerate(("canonical", "pending")):
+                group = ledger.reserve_group(
+                    cut,
+                    group_id=name,
+                    admission_id=name,
+                    prompt_id=str(idx),
+                    prompt_payload={"idx": idx},
+                    expected_generations=1,
+                    target_step=1,
+                    start_weight_version=0,
+                    task_source=None,
+                    restore_level=RecoveryTargetLevel.SIBLING,
+                    admitted=True,
+                )
+                ledger.mark_group_dispatched(cut, name)
+                rollout_id = group.gate_rollout_ids[0]
+                ledger.mark_sibling_sealed(
+                    cut,
+                    name,
+                    generation_index=0,
+                    gate_rollout_id=rollout_id,
+                    receipt={"rollout_id": rollout_id, "manifest": []},
+                    reward=1.0,
+                    mask_sample=False,
+                )
+
+    asyncio.run(populate())
+    original = ledger.state_dict()
+    skipped = ledger._groups["canonical"].siblings[0].current_attempt.receipt
+    copy_value = recovery._copy_checkpoint_value
+
+    def guarded(value, memo=None):
+        assert value is not skipped, (
+            "Canonical receipt must not be constructed and discarded"
+        )
+        return copy_value(value, memo)
+
+    monkeypatch.setattr(recovery, "_copy_checkpoint_value", guarded)
+    state = build_rollout_recovery_state(
+        ledger,
+        batch_shortfall={},
+        sampler_stamps_target_steps=False,
+        canonical_group_ids={"canonical"},
+    )
+    assert state["groups"] == [
+        group for group in original["groups"] if group["group_id"] == "pending"
+    ]
+    parsed = parse_rollout_recovery_state(state)
+    rebuilt = RolloutRecoveryLedger.from_state_dict(parsed.ledger_state)
+    assert len(rebuilt) == 1
+    rebuilt._groups["pending"].runtime_prompt_payload = {"idx": 1}
+    assert rebuilt.state_dict()["groups"] == state["groups"]
+    # Exclusion must retain the global checkpoint-safety invariant.
+    ledger._groups["canonical"].status = recovery.PromptGroupStatus.FINALIZING
+    with pytest.raises(RuntimeError, match="checkpoint-unsafe"):
+        ledger.state_dict(exclude_group_ids={"canonical"})

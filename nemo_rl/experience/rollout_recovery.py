@@ -1343,8 +1343,10 @@ class RolloutRecoveryLedger:
     def __contains__(self, group_id: object) -> bool:
         return isinstance(group_id, str) and group_id in self._groups
 
-    def state_dict(self) -> dict[str, Any]:
-        """Return the versioned metadata persisted in ``rollout_recovery.pt``."""
+    def state_dict(
+        self, *, exclude_group_ids: set[str] | None = None
+    ) -> dict[str, Any]:
+        """Detach checkpoint metadata, skipping copies of canonically owned groups."""
         self.assert_checkpoint_safe()
         groups = []
         for record in self._groups.values():
@@ -1359,6 +1361,8 @@ class RolloutRecoveryLedger:
                 prompt_payload,
                 group_id=record.group_id,
             )
+            if exclude_group_ids is not None and record.group_id in exclude_group_ids:
+                continue
             groups.append(
                 {
                     "group_id": record.group_id,
@@ -1833,7 +1837,7 @@ def build_rollout_recovery_state(
         raise TypeError(
             "rollout recovery sampler_stamps_target_steps must be a boolean"
         )
-    state = ledger.state_dict()
+    state = ledger.state_dict(exclude_group_ids=canonical_group_ids)
     state["batch_shortfall"] = _validate_batch_shortfall(batch_shortfall)
     state["sampler_stamps_target_steps"] = sampler_stamps_target_steps
     state["finalizer_metrics_by_group"] = _validate_finalizer_metrics(
@@ -1845,13 +1849,9 @@ def build_rollout_recovery_state(
     state["finalizer_rewards_by_group"] = {
         group_id: [_finalized_reward_state(row) for row in rows]
         for group_id, rows in (finalizer_rewards_by_group or {}).items()
+        if canonical_group_ids is None or group_id in canonical_group_ids
     }
     if canonical_group_ids is not None:
-        state["groups"] = [
-            group
-            for group in state["groups"]
-            if group["group_id"] not in canonical_group_ids
-        ]
         for key in ("finalizer_metrics_by_group", "finalizer_rewards_by_group"):
             state[key] = {
                 group_id: value

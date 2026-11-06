@@ -34,13 +34,12 @@ use.
 
 from __future__ import annotations
 
-import functools
 import hashlib
 import json
 import logging
 import math
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -61,14 +60,15 @@ if TYPE_CHECKING:
 
 from nemo_rl.data_plane.codec import stack_or_nest
 from nemo_rl.data_plane.direct_prefix_batch import (
-    EncodedPrefixBatch,
-    encode_text_generation_prefix_batch,
+    encode_generation_prefix_batch,
+    prepare_prefix_route_groups,
 )
 from nemo_rl.data_plane.schema import (
     PER_TOKEN_STAGING_FIELDS,
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
     ROUTE_ENCODING_NONE,
+    ROUTE_ENCODING_TENSOR,
     ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_EXPERTS_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
@@ -510,24 +510,29 @@ class TQTokenSink:
         media_pixel_dtype: torch.dtype | None = None,
     ) -> None:
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
+        self._prefix_store = self._store
         self._capture_media = capture_media
         # Pixel dtype every media row of this partition must carry (the engine
         # model dtype). Fixes the ``media_imgs`` column dtype so text-call
         # sentinels and real rows agree; see ``_media_sentinels``.
         self._media_pixel_dtype = media_pixel_dtype
-        self._generation_prefix_encoder: (
-            Callable[[Sequence[StagedCallRecord]], EncodedPrefixBatch] | None
-        ) = None
+        self._direct_prefix_batch_encoding = False
 
     def enable_direct_prefix_batch_encoding(self) -> None:
-        """Use owned batch columns for text-only generation-prefix writes.
+        """Use owned batch columns for text and routed generation-prefix writes.
 
-        The general encoder continues to handle media and routed-expert rows.
-        Ordinary terminal-call staging is unaffected.
+        Media partitions retain the general encoder. Ordinary terminal-call
+        staging is unaffected.
         """
-        self._generation_prefix_encoder = functools.partial(
-            encode_text_generation_prefix_batch, mode_codes=_MODE_TO_CODE
-        )
+        self._direct_prefix_batch_encoding = True
+
+    def configure_prefix_writer(self, client: Any, *, staging_partition: str) -> None:
+        """Redirect only prefix PUTs; terminal writes, reads and cleanup stay local."""
+        if self._capture_media or not self._direct_prefix_batch_encoding:
+            raise ValueError(
+                "Isolated prefix writes require direct text/router encoding"
+            )
+        self._prefix_store = TQStagingStore(client, staging_partition=staging_partition)
 
     @property
     def media_pixel_dtype(self) -> torch.dtype | None:
@@ -605,6 +610,16 @@ class TQTokenSink:
         boundary row: only the resume path reads it back, and the resumed
         call's canonical row supplies the boundary route the reassembler uses.
         """
+        router_attachment = None
+        if attachments is not None and ROUTED_EXPERTS_FIELD in attachments:
+            router_attachment = attachments[ROUTED_EXPERTS_FIELD]
+            if not isinstance(router_attachment, torch.Tensor):
+                raise ValueError("routed_experts attachment must be a tensor")
+            if ROUTED_EXPERTS_STAGING_ATTACHMENT in attachments:
+                raise ValueError("ambiguous route staging attachments")
+            attachments = {
+                k: v for k, v in attachments.items() if k != ROUTED_EXPERTS_FIELD
+            } or None
         route_payload = None
         if attachments is not None and ROUTED_EXPERTS_STAGING_ATTACHMENT in attachments:
             route_payload = attachments[ROUTED_EXPERTS_STAGING_ATTACHMENT]
@@ -700,11 +715,23 @@ class TQTokenSink:
             )
         routed_len = 0
         routed_encoding = ROUTE_ENCODING_NONE
-        if route_payload is not None and routed is None:
+        if (
+            route_payload is not None or router_attachment is not None
+        ) and routed is None:
             raise ValueError("route staging attachment has no record payload")
         if routed is not None:
             delta_len = len(record.token_ids_delta)
-            if route_payload is None:
+            if router_attachment is not None:
+                if not isinstance(routed, dict):
+                    raise ValueError(
+                        "routed_experts attachment requires its capture metadata"
+                    )
+                experts = router_attachment
+            elif route_payload is None:
+                if isinstance(routed, dict):
+                    raise ValueError(
+                        "routed_experts metadata requires a tensor attachment"
+                    )
                 with prefix_cut_timing("sink_route_decode"):
                     experts = decode_routed_experts(routed)
             else:
@@ -715,7 +742,9 @@ class TQTokenSink:
                     "sink_route_reuse_bytes", experts.numel() * experts.element_size()
                 )
             routed_encoding = (
-                ROUTE_ENCODING_ENVELOPE
+                ROUTE_ENCODING_TENSOR
+                if isinstance(routed, dict)
+                else ROUTE_ENCODING_ENVELOPE
                 if isinstance(routed, str)
                 else ROUTE_ENCODING_LIST
             )
@@ -784,26 +813,33 @@ class TQTokenSink:
         ]
         if len(set(keys)) != len(keys):
             raise ValueError("generation-prefix batch contains duplicate staging keys")
-        if (
-            records
-            and self._generation_prefix_encoder is not None
-            and not self._capture_media
-            and not any(attachments)
-            and not any(
-                record.extras is not None and "routed_experts" in record.extras
-                for record in records
-            )
-        ):
-            batch = self._generation_prefix_encoder(records)
-            prefix_cut_count("direct_batch_encoder_batches", 1)
-            prefix_cut_count("direct_batch_encoder_rows", len(records))
-            prefix_cut_count("tq_batches", 1)
-            prefix_cut_count("tensor_payload_bytes", batch.payload_bytes)
-            prefix_cut_count(
-                "max_batch_tensor_payload_bytes", batch.payload_bytes, maximum=True
-            )
+        if records and self._direct_prefix_batch_encoding and not self._capture_media:
+            route_groups = prepare_prefix_route_groups(records, attachments)
             try:
-                self._store.put_many(keys, batch.fields, tags=batch.tags)
+                for indices, routes in route_groups:
+                    batch = encode_generation_prefix_batch(
+                        [records[index] for index in indices],
+                        routes,
+                        mode_codes=_MODE_TO_CODE,
+                    )
+                    prefix_cut_count("direct_batch_encoder_batches", 1)
+                    prefix_cut_count("direct_batch_encoder_rows", len(indices))
+                    if routes is not None:
+                        prefix_cut_count(
+                            "direct_batch_encoder_route_rows", len(indices)
+                        )
+                    prefix_cut_count("tq_batches", 1)
+                    prefix_cut_count("tensor_payload_bytes", batch.payload_bytes)
+                    prefix_cut_count(
+                        "max_batch_tensor_payload_bytes",
+                        batch.payload_bytes,
+                        maximum=True,
+                    )
+                    self._prefix_store.put_many(
+                        [keys[index] for index in indices],
+                        batch.fields,
+                        tags=batch.tags,
+                    )
             except Exception:
                 self._discard_failed_writes(keys)
                 raise
@@ -846,7 +882,7 @@ class TQTokenSink:
                         },
                         batch_size=[len(group)],
                     )
-                self._store.put_many(
+                self._prefix_store.put_many(
                     [keys[item[0]] for item in group],
                     fields,
                     tags=[item[2] for item in group],
@@ -1319,6 +1355,7 @@ def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
         ROUTE_ENCODING_NONE,
         ROUTE_ENCODING_ENVELOPE,
         ROUTE_ENCODING_LIST,
+        ROUTE_ENCODING_TENSOR,
     ):
         raise ValueError(f"unknown routed_experts_encoding {routed_encoding}")
 

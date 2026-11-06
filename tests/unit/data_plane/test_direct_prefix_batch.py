@@ -29,7 +29,11 @@ from nemo_rl.utils.prefix_cut_diagnostics import (
     current_prefix_cut_probe,
     prefix_cut_probe,
 )
-from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+from nemo_rl.utils.routed_experts_codec import (
+    ROUTED_EXPERTS_STAGING_ATTACHMENT,
+    RoutedExpertsStagingPayload,
+    encode_routed_experts,
+)
 
 
 class MemoryClient:
@@ -86,7 +90,11 @@ def record(
 
 
 def stage(
-    records: list[StagedCallRecord], *, direct: bool, client: MemoryClient | None = None
+    records: list[StagedCallRecord],
+    *,
+    direct: bool,
+    client: MemoryClient | None = None,
+    attachments: list[dict[str, Any] | None] | None = None,
 ) -> tuple[MemoryClient, list[str]]:
     client = MemoryClient() if client is None else client
     sink = TQTokenSink(client, staging_partition="prefix")
@@ -96,6 +104,7 @@ def stage(
         records,
         checkpoint_id="checkpoint-7",
         chunk_sequences=list(range(10, 10 + len(records))),
+        attachments=attachments,
     )
     return client, keys
 
@@ -186,14 +195,14 @@ def test_default_stays_general_and_opt_in_has_exact_payload_counters() -> None:
     assert counters[1]["direct_batch_encoder_rows"] == 2
 
 
-@pytest.mark.parametrize("kind", ["routes", "media", "null-route-key"])
-def test_unsupported_batches_use_general_encoder(monkeypatch: Any, kind: str) -> None:
+def test_media_batches_use_general_encoder(monkeypatch: Any) -> None:
     import nemo_rl.data_plane.tq_token_sink as module
 
     def unexpected(*args: Any, **kwargs: Any) -> Any:
         raise AssertionError("Unsupported batch reached the direct encoder")
 
-    monkeypatch.setattr(module, "encode_text_generation_prefix_batch", unexpected)
+    monkeypatch.setattr(module, "encode_generation_prefix_batch", unexpected)
+    kind = "media"
     extras = None
     if kind == "routes":
         extras = {
@@ -220,6 +229,137 @@ def test_unsupported_batches_use_general_encoder(monkeypatch: Any, kind: str) ->
         )
         clients.append(client)
     assert_equal_batches(clients[0].puts[0], clients[1].puts[0])
+
+
+@pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32])
+@pytest.mark.parametrize("lengths", [[3], [3, 3], [1, 3, 17]])
+@pytest.mark.parametrize("owned", [False, True])
+def test_router_columns_match_general_and_restore(
+    dtype: torch.dtype,
+    lengths: list[int],
+    owned: bool,
+) -> None:
+    records = []
+    attachments = []
+    for index, length in enumerate(lengths):
+        routes = (torch.arange(length * 6).reshape(length, 3, 2) % 100).to(dtype)
+        payload = RoutedExpertsStagingPayload(routes)
+        records.append(
+            record(
+                index,
+                length,
+                extras={
+                    "routed_experts": payload.encoded,
+                    "nested": [True, "é", index],
+                },
+            )
+        )
+        attachments.append(
+            {ROUTED_EXPERTS_STAGING_ATTACHMENT: payload} if owned else None
+        )
+    old, _ = stage(records, direct=False, attachments=attachments)
+    with prefix_cut_probe(
+        enabled=True,
+        checkpoint_id="cp",
+        inventory_digest="d",
+        calls=len(records),
+        deadline=None,
+    ):
+        new, keys = stage(records, direct=True, attachments=attachments)
+        probe = current_prefix_cut_probe()
+        assert probe is not None
+        counts = probe.summary("completed")["counts"]
+    actual_bytes = assert_equal_batches(old.puts[0], new.puts[0])
+    assert counts["tensor_payload_bytes"] == actual_bytes
+    assert counts["direct_batch_encoder_route_rows"] == len(records)
+    if owned:
+        assert counts["sink_route_reuse_rows"] == len(records)
+    restored = TQTokenSource(new, staging_partition="prefix").fetch(keys)
+    assert [item.digest for item in restored] == [r.digest for r in records]
+
+
+def test_mixed_route_shapes_dtypes_and_absence_keep_grouping() -> None:
+    records = []
+    for index, shape in enumerate([(3, 2, 2), None, (3, 3, 2), (7, 2, 2), None]):
+        extras = (
+            {"routed_experts": None, "note": "absent"}
+            if shape is None
+            else {
+                "routed_experts": encode_routed_experts(
+                    torch.zeros(shape, dtype=torch.int16)
+                ),
+            }
+        )
+        records.append(record(index, shape[0] if shape else 3, extras=extras))
+    records.append(record(5, 3, extras={"routed_experts": [[[1, 2], [3, 4]]] * 3}))
+    records.append(
+        record(
+            6,
+            3,
+            extras={
+                "routed_experts": encode_routed_experts(
+                    torch.zeros(3, 2, 2, dtype=torch.int8)
+                )
+            },
+        )
+    )
+    old, keys = stage(records, direct=False)
+    new, new_keys = stage(records, direct=True)
+    assert keys == new_keys and len(old.puts) == len(new.puts) == 4
+    for before, after in zip(old.puts, new.puts, strict=True):
+        assert_equal_batches(before, after)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "mutated",
+        "wrong-envelope",
+        "missing-payload",
+        "bad-alignment",
+        "invalid-attachment",
+    ],
+)
+def test_route_attachment_errors_never_publish(kind: str) -> None:
+    payload = RoutedExpertsStagingPayload(torch.zeros(3, 2, 2, dtype=torch.int16))
+    extras = {"routed_experts": payload.encoded}
+    attached: Any = payload
+    if kind == "mutated":
+        payload.tensor_for_payload(payload.encoded)[0, 0, 0] = 1
+    elif kind == "wrong-envelope":
+        extras["routed_experts"] = encode_routed_experts(
+            torch.ones(3, 2, 2, dtype=torch.int16)
+        )
+    elif kind == "missing-payload":
+        extras = {}
+    elif kind == "bad-alignment":
+        payload = RoutedExpertsStagingPayload(torch.zeros(2, 2, 2, dtype=torch.int16))
+        extras["routed_experts"] = payload.encoded
+        attached = payload
+    else:
+        attached = object()
+    client = MemoryClient()
+    with pytest.raises((ValueError, TypeError)):
+        stage(
+            [record(0, 3, extras=extras)],
+            direct=True,
+            client=client,
+            attachments=[{ROUTED_EXPERTS_STAGING_ATTACHMENT: attached}],
+        )
+    assert not client.puts
+
+
+def test_route_batches_own_storage_and_failed_write_clears_all_groups() -> None:
+    payload = RoutedExpertsStagingPayload(torch.zeros(3, 2, 2, dtype=torch.int16))
+    records = [record(0, 3, extras={"routed_experts": payload.encoded})]
+    attachment = [{ROUTED_EXPERTS_STAGING_ATTACHMENT: payload}]
+    client, _ = stage(records, direct=True, attachments=attachment)
+    payload.tensor_for_payload(payload.encoded).fill_(7)
+    assert not client.puts[0]["fields"]["routed_experts"].any()
+    failed = MemoryClient(fail=True)
+    with pytest.raises(RuntimeError, match="storage failed"):
+        stage([*records, record(1, 3)], direct=True, client=failed)
+    assert len(failed.cleared) == 2
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -282,7 +422,8 @@ def test_concurrent_batches_keep_their_own_buffers() -> None:
         assert list(pool.map(execute, range(8))) == [2] * 8
 
 
-def test_actual_pinned_tq_wire_codec_roundtrip(monkeypatch: Any) -> None:
+@pytest.mark.parametrize("router", [False, True])
+def test_actual_pinned_tq_wire_codec_roundtrip(monkeypatch: Any, router: bool) -> None:
     source = os.environ.get("NRL_TEST_TQ_SERIAL_UTILS_SOURCE")
     if source is None:
         pytest.skip("Set NRL_TEST_TQ_SERIAL_UTILS_SOURCE to the pinned TQ codec")
@@ -308,7 +449,20 @@ def test_actual_pinned_tq_wire_codec_roundtrip(monkeypatch: Any) -> None:
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    records = [record(i, n) for i, n in enumerate([1, 3, 17, 2048])]
+    records = [
+        record(
+            i,
+            n,
+            extras={
+                "routed_experts": encode_routed_experts(
+                    torch.zeros(n, 3, 2, dtype=torch.int8)
+                )
+            }
+            if router
+            else None,
+        )
+        for i, n in enumerate([1, 3, 17, 2048])
+    ]
     old, _ = stage(records, direct=False, client=MemoryClient(serial=module))
     new, keys = stage(records, direct=True, client=MemoryClient(serial=module))
     assert_equal_batches(old.puts[0], new.puts[0])

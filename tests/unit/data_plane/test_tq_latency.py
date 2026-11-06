@@ -15,6 +15,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -30,6 +31,88 @@ G_PINNED = Path(
         "/tmp/nano35-tq-image-source/opt/nemo_rl_venv/lib/python3.13/site-packages/transfer_queue/utils/serial_utils.py",
     )
 ).parents[1]
+
+
+@pytest.mark.parametrize("cancel_acquisition", [False, True])
+def test_socket_acquisition_preserves_native_wait_and_exception_cleanup(
+    cancel_acquisition,
+):
+    async def exercise():
+        entered, release = asyncio.Event(), asyncio.Event()
+        exits = []
+
+        @asynccontextmanager
+        async def native(peer):
+            entered.set()
+            await release.wait()
+            try:
+                yield peer
+            except BaseException as error:
+                exits.append(type(error))
+                raise
+
+        trace = tq_latency._PutTrace(16, time.time())
+        token = tq_latency.G_TQ_TRACE.set(trace)
+        observed = tq_latency.observe_socket_acquisition(native)
+
+        async def call():
+            async with observed("socket") as value:
+                assert value == "socket"
+                # Acquisition has ended before any RPC/body work starts.
+                assert trace.events[0]["phase"] == "controller_socket_acquire"
+                assert trace.events[0]["failed"] is False
+                raise LookupError("native body failure")
+
+        try:
+            task = asyncio.create_task(call())
+            await entered.wait()
+            await asyncio.sleep(0)
+            assert trace.events == []
+            if cancel_acquisition:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert trace.events[0]["failed"] is True
+                assert exits == []
+            else:
+                release.set()
+                with pytest.raises(LookupError, match="native body failure"):
+                    await task
+                assert exits == [LookupError]
+            assert len(trace.events) == 1
+        finally:
+            tq_latency.G_TQ_TRACE.reset(token)
+
+    asyncio.run(exercise())
+
+
+def test_phase_totals_survive_event_budget():
+    trace = tq_latency._PutTrace(1, time.time())
+    for _ in range(5):
+        with trace.phase("controller_socket_acquire", cpu=False):
+            pass
+    assert len(trace.events) == 1
+    assert trace.dropped == 4
+    assert trace.phase_totals["controller_socket_acquire"]["calls"] == 5
+    assert (
+        trace.phase_totals["controller_socket_acquire"]["wall_s"]
+        >= trace.events[0]["wall_s"]
+    )
+
+
+def test_controller_pool_hook_is_instance_local_and_restored(client):
+    @asynccontextmanager
+    async def native(peer):
+        yield peer
+
+    pool = SimpleNamespace(alease=native)
+    client.controller_rpc_pool = pool
+    hooks = tq_latency.install_transfer_queue_latency(
+        client, max_events=32, slow_call_s=1
+    )
+    assert pool.alease is not native
+    hooks.close()
+    assert pool.alease is native
 
 
 def native_method(path, class_name, method, namespace, *, preserve_decorator=False):

@@ -49,6 +49,7 @@ import torch
 import transfer_queue as tq
 from tensordict import TensorDict
 
+from nemo_rl.data_plane.adapters.tq_controller_patch import configure_controller_patch
 from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
 from nemo_rl.data_plane.codec import timed_codec
 from nemo_rl.data_plane.interfaces import (
@@ -1019,6 +1020,7 @@ def _init_tq(
 
     conf = OmegaConf.merge(base, overlay)
 
+    configure_controller_patch()
     # pyrefly: ignore  # bad-argument-type
     tq.init(conf=conf)
 
@@ -1548,7 +1550,8 @@ class TQDataPlaneClient(DataPlaneClient):
             return
         self._mark_data_operation_started()
         # TQ's wire vocabulary is `keys=` — translation point.
-        tq.kv_clear(keys=list(sample_ids), partition_id=partition_id)
+        with trace_tq_put():
+            tq.kv_clear(keys=list(sample_ids), partition_id=partition_id)
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
 

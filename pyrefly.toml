@@ -24,8 +24,10 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/models/generation/generation_cut_routes.py",
   "nemo_rl/utils/checkpoint_latency.py",
   "nemo_rl/data_plane/tq_latency.py",
+  "nemo_rl/data_plane/prefix_writer_actor.py",
   "nemo_rl/data_plane/direct_prefix_batch.py",
   "nemo_rl/data_plane/generation_prefix_write_batcher.py",
   "nemo_rl/data_plane/background_prefix_cleanup.py",
@@ -161,6 +163,7 @@ project-includes = [
   "nemo_rl/data_plane/adapters/__init__.py",
   "nemo_rl/data_plane/adapters/local.py",
   "nemo_rl/data_plane/adapters/noop.py",
+  "nemo_rl/data_plane/adapters/tq_controller_patch.py",
   "nemo_rl/data_plane/adapters/tq_mooncake_checkpoint.py",
   "nemo_rl/data_plane/adapters/transfer_queue.py",
   "nemo_rl/data_plane/adapters/transfer_queue_env.py",

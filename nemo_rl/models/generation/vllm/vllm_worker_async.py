@@ -570,6 +570,8 @@ class _EngineTokenSnapshot:
     logprobs: list[float]
     finish_reason: str | None
     stop_reason: str | int | None
+    start: int = 0
+    request_identity: tuple[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -900,9 +902,11 @@ class _AsyncLLMHTTPClient:
         )
 
     def snapshot_generation_tokens(
-        self, request_id: str, *, deadline: float | None
+        self, request_id: str, *, deadline: float | None, start: int = 0
     ) -> _EngineTokenSnapshot | None:
-        """Copy a published token/logprob prefix without an engine-loop RPC."""
+        """Copy a published suffix, retaining its absolute offset and owner identity."""
+        if start < 0:
+            raise ValueError("generation token snapshot start must be nonnegative")
         if not self._token_snapshots_enabled:
             raise RuntimeError("direct token snapshots are not enabled")
         remaining = None if deadline is None else deadline - time.monotonic()
@@ -954,24 +958,31 @@ class _AsyncLLMHTTPClient:
                 else "engine_token_snapshot_live_reads",
                 1,
             )
-            token_ids = list(state.detokenizer.output_token_ids)
+            published_ids = state.detokenizer.output_token_ids
             logprobs = state.logprobs_processor.logprobs
             # Pin the fully published length while the engine is between
             # chunks. Decode FlatLogprobs positions outside the lock.
             count = len(logprobs) if logprobs is not None else 0
-            if len(token_ids) != count:
+            if len(published_ids) != count or start > count:
                 raise ValueError(
-                    "published engine tokens and logprobs differ in length"
+                    "published engine tokens/logprobs differ or prefix became shorter"
                 )
+            token_ids = list(published_ids[start:count])
+            request_identity = (internal_id, id(state))
             finish_reason = completed.finish_reason if completed is not None else None
             stop_reason = completed.stop_reason if completed is not None else None
         finally:
             self._token_snapshot_lock.release()
         with prefix_cut_timing("engine_token_snapshot_copy"):
-            selected = _extract_selected_token_logprobs(token_ids, logprobs, stop=count)
+            selected = _extract_selected_token_logprobs(
+                token_ids, logprobs, start=start, stop=count
+            )
         prefix_cut_count("engine_token_snapshot_calls", 1)
-        prefix_cut_count("engine_token_snapshot_tokens", count)
-        return _EngineTokenSnapshot(token_ids, selected, finish_reason, stop_reason)
+        prefix_cut_count("engine_token_snapshot_tokens", count - start)
+        prefix_cut_count("engine_token_snapshot_cumulative_tokens", count)
+        return _EngineTokenSnapshot(
+            token_ids, selected, finish_reason, stop_reason, start, request_identity
+        )
 
     def _direct_route_snapshot_enabled(self) -> bool:
         """Allow reference-only reads for the verified GIL-owned state layout."""
@@ -1240,6 +1251,7 @@ class VllmAsyncGenerationWorkerImpl(
         self._engine_loop_diagnostics: EngineLoopDiagnostics | None = None
         self._owned_array_decode_stats: dict[str, int] = {}
         self._logprob_buffer_detachment: LogprobBufferDetachment | None = None
+        self._prefix_writer_client: Any | None = None
         self._compact_output_pipeline: CompactOutputPipeline | None = None
         self._frontend_stage_timings: FrontendStageTimings | None = None
         # Resolved staging-chain prefixes, shared implementation with the Megatron
@@ -1666,6 +1678,8 @@ class VllmAsyncGenerationWorkerImpl(
         """
         if not self.is_model_owner:
             return None
+        if self._generation_cut_control_config.prefix_writer_actor and capture_media:
+            raise ValueError("Prefix writer actor does not support media capture")
         if generation_prefix_cleanup.enabled:
             if not generation_prefix_cuts_enabled:
                 raise ValueError(
@@ -1741,6 +1755,21 @@ class VllmAsyncGenerationWorkerImpl(
                     "direct prefix batch encoding requires generation-prefix cuts"
                 )
             sink.enable_direct_prefix_batch_encoding()
+        if write_config.prefix_writer_actor:
+            # Ray/TQ writer setup is optional outside this prefix capture mode.
+            from nemo_rl.data_plane.prefix_writer_actor import create_prefix_writer
+
+            if self._prefix_writer_client is not None:
+                raise RuntimeError("Prefix writer actor is already configured")
+            self._prefix_writer_client = await create_prefix_writer(
+                dp_cfg,
+                partition_id=staging_partition,
+                concurrency=write_config.pipeline.write_concurrency,
+                latency=latency_config,
+            )
+            sink.configure_prefix_writer(
+                self._prefix_writer_client, staging_partition=staging_partition
+            )
         if write_config.batch_inventory_writes:
             if not generation_prefix_cuts_enabled:
                 raise ValueError(
@@ -1926,6 +1955,22 @@ class VllmAsyncGenerationWorkerImpl(
                 else (None if admission.generation_cut is not None else [])
             ),
         )
+        if generation_cut is not None and generation_cut.digest_version == 3:
+            # Gym is optional outside token capture. Initialize immutable history
+            # on restore admission, so the first following cut only hashes new rows.
+            from nemo_gym.token_id_capture.staging.incremental_prefix import (
+                IncrementalPrefixDigest,
+            )
+
+            state.generation_prefix_digest = IncrementalPrefixDigest(
+                prefix_token_ids=call.prefix_token_ids,
+                parent_chain_hash=call.admission.parent_chain_hash,
+            )
+            state.generation_prefix_digest.append(
+                tokens=generation_cut.token_ids_delta,
+                mask=generation_cut.token_mask_delta,
+                logprobs=generation_cut.generation_log_probs_delta,
+            )
         with self._capture_registry_lock:
             if call.model_call_id in self._capture_calls_by_model_call_id:
                 raise RuntimeError(
@@ -2034,12 +2079,14 @@ class VllmAsyncGenerationWorkerImpl(
             if not state.engine_token_snapshot:
                 return
             request_id = state.engine_request_id
+            previous = len(state.generated_token_ids)
+            start = max(0, previous - 1)
         if request_id is None:
             raise ValueError("generation has not registered an engine request yet")
         assert self._http_engine_client is not None
         with prefix_cut_timing("engine_token_snapshot"):
             snapshot = self._http_engine_client.snapshot_generation_tokens(
-                request_id, deadline=deadline
+                request_id, deadline=deadline, start=start
             )
         with state.lock:
             # The final HTTP output owns a complete copy before releasing
@@ -2050,14 +2097,25 @@ class VllmAsyncGenerationWorkerImpl(
                 raise ValueError(
                     "generation request has no live or retained engine state"
                 )
-            previous = len(state.generated_token_ids)
-            if (
-                snapshot.token_ids[:previous] != state.generated_token_ids
-                or snapshot.logprobs[:previous] != state.generated_logprobs
+            if len(state.generated_token_ids) != previous or snapshot.start != start:
+                raise ValueError("generation prefix cursor changed during snapshot")
+            identity = state.engine_token_snapshot_identity
+            if identity is not None and identity != snapshot.request_identity:
+                raise ValueError("engine request identity changed between cuts")
+            # vLLM publishes append-only history. Verify owner, length and the
+            # preceding boundary instead of copying/re-decoding sealed history.
+            overlap = previous - start
+            if overlap and (
+                not snapshot.token_ids
+                or snapshot.token_ids[0] != state.generated_token_ids[-1]
+                or snapshot.logprobs[0] != state.generated_logprobs[-1]
             ):
-                raise ValueError("engine generation prefix changed between cuts")
-            state.generated_token_ids = snapshot.token_ids
-            state.generated_logprobs = snapshot.logprobs
+                raise ValueError(
+                    "engine generation prefix boundary changed between cuts"
+                )
+            state.generated_token_ids.extend(snapshot.token_ids[overlap:])
+            state.generated_logprobs.extend(snapshot.logprobs[overlap:])
+            state.engine_token_snapshot_identity = snapshot.request_identity
             state.terminal_finish_reason = snapshot.finish_reason
             state.terminal_stop_reason = snapshot.stop_reason
 
@@ -2361,7 +2419,11 @@ class VllmAsyncGenerationWorkerImpl(
             return None
         route_payload = None
         try:
-            experts = decode_routed_experts(routed)
+            experts = (
+                routed
+                if isinstance(routed, torch.Tensor)
+                else decode_routed_experts(routed)
+            )
             expected_full_len = prompt_len + generated_len
             if experts.dim() != 3 or experts.shape[0] != expected_full_len:
                 raise ValueError(
@@ -2369,7 +2431,9 @@ class VllmAsyncGenerationWorkerImpl(
                     f"length {expected_full_len}"
                 )
             start = prev_len - boundary_route_rows(prev_len)
-            route_payload = RoutedExpertsStagingPayload(experts[start:])
+            route_payload = RoutedExpertsStagingPayload(
+                experts[start:], native=isinstance(routed, torch.Tensor)
+            )
             message["routed_experts"] = route_payload.encoded
         except (IndexError, TypeError, ValueError) as error:
             LOGGER.warning(
@@ -2446,7 +2510,9 @@ class VllmAsyncGenerationWorkerImpl(
             current[boundary_rows : boundary_rows + replace_len] = restored[
                 :replace_len
             ]
-            route_payload = RoutedExpertsStagingPayload(current)
+            route_payload = RoutedExpertsStagingPayload(
+                current, native=isinstance(routed, dict)
+            )
             message["routed_experts"] = route_payload.encoded
             merged = route_payload.tensor_for_payload(route_payload.encoded)[
                 boundary_rows : boundary_rows + restored.shape[0]
@@ -3358,6 +3424,7 @@ class VllmAsyncGenerationWorkerImpl(
                         device=torch.device("cpu"),
                         logger=LOGGER,
                         routed_experts_dtype=worker_self.routed_experts_dtype,
+                        encode_for_wire=not captured_response,
                     )
 
                 return response
@@ -4644,6 +4711,10 @@ class VllmAsyncGenerationWorkerImpl(
             print(f"Error during vLLM shutdown: {e}")
             return False
         finally:
+            prefix_writer_client = self._prefix_writer_client
+            if prefix_writer_client is not None:
+                await asyncio.to_thread(prefix_writer_client.close)
+                self._prefix_writer_client = None
             latency = getattr(self, "_checkpoint_latency", None)
             if latency is not None:
                 await asyncio.to_thread(latency.close)

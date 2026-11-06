@@ -42,6 +42,10 @@ from nemo_rl.models.generation.generation_cut_pipeline import (
     PrefixCutBatchReleased,
     PrefixCutWrite,
 )
+from nemo_rl.models.generation.generation_cut_routes import (
+    RoutePieceIndex,
+    concatenate_route_pieces,
+)
 from nemo_rl.telemetry.rollout_checkpoint import checkpoint_phase, checkpoint_phase_sync
 from nemo_rl.utils.checkpoint_latency import (
     G_GATE_WORK,
@@ -183,6 +187,7 @@ class _RequestCaptureState:
     engine_request_id: str | None = None
     # vLLM can populate tokens at cut time instead of publishing every output.
     engine_token_snapshot: bool = False
+    engine_token_snapshot_identity: tuple[str, int] | None = None
     # Full-sequence routes from the request's final output.
     terminal_routed_experts: torch.Tensor | None = None
     # Backend-owned opaque state that must survive until the terminal row is
@@ -212,6 +217,10 @@ class _RequestCaptureState:
     # checkpoint. Only sealed rows enter this list; observed route cache state
     # below is independent of durability and survives a failed cut.
     generation_cut_chunk_digests: list[str] | None = field(default_factory=list)
+    # Optional Gym-owned hash states; published only after a cut seals.
+    generation_prefix_digest: Any | None = None
+    route_piece_index: RoutePieceIndex = field(default_factory=RoutePieceIndex)
+    route_chunk_shape: tuple[int, int] | None = None
     engine_route_piece_count: int = 0
     engine_route_rows: int = 0
     engine_route_buffer: np.ndarray | None = None
@@ -254,7 +263,7 @@ class _RequestCaptureState:
         )
 
     def freeze_for_checkpoint(
-        self, checkpoint_id: str
+        self, checkpoint_id: str, *, include_cumulative: bool = True
     ) -> tuple[str, int, list[int], list[float], list[int], list[float]]:
         """Freeze the current length; return the unstaged chunk and the prefix."""
         if self.frozen_cut is not None:
@@ -266,13 +275,25 @@ class _RequestCaptureState:
         self.next_chunk_sequence += 1
         self.frozen_cut = (checkpoint_id, frozen)
         staged = self.staged_token_count
+        chunk_ids = self.generated_token_ids[staged:frozen]
+        chunk_probs = self.generated_logprobs[staged:frozen]
+        if include_cumulative:
+            prefix_ids = self.generated_token_ids[:frozen]
+            prefix_probs = self.generated_logprobs[:frozen]
+        elif staged == 0:
+            prefix_ids, prefix_probs = chunk_ids, chunk_probs
+        else:
+            prefix_ids = self.generated_token_ids[
+                max(0, frozen - _PREFIX_BOUNDARY_TAIL_TOKENS) : frozen
+            ]
+            prefix_probs = []
         return (
             f"active/{checkpoint_id}/{sequence}",
             sequence,
-            self.generated_token_ids[staged:frozen],
-            self.generated_logprobs[staged:frozen],
-            self.generated_token_ids[:frozen],
-            self.generated_logprobs[:frozen],
+            chunk_ids,
+            chunk_probs,
+            prefix_ids,
+            prefix_probs,
         )
 
     def absorb_engine_route_pieces(self, pieces: list[Any]) -> torch.Tensor:
@@ -296,49 +317,10 @@ class _RequestCaptureState:
                 # source dtype, then check values before copying into the cache.
                 dtype = torch.empty((), dtype=self.routed_experts_dtype).numpy().dtype
                 new_pieces = pieces[covered:]
-                try:
-                    first_piece = new_pieces[0]
-                    if (
-                        not isinstance(first_piece, np.ndarray)
-                        or first_piece.dtype.kind not in "iu"
-                    ):
-                        raise TypeError("route fragments need integer dtypes")
-                    # Exact source-dtype matching keeps mixed/noninteger
-                    # fragments on the existing per-fragment validation path.
-                    added = np.concatenate(
-                        new_pieces, axis=0, dtype=first_piece.dtype, casting="no"
-                    )
-                except (TypeError, ValueError):
-                    arrays = [np.asarray(piece) for piece in new_pieces]
-                    shape = tuple(arrays[0].shape[1:])
-                    if (
-                        any(
-                            array.ndim != 3
-                            or tuple(array.shape[1:]) != shape
-                            or array.dtype.kind not in "iu"
-                            for array in arrays
-                        )
-                        or not shape
-                        or min(shape) < 1
-                    ):
-                        raise ValueError(
-                            "vLLM route chunks must share shape [*, layers, topk]"
-                        ) from None
-                    added = np.concatenate(arrays, axis=0)
-                    prefix_cut_count("route_history_bulk_fallbacks", 1)
-                else:
-                    shape = tuple(added.shape[1:])
-                    if added.ndim != 3 or not shape or min(shape) < 1:
-                        raise ValueError(
-                            "vLLM route chunks must share shape [*, layers, topk]"
-                        )
-                    prefix_cut_count("route_history_bulk_fast_calls", 1)
-                if added.size and not np.can_cast(added.dtype, dtype, casting="safe"):
-                    limits = np.iinfo(dtype)
-                    if int(added.min()) < limits.min or int(added.max()) > limits.max:
-                        raise ValueError(
-                            f"vLLM routed expert IDs do not fit checkpoint dtype {dtype}"
-                        )
+                added = concatenate_route_pieces(
+                    new_pieces, dtype=dtype, count=prefix_cut_count
+                )
+                shape = tuple(added.shape[1:])
                 buffer = self.engine_route_buffer
                 if buffer is not None and tuple(buffer.shape[1:]) != shape:
                     raise ValueError("vLLM route model dimensions changed between cuts")
@@ -364,6 +346,114 @@ class _RequestCaptureState:
             prefix_cut_count("route_history_bytes", added.nbytes)
         assert self.engine_route_buffer is not None
         return torch.from_numpy(self.engine_route_buffer[: self.engine_route_rows])
+
+    def frozen_cut_route_chunk(
+        self, engine_routed_experts: Any | None
+    ) -> torch.Tensor | None:
+        """Own only new route rows for a layout-2 cut, outside the HTTP lock.
+
+        Sealed chunks already commit older routes. Read their replacement
+        boundary row with the new chunk, retaining the existing wire layout.
+        Fragment offsets are cached, while route payloads stay in the engine.
+        This runs under the call's lifecycle ownership on the cut executor.
+        """
+        if self.frozen_cut is None:
+            raise RuntimeError("no generation cut is in progress")
+        if not self.capture_routed_experts:
+            return None
+        frozen, staged = self.frozen_cut[1], self.staged_token_count
+        if frozen < staged:
+            raise ValueError("frozen token count is shorter than the sealed prefix")
+        if frozen == staged:
+            return None
+        restored = self.restored_routed_experts
+        if restored is None:
+            first_chunk = staged == 0
+            start = (
+                self.call.admission.prev_len
+                if first_chunk
+                else len(self.prompt_token_ids) + staged - 1
+            )
+            stop = len(self.prompt_token_ids) + frozen - 1
+        else:
+            if restored.dim() != 3 or restored.shape[0] < 1:
+                raise ValueError(
+                    "restored routed experts must contain a final marker row"
+                )
+            first_chunk = False
+            offset = self.call.admission.prev_len + int(restored.shape[0]) - 1
+            start, stop = offset + staged, offset + frozen
+        raw = self.terminal_routed_experts
+        if raw is None:
+            raw = engine_routed_experts
+        if raw is None:
+            raise ValueError(
+                "the request left vLLM before its routes were read for the cut"
+            )
+        dtype = torch.empty((), dtype=self.routed_experts_dtype).numpy().dtype
+        with prefix_cut_timing("route_history_concat"):
+            if isinstance(raw, list):
+                before = self.route_piece_index.count
+                pieces = self.route_piece_index.select(raw, start=start, stop=stop)
+                prefix_cut_count(
+                    "route_chunk_indexed_pieces", self.route_piece_index.count - before
+                )
+            else:
+                tensor = torch.as_tensor(raw).detach().cpu()
+                if tensor.dim() != 3 or tensor.shape[1] < 1 or tensor.shape[2] < 1:
+                    raise ValueError(
+                        "routed experts must have shape [tokens, layers, topk]"
+                    )
+                if start < 0 or stop < start or stop > tensor.shape[0]:
+                    raise ValueError(
+                        "vLLM returned fewer routed experts than the frozen tokens need"
+                    )
+                pieces = [tensor[start:stop].numpy()]
+            added = concatenate_route_pieces(
+                pieces, dtype=dtype, count=prefix_cut_count
+            )
+            shape = (int(added.shape[1]), int(added.shape[2]))
+            if self.route_chunk_shape is not None and self.route_chunk_shape != shape:
+                raise ValueError("vLLM route model dimensions changed between cuts")
+            if restored is not None and tuple(restored.shape[1:]) != shape:
+                raise ValueError("restored routed experts changed model dimensions")
+            self.route_chunk_shape = shape
+            # Range validation above makes same-width native signed/unsigned
+            # reinterpretation exact, avoiding another full delta-sized copy.
+            if (
+                added.dtype != dtype
+                and added.dtype.isnative
+                and added.dtype.itemsize == dtype.itemsize
+                and added.dtype.kind in "iu"
+            ):
+                owned = added.view(dtype)
+            else:
+                owned = added.astype(dtype, copy=False)
+            chunk = torch.from_numpy(owned)
+            if first_chunk:
+                chunk = torch.cat(
+                    (
+                        chunk,
+                        _final_route_placeholder(
+                            shape[0], shape[1], self.routed_experts_dtype
+                        ),
+                    )
+                )
+            prefix_cut_count("route_history_chunks", len(pieces))
+            prefix_cut_count("route_history_bytes", added.nbytes)
+            prefix_cut_count("route_chunk_only_calls", 1)
+            prefix_cut_count(
+                "route_chunk_owned_bytes", chunk.numel() * chunk.element_size()
+            )
+            if not first_chunk:
+                prefix_cut_count(
+                    "route_chunk_cumulative_tensor_avoided_bytes",
+                    self._cumulative_route_count(frozen)
+                    * shape[0]
+                    * shape[1]
+                    * chunk.element_size(),
+                )
+            return chunk
 
     def frozen_cut_routed_experts(
         self, engine_routed_experts: Any | None
@@ -925,7 +1015,7 @@ class GenerationCutCaptureMixin:
             )
         call_extras = extras_by_chunk[0]
         layout = (call_extras or {}).get(_CUT_DIGEST_LAYOUT)
-        if layout is not None and (type(layout) is not int or layout != 2):
+        if layout is not None and (type(layout) is not int or layout not in (2, 3)):
             raise RuntimeError("unsupported generation-cut digest layout")
         continuation = admission.generation_cut
         weight_versions = [snapshot.weight_version for snapshot in snapshots]
@@ -981,8 +1071,10 @@ class GenerationCutCaptureMixin:
         routed_experts = self._generation_cut_routes(chunks, snapshots)
         chunk_digests = None
         extras = call_extras
-        if layout == 2:
-            if routed_experts is None:
+        if layout in (2, 3):
+            if routed_experts is None and (
+                layout == 2 or any(chunk.routed_len for chunk in chunks)
+            ):
                 raise RuntimeError("route-digest layout requires route fragments")
             chunk_digests = tuple(snapshot.digest for snapshot in snapshots)
             extras = {
@@ -997,27 +1089,63 @@ class GenerationCutCaptureMixin:
                 "routed_experts": encode_routed_experts(routed_experts),
             }
         extras_digest = compute_extras_digest(extras)
-        chain_hash = compute_chain_hash(admission.parent_chain_hash, token_ids_delta)
-        cumulative_hash = hash_token_ids(prefix_token_ids + token_ids_delta)
-        digest = compute_staging_digest(
-            schema_version=admission.schema_version,
-            digest_version=STAGING_DIGEST_VERSION,
-            extras_digest_version=EXTRAS_DIGEST_VERSION,
-            rollout_id=continuation.source_capture_key,
-            model_call_id=continuation.source_model_call_id,
-            parent_call_id=admission.parent_call_id,
-            mode=admission.mode,
-            prev_len=admission.prev_len,
-            delta_len=delta_len,
-            cum_len=cum_len,
-            weight_version=weight_version,
-            token_ids_delta=token_ids_delta,
-            token_mask_delta=token_mask_delta,
-            generation_log_probs_delta=generation_logprobs_delta,
-            extras_digest=extras_digest,
-            chain_hash=chain_hash,
-            cumulative_hash=cumulative_hash,
-        )
+        if layout == 3:
+            # Gym is optional outside token capture. Restore verifies all fetched bytes.
+            from nemo_gym.token_id_capture.staging.incremental_prefix import (
+                IncrementalPrefixDigest,
+                PrefixMetadata,
+            )
+
+            restored_digest = IncrementalPrefixDigest(
+                prefix_token_ids=prefix_token_ids,
+                parent_chain_hash=admission.parent_chain_hash,
+            )
+            restored_digest.append(
+                tokens=token_ids_delta,
+                mask=token_mask_delta,
+                logprobs=generation_logprobs_delta,
+            )
+            identity = restored_digest.identity(
+                PrefixMetadata(
+                    admission.schema_version,
+                    continuation.source_capture_key,
+                    continuation.source_model_call_id,
+                    admission.parent_call_id,
+                    admission.mode,
+                    admission.prev_len,
+                    weight_version,
+                ),
+                extras_digest=extras_digest,
+            )
+            chain_hash, cumulative_hash, digest = (
+                identity.chain_hash,
+                identity.cumulative_hash,
+                identity.digest,
+            )
+        else:
+            chain_hash = compute_chain_hash(
+                admission.parent_chain_hash, token_ids_delta
+            )
+            cumulative_hash = hash_token_ids(prefix_token_ids + token_ids_delta)
+            digest = compute_staging_digest(
+                schema_version=admission.schema_version,
+                digest_version=STAGING_DIGEST_VERSION,
+                extras_digest_version=EXTRAS_DIGEST_VERSION,
+                rollout_id=continuation.source_capture_key,
+                model_call_id=continuation.source_model_call_id,
+                parent_call_id=admission.parent_call_id,
+                mode=admission.mode,
+                prev_len=admission.prev_len,
+                delta_len=delta_len,
+                cum_len=cum_len,
+                weight_version=weight_version,
+                token_ids_delta=token_ids_delta,
+                token_mask_delta=token_mask_delta,
+                generation_log_probs_delta=generation_logprobs_delta,
+                extras_digest=extras_digest,
+                chain_hash=chain_hash,
+                cumulative_hash=cumulative_hash,
+            )
         # Gym's begin_call checks this snapshot's digest and generated-token
         # count against the admission before the call is served.
         snapshot = StagedCallBaseSnapshot(
@@ -1029,6 +1157,7 @@ class GenerationCutCaptureMixin:
             delta_len=delta_len,
             cum_len=cum_len,
             weight_version=weight_version,
+            digest_version=3 if layout == 3 else STAGING_DIGEST_VERSION,
             digest=digest,
             token_ids_delta=token_ids_delta,
             token_mask_delta=token_mask_delta,
@@ -1543,6 +1672,10 @@ class GenerationCutCaptureMixin:
 
             if state.engine_token_snapshot:
                 self._refresh_generation_cut_tokens(state, deadline=deadline)
+            incremental_prefix = state.generation_cut_chunk_digests is not None and (
+                state.call.generation_cut is None
+                or state.call.generation_cut.digest_version == 3
+            )
             with prefix_cut_timing("capture_freeze"), state.lock:
                 uncuttable_reason = state.uncuttable_reason
                 observation_error = state.observation_error
@@ -1561,7 +1694,9 @@ class GenerationCutCaptureMixin:
                         chunk_logprobs,
                         generated_token_ids,
                         generated_logprobs,
-                    ) = state.freeze_for_checkpoint(checkpoint_id)
+                    ) = state.freeze_for_checkpoint(
+                        checkpoint_id, include_cumulative=not incremental_prefix
+                    )
             if uncuttable_reason is not None:
                 # Expected for this request; the worker warned when it was set.
                 LOGGER.debug(
@@ -1592,15 +1727,19 @@ class GenerationCutCaptureMixin:
                 if state.call.admission.generation_cut is not None
                 else 0
             )
-            total_generation_token_count = inherited_prefix_token_count + len(
-                generated_token_ids
+            frozen_generation_token_count = state._require_frozen_cut(checkpoint_id)
+            total_generation_token_count = (
+                inherited_prefix_token_count + frozen_generation_token_count
             )
             with prefix_cut_timing("utf8_boundary_check"):
                 cannot_cut_boundary = total_generation_token_count == 0 or (
                     generated_token_ids
                     and _ends_inside_character(
                         self._generation_cut_tokenizer,
-                        state.resumed_generation_token_ids + generated_token_ids,
+                        state.resumed_generation_token_ids[
+                            -_PREFIX_BOUNDARY_TAIL_TOKENS:
+                        ]
+                        + generated_token_ids[-_PREFIX_BOUNDARY_TAIL_TOKENS:],
                     )
                 )
             if cannot_cut_boundary:
@@ -1645,18 +1784,25 @@ class GenerationCutCaptureMixin:
                         engine_routed_experts = self._frozen_cut_engine_routed_experts(
                             state, deadline=deadline
                         )
-                    if isinstance(engine_routed_experts, list):
-                        # Only the cut executor mutates this cache. Do the
-                        # potentially large copy without blocking HTTP token
-                        # observation on state.lock.
-                        engine_routed_experts = state.absorb_engine_route_pieces(
+                    if (
+                        state.capture_routed_experts
+                        and state.generation_cut_chunk_digests is not None
+                    ):
+                        # Layout 2 commits old route chunks by digest; it never
+                        # needs a cumulative route tensor on the capture path.
+                        chunk_routed_experts = state.frozen_cut_route_chunk(
                             engine_routed_experts
                         )
-                with state.lock, prefix_cut_timing("route_prefix_assembly"):
-                    (
-                        chunk_routed_experts,
-                        cumulative_routed_experts,
-                    ) = state.frozen_cut_routed_experts(engine_routed_experts)
+                        cumulative_routed_experts = None
+                    else:
+                        if isinstance(engine_routed_experts, list):
+                            engine_routed_experts = state.absorb_engine_route_pieces(
+                                engine_routed_experts
+                            )
+                        with state.lock, prefix_cut_timing("route_prefix_assembly"):
+                            chunk_routed_experts, cumulative_routed_experts = (
+                                state.frozen_cut_routed_experts(engine_routed_experts)
+                            )
             except (TimeoutError, TypeError, ValueError) as error:
                 # Only this call regenerates; the rest of the inventory is cut,
                 # and the next checkpoint tries this call again.
@@ -1682,12 +1828,20 @@ class GenerationCutCaptureMixin:
                 chunk_record = None
                 route_payload = None
                 chunk_digests = state.generation_cut_chunk_digests
-                new_layout = state.capture_routed_experts and chunk_digests is not None
+                # Old restored chains retain their original cumulative identity.
+                incremental_prefix = chunk_digests is not None and (
+                    state.call.generation_cut is None
+                    or state.call.generation_cut.digest_version == 3
+                )
+                new_layout = chunk_digests is not None and (
+                    state.capture_routed_experts or incremental_prefix
+                )
+                candidate_prefix_digest = None
                 if new_layout:
                     assert chunk_digests is not None
                     cumulative_extras = {
                         **(cumulative_extras or {}),
-                        _CUT_DIGEST_LAYOUT: 2,
+                        _CUT_DIGEST_LAYOUT: 3 if incremental_prefix else 2,
                     }
                     candidate_digests = list(chunk_digests)
                     if len(candidate_digests) != len(state.generation_cut_staging_keys):
@@ -1695,15 +1849,17 @@ class GenerationCutCaptureMixin:
                             "generation-cut chunk digests and keys differ"
                         )
                     if chunk_token_ids:
-                        if chunk_routed_experts is None:
-                            raise ValueError(
-                                "router-replay cut has no new route fragment"
-                            )
-                        with prefix_cut_timing("delta_route_encode"):
-                            route_payload = RoutedExpertsStagingPayload(
-                                chunk_routed_experts
-                            )
-                            chunk_extras = {"routed_experts": route_payload.encoded}
+                        chunk_extras = {}
+                        if state.capture_routed_experts:
+                            if chunk_routed_experts is None:
+                                raise ValueError(
+                                    "router-replay cut has no new route fragment"
+                                )
+                            with prefix_cut_timing("delta_route_encode"):
+                                route_payload = RoutedExpertsStagingPayload(
+                                    chunk_routed_experts, native=True
+                                )
+                                chunk_extras = {"routed_experts": route_payload.encoded}
                         with prefix_cut_timing("delta_record_build_and_digest"):
                             if not state.generation_cut_staging_keys:
                                 # The first persisted row carries prompt/call
@@ -1752,17 +1908,79 @@ class GenerationCutCaptureMixin:
                             "routed_experts": encoded_routes,
                         }
                 prefix_cut_count(
-                    "cumulative_generation_tokens", len(generated_token_ids)
+                    "cumulative_generation_tokens", frozen_generation_token_count
                 )
                 prefix_cut_count("new_chunk_tokens", len(chunk_token_ids))
-                with prefix_cut_timing("cumulative_record_build_and_digest"):
-                    cumulative_record = capture.build_prefix_record(
-                        state.call,
-                        prompt_token_ids=state.prompt_token_ids,
-                        generated_token_ids=generated_token_ids,
-                        generated_logprobs=generated_logprobs,
-                        extras=cumulative_extras,
+                if incremental_prefix:
+                    # Gym is an optional dependency outside token-capture jobs.
+                    from nemo_gym.token_id_capture.staging.digest import (
+                        compute_extras_digest,
                     )
+                    from nemo_gym.token_id_capture.staging.incremental_prefix import (
+                        IncrementalPrefixDigest,
+                        PrefixMetadata,
+                    )
+
+                    with prefix_cut_timing("incremental_prefix_identity"):
+                        committed_prefix_digest = state.generation_prefix_digest
+                        if committed_prefix_digest is None:
+                            committed_prefix_digest = IncrementalPrefixDigest(
+                                prefix_token_ids=state.call.prefix_token_ids,
+                                parent_chain_hash=state.call.admission.parent_chain_hash,
+                            )
+                            restored_prefix = state.call.generation_cut
+                            if restored_prefix is not None:
+                                committed_prefix_digest.append(
+                                    tokens=restored_prefix.token_ids_delta,
+                                    mask=restored_prefix.token_mask_delta,
+                                    logprobs=restored_prefix.generation_log_probs_delta,
+                                )
+                        candidate_prefix_digest = committed_prefix_digest.copy()
+                        if chunk_record is not None:
+                            candidate_prefix_digest.append(
+                                tokens=chunk_record.token_ids_delta,
+                                mask=chunk_record.token_mask_delta,
+                                logprobs=chunk_record.generation_log_probs_delta,
+                            )
+                        if (
+                            candidate_prefix_digest.generated_count
+                            != total_generation_token_count
+                        ):
+                            raise RuntimeError(
+                                "incremental prefix token count differs from frozen state"
+                            )
+                        identity = candidate_prefix_digest.identity(
+                            PrefixMetadata(
+                                state.call.admission.schema_version,
+                                state.call.rollout_id,
+                                state.call.model_call_id,
+                                state.call.admission.parent_call_id,
+                                state.call.admission.mode,
+                                state.call.admission.prev_len,
+                                state.call.oldest_weight_version,
+                            ),
+                            extras_digest=compute_extras_digest(cumulative_extras),
+                        )
+                        cumulative_digest = identity.digest
+                        prefix_cut_count(
+                            "incremental_prefix_new_positions",
+                            candidate_prefix_digest.count
+                            - committed_prefix_digest.count,
+                        )
+                        prefix_cut_count(
+                            "incremental_prefix_reused_positions",
+                            committed_prefix_digest.count,
+                        )
+                else:
+                    with prefix_cut_timing("cumulative_record_build_and_digest"):
+                        cumulative_record = capture.build_prefix_record(
+                            state.call,
+                            prompt_token_ids=state.prompt_token_ids,
+                            generated_token_ids=generated_token_ids,
+                            generated_logprobs=generated_logprobs,
+                            extras=cumulative_extras,
+                        )
+                    cumulative_digest = cumulative_record.digest
                 if chunk_token_ids:
                     if chunk_routed_experts is not None:
                         prefix_cut_count(
@@ -1779,7 +1997,7 @@ class GenerationCutCaptureMixin:
                         if chunk_routed_experts is not None:
                             with prefix_cut_timing("delta_route_encode"):
                                 route_payload = RoutedExpertsStagingPayload(
-                                    chunk_routed_experts
+                                    chunk_routed_experts, native=True
                                 )
                                 chunk_extras = {"routed_experts": route_payload.encoded}
                         with prefix_cut_timing("delta_record_build_and_digest"):
@@ -1801,7 +2019,7 @@ class GenerationCutCaptureMixin:
                         frozen_buffer_id=frozen_buffer_id,
                         staging_keys=candidate_staging_keys,
                         prefix_token_count=total_generation_token_count,
-                        prefix_digest=cumulative_record.digest,
+                        prefix_digest=cumulative_digest,
                         effective_output_limit=effective_output_limit,
                         terminal_finish_reason=terminal_finish_reason,
                         terminal_stop_reason=terminal_stop_reason,
@@ -1813,6 +2031,8 @@ class GenerationCutCaptureMixin:
                     yield acknowledgement
                 with prefix_cut_timing("cut_seal"), state.lock:
                     state.seal_frozen_cut(checkpoint_id)
+                    if candidate_prefix_digest is not None:
+                        state.generation_prefix_digest = candidate_prefix_digest
                     if staged_key is not None:
                         state.generation_cut_staging_keys.append(staged_key)
                         if new_layout:

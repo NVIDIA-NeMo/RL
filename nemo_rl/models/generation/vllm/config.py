@@ -284,8 +284,10 @@ class GenerationCutControlConfig(BaseModel, extra="forbid"):
     )
     # Merge prepared writes across admitted inventories on a dedicated thread.
     batch_inventory_writes: bool = False
-    # Construct text prefix columns directly, avoiding intermediate row tensors.
+    # Construct text/router prefix columns directly, avoiding intermediate row tensors.
     direct_prefix_batch_encoding: bool = False
+    # Keep native TQ serialization/PUTs on a colocated actor with a separate GIL.
+    prefix_writer_actor: bool = False
     # Group a bounded FIFO prefix before reserving one admission slot.
     group_pending_inventories: bool = False
     group_max_inventories: Annotated[int, Field(ge=1, le=32, strict=True)] = 8
@@ -299,6 +301,12 @@ class GenerationCutControlConfig(BaseModel, extra="forbid"):
 
     @model_validator(mode="after")
     def validate_pipeline_mode(self) -> "GenerationCutControlConfig":
+        if self.prefix_writer_actor and (
+            not self.pipeline.enabled or not self.direct_prefix_batch_encoding
+        ):
+            raise ValueError(
+                "Prefix writer actor requires the cut pipeline and direct prefix encoding"
+            )
         if self.pipeline.enabled and (
             self.batch_inventory_writes or self.group_pending_inventories
         ):

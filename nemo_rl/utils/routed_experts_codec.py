@@ -29,6 +29,8 @@ depend on torch.
 """
 
 import base64
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, Union
 
@@ -48,24 +50,36 @@ ROUTED_EXPERTS_STAGING_ATTACHMENT = "nrl_routed_experts_staging"
 
 @dataclass(frozen=True, init=False)
 class RoutedExpertsStagingPayload:
-    """Own a CPU route snapshot and the exact envelope committed by its record.
+    """Own a CPU route snapshot bound to its envelope or native descriptor.
 
-    The capture record still digests the ordinary envelope. The local sink can
-    reuse its tensor instead of decoding that envelope. No global cache or
-    request lookup is involved; the attachment lives only through staging.
+    Native capture commits compact tensor metadata; legacy callers retain the
+    envelope representation. The attachment lives only through staging.
     """
 
-    encoded: str = field(repr=False)
+    encoded: str | dict[str, Any] = field(repr=False)
+    _binding: str = field(repr=False)
     _routes: torch.Tensor = field(repr=False)
     _version: int = field(repr=False)
 
-    def __init__(self, routes: torch.Tensor) -> None:
+    def __init__(self, routes: torch.Tensor, *, native: bool = False) -> None:
         # Own the bytes: later engine/cache mutations cannot change a staged
         # record. Disable inference mode so mutation checks also work when the
         # source tensor was created under inference_mode().
         with torch.inference_mode(False):
             snapshot = routes.detach().to("cpu").clone().contiguous()
-        object.__setattr__(self, "encoded", encode_routed_experts(snapshot))
+        encoded = (
+            routed_experts_tensor_metadata(snapshot)
+            if native
+            else encode_routed_experts(snapshot)
+        )
+        object.__setattr__(self, "encoded", encoded)
+        object.__setattr__(
+            self,
+            "_binding",
+            encoded
+            if isinstance(encoded, str)
+            else json.dumps(encoded, sort_keys=True),
+        )
         object.__setattr__(self, "_routes", snapshot)
         object.__setattr__(self, "_version", snapshot._version)
 
@@ -76,19 +90,22 @@ class RoutedExpertsStagingPayload:
             ValueError: The record names another envelope, or a consumer has
                 modified the owned tensor since its envelope was computed.
         """
-        if not isinstance(encoded, str) or encoded != self.encoded:
+        binding = (
+            encoded
+            if isinstance(encoded, str)
+            else json.dumps(encoded, sort_keys=True)
+            if isinstance(encoded, dict)
+            else None
+        )
+        if binding != self._binding:
             raise ValueError("route staging attachment does not match record payload")
         if self._routes._version != self._version:
             raise ValueError("route staging attachment was modified after encoding")
         return self._routes
 
 
-def encode_routed_experts(routed_experts: torch.Tensor) -> str:
-    """Encode a [tokens, num_moe_layers, topk] tensor as a base64 envelope.
-
-    The tensor's own dtype (int8/int16/int32, as resolved by
-    ``resolve_routed_experts_dtype``) is preserved on the wire.
-    """
+def _route_array(routed_experts: torch.Tensor) -> tuple[str, Any]:
+    """Validate a route tensor; return its wire dtype name and CPU array."""
     if routed_experts.dim() != 3:
         raise ValueError(
             "routed_experts must have shape [tokens, num_moe_layers, topk], "
@@ -100,7 +117,32 @@ def encode_routed_experts(routed_experts: torch.Tensor) -> str:
             f"Unsupported routed_experts dtype {routed_experts.dtype}; "
             f"expected one of {sorted(_WIRE_TORCH_DTYPES)}."
         )
-    arr = routed_experts.detach().cpu().contiguous().numpy()
+    return dtype_name, routed_experts.detach().cpu().contiguous().numpy()
+
+
+def routed_experts_tensor_metadata(routed_experts: torch.Tensor) -> dict[str, Any]:
+    """Bind a captured route tensor to its dtype, shape, and content checksum.
+
+    Capture stages the tensor directly. Only this small descriptor enters Gym's
+    extras digest; consumers recreate it from the stored tensor for verification.
+    Hash contiguous little-endian bytes without allocating a base64 payload.
+    """
+    dtype_name, arr = _route_array(routed_experts)
+    arr = arr.astype(arr.dtype.newbyteorder("<"), copy=False)
+    return {
+        "dtype": dtype_name,
+        "shape": list(arr.shape),
+        "sha256": hashlib.sha256(memoryview(arr)).hexdigest(),
+    }
+
+
+def encode_routed_experts(routed_experts: torch.Tensor) -> str:
+    """Encode a [tokens, num_moe_layers, topk] tensor as a base64 envelope.
+
+    The tensor's own dtype (int8/int16/int32, as resolved by
+    ``resolve_routed_experts_dtype``) is preserved on the wire.
+    """
+    dtype_name, arr = _route_array(routed_experts)
     tokens, num_layers, topk = arr.shape
     # memoryview feeds the buffer to b64encode zero-copy; tobytes() would
     # materialize a full-size intermediate copy of the payload.

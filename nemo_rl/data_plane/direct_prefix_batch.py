@@ -1,7 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may obtain a copy at http://www.apache.org/licenses/LICENSE-2.0
-"""Owned column construction for text-only generation-prefix batches.
+"""Owned column construction for text and routed generation-prefix batches.
 
 The output uses the existing staging schema and row ordering. Token IDs are
 int64, masks/logprobs float32, and byte metadata uint8. NumPy/bytearray buffers
@@ -19,13 +19,23 @@ import numpy as np
 import torch
 from tensordict import TensorDict
 
+from nemo_rl.data_plane.codec import stack_or_nest
 from nemo_rl.data_plane.schema import (
+    ROUTE_ENCODING_ENVELOPE,
+    ROUTE_ENCODING_LIST,
     ROUTE_ENCODING_NONE,
+    ROUTE_ENCODING_TENSOR,
     ROUTED_EXPERTS_ENCODING_FIELD,
+    ROUTED_EXPERTS_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
     ROUTED_LEN_FIELD,
 )
-from nemo_rl.utils.prefix_cut_diagnostics import prefix_cut_timing
+from nemo_rl.utils.prefix_cut_diagnostics import prefix_cut_count, prefix_cut_timing
+from nemo_rl.utils.routed_experts_codec import (
+    ROUTED_EXPERTS_STAGING_ATTACHMENT,
+    RoutedExpertsStagingPayload,
+    decode_routed_experts,
+)
 
 if TYPE_CHECKING:
     from nemo_gym.token_id_capture.staging.records import StagedCallRecord
@@ -80,16 +90,108 @@ def encode_text_generation_prefix_batch(
 ) -> EncodedPrefixBatch:
     """Encode a nonempty text/no-router cohort directly into batch columns.
 
-    Media and routed-expert rows must use the general staging encoder.
-    Reject unsupported inputs instead of dropping their data.
+    Routed rows use encode_generation_prefix_batch with validated route rows;
+    media rows use the general staging encoder. Reject unsupported inputs.
     """
+    if any(
+        record.extras is not None and "routed_experts" in record.extras
+        for record in records
+    ):
+        raise ValueError("Direct text prefix encoding does not support routed experts")
+    return encode_generation_prefix_batch(records, None, mode_codes=mode_codes)
+
+
+def prepare_prefix_route_groups(
+    records: Sequence[StagedCallRecord],
+    attachments: Sequence[Mapping[str, Any] | None],
+) -> list[tuple[list[int], list[torch.Tensor] | None]]:
+    """Validate route ownership/alignment and group compatible rows before writes.
+
+    This is only used for non-media partitions. Every attachment is checked
+    before publishing any cohort; unknown attachments are never discarded.
+    """
+    if len(records) != len(attachments):
+        raise ValueError("records and attachments must have equal lengths")
+    groups: dict[
+        tuple[torch.dtype, tuple[int, ...]] | None,
+        tuple[list[int], list[torch.Tensor] | None],
+    ] = {}
+    for index, (record, row_attachments) in enumerate(
+        zip(records, attachments, strict=True)
+    ):
+        payload = None
+        if row_attachments:
+            if any(key != ROUTED_EXPERTS_STAGING_ATTACHMENT for key in row_attachments):
+                raise ValueError(
+                    "media attachments require a media-enabled staging partition"
+                )
+            payload = row_attachments[ROUTED_EXPERTS_STAGING_ATTACHMENT]
+            if not isinstance(payload, RoutedExpertsStagingPayload):
+                raise TypeError(
+                    "route staging attachment must be RoutedExpertsStagingPayload"
+                )
+        routed = (
+            record.extras.get("routed_experts") if record.extras is not None else None
+        )
+        if payload is not None and routed is None:
+            raise ValueError("route staging attachment has no record payload")
+        experts = None
+        signature = None
+        if routed is not None:
+            if payload is None:
+                with prefix_cut_timing("sink_route_decode"):
+                    experts = decode_routed_experts(routed)
+            else:
+                with prefix_cut_timing("sink_route_reuse"):
+                    experts = payload.tensor_for_payload(routed)
+                prefix_cut_count("sink_route_reuse_rows", 1)
+                prefix_cut_count(
+                    "sink_route_reuse_bytes", experts.numel() * experts.element_size()
+                )
+            if experts.dim() != 3 or experts.shape[0] != record.delta_len:
+                raise ValueError(
+                    "routed_experts must already be delta-aligned: "
+                    f"got shape {tuple(experts.shape)} for delta_len={record.delta_len}"
+                )
+            signature = (experts.dtype, tuple(experts.shape[1:]))
+        if signature not in groups:
+            groups[signature] = ([], [] if experts is not None else None)
+        indices, routes = groups[signature]
+        indices.append(index)
+        if routes is not None and experts is not None:
+            routes.append(experts)
+    return list(groups.values())
+
+
+def encode_generation_prefix_batch(
+    records: Sequence[StagedCallRecord],
+    route_rows: Sequence[torch.Tensor] | None,
+    *,
+    mode_codes: Mapping[str, int],
+) -> EncodedPrefixBatch:
+    """Build owned columns for an already route-validated homogeneous cohort."""
     if not records:
         raise ValueError("Direct prefix encoding requires at least one record")
+    if route_rows is not None and len(route_rows) != len(records):
+        raise ValueError("route and record counts differ")
+    for index, record in enumerate(records):
+        routed = (
+            record.extras.get("routed_experts") if record.extras is not None else None
+        )
+        if (routed is not None) != (route_rows is not None):
+            raise ValueError("route payload presence does not match batch columns")
+        if route_rows is not None:
+            row = route_rows[index]
+            if row.dim() != 3 or row.shape[0] != record.delta_len:
+                raise ValueError("routed_experts must already be delta-aligned")
+            if (
+                row.dtype != route_rows[0].dtype
+                or row.shape[1:] != route_rows[0].shape[1:]
+            ):
+                raise ValueError(
+                    "route batch must have uniform dtype and trailing shape"
+                )
     for record in records:
-        if record.extras is not None and "routed_experts" in record.extras:
-            raise ValueError(
-                "Direct text prefix encoding does not support routed experts"
-            )
         if not (
             len(record.token_ids_delta)
             == len(record.token_mask_delta)
@@ -119,8 +221,21 @@ def encode_text_generation_prefix_batch(
             "cum_len": [r.cum_len for r in records],
             "weight_version": [r.weight_version for r in records],
             "capture_mode": [mode_codes[r.mode] for r in records],
-            ROUTED_EXPERTS_ENCODING_FIELD: [ROUTE_ENCODING_NONE] * len(records),
-            ROUTED_LEN_FIELD: [0] * len(records),
+            ROUTED_EXPERTS_ENCODING_FIELD: [
+                (
+                    ROUTE_ENCODING_TENSOR
+                    if isinstance(r.extras["routed_experts"], dict)
+                    else ROUTE_ENCODING_ENVELOPE
+                    if isinstance(r.extras["routed_experts"], str)
+                    else ROUTE_ENCODING_LIST
+                )
+                if route_rows is not None
+                else ROUTE_ENCODING_NONE
+                for r in records
+            ],
+            ROUTED_LEN_FIELD: [
+                r.delta_len if route_rows is not None else 0 for r in records
+            ],
         }
         for name, values in scalars.items():
             fields[name] = torch.from_numpy(np.array(values, dtype=np.int64))
@@ -148,7 +263,13 @@ def encode_text_generation_prefix_batch(
             ],
             ROUTED_EXTRAS_METADATA_FIELD: [
                 json.dumps(
-                    dict(r.extras) if r.extras is not None else None,
+                    {
+                        key: value
+                        for key, value in r.extras.items()
+                        if key != "routed_experts"
+                    }
+                    if r.extras is not None
+                    else None,
                     sort_keys=True,
                     separators=(",", ":"),
                     ensure_ascii=False,
@@ -179,5 +300,10 @@ def encode_text_generation_prefix_batch(
         + sum(len(value) for values in bytes_columns.values() for value in values)
     )
     with prefix_cut_timing("sink_batch_construct"):
+        if route_rows is not None:
+            # stack/cat owns the batch storage, even when input rows are views
+            # into the attachment snapshot. No per-record metadata tensors.
+            fields[ROUTED_EXPERTS_FIELD] = stack_or_nest(list(route_rows))
+            payload_bytes += sum(row.numel() * row.element_size() for row in route_rows)
         batch = TensorDict(fields, batch_size=[len(records)])
     return EncodedPrefixBatch(batch, tags, payload_bytes)

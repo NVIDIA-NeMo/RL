@@ -19,8 +19,8 @@ import functools
 import inspect
 import threading
 import time
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import ExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from textwrap import dedent
 from types import MethodType
@@ -39,6 +39,7 @@ class _PutTrace:
     max_events: int
     started_unix_s: float
     events: list[dict[str, Any]] = field(default_factory=list)
+    phase_totals: dict[str, dict[str, float | int]] = field(default_factory=dict)
     dropped: int = 0
     lock: Any = field(default_factory=threading.Lock)
 
@@ -57,13 +58,14 @@ class _PutTrace:
             yield
             failed = False
         finally:
+            wall_elapsed = time.perf_counter() - wall
             event = {
                 "phase": name,
                 "storage_unit": storage_unit,
                 "controller_request": controller_request,
                 "started_unix_s": started,
                 "finished_unix_s": time.time(),
-                "wall_s": time.perf_counter() - wall,
+                "wall_s": wall_elapsed,
                 # An async interval can include other tasks' CPU; don't attribute it.
                 "thread_cpu_s": time.thread_time() - thread_cpu if cpu else None,
                 "thread_id": threading.get_ident(),
@@ -71,6 +73,12 @@ class _PutTrace:
                 "failed": failed,
             }
             with self.lock:
+                total = self.phase_totals.setdefault(
+                    name, {"calls": 0, "wall_s": 0.0, "failed": 0}
+                )
+                total["calls"] += 1
+                total["wall_s"] += wall_elapsed
+                total["failed"] += int(failed)
                 if len(self.events) < self.max_events:
                     self.events.append(event)
                 else:
@@ -134,6 +142,23 @@ def _context_call(function: Callable[..., Any]) -> Callable[..., Any]:
         return context.run(invoke)
 
     return run
+
+
+def observe_socket_acquisition(original: Callable[..., Any]) -> Callable[..., Any]:
+    """Measure native pool admission without replacing its lease or error handling."""
+
+    @functools.wraps(original)
+    @asynccontextmanager
+    async def lease(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        # Close the timer as soon as native __aenter__ returns. The native
+        # context manager still receives body errors and cancellation unchanged.
+        with ExitStack() as acquisition:
+            acquisition.enter_context(_phase("controller_socket_acquire", cpu=False))
+            async with original(*args, **kwargs) as socket:
+                acquisition.close()
+                yield socket
+
+    return lease
 
 
 def instrument_native_function(
@@ -454,6 +479,14 @@ class TransferQueueLatencyHooks:
             if not callable(getattr(obj, name, None)):
                 raise ValueError(f"Unsupported pinned TQ diagnostic method: {name}")
         try:
+            pool = getattr(client, "controller_rpc_pool", None)
+            if pool is not None:
+                self._replace(pool, "alease", observe_socket_acquisition(pool.alease))
+            # CLEAR uses the same controller pool as terminal PUT metadata.
+            for name in ("_mark_clearing_in_controller", "_clear_meta_in_controller"):
+                original = getattr(client, name, None)
+                if callable(original):
+                    self._replace(client, name, self._wrap(original, name.lstrip("_")))
             for obj, name, function in replacements:
                 self._replace(obj, name, MethodType(function, obj))
             for obj, name, phase in methods:
@@ -631,5 +664,6 @@ def trace_tq_put() -> Iterator[None]:
                 elapsed_s=elapsed,
                 failed=failed,
                 phases=trace.events,
+                phase_totals=trace.phase_totals,
                 dropped_events=trace.dropped,
             )

@@ -57,6 +57,7 @@ from nemo_rl.utils.prefix_cut_diagnostics import (  # noqa: E402
 from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
     decode_routed_experts,
     encode_routed_experts,
+    routed_experts_tensor_metadata,
 )
 
 pytestmark = pytest.mark.nemo_gym
@@ -64,13 +65,18 @@ pytestmark = pytest.mark.nemo_gym
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_write", [False, True])
+@pytest.mark.parametrize("router_replay", [False, True])
 async def test_streaming_pipeline_keeps_original_receipts_and_real_restore_integrity(
-    grouped_implementation, owner_loop, monkeypatch, fail_write
+    grouped_implementation, owner_loop, monkeypatch, fail_write, router_replay
 ):
     m = grouped_implementation
     worker, states, processor, whole = enable_engine_tokens(
         m, owner_loop, monkeypatch, count=16, packed=True
     )
+    if not router_replay:
+        worker._return_routed_experts_enabled = lambda: False
+        for state in states:
+            state.capture_routed_experts = False
     worker._generation_cut_receipts = {}
     worker._generation_cut_control_config = GenerationCutControlConfig(
         max_workers=4,
@@ -135,7 +141,12 @@ async def test_streaming_pipeline_keeps_original_receipts_and_real_restore_integ
             first[0].prefixes[0],
             chunks(m, worker._capture_sink, first[0].prefixes[0]),
         )
-        assert restored.routed_experts.flatten().tolist() == [1, 2, 3, -1]
+        if router_replay:
+            assert restored.routed_experts.flatten().tolist() == [1, 2, 3, -1]
+        else:
+            assert restored.routed_experts is None
+            assert restored.snapshot.token_ids_delta == [65, 66, 67, 68]
+            assert restored.snapshot.digest_version == 3
         for i in range(16):
             engine = processor.request_states[f"internal-{i}"]
             engine.detokenizer.output_token_ids.append(69)
@@ -161,7 +172,12 @@ async def test_streaming_pipeline_keeps_original_receipts_and_real_restore_integ
             second[0].prefixes[0],
             chunks(m, worker._capture_sink, second[0].prefixes[0]),
         )
-        assert restored.routed_experts.flatten().tolist() == [1, 2, 3, 9, -1]
+        if router_replay:
+            assert restored.routed_experts.flatten().tolist() == [1, 2, 3, 9, -1]
+        else:
+            assert restored.routed_experts is None
+            assert restored.snapshot.token_ids_delta == [65, 66, 67, 68, 69]
+            assert restored.snapshot.digest_version == 3
         assert all(state.staged_token_count == 3 for state in states)
         assert_group_released(states)
         assert pipeline.stats()["buffered_payload_bytes"] == 0
@@ -278,7 +294,13 @@ def implementation():
     )
     module = ModuleType("_route_cache_cut_test")
     sys.modules[module.__name__] = module
-    module.__dict__.update(json=json, ROUTE_ENCODING_ENVELOPE=1, ROUTE_ENCODING_LIST=2)
+    module.__dict__.update(
+        json=json,
+        ROUTE_ENCODING_ENVELOPE=1,
+        ROUTE_ENCODING_LIST=2,
+        ROUTE_ENCODING_TENSOR=3,
+        routed_experts_tensor_metadata=routed_experts_tensor_metadata,
+    )
     # Read the real wire constants without importing data_plane's Ray factory.
     schema = ast.parse((root / "data_plane/schema.py").read_text())
     constants = [
@@ -291,6 +313,7 @@ def implementation():
             in {
                 "ROUTE_ENCODING_ENVELOPE",
                 "ROUTE_ENCODING_LIST",
+                "ROUTE_ENCODING_TENSOR",
                 "ROUTED_EXPERTS_FIELD",
             }
             for t in n.targets
@@ -336,6 +359,7 @@ def implementation():
 class Sink:
     def __init__(self):
         self.records = {}
+        self.route_tensors = {}
         self.fail = False
 
     def stage_generation_prefix_batch(
@@ -351,20 +375,31 @@ class Sink:
             for record, attachment in zip(records, attachments, strict=True):
                 if attachment is not None:
                     routes = attachment[ROUTED_EXPERTS_STAGING_ATTACHMENT]
-                    assert torch.equal(
-                        routes.tensor_for_payload(record.extras["routed_experts"]),
-                        decode_routed_experts(record.extras["routed_experts"]),
-                    )
+                    tensor = routes.tensor_for_payload(record.extras["routed_experts"])
+                    payload = record.extras["routed_experts"]
+                    if isinstance(payload, dict):
+                        assert routed_experts_tensor_metadata(tensor) == payload
+                    else:
+                        assert torch.equal(tensor, decode_routed_experts(payload))
         keys = []
-        for record, sequence in zip(records, chunk_sequences, strict=True):
+        for index, (record, sequence) in enumerate(
+            zip(records, chunk_sequences, strict=True)
+        ):
             key = f"{checkpoint_id}/{record.model_call_id}/{sequence}"
             self.records[key] = record
+            if isinstance((record.extras or {}).get("routed_experts"), dict):
+                self.route_tensors[key] = (
+                    attachments[index][ROUTED_EXPERTS_STAGING_ATTACHMENT]
+                    .tensor_for_payload(record.extras["routed_experts"])
+                    .clone()
+                )
             keys.append(key)
         return keys
 
     def clear(self, keys):
         for key in keys:
             self.records.pop(key, None)
+            self.route_tensors.pop(key, None)
 
 
 def make_worker(m, *, sink=None, admission=None, resolved=None, prompt=(65, 66)):
@@ -447,18 +482,29 @@ def chunks(m, sink, ack):
     for key in ack.staging_keys:
         record = sink.records[key]
         extras = dict(record.extras or {})
-        tensor = decode_routed_experts(extras.pop("routed_experts"))
+        routed = extras.pop("routed_experts", None)
+        tensor = (
+            None
+            if routed is None
+            else sink.route_tensors[key].clone()
+            if isinstance(routed, dict)
+            else decode_routed_experts(routed)
+        )
         result.append(
             SimpleNamespace(
                 staging_key=key,
                 snapshot=StagedCallBaseSnapshot.model_validate(
                     record.model_dump(exclude={"extras"})
                 ),
-                extras=extras,
-                routed_len=len(tensor),
-                fragment=SimpleNamespace(
+                extras=None if record.extras is None else extras,
+                routed_len=0 if tensor is None else len(tensor),
+                fragment=None
+                if tensor is None
+                else SimpleNamespace(
                     routes=tensor,
-                    encoding=m.ROUTE_ENCODING_ENVELOPE,
+                    encoding=m.ROUTE_ENCODING_TENSOR
+                    if isinstance(routed, dict)
+                    else m.ROUTE_ENCODING_ENVELOPE,
                     extras_metadata_json=json.dumps(
                         extras, sort_keys=True, separators=(",", ":")
                     ).encode(),
@@ -561,19 +607,19 @@ def test_repeated_cuts_restore_and_cut_again_without_cumulative_route_encoding(
     worker.state.observe([67, 68], [-0.1, -0.2])
     worker.pieces = [routes(1, 2), routes(3)]
     encoded_sizes = []
-    original = m.encode_routed_experts
+    original = routed_experts_tensor_metadata
 
     def track_encode(tensor):
         encoded_sizes.append(len(tensor))
         return original(tensor)
 
     monkeypatch.setattr(
-        m,
-        "encode_routed_experts",
+        "nemo_rl.utils.routed_experts_codec.routed_experts_tensor_metadata",
         track_encode,
     )
     monkeypatch.setattr(
-        "nemo_rl.utils.routed_experts_codec.encode_routed_experts", track_encode
+        "nemo_rl.utils.routed_experts_codec.encode_routed_experts",
+        lambda *a, **k: pytest.fail("native cuts must not encode route envelopes"),
     )
     first = cut(worker, "cut1")
     worker.state.observe([69], [-0.3])
@@ -608,7 +654,8 @@ def test_failed_staging_keeps_cache_but_not_durable_digest_progress(implementati
     worker.pieces = [routes(1, 2)]
     worker._capture_sink.fail = True
     assert cut(worker, "failed").disposition == "durable_failure"
-    assert worker.state.engine_route_piece_count == 1
+    assert worker.state.route_piece_index.count == 1
+    assert worker.state.engine_route_buffer is None
     assert worker.state.generation_cut_chunk_digests == []
     assert worker.state.staged_token_count == 0
     worker._capture_sink.fail = False
@@ -683,7 +730,8 @@ def test_cache_can_include_post_freeze_routes_without_staging_them(implementatio
         worker, ack, chunks(implementation, worker._capture_sink, ack)
     )
     assert resolved.routed_experts.flatten().tolist() == [1, 2, 3, -1]
-    assert worker.state.engine_route_rows == 5
+    assert worker.state.route_piece_index.rows == 5
+    assert worker.state.engine_route_buffer is None
 
 
 def test_recut_without_new_tokens_reuses_the_same_digest_and_rows(implementation):
@@ -751,7 +799,8 @@ def test_later_cut_failure_does_not_advance_the_chunk_commitment(implementation)
     assert cut(worker, "failed").disposition == "durable_failure"
     assert worker.state.generation_cut_chunk_digests == digests
     assert worker.state.generation_cut_staging_keys == list(first.staging_keys)
-    assert worker.state.engine_route_piece_count == 2
+    assert worker.state.route_piece_index.count == 2
+    assert worker.state.engine_route_buffer is None
     worker._capture_sink.fail = False
     ack = cut(worker, "retry")
     _, resolved = restore(
@@ -822,6 +871,9 @@ def test_real_worker_admission_preserves_the_restored_digest_layout(
         None if legacy else list(resolved.chunk_digests)
     )
     assert state.generation_cut_staging_keys == list(ack.staging_keys)
+    if not legacy:
+        assert state.generation_prefix_digest is not None
+        assert state.generation_prefix_digest.generated_count == 1
     # A cut immediately after restore, before another token, needs no engine lookup.
     resumed.state = state
     same = cut(resumed, "no-new-tokens")
@@ -1732,9 +1784,9 @@ def test_group_uses_one_real_owner_handoff_after_every_call_is_frozen(
         assert ack.prefix_token_count == 2
         assert state.staged_token_count == 2
         record = worker._capture_sink.records[ack.staging_keys[0]]
-        assert decode_routed_experts(
-            record.extras["routed_experts"]
-        ).flatten().tolist() == [1, 2, 3, -1]
+        assert worker._capture_sink.route_tensors[
+            ack.staging_keys[0]
+        ].flatten().tolist() == [1, 2, 3, -1]
     assert_group_released(states)
 
 
@@ -1982,8 +2034,8 @@ def test_group_deadline_releases_pending_routes_and_records(
     if when == "before_lookup":
         original_freeze = states[0].freeze_for_checkpoint
 
-        def freeze(checkpoint_id):
-            result = original_freeze(checkpoint_id)
+        def freeze(checkpoint_id, **kwargs):
+            result = original_freeze(checkpoint_id, **kwargs)
             clock["now"] = 10.0
             return result
 
@@ -2780,3 +2832,230 @@ def test_shared_put_failure_does_not_advance_unrelated_call_digests(
         assert resolved.routed_experts.flatten().tolist() == [1, 2, 3, -1]
     finally:
         writer.close()
+
+
+@pytest.mark.parametrize("router_replay", [False, True])
+def test_incremental_identity_reuses_sealed_columns_and_survives_retry(
+    implementation: Any, monkeypatch: Any, router_replay: bool
+) -> None:
+    worker = make_worker(implementation)
+    worker._return_routed_experts_enabled = lambda: router_replay
+    worker.state.capture_routed_experts = router_replay
+    worker.state.observe([67], [-0.1])
+    worker.pieces = [routes(1, 2)]
+    first = cut(worker, "incremental-first")
+    original_state = worker.state.generation_prefix_digest
+    assert original_state.generated_count == 1
+    assert original_state.count == 3
+    admission, restored = restore(
+        worker, first, chunks(implementation, worker._capture_sink, first)
+    )
+    assert restored.snapshot.digest_version == 3
+
+    def no_cumulative_builder(*args, **kwargs):
+        raise AssertionError("A later v3 cut must not rebuild cumulative token columns")
+
+    monkeypatch.setattr(
+        worker.token_capture, "build_prefix_record", no_cumulative_builder
+    )
+    worker.state.observe([68], [-0.2])
+    worker.pieces.append(routes(3))
+    worker._capture_sink.fail = True
+    assert cut(worker, "incremental-fail").disposition == "durable_failure"
+    assert worker.state.generation_prefix_digest is original_state
+    assert original_state.generated_count == 1
+    worker._capture_sink.fail = False
+    second = cut(worker, "incremental-retry")
+    assert worker.state.generation_prefix_digest.generated_count == 2
+    _, restored = restore(
+        worker, second, chunks(implementation, worker._capture_sink, second)
+    )
+    assert restored.snapshot.token_ids_delta == [65, 66, 67, 68]
+    assert restored.snapshot.digest_version == 3
+    assert cut(worker, "incremental-unchanged").prefix_digest == second.prefix_digest
+
+
+def test_router_off_incremental_chain_extends_after_restore(
+    implementation: Any,
+) -> None:
+    worker = make_worker(implementation)
+    worker._return_routed_experts_enabled = lambda: False
+    worker.state.capture_routed_experts = False
+    worker.state.observe([67], [-0.1])
+    first = cut(worker, "router-off-first")
+    worker.state.observe([68], [-0.2])
+    second = cut(worker, "router-off-second")
+    admission, resolved = restore(
+        worker, second, chunks(implementation, worker._capture_sink, second)
+    )
+    assert len(second.staging_keys) == 2
+    assert second.staging_keys[0] == first.staging_keys[0]
+    assert resolved.routed_experts is None
+    resumed = make_worker(
+        implementation,
+        sink=worker._capture_sink,
+        admission=admission,
+        resolved=resolved,
+        prompt=tuple(resolved.snapshot.token_ids_delta),
+    )
+    resumed._return_routed_experts_enabled = lambda: False
+    resumed.state.capture_routed_experts = False
+    resumed.state.observe([69], [-0.3])
+    third = cut(resumed, "router-off-resumed")
+    assert third.disposition == "durable_prefix"
+    _, restored = restore(
+        resumed, third, chunks(implementation, resumed._capture_sink, third)
+    )
+    assert restored.snapshot.digest_version == 3
+    assert restored.snapshot.token_ids_delta == [65, 66, 67, 68, 69]
+    assert restored.snapshot.generation_log_probs_delta == pytest.approx(
+        [0.0, 0.0, -0.1, -0.2, -0.3]
+    )
+    assert restored.routed_experts is None
+
+
+@pytest.mark.parametrize("field", ["token", "logprob", "mask", "extras", "order"])
+def test_router_off_incremental_restore_rejects_corruption(
+    implementation: Any, field: str
+) -> None:
+    worker = make_worker(implementation)
+    worker._return_routed_experts_enabled = lambda: False
+    worker.state.capture_routed_experts = False
+    worker.state.observe([67], [-0.1])
+    cut(worker, "integrity-first")
+    worker.state.observe([68], [-0.2])
+    ack = cut(worker, "integrity-second")
+    fetched = chunks(implementation, worker._capture_sink, ack)
+    if field == "token":
+        fetched[-1].snapshot.token_ids_delta[0] = 69
+    elif field == "logprob":
+        fetched[-1].snapshot.generation_log_probs_delta[0] = -0.9
+    elif field == "mask":
+        fetched[-1].snapshot.token_mask_delta[0] = False
+    elif field == "extras":
+        fetched[0].extras["tampered"] = True
+    else:
+        fetched.reverse()
+    with pytest.raises((CaptureError, ValueError, RuntimeError)):
+        restore(worker, ack, fetched)
+
+
+def test_router_off_legacy_chain_retains_original_identity(implementation: Any) -> None:
+    worker = make_worker(implementation)
+    worker._return_routed_experts_enabled = lambda: False
+    worker.state.capture_routed_experts = False
+    worker.state.generation_cut_chunk_digests = None
+    worker.state.observe([67], [-0.1])
+    first = cut(worker, "legacy-first")
+    admission, resolved = restore(
+        worker, first, chunks(implementation, worker._capture_sink, first)
+    )
+    assert resolved.snapshot.digest_version == 2
+    assert resolved.chunk_digests is None
+    resumed = make_worker(
+        implementation,
+        sink=worker._capture_sink,
+        admission=admission,
+        resolved=resolved,
+        prompt=tuple(resolved.snapshot.token_ids_delta),
+    )
+    resumed._return_routed_experts_enabled = lambda: False
+    resumed.state.capture_routed_experts = False
+    resumed.state.observe([68], [-0.2])
+    second = cut(resumed, "legacy-resumed")
+    _, restored = restore(
+        resumed, second, chunks(implementation, resumed._capture_sink, second)
+    )
+    assert restored.snapshot.digest_version == 2
+    assert restored.snapshot.token_ids_delta == [65, 66, 67, 68]
+    assert restored.chunk_digests is None
+
+
+def test_layout3_missing_route_payload_is_not_accepted_as_router_off(
+    implementation: Any,
+) -> None:
+    worker = make_worker(implementation)
+    worker.state.observe([67], [-0.1])
+    worker.pieces = [routes(1, 2)]
+    ack = cut(worker, "missing-routes")
+    fetched = chunks(implementation, worker._capture_sink, ack)
+    assert fetched[0].routed_len > 0
+    fetched[0].fragment = None
+    worker._return_routed_experts_enabled = lambda: False
+    with pytest.raises(RuntimeError, match="requires route fragments"):
+        restore(worker, ack, fetched)
+
+
+def test_layout2_checkpoint_reader_remains_available(implementation):
+    worker = make_worker(implementation)
+    tensor = torch.tensor([[[1]], [[2]], [[-1]]], dtype=torch.int16)
+    chunk = worker.token_capture.build_prefix_record(
+        worker.state.call,
+        prompt_token_ids=[65, 66],
+        generated_token_ids=[67],
+        generated_logprobs=[-0.1],
+        extras={
+            implementation._CUT_DIGEST_LAYOUT: 2,
+            "routed_experts": encode_routed_experts(tensor),
+        },
+    )
+    cumulative = worker.token_capture.build_prefix_record(
+        worker.state.call,
+        prompt_token_ids=[65, 66],
+        generated_token_ids=[67],
+        generated_logprobs=[-0.1],
+        extras={
+            implementation._CUT_DIGEST_LAYOUT: 2,
+            implementation._CUT_CHUNKS_DIGEST: implementation._cut_chunk_digest(
+                [chunk.digest]
+            ),
+        },
+    )
+    worker._capture_sink.records["old-layout2"] = chunk
+    ack = SimpleNamespace(
+        staging_keys=("old-layout2",),
+        prefix_token_count=1,
+        prefix_digest=cumulative.digest,
+    )
+    _, restored = restore(
+        worker, ack, chunks(implementation, worker._capture_sink, ack)
+    )
+    assert restored.snapshot.digest_version == 2
+    assert restored.snapshot.token_ids_delta == [65, 66, 67]
+    assert restored.chunk_digests == (chunk.digest,)
+
+
+def test_engine_probe_reads_only_new_positions_plus_boundary(
+    grouped_implementation, owner_loop, monkeypatch
+):
+    m = grouped_implementation
+    worker, states, processor, inventory = enable_engine_tokens(
+        m, owner_loop, monkeypatch
+    )
+    assert (
+        worker._checkpoint_generation_cut_batched(inventory)[0].disposition
+        == "durable_prefix"
+    )
+    original = worker._http_engine_client.snapshot_generation_tokens
+    seen = []
+
+    def read(request_id, *, deadline, start=0):
+        value = original(request_id, deadline=deadline, start=start)
+        seen.append((start, len(value.token_ids)))
+        return value
+
+    monkeypatch.setattr(worker._http_engine_client, "snapshot_generation_tokens", read)
+    engine = processor.request_states["internal-0"]
+    engine.detokenizer.output_token_ids.append(69)
+    engine.logprobs_processor.logprobs.append({69: SimpleNamespace(logprob=-0.3)})
+    engine.routed_experts_chunks.append(routes(4))
+    next_inventory = GenerationCutInventory.build(
+        checkpoint_id="delta-read",
+        server_name="policy",
+        active_prefixes=list(inventory.active_prefixes),
+    )
+    ack = worker._checkpoint_generation_cut_batched(next_inventory)[0]
+    assert ack.disposition == "durable_prefix"
+    assert seen == [(1, 2)]
+    _, resolved = restore(worker, ack, chunks(m, worker._capture_sink, ack))
+    assert resolved.snapshot.token_ids_delta == [65, 66, 67, 68, 69]
