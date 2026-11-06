@@ -611,6 +611,40 @@ def validate_nvfp4_pertoken_model(hf_config: Any) -> None:
         )
 
 
+NATIVE_MXFP8_LINEAR_KERNELS = {
+    "flashinfer_cutedsl": "FlashInferCutedslMxfp8LinearKernel",
+    "flashinfer_trtllm": "FlashInferTrtllmMxfp8LinearKernel",
+}
+
+
+def _requested_linear_backend(config: VllmConfig) -> str | None:
+    vllm_kwargs = config.get("vllm_kwargs") or {}
+    kernel_config = vllm_kwargs.get("kernel_config") or {}
+    backend = vllm_kwargs.get("linear_backend")
+    if isinstance(backend, str):
+        backend = backend.lower().replace("-", "_")
+    if backend in (None, "auto") and isinstance(kernel_config, Mapping):
+        backend = kernel_config.get("linear_backend") or backend
+    return backend.lower().replace("-", "_") if isinstance(backend, str) else None
+
+
+def _reject_native_mxfp8_linear_refit_transport(
+    config: VllmConfig, transport: str
+) -> None:
+    """Reject native MXFP8 linear kernels on refit transports that bypass reload."""
+    vllm_cfg = config.get("vllm_cfg") or {}
+    if not (vllm_cfg.get("precision") == "fp8" and vllm_cfg.get("is_mx") is True):
+        return
+    linear_backend = _requested_linear_backend(config)
+    if linear_backend not in NATIVE_MXFP8_LINEAR_KERNELS:
+        return
+    raise ValueError(
+        f"refit_transport={transport!r} does not support native MXFP8 linear "
+        f"kernels (linear_backend={linear_backend!r}). Use refit_transport=null "
+        "(collective/IPC) or a non-native linear_backend."
+    )
+
+
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     """Validate the selected refit transport and resolve its scoped defaults."""
     validate_vllm_quantization_config(config)
@@ -628,6 +662,7 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
         )
     if transport is None:
         return None
+    _reject_native_mxfp8_linear_refit_transport(config, transport)
     if transport == "nccl_reshard":
         # nccl_reshard doesn't takes refit_cfg.
         return None
