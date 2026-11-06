@@ -1504,6 +1504,16 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
     asyncio.run(_main())
 
 
+class _SnapshotSinkTrainer:
+    """Picklable trainer stand-in: the controller registers snapshot sources on it."""
+
+    def add_data_plane_snapshot_source(self, actor) -> None:
+        pass
+
+    def add_data_plane_snapshot_fn(self, fn) -> None:
+        pass
+
+
 @pytest.mark.vllm
 def test_rollout_pump_writes_expected_tq_data(
     multi_step_setup_vllm_async,  # noqa: F811
@@ -1593,7 +1603,7 @@ def test_rollout_pump_writes_expected_tq_data(
     )
     actor_args = SingleControllerActorArgs(
         gen_handle=vllm_generation,
-        trainer_handle=object(),
+        trainer_handle=_SnapshotSinkTrainer(),
         env_handles={},
         train_cluster=None,  # type: ignore[arg-type]  # unused by _rollout_pump
         inference_cluster=None,  # type: ignore[arg-type]

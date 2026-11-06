@@ -235,6 +235,17 @@ class _FakeTrainer:
     def prepare_for_lp_inference(self, keep_train_buffers: bool = False) -> None:
         del keep_train_buffers
 
+    def add_data_plane_snapshot_source(self, actor: Any) -> None:
+        pass
+
+    def add_data_plane_snapshot_fn(self, fn: Any) -> None:
+        pass
+
+    def get_data_plane_step_metrics(
+        self, step_time_s: float, driver_client: Any = None
+    ) -> None:
+        return None
+
     def get_logprobs_from_meta(self, meta: KVBatchMeta) -> None:
         pass
 
