@@ -99,9 +99,11 @@ def extract_generation_logprobs(
 ) -> list[float]:
     """Read the sampled log probabilities of the generated tokens from ``start`` on.
 
-    ``logprobs`` may be vLLM's live, append-only container. Positions are read
-    one at a time, and only the positions of ``token_ids``, which the caller
-    must have seen published (under vLLM's output lock, or in a finished output).
+    ``logprobs`` may be vLLM's live, append-only container. Only the positions
+    of ``token_ids`` are read, which the caller must have seen published (under
+    vLLM's output lock, or in a finished output). ``FlatLogprobs`` (vLLM's
+    ``flat_logprobs``) is read through its arrays, without building a mapping
+    per position.
 
     Args:
         token_ids: The generated token IDs at positions ``start`` onward.
@@ -119,13 +121,67 @@ def extract_generation_logprobs(
             "vLLM generation output with token IDs did not include logprobs"
         )
     end = start + len(token_ids)
-    if len(logprobs) < end:
+    flat = _flat_logprob_arrays(logprobs)
+    published = len(logprobs) if flat is None else min(len(flat[0]), len(flat[1]))
+    if published < end:
         raise RuntimeError(
             "vLLM returned mismatched generation token IDs and log probabilities: "
-            f"token_count={end}, logprob_count={len(logprobs)}"
+            f"token_count={end}, logprob_count={published}"
         )
+    if flat is not None:
+        return _select_flat_logprobs(token_ids, flat, start=start)
     details = [logprobs[position] for position in range(start, end)]
     return _extract_selected_token_logprobs(list(token_ids), details)
+
+
+def _flat_logprob_arrays(
+    logprobs: Any,
+) -> tuple[list[int], list[int], list[int], list[float]] | None:
+    """Return vLLM ``FlatLogprobs``' arrays, or ``None`` for per-position mappings.
+
+    Indexing a ``FlatLogprobs`` position builds a dict of ``Logprob`` objects,
+    one per stored candidate; reading the arrays builds none.
+    """
+    starts = getattr(logprobs, "start_indices", None)
+    ends = getattr(logprobs, "end_indices", None)
+    candidate_ids = getattr(logprobs, "token_ids", None)
+    values = getattr(logprobs, "logprobs", None)
+    if (
+        isinstance(starts, list)
+        and isinstance(ends, list)
+        and isinstance(candidate_ids, list)
+        and isinstance(values, list)
+    ):
+        return starts, ends, candidate_ids, values
+    return None
+
+
+def _select_flat_logprobs(
+    token_ids: Sequence[int],
+    flat: tuple[list[int], list[int], list[int], list[float]],
+    *,
+    start: int,
+) -> list[float]:
+    """Read each sampled token's log probability straight from flat arrays.
+
+    A position's candidates sit at ``[start_indices[p], end_indices[p])``.
+    Scanning from the end keeps vLLM's mapping behavior when a token repeats
+    at one position: the last occurrence wins.
+    """
+    starts, ends, candidate_ids, values = flat
+    selected_logprobs: list[float] = []
+    for position, token_id in enumerate(token_ids, start):
+        begin = starts[position]
+        index = ends[position] - 1
+        while index >= begin and candidate_ids[index] != token_id:
+            index -= 1
+        if index < begin:
+            raise RuntimeError(
+                "vLLM generation log probabilities did not include the selected "
+                f"token: token_id={token_id}"
+            )
+        selected_logprobs.append(max(float(values[index]), VLLM_LOGPROB_FLOOR))
+    return selected_logprobs
 
 
 _GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
