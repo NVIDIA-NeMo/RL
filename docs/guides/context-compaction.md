@@ -93,7 +93,7 @@ The existing ledger tracks exact attempted call IDs. A missing worker acknowledg
 
 This figure describes the native recency client. Other harnesses choose their own compaction policies. The uncaught guard-rejection path shown here is a current limitation, not a recommended recovery policy.
 
-Set `async_rl.rollout_failure.nemo_gym.rollout_timeout_s` as a backstop for a hung prompt-group stream; it is not a per-model-call deadline or an acknowledgement that the remote engine stopped. A timeout or transport failure that prevents an agent result drops the prompt group. Forest training follows the existing drop budgets and `async_rl.rollout_failure.min_step_batch_fraction`: a permitted drop can reduce the number of complete prompt groups in a step. Each retained group still requires all logical siblings and their segments. Falling below the configured fraction, or retaining no groups, stops training; the controller logs `dropped_prompt_groups`. Loss normalization uses the retained valid tokens (or, with `token_capture.forest_loss_normalization: rollout`, the retained valid rollouts), with one optimizer step and unchanged configured global batch size. Forest training also does not redispatch failed groups because selected-response metadata is request-local; retry support is tracked in [#4557](https://github.com/NVIDIA-NeMo/RL/issues/4557). This differs from masking an invalid sibling while retaining the complete group, which is supported. Data-integrity errors still raise, and operator cancellation still propagates.
+Set `async_rl.rollout_failure.nemo_gym.rollout_timeout_s` as a backstop for a hung prompt-group stream; it is not a per-model-call deadline or an acknowledgement that the remote engine stopped. A timeout or transport failure that prevents an agent result drops the prompt group. Forest training follows the existing drop budgets and `async_rl.rollout_failure.min_step_batch_fraction`: a permitted drop can reduce the number of complete prompt groups in a step. Each retained group still requires all logical siblings and their segments. Falling below the configured fraction, or retaining no groups, stops training; the controller logs `dropped_prompt_groups`. Loss normalization uses the retained valid tokens (or, with `token_capture.forest_loss_normalization: rollout_token_mean`, the retained valid rollouts), with one optimizer step and unchanged configured global batch size. Forest training also does not redispatch failed groups because selected-response metadata is request-local; retry support is tracked in [#4557](https://github.com/NVIDIA-NeMo/RL/issues/4557). This differs from masking an invalid sibling while retaining the complete group, which is supported. Data-integrity errors still raise, and operator cancellation still propagates.
 
 Completed attempt receipts retain unselected records for cleanup. Before publication, the fixed selection determines exact canonical row and padding IDs. A lost canonical-write acknowledgement preserves source staging; the controller owns the exact publication cleanup keys. Foreign scope and invalid trainable selection fail before publication.
 
@@ -167,7 +167,7 @@ token_capture:
   enabled: true
   forest_training: true
   selection_policy: returned_history
-  forest_loss_normalization: token  # Optional: rollout weights each logical rollout equally.
+  forest_loss_normalization: global_token_mean  # Optional: rollout_token_mean weights each logical rollout equally.
   defer_routed_experts_to_policy: false
 policy:
   megatron_cfg:
@@ -229,27 +229,33 @@ its trainable tokens:
 
 | Value | Loss for a step with valid logical rollouts `r = 1..R` |
 | --- | --- |
-| `token` (default) | Mean over every trainable token in the step. A rollout's weight grows with its trainable token count, including tokens added by extra segments. |
-| `rollout` | `(1/R) * sum_r mean_{t in r} loss_t`: mean over each rollout's trainable tokens across all its segments, then mean over rollouts. |
+| `global_token_mean` (default) | Mean over every trainable token in the step. A rollout's weight grows with its trainable token count, including tokens added by extra segments. |
+| `rollout_token_mean` | `(1/R) * sum_r mean_{t in r} loss_t`: mean over each rollout's trainable tokens across all its segments, then mean over rollouts. |
 
-With `rollout`, the advantage stage gives each row of rollout `r` a loss weight
-of `1/T_r` in `sample_mask`, where `T_r` counts the rollout's trainable tokens
-across all of its rows. Shared prefix tokens owned by another row are not
-counted. The workers' existing global token normalizer then equals `R`, so the
-result is the same under data parallelism, microbatching, sequence packing, and
-gradient accumulation. Splitting a rollout into more segments does not change
-its total weight. Masked rollouts and execution padding have zero weight and do
-not count toward `R`. KL, MTP, and draft-model terms that read `sample_mask`
-use the same weights.
+The values use the reducer names of the `loss_fn.normalization` selector
+proposed in [#4946](https://github.com/NVIDIA-NeMo/RL/pull/4946).
+
+With `rollout_token_mean`, the advantage stage gives each row of rollout `r` a
+loss weight of `1/T_r` in `sample_mask`, where `T_r` counts the rollout's
+trainable tokens across all of its rows. Shared prefix tokens owned by another
+row are not counted. The workers' existing global token normalizer then equals
+`R`, so the result is the same under data parallelism, microbatching, sequence
+packing, and gradient accumulation. Splitting a rollout into more segments does
+not change its total weight. Masked rollouts and execution padding have zero
+weight and do not count toward `R`. KL, MTP, and draft-model terms that read
+`sample_mask` use the same weights, and token-level diagnostics such as
+`probs_ratio` become rollout-weighted means.
 The option requires `forest_training: true` and token-level loss.
 
-In `rollout` mode, step metric `global_valid_rollouts` reports `R` and
-`global_valid_toks` still reports the trained token count, so throughput
-metrics are unchanged. `global_valid_seqs` is not reported. Loss-function
-metrics that sum `sample_mask`, and `sample_loss_mask` in train-data dumps,
-show the fractional weights. A rollout checkpoint saved during an unfinished
-`rollout` step can only be resumed in `rollout` mode; resuming it in `token`
-mode fails the binary sample-mask check.
+With `rollout_token_mean`, the step metrics keep their counting meaning:
+`global_valid_toks` reports trained tokens, `global_valid_seqs` trained rows,
+and `num_valid_samples` rows. The added `global_valid_rollouts` reports `R`.
+Train-data dumps keep the binary `sample_loss_mask` and add
+`rollout_loss_weight`, the per-row weight used in training.
+
+Rows restored from an unfinished step are reweighted for the current mode, so
+a rollout checkpoint can be resumed under either value. Forest rows otherwise
+require a binary sample mask.
 
 Batch cardinality and advantages count logical rollouts, not physical rows. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping, reward penalties, and message-level advantage overrides remain unsupported for forest training. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
 

@@ -15,8 +15,10 @@
 """Exercise logical-owner GRPO through the actual SingleController stage."""
 
 import asyncio
+import json
 import math
 from collections import defaultdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -40,9 +42,16 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     TokenCaptureConfig,
     validate_forest_objective,
 )
+from nemo_rl.algorithms.single_controller_utils.debug_writer import JsonDebugWriter
+from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
+    build_logical_owner_batch,
+    rollout_loss_step_metrics,
+    rollout_token_mean_weights,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.utils.timer import Timer
 from tests.unit.single_controller.test_advantage_stage import _InlineActor, _RowStore
 
 
@@ -134,7 +143,8 @@ def _controller(
     grpo=None,
     loss=None,
     policy_logprobs_required: bool = False,
-    rollout_loss_normalization: bool = False,
+    forest_loss_normalization: str = "global_token_mean",
+    train_data_dump_dir: str | None = None,
 ):
     settings = dict(
         num_generations_per_prompt=2,
@@ -181,8 +191,8 @@ def _controller(
         opd_full_enabled=False,
         message_level_advantage_penalties_enabled=ctrl._message_level_advantage_penalties_enabled,
         shardable=True,
-        train_data_dump_dir=None,
-        rollout_loss_normalization=rollout_loss_normalization,
+        train_data_dump_dir=train_data_dump_dir,
+        forest_loss_normalization=forest_loss_normalization,
     )
     ctrl._advantage_computer = AdvantageComputer(
         ctrl._dp_client,
@@ -190,7 +200,12 @@ def _controller(
         advantage_estimator=ctrl._advantage_estimator,
     )
     ctrl._advantage_actors = []
-    ctrl._train_data_dump = None
+    ctrl._train_data_dump = (
+        None if train_data_dump_dir is None else JsonDebugWriter(train_data_dump_dir)
+    )
+    ctrl._train_data_dump_receipts = []
+    ctrl._train_steps = 0
+    ctrl._timer = Timer()
     ctrl._train_data_dump_rows = 0
     ctrl._opd_stat_sum = ctrl._opd_stat_sumsq = ctrl._opd_gap_sum = 0.0
     ctrl._opd_stat_count = 0
@@ -794,6 +809,9 @@ def test_unsupported_forest_estimator_or_objective_is_rejected(grpo, loss):
     assert not ctrl._dp_client.puts
 
 
+TOKEN, ROLLOUT = "global_token_mean", "rollout_token_mean"
+
+
 def _ragged_batch(
     groups: list[tuple[str, list[tuple[float, int]]]], lengths: list[int]
 ) -> tuple[KVBatchMeta, TensorDict]:
@@ -815,9 +833,11 @@ def _owner_mass(meta: KVBatchMeta, data: TensorDict) -> dict[str | None, float]:
 
 
 def test_rollout_normalization_requires_forest_training():
-    TokenCaptureConfig(forest_training=True, forest_loss_normalization="rollout")
+    TokenCaptureConfig(
+        forest_training=True, forest_loss_normalization="rollout_token_mean"
+    )
     with pytest.raises(ValueError, match="requires forest_training"):
-        TokenCaptureConfig(forest_loss_normalization="rollout")
+        TokenCaptureConfig(forest_loss_normalization="rollout_token_mean")
 
 
 @pytest.mark.parametrize("reorder", [False, True])
@@ -831,7 +851,7 @@ def test_rollout_normalization_gives_each_valid_rollout_unit_mass(reorder: bool)
         meta, data = meta.subset(order), data[order]
     token_data = data.clone()
     asyncio.run(_controller(meta, token_data)._advantage_stage(meta))
-    ctrl = _controller(meta, data, rollout_loss_normalization=True)
+    ctrl = _controller(meta, data, forest_loss_normalization=ROLLOUT)
     # A restored unfinished step sends already-weighted rows through again.
     for _ in range(2):
         _, valid = asyncio.run(ctrl._advantage_stage(meta))
@@ -858,7 +878,9 @@ def test_extra_segments_do_not_grow_a_rollouts_weight(segments: int, rollout: bo
     meta, data = _ragged_batch(
         [("a", [(0.0, segments), (1.0, 1)])], [2] * segments + [3, 0]
     )
-    ctrl = _controller(meta, data, rollout_loss_normalization=rollout)
+    ctrl = _controller(
+        meta, data, forest_loss_normalization=ROLLOUT if rollout else TOKEN
+    )
     asyncio.run(ctrl._advantage_stage(meta))
     mass = _owner_mass(meta, data)
     share = mass["a_g0"] / (mass["a_g0"] + mass["a_g1"])
@@ -866,6 +888,120 @@ def test_extra_segments_do_not_grow_a_rollouts_weight(segments: int, rollout: bo
     # tokens; rollout normalization gives both rollouts half the step.
     expected = 0.5 if rollout else 2 * segments / (2 * segments + 3)
     assert share == pytest.approx(expected)
+
+
+def test_rollout_token_mean_weights_are_one_over_rollout_tokens():
+    meta, data = _ragged_batch([("a", [(0.0, 3), (1.0, 1)])], [2, 5, 1, 0, 0])
+    sample_mask = torch.tensor([1.0, 1.0, 1.0, 1.0, 0.0])
+    owners = build_logical_owner_batch(
+        meta,
+        prompt_ids=data["prompt_ids_for_adv"],
+        rewards=data["total_reward"],
+        sample_mask=sample_mask,
+        expected_group_size=2,
+    )
+
+    weights = rollout_token_mean_weights(owners, data["token_mask"], sample_mask)
+
+    # a_g0 trains 2 + 5 + 1 tokens; a_g1 trains none and the last row is padding.
+    torch.testing.assert_close(weights, torch.tensor([1 / 8, 1 / 8, 1 / 8, 0, 0]))
+    assert weights.dtype == torch.float32 and not weights.requires_grad
+
+
+@pytest.mark.parametrize("resume_mode", [TOKEN, ROLLOUT])
+def test_unfinished_rollout_step_resumes_under_either_mode(resume_mode: str):
+    groups = [("a", [(0.0, 3), (1.0, 1), (3.0, 2)])]
+    meta, data = _ragged_batch(groups, [2, 5, 1, 4, 3, 3, 0])
+    data["mask_sample"][4] = True
+    fresh = data.clone()
+    asyncio.run(
+        _controller(
+            meta, fresh, forest_loss_normalization=resume_mode
+        )._advantage_stage(meta)
+    )
+    # The checkpoint holds rows that an unfinished rollout step weighted.
+    asyncio.run(
+        _controller(meta, data, forest_loss_normalization=ROLLOUT)._advantage_stage(
+            meta
+        )
+    )
+
+    asyncio.run(
+        _controller(meta, data, forest_loss_normalization=resume_mode)._advantage_stage(
+            meta
+        )
+    )
+
+    torch.testing.assert_close(data["sample_mask"], fresh["sample_mask"])
+    torch.testing.assert_close(data["advantages"], fresh["advantages"])
+
+
+@pytest.mark.parametrize("mode", [TOKEN, ROLLOUT])
+def test_resume_rejects_weights_this_stage_did_not_write(mode: str):
+    meta, data = _ragged_batch([("a", [(0.0, 3), (1.0, 1)])], [2, 5, 1, 4, 0])
+    ctrl = _controller(meta, data, forest_loss_normalization=ROLLOUT)
+    asyncio.run(ctrl._advantage_stage(meta))
+    # 1/8 is a_g0's weight, not a_g1's.
+    data["sample_mask"][3] = 1 / 8
+    ctrl = _controller(meta, data, forest_loss_normalization=mode)
+    with pytest.raises(ValueError, match="binary-masked"):
+        asyncio.run(ctrl._advantage_stage(meta))
+
+
+@pytest.mark.parametrize("mode", [TOKEN, ROLLOUT])
+def test_rollout_mode_reports_row_token_and_rollout_counts(mode: str):
+    groups = [("a", [(0.0, 3), (1.0, 1), (3.0, 2)])]
+    meta, data = _ragged_batch(groups, [2, 5, 1, 4, 3, 3, 0])
+    data["mask_sample"][4] = True
+    ctrl = _controller(meta, data, forest_loss_normalization=mode)
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    if mode == TOKEN:
+        assert not ctrl._step_log_dict["rollout_loss_counts"]
+        return
+    # a_g0 has three rows and 8 tokens, a_g1 one row and 4 tokens; a_g2 is
+    # masked and padding trains nothing.
+    assert rollout_loss_step_metrics(ctrl._step_log_dict["rollout_loss_counts"]) == {
+        "global_valid_seqs": 4.0,
+        "global_valid_toks": 12.0,
+        "global_valid_rollouts": 2.0,
+    }
+
+
+def test_rollout_mode_dump_keeps_binary_participation_and_records_weights(
+    tmp_path: Path,
+):
+    meta, data = _ragged_batch([("a", [(0.0, 3), (1.0, 1)])], [2, 5, 1, 4, 0])
+    # The dump also records the token ids, lengths and sampler logprobs.
+    data["input_ids"] = torch.zeros(data["token_mask"].shape, dtype=torch.long)
+    data["input_lengths"] = torch.full((meta.size,), data["token_mask"].shape[1])
+    data["generation_logprobs"] = torch.zeros(data["token_mask"].shape)
+    ctrl = _controller(
+        meta,
+        data,
+        forest_loss_normalization=ROLLOUT,
+        train_data_dump_dir=str(tmp_path),
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+    ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_receipts)
+
+    rows = {
+        row["sample_id"][0]: row
+        for row in map(
+            json.loads, (tmp_path / "train_data_step1.jsonl").read_text().splitlines()
+        )
+    }
+    by_row = [rows[sample_id] for sample_id in meta.sample_ids]
+    assert [row["sample_loss_mask"] for row in by_row] == [[1], [1], [1], [1], [0]]
+    assert [row["rollout_loss_weight"][0] for row in by_row] == pytest.approx(
+        [1 / 8, 1 / 8, 1 / 8, 1 / 4, 0.0]
+    )
+    # Training still reads the weighted mask.
+    torch.testing.assert_close(
+        data["sample_mask"], torch.tensor([1 / 8, 1 / 8, 1 / 8, 1 / 4, 0.0])
+    )
 
 
 def _rollout_normalized_training_batch() -> tuple[
@@ -884,7 +1020,9 @@ def _rollout_normalized_training_batch() -> tuple[
     meta, data = _ragged_batch(groups, lengths)
     data["mask_sample"][10] = True
     asyncio.run(
-        _controller(meta, data, rollout_loss_normalization=True)._advantage_stage(meta)
+        _controller(meta, data, forest_loss_normalization=ROLLOUT)._advantage_stage(
+            meta
+        )
     )
     generator = torch.Generator().manual_seed(7)
     shape = data["token_mask"].shape
@@ -905,16 +1043,21 @@ def _rollout_normalized_training_batch() -> tuple[
     return meta, batch, (prev + offset.double())[:, 1:]
 
 
-def _pg_loss(
+def _pg_loss_and_metrics(
     logprobs: torch.Tensor, data: BatchedDataDict, normalizer: torch.Tensor
-) -> torch.Tensor:
-    loss, _ = ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.0))(
+) -> tuple[torch.Tensor, dict]:
+    return ClippedPGLossFn(ClippedPGLossConfig(reference_policy_kl_penalty=0.0))(
         logprobs,
         data,
         global_valid_seqs=data["sample_mask"].sum(),
         global_valid_toks=normalizer,
     )
-    return loss
+
+
+def _pg_loss(
+    logprobs: torch.Tensor, data: BatchedDataDict, normalizer: torch.Tensor
+) -> torch.Tensor:
+    return _pg_loss_and_metrics(logprobs, data, normalizer)[0]
 
 
 def test_rollout_normalized_loss_averages_tokens_then_rollouts():
@@ -923,8 +1066,10 @@ def test_rollout_normalized_loss_averages_tokens_then_rollouts():
     normalizer = (batch["token_mask"][:, 1:] * batch["sample_mask"][:, None]).sum()
     # Five valid rollouts; b_g2 is masked and padding owns nothing.
     torch.testing.assert_close(normalizer, torch.tensor(5.0, dtype=torch.float64))
-    loss = _pg_loss(curr, batch, normalizer)
+    loss, metrics = _pg_loss_and_metrics(curr, batch, normalizer)
     loss.backward()
+    # A row count, not the weight sum: every row except b_g2's and padding.
+    assert metrics["num_valid_samples"] == 9
 
     ratio = (curr - batch["prev_logprobs"][:, 1:]).exp().detach()
     advantages = batch["advantages"][:, 1:]

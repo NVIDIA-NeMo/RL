@@ -41,7 +41,6 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageRequest,
     AdvantageStageConfig,
     group_index_column,
-    relabel_rollout_normalized_metrics,
     row_group_ids,
     split_meta_by_prompt_group,
 )
@@ -519,6 +518,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         # disk shard-side.
         "train_data_dump_s",
         "train_data_dump_receipt",
+        # Three integers under rollout_token_mean, not the weights.
+        "rollout_loss_counts",
     }
 
 
@@ -848,30 +849,3 @@ def test_failed_actor_rpc_raises_and_retires_the_actor(capsys) -> None:
     assert ctrl._available_advantage_actors.qsize() == 0
     # The mutation cut is released even on failure.
     assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1
-
-
-def test_rollout_normalized_metrics_report_trained_tokens_and_rollouts():
-    # Under rollout weights the workers' token normalizer is the rollout count
-    # and their row mass is a sum of fractional weights.
-    metrics = {"global_valid_toks": 5.0, "global_valid_seqs": 0.75, "loss": 1.0}
-    partials = [
-        AdvantagePartial.from_values(torch.ones(7)),
-        AdvantagePartial.from_values(torch.ones(0)),
-        AdvantagePartial.from_values(torch.ones(4)),
-    ]
-
-    relabel_rollout_normalized_metrics(metrics, partials)
-
-    assert metrics == {
-        "global_valid_rollouts": 5.0,
-        "global_valid_toks": 11.0,
-        "loss": 1.0,
-    }
-
-
-def test_rollout_normalized_metrics_leave_steps_without_training_metrics():
-    metrics = {"loss": 1.0}
-    relabel_rollout_normalized_metrics(
-        metrics, [AdvantagePartial.from_values(torch.ones(3))]
-    )
-    assert metrics == {"loss": 1.0}

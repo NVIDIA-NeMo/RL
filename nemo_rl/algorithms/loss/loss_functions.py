@@ -1173,7 +1173,8 @@ class ClippedPGLossFn(LossFunction):
                     if self.reference_policy_kl_penalty != 0
                     else curr_logprobs.new_zeros(())
                 ),
-                "num_valid_samples": sample_mask.sum(),
+                # A row count even when sample_mask carries loss weights.
+                "num_valid_samples": (sample_mask != 0).to(sample_mask.dtype).sum(),
                 "positive_nll_loss": nll_loss,
                 **_is_filter_metrics,
                 **score_centering_metrics,

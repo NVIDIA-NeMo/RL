@@ -33,9 +33,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 
 import torch
 
@@ -62,8 +61,11 @@ from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     make_debug_writer,
 )
 from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
+    LogicalOwnerBatch,
+    RolloutLossCounts,
     build_logical_owner_batch,
     has_logical_owners,
+    rollout_token_mean_weights,
 )
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
@@ -118,9 +120,11 @@ class AdvantageStageConfig:
     # computation moved here.
     train_data_dump_dir: Optional[str]
     filtering_on: bool = False
-    # token_capture.forest_loss_normalization == "rollout": weight each forest
-    # row by one over its logical rollout's trainable tokens.
-    rollout_loss_normalization: bool = False
+    # token_capture.forest_loss_normalization. rollout_token_mean weights each
+    # forest row by one over its logical rollout's trainable tokens.
+    forest_loss_normalization: Literal["global_token_mean", "rollout_token_mean"] = (
+        "global_token_mean"
+    )
     # Which writer the dump uses; ignored while train_data_dump_dir is None.
     debug_writer: DebugWriterConfig = field(default_factory=DebugWriterConfig)
 
@@ -166,8 +170,8 @@ class AdvantageStageConfig:
                 or algo_cfg.malformed_thinking_advantage is not None
             ),
             shardable=algo_cfg.adv_estimator.name in SHARD_INVARIANT_ESTIMATORS,
-            rollout_loss_normalization=(
-                master_config.token_capture.forest_loss_normalization == "rollout"
+            forest_loss_normalization=(
+                master_config.token_capture.forest_loss_normalization
             ),
             # Use the resolved logger config shared by controller and pool.
             train_data_dump_dir=(
@@ -283,22 +287,23 @@ def split_meta_by_prompt_group(
     return shards if len(shards) > 1 else None
 
 
-def relabel_rollout_normalized_metrics(
-    step_metrics: dict[str, Any], partials: Sequence[AdvantagePartial]
+def _check_restored_rollout_weights(
+    owner_batch: LogicalOwnerBatch,
+    token_mask: torch.Tensor,
+    participation: torch.Tensor,
+    incoming: torch.Tensor,
 ) -> None:
-    """Restore token-count metrics after a rollout-normalized step.
-
-    Rollout weights make the workers' token mass the valid rollout count and
-    their row mass a sum of fractional weights, so neither is a count of tokens
-    or rows any more.
-    """
-    if "global_valid_toks" not in step_metrics:
+    """Accept a non-binary forest row only if it carries this stage's own weight."""
+    if torch.equal(incoming, participation):
         return
-    step_metrics["global_valid_rollouts"] = step_metrics.pop("global_valid_toks")
-    step_metrics.pop("global_valid_seqs", None)
-    step_metrics["global_valid_toks"] = float(
-        sum(partial.count for partial in partials)
+    weighted = participation * rollout_token_mean_weights(
+        owner_batch, token_mask, participation
     )
+    own_weight = torch.isclose(incoming, weighted.to(incoming.dtype), rtol=1e-5)
+    if not ((incoming == participation) | own_weight).all():
+        raise ValueError(
+            "Forest advantage inputs must be finite, binary-masked, row-aligned"
+        )
 
 
 @dataclass(frozen=True)
@@ -331,6 +336,8 @@ class AdvantageOutcome:
     # What this call stored in the dump, so the controller's publish can tell a
     # missing chunk from an empty one.
     train_data_dump_receipt: Optional[ChunkReceipt] = None
+    # Set only for forest_loss_normalization=rollout_token_mean.
+    rollout_loss_counts: Optional[RolloutLossCounts] = None
 
 
 class AdvantageComputer:
@@ -414,9 +421,12 @@ class AdvantageComputer:
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
         ).float()
-        if logical and cfg.rollout_loss_normalization:
-            # Rows restored from an unfinished step still carry this stage's
-            # rollout weights; forest dataset weights are always unit.
+        incoming_sample_mask = sample_mask
+        if logical:
+            # Forest dataset weights are always unit, but rows restored from an
+            # unfinished rollout_token_mean step carry this stage's weights.
+            # Recover their participation so either mode can resume them; the
+            # owner checks below reject any other non-binary weight.
             sample_mask = _binary_participation(sample_mask)
         mask_sample = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.mask_sample_field)
@@ -470,6 +480,9 @@ class AdvantageComputer:
                 rewards=rewards,
                 sample_mask=final_sample_mask,
                 expected_group_size=cfg.algo.num_generations_per_prompt,
+            )
+            _check_restored_rollout_weights(
+                owner_batch, token_mask, sample_mask, incoming_sample_mask
             )
             # Any flagged segment filters its owner; padding has no owner.
             num_mask_sample_filtered = (
@@ -700,15 +713,24 @@ class AdvantageComputer:
             response_advantages = torch.masked_select(advantages, mask.bool())
         advantage_partial = AdvantagePartial.from_values(response_advantages)
 
-        if owner_batch is not None and cfg.rollout_loss_normalization:
+        participation_mask = final_sample_mask
+        rollout_weights = None
+        rollout_loss_counts = None
+        if (
+            owner_batch is not None
+            and cfg.forest_loss_normalization == "rollout_token_mean"
+        ):
             # Each rollout's trainable tokens now sum to one, so the workers'
             # global token normalizer becomes the step's valid rollout count.
-            final_sample_mask = (
-                final_sample_mask
-                * owner_batch.inverse_owner_mass(
-                    (token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1)
-                )
-            ).to(final_sample_mask.dtype)
+            rollout_weights = rollout_token_mean_weights(
+                owner_batch, token_mask, participation_mask
+            )
+            final_sample_mask = (participation_mask * rollout_weights).to(
+                participation_mask.dtype
+            )
+            rollout_loss_counts = RolloutLossCounts.from_masks(
+                owner_batch, token_mask, participation_mask
+            )
 
         train_data_dump_s = 0.0
         train_data_dump_receipt = None
@@ -738,8 +760,15 @@ class AdvantageComputer:
                     input_lengths=tensor_field(data, INPUT_LENGTHS),
                     sequences=sequences,
                     scalars={
-                        "sample_loss_mask": final_sample_mask,
+                        # Binary participation; the trained loss weight is
+                        # sample_loss_mask * rollout_loss_weight when present.
+                        "sample_loss_mask": participation_mask,
                         "pre_seq_error_sample_loss_mask": pre_seq_error_sample_mask,
+                        **(
+                            {}
+                            if rollout_weights is None
+                            else {"rollout_loss_weight": rollout_weights}
+                        ),
                         "rewards": rewards,
                         # Raw column: jagged when the chunk mixes prompt
                         # lengths, so rows carry no zero padding. Not the
@@ -751,7 +780,8 @@ class AdvantageComputer:
             train_data_dump_s = time.perf_counter() - dump_started
 
         fields_to_put = {adv_cfg.output_field: advantages}
-        if not torch.equal(final_sample_mask, sample_mask):
+        # Against the stored mask: resuming a weighted row must rewrite it.
+        if not torch.equal(final_sample_mask, incoming_sample_mask):
             fields_to_put[adv_cfg.sample_mask_field] = final_sample_mask
         new_fields = [adv_cfg.output_field]
         if returns is not None:
@@ -783,4 +813,5 @@ class AdvantageComputer:
             opd_gap_sum=opd_gap_sum,
             train_data_dump_s=train_data_dump_s,
             train_data_dump_receipt=train_data_dump_receipt,
+            rollout_loss_counts=rollout_loss_counts,
         )
