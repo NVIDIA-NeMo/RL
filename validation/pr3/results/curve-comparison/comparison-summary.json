@@ -1,14 +1,14 @@
 {
-  "generated_utc": "2026-11-06T04:40:57+00:00",
+  "generated_utc": "2026-11-06T14:07:01+00:00",
   "max_plot_step": 300,
-  "streaming_last_step": 195,
+  "streaming_last_step": 300,
   "matched_window": [
     1,
-    195
+    300
   ],
   "steady_timing_window": [
     11,
-    195
+    300
   ],
   "sources": {
     "V1 synchronous": {
@@ -235,7 +235,9 @@
       "source": "committed native SC logs",
       "files": [
         "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/single_controller/RL-pr5090-streaming/validation/pr3/slurm/21331883-logs/ray-driver.log",
-        "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/single_controller/RL-pr5090-streaming/validation/pr3/slurm/21331884-logs/ray-driver.log"
+        "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/single_controller/RL-pr5090-streaming/validation/pr3/slurm/21331884-logs/ray-driver.log",
+        "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/single_controller/RL-pr5090-streaming/validation/pr3/slurm/21331885-logs/ray-driver.log",
+        "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/single_controller/RL-pr5090-streaming/validation/pr3/slurm/21331930-logs/ray-driver.log"
       ],
       "url": "https://wandb.ai/yuekaiz/nemo-rl-automodel-sc/runs/yuekaiz5090explorela0s42",
       "repeated_step_receipts": 0,
@@ -247,57 +249,57 @@
     "train/reward": {
       "V1 synchronous": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 0.4238782051282051,
-        "matched_last20_mean": 0.5296875,
-        "steps11_to_common_mean": 0.4393581081081081,
+        "matched_count": 300,
+        "matched_mean": 0.49072916666666666,
+        "matched_last20_mean": 0.628125,
+        "steps11_to_common_mean": 0.5029094827586207,
         "matched_min": 0.0,
-        "matched_max": 0.875
+        "matched_max": 1.0
       },
       "SC full-batch LA0": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 0.41057692307692306,
-        "matched_last20_mean": 0.5234375,
-        "steps11_to_common_mean": 0.42533783783783785,
+        "matched_count": 300,
+        "matched_mean": 0.475,
+        "matched_last20_mean": 0.621875,
+        "steps11_to_common_mean": 0.4866379310344828,
         "matched_min": 0.0,
-        "matched_max": 0.875
+        "matched_max": 1.0
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 195,
-        "matched_count": 195,
-        "matched_mean": 0.4307692307692308,
-        "matched_last20_mean": 0.59375,
-        "steps11_to_common_mean": 0.4469594594594595,
+        "plotted_count": 300,
+        "matched_count": 300,
+        "matched_mean": 0.50875,
+        "matched_last20_mean": 0.709375,
+        "steps11_to_common_mean": 0.5217672413793103,
         "matched_min": 0.0,
-        "matched_max": 0.875
+        "matched_max": 1.0
       }
     },
     "train/mean_gen_tokens_per_sample": {
       "V1 synchronous": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 1538.7357371794872,
-        "matched_last20_mean": 1346.9875,
-        "steps11_to_common_mean": 1517.1869932432433,
-        "matched_min": 753.6875,
+        "matched_count": 300,
+        "matched_mean": 1414.4502083333334,
+        "matched_last20_mean": 1243.665625,
+        "steps11_to_common_mean": 1396.4178879310346,
+        "matched_min": 408.96875,
         "matched_max": 2048.0
       },
       "SC full-batch LA0": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 1564.5227564102563,
-        "matched_last20_mean": 1450.446875,
-        "steps11_to_common_mean": 1543.3194256756756,
-        "matched_min": 698.3125,
+        "matched_count": 300,
+        "matched_mean": 1466.36875,
+        "matched_last20_mean": 1211.59375,
+        "steps11_to_common_mean": 1449.4578663793104,
+        "matched_min": 497.125,
         "matched_max": 2048.0
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 195,
-        "matched_count": 195,
-        "matched_mean": 1391.5708333333334,
-        "matched_last20_mean": 1000.36875,
-        "steps11_to_common_mean": 1360.8050675675677,
+        "plotted_count": 300,
+        "matched_count": 300,
+        "matched_mean": 1293.1108333333334,
+        "matched_last20_mean": 1059.803125,
+        "steps11_to_common_mean": 1270.089224137931,
         "matched_min": 452.84375,
         "matched_max": 2048.0
       }
@@ -305,57 +307,57 @@
     "train/gen_kl_error": {
       "V1 synchronous": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 0.0008840974331840301,
-        "matched_last20_mean": 0.0008494369197109108,
-        "steps11_to_common_mean": 0.0008806684742193578,
-        "matched_min": 0.000638553727640101,
+        "matched_count": 300,
+        "matched_mean": 0.0008756808083808209,
+        "matched_last20_mean": 0.000811696583042476,
+        "steps11_to_common_mean": 0.0008732031405997986,
+        "matched_min": 0.0005845333757861226,
         "matched_max": 0.0014537377574015409
       },
       "SC full-batch LA0": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 0.0008754092427192261,
-        "matched_last20_mean": 0.0008013741049211376,
-        "steps11_to_common_mean": 0.0008724466793904793,
-        "matched_min": 0.0005926754130314293,
+        "matched_count": 300,
+        "matched_mean": 0.0008613140493536282,
+        "matched_last20_mean": 0.0008455015371382046,
+        "steps11_to_common_mean": 0.0008589380971140623,
+        "matched_min": 0.0005845829821282678,
         "matched_max": 0.0013600090721865854
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 195,
-        "matched_count": 195,
-        "matched_mean": 0.0011044078437641883,
-        "matched_last20_mean": 0.0012295554913397551,
-        "steps11_to_common_mean": 0.0011142842841399222,
+        "plotted_count": 300,
+        "matched_count": 300,
+        "matched_mean": 0.0011957506061107798,
+        "matched_last20_mean": 0.001570812394926208,
+        "steps11_to_common_mean": 0.0012052008443624235,
         "matched_min": 0.0007073346859800917,
-        "matched_max": 0.0017605275896853904
+        "matched_max": 0.001899546579316027
       }
     },
     "train/policy_kl_error": {
       "V1 synchronous": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 0.0009345015492481952,
-        "matched_last20_mean": 0.00087231623891455,
-        "steps11_to_common_mean": 0.0009288136584657607,
-        "matched_min": 0.000652919600270252,
+        "matched_count": 300,
+        "matched_mean": 0.0009225457497143452,
+        "matched_last20_mean": 0.0008505326345186858,
+        "steps11_to_common_mean": 0.0009185049987140388,
+        "matched_min": 0.0005945461484770931,
         "matched_max": 0.003636872464142016
       },
       "SC full-batch LA0": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 0.004003438285364014,
-        "matched_last20_mean": 0.00082152033386933,
-        "steps11_to_common_mean": 0.004168909414961429,
-        "matched_min": 0.0005934282330599672,
+        "matched_count": 300,
+        "matched_mean": 0.002907559090595555,
+        "matched_last20_mean": 0.0008707550297486933,
+        "steps11_to_common_mean": 0.0029753293217260274,
+        "matched_min": 0.0005926231415287475,
         "matched_max": 0.6055415848773009
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 195,
-        "matched_count": 195,
-        "matched_mean": 0.0016739253724688489,
-        "matched_last20_mean": 0.0013210866297422004,
-        "steps11_to_common_mean": 0.0017132192683191525,
+        "plotted_count": 300,
+        "matched_count": 300,
+        "matched_mean": 0.0016254976874447928,
+        "matched_last20_mean": 0.0016694349379103098,
+        "steps11_to_common_mean": 0.0016488945629001914,
         "matched_min": 0.0007200798316004779,
         "matched_max": 0.08548620663471022
       }
@@ -363,86 +365,86 @@
     "train/loss": {
       "V1 synchronous": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 0.03147215084530986,
-        "matched_last20_mean": 0.02895687387790531,
-        "steps11_to_common_mean": 0.032317049219902305,
-        "matched_min": -0.05284390738233924,
-        "matched_max": 0.1488722087815404
+        "matched_count": 300,
+        "matched_mean": 0.03360362408294653,
+        "matched_last20_mean": 0.0471281583304517,
+        "steps11_to_common_mean": 0.03421611005424297,
+        "matched_min": -0.12335675139911473,
+        "matched_max": 0.17207415122538805
       },
       "SC full-batch LA0": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 0.02862906656944408,
-        "matched_last20_mean": 0.03512002462521195,
-        "steps11_to_common_mean": 0.02970873752634066,
-        "matched_min": -0.027117986930534244,
-        "matched_max": 0.1335813757032156
+        "matched_count": 300,
+        "matched_mean": 0.031260812404410296,
+        "matched_last20_mean": 0.027385322423651815,
+        "steps11_to_common_mean": 0.03204031787122247,
+        "matched_min": -0.0619146004319191,
+        "matched_max": 0.20985582657158375
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 195,
-        "matched_count": 195,
-        "matched_mean": 0.028948094276327028,
-        "matched_last20_mean": 0.04542514970004866,
-        "steps11_to_common_mean": 0.03032702844662497,
+        "plotted_count": 300,
+        "matched_count": 300,
+        "matched_mean": 0.03252956614199996,
+        "matched_last20_mean": 0.04768507532067167,
+        "steps11_to_common_mean": 0.033532730073592545,
         "matched_min": -0.15481725021556722,
-        "matched_max": 0.16814129088812244
+        "matched_max": 0.17342218972326956
       }
     },
     "train/approx_entropy": {
       "V1 synchronous": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 0.40478952085772435,
-        "matched_last20_mean": 0.3277609912212938,
-        "steps11_to_common_mean": 0.3963118525325774,
-        "matched_min": 0.2207762791076675,
+        "matched_count": 300,
+        "matched_mean": 0.3751975628408642,
+        "matched_last20_mean": 0.29967280404671326,
+        "steps11_to_common_mean": 0.3687689827707925,
+        "matched_min": 0.20733022701460868,
         "matched_max": 0.6962436747271568
       },
       "SC full-batch LA0": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 0.4193338954424223,
-        "matched_last20_mean": 0.3372745647357078,
-        "steps11_to_common_mean": 0.4118074714756772,
+        "matched_count": 300,
+        "matched_mean": 0.39457663627438405,
+        "matched_last20_mean": 0.3492937503644498,
+        "steps11_to_common_mean": 0.3889215982553212,
         "matched_min": 0.23139176896074787,
         "matched_max": 0.6804383178241551
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 195,
-        "matched_count": 195,
-        "matched_mean": 0.48041958410554714,
-        "matched_last20_mean": 0.39414354587695494,
-        "steps11_to_common_mean": 0.47595300209686264,
-        "matched_min": 0.26838855772367465,
+        "plotted_count": 300,
+        "matched_count": 300,
+        "matched_mean": 0.43672225056233627,
+        "matched_last20_mean": 0.3617647712795624,
+        "steps11_to_common_mean": 0.43236607467599575,
+        "matched_min": 0.207448543618446,
         "matched_max": 0.8261238258772836
       }
     },
     "train/grad_norm": {
       "V1 synchronous": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 0.30806706051031746,
-        "matched_last20_mean": 0.3228622168302536,
-        "steps11_to_common_mean": 0.3170470474539576,
+        "matched_count": 300,
+        "matched_mean": 0.3373295793433984,
+        "matched_last20_mean": 0.3800276771187782,
+        "steps11_to_common_mean": 0.34406724407755096,
         "matched_min": 0.0,
         "matched_max": 1.2056423425674438
       },
       "SC full-batch LA0": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 0.2980080750890267,
-        "matched_last20_mean": 0.2846939109265804,
-        "steps11_to_common_mean": 0.3059414477364437,
+        "matched_count": 300,
+        "matched_mean": 0.3271920767178138,
+        "matched_last20_mean": 0.34233199134469033,
+        "steps11_to_common_mean": 0.333259366221469,
         "matched_min": 0.0,
-        "matched_max": 1.1448509693145752
+        "matched_max": 1.4225749969482422
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 195,
-        "matched_count": 195,
-        "matched_mean": 0.3899114217895728,
-        "matched_last20_mean": 0.6067981585860253,
-        "steps11_to_common_mean": 0.4040080120031898,
+        "plotted_count": 300,
+        "matched_count": 300,
+        "matched_mean": 0.433926143348217,
+        "matched_last20_mean": 0.5411097407341003,
+        "steps11_to_common_mean": 0.44443654474513283,
         "matched_min": 0.0,
         "matched_max": 1.521405577659607
       }
@@ -450,28 +452,28 @@
     "timing/train/total_step_time": {
       "V1 synchronous": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 139.6670427726563,
-        "matched_last20_mean": 143.78028614635076,
-        "steps11_to_common_mean": 139.15152466080733,
-        "matched_min": 128.89916663779877,
-        "matched_max": 253.38198633100183
+        "matched_count": 300,
+        "matched_mean": 138.9377208656526,
+        "matched_last20_mean": 144.24862948004156,
+        "steps11_to_common_mean": 138.5837068319902,
+        "matched_min": 88.6258062820416,
+        "matched_max": 253.9511322490871
       },
       "SC full-batch LA0": {
         "plotted_count": 300,
-        "matched_count": 195,
-        "matched_mean": 134.69473282890633,
-        "matched_last20_mean": 138.1227376091527,
-        "steps11_to_common_mean": 133.89226551409558,
-        "matched_min": 109.74648932553828,
+        "matched_count": 300,
+        "matched_mean": 134.12632013290266,
+        "matched_last20_mean": 140.94325417835498,
+        "steps11_to_common_mean": 133.59480089083362,
+        "matched_min": 70.02162605384365,
         "matched_max": 252.8438138156198
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 195,
-        "matched_count": 195,
-        "matched_mean": 134.22841025641026,
-        "matched_last20_mean": 127.77850000000001,
-        "steps11_to_common_mean": 132.9610810810811,
+        "plotted_count": 300,
+        "matched_count": 300,
+        "matched_mean": 134.1172,
+        "matched_last20_mean": 139.151,
+        "steps11_to_common_mean": 133.30489655172414,
         "matched_min": 89.05,
         "matched_max": 289.79
       }

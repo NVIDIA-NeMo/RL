@@ -1,6 +1,6 @@
 # PR3 implementation and validation record
 
-Updated 2026-11-05. Base PR1: `047d31a7f75dda062e82e29561a7e8460dc24b7c`;
+Updated 2026-11-06. Base PR1: `047d31a7f75dda062e82e29561a7e8460dc24b7c`;
 development branch: `yuekaiz/pr5090-automodel-streaming`. Main did not contain PR1.
 Image: `nemo_rl.1030.sqsh`; actual pinned AutoModel/PyTorch versions are recorded
 in source-evidence.json and dependency-runtime.json. Product dependency pins unchanged.
@@ -22,9 +22,9 @@ in source-evidence.json and dependency-runtime.json. Product dependency pins unc
 | Qwen3.5 EP16 + recipe FusedAdam | **FAILED** job21330640 on the first token-level preclip gradient comparison: observed rank relativeL2 about1.1–1.5%, exceeding1%; some cosine values also below.9999. Original limits unchanged. See ep16-failure.json; raw node logs retained. This was synthetic-input replay, not saved real-GRPO-input replay. |
 | Qwen3.5 strict qualification-gated LA0 300 steps | **NOT STARTED.** Jobs21330687–21330690 cancelled on failed qualification dependency. No extra full-batch convergence run. The distinct exploratory run below does not change the failed gate. |
 | Normalizer-placement diagnostic | **PASSED** tiny EP2 and Qwen3.5 EP16 job21331026, both objectives, one update each. All16 ranks match the independent full-input numerator reference exactly in preclip gradients/model/public+raw optimizer/scales/scheduler. Global original-normalizer differences: token1.343%, sequence1.322%; original gate remains failed. See normalizer-control-ep16-summary.json. |
-| Additional convergence evidence | **195/300 committed**, checkpoint195 saved. Segments21331883/84 completed0:0;21331885 awaits resources and21331930 its dependency as of2026-11-05 20:38PST. Same exploratory LA0 run,2dispatches/step,lag0. Original1% qualification stays failed; convergence/performance conclusions are pending. |
-| Historical baseline curve comparison | Eight panels: reward, generation length, gen_kl_error, policy_kl_error, loss, entropy, gradient norm and step time. Compare V1 synchronous2a121400, full-batch LA0c926b37d and exploratory streaming LA0 through195. Raw curves plus trailing10 means, shared-window statistics, explicit baseline-only shading. See CURVES.md and results/curve-comparison/. No duplicate baseline experiment. |
-| Fixed-checkpoint KL and timing investigation | New diagnostic21373254 queued for3nodes24H100,image1030. Same checkpoint210, native full/stream captures, seven real-input controls and warm second-update ungated CUDA traces; **large-model results pending**. Small Qwen2.5 runner smoke found fixed-input KL agreement (~8e-13 difference), backend4.58s full versus6.56s split, and zero observed ungated overlap; its shortened first rollout has zero gradients and is not large-model/nonzero-update qualification. See kl_replay/README.md, jobs.json and smoke-summary.json. |
+| Additional convergence evidence | **300/300 committed**, checkpoint300 saved. Final segment21331930 COMPLETED0:0 at2026-11-06 06:02PST; all four segments completed normally. Same exploratory LA0 run,2dispatches/step,lag0. Original1% qualification stays failed; completion does not establish numerical or convergence equivalence. |
+| Historical baseline curve comparison | All three series now cover1..300, eight panels: reward, generation length, gen_kl_error, policy_kl_error, loss, entropy, gradient norm and step time. V1 synchronous2a121400, full-batch LA0c926b37d and exploratory streaming LA0; raw plus trailing10 means. CPU-only refresh21389289 COMPLETED0:0, snapshot2026-11-06T14:07:01UTC,900CSV rows, no missing steps/metrics. See CURVES.md and results/curve-comparison/. No duplicate baseline experiment. |
+| Fixed-checkpoint KL and timing investigation | Diagnostic21373254 RUNNING on3nodes24H100,image1030 since05:40PST Nov6. Native stream/full resumes210->212 finished; warm second-update CUDA profiling in progress. First stream update has nonzero grad_norm0.5121751; **same-token replay/all-rank state/timing results pending**. Small Qwen2.5 runner smoke had zero gradients and is not large-model/nonzero-update qualification. See kl_replay/README.md, jobs.json and smoke-summary.json. |
 
 Numerical snapshots include preclip normalized gradient shards, every parameter
 and registered buffer, complete optimizer state_dict, scheduler state and exact
@@ -82,4 +82,12 @@ Exploratory run: https://wandb.ai/yuekaiz/nemo-rl-automodel-sc/runs/yuekaiz5090e
 The first update had all samples truncated and reward0; the second had reward.25
 but no within-group gradient signal. A nonzero gradient appears on update3,
 reward.21875. Initial step times include cold initialization/JIT and are not
-steady throughput. No300-step completion or convergence equivalence is claimed.
+steady throughput. The exploratory run is now complete; convergence equivalence
+is not established. In the final20 updates, V1/full-batch LA0/streaming LA0 means
+are genKL0.000811697/0.000845502/0.001570812, reward0.628125/0.621875/0.709375,
+and generated length1243.67/1211.59/1059.80. Over steps11..300, mean step times
+are138.58/133.59/133.30seconds, including checkpoint and resumed-first-step
+overheads. Streaming is approximately the same time as full-batch LA0 while
+generating shorter responses; this historical comparison does not demonstrate
+a streaming throughput gain. The visible KL gap still requires the same-input
+diagnostic and cannot be assigned to policy lag (observed lag remains0).

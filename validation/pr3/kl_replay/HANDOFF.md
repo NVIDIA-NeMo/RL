@@ -3,6 +3,15 @@
 User authorized completing same-checkpoint/same-rollout KL, numerical state and
 fixed-workload/actual-overlap diagnosis. Keep the separate300-step run running.
 
+Latest verified 2026-11-06 06:04 PST: original streaming LA0 reached300,
+checkpoint300 durable; final21331930 COMPLETED0:0. Do not launch any continuation.
+Curve refresh CPU-only job21389289 submitted once. Diagnostic21373254 RUNNING
+since05:40 on pool0-[01901,01903,01908]; stream and full native210->212 phases
+finished, warm profiling in progress, distributed replay still pending.
+First stream update has nonzero grad_norm0.5121751 and genKL0.001129127546;
+native full first-update genKL0.001208236162 is NOT yet a same-token comparison.
+Source HEADc7ddf1035 and frozen worker/harness hashes verified. Preserve pinned210.
+
 - Implementation/code commit:76c5a10dc on yuekaiz/pr5090-automodel-streaming,
   pushed to yuekaizhang/RL. Product worker/parity harness remain unchanged at
   SHA2567f598242.../ccb26bda...; their source guards protect original continuation.

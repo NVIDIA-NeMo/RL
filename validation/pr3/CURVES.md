@@ -48,3 +48,20 @@ Step time retains measured checkpoint and first-step overhead, and excludes
 queue waits and initialization outside the measured training step. Online
 validation accuracy is absent from these runs, so no accuracy panel is fabricated.
 The comparison is single-seed and cannot establish convergence equivalence.
+
+Latest snapshot:2026-11-06T14:07:01UTC, refreshed by CPU-only job21389289
+(COMPLETED0:0). All three runs have300 plotted points for every panel; no missing
+steps or repeated streaming commit receipts. Original streaming checkpoint300
+is durable and final training segment21331930 completed normally.
+
+| Window / metric | V1 synchronous | Full-batch LA0 | Streaming LA0 |
+| --- | --- | --- | --- |
+| Steps281..300 gen_kl_error mean | 0.000811697 | 0.000845502 | 0.001570812 |
+| Steps281..300 reward mean | 0.628125 | 0.621875 | 0.709375 |
+| Steps281..300 generated tokens/sample mean | 1243.67 | 1211.59 | 1059.80 |
+| Steps11..300 measured seconds/update mean | 138.58 | 133.59 | 133.30 |
+
+The generated-token workloads differ. Similar measured step time therefore
+does not demonstrate streaming speedup, and the higher observed reward is not
+a multi-seed convergence claim. See kl_replay/ for the separate fixed-checkpoint,
+same-real-rollout diagnosis; the original1% BF16 gradient gate remains failed.
