@@ -27,7 +27,6 @@ EXTERNAL_VLLM_SEGMENT_SIZE=2
 STEPS_PER_RUN=3
 MAX_STEPS=3
 NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
-# On HSG this shape had Ray and the judge pools up in ~7 min and finished 3 steps in 47 min.
 NUM_MINUTES=120
 USE_GYM_CONTAINER=true
 USES_SANDBOX=1
@@ -70,7 +69,7 @@ uv run examples/run_grpo_single_controller.py \
 
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
-# On HSG this shape gave token_mult_prob_error 1.021-1.027 and gen_kl_error 0.0010-0.0014.
+# The bounds are loose on purpose: they catch a broken train/generation match, not small drift.
 # The GenRM check fails if the external GenRM pool never scores a rollout.
 uv run tests/check_metrics.py $JSON_METRICS \
     'data["train/token_mult_prob_error"]["3"] < 1.1' \

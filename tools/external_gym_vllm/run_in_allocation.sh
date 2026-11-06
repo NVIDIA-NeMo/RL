@@ -396,9 +396,8 @@ cleanup() {
     fi
   fi
   if (( status == 0 )); then
-    # NeMo RL finished. Exit and let Slurm end the remaining replica and load-balancer
-    # steps, so the job ends COMPLETED. A SIGTERM to their srun clients makes srun force
-    # the termination and Slurm records the job as CANCELLED, which CI reads as a failure.
+    # Let Slurm end the pool steps. Killing their srun clients makes the job end
+    # CANCELLED instead of COMPLETED, and CI reads CANCELLED as a failure.
     exit 0
   fi
   if [[ -n "${ray_sub_pid}" ]] && kill -0 "${ray_sub_pid}" 2>/dev/null; then
