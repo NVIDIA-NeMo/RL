@@ -68,6 +68,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
     TokenCaptureConfig,
+    logprob_passes_required,
     resolve_ppo_chunk_alignment,
     validate_single_controller_config,
 )
@@ -4676,6 +4677,85 @@ def test_advantage_stage_statistics_participation_is_binary(policy: str) -> None
     )
     assert data_plane.written_fields is not None
     assert "sample_mask" not in data_plane.written_fields.keys()
+
+
+@pytest.mark.parametrize(
+    "policy, expected_participation",
+    [("exclude", [1.0, 0.0, 0.0, 1.0]), ("include", [1.0, 1.0, 0.0, 1.0])],
+)
+def test_advantage_stage_in_loss_seq_filter_keeps_legacy_participation(
+    policy: str, expected_participation: list[float]
+) -> None:
+    """In-loss filtering adds no pre-training mask and skips the logprob columns.
+
+    Row 1 carries mask_sample and row 2 is a token-capture placeholder; both
+    trainers keep the placeholder out of the baseline under either policy.
+    """
+    batch_size, sequence_length = 4, 4
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(batch_size, 1, dtype=torch.long),
+            "total_reward": torch.tensor([1.0, 3.0, 5.0, 0.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.tensor([1.0, 1.0, 0.0, 1.0]),
+            "mask_sample": torch.tensor([False, True, False, False]),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = _MaskRecordingAdvantageEstimator()
+    ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig(seq_logprob_error_threshold=2.0, masked_reward_policy=policy),
+        loss_fn=ClippedPGLossConfig(
+            seq_logprob_error_in_loss=True,
+            force_on_policy_ratio=True,
+            reference_policy_kl_penalty=0,
+        ),
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._policy_logprobs_required, ctrl._reference_logprobs_required = (
+        logprob_passes_required(ctrl._master_config, ctrl._algo_cfg)
+    )
+    ctrl._teacher_logprobs_required = False
+    ctrl._train_data_dump = None
+    ctrl._is_ppo = False
+    ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
+    ctrl._step_log_dict = {
+        key: []
+        for key in (
+            "reward_partials",
+            "advantage_partials",
+            "sequence_lengths",
+            "num_mask_sample_filtered",
+            "seq_logprob_error_metrics",
+        )
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
+    )
+
+    _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert not ctrl._policy_logprobs_required
+    assert has_valid_training_tokens
+    assert torch.equal(estimator.valid_mask, torch.tensor(expected_participation))
+    torch.testing.assert_close(
+        estimator.mask,
+        data["token_mask"] * torch.tensor([1.0, 0.0, 0.0, 1.0]).unsqueeze(-1),
+    )
+    # The loss reports logprob-error counts; no controller record is made.
+    assert ctrl._step_log_dict["seq_logprob_error_metrics"] == []
 
 
 @pytest.mark.parametrize("policy", ["exclude", "include"])
