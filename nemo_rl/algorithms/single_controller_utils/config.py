@@ -116,6 +116,32 @@ class NemoGymRolloutFTConfig(BaseModel, extra="allow"):
     # bad row takes every later row with it; recovering those individually is much
     # cheaper than redoing all num_generations_per_prompt of them.
     max_row_attempts: PositiveInt = 3
+    # Seconds of rollout_timeout_s kept back for scoring. When set, every dispatched row
+    # carries the group's remaining budget minus this margin as Gym's
+    # responses_create_params.metadata.agent_timeout_sec, so a harness that honors it
+    # stops at that point and verifies the work it kept; the scored result trains like
+    # any other, instead of the deadline dropping the group. Covers verification and the
+    # result's trip back. None disables; requires rollout_timeout_s.
+    agent_timeout_margin_s: Optional[PositiveFloat] = None
+
+    @model_validator(mode="after")
+    def _check_agent_timeout_margin(self) -> "NemoGymRolloutFTConfig":
+        margin = self.agent_timeout_margin_s
+        if margin is None:
+            return self
+        if self.rollout_timeout_s is None:
+            raise ValueError(
+                "async_rl.rollout_failure.nemo_gym.agent_timeout_margin_s is measured "
+                "back from rollout_timeout_s, which is unset; set rollout_timeout_s "
+                "or remove the margin"
+            )
+        if margin >= self.rollout_timeout_s:
+            raise ValueError(
+                "async_rl.rollout_failure.nemo_gym.agent_timeout_margin_s "
+                f"({margin}) must be < rollout_timeout_s ({self.rollout_timeout_s}); "
+                "otherwise no row has any time left to run"
+            )
+        return self
 
 
 class RolloutFailureConfig(BaseModel, extra="allow"):
@@ -1373,6 +1399,13 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 f"({async_config.min_groups_for_streaming_train}) == "
                 f"num_prompts_per_step ({algo_cfg.num_prompts_per_step})."
             )
+        if async_config.rollout_failure.nemo_gym.agent_timeout_margin_s is not None:
+            raise ValueError(
+                "async_rl.rollout_failure.nemo_gym.agent_timeout_margin_s is not "
+                "supported with colocated generation: rollout_timeout_s pauses while "
+                "the engine stands down for training, but the agent_timeout_sec handed "
+                "to the harness is wall-clock time and would end every rollout early."
+            )
 
     # Capacity is sized from the peak window whatever the algorithm, so an inert
     # setting still costs buffer and fails setup naming the wrong cause.
@@ -1833,6 +1866,19 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "rollout_recovery.gym_prepare_timeout_s + 2 * "
                 f"token_capture.control_timeout_s ({gym_park_s}); a turn snapshot "
                 "can hold rollout dispatch that long."
+            )
+        agent_margin_s = async_config.rollout_failure.nemo_gym.agent_timeout_margin_s
+        if agent_margin_s is not None:
+            warnings.warn(
+                "async_rl.rollout_failure.nemo_gym.agent_timeout_margin_s with "
+                "turn-level rollout recovery: each Gym checkpoint pauses "
+                "rollout_timeout_s, but a harness that reads agent_timeout_sec is "
+                "restart-only and keeps its wall-clock budget running while the "
+                f"policy server holds its model calls, for up to {gym_park_s}s per "
+                "checkpoint. Such a harness stops that much earlier than it could; "
+                "it is still scored inside the deadline. "
+                "<agent>/agent_timeout/parked_s/max reports the time lost.",
+                stacklevel=2,
             )
     if token_capture_config.defer_routed_experts_to_policy and not (
         token_capture_config.enabled

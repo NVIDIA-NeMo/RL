@@ -108,6 +108,11 @@ async_rl:
       # Gym's stream dies on its first failing row, so one bad row loses every later
       # one; recovering those individually beats redoing all N.
       max_row_attempts: 3
+      # Seconds of rollout_timeout_s kept back for scoring. Each row is handed the
+      # rest as metadata.agent_timeout_sec, so a harness that honors it stops,
+      # verifies its partial work and trains on that score instead of being dropped.
+      # Needs rollout_timeout_s and non-colocated generation.
+      agent_timeout_margin_s: null
 
   # Last-resort stall detection. stall_timeout_s must exceed interval_s and every
   # deadline above, so a merely-slow rollout is not reported as a stall.

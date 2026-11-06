@@ -48,7 +48,7 @@ from nemo_rl.experience.failures import (
     RolloutTimeout,
     classify_rollout_failure,
 )
-from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY
+from nemo_rl.experience.interfaces import NEMO_GYM_TASK_INDEX_KEY, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import (
     AsyncRolloutImpl,
     RequestDeadlineRegistry,
@@ -62,6 +62,7 @@ from nemo_rl.experience.rollout_manager import (
     _LedgerDispatchRecorder,
 )
 from nemo_rl.experience.rollout_recovery import RecoveryGranularity
+from nemo_rl.experience.rollouts import _mask_sample_flags
 from nemo_rl.utils.timer import Timer
 
 
@@ -844,6 +845,534 @@ class TestPartialGymRedispatch:
         )
         with pytest.raises(RolloutTimeout, match="NeMo-Gym prompt group"):
             asyncio.run(impl._run_rollouts(_gym_rows(2), Timer(), "timing/rollout"))
+
+
+def _scorable_rows(count: int, **metadata: str) -> list[dict]:
+    """Rows carrying the Responses parameters a harness budget is stamped into."""
+    rows = _gym_rows(count)
+    for row in rows:
+        row["responses_create_params"] = {"metadata": dict(metadata)}
+    return rows
+
+
+def _handed_budget(row: dict) -> str | None:
+    return row["responses_create_params"].get("metadata", {}).get("agent_timeout_sec")
+
+
+async def _scored_result(
+    rowidx: int, reward: float | None, failure_kind: str | None = None
+):
+    """A verified result; ``None`` is an assessment the verifier could not make."""
+    full_result: dict = {"reward": 0.0 if reward is None else reward}
+    if reward is None:
+        full_result["mask_sample"] = True
+    if failure_kind is not None:
+        full_result["failure_kind"] = failure_kind
+    return (
+        rowidx,
+        {"name": "agent"},
+        {
+            "input_message_log": [{"role": "user", "token_ids": [1]}],
+            "message_log": [{"role": "assistant", "token_ids": [2]}],
+            "full_result": full_result,
+        },
+        None,
+    )
+
+
+class _BudgetHonoringGym:
+    """Gym whose harnesses stop at the handed ``agent_timeout_sec`` and verify what they kept.
+
+    Without a handed budget, or with ``honors_budget=False``, every harness runs to
+    its own ``ceiling_s``. A harness the budget stopped reports Gym's
+    ``agent_timeout`` failure kind on a valid score, after ``verify_s``. The rows of
+    one dispatch run concurrently, as they do in Gym.
+    """
+
+    def __init__(
+        self,
+        rewards: list[float | None],
+        ceiling_s: float = 60.0,
+        *,
+        honors_budget: bool = True,
+        verify_s: float = 0.0,
+    ) -> None:
+        self._rewards = rewards
+        self._ceiling_s = ceiling_s
+        self._honors_budget = honors_budget
+        self._verify_s = verify_s
+        self.budgets: list[dict[int, str | None]] = []
+
+    def options(self, **kwargs):
+        del kwargs
+        return self
+
+    def remote(self, inputs, timer_prefix, per_prompt=False):
+        del timer_prefix, per_prompt
+        self.budgets.append({row["_rowidx"]: _handed_budget(row) for row in inputs})
+        return self._stream(inputs)
+
+    async def _stream(self, inputs):
+        handed = [_handed_budget(row) for row in inputs] if self._honors_budget else []
+        run_s = min([self._ceiling_s, *(float(b) for b in handed if b is not None)])
+        await asyncio.sleep(run_s + self._verify_s)
+        stopped = "agent_timeout" if run_s < self._ceiling_s else None
+        for row in inputs:
+            yield _scored_result(
+                row["_rowidx"], self._rewards[row["_rowidx"]], failure_kind=stopped
+            )
+
+
+class _GymGroupImpl:
+    """``run_rollout`` that runs one real Gym prompt group per call, as the Gym impl does."""
+
+    def __init__(self, gym_impl) -> None:
+        self._gym_impl = gym_impl
+        self.attempts = 0
+
+    async def run_rollout(self, input_sample):
+        del input_sample
+        self.attempts += 1
+        completions, prompt, metrics = await self._gym_impl._run_rollouts(
+            _scorable_rows(2), Timer(), "timing/rollout"
+        )
+        return PromptGroupRecord(
+            prompt_idx=0,
+            prompt=prompt,
+            extra_env_info=None,
+            metadata={},
+            completions=completions,
+            rollout_metrics=metrics,
+        )
+
+
+class TestAgentTimeoutHandOff:
+    """agent_timeout_margin_s turns the group deadline into a budget the harness scores at.
+
+    Without it, a rollout that outlives rollout_timeout_s is dropped with all of its
+    work. With it, each harness is told when to stop, verifies what it kept, and the
+    group trains on those scores; an assessment that failed stays masked rather than
+    becoming a zero reward.
+    """
+
+    def test_a_harness_that_honors_the_budget_is_scored_instead_of_dropped(self):
+        gym = _BudgetHonoringGym(rewards=[0.5, 0.0, None])
+        impl = _make_gym_impl(
+            gym,
+            num_generations=3,
+            timeouts=RolloutTimeouts(rollout_s=0.6, agent_margin_s=0.3),
+        )
+
+        completions, _, _ = asyncio.run(
+            impl._run_rollouts(_scorable_rows(3), Timer(), "timing/rollout")
+        )
+
+        (budgets,) = gym.budgets
+        assert all(0.2 < float(budget) <= 0.3 for budget in budgets.values())
+        assert [completion.reward for completion in completions] == [0.5, 0.0, 0.0]
+        # The valid zero trains; only the failed assessment is masked.
+        assert _mask_sample_flags(
+            [completion.env_extras for completion in completions]
+        ).tolist() == [0.0, 0.0, 1.0]
+
+    def test_without_a_margin_the_same_harness_is_cut_off(self):
+        gym = _BudgetHonoringGym(rewards=[0.5, 0.0])
+        impl = _make_gym_impl(gym, timeouts=RolloutTimeouts(rollout_s=0.3))
+
+        with pytest.raises(RolloutTimeout, match="NeMo-Gym prompt group"):
+            asyncio.run(
+                impl._run_rollouts(_scorable_rows(2), Timer(), "timing/rollout")
+            )
+        assert gym.budgets == [{0: None, 1: None}]
+
+    def test_a_re_dispatched_row_gets_only_what_is_left(self):
+        class _DiesAfterTheFirstRow(_PartialGymMethod):
+            def __init__(self) -> None:
+                super().__init__(fail_after_rows=1, failures_before_success=1)
+                self.budgets: list[list[float]] = []
+
+            def remote(self, inputs, timer_prefix, per_prompt=False):
+                self.budgets.append([float(_handed_budget(row)) for row in inputs])
+                return super().remote(inputs, timer_prefix, per_prompt)
+
+            async def _stream(self, inputs, attempt):
+                if attempt == 0:
+                    await asyncio.sleep(0.2)
+                async for item in super()._stream(inputs, attempt):
+                    yield item
+
+        method = _DiesAfterTheFirstRow()
+        impl = _make_gym_impl(
+            method,
+            num_generations=2,
+            row_attempts=2,
+            timeouts=RolloutTimeouts(rollout_s=2.0, agent_margin_s=0.5),
+        )
+
+        asyncio.run(impl._run_rollouts(_scorable_rows(2), Timer(), "timing/rollout"))
+
+        first, second = method.budgets
+        assert first == [pytest.approx(1.5, abs=0.05)] * 2
+        assert second[0] <= first[0] - 0.2
+
+    def test_a_smaller_budget_carried_by_the_task_is_kept(self):
+        gym = _BudgetHonoringGym(rewards=[1.0, 1.0])
+        impl = _make_gym_impl(
+            gym, timeouts=RolloutTimeouts(rollout_s=30.0, agent_margin_s=5.0)
+        )
+        rows = _scorable_rows(2, agent_timeout_sec="0.1", harbor_step="build")
+
+        asyncio.run(impl._run_rollouts(rows, Timer(), "timing/rollout"))
+
+        assert gym.budgets == [{0: "0.100", 1: "0.100"}]
+
+    def test_the_source_rows_are_left_for_a_group_retry_to_budget_afresh(self):
+        gym = _BudgetHonoringGym(rewards=[1.0, 1.0])
+        impl = _make_gym_impl(
+            gym, timeouts=RolloutTimeouts(rollout_s=30.0, agent_margin_s=5.0)
+        )
+        rows = _scorable_rows(2, harbor_step="build")
+
+        asyncio.run(impl._run_rollouts(rows, Timer(), "timing/rollout"))
+
+        assert all(float(budget) > 24.0 for budget in gym.budgets[0].values())
+        assert [row["responses_create_params"] for row in rows] == [
+            {"metadata": {"harbor_step": "build"}}
+        ] * 2
+
+    def test_no_budget_left_ends_the_group_without_a_re_dispatch(self):
+        class _SlowThenDies(_PartialGymMethod):
+            async def _stream(self, inputs, attempt):
+                await asyncio.sleep(0.6)
+                async for item in super()._stream(inputs, attempt):
+                    yield item
+
+        method = _SlowThenDies(fail_after_rows=1, failures_before_success=1)
+        impl = _make_gym_impl(
+            method,
+            num_generations=2,
+            row_attempts=3,
+            timeouts=RolloutTimeouts(rollout_s=1.0, agent_margin_s=0.5),
+        )
+
+        with pytest.raises(RolloutTimeout, match="no harness can run"):
+            asyncio.run(
+                impl._run_rollouts(_scorable_rows(2), Timer(), "timing/rollout")
+            )
+        assert method.dispatched == [[0, 1]]
+
+    def test_materialized_tasks_are_rejected(self):
+        gym = _BudgetHonoringGym(rewards=[1.0])
+        impl = _make_gym_impl(
+            gym,
+            num_generations=1,
+            timeouts=RolloutTimeouts(rollout_s=30.0, agent_margin_s=5.0),
+        )
+        task_row = {
+            "_rowidx": 0,
+            "task_id": {"taskset": "harbor:train"},
+            "task_input": {"responses_create_params": {}},
+        }
+
+        with pytest.raises(ValueError, match="materialized NeMo-Gym tasks"):
+            asyncio.run(impl._run_rollouts([task_row], Timer(), "timing/rollout"))
+        assert gym.budgets == []
+
+    def test_the_budget_round_trips_through_gyms_own_parser(self):
+        """Gym validates metadata as Dict[str, str] and parses the budget back."""
+        task_timeout = pytest.importorskip("nemo_gym.agent_utils.task_timeout")
+        openai_utils = pytest.importorskip("nemo_gym.openai_utils")
+        from nemo_rl.experience.rollout_manager import (
+            _NEMO_GYM_AGENT_TIMEOUT_KEY,
+            _hand_agent_timeout,
+        )
+
+        assert _NEMO_GYM_AGENT_TIMEOUT_KEY == task_timeout.AGENT_TIMEOUT_METADATA_KEY
+        rows = _scorable_rows(2, harbor_step="build")
+        rows[1]["responses_create_params"]["metadata"]["agent_timeout_sec"] = "12"
+        handed = _hand_agent_timeout(rows, remaining_s=100.0, margin_s=10.0)
+
+        budgets = []
+        for row in handed:
+            body = openai_utils.NeMoGymResponseCreateParamsNonStreaming(
+                input="hi", **row["responses_create_params"]
+            )
+            budgets.append(
+                task_timeout.resolve_agent_timeout(body.metadata, ceiling=3600.0)
+            )
+        assert budgets == [90.0, 12.0]
+        with pytest.raises(ValueError):
+            openai_utils.NeMoGymResponseCreateParamsNonStreaming(
+                input="hi", metadata={"agent_timeout_sec": 90.0}
+            )
+
+    def test_a_row_stopped_by_its_budget_is_a_policy_timeout_that_trains(self):
+        """Gym names the stop agent_timeout, a kind the policy caused, on a valid score.
+
+        It is not masked, so it trains under every masked-reward policy; the RL
+        backstop, by contrast, stays an infrastructure RolloutTimeout.
+        """
+        failure_kinds = pytest.importorskip("nemo_gym.failure_kinds")
+        from nemo_rl.experience.rollout_manager import (
+            _NEMO_GYM_AGENT_TIMEOUT_FAILURE_KIND,
+        )
+
+        assert _NEMO_GYM_AGENT_TIMEOUT_FAILURE_KIND == failure_kinds.AGENT_TIMEOUT
+        gym = _BudgetHonoringGym(rewards=[0.25, 0.0])
+        impl = _make_gym_impl(
+            gym, timeouts=RolloutTimeouts(rollout_s=0.5, agent_margin_s=0.2)
+        )
+
+        completions, _, _ = asyncio.run(
+            impl._run_rollouts(_scorable_rows(2), Timer(), "timing/rollout")
+        )
+
+        assert [c.env_extras["failure_kind"] for c in completions] == [
+            "agent_timeout"
+        ] * 2
+        assert [c.reward for c in completions] == [0.25, 0.0]
+        assert _mask_sample_flags([c.env_extras for c in completions]).tolist() == [
+            0.0,
+            0.0,
+        ]
+
+
+class TestAgentBudgetObservability:
+    """What tells a user whether their harnesses honor the budget, and how to size it."""
+
+    # Namespaced by the agent Gym resolved, like the group's other per-agent metrics.
+    _PREFIX = "agent/agent_timeout"
+
+    def test_rows_stopped_by_their_budget_report_the_tail_the_margin_covers(self):
+        gym = _BudgetHonoringGym(rewards=[1.0, 0.0], verify_s=0.15)
+        impl = _make_gym_impl(
+            gym, timeouts=RolloutTimeouts(rollout_s=1.0, agent_margin_s=0.5)
+        )
+
+        _, _, metrics = asyncio.run(
+            impl._run_rollouts(_scorable_rows(2), Timer(), "timing/rollout")
+        )
+
+        assert metrics[f"{self._PREFIX}/past_budget_rate"] == 1.0
+        assert metrics[f"{self._PREFIX}/reported_rate"] == 1.0
+        assert 0.15 <= metrics[f"{self._PREFIX}/post_budget_s/max"] < 0.4
+        assert metrics[f"{self._PREFIX}/parked_s/max"] < 0.05
+
+    def test_rows_that_finish_inside_their_budget_report_nothing_past_it(self):
+        gym = _BudgetHonoringGym(rewards=[1.0, 1.0], ceiling_s=0.05)
+        impl = _make_gym_impl(
+            gym, timeouts=RolloutTimeouts(rollout_s=30.0, agent_margin_s=5.0)
+        )
+
+        _, _, metrics = asyncio.run(
+            impl._run_rollouts(_scorable_rows(2), Timer(), "timing/rollout")
+        )
+
+        assert metrics[f"{self._PREFIX}/past_budget_rate"] == 0.0
+        assert metrics[f"{self._PREFIX}/reported_rate"] == 0.0
+        assert metrics[f"{self._PREFIX}/post_budget_s/max"] == 0.0
+
+    def test_no_metrics_without_a_margin(self):
+        gym = _BudgetHonoringGym(rewards=[1.0, 1.0], ceiling_s=0.01)
+        impl = _make_gym_impl(gym, timeouts=RolloutTimeouts(rollout_s=30.0))
+
+        _, _, metrics = asyncio.run(
+            impl._run_rollouts(_scorable_rows(2), Timer(), "timing/rollout")
+        )
+
+        assert not any("/agent_timeout/" in key for key in metrics)
+
+    def test_a_harness_that_ignores_its_budget_is_counted_and_named_once(self, capsys):
+        stats = RolloutStats()
+        gym = _BudgetHonoringGym(rewards=[1.0, 1.0], honors_budget=False)
+        impl = _make_gym_impl(
+            gym,
+            timeouts=RolloutTimeouts(rollout_s=0.2, agent_margin_s=0.1),
+            stats=stats,
+        )
+
+        for _ in range(2):
+            with pytest.raises(RolloutTimeout, match="NeMo-Gym prompt group"):
+                asyncio.run(
+                    impl._run_rollouts(_scorable_rows(2), Timer(), "timing/rollout")
+                )
+
+        agent = "task-source:workplace_assistant"
+        assert stats.agent_timeout_backstop_rows_by_agent == {agent: 4}
+        metrics = stats.as_metrics()
+        assert metrics["rollout/agent_timeout_backstop_rows_total"] == 4.0
+        assert metrics[f"rollout/agent_timeout_backstop_rows_total/{agent}"] == 4.0
+        warnings = [
+            line for line in capsys.readouterr().out.splitlines() if agent in line
+        ]
+        assert len(warnings) == 1
+        assert "ignores agent_timeout_sec" in warnings[0]
+
+    def test_a_backstop_without_a_margin_names_no_harness(self, capsys):
+        stats = RolloutStats()
+        gym = _BudgetHonoringGym(rewards=[1.0, 1.0])
+        impl = _make_gym_impl(gym, timeouts=RolloutTimeouts(rollout_s=0.1), stats=stats)
+
+        with pytest.raises(RolloutTimeout):
+            asyncio.run(
+                impl._run_rollouts(_scorable_rows(2), Timer(), "timing/rollout")
+            )
+
+        assert stats.agent_timeout_backstop_rows_by_agent == {}
+        assert "agent_timeout_sec" not in capsys.readouterr().out
+
+    def test_a_failed_row_is_not_blamed_on_its_harness(self, capsys):
+        """A row that failed is not running, so the backstop does not count it."""
+
+        class _OneRowFailsThenTheOtherHangs(_PartialGymMethod):
+            async def _stream(self, inputs, attempt):
+                del attempt
+
+                async def failed():
+                    return GymRowFailure(
+                        inputs[0]["_rowidx"], GymTransportError("row lost")
+                    )
+
+                yield failed()
+                await asyncio.sleep(60)
+                yield _row_result(inputs[1]["_rowidx"])
+
+        stats = RolloutStats()
+        impl = _make_gym_impl(
+            _OneRowFailsThenTheOtherHangs(fail_after_rows=0, failures_before_success=0),
+            timeouts=RolloutTimeouts(rollout_s=0.2, agent_margin_s=0.1),
+            stats=stats,
+        )
+
+        with pytest.raises(RolloutTimeout):
+            asyncio.run(
+                impl._run_rollouts(_scorable_rows(2), Timer(), "timing/rollout")
+            )
+
+        assert stats.agent_timeout_backstop_rows_by_agent == {
+            "task-source:workplace_assistant": 1
+        }
+
+
+class TestAgentBudgetUnderCheckpointPauses:
+    """A Gym checkpoint pauses the group deadline, but not a running harness's budget.
+
+    Every harness that reads agent_timeout_sec is restart-only in Gym: it keeps
+    running through a checkpoint while the policy server holds its model calls, so
+    the pause is charged to its wall-clock budget and it stops that much earlier,
+    still inside the group deadline and still scored. What is not yet running is
+    handed its budget only once admission reopens.
+    """
+
+    def test_a_row_waiting_at_the_closed_gate_is_not_charged_for_the_pause(self):
+        gym = _BudgetHonoringGym(rewards=[1.0, 1.0], ceiling_s=0.01)
+        impl = _make_gym_impl(
+            gym, timeouts=RolloutTimeouts(rollout_s=10.0, agent_margin_s=2.0)
+        )
+        registry = RequestDeadlineRegistry()
+        impl._deadline_registry = registry
+        gate = DataPlaneCheckpointBarrier()
+        impl._dispatch_admission_gate = gate
+
+        async def exercise() -> None:
+            async with gate.checkpoint():
+                registry.suspend("gym_checkpoint")
+                task = asyncio.create_task(
+                    impl._run_rollouts(_scorable_rows(2), Timer(), "timing/rollout")
+                )
+                await asyncio.sleep(0.3)
+                assert gym.budgets == []
+                registry.resume("gym_checkpoint")
+            await asyncio.wait_for(task, timeout=5.0)
+
+        asyncio.run(exercise())
+        (budgets,) = gym.budgets
+        assert all(float(b) == pytest.approx(8.0, abs=0.05) for b in budgets.values())
+
+    def test_a_pause_while_a_harness_runs_is_reported_as_parked_time(self):
+        gym = _BudgetHonoringGym(rewards=[1.0, 1.0])
+        impl = _make_gym_impl(
+            gym, timeouts=RolloutTimeouts(rollout_s=1.0, agent_margin_s=0.4)
+        )
+        registry = RequestDeadlineRegistry()
+        impl._deadline_registry = registry
+
+        async def exercise():
+            task = asyncio.create_task(
+                impl._run_rollouts(_scorable_rows(2), Timer(), "timing/rollout")
+            )
+            await asyncio.sleep(0.1)
+            registry.suspend("gym_checkpoint")
+            await asyncio.sleep(0.25)
+            registry.resume("gym_checkpoint")
+            return await asyncio.wait_for(task, timeout=5.0)
+
+        completions, _, metrics = asyncio.run(exercise())
+
+        # The harness kept its wall-clock budget, so it returned scored and early.
+        assert [c.reward for c in completions] == [1.0, 1.0]
+        prefix = TestAgentBudgetObservability._PREFIX
+        assert metrics[f"{prefix}/parked_s/max"] == pytest.approx(0.25, abs=0.05)
+        assert metrics[f"{prefix}/past_budget_rate"] == 1.0
+
+
+class TestNoBudgetLeftFollowsThePromptGroupRetryBudget:
+    """A dispatch with nothing left beyond the margin ends the group as the backstop does.
+
+    It is not re-sent inside the group, where it could never be scored in time; the
+    prompt-group retry policy then treats it exactly like the deadline firing.
+    """
+
+    @staticmethod
+    def _gym_impl():
+        class _SlowThenDiesOnce(_PartialGymMethod):
+            async def _stream(self, inputs, attempt):
+                if self.attempts == 1:
+                    await asyncio.sleep(0.6)
+                async for item in super()._stream(inputs, attempt):
+                    yield item
+
+        method = _SlowThenDiesOnce(fail_after_rows=1, failures_before_success=1)
+        return method, _make_gym_impl(
+            method,
+            num_generations=2,
+            row_attempts=3,
+            timeouts=RolloutTimeouts(rollout_s=1.0, agent_margin_s=0.5),
+        )
+
+    def test_it_spends_one_infra_attempt_and_the_retry_gets_a_fresh_budget(self):
+        method, gym_impl = self._gym_impl()
+        impl = _GymGroupImpl(gym_impl)
+        buffer = _RecordingBuffer()
+        manager = _make_manager(
+            buffer,
+            impl,
+            RolloutRetryPolicy.single_attempt(
+                max_infra_attempts=2, backoff_base_s=0.0, max_backoff_s=0.0
+            ),
+        )
+
+        asyncio.run(manager.generate_and_push(_sample()))
+
+        assert impl.attempts == 2
+        assert len(buffer.commits) == 1
+        # The same reason the deadline itself records, so one counter covers both.
+        assert manager.stats.redispatches_by_reason == {"RolloutTimeout": 1}
+        assert method.dispatched == [[0, 1], [0, 1]]
+
+    def test_without_retry_budget_the_prompt_is_dropped_like_a_backstop(self):
+        _, gym_impl = self._gym_impl()
+        manager = _make_manager(
+            _RecordingBuffer(),
+            _GymGroupImpl(gym_impl),
+            RolloutRetryPolicy.single_attempt(),
+        )
+
+        with pytest.raises(RolloutRedispatchExhausted) as excinfo:
+            asyncio.run(manager.generate_and_push(_sample()))
+
+        assert isinstance(excinfo.value.__cause__, RolloutTimeout)
+        assert classify_rollout_failure(excinfo.value.__cause__) is FailureClass.INFRA
 
 
 class TestClassifyGenerationFailure:
