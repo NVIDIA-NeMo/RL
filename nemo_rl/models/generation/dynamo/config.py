@@ -21,7 +21,7 @@ every field below carries its default.
 
 from typing import Annotated, Any, Literal, Mapping
 
-from pydantic import BaseModel, Field, PositiveFloat, model_validator
+from pydantic import BaseModel, Field, PositiveFloat, PositiveInt, model_validator
 
 
 class DynamoWorkerArgs(BaseModel, extra="forbid"):
@@ -67,10 +67,13 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
     # disable it. NeMo-Gym names the session on token-capture calls only (its
     # capture key), as the native backend pins each Gym session to one server; the
     # engine splices a call's staged prefix after routing, so the KV router alone
-    # cannot see where that prefix is cached. Dynamo keeps at most 65,536 sessions
-    # and answers a new one past that with HTTP 529, so keep (captured rollouts
-    # started per second) x TTL below 65,536. The bound is the frontend's own.
+    # cannot see where that prefix is cached.
     session_affinity_ttl_secs: Annotated[int, Field(gt=0, le=31_536_000)] | None = 300
+    # Most sessions the affinity table holds; a new one past it gets HTTP 529.
+    # Every frontend holds the whole fleet's sessions, so size it for all of them.
+    # Entries are allocated as sessions start and reaped after the TTL, so the cap
+    # only bounds memory; Dynamo's own 65,536 is below NT4-scale concurrency.
+    session_affinity_max_entries: PositiveInt = 16_777_216
     extra_cli_args: list[str] = Field(default_factory=list)
 
 

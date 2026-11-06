@@ -74,6 +74,8 @@ def frontend_argv(
         argv += [
             "--router-session-affinity-ttl-secs",
             str(dynamo_cfg.frontend_args.session_affinity_ttl_secs),
+            "--router-session-affinity-max-entries",
+            str(dynamo_cfg.frontend_args.session_affinity_max_entries),
         ]
     extra = dynamo_cfg.frontend_args.extra_cli_args
     for token in extra:

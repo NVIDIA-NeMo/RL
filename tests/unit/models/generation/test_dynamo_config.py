@@ -141,6 +141,9 @@ def test_frontend_argv_is_runtime_owned() -> None:
     assert argv[argv.index("--router-mode") + 1] == "kv"
     # Gym names a token-capture call's session; keep the session on one engine.
     assert argv[argv.index("--router-session-affinity-ttl-secs") + 1] == "300"
+    assert argv[argv.index("--router-session-affinity-max-entries") + 1] == str(
+        16_777_216
+    )
     assert argv[-2:] == ["--foo", "1"]
     no_affinity = DynamoCfg.model_validate(
         {"frontend_args": {"session_affinity_ttl_secs": None}}

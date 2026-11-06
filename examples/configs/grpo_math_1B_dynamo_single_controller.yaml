@@ -38,6 +38,8 @@ policy:
         # Keep a NeMo-Gym token-capture rollout on one engine while it idles up
         # to this many seconds (null disables it).
         session_affinity_ttl_secs: 300
+        # Most sessions the frontends hold at once, across all of them.
+        session_affinity_max_entries: 16777216
         extra_cli_args: []
 
 logger:
