@@ -91,7 +91,7 @@ The performance data includes:
 | GRPO | DeepSeek V3 | On policy | 1,536 | 712 | 128 | 512 | 512 | [32,1] | [1,1,16,8,n/a] | 50.5 | 64.7 |
 | GRPO | DeepSeek V3 | On policy | 1,536 | 711 | 256 | 512 | 512 | [32,1] | [1,1,32,8,n/a] | 28 | 58.3 |
 | GRPO | DeepSeek V3 | 1-step Off | 1,536 | 721 | 256 | 512 | 512 | [16,1] | [1,1,16,8,n/a] | 107 | 15.5 |
-| GRPO | Qwen3-235B-A22B | On policy | 8,192 | 5,707 | 64 | 512 | 512 | [8,1] | [2,2,16,4,n/a] | 174 | 268 |
+| GRPO | Qwen3-235B-A22B | On policy | 8,192 | 5,702 | 64 | 512 | 512 | [4,2] | [2,2,16,4,n/a] | 141 | 333 |
 | GRPO | Qwen3-235B-A22B | On policy | 8,192 | 5,729 | 128 | 512 | 512 | [4,2] | [2,2,16,4,n/a] | 130 | 180 |
 | GRPO | Qwen3-235B-A22B | 1-step Off | 8,192 | 5,706 | 128 | 512 | 512 | [8,1] | [4,1,16,4,n/a] | 277 | 98.2 |
 | GRPO | Qwen3-30B-A3B | On policy | 4,096 | 3,201 | 16 | 2,048 | 2,048 | [1,1] | [1,1,16,1,n/a] | 2,656 | 159 |
@@ -122,4 +122,3 @@ Note:
 
 * All Mixture-of-expert (MoE) model training uses token drop-less. 
 * The following metrics are extracted from the average of steps 3-8: G-Average Seq len, Tokens/sec/gpu, Total Step time(s). Because of the averaging, the numbers in the table do not completely match the equation stated in Performance Metrics above but the difference is small.
-* The GB200 BF16 Qwen3-235B-A22B on-policy row with 64 GPUs reports v0.7 numbers and its v0.7 generation config (`[8,1]`). The v0.8 recipe uses `[4,2]`; its v0.8 run did not complete.
