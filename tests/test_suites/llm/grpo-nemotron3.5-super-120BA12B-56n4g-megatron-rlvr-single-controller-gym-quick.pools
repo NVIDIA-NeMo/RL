@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # External vLLM judge pools for the test script of the same name. tools/launch sources this file
 # (after tools/external_gym_vllm/pool_config.sh) when it submits the heterogeneous job, so it may use
 # HF_HOME and GPUS_PER_NODE. Pools fill hetgroup 1: GenRM 2 x TP8 (4 nodes), NL2Bash 2 x TP4
