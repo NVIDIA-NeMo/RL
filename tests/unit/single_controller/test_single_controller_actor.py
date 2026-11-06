@@ -75,13 +75,13 @@ from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     JsonDebugWriter,
     TrainChunk,
 )
-from nemo_rl.algorithms.single_controller_utils.utils import tensor_field
 from nemo_rl.algorithms.single_controller_utils.masking_stats import (
     new_masking_stats_accumulator,
 )
 from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
     new_rollout_stats_accumulator,
 )
+from nemo_rl.algorithms.single_controller_utils.utils import tensor_field
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.schema import (
