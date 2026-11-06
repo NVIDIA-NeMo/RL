@@ -19,6 +19,7 @@ its output tensors for ``generate_async``.
 """
 
 import logging
+import math
 from dataclasses import dataclass
 from typing import Any, Optional, cast
 
@@ -176,7 +177,9 @@ def rollout_result_to_wire(result: RolloutResult) -> dict[str, Any]:
     """JSON-safe form of ``result``, for engines that answer over HTTP."""
     return {
         "token_ids": result.token_ids,
-        "logprobs": result.logprobs,
+        # Strict JSON has no NaN or infinity, and Dynamo's frontend turns them
+        # into null; send them as the strings float() reads back.
+        "logprobs": [lp if math.isfinite(lp) else str(lp) for lp in result.logprobs],
         "truncated": result.truncated,
         "routed_experts": (
             None
@@ -194,7 +197,7 @@ def rollout_result_from_wire(wire: dict[str, Any]) -> RolloutResult:
         routed_experts = decode_routed_experts(routed_experts, dtype=None)
     return RolloutResult(
         token_ids=list(wire["token_ids"]),
-        logprobs=list(wire["logprobs"]),
+        logprobs=[float(lp) for lp in wire["logprobs"]],
         truncated=bool(wire["truncated"]),
         routed_experts=routed_experts,
         r3_stats=wire["r3_stats"],

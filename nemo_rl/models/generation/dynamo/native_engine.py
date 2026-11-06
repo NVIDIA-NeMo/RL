@@ -61,6 +61,15 @@ if TYPE_CHECKING:
 
 LOGGER = logging.getLogger(__name__)
 
+# vLLM's main-attention kinds, as Dynamo's own vLLM backend counts them
+# (dynamo/vllm/cache_info.py MAIN_ATTENTION_KV_CACHE_KINDS, which NeMo RL may
+# not import); test_main_attention_kinds_match_dynamos checks the copy.
+_MAIN_ATTENTION_KINDS = (
+    KVCacheSpecKind.FULL_ATTENTION,
+    KVCacheSpecKind.MLA_ATTENTION,
+    KVCacheSpecKind.SINK_FULL_ATTENTION,
+)
+
 
 def dynamo_kv_events_config(
     cfg: DynamoCfg, *, prefix_caching: bool
@@ -158,12 +167,7 @@ class NativeVllmEngine(LLMEngine):
         for group in await self._llm.engine_core.call_utility_async(
             "get_kv_cache_group_metadata"
         ):
-            # vLLM's main-attention kinds, as Dynamo's own vLLM backend counts them.
-            if group.get("kind") in (
-                KVCacheSpecKind.FULL_ATTENTION,
-                KVCacheSpecKind.MLA_ATTENTION,
-                KVCacheSpecKind.SINK_FULL_ATTENTION,
-            ):
+            if group.get("kind") in _MAIN_ATTENTION_KINDS:
                 block_size = group["block_size"]
                 break
         model = self._host.model_name
@@ -201,14 +205,19 @@ class NativeVllmEngine(LLMEngine):
         the driver assembles the same output ``generate_async`` returns.
         """
         prompt_token_ids = list(request["token_ids"])
-        result, final_output = await self._host._serve_rollout(
-            TokensPrompt(prompt_token_ids=prompt_token_ids),
-            prompt_token_ids=prompt_token_ids,
-            greedy=rollout["greedy"],
-            stop_strings=rollout["stop_strings"],
-            request_id=context.id(),
-            device=torch.device("cpu"),
-        )
+        try:
+            result, final_output = await self._host._serve_rollout(
+                TokensPrompt(prompt_token_ids=prompt_token_ids),
+                prompt_token_ids=prompt_token_ids,
+                greedy=rollout["greedy"],
+                stop_strings=rollout["stop_strings"],
+                request_id=context.id(),
+                device=torch.device("cpu"),
+            )
+        except RuntimeError as error:
+            # A 5xx reaches the driver as "Internal server error" and is re-sent;
+            # a 4xx keeps the cause, and the rollout retry policy still applies.
+            raise InvalidArgument(f"{type(error).__name__}: {error}") from error
         chunk: GenerateChunk = {
             "token_ids": result.token_ids,
             "index": 0,
@@ -261,11 +270,15 @@ def _usage(output: Any, num_output_tokens: int) -> dict[str, Any]:
 def start_dynamo_endpoint(
     host: "VllmAsyncGenerationWorkerImpl",
     *,
+    model_path: str,
     namespace: str,
     engine_env: dict[str, str],
     leader_worker_idx: int,
 ) -> asyncio.Task:
     """Register ``host``'s engine with Dynamo and serve it on the running loop.
+
+    ``model_path`` is a local directory with the model's config and tokenizer
+    files; the engine is served under ``host.model_name``.
 
     The Rust Worker serves until the process gets SIGTERM. It installs a chained
     handler, so Ray's actor handler still runs and the actor exits as usual;
@@ -281,7 +294,7 @@ def start_dynamo_endpoint(
         namespace=namespace,
         component=DYNAMO_COMPONENT,
         endpoint=DYNAMO_ENDPOINT,
-        model_name=host.model_name,
+        model_name=model_path,
         served_model_name=host.model_name,
         # NeMo RL's rollouts go to /v1/completions only.
         endpoint_types="completions",

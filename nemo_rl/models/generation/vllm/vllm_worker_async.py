@@ -16,6 +16,7 @@ import asyncio
 import copy
 import gc
 import logging
+import os
 import secrets
 import threading
 import time
@@ -659,12 +660,23 @@ class VllmAsyncGenerationWorkerImpl(
         ``leader_worker_idx`` is this worker's index in its group; rollouts the
         engine serves report it, as ``generate_async`` results do.
         """
+        # ai-dynamo is optional: import it only for engines served through Dynamo.
+        from dynamo._core import fetch_model
+
         from nemo_rl.models.generation.dynamo.native_engine import (
             start_dynamo_endpoint,
         )
 
+        # Dynamo fetches a Hub ID's whole checkpoint before it registers; the engine's
+        # weights come from refit, so register the config and tokenizer files only.
+        model_path = (
+            self.model_name
+            if os.path.exists(self.model_name)
+            else await fetch_model(self.model_name, ignore_weights=True)
+        )
         self._dynamo_endpoint_task = start_dynamo_endpoint(
             self,
+            model_path=model_path,
             namespace=namespace,
             engine_env=engine_env,
             leader_worker_idx=leader_worker_idx,
