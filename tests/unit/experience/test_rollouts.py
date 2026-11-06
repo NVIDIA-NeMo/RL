@@ -3125,7 +3125,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
         dispatch_recorder=None,
         admission_closed_rows=None,
         recovery_granularity=None,
-        group_deadline=None,
+        agent_budget=None,
     ):
         del (
             total_rows,
@@ -3134,7 +3134,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
             dispatch_recorder,
             admission_closed_rows,
             recovery_granularity,
-            group_deadline,
+            agent_budget,
         )
         selected.append(environment)
         for row in pending:

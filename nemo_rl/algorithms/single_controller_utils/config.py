@@ -1867,6 +1867,19 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 f"token_capture.control_timeout_s ({gym_park_s}); a turn snapshot "
                 "can hold rollout dispatch that long."
             )
+        agent_margin_s = async_config.rollout_failure.nemo_gym.agent_timeout_margin_s
+        if agent_margin_s is not None:
+            warnings.warn(
+                "async_rl.rollout_failure.nemo_gym.agent_timeout_margin_s with "
+                "turn-level rollout recovery: each Gym checkpoint pauses "
+                "rollout_timeout_s, but a harness that reads agent_timeout_sec is "
+                "restart-only and keeps its wall-clock budget running while the "
+                f"policy server holds its model calls, for up to {gym_park_s}s per "
+                "checkpoint. Such a harness stops that much earlier than it could; "
+                "it is still scored inside the deadline. "
+                "<agent>/agent_timeout/parked_s/max reports the time lost.",
+                stacklevel=2,
+            )
     if token_capture_config.defer_routed_experts_to_policy and not (
         token_capture_config.enabled
     ):

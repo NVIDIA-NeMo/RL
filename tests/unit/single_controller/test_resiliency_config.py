@@ -679,3 +679,21 @@ class TestTheAgentTimeoutMarginIsCarvedFromTheRolloutDeadline:
                 }
             )
         )
+
+    def test_turn_level_recovery_warns_that_checkpoints_shorten_the_budget(self):
+        """Gym holds a restart-only harness's model calls while its budget runs."""
+        from nemo_rl.experience.rollout_recovery import RecoveryTargetLevel
+
+        cfg = _master_config(
+            rollout_failure={
+                "nemo_gym": {"rollout_timeout_s": 300.0, "agent_timeout_margin_s": 60.0}
+            },
+            stall_watchdog={"stall_timeout_s": 900.0},
+        )
+        cfg.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+        with pytest.warns(UserWarning, match="restart-only"):
+            validate_single_controller_config(cfg)
+        cfg.async_rl.rollout_failure.nemo_gym.agent_timeout_margin_s = None
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            validate_single_controller_config(cfg)

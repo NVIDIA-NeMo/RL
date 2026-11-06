@@ -258,6 +258,134 @@ def _hand_agent_timeout(
     return handed
 
 
+# Gym's failure_kinds.AGENT_TIMEOUT: the verify response's own account of a harness
+# that ran out of time, a policy failure rather than an infrastructure one.
+_NEMO_GYM_AGENT_TIMEOUT_FAILURE_KIND = "agent_timeout"
+
+
+@dataclass(frozen=True)
+class _HandedBudget:
+    agent: str
+    budget_s: float
+    dispatched_at: float
+    deadline_left_s: float
+
+
+@dataclass(frozen=True)
+class _LandedRow:
+    budget_s: float
+    elapsed_s: float
+    parked_s: float
+    failure_kind: Optional[str]
+
+
+class _AgentBudget:
+    """Hands each Gym dispatch its harness budget and records how its rows used it.
+
+    A row that lands after its budget was most likely stopped by it and scored on the
+    work it kept; the time it took past the budget is what ``agent_timeout_margin_s``
+    has to cover. Parked time is wall-clock time that the group deadline did not
+    count, such as a Gym checkpoint: the harness's own budget kept running through it.
+    A row still out when the group deadline fires was handed a budget it did not
+    stop at, so its agent is reported once.
+    """
+
+    def __init__(
+        self, deadline: _Deadline, margin_s: float, stats: Optional[RolloutStats]
+    ) -> None:
+        self._deadline = deadline
+        self._margin_s = margin_s
+        self._stats = stats
+        self._outstanding: dict[int, _HandedBudget] = {}
+        self._landed: list[_LandedRow] = []
+
+    def hand(self, rows: list[dict]) -> list[dict]:
+        """Return copies of ``rows`` carrying what is left of the group's budget."""
+        deadline_left_s = self._deadline.remaining()
+        handed = _hand_agent_timeout(
+            rows, remaining_s=deadline_left_s, margin_s=self._margin_s
+        )
+        assert deadline_left_s is not None
+        now = asyncio.get_running_loop().time()
+        for row in handed:
+            self._outstanding[row["_rowidx"]] = _HandedBudget(
+                agent=_nemo_gym_metric_namespace(row),
+                budget_s=float(
+                    row["responses_create_params"]["metadata"][
+                        _NEMO_GYM_AGENT_TIMEOUT_KEY
+                    ]
+                ),
+                dispatched_at=now,
+                deadline_left_s=deadline_left_s,
+            )
+        return handed
+
+    def landed(self, rowidx: int, full_result: Mapping[str, Any]) -> None:
+        handed = self._outstanding.pop(rowidx, None)
+        if handed is None:
+            return
+        elapsed_s = asyncio.get_running_loop().time() - handed.dispatched_at
+        counted_s = handed.deadline_left_s - (self._deadline.remaining() or 0.0)
+        failure_kind = full_result.get("failure_kind")
+        self._landed.append(
+            _LandedRow(
+                budget_s=handed.budget_s,
+                elapsed_s=elapsed_s,
+                parked_s=max(0.0, elapsed_s - counted_s),
+                failure_kind=failure_kind if isinstance(failure_kind, str) else None,
+            )
+        )
+
+    def released(self, rowidx: int) -> None:
+        """Forget a row that ended without a result, such as a failed or refused one."""
+        self._outstanding.pop(rowidx, None)
+
+    def metrics(self, namespace: str) -> dict[str, float]:
+        landed = self._landed
+        past_budget = [row for row in landed if row.elapsed_s > row.budget_s]
+        reported = [
+            row
+            for row in landed
+            if row.failure_kind == _NEMO_GYM_AGENT_TIMEOUT_FAILURE_KIND
+        ]
+        prefix = f"{namespace}/agent_timeout"
+        return {
+            f"{prefix}/past_budget_rate": len(past_budget) / max(1, len(landed)),
+            f"{prefix}/reported_rate": len(reported) / max(1, len(landed)),
+            f"{prefix}/post_budget_s/max": max(
+                (row.elapsed_s - row.budget_s for row in past_budget), default=0.0
+            ),
+            f"{prefix}/parked_s/max": max(
+                (row.parked_s for row in landed), default=0.0
+            ),
+        }
+
+    async def __aenter__(self) -> "_AgentBudget":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        if exc_type is None or not self._deadline.expired():
+            return
+        by_agent: dict[str, int] = {}
+        for handed in self._outstanding.values():
+            by_agent[handed.agent] = by_agent.get(handed.agent, 0) + 1
+        for agent, rows in sorted(by_agent.items()):
+            first = self._stats is None or self._stats.record_agent_timeout_backstop(
+                agent, rows
+            )
+            if first:
+                print(
+                    f"  warn: NeMo-Gym agent '{agent}' had {rows} row(s) still "
+                    "running when rollout_timeout_s fired, although each was handed "
+                    "metadata.agent_timeout_sec. Its harness ignores agent_timeout_sec, "
+                    "or verifying takes longer than agent_timeout_margin_s="
+                    f"{self._margin_s}; such groups are retried or dropped. Counted "
+                    f"in rollout/agent_timeout_backstop_rows_total/{agent}; this "
+                    "warning is printed once per agent.",
+                    flush=True,
+                )
+
+
 def _nemo_gym_metric_namespace(row: Mapping[str, Any]) -> str:
     """Return the best available namespace for NeMo-Gym rollout metrics."""
     attribution_key = get_nemo_gym_attribution_key(row)
@@ -384,6 +512,9 @@ class RolloutStats:
     # Rows Gym refused because a checkpoint had admission closed. Re-sent without
     # spending any retry budget, so they are counted apart from every family above.
     gym_admission_closed_rows: int = 0
+    # Rows handed agent_timeout_sec that were still running when rollout_timeout_s
+    # fired: their harness ignores the budget, or verification outlasts the margin.
+    agent_timeout_backstop_rows_by_agent: dict[str, int] = field(default_factory=dict)
 
     def record_redispatch(self, reason: str) -> None:
         self.redispatches_by_reason[reason] = (
@@ -414,6 +545,14 @@ class RolloutStats:
     def record_gym_admission_closed(self, rows: int = 1) -> None:
         self.gym_admission_closed_rows += rows
 
+    def record_agent_timeout_backstop(self, agent: str, rows: int) -> bool:
+        """Count rows that outlived their handed budget; True the first time per agent."""
+        first = agent not in self.agent_timeout_backstop_rows_by_agent
+        self.agent_timeout_backstop_rows_by_agent[agent] = (
+            self.agent_timeout_backstop_rows_by_agent.get(agent, 0) + rows
+        )
+        return first
+
     def as_metrics(self) -> dict[str, float]:
         """Flatten into a metric dict for the SingleController logger."""
         # Every family gets an aggregate, not just per-exception series: alerting on
@@ -440,7 +579,12 @@ class RolloutStats:
             "rollout/max_consecutive_infra_drops": float(
                 self.max_consecutive_infra_drops
             ),
+            "rollout/agent_timeout_backstop_rows_total": float(
+                sum(self.agent_timeout_backstop_rows_by_agent.values())
+            ),
         }
+        for agent, rows in self.agent_timeout_backstop_rows_by_agent.items():
+            metrics[f"rollout/agent_timeout_backstop_rows_total/{agent}"] = float(rows)
         for reason, count in self.redispatches_by_reason.items():
             metrics[f"rollout/redispatch_total/{reason}"] = float(count)
         for reason, count in self.data_retries_by_reason.items():
@@ -628,6 +772,10 @@ class _Deadline:
             raise RolloutTimeout(
                 f"{self._description} exceeded {self._seconds}s"
             ) from timeout_error
+
+    def expired(self) -> bool:
+        """Whether the deadline fired, including while it is still unwinding."""
+        return self._timeout is not None and self._timeout.expired()
 
     def remaining(self) -> Optional[float]:
         """Seconds of budget left, banked or live; ``None`` when disabled."""
@@ -1409,7 +1557,7 @@ class AsyncNemoGymRolloutImpl:
         dispatch_recorder: Optional[RolloutDispatchRecorder] = None,
         admission_closed_rows: Optional[set[int]] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
-        group_deadline: Optional[_Deadline] = None,
+        agent_budget: Optional[_AgentBudget] = None,
     ) -> Optional[dict[str, Any]]:
         """Dispatch ``pending`` rows and fill their slots in ``results`` as they land.
 
@@ -1431,8 +1579,8 @@ class AsyncNemoGymRolloutImpl:
                 ``dispatch_recorder``.
             recovery_granularity: Whether a failed row is re-sent on its own or
                 its whole prompt group is replaced.
-            group_deadline: The prompt group's deadline; with an agent margin
-                configured, each dispatch hands its harness what is left of it.
+            agent_budget: With an agent margin configured, hands each dispatch
+                what is left of the prompt group's deadline.
 
         Returns:
             The environment's timing metrics, or None if the stream ended without them.
@@ -1462,15 +1610,6 @@ class AsyncNemoGymRolloutImpl:
                         _MAX_PARKED_REDISPATCH_BACKOFF_S,
                     )
                 )
-            if self._timeouts.agent_margin_s is not None:
-                # Stamped per dispatch: a re-sent row gets only what is left.
-                pending_rows = _hand_agent_timeout(
-                    pending_rows,
-                    remaining_s=None
-                    if group_deadline is None
-                    else group_deadline.remaining(),
-                    margin_s=self._timeouts.agent_margin_s,
-                )
             dispatched = {row["_rowidx"] for row in pending_rows}
             inputs_by_rowidx = {row["_rowidx"]: row for row in pending_rows}
             received: set[int] = set()
@@ -1489,10 +1628,16 @@ class AsyncNemoGymRolloutImpl:
             async with (
                 gate.mutation("gym_dispatch") if gate is not None else nullcontext()
             ):
+                # Handed once admitted: waiting at a closed gate costs the harness nothing.
+                sent_rows = (
+                    pending_rows
+                    if agent_budget is None
+                    else agent_budget.hand(pending_rows)
+                )
                 if dispatch_recorder is None:
                     result_refs = dispatch_with_trace_context(
                         remote_method,
-                        pending_rows,
+                        sent_rows,
                         timer_prefix,
                         per_prompt=in_per_prompt_scope(),
                     )
@@ -1505,7 +1650,7 @@ class AsyncNemoGymRolloutImpl:
                     ) as mark_dispatched:
                         result_refs = dispatch_with_trace_context(
                             remote_method,
-                            pending_rows,
+                            sent_rows,
                             timer_prefix,
                             per_prompt=in_per_prompt_scope(),
                         )
@@ -1525,6 +1670,8 @@ class AsyncNemoGymRolloutImpl:
                     if dispatch_recorder is None:
                         raise item
                     received.add(rowidx)
+                    if agent_budget is not None:
+                        agent_budget.released(rowidx)
                     # Unwound before the next row is read, so a checkpoint draining
                     # right now stops waiting on an episode Gym never admitted.
                     await dispatch_recorder.refused(rowidx)
@@ -1547,6 +1694,8 @@ class AsyncNemoGymRolloutImpl:
                             f"outstanding row of this attempt ({sorted(dispatched)})"
                         )
                     received.add(rowidx)
+                    if agent_budget is not None:
+                        agent_budget.released(rowidx)
                     if (
                         classify_rollout_failure(item.error) is not FailureClass.INFRA
                         or recovery_granularity is RecoveryGranularity.PROMPT_GROUP
@@ -1622,6 +1771,8 @@ class AsyncNemoGymRolloutImpl:
                         [result], [inputs_by_rowidx[rowidx]], self._effort_config
                     )
                 results[rowidx] = result
+                if agent_budget is not None:
+                    agent_budget.landed(rowidx, result.get("full_result") or {})
                 if on_completion is not None:
                     # Use the same conversion path as completed groups so streamed
                     # recovery records inherit the current mask and reward semantics.
@@ -1767,11 +1918,14 @@ class AsyncNemoGymRolloutImpl:
                 or recovery_granularity is RecoveryGranularity.PROMPT_GROUP
                 else self._max_gym_row_attempts
             )
-            async with _Deadline(
-                self._timeouts.rollout_s,
-                "NeMo-Gym prompt group",
-                registry=self._deadline_registry,
-            ) as group_deadline:
+            async with (
+                _Deadline(
+                    self._timeouts.rollout_s,
+                    "NeMo-Gym prompt group",
+                    registry=self._deadline_registry,
+                ) as group_deadline,
+                self._agent_budget(group_deadline) as agent_budget,
+            ):
                 # Rows Gym refuses at checkpoint admission are re-sent inside
                 # _stream_rows; only a lost or failed row spends an attempt.
                 attempt = 1
@@ -1803,7 +1957,7 @@ class AsyncNemoGymRolloutImpl:
                             dispatch_recorder=dispatch_recorder,
                             admission_closed_rows=admission_closed_rows,
                             recovery_granularity=recovery_granularity,
-                            group_deadline=group_deadline,
+                            agent_budget=agent_budget,
                         )
                     except Exception as error:
                         last_error = error
@@ -1911,6 +2065,10 @@ class AsyncNemoGymRolloutImpl:
                 )
             )
 
+        if agent_budget is not None:
+            rollout_metrics.update(
+                agent_budget.metrics(_nemo_gym_metric_namespace(inputs[0]))
+            )
         rollout_metrics.update(env_timing_metrics)
         for handle in shard_set.all_handles:
             label = shard_set.instance_label(handle)
@@ -1918,6 +2076,14 @@ class AsyncNemoGymRolloutImpl:
         rollout_metrics[f"{timer_prefix}/routing/group_share/{instance_label}"] = 1
 
         return completions, prompt_message_log, rollout_metrics
+
+    def _agent_budget(
+        self, deadline: _Deadline
+    ) -> AbstractAsyncContextManager[Optional[_AgentBudget]]:
+        margin_s = self._timeouts.agent_margin_s
+        if margin_s is None:
+            return nullcontext(None)
+        return _AgentBudget(deadline, margin_s, self._stats)
 
     def select_checkpoint_instance(self, input_sample: DatumSpec) -> str:
         """Choose and return the durable Gym actor identity for one prompt group."""
