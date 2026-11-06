@@ -1917,7 +1917,10 @@ def test_native_rollout_groups_match_whole_batch(monkeypatch):
     )
 
 
-def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
+@pytest.mark.parametrize("skip_token_capture", [False, True])
+def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(
+    monkeypatch, skip_token_capture
+):
     """Prompt groups are yielded in completion order using async iteration."""
 
     clock = {"now": 0.0}
@@ -2129,6 +2132,7 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
             log_full_result_tables=False,
             deduplicate_multimodal_data=True,
             debug_payload_metrics=True,
+            skip_token_capture=skip_token_capture,
         ):
             results.append(result)
             if len(results) == 1:
@@ -2145,6 +2149,10 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     assert boundary == "nemo_gym_request"
     assert enabled is True
     assert ray_arguments[0] is rows
+    # The rows that reach the actor carry the mark only when the caller skips capture.
+    assert [row.get(NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY) for row in rows] == (
+        [True] * 4 if skip_token_capture else [None] * 4
+    )
     # (rows, timer_prefix, deduplicate_multimodal_data) -- the tokenizer is no longer
     # among the arguments crossing to the actor, which is the point of set_tokenizer.
     assert ray_arguments[2:] == (True,)
@@ -2713,6 +2721,7 @@ def test_run_nemo_gym_rollout_sync_separates_collection_and_identity_groups(
         assert kwargs["log_full_result_tables"] is False
         assert kwargs["deduplicate_multimodal_data"] is True
         assert kwargs["debug_payload_metrics"] is True
+        assert kwargs["skip_token_capture"] is True
         yield expected
 
     monkeypatch.setattr(rollouts_mod, "run_async_nemo_gym_rollout", fake_stream)
@@ -2727,6 +2736,7 @@ def test_run_nemo_gym_rollout_sync_separates_collection_and_identity_groups(
         num_generations_per_prompt=2,
         deduplicate_multimodal_data=True,
         debug_payload_metrics=True,
+        skip_token_capture=True,
     )
 
     assert actual is expected
@@ -3071,7 +3081,7 @@ def test_prepare_nemo_gym_rows_marks_rows_rl_does_not_train_on():
 
 
 def test_prepare_nemo_gym_rows_clears_a_mark_from_rows_rl_trains_on():
-    # A row reused from validation, or a dataset row carrying the key, is still captured for training.
+    # A row reused from validation, or a dataset row carrying the key, does not skip capture in training.
     rows = [{"responses_create_params": {}, NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY: True}]
 
     rollouts_mod._prepare_nemo_gym_rows(

@@ -2422,7 +2422,7 @@ def _prepare_nemo_gym_rows(
 
     ``skip_token_capture=True`` marks rows RL does not train on, such as
     validation rows, so Gym captures none of their model calls. Otherwise any
-    earlier mark is removed: a row RL trains on is always captured.
+    earlier mark is removed: a row RL trains on never skips capture.
     """
     if num_generations <= 0 or len(rows) % num_generations != 0:
         raise ValueError("NeMo-Gym rows must contain complete prompt groups")

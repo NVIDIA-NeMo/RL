@@ -8128,6 +8128,11 @@ class TestValidateFunction:
 
         scored_sizes = [c.args[0] for c in policy.prepare_val_partition.call_args_list]
         assert scored_sizes == expected_sizes
+        # Validation rows skip token capture.
+        assert all(
+            c.kwargs["skip_token_capture"] is True
+            for c in rollout_actor.rollout_to_tq.remote.call_args_list
+        )
         # avg_length weighs each wave's mean by its rollout count.
         expected_avg_length = sum(
             10.0 * (i + 1) * n for i, n in enumerate(expected_sizes)
