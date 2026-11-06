@@ -1271,7 +1271,7 @@ class AsyncNemoGymRolloutImpl:
         # this is NOT the prompt's dataloader position. Do not mutate the source
         # sample. Row-level redispatch reuses these rows and keeps the same ID.
         template_row[NEMO_GYM_TASK_INDEX_KEY] = task_index
-        # This path trains on every rollout it collects, so each one is captured.
+        # This path trains on every rollout it collects, so none skips capture.
         template_row.pop(NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY, None)
 
         # Gym applies these to the agent's model calls. A row-level max_seq_len limit
