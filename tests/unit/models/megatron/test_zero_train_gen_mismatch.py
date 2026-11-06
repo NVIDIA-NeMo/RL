@@ -748,6 +748,9 @@ def test_mamba_deterministic_turns_on_mcore_deterministic_tuning(
 
 def test_mcore_without_tuning_relies_on_mamba_deterministic(monkeypatch):
     monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
+    core = types.ModuleType("megatron.core")
+    core.__path__ = []  # type: ignore[attr-defined]
+    _install_fake_module(monkeypatch, "megatron.core", core)
     monkeypatch.setitem(sys.modules, "megatron.core.tuning", None)
 
     zgm._enable_mcore_deterministic_tuning()
