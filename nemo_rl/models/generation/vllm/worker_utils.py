@@ -21,6 +21,7 @@ TOKENIZER_REQUIRED_ARCHITECTURES = frozenset(
         "Gemma4UnifiedForConditionalGeneration",
         "Mistral3ForConditionalGeneration",
         "NemotronH_Omni_Reasoning_V3",
+        "Qwen2_5_VLForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
     }
