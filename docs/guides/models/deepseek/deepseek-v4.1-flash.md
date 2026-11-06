@@ -78,6 +78,8 @@ dataset download access. Configure W&B externally, or disable it at launch.
 | Model | Algorithm | Deployment | Recipe |
 | --- | --- | --- | --- |
 | DeepSeek V4.1 Flash | DAPO | Colocated AutoModel + vLLM | [Streaming CPU Adam recipe](../../../../examples/configs/recipes/llm/dapo-deepseek-v4.1-12n4g-fsdp2tp1-ep48-colocated-stream-adam.yaml) |
+| DeepSeek V4.1 Flash | DAPO | Colocated AutoModel + vLLM, 8 × 8 H100 | [H100 CPU-AdamW recipe](../../../../examples/configs/recipes/llm/dapo-deepseek-v4.1-8n8g-fsdp2tp1-ep64-colocated-cpu-adamw.yaml) |
+| DeepSeek V4.1 Flash | DAPO | Colocated AutoModel + vLLM, 16 × 8 H100 | [H100 16-node recipe](../../../../examples/configs/recipes/llm/dapo-deepseek-v4.1-16n8g-fsdp2tp1-ep128-colocated-cpu-adamw.yaml) |
 
 Provision resources matching the YAML. Training and generation share devices;
 review both parallel layouts before changing resource counts.
@@ -129,6 +131,51 @@ settings. The launcher does not allocate nodes or start the cluster for you.
   optimizer state, but not the external frozen Engram table. Restore requires
   the same table source and compatible optimizer shard layout.
 
+## H100
+
+The reference recipe is sized for 4-GPU nodes with ≈ 186 GB per GPU (12 × 4, EP48,
+vLLM TP8/EP8, `BF16CPUAdamW`). On 8 × H100-80GB nodes with 2 TB of host memory the
+same algorithm settings run with four layout changes, provided by
+`dapo-deepseek-v4.1-8n8g-fsdp2tp1-ep64-colocated-cpu-adamw.yaml` (and a 16-node
+variant, EP128, `train_global_batch_size: 256`):
+
+| Setting | 12 × 4 recipe | H100 recipes | Why |
+| --- | --- | --- | --- |
+| vLLM `expert_parallel_size` | 8 (= TP, no data parallel) | 64 / 128 (vLLM DP8 / DP16 × TP8, one instance) | BF16 experts need ≥ 1 TiB of HBM per instance; vLLM's V4.1 `o_proj` caps TP at `o_groups = 8`, so the experts must be spread over data-parallel ranks |
+| vLLM `async_scheduling` | vLLM default (on) | `false` | with EP > TP the engines share the expert all-to-all; async scheduling deadlocks the group when the first engine finishes its prompts (vllm-project/vllm#43547) |
+| `backend.dispatcher` | `torch` | `hybridep` | the `torch` dispatcher's all-gather/all-reduce buffer grows with the EP size (≈ 13 GiB at EP64, 44 GiB at EP128 per micro-batch) |
+| `policy.optimizer` | `BF16CPUAdamW` | `torch.optim.AdamW` | the streaming path keeps the reduced FP32 gradient shards on the GPU until the step (34.5 GB per rank at EP64); plain AdamW on the CPU-offloaded parameters reduces to host memory — ≈ 35 GB more host memory per rank, FP32 moments, 6.6 TB checkpoints |
+
+Also changed: `gpu_memory_utilization` 0.70 (8 nodes) / 0.65 (16 nodes) — the KV
+budget is large (≈ 1.8 M tokens) and the policy side's resident HybridEP/NCCL
+buffers must fit next to vLLM across sleep/wake; `max_num_seqs: 24` so each engine
+serves its prompts in one wave; `save_period: 10` with `metric_name: null`
+(recency-based retention of one 6.6 TB checkpoint).
+
+Measured on 8 × 8 H100 (recipe as above, GBS 192): 491–830 s per step
+(generation 250–350 s, training 120–320 s, log-probs 70–150 s), generation-KL
+error 0.0005, host memory ≈ 1.2 TB per node steady and 1.5 TB peak,
+checkpoint save 121–175 s, validation 444–532 s. Over 50 steps the AIME-2024
+validation accuracy went 0.4375 → 0.4542 → 0.5458 → 0.6000 → 0.6333 (steps 10–50),
+the same trajectory as the 12 × 4 reference curve above. 16 × 8: 646–814 s per step
+at GBS 256.
+
+Notes for H100 clusters:
+
+- DeepEP (`dispatcher: deepep`) times out in the first multi-node dispatch on the
+  pinned DeepEP commit with NVSHMEM 3.7.2 (#4027); use HybridEP.
+- HybridEP sizes its buffer from the first micro-batch and reallocates for larger
+  ones; multi-node reallocation re-creates the DOCA queue pairs and is slow. Keep the
+  micro-batch token cap (`train_mb_tokens` / `logprob_mb_tokens`) fixed; a
+  configurable pre-size is proposed in NVIDIA-NeMo/Automodel.
+- First-use JIT compilation (HybridEP, TileLang) on cold nodes can hold ranks apart
+  for several minutes; if the default 10-minute NCCL timeout is hit during the first
+  step, raise the process-group timeout.
+- vLLM CUDA graphs without Inductor (`vllm_cfg.enforce_eager: false`,
+  `vllm_kwargs.compilation_config.backend: eager`) cut generation to 112–116 s per
+  step and the step to 419–579 s with unchanged generation-KL error; the recipes keep
+  `enforce_eager: true` for comparability with the reference curve.
+
 ## Reference Training Curves
 
 The following panels show raw, unsmoothed W&B metrics through training step 47
@@ -160,3 +207,7 @@ Validation markers show the recorded evaluation points only.
   throughput claim is made for this configuration.
 - Optimizer restore checks dtype, shape and distributed layout. The optimizer's
   loader does not itself provide resharding across different layouts.
+- The H100 recipes were validated for 50 steps (8 × 8) and 5 steps (16 × 8) on one
+  InfiniBand cluster; they use `torch.optim.AdamW` with FP32 moments, so their
+  optimizer rounding differs from the `BF16CPUAdamW` reference and their checkpoints
+  are 6.6 TB instead of 4.1 TB.
