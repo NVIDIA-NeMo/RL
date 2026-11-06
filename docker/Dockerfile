@@ -159,8 +159,8 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
 # Install uv and python outside /root so an unprivileged runtime UID (for example
 # 65532) can execute them: /root is not traversable by other users, and the project
 # venv's python is a symlink into uv's managed-Python directory.
-ARG UV_VERSION=0.11.28
-ARG PYTHON_VERSION=3.13.14
+ARG UV_VERSION=0.13.7
+ARG PYTHON_VERSION=3.13.18
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 # One uv cache for the build and for every runtime identity. It holds every wheel the venvs are
 # hardlinked from, so `uv run --extra <backend>` can install an extra offline. It lives outside
