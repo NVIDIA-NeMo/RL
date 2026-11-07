@@ -77,6 +77,8 @@ policy:
       CUDA_DEVICE_MAX_CONNECTIONS: '1'
     model_overrides:
       dsa_indexer_rope_interleaved: true
+      dsa_indexer_rope_fp32: true
+      dsa_indexer_scoring_precision: fp8
       dsa_indexer_rotate_activation: false
       dsa_indexer_k_norm_epsilon: 1.0e-06
       dsa_kernel_backend: cudnn
