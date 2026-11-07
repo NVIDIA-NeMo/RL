@@ -99,9 +99,16 @@ policy: &POLICY_BASE
         checkpoint:
           async_save: false
           ckpt_assume_constant_structure: false
+          parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
         force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
         empty_unused_memory_level: 0
+        # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+        # together every manual_gc_interval optimizer steps (a positive integer).
+        manual_gc: false
+        manual_gc_interval: 10
         activation_checkpointing: false
+        # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+        clear_memory_caches_before_refit: false
         # Training CUDA Graph settings; modules and warmup are inactive with impl "none".
         cuda_graph_impl: "none"
         cuda_graph_modules: []
@@ -148,6 +155,7 @@ policy: &POLICY_BASE
         flash_attention_version: 2
         bias_activation_fusion: True
         defer_fp32_logits: False
+        reuse_logits_storage: false
         fp32_lm_head: false # Emit fp32 logits from Megatron's LM head; must match policy.generation.vllm_cfg.fp32_lm_head.
         moe_per_layer_logging: False
         moe_enable_deepep: false
@@ -236,12 +244,14 @@ policy: &POLICY_BASE
         val_top_k: ${.top_k}
         stop_token_ids: null
         stop_strings: null
+        # LoRA refit representation for vLLM. Use merged only as an explicit opt-in.
+        lora_refit_mode: native
         vllm_cfg:
             async_engine: false
             precision: ${...precision}
             kv_cache_dtype: "auto"
             logprobs_mode: processed_logprobs
-            fp32_lm_head: ${...megatron_cfg.fp32_lm_head} # Compute Nemotron-H logits with an fp32 LM head.
+            fp32_lm_head: ${...megatron_cfg.fp32_lm_head} # Compute vLLM logits with an fp32 LM head.
             # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
             refit_with_reload_api: false
             tensor_parallel_size: 1
@@ -254,6 +264,8 @@ policy: &POLICY_BASE
             num_last_layers_in_bf16: 0
             num_first_layers_in_bf16: 0
             distributed_executor_backend: null
+            flat_logprobs: false # Requires async_engine: true and expose_http_server: true. Store logprobs in vLLM's FlatLogprobs (not for requests asking for prompt logprobs); avoids long GC pauses on the generation actor under large backlogs
+            output_loop_yield_budget_ms: null # Requires async_engine: true. e.g. 20: make vLLM's output loops yield so refit/control calls are not starved under a backlog
         vllm_kwargs: {}
 
         colocated:
@@ -297,6 +309,7 @@ env:
 logger:
     log_dir: "logs/distillation"
     num_val_samples_to_print: 5
+    extra_backends: []  # LoggerInterface subclasses as "pkg.module.Class"
     wandb_enabled: true
     tensorboard_enabled: true
     mlflow_enabled: false

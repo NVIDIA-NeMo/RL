@@ -42,7 +42,7 @@ import weakref
 from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import psutil
 import torch
@@ -53,6 +53,7 @@ import transfer_queue as tq
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.adapters import mooncake_ssd_offload
+from nemo_rl.data_plane.adapters.tq_controller_patch import configure_controller_patch
 from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
 from nemo_rl.data_plane.codec import timed_codec
 from nemo_rl.data_plane.interfaces import (
@@ -61,6 +62,7 @@ from nemo_rl.data_plane.interfaces import (
     KVBatchMeta,
     backend_config,
     data_plane_supports_checkpointing,
+    gdr_enabled,
     storage_unit_placement,
 )
 from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
@@ -830,6 +832,48 @@ def _connect_existing_with_segment_size(segment_size: int) -> None:
     tq_interface._maybe_create_tq_client(conf)
 
 
+def _call_on_cuda_device(
+    device: torch.device, method: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    with torch.cuda.device(device):
+        return method(*args, **kwargs)
+
+
+def _bind_mooncake_cuda_device() -> None:
+    """Keep GDR staging and transfers on this worker's GPU instead of GPU 0.
+
+    CUDA's current device is per thread. TQ runs PUT on an executor thread and
+    GET on its own event-loop thread, and both start on GPU 0, so a worker that
+    sees every GPU on its node would allocate its GDR staging buffer, synchronize
+    and receive GET tensors on GPU 0 rather than on the GPU it set.
+    """
+    storage_client = tq.get_client().storage_manager.storage_client
+    if not hasattr(storage_client, "_gdr_staging"):
+        raise _tq_shape_drift_error(
+            "storage client no longer has a _gdr_staging attribute",
+            "GDR transfers cannot be bound to this worker's GPU",
+            "GDR staging attribute",
+        )
+    if storage_client._gdr_staging is None:
+        return
+    # TQ's client is a process singleton: a later adapter in this process must
+    # not retarget the binding or the staging buffer it may already own.
+    if (
+        isinstance(storage_client.put, functools.partial)
+        and storage_client.put.func is _call_on_cuda_device
+    ):
+        return
+    device = torch.device("cuda", torch.cuda.current_device())
+    for name in ("put", "get"):
+        setattr(
+            storage_client,
+            name,
+            functools.partial(
+                _call_on_cuda_device, device, getattr(storage_client, name)
+            ),
+        )
+
+
 _STORAGE_UNITS_SC_ONLY = (
     "data_plane.mooncake_cpu.storage_unit_segment_size > 0 and "
     "data_plane.simple.storage_unit_placement are only supported by the "
@@ -871,6 +915,35 @@ def _pin_simple_storage_units(node_ids: list[str]) -> None:
 
     simple_storage_bootstrap.get_node_round_robin_scheduling_strategies = (
         pinned_strategies
+    )
+
+
+def _nixl_storage_node_ids(
+    placement: list[Literal["train", "inference"]] | Literal["all"],
+) -> list[str]:
+    """Ray node IDs for a NIXL storage_unit_placement.
+
+    ``all``: every alive GPU node; else the union of the named clusters
+    (``train`` / ``inference``).
+    """
+    from ray.util.placement_group import placement_group_table
+
+    from nemo_rl.data_plane.adapters.tq_nixl import alive_node_ids
+
+    if placement == "all":
+        return alive_node_ids("GPU")
+    prefixes = {
+        "train": ("sc_train_cluster", "sc_policy_cluster"),
+        "inference": ("sc_inference_cluster", "sc_policy_cluster"),
+    }
+    wanted = tuple(p for name in placement for p in prefixes[name])
+    return sorted(
+        {
+            node_id
+            for pg in placement_group_table().values()
+            if pg["name"].startswith(wanted) and pg["state"] == "CREATED"
+            for node_id in pg["bundles_to_node_id"].values()
+        }
     )
 
 
@@ -1014,11 +1087,31 @@ def _init_tq(
                 hard_pin=not mooncake_cfg.ssd_offload.enabled,
                 offload={"enabled": False},
             )
+    elif backend == "nixl":
+        # The NIXL data plane's TransferQueue backend (adapters/tq_nixl.py): CPU NixlStorageUnit actors own
+        # pinned-DRAM slabs, every other process is a client doing one-sided
+        # NIXL RDMA. Importing the plug-in registers "NixlStore" with TQ's
+        # manager / client / bootstrap registries; the bootstrap provider
+        # starts the units and the BlobDirectory inside tq.init.
+        import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
+
+        nixl_cfg = backend_config(cfg)
+        block = nixl_cfg.model_dump()
+        placement = block.pop("storage_unit_placement")
+        if not block.get("node_ids"):
+            block["node_ids"] = _nixl_storage_node_ids(placement)
+            if not block["node_ids"]:
+                raise RuntimeError(f"no nodes for storage_unit_placement={placement!r}")
+        overlay = {
+            **controller_overlay,
+            "backend": {"storage_backend": "NixlStore", "NixlStore": block},
+        }
     else:
         raise ValueError(f"unknown TQ backend: {backend!r}")
 
     conf = OmegaConf.merge(base, overlay)
 
+    configure_controller_patch()
     # pyrefly: ignore  # bad-argument-type
     tq.init(conf=conf)
 
@@ -1183,13 +1276,14 @@ class TQDataPlaneClient(DataPlaneClient):
             # Before the store is set up; a no-op unless this process owns memory.
             mooncake_ssd_offload.install(mooncake_cfg, segment_size)
 
+        if cfg["backend"] == "nixl":
+            # Workers attach with tq.init() and need TQ's registries to know
+            # "NixlStore" before the client's storage manager is built.
+            import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
+
         self._backend = cfg["backend"]
         self._supports_checkpointing = data_plane_supports_checkpointing(cfg)
-        # GDR is a mooncake_cpu-only transport knob, so key it off the backend
-        # directly rather than off any incidental per-backend flag.
-        self._gdr_requested = self._backend == "mooncake_cpu" and bool(
-            backend_config(cfg).use_gdr
-        )
+        self._gdr_requested = gdr_enabled(cfg)
         self._gdr_put_confirmed = False
 
         if bootstrap:
@@ -1204,6 +1298,8 @@ class TQDataPlaneClient(DataPlaneClient):
             _connect_existing()
         else:
             _connect_existing_with_segment_size(segment_size)
+        if self._gdr_requested and torch.cuda.is_initialized():
+            _bind_mooncake_cuda_device()
         # TQ has built this process's store by now; a no-op unless it owns memory.
         mooncake_ssd_offload.require_offloading_store()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]

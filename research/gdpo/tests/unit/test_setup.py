@@ -26,20 +26,20 @@ from gdpo import (
 )
 from pydantic import ValidationError
 
-from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.grpo import AsyncGRPOConfig, GRPOConfig
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig
 
-VALID_LOSS = {
-    "sequence_level_importance_ratios": True,
-    "token_level_loss": False,
-    "use_importance_sampling_correction": False,
-    "reference_policy_kl_penalty": 0.0,
-    "position_aligned_logprobs": True,
-}
+VALID_LOSS = ClippedPGLossConfig(
+    sequence_level_importance_ratios=True,
+    token_level_loss=False,
+    use_importance_sampling_correction=False,
+    reference_policy_kl_penalty=0.0,
+    position_aligned_logprobs=True,
+)
 
 
 def make_loss(**overrides):
-    return ClippedPGLossConfig(**{**VALID_LOSS, **overrides})
+    return VALID_LOSS.model_copy(update=overrides)
 
 
 def validate(policy, loss=None, grpo=None):
@@ -245,7 +245,7 @@ def test_async_grpo_is_rejected_for_dllm():
     """Async rollouts would silently fall back to synchronous ones."""
     policy = make_policy(generation=make_generation())
     with pytest.raises(ValueError, match="async_grpo.enabled is not supported"):
-        validate(policy, grpo=GRPOConfig(async_grpo={"enabled": True}))
+        validate(policy, grpo=GRPOConfig(async_grpo=AsyncGRPOConfig(enabled=True)))
 
 
 def test_sync_grpo_is_accepted_for_dllm():
@@ -278,4 +278,4 @@ def test_invalid_diffusion_config_values_are_rejected(model, field, value):
 
 def test_async_grpo_is_ignored_when_dllm_is_disabled():
     policy = make_policy(dllm=False, generation=make_generation(backend="vllm"))
-    validate(policy, grpo=GRPOConfig(async_grpo={"enabled": True}))
+    validate(policy, grpo=GRPOConfig(async_grpo=AsyncGRPOConfig(enabled=True)))

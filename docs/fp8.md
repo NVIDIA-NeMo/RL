@@ -159,6 +159,23 @@ different packed-weight refit protocol. GB200 tests check quantized-value
 parity with the installed vLLM quantizer. Functional GRPO tests also check
 refit in separate policy and rollout worker environments.
 
+### Native MXFP8 linear backends for vLLM refit
+
+MXFP8 rollout uses the FlashInfer CUTLASS linear kernel by default. To use
+FlashInfer CuTeDSL or TRTLLM instead, set `linear_backend` explicitly:
+
+```yaml
+policy:
+  generation:
+    vllm_kwargs:
+      linear_backend: flashinfer_trtllm # or flashinfer_cutedsl
+```
+
+These native kernels use vLLM's layerwise reload during weight refit. Use
+`refit_transport: null` with collective or IPC refit. NCCL Reshard and other
+explicit refit transports are not supported. Native layerwise refit also does
+not support an FP8 KV cache or a co-trained MTP drafter.
+
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
 ```yaml
@@ -209,9 +226,11 @@ does not enable FP8 compute in the usual training path, so keep
 When both `fp8_cfg` and `te_precision_config_file` are set, matched modules use
 the recipe's per-module quantization config. NeMo RL still derives sequence
 padding and FP8 refit behavior from `fp8_cfg`, so matched FP8 recipes must use
-the same `fp8_quantization_recipe` as `fp8_cfg.fp8_recipe`. Recipe
-`training_recipe` and `evaluation_recipe` fields `fp8_param` and `fp4_param`
-are rejected; use `fp8_cfg.fp8_param` for supported FP8 parameter storage.
+the same `fp8_quantization_recipe` as `fp8_cfg.fp8_recipe`. Per-module
+`fp8_param: true` is supported only with `megatron_cfg.zero_train_gen_mismatch: true`
+and both `fp8_cfg.enabled` and `fp8_cfg.fp8_param` true; otherwise use
+`fp8_cfg.fp8_param`. Per-module `fp4_param: true` remains unsupported.
+Matched BF16 blocks may leave both parameter-storage flags unset.
 
 ## Compatibility Note for DeepSeek-Style FP8 Training
 
