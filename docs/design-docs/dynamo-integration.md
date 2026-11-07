@@ -7,8 +7,8 @@ Dynamo's frontend and KV-aware router. Two requirements shape the design:
 - Dynamo CI coverage must stay consistent with native vLLM's.
 
 Both hold only if the engine process contains no Dynamo-owned vLLM code. A vLLM
-bump can then break Dynamo serving only in NeMo RL's own adapter
-(`native_engine.py`), which calls a few vLLM APIs native NeMo RL does not: the
+bump can then break Dynamo serving only in NeMo RL's own vLLM adapter
+(`vllm_adapter.py`), which calls a few vLLM APIs native NeMo RL does not: the
 `get_kv_cache_group_metadata` engine utility and `KVCacheSpecKind` at
 registration, and `StatLoggerBase` for the router's load signal. A renamed import
 fails the vLLM-lane unit tests at collection, and the Dynamo functional overlays
@@ -22,8 +22,18 @@ also runs `dynamo.common.backend.Worker` as a task on its own actor event loop,
 which is the loop that owns the `AsyncLLM`.
 
 `dynamo.common.backend` is Dynamo's engine-agnostic backend SDK and imports no
-vLLM. The adapter, `nemo_rl/models/generation/dynamo/native_engine.py`,
-implements its `LLMEngine` over the worker's `AsyncLLM`:
+vLLM. NeMo RL implements its `LLMEngine` in two parts:
+
+- `dynamo/engine_adapter.py`: `DynamoEngineAdapter`, the Dynamo side shared by
+  every generation backend. It serves request kinds as handlers keyed by their
+  annotation, maps engine errors to a 400 that keeps the cause, and registers the
+  endpoint for `/v1/completions` only. It imports no backend, and the engine only
+  ever receives token IDs.
+- `dynamo/vllm_adapter.py`: `DynamoVllmAdapter`, the vLLM backend over the
+  worker's `AsyncLLM`. A backend implements `serve_rollout`, `start`, `abort` and
+  `kv_event_sources`.
+
+The two together:
 
 - `generate` serves only the rollouts NeMo RL itself sends, which carry an
   annotation, and refuses other requests. The worker's own `_serve_rollout` runs
