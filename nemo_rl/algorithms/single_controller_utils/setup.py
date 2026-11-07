@@ -25,6 +25,7 @@ import os
 import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -65,6 +66,13 @@ from nemo_rl.algorithms.metric_utils import (
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.rollout_checkpointing.manifest import (
+    BOOTSTRAP_DIRNAME,
+    BootstrapCompatibilityIdentity,
+    bootstrap_compatibility_identity,
+    resolve_latest_snapshot,
+    validate_bootstrap_anchor,
+)
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageStageConfig,
 )
@@ -76,13 +84,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     logprob_passes_required,
     resolve_ppo_chunk_alignment,
     validate_single_controller_config,
-)
-from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
-    BOOTSTRAP_DIRNAME,
-    BootstrapCompatibilityIdentity,
-    bootstrap_compatibility_identity,
-    resolve_latest_snapshot,
-    validate_bootstrap_anchor,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -853,6 +854,13 @@ def _generation_max_seq_len(generation_config) -> int:
     if backend == "megatron":
         return generation_config["mcore_generation_config"]["max_model_len"]
     raise ValueError(f"Unknown generation backend: {backend!r}")
+
+
+# On the overlapped path the trainer build waits up to this long for the dataset. Within it, the trainer is built once
+# for the clamped step count; past it, the trainer starts with the unclamped count and is rebuilt if the clamp changes
+# train_iters. A rebuild costs a full second trainer build, while a fast load costs the trainer only its own duration,
+# so the wait is cheap insurance; a slow load loses at most this much.
+_TRAINER_BUILD_DATASET_WAIT_S = 20.0
 
 
 def _clamp_max_num_steps(
@@ -1657,8 +1665,8 @@ def setup_single_controller(
     # len(dataloader), and the clamp only binds when a run asks for more steps than
     # its data holds. So on that path the trainer is built with the unclamped value,
     # the dataset loads while all three build, and the trainer is rebuilt if the
-    # clamp changed train_iters. Every other path, and every resume, keeps the
-    # original order.
+    # clamp changed train_iters (unless the load beats _TRAINER_BUILD_DATASET_WAIT_S).
+    # Every other path, and every resume, keeps the original order.
     overlap_dataset_load = (
         use_nemo_gym
         and generation_config["backend"] == "vllm"
@@ -1708,6 +1716,18 @@ def setup_single_controller(
             teacher_segment_topology=teacher_segment_topology,
         )
         setup_timing_metrics.teacher_reservation_time_s = time.perf_counter() - t0
+
+    # NIXL units with storage_unit_placement=inference read the inference
+    # placement groups when TQ bootstraps inside the trainer build, which runs
+    # in parallel with the generation build: reserve them first.
+    from nemo_rl.data_plane.interfaces import backend_config
+
+    if (
+        not colocated
+        and dp_config["backend"] == "nixl"
+        and backend_config(dp_config).storage_unit_placement == "inference"
+    ):
+        inference_cluster.get_placement_groups()
 
     # Storage-unit plan, one Ray node ID per unit (None: units off). Made once,
     # after the train/teacher claims above, and used twice: TQ's bootstrap in
@@ -1975,18 +1995,54 @@ def setup_single_controller(
     nemo_gym_shards = None
     try:
         with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
-            submitted = {k: executor.submit(fn) for k, fn in build_tasks.items()}
+            # A Megatron trainer waits for the dataset; see _TRAINER_BUILD_DATASET_WAIT_S.
+            defer_trainer = (
+                overlap_dataset_load
+                and "trainer" in build_tasks
+                and speculative_train_iters is not None
+                and any(iters is not None for iters in speculative_train_iters)
+            )
+            submitted = {
+                k: executor.submit(fn)
+                for k, fn in build_tasks.items()
+                if not (defer_trainer and k == "trainer")
+            }
             if preloaded_training_data is not None:
                 dataset, _val_dataset, env_handles, dataloader = preloaded_training_data
             else:
-                # Generation, Gym and the trainer are building; load the dataset
-                # meanwhile. train_iters is not written here: the trainer build is
-                # reading that config.
+                # Generation and Gym build meanwhile; the load does not write train_iters,
+                # which a trainer already building would be reading.
                 t0 = time.perf_counter()
-                dataset, _val_dataset, env_handles, dataloader = _load_training_data()
+                with ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="training-data-load"
+                ) as load_executor:
+                    load_future = load_executor.submit(_load_training_data)
+                    if defer_trainer:
+                        try:
+                            load_future.result(timeout=_TRAINER_BUILD_DATASET_WAIT_S)
+                        except FuturesTimeoutError:
+                            # Slow load: start the trainer on the unclamped count
+                            # (already in the config) and rebuild it below if needed.
+                            pass
+                        else:
+                            # The clamp is known, so the trainer is built once, for it.
+                            _maybe_inject_megatron_train_iters(master_config)
+                            speculative_train_iters = _megatron_train_iters(
+                                master_config
+                            )
+                            print(
+                                f"  ✓ Dataset ready in {time.perf_counter() - t0:.1f}s; "
+                                f"building the trainer for max_num_steps="
+                                f"{algo_cfg.max_num_steps}",
+                                flush=True,
+                            )
+                        submitted["trainer"] = executor.submit(build_tasks["trainer"])
+                    dataset, _val_dataset, env_handles, dataloader = (
+                        load_future.result()
+                    )
                 print(
                     f"  ✓ Dataset and dataloader ready in {time.perf_counter() - t0:.1f}s "
-                    "(overlapped with generation, NeMo-Gym and trainer spin-up)",
+                    "(overlapped with generation and NeMo-Gym spin-up)",
                     flush=True,
                 )
                 final_train_iters = _megatron_train_iters(master_config)
@@ -2006,7 +2062,7 @@ def setup_single_controller(
                         stale_value.shutdown()
                     stale_trainer.shutdown()
                     _maybe_inject_megatron_train_iters(master_config)
-                    submitted["trainer"] = executor.submit(_build_trainer_and_value)
+                    submitted["trainer"] = executor.submit(build_tasks["trainer"])
             if "generation_trainer" in submitted:
                 generation, trainer, value, time_metrics = submitted[
                     "generation_trainer"
@@ -2206,6 +2262,7 @@ def setup_single_controller(
     loss_fn = ClippedPGLossFn(
         master_config.loss_fn,
         opd_full=opd_module.get_opd_full_config(master_config),
+        seq_logprob_error_threshold=algo_cfg.seq_logprob_error_threshold,
     )
     _restore_adaptive_loss_state(loss_fn, save_state)
     value_loss_fn: Optional[LossFunction] = (

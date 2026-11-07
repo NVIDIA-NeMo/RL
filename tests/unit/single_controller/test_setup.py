@@ -64,6 +64,10 @@ from nemo_rl.algorithms.opd import (
     opd_full_teacher_index_field,
 )
 from nemo_rl.algorithms.ppo import PPOConfig
+from nemo_rl.algorithms.rollout_checkpointing.manifest import (
+    bootstrap_compatibility_identity,
+    ensure_bootstrap_anchor,
+)
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -79,10 +83,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     _validate_opd_full_config,
     forest_execution_row_multiple,
     validate_single_controller_config,
-)
-from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
-    bootstrap_compatibility_identity,
-    ensure_bootstrap_anchor,
 )
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
@@ -1861,15 +1861,8 @@ class TestSetup:
                 {"use_importance_sampling_correction": False},
                 "use_importance_sampling_correction=true",
             ),
-            (
-                {
-                    "use_importance_sampling_correction": True,
-                    "force_on_policy_ratio": True,
-                },
-                "force_on_policy_ratio=false",
-            ),
         ],
-        ids=["no_is_correction", "forced_on_policy_ratio"],
+        ids=["no_is_correction"],
     )
     def test_ready_first_sampler_rejects_incompatible_loss_config(
         self,
@@ -1877,9 +1870,8 @@ class TestSetup:
         match: str,
         patched_factories,
     ):
-        # ready_first is only valid with use_importance_sampling_correction=true
-        # and force_on_policy_ratio=false; anything else is rejected at setup,
-        # before any factory allocates resources.
+        # ready_first requires use_importance_sampling_correction=true; anything
+        # else is rejected at setup, before any factory allocates resources.
         mc = _make_master_config(
             sampler_cfg=ReadyFirstSamplerConfig(max_staleness_versions=1),
             loss_cfg=ClippedPGLossConfig(**loss_overrides),
@@ -1890,6 +1882,18 @@ class TestSetup:
 
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
+
+    def test_ready_first_sampler_accepts_forced_ratio_for_grpo(self):
+        # GRPO takes one optimizer step per RL step, so the ratio is 1 anyway.
+        mc = _make_master_config(
+            sampler_cfg=ReadyFirstSamplerConfig(max_staleness_versions=1),
+            loss_cfg=ClippedPGLossConfig(
+                use_importance_sampling_correction=True,
+                force_on_policy_ratio=True,
+            ),
+        )
+
+        validate_single_controller_config(mc)
 
     def test_returns_actor_args(self, patched_factories):
         mc = _make_master_config()
@@ -2230,7 +2234,12 @@ class TestSetup:
         patched_factories["_build_trainer"].side_effect = _build_trainer
         patched_factories["setup_response_data"].side_effect = _setup_response_data
 
-        with self._gym_patches():
+        # Longer than the load's 30 s wait below: a trainer with no Megatron
+        # train_iters must not wait for the dataset at all.
+        with (
+            self._gym_patches(),
+            patch.object(sc_setup_mod, "_TRAINER_BUILD_DATASET_WAIT_S", 60.0),
+        ):
             actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert actor_args.dataloader is patched_factories["dataloader"]
@@ -2283,26 +2292,37 @@ class TestSetup:
         fake_policy.shutdown.assert_not_called()
         assert mc.policy["megatron_cfg"]["train_iters"] == 2
 
-    def test_gym_vllm_rebuilds_trainer_when_clamp_binds(
+    def test_gym_vllm_rebuilds_trainer_when_a_slow_load_shows_the_clamp_binds(
         self, patched_factories, capsys
     ):
-        """More steps than the data holds: the speculative trainer is replaced."""
+        """The dataset outlasts the trainer's wait and the data holds fewer steps than
+        asked for: the speculative trainer is replaced."""
         mc = self._gym_vllm_config(
             megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
         )
-        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
         train_iters_at_build: list[int] = []
         stale_policy = MagicMock(name="stale_policy")
         final_policy = patched_factories["fake_policy"]
         policies = iter([stale_policy, final_policy])
+        trainer_started = threading.Event()
 
         def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
             train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            trainer_started.set()
             return next(policies), 0.0
 
-        patched_factories["_build_trainer"].side_effect = _build_trainer
+        def _setup_response_data(*args: Any, **kwargs: Any) -> tuple[list[int], None]:
+            # Slow: not done until the speculative trainer has started.
+            assert trainer_started.wait(timeout=30)
+            return list(range(8)), None
 
-        with self._gym_patches():
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+        patched_factories["setup_response_data"].side_effect = _setup_response_data
+
+        with (
+            self._gym_patches(),
+            patch.object(sc_setup_mod, "_TRAINER_BUILD_DATASET_WAIT_S", 0.0),
+        ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
@@ -2312,6 +2332,34 @@ class TestSetup:
         assert mc.grpo.max_num_steps == 8
         assert mc.policy["megatron_cfg"]["train_iters"] == 8
         assert "Rebuilding the trainer" in capsys.readouterr().out
+
+    def test_gym_vllm_builds_trainer_once_when_the_dataset_arrives_in_time(
+        self, patched_factories, capsys
+    ):
+        """More steps than the data holds, but the dataset is ready within the
+        trainer's wait: the trainer is built once, for the clamped count."""
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
+        )
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        train_iters_at_build: list[int] = []
+        fake_policy = patched_factories["fake_policy"]
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            return fake_policy, 0.0
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+
+        with self._gym_patches():
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # patched dataloader has len() == 4 -> 2 * 4 = 8 < 1000.
+        assert train_iters_at_build == [8]
+        fake_policy.shutdown.assert_not_called()
+        assert mc.grpo.max_num_steps == 8
+        assert mc.policy["megatron_cfg"]["train_iters"] == 8
+        assert "Rebuilding the trainer" not in capsys.readouterr().out
 
     def test_gym_vllm_dataset_load_failure_shuts_down_gym(self, patched_factories):
         mc = self._gym_vllm_config()
@@ -2326,6 +2374,28 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+        fake_gym_shards.shutdown.assert_called_once()
+
+    def test_gym_vllm_dataset_load_failure_before_trainer_starts_shuts_down_gym(
+        self, patched_factories
+    ):
+        """The load fails while the Megatron trainer waits for it: the trainer is
+        never built, and Gym is still shut down."""
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
+        )
+        fake_gym_shards = MagicMock(name="nemo_gym_shards")
+        patched_factories["setup_response_data"].side_effect = RuntimeError(
+            "bad data path"
+        )
+
+        with (
+            self._gym_patches(fake_gym_shards),
+            pytest.raises(RuntimeError, match="bad data path"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_trainer"].assert_not_called()
         fake_gym_shards.shutdown.assert_called_once()
 
     def test_gym_vllm_resume_builds_trainer_once_with_clamped_train_iters(
@@ -3577,6 +3647,36 @@ class TestNativeTQRecoverySetup:
             )
 
         policy.load_data_plane_checkpoint.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "field,value,error",
+        [
+            ("replay_manifest_digest", None, "missing replay_manifest_digest"),
+            ("replay_manifest_digest", "", "missing replay_manifest_digest"),
+            ("replay_group_count", None, "invalid replay_group_count"),
+            ("replay_group_count", -1, "invalid replay_group_count"),
+        ],
+    )
+    def test_rejects_tq_checkpoint_without_a_valid_replay_index(
+        self, tmp_path, field, value, error
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        metadata = _native_tq_metadata()
+        if value is None:
+            del metadata[field]
+        else:
+            metadata[field] = value
+
+        with pytest.raises(ValueError, match=error):
+            sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+                load_checkpoint=MagicMock(return_value=metadata),
+                last_checkpoint_path=str(checkpoint_path),
+                save_state=_save_state(),
+                partition_id="rollout_data",
+                sampler_name="in_order",
+            )
 
     def test_checkpoint_without_replay_artifacts_does_not_load_tq(
         self, tmp_path, capsys
