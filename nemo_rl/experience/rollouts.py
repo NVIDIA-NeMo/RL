@@ -1192,8 +1192,10 @@ def run_multi_turn_rollout(
                 # truncate
                 tokenized_obs = tokenized_obs[:tokens_left_for_obs]
                 truncation_mask[i] = True
-                # Record truncation
-                sample_truncated[active_indices[i]] = True
+                # Record truncation. An episode that terminated on its own is not
+                # truncated just because its final observation was cut.
+                if not env_output.terminateds[i]:
+                    sample_truncated[active_indices[i]] = True
 
             tokenized_env_obs_message: dict[str, Any] = {
                 "role": env_output.observations[i]["role"],
@@ -1518,7 +1520,10 @@ async def run_sample_multi_turn_rollout(
                 tokenized_obs = tokenized_obs[:max_env_tokens]
             else:
                 tokenized_obs = torch.empty(0, dtype=tokenized_obs.dtype)
-            truncated = True
+            # An episode that terminated on its own is not truncated just because
+            # its final observation was cut.
+            if not terminated:
+                truncated = True
 
         env_message: dict[str, Any] = {
             "role": env_output.observations[0]["role"],
