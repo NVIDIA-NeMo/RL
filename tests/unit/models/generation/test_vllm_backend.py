@@ -95,6 +95,55 @@ def test_prepare_refit_info_builds_common_speculator_manifest(
 
 
 @pytest.mark.vllm
+def test_prepare_nccl_reshard_refit_info_builds_draft_manifest(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    draft_model = object()
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        get_draft_model=lambda: draft_model,
+        vllm_config=SimpleNamespace(
+            speculative_config=SimpleNamespace(method="dflash")
+        ),
+    )
+    ext.pp_comm_groups = {}
+    ext._uses_unquantized_flashinfer_trtllm = lambda: False
+    ext._validate_native_layerwise_refit = MagicMock()
+    ext.build_hf_to_local_param_map = MagicMock(return_value={})
+    monkeypatch.setattr(
+        vllm_backend,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=0, world_size=1),
+    )
+
+    ext.prepare_nccl_reshard_refit_info(
+        {
+            "layer_names": [],
+            "per_layer_params": {},
+            "misc_meta": {
+                "model.norm.weight": {
+                    "shape": [2],
+                    "dtype": "torch.float32",
+                },
+                "draft.model.weight": {
+                    "shape": [2],
+                    "dtype": "torch.float32",
+                },
+            },
+        }
+    )
+
+    assert ext._draft_runtime_adapter is not None
+    assert ext._draft_runtime_adapter.model is draft_model
+    assert ext._model_update_manifest is not None
+    assert ext._model_update_manifest.draft is not None
+    assert ext._model_update_manifest.draft.ordered_names == ("draft.model.weight",)
+    ext._validate_native_layerwise_refit.assert_called_once_with("nccl_reshard")
+
+
+@pytest.mark.vllm
 def test_prepare_refit_info_rejects_trtllm_moe_draft_before_first_refit(monkeypatch):
     from nemo_rl.models.generation.vllm import vllm_backend
 
@@ -572,6 +621,7 @@ def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
     )
     ext.model_config = object()
     ext.device = object()
+    ext.model_update_group = object()
 
     class _ExplodingInfo:
         def __getitem__(self, key):
@@ -584,6 +634,11 @@ def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
     ext.hf_to_local_param_map = {}
     monkeypatch.setattr(
         "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        vllm_backend,
+        "packed_broadcast_preflight_consumer",
+        lambda _group, _src: None,
     )
 
     # A failure inside the bulk receive must not propagate (nonfatal contract,
@@ -600,6 +655,138 @@ def test_nccl_reshard_refit_failure_is_fail_closed_and_nonfatal(monkeypatch):
     monkeypatch.setattr(ext, "_weight_update_errors_are_fatal", lambda: True)
     with pytest.raises(RuntimeError, match="^bulk receive failed$"):
         ext.nccl_reshard_refit()
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize("deliver_draft", [True, False])
+def test_nccl_reshard_misc_stream_requires_draft_coverage(monkeypatch, deliver_draft):
+    from nemo_rl.models.generation.vllm import vllm_backend
+    from nemo_rl.models.generation.vllm.speculator_runtime import (
+        ModelUpdateManifest,
+        SpeculatorRuntimeError,
+    )
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    misc_meta = {
+        "model.norm.weight": {"shape": [2], "dtype": str(torch.float32)},
+        "draft.fc.weight": {"shape": [2], "dtype": str(torch.float32)},
+    }
+    ext.nccl_reshard_refit_info = {"misc_meta": misc_meta}
+    ext.model_update_group = object()
+    ext._model_update_manifest = ModelUpdateManifest.from_state_dict_info(
+        {
+            "model.layers.0.weight": ((2,), torch.float32),
+            "model.norm.weight": ((2,), torch.float32),
+            "draft.fc.weight": ((2,), torch.float32),
+        },
+        target_owner_ranks=(0,),
+        draft_owner_ranks=(0,),
+    )
+    monkeypatch.setattr(
+        vllm_backend, "get_pp_group", lambda: SimpleNamespace(rank_in_group=0)
+    )
+
+    def load_weights(weights, *, coverage):
+        coverage.record_loaded(tuple(name for name, _ in weights))
+
+    monkeypatch.setattr(ext, "_load_weights", load_weights)
+
+    def consumer(*, iterator, post_unpack_func, **_kwargs):
+        names = [name for name, _ in iterator]
+        if not deliver_draft:
+            names.remove("draft.fc.weight")
+        post_unpack_func([(name, torch.zeros(2)) for name in names])
+
+    monkeypatch.setattr(vllm_backend, "packed_broadcast_consumer", consumer)
+
+    # Bulk target names are absent from this stream, so only misc names count.
+    if deliver_draft:
+        ext._receive_and_load_misc_params()
+    else:
+        with pytest.raises(SpeculatorRuntimeError, match="draft.fc.weight"):
+            ext._receive_and_load_misc_params()
+
+
+@pytest.mark.vllm
+def test_nccl_reshard_refit_watchdog_abort_raises_refit_aborted(monkeypatch):
+    from nemo_rl.distributed import refit_watchdog
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    class _FiredWatchdog:
+        fired = True
+
+        def __init__(self, groups, timeout_s):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=torch.nn.Module(), vllm_config=SimpleNamespace(speculative_config=None)
+    )
+    ext.model_config = object()
+    ext.device = object()
+    ext.nccl_reshard_refit_info = {"layer_names": []}
+    ext.hf_to_local_param_map = {}
+    ext.model_update_group = object()
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(refit_watchdog, "RefitAbortWatchdog", _FiredWatchdog)
+
+    def aborted_preflight(_group, _src):
+        raise RuntimeError("communicator aborted")
+
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_preflight_consumer", aborted_preflight
+    )
+
+    # An abort by the watchdog is fatal even when weight update errors are not.
+    monkeypatch.setattr(ext, "_weight_update_errors_are_fatal", lambda: False)
+    with pytest.raises(refit_watchdog.RefitAborted) as excinfo:
+        ext.nccl_reshard_refit(refit_timeout_s=1.0)
+    assert isinstance(excinfo.value.__cause__, RuntimeError)
+    assert "communicator aborted" in str(excinfo.value.__cause__)
+
+
+@pytest.mark.vllm
+def test_nccl_reshard_preflight_failure_is_fail_closed_and_nonfatal(monkeypatch):
+    from nemo_rl.models.generation.vllm import vllm_backend
+
+    ext = vllm_backend.VllmInternalWorkerExtension.__new__(
+        vllm_backend.VllmInternalWorkerExtension
+    )
+    ext.model_runner = SimpleNamespace(
+        model=torch.nn.Module(), vllm_config=SimpleNamespace(speculative_config=None)
+    )
+    ext.model_config = object()
+    ext.device = object()
+    ext.nccl_reshard_refit_info = {"layer_names": []}
+    ext.hf_to_local_param_map = {}
+    ext.model_update_group = object()
+    monkeypatch.setattr(
+        "vllm.config.set_current_vllm_config", lambda _: contextlib.nullcontext()
+    )
+
+    def failing_preflight(_group, _src):
+        raise RuntimeError("train-signaled preflight failure")
+
+    monkeypatch.setattr(
+        vllm_backend, "packed_broadcast_preflight_consumer", failing_preflight
+    )
+
+    assert ext.nccl_reshard_refit() is False
+    assert ext._refit_unusable_reason is not None
+    assert "preflight failure" in ext._refit_unusable_reason
+    assert ext.nccl_reshard_refit() is False
 
 
 @pytest.mark.vllm
