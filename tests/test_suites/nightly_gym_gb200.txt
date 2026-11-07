@@ -1,0 +1,10 @@
+# Placeholder suite for the nightly Gym-bump validation lane (GB200, 4 GPUs per
+# node). GB200 counterpart of nightly_gym.txt; keep the two in sync.
+
+########
+# GRPO #
+########
+
+# Gym smoke
+tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-async-gym-quick.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-colocated-reshard-async-gym-quick.sh
