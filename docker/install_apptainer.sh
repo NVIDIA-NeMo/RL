@@ -46,6 +46,45 @@ verify_install() {
     singularity --version
 }
 
+# Runs a network-bound command, retrying with exponential backoff.
+retry_with_backoff() {
+    local description="$1"
+    shift
+    local max_attempts=5
+    local retry_delay=5
+    local status
+    local attempt
+
+    for ((attempt = 1; attempt <= max_attempts; attempt++)); do
+        if "$@"; then
+            return 0
+        else
+            status=$?
+        fi
+
+        if ((attempt == max_attempts)); then
+            echo "${description} failed after ${attempt} attempts" >&2
+            return "${status}"
+        fi
+
+        echo "${description} attempt ${attempt} failed; retrying in ${retry_delay}s" >&2
+        sleep "${retry_delay}"
+        retry_delay=$((retry_delay * 2))
+    done
+}
+
+# Commands are chained with && because set -e does not apply inside a function called from `if`.
+patch_vendored_go_modules() {
+    go get "golang.org/x/crypto@v${GO_CRYPTO_VERSION}" &&
+        go get "golang.org/x/text@v${GO_TEXT_VERSION}" &&
+        go get "google.golang.org/grpc@v${GRPC_VERSION}" &&
+        go get "github.com/sigstore/fulcio@v${FULCIO_VERSION}" &&
+        go get "github.com/docker/docker@v${DOCKER_VERSION}" &&
+        go get "github.com/containers/image/v5@v${CONTAINERS_IMAGE_VERSION}" &&
+        go mod tidy &&
+        go mod vendor
+}
+
 install_from_source() {
     local arch="$1"
     local go_sha256="$2"
@@ -87,10 +126,6 @@ install_from_source() {
         zlib1g
     )
     local new_build_packages=()
-    local dependency_download_max_attempts=5
-    local dependency_download_retry_delay=5
-    local dependency_download_status
-    local attempt
 
     for package in "${build_packages[@]}"; do
         if ! dpkg-query -W -f='${db:Status-Abbrev}' "${package}" 2>/dev/null | grep -q '^ii '; then
@@ -113,35 +148,14 @@ install_from_source() {
     # Anonymous GitHub patch downloads can return transient HTTP 429 responses.
     # The downloader cleans partial dependency files before every attempt.
     cd "${build_dir}"
-    for ((attempt = 1; attempt <= dependency_download_max_attempts; attempt++)); do
-        if ./scripts/download-dependencies; then
-            break
-        else
-            dependency_download_status=$?
-        fi
-
-        if ((attempt == dependency_download_max_attempts)); then
-            echo "Apptainer dependency download failed after ${attempt} attempts" >&2
-            return "${dependency_download_status}"
-        fi
-
-        echo "Apptainer dependency download attempt ${attempt} failed; retrying in ${dependency_download_retry_delay}s" >&2
-        sleep "${dependency_download_retry_delay}"
-        dependency_download_retry_delay=$((dependency_download_retry_delay * 2))
-    done
+    retry_with_backoff "Apptainer dependency download" ./scripts/download-dependencies
     ./scripts/compile-dependencies
 
     # Patch vendored dependency versions in place, keeping APPTAINER_VERSION
     # unchanged. `go mod tidy` resolves any transitive deps (e.g. x/net, which
     # grpc pulls in) to versions compatible with the bumped direct deps.
-    go get "golang.org/x/crypto@v${GO_CRYPTO_VERSION}"
-    go get "golang.org/x/text@v${GO_TEXT_VERSION}"
-    go get "google.golang.org/grpc@v${GRPC_VERSION}"
-    go get "github.com/sigstore/fulcio@v${FULCIO_VERSION}"
-    go get "github.com/docker/docker@v${DOCKER_VERSION}"
-    go get "github.com/containers/image/v5@v${CONTAINERS_IMAGE_VERSION}"
-    go mod tidy
-    go mod vendor
+    # The Go module proxy can return transient stream errors, so retry.
+    retry_with_backoff "Go module patching" patch_vendored_go_modules
 
     ./mconfig --without-suid
     make -C builddir

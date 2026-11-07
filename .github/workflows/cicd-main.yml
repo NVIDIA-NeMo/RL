@@ -1191,11 +1191,21 @@ jobs:
       deployment: false
     permissions: {}
     # Include setup/build failures even when downstream jobs are skipped.
+    # cicd-auto-rerun.yml re-runs a failed first attempt, so alert on the re-run unless a
+    # deterministic check failed (keep that job list in sync with cicd-auto-rerun.yml).
     if: >-
       ${{ always() && !cancelled() && failure() &&
           github.repository == 'NVIDIA-NeMo/RL' &&
           github.event_name == 'schedule' &&
-          github.ref_name == github.event.repository.default_branch }}
+          github.ref_name == github.event.repository.default_branch &&
+          (
+            fromJSON(github.run_attempt) > 1 ||
+            needs.pre-flight.result == 'failure' ||
+            needs.lint-check.result == 'failure' ||
+            needs.cpu-config-tests.result == 'failure' ||
+            needs.unit-test-script-check.result == 'failure' ||
+            needs.functional-test-script-check.result == 'failure'
+          ) }}
     steps:
       - name: Send Slack notification
         uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/notify-ci-failure@631c404d00a9e60afc591cd071d35d2e18f82fc6
