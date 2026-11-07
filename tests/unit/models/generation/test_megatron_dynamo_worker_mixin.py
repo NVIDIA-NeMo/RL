@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import sys
+import threading
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -111,14 +113,51 @@ def test_engine_state_reset_clears_the_event_reporter_and_endpoint():
     worker = _bare_worker(role="prefill")
     worker._dynamo_event_reporter = MagicMock()
     worker._dynamo_endpoint_future = MagicMock()
-    worker._dynamo_endpoint_metadata = {"event_port": 1}
+    worker._dynamo_endpoint_metadata = {"event_port": 1, "handoff_owner": "o"}
 
     worker._init_inference_engine_state()
 
     assert worker._dynamo_event_reporter is None
     assert worker._dynamo_endpoint_future is None
     assert worker._dynamo_endpoint_metadata is None
+    assert worker.dynamo_endpoint_metadata() is None
     assert worker.dynamic_inference_engine is None
+    assert worker.coordinator_addr is None
+    assert worker.dynamo_coordinator_address() is None
+
+
+def test_pinned_handoff_block_count_is_zero_without_an_engine():
+    worker = _bare_worker(role="prefill")
+    worker._init_inference_engine_state()
+    worker._inference_loop = None
+
+    assert worker.pinned_handoff_block_count() == 0
+
+
+def test_pinned_handoff_block_count_is_read_on_the_inference_loop(dynamo_endpoint_env):
+    env = dynamo_endpoint_env
+    reads = []
+
+    class Engine:
+        @property
+        def pinned_handoff_block_count(self):
+            reads.append(asyncio.get_running_loop())
+            return 3
+
+    env.worker.dynamic_inference_engine = Engine()
+
+    assert env.worker.pinned_handoff_block_count() == 3
+    # Read on the loop the engine mutates the pinned map from.
+    assert reads == [env.worker._inference_loop]
+
+
+def test_attach_dynamo_events_needs_a_built_engine():
+    worker = _bare_worker(role="prefill")
+    worker._init_inference_engine_state()
+    worker._inference_engine_initialized = False
+
+    with pytest.raises(RuntimeError, match="engine to be built"):
+        worker.attach_dynamo_events(parent_event_address="tcp://10.0.0.5:4001")
 
 
 # ---------------------------------------------------------------------------
@@ -130,16 +169,11 @@ class _LoopThread:
     """A running asyncio loop on a thread, standing in for the worker's inference loop."""
 
     def __init__(self) -> None:
-        import asyncio
-        import threading
-
         self.loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self.loop.run_forever, daemon=True)
         self._thread.start()
 
     def close(self) -> None:
-        import asyncio
-
         async def _drain() -> None:
             # Run every cancelled or still-running task to completion, so none is
             # garbage-collected pending (and logged) during a later test.
@@ -161,15 +195,12 @@ def dynamo_endpoint_env(monkeypatch):
     Yields a namespace with the worker, the fakes' call records, and a knob that
     makes the fake ``Worker.run`` return (``finish``) or raise (``fail``).
     """
-    import asyncio
-    import sys
-    import types
-
     records = SimpleNamespace(
         configs=[],
         engines=[],
         workers=[],
         fetched=[],
+        attested=[],
         run_started=None,
         run_cancelled=False,
         reporters=[],
@@ -242,6 +273,11 @@ def dynamo_endpoint_env(monkeypatch):
         def to_dict(self):
             return {"coordinator_address": self.address}
 
+    async def confirm_terminated(address, owner, timeout=30.0):
+        records.attested.append((address, owner, timeout))
+        if address.endswith(":dead"):
+            raise ConnectionError(address)
+
     def module(name, **attrs):
         mod = types.ModuleType(name)
         mod.__dict__.update(attrs)
@@ -258,6 +294,10 @@ def dynamo_endpoint_env(monkeypatch):
     module(
         "megatron.inference.integrations.dynamo.llm_engine",
         MegatronLLMEngine=MegatronLLMEngine,
+    )
+    module(
+        "megatron.inference.integrations.dynamo.handoff_recovery",
+        confirm_terminated=confirm_terminated,
     )
     module(
         "megatron.inference.integrations.dynamo.telemetry",
@@ -362,6 +402,7 @@ def test_start_dynamo_endpoint_hosts_the_adapter_on_the_inference_loop(
     # It runs on the inference loop, the loop the engine itself will use.
     assert env.records.run_started is env.worker._inference_loop
     assert not env.worker._dynamo_endpoint_future.done()
+    assert env.worker.dynamo_endpoint_metadata() == metadata
 
     # A repeat start hands back the same endpoint and launches no second adapter.
     assert _start(env, role=role, excluded_ports=[]) == metadata
@@ -537,3 +578,24 @@ def test_attach_dynamo_events_on_a_non_leader_rank_sends_no_ready(
     (reporter,) = env.records.reporters
     assert reporter.events == []
     assert env.worker._dynamo_event_reporter is reporter
+
+
+@pytest.mark.parametrize(
+    ("addresses", "confirmed"),
+    [
+        pytest.param([], True, id="no_prefill_coordinators"),
+        pytest.param(
+            ["tcp://10.0.0.1:5555", "tcp://10.0.0.2:5555"], True, id="every_one"
+        ),
+        # One unreachable coordinator makes the attestation False, not an exception.
+        pytest.param(
+            ["tcp://10.0.0.1:5555", "tcp://10.0.0.3:dead"], False, id="unreachable"
+        ),
+    ],
+)
+def test_confirm_decode_terminated_attests_to_every_prefill_coordinator(
+    dynamo_endpoint_env, addresses, confirmed
+):
+    env = dynamo_endpoint_env
+    assert env.worker.confirm_decode_terminated(addresses, "owner-1", 3.0) is confirmed
+    assert env.records.attested == [(address, "owner-1", 3.0) for address in addresses]

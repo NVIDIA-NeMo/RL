@@ -14,8 +14,10 @@
 """Worker-side hooks for a Megatron engine served through Dynamo."""
 
 import asyncio
+import logging
 import os
 import uuid
+from concurrent.futures import CancelledError
 from concurrent.futures import Future as ConcurrentFuture
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Optional
@@ -39,6 +41,8 @@ if TYPE_CHECKING:
         TextGenerationController,
     )
     from megatron.inference.integrations.dynamo.telemetry import EngineEventReporter
+
+LOGGER = logging.getLogger(__name__)
 
 
 def require_megatron_dynamo_integration() -> None:
@@ -74,6 +78,7 @@ class MegatronDynamoGenerationMixin:
      - coordinator_addr: the engine's coordinator address once it listens.
      - _inference_loop: the engine's asyncio loop.
      - _inference_engine_initialized: whether the engine is built.
+     - _start_inference_loop_thread(): starts the loop when it is not up yet.
     """
 
     cfg: dict[str, Any]
@@ -102,8 +107,8 @@ class MegatronDynamoGenerationMixin:
         # Rank zero only: the task serving this engine's Dynamo endpoint, once
         # start_dynamo_endpoint scheduled it on the inference loop.
         self._dynamo_endpoint_future: Optional[ConcurrentFuture] = None
-        # What start_dynamo_endpoint returned; kept so a repeat call reads the
-        # same ports and handoff owner.
+        # What start_dynamo_endpoint returned; kept so a repeat call and the
+        # owner's teardown read the same ports and handoff owner.
         self._dynamo_endpoint_metadata: Optional[dict[str, Any]] = None
 
     def _inference_config_overrides(self) -> dict[str, Any]:
@@ -184,6 +189,26 @@ class MegatronDynamoGenerationMixin:
             self._dynamo_event_reporter = reporter
 
         asyncio.run_coroutine_threadsafe(_attach(), self._inference_loop).result()
+
+    def pinned_handoff_block_count(self) -> int:
+        """Prefill KV blocks still pinned for decode handoffs (0 without an engine).
+
+        Read on the inference loop: the engine pops entries from the pinned
+        block map there as decode releases them, so summing it from this thread
+        could see the map change size mid-iteration.
+        """
+        engine = self.dynamic_inference_engine
+        if engine is None or self._inference_loop is None:
+            return 0
+
+        async def _read() -> int:
+            return int(engine.pinned_handoff_block_count)
+
+        return asyncio.run_coroutine_threadsafe(_read(), self._inference_loop).result()
+
+    def dynamo_coordinator_address(self) -> Optional[str]:
+        """This engine's coordinator address once it is listening, else None."""
+        return self.coordinator_addr
 
     def start_dynamo_endpoint(
         self,
@@ -268,7 +293,8 @@ class MegatronDynamoGenerationMixin:
             max_retries=None,
             excluded_ports=used,
         )
-        # A fresh owner per launch: prefill pins KV blocks per decode owner.
+        # A fresh owner per launch: prefill pins KV blocks per decode owner and
+        # releases them when that owner is attested gone.
         handoff_owner = uuid.uuid4().hex if role == "decode" else None
         # The Rust runtime reads these when the first Worker is constructed.
         os.environ.update({**manager_env, "DYN_SYSTEM_PORT": str(system_port)})
@@ -349,6 +375,12 @@ class MegatronDynamoGenerationMixin:
         error = future.exception()
         return "exited" if error is None else repr(error)
 
+    def dynamo_endpoint_metadata(self) -> Optional[dict[str, Any]]:
+        """What ``start_dynamo_endpoint`` returned on this rank, or None before it."""
+        if self._dynamo_endpoint_metadata is None:
+            return None
+        return dict(self._dynamo_endpoint_metadata)
+
     def stop_dynamo_endpoint(self) -> None:
         """Cancel the Dynamo endpoint task and stop the engine's event reporter.
 
@@ -366,6 +398,80 @@ class MegatronDynamoGenerationMixin:
         self._dynamo_event_reporter = None
         if reporter is not None:
             reporter.stop()
+
+    def confirm_decode_terminated(
+        self, coordinator_addresses: list[str], owner: str, timeout_s: float
+    ) -> bool:
+        """Tell every prefill coordinator that a decode owner is gone for good.
+
+        Runs Megatron-LM's handoff-recovery hook on the inference loop (started
+        here if it is not up yet) so the prefill engines release the KV blocks
+        pinned for ``owner``. Megatron-LM requires that every rank of that
+        decode engine has exited and cannot restart. ``MegatronDynamoGeneration``
+        calls this at shutdown once the decode engine's endpoint task is
+        cancelled and its workers' kill has been issued, not awaited, which is
+        safe only because the prefill engines stop right after; a live
+        replacement of a decode engine must wait for its actors to exit first.
+        The hook does not retry an unreachable coordinator; callers that need
+        the release to land retry this call.
+
+        Every coordinator is attested concurrently, so one unreachable
+        coordinator does not keep the others from releasing their pins.
+
+        Args:
+            coordinator_addresses: The prefill engines' coordinator addresses.
+            owner: The decode engine's handoff owner, from its endpoint metadata.
+            timeout_s: Bound on each coordinator's attestation; the whole call
+                gives up and returns False shortly after it.
+
+        Returns:
+            True when every coordinator accepted the attestation, or there was
+            none to attest to; False (after logging each failure) when any
+            call failed or the wait ran out.
+        """
+        if not coordinator_addresses:
+            return True
+        if self._inference_loop is None:
+            self._start_inference_loop_thread()
+        # Deferred: ships only with the Megatron-LM versions that carry the
+        # Dynamo integration.
+        from megatron.inference.integrations.dynamo.handoff_recovery import (
+            confirm_terminated,
+        )
+
+        async def _attest() -> list[Any]:
+            return await asyncio.gather(
+                *(
+                    confirm_terminated(address, owner, timeout=timeout_s)
+                    for address in coordinator_addresses
+                ),
+                return_exceptions=True,
+            )
+
+        future = asyncio.run_coroutine_threadsafe(_attest(), self._inference_loop)
+        try:
+            results = future.result(timeout=timeout_s + 5.0)
+        except (TimeoutError, CancelledError):
+            # Per-coordinator failures come back in results; only the wait
+            # running out or the loop cancelling the task lands here.
+            LOGGER.exception(
+                "handoff recovery for decode owner %s did not finish on %s",
+                owner,
+                coordinator_addresses,
+            )
+            future.cancel()
+            return False
+        failed = False
+        for address, result in zip(coordinator_addresses, results, strict=True):
+            if isinstance(result, BaseException):
+                failed = True
+                LOGGER.error(
+                    "handoff recovery for decode owner %s failed on %s",
+                    owner,
+                    address,
+                    exc_info=result,
+                )
+        return not failed
 
     def _start_dynamo_event_reporter(
         self, parent_event_address: str
