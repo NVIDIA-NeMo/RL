@@ -103,7 +103,7 @@ dependencies = [
   # gated-chunk backward with a RuntimeError pointing at this exact pip install.
   # Keep the base range broad for both supported Linux architectures; backend
   # extras tighten the version as required.
-  "tilelang>=0.1.9,<0.1.13; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "tilelang>=0.1.9,<0.1.14; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Data-plane stack — promoted to base so worker venvs (built by
   # nemo_rl.utils.venvs.create_local_venv via bare `uv sync`, no extras)
   # automatically include them. Removes the need for a `[data-plane]`
@@ -232,7 +232,7 @@ mcore = [
   "torch==2.13.0",
   "torchvision==0.28.0",
   "transformers==5.20.1",
-  "tilelang==0.1.9; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "tilelang==0.1.13; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
@@ -241,8 +241,8 @@ mcore = [
   # zero_train_gen_mismatch / batch_invariant_mode pins on both train and generation.
   # b27 supports QuACK's current packed-subtraction API and CUTLASS >=4.6.2.
   "flash-attn-4==4.0.0b27 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  # FA4 needs >=0.1.12; keep the older backends' TVM-FFI pin in their own extras.
-  "apache-tvm-ffi==0.1.13.post2",
+  # FA4 requires TVM-FFI >=0.1.12; TileLang 0.1.13 requires <0.1.13.
+  "apache-tvm-ffi==0.1.12",
   # Core's tool.uv constraint is not inherited by downstream projects. Older
   # Quack releases use CuTe APIs moved by the required CUTLASS 4.8 runtime.
   "quack-kernels>=0.6.5 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",

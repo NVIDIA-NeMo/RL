@@ -1295,7 +1295,9 @@ class TestFinishInLossSeqFilter:
         reduced = mock_module_symbols["all_reduce"].call_args_list[0].args[0]
         assert reduced.tolist() == [4.0, 600.0]
         w.model.scale_gradients.assert_called_once()
-        assert w.model.scale_gradients.call_args.args[0] == pytest.approx(1 / 600)
+        assert w.model.scale_gradients.call_args.args[0].item() == pytest.approx(
+            1 / 600
+        )
         metrics = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"]
         assert [m["loss"] for m in metrics] == pytest.approx([3 / 600] * 2)
         assert [m["num_masked_seqs_by_logprob_error"] for m in metrics] == [6.0] * 2
