@@ -2879,9 +2879,11 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     }
     manager._tokenizer = None
     manager._effort_config = None
-    manager._results_to_completions = lambda results: (
+    manager._mask_sample_rules = ()
+    manager._results_to_completions = lambda results, **_: (
         [result["value"] for result in results],
         {},
+        ({}, {}, 0),
     )
     manager._compute_reward_penalty_metrics = lambda counts, num_results: {}
     manager._compute_rollout_metrics = lambda completions, agent, **_kwargs: {
@@ -3149,7 +3151,12 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
             )
 
     manager._stream_rows = fake_stream_rows
-    manager._results_to_completions = lambda _results: ([object()], {})
+    manager._mask_sample_rules = ()
+    manager._results_to_completions = lambda _results, **_: (
+        [object()],
+        {},
+        ({}, {}, 0),
+    )
     manager._compute_rollout_metrics = lambda *_args, **_kwargs: {}
     manager._compute_reward_penalty_metrics = lambda *_args: {}
 
@@ -3513,6 +3520,7 @@ def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
     }
     impl._tokenizer = None
     impl._effort_config = None
+    impl._mask_sample_rules = ()
 
     async def fake_stream_rows(environment, pending, results, shaping, *_a, **_k):
         selected.append(environment)
@@ -3526,7 +3534,7 @@ def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
             )
 
     impl._stream_rows = fake_stream_rows
-    impl._results_to_completions = lambda _results: ([object()], {})
+    impl._results_to_completions = lambda _results, **_: ([object()], {}, ({}, {}, 0))
     impl._compute_rollout_metrics = lambda *_args, **_kwargs: {}
     impl._compute_reward_penalty_metrics = lambda *_args: {}
     owner = GymCheckpointInstance("tools", 1).instance_id

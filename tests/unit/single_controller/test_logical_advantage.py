@@ -40,6 +40,12 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     TokenCaptureConfig,
     validate_forest_objective,
 )
+from nemo_rl.algorithms.single_controller_utils.masking_stats import (
+    new_masking_stats_accumulator,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
+    new_rollout_stats_accumulator,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import GROUP_ID_TAG
 from tests.unit.single_controller.test_advantage_stage import _InlineActor, _RowStore
@@ -103,6 +109,7 @@ def _batch(
             "prompt_ids_for_adv": torch.tensor([[17, 42]] * n),
             "total_reward": torch.tensor(rewards),
             "token_mask": torch.tensor([[0.0, 1.0, 1.0]] * n),
+            "input_lengths": torch.full((n,), 3),
             "sample_mask": torch.ones(n),
             "mask_sample": torch.zeros(n, dtype=torch.bool),
             "truncated": torch.zeros(n, dtype=torch.bool),
@@ -186,6 +193,8 @@ def _controller(
     ctrl._train_data_dump_rows = 0
     ctrl._opd_stat_sum = ctrl._opd_stat_sumsq = ctrl._opd_gap_sum = 0.0
     ctrl._opd_stat_count = 0
+    ctrl._masking_stats_acc = new_masking_stats_accumulator()
+    ctrl._rollout_stats_acc = new_rollout_stats_accumulator()
     return ctrl
 
 

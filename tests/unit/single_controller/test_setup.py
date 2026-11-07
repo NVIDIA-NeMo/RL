@@ -3397,6 +3397,22 @@ class TestSetup:
         assert finalizer_config.defer_routed_experts_to_policy is False
         assert actor_args.tq_buffer._require_routed_experts is True
 
+    def test_mask_sample_rules_require_nemo_gym(self, patched_factories):
+        """env.mask_sample_rules read Gym response fields; the native path must refuse them."""
+        mc = _make_master_config(
+            env={
+                "mask_sample_rules": [
+                    {"field": "evaluation_completed", "equals": False}
+                ]
+            }
+        )
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=False),
+            pytest.raises(ValueError, match="mask_sample_rules"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+        patched_factories["_build_clusters"].assert_not_called()
+
     @pytest.mark.parametrize("backend", ["sglang"])
     def test_nemo_gym_rejects_non_vllm_backend(self, patched_factories, backend):
         """SC nemo-gym wiring supports vllm and megatron; every other backend must raise."""
