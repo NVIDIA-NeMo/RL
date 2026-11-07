@@ -14,7 +14,7 @@
 
 """NCCL-xfer (shard-to-shard) weight synchronizer for non-colocated deployments.
 
-Handles disaggregated Megatron-train -> vLLM/Megatron-gen weight refit via the
+Handles disaggregated Megatron-train -> vLLM/Megatron/SGLang-gen weight refit via the
 ``xferdtensor`` reshard: bulk FFN/expert params are resharded shard-to-shard
 between the train and gen parallelism layouts over a dedicated per-PP-stage NCCL
 communicator, while the remaining "misc" params ride a packed broadcast over the
@@ -98,7 +98,7 @@ def _settle_before_propagating(futures, budget_s, what: str) -> None:
 class NcclReshardWeightSynchronizer(WeightSynchronizer):
     """Weight synchronizer using the ``xferdtensor`` shard-to-shard reshard.
 
-    For non-colocated Megatron-train -> vLLM/Megatron-gen deployments where weights are
+    For non-colocated Megatron-train -> vLLM/Megatron/SGLang-gen deployments where weights are
     redistributed directly between the two parallelism layouts (bulk path) plus
     a packed broadcast for the misc params. Mirrors
     :class:`CollectiveWeightSynchronizer` but additionally bootstraps the
@@ -183,8 +183,16 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 "etp_size": tp_size if etp_size is None else etp_size,
                 "pp_size": megatron_cfg["pipeline_model_parallel_size"],
             }
+        if generation_cfg["backend"] == "sglang":
+            config = generation_cfg["sglang_cfg"]
+            return {
+                "tp_size": config["tp_size"],
+                "ep_size": 1,
+                "etp_size": config["tp_size"],
+                "pp_size": 1,
+            }
         raise ValueError(
-            "NCCL M-to-N refit only supports vLLM or Megatron generation, got "
+            "NCCL M-to-N refit only supports vLLM, Megatron, or SGLang generation, got "
             f"{generation_cfg['backend']!r}."
         )
 
@@ -247,6 +255,16 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
 
     def init_communicator(self) -> None:
         """Build both communicator families and the refit plan, over the whole fleet."""
+        if self._generation.cfg["backend"] == "sglang":
+            self._build(
+                desired_membership(
+                    absent_shards=[],
+                    dp_size=1,
+                    total_gen_workers=self._inference_cluster.world_size(),
+                    train_world_size=self._train_cluster.world_size(),
+                )
+            )
+            return
         self._build(
             desired_membership(
                 absent_shards=[],

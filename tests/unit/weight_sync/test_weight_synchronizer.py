@@ -80,7 +80,7 @@ def _mock_policy(**overrides):
 
 def _mock_generation(**overrides):
     gen = MagicMock()
-    gen.cfg = {}
+    gen.cfg = {"backend": "vllm"}
     gen.prepare_for_generation.return_value = True
     gen.finish_generation.return_value = True
     gen.prepare_refit_info.return_value = None
