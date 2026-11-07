@@ -107,6 +107,13 @@ Reproduce DeepscaleR results with NeMo RL using GRPO on mathematical reasoning t
 Step-by-step guide for supervised fine-tuning on the OpenMathInstruct2 dataset.
 :::
 
+:::{grid-item-card} {octicon}`number` SFT v2 with Energon
+:link: guides/sft_v2
+:link-type: doc
+
+Prepare CLEVR-CoGenT for Energon and train Qwen2.5-VL-3B-Instruct on two GPUs.
+:::
+
 :::{grid-item-card} {octicon}`rocket` Nemotron 3 Ultra
 :link: guides/models/nemotron/nemotron-3-ultra
 :link-type: doc
@@ -311,6 +318,7 @@ guides/sft-openmathinstruct2.md
 
 adding-new-models.md
 guides/sft.md
+guides/sft_v2.md
 guides/dpo.md
 guides/nemotron-omni-mpo.md
 guides/dapo.md
