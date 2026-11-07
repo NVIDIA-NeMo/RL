@@ -23,7 +23,8 @@ from logra.policy import make_policy_factory
 from omegaconf import OmegaConf
 from pydantic import Field
 
-from nemo_rl.algorithms.grpo import MasterConfig, grpo_train, setup
+from nemo_rl.algorithms.grpo import MasterConfig as GRPOMasterConfig
+from nemo_rl.algorithms.grpo import grpo_train, setup
 from nemo_rl.algorithms.utils import get_tokenizer, set_seed
 from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.virtual_cluster import init_ray
@@ -37,7 +38,7 @@ from nemo_rl.utils.logger import get_next_experiment_dir
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 
-class ResearchConfig(MasterConfig):
+class MasterConfig(GRPOMasterConfig):
     logra: LoGRAConfig = Field(default_factory=LoGRAConfig)
     task: Literal["math", "sliding_puzzle"] = "math"
 
@@ -50,7 +51,7 @@ def main():
     raw = parse_hydra_overrides(load_config(args.config), overrides)
     resolved = cast(dict[str, Any], OmegaConf.to_container(raw, resolve=True))
     check_outdated_config(resolved)
-    config = ResearchConfig.model_validate(resolved)
+    config = MasterConfig.model_validate(resolved)
     if config.grpo.async_grpo.enabled or (
         config.data_plane is not None and config.data_plane["enabled"]
     ):
