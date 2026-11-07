@@ -1260,6 +1260,20 @@ def _create_advantage_estimator(master_config: MasterConfig):
     adv_estimator_config = ppo_config.adv_estimator
 
     adv_estimator_name = adv_estimator_config.name
+    # ClippedPGLossFn zeroes its KL term when use_kl_in_reward is set, so an
+    # estimator that never reads the KL would silently train without it.
+    if (
+        loss_config.use_kl_in_reward
+        and loss_config.reference_policy_kl_penalty != 0
+        and adv_estimator_name != "gae"
+    ):
+        raise ValueError(
+            "loss_fn.use_kl_in_reward moves the KL penalty out of the loss, but "
+            f"the {adv_estimator_name!r} advantage estimator does not add it to "
+            "the reward, so no KL penalty would be applied. Use "
+            "ppo.adv_estimator.name='gae', or set loss_fn.use_kl_in_reward=false "
+            "to keep the KL penalty in the loss."
+        )
     if adv_estimator_name == "gae":
         adv_estimator = GeneralizedAdvantageEstimator(adv_estimator_config, loss_config)
         gae_lambda = adv_estimator_config.gae_lambda

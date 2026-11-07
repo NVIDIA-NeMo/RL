@@ -1454,6 +1454,7 @@ def test_create_advantage_estimator_opd_branch():
 
     # loss_fn not MOPD-configured -> the 3 recommendation warnings fire.
     loss_fn = SimpleNamespace(
+        use_kl_in_reward=False,
         disable_ppo_ratio=False,
         use_importance_sampling_correction=False,
         truncated_importance_sampling_type="none",
@@ -1500,7 +1501,7 @@ def test_create_advantage_estimator_rejects_tropd_with_full_vocab_opd(
         grpo=GRPOConfig(
             adv_estimator=AdvEstimatorConfig(name="opd", **tropd_overrides)
         ),
-        loss_fn=SimpleNamespace(force_on_policy_ratio=False),
+        loss_fn=SimpleNamespace(use_kl_in_reward=False, force_on_policy_ratio=False),
         on_policy_distillation=OnPolicyDistillationConfig(
             enabled=True,
             full=OnPolicyDistillationFullConfig(enabled=True),
