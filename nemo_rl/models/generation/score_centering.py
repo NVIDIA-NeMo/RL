@@ -104,7 +104,7 @@ def extract_score_centering_samples(
         raise RuntimeError("Sampler top-k rows must match the generated token count")
     max_token_id = torch.iinfo(torch.int32).max
     min_logprob = torch.finfo(torch.float32).min
-    for position in output.logprobs or []:
+    for index, position in enumerate(output.logprobs or []):
         for token_id, entry in position.items():
             lp = entry.logprob
             if (
@@ -116,7 +116,10 @@ def extract_score_centering_samples(
                 or (float(lp) < min_logprob and lp != -math.inf)
                 or float(lp) > 1e-5
             ):
-                raise ValueError("Invalid sampler top-k token id or log probability")
+                raise ValueError(
+                    "Invalid sampler top-k token id or log probability at position "
+                    f"{index}: token_id={token_id!r} logprob={lp!r}"
+                )
     ranked = [
         sorted(position.items(), key=lambda item: item[1].rank)[:num_candidates]
         for position in output.logprobs or []

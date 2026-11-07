@@ -139,8 +139,11 @@ def test_score_centering_rejects_invalid_probabilities(token_id, logprob):
         token_ids=[1],
         logprobs=[{token_id: SimpleNamespace(rank=1, logprob=logprob)}],
     )
-    with pytest.raises(ValueError, match="Invalid sampler"):
+    with pytest.raises(ValueError, match="Invalid sampler") as caught:
         extract_score_centering_samples(output, num_candidates=1)
+    # The message names the rejected entry, so a failure in a run shows which bound it broke.
+    message = str(caught.value)
+    assert f"at position 0: token_id={token_id!r} logprob={logprob!r}" in message
 
 
 def test_score_centering_keeps_candidates_the_sampler_filtered_out():
