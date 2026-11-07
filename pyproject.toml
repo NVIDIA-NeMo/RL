@@ -286,6 +286,7 @@ trtllm = [
   "nvidia-cutlass-dsl-libs-cu13==4.8.0.dev0",
   "transformers==5.5.4",
   "tilelang==0.1.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "tilelang==0.1.12; sys_platform == 'linux' and platform_machine == 'aarch64'",
 ]
 modelopt = ["nvidia-modelopt"]
 nvrx = [
