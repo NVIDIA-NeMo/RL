@@ -3293,8 +3293,8 @@ def _postprocess_rollouts(first_prompts, group_ids=None, agent_name="agent"):
 def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog, monkeypatch):
     """Warn only when the rollouts of one logical prompt group do not share a prompt.
 
-    The comparison is distinct first prompts against logical prompt groups
-    (``_ng_group_id``), so a validation batch with one rollout per prompt stays
+    The comparison is within each logical prompt group (``_ng_group_id``),
+    so a validation batch with one rollout per prompt stays
     silent, and rows without the key form a single group. The warning is
     reported once per agent name in a process; the ``baseline_groups/*`` keys
     carry the per-step signal.
@@ -3321,7 +3321,7 @@ def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog, monkey
     assert distinct.rollout_metrics["baseline_groups/logical_groups"] == 1
     [record] = warnings()
     assert record.levelname == "WARNING"
-    assert "form 1 logical prompt group(s) but have 2 distinct" in record.getMessage()
+    assert "form 1 logical prompt group(s) with 2 distinct" in record.getMessage()
     assert "do not share a prompt prefix" in record.getMessage()
     assert "agent(s) ['agent']" in record.getMessage()
 
@@ -3357,6 +3357,21 @@ def test_postprocess_nemo_gym_group_counts_distinct_first_prompts(caplog, monkey
     [record] = warnings()
     assert "3 NeMo-Gym rollouts form 2 logical prompt group(s)" in record.getMessage()
     assert "agent(s) ['other']" in record.getMessage()
+
+    # Shared text across groups must not hide a split within one of them.
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="nemo_rl.experience.rollouts"):
+        overlapping = _postprocess_rollouts(
+            [[1, 5, 7], [1, 5, 9], [1, 5, 7], [1, 5, 7]],
+            group_ids=["a", "a", "b", "b"],
+            agent_name="overlapping",
+        )
+    assert overlapping.rollout_metrics["baseline_groups/distinct_first_prompts"] == 2
+    assert overlapping.rollout_metrics["baseline_groups/logical_groups"] == 2
+    assert overlapping.rollout_metrics["baseline_groups/samples"] == 4
+    [record] = warnings()
+    assert "do not share a prompt prefix" in record.getMessage()
+    assert "agent(s) ['overlapping']" in record.getMessage()
 
     # A one-rollout group is trivially distinct and must stay silent.
     caplog.clear()
