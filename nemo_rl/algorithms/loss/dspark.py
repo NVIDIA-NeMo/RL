@@ -17,7 +17,6 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
 from typing import Any
 
 import torch
@@ -25,6 +24,7 @@ import torch.nn.functional as F
 
 from nemo_rl.algorithms.loss.draft import (
     _DTYPE_HEADER_CODES,
+    DraftLossStats,
     _tile_distributions,
     _tile_log_normalizers,
 )
@@ -183,89 +183,6 @@ def _compact_retained_view(tensor: torch.Tensor) -> torch.Tensor:
     if tensor.untyped_storage().nbytes() > compact_nbytes:
         return tensor.clone()
     return tensor
-
-
-@dataclass(frozen=True, slots=True)
-class DSparkLossBins:
-    """Raw additive numerator and count bins for one DSpark objective."""
-
-    numerators: torch.Tensor
-    counts: torch.Tensor
-    weights: torch.Tensor
-
-    def __post_init__(self) -> None:
-        if any(
-            tensor.ndim != 1 for tensor in (self.numerators, self.counts, self.weights)
-        ):
-            raise ValueError(
-                "DSpark loss numerators, counts, and weights must be vectors"
-            )
-        if not (self.numerators.shape == self.counts.shape == self.weights.shape):
-            raise ValueError(
-                "DSpark loss numerators, counts, and weights must have the same shape"
-            )
-        if not self.weights.is_floating_point():
-            raise TypeError("DSpark loss weights must use a floating dtype")
-        if not (self.numerators.device == self.counts.device == self.weights.device):
-            raise ValueError("DSpark loss bins must share a device")
-        if self.weights.requires_grad or self.weights.dtype != torch.float32:
-            object.__setattr__(self, "weights", self.weights.detach().float())
-
-    def normalized(
-        self,
-        *,
-        normalization_counts: torch.Tensor,
-    ) -> torch.Tensor:
-        """Normalize a local differentiable numerator by externally reduced counts."""
-        if normalization_counts.shape != self.counts.shape:
-            raise ValueError("normalization_counts must match the local count bins")
-        weights = self.weights.to(
-            device=self.numerators.device,
-            dtype=self.numerators.dtype,
-        )
-        denominator = (
-            normalization_counts.detach().to(
-                device=self.weights.device,
-                dtype=torch.float32,
-            )
-            * self.weights
-        ).sum()
-        return (self.numerators * weights).sum() / (denominator + 1e-8)
-
-    def __add__(self, other: object) -> DSparkLossBins:
-        if not isinstance(other, DSparkLossBins):
-            return NotImplemented
-        if self.numerators.shape != other.numerators.shape:
-            raise ValueError("DSpark loss bins must have matching shapes")
-        if self.weights is not other.weights and not torch.equal(
-            self.weights, other.weights
-        ):
-            raise ValueError("DSpark loss bins must have matching weights")
-        return DSparkLossBins(
-            numerators=self.numerators + other.numerators,
-            counts=self.counts + other.counts,
-            weights=self.weights,
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class DSparkObjectiveStats:
-    """Raw CE, TV, confidence, and weighted-combined DSpark statistics."""
-
-    ce: DSparkLossBins
-    tv: DSparkLossBins
-    confidence: DSparkLossBins
-    combined: DSparkLossBins
-
-    def __add__(self, other: object) -> DSparkObjectiveStats:
-        if not isinstance(other, DSparkObjectiveStats):
-            return NotImplemented
-        return DSparkObjectiveStats(
-            ce=self.ce + other.ce,
-            tv=self.tv + other.tv,
-            confidence=self.confidence + other.confidence,
-            combined=self.combined + other.combined,
-        )
 
 
 def _local_label_logits(
@@ -803,8 +720,8 @@ def dspark_tiled_objective(
     token_chunk_size: int,
     draft_vocab_start_index: int,
     tp_group: torch.distributed.ProcessGroup | None,
-) -> DSparkObjectiveStats:
-    """Return raw DSpark bins over a selected draft-vocabulary ordering.
+) -> DraftLossStats:
+    """Return weighted DSpark loss bins over a selected draft-vocabulary ordering.
 
     ``target_logits``, ``target_output_weight``, and ``markov_w2`` use the same
     selected draft-vocabulary order. Their positions are draft IDs, whereas
@@ -813,8 +730,12 @@ def dspark_tiled_objective(
     shard beginning at ``draft_vocab_start_index``. ``hard_labels`` contains the
     sampled target tokens mapped into that global selected-vocabulary ordering.
 
-    The returned numerators and counts remain additive across data-parallel
-    ranks. Reduce counts externally before calling ``normalized``. Detached
+    The returned ``DraftLossStats`` numerators combine CE, TV, and confidence
+    with ``loss_weights``. A zero weight skips its term, so that term adds no
+    gradient path. A nonzero confidence weight without ``confidence_logits``
+    raises ``ValueError``.
+    Numerators and counts remain additive across data-parallel ranks. Reduce
+    counts externally before calling ``normalized``. Detached
     ``slot_weights`` scale both numerator contributions and the global valid-slot
     denominator. This supports fixed per-slot schedules but not example-dependent
     reweighting.
@@ -871,10 +792,8 @@ def dspark_tiled_objective(
     )
     counts = counts.detach()
 
-    confidence_counts = counts
     if confidence_logits is None:
         confidence_numerators = torch.zeros_like(ce_numerators)
-        confidence_counts = torch.zeros_like(counts)
     else:
         safe_confidence = torch.where(
             valid_mask,
@@ -893,37 +812,18 @@ def dspark_tiled_objective(
             confidence_rows.reshape(-1) * valid_mask.reshape(-1).float(),
         )
 
-    ce = DSparkLossBins(
-        numerators=ce_numerators,
+    # Zero-weight terms are skipped so they add no gradient path and no 0 * inf.
+    numerators = torch.zeros_like(ce_numerators)
+    for weight, component in zip(
+        loss_weights, (ce_numerators, tv_numerators, confidence_numerators)
+    ):
+        if weight != 0:
+            numerators = numerators + weight * component
+    return DraftLossStats(
+        numerators=numerators,
         counts=counts,
         weights=resolved_slot_weights,
-    )
-    tv = DSparkLossBins(
-        numerators=tv_numerators,
-        counts=counts,
-        weights=resolved_slot_weights,
-    )
-    confidence = DSparkLossBins(
-        numerators=confidence_numerators,
-        counts=confidence_counts,
-        weights=resolved_slot_weights,
-    )
-    combined_numerators = (
-        loss_weights[0] * ce_numerators
-        + loss_weights[1] * tv_numerators
-        + loss_weights[2] * confidence_numerators
-    )
-    combined = DSparkLossBins(
-        numerators=combined_numerators,
-        counts=counts,
-        weights=resolved_slot_weights,
-    )
-    return DSparkObjectiveStats(
-        ce=ce,
-        tv=tv,
-        confidence=confidence,
-        combined=combined,
     )
 
 
-__all__ = ["DSparkLossBins", "DSparkObjectiveStats", "dspark_tiled_objective"]
+__all__ = ["dspark_tiled_objective"]

@@ -21,8 +21,8 @@ from typing import Any, Protocol, cast
 import torch
 from torch import nn
 
+from nemo_rl.algorithms.loss.draft import DraftLossStats
 from nemo_rl.algorithms.loss.dspark import (
-    DSparkObjectiveStats,
     _dtype_code,
     dspark_tiled_objective,
 )
@@ -148,8 +148,8 @@ class _DSparkProviderAdapter(nn.Module):
         loss_weights: tuple[float, float, float],
         token_chunk_size: int,
         tp_group: torch.distributed.ProcessGroup | None,
-    ) -> DSparkObjectiveStats:
-        """Project with the detached live head and evaluate raw DSpark loss bins."""
+    ) -> DraftLossStats:
+        """Project with the detached live head and evaluate weighted DSpark loss bins."""
         _preflight_provider_inputs(
             draft_hidden=draft_hidden,
             target_output_weight=target_output_weight,
@@ -184,13 +184,8 @@ class _DSparkProviderAdapter(nn.Module):
 
         confidence_logits = None
         if self.confidence_head is not None:
-            # The confidence path reads markov_w1 directly (no TP copy-region):
-            # every input here (draft_hidden, valid_mask, previous_token_ids) is
-            # TP-replicated full-sequence, so each rank computes the identical,
-            # complete gradient - wrapping in _CopyToTensorParallelRegion would
-            # over-count markov_w1.grad by the TP world size. If a future change
-            # delivers sequence-sharded draft_hidden, the metadata-agreement and
-            # slot-shape checks in dspark_tiled_objective fail loudly first.
+            # TP-replicated inputs already yield complete confidence gradients;
+            # a TP copy-region would over-count markov_w1.grad.
             markov_embeddings = None
             if self.confidence_head.with_markov:
                 # Clamp so an out-of-range valid ID reaches the objective's range
@@ -282,7 +277,10 @@ def build_dspark_provider(
     device: torch.device | str | None = None,
     dtype: torch.dtype | None = None,
 ) -> _DSparkProviderAdapter:
-    """Construct the private DSpark adapter without registering a generic loss."""
+    """Construct the private DSpark adapter without registering a generic loss.
+
+    Training-loop integration is provided by PR #3757.
+    """
     if confidence_with_markov and not confidence_enabled:
         raise ValueError("confidence_with_markov requires confidence_enabled")
     if not callable(getattr(body, "sharded_state_dict", None)):

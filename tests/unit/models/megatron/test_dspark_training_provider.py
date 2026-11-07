@@ -20,6 +20,7 @@ import pytest
 import torch
 from torch import Tensor
 
+from nemo_rl.algorithms.loss.draft import DraftLossStats
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.megatron.draft.hidden_capture import CapturedStates
 from nemo_rl.models.megatron.draft.sequence_layout import build_draft_sequence_layout
@@ -176,16 +177,12 @@ def test_dspark_packed_cp_masks_label_positions_for_counts(cp_size: int) -> None
     )
 
     class _Adapter:
-        def objective_stats(
-            self, *, valid_mask: Tensor, **_: object
-        ) -> SimpleNamespace:
+        def objective_stats(self, *, valid_mask: Tensor, **_: object) -> DraftLossStats:
             counts = valid_mask.sum(dim=0, dtype=torch.float32)
-            return SimpleNamespace(
-                combined=SimpleNamespace(
-                    numerators=counts,
-                    counts=counts,
-                    weights=torch.ones_like(counts),
-                )
+            return DraftLossStats(
+                numerators=counts,
+                counts=counts,
+                weights=torch.ones_like(counts),
             )
 
     data["dspark_output"] = DSparkForwardOutput(
@@ -257,15 +254,13 @@ def test_dspark_loss_uses_sampled_rollout_tokens_as_hard_labels() -> None:
             *,
             hard_labels: torch.Tensor,
             **_: object,
-        ) -> SimpleNamespace:
+        ) -> DraftLossStats:
             captured["hard_labels"] = hard_labels
             bins = torch.ones(plan.block_size)
-            return SimpleNamespace(
-                combined=SimpleNamespace(
-                    numerators=bins,
-                    counts=bins,
-                    weights=bins,
-                )
+            return DraftLossStats(
+                numerators=bins,
+                counts=bins,
+                weights=bins,
             )
 
     data["dspark_output"] = DSparkForwardOutput(
@@ -428,7 +423,7 @@ def test_dspark_provider_maps_packed_cp_inputs_to_local_objective_slots(
             super().__init__()
             self.body = _Body()
 
-        def objective_stats(self, **kwargs: object) -> SimpleNamespace:
+        def objective_stats(self, **kwargs: object) -> DraftLossStats:
             captured_objective.update(
                 {
                     name: value
@@ -437,12 +432,10 @@ def test_dspark_provider_maps_packed_cp_inputs_to_local_objective_slots(
                 }
             )
             bins = kwargs["valid_mask"].sum(dim=0, dtype=torch.float32)  # type: ignore[union-attr]
-            return SimpleNamespace(
-                combined=SimpleNamespace(
-                    numerators=bins * self.body.scale,
-                    counts=bins,
-                    weights=torch.ones_like(bins),
-                )
+            return DraftLossStats(
+                numerators=bins * self.body.scale,
+                counts=bins,
+                weights=torch.ones_like(bins),
             )
 
     target = _Target()

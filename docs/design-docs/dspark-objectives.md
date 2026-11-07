@@ -13,10 +13,10 @@ logits and the target output head stop-gradient. The Markov head uses
 previous-token IDs from the target vocabulary. Loss labels use the selected
 draft-vocabulary order. The two vocabularies can have different sizes.
 
-Each loss returns raw numerator and valid-slot count bins. The combined loss
-uses the configured CE, TV, and confidence weights. Position weights scale
-both numerators and denominators. Reduce counts across data-parallel ranks
-before calling `DSparkLossBins.normalized`.
+The function returns one `DraftLossStats` value. Its numerators combine the
+CE, TV, and confidence losses with the configured loss weights. Position
+weights scale both numerators and denominators. Reduce counts across
+data-parallel ranks before you call `DraftLossStats.normalized`.
 
 `build_dspark_provider` attaches the Markov head and optional confidence head
 to a checkpointable draft body. PR #3711 defines the head shapes and

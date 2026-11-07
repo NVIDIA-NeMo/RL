@@ -52,10 +52,10 @@ def test_dspark_zero_owner_keeps_fixed_bins_and_zero_gradients() -> None:
         tp_group=None,
     )
 
-    assert stats.combined.numerators.shape == (block_size,)
-    assert torch.equal(stats.combined.counts, torch.zeros(block_size))
-    stats.combined.normalized(
-        normalization_counts=stats.combined.counts,
+    assert stats.numerators.shape == (block_size,)
+    assert torch.equal(stats.counts, torch.zeros(block_size))
+    stats.normalized(
+        normalization_counts=stats.counts,
     ).backward()
     for tensor in (draft_hidden, markov_w1, markov_w2, confidence_logits):
         assert tensor.grad is not None

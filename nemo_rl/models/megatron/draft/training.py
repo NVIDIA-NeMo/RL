@@ -1091,7 +1091,7 @@ class DSparkSpeculator:
             )
             / self.config.loss_decay_gamma
         )
-        stats = output.adapter.objective_stats(
+        return output.adapter.objective_stats(
             draft_hidden=output.hidden,
             target_output_weight=output.output_weight,
             target_logits=selected_target_logits,
@@ -1107,11 +1107,6 @@ class DSparkSpeculator:
             ),
             token_chunk_size=self.config.vocab_tile_size,
             tp_group=vocab_parallel_group,
-        )
-        return DraftLossStats(
-            numerators=stats.combined.numerators,
-            counts=stats.combined.counts,
-            weights=stats.combined.weights,
         )
 
     def export_weights(self, model: MegatronModule) -> list[tuple[str, Tensor]]:
