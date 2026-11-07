@@ -3028,6 +3028,9 @@ class SingleControllerActor:
                         step_finalizer_rewards
                     ).items():
                         step_metrics[name] = Table(data=data, columns=["Full result"])
+                # After the per-group aggregate, so the step-pooled
+                # mask_rules/<name>_reward_mean is the value that is logged.
+                step_metrics.update(self._rollout_manager.pop_mask_rule_metrics())
                 try:
                     step_metrics.update(
                         await asyncio.to_thread(self._gen.get_step_metrics)
