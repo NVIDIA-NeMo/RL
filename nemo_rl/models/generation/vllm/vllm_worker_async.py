@@ -69,8 +69,8 @@ from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
 from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
+from nemo_rl.models.generation.rollout_result import RolloutResult
 from nemo_rl.models.generation.vllm.request_pipeline import (
-    RolloutResult,
     rollout_output,
     rollout_result,
 )
@@ -446,7 +446,7 @@ class VllmAsyncGenerationWorkerImpl(
             else []
         )
         if dynamo_enabled(self.cfg):
-            from nemo_rl.models.generation.dynamo.native_engine import (
+            from nemo_rl.models.generation.dynamo.vllm_adapter import (
                 SnapshotStatLogger,
                 dynamo_kv_events_config,
             )
@@ -663,9 +663,10 @@ class VllmAsyncGenerationWorkerImpl(
         # ai-dynamo is optional: import it only for engines served through Dynamo.
         from dynamo._core import fetch_model
 
-        from nemo_rl.models.generation.dynamo.native_engine import (
+        from nemo_rl.models.generation.dynamo.engine_adapter import (
             start_dynamo_endpoint,
         )
+        from nemo_rl.models.generation.dynamo.vllm_adapter import DynamoVllmAdapter
 
         # Dynamo fetches a Hub ID's whole checkpoint before it registers; the engine's
         # weights come from refit, so register the config and tokenizer files only.
@@ -674,12 +675,16 @@ class VllmAsyncGenerationWorkerImpl(
             if os.path.exists(self.model_name)
             else await fetch_model(self.model_name, ignore_weights=True)
         )
+        kv_events = self.llm.vllm_config.kv_events_config
+        publishes = kv_events is not None and kv_events.enable_kv_cache_events
+        # The Dynamo functional overlays check the router applied these.
+        print(f"  [Dynamo] engine publishes KV events: {publishes}", flush=True)
         self._dynamo_endpoint_task = start_dynamo_endpoint(
-            self,
+            DynamoVllmAdapter(self, leader_worker_idx=leader_worker_idx),
             model_path=model_path,
+            served_model_name=self.model_name,
             namespace=namespace,
             engine_env=engine_env,
-            leader_worker_idx=leader_worker_idx,
         )
 
     async def dynamo_endpoint_error(self) -> Optional[str]:
@@ -2116,7 +2121,7 @@ class VllmAsyncGenerationWorkerImpl(
         Returns:
             The result, and vLLM's final RequestOutput (None when no new token fits).
             The final output supplies finish and usage metadata to Dynamo
-            (``dynamo/native_engine.py``).
+            (``dynamo/vllm_adapter.py``).
         """
         max_new_tokens = self._rollout_max_new_tokens(len(prompt_token_ids))
         if max_new_tokens == 0:

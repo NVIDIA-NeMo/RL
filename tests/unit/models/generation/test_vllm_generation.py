@@ -2867,11 +2867,11 @@ def test_vllm_validate_settings_rejects_what_dynamo_cannot_serve(settings, error
 def test_vllm_dynamo_rollouts_go_through_the_frontend(monkeypatch):
     from nemo_rl.experience.failures import GenerationUnavailable
     from nemo_rl.models.generation.dynamo import rollout_client
-    from nemo_rl.models.generation.vllm.request_pipeline import (
+    from nemo_rl.models.generation.rollout_result import (
         RolloutResult,
-        rollout_output,
         rollout_result_to_wire,
     )
+    from nemo_rl.models.generation.vllm.request_pipeline import rollout_output
 
     result = RolloutResult([7, 8], [-0.5, -0.25], False, None, None)
     responses = [

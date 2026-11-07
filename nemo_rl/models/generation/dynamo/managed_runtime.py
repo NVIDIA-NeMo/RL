@@ -15,7 +15,7 @@
 """Driver-owned Dynamo services: etcd, NATS and the OpenAI frontend.
 
 The vLLM engines are NeMo RL's own workers; each registers itself with these
-services (see ``native_engine``), so the runtime only waits to see them.
+services (see ``engine_adapter``), so the runtime only waits to see them.
 """
 
 import atexit
@@ -43,7 +43,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.models.generation.dynamo.config import DynamoCfg
 
-# The engines register on this component and endpoint (see native_engine).
+# The engines register on this component and endpoint (see engine_adapter).
 DYNAMO_COMPONENT = "backend"
 DYNAMO_ENDPOINT = "generate"
 

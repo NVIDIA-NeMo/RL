@@ -21,12 +21,14 @@ import numpy as np
 import pytest
 import torch
 
-from nemo_rl.models.generation.vllm.request_pipeline import (
+from nemo_rl.models.generation.rollout_result import (
     RolloutResult,
-    rollout_output,
-    rollout_result,
     rollout_result_from_wire,
     rollout_result_to_wire,
+)
+from nemo_rl.models.generation.vllm.request_pipeline import (
+    rollout_output,
+    rollout_result,
 )
 from nemo_rl.models.generation.vllm.utils import R3_MISSING_ROUTE_SENTINEL
 

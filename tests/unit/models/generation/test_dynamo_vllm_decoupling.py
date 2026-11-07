@@ -15,9 +15,10 @@
 
 The engines run NeMo RL's own vLLM and use Dynamo only through its
 engine-agnostic backend SDK, so a vLLM bump can break Dynamo serving only in
-NeMo RL's own adapter (``dynamo/native_engine.py``). These guards fail if
+NeMo RL's own adapter (``dynamo/vllm_adapter.py``). These guards fail if
 NeMo RL starts importing Dynamo's vLLM integration (or any other Dynamo
-module), or if the SDK itself starts importing vLLM.
+module), if the SDK itself starts importing vLLM, or if the Dynamo side shared
+by every backend starts importing one.
 """
 
 import ast
@@ -41,22 +42,36 @@ DYNAMO_SDK_MODULES = {
 }
 
 
+# The Dynamo side every generation backend builds on.
+BACKEND_NEUTRAL_MODULES = (
+    "models/generation/dynamo/engine_adapter.py",
+    "models/generation/rollout_result.py",
+)
+GENERATION_BACKENDS = {"vllm", "sglang", "trtllm", "megatron"}
+
+
+def _imports(path: Path) -> set[str]:
+    """The absolute modules ``path`` imports, at any depth."""
+    modules: set[str] = set()
+    for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
+        if isinstance(node, ast.ImportFrom) and node.level == 0:
+            modules.add(node.module or "")
+        elif isinstance(node, ast.Import):
+            modules.update(alias.name for alias in node.names)
+    return modules
+
+
 def _dynamo_imports() -> dict[str, set[str]]:
     """The Dynamo modules each nemo_rl source file imports."""
     imports: dict[str, set[str]] = {}
     for path in NEMO_RL_ROOT.rglob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text(), filename=str(path))):
-            if isinstance(node, ast.ImportFrom) and node.level == 0:
-                modules = [node.module or ""]
-            elif isinstance(node, ast.Import):
-                modules = [alias.name for alias in node.names]
-            else:
-                continue
-            for module in modules:
-                if module == "dynamo" or module.startswith("dynamo."):
-                    imports.setdefault(str(path.relative_to(NEMO_RL_ROOT)), set()).add(
-                        module
-                    )
+        dynamo = {
+            module
+            for module in _imports(path)
+            if module == "dynamo" or module.startswith("dynamo.")
+        }
+        if dynamo:
+            imports[str(path.relative_to(NEMO_RL_ROOT))] = dynamo
     return imports
 
 
@@ -72,6 +87,19 @@ def test_nemo_rl_imports_only_dynamos_backend_sdk() -> None:
     assert not outside, (
         f"nemo_rl imports Dynamo modules beyond its backend SDK: {outside}"
     )
+
+
+def test_the_shared_dynamo_side_imports_no_generation_backend() -> None:
+    backends = {
+        path: sorted(
+            module
+            for module in _imports(NEMO_RL_ROOT / path)
+            if GENERATION_BACKENDS & set(module.split("."))
+        )
+        for path in BACKEND_NEUTRAL_MODULES
+    }
+
+    assert backends == {path: [] for path in BACKEND_NEUTRAL_MODULES}
 
 
 @pytest.mark.vllm

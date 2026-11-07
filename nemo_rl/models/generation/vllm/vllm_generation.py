@@ -52,6 +52,7 @@ from nemo_rl.models.generation.interfaces import (
     agreed_media_columns,
     verify_right_padding,
 )
+from nemo_rl.models.generation.rollout_result import rollout_result_from_wire
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
@@ -63,10 +64,7 @@ from nemo_rl.models.generation.vllm.draft_utils import (
     draft_module_sharing_disable_required,
 )
 from nemo_rl.models.generation.vllm.metric_names import BATCH_DURATION_KEY
-from nemo_rl.models.generation.vllm.request_pipeline import (
-    rollout_output,
-    rollout_result_from_wire,
-)
+from nemo_rl.models.generation.vllm.request_pipeline import rollout_output
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     assert_reload_refit_config_supported,
