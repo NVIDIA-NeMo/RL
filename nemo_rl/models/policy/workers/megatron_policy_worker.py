@@ -5489,8 +5489,12 @@ class MegatronPolicyWorkerImpl(
         return final_result
 
 
+# Every rollout sample is one generate_async call on rank 0, and the engine queues
+# requests past its own capacity. Ray's async-actor default of 1000 calls would
+# otherwise cap in-flight rows and queue control calls (finish_generation) behind them.
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
+    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker"),
+    max_concurrency=2**16,
 )  # pragma: no cover
 class MegatronPolicyWorker(MegatronPolicyWorkerImpl):
     pass
