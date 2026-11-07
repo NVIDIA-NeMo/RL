@@ -288,4 +288,5 @@ class SGLangConfig(GenerationConfig):
     """Configuration for SGLang runtime."""
 
     sglang_cfg: SglangSpecificArgs
+    # Additional native ServerArgs; conflicting framework-owned values are rejected.
     sglang_kwargs: NotRequired[dict[str, Any]]
