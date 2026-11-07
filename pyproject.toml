@@ -238,11 +238,13 @@ mcore = [
   "mamba-ssm",
   "causal-conv1d",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  "flashinfer-python==0.6.18.post1",
-  "flashinfer-cubin==0.6.18.post1",
-  "flashinfer-jit-cache==0.6.18.post1",
+  "flashinfer-python==0.7.2.post1",
+  "flashinfer-cubin==0.7.2.post1",
+  "flashinfer-jit-cache==0.7.2.post1",
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  "nvidia-cutlass-dsl[cu13]==4.6.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cutlass-dsl[cu13]==4.8.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  # CUTLASS 4.8 moved CuTe APIs used by older Quack releases.
+  "quack-kernels>=0.6.5",
   "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
@@ -411,7 +413,8 @@ explicit = true
 [[tool.uv.index]]
 name = "flashinfer-cu130"
 url = "https://flashinfer.ai/whl/cu130"
-explicit = true
+# The shim pulls architecture providers transitively from this index.
+explicit = false
 
 [tool.uv]
 managed = true
@@ -452,7 +455,6 @@ override-dependencies = [
   "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.26.0.51; sys_platform != 'darwin'",
-  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
   # Keep NCCL shared with the isolated Dynamo environment across torch upgrades.
@@ -615,6 +617,22 @@ torch-memory-saver = { TMS_CUDA_MAJOR = "13" }
 # `Killed "$CICC_PATH/cicc"`) on both x86 and aarch64. 4 jobs x 4 threads built cleanly on
 # both architectures (2h47m aarch64, ~2h x86 alongside TE/flash-mla).
 flash-attn = { MAX_JOBS = "4" }
+
+# The shim wheels have different Requires-Dist lists by CPU architecture.
+# Express that difference with markers so uv can produce one cross-platform lock.
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache"
+version = "0.7.2.post1+cu130"
+requires-dist = [
+  "flashinfer-jit-cache-sm80==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm89==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm90a==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm100a==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm103a==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm110a==0.7.2.post1+cu130 ; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm120f==0.7.2.post1+cu130",
+  "flashinfer-jit-cache-sm121a==0.7.2.post1+cu130 ; platform_machine == 'aarch64'",
+]
 
 # Needed when building from source
 [[tool.uv.dependency-metadata]]

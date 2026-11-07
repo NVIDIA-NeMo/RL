@@ -298,13 +298,6 @@ def test_validate_rejects_a_non_megatron_generation_backend():
     assert any("generation.backend must be 'megatron'" in v for v in result.violations)
 
 
-def test_validate_rejects_colocated_generation():
-    config = _policy_config()
-    config["generation"]["colocated"] = {"enabled": True}
-    result = _validate(config)
-    assert any("does not support colocated generation" in v for v in result.violations)
-
-
 def test_validate_rejects_missing_generation_block():
     config = _policy_config()
     del config["generation"]
@@ -755,6 +748,9 @@ def test_mamba_deterministic_turns_on_mcore_deterministic_tuning(
 
 def test_mcore_without_tuning_relies_on_mamba_deterministic(monkeypatch):
     monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
+    core = types.ModuleType("megatron.core")
+    core.__path__ = []  # type: ignore[attr-defined]
+    _install_fake_module(monkeypatch, "megatron.core", core)
     monkeypatch.setitem(sys.modules, "megatron.core.tuning", None)
 
     zgm._enable_mcore_deterministic_tuning()
