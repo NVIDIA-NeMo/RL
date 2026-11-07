@@ -8,6 +8,16 @@ NeMo RL supports 🤗Hugging Face models from the following classes
 
 for model sizes under 70B at up to 32k sequence length.
 
+Recipes on the Automodel backend are also provided for these larger and newer models:
+
+- **DeepSeek**: [DeepSeek-V4-Flash](../guides/models/deepseek/deepseek-v4-flash.md)
+- **MiniMax**: [MiniMax-M3](../guides/models/minimax/minimax-m3.md), MiniMax-M2.7
+- **Gemma**: [Gemma 4](../guides/models/gemma/gemma4.md) E2B/12B/26B-A4B/31B
+- **Mistral**: Mistral-Medium-3.5-128B
+- **GLM**: GLM-4.7-Flash
+- **Nemotron**: [NVIDIA-Nemotron-3.5-Lightning-30B-A3B](../guides/models/nemotron/nemotron-3.5-lightning.md), [Nemotron 3 Nano Omni 30B-A3B](../guides/models/nemotron/nemotron-3-nano-omni.md) (VLM)
+- **Qwen**: [Qwen3.5-35B-A3B](../guides/models/qwen/qwen3-5.md) (LLM and VLM)
+
 ## Optimal acceleration for top models via [NeMo Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)
 
 [NeMo Megatron-Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge) provides acceleration [recipes](https://github.com/NVIDIA-NeMo/RL/tree/main/examples/configs/recipes) for the below models. Users can also leverage the on-line checkpoint conversion (i.e the "bridge") by directly inputting a 🤗Hugging Face checkpoint. 
@@ -22,10 +32,13 @@ for model sizes under 70B at up to 32k sequence length.
 - **Moonlight-16B-A3B**
 - **Gemma**: Gemma-3-1B/27B
 - **GPT-OSS**: GPT-OSS-20B/120B
-- **Nemotron**: [NVIDIA-Nemotron-3-Super-120B-A12B](../guides/models/nemotron/nemotron-3-super.md), Nemotron-3-Nano-30B-A3B, Llama-3.3-Nemotron-Super-49B, Nemotron-Nano-12B-v2
+- **Nemotron**: [NVIDIA-Nemotron-3-Ultra-550B-A55B](../guides/models/nemotron/nemotron-3-ultra.md), [NVIDIA-Nemotron-3-Super-120B-A12B](../guides/models/nemotron/nemotron-3-super.md), [NVIDIA-Nemotron-3.5-Lightning-30B-A3B](../guides/models/nemotron/nemotron-3.5-lightning.md), [Nemotron-3-Nano-30B-A3B](../guides/models/nemotron/nemotron-3-nano.md), Llama-3.3-Nemotron-Super-49B, Nemotron-Nano-12B-v2
 
 **VLMs**:
 
-- **Qwen**: Qwen3.5-35B-A3B/397B-A17B, Qwen2.5VL-3B
+- **Qwen**: Qwen3.5-35B-A3B/397B-A17B, Qwen2.5VL-3B, Qwen2.5-Omni-3B/7B, Qwen3-Omni-30B-A3B
+- **Nemotron**: [Nemotron 3 Nano Omni 30B-A3B](../guides/models/nemotron/nemotron-3-nano-omni.md), [Nemotron 3 Super Omni 120B-A12B](../guides/models/nemotron/nemotron-3-super-omni-mopd.md)
+
+For per-model setup notes and results, see the [model guides](../guides/models/index.md).
 
 In addition, please refer to our [performance page](https://docs.nvidia.com/nemo/rl/latest/about/performance-summary.html) for benchmarks and full reproducible yaml recipe configs.
