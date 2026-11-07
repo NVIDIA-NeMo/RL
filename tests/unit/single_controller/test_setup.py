@@ -4117,7 +4117,8 @@ def test_master_config_reports_the_reward_scaling_field_path(
     algorithm: str, recipe: str
 ) -> None:
     register_omegaconf_resolvers()
-    config = OmegaConf.to_container(load_config(recipe), resolve=True)
+    repo_root = Path(__file__).resolve().parents[3]
+    config = OmegaConf.to_container(load_config(repo_root / recipe), resolve=True)
     config[algorithm]["reward_scaling"] = {
         "enabled": True,
         "source_min": 1.0,
