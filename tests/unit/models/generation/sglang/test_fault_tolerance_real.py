@@ -81,6 +81,7 @@ def _make_fault_tolerant_cfg(pad_token_id: int) -> dict:
             "disable_cuda_graph": True,
             "cuda_graph_backend_prefill": "disabled",
             "mem_fraction_static": 0.3,
+            "quantization": {"scheme": "bf16"},
             "sglang_server_config": {
                 "num_gpus": 2,
                 "num_gpus_per_engine": 1,
