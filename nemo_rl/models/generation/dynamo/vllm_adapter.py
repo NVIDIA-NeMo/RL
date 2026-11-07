@@ -75,7 +75,11 @@ from nemo_rl.models.generation.dynamo.engine_adapter import (
     ServedRollout,
     _annotation_value,
 )
-from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
+from nemo_rl.models.generation.openai_server_utils import (
+    model_stop_token_ids,
+    splice_prefix_tokens,
+    turn_end_token_ids,
+)
 from nemo_rl.models.generation.vllm.utils import (
     chat_generation_tokens,
     chat_routed_experts,
@@ -475,6 +479,10 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
                 model_prefix_token_ids=prefix_token_ids,
                 template_prefix_token_ids=None,
                 template_token_ids=template_token_ids,
+                eos_token_id=turn_end_token_ids(
+                    model_stop_token_ids(self._llm.model_config, host.cfg),
+                    self._llm.tokenizer,
+                ),
             )
             token_ids = splice.token_ids
             self._check_prompt_fits(len(token_ids))

@@ -59,8 +59,12 @@ from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
 from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
 from nemo_rl.data.captured_media import MediaCaptureRejected
-from nemo_rl.models.generation.capture_context import decide_capture_input
-from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
+from nemo_rl.models.generation.capture_context import resolve_capture_input
+from nemo_rl.models.generation.openai_server_utils import (
+    model_stop_token_ids,
+    splice_prefix_tokens,
+    turn_end_token_ids,
+)
 from nemo_rl.models.generation.vllm.captured_chat_logprobs import (
     CapturedChatLogprobsMixin,
 )
@@ -68,8 +72,8 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
-    check_sampling_param,
     model_dump_chat_response_with_dynamic_message_fields,
+    on_policy_sampling,
     remap_multimodal_placeholders,
 )
 
@@ -144,6 +148,85 @@ class NeMoRLOpenAIServingMixin:
         max_tokens = min(request_max_tokens, remaining)
         self._set_max_tokens(request, max_tokens)
 
+    async def _render_chat_call(
+        self, request, messages, render_kwargs: dict[str, Any], *, admission
+    ) -> "RenderedChat":
+        """Render a chat call and decide how its capture prefix is served.
+
+        The steps every host of the chat path shares, before any TQ read: the
+        render with the checkpoint's template and processor, the capture
+        decision for a Gym candidate (C26 on #4979), and, when a prefix will be
+        spliced, the render of the history up to the last assistant turn that
+        the splice cuts against.
+        """
+        for message in messages:
+            if message.get("tool_calls"):
+                message["tool_calls"] = list(message["tool_calls"])
+        messages_for_replace_prefix_tokens = deepcopy(messages)
+
+        try:
+            conversation, (engine_prompt,) = await super().preprocess_chat(
+                request=request, messages=messages, **render_kwargs
+            )
+        except (ValueError, VLLMValidationError) as e:
+            if "maximum context length" in str(e):
+                LOGGER.warning("Prompt exceeds max_model_len: %s", e)
+            raise
+
+        # Token capture: the admission is built once by the host and resolved
+        # here, before branching; the ``ng_capture`` dict is never mutated.
+        serving_admission = admission
+        verify_retained_media = False
+        if admission is not None and (
+            admission.mode == "candidate" or admission.request_replay is not None
+        ):
+            # Inline assistant token fields cannot override RL's decision.
+            request.required_prefix_token_ids = None
+            decision = resolve_capture_input(
+                admission,
+                messages=messages_for_replace_prefix_tokens,
+                conversation=conversation,
+                renderer_is_hf=type(self.renderer) is HfRenderer,
+            )
+            admission = decision.storage
+            serving_admission = decision.serving
+            verify_retained_media = decision.verify_retained_media
+
+        history_token_ids = None
+        if getattr(request, "required_prefix_token_ids", None) is not None or (
+            serving_admission is not None and serving_admission.mode == "token_in"
+        ):
+            # The splice cuts the full render at the turn this history ends.
+            last_assistant_message_idx = None
+            for i in reversed(range(len(messages_for_replace_prefix_tokens))):
+                if messages_for_replace_prefix_tokens[i]["role"] == "assistant":
+                    last_assistant_message_idx = i
+                    break
+            if last_assistant_message_idx is None:
+                messages_to_last_assistant_message = messages_for_replace_prefix_tokens
+            else:
+                messages_to_last_assistant_message = messages_for_replace_prefix_tokens[
+                    : last_assistant_message_idx + 1
+                ]
+            modified_request = request.model_copy(
+                update={"add_generation_prompt": False}
+            )
+            _, (history_prompt,) = await super().preprocess_chat(
+                request=modified_request,
+                messages=messages_to_last_assistant_message,
+                **render_kwargs,
+            )
+            history_token_ids = history_prompt["prompt_token_ids"]
+
+        return RenderedChat(
+            conversation=conversation,
+            engine_prompt=engine_prompt,
+            admission=admission,
+            serving_admission=serving_admission,
+            verify_retained_media=verify_retained_media,
+            history_token_ids=history_token_ids,
+        )
+
     # vLLM 0.25 moved chat preprocessing to
     # OnlineRenderer.preprocess_chat (tool_parser/reasoning_parser were
     # folded into a single `parser`), so this override now applies via
@@ -161,14 +244,10 @@ class NeMoRLOpenAIServingMixin:
         skip_mm_cache: bool = False,
     ):
         host = self._host
-        for message in messages:
-            if message.get("tool_calls"):
-                message["tool_calls"] = list(message["tool_calls"])
-
-        messages_for_replace_prefix_tokens = deepcopy(messages)
+        admission = host._capture_admission(request)
         # #4124: processor-only cache reads retain concrete pixels even
         # when the engine's sender cache would return references.
-        if host._capture_media and host._capture_admission(request) is not None:
+        if host._capture_media and admission is not None:
             skip_mm_cache = True
 
         # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
@@ -185,54 +264,31 @@ class NeMoRLOpenAIServingMixin:
             if actual_request_max_tokens is not None:
                 self._set_max_tokens(request, 1)
 
-        try:
-            res = await super().preprocess_chat(
-                request=request,
-                messages=messages,
+        rendered = await self._render_chat_call(
+            request,
+            messages,
+            dict(
                 default_template=default_template,
                 default_template_content_format=default_template_content_format,
                 default_template_kwargs=default_template_kwargs,
                 tool_dicts=tool_dicts,
                 parser=parser,
                 skip_mm_cache=skip_mm_cache,
-            )
-        except (ValueError, VLLMValidationError) as e:
-            if "maximum context length" in str(e):
-                LOGGER.warning("Prompt exceeds max_model_len: %s", e)
-            raise
+            ),
+            admission=admission,
+        )
+        res = (rendered.conversation, [rendered.engine_prompt])
+        engine_prompt = rendered.engine_prompt
+        admission = rendered.admission
+        serving_admission = rendered.serving_admission
+        verify_retained_media = rendered.verify_retained_media
 
-        # Token capture: build the admission once, before branching,
-        # and resolve its prefix from it (staging_chain -> cached TQ
-        # read, inline ids, or nothing for a text root). The
-        # ``ng_capture`` dict is never mutated. Off-loop: the chain
-        # fetch is a blocking TQ read, and Gym's staging protocol
-        # requires the serving host to move blocking staging I/O off
-        # its event loop explicitly. The adapter then attaches the
-        # prefix to the request, so the inline-prefix branch below is
-        # the single splice path for staged and inline prefixes.
-        admission = host._capture_admission(request)
-        serving_admission = admission
-        verify_retained_media = False
-        if admission is not None and (
-            admission.mode == "candidate" or admission.request_replay is not None
-        ):
-            # Inline assistant token fields cannot override RL's decision.
-            request.required_prefix_token_ids = None
-            decision = decide_capture_input(
-                admission,
-                messages=messages_for_replace_prefix_tokens,
-                # HF/string parsing maps null and empty tool content to
-                # identical template inputs. Structured content and
-                # other renderers cannot authorize that equivalence.
-                allow_empty_tool_content=(
-                    type(self.renderer) is HfRenderer
-                    and bool(res[0])
-                    and all(isinstance(item.get("content"), str) for item in res[0])
-                ),
-            )
-            admission = decision.storage
-            serving_admission = decision.serving
-            verify_retained_media = decision.verify_retained_media
+        # Resolve the admission's prefix (staging_chain -> cached TQ read).
+        # Off-loop: the chain fetch is a blocking TQ read, and Gym's staging
+        # protocol requires the serving host to move blocking staging I/O off
+        # its event loop explicitly. The adapter then attaches the prefix to
+        # the request, so the inline-prefix branch below is the single splice
+        # path for staged and inline prefixes.
         capture_prefix_token_ids: list[int] | None = None
         if serving_admission is not None and serving_admission.mode == "token_in":
             capture_prefix_token_ids = await asyncio.to_thread(
@@ -249,65 +305,32 @@ class NeMoRLOpenAIServingMixin:
                 self._clamp_max_tokens(
                     request,
                     actual_request_max_tokens,
-                    res[1][0]["prompt_token_ids"],
+                    engine_prompt["prompt_token_ids"],
                 )
             # Token capture, text mode: the full render is the exact
             # engine prompt.
             media = await asyncio.to_thread(
                 host._capture_request_media,
-                res[1][0],
+                engine_prompt,
                 admission=admission,
                 verify_retained_media=verify_retained_media,
             )
             host._begin_request_capture(
                 request,
-                res[1][0]["prompt_token_ids"],
+                engine_prompt["prompt_token_ids"],
                 admission=admission,
                 media=media,
             )
             return res
 
-        model_prefix_token_ids = list(request.required_prefix_token_ids)
-
-        # Token-in splice path — shared by staging_chain and direct prefix.
-        last_assistant_message_idx = None
-        for i in reversed(range(len(messages_for_replace_prefix_tokens))):
-            if messages_for_replace_prefix_tokens[i]["role"] == "assistant":
-                last_assistant_message_idx = i
-                break
-
-        if last_assistant_message_idx is None:
-            messages_to_last_assistant_message = messages_for_replace_prefix_tokens
-        else:
-            messages_to_last_assistant_message = messages_for_replace_prefix_tokens[
-                : last_assistant_message_idx + 1
-            ]
-
-        modified_request = request.model_copy(update={"add_generation_prompt": False})
-
-        corresponding_res = await super().preprocess_chat(
-            request=modified_request,
-            messages=messages_to_last_assistant_message,
-            default_template=default_template,
-            default_template_content_format=default_template_content_format,
-            default_template_kwargs=default_template_kwargs,
-            tool_dicts=tool_dicts,
-            parser=parser,
-            skip_mm_cache=skip_mm_cache,
-        )
-        actual_corresponding_token_ids = corresponding_res[1][0]["prompt_token_ids"]
-
-        engine_prompt = res[1][0]
-
         splice = splice_prefix_tokens(
             tokenizer=self.renderer.tokenizer,
-            model_prefix_token_ids=model_prefix_token_ids,
-            template_prefix_token_ids=actual_corresponding_token_ids,
+            model_prefix_token_ids=list(request.required_prefix_token_ids),
+            template_prefix_token_ids=rendered.history_token_ids,
             template_token_ids=engine_prompt["prompt_token_ids"],
-            # The template's own EOS must stay countable even when the
-            # configured stops don't include it.
-            eos_token_id=self._model_stop_token_ids
-            | {self.renderer.tokenizer.eos_token_id},
+            eos_token_id=turn_end_token_ids(
+                self._model_stop_token_ids, self.renderer.tokenizer
+            ),
         )
         final_prompt_token_ids = splice.token_ids
         # Reject overflows before media validation can mask the length error.
@@ -358,8 +381,26 @@ class NeMoRLOpenAIServingMixin:
         return res
 
 
+@dataclass(frozen=True)
+class RenderedChat:
+    """One chat call rendered for the engine, before its prefix is spliced in."""
+
+    conversation: list[Any]
+    # The full render, multimodal inputs included; its ids are the template's.
+    engine_prompt: dict[str, Any]
+    # What capture stores, after the candidate decision; None without capture.
+    admission: Any
+    # How the prompt is served: "token_in" reads the prefix from TQ.
+    serving_admission: Any
+    verify_retained_media: bool
+    # The render up to the last assistant turn, when a prefix will be spliced.
+    history_token_ids: Optional[list[int]]
+
+
 class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
-    def __init__(self, *args, host: Any, model_stop_token_ids: set[int], **kwargs):
+    def __init__(
+        self, *args, host: Any, model_stop_token_ids: frozenset[int], **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self._host = host
         # vLLM adds the generation config's EOS to every request's stop set
@@ -489,17 +530,6 @@ class ChatServer:
     online_renderer: NeMoRLOnlineRenderer
     serving_chat: NeMoRLOpenAIServingChat
     serving_tokenization: NeMoRLServingTokenization
-
-
-def model_stop_token_ids(model_config: Any, cfg: dict[str, Any]) -> set[int]:
-    """The configured stops plus the generation config's EOS."""
-    stop_token_ids = set(cfg.get("stop_token_ids") or ())
-    generation_eos_token_ids = model_config.try_get_generation_config().get(
-        "eos_token_id"
-    )
-    if isinstance(generation_eos_token_ids, int):
-        generation_eos_token_ids = [generation_eos_token_ids]
-    return stop_token_ids | set(generation_eos_token_ids or ())
 
 
 def build_chat_server(
@@ -642,36 +672,22 @@ def register_routes(
         # Accept train and validation profiles; reject off-policy requests.
         # vLLM fills an unset top_k/min_p/repetition_penalty from
         # generation_config.json when vllm_kwargs sets generation_config="auto",
-        # so pin top_k to the matched profile's (as
+        # so serve the matched profile's top_k (as
         # vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params does)
-        # and disable min_p and the repetition penalty. vLLM applies these and
-        # the presence/frequency penalties and logit bias before sampling; the
-        # trainer replays none of them, so a request may not set them.
-        top_k = check_sampling_param(
+        # with min_p and the repetition penalty off; the trainer replays none of
+        # them, nor the penalties or logit bias a request may therefore not set.
+        for field, value in on_policy_sampling(
             temperature=request.temperature,
             top_p=request.top_p,
             top_k=request.top_k,
+            min_p=request.min_p,
+            repetition_penalty=request.repetition_penalty,
+            presence_penalty=request.presence_penalty,
+            frequency_penalty=request.frequency_penalty,
+            logit_bias=request.logit_bias,
             generation_config=generation_config,
-        )
-        assert request.min_p in (None, 0.0), (
-            f"request min_p={request.min_p} is not supported; leave it unset"
-        )
-        assert request.repetition_penalty in (None, 1.0), (
-            f"request repetition_penalty={request.repetition_penalty} is not "
-            "supported; leave it unset"
-        )
-        assert request.presence_penalty in (None, 0.0), (
-            f"request presence_penalty={request.presence_penalty} is not "
-            "supported; leave it unset"
-        )
-        assert request.frequency_penalty in (None, 0.0), (
-            f"request frequency_penalty={request.frequency_penalty} is not "
-            "supported; leave it unset"
-        )
-        assert not request.logit_bias, "request logit_bias is not supported"
-        request.top_k = top_k
-        request.min_p = 0.0
-        request.repetition_penalty = 1.0
+        ).items():
+            setattr(request, field, value)
 
         try:
             generator = await openai_serving_chat.create_chat_completion(

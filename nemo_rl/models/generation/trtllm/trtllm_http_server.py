@@ -168,7 +168,7 @@ async def build_spliced_prompt_ids(
             model_prefix_token_ids=required_prefix_ids,
             template_prefix_token_ids=template_prefix_ids,
             template_token_ids=prompt_token_ids,
-            eos_token_id=eos_token_ids or None,
+            eos_token_id=eos_token_ids or tokenizer.eos_token_id,
         )
 
     return await asyncio.to_thread(_sync)

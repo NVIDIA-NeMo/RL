@@ -4018,6 +4018,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
         template_token_ids=template_token_ids,
+        eos_token_id=tokenizer.eos_token_id,
     )
     assert result == og_model_token_ids
 
@@ -4031,6 +4032,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
         template_token_ids=template_token_ids,
+        eos_token_id=tokenizer.eos_token_id,
     )
     assert result == og_model_token_ids
 
@@ -4045,6 +4047,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
         template_token_ids=template_token_ids,
+        eos_token_id=tokenizer.eos_token_id,
     )
     assert result == og_model_token_ids
 
@@ -4060,6 +4063,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
         template_token_ids=template_token_ids,
+        eos_token_id=tokenizer.eos_token_id,
     )
     assert result == og_model_token_ids
 
@@ -4072,6 +4076,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
         template_token_ids=template_token_ids,
+        eos_token_id=tokenizer.eos_token_id,
     )
     assert result == model_token_ids
 
@@ -4085,6 +4090,7 @@ def test_VllmAsyncGenerationWorker_replace_prefix_tokens(tokenizer):
         model_prefix_token_ids=model_prefix_token_ids,
         template_prefix_token_ids=template_prefix_token_ids,
         template_token_ids=template_token_ids,
+        eos_token_id=tokenizer.eos_token_id,
     )
     assert result == model_token_ids
 

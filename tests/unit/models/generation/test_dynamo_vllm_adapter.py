@@ -145,6 +145,7 @@ class _FakeLLM:
         self.renderer = _FakeRenderer()
         self.model_config = SimpleNamespace(
             get_diff_sampling_param=lambda: dict(defaults or {}),
+            try_get_generation_config=lambda: {},
             multimodal_config=None,
             allowed_local_media_path="",
             allowed_media_domains=None,
