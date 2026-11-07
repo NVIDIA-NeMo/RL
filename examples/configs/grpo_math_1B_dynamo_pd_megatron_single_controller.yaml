@@ -66,7 +66,8 @@ policy:
       # is the allocator decode admission reuses. Both are required.
       enable_prefix_caching: true
       kv_cache_management_mode: persist
-      # The Dynamo frontend is the HTTP surface.
+      # NeMo RL's own rollouts go to the Dynamo frontend. true serves NeMo-Gym
+      # from each engine's rank zero, over the frontend (env.should_use_nemo_gym).
       expose_http_server: false
       # Only read by refit_transport: mcore.
       refit_backend: null

@@ -299,11 +299,6 @@ def test_engine_width_must_hold_the_expert_parallel_grid(layout, decode, match) 
             "persist",
             id="kv_cache_mode",
         ),
-        pytest.param(
-            _set("mcore_generation_config", "expose_http_server", value=True),
-            "expose_http_server",
-            id="http_server",
-        ),
     ],
 )
 def test_validation_rejects_unsupported_shapes(mutate, match) -> None:
@@ -318,11 +313,19 @@ def test_validation_accepts_the_reference_shape_and_null_colocated() -> None:
     validate_megatron_dynamo_generation(_megatron_config(colocated=None))
 
 
+def test_validation_accepts_the_http_server_for_nemo_gym() -> None:
+    # Each engine's rank zero serves NeMo-Gym over the frontend from that server.
+    config = _megatron_config()
+    config["mcore_generation_config"]["expose_http_server"] = True
+    validate_megatron_dynamo_generation(config)
+
+
 def _master_config(generation: dict) -> SimpleNamespace:
     """The fields MegatronGeneration.validate_settings reads, at accepted values."""
     return SimpleNamespace(
         policy=_policy(generation),
         env={"should_use_nemo_gym": False},
+        token_capture=SimpleNamespace(enabled=False),
         async_rl=SimpleNamespace(
             recompute_kv_cache_after_weight_updates=False,
             generation_fleet_health=SimpleNamespace(enabled=False),
