@@ -575,12 +575,12 @@ def _get_gpu_id_info() -> tuple[int, str, int]:  # pragma: no cover
 
 
 @ray.remote(num_gpus=1)
-def _get_gpu_id() -> int:  # pragma: no cover
+def _get_gpu_id() -> int | str:  # pragma: no cover
     """Return the GPU id Ray assigned to the current task's bundle."""
-    return int(ray.get_gpu_ids()[0])
+    return ray.get_gpu_ids()[0]
 
 
-def get_bundle_gpu_id(pg: PlacementGroup, bundle_index: int) -> int:
+def get_bundle_gpu_id(pg: PlacementGroup, bundle_index: int) -> int | str:
     """Return the GPU id Ray assigned to one placement-group bundle.
 
     Same probe as ``get_reordered_bundle``: a short task with a small GPU share (so it
