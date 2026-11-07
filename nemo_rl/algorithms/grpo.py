@@ -4239,6 +4239,7 @@ def _grpo_train_impl(
                                 master_config.grpo,
                                 dataset_loss_multiplier,
                             ),
+                            "generation_logprobs": train_data["generation_logprobs"],
                             **extra_multimodal_data,
                         }
                     )
