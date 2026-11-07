@@ -528,6 +528,12 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     recompute_kv_cache_after_weight_updates: bool = True
     # Min ready groups the streaming trainer waits for before dispatching a batch.
     min_groups_for_streaming_train: int = 32
+    # Max groups the streaming trainer dispatches in one chunk. ``None`` leaves
+    # chunks unbounded, so a buffer that is already warm trains the whole step as
+    # a single chunk -- which is correct but pins the generation fleet idle for
+    # the entire training tail. A cap splits the step into chunks that overlap
+    # with generation instead.
+    max_groups_for_streaming_train: Optional[int] = None
     # Cap on in-flight generate_and_push calls in the rollout pump.
     max_inflight_prompts: int = 32
     # Cap on unconsumed rollout groups buffered in the DataPlane (backpressure).
@@ -572,6 +578,32 @@ class AsyncRLConfig(BaseModel, extra="allow"):
             raise ValueError(
                 "async_rl blocks have been renamed to say what they watch or route:\n"
                 + "\n".join(stale)
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_streaming_chunk_bounds(self) -> "AsyncRLConfig":
+        """The chunk cap must leave room for the floor it is capping.
+
+        ``_train_pump`` clamps the floor down to the cap so a short tail chunk can
+        still close the step. Set the cap below the floor and that clamp fires on
+        *every* chunk, so the configured floor never applies and the run streams at
+        the cap instead -- the floor becomes dead config rather than a bound.
+        """
+        max_groups = self.max_groups_for_streaming_train
+        if max_groups is None:
+            return self
+        if max_groups < 1:
+            raise ValueError(
+                f"async_rl.max_groups_for_streaming_train ({max_groups}) must be >= 1"
+            )
+        if max_groups < self.min_groups_for_streaming_train:
+            raise ValueError(
+                "async_rl.max_groups_for_streaming_train "
+                f"({max_groups}) must be >= "
+                "async_rl.min_groups_for_streaming_train "
+                f"({self.min_groups_for_streaming_train}): the cap would clamp the "
+                "floor on every chunk, leaving the floor with no effect."
             )
         return self
 
@@ -1587,10 +1619,66 @@ def resolve_ppo_chunk_alignment(
             f"policy/value group multiple ({group_multiple}) so each chunk "
             "contains complete microbatches on every DP rank"
         )
+    # Tail-aware selection refuses an unaligned max, and only a binding cap can
+    # produce one: the uncapped max is the already-aligned step remainder.
+    chunk_cap = master_config.async_rl.max_groups_for_streaming_train
+    if (
+        chunk_cap is not None
+        and chunk_cap < ppo_config.num_prompts_per_step
+        and chunk_cap % group_multiple != 0
+    ):
+        raise ValueError(
+            "PPO max_groups_for_streaming_train must be divisible by the "
+            f"policy/value group multiple ({group_multiple}) so each capped "
+            "chunk contains complete microbatches on every DP rank"
+        )
     min_remaining_groups = (
         (min_groups + 1) // 2 if min_groups < ppo_config.num_prompts_per_step else 0
     )
     return group_multiple, min_remaining_groups
+
+
+def validate_grpo_chunk_cap_alignment(
+    master_config: MasterConfig, policy_dp: int
+) -> None:
+    """Reject a GRPO chunk cap whose samples cannot shard across policy DP ranks.
+
+    GRPO passes no ``group_multiple`` to the sampler, so a chunk can be any size
+    from the floor up to the cap, and the training dispatch shards it without
+    ``allow_uneven_shards``. This guards the full-cap chunk only: a cap of 3 at 2
+    generations per prompt is 6 samples, which fails on a DP of 4. An unaligned
+    chunk below the cap stays reachable, as it already is from an unaligned
+    ``min_groups_for_streaming_train``, which no validator covers today.
+
+    Only a cap below ``num_prompts_per_step`` can bind, and Forest is exempt: its
+    producer pads each group to the policy execution row multiple, so the logical
+    group count is not the physical row count.
+
+    Args:
+        master_config: The run configuration.
+        policy_dp: Data-parallel size of the policy trainer.
+
+    Raises:
+        ValueError: The capped chunk's sample count is not divisible by ``policy_dp``.
+    """
+    if is_ppo_run(master_config):
+        return
+    chunk_cap = master_config.async_rl.max_groups_for_streaming_train
+    algo_cfg = algo_config(master_config)
+    if (
+        master_config.token_capture.forest_training
+        or chunk_cap is None
+        or chunk_cap >= algo_cfg.num_prompts_per_step
+    ):
+        return
+    if (chunk_cap * algo_cfg.num_generations_per_prompt) % policy_dp != 0:
+        raise ValueError(
+            "GRPO async_rl.max_groups_for_streaming_train "
+            f"({chunk_cap}) x num_generations_per_prompt "
+            f"({algo_cfg.num_generations_per_prompt}) must be divisible by the "
+            f"policy data-parallel size ({policy_dp}) so each capped chunk "
+            "shards evenly across the training ranks"
+        )
 
 
 def validate_single_controller_config(master_config: MasterConfig) -> None:
