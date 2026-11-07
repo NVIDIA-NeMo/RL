@@ -209,6 +209,13 @@ _REMOVED_DYNAMO_CFG_KEYS = {
     "metrics_include_prefixes": "set vllm_cfg.enable_vllm_metrics_logger instead",
     "metrics_exclude_prefixes": "set vllm_cfg.enable_vllm_metrics_logger instead",
 }
+_REMOVED_DYNAMO_WORKER_KEYS = {
+    "extra_cli_args": "engines are configured through vllm_cfg and vllm_kwargs",
+    "endpoint_types": (
+        "the engines always serve /v1/completions (NeMo RL's rollouts) and chat "
+        "(NeMo-Gym)"
+    ),
+}
 _REMOVED_DYNAMO_FRONTEND_KEYS = (
     "tokenizer",
     "tokenizer_cache",
@@ -257,11 +264,13 @@ def reject_outdated_dynamo_backend(config: dict[str, Any]) -> None:
                         "frontend never tokenizes."
                     )
         worker_args = dynamo_cfg.get("worker_args")
-        if isinstance(worker_args, dict) and "extra_cli_args" in worker_args:
-            problems.append(
-                "policy.generation.dynamo_cfg.worker_args.extra_cli_args was "
-                "removed: engines are configured through vllm_cfg and vllm_kwargs."
-            )
+        if isinstance(worker_args, dict):
+            for key, replacement in _REMOVED_DYNAMO_WORKER_KEYS.items():
+                if key in worker_args:
+                    problems.append(
+                        f"policy.generation.dynamo_cfg.worker_args.{key} was "
+                        f"removed: {replacement}."
+                    )
     if problems:
         raise ValueError(" ".join(problems))
 

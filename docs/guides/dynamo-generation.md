@@ -75,17 +75,6 @@ native path: token IDs, log probabilities, truncation, routed experts with
 their `r3_routed_experts_*` counts, and `gen_leader_worker_idx`. Both paths
 build it with `nemo_rl/models/generation/vllm/request_pipeline.py`.
 
-OpenAI clients of the frontend get what vLLM's own OpenAI server applies:
-- the model's generation-config sampling defaults;
-- `n > 1`;
-- guided decoding (`guided_*`, `response_format`);
-- `bad_words_token_ids` and `allowed_token_ids`;
-- prompt log probabilities (`nvext.extra_fields: ["prompt_logprobs"]`);
-- vLLM's queue limits, rejected with HTTP 503;
-- a 400 naming the "maximum context length" for a prompt that leaves no room
-  for output. The engine, not the frontend, checks the context, so it checks
-  the prompt it actually runs.
-
 ## NeMo-Gym
 
 NeMo-Gym's policy model calls the frontend. Setup turns on Gym's Dynamo dialect

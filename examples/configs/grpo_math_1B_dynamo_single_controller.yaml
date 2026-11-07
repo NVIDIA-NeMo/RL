@@ -31,7 +31,6 @@ policy:
         # A chat template that replaces the model's own. null follows
         # vllm_cfg.http_server_serving_chat_kwargs.chat_template.
         custom_jinja_template: null
-        endpoint_types: [chat, completions]
       frontend_args:
         # kv: route each request to the engine holding most of its prefix.
         router_mode: kv

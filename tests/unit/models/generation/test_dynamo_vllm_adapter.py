@@ -345,7 +345,6 @@ def test_every_worker_arg_reaches_the_dynamo_worker_config(
         "structural_tag_scope": "always",
         "structural_tag_schema": "strict",
         "custom_jinja_template": str(template),
-        "endpoint_types": ["chat"],
     }
     assert set(worker_args) == set(DynamoWorkerArgs.model_fields)
     host = _host(_FakeLLM(), dynamo_cfg={"worker_args": worker_args})
@@ -363,11 +362,7 @@ def test_every_worker_arg_reaches_the_dynamo_worker_config(
     assert config.structural_tag_mode == "on"
     with open(config.custom_jinja_template) as template_file:
         assert template_file.read() == "{{ messages }}"
-    for key in worker_args.keys() - {
-        "endpoint_types",
-        "enable_structural_tag",
-        "custom_jinja_template",
-    }:
+    for key in worker_args.keys() - {"enable_structural_tag", "custom_jinja_template"}:
         assert getattr(config, key) == worker_args[key], key
 
 

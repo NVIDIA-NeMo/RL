@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import pytest
-from pydantic import ValidationError
 
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.dynamo.config import (
@@ -116,13 +115,6 @@ def test_configs_dynamo_would_not_serve_as_written_fail_at_startup(
 ) -> None:
     with pytest.raises(ValueError, match=error):
         configure_generation_config(config, _Tokenizer())
-
-
-def test_dynamo_cfg_rejects_unknown_keys() -> None:
-    with pytest.raises(ValidationError, match="extra_cli_args"):
-        dynamo_cfg({"dynamo_cfg": {"worker_args": {"extra_cli_args": []}}})
-    with pytest.raises(ValidationError, match="duplicates"):
-        dynamo_cfg({"dynamo_cfg": {"worker_args": {"endpoint_types": ["chat"] * 2}}})
 
 
 def test_frontend_argv_is_runtime_owned() -> None:

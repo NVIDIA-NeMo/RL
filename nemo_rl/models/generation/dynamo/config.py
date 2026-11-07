@@ -21,7 +21,7 @@ every field below carries its default.
 
 from typing import Annotated, Any, Literal, Mapping
 
-from pydantic import BaseModel, Field, PositiveFloat, model_validator
+from pydantic import BaseModel, Field, PositiveFloat
 
 
 class DynamoWorkerArgs(BaseModel, extra="forbid"):
@@ -39,15 +39,6 @@ class DynamoWorkerArgs(BaseModel, extra="forbid"):
     # A Jinja chat template file that replaces the model's own. None follows
     # vllm_cfg.http_server_serving_chat_kwargs.chat_template.
     custom_jinja_template: str | None = None
-    endpoint_types: list[Literal["chat", "completions"]] = ["chat", "completions"]
-
-    @model_validator(mode="after")
-    def _validate_endpoint_types(self) -> "DynamoWorkerArgs":
-        if not self.endpoint_types:
-            raise ValueError("endpoint_types must contain at least one endpoint")
-        if len(self.endpoint_types) != len(set(self.endpoint_types)):
-            raise ValueError("endpoint_types must not contain duplicates")
-        return self
 
 
 class DynamoFrontendArgs(BaseModel, extra="forbid"):

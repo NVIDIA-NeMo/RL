@@ -435,6 +435,10 @@ def _generation_config(**generation) -> dict:
             r"worker_args\.extra_cli_args",
         ),
         (
+            {"dynamo_cfg": {"worker_args": {"endpoint_types": ["chat"]}}},
+            r"worker_args\.endpoint_types was removed",
+        ),
+        (
             {"dynamo_cfg": {"frontend_args": {"tokenizer_cache": False}}},
             r"frontend_args\.tokenizer_cache was",
         ),
