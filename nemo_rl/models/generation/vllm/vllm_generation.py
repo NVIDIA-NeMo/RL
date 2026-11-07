@@ -765,6 +765,14 @@ class VllmGeneration(GenerationInterface):
         self._token_capture_setup = setup
         return self._token_capture_media
 
+    def get_data_plane_snapshots(self) -> list[dict[str, Any]]:
+        """Capture-client counters from every DP-leader worker that has one."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_data_plane_snapshot",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return [s for s in ray.get(futures) if s]
+
     def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version refit members stamp on captured model calls.
 
