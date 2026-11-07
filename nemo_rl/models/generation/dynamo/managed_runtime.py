@@ -22,6 +22,7 @@ import atexit
 import json
 import logging
 import os
+import pickle
 import re
 import shutil
 import signal
@@ -31,7 +32,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from typing import Callable
+from typing import Any, Callable
 
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
@@ -118,11 +119,24 @@ def _managed_namespace() -> str:
     return re.sub(r"[^a-zA-Z0-9_-]+", "-", raw).strip("-_").lower()
 
 
+# The frontend process's environment for NeMo RL's chat engine
+# (dynamo/vllm/chat_engine.py): its render workers, where setup_token_capture
+# writes the capture config, and the Ray cluster its TQ reads go through.
+RENDER_WORKERS_ENV = "NEMO_RL_DYNAMO_RENDER_WORKERS"
+CAPTURE_FILE_ENV = "NEMO_RL_DYNAMO_CAPTURE_FILE"
+RAY_ADDRESS_ENV = "NEMO_RL_DYNAMO_RAY_ADDRESS"
+
+
 class ManagedDynamoRuntime:
     """Own etcd, NATS and the frontend that NeMo RL's vLLM engines register with."""
 
     def __init__(
-        self, *, dynamo_cfg: DynamoCfg, model_name: str, frontend_python: str
+        self,
+        *,
+        dynamo_cfg: DynamoCfg,
+        model_name: str,
+        frontend_python: str,
+        ray_address: str,
     ) -> None:
         """Describe the services; nothing starts until :meth:`start`.
 
@@ -131,10 +145,14 @@ class ManagedDynamoRuntime:
             model_name: The served model; the frontend is ready once it lists it.
             frontend_python: An interpreter whose environment has ``ai-dynamo``:
                 the vLLM workers' own.
+            ray_address: The Ray cluster's GCS address; the frontend's chat
+                engine reads token-capture prefixes from TQ through it.
         """
         self._dynamo_cfg = dynamo_cfg
         self._model_name = model_name
         self._frontend_python = frontend_python
+        self._ray_address = ray_address
+        self._chat_dir: str | None = None
         self._namespace = _managed_namespace()
         self._host = ""
         self._etcd_port = 0
@@ -198,10 +216,9 @@ class ManagedDynamoRuntime:
             "NATS_SERVER": f"nats://{self._host}:{self._nats_port}",
             "DYN_NAMESPACE": self._namespace,
             "DYN_DISCOVERY_BACKEND": "etcd",
-            # Dynamo's legacy tool jail rebuilds response chunks with nvext=None.
-            # Its v2 parser path preserves engine_data, which NeMo-Gym needs for
-            # exact token IDs and log probabilities.
-            "DYN_ENABLE_EXPERIMENTAL_PARSERS_V2": "1",
+            # A field the frontend doesn't know fails the call with a 400 rather
+            # than vanishing; an inherited setting can't turn that off.
+            "DYN_IGNORE_OPENAI_FE_UNSUPPORTED_FIELDS": "0",
             "DYN_REQUEST_PLANE": "tcp",
             "DYN_EVENT_PLANE": "nats",
             # NeMo-Gym sends media inline: raise the frontend's 45 MB HTTP body
@@ -335,20 +352,57 @@ class ManagedDynamoRuntime:
             namespace=self._namespace,
             dynamo_cfg=self._dynamo_cfg,
         )
+        # Dynamo's frontend, with NeMo RL's chat engine serving chat calls.
         command = [
             self._frontend_python,
             "-m",
-            "dynamo.frontend",
+            "nemo_rl.models.generation.dynamo.vllm.frontend",
             *argv,
         ]
         print(f"  [Dynamo] launching frontend argv={command!r}", flush=True)
+        self._chat_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_chat_")
         frontend_env = self._service_env()
+        frontend_env[RENDER_WORKERS_ENV] = str(
+            self._dynamo_cfg.frontend_args.render_workers
+        )
+        frontend_env[CAPTURE_FILE_ENV] = os.path.join(self._chat_dir, "capture.pkl")
+        frontend_env[RAY_ADDRESS_ENV] = self._ray_address
         dynamo_venv = os.path.dirname(os.path.dirname(self._frontend_python))
         frontend_env["VIRTUAL_ENV"] = dynamo_venv
         frontend_env["UV_PROJECT_ENVIRONMENT"] = dynamo_venv
         self._frontend_process = subprocess.Popen(
             command, env=frontend_env, start_new_session=True
         )
+
+    def publish_chat_capture(
+        self,
+        *,
+        dp_cfg: dict[str, Any],
+        staging_partition: str,
+        capture_media: bool,
+    ) -> None:
+        """Tell the frontend's chat engine where token-capture prefixes are read.
+
+        Capture is set up after the engines register, so the chat engine reads
+        this on its first captured call.
+        """
+        if self._chat_dir is None:
+            raise RuntimeError("Managed Dynamo runtime has not been started")
+        path = os.path.join(self._chat_dir, "capture.pkl")
+        # Pickled: the data-plane config holds pydantic storage configs.
+        with tempfile.NamedTemporaryFile(
+            "wb", dir=self._chat_dir, suffix=".pkl", delete=False
+        ) as capture_file:
+            pickle.dump(
+                {
+                    "data_plane": dp_cfg,
+                    "staging_partition": staging_partition,
+                    "capture_media": capture_media,
+                },
+                capture_file,
+            )
+        # Renamed into place, so the chat engine never reads a partial file.
+        os.replace(capture_file.name, path)
 
     def wait_for_engines(
         self, expected_engines: int, check_engines: Callable[[], None]
@@ -471,6 +525,9 @@ class ManagedDynamoRuntime:
         if self._etcd_data_dir is not None:
             shutil.rmtree(self._etcd_data_dir, ignore_errors=True)
             self._etcd_data_dir = None
+        if self._chat_dir is not None:
+            shutil.rmtree(self._chat_dir, ignore_errors=True)
+            self._chat_dir = None
         if self._nats_data_dir is not None:
             shutil.rmtree(self._nats_data_dir, ignore_errors=True)
             self._nats_data_dir = None

@@ -69,6 +69,7 @@ from nemo_rl.models.generation.vllm.captured_chat_logprobs import (
     CapturedChatLogprobsMixin,
 )
 from nemo_rl.models.generation.vllm.utils import (
+    OffPolicySamplingError,
     attach_routed_experts_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
@@ -81,6 +82,10 @@ LOGGER = logging.getLogger(__name__)
 
 
 class NeMoRLOpenAIChatRequestMixin:
+    # Declared by the request models this mixes into.
+    required_prefix_token_ids: Optional[list[int]]
+    messages: Any
+
     def model_post_init(self, context):
         # NeMo-Gym specific processing. This is just how NeMo-Gym returns the extra token information.
         if self.required_prefix_token_ids is None:
@@ -112,20 +117,20 @@ class NeMoRLTokenizeChatRequest(NeMoRLOpenAIChatRequestMixin, TokenizeChatReques
 NeMoRLTokenizeRequest = Union[TokenizeCompletionRequest, NeMoRLTokenizeChatRequest]
 
 
+def set_max_tokens(request: Any, max_tokens: int) -> None:
+    """Set the request's max output tokens.
+
+    Mutates the request in place. Handles both max_completion_tokens (newer OpenAI API)
+    and max_tokens (deprecated but still supported by vLLM).
+    """
+    if request.max_completion_tokens is not None:
+        request.max_completion_tokens = max_tokens
+    elif request.max_tokens is not None:
+        request.max_tokens = max_tokens
+
+
 class NeMoRLOpenAIServingMixin:
     """The chat preprocessing NeMo RL adds: prefix splice and token capture."""
-
-    @staticmethod
-    def _set_max_tokens(request, max_tokens: int) -> None:
-        """Set the request's max output tokens.
-
-        Mutates the request in place. Handles both max_completion_tokens (newer OpenAI API)
-        and max_tokens (deprecated but still supported by vLLM).
-        """
-        if request.max_completion_tokens is not None:
-            request.max_completion_tokens = max_tokens
-        elif request.max_tokens is not None:
-            request.max_tokens = max_tokens
 
     def _clamp_max_tokens(
         self, request, request_max_tokens: int, prompt_token_ids: list[int]
@@ -146,7 +151,7 @@ class NeMoRLOpenAIServingMixin:
                 value=len(prompt_token_ids),
             )
         max_tokens = min(request_max_tokens, remaining)
-        self._set_max_tokens(request, max_tokens)
+        set_max_tokens(request, max_tokens)
 
     async def _render_chat_call(
         self, request, messages, render_kwargs: dict[str, Any], *, admission
@@ -262,7 +267,7 @@ class NeMoRLOpenAIServingMixin:
             # If max_completion_tokens or max_tokens is not set, we don't need to do _clamp_max_tokens.
             # So we don't need to set the request's max output tokens to 1 here.
             if actual_request_max_tokens is not None:
-                self._set_max_tokens(request, 1)
+                set_max_tokens(request, 1)
 
         rendered = await self._render_chat_call(
             request,
@@ -408,6 +413,58 @@ class NeMoRLOnlineRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
         self._model_stop_token_ids = model_stop_token_ids
 
 
+class FrontendRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
+    """The render step for NeMo RL's chat engine in Dynamo's frontend.
+
+    Runs only the shared step (:meth:`_render_chat_call`): the frontend reads
+    the TQ prefix and splices, and the engine captures. Media is always
+    processed here, never served from a processor cache, since the engine runs
+    on the pixels the frontend sends.
+    """
+
+    # The render the overridden preprocess_chat is asked for, and its result.
+    _admission: Any = None
+    _rendered: Any = None
+
+    async def render_for_frontend(self, request, *, admission) -> "RenderedChat":
+        """Render ``request``; the caller restores its lowered output budget."""
+        self._admission = admission
+        # As preprocess_chat does: vLLM's pre-tokenization length check must
+        # pass; the frontend clamps the budget after the splice.
+        set_max_tokens(request, 1)
+        result = await self.render_chat(request, skip_mm_cache=True)
+        if not isinstance(result, tuple):
+            raise ValueError(result.error.message)
+        return self._rendered
+
+    async def preprocess_chat(
+        self,
+        request,
+        messages,
+        default_template,
+        default_template_content_format,
+        default_template_kwargs,
+        tool_dicts=None,
+        parser=None,
+        *,
+        skip_mm_cache: bool = False,
+    ):
+        self._rendered = await self._render_chat_call(
+            request,
+            messages,
+            dict(
+                default_template=default_template,
+                default_template_content_format=default_template_content_format,
+                default_template_kwargs=default_template_kwargs,
+                tool_dicts=tool_dicts,
+                parser=parser,
+                skip_mm_cache=True,
+            ),
+            admission=self._admission,
+        )
+        return self._rendered.conversation, [self._rendered.engine_prompt]
+
+
 class NeMoRLOpenAIServingChatMixin:
     async def chat_completion_full_generator(
         self,
@@ -532,17 +589,8 @@ class ChatServer:
     serving_tokenization: NeMoRLServingTokenization
 
 
-def build_chat_server(
-    host: Any, *, engine_client: Any, model_config: Any, cfg: dict[str, Any]
-) -> ChatServer:
-    """Build the chat serving the worker's HTTP server answers with.
-
-    Args:
-        host: The vLLM worker; it owns token capture.
-        engine_client: The engine the chat serving generates with.
-        model_config: The engine's vLLM ``ModelConfig``.
-        cfg: ``policy.generation``.
-    """
+def register_parser_plugins(cfg: dict[str, Any]) -> None:
+    """Import the tool and reasoning parser plugins ``policy.generation`` names."""
     maybe_tool_parser_plugin = cfg["vllm_cfg"].get("tool_parser_plugin")
     if maybe_tool_parser_plugin:
         ToolParserManager.import_tool_parser(maybe_tool_parser_plugin)
@@ -551,27 +599,21 @@ def build_chat_server(
     if maybe_reasoning_parser_plugin:
         ReasoningParserManager.import_reasoning_parser(maybe_reasoning_parser_plugin)
 
-    base_model_paths = [
-        BaseModelPath(
-            name=model_config.served_model_name, model_path=model_config.model
-        ),
-        BaseModelPath(name=model_config.model, model_path=model_config.model),
-    ]
 
-    openai_serving_models_kwargs = dict(
-        engine_client=engine_client,
-        base_model_paths=base_model_paths,
-        lora_modules=None,
-    )
-    openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
+def serving_chat_settings(cfg: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The chat serving's settings and default chat-template kwargs.
 
-    serving_chat_default_kwargs = dict(
-        response_role="assistant",
-        request_logger=None,
-        chat_template=None,
-        chat_template_content_format="auto",
-        enable_auto_tools=True,
-    )
+    One copy for every host of the chat path, so each renders and parses
+    alike. Returns the ``OpenAIServingChat`` kwargs (template loaded,
+    ``default_chat_template_kwargs`` normalized) and those template kwargs.
+    """
+    serving_chat_default_kwargs: dict[str, Any] = {
+        "response_role": "assistant",
+        "request_logger": None,
+        "chat_template": None,
+        "chat_template_content_format": "auto",
+        "enable_auto_tools": True,
+    }
     serving_chat_kwargs = serving_chat_default_kwargs | cfg["vllm_cfg"].get(
         "http_server_serving_chat_kwargs", dict()
     )
@@ -604,6 +646,37 @@ def build_chat_server(
     default_chat_template_kwargs: dict[str, Any] = (
         serving_chat_kwargs["default_chat_template_kwargs"] or {}
     )
+    return serving_chat_kwargs, default_chat_template_kwargs
+
+
+def build_chat_server(
+    host: Any, *, engine_client: Any, model_config: Any, cfg: dict[str, Any]
+) -> ChatServer:
+    """Build the chat serving the worker's HTTP server answers with.
+
+    Args:
+        host: The vLLM worker; it owns token capture.
+        engine_client: The engine the chat serving generates with.
+        model_config: The engine's vLLM ``ModelConfig``.
+        cfg: ``policy.generation``.
+    """
+    register_parser_plugins(cfg)
+
+    base_model_paths = [
+        BaseModelPath(
+            name=model_config.served_model_name, model_path=model_config.model
+        ),
+        BaseModelPath(name=model_config.model, model_path=model_config.model),
+    ]
+
+    openai_serving_models_kwargs = dict(
+        engine_client=engine_client,
+        base_model_paths=base_model_paths,
+        lora_modules=None,
+    )
+    openai_serving_models = OpenAIServingModels(**openai_serving_models_kwargs)
+
+    serving_chat_kwargs, default_chat_template_kwargs = serving_chat_settings(cfg)
     online_renderer = NeMoRLOnlineRenderer(
         model_config=engine_client.model_config,
         renderer=engine_client.renderer,
@@ -676,17 +749,32 @@ def register_routes(
         # vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params does)
         # with min_p and the repetition penalty off; the trainer replays none of
         # them, nor the penalties or logit bias a request may therefore not set.
-        for field, value in on_policy_sampling(
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k,
-            min_p=request.min_p,
-            repetition_penalty=request.repetition_penalty,
-            presence_penalty=request.presence_penalty,
-            frequency_penalty=request.frequency_penalty,
-            logit_bias=request.logit_bias,
-            generation_config=generation_config,
-        ).items():
+        try:
+            sampling = on_policy_sampling(
+                temperature=request.temperature,
+                top_p=request.top_p,
+                top_k=request.top_k,
+                min_p=request.min_p,
+                repetition_penalty=request.repetition_penalty,
+                presence_penalty=request.presence_penalty,
+                frequency_penalty=request.frequency_penalty,
+                logit_bias=request.logit_bias,
+                generation_config=generation_config,
+            )
+        except OffPolicySamplingError as e:
+            # Before capture begins, so there is no capture state to settle.
+            return JSONResponse(
+                content={
+                    "error": {
+                        "message": str(e),
+                        "type": "invalid_request_error",
+                        "param": "sampling",
+                        "code": 400,
+                    }
+                },
+                status_code=400,
+            )
+        for field, value in sampling.items():
             setattr(request, field, value)
 
         try:

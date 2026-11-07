@@ -14,22 +14,21 @@
 """The vLLM Dynamo adapter over a fake AsyncLLM.
 
 The host is a real ``VllmAsyncGenerationWorkerImpl`` built without its
-constructor, so rollouts are sampled by the native worker's own helpers.
+constructor, so rollouts and NeMo-Gym calls run the native worker's own helpers.
 """
 
 import ast
 import asyncio
 import base64
 import importlib.util
-import io
 import json
+import pickle
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
-from PIL import Image
 
 pytestmark = pytest.mark.vllm
 pytest.importorskip("dynamo._core")
@@ -38,36 +37,43 @@ vllm = pytest.importorskip("vllm")
 from dynamo.llm.exceptions import InvalidArgument  # noqa: E402
 from vllm.multimodal.inputs import PlaceholderRange  # noqa: E402
 
-from nemo_rl.models.generation.dynamo import (  # noqa: E402
-    engine_adapter,
-    vllm_adapter,
-)
+from nemo_rl.models.generation.dynamo import engine_adapter  # noqa: E402
 from nemo_rl.models.generation.dynamo.config import (  # noqa: E402
     DynamoCfg,
     DynamoFrontendArgs,
-    DynamoWorkerArgs,
 )
 from nemo_rl.models.generation.dynamo.rollout_client import (  # noqa: E402
     ROLLOUT_ANNOTATION,
+)
+from nemo_rl.models.generation.dynamo.vllm import (  # noqa: E402
+    adapter as vllm_adapter,
+)
+from nemo_rl.models.generation.dynamo.vllm.chat_engine import (  # noqa: E402
+    GYM_CALL_ANNOTATION,
+    PLAN_KEY,
+    RUNTIME_DATA_KEY,
 )
 from nemo_rl.models.generation.rollout_result import (  # noqa: E402
     rollout_result_from_wire,
     rollout_result_to_wire,
 )
+from nemo_rl.models.generation.vllm.chat_server import (  # noqa: E402
+    NeMoRLChatCompletionRequest,
+)
 from nemo_rl.models.generation.vllm.request_pipeline import (  # noqa: E402
     rollout_output,
     rollout_result,
 )
+from nemo_rl.models.generation.vllm.utils import R3_MISSING_ROUTE_SENTINEL  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
 )
+from nemo_rl.utils.routed_experts_codec import decode_routed_experts  # noqa: E402
 
 MAX_MODEL_LEN = 16
-
-
 EOS = 2
-# The fake processor expands each image placeholder to IMAGE_TOKENS image tokens.
-IMAGE_PLACEHOLDER, IMAGE_TOKEN, IMAGE_TOKENS = 90, 91, 3
+# A processed image's placeholder tokens.
+IMAGE_TOKEN, IMAGE_TOKENS = 91, 3
 
 
 class _Context:
@@ -78,23 +84,18 @@ class _Context:
         return False
 
 
-class _Tokenizer:
-    eos_token_id = EOS
-
-    def decode(self, token_ids) -> str:
-        return "".join(f"<{token_id}>" for token_id in token_ids)
-
-
-def _logprob(value: float):
-    return SimpleNamespace(logprob=value, rank=1, decoded_token=None)
+def _logprob(value: float, rank: int = 1):
+    return SimpleNamespace(logprob=value, rank=rank, decoded_token=None)
 
 
 def _completion(token_ids, finish_reason=None, index=0, routed_experts=None):
     return SimpleNamespace(
         index=index,
+        text="".join(f"<{token_id}>" for token_id in token_ids),
         token_ids=token_ids,
         logprobs=[{t: _logprob(-0.5)} for t in token_ids],
         finish_reason=finish_reason,
+        stop_reason=None,
         routed_experts=routed_experts,
     )
 
@@ -109,31 +110,6 @@ def _output(prompt, *completions, prompt_routed_experts=None, prompt_logprobs=No
     )
 
 
-class _FakeRenderer:
-    """vLLM's processing step: expands each image placeholder, as a VLM processor does."""
-
-    def __init__(self) -> None:
-        self.prompts = []
-
-    async def process_for_engine_async(self, prompt, arrival_time, *, skip_mm_cache):
-        self.prompts.append((prompt, skip_mm_cache))
-        if "multi_modal_data" not in prompt:
-            return {"type": "token", "prompt_token_ids": prompt["prompt_token_ids"]}
-        tokens, placeholders = [], []
-        for token in prompt["prompt_token_ids"]:
-            if token == IMAGE_PLACEHOLDER:
-                placeholders.append(PlaceholderRange(len(tokens), IMAGE_TOKENS))
-                tokens.extend([IMAGE_TOKEN] * IMAGE_TOKENS)
-            else:
-                tokens.append(token)
-        return {
-            "type": "multimodal",
-            "prompt_token_ids": tokens,
-            "mm_kwargs": {"image": [object() for _ in placeholders]},
-            "mm_placeholders": {"image": placeholders},
-        }
-
-
 class _FakeLLM:
     """Yields scripted RequestOutputs and records what it was asked to generate."""
 
@@ -142,13 +118,11 @@ class _FakeLLM:
         self.calls = []
         self.admission_error = admission_error
         self.tokenizer = None
-        self.renderer = _FakeRenderer()
         self.model_config = SimpleNamespace(
             get_diff_sampling_param=lambda: dict(defaults or {}),
             try_get_generation_config=lambda: {},
-            multimodal_config=None,
-            allowed_local_media_path="",
-            allowed_media_domains=None,
+            generation_config="auto",
+            override_generation_config={},
         )
         self.vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(max_model_len=MAX_MODEL_LEN),
@@ -159,8 +133,8 @@ class _FakeLLM:
         if self.admission_error is not None:
             raise self.admission_error
 
-    async def generate(self, prompt, sampling_params, request_id):
-        self.calls.append((prompt, sampling_params, request_id))
+    async def generate(self, prompt, sampling_params, request_id, **kwargs):
+        self.calls.append((prompt, sampling_params, request_id, kwargs))
         for output in self.outputs:
             yield output
 
@@ -175,7 +149,7 @@ def _host(llm: _FakeLLM, **cfg) -> VllmAsyncGenerationWorkerImpl:
         "val_top_p": 1.0,
         "top_k": None,
         "val_top_k": None,
-        "stop_token_ids": [2],
+        "stop_token_ids": [EOS],
         "stop_strings": ["</done>"],
         "vllm_cfg": {"max_model_len": MAX_MODEL_LEN},
         **cfg,
@@ -184,7 +158,10 @@ def _host(llm: _FakeLLM, **cfg) -> VllmAsyncGenerationWorkerImpl:
     host.model_name = "model"
     host.routed_experts_dtype = torch.int16
     host.llm = llm
+    host._http_engine_client = None
     host._capture_media = False
+    host._capture_calls = {}
+    host._capture_top_logprobs = 0
     host.token_capture = None
     return host
 
@@ -213,7 +190,7 @@ def test_rollouts_are_served_like_generate_async() -> None:
         engine, _rollout_request([1, 2, 3], greedy=True, stop_strings=["</x>"])
     )
 
-    ((_, sampling_params, _),) = llm.calls
+    ((_, sampling_params, _, _),) = llm.calls
     # The worker's _serve_rollout samples it, as it does for generate_async...
     assert sampling_params.max_tokens == 8
     assert sampling_params.temperature == 0.0
@@ -247,7 +224,7 @@ def test_a_cancelled_rollout_aborts_the_vllm_request_it_runs() -> None:
     # Dynamo's worker calls abort() when the frontend cancels a request.
     asyncio.run(engine.abort(_Context()))
 
-    ((_, _, request_id),) = llm.calls
+    ((_, _, request_id, _),) = llm.calls
     assert aborted == [request_id]
 
 
@@ -325,7 +302,6 @@ def _start_worker_config(monkeypatch, host) -> engine_adapter.WorkerConfig:
             served_model_name=host.model_name,
             namespace="ns",
             engine_env=env,
-            chat_config=vllm_adapter.chat_worker_config(host),
         )
 
     asyncio.run(start())
@@ -333,24 +309,8 @@ def _start_worker_config(monkeypatch, host) -> engine_adapter.WorkerConfig:
     return config
 
 
-def test_every_worker_arg_reaches_the_dynamo_worker_config(
-    monkeypatch, tmp_path
-) -> None:
-    template = tmp_path / "chat.jinja"
-    template.write_text("{{ messages }}")
-    worker_args = {
-        "tool_call_parser": "qwen3_coder",
-        "reasoning_parser": "nemotron_nano",
-        "exclude_tools_when_tool_choice_none": True,
-        "enable_structural_tag": True,
-        "structural_tag_scope": "always",
-        "structural_tag_schema": "strict",
-        "custom_jinja_template": str(template),
-    }
-    assert set(worker_args) == set(DynamoWorkerArgs.model_fields)
-    host = _host(_FakeLLM(), dynamo_cfg={"worker_args": worker_args})
-
-    config = _start_worker_config(monkeypatch, host)
+def test_engines_register_for_rollouts_and_nemo_gym_chat(monkeypatch) -> None:
+    config = _start_worker_config(monkeypatch, _host(_FakeLLM()))
 
     assert config.namespace == "ns"
     # Registered from the weight-free snapshot, served under the model's name.
@@ -360,53 +320,16 @@ def test_every_worker_arg_reaches_the_dynamo_worker_config(
     )
     # NeMo RL's rollouts go to /v1/completions, NeMo-Gym's calls to chat.
     assert config.endpoint_types == "chat,completions"
-    assert config.structural_tag_mode == "on"
-    with open(config.custom_jinja_template) as template_file:
-        assert template_file.read() == "{{ messages }}"
-    for key in worker_args.keys() - {"enable_structural_tag", "custom_jinja_template"}:
-        assert getattr(config, key) == worker_args[key], key
 
 
-def test_requests_other_than_rollouts_are_refused() -> None:
+def test_requests_other_than_nemo_rls_are_refused() -> None:
     llm = _FakeLLM()
     engine = vllm_adapter.DynamoVllmAdapter(_host(llm), leader_worker_idx=0)
 
-    with pytest.raises(InvalidArgument, match="only NeMo RL rollouts"):
+    with pytest.raises(InvalidArgument, match="only NeMo RL's own requests"):
         _collect(engine, {"token_ids": [1, 2, 3, 4]})
 
     assert llm.calls == []
-
-
-def test_the_native_servers_chat_settings_reach_the_frontend(monkeypatch) -> None:
-    host = _host(_FakeLLM())
-    host.cfg["vllm_cfg"] = {
-        "max_model_len": MAX_MODEL_LEN,
-        "reasoning_parser_plugin": "nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py",
-        "http_server_serving_chat_kwargs": {
-            "tool_parser": "qwen3_coder",
-            "reasoning_parser": "nano_v3",
-            # Literal Jinja, which the native server also accepts.
-            "chat_template": "{{ messages }}\n",
-        },
-    }
-
-    config = _start_worker_config(monkeypatch, host)
-
-    assert (config.tool_call_parser, config.reasoning_parser) == (
-        "qwen3_coder",
-        "nemotron_v3",
-    )
-    with open(config.custom_jinja_template) as template_file:
-        assert template_file.read() == "{{ messages }}\n"
-
-
-def test_a_parser_dynamo_lacks_fails_registration(monkeypatch) -> None:
-    host = _host(
-        _FakeLLM(), dynamo_cfg={"worker_args": {"tool_call_parser": "no_such_parser"}}
-    )
-
-    with pytest.raises(ValueError, match="no tool call parser named 'no_such_parser'"):
-        _start_worker_config(monkeypatch, host)
 
 
 def test_an_engine_error_reaches_the_driver_with_its_cause() -> None:
@@ -460,199 +383,265 @@ def test_engines_register_the_block_size_kv_events_are_hashed_with() -> None:
         ]
 
     llm.engine_core = SimpleNamespace(call_utility_async=call_utility_async)
-    engine = vllm_adapter.DynamoVllmAdapter(_host(llm), leader_worker_idx=0)
+    host = _host(llm)
+    host.llm_async_engine_args = vllm.AsyncEngineArgs(model="/models/m")
+    engine = vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0)
 
-    registration = asyncio.run(engine.start(worker_id=0)).llm
+    config = asyncio.run(engine.start(worker_id=0))
+    registration = config.llm
 
     # The KV router hashes events in blocks of the main-attention group; a
     # wrong size would quietly turn KV routing into load-only routing.
     assert registration.kv_cache_block_size == 528
     assert registration.total_kv_blocks == 64
     assert registration.context_length == MAX_MODEL_LEN
+    # The frontend's chat engine renders with what the engine publishes.
+    assert config.runtime_data == vllm_adapter.chat_runtime_data(host)
 
 
-def _image_url() -> str:
-    buffer = io.BytesIO()
-    Image.new("RGB", (8, 8), color="red").save(buffer, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
-
-
-def test_media_is_loaded_and_processed_as_vllms_chat_parser_does() -> None:
-    final = _output([1, *[IMAGE_TOKEN] * IMAGE_TOKENS, 3], _completion([5], "stop"))
-    llm = _FakeLLM([final])
-    engine = vllm_adapter.DynamoVllmAdapter(_host(llm), leader_worker_idx=0)
-
-    _collect(
-        engine,
-        _gym_request(
-            token_ids=[1, IMAGE_PLACEHOLDER, 3],
-            multi_modal_data={"image_url": [{"Url": _image_url()}]},
-            mm_processor_kwargs={"max_num_tiles": 2},
-        ),
+def test_engines_publish_what_the_frontends_chat_engine_renders_with() -> None:
+    host = _host(_FakeLLM())
+    host.llm_async_engine_args = vllm.AsyncEngineArgs(
+        model="/models/m",
+        max_model_len=MAX_MODEL_LEN,
+        enable_prefix_caching=True,
+        skip_tokenizer_init=True,
     )
+    serving_chat_kwargs = {"tool_parser": "hermes", "enable_auto_tools": True}
+    host.cfg["vllm_cfg"] = {
+        "max_model_len": MAX_MODEL_LEN,
+        "http_server_serving_chat_kwargs": serving_chat_kwargs,
+        "reasoning_parser_plugin": "/plugins/reasoning.py",
+    }
 
-    ((prompt, skip_mm_cache),) = llm.renderer.prompts
-    # The frontend's unexpanded tokens, the decoded image and the processor kwargs.
-    assert prompt["prompt_token_ids"] == [1, IMAGE_PLACEHOLDER, 3]
-    (image,) = prompt["multi_modal_data"]["image"]
-    assert image.size == (8, 8) and image.mode == "RGB"
-    assert prompt["multi_modal_uuids"] == {"image": [None]}
-    assert prompt["mm_processor_kwargs"] == {"max_num_tiles": 2}
-    assert skip_mm_cache is False
-    # vLLM generates from the processed prompt, and the output cap counts its tokens.
-    ((engine_input, params, _),) = llm.calls
-    assert engine_input["prompt_token_ids"] == [1, *[IMAGE_TOKEN] * IMAGE_TOKENS, 3]
-    assert params.max_tokens == MAX_MODEL_LEN - 2 - IMAGE_TOKENS
+    # Dynamo carries runtime_data as JSON.
+    spec = json.loads(json.dumps(vllm_adapter.chat_runtime_data(host)))[
+        RUNTIME_DATA_KEY
+    ]
 
-
-# --- NeMo-Gym's Dynamo dialect -------------------------------------------------
-
-
-def _gym_request(
-    *, temperature=0.7, top_p=0.9, prefix=None, sampling=None, **fields
-) -> dict:
-    annotations = [vllm_adapter.GYM_ROLLOUT_ANNOTATION]
-    if prefix is not None:
-        annotations.insert(
-            0, vllm_adapter.GYM_PREFIX_ANNOTATION_PREFIX + json.dumps(prefix)
-        )
-    sampling_options = {"temperature": temperature, "top_p": top_p, **(sampling or {})}
-    return {
-        "token_ids": [1, 3, 4],
-        # The frontend carries sampling floats as f32.
-        "sampling_options": {
-            key: vllm_adapter._as_f32(value) if isinstance(value, float) else value
-            for key, value in sampling_options.items()
+    # The engine's own args rebuild the same model config, tokenizer included.
+    published = vllm.AsyncEngineArgs(**spec["engine_args"])
+    for field in ("model", "max_model_len", "enable_prefix_caching"):
+        assert getattr(published, field) == getattr(
+            host.llm_async_engine_args, field
+        ), field
+    assert published.skip_tokenizer_init is False
+    # The native server's chat settings and the sampling profiles it checks.
+    assert spec["generation"] == {
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "top_k": None,
+        "val_temperature": 0.0,
+        "val_top_p": 1.0,
+        "val_top_k": None,
+        "stop_token_ids": [EOS],
+        "vllm_cfg": {
+            "http_server_serving_chat_kwargs": serving_chat_kwargs,
+            "reasoning_parser_plugin": "/plugins/reasoning.py",
         },
-        # Gym's token information: logprobs=true, top_logprobs=0.
-        "output_options": {"logprobs": 0},
-        "annotations": annotations,
+    }
+
+
+# --- NeMo-Gym calls, after the frontend's chat engine rendered them -----------
+
+
+def _chat(**fields) -> dict:
+    """A rendered chat request, as the chat engine sends it (without messages)."""
+    return NeMoRLChatCompletionRequest(
+        model="model",
+        messages=[{"role": "user", "content": "hi"}],
+        temperature=0.7,
+        top_p=0.9,
         **fields,
+    ).model_dump(mode="json", exclude={"messages"})
+
+
+def _gym_call(token_ids: list[int], **plan) -> dict:
+    """A Gym call as the chat engine routes it: final token ids and the plan."""
+    plan = {
+        "request": _chat(),
+        "admission": None,
+        "serving_admission": None,
+        "verify_retained_media": False,
+        "prefix_len": None,
+        "template_token_ids": token_ids,
+        "splice": None,
+        "multimodal": None,
+        "reasoning_ended": None,
+        "reasoning_parser_kwargs": None,
+        **plan,
+    }
+    return {
+        "token_ids": token_ids,
+        "annotations": [GYM_CALL_ANNOTATION],
+        "extra_args": {PLAN_KEY: plan},
     }
 
 
 @pytest.mark.parametrize(
-    ("temperature", "top_p", "skip_special_tokens"),
-    [
-        # The train profile; the frontend left skip_special_tokens unset.
-        (0.7, 0.9, None),
-        # The validation profile; the frontend decodes special tokens.
-        (0.0, 1.0, False),
-    ],
+    ("max_tokens", "served_max_tokens"), [(5, 5), (None, MAX_MODEL_LEN - 3)]
 )
-def test_gym_calls_sample_with_nemo_rls_exact_profile(
-    temperature, top_p, skip_special_tokens
+def test_gym_calls_generate_with_the_native_servers_sampling_params(
+    max_tokens, served_max_tokens
 ) -> None:
     final = _output([1, 3, 4], _completion([10, 11], "stop"))
     llm = _FakeLLM([final])
     engine = vllm_adapter.DynamoVllmAdapter(_host(llm), leader_worker_idx=0)
-    output_options = {"logprobs": 0}
-    if skip_special_tokens is not None:
-        output_options["skip_special_tokens"] = skip_special_tokens
+    reasoning = {"chat_template_kwargs": {"enable_thinking": True}}
 
     (chunk,) = _collect(
         engine,
-        _gym_request(
-            temperature=temperature,
-            top_p=top_p,
-            stop_conditions={"max_tokens": 100, "stop": ["</s>"]},
-            output_options=output_options,
+        _gym_call(
+            [1, 3, 4],
+            # Gym's token information: logprobs=true, top_logprobs=0.
+            request=_chat(
+                max_tokens=max_tokens, stop=["</s>"], logprobs=True, top_logprobs=0
+            ),
+            reasoning_ended=False,
+            reasoning_parser_kwargs=reasoning,
         ),
     )
 
-    ((prompt, params, _),) = llm.calls
-    assert prompt["prompt_token_ids"] == [1, 3, 4]
-    # The configured values, not the f32 values the frontend delivered.
-    assert (params.temperature, params.top_p) == (temperature, top_p)
-    # The profile's top_k (unset here), as vLLM normalizes it for this temperature,
-    # and none of the generation config's min_p or penalties.
-    assert params.top_k == vllm.SamplingParams(temperature=temperature, top_k=-1).top_k
-    assert (params.min_p, params.repetition_penalty) == (0.0, 1.0)
+    ((prompt, params, _, kwargs),) = llm.calls
+    assert prompt == {"prompt_token_ids": [1, 3, 4]}
+    # The request's own sampling, as vLLM's chat server builds it.
+    assert (params.temperature, params.top_p) == (0.7, 0.9)
+    assert (params.max_tokens, params.stop, params.logprobs) == (
+        served_max_tokens,
+        ["</s>"],
+        0,
+    )
     assert params.output_kind == vllm.sampling_params.RequestOutputKind.FINAL_ONLY
-    # Output fits the context, and vLLM stops on the stop strings itself,
-    # decoding special tokens as the frontend does.
-    assert params.max_tokens == MAX_MODEL_LEN - 3
-    assert (params.stop, params.detokenize) == (["</s>"], True)
-    assert params.skip_special_tokens is (skip_special_tokens is not False)
+    # What vLLM's chat serving hands the engine besides the prompt.
+    assert kwargs == {"reasoning_ended": False, "reasoning_parser_kwargs": reasoning}
+    # The output the frontend builds the reply from, and the call's result.
     assert chunk["engine_data"] == {
-        "prompt_token_ids": [1, 3, 4],
-        "completion_token_ids": [10, 11],
-        "completion_logprobs": [-0.5, -0.5],
+        "output": {
+            "text": "<10><11>",
+            "token_ids": [10, 11],
+            "finish_reason": "stop",
+            "stop_reason": None,
+            "logprobs": [{"10": [-0.5, 1, None]}, {"11": [-0.5, 1, None]}],
+        },
+        "result": {
+            "prompt_token_ids": [1, 3, 4],
+            "generation_token_ids": [10, 11],
+            "generation_log_probs": [-0.5, -0.5],
+        },
     }
-    assert (chunk["token_ids"], chunk["finish_reason"]) == ([10, 11], "stop")
-    assert chunk["log_probs"] == [-0.5, -0.5]
+    assert chunk["completion_usage"]["prompt_tokens"] == 3
+
+
+def test_an_uncaptured_gym_call_carries_its_routes() -> None:
+    # vLLM routes every token but the last sampled one.
+    routes = np.arange(4 * 2 * 2, dtype=np.int16).reshape(4, 2, 2)
+    final = _output(
+        [1, 3, 4],
+        _completion([10, 11], "stop", routed_experts=routes[3:]),
+        prompt_routed_experts=routes[:3],
+    )
+    host = _host(_FakeLLM([final]), vllm_kwargs={"enable_return_routed_experts": True})
+    engine = vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0)
+
+    (chunk,) = _collect(engine, _gym_call([1, 3, 4]))
+
+    # As the native endpoint attaches them: one row per token of the sequence.
+    expected = torch.full((5, 2, 2), R3_MISSING_ROUTE_SENTINEL, dtype=torch.int16)
+    expected[:4] = torch.from_numpy(routes)
+    shipped = chunk["engine_data"]["result"]["routed_experts"]
+    assert torch.equal(decode_routed_experts(shipped, dtype=None), expected)
+
+
+def test_a_gym_call_without_routes_fails_under_router_replay() -> None:
+    final = _output([1, 3, 4], _completion([10, 11], "stop"))
+    host = _host(_FakeLLM([final]), vllm_kwargs={"enable_return_routed_experts": True})
+    engine = vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0)
+
+    # Training would replay the router on routes the call never returned.
+    with pytest.raises(InvalidArgument, match="did not include routed_experts"):
+        _collect(engine, _gym_call([1, 3, 4]))
 
 
 @pytest.mark.parametrize(
-    ("request_fields", "error"),
+    ("call", "error"),
     [
-        ({"temperature": 0.5}, "matches neither"),
-        ({"top_p": None}, "top_p must be set explicitly"),
-        ({"sampling": {"top_k": 5}}, "must be unset or match the configured top_k"),
-        ({"sampling": {"presence_penalty": 0.5}}, "presence_penalty=0.5 is not"),
-        ({"sampling": {"n": 2}}, "take n=1"),
-        ({"multi_modal_data": {"image_url": [{"UuidOnly": "u"}]}}, "carry their URL"),
         (
-            {
-                "multi_modal_data": {
-                    "image_url": [{"Url": "data:image/png;base64,eA=="}]
-                }
-            },
-            "Cannot load image_url",
+            {"token_ids": [1, 3, 4], "annotations": [GYM_CALL_ANNOTATION]},
+            r"extra_args\.nemo_rl",
         ),
-        # vLLM's own request errors (not ValueErrors) keep their message, as the
-        # native server's 4xx does, instead of becoming a bare 500.
-        ({"stop_conditions": {"min_tokens": 10, "max_tokens": 5}}, "min_tokens"),
-        # The echoed prefix, spliced in, leaves no room for output.
+        # vLLM's own request errors (not RuntimeErrors) keep their message, as
+        # the native server's 4xx does, instead of becoming a bare 500.
         (
-            {
-                "prefix": [1, *range(20, 20 + MAX_MODEL_LEN), EOS],
-                "token_ids": [1, 7, EOS, 3],
-            },
-            "maximum context length",
+            _gym_call([1, 3, 4], request=_chat(min_tokens=10, max_tokens=5)),
+            "min_tokens",
         ),
     ],
 )
-def test_gym_calls_the_engine_cannot_serve_are_refused(request_fields, error) -> None:
+def test_gym_calls_the_engine_cannot_serve_are_refused(call, error) -> None:
     llm = _FakeLLM()
-    llm.tokenizer = _Tokenizer()
     engine = vllm_adapter.DynamoVllmAdapter(_host(llm), leader_worker_idx=0)
 
     with pytest.raises(InvalidArgument, match=error):
-        _collect(engine, _gym_request(**request_fields))
+        _collect(engine, call)
 
     assert llm.calls == []
 
 
-def test_gym_echoed_prefix_keeps_media_placeholders_on_their_tokens() -> None:
-    # Turn 1 ran [1, <image>, 3] and generated [5, 6, EOS]; the frontend
-    # re-rendered that turn as [7, EOS] and appended a turn with a second image.
-    turn1 = [1, *[IMAGE_TOKEN] * IMAGE_TOKENS, 3]
-    prefix = [*turn1, 5, 6, EOS]
-    rendered = [1, IMAGE_PLACEHOLDER, 3, 7, EOS, IMAGE_PLACEHOLDER, 4]
-    spliced = [*prefix, *[IMAGE_TOKEN] * IMAGE_TOKENS, 4]
-    llm = _FakeLLM([_output(spliced, _completion([10], "stop"))])
-    llm.tokenizer = _Tokenizer()
+def test_a_gym_call_over_the_engines_queue_limits_is_refused_before_it_runs() -> None:
+    full = vllm.exceptions.QueueOverflowError()
+    llm = _FakeLLM(
+        [_output([1, 3, 4], _completion([10], "stop"))], admission_error=full
+    )
     engine = vllm_adapter.DynamoVllmAdapter(_host(llm), leader_worker_idx=0)
 
-    (chunk,) = _collect(
+    # As the native server checks max_num_queued_reqs / max_num_queued_tokens.
+    with pytest.raises(vllm.exceptions.QueueOverflowError):
+        _collect(engine, _gym_call([1, 3, 4]))
+
+    assert llm.calls == []
+
+
+def test_a_spliced_media_call_keeps_placeholders_on_their_tokens() -> None:
+    # Turn 1 ran [1, <image>, 3] and generated [5, 6, EOS]; the template
+    # re-rendered that turn as [7, EOS] and appended a turn with a second image.
+    image = [IMAGE_TOKEN] * IMAGE_TOKENS
+    template = [1, *image, 3, 7, EOS, *image, 4]
+    prefix = [1, *image, 3, 5, 6, EOS]
+    spliced = [*prefix, *image, 4]
+    multimodal = {
+        "type": "multimodal",
+        "mm_kwargs": {"image": ["pixels-0", "pixels-1"]},
+        "mm_hashes": {"image": ["h0", "h1"]},
+        "mm_placeholders": {
+            "image": [
+                PlaceholderRange(1, IMAGE_TOKENS),
+                PlaceholderRange(7, IMAGE_TOKENS),
+            ]
+        },
+    }
+    llm = _FakeLLM([_output(spliced, _completion([10], "stop"))])
+    engine = vllm_adapter.DynamoVllmAdapter(_host(llm), leader_worker_idx=0)
+
+    _collect(
         engine,
-        _gym_request(
-            prefix=prefix,
-            token_ids=rendered,
-            multi_modal_data={"image_url": [{"Url": _image_url()}] * 2},
+        _gym_call(
+            spliced,
+            template_token_ids=template,
+            # Each side cut at its turn end: prefix[:7] + template[6:].
+            splice=[7, 6],
+            multimodal=base64.b64encode(pickle.dumps(multimodal)).decode(),
         ),
     )
 
-    ((engine_input, params, _),) = llm.calls
+    ((engine_input, params, _, _),) = llm.calls
     assert engine_input["prompt_token_ids"] == spliced
+    assert engine_input["mm_kwargs"] == multimodal["mm_kwargs"]
     # The first image sits in the model's own prefix; the second moved with the
     # longer generated turn, as the native endpoint remaps them.
     assert [
         (span.offset, span.length) for span in engine_input["mm_placeholders"]["image"]
     ] == [(1, IMAGE_TOKENS), (len(prefix), IMAGE_TOKENS)]
     assert params.max_tokens == MAX_MODEL_LEN - len(spliced)
-    assert chunk["engine_data"]["prompt_token_ids"] == spliced
 
 
 @pytest.mark.parametrize(

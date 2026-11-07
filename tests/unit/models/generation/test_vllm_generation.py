@@ -1365,9 +1365,12 @@ def test_chat_request_rejects_unreplayed_sampling_params(
     request.top_k = None
     setattr(request, field, value)
 
-    # check_sampling_param raises ValueError for top_k; the rest are asserts.
-    with pytest.raises((AssertionError, ValueError), match=field):
-        asyncio.run(chat_handler(request, MagicMock()))
+    response = asyncio.run(chat_handler(request, MagicMock()))
+
+    # A client error Gym sees, not a server failure.
+    assert response.status_code == 400
+    assert field in json.loads(response.body)["error"]["message"]
+    serving_chat.create_chat_completion.assert_not_called()
 
 
 def _track_request_capture(worker, request):
@@ -1580,8 +1583,9 @@ async def test_chat_handler_rejects_off_policy_sampling_and_pins_top_k(monkeypat
 
     off_policy = _fake_chat_request()
     off_policy.temperature = 0.5
-    with pytest.raises(ValueError, match="matches neither"):
-        await chat_handler(off_policy, MagicMock())
+    response = await chat_handler(off_policy, MagicMock())
+    assert response.status_code == 400
+    assert "matches neither" in json.loads(response.body)["error"]["message"]
     serving_chat.create_chat_completion.assert_not_awaited()
 
     request = _fake_chat_request()

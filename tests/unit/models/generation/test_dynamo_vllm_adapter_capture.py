@@ -13,11 +13,14 @@
 # limitations under the License.
 """NeMo-Gym token capture through the Dynamo engine adapter.
 
-The worker's own capture lifecycle stages each call, as on the native chat
-endpoint; only Gym's capture core, and in the media tests the worker's media
-snapshot, are faked.
+The frontend's chat engine rendered and spliced each call; the adapter runs the
+worker's own capture lifecycle on it, as the native chat endpoint does. Only
+Gym's capture core, and in the media tests the worker's media snapshot, are
+faked.
 """
 
+import base64
+import pickle
 from types import SimpleNamespace
 
 import numpy as np
@@ -30,43 +33,58 @@ pytest.importorskip("vllm")
 # The vLLM lanes import this module without the nemo_gym extra.
 pytest.importorskip("nemo_gym.token_id_capture.staging")
 
+from dynamo.llm.exceptions import InvalidArgument  # noqa: E402
 from nemo_gym.token_id_capture import NG_COMMIT_COORDS_FIELD  # noqa: E402
 from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter  # noqa: E402
-from nemo_gym.token_id_capture.external_capture import (  # noqa: E402
-    DYNAMO_CAPTURE_ANNOTATION_PREFIX,
-    DYNAMO_GYM_REQUEST_ANNOTATION,
-    DYNAMO_PREFIX_ANNOTATION_PREFIX,
+from nemo_gym.token_id_capture.replay import (  # noqa: E402
+    replay_context,
+    summarize_replay,
 )
 from nemo_gym.token_id_capture.staging.records import CaptureAdmission  # noqa: E402
-from responses_api_models.vllm_model.app import (  # noqa: E402
-    _DYNAMO_ENGINE_DATA_FIELDS,
-)
 from vllm.multimodal.inputs import PlaceholderRange  # noqa: E402
 
 from nemo_rl.data.captured_media import CapturedMedia  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache  # noqa: E402
-from nemo_rl.models.generation.dynamo import vllm_adapter  # noqa: E402
+from nemo_rl.models.generation.dynamo.vllm import (  # noqa: E402
+    adapter as vllm_adapter,
+)
 from nemo_rl.models.generation.vllm.utils import R3_MISSING_ROUTE_SENTINEL  # noqa: E402
 from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
     routed_experts_tensor_metadata,
 )
 from tests.unit.models.generation.test_dynamo_vllm_adapter import (  # noqa: E402
     EOS,
-    IMAGE_PLACEHOLDER,
     IMAGE_TOKEN,
     IMAGE_TOKENS,
+    _chat,
     _collect,
     _completion,
     _Context,
     _FakeLLM,
-    _gym_request,
+    _gym_call,
     _host,
-    _image_url,
+    _logprob,
     _output,
-    _Tokenizer,
 )
 
 COORDS = {"staging_key": "rollout-1/c2"}
+# Turn 2 of a rollout: the staged prefix [1, 5, 6, EOS] replaces the template's
+# re-render of turn 1, [1, 7, EOS], before the new turn [3, 4].
+PREFIX = [1, 5, 6, EOS]
+TEMPLATE = [1, 7, EOS, 3, 4]
+# Each side cut at its turn end: PREFIX[:3] + TEMPLATE[2:].
+SPLICE = [3, 2]
+SPLICED = [*PREFIX, 3, 4]
+TOKEN_IN = CaptureAdmission(
+    capture_key="rollout-1",
+    model_call_id="c2",
+    parent_call_id="c1",
+    prev_len=len(PREFIX),
+    mode="token_in",
+    required_prefix_token_ids=PREFIX,
+    parent_chain_hash="0" * 64,
+)
+TEXT = CaptureAdmission(capture_key="rollout-1", model_call_id="c1", mode="text")
 
 
 class _Capture:
@@ -96,74 +114,57 @@ class _Capture:
 def _capturing_host(llm, **cfg):
     host = _host(llm, **cfg)
     host.token_capture = _Capture()
-    host._capture_calls = {}
-    host._capture_top_logprobs = 0
     host._chain_prefix = ChainPrefixCache()
     return host
 
 
-def _captured_request(admission: CaptureAdmission, **fields) -> dict:
-    request = _gym_request(**fields)
-    # Gym's dynamo_worker handler: no logprobs, the admission in an annotation.
-    request["output_options"] = {}
-    request["annotations"] = [
-        DYNAMO_CAPTURE_ANNOTATION_PREFIX + admission.model_dump_json(),
-        *request["annotations"],
-    ]
-    return request
-
-
-def test_annotations_and_engine_data_are_the_ones_gyms_dynamo_dialect_uses() -> None:
-    assert vllm_adapter.GYM_ROLLOUT_ANNOTATION == DYNAMO_GYM_REQUEST_ANNOTATION
-    assert vllm_adapter.GYM_CAPTURE_ANNOTATION_PREFIX == (
-        DYNAMO_CAPTURE_ANNOTATION_PREFIX
+def _captured_call(
+    token_ids: list[int], admission: CaptureAdmission, top_logprobs: int = 0, **plan
+) -> dict:
+    """A captured Gym call, as the chat engine routes it after its render."""
+    admission_json = admission.model_dump(mode="json")
+    return _gym_call(
+        token_ids,
+        # Gym's dynamo_worker handler asks for the sampled tokens' logprobs.
+        request=_chat(
+            logprobs=True, top_logprobs=top_logprobs, ng_capture=admission_json
+        ),
+        admission=admission_json,
+        serving_admission=admission_json,
+        **plan,
     )
-    assert vllm_adapter.GYM_PREFIX_ANNOTATION_PREFIX == (
-        DYNAMO_PREFIX_ANNOTATION_PREFIX
-    )
-    # The engine_data keys Gym requires on a call without capture.
-    llm = _FakeLLM([_output([1, 3, 4], _completion([10], "stop"))])
-    engine = vllm_adapter.DynamoVllmAdapter(_host(llm), leader_worker_idx=0)
-    (chunk,) = _collect(engine, _gym_request())
-    assert chunk["engine_data"].keys() == _DYNAMO_ENGINE_DATA_FIELDS.keys()
 
 
 def test_a_captured_token_in_call_is_staged_from_the_engine() -> None:
-    # The staged prefix [1, 5, 6, EOS] replaces the rendered history [1, 7, EOS].
-    prefix = [1, 5, 6, EOS]
-    admission = CaptureAdmission(
-        capture_key="rollout-1",
-        model_call_id="c2",
-        parent_call_id="c1",
-        prev_len=len(prefix),
-        mode="token_in",
-        required_prefix_token_ids=prefix,
-        parent_chain_hash="0" * 64,
-    )
-    spliced = [*prefix, 3, 4]
-    routes = np.arange(8 * 2 * 2, dtype=np.int16).reshape(8, 2, 2)
+    # vLLM routes every token but the last sampled one.
+    routes = np.arange(7 * 2 * 2, dtype=np.int16).reshape(7, 2, 2)
     final = _output(
-        spliced,
+        SPLICED,
         _completion([10, 11], "stop", routed_experts=routes[6:]),
         prompt_routed_experts=routes[:6],
     )
     llm = _FakeLLM([final])
-    llm.tokenizer = _Tokenizer()
     host = _capturing_host(llm, vllm_kwargs={"enable_return_routed_experts": True})
     engine = vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0)
 
     (chunk,) = _collect(
-        engine, _captured_request(admission, token_ids=[1, 7, EOS, 3, 4])
+        engine,
+        _captured_call(
+            SPLICED,
+            TOKEN_IN,
+            prefix_len=len(PREFIX),
+            template_token_ids=TEMPLATE,
+            splice=SPLICE,
+        ),
     )
 
-    ((prompt, params, _),) = llm.calls
-    assert prompt["prompt_token_ids"] == spliced
-    # The sampled tokens' log probabilities are staged; Gym asked for none.
+    ((prompt, params, _, _),) = llm.calls
+    assert prompt["prompt_token_ids"] == SPLICED
     assert params.logprobs == 0
-    ((begun_admission, begun_prefix, stream),) = host.token_capture.begun
-    assert (begun_admission, begun_prefix, stream) == (admission, prefix, False)
+    # The model's own prefix, as the frontend spliced it, begins the call.
+    assert host.token_capture.begun == [(TOKEN_IN, PREFIX, False)]
     (payload,) = host.token_capture.staged
-    assert payload["prompt_token_ids"] == spliced
+    assert payload["prompt_token_ids"] == SPLICED
     message = payload["choices"][0]["message"]
     assert message["generation_token_ids"] == [10, 11]
     assert message["generation_log_probs"] == [-0.5, -0.5]
@@ -175,14 +176,62 @@ def test_a_captured_token_in_call_is_staged_from_the_engine() -> None:
     expected[:4] = torch.from_numpy(routes[3:7])
     assert torch.equal(staged_routes, expected)
     assert message["routed_experts"] == routed_experts_tensor_metadata(staged_routes)
-    # Only the commit coordinates go back through the frontend.
-    assert chunk["engine_data"] == {NG_COMMIT_COORDS_FIELD: COORDS}
-    assert "log_probs" not in chunk
+    # Only the commit coordinates go back through the frontend, beside the text.
+    assert chunk["engine_data"]["result"] == {NG_COMMIT_COORDS_FIELD: COORDS}
+    assert "logprobs" not in chunk["engine_data"]["output"]
     assert host._capture_calls == {}
 
 
+def test_a_captured_call_stages_the_samplers_top_k_for_score_centering() -> None:
+    completion = _completion([10, 11], "stop")
+    completion.logprobs = [
+        {10: _logprob(-0.5), 20: _logprob(-2.0, rank=2)},
+        {11: _logprob(-0.7), 21: _logprob(-3.0, rank=2)},
+    ]
+    llm = _FakeLLM([_output([1, 3, 4], completion)])
+    host = _capturing_host(llm)
+    host._capture_top_logprobs = 2
+    engine = vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0)
+
+    _collect(engine, _captured_call([1, 3, 4], TEXT, top_logprobs=2))
+
+    ((_, params, _, _),) = llm.calls
+    assert params.logprobs == 2
+    (attachments,) = host.token_capture.attachments
+    assert attachments["sampler_topk_token_ids"].tolist() == [[10, 20], [11, 21]]
+    assert torch.equal(
+        attachments["sampler_topk_logprobs"],
+        torch.tensor([[-0.5, -2.0], [-0.7, -3.0]], dtype=torch.float32),
+    )
+    assert host.token_capture.failed == []
+
+
+def test_an_undecided_candidate_admission_is_refused() -> None:
+    history = [{"role": "user", "content": "q"}, {"role": "assistant", "content": "a"}]
+    candidate = CaptureAdmission(
+        **{
+            **TOKEN_IN.model_dump(),
+            "mode": "candidate",
+            "requires_empty_tool_content_equivalence": False,
+            "candidate_replay": summarize_replay(
+                replay_context(history, render_digest="b" * 64)
+            ),
+            "request_replay": replay_context(history, render_digest="b" * 64),
+        }
+    )
+    llm = _FakeLLM()
+    host = _capturing_host(llm)
+    engine = vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0)
+
+    # The frontend's render decides a candidate; one reaching the engine skipped it.
+    with pytest.raises(InvalidArgument, match="candidate"):
+        _collect(engine, _captured_call(SPLICED, candidate))
+
+    assert (llm.calls, host.token_capture.begun) == ([], [])
+
+
 class _FailingLLM(_FakeLLM):
-    async def generate(self, prompt, sampling_params, request_id):
+    async def generate(self, prompt, sampling_params, request_id, **kwargs):
         raise RuntimeError("engine died")
         yield  # pragma: no cover
 
@@ -216,44 +265,46 @@ class _Disconnected(_Context):
 def test_a_call_that_does_not_finish_cleanly_fails_its_capture(
     llm, context, error, reason
 ) -> None:
-    admission = CaptureAdmission(
-        capture_key="rollout-1", model_call_id="c1", mode="text"
-    )
     host = _capturing_host(llm)
     engine = vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0)
 
     if error is None:
-        assert _collect(engine, _captured_request(admission), context) == []
+        assert _collect(engine, _captured_call([1, 3, 4], TEXT), context) == []
     else:
-        with pytest.raises(RuntimeError, match=error):
-            _collect(engine, _captured_request(admission), context)
+        with pytest.raises(InvalidArgument, match=error):
+            _collect(engine, _captured_call([1, 3, 4], TEXT), context)
 
     assert host.token_capture.staged == []
     assert host.token_capture.failed == [reason]
     assert host._capture_calls == {}
 
 
+def _multimodal(placeholders: list[PlaceholderRange]) -> str:
+    """The rendered engine input's media, as the chat engine ships it."""
+    multimodal = {
+        "type": "multimodal",
+        "mm_kwargs": {"image": [f"pixels-{i}" for i in range(len(placeholders))]},
+        "mm_hashes": {"image": [f"hash-{i}" for i in range(len(placeholders))]},
+        "mm_placeholders": {"image": placeholders},
+    }
+    return base64.b64encode(pickle.dumps(multimodal)).decode()
+
+
 def test_a_captured_media_call_keeps_the_placeholders_capture_moved() -> None:
-    # The staged prefix [1, 5, 6, EOS] replaces the rendered history [1, 7, EOS].
-    prefix = [1, 5, 6, EOS]
-    admission = CaptureAdmission(
-        capture_key="rollout-1",
-        model_call_id="c2",
-        parent_call_id="c1",
-        prev_len=len(prefix),
-        mode="token_in",
-        required_prefix_token_ids=prefix,
-        parent_chain_hash="0" * 64,
-    )
-    spliced = [*prefix, *[IMAGE_TOKEN] * IMAGE_TOKENS, 4]
+    image = [IMAGE_TOKEN] * IMAGE_TOKENS
+    template = [1, 7, EOS, *image, 4]
+    spliced = [*PREFIX, *image, 4]
     llm = _FakeLLM([_output(spliced, _completion([10], "stop"))])
-    llm.tokenizer = _Tokenizer()
     host = _capturing_host(llm)
     host._capture_media = True
-    moved = {"image": [PlaceholderRange(len(prefix), IMAGE_TOKENS)]}
+    moved = {"image": [PlaceholderRange(len(PREFIX), IMAGE_TOKENS)]}
+    snapshots = []
 
-    def capture_request_media(engine_input, *, admission, splice):
+    def capture_request_media(
+        engine_input, *, admission, splice, verify_retained_media
+    ):
         # As capture_processed_media, which moves the placeholders itself.
+        snapshots.append((admission, splice, verify_retained_media))
         engine_input["mm_placeholders"] = moved
         return CapturedMedia((), None)
 
@@ -262,51 +313,56 @@ def test_a_captured_media_call_keeps_the_placeholders_capture_moved() -> None:
 
     _collect(
         engine,
-        _captured_request(
-            admission,
-            token_ids=[1, 7, EOS, IMAGE_PLACEHOLDER, 4],
-            multi_modal_data={"image_url": [{"Url": _image_url()}]},
+        _captured_call(
+            spliced,
+            TOKEN_IN,
+            prefix_len=len(PREFIX),
+            template_token_ids=template,
+            splice=SPLICE,
+            multimodal=_multimodal([PlaceholderRange(3, IMAGE_TOKENS)]),
+            verify_retained_media=True,
         ),
     )
 
-    ((engine_input, _, _),) = llm.calls
+    ((admission, splice, verify),) = snapshots
+    assert (admission, verify) == (TOKEN_IN, True)
+    assert (splice.token_ids, splice.model_cut_end, splice.template_cut_start) == (
+        spliced,
+        *SPLICE,
+    )
+    ((engine_input, _, _, _),) = llm.calls
     assert engine_input["prompt_token_ids"] == spliced
     # Not remapped a second time.
     assert engine_input["mm_placeholders"] == moved
 
 
 def test_a_captured_media_call_stages_the_media_the_engine_ran_on() -> None:
-    admission = CaptureAdmission(
-        capture_key="rollout-1", model_call_id="c1", mode="text"
-    )
     processed = [1, *[IMAGE_TOKEN] * IMAGE_TOKENS, 3]
     llm = _FakeLLM([_output(processed, _completion([10], "stop"))])
     host = _capturing_host(llm)
     host._capture_media = True
-    captured = CapturedMedia((), None)
     snapshots = []
 
-    def capture_request_media(engine_input, *, admission, splice):
+    def capture_request_media(
+        engine_input, *, admission, splice, verify_retained_media
+    ):
         snapshots.append((list(engine_input["prompt_token_ids"]), admission, splice))
-        return captured
+        return CapturedMedia((), None)
 
     host._capture_request_media = capture_request_media
     engine = vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0)
 
     (chunk,) = _collect(
         engine,
-        _captured_request(
-            admission,
-            token_ids=[1, IMAGE_PLACEHOLDER, 3],
-            multi_modal_data={"image_url": [{"Url": _image_url()}]},
+        _captured_call(
+            processed,
+            TEXT,
+            multimodal=_multimodal([PlaceholderRange(1, IMAGE_TOKENS)]),
         ),
     )
 
-    # The processor's own pixels, not cache references, as natively (#4124).
-    ((_, skip_mm_cache),) = llm.renderer.prompts
-    assert skip_mm_cache is True
     # Media is snapshotted from the processed prompt the engine runs.
-    assert snapshots == [(processed, admission, None)]
+    assert snapshots == [(processed, TEXT, None)]
     (payload,) = host.token_capture.staged
     assert payload["prompt_token_ids"] == processed
-    assert chunk["engine_data"] == {NG_COMMIT_COORDS_FIELD: COORDS}
+    assert chunk["engine_data"]["result"] == {NG_COMMIT_COORDS_FIELD: COORDS}

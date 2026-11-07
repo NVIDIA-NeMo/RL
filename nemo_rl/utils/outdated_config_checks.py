@@ -208,12 +208,11 @@ _REMOVED_DYNAMO_CFG_KEYS = {
     "control_timeout_s": "refit and pause use the vLLM backend's own controls",
     "metrics_include_prefixes": "set vllm_cfg.enable_vllm_metrics_logger instead",
     "metrics_exclude_prefixes": "set vllm_cfg.enable_vllm_metrics_logger instead",
-}
-_REMOVED_DYNAMO_WORKER_KEYS = {
-    "extra_cli_args": "engines are configured through vllm_cfg and vllm_kwargs",
-    "endpoint_types": (
-        "the engines always serve /v1/completions (NeMo RL's rollouts) and chat "
-        "(NeMo-Gym)"
+    "worker_args": (
+        "NeMo RL's chat engine in the frontend renders and parses NeMo-Gym's calls "
+        "with the native server's vllm_cfg.http_server_serving_chat_kwargs and "
+        "parser plugins, and engines are configured through vllm_cfg and "
+        "vllm_kwargs"
     ),
 }
 _REMOVED_DYNAMO_FRONTEND_KEYS = (
@@ -260,16 +259,9 @@ def reject_outdated_dynamo_backend(config: dict[str, Any]) -> None:
                 if key in frontend_args:
                     problems.append(
                         f"policy.generation.dynamo_cfg.frontend_args.{key} was "
-                        "removed: NeMo RL's rollouts send token IDs, which the "
-                        "frontend never tokenizes."
-                    )
-        worker_args = dynamo_cfg.get("worker_args")
-        if isinstance(worker_args, dict):
-            for key, replacement in _REMOVED_DYNAMO_WORKER_KEYS.items():
-                if key in worker_args:
-                    problems.append(
-                        f"policy.generation.dynamo_cfg.worker_args.{key} was "
-                        f"removed: {replacement}."
+                        "removed: NeMo RL never uses the frontend's tokenizer: "
+                        "rollouts send token IDs, and NeMo-Gym's chat calls are "
+                        "rendered by NeMo RL's own chat engine."
                     )
     if problems:
         raise ValueError(" ".join(problems))

@@ -785,6 +785,7 @@ class VllmGeneration(GenerationInterface):
             # The workers' venv carries ai-dynamo, so the frontend runs the same
             # release as every engine.
             frontend_python=self.worker_group.py_executable,
+            ray_address=ray.get_runtime_context().gcs_address,
         )
         runtime.start()
         self._dynamo_runtime = runtime
@@ -878,6 +879,13 @@ class VllmGeneration(GenerationInterface):
         )
         self._token_capture_media = agreed_media_columns(ray.get(futures))
         self._token_capture_setup = setup
+        if self._dynamo_runtime is not None:
+            # NeMo-Gym's calls through Dynamo read their prefix in the frontend.
+            self._dynamo_runtime.publish_chat_capture(
+                dp_cfg=dp_cfg,
+                staging_partition=staging_partition,
+                capture_media=capture_media,
+            )
         return self._token_capture_media
 
     def get_data_plane_snapshots(self) -> list[dict[str, Any]]:

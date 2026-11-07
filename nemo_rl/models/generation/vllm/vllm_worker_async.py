@@ -447,7 +447,7 @@ class VllmAsyncGenerationWorkerImpl(
             else []
         )
         if dynamo_enabled(self.cfg):
-            from nemo_rl.models.generation.dynamo.vllm_adapter import (
+            from nemo_rl.models.generation.dynamo.vllm.adapter import (
                 SnapshotStatLogger,
                 dynamo_kv_events_config,
             )
@@ -667,10 +667,7 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.models.generation.dynamo.engine_adapter import (
             start_dynamo_endpoint,
         )
-        from nemo_rl.models.generation.dynamo.vllm_adapter import (
-            DynamoVllmAdapter,
-            chat_worker_config,
-        )
+        from nemo_rl.models.generation.dynamo.vllm.adapter import DynamoVllmAdapter
 
         # Dynamo fetches a Hub ID's whole checkpoint before it registers; the engine's
         # weights come from refit, so register the config and tokenizer files only.
@@ -689,7 +686,6 @@ class VllmAsyncGenerationWorkerImpl(
             served_model_name=self.model_name,
             namespace=namespace,
             engine_env=engine_env,
-            chat_config=chat_worker_config(self),
         )
 
     async def dynamo_endpoint_error(self) -> Optional[str]:
