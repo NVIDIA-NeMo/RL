@@ -159,6 +159,7 @@ class FakeInferenceReply:
         self.prompt_tokens = prompt_tokens
         self.generated_tokens = generated_tokens
         self.generated_log_probs = generated_log_probs
+        self.finish_reason = "stop"
 
 
 def parse(data: BatchedDataDict, result: list[FakeInferenceReply]) -> BatchedDataDict:
