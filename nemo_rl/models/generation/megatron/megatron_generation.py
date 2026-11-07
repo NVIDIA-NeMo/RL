@@ -36,6 +36,13 @@ from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
     merged_inference_megatron_cfg,
 )
+from nemo_rl.models.generation.megatron.dynamo_config import (
+    disaggregation_cfg,
+    dynamo_enabled,
+    engine_widths,
+    replica_width,
+    validate_megatron_dynamo_generation,
+)
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 
@@ -72,7 +79,13 @@ class MegatronGeneration(GenerationInterface):
         """Largest GPU group requiring full NVLink connectivity.
 
         Colocated reshard hosts a second, inference-layout model on the same ranks.
+        Behind Dynamo the unit is one prefill/decode replica: its engines' widths
+        summed, as for TRT-LLM disaggregation.
         """
+        if dynamo_enabled(config["generation"]):
+            return replica_width(
+                disaggregation_cfg(config["generation"]), engine_widths(config)
+            )
         if config["generation"]["colocated"]["enabled"]:
             # Placement must satisfy both the resident training layout and any
             # dedicated inference layout built on those same ranks.
@@ -246,6 +259,24 @@ class MegatronGeneration(GenerationInterface):
                 "async_rl.generation_fleet_health.enabled=true is not supported "
                 f"for the {cls.__name__} generation backend"
             )
+        if dynamo_enabled(policy_config["generation"]):
+            cls._validate_dynamo_settings(master_config)
+
+    @classmethod
+    def _validate_dynamo_settings(cls, master_config: "MasterConfig") -> None:
+        """Reject ``policy.generation.dynamo=true`` until the engine fleet exists.
+
+        The config is checked first so a shape the fleet could never serve is
+        named as such; any config is then refused, because nothing builds
+        prefill/decode engines yet and the run would otherwise train plain
+        aggregated engines.
+        """
+        validate_megatron_dynamo_generation(master_config.policy["generation"])
+        raise NotImplementedError(
+            "policy.generation.dynamo=true is not served by MegatronGeneration yet: "
+            "the Megatron prefill/decode engine fleet is not built. Remove "
+            "policy.generation.dynamo."
+        )
 
     @classmethod
     def verify_served_addresses(
@@ -492,8 +523,8 @@ class MegatronGeneration(GenerationInterface):
         workers = self.worker_group.workers
         ranked_workers: list[tuple[Any, int, int]] = []
         for shard_idx, rank_prefix in active.shard_prefixes.items():
-            worker_start = shard_idx * active.workers_per_shard
-            for local_rank in range(active.workers_per_shard):
+            worker_start = active.worker_offset(shard_idx)
+            for local_rank in range(active.workers_per_shard[shard_idx]):
                 worker_idx = worker_start + local_rank
                 if worker_idx >= len(workers):
                     raise RuntimeError(

@@ -4640,6 +4640,34 @@ def test_dynamo_rejects_colocated_inference_before_setup_side_effects(
     assert master_config.policy["generation"]["vllm_kwargs"]["hf_overrides"] == {}
 
 
+def test_megatron_engines_behind_dynamo_are_refused_outside_the_single_controller(
+    mock_grpo_components,
+):
+    """Legacy GRPO names the entrypoint to use before touching the config or cluster."""
+    from nemo_rl.algorithms.grpo import setup
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.policy["generation"] = {
+        "backend": "megatron",
+        "dynamo": True,
+        "mcore_generation_config": {},
+    }
+
+    with (
+        patch("nemo_rl.algorithms.grpo.Logger") as mock_logger,
+        pytest.raises(
+            NotImplementedError, match="runs only under the SingleController"
+        ),
+    ):
+        setup(
+            master_config,
+            tokenizer=MagicMock(),
+            dataset=MagicMock(),
+            val_dataset=None,
+        )
+    mock_logger.assert_not_called()
+
+
 @pytest.mark.parametrize("configured_gym_log_dir", [None, "logs/nemo_gym"])
 def test_setup_initializes_noncolocated_dynamo_with_nemo_gym(
     monkeypatch, configured_gym_log_dir
