@@ -17,13 +17,22 @@ from typing import cast
 
 from transformers import PreTrainedTokenizerBase
 
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    check_top_p_has_top_k,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.models.generation.dynamo.config import (
     check_dynamo_serving_chat_kwargs,
     dynamo_cfg,
     dynamo_enabled,
     dynamo_parsers,
 )
-from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
+from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
+    GenerationInterface,
+    sampler_replay_enabled,
+)
 from nemo_rl.models.generation.trtllm.config import (
     TrtllmConfig,
     resolve_role_overrides,
@@ -31,6 +40,7 @@ from nemo_rl.models.generation.trtllm.config import (
 from nemo_rl.models.generation.vllm import VllmConfig
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    resolve_vllm_logprobs_mode,
     validate_nvfp4_pertoken_generation,
     validate_vllm_quantization_config,
 )
@@ -167,6 +177,29 @@ def configure_generation_config(
             "true, so it would be ignored. Set policy.generation.dynamo=true to "
             "serve generation through Dynamo, or remove dynamo_cfg."
         )
+    if not is_eval and sampler_replay_enabled(config):
+        # Only vLLM returns the processed top-K log-probs replay reads; say so
+        # before asking for top_k/top_logprobs, which other backends reject anyway.
+        if config["backend"] != "vllm":
+            raise ValueError(
+                "policy.generation.sampler_replay.enabled requires the vllm "
+                f"generation backend (got backend={config['backend']!r})"
+            )
+        # Replaying the sampler's support needs top_k to bound it.
+        check_top_p_has_top_k(config["top_k"], config["top_p"])
+        if not need_top_k_or_top_p_filtering(
+            TrainingSamplingParams(top_k=config["top_k"], top_p=config["top_p"])
+        ):
+            raise ValueError(
+                "policy.generation.sampler_replay.enabled needs top-k/top-p "
+                "sampling (policy.generation.top_k/top_p)"
+            )
+        if not config.get("top_logprobs"):
+            raise ValueError(
+                "policy.generation.sampler_replay.enabled reads the sampler's "
+                "support from the captured sampler head: set "
+                "policy.generation.top_logprobs >= top_k"
+            )
 
     # tokenizer setting
     if "_pad_token_id" in config:
@@ -200,7 +233,8 @@ def configure_generation_config(
                 )
             if config.get("top_logprobs"):
                 raise ValueError(
-                    "policy.generation.top_logprobs > 0 (loss_fn.score_centering) is "
+                    "policy.generation.top_logprobs > 0 (loss_fn.score_centering, "
+                    "policy.generation.sampler_replay) is "
                     "not supported with policy.generation.dynamo=true yet: the "
                     "Dynamo engine's token capture does not stage sampler top-k "
                     "log-probs. Set top_logprobs to 0 and turn off "
@@ -235,6 +269,22 @@ def configure_generation_config(
                 config["vllm_cfg"]["async_engine"] = True
         validate_vllm_quantization_config(config)
         validate_nvfp4_pertoken_generation(config, is_eval=is_eval)
+        # Training replays the sampler's top-k/top-p on the policy logits,
+        # which only matches logprobs vLLM reports after filtering.
+        logprobs_mode = resolve_vllm_logprobs_mode(config)
+        if (
+            not is_eval
+            and logprobs_mode != "processed_logprobs"
+            and need_top_k_or_top_p_filtering(
+                TrainingSamplingParams(top_k=config["top_k"], top_p=config["top_p"])
+            )
+        ):
+            raise ValueError(
+                "generation.top_k/top_p filtering requires "
+                "generation.vllm_cfg.logprobs_mode=processed_logprobs, since the "
+                "trainer replays the filters on the policy logits "
+                f"(got {logprobs_mode!r}; unset means vLLM's raw_logprobs)."
+            )
         if config.get("real_quant"):
             export_cpu_offload = config.get("real_quant_export_cpu_offload")
             if not isinstance(export_cpu_offload, bool):
@@ -296,6 +346,12 @@ def configure_generation_config(
                 config["vllm_cfg"]["skip_tokenizer_init"] = True
 
     elif config["backend"] == "trtllm":
+        # Resolve loading before the role engines copy the shared config.
+        trtllm_cfg = cast(TrtllmConfig, config)["trtllm_cfg"]
+        trtllm_cfg.setdefault(
+            "load_format",
+            "dummy" if trtllm_cfg.get("precision") == "fp8" or not is_eval else "auto",
+        )
         config = resolve_role_overrides(cast(TrtllmConfig, config))
 
     return config

@@ -327,7 +327,7 @@ def check_sampling_param(
     top_p: Optional[float],
     top_k: Optional[int],
     generation_config: Any,
-) -> None:
+) -> int:
     """Reject an HTTP rollout request that would sample off-policy.
 
     Request sampling must match NeMo RL's exactly, or inference runs off-policy and
@@ -339,23 +339,20 @@ def check_sampling_param(
     Args:
         temperature: The request's temperature.
         top_p: The request's top_p. It must be explicit: vLLM resolves an unset top_p
-            from the model's generation_config.json (``ModelConfig.generation_config``
-            defaults to ``"auto"``), not necessarily 1.0.
-        top_k: The request's top_k, which must be unset or -1 (disabled), matching
-            ``BaseVllmGenerationWorker._build_sampling_params``. vLLM resolves an
-            unset top_k from generation_config.json too, so None means on-policy only
-            once the caller sends the request with top_k=-1.
+            from the model's generation_config.json, not necessarily 1.0.
+        top_k: The request's top_k, which must be unset or equal the matched
+            profile's top_k (``top_k`` or ``val_top_k``; -1 when that is None).
         generation_config: ``policy.generation``, with the train and validation
             sampling parameters.
 
+    Returns:
+        The top_k to serve the request with: the matched profile's, as
+        ``BaseVllmGenerationWorker._build_sampling_params`` sets it (-1 disables).
+
     Raises:
-        ValueError: The request's top_k is set, its top_p is unset, or its
-            temperature and top_p match neither sampling profile.
+        ValueError: The request's top_p is unset, its temperature and top_p match
+            neither sampling profile, or its top_k differs from the profile's.
     """
-    if top_k not in (None, -1):
-        raise ValueError(
-            f"Top k sampling parameter must be unset, empty, or -1. Got `{top_k}`"
-        )
     if top_p is None:
         raise ValueError(
             "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
@@ -370,15 +367,25 @@ def check_sampling_param(
         temperature == generation_config["val_temperature"]
         and top_p == generation_config["val_top_p"]
     )
-    if is_train_sampling or is_val_sampling:
-        return
-    raise ValueError(
-        f"request sampling (temperature={temperature}, top_p={top_p}) matches neither "
-        f"the train sampling params (temperature={generation_config['temperature']}, "
-        f"top_p={generation_config['top_p']}) nor the validation sampling params "
-        f"(val_temperature={generation_config['val_temperature']}, "
-        f"val_top_p={generation_config['val_top_p']})"
-    )
+    if not (is_train_sampling or is_val_sampling):
+        raise ValueError(
+            f"request sampling (temperature={temperature}, top_p={top_p}) matches "
+            "neither the train sampling params "
+            f"(temperature={generation_config['temperature']}, "
+            f"top_p={generation_config['top_p']}) nor the validation sampling params "
+            f"(val_temperature={generation_config['val_temperature']}, "
+            f"val_top_p={generation_config['val_top_p']})"
+        )
+    # Train wins a tie: grpo.setup() rejects a val_top_k that differs from top_k
+    # when the two profiles share temperature and top_p.
+    profile_top_k = generation_config["top_k" if is_train_sampling else "val_top_k"]
+    profile_top_k = -1 if profile_top_k is None else profile_top_k
+    if top_k not in (None, profile_top_k):
+        raise ValueError(
+            f"request top_k={top_k} must be unset or match the configured top_k "
+            f"({profile_top_k})"
+        )
+    return profile_top_k
 
 
 def validate_rollout_prompt(expected: list[int], actual: list[int] | None) -> None:

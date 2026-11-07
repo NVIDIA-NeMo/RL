@@ -25,7 +25,7 @@ from nemo_rl.experience.failures import http_status_is_infra
 
 LOGGER = logging.getLogger(__name__)
 
-# Marks a request as a NeMo RL rollout for the engine (native_engine), which
+# Marks a request as a NeMo RL rollout for the engine (engine_adapter), which
 # then samples it from the generation config. Defined here, not in the engine
 # module, so the driver need not import ai-dynamo.
 ROLLOUT_ANNOTATION = "nemo_rl:rollout:"
@@ -120,7 +120,7 @@ def rollout_payload(
 def parse_rollout_response(response: dict[str, Any], *, url: str) -> dict[str, Any]:
     """Return the engine's ``engine_data``, or raise with the frontend's error.
 
-    It holds the rollout result (``request_pipeline.rollout_result_to_wire``)
+    It holds the rollout result (``rollout_result.rollout_result_to_wire``)
     and the serving worker's index.
     """
     if response.get("status") == "error":

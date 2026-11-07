@@ -19,7 +19,7 @@ from pathlib import Path
 
 import pytest
 
-from nemo_rl.models.generation.dynamo.config import DynamoCfg
+from nemo_rl.models.generation.dynamo.config import DynamoCfg, DynamoFrontendArgs
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     ManagedDynamoRuntime,
     _managed_namespace,
@@ -29,8 +29,8 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
 
 def _runtime(**frontend_args) -> ManagedDynamoRuntime:
     return ManagedDynamoRuntime(
-        dynamo_cfg=DynamoCfg.model_validate(
-            {"startup_timeout_s": 5, "frontend_args": frontend_args}
+        dynamo_cfg=DynamoCfg(
+            startup_timeout_s=5, frontend_args=DynamoFrontendArgs(**frontend_args)
         ),
         model_name="model",
         frontend_python="/venvs/vllm/bin/python",
@@ -261,14 +261,28 @@ def test_engines_are_ready_once_registered_and_the_model_is_served(
     )
 
 
-def test_engine_wait_fails_immediately_with_the_engines_error() -> None:
+@pytest.mark.parametrize(
+    ("stopped", "error"),
+    [
+        ("engine", "shard 0 stopped serving"),
+        # A bad frontend_args.extra_cli_args flag makes the frontend exit at once.
+        ("frontend", r"frontend is not alive \(code=2\)"),
+    ],
+)
+def test_engine_wait_fails_immediately_when_an_engine_or_service_stops(
+    stopped, error
+) -> None:
     runtime = _started(_runtime())
+    if stopped == "frontend":
+        runtime._frontend_process.poll = lambda: 2
+        runtime._frontend_process.returncode = 2
 
-    def endpoint_stopped() -> None:
-        raise RuntimeError("endpoint of generation shard 0 stopped serving")
+    def check_engines() -> None:
+        if stopped == "engine":
+            raise RuntimeError("endpoint of generation shard 0 stopped serving")
 
-    with pytest.raises(RuntimeError, match="shard 0 stopped serving"):
-        runtime.wait_for_engines(1, check_engines=endpoint_stopped)
+    with pytest.raises(RuntimeError, match=error):
+        runtime.wait_for_engines(1, check_engines=check_engines)
 
 
 def test_frontend_launches_from_the_given_interpreter(monkeypatch) -> None:
@@ -290,9 +304,11 @@ def test_shutdown_logs_the_kv_events_the_router_applied(monkeypatch, capsys) -> 
     runtime = _started(_runtime())
     metrics = (
         "# HELP dynamo_component_kv_cache_events_applied KV events applied\n"
-        'dynamo_component_kv_cache_events_applied{status="ok",worker_id="1"} 40\n'
-        'dynamo_component_kv_cache_events_applied{status="ok",worker_id="2"} 2\n'
-        'dynamo_component_kv_cache_events_applied{status="parent_block_not_found"} 3\n'
+        'dynamo_component_kv_cache_events_applied{event_type="stored",status="ok",worker_id="1"} 40\n'
+        'dynamo_component_kv_cache_events_applied{event_type="stored",status="ok",worker_id="2"} 2\n'
+        'dynamo_component_kv_cache_events_applied{event_type="stored",status="parent_block_not_found"} 3\n'
+        # Every prefix-cache reset applies one; it says nothing about block events.
+        'dynamo_component_kv_cache_events_applied{event_type="cleared",status="ok",worker_id="1"} 5\n'
         'dynamo_component_requests_total{status="ok"} 9\n'
     )
 

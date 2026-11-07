@@ -1251,6 +1251,31 @@ def test_serve_mode_requires_a_pool_dir_and_rejects_unknown_modes(tmp_path):
     assert "EXTERNAL_VLLM_MODE must be inline or serve, got: attach" in result.stderr
 
 
+def test_serve_mode_publishes_the_manifest_before_the_pools_are_healthy(tmp_path):
+    pool_dir = tmp_path / "pool"
+    env = _serve_env(tmp_path)
+    stub_log = Path(env["STUB_LOG"])
+    # No load balancer counts a healthy backend yet, so the pool cannot be READY.
+    (stub_log / "healthy_9213").write_text("0\n")
+    (stub_log / "healthy_9214").write_text("0\n")
+    process = _start(_WRAPPER, env, tmp_path / "serve.out")
+    try:
+        # The URLs are fixed once the load balancers are placed, well before READY.
+        # pools.env is written right after manifest.tsv, so waiting for it covers both.
+        _wait_for(
+            (pool_dir / "pools.env").exists, 60, "manifest was not published early"
+        )
+        assert "http://127.0.0.1:9213/v1" in (pool_dir / "manifest.tsv").read_text()
+        assert not (pool_dir / "READY").exists()
+        (stub_log / "healthy_9213").unlink()
+        (stub_log / "healthy_9214").unlink()
+        _wait_for((pool_dir / "READY").exists, 60, "pools never published READY")
+        # READY does not change what was published.
+        assert "http://127.0.0.1:9213/v1" in (pool_dir / "manifest.tsv").read_text()
+    finally:
+        _stop(process)
+
+
 def test_serve_mode_publishes_relaunches_and_withdraws_ready_while_degraded(tmp_path):
     pool_dir = tmp_path / "pool"
     env = _serve_env(tmp_path, STUB_END_TIME="2026-10-14T06:00:00")
@@ -1526,6 +1551,81 @@ def test_attach_and_run_resolves_urls_and_the_readiness_gate_from_the_manifest(
     assert not (pool_dir / "attached" / "900").exists()
 
 
+def test_attach_and_run_early_starts_ray_sub_once_the_manifest_is_published(tmp_path):
+    pool_dir = _published_pool(tmp_path)
+    (pool_dir / "READY").unlink()  # replicas are still loading
+    env = _attach_env(tmp_path, EXTERNAL_VLLM_ATTACH_EARLY="1")
+    result = subprocess.run(
+        ["bash", str(_ATTACH)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    assert "manifest published, replicas still loading" in result.stdout
+    # The driver command still carries the readiness gate that waits for the backends.
+    assert "external_service_readiness=" in (tmp_path / "command_seen").read_text()
+    assert "a=http://10.0.0.1:9213/v1" in (tmp_path / "command_seen").read_text()
+
+
+def test_attach_and_run_waits_for_ready_when_early_is_off(tmp_path):
+    pool_dir = _published_pool(tmp_path)
+    (pool_dir / "READY").unlink()
+    env = _attach_env(
+        tmp_path, EXTERNAL_VLLM_ATTACH_EARLY="0", EXTERNAL_VLLM_ATTACH_TIMEOUT="1"
+    )
+    result = subprocess.run(
+        ["bash", str(_ATTACH)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode != 0
+    assert "pool job 555 not READY after 1s" in result.stderr
+    assert not (tmp_path / "command_seen").exists()
+
+
+def test_attach_and_run_starts_ray_sub_before_ready_by_default(tmp_path):
+    pool_dir = _published_pool(tmp_path)
+    (pool_dir / "READY").unlink()  # replicas are still loading
+    env = _attach_env(tmp_path)
+    env.pop("EXTERNAL_VLLM_ATTACH_EARLY", None)
+    result = subprocess.run(
+        ["bash", str(_ATTACH)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode == 0, result.stderr
+    assert "manifest published, replicas still loading" in result.stdout
+    assert (tmp_path / "command_seen").exists()
+
+
+def test_attach_and_run_early_does_not_trust_a_manifest_from_another_job(tmp_path):
+    pool_dir = _published_pool(tmp_path)
+    (pool_dir / "READY").unlink()
+    (pool_dir / "generation").write_text("444-0\n")
+    env = _attach_env(
+        tmp_path, EXTERNAL_VLLM_ATTACH_EARLY="1", EXTERNAL_VLLM_ATTACH_TIMEOUT="1"
+    )
+    result = subprocess.run(
+        ["bash", str(_ATTACH)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode != 0
+    assert "pool job 555" in result.stderr and "after 1s" in result.stderr
+    assert not (tmp_path / "command_seen").exists()
+
+
+def test_attach_and_run_early_does_not_trust_the_manifest_of_a_stopped_generation(
+    tmp_path,
+):
+    # Generation 555-0 stopped (e.g. before a requeue to 555-1): its exit trap
+    # removes READY and writes STOPPED but leaves manifest.tsv, generation and a
+    # heartbeat that is still fresh. Its URLs are dead.
+    pool_dir = _published_pool(tmp_path)
+    (pool_dir / "READY").unlink()
+    (pool_dir / "STOPPED").write_text("555-0 2026-01-01T00:00:00 status=1\n")
+    env = _attach_env(
+        tmp_path, EXTERNAL_VLLM_ATTACH_EARLY="1", EXTERNAL_VLLM_ATTACH_TIMEOUT="1"
+    )
+    result = subprocess.run(
+        ["bash", str(_ATTACH)], env=env, capture_output=True, text=True, timeout=60
+    )
+    assert result.returncode != 0
+    assert not (tmp_path / "command_seen").exists()
+
+
 def test_attach_and_run_requires_the_readiness_placeholder(tmp_path):
     _published_pool(tmp_path)
     env = _attach_env(
@@ -1544,7 +1644,7 @@ def test_attach_and_run_requires_the_readiness_placeholder(tmp_path):
 )
 def test_attach_and_run_does_not_trust_a_stale_ready(tmp_path, stale):
     pool_dir = _published_pool(tmp_path)
-    extra = {"EXTERNAL_VLLM_ATTACH_TIMEOUT": "1"}
+    extra = {"EXTERNAL_VLLM_ATTACH_TIMEOUT": "1", "EXTERNAL_VLLM_ATTACH_EARLY": "0"}
     if stale == "generation_from_another_job":
         (pool_dir / "generation").write_text("444-0\n")
     else:
@@ -1658,9 +1758,10 @@ def test_pool_config_submit_helpers_reuse_a_live_pool_and_depend_on_it_only_whil
         pool_job=$(submit_external_vllm_pool_job {pool_dir} --time=12:00:00)
         again=$(submit_external_vllm_pool_job {pool_dir} --time=12:00:00)
         loading=$(submit_external_vllm_attached_job {pool_dir} "$pool_job" "{_TRAIN_COMMAND}" --nodes=68)
+        loading_ready=$(EXTERNAL_VLLM_ATTACH_EARLY=0 submit_external_vllm_attached_job {pool_dir} "$pool_job" "{_TRAIN_COMMAND}" --nodes=68)
         touch {pool_dir}/READY
         warm=$(submit_external_vllm_attached_job {pool_dir} "$pool_job" "{_TRAIN_COMMAND}" --nodes=68)
-        printf 'pool=%s again=%s loading=%s warm=%s\\n' "$pool_job" "$again" "$loading" "$warm"
+        printf 'pool=%s again=%s loading=%s loading_ready=%s warm=%s\\n' "$pool_job" "$again" "$loading" "$loading_ready" "$warm"
         if submit_external_vllm_attached_job {pool_dir} "$pool_job" "train __ALPHA_BASE_URL__" --nodes=68; then
           echo "accepted a command without every placeholder"
         fi
@@ -1670,7 +1771,7 @@ def test_pool_config_submit_helpers_reuse_a_live_pool_and_depend_on_it_only_whil
         ["bash", "-c", program], env=env, capture_output=True, text=True, timeout=60
     )
     assert result.returncode == 0, result.stderr
-    assert "pool=701 again=701 loading=702 warm=703" in result.stdout
+    assert "pool=701 again=701 loading=702 loading_ready=703 warm=704" in result.stdout
     assert "accepted" not in result.stdout
     assert "missing __BETA_BASE_URL__ for pool BETA" in result.stderr
     assert (pool_dir / "submitted_job").read_text().strip() == "701"
@@ -1678,6 +1779,8 @@ def test_pool_config_submit_helpers_reuse_a_live_pool_and_depend_on_it_only_whil
     tools = env["EXTERNAL_VLLM_TOOLS_DIR_HOST"]
     assert calls == [
         f"--parsable --nodes=3 --exclusive --gres=gpu:4 --export=ALL --time=12:00:00 {tools}/run_in_allocation.sh",
+        # Early attach (the default) only needs the pool job running; no delay.
+        f"--parsable --export=ALL --dependency=after:701 --nodes=68 {tools}/attach_and_run.sh",
         f"--parsable --export=ALL --dependency=after:701+15 --nodes=68 {tools}/attach_and_run.sh",
         f"--parsable --export=ALL --nodes=68 {tools}/attach_and_run.sh",
     ]

@@ -16,6 +16,7 @@ import asyncio
 import copy
 import gc
 import logging
+import os
 import secrets
 import threading
 import time
@@ -68,8 +69,8 @@ from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
 from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
+from nemo_rl.models.generation.rollout_result import RolloutResult
 from nemo_rl.models.generation.vllm.request_pipeline import (
-    RolloutResult,
     rollout_output,
     rollout_result,
 )
@@ -320,6 +321,7 @@ class VllmAsyncGenerationWorkerImpl(
         # parent-chain rows through it directly; prefix resolution goes through
         # the shared ChainPrefixCache below.
         self._staging_source: Any | None = None
+        self._capture_dp_client: Any | None = None
         # Resolved staging-chain prefixes, shared implementation with the Megatron
         # preparer. Installed by setup_token_capture; fetch runs on executor threads.
         # Deferred import: tq_token_sink pulls in the data-plane stack.
@@ -445,7 +447,7 @@ class VllmAsyncGenerationWorkerImpl(
             else []
         )
         if dynamo_enabled(self.cfg):
-            from nemo_rl.models.generation.dynamo.native_engine import (
+            from nemo_rl.models.generation.dynamo.vllm_adapter import (
                 SnapshotStatLogger,
                 dynamo_kv_events_config,
             )
@@ -659,15 +661,35 @@ class VllmAsyncGenerationWorkerImpl(
         ``leader_worker_idx`` is this worker's index in its group; rollouts the
         engine serves report it, as ``generate_async`` results do.
         """
-        from nemo_rl.models.generation.dynamo.native_engine import (
+        # ai-dynamo is optional: import it only for engines served through Dynamo.
+        from dynamo._core import fetch_model
+
+        from nemo_rl.models.generation.dynamo.engine_adapter import (
             start_dynamo_endpoint,
         )
+        from nemo_rl.models.generation.dynamo.vllm_adapter import (
+            DynamoVllmAdapter,
+            chat_worker_config,
+        )
 
+        # Dynamo fetches a Hub ID's whole checkpoint before it registers; the engine's
+        # weights come from refit, so register the config and tokenizer files only.
+        model_path = (
+            self.model_name
+            if os.path.exists(self.model_name)
+            else await fetch_model(self.model_name, ignore_weights=True)
+        )
+        kv_events = self.llm.vllm_config.kv_events_config
+        publishes = kv_events is not None and kv_events.enable_kv_cache_events
+        # The Dynamo functional overlays check the router applied these.
+        print(f"  [Dynamo] engine publishes KV events: {publishes}", flush=True)
         self._dynamo_endpoint_task = start_dynamo_endpoint(
-            self,
+            DynamoVllmAdapter(self, leader_worker_idx=leader_worker_idx),
+            model_path=model_path,
+            served_model_name=self.model_name,
             namespace=namespace,
             engine_env=engine_env,
-            leader_worker_idx=leader_worker_idx,
+            chat_config=chat_worker_config(self),
         )
 
     async def dynamo_endpoint_error(self) -> Optional[str]:
@@ -723,6 +745,7 @@ class VllmAsyncGenerationWorkerImpl(
         # Own no segment: a save would otherwise wait on this actor, whose event
         # loop is busy serving rollouts. Capture writes land in other segments.
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
+        self._capture_dp_client = dp_client
         # The Omni processor emits pixels in the engine's model dtype; the
         # sink pins its media column to it so text-call sentinels never
         # introduce a second dtype (TQ keeps one dtype per field).
@@ -785,6 +808,14 @@ class VllmAsyncGenerationWorkerImpl(
     async def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """Run owner-local checkpoint I/O without blocking the actor event loop."""
         return await asyncio.to_thread(run_checkpoint_command, body)
+
+    def get_data_plane_snapshot(self) -> dict[str, Any] | None:
+        """The capture client's data-plane counters, ``None`` when it has none."""
+        from nemo_rl.data_plane.observability import is_metrics_client
+
+        if not is_metrics_client(self._capture_dp_client):
+            return None
+        return self._capture_dp_client.snapshot(reset_step_window=True)
 
     async def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version stamped on subsequent captured calls."""
@@ -1704,14 +1735,38 @@ class VllmAsyncGenerationWorkerImpl(
             request: NeMoRLChatCompletionRequest, raw_request: Request
         ):
             # Accept train and validation profiles; reject off-policy requests.
-            check_sampling_param(
+            # vLLM fills an unset top_k/min_p/repetition_penalty from
+            # generation_config.json when vllm_kwargs sets generation_config="auto",
+            # so pin top_k to the matched profile's (as
+            # vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params does)
+            # and disable min_p and the repetition penalty. vLLM applies these and
+            # the presence/frequency penalties and logit bias before sampling; the
+            # trainer replays none of them, so a request may not set them.
+            top_k = check_sampling_param(
                 temperature=request.temperature,
                 top_p=request.top_p,
                 top_k=request.top_k,
                 generation_config=generation_config,
             )
-            # This needs to match the behavior in nemo_rl/models/generation/vllm/vllm_worker.py::BaseVllmGenerationWorker::_build_sampling_params
-            request.top_k = -1
+            assert request.min_p in (None, 0.0), (
+                f"request min_p={request.min_p} is not supported; leave it unset"
+            )
+            assert request.repetition_penalty in (None, 1.0), (
+                f"request repetition_penalty={request.repetition_penalty} is not "
+                "supported; leave it unset"
+            )
+            assert request.presence_penalty in (None, 0.0), (
+                f"request presence_penalty={request.presence_penalty} is not "
+                "supported; leave it unset"
+            )
+            assert request.frequency_penalty in (None, 0.0), (
+                f"request frequency_penalty={request.frequency_penalty} is not "
+                "supported; leave it unset"
+            )
+            assert not request.logit_bias, "request logit_bias is not supported"
+            request.top_k = top_k
+            request.min_p = 0.0
+            request.repetition_penalty = 1.0
 
             try:
                 generator = await openai_serving_chat.create_chat_completion(
@@ -2083,7 +2138,7 @@ class VllmAsyncGenerationWorkerImpl(
         Returns:
             The result, and vLLM's final RequestOutput (None when no new token fits).
             The final output supplies finish and usage metadata to Dynamo
-            (``dynamo/native_engine.py``).
+            (``dynamo/vllm_adapter.py``).
         """
         max_new_tokens = self._rollout_max_new_tokens(len(prompt_token_ids))
         if max_new_tokens == 0:

@@ -19,41 +19,16 @@ its output tensors for ``generate_async``.
 """
 
 import logging
-from dataclasses import dataclass
 from typing import Any, Optional, cast
 
 import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.interfaces import GenerationOutputSpec
+from nemo_rl.models.generation.rollout_result import RolloutResult
 from nemo_rl.models.generation.vllm.utils import pad_and_align_routed_expert_indices
-from nemo_rl.utils.routed_experts_codec import (
-    decode_routed_experts,
-    encode_routed_experts,
-)
 
 LOGGER = logging.getLogger(__name__)
-
-
-@dataclass
-class RolloutResult:
-    """One rollout's outcome, independent of where its output is assembled."""
-
-    token_ids: list[int]
-    # The sampled token's log probability at each position; 0.0 where vLLM
-    # reported none.
-    logprobs: list[float]
-    # The engine stopped at max_tokens.
-    truncated: bool
-    # [prompt + generated, num_moe_layers, topk], aligned for router replay.
-    routed_experts: Optional[torch.Tensor]
-    # missing/expected/actual route counts; set when router replay is on.
-    r3_stats: Optional[dict[str, int]]
-
-    @classmethod
-    def nothing_generated(cls) -> "RolloutResult":
-        """The result when no new token fits: the prompt alone, untruncated."""
-        return cls([], [], False, None, None)
 
 
 def _selected_logprobs(completion: Any) -> list[float]:
@@ -170,32 +145,3 @@ def rollout_output(
     if result.routed_experts is not None:
         output["routed_experts"] = result.routed_experts.to(device).unsqueeze(0)
     return BatchedDataDict[GenerationOutputSpec](output)
-
-
-def rollout_result_to_wire(result: RolloutResult) -> dict[str, Any]:
-    """JSON-safe form of ``result``, for engines that answer over HTTP."""
-    return {
-        "token_ids": result.token_ids,
-        "logprobs": result.logprobs,
-        "truncated": result.truncated,
-        "routed_experts": (
-            None
-            if result.routed_experts is None
-            else encode_routed_experts(result.routed_experts)
-        ),
-        "r3_stats": result.r3_stats,
-    }
-
-
-def rollout_result_from_wire(wire: dict[str, Any]) -> RolloutResult:
-    """Inverse of :func:`rollout_result_to_wire`; routes keep their own dtype."""
-    routed_experts = wire["routed_experts"]
-    if routed_experts is not None:
-        routed_experts = decode_routed_experts(routed_experts, dtype=None)
-    return RolloutResult(
-        token_ids=list(wire["token_ids"]),
-        logprobs=list(wire["logprobs"]),
-        truncated=bool(wire["truncated"]),
-        routed_experts=routed_experts,
-        r3_stats=wire["r3_stats"],
-    )

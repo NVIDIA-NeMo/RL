@@ -256,6 +256,64 @@ def test_automodel_prev_logprobs_keep_support_only_on_valid_tokens():
     torch.testing.assert_close(logprobs, expected, rtol=0, atol=0)
 
 
+@pytest.mark.automodel
+@pytest.mark.parametrize("packed", [False, True])
+def test_automodel_prev_logprobs_replay_the_sampler_support(packed):
+    """Prev logprobs renormalize over the captured S_q, like the actor loss."""
+    from types import SimpleNamespace
+
+    from nemo_rl.models.automodel.train import LogprobsPostProcessor
+
+    torch.manual_seed(0)
+    processor = LogprobsPostProcessor(
+        cfg={"logprob_chunk_size": 2},
+        enable_seq_packing=packed,
+        sampling_params=TrainingSamplingParams(top_k=3, top_p=0.9, sampler_replay=True),
+    )
+    lengths = [4, 3]
+    logits = torch.randn(2, 4, 6)
+    head_ids = torch.tensor([[2, 4, 1], [5, 0, 3]]).repeat(2, 2, 1)  # [2, 4, 3]
+    head_logprobs = torch.tensor([0.6, 0.4, 0.0]).log().expand(2, 4, 3)
+    input_ids = head_ids[..., 0].clone()
+    input_ids[:, 2] = head_ids[:, 2, 1]
+    data = BatchedDataDict(
+        {
+            "input_ids": input_ids,
+            "input_lengths": torch.tensor(lengths),
+            "token_mask": torch.tensor([[0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 1.0, 0.0]]),
+            "sample_mask": torch.ones(2),
+            "sampler_topk_token_ids": head_ids,
+            "sampler_topk_logprobs": head_logprobs.clone(),
+        }
+    )
+    if packed:
+        cu_seqlens = torch.tensor([0, 4, 7])
+        model_logits = torch.cat([logits[0, :4], logits[1, :3]])[None]
+        processed = SimpleNamespace(
+            flash_attn_kwargs=SimpleNamespace(cu_seqlens_q=cu_seqlens)
+        )
+    else:
+        model_logits = logits
+        processed = SimpleNamespace(input_ids=input_ids, seq_len=4)
+
+    logprobs = processor(
+        model_logits,
+        data,
+        processed,
+        original_batch_size=2,
+        original_seq_len=4,
+        cp_sharder=None,
+    )
+
+    support = head_ids[:, 1:, :2]  # the sampler kept the first two head ids
+    z = logits[:, :-1].gather(-1, support)
+    sampled = (support == input_ids[:, 1:, None]).int().argmax(-1, keepdim=True)
+    replayed = (z - z.logsumexp(-1, keepdim=True)).gather(-1, sampled).squeeze(-1)
+    expected = torch.cat([torch.zeros(2, 1), replayed], dim=1)
+    expected = torch.where(data["token_mask"].bool(), expected, 0.0)
+    torch.testing.assert_close(logprobs, expected)
+
+
 def _kl_in_reward_loss_config():
     return ClippedPGLossConfig(
         use_kl_in_reward=True,

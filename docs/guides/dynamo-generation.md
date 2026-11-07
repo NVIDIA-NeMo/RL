@@ -1,6 +1,7 @@
 # Dynamo serving for vLLM generation
 
-Any non-colocated vLLM generation config can serve its rollouts through
+SingleController runs (`examples/run_grpo_single_controller.py`) with non-colocated
+vLLM generation can serve their rollouts through
 [Dynamo](https://github.com/ai-dynamo/dynamo)'s OpenAI frontend and KV-aware
 router. Add one line:
 
@@ -137,8 +138,7 @@ Where the behavior differs from the native endpoint:
 Startup rejects these with `dynamo: true`:
 
 - `colocated.enabled: true`: a colocated engine sleeps while the policy trains,
-  and the frontend would keep routing to it. The SingleController never runs
-  colocated vLLM; the other entrypoints need non-colocated generation.
+  and the frontend would keep routing to it.
 - `async_rl.generation_fleet_health.enabled`: the frontend picks engines itself,
   and a restarted shard does not register with it yet.
 - `async_rl.generation_router`: the frontend already routes the fleet behind one
@@ -187,7 +187,8 @@ bash docker/dynamo/install.sh
 
 ## Run
 
-Use any non-colocated vLLM recipe that does not use NeMo-Gym, and add the switch:
+Use any non-colocated SingleController vLLM recipe that does not use NeMo-Gym,
+and add the switch:
 
 ```bash
 uv run examples/run_grpo_single_controller.py \

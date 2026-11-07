@@ -15,7 +15,7 @@
 """Driver-owned Dynamo services: etcd, NATS and the OpenAI frontend.
 
 The vLLM engines are NeMo RL's own workers; each registers itself with these
-services (see ``native_engine``), so the runtime only waits to see them.
+services (see ``engine_adapter``), so the runtime only waits to see them.
 """
 
 import atexit
@@ -43,7 +43,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.models.generation.dynamo.config import DynamoCfg
 
-# The engines register on this component and endpoint (see native_engine).
+# The engines register on this component and endpoint (see engine_adapter).
 DYNAMO_COMPONENT = "backend"
 DYNAMO_ENDPOINT = "generate"
 
@@ -102,9 +102,12 @@ def _service_executable(name: str) -> str:
 
 
 # The KV router's applied-event counter (Dynamo's kvrouter.KV_CACHE_EVENTS_APPLIED),
-# one sample per label set.
+# one sample per label set. Stored-block events only: every prefix-cache reset
+# emits a payload-free "cleared" event, which applies even when the router
+# decodes none of vLLM's block events.
 _KV_EVENTS_APPLIED = re.compile(
-    r'^\w*kv_cache_events_applied(?:_total)?\{(?=[^}]*status="(?P<status>[^"]*)")'
+    r'^\w*kv_cache_events_applied(?:_total)?\{(?=[^}]*event_type="stored")'
+    r'(?=[^}]*status="(?P<status>[^"]*)")'
     r"[^}]*\}\s+(?P<value>\S+)$",
     re.MULTILINE,
 )
@@ -420,7 +423,7 @@ class ManagedDynamoRuntime:
                 )
 
     def _log_router_kv_events(self) -> None:
-        """Log how many engine KV-cache events the KV router applied, by status.
+        """Log how many stored-block KV events the KV router applied, by status.
 
         Read from the frontend's metrics before it stops. A KV router that never
         applied one routed on load alone.
