@@ -150,9 +150,9 @@ automodel = [
   "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "apache-tvm-ffi==0.1.11",
   "nemo-automodel[moe]",
-  # Automodel's FLA kernels require this TileLang version on Hopper.
-  # Keep this scoped to the automodel fork; sglang intentionally pins TileLang 0.1.8.
+  # Keep AutoModel's existing TileLang versions independent of Megatron's pin.
   "tilelang==0.1.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "tilelang==0.1.12; sys_platform == 'linux' and platform_machine == 'aarch64'",
   # Flash-attn version should be selected to satisfy both TE + vLLM requirements (xformers in particular)
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
@@ -202,14 +202,14 @@ sglang = [
   # re-materialized once, after the last bucket lands. No tagged release has
   # those endpoints, and re-running the finalize per bucket is not idempotent.
   "sglang",
-  "sglang-kernel==0.4.5",                                                       # Direct dep for explicit version control; required by sglang-miles
-  "sglang-router",                                                              # Used by nemo_rl.models.generation.sglang.sglang_router for multi-engine routing
+  "sglang-kernel==0.4.5",                                                                                          # Direct dep for explicit version control; required by sglang-miles
+  "sglang-router",                                                                                                 # Used by nemo_rl.models.generation.sglang.sglang_router for multi-engine routing
   "kernels>=0.14.1,<0.15",
   "flashinfer-python==0.6.14",
   "flashinfer-cubin==0.6.14",
   "flashinfer-jit-cache==0.6.14",
   "transformers==5.12.1",
-  "tilelang==0.1.11; sys_platform == 'linux' and platform_machine == 'x86_64'",
+  "tilelang==0.1.11; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
 ]
 mcore = [
   # also need cudnn (https://developer.nvidia.com/cudnn-downloads?target_os=Linux&target_arch=x86_64&Distribution=Ubuntu&target_version=20.04&target_type=deb_network)
