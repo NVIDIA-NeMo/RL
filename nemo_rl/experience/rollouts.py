@@ -2421,8 +2421,10 @@ def _prepare_nemo_gym_rows(
 
     group_ids: dict[int, str] = {}
     group_attempts: dict[int, int] = {}
+    fallback_task_indices: dict[int, int] = {}
     for group_index, group_start in enumerate(range(0, len(rows), num_generations)):
         group_rows = rows[group_start : group_start + num_generations]
+        fallback_task_indices[group_index] = uuid.uuid4().int % (1 << 63)
         existing_group_ids = {
             row[NEMO_GYM_GROUP_ID_KEY]
             for row in group_rows
@@ -2478,6 +2480,7 @@ def _prepare_nemo_gym_rows(
             else configured_max_tokens
         )
         row["_rowidx"] = row_index
+        row.setdefault(NEMO_GYM_TASK_INDEX_KEY, fallback_task_indices[group_index])
         row[NEMO_GYM_GROUP_ID_KEY] = group_ids[group_index]
         row[NEMO_GYM_GROUP_ATTEMPT_KEY] = group_attempts[group_index]
         row[NEMO_GYM_ROLLOUT_INDEX_KEY] = rollout_index
@@ -2773,7 +2776,9 @@ async def run_async_nemo_gym_rollout(
     assert max_rollout_turns is None, (
         "`max_rollout_turns` is not supported in NeMo-Gym path!"
     )
-    if "vllm_cfg" in policy_generation.cfg:
+    if policy_generation.cfg["backend"] == "coreweave":
+        engine_max_model_len = policy_generation.cfg["coreweave_cfg"]["max_model_len"]
+    elif "vllm_cfg" in policy_generation.cfg:
         engine_max_model_len = policy_generation.cfg["vllm_cfg"]["max_model_len"]
     elif "mcore_generation_config" in policy_generation.cfg:
         engine_max_model_len = policy_generation.cfg["mcore_generation_config"][
@@ -3291,7 +3296,11 @@ def _postprocess_single_nemo_gym_group(
     # Prepare for the rollout metrics calculation below. Not strictly necessary here, but good to have parity with `run_async_multi_turn_rollout`
     with timer.time(f"{timer_prefix}/prepare_for_metrics_calculation"):
         batch_size = len(nemo_gym_rows)
-        if "vllm_cfg" in policy_generation.cfg:
+        if policy_generation.cfg["backend"] == "coreweave":
+            max_total_tokens_per_sample = policy_generation.cfg["coreweave_cfg"][
+                "max_model_len"
+            ]
+        elif "vllm_cfg" in policy_generation.cfg:
             max_total_tokens_per_sample = policy_generation.cfg["vllm_cfg"][
                 "max_model_len"
             ]
@@ -3529,16 +3538,18 @@ def _postprocess_single_nemo_gym_group(
         validate_reward_components_match_scalar([r["full_result"] for r in results])
 
     group_task_index = None
-    if nemo_gym_rows and NEMO_GYM_TASK_INDEX_KEY in nemo_gym_rows[0]:
-        group_task_index = int(nemo_gym_rows[0][NEMO_GYM_TASK_INDEX_KEY])
-        task_indices = [row.get(NEMO_GYM_TASK_INDEX_KEY) for row in nemo_gym_rows]
-        if any(
-            task_index is None or int(task_index) != group_task_index
-            for task_index in task_indices
-        ):
-            raise ValueError(
-                f"Expected one _ng_task_index per prompt group, got {task_indices}"
-            )
+    prompt_group_size = group_size if group_size is not None else len(nemo_gym_rows)
+    for start in range(0, len(nemo_gym_rows), prompt_group_size):
+        group_rows = nemo_gym_rows[start : start + prompt_group_size]
+        if NEMO_GYM_TASK_INDEX_KEY in group_rows[0]:
+            task_index = int(group_rows[0][NEMO_GYM_TASK_INDEX_KEY])
+            task_indices = [row.get(NEMO_GYM_TASK_INDEX_KEY) for row in group_rows]
+            if any(index is None or int(index) != task_index for index in task_indices):
+                raise ValueError(
+                    f"Expected one _ng_task_index per prompt group, got {task_indices}"
+                )
+            if len(nemo_gym_rows) == prompt_group_size:
+                group_task_index = task_index
 
     return NemoGymRolloutResult(
         input_ids=input_ids,

@@ -769,6 +769,13 @@ def setup(
             "Megatron-generation router replay is only supported on the "
             "SingleController token-capture path"
         )
+    if generation_config["backend"] == "coreweave":
+        # cwtrain is optional and is imported only for this backend.
+        from nemo_rl.models.generation.coreweave.coreweave_generation import (
+            CoreWeaveGeneration,
+        )
+
+        CoreWeaveGeneration.validate_settings(master_config)
     configure_lora_refit(policy_config)
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
@@ -1064,6 +1071,18 @@ def setup(
         ``http_server_api_key``), or None when the server checks none.
         """
         t0 = time.perf_counter()
+        runtime_env = None
+        if generation_config["backend"] == "coreweave":
+            from cwtrain.integrations.launch import is_secret_env_var
+
+            from nemo_rl.environments.nemo_gym import NEMO_GYM_ACTOR_FQN
+
+            runtime_env = make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
+            runtime_env["env_vars"] = {
+                key: value
+                for key, value in runtime_env["env_vars"].items()
+                if not is_secret_env_var(key)
+            }
         shard_set = build_nemo_gym_actors(
             env_configs,
             base_urls=base_urls,
@@ -1072,6 +1091,7 @@ def setup(
             enable_router_replay=router_replay_enabled(policy_config),
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
             policy_api_key=policy_api_key,
+            runtime_env=runtime_env,
             turn_checkpointing_enabled=False,
         )
         train_splits = (
@@ -1140,7 +1160,31 @@ def setup(
             flush=True,
         )
 
-    if colocated_inference:
+    if generation_config["backend"] == "coreweave":
+        policy_gpus_per_node = cluster_config.gpus_per_node - (
+            rm_gpus_per_node if total_nodes == 1 else 0
+        )
+        if policy_gpus_per_node <= 0:
+            raise ValueError("CoreWeave requires GPUs for the training policy")
+        constraints, remaining, topology = prepare_segment_topology(
+            segment_size, policy_nodes
+        )
+        if segment_size is not None:
+            teacher_segment_topology = {nid: topology[nid] for nid in remaining}
+        train_cluster = RayVirtualCluster(
+            name="grpo_policy_cluster",
+            bundle_ct_per_node_list=[policy_gpus_per_node] * policy_nodes,
+            use_gpus=True,
+            num_gpus_per_node=policy_gpus_per_node,
+            max_colocated_worker_groups=1,
+            port_range_low=cluster_config.master_port_range_low,
+            port_range_high=cluster_config.master_port_range_high,
+            segment_size=segment_size,
+            node_resource_constraints=constraints,
+        )
+        inference_cluster = None
+        inference_nodes = inference_gpus_per_node = 0
+    elif colocated_inference:
         if total_nodes == 1:
             policy_gpus_per_node = cluster_config.gpus_per_node - rm_gpus_per_node
             assert policy_gpus_per_node > 0, (
@@ -1984,6 +2028,37 @@ def setup(
             flush=True,
         )
 
+    elif backend == "coreweave":
+        # cwtrain is optional and is imported only for this backend.
+        from nemo_rl.models.generation.coreweave.coreweave_generation import (
+            CoreWeaveGeneration,
+        )
+
+        def init_coreweave() -> tuple[CoreWeaveGeneration, float]:
+            t0 = time.perf_counter()
+            generation = CoreWeaveGeneration(generation_config, tokenizer)
+            return generation, time.perf_counter() - t0
+
+        policy_generation, policy = initialize_generation_with_policy(
+            init_generation_fn=init_coreweave,
+            colocated_inference=False,
+            setup_timing_metrics=setup_timing_metrics,
+        )
+        policy_generation.weight_synchronizer = create_weight_synchronizer(
+            policy=policy,
+            generation=policy_generation,
+            generation_backend=backend,
+            colocated=False,
+        )
+        policy_generation.weight_synchronizer.init_communicator()
+
+        if enable_nemo_gym:
+            nemo_gym_actor, gym_time = _spinup_nemo_gym(
+                [policy_generation.rollout_config.base_url],
+                policy_generation.rollout_config.model,
+            )
+            setup_timing_metrics.nemo_gym_init_time_s = gym_time
+
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
@@ -2018,7 +2093,7 @@ def setup(
     # if it is not colocated inference, initialize collective communication for update weights
     elif (
         not colocated_inference
-        and backend != "sglang"
+        and backend not in ("sglang", "coreweave")
         and remote_transport is None
         and checkpoint_engine_config is None
     ):

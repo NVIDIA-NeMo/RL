@@ -1144,6 +1144,11 @@ def setup_single_controller(
     """
     validate_single_controller_config(master_config)
     generation_config = master_config.policy["generation"]
+    if generation_config["backend"] == "coreweave":
+        raise ValueError(
+            "CoreWeave currently uses examples/run_grpo.py with synchronous GRPO"
+        )
+
     # Normalize the optional request count once before partitions/workers start.
     top_logprobs = generation_config.setdefault("top_logprobs", 0)
     if top_logprobs > 0:

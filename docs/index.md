@@ -48,6 +48,8 @@ Troubleshooting common issues including missing submodules and memory fragmentat
 
 ## Training and Generation
 
+[CoreWeave Dedicated Inference](guides/coreweave-generation.md) serves external GRPO rollouts and loads policy checkpoints.
+
 ::::{grid} 1 1 2 2
 :gutter: 3
 
@@ -349,6 +351,7 @@ guides/xtoken-off-policy-distillation.md
 guides/refit.md
 guides/checkpoint-engine-refit.md
 guides/dynamo-generation.md
+guides/coreweave-generation.md
 guides/router-replay.md
 guides/sampler-replay.md
 guides/muon-optimizer.md

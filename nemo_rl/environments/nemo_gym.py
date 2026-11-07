@@ -484,6 +484,8 @@ def should_use_nemo_gym(master_config: NemoGymCompatibleConfig) -> bool:
         return False
 
     generation_config = master_config.policy["generation"]
+    if generation_config["backend"] == "coreweave":
+        return True
     assert should_use_async_rollouts(generation_config), (
         "❌ Error: In order to use NeMo-Gym, you must use a generation "
         "backend with `async_engine: true`!"
@@ -2930,9 +2932,15 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
         # each engine on, so there is no non-HTTP Gym path for this backend.
         generation_config["trtllm_cfg"]["async_engine"] = True
         generation_config["trtllm_cfg"]["expose_http_server"] = True
+    elif generation_config["backend"] == "coreweave":
+        from nemo_rl.models.generation.coreweave.coreweave_generation import (
+            CoreWeaveGeneration,
+        )
+
+        CoreWeaveGeneration.validate_settings(config)
     else:
         raise ValueError(
-            "NeMo-Gym setup supports vllm, dynamo, megatron, or trtllm "
+            "NeMo-Gym setup supports vllm, dynamo, megatron, trtllm, or coreweave "
             f"generation; got {generation_config['backend']!r}"
         )
 
@@ -3421,6 +3429,7 @@ def build_nemo_gym_actors(
     turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
+    runtime_env: Optional[dict[str, Any]] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
     spinup_timeout: float = DEFAULT_SHARD_SPINUP_TIMEOUT_SECONDS,
 ) -> NemoGymShardSet:
@@ -3437,6 +3446,8 @@ def build_nemo_gym_actors(
             per rollout call. See ``NemoGym.set_tokenizer`` for why.
         turn_checkpointing_enabled: Install and discover one Gym v2 checkpoint
             coordinator per actor without triggering checkpoint saves.
+        runtime_env: Explicit actor environment, for backends that supply
+            credentials through mounted files instead of serialized variables.
 
     Returns:
         A :class:`NemoGymShardSet` whose actors are all running and validated.
@@ -3460,6 +3471,7 @@ def build_nemo_gym_actors(
             turn_checkpointing_enabled=turn_checkpointing_enabled,
             token_capture=token_capture,
             policy_api_key=policy_api_key,
+            runtime_env=runtime_env,
         )
 
     return _build_sharded_gym_actors(
@@ -3473,6 +3485,7 @@ def build_nemo_gym_actors(
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
+        runtime_env=runtime_env,
         pg_ready_timeout=pg_ready_timeout,
         spinup_timeout=spinup_timeout,
     )
@@ -3489,6 +3502,7 @@ def _build_single_gym_actor(
     turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
+    runtime_env: Optional[dict[str, Any]] = None,
 ) -> NemoGymShardSet:
     """Start one actor and read its resolved taskset routes."""
     actor_config = _build_gym_actor_config(
@@ -3507,7 +3521,9 @@ def _build_single_gym_actor(
     )
 
     actor_options: dict[str, Any] = {
-        "runtime_env": make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
+        "runtime_env": runtime_env
+        if runtime_env is not None
+        else make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
     }
     if nemo_gym_dict.get("num_gpu_nodes", 0):
         actor_options["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
@@ -3553,6 +3569,7 @@ def _build_sharded_gym_actors(
     turn_checkpointing_enabled: bool,
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
+    runtime_env: Optional[dict[str, Any]] = None,
     pg_ready_timeout: float,
     spinup_timeout: float,
 ) -> NemoGymShardSet:
@@ -3587,7 +3604,11 @@ def _build_sharded_gym_actors(
 
     # This may create a temporary all-node placement group while materializing
     # the actor venv. Finish it before the shard group reserves those CPUs.
-    actor_runtime_env = make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
+    actor_runtime_env = (
+        runtime_env
+        if runtime_env is not None
+        else make_actor_runtime_env(NEMO_GYM_ACTOR_FQN)
+    )
 
     pg = placement_group(
         bundles=[
