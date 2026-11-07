@@ -55,6 +55,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.models.value.config import ValueResourcesConfig
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig
 
@@ -752,6 +753,7 @@ def patched_ppo_factories():
                 MagicMock(name="train"),
                 MagicMock(name="inference"),
                 None,
+                None,
             ),
         ),
         patch.object(
@@ -954,6 +956,27 @@ class TestTrainClusterSizesForTheCritic:
             cls.side_effect = lambda **kwargs: MagicMock(kwargs=kwargs)
             yield cls
 
+    def test_dedicated_value_uses_separate_cluster(self, fake_cluster):
+        master_config = _cluster_config(
+            _ppo_master_config(), colocated=False, backend="vllm"
+        )
+        master_config.cluster = ClusterConfig(num_nodes=5, gpus_per_node=8)
+        master_config.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 8,
+            "num_nodes": 1,
+        }
+        master_config.value["resources"] = ValueResourcesConfig(
+            dedicated=True, num_nodes=2
+        )
+
+        train, inference, value, _ = sc_setup_mod._build_clusters(master_config)
+
+        assert train.kwargs["bundle_ct_per_node_list"] == [8, 8]
+        assert inference.kwargs["bundle_ct_per_node_list"] == [8]
+        assert value.kwargs["bundle_ct_per_node_list"] == [8, 8]
+        assert train.kwargs["max_colocated_worker_groups"] == 1
+        assert value.kwargs["max_colocated_worker_groups"] == 1
+
     @pytest.mark.parametrize(
         ("make_config", "colocated", "backend", "expected_train_groups"),
         [
@@ -977,9 +1000,10 @@ class TestTrainClusterSizesForTheCritic:
     ):
         mc = _cluster_config(make_config(), colocated=colocated, backend=backend)
 
-        train, inference, _teacher_topology = sc_setup_mod._build_clusters(mc)
+        train, inference, value, _teacher_topology = sc_setup_mod._build_clusters(mc)
 
         assert train.kwargs["max_colocated_worker_groups"] == expected_train_groups
+        assert value is None
         if colocated:
             assert train is inference
         else:

@@ -1072,6 +1072,12 @@ def is_ppo_run(master_config: MasterConfig) -> bool:
     return getattr(master_config, "ppo", None) is not None
 
 
+def dedicated_value_enabled(master_config: MasterConfig) -> bool:
+    value_config = getattr(master_config, "value", None)
+    resources = value_config.get("resources") if value_config else None
+    return bool(resources and resources.dedicated)
+
+
 def algo_config(master_config: MasterConfig) -> GRPOConfig | PPOConfig:
     """The active algorithm block: ``ppo`` on a PPO run, else ``grpo``.
 
@@ -1508,6 +1514,77 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "Shortened PPO steps are not supported yet."
         )
 
+    value_resources = master_config.value.get("resources")  # type: ignore
+    if value_resources and value_resources.dedicated:
+        if not policy_megatron_cfg or not policy_megatron_cfg.get("enabled"):
+            raise ValueError(
+                "value.resources.dedicated=true requires "
+                "policy.megatron_cfg.enabled=true"
+            )
+        generation_config = master_config.policy["generation"]
+        if generation_config["colocated"]["enabled"]:
+            raise ValueError(
+                "value.resources.dedicated=true requires non-colocated generation"
+            )
+        value_nodes = value_resources.num_nodes
+        if value_nodes is None or value_nodes < 1:
+            raise ValueError(
+                "value.resources.dedicated=true requires value.resources.num_nodes >= 1"
+            )
+        cluster_gpus = master_config.cluster.gpus_per_node
+        inference_resources = generation_config["colocated"]["resources"]
+        if inference_resources["gpus_per_node"] != cluster_gpus:
+            raise ValueError(
+                "value.resources.dedicated=true requires generation to use full nodes"
+            )
+        inference_nodes = inference_resources["num_nodes"] or 1
+        if master_config.cluster.num_nodes - value_nodes - inference_nodes < 1:
+            raise ValueError(
+                "cluster.num_nodes must leave at least one full policy node after "
+                "reserving generation and dedicated value nodes"
+            )
+        policy_gpus = (
+            master_config.cluster.num_nodes - value_nodes - inference_nodes
+        ) * cluster_gpus
+        value_gpus = value_nodes * cluster_gpus
+        for role, megatron_config, available_gpus in (
+            ("policy", policy_megatron_cfg, policy_gpus),
+            ("value", value_megatron_cfg, value_gpus),
+        ):
+            parallel_sizes = {
+                name: megatron_config.get(name, 1)
+                for name in (
+                    "tensor_model_parallel_size",
+                    "pipeline_model_parallel_size",
+                    "context_parallel_size",
+                    "expert_model_parallel_size",
+                )
+            }
+            if any(
+                not isinstance(size, int) or size < 1
+                for size in parallel_sizes.values()
+            ):
+                raise ValueError(
+                    f"{role}.megatron_cfg parallel sizes must be positive integers"
+                )
+            validated_parallel_sizes = cast(dict[str, int], parallel_sizes)
+            model_parallel_size = (
+                validated_parallel_sizes["tensor_model_parallel_size"]
+                * validated_parallel_sizes["pipeline_model_parallel_size"]
+                * validated_parallel_sizes["context_parallel_size"]
+            )
+            expert_parallel_size = validated_parallel_sizes[
+                "expert_model_parallel_size"
+            ]
+            if (
+                available_gpus % model_parallel_size
+                or available_gpus % expert_parallel_size
+            ):
+                raise ValueError(
+                    f"Dedicated {role} has {available_gpus} GPUs, incompatible with "
+                    f"model parallel size {model_parallel_size} and expert parallel "
+                    f"size {expert_parallel_size}"
+                )
     if (
         getattr(algo_cfg, "policy_training_start_step", 0) > 0
         and master_config.checkpointing["enabled"]
