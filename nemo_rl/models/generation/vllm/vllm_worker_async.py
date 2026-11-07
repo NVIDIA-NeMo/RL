@@ -317,6 +317,7 @@ class VllmAsyncGenerationWorkerImpl(
         # parent-chain rows through it directly; prefix resolution goes through
         # the shared ChainPrefixCache below.
         self._staging_source: Any | None = None
+        self._capture_dp_client: Any | None = None
         # Resolved staging-chain prefixes, shared implementation with the Megatron
         # preparer. Installed by setup_token_capture; fetch runs on executor threads.
         # Deferred import: tq_token_sink pulls in the data-plane stack.
@@ -666,6 +667,7 @@ class VllmAsyncGenerationWorkerImpl(
         # Own no segment: a save would otherwise wait on this actor, whose event
         # loop is busy serving rollouts. Capture writes land in other segments.
         dp_client = build_data_plane_client(dp_cfg, bootstrap=False, segment_size=0)
+        self._capture_dp_client = dp_client
         # The Omni processor emits pixels in the engine's model dtype; the
         # sink pins its media column to it so text-call sentinels never
         # introduce a second dtype (TQ keeps one dtype per field).
@@ -728,6 +730,14 @@ class VllmAsyncGenerationWorkerImpl(
     async def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """Run owner-local checkpoint I/O without blocking the actor event loop."""
         return await asyncio.to_thread(run_checkpoint_command, body)
+
+    def get_data_plane_snapshot(self) -> dict[str, Any] | None:
+        """The capture client's data-plane counters, ``None`` when it has none."""
+        from nemo_rl.data_plane.observability import is_metrics_client
+
+        if not is_metrics_client(self._capture_dp_client):
+            return None
+        return self._capture_dp_client.snapshot(reset_step_window=True)
 
     async def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version stamped on subsequent captured calls."""
