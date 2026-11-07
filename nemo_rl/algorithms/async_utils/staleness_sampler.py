@@ -495,11 +495,15 @@ class _GatedSampler(BaseSampler):
             gate_window=self._gate_window,
         )
 
+    def can_admit(self, *, trainer_version: int) -> bool:
+        """Whether the gate permits admission without advancing the cursor."""
+        return self._dispatch_index < trainer_version + self._gate_window
+
     async def wait_until_admissible(
         self, *, trainer_version_fn: Callable[[], int]
     ) -> None:
         """Wait for the gate without advancing the durable dispatch cursor."""
-        while self._dispatch_index >= trainer_version_fn() + self._gate_window:
+        while not self.can_admit(trainer_version=trainer_version_fn()):
             await asyncio.sleep(_GATE_POLL_SECONDS)
 
     def commit_admission(self, cut: DataPlaneMutationCut) -> Optional[int]:

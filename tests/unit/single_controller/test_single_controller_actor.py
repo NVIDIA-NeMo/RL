@@ -2440,6 +2440,8 @@ def _train_pump_controller(*, sampler) -> object:
         set_weight_version=MagicMock(),
         suspend_request_deadlines=MagicMock(),
         resume_request_deadlines=MagicMock(),
+        drain_step_reward_metrics=MagicMock(return_value={}),
+        filter_zero_variance_groups=False,
     )
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
@@ -2450,6 +2452,12 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
+    # Read by _target_groups_for_step. Set in the shared builder, since a field added
+    # to only some callers is an AttributeError rather than a wrong answer.
+    ctrl._dynamic_sampling_enabled = False
+    ctrl._rollout_runtime.steps_allowed_short = set()
+    ctrl._rollout_runtime.finalizer_metrics_by_group = {}
+    ctrl._rollout_runtime.finalizer_rewards_by_group = {}
     ctrl._log_full_result_tables = False
     ctrl._step_log_dict = {
         "reward_partials": [],
@@ -2588,6 +2596,92 @@ def test_train_pump_closes_a_step_short_when_a_stamped_prompt_is_dropped(
     assert ctrl._rollout_runtime.batch_shortfall == {}
     assert ctrl._batch_replacements == {}
     assert ctrl._batch_promotions == {3: 1}
+
+
+@pytest.mark.parametrize("credit_in_evict", [False, True])
+@pytest.mark.parametrize("fraction, skipped", [(0.5, False), (0.51, True)])
+def test_data_exhausted_step_respects_batch_floor(
+    monkeypatch, credit_in_evict: bool, fraction: float, skipped: bool
+) -> None:
+    ctrl = _dropping_controller(credit_in_evict=credit_in_evict)
+    ctrl._rollout_runtime.steps_allowed_short.add(0)
+    ctrl._async_cfg.rollout_failure.min_step_batch_fraction = fraction
+    ctrl._trainer.abort_train_step = MagicMock()
+    ctrl._trainer.finish_train_step = MagicMock(return_value={})
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._trainer.abort_train_step.call_count == int(skipped)
+    assert ctrl._trainer.finish_train_step.call_count == int(not skipped)
+    assert ctrl._consumed_samples == int(not skipped)
+    assert ctrl._train_steps == ctrl._trainer_version == 1
+    metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert metrics["skipped_step"] == int(skipped)
+    assert ctrl._buffer_capacity._value == 3
+    assert ctrl._sync_weights.await_count == int(not skipped)
+
+
+def test_skipped_exhausted_step_allows_later_admitted_step_to_train(
+    monkeypatch,
+) -> None:
+    metas = [
+        KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"sample-{index}"],
+            fields=[],
+            sequence_lengths=[1],
+            tags=_one_group_tags(1),
+        )
+        for index in range(3)
+    ]
+    ctrl = _train_pump_controller(sampler=_SequenceSampler(metas))
+    ctrl._algo_cfg.max_num_steps = 2
+    ctrl._rollout_runtime.steps_allowed_short.add(0)
+    ctrl._rollout_runtime.batch_shortfall[0] = 1
+    ctrl._trainer.abort_train_step = MagicMock()
+    ctrl._trainer.finish_train_step = MagicMock(return_value={})
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    ctrl._trainer.abort_train_step.assert_called_once()
+    ctrl._trainer.finish_train_step.assert_called_once()
+    assert ctrl._consumed_samples == 2
+    assert ctrl._train_steps == ctrl._trainer_version == 2
+    metrics = [
+        call.args[0]
+        for call in ctrl._logger.log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    ]
+    assert [item["skipped_step"] for item in metrics] == [1, 0]
+    assert ctrl._buffer_capacity._value == 5
+
+
+def test_data_exhausted_step_with_no_groups_skips_without_opening_optimizer(
+    monkeypatch,
+) -> None:
+    ctrl = _train_pump_controller(sampler=_EmptySampler())
+    ctrl._rollout_runtime.steps_allowed_short.add(0)
+    ctrl._rollout_runtime.batch_shortfall[0] = 2
+    ctrl._trainer.begin_train_step = MagicMock()
+    ctrl._trainer.abort_train_step = MagicMock()
+    ctrl._trainer.finish_train_step = MagicMock()
+    ctrl._logger = MagicMock()
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    ctrl._trainer.begin_train_step.assert_not_called()
+    ctrl._trainer.abort_train_step.assert_not_called()
+    ctrl._trainer.finish_train_step.assert_not_called()
+    assert ctrl._consumed_samples == 0
+    assert ctrl._train_steps == ctrl._trainer_version == 1
+    assert ctrl._logger.log_metrics.call_args_list[0].args[0]["skipped_step"] == 1
 
 
 def test_train_pump_prunes_stamps_older_than_the_step_that_just_closed(
@@ -4559,6 +4653,7 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
     state = build_rollout_recovery_state(
         RolloutRecoveryLedger(),
         batch_shortfall={},
+        steps_allowed_short=set(),
         sampler_stamps_target_steps=True,
         finalizer_metrics_by_group=pending,
         finalizer_rewards_by_group={
