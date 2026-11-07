@@ -12,10 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
+
 import pytest
 import torch
+from pydantic import ValidationError
 
-from nemo_rl.algorithms.grpo import RewardScalingConfig, scale_rewards
+from nemo_rl.algorithms.grpo import GRPOConfig, RewardScalingConfig, scale_rewards
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -24,6 +28,73 @@ from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.llm_message_utils import decompose_message_log
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from tests.unit.algorithms.utils import create_mock_batch_with_responses
+
+
+class TestRewardScalingValidation:
+    """Validate active bounds at configuration construction on every path."""
+
+    @pytest.mark.parametrize(
+        ("target_min", "target_max"), [(-1.0, 1.0), (1.0, 1.0), (1.0, -1.0)]
+    )
+    def test_accepts_finite_target_intervals(
+        self, target_min: float, target_max: float
+    ) -> None:
+        config = RewardScalingConfig(
+            enabled=True, target_min=target_min, target_max=target_max
+        )
+        assert (config.target_min, config.target_max) == (target_min, target_max)
+
+    @pytest.mark.parametrize(("source_min", "source_max"), [(1.0, 1.0), (1.0, 0.0)])
+    def test_rejects_empty_or_inverted_source_interval(
+        self, source_min: float, source_max: float
+    ) -> None:
+        with pytest.raises(ValidationError, match="reward_scaling.source_min"):
+            RewardScalingConfig(
+                enabled=True, source_min=source_min, source_max=source_max
+            )
+
+    @pytest.mark.parametrize(
+        "bound", ["source_min", "source_max", "target_min", "target_max"]
+    )
+    @pytest.mark.parametrize("value", [math.nan, math.inf, -math.inf])
+    def test_rejects_non_finite_bounds(self, bound: str, value: float) -> None:
+        with pytest.raises(ValidationError, match="bounds must be finite"):
+            RewardScalingConfig(
+                enabled=True,
+                source_min=value if bound == "source_min" else 0.0,
+                source_max=value if bound == "source_max" else 1.0,
+                target_min=value if bound == "target_min" else 0.0,
+                target_max=value if bound == "target_max" else 1.0,
+            )
+
+    def test_ignores_unused_invalid_bounds_when_disabled(self) -> None:
+        config = RewardScalingConfig(
+            enabled=False,
+            source_min=1.0,
+            source_max=1.0,
+            target_min=math.nan,
+            target_max=math.inf,
+        )
+        assert not config.enabled
+
+    @pytest.mark.parametrize("algorithm_type", [GRPOConfig, PPOConfig])
+    @pytest.mark.parametrize(
+        "bounds",
+        [
+            {"source_min": 1.0, "source_max": 1.0},
+            {"source_min": 1.0, "source_max": 0.0},
+            {"source_min": math.nan},
+            {"target_max": math.inf},
+        ],
+    )
+    def test_algorithm_config_rejects_invalid_scaling(
+        self,
+        algorithm_type: type[GRPOConfig] | type[PPOConfig],
+        bounds: dict[str, float],
+    ) -> None:
+        with pytest.raises(ValidationError) as error:
+            algorithm_type(reward_scaling={"enabled": True, **bounds})
+        assert error.value.errors()[0]["loc"] == ("reward_scaling",)
 
 
 def test_reward_scaling_disabled():
