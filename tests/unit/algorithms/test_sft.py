@@ -148,11 +148,7 @@ def mock_components():
             "make_sequence_length_divisible_by": 8,
         },
         checkpointing=CheckpointingConfig.model_construct(
-            **{
-                "enabled": False,
-                "checkpoint_must_save_by": None,
-                "save_period": 10,
-            }
+            enabled=False, checkpoint_must_save_by=None, save_period=10
         ),
         cluster=ClusterConfig(num_nodes=1, gpus_per_node=2),
     )

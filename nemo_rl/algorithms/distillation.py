@@ -62,6 +62,7 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
+    sampler_replay_enabled,
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -240,6 +241,11 @@ def setup(
     # Extract configuration
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
+    if generation_config is not None and sampler_replay_enabled(generation_config):
+        raise ValueError(
+            "policy.generation.sampler_replay.enabled requires SingleController with "
+            "NeMo Gym + vLLM; distillation does not capture sampler tensors."
+        )
     teacher_config = master_config.teacher
     loss_config = master_config.loss_fn
     data_config = master_config.data
@@ -251,9 +257,7 @@ def setup(
 
     checkpointing_pretrained = checkpointing_config.pretrained_checkpoint
     if checkpointing_pretrained is not None:
-        # PolicyConfig is still TypedDict-shaped; hand off a plain dict so the
-        # Megatron setup path keeps its key-style access.
-        policy_config["pretrained_checkpoint"] = checkpointing_pretrained.model_dump()
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
     assert generation_config is not None, (
         "A generation config in the PolicyConfig is required for distillation"
@@ -567,6 +571,7 @@ def setup(
                     # The workers enforce this key whenever the recipe asks for
                     # one, so Gym's model server must send the same key.
                     policy_api_key=deferred_vllm.http_server_api_key,
+                    turn_checkpointing_enabled=False,
                 )
                 try:
                     validate_dataset_agent_coverage(

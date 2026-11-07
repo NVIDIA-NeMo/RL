@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import math
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -34,6 +35,7 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    check_sampling_param,
     compute_engine_step_metrics,
     compute_spec_decode_metrics,
     encode_counter_key,
@@ -461,7 +463,18 @@ def test_normalize_routed_experts_strict_mode_rejects_surplus_routes():
         )
 
 
-def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_index():
+@pytest.mark.parametrize("encode_for_wire", [False, True])
+def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_index(
+    monkeypatch, encode_for_wire
+):
+    if not encode_for_wire:
+
+        def reject_codec(*args, **kwargs):
+            pytest.fail("worker-owned capture must retain native route tensors")
+
+        monkeypatch.setattr(
+            "nemo_rl.models.generation.vllm.utils.encode_routed_experts", reject_codec
+        )
     final_res = SimpleNamespace(
         prompt_token_ids=[101, 102, 103],
         prompt_routed_experts=torch.tensor(
@@ -495,17 +508,26 @@ def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_i
         response,
         final_res,
         device=torch.device("cpu"),
+        encode_for_wire=encode_for_wire,
     )
 
-    # Routes travel as a base64 string envelope, one opaque object per choice.
-    assert isinstance(response.choices[0].message.routed_experts, str)
-    assert _decoded_routes(response.choices[0].message.routed_experts) == [
+    def route_values(choice):
+        routes = choice.message.routed_experts
+        if encode_for_wire:
+            assert isinstance(routes, str)
+            return _decoded_routes(routes)
+        assert isinstance(routes, torch.Tensor)
+        assert routes.device.type == "cpu"
+        assert routes.dtype == ROUTED_EXPERTS_FALLBACK_DTYPE
+        return routes.tolist()
+
+    assert route_values(response.choices[0]) == [
         [[10]],
         [[11]],
         [[30]],
         [[R3_MISSING_ROUTE_SENTINEL]],
     ]
-    assert _decoded_routes(response.choices[1].message.routed_experts) == [
+    assert route_values(response.choices[1]) == [
         [[10]],
         [[11]],
         [[31]],
@@ -817,7 +839,10 @@ def test_attach_token_information_to_chat_response_choices_rejects_invalid_struc
         attach_token_information_to_chat_response_choices(response, final_res)
 
 
-def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fields():
+@pytest.mark.parametrize("encode_for_wire", [False, True])
+def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fields(
+    encode_for_wire,
+):
     final_res = SimpleNamespace(
         prompt_token_ids=[101, 102],
         prompt_routed_experts=torch.tensor(
@@ -861,11 +886,12 @@ def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fiel
         response,
         final_res,
         device=torch.device("cpu"),
+        encode_for_wire=encode_for_wire,
     )
     response_dict = model_dump_chat_response_with_dynamic_message_fields(response)
 
     message = response_dict["choices"][0]["message"]
-    assert message["routed_experts"] == response.choices[0].message.routed_experts
+    assert message["routed_experts"] is response.choices[0].message.routed_experts
     assert message["prompt_token_ids"] == [101, 102]
     assert message["generation_token_ids"] == [201]
     assert message["generation_log_probs"] == [-0.1]
@@ -1518,3 +1544,37 @@ def test_remap_multimodal_placeholders_rebuilds_real_vllm_placeholder_range():
     assert isinstance(moved, PlaceholderRange)
     assert (moved.offset, moved.length) == (3, 3)
     assert moved.is_embed is is_embed
+
+
+@pytest.mark.parametrize(
+    ("temperature", "top_p", "top_k", "error"),
+    [
+        (1.0, 1.0, None, None),  # train profile
+        (0.0, 0.9, -1, None),  # validation profile
+        (0.7, 1.0, None, "matches neither"),
+        (1.0, None, None, "top_p must be set explicitly"),
+        (1.0, 1.0, 5, "must be unset or match the configured top_k \\(20\\)"),
+        (1.0, 1.0, 20, None),  # the train profile pins top_k=20
+        (0.0, 0.9, 20, "must be unset or match the configured top_k \\(-1\\)"),
+    ],
+)
+def test_check_sampling_param(temperature, top_p, top_k, error) -> None:
+    generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 20,
+        "val_temperature": 0.0,
+        "val_top_p": 0.9,
+        "val_top_k": None,
+    }
+    with (
+        contextlib.nullcontext()
+        if error is None
+        else pytest.raises(ValueError, match=error)
+    ):
+        check_sampling_param(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            generation_config=generation_config,
+        )

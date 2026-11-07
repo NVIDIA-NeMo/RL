@@ -45,7 +45,7 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         env={},
         data_plane={"enabled": True, "impl": "transfer_queue", "backend": "simple"},
         logger=LoggerConfig(log_dir="/tmp/logs"),
-        checkpointing=CheckpointingConfig.model_construct(**{"enabled": False}),
+        checkpointing=CheckpointingConfig.model_construct(enabled=False),
         async_rl=SimpleNamespace(
             stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0),
             # model_construct skips validation, so nothing fills the real

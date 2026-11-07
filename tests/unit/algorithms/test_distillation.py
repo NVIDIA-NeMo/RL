@@ -182,12 +182,10 @@ def mock_components():
             "logger": LoggerConfig.model_construct(num_val_samples_to_print=5),
             "cluster": ClusterConfig(num_nodes=1, gpus_per_node=2),
             "checkpointing": CheckpointingConfig.model_construct(
-                **{
-                    "enabled": False,
-                    "checkpoint_must_save_by": None,
-                    "save_period": 10,
-                    "metric_name": None,
-                }
+                enabled=False,
+                checkpoint_must_save_by=None,
+                save_period=10,
+                metric_name=None,
             ),
         }
     )
@@ -1418,6 +1416,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         enable_router_replay=False,
         use_fastokens=False,
         policy_api_key="k",
+        turn_checkpointing_enabled=False,
     )
     # Building the actor leaves the configured keys alone. setup() adds only the
     # Gym log dir, under this run's log dir.
@@ -1441,7 +1440,7 @@ def test_nemo_gym_distillation_runner_uses_setup_actor():
         data={"train": {}},
         env={"should_use_nemo_gym": True, "nemo_gym": {}},
         logger=LoggerConfig(log_dir="/tmp/logs"),
-        checkpointing=CheckpointingConfig.model_construct(**{"enabled": False}),
+        checkpointing=CheckpointingConfig.model_construct(enabled=False),
         cluster={},
     )
 

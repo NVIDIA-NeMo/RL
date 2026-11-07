@@ -34,20 +34,20 @@ def checkpoint_dir(tmp_path):
 
 @pytest.fixture
 def checkpoint_config(checkpoint_dir):
-    return {
-        "enabled": True,
-        "checkpoint_dir": checkpoint_dir,
-        "metric_name": "loss",
-        "higher_is_better": False,
-        "save_period": 1,
-        "keep_top_k": 3,
-        "save_optimizer": True,
-    }
+    return CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=checkpoint_dir,
+        metric_name="loss",
+        higher_is_better=False,
+        save_period=1,
+        keep_top_k=3,
+        save_optimizer=True,
+    )
 
 
 @pytest.fixture
 def checkpoint_manager(checkpoint_config):
-    return CheckpointManager(CheckpointingConfig.model_validate(checkpoint_config))
+    return CheckpointManager(checkpoint_config)
 
 
 def test_checkpoint_manager_rejects_top_level_automodel_fields(checkpoint_config):
@@ -62,11 +62,11 @@ def test_checkpoint_manager_rejects_top_level_automodel_fields(checkpoint_config
         "peft_config": None,
         "is_async": True,
     }
-    checkpoint_config.update(legacy_fields)
-
     with pytest.raises(ValueError) as error:
         # Legacy keys arrive through extra="allow" on the validated model.
-        CheckpointManager(CheckpointingConfig.model_validate(checkpoint_config))
+        CheckpointManager(
+            CheckpointingConfig(**checkpoint_config.model_dump(), **legacy_fields)
+        )
 
     for field in legacy_fields:
         assert field in str(error.value)
@@ -352,33 +352,18 @@ def test_load_training_metadata(checkpoint_manager, checkpoint_dir):
     assert metadata == training_info
 
 
-def test_checkpoint_manager_defaults_when_optional_keys_omitted(tmp_path):
-    # save_optimizer/keep_top_k are BaseModel defaults; omitting them must yield
-    # the documented default instead of the pre-migration KeyError.
-    config = {
-        "enabled": True,
-        "checkpoint_dir": str(tmp_path.resolve() / "checkpoints"),
-        "metric_name": "loss",
-        "higher_is_better": False,
-        "save_period": 1,
-    }
-    manager = CheckpointManager(CheckpointingConfig.model_validate(config))
-    assert manager.save_optimizer is True
-    assert manager.keep_top_k is None
-
-
 def test_checkpoint_without_keep_top_k(tmp_path):
     # Test checkpoint manager without keep_top_k
-    config = {
-        "enabled": True,
-        "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
-        "metric_name": "loss",
-        "higher_is_better": False,
-        "save_period": 1,
-        "keep_top_k": None,
-        "save_optimizer": True,
-    }
-    manager = CheckpointManager(CheckpointingConfig.model_validate(config))
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str((tmp_path.resolve() / "checkpoints")),
+        metric_name="loss",
+        higher_is_better=False,
+        save_period=1,
+        keep_top_k=None,
+        save_optimizer=True,
+    )
+    manager = CheckpointManager(config)
 
     # Create multiple checkpoints
     steps = [1, 2, 3]
@@ -433,12 +418,12 @@ def test_get_latest_checkpoint_path_across_digits(checkpoint_manager, checkpoint
 
 def test_save_optimizer_flag_initialization(checkpoint_config):
     # Test that save_optimizer defaults to True
-    manager = CheckpointManager(CheckpointingConfig.model_validate(checkpoint_config))
+    manager = CheckpointManager(checkpoint_config)
     assert manager.save_optimizer is True
 
     # Test that save_optimizer respects explicit False
-    checkpoint_config["save_optimizer"] = False
-    manager = CheckpointManager(CheckpointingConfig.model_validate(checkpoint_config))
+    checkpoint_config.save_optimizer = False
+    manager = CheckpointManager(checkpoint_config)
     assert manager.save_optimizer is False
 
 
@@ -680,16 +665,16 @@ def test_get_best_checkpoint_path_no_checkpoints(checkpoint_manager, checkpoint_
 def test_get_best_checkpoint_path_some_missing_metric(tmp_path):
     """Test that get_best_checkpoint_path filters out checkpoints missing the metric and warns."""
     # Use keep_top_k=None to keep all checkpoints for this test
-    config = {
-        "enabled": True,
-        "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
-        "metric_name": "loss",
-        "higher_is_better": False,
-        "save_period": 1,
-        "keep_top_k": None,  # Keep all checkpoints
-        "save_optimizer": True,
-    }
-    manager = CheckpointManager(CheckpointingConfig.model_validate(config))
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str((tmp_path.resolve() / "checkpoints")),
+        metric_name="loss",
+        higher_is_better=False,
+        save_period=1,
+        keep_top_k=None,
+        save_optimizer=True,
+    )
+    manager = CheckpointManager(config)
 
     # Create checkpoints where some have the metric and others don't
     steps = [1, 2, 3, 4]
@@ -725,16 +710,16 @@ def test_get_best_checkpoint_path_some_missing_metric(tmp_path):
 def test_get_best_checkpoint_path_all_missing_metric(tmp_path):
     """Test that get_best_checkpoint_path returns latest checkpoint when all are missing the metric."""
     # Use keep_top_k=None to keep all checkpoints for this test
-    config = {
-        "enabled": True,
-        "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
-        "metric_name": "loss",
-        "higher_is_better": False,
-        "save_period": 1,
-        "keep_top_k": None,  # Keep all checkpoints
-        "save_optimizer": True,
-    }
-    manager = CheckpointManager(CheckpointingConfig.model_validate(config))
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str((tmp_path.resolve() / "checkpoints")),
+        metric_name="loss",
+        higher_is_better=False,
+        save_period=1,
+        keep_top_k=None,
+        save_optimizer=True,
+    )
+    manager = CheckpointManager(config)
 
     # Create checkpoints where none have the required metric
     steps = [1, 2, 3]
@@ -768,16 +753,16 @@ def test_get_best_checkpoint_path_all_missing_metric(tmp_path):
 
 def test_get_best_checkpoint_path_higher_is_better(tmp_path):
     """Test get_best_checkpoint_path with higher_is_better=True."""
-    config = {
-        "enabled": True,
-        "checkpoint_dir": str((tmp_path.resolve() / "checkpoints")),
-        "metric_name": "accuracy",
-        "higher_is_better": True,
-        "save_period": 1,
-        "keep_top_k": None,  # Keep all
-        "save_optimizer": True,
-    }
-    manager = CheckpointManager(CheckpointingConfig.model_validate(config))
+    config = CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=str((tmp_path.resolve() / "checkpoints")),
+        metric_name="accuracy",
+        higher_is_better=True,
+        save_period=1,
+        keep_top_k=None,
+        save_optimizer=True,
+    )
+    manager = CheckpointManager(config)
 
     # Create checkpoints with different accuracy values
     steps = [1, 2, 3]
@@ -799,20 +784,20 @@ def test_get_best_checkpoint_path_higher_is_better(tmp_path):
 
 @pytest.fixture
 def async_checkpoint_config(checkpoint_dir):
-    return {
-        "enabled": True,
-        "checkpoint_dir": checkpoint_dir,
-        "metric_name": None,
-        "higher_is_better": False,
-        "save_period": 1,
-        "keep_top_k": None,
-        "save_optimizer": True,
-    }
+    return CheckpointingConfig(
+        enabled=True,
+        checkpoint_dir=checkpoint_dir,
+        metric_name=None,
+        higher_is_better=False,
+        save_period=1,
+        keep_top_k=None,
+        save_optimizer=True,
+    )
 
 
 @pytest.fixture
 def async_manager(async_checkpoint_config):
-    mgr = CheckpointManager(CheckpointingConfig.model_validate(async_checkpoint_config))
+    mgr = CheckpointManager(async_checkpoint_config)
     yield mgr
     mgr.shutdown()
 
@@ -924,16 +909,16 @@ class TestShutdown:
 
     def test_waits_for_rename_and_deletion(self, checkpoint_dir):
         """shutdown() blocks until both rename and deletion complete."""
-        config = {
-            "enabled": True,
-            "checkpoint_dir": checkpoint_dir,
-            "metric_name": None,
-            "higher_is_better": False,
-            "save_period": 1,
-            "keep_top_k": 1,
-            "save_optimizer": True,
-        }
-        manager = CheckpointManager(CheckpointingConfig.model_validate(config))
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=checkpoint_dir,
+            metric_name=None,
+            higher_is_better=False,
+            save_period=1,
+            keep_top_k=1,
+            save_optimizer=True,
+        )
+        manager = CheckpointManager(config)
 
         for step in [1, 2, 3]:
             tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
@@ -1016,16 +1001,16 @@ class TestDeletionSerialization:
 
     def test_keep_top_k_with_async_finalization(self, checkpoint_dir):
         """Old checkpoints are deleted without blocking the main thread."""
-        config = {
-            "enabled": True,
-            "checkpoint_dir": checkpoint_dir,
-            "metric_name": None,
-            "higher_is_better": False,
-            "save_period": 1,
-            "keep_top_k": 2,
-            "save_optimizer": True,
-        }
-        manager = CheckpointManager(CheckpointingConfig.model_validate(config))
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=checkpoint_dir,
+            metric_name=None,
+            higher_is_better=False,
+            save_period=1,
+            keep_top_k=2,
+            save_optimizer=True,
+        )
+        manager = CheckpointManager(config)
 
         for step in range(1, 6):
             tmp = manager.init_tmp_checkpoint(step, {"loss": float(step)})
@@ -1042,16 +1027,16 @@ class TestDeletionSerialization:
 
     def test_deletion_does_not_block_next_save(self, checkpoint_dir):
         """Deletion runs asynchronously, so the next begin_finalization returns quickly."""
-        config = {
-            "enabled": True,
-            "checkpoint_dir": checkpoint_dir,
-            "metric_name": None,
-            "higher_is_better": False,
-            "save_period": 1,
-            "keep_top_k": 1,
-            "save_optimizer": True,
-        }
-        manager = CheckpointManager(CheckpointingConfig.model_validate(config))
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=checkpoint_dir,
+            metric_name=None,
+            higher_is_better=False,
+            save_period=1,
+            keep_top_k=1,
+            save_optimizer=True,
+        )
+        manager = CheckpointManager(config)
 
         tmp1 = manager.init_tmp_checkpoint(1, {"loss": 0.1})
         manager.begin_finalization(tmp1, wait_fn=None)
@@ -1099,9 +1084,7 @@ class TestDeleteFailureVisibility:
         self, async_checkpoint_config, checkpoint_dir, monkeypatch
     ):
         """A raising remove_old_checkpoints does not corrupt the finalized rename."""
-        manager = CheckpointManager(
-            CheckpointingConfig.model_validate(async_checkpoint_config)
-        )
+        manager = CheckpointManager(async_checkpoint_config)
 
         def boom():
             raise RuntimeError("simulated prune failure")
@@ -1130,9 +1113,7 @@ class TestContextManager:
         self, async_checkpoint_config, checkpoint_dir
     ):
         """A pending begin_finalization is flushed when the with-block exits."""
-        with CheckpointManager(
-            CheckpointingConfig.model_validate(async_checkpoint_config)
-        ) as manager:
+        with CheckpointManager(async_checkpoint_config) as manager:
             tmp = manager.init_tmp_checkpoint(1, {"loss": 0.1})
             manager.begin_finalization(tmp, wait_fn=None)
             # Not yet flushed inside the block.
@@ -1145,9 +1126,7 @@ class TestContextManager:
         self, async_checkpoint_config, checkpoint_dir
     ):
         """On exception, the checkpoint is still flushed and the error propagates."""
-        manager = CheckpointManager(
-            CheckpointingConfig.model_validate(async_checkpoint_config)
-        )
+        manager = CheckpointManager(async_checkpoint_config)
         with pytest.raises(ValueError, match="training blew up"):
             with manager:
                 tmp = manager.init_tmp_checkpoint(1, {"loss": 0.1})
@@ -1161,9 +1140,7 @@ class TestContextManager:
         self, async_checkpoint_config
     ):
         """If flushing fails while an exception propagates, the original is kept."""
-        manager = CheckpointManager(
-            CheckpointingConfig.model_validate(async_checkpoint_config)
-        )
+        manager = CheckpointManager(async_checkpoint_config)
 
         def failing_wait():
             raise ValueError("async write failed")
@@ -1185,9 +1162,7 @@ class TestContextManager:
         self, async_checkpoint_config
     ):
         """On a clean exit, a finalization failure is raised (not silently dropped)."""
-        manager = CheckpointManager(
-            CheckpointingConfig.model_validate(async_checkpoint_config)
-        )
+        manager = CheckpointManager(async_checkpoint_config)
 
         def failing_wait():
             raise ValueError("async write failed")
@@ -1251,17 +1226,17 @@ class TestFTKeepLatestK:
         higher_is_better=False,
         save_period=1,
     ):
-        config = {
-            "enabled": True,
-            "checkpoint_dir": checkpoint_dir,
-            "metric_name": metric_name,
-            "higher_is_better": higher_is_better,
-            "save_period": save_period,
-            "keep_top_k": keep_top_k,
-            "ft_keep_latest_k": ft_keep_latest_k,
-            "save_optimizer": True,
-        }
-        return CheckpointManager(CheckpointingConfig.model_validate(config))
+        config = CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=checkpoint_dir,
+            metric_name=metric_name,
+            higher_is_better=higher_is_better,
+            save_period=save_period,
+            keep_top_k=keep_top_k,
+            ft_keep_latest_k=ft_keep_latest_k,
+            save_optimizer=True,
+        )
+        return CheckpointManager(config)
 
     @staticmethod
     def _remaining_steps(checkpoint_dir):

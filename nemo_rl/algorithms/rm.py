@@ -172,9 +172,7 @@ def setup(
 
     checkpointing_pretrained = checkpointing_config.pretrained_checkpoint
     if checkpointing_pretrained is not None:
-        # PolicyConfig is still TypedDict-shaped; hand off a plain dict so the
-        # Megatron setup path keeps its key-style access.
-        policy_config["pretrained_checkpoint"] = checkpointing_pretrained.model_dump()
+        policy_config["pretrained_checkpoint"] = checkpointing_pretrained
 
     # ==========================
     #         Logger

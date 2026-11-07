@@ -32,6 +32,7 @@ from typing import (
     Literal,
     Mapping,
     Optional,
+    TypedDict,
     Union,
 )
 
@@ -163,7 +164,7 @@ def validate_warm_start_checkpoint(
         )
 
 
-class PretrainedCheckpointConfig(BaseModel, extra="allow"):
+class PretrainedCheckpointConfig(TypedDict):
     """Configuration for restoring initial weights from a pre-existing Megatron checkpoint.
 
     When set, the policy will restore its initial weights from this checkpoint
@@ -202,34 +203,40 @@ class CheckpointingConfig(BaseModel, extra="allow"):
     """Configuration for checkpoint management.
 
     Attributes:
-    enabled (bool): Whether checkpointing is enabled.
-    checkpoint_dir (PathLike): Directory where checkpoints will be saved.
-    metric_name (str | None): Name of the metric to use for determining best checkpoints.
-        Must be of the form "val:<metric_name>" or "train:<metric_name>" to indicate whether
-        the metric should be taken from the validation or training metrics.
-    higher_is_better (bool): Whether higher values of the metric indicate better performance.
-    keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
-    ft_keep_latest_k (Optional[int]): Number of most recent checkpoints to keep for crash recovery.
-    ft_save_period (Optional[int]): How often to save fault-tolerance checkpoints, in steps.
-        When set, a checkpoint is saved every ft_save_period steps for crash recovery.
-        Requires ft_keep_latest_k to control how many of these are retained.
-    save_optimizer (bool): Whether to save optimizer state with checkpoints.
-    save_data_plane (bool): Whether SingleController checkpoints include the
-        native TQ snapshot and replay-buffer metadata. Supported by the simple
-        and mooncake_cpu backends; no backend-specific checkpoint switch is needed.
-    load_replay_buffer (Optional[bool]): Whether async GRPO or SingleController
-        restores replay-buffer state when resuming from a checkpoint. Defaults to
-        None, which is treated the same as True (restore); only an explicit False
-        opts out. When False, a frontier-aligned async resume or a SingleController native
-        TQ resume regenerates the buffered prompt groups on the current policy
-        instead of reusing completed groups.
+        enabled (bool): Whether checkpointing is enabled.
+        checkpoint_dir (PathLike): Directory where checkpoints will be saved.
+        metric_name (str | None): Name of the metric to use for determining best checkpoints.
+            Must be of the form "val:<metric_name>" or "train:<metric_name>" to indicate whether
+            the metric should be taken from the validation or training metrics.
+        higher_is_better (bool): Whether higher values of the metric indicate better performance.
+            Only read when metric_name is set.
+        save_period (int): How often to save a checkpoint, in steps.
+        keep_top_k (Optional[int]): Number of best checkpoints to keep. If None, all checkpoints are kept.
+        ft_keep_latest_k (Optional[int]): Number of most recent checkpoints to keep for crash recovery.
+        ft_save_period (Optional[int]): How often to save fault-tolerance checkpoints, in steps.
+            When set, a checkpoint is saved every ft_save_period steps for crash recovery.
+            Requires ft_keep_latest_k to control how many of these are retained.
+        checkpoint_must_save_by (Optional[str]): Deadline in DD:HH:MM:SS, measured from job start,
+            by which a checkpoint is saved. None disables it.
+        pretrained_checkpoint (Optional[PretrainedCheckpointConfig]): Megatron checkpoint to restore
+            the initial weights from. None loads the weights from model_name.
+        save_optimizer (bool): Whether to save optimizer state with checkpoints.
+        save_data_plane (bool): Whether SingleController checkpoints include the
+            native TQ snapshot and replay-buffer metadata. Supported by the simple
+            and mooncake_cpu backends; no backend-specific checkpoint switch is needed.
+        load_replay_buffer (bool): Whether async GRPO or SingleController restores
+            replay-buffer state when resuming from a checkpoint. When False, a
+            frontier-aligned async resume or a SingleController native TQ resume
+            regenerates the buffered prompt groups on the current policy instead
+            of reusing completed groups.
     """
 
     enabled: bool
     checkpoint_dir: PathLike
     metric_name: str | None
+    # Only read when metric_name is set.
     higher_is_better: bool
-    save_period: int
+    save_period: int = 10
     keep_top_k: Optional[int] = None
     ft_keep_latest_k: Optional[int] = None
     ft_save_period: Optional[int] = None
@@ -237,10 +244,7 @@ class CheckpointingConfig(BaseModel, extra="allow"):
     pretrained_checkpoint: Optional[PretrainedCheckpointConfig] = None
     save_optimizer: bool = True
     save_data_plane: bool = False
-    # Tri-state on purpose: the async-GRPO restore path treats None the same as
-    # True (restore) and only `False` opts out, so an omitted key must stay
-    # distinguishable from an explicit `true`.
-    load_replay_buffer: Optional[bool] = None
+    load_replay_buffer: bool = True
 
 
 _AUTOMODEL_ONLY_CHECKPOINT_FIELDS = frozenset(

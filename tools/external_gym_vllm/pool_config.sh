@@ -357,8 +357,9 @@ submit_external_vllm_pool_job() {
 # submit_external_vllm_attached_job POOL_DIR POOL_JOB COMMAND [SBATCH_ARG...]:
 # submit a NeMo RL job that attaches to POOL_JOB through attach_and_run.sh and
 # print its id. While the pool is not READY yet the job also depends on
-# after:POOL_JOB+EXTERNAL_VLLM_ATTACH_AFTER_MIN (default 15), so it does not hold
-# its nodes idle through the pool's queue wait and model load. Needs RAY_SUB.
+# after:POOL_JOB, so it does not hold its nodes idle through the pool's queue wait.
+# With EXTERNAL_VLLM_ATTACH_EARLY=0 the dependency adds +EXTERNAL_VLLM_ATTACH_AFTER_MIN
+# (default 15) to cover the model load too. Needs RAY_SUB.
 submit_external_vllm_attached_job() {
   local pool_dir="${1:?pool directory required}" pool_job="${2:?pool job id required}"
   local command="${3:?command required}"
@@ -386,7 +387,12 @@ submit_external_vllm_attached_job() {
     return 2
   fi
   if [[ ! -f "${pool_dir}/READY" ]]; then
-    dependency=(--dependency="after:${pool_job}+${EXTERNAL_VLLM_ATTACH_AFTER_MIN:-15}")
+    if [[ "${EXTERNAL_VLLM_ATTACH_EARLY:-1}" == 0 ]]; then
+      dependency=(--dependency="after:${pool_job}+${EXTERNAL_VLLM_ATTACH_AFTER_MIN:-15}")
+    else
+      # Early attach only needs the pool job running; the manifest follows within seconds.
+      dependency=(--dependency="after:${pool_job}")
+    fi
   fi
   submitted=$(
     COMMAND="${command}" EXTERNAL_VLLM_POOL_DIR="${pool_dir}" EXTERNAL_VLLM_POOL_JOB="${pool_job}" \

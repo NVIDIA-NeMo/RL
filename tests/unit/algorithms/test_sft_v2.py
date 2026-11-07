@@ -33,7 +33,7 @@ from nemo_rl.data.energon.sft_types import StepEnvelope
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.instrumentation import TRACE_CARRIER_KWARG
-from nemo_rl.utils.checkpoint import CheckpointingConfig, PretrainedCheckpointConfig
+from nemo_rl.utils.checkpoint import CheckpointingConfig
 
 _ACTOR_CLS = SFTSingleControllerActor.__ray_metadata__.modified_class
 
@@ -95,7 +95,9 @@ def _valid_setup_config(
         "backend": "energon",
         "validation": None,
         "max_input_seq_length": 128,
-        "energon": SimpleNamespace(task_encoder=SimpleNamespace(packing=None)),
+        "energon": SimpleNamespace(
+            task_encoder=SimpleNamespace(packing=None), topology_mapper="default"
+        ),
     }
     data.update(data_overrides or {})
     policy = {
@@ -104,20 +106,31 @@ def _valid_setup_config(
             "context_parallel_size": 1,
             "tensor_model_parallel_size": 1,
             "sequence_parallel": False,
+            "use_fused_linear_logprobs": True,
         },
         "sequence_packing": {"enabled": False},
         "dynamic_batching": {"enabled": False},
         "make_sequence_length_divisible_by": 1,
+        "tokenizer": {},
+        "train_global_batch_size": 8,
     }
     for section, values in (policy_overrides or {}).items():
         policy[section].update(values)
+    # Most callers raise during validation and never read the rest. The fields below are
+    # what `setup_sft_v2` needs once it gets past that, so one config serves both.
     return SimpleNamespace(
         sft=SimpleNamespace(**sft),
         data=data,
         policy=policy,
-        checkpointing=CheckpointingConfig.model_construct(
-            **{"metric_name": metric_name}
+        checkpointing=CheckpointingConfig.model_construct(metric_name=metric_name),
+        cluster=SimpleNamespace(
+            num_nodes=1,
+            segment_size=1,
+            gpus_per_node=8,
+            master_port_range_low=1,
+            master_port_range_high=2,
         ),
+        data_plane=SimpleNamespace(),
     )
 
 
@@ -154,15 +167,19 @@ def test_train_step_aborts_policy_and_loader_on_training_failure() -> None:
     assert controller._save_state.total_steps == 0
 
 
-def _save_controller(**checkpointing: Any) -> object:
+def _save_controller(
+    *,
+    enabled: bool = True,
+    save_period: int = 10,
+    metric_name: str | None = None,
+    **checkpointing: Any,
+) -> object:
     controller = _controller()
     controller._master_config.checkpointing = CheckpointingConfig.model_construct(
-        **{
-            "enabled": True,
-            "save_period": 10,
-            "metric_name": None,
-            **checkpointing,
-        }
+        enabled=enabled,
+        save_period=save_period,
+        metric_name=metric_name,
+        **checkpointing,
     )
     controller._max_steps = 25
     return controller
@@ -672,6 +689,7 @@ def test_setup_loaders_passes_canonical_geometry_and_nested_packing(
         placement_hash="placement",
     )
     controller._loader_states = [{"shard": 0}, {"shard": 1}] if restored else None
+    controller._tracer = None
     controller._trainer = MagicMock()
     futures = [object(), object()]
     controller._trainer.worker_group.run_all_workers_single_data.return_value = futures
@@ -809,9 +827,7 @@ def test_setup_propagates_pretrained_checkpoint_before_validation(pretrained):
     from nemo_rl.algorithms.sft_v2 import setup_sft_v2
 
     config = _valid_setup_config(data_overrides={"backend": "invalid"})
-    config.checkpointing.pretrained_checkpoint = (
-        PretrainedCheckpointConfig(**pretrained) if pretrained else None
-    )
+    config.checkpointing.pretrained_checkpoint = pretrained
     with pytest.raises(ValueError, match="data.backend=energon"):
         setup_sft_v2(config, MagicMock())
     assert config.policy.get("pretrained_checkpoint") == pretrained
@@ -827,3 +843,57 @@ def test_setup_keeps_policy_pretrained_checkpoint_when_checkpointing_is_null():
     with pytest.raises(ValueError, match="data.backend=energon"):
         setup_sft_v2(config, MagicMock())
     assert config.policy["pretrained_checkpoint"] == existing
+
+
+def test_setup_charges_the_placement_wait_to_cluster_init() -> None:
+    """The placement wait is charged to cluster_init, not policy_init (fake clock gives exact phases)."""
+    from nemo_rl.algorithms import sft_v2
+
+    calls: list[str] = []
+    clock = {"t": 0.0}
+
+    def advance(label: str, seconds: float, result: Any = None):
+        def _advance(*args: Any, **kwargs: Any) -> Any:
+            calls.append(label)
+            clock["t"] += seconds
+            return result
+
+        return _advance
+
+    cluster = MagicMock()
+    cluster.get_placement_groups.side_effect = advance("placement", 7.0)
+    probe = MagicMock()
+    probe.get_latest_checkpoint_path.return_value = None
+    probe.load_training_info.return_value = None
+    probe.get_resume_paths.return_value = (None, None)
+
+    with (
+        patch.object(sft_v2, "time", SimpleNamespace(monotonic=lambda: clock["t"])),
+        patch.object(sft_v2, "set_seed"),
+        patch.object(sft_v2, "CheckpointManager", return_value=probe),
+        patch.object(
+            sft_v2, "prepare_segment_topology", return_value=(None, None, None)
+        ),
+        patch.object(sft_v2, "RayVirtualCluster", return_value=cluster),
+        patch.object(
+            sft_v2, "TQPolicy", side_effect=advance("policy", 3.0, MagicMock())
+        ),
+        patch.object(sft_v2, "resolve_topology_mapper") as resolve_mapper,
+        patch.object(sft_v2, "NLLLossFn"),
+        patch.object(sft_v2, "_restore_save_state"),
+        patch.object(sft_v2, "_max_train_steps", return_value=10),
+    ):
+        resolve_mapper.return_value.map.return_value = SimpleNamespace(
+            logical_world_size=4, placement_hash="hash"
+        )
+        actor_args = sft_v2.setup_sft_v2(_valid_setup_config(), MagicMock())
+
+    assert calls == ["placement", "policy"], (
+        f"the placement wait must be taken before the policy build, got {calls}"
+    )
+    timing = actor_args.setup_timing
+    assert timing.cluster_init_time_s == 7.0
+    assert timing.policy_init_time_s == 3.0, (
+        "policy_init must cover the policy build alone, not the placement wait"
+    )
+    assert timing.total_setup_time_s == 10.0
