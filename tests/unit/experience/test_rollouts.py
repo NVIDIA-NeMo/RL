@@ -4203,6 +4203,21 @@ def test_nemo_gym_rollout_metrics_hook_output_is_validated(caplog, monkeypatch):
     assert len(dropped) == 1
     assert "['pass_rate/histogram', 'score_over_correct']" in dropped[0].getMessage()
 
+    def mixed_keys(rows, full_results):
+        return {1: 0.5, None: 0.5, ("agent", "score"): 0.5, "valid": 0.5}
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        metrics = _postprocess_hook_group(
+            [_hook_group_result(1.0)], mixed_keys
+        ).rollout_metrics
+    assert metrics["valid"] == 0.5
+    assert metrics["agent/reward/mean"] == pytest.approx(1.0)
+    assert all(key not in metrics for key in (1, None, ("agent", "score")))
+    dropped = [r for r in caplog.records if "non-string" in r.message]
+    assert len(dropped) == 1
+    assert "[('agent', 'score'), 1, None]" in dropped[0].getMessage()
+
 
 def test_nemo_gym_rollout_metrics_hook_conditions_are_reported_once(
     caplog, monkeypatch

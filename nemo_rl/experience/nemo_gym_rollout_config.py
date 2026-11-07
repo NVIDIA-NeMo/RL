@@ -173,8 +173,8 @@ def apply_nemo_gym_rollout_metrics_hook(
     rather than silently reabsorbed. A hook that raises or returns no mapping
     is warned once and contributes nothing to the group; a value the step
     aggregation cannot average (anything but a number, or a sequence of
-    numbers under a histogram key) is dropped and warned once. The rollout
-    never fails because of the hook.
+    numbers under a histogram key), or a non-string key, is dropped and warned
+    once. The rollout never fails because of the hook.
     """
     if hook is None:
         return
@@ -198,17 +198,18 @@ def apply_nemo_gym_rollout_metrics_hook(
     accepted = {
         key: value
         for key, value in hook_metrics.items()
-        if _is_loggable_hook_value(key, value)
+        if isinstance(key, str) and _is_loggable_hook_value(key, value)
     }
     if len(accepted) != len(hook_metrics):
         _warn_rollout_metrics_hook_once(
             hook_name,
             "values",
-            "NeMo-Gym rollout metrics hook %s returned values the step aggregation "
-            "cannot average under %s; those keys are dropped (reported once). "
-            "Return a number per key, a sequence of numbers under a histogram "
+            "NeMo-Gym rollout metrics hook %s returned non-string keys or values "
+            "the step aggregation cannot average under %s; those keys are dropped "
+            "(reported once). Use string keys and return a number per key, "
+            "a sequence of numbers under a histogram "
             "key, and omit a key instead of returning None",
-            sorted(set(hook_metrics) - set(accepted)),
+            sorted(set(hook_metrics) - set(accepted), key=repr),
         )
     collisions = rollout_metrics.keys() & accepted.keys()
     if collisions:
