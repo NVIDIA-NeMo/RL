@@ -1630,6 +1630,10 @@ def setup_single_controller(
     # Setup Dataset & Environments
     # ==========================
     # TODO: add validate dataset wiring.
+    # Backend settings checks are pure config: run them before anything builds,
+    # and before should_use_nemo_gym() so a backend that refuses Gym says so
+    # instead of tripping that function's server assertions.
+    resolve_generation_class(generation_config).validate_settings(master_config)
     use_nemo_gym = should_use_nemo_gym(master_config)
     data_tokenizer = processor if processor is not None else tokenizer
     is_vlm = processor is not None
@@ -1638,8 +1642,6 @@ def setup_single_controller(
             "SC NeMo-Gym integration currently supports the vllm and megatron backends only; got "
             f"{generation_config['backend']!r}"
         )
-    # Backend settings checks are pure config: run them before anything builds.
-    resolve_generation_class(generation_config).validate_settings(master_config)
 
     def _load_training_data() -> tuple[
         Any, Any, dict[str, EnvironmentInterface], StatefulDataLoader

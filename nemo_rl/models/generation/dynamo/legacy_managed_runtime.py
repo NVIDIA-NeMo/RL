@@ -14,9 +14,9 @@
 
 """Driver-owned lifecycle for a fixed Ray-managed Dynamo deployment.
 
-Deprecated: the ``dynamo.vllm`` subprocess fleet behind ``DynamoGeneration``
-keeps it until that path is replaced by engines that register themselves with
-the slim ``managed_runtime.ManagedDynamoRuntime``.
+The ``dynamo.vllm`` subprocess fleet behind ``DynamoGeneration`` uses it.
+Engines that register themselves (the Megatron backend) use the services-only
+``managed_runtime.ManagedDynamoRuntime`` instead.
 """
 
 import atexit
@@ -32,7 +32,6 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-import warnings
 from typing import Any
 
 from nemo_rl.distributed.virtual_cluster import (
@@ -70,7 +69,7 @@ def _managed_namespace() -> str:
 class LegacyManagedDynamoRuntime:
     """Own etcd, NATS, frontend, and a fixed Ray actor worker fleet.
 
-    Deprecated: new backends start their engines themselves and use
+    Backends that start their engines themselves use
     ``managed_runtime.ManagedDynamoRuntime``, which owns only the services.
     """
 
@@ -80,13 +79,6 @@ class LegacyManagedDynamoRuntime:
         cluster: RayVirtualCluster,
         config: dict[str, Any],
     ) -> None:
-        warnings.warn(
-            "LegacyManagedDynamoRuntime (the dynamo.vllm subprocess fleet) is "
-            "deprecated; engines that register themselves use "
-            "nemo_rl.models.generation.dynamo.managed_runtime.ManagedDynamoRuntime.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
         validated_config = DynamoConfig.model_validate(config)
         self._cluster = cluster
         self._config = validated_config.model_dump()

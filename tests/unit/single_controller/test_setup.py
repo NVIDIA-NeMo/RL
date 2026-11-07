@@ -948,6 +948,30 @@ class TestSetup:
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
 
+    def test_backend_settings_are_checked_before_the_gym_server_assertions(
+        self, patched_factories
+    ):
+        # The vLLM config here has no async engine, so should_use_nemo_gym()
+        # would assert; the backend's own refusal has to come first.
+        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        refusing_backend = MagicMock()
+        refusing_backend.validate_settings.side_effect = NotImplementedError(
+            "backend refuses NeMo-Gym"
+        )
+
+        with (
+            patch.object(
+                sc_setup_mod,
+                "resolve_generation_class",
+                return_value=refusing_backend,
+            ),
+            pytest.raises(NotImplementedError, match="backend refuses NeMo-Gym"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        refusing_backend.validate_settings.assert_called_once_with(mc)
+        patched_factories["setup_response_data"].assert_not_called()
+
     def test_invalid_reward_penalty_config_fails_before_setup_factories(
         self, patched_factories
     ):

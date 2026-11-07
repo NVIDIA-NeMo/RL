@@ -261,6 +261,7 @@ project-includes = [
   "nemo_rl/models/generation/megatron/config.py",
   "nemo_rl/models/generation/megatron/dynamo_config.py",
   "nemo_rl/models/generation/megatron/dynamo_generation.py",
+  "nemo_rl/models/generation/megatron/dynamo_rollouts.py",
   "nemo_rl/models/generation/megatron/dynamo_worker_mixin.py",
   "nemo_rl/models/generation/megatron/token_capture.py",
   "nemo_rl/models/generation/megatron/utils.py",
