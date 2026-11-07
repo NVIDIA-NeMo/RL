@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import asyncio
 import sys
+import threading
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -107,13 +109,18 @@ def test_dynamo_worker_builds_the_handoff_engine(engine_modules, role):
     plain.assert_not_called()
 
 
-def test_engine_state_reset_clears_the_event_reporter():
+def test_engine_state_reset_clears_the_event_reporter_and_endpoint():
     worker = _bare_worker(role="prefill")
     worker._dynamo_event_reporter = MagicMock()
+    worker._dynamo_endpoint_future = MagicMock()
+    worker._dynamo_endpoint_metadata = {"event_port": 1, "handoff_owner": "o"}
 
     worker._init_inference_engine_state()
 
     assert worker._dynamo_event_reporter is None
+    assert worker._dynamo_endpoint_future is None
+    assert worker._dynamo_endpoint_metadata is None
+    assert worker.dynamo_endpoint_metadata() is None
     assert worker.dynamic_inference_engine is None
     assert worker.coordinator_addr is None
     assert worker.dynamo_coordinator_address() is None
@@ -125,6 +132,23 @@ def test_pinned_handoff_block_count_is_zero_without_an_engine():
     worker._inference_loop = None
 
     assert worker.pinned_handoff_block_count() == 0
+
+
+def test_pinned_handoff_block_count_is_read_on_the_inference_loop(dynamo_endpoint_env):
+    env = dynamo_endpoint_env
+    reads = []
+
+    class Engine:
+        @property
+        def pinned_handoff_block_count(self):
+            reads.append(asyncio.get_running_loop())
+            return 3
+
+    env.worker.dynamic_inference_engine = Engine()
+
+    assert env.worker.pinned_handoff_block_count() == 3
+    # Read on the loop the engine mutates the pinned map from.
+    assert reads == [env.worker._inference_loop]
 
 
 def test_attach_dynamo_events_needs_a_built_engine():
@@ -145,16 +169,11 @@ class _LoopThread:
     """A running asyncio loop on a thread, standing in for the worker's inference loop."""
 
     def __init__(self) -> None:
-        import asyncio
-        import threading
-
         self.loop = asyncio.new_event_loop()
         self._thread = threading.Thread(target=self.loop.run_forever, daemon=True)
         self._thread.start()
 
     def close(self) -> None:
-        import asyncio
-
         async def _drain() -> None:
             # Run every cancelled or still-running task to completion, so none is
             # garbage-collected pending (and logged) during a later test.
@@ -176,10 +195,6 @@ def dynamo_endpoint_env(monkeypatch):
     Yields a namespace with the worker, the fakes' call records, and a knob that
     makes the fake ``Worker.run`` return (``finish``) or raise (``fail``).
     """
-    import asyncio
-    import sys
-    import types
-
     records = SimpleNamespace(
         configs=[],
         engines=[],

@@ -17,6 +17,7 @@ import asyncio
 import logging
 import os
 import uuid
+from concurrent.futures import CancelledError
 from concurrent.futures import Future as ConcurrentFuture
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping, Optional
@@ -403,18 +404,30 @@ class MegatronDynamoGenerationMixin:
     ) -> bool:
         """Tell every prefill coordinator that a decode owner is gone for good.
 
-        Runs Megatron-LM's handoff-recovery hook on the inference loop so the
-        prefill engines release the KV blocks pinned for ``owner``. Only valid
-        after every rank of that decode engine has exited. The hook does not
-        retry an unreachable coordinator; callers that need the release to land
-        retry this call.
+        Runs Megatron-LM's handoff-recovery hook on the inference loop (started
+        here if it is not up yet) so the prefill engines release the KV blocks
+        pinned for ``owner``. Megatron-LM requires that every rank of that
+        decode engine has exited and cannot restart. ``MegatronDynamoGeneration``
+        calls this at shutdown once the decode engine's endpoint task is
+        cancelled and its workers' kill has been issued, not awaited, which is
+        safe only because the prefill engines stop right after; a live
+        replacement of a decode engine must wait for its actors to exit first.
+        The hook does not retry an unreachable coordinator; callers that need
+        the release to land retry this call.
 
         Every coordinator is attested concurrently, so one unreachable
         coordinator does not keep the others from releasing their pins.
 
+        Args:
+            coordinator_addresses: The prefill engines' coordinator addresses.
+            owner: The decode engine's handoff owner, from its endpoint metadata.
+            timeout_s: Bound on each coordinator's attestation; the whole call
+                gives up and returns False shortly after it.
+
         Returns:
-            True when every coordinator accepted the attestation; False (after
-            logging each failure) when any call failed or timed out.
+            True when every coordinator accepted the attestation, or there was
+            none to attest to; False (after logging each failure) when any
+            call failed or the wait ran out.
         """
         if not coordinator_addresses:
             return True
@@ -438,7 +451,9 @@ class MegatronDynamoGenerationMixin:
         future = asyncio.run_coroutine_threadsafe(_attest(), self._inference_loop)
         try:
             results = future.result(timeout=timeout_s + 5.0)
-        except Exception:
+        except (TimeoutError, CancelledError):
+            # Per-coordinator failures come back in results; only the wait
+            # running out or the loop cancelling the task lands here.
             LOGGER.exception(
                 "handoff recovery for decode owner %s did not finish on %s",
                 owner,

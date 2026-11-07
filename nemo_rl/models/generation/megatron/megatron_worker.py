@@ -824,21 +824,27 @@ class MegatronGenerationMixin:
             self._pause_engine(), self._inference_loop
         )
         future.result()
-        torch.distributed.barrier()
+        # Here and in _sleep / _wake the flags are set before the barrier: the
+        # engine state is final once wait_until returned and the barrier only
+        # aligns the ranks, so a failed barrier must not leave stale flags.
         self._inference_engine_paused = True
+        torch.distributed.barrier()
         print(f"[Rank {self.rank}] paused inference engine scheduling")
 
     def _sleep(self) -> None:
-        """Pause + suspend the engine. No-op if already asleep."""
+        """Pause (unless ``pause_for_refit`` already did) and suspend the engine.
+
+        No-op if already asleep.
+        """
         if self._inference_engine_asleep:
             return
         future = asyncio.run_coroutine_threadsafe(
             self._sleep_engine(), self._inference_loop
         )
         future.result()
-        torch.distributed.barrier()
         self._inference_engine_asleep = True
         self._inference_engine_paused = False
+        torch.distributed.barrier()
         print(f"[Rank {self.rank}] paused inference engine")
 
     async def _pause_engine(self):
@@ -871,9 +877,9 @@ class MegatronGenerationMixin:
             return
         future = asyncio.run_coroutine_threadsafe(coroutine, self._inference_loop)
         future.result()
-        torch.distributed.barrier()
         self._inference_engine_asleep = False
         self._inference_engine_paused = False
+        torch.distributed.barrier()
         print(f"[Rank {self.rank}] resumed inference engine")
 
     async def _unpause_engine(self):

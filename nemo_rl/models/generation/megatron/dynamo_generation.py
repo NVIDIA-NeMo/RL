@@ -128,8 +128,13 @@ def _seconds_left(deadline: float) -> float:
     return max(0.0, deadline - time.monotonic())
 
 
-class PinnedHandoffTimeout(TimeoutError):
-    """Prefill engines still pinned handoff blocks when the pause deadline passed."""
+class PinnedHandoffTimeout(RuntimeError):
+    """Blocks were still pinned for decode handoffs when the suspend deadline passed.
+
+    Deliberately not a ``TimeoutError``: the controller's refit await treats any
+    ``TimeoutError`` escaping the refit as its own deadline and replaces it with
+    a "rank not answering" abort, dropping this message and its notes.
+    """
 
 
 @dataclasses.dataclass(frozen=True)
@@ -287,9 +292,10 @@ class MegatronDynamoGeneration(GenerationInterface):
     arithmetic: engine ``i`` starts at the trainers plus the widths of the
     engines before it, so a prefill engine at TP 4 may sit next to decode
     engines at TP 2. Prefill engines are paused first and suspended only once
-    decode has pulled every block they pin. After a failed suspend the fleet
-    attempts a best-effort resume of every engine and the original error still
-    propagates. The object owns no policy and no worker group of its own.
+    decode has pulled every block they pin; every engine resumes in one wave.
+    After a failed suspend the fleet attempts a best-effort resume of every
+    engine the suspend reached and the original error still propagates. The
+    object owns no policy and no worker group of its own.
 
     Pickling keeps the engine records (plain data plus the workers' actor
     handles), the frontend URL, the namespace and engine environment, and
@@ -304,6 +310,8 @@ class MegatronDynamoGeneration(GenerationInterface):
     # How often the refit pause re-reads the prefill engines' pinned handoff
     # blocks while waiting for them to drain.
     _idle_poll_interval_s: float = 0.2
+    # How often that wait prints the counts it is still waiting on.
+    _pin_report_interval_s: float = 10.0
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
@@ -521,17 +529,27 @@ class MegatronDynamoGeneration(GenerationInterface):
             raise RuntimeError("A copy of MegatronDynamoGeneration owns no engines")
         return str(self._engines[0].worker_group.py_executable)
 
-    def check_alive(self) -> None:
+    def check_alive(self, *, timeout_s: float | None = None) -> None:
         """Raise if any engine's leading worker has died or its endpoint stopped serving.
 
-        Used while waiting for the engines to register with the frontend, so a
+        Used while waiting for the engines to register with the frontend, and
+        while the refit pause waits for decode to release prefill's pins, so a
         dead engine, or an endpoint task that failed or exited on rank zero,
-        fails the wait at once instead of at the startup timeout. Endpoints are
+        fails the wait at once instead of at its timeout. Endpoints are
         checked only once ``start_endpoints`` started all of them. A worker
         whose actor died raises ``RayActorError`` on the probe; that counts as
         dead, and the first such error is chained.
+
+        Args:
+            timeout_s: One deadline for every probe; ``None`` uses
+                ``dynamo_cfg.control_timeout_s``.
+
+        Raises:
+            RuntimeError: An engine died or its endpoint stopped serving.
+            ray.exceptions.GetTimeoutError: A probe ran past the deadline.
         """
-        deadline = time.monotonic() + self._control_timeout_s
+        timeout_s = self._control_timeout_s if timeout_s is None else timeout_s
+        deadline = time.monotonic() + timeout_s
         pending = [(record, record.liveness_ref()) for record in self._engine_records]
         dead: list[str] = []
         first_error: Exception | None = None
@@ -769,22 +787,68 @@ class MegatronDynamoGeneration(GenerationInterface):
         A pinned block is prompt KV a decode engine may still be pulling over
         NIXL; suspending the prefill engine while any are pinned could corrupt
         that transfer. Requests may still be in flight (nothing holds new ones
-        back), but the prefill engines are paused, so no new handoff starts
-        and the count only decreases while the still-running decode engines
-        pull and release what is pinned.
+        back), but the prefill engines are paused, so no new handoff starts.
+        The count decreases as a still-running decode engine finds room for a
+        handoff it claimed (free KV blocks, then a batch slot), pulls it and
+        releases it after its first streamed token, or as Megatron-LM's
+        prefill coordinator releases an offer no decode engine claimed once
+        its offer timeout (300 s by default) passes.
+
+        Every engine is probed on each poll, so a dead engine or endpoint
+        fails the wait as itself. The counts are printed on the first nonzero
+        read and then every ``_pin_report_interval_s``.
+
+        Raises:
+            PinnedHandoffTimeout: Blocks were still pinned when the deadline
+                passed, including a pin read or probe the deadline cut off.
+            ray.exceptions.GetTimeoutError: A pin read ran past the deadline
+                while every engine's latest count was zero (always so for the
+                first read).
+            ray.exceptions.RayActorError: A prefill worker died during a pin
+                read. Other errors from a pin read also propagate unchanged;
+                each carries a note naming the engine.
+            RuntimeError: The liveness probe found an engine dead or its
+                endpoint no longer serving.
         """
+        # The last count read from each engine, kept across polls so a spent
+        # deadline reports what is still pinned.
+        pinned: dict[str, int] = {}
+        stuck = (
+            "prefill engines still hold KV blocks pinned for decode handoffs: "
+            "{pinned}. A decode engine releases a pin it claimed after it "
+            "admits the handoff and streams its first token; the prefill "
+            "coordinator releases an offer no decode engine claimed once "
+            "Megatron-LM's offer timeout (300 s by default) passes. So either a "
+            "decode engine that claimed a handoff has stalled or died (see its "
+            "rank-zero log), or this wait ended before an unclaimed offer "
+            "expired; raise policy.generation.dynamo_cfg.control_timeout_s "
+            "above that offer timeout."
+        )
+        next_report = float("-inf")
         while True:
+            # Checked before a read: one issued with no time left cannot be
+            # answered (Ray's get at timeout 0 raises unless the value is ready).
+            if any(pinned.values()) and _seconds_left(deadline) <= 0:
+                raise PinnedHandoffTimeout(stuck.format(pinned=pinned))
             pending = [
                 (index, self._engine_records[index].pinned_handoff_block_count())
                 for index in prefill
             ]
-            pinned: dict[str, int] = {}
             for index, future in pending:
                 instance_id = self._engine_records[index].instance_id
                 try:
                     pinned[instance_id] = int(
                         ray.get(future, timeout=_seconds_left(deadline))
                     )
+                except ray.exceptions.GetTimeoutError as error:
+                    if any(pinned.values()):
+                        raise PinnedHandoffTimeout(
+                            stuck.format(pinned=pinned)
+                        ) from error
+                    error.add_note(
+                        f"reading pinned handoff blocks failed on engine {instance_id}"
+                    )
+                    raise
                 except Exception as error:
                     error.add_note(
                         f"reading pinned handoff blocks failed on engine {instance_id}"
@@ -792,10 +856,22 @@ class MegatronDynamoGeneration(GenerationInterface):
                     raise
             if not any(pinned.values()):
                 return
-            if time.monotonic() >= deadline:
-                raise PinnedHandoffTimeout(
-                    f"prefill engines still hold handoff blocks: {pinned}"
+            if time.monotonic() >= next_report:
+                print(
+                    "  [Dynamo] Refit waiting for the KV blocks prefill pins "
+                    f"for decode handoffs to drain: {pinned}",
+                    flush=True,
                 )
+                next_report = time.monotonic() + self._pin_report_interval_s
+            # Only a running decode engine releases a pin it claimed, so a dead
+            # engine or endpoint must surface as itself, not as this wait
+            # running out.
+            # The probe shares the wait's deadline; one it cuts off is the
+            # wait running out.
+            try:
+                self.check_alive(timeout_s=_seconds_left(deadline))
+            except ray.exceptions.GetTimeoutError as error:
+                raise PinnedHandoffTimeout(stuck.format(pinned=pinned)) from error
             time.sleep(min(self._idle_poll_interval_s, _seconds_left(deadline)))
 
     def _restore_engines(self, indices: Sequence[int], *, deadline: float) -> list[str]:
@@ -811,7 +887,7 @@ class MegatronDynamoGeneration(GenerationInterface):
         return errors
 
     def suspend_for_refit(self, *, timeout_s: float | None = None) -> None:
-        """Take every engine down in the order that keeps prefill handoffs whole.
+        """Suspend every engine in the order that keeps prefill handoffs whole.
 
         Prefill engines stop scheduling first, so no new handoff can start,
         then this waits until decode has pulled every block prefill still
@@ -820,16 +896,29 @@ class MegatronDynamoGeneration(GenerationInterface):
         weight synchronizer does for one dedicated engine.
 
         If any step fails or the deadline passes, the fleet attempts a
-        best-effort resume of every engine the suspend reached and the original
-        error still propagates, with any resume failures added to it as notes.
-        A worker that failed mid-transition may need the next refit to recover.
+        best-effort resume of every engine the suspend reached (prefill after
+        a failed pause, pin wait or prefill suspend; every engine after a
+        failed decode suspend) and the original error still propagates, with
+        any resume failures added to it as notes. A worker that failed
+        mid-transition may need the next refit to recover.
 
         Args:
             timeout_s: One deadline for the whole suspend; ``None`` uses
                 ``dynamo_cfg.control_timeout_s``.
 
         Raises:
-            PinnedHandoffTimeout: The prefill pins did not drain in time.
+            PinnedHandoffTimeout: Blocks were still pinned when the deadline
+                passed, including a pin read or liveness probe the deadline
+                cut off.
+            ray.exceptions.GetTimeoutError: A pause or suspend call ran past
+                the deadline, or a pin read did while every engine's latest
+                count was zero.
+            RuntimeError: An engine died or its endpoint stopped serving
+                while prefill still pinned blocks.
+            ray.exceptions.RayActorError: A worker died during a pause,
+                suspend or pin read. Other worker errors propagate unchanged;
+                every error from those calls carries a note naming the engine
+                and the step.
         """
         timeout_s = self._control_timeout_s if timeout_s is None else timeout_s
         deadline = time.monotonic() + timeout_s
@@ -1207,62 +1296,80 @@ class MegatronDynamoGeneration(GenerationInterface):
             )
         return next(iter(node_ips))
 
-    def _prefill_coordinator_addresses(self) -> list[str]:
-        """Coordinator addresses of the prefill engines that are listening.
+    def _prefill_coordinator_addresses(self) -> dict[int, str]:
+        """Each listening prefill engine's coordinator address, by engine index.
 
         Read from every prefill engine's rank zero at once, under one
-        control-timeout deadline. Engines that failed before their record
-        existed have no coordinator.
+        control-timeout deadline. A read that fails or runs past it is logged
+        and that engine left out, so the others still count; so is an engine
+        whose coordinator is not up yet (before the first refit builds it).
+        Only issuing the reads raises (when Ray itself is gone).
         """
         deadline = time.monotonic() + self._control_timeout_s
         pending = [
-            record.leader.dynamo_coordinator_address.remote()
-            for record in self._engine_records
-            if record.role == "prefill"
+            (
+                index,
+                self._engine_records[index].leader.dynamo_coordinator_address.remote(),
+            )
+            for index in self._prefill_indices()
         ]
-        addresses = []
-        for future in pending:
-            address = ray.get(future, timeout=_seconds_left(deadline))
+        addresses: dict[int, str] = {}
+        for index, future in pending:
+            try:
+                address = ray.get(future, timeout=_seconds_left(deadline))
+            except Exception:
+                LOGGER.exception(
+                    "Could not read the coordinator address of %s",
+                    self._engine_records[index].instance_id,
+                )
+                continue
             if address:
-                addresses.append(address)
+                addresses[index] = address
         return addresses
 
     def shutdown(self) -> bool:
         """Decode first, attest their termination to prefill, then prefill, then the services.
 
         Prefill engines keep KV blocks pinned for decode attempts they have not
-        heard back from. Once every decode rank is gone, their owner IDs are
-        reported to each prefill coordinator so the pins are released before
-        the prefill engines themselves go down. A decode engine that did not
-        stop cleanly is not attested. The frontend, NATS and etcd stop last.
-        Best effort and idempotent: every failure is logged and the teardown
-        continues. A copy that owns neither engines nor services does nothing.
+        heard back from. Once a decode engine's endpoint task is cancelled and
+        its workers' kill has been issued (not awaited, which is short of the
+        hook's "every rank exited" precondition and safe only because the
+        prefill engines stop next), its owner ID is reported to each prefill
+        coordinator so the pins are released before the prefill engines
+        themselves go down. A decode engine that did not stop cleanly is not
+        attested, and with no owner to attest (before the first refit started
+        the endpoints) no prefill engine is asked. The frontend, NATS and etcd
+        stop last. Best effort and idempotent: every failure is logged and the
+        teardown continues. A copy that owns neither engines nor services does
+        nothing.
         """
         if self._is_client_copy:
             return True
-        indexed = list(enumerate(self._engine_records))
-        decode = [i for i, record in indexed if record.role == "decode"]
-        prefill = [i for i, record in indexed if record.role == "prefill"]
+        decode = self._decode_indices()
+        prefill = self._prefill_indices()
         # Read before the decode engines stop: only their rank zero knows the
         # owner prefill pins KV blocks for.
-        owners = self._handoff_owners(decode)
-        stopped_decode = []
+        try:
+            owners = self._handoff_owners(decode)
+        except Exception:
+            LOGGER.exception("Could not read the decode engines' handoff owners")
+            owners = {index: None for index in decode}
+        stopped_owners: list[str] = []
         for index in decode:
-            if self._stop_engine(index):
-                stopped_decode.append(index)
-            else:
+            if not self._stop_engine(index):
                 LOGGER.warning(
                     "Decode engine %s did not stop cleanly; its handoff owner is "
                     "not attested as terminated",
                     self._engine_records[index].instance_id,
                 )
+                continue
+            owner = owners[index]
+            if owner:
+                stopped_owners.append(owner)
         # Releases the KV blocks prefill still pins for the stopped decode
         # engines; best effort at full teardown, since prefill stops next.
-        if stopped_decode and prefill:
-            self._confirm_decode_terminated(
-                attester=self._engine_records[prefill[0]],
-                owners=[owners[index] for index in stopped_decode],
-            )
+        if stopped_owners and prefill:
+            self._confirm_decode_terminated(stopped_owners)
         for index in prefill:
             self._stop_engine(index)
         # Engines that failed before their record existed.
@@ -1286,7 +1393,8 @@ class MegatronDynamoGeneration(GenerationInterface):
     def _handoff_owners(self, indices: Sequence[int]) -> dict[int, str | None]:
         """Each decode engine's handoff owner; None before its endpoint started.
 
-        Read from every engine at once, under one control-timeout deadline.
+        Read from every engine at once, under one control-timeout deadline. A
+        read that fails or runs past it is logged and counts as no owner.
         """
         deadline = time.monotonic() + self._control_timeout_s
         pending = [
@@ -1309,30 +1417,34 @@ class MegatronDynamoGeneration(GenerationInterface):
             owners[index] = None if metadata is None else metadata.get("handoff_owner")
         return owners
 
-    def _confirm_decode_terminated(
-        self, *, attester: MegatronDynamoEngine, owners: list[str | None]
-    ) -> None:
-        """Have a prefill engine's rank zero attest the stopped decode owners."""
+    def _confirm_decode_terminated(self, owners: Sequence[str]) -> None:
+        """Have a prefill engine's rank zero attest the stopped decode owners.
+
+        The attester is the first prefill engine whose coordinator address was
+        read, and only the coordinators read are attested to, so a prefill
+        engine that does not answer does not keep the others from releasing
+        their pins.
+        """
         try:
             addresses = self._prefill_coordinator_addresses()
         except Exception:
             LOGGER.exception("Could not read prefill coordinator addresses")
             return
         if not addresses:
-            LOGGER.info(
-                "No prefill coordinator is listening (expected before the first "
-                "refit); skipping handoff attestation for %d decode engines",
-                len(owners),
+            LOGGER.warning(
+                "No prefill coordinator address could be read; decode owners %s "
+                "are not attested as terminated",
+                list(owners),
             )
             return
+        attester = self._engine_records[next(iter(addresses))]
+        coordinator_addresses = list(addresses.values())
         timeout_s = self._control_timeout_s
         for owner in owners:
-            if not owner:
-                continue
             try:
                 accepted = ray.get(
                     attester.leader.confirm_decode_terminated.remote(
-                        coordinator_addresses=addresses,
+                        coordinator_addresses=coordinator_addresses,
                         owner=owner,
                         timeout_s=timeout_s,
                     ),

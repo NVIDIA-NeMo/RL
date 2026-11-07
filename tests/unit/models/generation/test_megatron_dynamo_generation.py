@@ -95,6 +95,10 @@ class _FakeRay:
 
     def get(self, item, timeout=None):
         self.get_timeouts.append(timeout)
+        # Ray raises at timeout 0 unless the value is already there, which a
+        # call just issued never is.
+        if timeout is not None and timeout <= 0:
+            raise GetTimeoutError(f"no time left (timeout={timeout})")
         return self._resolve(item)
 
     def _resolve(self, item):
@@ -189,9 +193,12 @@ class _FakeEngine:
         self.endpoint_error = None
         # Refit fakes: rank zero's calls land in the log. ``pinned`` is a
         # scripted sequence of pinned-handoff reads (the last value repeats);
-        # ``faults`` maps a worker method to an exception, or "hang".
+        # ``faults`` maps a worker method to an exception, or "hang", or (for
+        # an endpoint method) "disconnected", which raises from ``.remote()``.
         self.pinned = list(env.pinned.get(self.name, [0]))
         self.faults: dict[str, object] = {}
+        # Every method rank zero was called with, in call order.
+        self.calls: list[str] = []
         (width,) = kwargs["cluster"].kwargs["bundle_ct_per_node_list"]
         workers = [_FakeWorker(self.short, rank) for rank in range(width)]
         self.worker_group = SimpleNamespace(
@@ -202,6 +209,8 @@ class _FakeEngine:
         self.log.append(f"engine {self.name} up")
 
     def call(self, rank: int, method: str, kwargs: dict) -> _Ref:
+        if rank == 0:
+            self.calls.append(method)
         if method == "is_alive":
             if self.actor_dead:
                 return _Ref(error=ray.exceptions.RayActorError())
@@ -215,8 +224,14 @@ class _FakeEngine:
             "dynamo_coordinator_address",
             "dynamo_endpoint_error",
         ):
-            if self.faults.get(method) == "hang":
+            fault = self.faults.get(method)
+            if fault == "disconnected":
+                # Ray gone: issuing the call raises, as after ray.shutdown().
+                raise AttributeError("'Worker' object has no attribute 'core_worker'")
+            if fault == "hang":
                 return _Ref(hang=True)
+            if fault is not None:
+                return _Ref(error=fault)
             try:
                 return _Ref(getattr(self, f"_{method}")(rank, **kwargs))
             except Exception as error:
@@ -375,6 +390,8 @@ class _Env:
         # instance id -> scripted pinned-handoff reads for that engine.
         self.pinned: dict[str, list[int]] = {}
         self.ray = _FakeRay()
+        # Every generation built here; torn down by close().
+        self.generations: list[MegatronDynamoGeneration] = []
 
         def make_cluster(**kwargs):
             cluster = _FakeCluster(self, kwargs)
@@ -433,6 +450,7 @@ class _Env:
         )
         # The pin-drain poll must not sleep in tests.
         generation._idle_poll_interval_s = 0.0
+        self.generations.append(generation)
         return generation
 
     def started(
@@ -457,13 +475,46 @@ class _Env:
         return runtime
 
     def refit_timeouts(self) -> list:
-        """Timeouts of the gets the refit path made (liveness probes excluded)."""
+        """Timeouts of every bounded get since they were last cleared.
+
+        Liveness probes are included: the pin wait probes every engine on each
+        poll that finds pins, and the first resume's readiness wait probes them
+        too.
+        """
         return [t for t in self.ray.get_timeouts if t is not None]
+
+    def close(self) -> None:
+        """Tear every generation down while this env's fakes are the ones it reaches.
+
+        One left to the GC would run ``__del__`` -> ``shutdown()`` during a
+        later test, against that test's engines and log.
+        """
+        for generation in self.generations:
+            generation.shutdown()
 
 
 @pytest.fixture
 def env(monkeypatch):
-    return _Env(monkeypatch, _NODES)
+    env = _Env(monkeypatch, _NODES)
+    yield env
+    env.close()
+
+
+# One replica of two prefill and two decode engines, TP 2 each.
+_TWO_PREFILL_NODES = ["10.0.0.1", "10.0.0.1", "10.0.0.2", "10.0.0.2"]
+
+
+def _two_prefill_config() -> dict:
+    config = _megatron_config()
+    config["disaggregation"]["num_prefill_engines"] = 2
+    return config
+
+
+@pytest.fixture
+def env2(monkeypatch):
+    env = _Env(monkeypatch, _TWO_PREFILL_NODES)
+    yield env
+    env.close()
 
 
 def _with_role(policy_config: dict, role: str) -> dict:
@@ -844,8 +895,27 @@ def _confirm(owner: str) -> str:
             False,
             {},
             _DECODE_STOPS + _PREFILL_STOP + _CLUSTERS_DOWN,
-            [],
+            [
+                "No prefill coordinator address could be read; decode owners "
+                "['owner-decode-0', 'owner-decode-1'] are not attested as terminated"
+            ],
             id="no_prefill_coordinator",
+        ),
+        # Ray is gone, so issuing the owner or address reads raises outright;
+        # every engine, cluster and the runtime still stop, unattested.
+        pytest.param(
+            True,
+            {"d0": {"faults": {"dynamo_endpoint_metadata": "disconnected"}}},
+            _DECODE_STOPS + _PREFILL_STOP + _CLUSTERS_DOWN,
+            ["Could not read the decode engines' handoff owners"],
+            id="owner_reads_cannot_be_issued",
+        ),
+        pytest.param(
+            True,
+            {"p0": {"faults": {"dynamo_coordinator_address": "disconnected"}}},
+            _DECODE_STOPS + _PREFILL_STOP + _CLUSTERS_DOWN,
+            ["Could not read prefill coordinator addresses"],
+            id="address_reads_cannot_be_issued",
         ),
         # The attester's endpoint calls raise and decode-0 fails to stop at all.
         pytest.param(
@@ -859,6 +929,8 @@ def _confirm(owner: str) -> str:
             [
                 "Could not stop a Megatron engine's Dynamo endpoint",
                 "Could not stop a Megatron engine",
+                "Could not read the handoff owner of decode-0",
+                "Could not attest decode owner owner-decode-1 termination",
             ],
             id="continues_past_failures",
         ),
@@ -888,7 +960,7 @@ def test_shutdown_stops_decode_attests_owners_then_prefill_then_the_runtime(
     if coordinator:
         env.engine("p0").coordinator = _COORDINATOR
     assert generation._prefill_coordinator_addresses() == (
-        [_COORDINATOR] if coordinator else []
+        {0: _COORDINATOR} if coordinator else {}
     )
     for short, flags in faults.items():
         vars(env.engine(short)).update(flags)
@@ -912,7 +984,7 @@ def test_shutdown_bounds_every_endpoint_call_and_still_stops_the_engines(env, ca
     generation = env.started()
     _start_endpoints(generation)
     env.engine("p0").coordinator = _COORDINATOR
-    env.engine("d0").faults["dynamo_endpoint_metadata"] = "hang"
+    env.engine("d1").faults["dynamo_endpoint_metadata"] = "hang"
     env.engine("d1").faults["stop_dynamo_endpoint"] = "hang"
     env.engine("p0").faults["confirm_decode_terminated"] = "hang"
     env.log.clear()
@@ -927,7 +999,62 @@ def test_shutdown_bounds_every_endpoint_call_and_still_stops_the_engines(env, ca
         "engine prefill-0 down",
     ]
     assert "Decode engine decode-1 did not stop cleanly" in caplog.text
-    assert env.ray.get_timeouts and None not in env.ray.get_timeouts
+    assert "Could not read the handoff owner of decode-1" in caplog.text
+    # decode-0 stopped cleanly; the attestation of its owner hung and was cut
+    # off at the bound.
+    assert "Could not attest decode owner owner-decode-0 termination" in caplog.text
+    assert all(0 < t <= _CONTROL_TIMEOUT_S + 10.0 for t in env.ray.get_timeouts)
+    assert _CONTROL_TIMEOUT_S + 10.0 in env.ray.get_timeouts
+
+
+@pytest.mark.parametrize(
+    "fault",
+    ["hang", ray.exceptions.RayActorError()],
+    ids=["address_read_times_out", "address_read_fails"],
+)
+def test_shutdown_attests_through_the_prefill_engines_that_answered(
+    env2, caplog, fault
+):
+    """One prefill engine's unreadable address keeps no other from releasing pins."""
+    generation = env2.generation(_two_prefill_config(), world_size=8)
+    _start_endpoints(generation)
+    second = "tcp://10.0.0.2:5555"
+    env2.engine("p0").coordinator = _COORDINATOR
+    env2.engine("prefill-1").coordinator = second
+    env2.engine("p0").faults["dynamo_coordinator_address"] = fault
+    env2.log.clear()
+
+    with caplog.at_level("WARNING"):
+        assert generation.shutdown() is True
+
+    # prefill-1 answered, so its rank zero attests both stopped decode owners
+    # to its own coordinator; prefill-0 still stops normally.
+    assert env2.log == [
+        *_DECODE_STOPS,
+        f"confirm prefill-1 owner-decode-0 ['{second}'] {_CONTROL_TIMEOUT_S}",
+        f"confirm prefill-1 owner-decode-1 ['{second}'] {_CONTROL_TIMEOUT_S}",
+        "stop-endpoint prefill-0",
+        "engine prefill-0 down",
+        "stop-endpoint prefill-1",
+        "engine prefill-1 down",
+        "cluster prefill-0 down",
+        "cluster prefill-1 down",
+        "cluster decode-0 down",
+        "cluster decode-1 down",
+        "runtime down",
+    ]
+    assert "Could not read the coordinator address of prefill-0" in caplog.text
+
+
+def test_shutdown_asks_no_prefill_engine_without_a_decode_owner(env):
+    """Before the first refit starts the endpoints there is no owner to attest."""
+    generation = env.started()
+    env.engine("p0").coordinator = _COORDINATOR
+
+    assert generation.shutdown() is True
+
+    assert "dynamo_coordinator_address" not in env.engine("p0").calls
+    assert env.log == _DECODE_STOPS + _PREFILL_STOP + _CLUSTERS_DOWN + ["runtime down"]
 
 
 # ---------------------------------------------------------------------------
@@ -1019,8 +1146,12 @@ def test_check_alive_names_the_engine_whose_endpoint_stopped(env):
         match=r"stopped serving: decode-1: RuntimeError\('adapter failed'\)",
     ):
         generation.check_alive()
-    # Both the liveness probe and the endpoint check are bounded.
-    assert env.ray.get_timeouts and None not in env.ray.get_timeouts
+    timeouts = env.ray.get_timeouts
+    assert len(timeouts) == 4
+    # One deadline spans the three probes and the endpoint check, so every
+    # later call gets strictly less of it.
+    assert all(0 < t < _CONTROL_TIMEOUT_S for t in timeouts)
+    assert timeouts == sorted(timeouts, reverse=True)
 
 
 def test_check_alive_counts_a_dead_actor_as_dead(env):
@@ -1229,7 +1360,8 @@ def test_refit_sequence_suspends_prefill_pins_around_decode(env):
     assert log == [
         "p0.pause",
         # Prefill is suspended only after its pins drained, which takes three
-        # reads; decode keeps serving (no decode call) the whole time.
+        # reads; decode keeps serving meanwhile and only answers the liveness
+        # probe after each nonzero read, which the log does not record.
         "p0.pinned",
         "p0.pinned",
         "p0.pinned",
@@ -1237,6 +1369,7 @@ def test_refit_sequence_suspends_prefill_pins_around_decode(env):
         "d0.suspend",
         "d1.suspend",
     ]
+    assert env.engine("d0").calls.count("is_alive") == 2
     log.clear()
     generation.prepare_for_generation(tags=["weights"])
     generation.prepare_for_generation(tags=["kv_cache"])
@@ -1252,11 +1385,112 @@ def test_refit_sequence_suspends_prefill_pins_around_decode(env):
     assert all(t <= _CONTROL_TIMEOUT_S for t in env.refit_timeouts())
 
 
-def test_suspend_times_out_on_stuck_prefill_pins_and_unpauses_prefill(env):
+class _Clock:
+    """A fake ``time`` for the module under test: sleeping advances it."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def test_stuck_pins_time_out_after_bounded_polls_and_unpause_prefill(
+    env, monkeypatch, capsys
+):
     generation = env.started(pinned=[2])
+    generation._idle_poll_interval_s = 0.2
+    generation._pin_report_interval_s = 0.3
+    clock = _Clock()
+    monkeypatch.setattr(generation_module, "time", clock)
+
     with pytest.raises(PinnedHandoffTimeout, match="'prefill-0': 2"):
-        generation.suspend_for_refit(timeout_s=0.0)
+        generation.suspend_for_refit(timeout_s=0.5)
+
+    # Polls at t=0, 0.2 and 0.4; the last sleep is cut to what is left, and the
+    # spent deadline is reported before a fourth read is issued.
+    assert clock.sleeps == [0.2, 0.2, pytest.approx(0.1)]
     # Prefill was paused, then handed back to serving; nothing was suspended.
+    assert env.log == ["p0.pause"] + ["p0.pinned"] * 3 + ["p0.resume"]
+    # The counts are printed on the first nonzero read (t=0), then once the
+    # report interval has passed (t=0.4), not on every poll.
+    assert capsys.readouterr().out.count("{'prefill-0': 2}") == 2
+
+
+def test_a_dead_decode_engine_fails_the_pin_wait_as_itself(env, monkeypatch):
+    """Only decode releases a pin it claimed, so every poll probes the fleet."""
+    generation = env.started(pinned=[2])
+    generation._idle_poll_interval_s = 0.2
+    monkeypatch.setattr(generation_module, "time", _Clock())
+    env.engine("d0").actor_dead = True
+
+    with pytest.raises(RuntimeError, match="died: decode-0") as raised:
+        generation.suspend_for_refit(timeout_s=0.5)
+
+    assert isinstance(raised.value.__cause__, ray.exceptions.RayActorError)
+    # Found on the first poll, not when the deadline ran out.
+    assert env.log == ["p0.pause", "p0.pinned", "p0.resume"]
+
+
+def test_a_pin_read_cut_off_after_another_engine_reported_pins_times_out(env2):
+    """The deadline ending inside a read still reports the pins known so far."""
+    env2.pinned = {"prefill-0": [2]}
+    generation = env2.generation(_two_prefill_config(), world_size=8)
+    env2.engine("prefill-1").faults["pinned_handoff_block_count"] = "hang"
+    env2.log.clear()
+
+    with pytest.raises(PinnedHandoffTimeout, match="'prefill-0': 2") as raised:
+        generation.suspend_for_refit()
+
+    assert isinstance(raised.value.__cause__, GetTimeoutError)
+    assert env2.log == [
+        "p0.pause",
+        "prefill-1.pause",
+        "p0.pinned",
+        "prefill-1.pinned",
+        "p0.resume",
+        "prefill-1.resume",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("short", "flags", "error", "match"),
+    [
+        pytest.param(
+            "d0",
+            {"faults": {"dynamo_endpoint_error": "hang"}},
+            PinnedHandoffTimeout,
+            "'prefill-0': 2",
+            id="probe_cut_off",
+        ),
+        pytest.param(
+            "d1",
+            {"endpoint_error": "RuntimeError('adapter failed')"},
+            RuntimeError,
+            "stopped serving: decode-1",
+            id="endpoint_stopped",
+        ),
+    ],
+)
+def test_the_pin_wait_probe_checks_the_endpoints_once_they_serve(
+    env, short, flags, error, match
+):
+    """A probe the deadline cuts off is the wait running out; a stopped endpoint is itself."""
+    generation = env.started(pinned=[2])
+    _start_endpoints(generation)
+    vars(env.engine(short)).update(flags)
+    env.log.clear()
+
+    with pytest.raises(error, match=match) as raised:
+        generation.suspend_for_refit()
+
+    if error is PinnedHandoffTimeout:
+        assert isinstance(raised.value.__cause__, GetTimeoutError)
     assert env.log == ["p0.pause", "p0.pinned", "p0.resume"]
 
 
@@ -1297,7 +1531,7 @@ def test_a_hung_engine_call_times_out_and_the_engines_are_resumed(env):
     # restore that follows gets a fresh control-timeout deadline.
     timeouts = env.refit_timeouts()
     suspend_waits = timeouts[: -len(_NAMES)]
-    assert suspend_waits and all(t <= 0.5 for t in suspend_waits)
+    assert suspend_waits and all(0 < t < 0.5 for t in suspend_waits)
 
 
 def test_failed_restore_is_reported_on_the_original_error(env):

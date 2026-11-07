@@ -1778,35 +1778,53 @@ def test_finish_generation_clears_router_replay_record_state(monkeypatch):
 
 
 class _ControlSignalEngine:
-    """Applies Megatron-LM's control-signal state checks to pause/suspend/wake."""
+    """Applies Megatron-LM's control-signal checks; a transition lands on wait_until.
+
+    A signal only requests a transition (the engine loop applies it on a later
+    iteration), so a worker that sends the next signal before awaiting the
+    state the previous one leads to fails here, as the engine loop's state
+    assertion does when that transition has not finished. PAUSE outside
+    RUNNING is ignored, as in the engine.
+    """
 
     def __init__(self):
         from megatron.core.inference.engines.dynamic_engine import EngineState
 
         self.states = EngineState
         self.state = EngineState.RUNNING
+        self.pending = None
         self.log = []
 
     def signal(self, header):
-        self.log.append(header)
         states = self.states
+        self.log.append(header)
         if header == "pause":
-            if self.state == states.RUNNING:
-                self.state = states.PAUSED
-        elif header == "unpause":
+            if self.state == states.RUNNING and self.pending is None:
+                self.pending = states.PAUSED
+            return
+        assert self.pending is None, (
+            f"{header} sent while {self.state} -> {self.pending} is in flight"
+        )
+        if header == "unpause":
             assert self.state == states.PAUSED, f"UNPAUSE in {self.state}"
-            self.state = states.RUNNING
+            self.pending = states.RUNNING
         elif header == "suspend":
             assert self.state == states.PAUSED, f"SUSPEND in {self.state}"
-            self.state = states.SUSPENDED
+            self.pending = states.SUSPENDED
         elif header == "resume":
             assert self.state == states.SUSPENDED, f"RESUME in {self.state}"
-            self.state = states.PAUSED
+            self.pending = states.RESUMED
 
     async def wait_until(self, state):
-        # RESUMED is reached on the way back to PAUSED.
-        target = {self.states.RESUMED: self.states.PAUSED}.get(state, state)
-        assert self.state == target, (state, self.state)
+        if self.pending is None:
+            reached = self.state
+        else:
+            reached, self.pending = self.pending, None
+            # RESUMED is reached on the way back to PAUSED.
+            self.state = (
+                self.states.PAUSED if reached is self.states.RESUMED else reached
+            )
+        assert state == reached, f"awaited {state}, the engine reached {reached}"
 
 
 @pytest.fixture
@@ -1841,6 +1859,7 @@ def serving_worker(monkeypatch):
     yield worker, engine
     loop.call_soon_threadsafe(loop.stop)
     thread.join(timeout=5)
+    loop.close()
 
 
 @pytest.mark.mcore
@@ -1904,3 +1923,28 @@ def test_untagged_prepare_wakes_a_paused_engine(serving_worker, monkeypatch):
     assert engine.log == ["pause", "unpause"]
     assert engine.state == engine.states.RUNNING
     assert not worker._inference_engine_paused
+
+
+@pytest.mark.mcore
+def test_failed_barrier_after_suspend_leaves_the_engine_asleep(
+    serving_worker, monkeypatch
+):
+    """The flags follow the engine, not the barrier that aligns the ranks."""
+    worker, engine = serving_worker
+    worker.pause_for_refit()
+
+    def failing_barrier(*args, **kwargs):
+        raise RuntimeError("barrier failed")
+
+    monkeypatch.setattr(torch.distributed, "barrier", failing_barrier)
+    with pytest.raises(RuntimeError, match="barrier failed"):
+        worker.suspend_for_refit()
+    assert engine.state == engine.states.SUSPENDED
+    assert worker._inference_engine_asleep
+    assert not worker._inference_engine_paused
+
+    # The wake resumes the suspended engine instead of unpausing it.
+    monkeypatch.setattr(torch.distributed, "barrier", lambda *a, **k: None)
+    worker.resume_after_refit()
+    assert engine.log == ["pause", "suspend", "resume", "unpause"]
+    assert engine.state == engine.states.RUNNING
