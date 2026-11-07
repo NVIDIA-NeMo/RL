@@ -88,6 +88,8 @@ class _TinyOmniProvider(NemotronOmniModelProvider):
     pipeline_model_parallel_size: int = 1
     use_cpu_initialization: bool = False
     gradient_accumulation_fusion: bool = False
+    # The direct provider bypasses NeMo-RL setup, which defaults to FA2.
+    flash_attention_version: int = 2
     nemotron_omni_contract: str = NEMOTRON_OMNI_EXPANDED_SEQUENCE_CONTRACT
 
     def _build_vision_config(self, language_cfg):

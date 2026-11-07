@@ -159,9 +159,6 @@ def xferdtensor(
     src_local = src_tensor._local_tensor if src_tensor is not None else None
     dst_local = dst_tensor._local_tensor if dst_tensor is not None else None
 
-    reshard_kwargs = {}
-    if stream is not None:
-        reshard_kwargs["stream"] = int(stream.cuda_stream)
     _reshard(  # pyrefly: ignore[not-callable]
         src_local,
         dst_local,
@@ -170,7 +167,7 @@ def xferdtensor(
         src_placements=src_placement,
         dst_mesh=dst_mesh.mesh.tolist(),
         dst_placements=dst_placement,
-        **reshard_kwargs,
+        stream=int(stream.cuda_stream) if stream is not None else None,
     )
 
 

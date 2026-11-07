@@ -145,7 +145,10 @@ def test_survivor_normalization_reduces_dp_counts_on_every_pipeline_stage(
         synchronize.assert_not_called()
     else:
         synchronize.assert_called_once()
-        model.scale_gradients.assert_called_once_with(1.5)
+        model.scale_gradients.assert_called_once()
+        factor = model.scale_gradients.call_args.args[0]
+        assert isinstance(factor, torch.Tensor)
+        torch.testing.assert_close(factor, torch.full_like(tokens, 1.5))
 
 
 @pytest.mark.mcore

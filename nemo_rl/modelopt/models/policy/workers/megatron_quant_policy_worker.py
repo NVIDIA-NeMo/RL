@@ -20,6 +20,7 @@ import warnings
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import ray
 import torch
@@ -29,10 +30,13 @@ from megatron.bridge.training.post_training.checkpointing import (
     load_modelopt_state,
 )
 from megatron.core.utils import unwrap_model
+from modelopt.torch.quantization.nn import AnyQuantizer
 from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+from modelopt.torch.quantization.utils import apply_without_qdq
 
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
+from nemo_rl.distributed.collectives import gather_jagged_object_lists
 from nemo_rl.modelopt.models.policy.workers.utils import (
     get_quantization_layer_spec,
     get_quantization_mamba_stack_spec,
@@ -48,6 +52,9 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
 )
+
+if TYPE_CHECKING:
+    from megatron.bridge.models.conversion.modelopt_utils import ModelOptExportPlan
 
 
 def _quant_checkpoint_cache_suffix(config: Mapping[str, object]) -> str:
@@ -304,8 +311,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             load_modelopt_state(unwrapped_model, model_path)
 
     @contextmanager
-    def hide_tensor_quantizers(self):
-        """Context manager that temporarily hides TensorQuantizer modules from module iteration."""
+    def hide_quantizers(self):
+        """Temporarily hide ModelOpt quantizers from DDP module iteration."""
         from megatron.core.distributed import DistributedDataParallel
 
         if not isinstance(self.model, DistributedDataParallel):
@@ -317,7 +324,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
         def filtered_named_modules(*args, **kwargs):
             for name, module in original_named_modules(*args, **kwargs):
-                if not isinstance(module, TensorQuantizer):
+                if not isinstance(module, AnyQuantizer):
                     yield name, module
 
         try:
@@ -327,13 +334,13 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             inner_module.named_modules = original_named_modules
 
     def enable_forward_pre_hook(self):
-        """Enable forward pre-hook, hiding TensorQuantizer modules."""
-        with self.hide_tensor_quantizers():
+        """Enable forward pre-hook, hiding ModelOpt quantizers."""
+        with self.hide_quantizers():
             super().enable_forward_pre_hook()
 
     def disable_forward_pre_hook(self, param_sync=True):
-        """Disable forward pre-hook, hiding TensorQuantizer modules."""
-        with self.hide_tensor_quantizers():
+        """Disable forward pre-hook, hiding ModelOpt quantizers."""
+        with self.hide_quantizers():
             super().disable_forward_pre_hook(param_sync=param_sync)
 
     @contextmanager
@@ -459,6 +466,29 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             and bool(generation_cfg.get("real_quant"))
         )
 
+    def _build_refit_conversion_tasks(self) -> list:
+        if not self._use_real_quant_refit():
+            # Weight quantizers are folded locally; input scales retain HF mappings.
+            return super()._build_refit_conversion_tasks(
+                exclude_param_patterns=("*weight_quantizer*",)
+            )
+
+        return self._get_modelopt_export_plan().conversion_tasks
+
+    def _get_modelopt_export_plan(self) -> "ModelOptExportPlan":
+        plan = getattr(self, "_modelopt_export_plan", None)
+        if plan is not None:
+            return plan
+
+        from nemo_rl.models.megatron.draft import draft_model_detached
+
+        # The canonical planner reads scales from the owning weights and excludes
+        # quantizer modules before Bridge validates the HF parameter mappings.
+        with draft_model_detached([self.model]):
+            plan = self.megatron_bridge.build_hf_modelopt_export_plan([self.model])
+        self._modelopt_export_plan = plan
+        return plan
+
     def _get_real_quant_mode(self) -> str:
         """Resolve and cross-check the training and rollout quantization modes."""
         cached_mode = getattr(self, "_real_quant_mode", None)
@@ -483,7 +513,10 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         kv_scales: dict[str, float] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Export packed NVFP4 weights and scales for real-quant vLLM rollout."""
-        from nemo_rl.modelopt.utils import DEFAULT_NVFP4_IGNORE
+        from nemo_rl.modelopt.utils import (
+            DEFAULT_NVFP4_IGNORE,
+            matches_quant_ignore_pattern,
+        )
 
         generation_cfg = self.cfg["generation"]
         vllm_cfg = generation_cfg["vllm_cfg"]
@@ -492,13 +525,36 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             ignore = DEFAULT_NVFP4_IGNORE
         mode = self._get_real_quant_mode()
         export_cpu_offload = generation_cfg["real_quant_export_cpu_offload"]
+        plan = self._get_modelopt_export_plan()
+        expected_algo = "NVFP4" if mode == "w4a4" else "W4A16_NVFP4"
+        if plan.quantization_config["quant_algo"] != expected_algo:
+            raise ValueError(
+                f"Calibrated ModelOpt export must use {expected_algo} to match rollout."
+            )
+        ignored_weights: list[str] = []
+        for task in plan.conversion_tasks:
+            if task.global_param_name not in plan.quantized_params:
+                continue
+            hf_param = task.mapping.hf_param
+            names = hf_param.values() if isinstance(hf_param, dict) else (hf_param,)
+            for name in names:
+                if matches_quant_ignore_pattern(name, ignore):
+                    ignored_weights.append(name)
+        # Expert conversion tasks are local; reject conflicts on every rank
+        # before any rank enters Bridge's export collectives.
+        if torch.distributed.is_initialized():
+            ignored_weights = gather_jagged_object_lists(ignored_weights)
+        if ignored_weights:
+            raise ValueError(
+                f"Calibrated quantized weights {sorted(set(ignored_weights))!r} "
+                "conflict with generation.real_quant_ignore; disable their "
+                "quantizers in policy.quant_cfg or remove the rollout exclusion."
+            )
         yield from self.megatron_bridge.export_hf_weights_modelopt(
             [self.model],
-            quant_mode="nvfp4" if mode == "w4a4" else "w4a16_nvfp4",
             cpu=export_cpu_offload,
             show_progress=False,
-            conversion_tasks=self.refit_conversion_tasks,
-            ignore_patterns=ignore,
+            export_plan=plan,
         )
 
         if self.draft_model is not None:
@@ -632,7 +688,15 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 if w is None:
                     return None
                 try:
-                    return self._wq(w.float()).to(w.dtype)
+                    rows = getattr(
+                        self._task.megatron_module,
+                        "_modelopt_unquantized_output_rows",
+                        None,
+                    )
+                    folded = self._wq(w.float()).to(w.dtype, copy=rows is not None)
+                    if rows is not None:
+                        folded[rows] = apply_without_qdq(self._wq, w[rows]).to(w.dtype)
+                    return folded
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to apply weight quantizer for param "
