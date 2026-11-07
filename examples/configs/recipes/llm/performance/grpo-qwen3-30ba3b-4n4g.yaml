@@ -10,8 +10,10 @@ checkpointing:
 policy:
   model_name: Qwen/Qwen3-30B-A3B
   train_global_batch_size: 2048
-  train_micro_batch_size: 1
-  logprob_batch_size: 2
+  train_micro_batch_size: 4
+  logprob_batch_size: 8
+  # Bound full-vocabulary logprob temporaries for the larger training microbatch.
+  logprob_chunk_size: 1024
   max_total_sequence_length: 4096
   sequence_packing:
     fuse_loss: true
@@ -22,6 +24,7 @@ policy:
   make_sequence_length_divisible_by: ${policy.megatron_cfg.tensor_model_parallel_size}
   megatron_cfg:
     enabled: true
+    defer_fp32_logits: true
     expert_model_parallel_size: 16
     moe_grouped_gemm: true
     moe_token_dispatcher_type: flex
@@ -43,6 +46,8 @@ policy:
   generation:
     vllm_kwargs:
       moe_backend: flashinfer_trtllm
+      max_num_seqs: 256
+      max_num_batched_tokens: 8192
 logger:
   log_dir: logs/grpo-qwen3-30ba3b-4n4g
   wandb_enabled: true
