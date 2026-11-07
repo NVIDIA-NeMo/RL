@@ -29,11 +29,12 @@ With `dynamo: true`:
 - `vllm_cfg.async_engine` is turned on, because Dynamo drives the engine's
   `AsyncLLM`. Settings Dynamo does not serve are rejected at startup; see
   [Not supported](#not-supported).
-- The driver starts etcd, NATS and `dynamo.frontend`. The frontend runs from the
-  vLLM workers' own venv, so it is the same ai-dynamo release.
+- The driver starts etcd and NATS. Each `dynamo.frontend` runs on a generation
+  node, from a small Ray actor, in the vLLM workers' own venv, so it is the same
+  ai-dynamo release.
 - Each engine turns on vLLM's KV-cache events for `router_mode: kv` and
-  registers with the frontend from inside its own worker process. Setup waits
-  until the frontend routes to every engine.
+  registers with the frontends from inside its own worker process. Setup waits
+  until every frontend routes to every engine.
 - vLLM publishes KV-cache events only for blocks its prefix cache stores. With
   `vllm_cfg.enable_prefix_caching: false`, the engines publish none, and the
   KV router routes on load alone.
@@ -54,8 +55,11 @@ shows them all:
 | `worker_args.tool_call_parser`, `reasoning_parser` | null | Dynamo's built-in parser names. null follows the native server's settings; see [NeMo-Gym](#nemo-gym) |
 | `worker_args.custom_jinja_template` | null | A chat template that replaces the model's own. null follows the native server's |
 | `frontend_args.router_mode` | `kv` | Frontend routing policy |
-| `frontend_args.session_affinity_ttl_secs` | 300 | Keeps a NeMo-Gym token-capture rollout on one engine while it is idle for up to this many seconds; null disables it. Dynamo keeps at most 65,536 sessions and answers a new one past that with HTTP 529 |
+| `frontend_args.session_affinity_ttl_secs` | 300 | Keeps a NeMo-Gym token-capture rollout on one engine while it is idle for up to this many seconds; null disables it |
+| `frontend_args.session_affinity_max_entries` | 16,777,216 | Most sessions the frontends hold at once, across all of them; a new one past it gets HTTP 529. Entries are allocated as sessions start, so a high cap costs nothing until it is used |
+| `frontend_args.num_frontends` | 1 | Frontends, each with its own router, spread round-robin over the generation nodes. More than one adds `--router-replica-sync`, so each router sees the requests the others have in flight; NeMo-Gym keeps each session on one frontend, and NeMo RL's own rollouts pick one at random |
 | `frontend_args.extra_cli_args` | `[]` | Extra `dynamo.frontend` flags |
+| `frontend_args.extra_env` | `{}` | Extra frontend environment, for settings Dynamo reads only from the environment. For example, `DYN_TOKENIZER_CACHE_BYTES` sizes the tokenizer's prefix cache for NeMo-Gym chat; Dynamo's default is 1/16 of the cgroup memory limit, up to 8 GiB, or 64 MiB without a limit. Variables the runtime manages are rejected |
 
 The etcd and nats-server binaries are found in `NEMO_RL_DYNAMO_BIN_DIR` when it
 is set (the image sets it to `/opt/dynamo/bin`), and on `PATH` otherwise.
