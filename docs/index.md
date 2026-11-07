@@ -83,7 +83,7 @@ Configure and launch NeMo RL on multi-node Slurm or Kubernetes clusters for dist
 :link: guides/dynamo-generation
 :link-type: doc
 
-Run a fixed Dynamo vLLM fleet with NCCL refit and W&B telemetry inside a Slurm Ray allocation.
+Run a fixed Dynamo vLLM fleet, or Megatron prefill/decode engines behind the Dynamo frontend, with NCCL refit and W&B telemetry inside a Slurm Ray allocation.
 :::
 
 ::::

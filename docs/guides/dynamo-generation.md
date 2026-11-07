@@ -1,16 +1,20 @@
 # Managed Dynamo generation on Slurm
 
-NeMo RL can launch and own Dynamo's control plane, frontend, and a fixed vLLM
-worker fleet inside a Slurm-backed Ray allocation. This mode supports direct
+NeMo RL can launch and own Dynamo's control plane and frontend inside a
+Slurm-backed Ray allocation, serving either a fixed vLLM worker fleet
+(`backend: dynamo`) or NeMo RL's own Megatron prefill/decode engines
+(`backend: megatron` with `dynamo: true`; see "Run Megatron prefill/decode
+engines under the SingleController" below). The vLLM fleet supports direct
 GRPO and NeMo-Gym rollouts, NCCL weight refits, cache invalidation, and
 `generation_metrics/*` telemetry sent to enabled loggers such as W&B.
 See the [Dynamo integration design](../design-docs/dynamo-integration.md) for
 the service ownership, startup, and weight-refit architecture.
 
-This integration is managed and vLLM-only. It does not connect to an external
-Dynamo deployment and does not support Kubernetes, DGD, SGLang, TensorRT-LLM,
-speculative decoding, quantized generation, or model-parallel engine groups
-that span nodes.
+This integration is managed: the `backend: dynamo` fleet is vLLM-only, and the
+Megatron path serves NeMo RL's own Megatron inference engines. Neither connects
+to an external Dynamo deployment, and neither supports Kubernetes, DGD, SGLang,
+TensorRT-LLM, speculative decoding, quantized generation, or model-parallel
+engine groups that span nodes.
 
 ## Build the image
 
@@ -336,8 +340,8 @@ Limits:
 - The Megatron environment needs the `nixl` package for the KV handoff and a
   Megatron-LM with the Dynamo integration
   (`megatron/inference/integrations/dynamo`). etcd and nats-server are looked
-  up in `NEMO_RL_DYNAMO_BIN_DIR`, then on `PATH`, then in the image's Dynamo
-  virtual environment.
+  up in `NEMO_RL_DYNAMO_BIN_DIR` when it is set (only there); otherwise on
+  `PATH`, then in the image's Dynamo virtual environment.
 
 The functional test is
 `tests/functional/grpo_dynamo_pd_megatron_single_controller.sh` (three GPUs:

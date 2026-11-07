@@ -23,6 +23,8 @@ import torch
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.models.generation.megatron import dynamo_rollouts as rollouts
 
+pytestmark = pytest.mark.mcore
+
 _URL = "http://10.0.0.1:3000/v1"
 
 

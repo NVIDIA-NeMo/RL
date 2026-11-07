@@ -10,8 +10,8 @@
 # Weight updates use the collective transport, as for backend: megatron with
 # colocated.enabled: false. Before each refit the prefill engines stop
 # scheduling first, decode keeps running until every handed-off prefill block
-# is pulled, then every engine is suspended; after the refit decode resumes,
-# then prefill. dynamo_cfg.control_timeout_s bounds that wait.
+# is pulled, then every engine is suspended; after the refit every engine
+# resumes in one wave. dynamo_cfg.control_timeout_s bounds each step.
 defaults: grpo_math_1B_megatron_single_controller.yaml
 
 async_rl:

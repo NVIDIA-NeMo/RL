@@ -37,6 +37,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from transformers import AutoProcessor
 from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
+from nemo_rl.data_plane.interfaces import storage_unit_placement
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, _get_node_ip_local
 from nemo_rl.models.generation.dynamo.managed_runtime import (
@@ -59,7 +60,11 @@ from nemo_rl.models.generation.megatron.dynamo_config import (
     megatron_dynamo_cfg,
     validate_megatron_dynamo_generation,
 )
+from nemo_rl.models.generation.megatron.dynamo_rollouts import (
+    generate_through_frontend,
+)
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
+from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
 from nemo_rl.weight_sync.membership import RefitMembership, desired_membership
@@ -315,10 +320,6 @@ class MegatronDynamoGeneration(GenerationInterface):
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
         """Reject what prefill/decode engines behind the Dynamo frontend cannot serve."""
-        # Deferred: both modules pull in the rollout and data-plane stacks.
-        from nemo_rl.data_plane.interfaces import storage_unit_placement
-        from nemo_rl.models.megatron.router_replay import router_replay_enabled
-
         MegatronGeneration.validate_settings(master_config)
         policy_config = master_config.policy
         # The raw flag: should_use_nemo_gym() asserts the HTTP server is exposed,
@@ -1139,21 +1140,15 @@ class MegatronDynamoGeneration(GenerationInterface):
     def generate(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> BatchedDataDict[GenerationOutputSpec]:
-        """Not served yet: the engines register with no frontend."""
+        """Not used: the SingleController drives generate_async(), one prompt per request."""
         raise NotImplementedError(
-            "Megatron engines behind Dynamo serve generate_async() only; the "
-            "frontend takes one request at a time."
+            "Megatron engines behind Dynamo serve rollouts through generate_async() only."
         )
 
     async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Post the batch to the frontend, one request per prompt; yield the assembled batch."""
-        # Deferred: the rollout client pulls in aiohttp.
-        from nemo_rl.models.generation.megatron.dynamo_rollouts import (
-            generate_through_frontend,
-        )
-
         if len(data["input_ids"]) == 0:
             return
         output = await generate_through_frontend(
