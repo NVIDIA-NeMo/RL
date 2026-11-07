@@ -382,7 +382,7 @@ def test_vllm_generation_rejects_unregistered_worker_extension(
     cluster._init_placement_groups.assert_not_called()
 
 
-@pytest.mark.parametrize("backend", ["sglang", "megatron", "trtllm", "dynamo"])
+@pytest.mark.parametrize("backend", ["sglang", "megatron", "trtllm"])
 def test_generation_config_rejects_worker_extension_for_other_backends(
     backend: str,
 ) -> None:
@@ -394,7 +394,7 @@ def test_generation_config_rejects_worker_extension_for_other_backends(
         configure_generation_config(config, MagicMock())
 
 
-@pytest.mark.parametrize("backend", ["vllm", "sglang", "megatron", "trtllm", "dynamo"])
+@pytest.mark.parametrize("backend", ["vllm", "sglang", "megatron", "trtllm"])
 @pytest.mark.parametrize("include_null", [False, True])
 def test_generation_config_allows_no_worker_extension(
     backend: str,
@@ -2833,6 +2833,103 @@ def test_vllm_validate_settings_accepts_missing_vllm_cfg_as_refit_disabled():
     master_config = types.SimpleNamespace(policy={"generation": vllm_config})
 
     VllmGeneration.validate_settings(master_config)
+
+
+def _dynamo_master_config(*, fleet_health=False):
+    vllm_config = deepcopy(basic_vllm_test_config)
+    vllm_config["dynamo"] = True
+    vllm_config["vllm_cfg"]["async_engine"] = True
+    vllm_config["vllm_cfg"]["expose_http_server"] = True
+    return types.SimpleNamespace(
+        policy={"generation": vllm_config},
+        async_rl=types.SimpleNamespace(
+            generation_fleet_health=types.SimpleNamespace(enabled=fleet_health),
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("settings", "error"),
+    [
+        ({}, None),
+        ({"fleet_health": True}, "Disable fleet health"),
+    ],
+)
+def test_vllm_validate_settings_rejects_what_dynamo_cannot_serve(settings, error):
+    master_config = _dynamo_master_config(**settings)
+    if error is None:
+        VllmGeneration.validate_settings(master_config)
+        return
+    with pytest.raises(ValueError, match=error):
+        VllmGeneration.validate_settings(master_config)
+
+
+def test_vllm_dynamo_rollouts_go_through_the_frontend(monkeypatch):
+    from nemo_rl.experience.failures import GenerationUnavailable
+    from nemo_rl.models.generation.dynamo import rollout_client
+    from nemo_rl.models.generation.rollout_result import (
+        RolloutResult,
+        rollout_result_to_wire,
+    )
+    from nemo_rl.models.generation.vllm.request_pipeline import rollout_output
+
+    result = RolloutResult([7, 8], [-0.5, -0.25], False, None, None)
+    responses = [
+        {"rollout": rollout_result_to_wire(result), "gen_leader_worker_idx": 3},
+        RuntimeError("Dynamo rollout request to frontend failed: HTTP 503"),
+    ]
+    requests = []
+
+    async def frontend(url, payload, timeout_s):
+        requests.append((url, payload, timeout_s))
+        response = responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+    monkeypatch.setattr(rollout_client, "post_rollout", frontend)
+    generation = object.__new__(VllmGeneration)
+    generation.cfg = {
+        "model_name": "model",
+        "_pad_token_id": 0,
+        "vllm_cfg": {"max_model_len": 16},
+    }
+    generation.dynamo_frontend_url = "http://frontend/v1"
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[5, 6, 0]]),
+            "input_lengths": torch.tensor([2]),
+            "stop_strings": [["</answer>"]],
+        }
+    )
+    # The frontend request carries token IDs only, so media prompts stay native.
+    media = BatchedDataDict({**data, "vllm_content": [None]})
+    assert generation._dynamo_serves(data) and not generation._dynamo_serves(media)
+
+    _, output = asyncio.run(anext(generation.generate_async(data, greedy=True)))
+
+    ((url, payload, timeout_s),) = requests
+    assert (url, timeout_s) == ("http://frontend/v1/completions", None)
+    # The unpadded prompt; the engine samples it from the generation config, and
+    # the frontend's own stop rules never end the stream before the engine does.
+    assert payload["prompt"] == [5, 6]
+    assert payload["ignore_eos"] is True and payload["max_tokens"] == 14
+    assert "stop" not in payload and "temperature" not in payload
+    (annotation,) = payload["nvext"]["annotations"]
+    assert json.loads(annotation.removeprefix(rollout_client.ROLLOUT_ANNOTATION)) == {
+        "greedy": True,
+        "stop_strings": ["</answer>"],
+    }
+    assert payload["nvext"]["extra_fields"] == ["engine_data"]
+    # The driver returns what native dispatch returns.
+    native = rollout_output(result, input_ids=data["input_ids"][0], input_length=2)
+    assert output["gen_leader_worker_idx"] == [3]
+    for key in native:
+        assert torch.equal(output[key], native[key]), key
+    # An infrastructure failure is re-dispatched; an unmapped RuntimeError would
+    # count as a DATA failure against the prompt.
+    with pytest.raises(GenerationUnavailable, match="HTTP 503"):
+        asyncio.run(anext(generation.generate_async(data)))
 
 
 def test_vllm_policy_generation(policy, test_input_data, tokenizer):
