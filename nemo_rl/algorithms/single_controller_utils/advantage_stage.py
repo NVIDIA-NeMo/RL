@@ -677,7 +677,13 @@ class AdvantageComputer:
             sample_mask=final_sample_mask,
             token_mask=token_mask,
             truncated=truncated,
-            seq_lens=tensor_field(data, INPUT_LENGTHS),
+            # Optional: the seq_len metrics are skipped for a step whose rows
+            # carry no lengths.
+            seq_lens=(
+                tensor_field(data, INPUT_LENGTHS)
+                if INPUT_LENGTHS in data.keys()
+                else None
+            ),
             baseline_mask=advantage_valid_mask,
         )
         metric_rows = (
