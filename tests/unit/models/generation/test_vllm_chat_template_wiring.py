@@ -39,6 +39,7 @@ import pytest
 import torch
 
 from nemo_rl.data.captured_media import capture_processed_media
+from nemo_rl.models.generation import vllm as vllm_generation_pkg
 from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
@@ -49,6 +50,7 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 # A class attribute would be shadowed by the subclass and the construction would
 # be recorded somewhere the assertions never look.
 _BUILT: dict[str, list] = {"renderer": [], "chat": [], "tokenize": []}
+_CHAT_SERVER = "nemo_rl.models.generation.vllm.chat_server"
 
 
 def _recorder(slot: str):
@@ -87,6 +89,12 @@ class _FakeApp:
 
 def _install_fake_vllm(monkeypatch):
     """Stub exactly the vLLM surface _setup_vllm_openai_api_server imports."""
+    # chat_server imports vLLM at module level: drop the cached copy (and the
+    # package attribute an earlier import set) so the server is built against
+    # these fakes; monkeypatch restores both afterwards.
+    monkeypatch.setitem(sys.modules, _CHAT_SERVER, None)
+    del sys.modules[_CHAT_SERVER]
+    monkeypatch.delattr(vllm_generation_pkg, "chat_server", raising=False)
     for name in (
         "vllm",
         "vllm.entrypoints",
@@ -677,11 +685,9 @@ def test_prefix_overflow_precedes_media_validation(
     monkeypatch.setattr(
         VllmAsyncGenerationWorkerImpl, "_capture_request_media", capture
     )
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async.remap_multimodal_placeholders",
-        remap,
-    )
     renderers, _, _ = _build_server(monkeypatch, {}, app=app)
+    # The server module was just imported against the fakes; patch that copy.
+    monkeypatch.setattr(sys.modules[_CHAT_SERVER], "remap_multimodal_placeholders", remap)
     renderer = renderers[0]
     renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
     renderer.model_config = SimpleNamespace(max_model_len=8 if overflows else 16)

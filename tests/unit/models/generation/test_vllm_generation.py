@@ -983,6 +983,14 @@ def skip_fp8_known_failures() -> None:
 
 
 def _install_fake_vllm_openai_modules(monkeypatch):
+    # chat_server imports vLLM at module level: drop the cached copy so the
+    # server is built against these fakes, and restore it afterwards.
+    chat_server = "nemo_rl.models.generation.vllm.chat_server"
+    monkeypatch.setitem(sys.modules, chat_server, None)
+    del sys.modules[chat_server]
+    monkeypatch.delattr(
+        sys.modules["nemo_rl.models.generation.vllm"], "chat_server", raising=False
+    )
     for module_name in (
         "vllm",
         "vllm.entrypoints",
@@ -1634,8 +1642,9 @@ def test_chat_disconnect_releases_capture_queued_for_finalization(
         "vllm.entrypoints.openai.chat_completion.protocol"
     ].ChatCompletionResponse
     serving_chat.create_chat_completion = AsyncMock(return_value=response_type())
+    # The server module was just imported against the fakes; patch that copy.
     monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async."
+        sys.modules["nemo_rl.models.generation.vllm.chat_server"],
         "model_dump_chat_response_with_dynamic_message_fields",
         lambda _response: {"choices": []},
     )
