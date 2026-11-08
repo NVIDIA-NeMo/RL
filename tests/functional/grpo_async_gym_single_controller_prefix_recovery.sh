@@ -170,6 +170,9 @@ COMMON_OVERRIDES=(
     # checks rollout and training-data parity, not learning.
     policy.generation.temperature=1.0
     policy.generation.top_p=0.000001
+    # The trainer replays the top_p filter, so it needs vLLM's logprobs after
+    # that filter (#5006).
+    ++policy.generation.vllm_cfg.logprobs_mode=processed_logprobs
     '~env.nemo_gym.code_gen'
     # Keep each step's prompt membership fixed across runs.
     data.shuffle=false
