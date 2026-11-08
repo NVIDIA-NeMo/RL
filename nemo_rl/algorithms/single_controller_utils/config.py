@@ -689,10 +689,11 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # derived at setup
     # under the run's log dir.
     capture_dir: Optional[str] = None
-    # Generation backend hosting token capture. This is derived from
-    # policy.generation.backend during setup; users should not set it separately.
-    # "dynamo" is the vLLM backend served through Dynamo (policy.generation.dynamo):
-    # the same workers host capture, and NeMo-Gym reaches them through the frontend.
+    # How NeMo-Gym reaches the capture host; derived during setup, users should not
+    # set it. "dynamo" = vLLM served through the Dynamo frontend
+    # (policy.generation.dynamo): same workers and capture code, but Gym's
+    # dynamo_worker handler sends capture fields in nvext, because the frontend
+    # carries only OpenAI fields plus nvext.
     generation_backend: Optional[Literal["vllm", "megatron", "dynamo"]] = None
     # Keep routed_experts out of canonical rows and assemble them on policy
     # workers from strict staged-fragment plans.
