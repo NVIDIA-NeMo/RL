@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Research worker. Native batching/loss logic pinned to main 26e2b802."""
+"""LoGRA policy worker using native Automodel batching and losses."""
 
 import os
 import warnings
@@ -401,7 +401,6 @@ class LoGRAWorkerImpl(AutomodelPolicyWorkerImpl):
                         padding_token_id=self.tokenizer.pad_token_id or 0,
                         autocast_context_factory=self._autocast_context,
                         forward_only=eval_mode,
-                        is_reward_model=self._is_reward_model,
                         allow_flash_attn_args=self.allow_flash_attn_args,
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,

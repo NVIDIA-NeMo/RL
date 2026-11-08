@@ -337,7 +337,6 @@ class CuaUpdate:
                     device_mesh=worker.device_mesh,
                     cp_size=1,
                     padding_token_id=worker.tokenizer.pad_token_id or 0,
-                    is_reward_model=False,
                     allow_flash_attn_args=worker.allow_flash_attn_args,
                 )
                 kwargs = dict(prepared.model_batch)
