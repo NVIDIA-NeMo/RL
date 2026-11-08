@@ -411,7 +411,6 @@ env:
           # Comparison settings
           num_judges_per_comparison: 1
           # The default_principle is specified in resources_servers\dwrl_genrm_compare_pointwise\configs in Gym itself, but you can override it here if you want
-          #default_principle: "Please act as an impartial judge and evaluate the quality of the response provided by an AI assistant to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistant's response, compare the assistant's response with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's response is helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when the user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user rather than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's response when needed. Finally, identify any missing important information in the assistant's response which would be beneficial to include when responding to the user prompt."
           reasoning_bonus: 0.0
           answer_bonus: 0.0
           top_percentile: 0.2

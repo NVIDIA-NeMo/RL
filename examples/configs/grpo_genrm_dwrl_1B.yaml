@@ -504,7 +504,6 @@ data:
 env:
   should_use_nemo_gym: false
   genrm_dwrl:
-    reward_design: rb0
     num_workers: 8
     score_weight: 1.0
     ranking_weight: 1.0

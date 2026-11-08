@@ -1,0 +1,107 @@
+{#- Vanilla GenRM judge template for Gym's genrm_compare + genrm_model servers, which send the conversation followed by
+    `principle` (only when use_principle is on), `response_1` and `response_2` messages. It renders exactly the prompt
+    NeMo-RL trains the GenRM on (examples/run_genrm_pairwise_vlm.py): DWRL_AND_GENRM_PAIRWISE_RUBRIC_TEMPLATE from
+    nemo_rl/data/genrm_prompts.py, with the conversation as flatten_to_single_turn renders it (text content only) and
+    GENRM_PAIRWISE_DEFAULT_PRINCIPLE when no principle is given, in Super 3.5's chat format.
+    NeMo-RL's tests/unit/data/test_genrm_gym_prompt_drift.py checks that the two agree. -#}
+{%- macro strip_prefix(text) -%}
+    {%- if text.lower().startswith('user:') -%}
+        {{- text[5:] | trim -}}
+    {%- elif text.lower().startswith('assistant:') -%}
+        {{- text[10:] | trim -}}
+    {%- elif text.lower().startswith('system:') -%}
+        {{- text[7:] | trim -}}
+    {%- else -%}
+        {{- text -}}
+    {%- endif -%}
+{%- endmacro -%}
+{%- set ns = namespace(context='', principle='', response_1='', response_2='') -%}
+{%- for message in messages -%}
+    {%- if message['role'] == 'system' -%}
+        {%- set ns.context = ns.context + '\n[The Start of the System Prompt for this Conversation]\n' + strip_prefix(message['content']) + '\n[The End of the System Prompt for this Conversation]\n\n' -%}
+    {%- elif message['role'] == 'user' -%}
+        {%- set ns.context = ns.context + 'User: ' + strip_prefix(message['content']) + '\n\n' -%}
+    {%- elif message['role'] == 'assistant' -%}
+        {%- set ns.context = ns.context + 'Assistant: ' + strip_prefix(message['content'].split('</think>')[-1] | trim) + '\n\n' -%}
+    {%- elif message['role'] == 'principle' -%}
+        {%- set ns.principle = message['content'] -%}
+    {%- elif message['role'] == 'response_1' -%}
+        {%- set ns.response_1 = message['content'] -%}
+    {%- elif message['role'] == 'response_2' -%}
+        {%- set ns.response_2 = message['content'] -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- set default_principle -%}
+You will be given one or more evaluation criteria (rubrics).
+Evaluate both responses on EACH criterion individually first, then synthesize an overall judgment.
+Criteria:
+
+1. Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistants' answers, compare both assistants' answers with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistants' answers are helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when the user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user rather than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistants' answers when needed. Finally, identify any missing important information in the assistants' answers which would be beneficial to include when responding to the user prompt.
+{%- endset -%}
+{{- '<|im_start|>system\n<|im_end|>\n<|im_start|>user\n' -}}
+You are an expert evaluation judge specializing in comparative assessment of LLM responses. You are impartial, rigorous, and consistent. Given the conversation context and two assistant responses to the user's latest query, you will follow the evaluation plan and scoring guidelines exactly as written below.
+
+#### Conversation Context ####
+{{ ns.context | trim }}
+
+#### Responses to be Scored ####
+[The Start of Response 1]
+{{ ns.response_1 }}
+[The End of Response 1]
+
+[The Start of Response 2]
+{{ ns.response_2 }}
+[The End of Response 2]
+
+#### Evaluation Plan ####
+{{ ns.principle if ns.principle else default_principle }}
+
+#### Scoring Guidelines ####
+Based on the evaluation plan above, assign scores using these scales:
+
+**Individual Helpfulness Scores (1-5):**
+- 5: Extremely Helpful - Completely aligned with what the user was asking for
+- 4: Mostly Helpful - Generally useful with minor room for improvement
+- 3: Partially Helpful - Misses the overall goal in some way
+- 2: Borderline Unhelpful - Mostly doesn't capture what the user wanted
+- 1: Not Helpful - Completely missed the essence of the request
+
+**Comparative Ranking (1-6):**
+- 1: Response 1 is much better than Response 2
+- 2: Response 1 is better than Response 2
+- 3: Response 1 is slightly better than Response 2
+- 4: Response 2 is slightly better than Response 1
+- 5: Response 2 is better than Response 1
+- 6: Response 2 is much better than Response 1
+
+#### Output Format ####
+First, evaluate each rubric individually. Then synthesize an overall judgment.
+Provide your judgment as JSON:
+```json
+{
+    "rubric_evaluations": [
+        {
+            "rubric_id": 1,
+            "response_1_analysis": "Your analysis of Response 1 for this rubric",
+            "response_2_analysis": "Your analysis of Response 2 for this rubric",
+            "score_1": <1-5>,
+            "score_2": <1-5>,
+            "ranking": <1-6>
+        }
+    ],
+    "overall": {
+        "response_1_analysis": "Your overall analysis of Response 1 considering all rubrics",
+        "response_2_analysis": "Your overall analysis of Response 2 considering all rubrics",
+        "score_1": <1-5>,
+        "score_2": <1-5>,
+        "ranking": <1-6>
+    }
+}
+```{{ '<|im_end|>\n' }}
+{%- if add_generation_prompt -%}
+    {%- if enable_thinking is defined and enable_thinking is false -%}
+        {{- '<|im_start|>assistant\n<think></think>' -}}
+    {%- else -%}
+        {{- '<|im_start|>assistant\n<think>\n' -}}
+    {%- endif -%}
+{%- endif -%}

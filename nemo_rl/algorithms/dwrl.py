@@ -73,6 +73,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn, preference_collate_fn
 from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.genrm_prompts import build_bt_turn
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, VLMMessageLogType
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
@@ -91,6 +92,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym, spinup_nemo_gym_actor
+from nemo_rl.environments.vanilla_genrm_environment import VanillaGenRMConfig, _nothing_to_grade
 from nemo_rl.experience.interfaces import (
     FRONTIER_ORDINAL_KEY,
     NEMO_GYM_ATTEMPT_INDEX_KEY,
@@ -1608,6 +1610,32 @@ def compute_dwrl_weights(
     return misalignment_bcast, omega.view(-1), response_sign.view(-1), adv.view(-1)
 
 
+def env_reward_metrics(
+    env_rewards: torch.Tensor,
+    extra_env_info: list,
+    loss_multiplier: torch.Tensor,
+    parse_failure_penalty: float,
+) -> dict[str, float]:
+    """Metrics of the environment's rewards for the judgments it grades (they are only logged when use_env_rewards is
+    off): how often a judgment's JSON could not be parsed, and the mean reward of the parsed ones, i.e. how close the
+    judgments' own scores are to the ground truth, apart from format failures.
+
+    Samples the environment does not grade are left out: those masked out of the loss, and pointwise samples without a
+    score_1 ground truth (see `_nothing_to_grade`)."""
+    graded = [
+        not _nothing_to_grade({**metadata, "loss_multiplier": float(loss_mx)})
+        for metadata, loss_mx in zip(extra_env_info, loss_multiplier.tolist())
+    ]
+    rewards = env_rewards.float()[torch.tensor(graded, dtype=torch.bool)]
+    if rewards.numel() == 0:
+        return {}
+    parsed = rewards[rewards != parse_failure_penalty]
+    metrics = {"env_parse_failure_rate": 1.0 - parsed.numel() / rewards.numel()}
+    if parsed.numel() > 0:
+        metrics["env_reward_parsed_mean"] = parsed.mean().item()
+    return metrics
+
+
 def build_thought_and_answer_masks(
     seq_len: int,
     input_lengths: torch.Tensor,
@@ -1998,6 +2026,7 @@ def dwrl_train(
                     )
                 
                 # Inject the second user turn for DWRL
+                bt_turn = build_bt_turn(tokenizer, master_config.grpo.dwrl["bt_prompt"])
                 new_msg_log = []
                 for outer in repeated_batch['message_log']:
                     p = []
@@ -2009,9 +2038,7 @@ def dwrl_train(
                         #    pp["generation_logprobs"] = inner["generation_logprobs"]
                         pp = copy.deepcopy(inner)
                         p.append(pp)
-                    px = {"role": "user", "content": master_config.grpo.dwrl["bt_prompt"]}
-                    npx = tokenizer.apply_chat_template([px], tokenize=False, add_generation_prompt=True, add_special_tokens=False, enable_thinking=False)
-                    px['content'] = npx.replace("<|im_start|>system\n<|im_end|>\n", "").replace("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n", "")# + "\n\n</think>\n\n"
+                    px = {"role": "user", "content": bt_turn}
                     px["token_ids"] = tokenizer(text=px['content'], return_tensors="pt")["input_ids"][0]
                     p.append(px)
                     new_msg_log.append(p)
@@ -2197,6 +2224,16 @@ def dwrl_train(
                 memory_tracker.snapshot_start_of_stage("Processing rewards", dir())
                 print("▶ Processing rewards...,", flush=True)
                 with timer.time("reward_calculation"):
+                    # The environment's rewards are replaced by the BT probabilities below (unless use_env_rewards), so
+                    # their metrics are taken here. They are VanillaGenRMEnvironment's, not NeMo-Gym's.
+                    env_metrics = {}
+                    if not should_use_nemo_gym(master_config):
+                        env_metrics = env_reward_metrics(
+                            repeated_batch["total_reward"],
+                            repeated_batch["extra_env_info"],
+                            repeated_batch["loss_multiplier"],
+                            VanillaGenRMConfig(**(master_config.env.get("genrm_dwrl") or {})).parse_failure_penalty,
+                        )
                     # Extract rewards from final_batch
                     final_logprobs = train_data["prev_logprobs"].gather(-1, input_lengths.unsqueeze(-1)).squeeze(-1)
                     bt_probs = final_logprobs.exp()
@@ -2513,6 +2550,7 @@ def dwrl_train(
                     "grad_norm": train_results["grad_norm"].numpy(),
                     "reward": rewards.numpy(),
                     "bt_accuracy": bt_accuracy,
+                    **env_metrics,
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
                     # Add masked advantages tracking metrics (only for valid response tokens)
@@ -2915,6 +2953,7 @@ def validate(
 
         total_rewards = []
         total_rewards_env = []
+        total_loss_multipliers = []  # the metrics below leave out masked rows (e.g. truncated prompts)
         total_lengths = []
         all_message_logs = []  # Collect all message logs
         processed_batches = []
@@ -2923,8 +2962,6 @@ def validate(
             master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
         )
         for batch_idx, val_batch in enumerate(val_dataloader):
-            batch_size = len(val_batch["message_log"])
-            active_indices = torch.arange(batch_size)
             additional_metrics_to_report = dict()
             if batch_idx >= max_batches:
                 break
@@ -3013,6 +3050,7 @@ def validate(
                 )
             
             # need to calculate reward in the DWRL way
+            bt_turn = build_bt_turn(tokenizer, master_config.grpo.dwrl["bt_prompt"])
             new_msg_log = []
             for outer in val_batch['message_log']:
                 p = []
@@ -3024,9 +3062,7 @@ def validate(
                     #    pp["generation_logprobs"] = inner["generation_logprobs"]
                     pp = copy.deepcopy(inner)
                     p.append(pp)
-                px = {"role": "user", "content": master_config.grpo.dwrl["bt_prompt"]}
-                npx = tokenizer.apply_chat_template([px], tokenize=False, add_generation_prompt=True, add_special_tokens=False, enable_thinking=False)
-                px['content'] = npx.replace("<|im_start|>system\n<|im_end|>\n", "").replace("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n", "")# + "\n\n</think>\n\n"
+                px = {"role": "user", "content": bt_turn}
                 px["token_ids"] = tokenizer(text=px['content'], return_tensors="pt")["input_ids"][0]
                 p.append(px)
                 new_msg_log.append(p)
@@ -3064,6 +3100,7 @@ def validate(
 
             total_rewards.extend(actual_rewards.exp().tolist())
             total_rewards_env.extend(val_batch["total_reward"].tolist())
+            total_loss_multipliers.extend(torch.as_tensor(val_batch["loss_multiplier"]).tolist())
             total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
 
             # Collect message logs for later display
@@ -3077,40 +3114,49 @@ def validate(
             all_message_logs.extend(to_env)
             
             val_batch['rewards'] = actual_rewards.exp().cpu().tolist()
-            for sub_idx in active_indices.split(2):
-                sub = val_batch.select_indices(sub_idx)
-                processed_batches.append(sub)
-                
+            processed_batches.append(val_batch)
+
+        # Each batch's rows are laid out [pair, chosen/rejected, generation]: preference_collate_fn interleaves every
+        # pair's chosen and rejected rows, and repeat_interleave then repeats each row k times in place (the layout
+        # training's compute_dwrl_weights relies on). Chosen generation i is compared with rejected generation i, as
+        # training's bt_accuracy does.
+        k = val_num_generations_per_prompt
         results = []
+        pass_k_hits = []
         for pb in processed_batches:
-            assert len(set(pb['idx'])) == 1, "ID check failed"
-            assert len(pb['message_log']) == 2, "wrong length, should be 2"
-            assert pb["extra_env_info"][0]["preference"] == pb["extra_env_info"][-1]["preference"], "mismatched preference scores"
+            num_rows = len(pb['message_log'])
+            assert num_rows % (2 * k) == 0, f"wrong length {num_rows}, should be a multiple of 2 * val_num_generations_per_prompt"
+            preferences = [eei["preference"] for eei in pb["extra_env_info"]]
+            for start in range(0, num_rows, 2 * k):
+                assert len(set(pb['idx'][start:start + 2 * k])) == 1, "ID check failed"
+                assert all(p == preferences[start] for p in preferences[start:start + 2 * k]), "mismatched preference scores"
 
-            score_1 = pb['rewards'][0]
-            score_2 = pb['rewards'][-1]
-            
-            results.append( int(score_1 > score_2) )
+            probs = torch.tensor(pb['rewards'], dtype=torch.float64).view(-1, 2, k)
+            # a pair's generation counts only if both its chosen and rejected rows are unmasked (a masked row, e.g. a
+            # truncated prompt, has a junk verdict)
+            unmasked = torch.as_tensor(pb["loss_multiplier"]).view(-1, 2, k).bool().all(dim=1)  # [pair, generation]
+            wins = probs[:, 0, :] > probs[:, 1, :]  # [pair, generation]
+            results.extend(wins[unmasked].int().tolist())
+            pass_k_hits.extend((wins & unmasked).any(dim=1)[unmasked.any(dim=1)].int().tolist())
 
-        # Calculate validation metrics. accuracy is the mean reward over all
-        # rollouts; grouped validation (val_num_generations_per_prompt > 1)
-        # additionally reports pass@k over each prompt's k rollouts as pass_k.
+        # Calculate validation metrics. accuracy is the fraction of (chosen, rejected) generation pairs where the chosen
+        # response gets the higher P(score_token); grouped validation (val_num_generations_per_prompt > 1)
+        # additionally reports as pass_k the fraction of pairs where at least one of the k generations does.
         num_samples = len(total_rewards)
         pass_k = None
+        loss_mask = torch.tensor(total_loss_multipliers, dtype=torch.float32)
         if num_samples > 0:
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
-            reward_accuracy = rewards_t.mean().item()
+            reward_accuracy = ((rewards_t * loss_mask).sum() / loss_mask.sum().clamp(min=1)).item()
             if val_num_generations_per_prompt > 1:
                 assert num_samples % val_num_generations_per_prompt == 0, (
                     "Validation rewards must be divisible by "
                     "grpo.val_num_generations_per_prompt"
                 )
                 pass_k = (
-                    (rewards_t.view(-1, val_num_generations_per_prompt) > 0)
-                    .any(dim=1)
-                    .float()
-                    .mean()
-                    .item()
+                    torch.tensor(pass_k_hits, dtype=torch.float32).mean().item()
+                    if pass_k_hits
+                    else 0.0
                 )
         else:
             reward_accuracy = 0.0
@@ -3118,7 +3164,7 @@ def validate(
         num_samples_env = len(total_rewards_env)
         if num_samples_env > 0:
             rewards_t_env = torch.tensor(total_rewards_env, dtype=torch.float32)
-            rewards_env = rewards_t_env.mean().item()
+            rewards_env = ((rewards_t_env * loss_mask).sum() / loss_mask.sum().clamp(min=1)).item()
         else:
             rewards_env = 0.0
             

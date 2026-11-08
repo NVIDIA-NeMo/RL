@@ -1,10 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-from typing import Any, Optional
-
-from datasets import Dataset, load_dataset, concatenate_datasets
-from nemo_rl.data.interfaces import TaskDataSpec
-#from examples.prompts.genrm import GENRM_PROMPT_TEMPLATE 
+from typing import Any
+from datasets import Dataset, load_dataset
 import json
 import itertools
 import numpy as np
@@ -16,99 +13,6 @@ import pathlib
 import base64
 
 random.seed(42)
-   
-   
-GENRM_PROMPT_TEMPLATE = """You are a skilled little expert at scoring responses. You should evaluate given responses based on the given judging criteria.
-Given the context of the conversation (the last turn is the User's query) and one or two responses from the Assistant, you need to refer to the [Helpfulness Scoring Guidelines] to score each individual response.
-If there are two responses, you need to also give a ranking score based on the [Ranking Scoring Guidelines].
-Before scoring, please analyze step by step. Your scoring needs to be as strict as possible.
-
-[Helpfulness Scoring Guidelines]
-
-When evaluating Helpfulness, consider the following factors:
-
-- Correctness/Completeness: Is the response accurate and complete?
-- Coherence/Clarity: Is the response clear, coherent, and easy to understand?
-- Instruction following: Does the response follow the instructions and fulfill the user's request?
-- Relevance: Is the response relevant to the user's query/input?
-- Level of Detail and Creativity: Does the response provide enough detail without being too verbose? Does it show creativity but not hallucinations?
-
-**Score 5: Extremely Helpful**
-
-- The response is extremely helpful and completely aligned with the spirit of what the prompt was asking for.
-- It accurately acts on the user's request, without unnecessary information.
-- If a user request is not possible/in line with desired model behavior, a helpful response provides useful context and rationale.
-
-**Score 4: Mostly Helpful**
-
-- The response is mostly helpful and mainly aligned with what the user was looking for.
-- There is still some room for improvement, but the response is generally useful.
-
-**Score 3: Partially Helpful**
-
-- The response is partially helpful but misses the overall goal of the user's query/input in some way.
-- The response did not fully satisfy what the user was looking for.
-
-**Score 2: Borderline Unhelpful**
-
-- The response is borderline unhelpful and mostly does not capture what the user was looking for.
-- However, it is still usable and helpful in a small way.
-
-**Score 1: Not Helpful**
-
-- The response is not useful or helpful at all.
-- The response completely missed the essence of what the user wanted.
-
-[Ranking Scoring Guidelines]
-
-Ranking score is used to rank the two responses based on their helpfulness. Even if you give the same individual helpfulness score for both responses, you need to differentiate them strictly.
-The ranking score is a number between 1 and 6, where:
-1 = Response 1 is much better than Response 2
-2 = Response 1 is better than Response 2
-3 = Response 1 is slightly better than Response 2
-4 = Response 2 is slightly better than Response 1
-5 = Response 2 is better than Response 1
-6 = Response 2 is much better than Response 1
-
-#### Conversation Context ####
-{context}
-
-#### Responses to be Scored ####
-{responses}
-
-#### Output Format Requirements ####
-First give your analysis on each responses in the format of:
-[The Begin of Analysis on Response i]
-Analysis on the i-th response
-[The End of Analysis on Response i]
-
-Then give the scores of each response in order, separate by comma in the boxed, adhering this format:
-[The Begin of Individual Scores]
-\\boxed{{x, y}} 
-[The End of Individual Scores]
-
-If there are two responses, give the relative ranking score in the format of:
-[The Begin of Ranking Score]
-\\boxed{{z}} if there exists 2 responses
-[The End of Ranking Score]
-You don't need to give a ranking score if only one response is provided."""
-         
-
-def format_genrm_prompt(context: str, response1: str, response2: Optional[str] = None) -> str:
-    """Format the GenRM prompt with context and responses."""
-    if response2 is None:
-        responses = f"[The Begin of Response 1]\n{response1}\n[The End of Response 1]"
-    else:
-        responses = (
-            f"[The Begin of Response 1]\n{response1}\n[The End of Response 1]\n"
-            f"[The Begin of Response 2]\n{response2}\n[The End of Response 2]\n"
-        )
-    
-    return GENRM_PROMPT_TEMPLATE.format(
-        context=context,
-        responses=responses
-    )
-
 
 
 def format_judgebench_example(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -147,23 +51,21 @@ def format_judgebench_example(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 
     result1 = {
-        "prompt": format_genrm_prompt(context, response1, response2),
         "num_responses": 2,
         "preference": preference,
         "context": context,
-        "response1": response1,
-        "response2": response2,
+        "response_1": response1,
+        "response_2": response2,
         "domain": domain,
         "sample_id": pair_id
     }
     
     result2 = {
-        "prompt": format_genrm_prompt(context, response2, response1),
         "num_responses": 2,
         "preference": 1-preference,
         "context": context,
-        "response1": response2,
-        "response2": response1,
+        "response_1": response2,
+        "response_2": response1,
         "domain": domain,
         "sample_id": pair_id
     }
@@ -203,12 +105,11 @@ def format_rmbench_example(data: dict[str, Any]) -> list[dict[str, Any]]:
                 response2 = chosen_resp
             
             example = {
-                "prompt": format_genrm_prompt(context, response1, response2),
                 "num_responses": 2,
                 "preference": preference,
                 "context": context,
-                "response1": response1,
-                "response2": response2,
+                "response_1": response1,
+                "response_2": response2,
                 "domain": domain,
                 "sample_id": sample_id,
                 "chosen_style_idx": i,  # 0=concise, 1=detailed_plain, 2=detailed_markdown
@@ -247,12 +148,11 @@ def format_rewardbench2_example(data: dict[str, Any]) -> list[dict[str, Any]]:
                 response2 = chosen_responses[0]
                     
             example = {
-                "prompt": format_genrm_prompt(context, response1, response2),
                 "num_responses": 2,
                 "preference": preference,
                 "context": context,
-                "response1": response1,
-                "response2": response2,
+                "response_1": response1,
+                "response_2": response2,
                 "domain": subset,
                 "sample_id": sample_id
             }
@@ -273,12 +173,11 @@ def format_rewardbench2_example(data: dict[str, Any]) -> list[dict[str, Any]]:
                 response2 = c
                     
             example = {
-                "prompt": format_genrm_prompt(context, response1, response2),
                 "num_responses": 2,
                 "preference": preference,
                 "context": context,
-                "response1": response1,
-                "response2": response2,
+                "response_1": response1,
+                "response_2": response2,
                 "domain": subset,
                 "sample_id": sample_id
             }
@@ -338,12 +237,11 @@ def format_rewardbench_example(data: dict[str, Any]) -> list[dict[str, Any]]:
     }  
 
     example = {
-        "prompt": format_genrm_prompt(context, response1, response2),
         "num_responses": 2,
         "preference": preference,
         "context": context,
-        "response1": response1,
-        "response2": response2,
+        "response_1": response1,
+        "response_2": response2,
         "domain": domain_map[subset],
         "sample_id": sample_id
     }
@@ -394,12 +292,11 @@ def format_rmb_example(data: dict[str, Any]) -> list[dict[str, Any]]:
                 response2 = chosen_resp
             
             example = {
-                "prompt": format_genrm_prompt(context, response1, response2),
                 "num_responses": 2,
                 "preference": preference,
                 "context": context,
-                "response1": response1,
-                "response2": response2,
+                "response_1": response1,
+                "response_2": response2,
                 "category_path": category_path,
                 "domain": domain,
                 "sample_id": sample_id,
@@ -550,7 +447,7 @@ def encode_non_text_input_data(turns, media_dir: pathlib.Path=None) -> None:
                     item[item["type"]]["url"] = item[item["type"]]["url"].format(b64=b64)
 
 
-class HelpSteer3LocalDatasetOld(torch.utils.data.Dataset):
+class HelpSteer3LocalDatasetOldOld(torch.utils.data.Dataset):
     """Dataset for loading HelpSteer3 data from local JSONL files."""
     def __init__(self, data_path: str, media_path: str=None, task_name: str="genrm", shuffle_seed: int = -1, split: str="train", max_number: int=-1, double_swap=False):
         data = []
@@ -621,7 +518,7 @@ class HelpSteer3LocalDatasetOld(torch.utils.data.Dataset):
         item["task_name"] = self.task_name
         return item
 
-class HelpSteer3LocalDataset(torch.utils.data.Dataset):
+class HelpSteer3LocalDatasetOld(torch.utils.data.Dataset):
     """Dataset for loading HelpSteer3 data from local JSONL files."""
     def __init__(self, data_path: str, media_path: str=None, task_name: str="genrm", shuffle_seed: int = -1, split: str="train", max_number: int=-1, double_swap=False):
         data = []
@@ -646,23 +543,100 @@ class HelpSteer3LocalDataset(torch.utils.data.Dataset):
                     "response1": one["response_1"],
                     "response2": one["response_2"],
                 }
-                if "principle" in one:
+                if one.get("principle") is not None:
                     example["principle"] = one["principle"]
                 examples.append(example)
 
                 if double_swap:
                     example = {
                         "num_responses": 2,
-                        "helpfulness_1": gt_overall["score_1"],
-                        "helpfulness_2": gt_overall["score_2"],
+                        "helpfulness_1": gt_overall["score_2"],
+                        "helpfulness_2": gt_overall["score_1"],
                         "preference": 1 - preference, 
                         "preference_ranking": 7 - gt_overall["ranking"],
                         "context": one["responses_create_params"]["input"],
                         "response1": one["response_2"],
                         "response2": one["response_1"],
                     }
-                    if "principle" in one:
+                    if one.get("principle") is not None:
                         example["principle"] = one["principle"]
+                    examples.append(example)
+
+                if split == "validation":
+                    data.append(random.choice(examples))
+                else:
+                    data += examples
+        
+        if shuffle_seed != -1:
+            rng = np.random.default_rng(shuffle_seed)
+            rng.shuffle(data)
+            print(f"Shuffled the dataset with {len(data)} samples using seed {shuffle_seed}")
+
+        if max_number != -1:
+            data = data[:max_number]
+            
+        #self.data = Dataset.from_list(data)
+        self.data = data
+        self.formatted_ds = self.data
+        self.task_name = task_name
+
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        # Add task_name for compatibility with AllTaskProcessedDataset
+        item = self.data[idx].copy()
+        item["task_name"] = self.task_name
+        return item
+
+class HelpSteer3LocalDataset(torch.utils.data.Dataset):
+    """Dataset for loading HelpSteer3 data from local JSONL files."""
+    def __init__(self, data_path: str, media_path: str=None, task_name: str="genrm", shuffle_seed: int = -1, split: str="train", max_number: int=-1, double_swap=False):
+        data = []
+        if media_path is not None:
+            media_path = pathlib.Path(media_path)
+        with open(data_path, 'r', encoding='utf_8') as f:
+            for line in f:
+                one = json.loads(line)
+                examples = []
+                
+                gt_overall = one.get("ground_truth_overall")
+                gt_rubrics = one.get("ground_truth_rubric_scores")
+                preference = 0 if gt_overall["ranking"] <= 3 else 1
+                encode_non_text_input_data(one["responses_create_params"]["input"], media_path)
+
+                example = {
+                    "num_responses": 2,
+                    "context": one["responses_create_params"]["input"],
+                    "response_1": one["response_1"],
+                    "response_2": one["response_2"],
+                    "preference": preference,
+                    "ground_truth_overall": gt_overall,
+                }
+                # need to do it like this because downstream runners call principle = datum_dict.get("principle", DEFAULT_PRINCIPLE)
+                if one.get("principle") is not None:
+                    example["principle"] = one["principle"]
+                if gt_rubrics is not None:
+                    example["ground_truth_rubric_scores"] = gt_rubrics
+                
+                examples.append(example)
+
+                if double_swap:
+                    example = {
+                        "num_responses": 2,
+                        "context": one["responses_create_params"]["input"],
+                        "response_1": one["response_2"],
+                        "response_2": one["response_1"],
+                        "preference": 1 - preference,
+                    }
+                    # need to do it like this because downstream runners call principle = datum_dict.get("principle", DEFAULT_PRINCIPLE)
+                    if one.get("principle") is not None:
+                        example["principle"] = one["principle"]
+                    if gt_overall is not None:
+                        example["ground_truth_overall"] = {'score_1': gt_overall.get("score_2"), 'score_2': gt_overall.get("score_1"), 'ranking': 7 - gt_overall["ranking"]}
+                    if gt_rubrics is not None:
+                        example["ground_truth_rubric_scores"] = [{'rubric_id': rl['rubric_id'], 'score_1': rl.get("score_2"), 'score_2': rl.get("score_1"), 'ranking': 7 - rl["ranking"]} for rl in gt_rubrics]
+                    
                     examples.append(example)
 
                 if split == "validation":

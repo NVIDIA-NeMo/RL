@@ -1183,23 +1183,28 @@ class DWRLLossFn(LossFunction):
             ratios = curr_logprobs
             ratios_clamped = curr_logprobs
 
-        if self.use_cispo:
-            clip_loss = 2.0 * misalignment.unsqueeze(-1) * advantages * response_sign.unsqueeze(-1) * ratios_clamped.detach() * curr_logprobs
-        else:
-            loss1 = 2.0 * misalignment.unsqueeze(-1) * advantages * response_sign.unsqueeze(-1) * ratios
-            loss2 = 2.0 * misalignment.unsqueeze(-1) * advantages * response_sign.unsqueeze(-1) * ratios_clamped
+        # DWRL's thought advantage: p̂ · s · Ã. Like a GRPO advantage it is positive for a thought that judged correctly
+        # (one leading to "yes" for the chosen response, or to "no" for the rejected one), so it is used exactly as GRPO
+        # uses its advantages below: the loss is its negative, and minimizing it makes those thoughts more likely.
+        pg_advantages = 2.0 * misalignment.unsqueeze(-1) * response_sign.unsqueeze(-1) * advantages
 
-        # Determine which value to use for clipping (max for pessimistic estimate)
-        clip_loss = torch.max(loss1, loss2)
+        if self.use_cispo:
+            clip_loss = -pg_advantages * ratios_clamped.detach() * curr_logprobs
+        else:
+            loss1 = -pg_advantages * ratios
+            loss2 = -pg_advantages * ratios_clamped
+
+            # Determine which value to use for clipping (max for pessimistic estimate)
+            clip_loss = torch.max(loss1, loss2)
 
         # Dual-clipping see https://arxiv.org/pdf/1912.09729
         if self.ratio_clip_c is not None:
             assert self.ratio_clip_c > 1, (
                 f"ratio_clip_c must exceed 1 representing a lower bound of the ratios, got {self.ratio_clip_c}."
             )
-            loss3 = -advantages * self.ratio_clip_c
+            loss3 = -pg_advantages * self.ratio_clip_c
             clip_loss = torch.where(
-                advantages < 0, torch.min(clip_loss, loss3), clip_loss
+                pg_advantages < 0, torch.min(clip_loss, loss3), clip_loss
             )
 
         # -------------------------------------------------------------

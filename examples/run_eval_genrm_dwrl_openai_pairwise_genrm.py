@@ -30,74 +30,17 @@ from nemo_rl.data.datasets.preference_datasets.reward_benchmarks import (
     RewardBench2Dataset,
     HelpSteer3LocalDataset,
 )
+from nemo_rl.data.genrm_prompts import (
+    DWRL_AND_GENRM_PAIRWISE_RUBRIC_TEMPLATE,
+    GENRM_PAIRWISE_DEFAULT_PRINCIPLE,
+    build_openai_judge_content,
+    flatten_to_single_turn,
+)
 
-
-DWRL_PROMPT_TEMPLATE = """You are an expert evaluation judge specializing in comparative assessment of LLM responses. You are impartial, rigorous, and consistent. Given the conversation context and two assistant responses to the user's latest query, you will follow the evaluation plan and scoring guidelines exactly as written below.
-
-#### Conversation Context ####
-{context}
-
-#### Responses to be Scored ####
-[The Start of Response 1]
-{response_1}
-[The End of Response 1]
-
-[The Start of Response 2]
-{response_2}
-[The End of Response 2]
-
-#### Evaluation Plan ####
-{principle}
-
-#### Scoring Guidelines ####
-Based on the evaluation plan above, assign scores using these scales:
-
-**Individual Helpfulness Scores (1-5):**
-- 5: Extremely Helpful - Completely aligned with what the user was asking for
-- 4: Mostly Helpful - Generally useful with minor room for improvement
-- 3: Partially Helpful - Misses the overall goal in some way
-- 2: Borderline Unhelpful - Mostly doesn't capture what the user wanted
-- 1: Not Helpful - Completely missed the essence of the request
-
-**Comparative Ranking (1-6):**
-- 1: Response 1 is much better than Response 2
-- 2: Response 1 is better than Response 2
-- 3: Response 1 is slightly better than Response 2
-- 4: Response 2 is slightly better than Response 1
-- 5: Response 2 is better than Response 1
-- 6: Response 2 is much better than Response 1
-
-#### Output Format ####
-Analyze step by step following the evaluation plan, then provide your judgment as JSON:
-```json
-{{
-    "response_1_analysis": "Your detailed analysis of Response 1 based on the evaluation plan",
-    "response_2_analysis": "Your detailed analysis of Response 2 based on the evaluation plan",
-    "score_1": <1-5>,
-    "score_2": <1-5>,
-    "ranking": <1-6>
-}}
-```"""
-
-DEFAULT_PRINCIPLE = "Please act as an impartial judge and evaluate the quality of the responses provided by two AI assistants to the user prompt. Begin your evaluation by generating your own answer to the prompt. You must provide your answer before judging any answers. When evaluating the assistants' answers, compare both assistants' answers with your answer. You must identify and correct any mistakes or inaccurate information. Then consider if the assistant's answers are helpful, relevant, and concise. Helpful means the answer correctly responds to the prompt or follows the instructions. Note when the user prompt has any ambiguity or more than one interpretation, it is more helpful and appropriate to ask for clarifications or more information from the user rather than providing an answer based on assumptions. Relevant means all parts of the response closely connect or are appropriate to what is being asked. Concise means the response is clear and not verbose or excessive. Then consider the creativity and novelty of the assistant's answers when needed. Finally, identify any missing important information in the assistants' answers which would be beneficial to include when responding to the user prompt."
 
 shared_data = {}
 master_lock = threading.Lock()
 
-
-def flatten_to_single_turn(message_log):
-    ret = ""
-    for idx, message in enumerate(message_log):
-        if message["role"] == "system":
-            ret += "System: " + message["content"].strip() + "\n\n"
-        elif message["role"] == "user":
-            ret += "User: " + message["content"].strip() + "\n\n"
-        elif message["role"] == "assistant":
-            resp_no_thinking1 = re.sub(r"(?i)(?s)(\<think\>)(.*?)(\<\/think\>)", "", message["content"]).strip()
-            resp_no_thinking2 = re.sub(r"(?i)(?s)(.*?)(\<\/think\>)", "", resp_no_thinking1).strip()
-            ret += "Assistant: " + resp_no_thinking2 + "\n\n"
-    
-    return ret.strip()
 
 def get_json_response(response):
     if response is None:
@@ -108,16 +51,18 @@ def get_json_response(response):
     
     try:
         jp = json.loads(re.search(r"(?i)(?s)(\{\n)(.*?)(\n\})", resp_no_thinking2).group(0))
-        return jp
+        # the rubric templates nest the final scores and analyses under "overall"
+        return jp["overall"] if isinstance(jp.get("overall"), dict) else jp
     except:
         return resp_no_thinking2
 
 
 def get_score_from_vllm(samp, resp1, resp2, principle):
     try:
+        prompt_content = build_openai_judge_content(DWRL_AND_GENRM_PAIRWISE_RUBRIC_TEMPLATE, samp['context'], response_1=resp1, response_2=resp2, principle=principle)
         completion = client.chat.completions.create(
           model="model",
-          messages=[{"role": "user", "content": DWRL_PROMPT_TEMPLATE.format(context=flatten_to_single_turn(samp['context']) if isinstance(samp['context'], list) else samp['context'], response_1=resp1, response_2=resp2, principle=principle)}],
+          messages=[{"role": "user", "content": prompt_content}],
           temperature=args.temperature,
           top_p=args.top_p,
           max_tokens=args.max_tokens,
@@ -137,9 +82,9 @@ def get_score_from_vllm(samp, resp1, resp2, principle):
 
 
 def benchmark_single(samp, idx):
-    response_1 = samp["response1"]
-    response_2 = samp["response2"]
-    principle = samp.get("principle", DEFAULT_PRINCIPLE)
+    response_1 = samp["response_1"]
+    response_2 = samp["response_2"]
+    principle = samp.get("principle", GENRM_PAIRWISE_DEFAULT_PRINCIPLE)
     
     thought = get_score_from_vllm(samp, response_1, response_2, principle)
     json_return = get_json_response(thought)
@@ -158,11 +103,11 @@ def benchmark_single(samp, idx):
     return payload
 
 def benchmark_single_pos_bias(samp, idx):
-    response_1 = samp["response1"]
-    response_2 = samp["response2"]
-    principle = samp.get("principle", DEFAULT_PRINCIPLE)
+    response_1 = samp["response_1"]
+    response_2 = samp["response_2"]
+    principle = samp.get("principle", GENRM_PAIRWISE_DEFAULT_PRINCIPLE)
     
-    samp_key = flatten_to_single_turn(samp['context']) if isinstance(samp['context'], list) else samp['context']
+    samp_key = flatten_to_single_turn(samp['context'])[0] if isinstance(samp['context'], list) else samp['context']
     with master_lock:
         if (samp_key, response_1, response_2) in shared_data:
             json_return1 = shared_data[(samp_key, response_1, response_2)]

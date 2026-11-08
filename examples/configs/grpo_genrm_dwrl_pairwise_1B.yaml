@@ -507,7 +507,6 @@ env:
     num_workers: 8
     score_weight: 1.0
     ranking_weight: 1.0
-    use_binary_reward: false
 
 # Logger configuration
 logger:

@@ -14,7 +14,7 @@ grpo:
   overlong_filtering: false
   advantage_clip_low: null
   advantage_clip_high: null
-  max_val_samples: null
+  max_val_samples: 32
   # Validation rollouts per prompt; k > 1 also reports the pass_k metric.
   # max_val_samples counts PROMPTS: total validation rollouts = max_val_samples * k.
   # must be 1 for DWRL to work properly
@@ -147,7 +147,7 @@ policy:
   train_micro_batch_size: 1
   generation_batch_size: 32
   logprob_batch_size: ${policy.train_micro_batch_size}
-  max_total_sequence_length: 8192
+  max_total_sequence_length: 49152
   precision: "bfloat16"
   logprob_chunk_size: null
   offload_optimizer_for_logprob: false
@@ -328,7 +328,8 @@ policy:
     port_range_low: 3000
     port_range_high: 4999
     backend: "vllm"
-    max_new_tokens: ${policy.max_total_sequence_length}
+    # Set this and policy.max_total_sequence_length; data.max_input_seq_length is derived from them (see data below)
+    max_new_tokens: 16384
     temperature: 1.0
     top_p: 1.0
     top_k: null
@@ -354,11 +355,10 @@ policy:
       vllm_metrics_logger_interval: 0.5
       expose_http_server: true
       skip_tokenizer_init: false
-      #http_server_serving_chat_kwargs:
-      #  enable_auto_tools: true
-      #  tool_parser: qwen3_coder
-      #  reasoning_parser: nano_v3
-      #reasoning_parser_plugin: nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: true
+        tool_parser: qwen3_coder
+        reasoning_parser: nemotron_v3
 
     vllm_kwargs:
       # Use the Super branch's pinned vLLM/FlashInfer serving backend. This
@@ -384,7 +384,9 @@ policy:
 
 # Data configuration
 data:
-  max_input_seq_length: ${policy.max_total_sequence_length} # upper bound, real truncation occurs at vllm.max_model_len
+  # Longer prompts are masked out. max_total_sequence_length - max_new_tokens - 64: the 64 tokens leave room for DWRL's
+  # stage 2 (BT turn + score token, ~35 tokens) after a full-length generation, inside the sequence packing bin
+  max_input_seq_length: ${add:${add:${policy.max_total_sequence_length},${mul:${policy.generation.max_new_tokens},-1}},-64}
   shuffle: true
   num_workers: 1
 
@@ -408,7 +410,6 @@ data:
 env:
   should_use_nemo_gym: false
   genrm_dwrl:
-    reward_design: rb0
     num_workers: 8
     score_weight: 1.0
     ranking_weight: 1.0

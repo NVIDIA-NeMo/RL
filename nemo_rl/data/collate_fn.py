@@ -183,7 +183,8 @@ def preference_collate_fn(
         loss_multiplier.extend([datum_spec["loss_multiplier"]] * 2)
         idx.extend([datum_spec["idx"]] * 2)
         task_names.extend([datum_spec.get("task_name", None)] * 2)
-        extra_env_infos.extend([datum_spec["extra_env_info"], datum_spec["extra_env_info"]])
+        # A processor can give the rejected row its own extra_env_info (DWRL pointwise: per-response ground truth)
+        extra_env_infos.extend([datum_spec.get("extra_env_info"), datum_spec.get("extra_env_info_rejected", datum_spec.get("extra_env_info"))])
     length_batch: torch.Tensor = torch.tensor(length)
     loss_multiplier_batch: torch.Tensor = torch.tensor(loss_multiplier)
 

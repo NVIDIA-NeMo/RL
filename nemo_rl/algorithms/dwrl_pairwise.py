@@ -73,6 +73,7 @@ from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn, preference_collate_fn
 from nemo_rl.data.dataloader import MultipleDataloaderWrapper
 from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.genrm_prompts import build_bt_turn
 from nemo_rl.data.interfaces import DatumSpec, LLMMessageLogType, VLMMessageLogType
 from nemo_rl.data.llm_message_utils import (
     batched_message_log_to_flat_message,
@@ -645,6 +646,7 @@ def dwrl_train_pairwise(
                     )
                 
                 # Inject the second user turn for DWRL
+                bt_turn = build_bt_turn(tokenizer, master_config.grpo.dwrl["bt_prompt"])
                 new_msg_log = []
                 for outer in repeated_batch['message_log']:
                     p = []
@@ -656,9 +658,7 @@ def dwrl_train_pairwise(
                         #    pp["generation_logprobs"] = inner["generation_logprobs"]
                         pp = copy.deepcopy(inner)
                         p.append(pp)
-                    px = {"role": "user", "content": master_config.grpo.dwrl["bt_prompt"]}
-                    npx = tokenizer.apply_chat_template([px], tokenize=False, add_generation_prompt=True, add_special_tokens=False, enable_thinking=False)
-                    px['content'] = npx.replace("<|im_start|>system\n<|im_end|>\n", "").replace("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n", "")# + "\n\n</think>\n\n"
+                    px = {"role": "user", "content": bt_turn}
                     px["token_ids"] = tokenizer(text=px['content'], return_tensors="pt")["input_ids"][0]
                     p.append(px)
                     new_msg_log.append(p)
@@ -971,7 +971,10 @@ def dwrl_train_pairwise(
                     sample_mask = repeated_batch_2["loss_multiplier"]
                     gt = torch.tensor([x['preference'] for x in train_data['metadata']], dtype=torch.int16, device=final_logprobs.device)
                     if sample_mask.sum() > 0:
-                        bt_accuracy = (torch.where(final_logprobs.detach().exp() >= 0.5, 0, 1) == gt).sum().item() / sample_mask.sum().item()
+                        # Count only unmasked rows in the numerator too: masked rows (e.g. truncated prompts) still get a
+                        # verdict, and counting theirs over the unmasked total inflates the accuracy, even past 1.0
+                        correct = (torch.where(final_logprobs.detach().exp() >= 0.5, 0, 1) == gt).float()
+                        bt_accuracy = (correct * sample_mask.to(correct.device)).sum().item() / sample_mask.sum().item()
                     else:
                         bt_accuracy = 0.0
                     
@@ -1001,7 +1004,7 @@ def dwrl_train_pairwise(
                     token_mask = train_data["token_mask"]
                     sample_mask = train_data["sample_mask"]
                     mask = token_mask * sample_mask.unsqueeze(-1)
-                    if not master_config.grpo.dwrl.get("use_env_rewards", True):
+                    if not master_config.grpo.dwrl.get("use_env_rewards", False):
                         final_probs = final_logprobs.detach().exp()
                         rewards = torch.where(gt.bool(), 1.0 - final_probs, final_probs)
 
@@ -1552,6 +1555,7 @@ def validate(
 
         total_rewards = []
         bt_probs = []
+        total_loss_multipliers = []  # the metrics below leave out masked rows (e.g. truncated prompts)
         total_lengths = []
         all_message_logs = []  # Collect all message logs
         results = []
@@ -1650,6 +1654,7 @@ def validate(
                 )
             
             # need to calculate reward in the DWRL way
+            bt_turn = build_bt_turn(tokenizer, master_config.grpo.dwrl["bt_prompt"])
             new_msg_log = []
             for outer in val_batch['message_log']:
                 p = []
@@ -1661,9 +1666,7 @@ def validate(
                     #    pp["generation_logprobs"] = inner["generation_logprobs"]
                     pp = copy.deepcopy(inner)
                     p.append(pp)
-                px = {"role": "user", "content": master_config.grpo.dwrl["bt_prompt"]}
-                npx = tokenizer.apply_chat_template([px], tokenize=False, add_generation_prompt=True, add_special_tokens=False, enable_thinking=False)
-                px['content'] = npx.replace("<|im_start|>system\n<|im_end|>\n", "").replace("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n", "")# + "\n\n</think>\n\n"
+                px = {"role": "user", "content": bt_turn}
                 px["token_ids"] = tokenizer(text=px['content'], return_tensors="pt")["input_ids"][0]
                 p.append(px)
                 new_msg_log.append(p)
@@ -1713,9 +1716,13 @@ def validate(
 
             all_message_logs.extend(to_env)
             
-            for eei, pred in zip(val_batch["extra_env_info"], actual_rewards.exp().cpu().tolist()):
+            loss_multipliers = torch.as_tensor(val_batch["loss_multiplier"]).tolist()
+            total_loss_multipliers.extend(loss_multipliers)
+            for eei, pred, loss_mx in zip(val_batch["extra_env_info"], actual_rewards.exp().cpu().tolist(), loss_multipliers):
+                if not loss_mx:  # a masked row (e.g. truncated prompt) has a junk verdict
+                    continue
                 gt = eei["preference"]
-                
+
                 results.append( int((pred >= 0.5 and gt == 0) or (pred < 0.5 and gt == 1)) )
 
         # Calculate validation metrics. accuracy is the mean reward over all
@@ -1723,9 +1730,10 @@ def validate(
         # additionally reports pass@k over each prompt's k rollouts as pass_k.
         num_samples = len(total_rewards)
         pass_k = None
+        loss_mask = torch.tensor(total_loss_multipliers, dtype=torch.float32)
         if num_samples > 0:
             rewards_t = torch.tensor(total_rewards, dtype=torch.float32)
-            rewards_mean = rewards_t.mean().item()
+            rewards_mean = ((rewards_t * loss_mask).sum() / loss_mask.sum().clamp(min=1)).item()
             if val_num_generations_per_prompt > 1:
                 assert num_samples % val_num_generations_per_prompt == 0, (
                     "Validation rewards must be divisible by "
@@ -1744,7 +1752,7 @@ def validate(
         num_samples_env = len(bt_probs)
         if num_samples_env > 0:
             bt_probs_t = torch.tensor(bt_probs, dtype=torch.float32)
-            bt_probs_mean = bt_probs_t.mean().item()
+            bt_probs_mean = ((bt_probs_t * loss_mask).sum() / loss_mask.sum().clamp(min=1)).item()
         else:
             bt_probs_mean = 0.0
             
