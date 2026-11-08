@@ -217,7 +217,7 @@ def main() -> None:
     paths = [
         path
         for path in paths
-        if re.search(r"train step \d+/300", path.read_text(errors="replace"))
+        if re.search(r"train step \d+/(?:300|600)\b", path.read_text(errors="replace"))
     ]
     records = [row for path in paths for row in committed_log_rows(path)]
     series[STREAM_LABEL] = merge_records(records)
@@ -249,7 +249,7 @@ def main() -> None:
         "metrics": {},
         "notes": [
             "Raw curves and trailing 10 optimizer-step means; one seed per run, no uncertainty estimate.",
-            "Baseline-only future steps are shaded; summaries use only the shared observed steps.",
+            "Steps outside shared observed coverage are shaded; absent series are not extrapolated and summaries use only shared steps.",
             "Step time includes measured checkpoint/first-step overhead; excludes queue/setup time outside the step.",
             "Policy KL uses a logarithmic y-axis so baseline spikes do not flatten normal variation.",
             "Historical baselines: same model, data recipe, batch and resources; not a controlled same-image A/B.",
@@ -306,9 +306,9 @@ def main() -> None:
         ax.set(title=title, ylabel=ylabel, xlim=(1, args.max_step))
         ax.grid(alpha=0.22)
         ax.spines[["top", "right"]].set_visible(False)
-        if last_stream_step < args.max_step:
-            ax.axvspan(last_stream_step, args.max_step, color="#808080", alpha=0.07)
-            ax.axvline(last_stream_step, color="#777777", linestyle=":", linewidth=0.9)
+        if common_last < args.max_step:
+            ax.axvspan(common_last, args.max_step, color="#808080", alpha=0.07)
+            ax.axvline(common_last, color="#777777", linestyle=":", linewidth=0.9)
         if metric == "train/policy_kl_error":
             if any(
                 min(metric_values(rows, metric, first=1, last=args.max_step).values())
@@ -336,15 +336,15 @@ def main() -> None:
     )
     fig.suptitle(
         f"Qwen3.5-35B-A3B: synchronous / full-batch LA0 / streaming LA0\n"
-        f"8 prompts x 4 responses | 24 H100 (16 training + 8 rollout) | streaming {last_stream_step}/300",
+        f"8 prompts x 4 responses | 24 H100 (16 training + 8 rollout) | streaming {last_stream_step}/{args.max_step}",
         fontsize=15,
         y=0.995,
     )
     fig.text(
         0.5,
         0.018,
-        f"Faint: raw values. Solid: trailing 10-step means. Shaded: baseline only. Snapshot {generated}.\n"
-        "Historical baselines; single seed. Step time excludes queue waits. Streaming numerical qualification remains incomplete.",
+        f"Faint: raw values. Solid: trailing 10-step means. Shaded: outside shared coverage (1..{common_last}). Snapshot {generated}.\n"
+        "Historical baselines; single seed. Step time excludes queue waits. Original 1% BF16 gradient gate remains FAILED.",
         ha="center",
         fontsize=9,
         color="#555555",

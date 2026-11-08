@@ -1,8 +1,23 @@
 # Streaming KL/performance investigation handoff
 
 User authorized completing same-checkpoint/same-rollout KL, numerical state and
-fixed-workload/actual-overlap diagnosis. The separate300-step run is complete;
-preserve checkpoint300 and do not launch a continuation.
+fixed-workload/actual-overlap diagnosis. The original300-step run completed;
+on2026-11-08 the user explicitly authorized continuing it to600. Preserve the
+protected300snapshot; the earlier no-continuation instruction is superseded.
+
+Latest2026-11-08 06:46PST: continue ORIGINALstreamingLA0 to600, not another
+diagnostic. Read ../RESUME600.md and session_state.md latest section. Same
+model/LA0/24H100/image1030/W&B id yuekaiz5090explorela0s42, numericalworker
+unchanged. Resumejobs21509383->21509384->21509385->21509386; firstRUNNING on
+pool0-[00139,00585,01164], othersDependency. ActualYAMLtarget600 and dataloader/
+weightrestorefromstep300verified; first301commitstillpending. Protected300
+hardlinks at ../results/resume600-source/step_300; originalpin210unchanged.
+Monitor uv2448041/python2448158 polls10min and resumesTHISthread; source
+session/20261105_pr3_design/monitor_resume600.py. Runtime filesunder
+../slurm/resume600-monitor, readlateststatus/logs. Code+recipecommit2a9ec1e77
+pushed; docs/600plot-loader updatefollow. DoNOTstartold900/MCore/siblingtasks
+or repeat completedKLdiagnostics. OriginalBF161%gateFAILED remainsunchanged;
+continuationisexploratory. Historicalstatusbelowdoesnotoverridenewuserrequest.
 
 Latest verified2026-11-06 07:34PST (supersedes all historical status below):
 

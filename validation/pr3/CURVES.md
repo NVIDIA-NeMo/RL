@@ -5,8 +5,8 @@ policy_kl_error, policy loss, approximate entropy, preclip gradient norm and
 step time. Faint lines are raw values; solid lines are trailing 10-step means.
 Policy KL uses a logarithmic y-axis to retain spikes while keeping the usual
 range readable. All other panels use linear axes.
-The plot stops the streaming series at its latest committed optimizer step;
-shading marks the remaining steps for which only historical baselines exist.
+The plot stops each series at its latest committed optimizer step. Shading marks
+steps beyond shared observed coverage; absent series are never extrapolated.
 
 Runs:
 
@@ -65,3 +65,10 @@ The generated-token workloads differ. Similar measured step time therefore
 does not demonstrate streaming speedup, and the higher observed reward is not
 a multi-seed convergence claim. See kl_replay/ for the separate fixed-checkpoint,
 same-real-rollout diagnosis; the original1% BF16 gradient gate remains failed.
+
+The same exploratory run was authorized to continue300->600 on2026-11-08.
+The loader merges original /300 and resumed /600 commit receipts. Once600 is
+durable, pass `--max-step 600` to plot_comparison.sh.
+Baseline coverage is taken from actual fetched records; shared-window statistics
+stop at the shortest series. The existing300-step snapshot remains historical
+until a fresh plot is generated. See RESUME600.md for the active job chain.

@@ -1,5 +1,5 @@
 {
-  "observed_at": "2026-11-05T05:11:00-08:00",
+  "observed_at": "2026-11-08T06:48:54-08:00",
   "code_and_recipes_commit": "ad5582855",
   "image": "containers/nemo_rl.1030.sqsh",
   "qualification": {
@@ -10,7 +10,12 @@
     "reason": "first token-level gradient comparison exceeded declared 1% relativeL2 and some cosine limits"
   },
   "streaming_la0": {
-    "segment_job_ids": [21330687, 21330688, 21330689, 21330690],
+    "segment_job_ids": [
+      21330687,
+      21330688,
+      21330689,
+      21330690
+    ],
     "nodes": 3,
     "gpus_per_node": 8,
     "target_steps": 300,
@@ -36,32 +41,61 @@
     "original_gradient_gate_still_failed": true
   },
   "exploratory_streaming_la0": {
-    "segment_job_ids": [21331883, 21331884, 21331885, 21331930],
+    "segment_job_ids": [
+      21331883,
+      21331884,
+      21331885,
+      21331930
+    ],
     "source_and_recipe_commit": "1154fbb1f",
     "nodes": 3,
     "gpus_per_node": 8,
-    "target_steps": 300,
-    "state": "COMPLETED",
+    "target_steps": 600,
+    "state": "RUNNING",
     "observed_committed_steps": 300,
     "durable_checkpoint_step": 300,
-    "verified_at": "2026-11-06T06:07:53-08:00",
-    "final_segment_exit_code": "0:0",
+    "verified_at": "2026-11-08T06:48:54-08:00",
     "curve_refresh_job_id": 21389289,
     "same_checkpoint_and_run_id_across_segments": true,
     "original_numerical_qualification_passed": false,
     "wandb_entity": "yuekaiz",
     "wandb_project": "nemo-rl-automodel-sc",
     "wandb_run_id": "yuekaiz5090explorela0s42",
-    "wandb_url": "https://wandb.ai/yuekaiz/nemo-rl-automodel-sc/runs/yuekaiz5090explorela0s42"
+    "wandb_url": "https://wandb.ai/yuekaiz/nemo-rl-automodel-sc/runs/yuekaiz5090explorela0s42",
+    "initial_target_steps": 300,
+    "resume_from_checkpoint": 300,
+    "resume600_segment_job_ids": [
+      21509383,
+      21509384,
+      21509385,
+      21509386
+    ],
+    "resume600_recipe": "validation/pr3/streaming_qwen35_exploratory_600.yaml",
+    "resume600_code_commit": "2a9ec1e77",
+    "checkpoint300_pin": "validation/pr3/results/resume600-source/step_300",
+    "initial_300_final_segment_exit_code": "0:0",
+    "startup_verified": [
+      "YAML target600",
+      "step300 weights on16workers",
+      "step300 data-loader/TQ/recovery restore",
+      "same W&B run resumed online"
+    ]
   },
   "previous_attempts": [
     {
       "qualification_job_id": 21329914,
       "result": "launcher failed before model initialization: Ray task did not inherit PR3_PYTHON",
       "fix_commit": "ad5582855",
-      "blocked_training_jobs_cancelled": [21330508, 21330509, 21330510, 21330511]
+      "blocked_training_jobs_cancelled": [
+        21330508,
+        21330509,
+        21330510,
+        21330511
+      ]
     }
   ],
   "status_log": "validation/pr3/slurm/watch.log",
-  "failure_marker": "validation/pr3/slurm/FAILURE_DETECTED"
+  "failure_marker": "validation/pr3/slurm/FAILURE_DETECTED",
+  "initial_code_and_recipes_commit": "ad5582855",
+  "latest_resume_code_commit": "2a9ec1e77"
 }
