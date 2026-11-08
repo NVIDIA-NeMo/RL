@@ -4276,21 +4276,7 @@ def test_master_config_reports_the_reward_scaling_field_path(
 
 
 class TestRewardShapingValidation:
-    """``_validate_reward_shaping`` rejects at startup, not one rollout in.
-
-    The advantage stage applies the block, so it is supported -- but
-    ``apply_reward_shaping`` only rejects a bad one at the first advantage
-    call, a whole round of rollouts and logprobs later. Every check mirrors one
-    there, so these cover the accepting side too: a check stricter than the one
-    it mirrors would reject configs that work, which is harder to notice than a
-    missing check.
-
-    ``_validate_reward_shaping`` takes the shaping block rather than the master
-    config, so the surrounding algorithm block cannot change what it accepts
-    and GRPO alone covers the boundaries. That a PPO run reaches it at all is
-    covered by ``test_accepts_dapo_reward_shaping_on_a_ppo_run`` in
-    test_ppo_setup.py, which is where the PPO config fixture lives.
-    """
+    """SC revalidates shaping settings modified after model construction."""
 
     @staticmethod
     def _dapo_config() -> MasterConfig:
@@ -4305,6 +4291,42 @@ class TestRewardShapingValidation:
 
     def test_accepts_a_complete_dapo_block(self):
         validate_single_controller_config(self._dapo_config())
+
+    @pytest.mark.parametrize("max_response_length", [256, 512, 1024])
+    def test_warns_when_the_buffer_covers_the_response_length(
+        self, max_response_length: int, recwarn: pytest.WarningsRecorder
+    ) -> None:
+        config = self._dapo_config()
+        config.grpo.reward_shaping.max_response_length = max_response_length
+
+        validate_single_controller_config(config)
+
+        assert len(recwarn) == int(max_response_length <= 512)
+        if recwarn:
+            message = str(recwarn[0].message)
+            assert (
+                f"reward_shaping.max_response_length={max_response_length}" in message
+            )
+            assert "reward_shaping.overlong_buffer_length=512" in message
+
+    @pytest.mark.parametrize(
+        ("enabled", "stop_properly_penalty_coef"), [(False, None), (True, 0.5)]
+    )
+    def test_ignored_dapo_lengths_do_not_warn(
+        self,
+        enabled: bool,
+        stop_properly_penalty_coef: float | None,
+        recwarn: pytest.WarningsRecorder,
+    ) -> None:
+        config = self._dapo_config()
+        shaping = config.grpo.reward_shaping
+        shaping.enabled = enabled
+        shaping.stop_properly_penalty_coef = stop_properly_penalty_coef
+        shaping.max_response_length = 256
+
+        validate_single_controller_config(config)
+
+        assert not recwarn
 
     def test_accepts_the_stop_properly_mode_without_the_dapo_trio(self):
         """It short-circuits before the DAPO block, so the three are not read."""

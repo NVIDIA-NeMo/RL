@@ -27,6 +27,7 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
+    GeneralizedAdvantageEstimator,
     GRPOAdvantageEstimator,
     OPDAdvantageEstimator,
 )
@@ -38,6 +39,7 @@ from nemo_rl.algorithms.grpo import (
 )
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import REWARD_KEY
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
@@ -922,6 +924,33 @@ def test_token_mask_sum_is_the_response_token_length() -> None:
     assert token_loss_mask_total == 5
 
 
+def _run_ppo_stage(store: _RowStore, algo: PPOConfig) -> dict[str, torch.Tensor]:
+    """Run the shared advantage stage with PPO's real GAE estimator."""
+    computer = AdvantageComputer(
+        store,
+        config=_config(algo=algo, is_ppo=True, shardable=False),
+        advantage_estimator=GeneralizedAdvantageEstimator(
+            algo.adv_estimator, ClippedPGLossConfig()
+        ),
+    )
+    asyncio.run(computer.run(AdvantageRequest(meta=_pool_meta())))
+    return {
+        name: torch.stack(
+            [store.rows[f"s{i}"][name] for i in range(NUM_GROUPS * GROUP_SIZE)]
+        )
+        for name in ("advantages", "returns")
+    }
+
+
+def _ppo_rows(lengths: Sequence[int]) -> dict[str, dict[str, torch.Tensor]]:
+    """Give every comparison arm the same response lengths and critic values."""
+    rows = _rows_with_response_lengths(lengths)
+    generator = torch.Generator().manual_seed(1)
+    for row in rows.values():
+        row["values"] = torch.rand(SEQ, generator=generator)
+    return rows
+
+
 class TestRewardShaping:
     """DAPO overlong shaping on the SC path, and where it is applied.
 
@@ -946,6 +975,39 @@ class TestRewardShaping:
             [min(-(length - 2) / 2 * 1, 0) for length in self.LENGTHS],
             dtype=torch.float32,
         )
+
+    @pytest.mark.parametrize("scaling_enabled", [False, True])
+    def test_ppo_gae_sees_the_shaped_reward(self, scaling_enabled: bool) -> None:
+        scaling = RewardScalingConfig(
+            enabled=scaling_enabled, target_min=-1.0, target_max=1.0
+        )
+        on = _run_ppo_stage(
+            _RowStore(_ppo_rows(self.LENGTHS)),
+            PPOConfig(
+                num_generations_per_prompt=GROUP_SIZE,
+                reward_scaling=scaling,
+                reward_shaping=self.DAPO,
+            ),
+        )
+        pre_rows = _ppo_rows(self.LENGTHS)
+        penalty = self._expected_penalty()
+        for index in range(NUM_GROUPS * GROUP_SIZE):
+            row = pre_rows[f"s{index}"]
+            reward = row["total_reward"].float()
+            if scaling_enabled:
+                reward = 2 * reward - 1
+            row["total_reward"] = reward + penalty[index]
+        pre = _run_ppo_stage(
+            _RowStore(pre_rows), PPOConfig(num_generations_per_prompt=GROUP_SIZE)
+        )
+        off = _run_ppo_stage(
+            _RowStore(_ppo_rows(self.LENGTHS)),
+            PPOConfig(num_generations_per_prompt=GROUP_SIZE, reward_scaling=scaling),
+        )
+
+        for field in ("advantages", "returns"):
+            torch.testing.assert_close(on[field], pre[field])
+            assert not torch.allclose(on[field], off[field])
 
     def test_disabled_leaves_rewards_and_advantages_alone(self) -> None:
         _, advantages, metrics = _run_with_shaping(None, 0, self.LENGTHS)

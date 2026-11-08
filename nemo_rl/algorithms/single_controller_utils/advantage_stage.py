@@ -402,10 +402,9 @@ class AdvantageComputer:
             tensor_field(data, adv_cfg.truncated_field)
         ).bool()
 
-        # After scale_rewards, as v1 orders them: the penalty is subtracted, so
-        # it only means something against the scaled range. token_mask.sum(-1)
-        # is response_token_lengths on payload.py's path only (see
-        # test_token_mask_sum_is_the_response_token_length).
+        # After scale_rewards, as v1 orders them. token_mask.sum(-1) is the
+        # generated-token count on both producers; pinned for payload.py by
+        # test_token_mask_sum_is_the_response_token_length.
         rewards = apply_reward_shaping(
             BatchedDataDict(
                 {
