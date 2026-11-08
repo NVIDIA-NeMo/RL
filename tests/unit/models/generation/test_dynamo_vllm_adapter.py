@@ -100,11 +100,10 @@ def _completion(token_ids, finish_reason=None, index=0, routed_experts=None):
     )
 
 
-def _output(prompt, *completions, prompt_routed_experts=None, prompt_logprobs=None):
+def _output(prompt, *completions, prompt_routed_experts=None):
     return SimpleNamespace(
         prompt_token_ids=prompt,
         num_cached_tokens=0,
-        prompt_logprobs=prompt_logprobs,
         prompt_routed_experts=prompt_routed_experts,
         outputs=list(completions),
     )
