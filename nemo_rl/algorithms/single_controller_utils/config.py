@@ -874,14 +874,9 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
 class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     """Frequent rollout-state snapshots anchored to durable trainer state.
 
-    Rollout snapshots are saved and restored when ``snapshot_attempt_interval_s``
-    is set or when ``rollout_recovery.target_level='turn'``, whose environment
-    state no trainer checkpoint holds. ``snapshot_attempt_interval_s`` attempts
-    one every that many seconds. With turn-level recovery, a snapshot is also
-    saved after the trainer checkpoint ``checkpointing.checkpoint_must_save_by``
-    triggers, before the run stops, and ``snapshot_on_trainer_checkpoint`` saves
-    one after every other trainer checkpoint too. Set it to ``false`` with no
-    interval to save environment state only at that deadline.
+    Rollout snapshots are on when ``snapshot_attempt_interval_s`` is set or with
+    turn-level recovery; see docs/guides/single-controller.md for when they are
+    saved.
 
     A snapshot taken before the first trainer checkpoint is anchored
     to the initial model and a rollout-semantic configuration fingerprint. Later

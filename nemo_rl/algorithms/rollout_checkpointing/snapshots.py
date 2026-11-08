@@ -712,10 +712,6 @@ class RolloutSnapshotter(_UsesRolloutParts):
             self._last_snapshot_mutation_version = snapshot_cut.mutation_version
             self._last_missing_anchor = None
             save_completed = time.monotonic()
-            if self._environment_checkpoint.holds_rollout_state:
-                # The deadline's trainer checkpoint is followed by a snapshot
-                # like this one, so the deadline must leave time for both.
-                self._timeout.save_reserve_seconds = save_completed - save_started
             checkpoint_metrics = {
                 "snapshot_sequence": float(snapshot_sequence),
                 "total_save_seconds": save_completed - save_started,
@@ -842,6 +838,28 @@ class RolloutSnapshotter(_UsesRolloutParts):
             return "gym_unavailable"
         return "invariant_error"
 
+    async def _attempt(self, *, force: bool) -> RolloutCheckpointSaveResult | Exception:
+        """Run and log one snapshot attempt; return a retryable error, raise the rest."""
+        started = time.monotonic()
+        try:
+            result = await self.save_snapshot(force=force)
+        except Exception as error:
+            reason = self._failure_reason(error)
+            self._log_outcome(
+                outcome="failed",
+                reason=reason,
+                attempt_duration_seconds=time.monotonic() - started,
+            )
+            if reason == "invariant_error":
+                raise
+            return error
+        self._log_outcome(
+            outcome="completed" if result.saved else "skipped",
+            reason=result.reason,
+            attempt_duration_seconds=time.monotonic() - started,
+        )
+        return result
+
     def _seconds_until_next_attempt(self) -> Optional[float]:
         """How long the pump waits for a wakeup before attempting anyway.
 
@@ -881,7 +899,6 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 pass
             woken = self._wakeup.is_set()
             self._wakeup.clear()
-            attempt_started = time.monotonic()
             deadline_due = (
                 self._read_progress().train_steps == 0 and self._timeout.would_save()
             )
@@ -893,27 +910,18 @@ class RolloutSnapshotter(_UsesRolloutParts):
             ):
                 # A wait timed for a deadline that the first train step now handles.
                 continue
-            try:
-                result = await self.save_snapshot(force=deadline_due)
-            except Exception as error:
-                failure_reason = self._failure_reason(error)
-                self._log_outcome(
-                    outcome="failed",
-                    reason=failure_reason,
-                    attempt_duration_seconds=time.monotonic() - attempt_started,
-                )
-                if failure_reason == "invariant_error":
-                    raise
+            result = await self._attempt(force=deadline_due)
+            if isinstance(result, Exception):
                 if deadline_due:
                     raise RuntimeError(
                         "failed to save the required pre-step rollout checkpoint"
-                    ) from error
+                    ) from result
                 consecutive_failures += 1
                 print(
                     "Periodic rollout checkpoint failed; retaining the previous "
                     "committed snapshot: "
                     f"consecutive_failures={consecutive_failures}, "
-                    f"{type(error).__name__}: {error}",
+                    f"{type(result).__name__}: {result}",
                     flush=True,
                 )
                 if (
@@ -923,14 +931,9 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     raise RuntimeError(
                         "periodic rollout checkpoint failed "
                         f"{consecutive_failures} consecutive times"
-                    ) from error
+                    ) from result
                 continue
             consecutive_failures = 0
-            self._log_outcome(
-                outcome="completed" if result.saved else "skipped",
-                reason=result.reason,
-                attempt_duration_seconds=time.monotonic() - attempt_started,
-            )
             consecutive_discards = (
                 consecutive_discards + 1
                 if result.reason == "trainer_state_changed"
@@ -957,34 +960,15 @@ class RolloutSnapshotter(_UsesRolloutParts):
             return
         # The pump need not also answer the trainer checkpoint's wakeup.
         self._wakeup.clear()
-        attempt_started = time.monotonic()
-        try:
-            result = await self.save_snapshot(force=True)
-        except Exception as error:
-            failure_reason = self._failure_reason(error)
-            self._log_outcome(
-                outcome="failed",
-                reason=failure_reason,
-                attempt_duration_seconds=time.monotonic() - attempt_started,
-            )
-            if failure_reason == "invariant_error":
-                raise
-            warnings.warn(
-                "rollout snapshot at the checkpoint deadline failed; a restore "
-                "redoes the unfinished turns from the trainer checkpoint: "
-                f"{type(error).__name__}: {error}",
-                stacklevel=2,
-            )
+        outcome = await self._attempt(force=True)
+        if isinstance(outcome, Exception):
+            problem = f"failed: {type(outcome).__name__}: {outcome}"
+        elif not outcome.saved:
+            problem = f"was skipped ({outcome.reason})"
+        else:
             return
-        self._log_outcome(
-            outcome="completed" if result.saved else "skipped",
-            reason=result.reason,
-            attempt_duration_seconds=time.monotonic() - attempt_started,
+        warnings.warn(
+            f"rollout snapshot at the checkpoint deadline {problem}; a restore "
+            "redoes the unfinished turns from the trainer checkpoint",
+            stacklevel=2,
         )
-        if not result.saved:
-            warnings.warn(
-                "rollout snapshot at the checkpoint deadline was skipped "
-                f"({result.reason}); a restore redoes the unfinished turns from "
-                "the trainer checkpoint",
-                stacklevel=2,
-            )

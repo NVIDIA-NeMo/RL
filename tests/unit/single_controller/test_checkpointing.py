@@ -1670,37 +1670,24 @@ class TestSaveTrigger:
         assert trainer.save_calls == []
         assert _step_dir_names(tmp_path / "checkpoints") == set()
 
-    def test_timeout_saves_and_stops_training_early(self, tmp_path):
-        # 0-second budget: the first check_save() fires; the pump must save
-        # at step 1 (off the period boundary) and break out of the loop.
+    @pytest.mark.parametrize("defer_finalize", [False, True])
+    def test_timeout_saves_and_stops_training_early(self, tmp_path, defer_finalize):
+        # 0-second budget: the first check_save() fires; the pump must save at
+        # step 1 (off the period boundary), snapshot rollouts, then stop.
         mc = _actor_master_config(
             tmp_path,
             max_num_steps=4,
             save_period=100,
             checkpoint_must_save_by="00:00:00:00",
+            defer_finalize=defer_finalize,
         )
         trainer = _FakeTrainer()
-
-        actor = _run_train_pump(mc, _make_actor_args(trainer=trainer))
-
-        assert actor._train_steps == 1
-        assert len(trainer.save_calls) == 1
-        assert trainer.save_calls[0]["is_final_checkpoint"] is False
-        assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
-
-    def test_timeout_snapshots_rollouts_before_stopping(self, tmp_path):
-        mc = _actor_master_config(
-            tmp_path,
-            max_num_steps=4,
-            save_period=100,
-            checkpoint_must_save_by="00:00:00:00",
-        )
-        trainer = _FakeTrainer()
-        events: list[str] = []
+        published_at_snapshot: list[set[str]] = []
 
         def _seed(actor) -> None:
             async def _save_at_deadline() -> None:
-                events.append(f"snapshot after step_{actor._train_steps}")
+                await asyncio.to_thread(actor._checkpointer.finalize_pending)
+                published_at_snapshot.append(_step_dir_names(tmp_path / "checkpoints"))
 
             actor._rollout_snapshots.save_at_deadline = _save_at_deadline
 
@@ -1708,7 +1695,10 @@ class TestSaveTrigger:
 
         assert actor._train_steps == 1
         assert len(trainer.save_calls) == 1
-        assert events == ["snapshot after step_1"]
+        assert trainer.save_calls[0]["is_final_checkpoint"] is False
+        # The deadline snapshot runs once, after step_1 is published.
+        assert published_at_snapshot == [{"step_1"}]
+        assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
 
     def test_rollout_exhaustion_saves_final_checkpoint(self, tmp_path):
         # A resumed run can exhaust its data before max_num_steps:
@@ -2101,6 +2091,25 @@ class TestPeriodicRolloutCheckpoint:
             SetupTimingMetrics(),
         )
 
+    def _interval_free_actor(self, tmp_path: Path, timeout=None):
+        """An actor snapshotting only on wakeups or the deadline; records ``force``."""
+        actor = self._actor(tmp_path)
+        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = None
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint()
+        if timeout is not None:
+            actor._timeout = timeout
+        attach_rollout_checkpointing(actor)
+        forced: list[bool] = []
+        attempted = asyncio.Event()
+
+        async def _save(*, force: bool = False) -> RolloutCheckpointSaveResult:
+            forced.append(force)
+            attempted.set()
+            return RolloutCheckpointSaveResult(saved=True, reason="completed")
+
+        actor._rollout_snapshots.save_snapshot = _save
+        return actor, forced, attempted
+
     @pytest.mark.parametrize(
         "changed_setting", [None, "penalty", "effort", "extras", "inactive"]
     )
@@ -2266,8 +2275,6 @@ class TestPeriodicRolloutCheckpoint:
             < logged["environment_paused_seconds"]
             < logged["total_save_seconds"]
         )
-        # The deadline leaves room for a snapshot like this one.
-        assert actor._timeout.save_reserve_seconds == logged["total_save_seconds"]
         parked_warnings = [
             str(warning.message)
             for warning in caught
@@ -2865,75 +2872,43 @@ class TestPeriodicRolloutCheckpoint:
         finally:
             actor._checkpointer.shutdown()
 
+    @pytest.mark.parametrize("on_trainer_checkpoint", [True, False])
     def test_pump_without_an_interval_waits_for_a_trainer_checkpoint(
-        self, tmp_path: Path
+        self, tmp_path: Path, on_trainer_checkpoint: bool
     ):
-        actor = self._actor(tmp_path)
-        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = None
-        actor._environment_checkpoint = _FakeEnvironmentCheckpoint()
-        attach_rollout_checkpointing(actor)
+        actor, forced, attempted = self._interval_free_actor(tmp_path)
+        actor._master_config.rollout_checkpointing.snapshot_on_trainer_checkpoint = (
+            on_trainer_checkpoint
+        )
         actor._train_steps = 1
 
         async def _main() -> None:
-            attempts: list[bool] = []
-            attempted = asyncio.Event()
-
-            async def _save(*, force: bool = False) -> RolloutCheckpointSaveResult:
-                attempts.append(force)
-                attempted.set()
-                return RolloutCheckpointSaveResult(
-                    saved=False, reason="no_data_plane_mutations"
-                )
-
-            actor._rollout_snapshots.save_snapshot = _save
             pump = asyncio.create_task(actor._rollout_snapshots.run())
             try:
                 await asyncio.sleep(0.05)
-                assert attempts == []
+                assert forced == []
                 actor._rollout_snapshots.trainer_checkpoint_published(1)
-                await asyncio.wait_for(attempted.wait(), timeout=1.0)
+                if on_trainer_checkpoint:
+                    await asyncio.wait_for(attempted.wait(), timeout=1.0)
+                else:
+                    await asyncio.sleep(0.05)
             finally:
                 pump.cancel()
                 await asyncio.gather(pump, return_exceptions=True)
-            assert attempts == [False]
 
         try:
             asyncio.run(_main())
         finally:
             actor._checkpointer.shutdown()
 
-    @pytest.mark.parametrize("on_trainer_checkpoint", [True, False])
-    def test_trainer_checkpoint_wakes_the_pump_only_when_configured(
-        self, tmp_path: Path, on_trainer_checkpoint: bool
-    ):
-        actor = self._actor(tmp_path)
-        actor._master_config.rollout_checkpointing.snapshot_on_trainer_checkpoint = (
-            on_trainer_checkpoint
-        )
-        actor._environment_checkpoint = _FakeEnvironmentCheckpoint()
-        attach_rollout_checkpointing(actor)
-        try:
-            actor._rollout_snapshots.trainer_checkpoint_published(1)
-        finally:
-            actor._checkpointer.shutdown()
-
-        assert actor._rollout_snapshots._wakeup.is_set() is on_trainer_checkpoint
+        assert forced == ([False] if on_trainer_checkpoint else [])
 
     def test_pump_without_an_interval_snapshots_at_a_pre_step_deadline(
         self, tmp_path: Path
     ):
-        actor = self._actor(tmp_path)
-        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = None
-        actor._environment_checkpoint = _FakeEnvironmentCheckpoint()
-        actor._timeout = TimeoutChecker(timeout="00:00:00:00")
-        attach_rollout_checkpointing(actor)
-        forced: list[bool] = []
-
-        async def _save(*, force: bool = False) -> RolloutCheckpointSaveResult:
-            forced.append(force)
-            return RolloutCheckpointSaveResult(saved=True, reason="completed")
-
-        actor._rollout_snapshots.save_snapshot = _save
+        actor, forced, _ = self._interval_free_actor(
+            tmp_path, timeout=TimeoutChecker(timeout="00:00:00:00")
+        )
         try:
             asyncio.run(asyncio.wait_for(actor._rollout_snapshots.run(), timeout=5.0))
         finally:
@@ -2946,18 +2921,9 @@ class TestPeriodicRolloutCheckpoint:
         self, tmp_path: Path
     ):
         """Past step 0 the train pump owns the deadline, so a stale wait saves nothing."""
-        actor = self._actor(tmp_path)
-        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = None
-        actor._environment_checkpoint = _FakeEnvironmentCheckpoint()
-        attach_rollout_checkpointing(actor)
-        attempts: list[bool] = []
+        actor, forced, _ = self._interval_free_actor(tmp_path)
 
         async def _main() -> None:
-            async def _save(*, force: bool = False) -> RolloutCheckpointSaveResult:
-                attempts.append(force)
-                return RolloutCheckpointSaveResult(saved=True, reason="completed")
-
-            actor._rollout_snapshots.save_snapshot = _save
             # Timed for a deadline 1s away, then step 1 finishes first.
             with patch.object(
                 actor._rollout_snapshots,
@@ -2975,7 +2941,7 @@ class TestPeriodicRolloutCheckpoint:
         finally:
             actor._checkpointer.shutdown()
 
-        assert attempts == []
+        assert forced == []
 
     @pytest.mark.parametrize(
         ("holds_rollout_state", "outcome", "expected"),

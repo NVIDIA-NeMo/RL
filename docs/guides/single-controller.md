@@ -242,15 +242,9 @@ the rollout-semantic configuration.
 
 With `rollout_recovery.target_level: turn`, rollout snapshots are on even with
 `snapshot_attempt_interval_s: null`, because only a snapshot holds the
-environment's state. Two more saves then apply:
-
-- At the `checkpointing.checkpoint_must_save_by` deadline, the trainer
-  checkpoint is followed by a rollout snapshot before the run stops. The
-  deadline is moved earlier by how long the last snapshot took, so both fit.
-- `snapshot_on_trainer_checkpoint` (default `true`) takes a snapshot after
-  every other trainer checkpoint too. Set it to `false` with no interval to
-  save environment state only at the deadline, for example to carry rollouts
-  across a job's walltime without pausing the environment every step.
+environment's state. A snapshot also follows the trainer checkpoint that
+`checkpointing.checkpoint_must_save_by` triggers, before the run stops, so
+leave room in that deadline for both saves.
 
 | Saves environment state | `snapshot_on_trainer_checkpoint` | `snapshot_attempt_interval_s` |
 |---|---|---|

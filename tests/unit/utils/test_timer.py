@@ -654,10 +654,10 @@ class TestTimeoutChecker:
             checker = TimeoutChecker(timeout="00:00:00:30")
         assert checker.seconds_until_save() == 20.0
 
-        checker.save_reserve_seconds = 25.0
-        assert checker.seconds_until_save() == -5.0
-        assert checker.check_save() is True
-        assert checker.seconds_until_save() is None
+        with patch("time.time", return_value=135.0):
+            assert checker.seconds_until_save() == -5.0
+            assert checker.check_save() is True
+            assert checker.seconds_until_save() is None
 
     def test_seconds_until_save_without_a_deadline(self):
         assert TimeoutChecker(timeout=None).seconds_until_save() is None

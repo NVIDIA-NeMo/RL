@@ -180,10 +180,8 @@ checkpointing:
 rollout_checkpointing:
   # Attempt a snapshot every this many seconds; null for none on a timer.
   snapshot_attempt_interval_s: null
-  # With target_level "turn": also snapshot the environment after every trainer
-  # checkpoint. A snapshot always follows the trainer checkpoint that
-  # checkpointing.checkpoint_must_save_by triggers, so false with no interval
-  # saves environment state only at that deadline.
+  # target_level "turn" only: also snapshot after every trainer checkpoint;
+  # false snapshots only at checkpointing.checkpoint_must_save_by.
   snapshot_on_trainer_checkpoint: true
   telemetry_interval_s: null
   max_consecutive_failures: 3

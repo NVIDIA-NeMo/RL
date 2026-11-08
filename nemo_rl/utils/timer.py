@@ -463,15 +463,12 @@ class TimeoutChecker:
         self.iteration_times = []
         self.previous_iteration_time: Optional[float] = None
         self.fit_last_save_time = fit_last_save_time
-        # Time the save at the deadline needs on top of a step, such as a
-        # rollout snapshot that follows the trainer checkpoint.
-        self.save_reserve_seconds = 0.0
 
     def seconds_until_save(self) -> Optional[float]:
         """Seconds until the deadline is due, or ``None`` once it can no longer be."""
         if self.last_saved or self.last_save_time == float("inf"):
             return None
-        lead_time = self.save_reserve_seconds
+        lead_time = 0.0
         if self.fit_last_save_time and self.iteration_times:
             lead_time += sum(self.iteration_times) / len(self.iteration_times)
         elapsed_time = time.time() - self.start_time
