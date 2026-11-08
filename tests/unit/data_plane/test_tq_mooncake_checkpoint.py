@@ -1898,7 +1898,13 @@ def _evictable_managers(cluster: _FakeCluster, identities, **options) -> list[An
 @pytest.fixture
 def no_restore_backoff(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     sleeps: list[float] = []
-    monkeypatch.setattr(offload.time, "sleep", sleeps.append)
+    # Swap only offload's `time`: patching time.sleep itself would also record
+    # every other thread's sleep, and `== []` below would fail on those.
+    monkeypatch.setattr(
+        offload,
+        "time",
+        SimpleNamespace(monotonic=offload.time.monotonic, sleep=sleeps.append),
+    )
     return sleeps
 
 

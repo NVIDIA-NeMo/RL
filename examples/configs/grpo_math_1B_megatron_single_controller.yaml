@@ -187,6 +187,9 @@ rollout_checkpointing:
   # Every config path not excluded here or by NeMo-RL's built-in denylist must
   # match before a bootstrap rollout snapshot can be restored.
   extra_fingerprint_excluded_paths: []
+  # Append one JSON line per rollout event to rollout_trace.jsonl in the log dir.
+  # The events are listed in nemo_rl/algorithms/rollout_checkpointing/trace.py.
+  trace: false
 
 policy:
   automodel_cfg:

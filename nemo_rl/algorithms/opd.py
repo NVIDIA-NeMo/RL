@@ -33,6 +33,7 @@ import torch
 from pydantic import BaseModel, Field, model_validator
 from tensordict import TensorDict
 
+from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
 from nemo_rl.data.multimodal_utils import teacher_multimodal_fields
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.data_plane.schema import (
@@ -277,18 +278,12 @@ def opd_full_teacher_checkpoints_by_index(
 def _skip_prev_logprobs(master_config: Any) -> bool:
     """Whether the training loop will zero ``prev_logprobs`` instead of computing it.
 
-    Mirrors the predicate in ``grpo_train``: ``force_on_policy_ratio`` with no
-    ``seq_logprob_error_threshold`` skips the student logprob pass. GRPO can
-    also evaluate that threshold in the training loss without this pass.
+    ``force_on_policy_ratio`` with no ``seq_logprob_error_threshold`` skips the
+    student logprob pass. GRPO can also evaluate that threshold in the training
+    loss without this pass.
     """
-    force_on_policy_ratio = master_config.loss_fn.force_on_policy_ratio
-    seq_logprob_error_threshold = master_config.grpo.seq_logprob_error_threshold
-    return bool(
-        force_on_policy_ratio
-        and (
-            seq_logprob_error_threshold is None
-            or master_config.loss_fn.seq_logprob_error_in_loss
-        )
+    return skips_policy_logprob_pass(
+        master_config.loss_fn, master_config.grpo.seq_logprob_error_threshold
     )
 
 

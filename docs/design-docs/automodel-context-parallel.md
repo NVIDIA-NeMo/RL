@@ -180,8 +180,8 @@ This matrix describes the current NeMo RL integration pinned to Automodel `v0.6.
 | DPO | Supported | Full-sequence policy/reference logprobs are restored through the sharder before loss computation |
 | Same-tokenizer distillation | Supported | Top-k and student outputs are restored through the sharder; replicated loss uses `loss * DP` |
 | X-token distillation | Conditional | Specialized heterogeneous TP/CP path remains; no sequence packing, and each teacher/student sequence length must be divisible by its own CP size for the contiguous IPC windows |
-| PPO | Not supported end to end | Actor policy can use CP, but the Automodel critic/value path still requires `CP=1` |
-| Reward-model training and scoring | Not supported | RM setup and `ScorePostProcessor` reject `CP>1` |
+| PPO | Supported | Both the actor policy and token-level Automodel critic/value path support CP |
+| Reward-model training and scoring | Not supported | Standalone RM training and sequence-level reward scoring do not support CP |
 | CP with sequence packing | Not supported in NeMo RL | The integration still rejects it, even though the upstream sharder can represent packed/THD layouts |
 | CP with Automodel sequence parallel | Not supported | The existing TP sequence-parallel guard remains |
 | Non-packed sequence length | Supported with padding | The generic sharder pads and trims automatically; x-token keeps the divisibility restriction described above |
