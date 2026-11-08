@@ -85,10 +85,39 @@ uv run examples/nemo_gym/nemotron-3.5-super-vl/prepare_mm_coding_single.py \
   --reference-root /shared/coding/assets --split train --max-output-tokens 8192
 ```
 
-Run it separately for an approved validation split. The adapter preserves
+For an existing source Gym JSONL envelope, add `--input-format legacy-row`.
+This reads the original task metadata and rebuilds the agent-facing input; it
+does not reuse old harness instructions or completions. Run the adapter
+separately for an approved validation split. The adapter preserves
 prompt text and image bytes, puts reference source only in verifier metadata,
 rejects duplicate task IDs and refuses to overwrite an existing dataset. It
 does not prove that a caller-labeled split is free of held-out evaluation data.
+
+Before allocating GPUs, run the runtime check in the driver and every actor
+interpreter (Gym and generation included):
+
+```bash
+python examples/nemo_gym/nemotron-3.5-super-vl/check_mm_coding_runtime.py
+```
+
+The current NeMo RL Gym submodule pin predates the submitted Gym package layout
+and session helper. Merely adding the resources config does not update actor
+interpreters: default actor commands use `uv run --locked`. Install the submitted
+internal Gym revision and its dependencies into each deployment-owned runtime,
+and configure the deployment to retain those environments. The existing
+`NEMO_RL_VENV_DIR` selects the deployment-owned per-actor venv cache. Prebuild
+those venvs with `nemo_rl/utils/prefetch_venvs.py`, install the reviewed Gym
+revision into every Gym-dependent actor venv and the driver, and run
+`uv pip check --python <actor-venv>/bin/python` plus this preflight under each
+interpreter. Retain the exact dependency reports. Use a new cache directory
+for this experiment; do not modify another run's cached environments. Leave
+`NRL_FORCE_REBUILD_VENVS` unset so the already-provisioned per-actor venvs are
+reused. A dependency conflict must be resolved in the runtime packaging rather
+than hidden with a skipped dependency check. Do not use the stock
+Gym pin or assume `NEMO_GYM_EXTRA_ROOTS` alone upgrades core APIs. A supported
+runtime packaging/pin update and real actor startup are merge gates for this
+draft. The check verifies API/component discovery only, not model kernels,
+credentials, network reachability, token capture or optimizer correctness.
 
 Set `MM_CODING_TRAIN_DATA` and `MM_CODING_VALIDATION_DATA` to the adapted files,
 and `MM_CODING_REFERENCE_ROOT` to their shared reference root. Both data paths

@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 from omegaconf import OmegaConf
+from omegaconf.errors import InterpolationResolutionError
 from PIL import Image
 from pydantic import ValidationError
 
@@ -79,7 +80,7 @@ def test_data_paths_are_explicit_not_example_or_benchmark_fallback(
 ) -> None:
     monkeypatch.delenv("MM_CODING_TRAIN_DATA", raising=False)
     config = load_config(EXAMPLE / "mm_coding_single.yaml")
-    with pytest.raises(Exception, match="MM_CODING_TRAIN_DATA"):
+    with pytest.raises(InterpolationResolutionError, match="MM_CODING_TRAIN_DATA"):
         _ = config.data.train.data_path
 
 
@@ -248,3 +249,97 @@ def test_unknown_or_repeated_harness_routes_are_rejected(harnesses):
     )
     with pytest.raises(ValueError, match="unique supported"):
         adapter.select_route(task, mode="mixed", harnesses=harnesses)
+
+
+@pytest.mark.parametrize("mode", ["single", "multi", "mixed"])
+def test_existing_source_jsonl_is_retargeted_without_reusing_old_agent_prompt(
+    tmp_path, mode
+):
+    source, output = tmp_path / "legacy.jsonl", tmp_path / "converted.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "agent_ref": {"type": "responses_api_agents", "name": "mm_old"},
+                "task": {
+                    "benchmark": "mmsvg_text2svg",
+                    "task_id": "task",
+                    "prompt": "original task",
+                    "ground_truth": "PRIVATE_GOLD",
+                },
+                "route": "single",
+                "responses_create_params": {"input": "OLD_AGENT_INSTRUCTIONS"},
+            }
+        )
+        + "\n"
+    )
+    assert (
+        adapter.export(
+            source,
+            output,
+            reference_root=tmp_path,
+            split="train",
+            max_output_tokens=8192,
+            input_format="legacy-row",
+            mode=mode,
+        )
+        == 1
+    )
+    row = json.loads(output.read_text())
+    params = (
+        row["task_input"]["responses_create_params"]
+        if "task_input" in row
+        else row["responses_create_params"]
+    )
+    assert "original task" in json.dumps(params)
+    assert "PRIVATE_GOLD" not in json.dumps(
+        params
+    ) and "OLD_AGENT_INSTRUCTIONS" not in json.dumps(params)
+
+
+def test_adapter_cli_writes_multi_dataset(tmp_path, monkeypatch, capsys):
+    source, output = tmp_path / "tasks.jsonl", tmp_path / "multi.jsonl"
+    source.write_text(
+        json.dumps({"benchmark": "mmsvg_text2svg", "task_id": "one", "prompt": "draw"})
+        + "\n"
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "prepare",
+            "--input",
+            str(source),
+            "--output",
+            str(output),
+            "--reference-root",
+            str(tmp_path),
+            "--split",
+            "train",
+            "--input-format",
+            "task",
+            "--mode",
+            "multi",
+            "--harnesses",
+            "codex",
+        ],
+    )
+    adapter.main()
+    assert json.loads(output.read_text())["task_id"]["taskset"] == "mm-coding:codex"
+    assert json.loads(capsys.readouterr().out)["rows"] == 1
+
+
+def test_runtime_guard_detects_missing_session_api(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "check_mm_coding_runtime", EXAMPLE / "check_mm_coding_runtime.py"
+    )
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+
+    def find(module):
+        return (
+            None if module == "nemo_gym.resources_server_sandbox_sessions" else object()
+        )
+
+    monkeypatch.setattr(guard.importlib.util, "find_spec", find)
+    assert guard.check_runtime() == ["nemo_gym.resources_server_sandbox_sessions"]
+    with pytest.raises(SystemExit, match="stock RL Gym pin"):
+        guard.main()

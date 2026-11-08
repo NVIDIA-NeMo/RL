@@ -70,6 +70,16 @@ class ExperimentTask(BaseModel):
         return self
 
 
+class SourceGymRow(BaseModel):
+    """The source experiment's existing flat JSONL envelope, consumed only for its task."""
+
+    model_config = ConfigDict(extra="forbid")
+    agent_ref: dict[str, str]
+    task: ExperimentTask
+    route: Literal["single", "opencode", "codex", "hermes"]
+    responses_create_params: dict[str, object]
+
+
 HARNESS_NAMES = ("opencode", "codex", "hermes")
 MULTI_FRACTIONS = {
     "chart2code": 0.5,
@@ -124,7 +134,7 @@ def gym_row(
     selected: str = "single",
 ) -> dict:
     """Preserve the task prompt and input image without exposing the reference source."""
-    if selected not in {"single", *HARNESS_NAMES}:
+    if selected != "single" and selected not in HARNESS_NAMES:
         raise ValueError("Unknown harness route")
     if split not in {"train", "validation", "example"}:
         raise ValueError(
@@ -231,8 +241,9 @@ def export(
     output_path: Path,
     *,
     reference_root: Path,
-    split: str,
+    split: Literal["train", "validation", "example"],
     max_output_tokens: int,
+    input_format: Literal["task", "legacy-row"] = "task",
     mode: str = "single",
     seed: int = 42,
     epoch: int = 0,
@@ -250,7 +261,12 @@ def export(
                 for line in source:
                     if not line.strip():
                         continue
-                    task = ExperimentTask.model_validate_json(line)
+                    if input_format == "task":
+                        task = ExperimentTask.model_validate_json(line)
+                    elif input_format == "legacy-row":
+                        task = SourceGymRow.model_validate_json(line).task
+                    else:
+                        raise ValueError("input_format must be task or legacy-row")
                     identity = (task.benchmark, task.task_id)
                     if identity in seen:
                         raise ValueError(f"Duplicate task identity: {identity}")
@@ -285,6 +301,9 @@ def main() -> None:
     )
     parser.add_argument("--max-output-tokens", type=int, default=8192)
     parser.add_argument(
+        "--input-format", choices=["task", "legacy-row"], default="task"
+    )
+    parser.add_argument(
         "--mode", choices=["single", "multi", "mixed"], default="single"
     )
     parser.add_argument("--seed", type=int, default=42)
@@ -299,6 +318,7 @@ def main() -> None:
         reference_root=args.reference_root,
         split=args.split,
         max_output_tokens=args.max_output_tokens,
+        input_format=args.input_format,
         mode=args.mode,
         seed=args.seed,
         epoch=args.epoch,
