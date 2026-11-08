@@ -1,5 +1,5 @@
 {
-  "observed_at": "2026-11-08T06:54:49-08:00",
+  "observed_at": "2026-11-08T10:39:00-08:00",
   "code_and_recipes_commit": "ad5582855",
   "image": "containers/nemo_rl.1030.sqsh",
   "qualification": {
@@ -52,9 +52,9 @@
     "gpus_per_node": 8,
     "target_steps": 600,
     "state": "RUNNING",
-    "observed_committed_steps": 302,
-    "durable_checkpoint_step": 300,
-    "verified_at": "2026-11-08T06:54:49-08:00",
+    "observed_committed_steps": 402,
+    "durable_checkpoint_step": 401,
+    "verified_at": "2026-11-08T10:39:00-08:00",
     "curve_refresh_job_id": 21389289,
     "same_checkpoint_and_run_id_across_segments": true,
     "original_numerical_qualification_passed": false,
@@ -92,15 +92,34 @@
       "lr": 1e-06
     },
     "latest_observed_metrics": {
-      "gen_kl_error": 0.0014097516975230355,
-      "policy_kl_error": 0.0014922586556811968,
-      "grad_norm": 0.31445711851119995,
-      "reward": 0.65625,
-      "mean_gen_tokens_per_sample": 915.78125,
-      "policy_train_dispatches": 2,
-      "weight_version_lag": 0,
-      "lr": 1e-06
-    }
+      "gen_kl_error": 0.001160693990712869,
+      "policy_kl_error": 0.0012159759163153146,
+      "reward": 0.8125,
+      "grad_norm": 0.6075792908668518,
+      "mean_gen_tokens_per_sample": 958.65625,
+      "policy_train_dispatches": 2.0,
+      "lr": 1e-06,
+      "weight_version_lag": 0
+    },
+    "current_resume600_job": 21509384,
+    "resume600_segment_states": {
+      "21509383": {
+        "state": "COMPLETED",
+        "exit_code": "0:0",
+        "elapsed": "03:45:17",
+        "last_step": 401
+      },
+      "21509384": {
+        "state": "RUNNING"
+      },
+      "21509385": {
+        "state": "PENDING: Dependency"
+      },
+      "21509386": {
+        "state": "PENDING: Dependency"
+      }
+    },
+    "resume600_segment1_summary": "validation/pr3/results/resume600/segment1-summary.json"
   },
   "previous_attempts": [
     {

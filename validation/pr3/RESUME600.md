@@ -6,6 +6,22 @@ run stopped. It does not resume the separate held900/MCore/sibling experiments.
 The original1%BF16 numerical qualification remains failed; this is continuation
 of the same exploratory run, not a new qualification result.
 
+Latest handoff on2026-11-08 around10:38PST: segment21509383 COMPLETED0:0 after
+3h45m17s, saving checkpoint401 at its configured checkpoint deadline.
+Segment21509384 is RUNNING onpool0-[00172,00183-00184] and committed402/600,
+trainer_version402,lag0,two dispatches,LR1e-6. It restored401weights on16workers,
+the saved data-loader/TQ state and16unfinished rollout groups. Checkpoint401
+metadata has consumed_samples3208,trainer_version/total_steps401,epoch0.
+The W&B run remains the same. Segments21509385/86 wait on dependencies.
+
+All101updates301..401 have finite metrics,lag0,LR1e-6 andtwo dispatches. First20
+versus last20 genKL means0.00153708/0.00154503; segmentrange0.00103316..0.00192386.
+Last20 reward mean0.6734375,generated length981.80,measured step time128.727s.
+No gen-KL explosion observed through401; this is observational, not numerical
+qualification or an isolated throughput claim. See results/resume600/segment1-summary.json.
+The second segment's first committed genKL is0.00116069. Continue to600 without
+new submission or changes to training code/configuration.
+
 - Recipe: streaming_qwen35_exploratory_600.yaml inherits the original exploratory
   recipe. Only grpo.max_num_steps changes to600 and the display name says600.
 - Same Qwen3.5-35B-A3B-Base, image nemo_rl.1030.sqsh,3nodes/24H100:
