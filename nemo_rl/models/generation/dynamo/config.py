@@ -39,13 +39,10 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
         "least-loaded",
         "device-aware-weighted",
     ] = "kv"
-    # Idle TTL in seconds for keeping one session on one engine, or None to
-    # disable it. NeMo-Gym names the session on token-capture calls only (its
-    # capture key), as the native backend pins each Gym session to one server; the
-    # engine splices a call's staged prefix after routing, so the KV router alone
-    # cannot see where that prefix is cached. Dynamo keeps at most 65,536 sessions
-    # and answers a new one past that with HTTP 529, so keep (captured rollouts
-    # started per second) x TTL below 65,536. The bound is the frontend's own.
+    # Idle seconds a NeMo-Gym token-capture session stays on one engine, as native
+    # pins each Gym session to one server; None disables it. Dynamo keeps at most
+    # 65,536 sessions (HTTP 529 past that), so keep (captured rollouts started per
+    # second) x TTL below that.
     session_affinity_ttl_secs: Annotated[int, Field(gt=0, le=31_536_000)] | None = 300
     # Processes that render NeMo-Gym's chat calls and build their replies (the
     # checkpoint's template, tokenizer, HF processor and vLLM's parsers). Each

@@ -77,9 +77,9 @@ build it with `nemo_rl/models/generation/vllm/request_pipeline.py`.
 ## NeMo-Gym
 
 NeMo-Gym's policy model calls the frontend. Setup turns on Gym's Dynamo dialect
-(`vllm_model.dynamo_frontend`, from
-[NVIDIA-NeMo/Gym#4817](https://github.com/NVIDIA-NeMo/Gym/pull/4817)). The
-frontend takes only OpenAI fields plus `nvext`, so Gym sends the native
+(`dynamo_frontend` in Gym's
+[`vllm_model`](https://github.com/NVIDIA-NeMo/Gym/tree/main/responses_api_models/vllm_model)
+config). The frontend takes only OpenAI fields plus `nvext`, so Gym sends the native
 request's extra fields (`ng_capture`, `required_prefix_token_ids`, `ng_measure`)
 in one `nemo_rl:gym:` annotation, and reads the call's token fields
 (`prompt_token_ids`, `generation_token_ids`, `generation_log_probs`,

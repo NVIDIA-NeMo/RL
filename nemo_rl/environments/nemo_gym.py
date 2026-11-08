@@ -3024,7 +3024,7 @@ def build_nemo_gym_config(
 
 
 def _apply_dynamo_dialect(nemo_gym_dict: dict[str, Any]) -> None:
-    """Point one actor's policy model at the Dynamo frontend, in Gym's Dynamo dialect.
+    """Point Gym's `policy_model` server in one NemoGym actor's config at the Dynamo frontend.
 
     The frontend takes token data in nvext instead of vLLM's request extensions.
     Applied to the actor's composed config (a shard's overrides included), so
