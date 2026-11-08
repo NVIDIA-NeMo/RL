@@ -15,6 +15,7 @@
 """How far each running captured call got, read while paused for a refit."""
 
 import asyncio
+import inspect
 from types import SimpleNamespace
 from typing import Any, Optional
 
@@ -99,3 +100,20 @@ def test_an_engine_without_output_processor_state_reports_nothing() -> None:
         return await client.captured_call_progress()
 
     assert asyncio.run(exercise()) == []
+
+
+def test_vllm_still_has_the_request_state_we_read() -> None:
+    """The fakes above would pass a vLLM that renamed these; this checks the real ones.
+
+    The read goes engine.output_processor.request_states[*].external_req_id and
+    .detokenizer.num_output_tokens(), none of which is public API.
+    """
+    from vllm.v1.engine.async_llm import AsyncLLM
+    from vllm.v1.engine.detokenizer import IncrementalDetokenizer
+    from vllm.v1.engine.output_processor import OutputProcessor, RequestState
+
+    assert "self.output_processor" in inspect.getsource(AsyncLLM.__init__)
+    assert "self.request_states" in inspect.getsource(OutputProcessor.__init__)
+    params = inspect.signature(RequestState.__init__).parameters
+    assert "external_req_id" in params and "detokenizer" in params
+    assert callable(IncrementalDetokenizer.num_output_tokens)
