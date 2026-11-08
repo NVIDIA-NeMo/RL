@@ -292,6 +292,10 @@ class NemoRLChatEngine:
             "extra_args": {PLAN_KEY: plan},
         }
         engine_data = await self._call_engine(preprocessed, context)
+        if (refusal := engine_data.get("refusal")) is not None:
+            # The engine refused the call before it ran, with the native status.
+            ack = _capture_refusal_ack(extras) if refusal["acknowledge"] else ""
+            raise HttpError(refusal["status"], refusal["message"] + ack)
         result = GymCallResult.model_validate(engine_data["result"])
         reply_request = engine_request
         if result.ng_commit_coords is not None:

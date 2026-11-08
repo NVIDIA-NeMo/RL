@@ -673,6 +673,15 @@ CASES = [
         top_logprobs=2,
         mode="text",
     ),
+    # Capture with a processor that has no media capture is refused before it
+    # runs, with the native server's 400.
+    _Case(
+        "image_capture_unsupported",
+        messages=[IMAGE_TURN],
+        extras=lambda kit: {"ng_capture": _admission(mode="text")},
+        status=400,
+        kit="vlm",
+    ),
     # An image after the echoed turn 1: processed once in the frontend, both
     # engines run the same pixels, and the splice moves its tokens (C30).
     _Case(

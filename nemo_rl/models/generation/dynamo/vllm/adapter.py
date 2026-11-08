@@ -37,6 +37,7 @@ import logging
 import os
 import pickle
 from collections.abc import AsyncGenerator
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -49,8 +50,11 @@ from dynamo.common.backend import (
 )
 from dynamo.common.backend.publisher import ComponentSnapshot, KvEventSource, ZmqSource
 from dynamo.llm.exceptions import InvalidArgument
+from vllm.entrypoints.serve.exception_handling.error_response import (
+    create_error_response,
+)
 from vllm.entrypoints.serve.utils.api_utils import get_max_tokens
-from vllm.exceptions import VLLMClientError
+from vllm.exceptions import GracefulHTTPError, VLLMClientError, VLLMValidationError
 from vllm.inputs import TokensPrompt
 from vllm.v1.kv_cache_interface import KVCacheSpecKind
 from vllm.v1.metrics.loggers import StatLoggerBase
@@ -287,12 +291,17 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
             chunk = await self._serve_gym_call(
                 plan, list(request["token_ids"]), context
             )
-        except VLLMClientError as error:
-            # vLLM's request errors are not RuntimeErrors; the native server
-            # answers them with a 4xx that carries the message.
-            raise InvalidArgument(str(error)) from error
+        except (VLLMClientError, GracefulHTTPError) as error:
+            # The status vLLM's server answers it with; a native 400 for a
+            # validation error also acknowledges a capture call's refusal.
+            response = create_error_response(error).error
+            chunk = _refusal(
+                response.code,
+                response.message,
+                acknowledge=isinstance(error, VLLMValidationError),
+            )
         except MediaCaptureRejected as error:
-            raise InvalidArgument(f"{error} ({error.code})") from error
+            chunk = _refusal(HTTPStatus.BAD_REQUEST, f"{error} ({error.code})")
         if chunk is not None:
             yield chunk
 
@@ -555,6 +564,27 @@ def _wire_logprobs(logprobs: Any) -> Optional[list[dict[str, list[Any]]]]:
         }
         for position in logprobs
     ]
+
+
+def _refusal(status: int, message: str, *, acknowledge: bool = False) -> GenerateChunk:
+    """A Gym call the engine refused before it ran, answered in the chunk.
+
+    Dynamo hands an error the engine raises to the frontend's chat engine
+    without its status, so it could only answer 500; the chat engine answers
+    this with ``status``, as the native server does.
+    """
+    return {
+        "token_ids": [],
+        "index": 0,
+        "finish_reason": "stop",
+        "engine_data": {
+            "refusal": {
+                "status": int(status),
+                "message": message,
+                "acknowledge": acknowledge,
+            }
+        },
+    }
 
 
 def _usage(output: Any, num_output_tokens: int) -> dict[str, Any]:

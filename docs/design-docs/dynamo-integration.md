@@ -59,7 +59,11 @@ The two together:
   (`_capture_request_media`), `begin_call` (which stamps the weight version),
   the generation with the `SamplingParams` vLLM's chat serving builds from the
   request, and the one TQ write. Its `engine_data` carries the output the
-  frontend builds the reply from, and the call's `GymCallResult`.
+  frontend builds the reply from, and the call's `GymCallResult`. A call the
+  engine refuses before it runs (a vLLM request error, a full queue, media
+  capture refused) comes back in `engine_data` too, with the status the native
+  server answers it with: Dynamo hands a raised error to the chat engine
+  without its status.
 - `abort` cancels the vLLM request on client disconnect.
 - Registration advertises the context length, the KV block size (from vLLM's
   KV-cache group metadata), the block count and the scheduler limits. It

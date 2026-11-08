@@ -375,7 +375,7 @@ def test_gym_calls_nemo_rl_cannot_serve_are_refused_with_a_400(
 
 @pytest.mark.nemo_gym
 @pytest.mark.parametrize("captured", [True, False])
-@pytest.mark.parametrize("refused_by", ["render", "clamp"])
+@pytest.mark.parametrize("refused_by", ["render", "clamp", "engine"])
 def test_a_call_refused_before_it_runs_acknowledges_its_capture_to_gym(
     captured, refused_by
 ) -> None:
@@ -384,14 +384,25 @@ def test_a_call_refused_before_it_runs_acknowledges_its_capture_to_gym(
     )
     from vllm.exceptions import VLLMValidationError
 
-    # The prompt alone fills the context.
-    pool = _Pool(_rendered(template_token_ids=list(range(MAX_MODEL_LEN))))
+    pool = _Pool(_rendered())
+    router = _Router()
     if refused_by == "render":
         pool.error = VLLMValidationError("maximum context length is 16 tokens")
+    elif refused_by == "clamp":
+        # The prompt alone fills the context.
+        pool.rendered = _rendered(template_token_ids=list(range(MAX_MODEL_LEN)))
+    else:
+        router.engine_data = {
+            "refusal": {
+                "status": 400,
+                "message": "maximum context length is 16 tokens",
+                "acknowledge": True,
+            }
+        }
     extras = {"ng_capture": TOKEN_IN} if captured else {}
 
     with pytest.raises(HttpError) as refused:
-        _serve(pool, _Router(), _call(extras))
+        _serve(pool, router, _call(extras))
 
     # Gym reads the acknowledgement off the message, as natively off the header.
     message, refused_call = split_dynamo_capture_refusal(refused.value.message)
@@ -399,11 +410,32 @@ def test_a_call_refused_before_it_runs_acknowledges_its_capture_to_gym(
     assert refused_call == (TOKEN_IN["model_call_id"] if captured else None)
 
 
-def test_an_engine_error_fails_the_call() -> None:
-    with pytest.raises(HttpError, match="engine died") as failed:
-        _serve(_Pool(_rendered()), _Router(error="engine died"), _call({}))
+@pytest.mark.parametrize(
+    ("router", "status", "message"),
+    [
+        (_Router(error="engine died"), 500, "engine died"),
+        # Refused before it ran, with the status the native server answers.
+        (
+            _Router(
+                engine_data={
+                    "refusal": {
+                        "status": 503,
+                        "message": "queue full",
+                        "acknowledge": False,
+                    }
+                }
+            ),
+            503,
+            "queue full",
+        ),
+    ],
+    ids=["error", "refusal"],
+)
+def test_an_engine_that_does_not_serve_the_call_fails_it(router, status, message):
+    with pytest.raises(HttpError, match=message) as failed:
+        _serve(_Pool(_rendered()), router, _call({}))
 
-    assert failed.value.code == 500
+    assert failed.value.code == status
 
 
 def test_only_nemo_rls_engines_are_served() -> None:

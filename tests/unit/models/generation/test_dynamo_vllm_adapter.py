@@ -561,42 +561,42 @@ def test_a_gym_call_without_routes_fails_under_router_replay() -> None:
         _collect(engine, _gym_call([1, 3, 4]))
 
 
-@pytest.mark.parametrize(
-    ("call", "error"),
-    [
-        (
-            {"token_ids": [1, 3, 4], "annotations": [GYM_CALL_ANNOTATION]},
-            r"extra_args\.nemo_rl",
-        ),
-        # vLLM's own request errors (not RuntimeErrors) keep their message, as
-        # the native server's 4xx does, instead of becoming a bare 500.
-        (
-            _gym_call([1, 3, 4], request=_chat(min_tokens=10, max_tokens=5)),
-            "min_tokens",
-        ),
-    ],
-)
-def test_gym_calls_the_engine_cannot_serve_are_refused(call, error) -> None:
+def test_a_gym_call_without_the_chat_engines_plan_is_refused() -> None:
     llm = _FakeLLM()
     engine = vllm_adapter.DynamoVllmAdapter(_host(llm), leader_worker_idx=0)
 
-    with pytest.raises(InvalidArgument, match=error):
-        _collect(engine, call)
+    with pytest.raises(InvalidArgument, match=r"extra_args\.nemo_rl"):
+        _collect(engine, {"token_ids": [1, 3, 4], "annotations": [GYM_CALL_ANNOTATION]})
 
     assert llm.calls == []
 
 
-def test_a_gym_call_over_the_engines_queue_limits_is_refused_before_it_runs() -> None:
-    full = vllm.exceptions.QueueOverflowError()
+@pytest.mark.parametrize(
+    ("chat", "admission_error", "status", "acknowledge", "message"),
+    [
+        # vLLM's own validation errors keep their 400 and message, as natively,
+        # and acknowledge a capture call's refusal.
+        (_chat(min_tokens=10, max_tokens=5), None, 400, True, "min_tokens"),
+        # The queue limits the native server checks: a 503 to retry elsewhere.
+        (_chat(), vllm.exceptions.QueueOverflowError(), 503, False, "busy"),
+    ],
+    ids=["request_error", "queue_full"],
+)
+def test_a_gym_call_the_engine_refuses_answers_with_the_native_status(
+    chat, admission_error, status, acknowledge, message
+) -> None:
     llm = _FakeLLM(
-        [_output([1, 3, 4], _completion([10], "stop"))], admission_error=full
+        [_output([1, 3, 4], _completion([10], "stop"))],
+        admission_error=admission_error,
     )
     engine = vllm_adapter.DynamoVllmAdapter(_host(llm), leader_worker_idx=0)
 
-    # As the native server checks max_num_queued_reqs / max_num_queued_tokens.
-    with pytest.raises(vllm.exceptions.QueueOverflowError):
-        _collect(engine, _gym_call([1, 3, 4]))
+    # In the chunk: Dynamo hands a raised error to the chat engine without it.
+    (chunk,) = _collect(engine, _gym_call([1, 3, 4], request=chat))
 
+    refusal = chunk["engine_data"]["refusal"]
+    assert (refusal["status"], refusal["acknowledge"]) == (status, acknowledge)
+    assert message in refusal["message"]
     assert llm.calls == []
 
 
