@@ -4445,11 +4445,15 @@ def test_forest_startup_accepts_partial_step_policy(forest_config, fraction):
 
 
 @pytest.mark.parametrize("scope", ["scored_segment", "all_segments"])
-def test_forest_startup_accepts_reward_penalties(forest_config, scope):
-    # penalize_malformed_think_tag is rejected for any token capture run.
-    forest_config.reward_penalties = RewardPenaltyConfig(
-        penalize_unwanted_tokens=True, token_ids={"unwanted": [7]}
-    )
+@pytest.mark.parametrize(
+    "penalties",
+    [
+        {"penalize_unwanted_tokens": True, "token_ids": {"unwanted": [7]}},
+        {"penalize_malformed_think_tag": True},
+    ],
+)
+def test_forest_startup_accepts_reward_penalties(forest_config, scope, penalties):
+    forest_config.reward_penalties = RewardPenaltyConfig(**penalties)
     forest_config.token_capture.forest_penalty_scope = scope
     validate_single_controller_config(forest_config)
 

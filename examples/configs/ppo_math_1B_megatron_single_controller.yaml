@@ -296,6 +296,8 @@ token_capture:
   forest_padding_scope: group
   # Step padding only. Rows the padding copies: row0 or cyclic.
   forest_pad_source: row0
+  # Forest only. Segments the token penalties check: scored_segment or all_segments.
+  forest_penalty_scope: scored_segment
   staging_partition: rollout_staging
 
 # Target recovery boundary for unfinished token-capture groups. "turn" enables

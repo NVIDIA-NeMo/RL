@@ -126,6 +126,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
 )
+from nemo_rl.experience.reward_penalties import scored_text_checks
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
@@ -2099,6 +2100,7 @@ Depending on your data shape, you may want to change these values."""
             "full_result": nemo_gym_result,
             "rollout_id": rollout_id,
             "receipt": receipt,
+            "scored_text_checks": scored_text_checks(nemo_gym_result),
         }
 
     async def _postprocess_captured_history(self, row: dict, result: dict) -> dict:
@@ -2109,7 +2111,6 @@ Depending on your data shape, you may want to change these values."""
         from nemo_gym.token_id_capture.staging.records import RolloutManifest
 
         from nemo_rl.environments.call_selection import resolve_selection_policy
-        from nemo_rl.experience.reward_penalties import scored_text_checks
         from nemo_rl.experience.rollout_reassembler import (
             ActionOutputFlags,
             RolloutSelection,

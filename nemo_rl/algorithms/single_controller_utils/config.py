@@ -722,7 +722,7 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # malformed think tags) check.
     # scored_segment: only the segment holding the scored call (default).
     # all_segments: every segment; a hit in any of them zeroes the owner's reward.
-    # Rollout-scoped text penalties always run once, on the scored segment.
+    # Text penalties run once per rollout, on the scored response.
     forest_penalty_scope: Literal["scored_segment", "all_segments"] = "scored_segment"
 
     @model_validator(mode="after")
