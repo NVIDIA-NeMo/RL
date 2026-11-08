@@ -140,7 +140,10 @@ expanded. The model-visible task prompt is preserved; multi adds workspace and
 preview instructions. Private grading metadata stays outside model input.
 Use the matching [`mm_coding_multi.yaml`](../../../../examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_multi.yaml)
 or [`mm_coding_mixed.yaml`](../../../../examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_mixed.yaml)
-recipe. All three recipes share the learner, optimizer and reward settings.
+recipe. All three recipes share the learner, optimizer and reward settings. Multi and
+mixed permit up to 32 images per request instead of the single-answer cap of
+2, so retained reference/preview observations do not fail after two images. The
+16384-token context and adapter/model-server request limits still apply.
 Multi rows route typed tasksets to Gym's existing sandboxed harnesses; single
 rows use the existing simple-agent relay. This contribution does not port the
 experimental V2 asynchronous controller or change GRPO loss/optimizer behavior.

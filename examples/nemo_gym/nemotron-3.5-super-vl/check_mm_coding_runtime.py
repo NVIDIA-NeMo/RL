@@ -23,6 +23,7 @@ REQUIRED_MODULES = (
     "nemo_gym.resources_server_sandbox_sessions",
     "resources_servers.mm_coding_training.app",
     "resources_servers.mm_coding_training.session_app",
+    "responses_api_agents.hermes_agent.image_observations",
 )
 
 

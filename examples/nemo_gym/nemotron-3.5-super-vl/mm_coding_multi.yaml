@@ -4,6 +4,13 @@ defaults: mm_coding_single.yaml
 checkpointing:
   checkpoint_dir: results/grpo-super35-mm-coding-multi
 
+# A multi-turn history can retain the reference and several preview images.
+policy:
+  generation:
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: 32
+
 env:
   nemo_gym:
     config_paths:

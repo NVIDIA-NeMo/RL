@@ -188,9 +188,13 @@ def test_multi_recipes_share_learner_and_reward(monkeypatch, mode):
     monkeypatch.setenv("MM_CODING_VALIDATION_DATA", "/approved/validation.jsonl")
     config = load_config(EXAMPLE / f"mm_coding_{mode}.yaml")
     single = load_config(EXAMPLE / "mm_coding_single.yaml")
-    assert OmegaConf.to_container(config.policy) == OmegaConf.to_container(
-        single.policy
-    )
+    assert config.policy.generation.vllm_kwargs.limit_mm_per_prompt.image == 32
+    assert single.policy.generation.vllm_kwargs.limit_mm_per_prompt.image == 2
+    candidate = OmegaConf.to_container(config.policy)
+    baseline = OmegaConf.to_container(single.policy)
+    assert isinstance(candidate, dict) and isinstance(baseline, dict)
+    candidate["generation"]["vllm_kwargs"]["limit_mm_per_prompt"]["image"] = 2
+    assert candidate == baseline
     assert config.grpo == single.grpo
     assert config.env.should_mask_flagged_samples
     assert any(
