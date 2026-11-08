@@ -1,0 +1,56 @@
+{
+  "checkpoint": 503,
+  "analyzed_inside_job": 21509385,
+  "optimizer_shards": 16,
+  "training_info": {
+    "consumed_samples": 4024,
+    "current_step": 503,
+    "current_epoch": 0,
+    "total_steps": 503,
+    "total_valid_tokens": 18954095.0,
+    "trainer_version": 503,
+    "sampler_name": "in_order",
+    "sampler_dispatch_index": 503,
+    "cur_adaptive_ppo_clip_k": null
+  },
+  "scope": "On-disk saved counters only; runtime restoration follows the existing AutoModel checkpoint loader, not a live per-rank optimizer-state comparison.",
+  "optimizer_step_entries": 693,
+  "all_saved_optimizer_steps_503": true,
+  "optimizer_lr_entries": 693,
+  "all_saved_optimizer_lrs_1e_6": true,
+  "scheduler": {
+    "sched._schedulers.0._is_initial": false,
+    "sched._schedulers.0._get_lr_called_within_step": false,
+    "sched._schedulers.0._last_lr": [
+      9.000000010000003e-07
+    ],
+    "sched._schedulers.1.factor": 1.0,
+    "sched._schedulers.1.total_iters": 10000000000,
+    "sched._schedulers.1.base_lrs": [
+      1e-06
+    ],
+    "sched._milestones": [
+      10
+    ],
+    "sched._schedulers.1.last_epoch": 493,
+    "sched.last_epoch": 503,
+    "sched._schedulers.1._step_count": 494,
+    "sched._last_lr": [
+      1e-06
+    ],
+    "sched._schedulers.1._is_initial": false,
+    "sched._schedulers.0.start_factor": 1e-08,
+    "sched._schedulers.1._get_lr_called_within_step": false,
+    "sched._schedulers.0.end_factor": 1.0,
+    "sched._schedulers.1._last_lr": [
+      1e-06
+    ],
+    "sched._schedulers.0.total_iters": 10,
+    "sched._schedulers.0.base_lrs": [
+      1e-06
+    ],
+    "sched._schedulers.0.last_epoch": 9,
+    "sched._schedulers.0._step_count": 10
+  },
+  "optimizer_metadata_sha256": "0fdfbcf98237e8e7a559faa3e4558950f5dceff0401da38b6f08faf687e929a3"
+}
