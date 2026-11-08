@@ -1904,7 +1904,9 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError("Failed to pause every async vLLM engine")
         return True
 
-    def captured_call_progress(self) -> list[dict[str, Any]]:
+    def captured_call_progress(
+        self, *, timeout_s: Optional[float] = None
+    ) -> list[dict[str, Any]]:
         """Collect each paused engine's running captured calls and their lengths."""
         if not self.cfg["vllm_cfg"]["async_engine"]:
             return []
@@ -1912,7 +1914,11 @@ class VllmGeneration(GenerationInterface):
             worker.captured_call_progress.remote()
             for worker in self._refit_leader_workers()
         ]
-        return [progress for progress in ray.get(futures) if progress is not None]
+        return [
+            progress
+            for progress in ray.get(futures, timeout=timeout_s)
+            if progress is not None
+        ]
 
     def resume_generation_after_refit(
         self, *, timeout_s: Optional[float] = None

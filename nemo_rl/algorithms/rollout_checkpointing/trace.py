@@ -29,14 +29,13 @@ Rows match across runs by
 ``prompt_id`` (the dataset index) and ``generation_index``; group and attempt
 IDs are new in every run.
 
-With token capture, each refit lists how many tokens every running call had
-generated when it paused, and each published group counts its trained tokens
-by the weight version each call began on, listing on its own only the calls a
-refit paused.
-``tokens_by_version`` splits each call at those refits, and
-``batch_age_by_step`` turns that into each step's batch age: the
-token-weighted number of weight updates between generating a token and
-training on it. Run this module on a trace file to print it per step.
+With token capture, each published group counts its trained tokens by the
+weight version that generated them. vLLM keeps running calls across a refit,
+so ``RefitCuts`` records how far each running call got when a refit paused it
+and splits the call there. ``batch_age_by_step`` turns those counts into each
+step's batch age: the token-weighted number of weight updates between
+generating a token and training on it. The controller logs the same number as
+``batch_age`` every step; run this module on a trace file to print it per step.
 """
 
 from __future__ import annotations
@@ -49,11 +48,14 @@ import threading
 import time
 import uuid
 import warnings
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
 from typing import IO, Any, Optional
 
 ROLLOUT_TRACE_FILENAME = "rollout_trace.jsonl"
+# Per-group rollout metrics a step sums into its batch age.
+BATCH_AGE_TOKENS_METRIC = "batch_age/trained_tokens"
+BATCH_AGE_VERSION_SUM_METRIC = "batch_age/token_version_sum"
 
 
 class RolloutTrace:
@@ -71,8 +73,6 @@ class RolloutTrace:
         # controller class that defaults to one still pickles for Ray.
         self._lines: Optional[queue.Queue[Optional[str]]] = None
         self._writer: Optional[threading.Thread] = None
-        # Model calls a refit paused, until their group is published.
-        self._cut_calls: set[str] = set()
         if path is not None:
             path.parent.mkdir(parents=True, exist_ok=True)
             self._file = open(path, "a", encoding="utf-8")
@@ -93,40 +93,6 @@ class RolloutTrace:
             return
         record = {"t": time.time(), "run": self._run_id, "event": event, **fields}
         self._lines.put(json.dumps(record, default=str) + "\n")
-
-    def emit_refit_cut(self, weight_version: int, calls: list[list[Any]]) -> None:
-        """Record how far each running captured call got before a refit paused it."""
-        if self._file is None:
-            return
-        self._cut_calls.update(call_id for call_id, _ in calls)
-        self.emit("refit_cut", weight_version=weight_version, calls=calls)
-
-    def emit_group_published(
-        self, group_id: str, call_versions: list[tuple[str, int, int]]
-    ) -> None:
-        """Record a published group's trained tokens by the version each call began on.
-
-        Only the calls a refit paused are listed on their own, since only they
-        are split across versions; the rest are summed per version.
-        """
-        if self._file is None:
-            return
-        tokens_by_begin_version: dict[int, int] = {}
-        cut_calls = []
-        for call_id, version, tokens in call_versions:
-            if call_id in self._cut_calls:
-                self._cut_calls.discard(call_id)
-                cut_calls.append([call_id, version, tokens])
-            else:
-                tokens_by_begin_version[version] = (
-                    tokens_by_begin_version.get(version, 0) + tokens
-                )
-        self.emit(
-            "group_published",
-            group_id=group_id,
-            tokens_by_version=tokens_by_begin_version,
-            calls=cut_calls,
-        )
 
     def flush(self) -> None:
         """Wait until every queued event has been written."""
@@ -180,48 +146,106 @@ def read_events(path: Path) -> Iterator[dict[str, Any]]:
             yield json.loads(line)
 
 
-def tokens_by_version(events: Iterable[dict[str, Any]]) -> dict[str, dict[int, int]]:
-    """Each published group's generated tokens, by the weight version that made them.
+class RefitCuts:
+    """Where each running captured call switched weights, until its group publishes.
 
-    A call's tokens count under the version it began on until a refit paused
-    it, and under the version that refit synced from there on. ``refit_cut``
-    events say how many tokens each running call had at the pause, and the next
-    ``weights_synced`` says which version it continued on. A group's other calls
-    arrive already summed by the version they began on.
+    vLLM keeps running calls across a refit, so a call's tokens after the refit
+    come from the new weights.
     """
-    # Call ID -> [(tokens generated before the refit, version after it), ...]
-    cuts: dict[str, list[tuple[int, int]]] = {}
-    pending: list[tuple[str, int]] = []
-    groups: dict[str, dict[int, int]] = {}
-    for event in events:
-        kind = event["event"]
-        if kind == "trace_opened":
-            # A refit the previous process did not finish never synced.
-            pending = []
-        elif kind == "refit_cut":
-            pending.extend((call_id, tokens) for call_id, tokens in event["calls"])
-        elif kind == "weights_synced":
-            for call_id, tokens in pending:
-                cuts.setdefault(call_id, []).append((tokens, event["weight_version"]))
-            pending = []
-        elif kind == "group_published":
+
+    def __init__(self) -> None:
+        # Call ID -> (the version its first refit replaced,
+        #             [(tokens before a refit, version after it), ...]).
+        self._calls: dict[str, tuple[int, list[tuple[int, int]]]] = {}
+
+    def record(
+        self, replaced_version: int, new_version: int, calls: Iterable[Sequence[Any]]
+    ) -> None:
+        """Record how many tokens each call had when a refit paused it."""
+        for call_id, tokens in calls:
+            _, cuts = self._calls.setdefault(call_id, (replaced_version, []))
+            cuts.append((tokens, new_version))
+
+    def forget_before(self, oldest_trainable_version: int) -> None:
+        """Drop calls whose group cannot be trained any more.
+
+        A call began on or before the version its first refit replaced, and its
+        group no later than the call, so the group is too old to train when
+        that version is.
+        """
+        self._calls = {
+            call_id: entry
+            for call_id, entry in self._calls.items()
+            if entry[0] >= oldest_trainable_version
+        }
+
+    def tokens_by_version(
+        self, call_versions: Iterable[tuple[str, int, int]]
+    ) -> dict[int, int]:
+        """A published group's trained tokens by the weight version that made them.
+
+        Args:
+            call_versions: Each trained call's ID, the version it began on and
+                the tokens it generated.
+
+        Returns:
+            Token counts by weight version. A call's tokens count under the
+            version it began on until a refit paused it, and under the version
+            that refit installed from there on.
+        """
+        counts: dict[int, int] = {}
+        for call_id, version, total in call_versions:
+            done = 0
+            for tokens, next_version in self._calls.pop(call_id, (version, []))[1]:
+                tokens = min(tokens, total)
+                if tokens > done:
+                    counts[version] = counts.get(version, 0) + tokens - done
+                    done = tokens
+                version = next_version
+            if total > done:
+                counts[version] = counts.get(version, 0) + total - done
+        return counts
+
+
+def tokens_by_version(events: Iterable[dict[str, Any]]) -> dict[str, dict[int, int]]:
+    """Each published group's trained tokens, by the weight version that made them."""
+    return {
+        event["group_id"]: {
             # JSON keys are strings.
-            counts = {
-                int(version): tokens
-                for version, tokens in event.get("tokens_by_version", {}).items()
-            }
-            for call_id, version, total in event["calls"]:
-                done = 0
-                for tokens, next_version in cuts.pop(call_id, []):
-                    tokens = min(tokens, total)
-                    if tokens > done:
-                        counts[version] = counts.get(version, 0) + tokens - done
-                        done = tokens
-                    version = next_version
-                if total > done:
-                    counts[version] = counts.get(version, 0) + total - done
-            groups[event["group_id"]] = counts
-    return groups
+            int(version): tokens
+            for version, tokens in event["tokens_by_version"].items()
+        }
+        for event in events
+        if event["event"] == "group_published"
+    }
+
+
+def batch_age_group_metrics(counts: dict[int, int]) -> dict[str, int]:
+    """A published group's share of its step's batch age, as two sums."""
+    if not counts:
+        return {}
+    return {
+        BATCH_AGE_TOKENS_METRIC: sum(counts.values()),
+        BATCH_AGE_VERSION_SUM_METRIC: sum(
+            version * tokens for version, tokens in counts.items()
+        ),
+    }
+
+
+def pop_batch_age(
+    per_group_metrics: dict[str, list[Any]], trained_version: int
+) -> Optional[float]:
+    """Remove the step's batch-age sums and return its batch age, if it has tokens.
+
+    Args:
+        per_group_metrics: The step's rollout metrics, one value per group.
+        trained_version: The policy version the step updates.
+    """
+    tokens = sum(per_group_metrics.pop(BATCH_AGE_TOKENS_METRIC, []))
+    version_sum = sum(per_group_metrics.pop(BATCH_AGE_VERSION_SUM_METRIC, []))
+    if not tokens:
+        return None
+    return trained_version - version_sum / tokens
 
 
 def batch_age_by_step(events: Iterable[dict[str, Any]]) -> dict[int, float]:
