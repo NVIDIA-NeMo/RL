@@ -1,5 +1,5 @@
 {
-  "observed_at": "2026-11-08T06:48:54-08:00",
+  "observed_at": "2026-11-08T06:54:49-08:00",
   "code_and_recipes_commit": "ad5582855",
   "image": "containers/nemo_rl.1030.sqsh",
   "qualification": {
@@ -52,9 +52,9 @@
     "gpus_per_node": 8,
     "target_steps": 600,
     "state": "RUNNING",
-    "observed_committed_steps": 300,
+    "observed_committed_steps": 302,
     "durable_checkpoint_step": 300,
-    "verified_at": "2026-11-08T06:48:54-08:00",
+    "verified_at": "2026-11-08T06:54:49-08:00",
     "curve_refresh_job_id": 21389289,
     "same_checkpoint_and_run_id_across_segments": true,
     "original_numerical_qualification_passed": false,
@@ -79,7 +79,28 @@
       "step300 weights on16workers",
       "step300 data-loader/TQ/recovery restore",
       "same W&B run resumed online"
-    ]
+    ],
+    "first_resumed_step": 301,
+    "first_resumed_step_metrics": {
+      "gen_kl_error": 0.0015835980198881713,
+      "policy_kl_error": 5.046486964892457,
+      "grad_norm": 0.5289129018783569,
+      "reward": 0.4375,
+      "mean_gen_tokens_per_sample": 1572.84375,
+      "policy_train_dispatches": 2,
+      "weight_version_lag": 0,
+      "lr": 1e-06
+    },
+    "latest_observed_metrics": {
+      "gen_kl_error": 0.0014097516975230355,
+      "policy_kl_error": 0.0014922586556811968,
+      "grad_norm": 0.31445711851119995,
+      "reward": 0.65625,
+      "mean_gen_tokens_per_sample": 915.78125,
+      "policy_train_dispatches": 2,
+      "weight_version_lag": 0,
+      "lr": 1e-06
+    }
   },
   "previous_attempts": [
     {

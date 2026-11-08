@@ -41,8 +41,14 @@ Submitted on2026-11-08 06:41PST, code2a9ec1e77:
 | 3 | 21509385 | afterok:21509384 |
 | 4 | 21509386 | afterok:21509385 |
 
-At06:42PST first job is RUNNING onpool0-[00139,00585,01164]; others wait on
-dependencies. Training has not yet committed301 at this snapshot. Always inspect
+At06:54PST first job is RUNNING onpool0-[00139,00585,01164]; others wait on
+dependencies. Updates301and302 committed with trainer versions301/302,lag0,
+two dispatches each and LR1e-6. Step301 genKL0.0015835980; step302 genKL0.0014097517.
+W&B read-only API confirmed the existing run is running and has received301,
+matching native metrics. Step301 has a policy-KL spike5.04649 while gradient/loss
+remain finite; step302 returns to its ordinary range. Record and monitor subsequent
+steps rather than treating that spike as a gen-KL explosion. Latest durable
+checkpoint remains300 until the next periodic save. Always inspect current
 Slurm/logs/latest_checkpoint_status.json rather than treating these notes as live.
 
 Every10minutes, session/20261105_pr3_design/monitor_resume600.py reads only this
