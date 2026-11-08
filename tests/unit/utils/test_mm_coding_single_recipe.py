@@ -331,6 +331,7 @@ def test_runtime_guard_detects_missing_session_api(monkeypatch):
     spec = importlib.util.spec_from_file_location(
         "check_mm_coding_runtime", EXAMPLE / "check_mm_coding_runtime.py"
     )
+    assert spec is not None and spec.loader is not None
     guard = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(guard)
 
