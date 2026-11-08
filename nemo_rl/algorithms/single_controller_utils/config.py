@@ -40,6 +40,7 @@ from nemo_rl.algorithms.grpo import (
     _REWARD_PENALTY_FLAGS,
     GRPOConfig,
     RewardPenaltyConfig,
+    _validate_seq_logprob_error_in_loss,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -47,6 +48,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
+from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
@@ -71,9 +73,11 @@ from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
     RecoveryTargetLevel,
 )
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
+    resolve_vllm_logprobs_mode,
 )
 from nemo_rl.models.policy import AutomodelConfig, MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
@@ -933,6 +937,12 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     periodic-checkpoint failures are tolerated before the controller aborts the
     run. A successful or skipped attempt resets the counter; checkpoint
     invariant failures still fail immediately.
+
+    ``trace=True`` appends one JSON line per rollout event to
+    ``rollout_trace.jsonl`` in the log directory, to check what a stop and
+    restore cost. Per-rollout events need ``rollout_recovery`` dispatch. It does
+    not enable checkpointing. The events are listed in
+    ``nemo_rl/algorithms/rollout_checkpointing/trace.py``.
     """
 
     snapshot_attempt_interval_s: Annotated[Optional[float], Field(gt=0)] = None
@@ -941,6 +951,7 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     keep_latest_k: Annotated[int, Field(ge=1)] = 2
     restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
     extra_fingerprint_excluded_paths: list[str] = Field(default_factory=list)
+    trace: bool = False
 
     @model_validator(mode="after")
     def validate_extra_fingerprint_excluded_paths(self) -> "RolloutCheckpointConfig":
@@ -1021,6 +1032,8 @@ def validate_forest_objective(
         == "seq-mask-tis",
         "loss_fn.use_kl_in_reward": loss.use_kl_in_reward,
         "loss_fn.positive_example_nll_weight": loss.positive_example_nll_weight != 0,
+        # The loss filters physical rows; forest training masks whole owners.
+        "loss_fn.seq_logprob_error_in_loss": loss.seq_logprob_error_in_loss,
         f"{section}.use_dynamic_sampling": algo_cfg.use_dynamic_sampling,
         f"{section}.reward_shaping.enabled": algo_cfg.reward_shaping.enabled,
         f"{section}.reward_scaling.enabled": algo_cfg.reward_scaling.enabled,
@@ -1047,9 +1060,8 @@ def logprob_passes_required(
 ) -> tuple[bool, bool]:
     """Return policy/reference forward requirements for both setup and execution."""
     return (
-        not (
-            master_config.loss_fn.force_on_policy_ratio
-            and algo_cfg.seq_logprob_error_threshold is None
+        not skips_policy_logprob_pass(
+            master_config.loss_fn, algo_cfg.seq_logprob_error_threshold
         ),
         bool(
             master_config.loss_fn.reference_policy_kl_penalty > 0
@@ -1518,6 +1530,15 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 stacklevel=2,
             )
 
+    # A forced ratio equals the true one only on the first optimizer step taken
+    # on a batch; later epochs would train without any trust region.
+    if master_config.loss_fn.force_on_policy_ratio and algo_cfg.ppo_epochs != 1:
+        raise ValueError(
+            "loss_fn.force_on_policy_ratio=true requires ppo.ppo_epochs=1, got "
+            f"ppo.ppo_epochs={algo_cfg.ppo_epochs}. Set "
+            "loss_fn.force_on_policy_ratio=false to run multiple policy epochs."
+        )
+
     failure_config = async_config.rollout_failure
     drop_budget = (
         failure_config.max_skipped_prompts
@@ -1628,11 +1649,9 @@ def resolve_ppo_chunk_alignment(
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     if master_config.loss_fn.seq_logprob_error_in_loss:
-        raise ValueError(
-            "loss_fn.seq_logprob_error_in_loss is not supported by SingleController: "
-            "its advantage baselines depend on the pre-training sequence mask. "
-            "Use the non-streaming GRPO trainer."
-        )
+        if is_ppo_run(master_config):
+            raise ValueError("loss_fn.seq_logprob_error_in_loss requires GRPO")
+        _validate_seq_logprob_error_in_loss(master_config)
     _validate_algo_settings(master_config)
 
     async_config = master_config.async_rl
@@ -1679,10 +1698,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         or top_logprobs < 0
     ):
         raise ValueError("policy.generation.top_logprobs must be a nonnegative integer")
-    if top_logprobs > 0 and not master_config.loss_fn.score_centering:
+    score_centering = master_config.loss_fn.score_centering
+    replay = sampler_replay_enabled(generation_cfg)
+    if top_logprobs > 0 and not (score_centering or replay):
         raise ValueError(
-            "policy.generation.top_logprobs > 0 is only read by loss_fn.score_centering; "
-            "set it to 0 or enable score centering"
+            "policy.generation.top_logprobs > 0 is only read by loss_fn.score_centering "
+            "and policy.generation.sampler_replay.enabled; set it to 0 or enable one"
         )
     if top_logprobs > 0:
         if master_config.policy["generation"]["backend"] != "vllm":
@@ -1693,18 +1714,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             raise ValueError(
                 "policy.generation.top_logprobs requires token_capture.enabled=true"
             )
-    if master_config.loss_fn.score_centering:
+    if score_centering:
         if top_logprobs == 0:
             raise ValueError(
                 "loss_fn.score_centering requires policy.generation.top_logprobs > 0"
             )
-        generation_cfg = master_config.policy["generation"]
         temperature = generation_cfg["temperature"]
-        logprobs_mode = (generation_cfg.get("vllm_cfg") or {}).get("logprobs_mode")
-        if logprobs_mode is None:
-            logprobs_mode = (generation_cfg.get("vllm_kwargs") or {}).get(
-                "logprobs_mode"
-            )
+        logprobs_mode = resolve_vllm_logprobs_mode(cast(VllmConfig, generation_cfg))
         if temperature <= 0 or not math.isfinite(temperature):
             raise ValueError(
                 "loss_fn.score_centering requires a finite positive sampling temperature"
@@ -1719,13 +1735,27 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "processed_logprobs when policy.generation.temperature != 1.0"
             )
         if (
-            generation_cfg.get("top_p") != 1.0
-            or generation_cfg.get("top_k") is not None
+            need_top_k_or_top_p_filtering(
+                TrainingSamplingParams(
+                    top_k=generation_cfg["top_k"], top_p=generation_cfg["top_p"]
+                )
+            )
+            and not replay
         ):
             raise ValueError(
-                "loss_fn.score_centering needs unfiltered sampling "
-                "(policy.generation.top_p=1, top_k=null) so the captured top-k is "
-                "the sampling distribution"
+                "loss_fn.score_centering with top-k/top-p sampling requires "
+                "policy.generation.sampler_replay.enabled=true: the estimator is "
+                "exact only over the support the sampler drew from"
+            )
+    if score_centering or replay:
+        # Both score the trainer's logits at the captured sampler head ids.
+        top_k = generation_cfg["top_k"]
+        if top_k is not None and top_logprobs < top_k:
+            raise ValueError(
+                "loss_fn.score_centering and policy.generation.sampler_replay.enabled "
+                "with top-k sampling require policy.generation.top_logprobs >= "
+                "policy.generation.top_k, so the captured head holds the kept set. "
+                "See docs/guides/sampler-replay.md#head-size-and-top-p"
             )
 
         automodel_cfg = master_config.policy.get("automodel_cfg")
@@ -1736,16 +1766,23 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 or enabled_automodel_cfg["context_parallel_size"] > 1
             ):
                 raise ValueError(
-                    "loss_fn.score_centering supports Automodel only with "
-                    "tensor_parallel_size=1 and context_parallel_size=1; use Megatron for TP/CP"
+                    "loss_fn.score_centering and policy.generation.sampler_replay.enabled "
+                    "support Automodel only with tensor_parallel_size=1 and "
+                    "context_parallel_size=1; use Megatron for TP/CP"
                 )
         megatron_cfg = master_config.policy.get("megatron_cfg") or {}
         if megatron_cfg.get("enabled") and megatron_cfg.get(
             "use_fused_linear_logprobs"
         ):
             raise ValueError(
-                "loss_fn.score_centering needs vocabulary logits; disable "
+                "loss_fn.score_centering and policy.generation.sampler_replay.enabled "
+                "need vocabulary logits; disable "
                 "policy.megatron_cfg.use_fused_linear_logprobs"
+            )
+        if megatron_cfg.get("enabled") and megatron_cfg.get("reuse_logits_storage"):
+            raise ValueError(
+                "loss_fn.score_centering reads the packed logits again; disable "
+                "policy.megatron_cfg.reuse_logits_storage"
             )
 
     if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:
@@ -1785,14 +1822,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "the ready_first sampler requires "
                 "loss_fn.use_importance_sampling_correction=true"
             )
-        if (
-            master_config.loss_fn.force_on_policy_ratio
-            and not master_config.loss_fn.use_cispo
-        ):
-            raise ValueError(
-                "the ready_first sampler requires "
-                "loss_fn.force_on_policy_ratio=false unless loss_fn.use_cispo=true"
-            )
+        # TIS corrects generation staleness; a forced ratio stays exact with one
+        # optimizer step per batch (enforced for PPO in _validate_algo_settings).
 
     # Top-k retention keys off checkpointing.metric_name, but SC has no
     # validation loop yet (see _save_checkpoint), so a "val:" metric would
@@ -1825,6 +1856,20 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "non-default rollout_recovery policies require "
             "token_capture.enabled=true; without token capture, unfinished Gym "
             "siblings have no durable receipts to recover"
+        )
+    if (
+        is_ppo_run(master_config)
+        and master_config.ppo.adv_estimator.name == "gae"  # type: ignore
+        and master_config.ppo.adv_estimator.whiten_execution_padding  # type: ignore
+        and not (
+            token_capture_config.forest_training
+            and token_capture_config.forest_padding_scope == "step"
+        )
+    ):
+        # Only step padding copies carry token_mask; group padding has none.
+        raise ValueError(
+            "ppo.adv_estimator.whiten_execution_padding requires "
+            "token_capture.forest_training=true and forest_padding_scope=step"
         )
     if token_capture_config.forest_training:
         forest_algo_cfg = algo_config(master_config)
