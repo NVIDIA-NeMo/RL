@@ -44,13 +44,14 @@ if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
     from nemo_rl.experience.rollout_reassembler import RolloutSelection
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 7
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 8
 # Schemas 2 to 5 predate turn-level recovery; they load through
 # _upgrade_pre_turn_recovery_groups.
 _PRE_TURN_RECOVERY_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
 SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {
     *_PRE_TURN_RECOVERY_SCHEMA_VERSIONS,
     6,
+    7,
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
 }
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
@@ -76,6 +77,7 @@ _GROUP_STATE_FIELDS = frozenset(
         "task_source",
         "resolved_agent_name",
         "attribution_key",
+        "allow_mixed_agents",
         "restore_level",
         "expected_generations",
         "target_step",
@@ -86,7 +88,9 @@ _GROUP_STATE_FIELDS = frozenset(
     }
 )
 _PROMPT_REF_STATE_FIELDS = frozenset({"sample_id", "task_name"})
-_SIBLING_STATE_FIELDS = frozenset({"generation_index", "attempts"})
+_SIBLING_STATE_FIELDS = frozenset(
+    {"generation_index", "attempts", "resolved_agent_name"}
+)
 _ATTEMPT_STATE_FIELDS = frozenset(
     {
         "attempt_uuid",
@@ -313,6 +317,8 @@ class RolloutSiblingRecord:
 
     generation_index: int
     attempts: list[RolloutAttemptRecord]
+    # Stable across physical attempts; a retry must use the original harness.
+    resolved_agent_name: Optional[str] = None
 
     @property
     def current_attempt(self) -> RolloutAttemptRecord:
@@ -345,6 +351,7 @@ class PromptGroupRecoveryRecord:
     resolved_agent_name: Optional[str] = None
     # Sealed with receipts so all-sealed recovery retains teacher/metric routing.
     attribution_key: Optional[str] = None
+    allow_mixed_agents: bool = False
 
     @property
     def recovery_granularity(self) -> RecoveryGranularity:
@@ -644,9 +651,12 @@ class RolloutRecoveryLedger:
         group_id: Optional[str] = None,
         admission_id: Optional[str] = None,
         prompt_ref: Optional[PromptRef] = None,
+        allow_mixed_agents: bool = False,
     ) -> PromptGroupRecoveryRecord:
         """Create one logical group and its first physical sibling attempts."""
         cut.require_live()
+        if not isinstance(allow_mixed_agents, bool):
+            raise TypeError("allow_mixed_agents must be a bool")
         if not prompt_id:
             raise ValueError("prompt_id must not be empty")
         if prompt_ref is None:
@@ -690,6 +700,7 @@ class RolloutRecoveryLedger:
             target_step=target_step,
             start_weight_version=start_weight_version,
             siblings=siblings,
+            allow_mixed_agents=allow_mixed_agents,
             phase=(
                 PromptGroupPhase.ADMITTED if admitted else PromptGroupPhase.RESERVED
             ),
@@ -1207,7 +1218,7 @@ class RolloutRecoveryLedger:
         )
         if not isinstance(mask_sample, bool):
             raise TypeError("mask_sample must be a bool")
-        self._validate_agent_name(record, resolved_agent_name)
+        self._validate_agent_name(record, sibling, resolved_agent_name)
         if attribution_key is None:
             attribution_key = resolved_agent_name
         self._validate_attribution_key(record, attribution_key)
@@ -1243,7 +1254,8 @@ class RolloutRecoveryLedger:
                 f"from status {attempt.status.value!r}"
             )
 
-        record.resolved_agent_name = resolved_agent_name
+        sibling.resolved_agent_name = resolved_agent_name
+        record.resolved_agent_name = self._group_agent_name(record)
         record.attribution_key = attribution_key
         attempt.receipt = copy.deepcopy(receipt)
         attempt.logical_selection = copy.deepcopy(logical_selection)
@@ -1285,10 +1297,8 @@ class RolloutRecoveryLedger:
             )
 
         agent_names = {result.resolved_agent_name for result in results.values()}
-        if len(agent_names) != 1:
+        if len(agent_names) != 1 and not record.allow_mixed_agents:
             raise ValueError("prompt-group siblings resolved to different agents")
-        resolved_agent_name = next(iter(agent_names))
-        self._validate_agent_name(record, resolved_agent_name)
         attribution_keys = {
             result.attribution_key
             if result.attribution_key is not None
@@ -1306,6 +1316,7 @@ class RolloutRecoveryLedger:
         for generation_index in range(record.expected_generations):
             result = results[generation_index]
             sibling = self._require_sibling(record, generation_index)
+            self._validate_agent_name(record, sibling, result.resolved_agent_name)
             attempt = sibling.current_attempt
             expected_gate_rollout_id = record.gate_rollout_id(generation_index)
             if attempt.status is not RolloutAttemptStatus.DISPATCHED:
@@ -1343,9 +1354,11 @@ class RolloutRecoveryLedger:
 
         # Validate the complete cohort before changing any sibling. A checkpoint
         # therefore observes either no committed siblings or the complete group.
-        record.resolved_agent_name = resolved_agent_name
         record.attribution_key = attribution_key
         for generation_index, (attempt, result, staging_keys) in enumerate(validated):
+            record.siblings[
+                generation_index
+            ].resolved_agent_name = result.resolved_agent_name
             attempt.receipt = copy.deepcopy(result.receipt)
             attempt.logical_selection = copy.deepcopy(result.logical_selection)
             attempt.reward = float(result.reward)
@@ -1355,18 +1368,31 @@ class RolloutRecoveryLedger:
             attempt.staging_keys = staging_keys
             attempt.status = RolloutAttemptStatus.SEALED
             self._record_gym_forget_if_restored(record, generation_index)
+        record.resolved_agent_name = self._group_agent_name(record)
         record.status = PromptGroupStatus.READY_TO_FINALIZE
 
     @staticmethod
     def _validate_agent_name(
-        record: PromptGroupRecoveryRecord, agent_name: Optional[str]
+        record: PromptGroupRecoveryRecord,
+        sibling: RolloutSiblingRecord,
+        agent_name: Optional[str],
     ) -> None:
         if agent_name is not None and (
             not isinstance(agent_name, str) or not agent_name
         ):
             raise ValueError("resolved_agent_name must be a non-empty string or None")
+        if record.allow_mixed_agents and agent_name is None:
+            raise ValueError(
+                "mixed-agent groups require a resolved agent for every sibling"
+            )
         if (
-            record.resolved_agent_name is not None
+            sibling.resolved_agent_name is not None
+            and sibling.resolved_agent_name != agent_name
+        ):
+            raise ValueError("logical rollout resolved to a different agent on retry")
+        if (
+            not record.allow_mixed_agents
+            and record.resolved_agent_name is not None
             and record.resolved_agent_name != agent_name
         ):
             raise ValueError("prompt-group siblings resolved to different agents")
@@ -1386,6 +1412,15 @@ class RolloutRecoveryLedger:
             raise ValueError(
                 "prompt-group siblings resolved to different attribution keys"
             )
+
+    @staticmethod
+    def _group_agent_name(record: PromptGroupRecoveryRecord) -> Optional[str]:
+        names = {
+            sibling.resolved_agent_name
+            for sibling in record.siblings
+            if sibling.resolved_agent_name is not None
+        }
+        return next(iter(names)) if len(names) == 1 else None
 
     def abandon_unsealed(self, cut: DataPlaneMutationCut, group_id: str) -> None:
         """Abandon failed work at the group's persisted recovery granularity."""
@@ -1553,6 +1588,7 @@ class RolloutRecoveryLedger:
                     "task_source": record.task_source,
                     "resolved_agent_name": record.resolved_agent_name,
                     "attribution_key": record.attribution_key,
+                    "allow_mixed_agents": record.allow_mixed_agents,
                     "restore_level": record.restore_level.value,
                     "expected_generations": record.expected_generations,
                     "target_step": record.target_step,
@@ -1562,6 +1598,7 @@ class RolloutRecoveryLedger:
                     "siblings": [
                         {
                             "generation_index": sibling.generation_index,
+                            "resolved_agent_name": sibling.resolved_agent_name,
                             "attempts": [
                                 {
                                     "attempt_uuid": attempt.attempt_uuid.bytes,
@@ -1689,6 +1726,9 @@ class RolloutRecoveryLedger:
         resolved_agent_name = raw_group.get("resolved_agent_name")
         # Schemas 2 to 6 predate taskset attribution and stored only the flat agent.
         attribution_key = raw_group.get("attribution_key", resolved_agent_name)
+        allow_mixed_agents = raw_group.get("allow_mixed_agents", False)
+        if not isinstance(allow_mixed_agents, bool):
+            raise ValueError("allow_mixed_agents must be a bool")
         raw_restore_level = raw_group.get("restore_level")
         expected_generations = raw_group.get("expected_generations")
         siblings_state = raw_group.get("siblings")
@@ -1750,6 +1790,16 @@ class RolloutRecoveryLedger:
             )
             if sibling_state.get("generation_index") != generation_index:
                 raise ValueError("generation indices must be contiguous")
+            # Older checkpoints recorded only the shared group agent.
+            sibling_agent_name = sibling_state.get(
+                "resolved_agent_name", resolved_agent_name
+            )
+            if sibling_agent_name is not None and (
+                not isinstance(sibling_agent_name, str) or not sibling_agent_name
+            ):
+                raise ValueError(
+                    "sibling resolved_agent_name must be a non-empty string or None"
+                )
             logical_id = f"{group_id}_g{generation_index}"
             attempts_state = sibling_state.get("attempts")
             if not isinstance(attempts_state, list) or not attempts_state:
@@ -1895,6 +1945,7 @@ class RolloutRecoveryLedger:
                 RolloutSiblingRecord(
                     generation_index=generation_index,
                     attempts=attempts,
+                    resolved_agent_name=sibling_agent_name,
                 )
             )
 
@@ -1936,6 +1987,25 @@ class RolloutRecoveryLedger:
                 f"group state {status.value!r} requires every sibling to be sealed"
             )
 
+        names = {
+            sibling.resolved_agent_name
+            for sibling in siblings
+            if sibling.resolved_agent_name is not None
+        }
+        if len(names) > 1 and not allow_mixed_agents:
+            raise ValueError("prompt-group siblings resolved to different agents")
+        expected_agent_name = next(iter(names)) if len(names) == 1 else None
+        if resolved_agent_name != expected_agent_name:
+            raise ValueError("group agent attribution disagrees with its siblings")
+        if allow_mixed_agents and any(
+            sibling.current_attempt.status == RolloutAttemptStatus.SEALED
+            and sibling.resolved_agent_name is None
+            for sibling in siblings
+        ):
+            raise ValueError(
+                "sealed mixed-agent sibling is missing its agent attribution"
+            )
+
         return PromptGroupRecoveryRecord(
             group_id=group_id,
             admission_id=admission_id,
@@ -1952,6 +2022,7 @@ class RolloutRecoveryLedger:
             status=status,
             resolved_agent_name=resolved_agent_name,
             attribution_key=attribution_key,
+            allow_mixed_agents=allow_mixed_agents,
         )
 
     def _require_group(self, group_id: str) -> PromptGroupRecoveryRecord:

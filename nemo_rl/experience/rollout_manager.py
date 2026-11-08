@@ -44,9 +44,9 @@ from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
+from nemo_rl.environments.nemo_gym_harnesses import HarnessPool
 from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
-    get_nemo_gym_task_input,
 )
 from nemo_rl.experience.failures import (
     FailureClass,
@@ -64,6 +64,7 @@ from nemo_rl.experience.failures import (
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_MODEL_SAMPLING_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     Completion,
@@ -1047,6 +1048,8 @@ class AsyncNemoGymRolloutImpl:
         effort_config: Optional[EffortLevelsConfig] = None,
         log_full_result_tables: bool = False,
         forest_training: bool = False,
+        *,
+        harness_pool: Optional[HarnessPool] = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -1068,6 +1071,7 @@ class AsyncNemoGymRolloutImpl:
         ).max_gym_row_attempts
         self._stats = stats
         self._effort_config = effort_config
+        self._harness_pool = harness_pool
         # Small integers keep Gym task IDs safe for NumPy/W&B numeric metrics.
         self._next_nemo_gym_task_index = 0
 
@@ -1191,7 +1195,7 @@ class AsyncNemoGymRolloutImpl:
         record_extra_env_info = copy.deepcopy(input_sample["extra_env_info"])
         record_extra_env_info["attribution_key"] = attribution_key
         resolved_agent_ref = rollout_inputs[0].get("agent_ref")
-        if resolved_agent_ref is not None:
+        if resolved_agent_ref is not None and not self._harness_pool:
             record_extra_env_info["agent_ref"] = copy.deepcopy(resolved_agent_ref)
         else:
             record_extra_env_info.pop("agent_ref", None)
@@ -1228,8 +1232,7 @@ class AsyncNemoGymRolloutImpl:
         rollout_ids: Optional[list[str]] = None,
         generation_indices: Optional[list[int]] = None,
     ) -> list[dict]:
-        """Build N row dicts from input_sample, applying generation config params."""
-        # Build a template row from the input_sample's extra_env_info, applying generation params.
+        """Build N rows while preserving harness-owned request parameters."""
         template_row: dict = copy.deepcopy(input_sample["extra_env_info"])  # type: ignore
         # One fresh ID per run_rollout attempt, shared by all sibling rows.
         # Gym keys rollouts by task + rollout index (observability capture when
@@ -1239,26 +1242,13 @@ class AsyncNemoGymRolloutImpl:
         # sample. Row-level redispatch reuses these rows and keeps the same ID.
         template_row[NEMO_GYM_TASK_INDEX_KEY] = task_index
 
-        # We do not translate max_seq_len into row-level max_tokens here because that would
-        # change semantics from "total sequence length" to "max new tokens".
-        responses_create_params = get_nemo_gym_task_input(template_row).get(
-            "responses_create_params"
-        )
-        if not isinstance(responses_create_params, dict):
-            raise TypeError(
-                "Each NeMo-Gym task input must contain a responses_create_params dict"
-            )
-        responses_create_params["temperature"] = self._generation_config["temperature"]
-        responses_create_params["top_p"] = self._generation_config["top_p"]
-
-        # Configure max_output_tokens to respect the max_new_tokens setting.
-        # Will clamp max_output_tokens in vllm_worker_async.py so that input + output <= max_seq_len
-        existing = responses_create_params.get("max_output_tokens")
-        responses_create_params["max_output_tokens"] = (
-            min(existing, self._generation_config["max_new_tokens"])
-            if existing is not None
-            else self._generation_config["max_new_tokens"]
-        )
+        # Carry the sampling profile beside the task so session harnesses receive
+        # the same policy values on every model call, including validation.
+        template_row[NEMO_GYM_MODEL_SAMPLING_KEY] = {
+            "temperature": self._generation_config["temperature"],
+            "top_p": self._generation_config["top_p"],
+            "max_output_tokens": self._generation_config["max_new_tokens"],
+        }
 
         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
         if rollout_ids is not None:
@@ -1481,9 +1471,9 @@ class AsyncNemoGymRolloutImpl:
                 else:
                     input_row.pop("agent_ref", None)
                     result.pop("agent_ref", None)
-                attribution_key = get_nemo_gym_attribution_key(result)
+                attribution_key = get_nemo_gym_attribution_key(input_row)
                 if attribution_key is None:
-                    attribution_key = get_nemo_gym_attribution_key(input_row)
+                    attribution_key = get_nemo_gym_attribution_key(result)
                 if attribution_key is None:
                     raise ValueError(
                         "NeMo-Gym did not return a resolved attribution key"
@@ -1497,7 +1487,9 @@ class AsyncNemoGymRolloutImpl:
                         self._effort_config,
                     )
                     result["reward_log_context"] = RewardLogContext(
-                        agent_name=_nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),
+                        agent_name=resolved_agent_ref["name"]
+                        if self._harness_pool
+                        else _nemo_gym_metric_namespace(input_row),
                         full_result_json=json.dumps(
                             {
                                 key: value
@@ -1611,9 +1603,11 @@ class AsyncNemoGymRolloutImpl:
         # They share one Gym route and must stay on one instance.
         shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
         nemo_gym_env = (
-            shard_set.pick_handle_for_group(inputs)
-            if gym_instance_id is None
-            else shard_set.handle_for_checkpoint_instance(gym_instance_id)
+            shard_set.handle_for_checkpoint_instance(gym_instance_id)
+            if gym_instance_id is not None
+            else shard_set.sole_handle()
+            if self._harness_pool
+            else shard_set.pick_handle_for_group(inputs)
         )
         instance_label = shard_set.instance_label(nemo_gym_env)
         instance_timer_prefix = f"{timer_prefix}/shard/{instance_label}"
@@ -1786,6 +1780,12 @@ class AsyncNemoGymRolloutImpl:
                 full_results=[
                     result.get("full_result") or {} for result in completed_results
                 ],
+                agent_names=[
+                    row["agent_ref"]["name"]
+                    for row in sorted(inputs, key=lambda row: row["_rowidx"])
+                ]
+                if self._harness_pool
+                else None,
             )
             # Receipt metrics come from their manifests, not token-bearing results.
             receipt_mode = bool(completed_results) and "receipt" in completed_results[0]
@@ -1814,7 +1814,11 @@ class AsyncNemoGymRolloutImpl:
         if not isinstance(extra_env_info, Mapping):
             raise ValueError("NeMo-Gym input must contain extra_env_info")
         shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
-        handle = shard_set.pick_handle_for_group([dict(extra_env_info)])
+        handle = (
+            shard_set.sole_handle()
+            if self._harness_pool
+            else shard_set.pick_handle_for_group([dict(extra_env_info)])
+        )
         return shard_set.checkpoint_instance_for_handle(handle).instance_id
 
     def _results_to_completions(
@@ -1861,7 +1865,9 @@ class AsyncNemoGymRolloutImpl:
         completions = []
         for result in results:
             env_extras = dict(completion_extras(result["full_result"]))
-            attribution_key = get_nemo_gym_attribution_key(result)
+            attribution_key = result.get(
+                "attribution_key"
+            ) or get_nemo_gym_attribution_key(result)
             if attribution_key is not None:
                 env_extras["attribution_key"] = attribution_key
             if result.get("agent_ref") is not None:
@@ -1921,6 +1927,8 @@ class AsyncNemoGymRolloutImpl:
         completions: list[Completion],
         agent_name: str,
         full_results: Optional[list[dict[str, Any]]] = None,
+        *,
+        agent_names: Optional[list[str]] = None,
     ) -> dict[str, Any]:
         """Aggregate per-sample and per-agent metrics.
 
@@ -2018,7 +2026,6 @@ class AsyncNemoGymRolloutImpl:
             # truncated metrics
             "natural_termination_rate": sum(not t for t in truncated) / n,
             "truncation_rate": truncation_rate,
-            f"{agent_name}/truncation_rate": truncation_rate,
         }
 
         # Agent-level metrics. Receipts are lineage records, not agent
@@ -2052,27 +2059,51 @@ class AsyncNemoGymRolloutImpl:
             }
             for result in agent_results
         ]
-        for key in agent_extras[0].keys():
-            if key in _SHARED_GENRM_METRICS:
-                continue
-            values = [
-                float(r[key])  # type: ignore
-                for r in agent_extras
-                if isinstance(r.get(key), (bool, int, float))
-            ]
-            if values:
+        names = agent_names if agent_names is not None else [agent_name] * n
+        if len(names) != n:
+            raise ValueError("agent_names must align with NeMo-Gym completions")
+        for name in dict.fromkeys(names):
+            indices = [index for index, value in enumerate(names) if value == name]
+            count = len(indices)
+            extras = [agent_extras[index] for index in indices]
+            rollout_metrics[f"{name}/truncation_rate"] = (
+                sum(truncated[index] for index in indices) / count
+            )
+            for key in extras[0]:
+                if key in _SHARED_GENRM_METRICS:
+                    continue
+                values = [
+                    float(row[key])
+                    for row in extras
+                    if isinstance(row.get(key), (bool, int, float))
+                ]
+                if values:
+                    rollout_metrics.update(
+                        calculate_single_metric(values, count, f"{name}/{key}")
+                    )
+
+            # Live token counts take precedence over similarly named metadata.
+            rollout_metrics.update(
+                calculate_single_metric(
+                    [total_tokens[index] for index in indices],
+                    count,
+                    f"{name}/total_tokens_per_sample",
+                )
+            )
+            if not receipt_mode:
                 rollout_metrics.update(
-                    calculate_single_metric(values, n, f"{agent_name}/{key}")
+                    calculate_single_metric(
+                        [assistant_tokens[index] for index in indices],
+                        count,
+                        f"{name}/gen_tokens_per_sample",
+                    )
+                )
+            if self._log_full_result_tables and not receipt_mode:
+                rollout_metrics[f"{name}/full_result"] = Table(
+                    data=[[json.dumps(row, separators=(",", ":"))] for row in extras],
+                    columns=["Full result"],
                 )
 
-        # Emit authoritative live token metrics after full-result metrics so
-        # similarly named environment metadata cannot overwrite them. In receipt
-        # mode these come from the manifest-derived token counts above.
-        rollout_metrics.update(
-            calculate_single_metric(
-                total_tokens, n, f"{agent_name}/total_tokens_per_sample"
-            )
-        )
         if not receipt_mode:
             rollout_metrics.update(
                 calculate_single_metric(assistant_tokens, n, "gen_tokens_per_sample")
@@ -2084,16 +2115,6 @@ class AsyncNemoGymRolloutImpl:
             )
             rollout_metrics["max_gen_tokens_per_turn/p95"] = pct(
                 max_gen_tokens_per_turn, 95
-            )
-            rollout_metrics.update(
-                calculate_single_metric(
-                    assistant_tokens, n, f"{agent_name}/gen_tokens_per_sample"
-                )
-            )
-        if self._log_full_result_tables and not receipt_mode:
-            rollout_metrics[f"{agent_name}/full_result"] = Table(
-                data=[[json.dumps(r, separators=(",", ":"))] for r in agent_extras],
-                columns=["Full result"],
             )
 
         # Necessary for downstream nemo rl logging/printing.
@@ -2190,6 +2211,8 @@ class RolloutManager:
         log_full_result_tables: bool = False,
         forest_training: bool = False,
         execution_row_multiple: int = 1,
+        *,
+        harness_pool: Optional[HarnessPool] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
@@ -2203,6 +2226,7 @@ class RolloutManager:
             else RolloutRetryPolicy.single_attempt()
         )
         self._stats = RolloutStats()
+        self._harness_pool = harness_pool
         # Shared with the impl's request deadlines so the controller can pause their clocks
         # while a colocated engine is in training mode.
         self._request_deadlines = RequestDeadlineRegistry()
@@ -2242,6 +2266,7 @@ class RolloutManager:
             retry_policy=self._retry_policy,
             stats=self._stats,
             effort_config=effort_config,
+            harness_pool=harness_pool,
             forest_training=forest_training,
         )
         self._tokenizer = tokenizer
@@ -2390,6 +2415,7 @@ class RolloutManager:
             restore_level=recovery_policy.restore_level,
             admitted=admitted,
             admission_id=admission_id,
+            allow_mixed_agents=bool(self._harness_pool),
         )
         return record.group_id
 
@@ -2929,7 +2955,9 @@ class RolloutManager:
             resolved_agent_name = (
                 agent_ref.get("name") if isinstance(agent_ref, dict) else None
             )
-            attribution_key = get_nemo_gym_attribution_key(env_extras)
+            attribution_key = env_extras.get(
+                "attribution_key"
+            ) or get_nemo_gym_attribution_key(env_extras)
             if attribution_key is None:
                 raise ValueError("token-capture completion requires an attribution key")
             if "ng_receipt" not in env_extras:
@@ -3071,6 +3099,15 @@ class RolloutManager:
                 reward_checks,
                 reward_log_contexts,
             ) = self._recovery_ledger.finalization_inputs(group_id)
+            sealed_group = self._recovery_ledger.get_group(group_id)
+            resolved_agent_names: tuple[str, ...] | None = None
+            if sealed_group.allow_mixed_agents:
+                names = []
+                for sibling in sealed_group.siblings:
+                    if not sibling.resolved_agent_name:
+                        raise ValueError("Harness-pool sibling has no resolved agent")
+                    names.append(sibling.resolved_agent_name)
+                resolved_agent_names = tuple(names)
             request = ReassemblyRequest(
                 group_id=group_id,
                 rollout_ids=tuple(physical_rollout_ids),
@@ -3083,23 +3120,18 @@ class RolloutManager:
                 prompt_idx=int(recovery_group.prompt_id),
                 mask_sample=tuple(mask_sample),
                 loss_multiplier=float(input_sample.get("loss_multiplier", 1.0)),
+                resolved_agent_name=sealed_group.resolved_agent_name,
+                resolved_agent_names=resolved_agent_names,
                 logical_selections=(
                     tuple(
                         sibling.current_attempt.logical_selection
-                        for sibling in self._recovery_ledger.get_group(
-                            group_id
-                        ).siblings
+                        for sibling in sealed_group.siblings
                     )
                     if self._forest_training
                     else None
                 ),
                 execution_row_multiple=self._execution_row_multiple,
-                resolved_agent_name=self._recovery_ledger.get_group(
-                    group_id
-                ).resolved_agent_name,
-                attribution_key=self._recovery_ledger.get_group(
-                    group_id
-                ).attribution_key,
+                attribution_key=sealed_group.attribution_key,
             )
             assert_metadata_only(request)
             return request

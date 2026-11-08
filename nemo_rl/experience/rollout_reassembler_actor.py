@@ -66,6 +66,8 @@ class ReassemblyRequest:
     resolved_agent_name: Optional[str] = None
     # Taskset or flat-agent attribution, persisted with sealed receipts.
     attribution_key: Optional[str] = None
+    # Actual harness per generation, including restored siblings in mixed groups.
+    resolved_agent_names: tuple[str, ...] | None = None
 
     @property
     def capture_receipts(self) -> tuple[Optional[dict[str, Any]], ...]:
@@ -224,6 +226,9 @@ class RolloutReassemblerActor:  # pragma: no cover
             else None,
             reward_log_contexts=list(request.reward_log_contexts)
             if request.reward_log_contexts is not None
+            else None,
+            resolved_agent_names=list(request.resolved_agent_names)
+            if request.resolved_agent_names is not None
             else None,
         )
         assert_metadata_only(result)

@@ -888,6 +888,47 @@ def test_list_environment_server_routes_rejects_malformed_routes(routes):
             _spun_up_actor().list_environment_server_routes()
 
 
+def test_taskset_harness_pools_supply_only_configured_driver_routes():
+    from nemo_rl.environments.nemo_gym_harnesses import HarnessRoute
+
+    resolved = DictConfig(
+        {"environment_server_routes": {"scale_swe": "old", "other": "other_env"}}
+    )
+    with _stub_gym_resolved_config(resolved):
+        actor = _spun_up_actor()
+        actor._harness_routes = {
+            "scale_swe": (
+                HarnessRoute("scale_opencode", "opencode", "scale_resources"),
+                HarnessRoute("scale_pi", "pi", "scale_resources"),
+            ),
+            "harbor_tasks": (HarnessRoute("harbor_pi", "pi", None),),
+        }
+        routes = actor.list_environment_server_routes()
+        assert routes == {
+            "scale_swe": "scale_opencode",
+            "harbor_tasks": "harbor_pi",
+        }
+        shard_set = nemo_gym_mod.NemoGymShardSet(
+            handles={"default": [actor]}, environment_server_routes=routes
+        )
+        for taskset in actor._harness_routes:
+            assert (
+                shard_set.pick_handle_for_group(
+                    [
+                        {
+                            "task_id": {"taskset": taskset, "task_id": "1"},
+                            "task_input": {},
+                        }
+                    ]
+                )
+                is actor
+            )
+        with pytest.raises(ValueError, match="No environment server route.*other"):
+            shard_set.pick_handle_for_group(
+                [{"task_id": {"taskset": "other", "task_id": "1"}, "task_input": {}}]
+            )
+
+
 def test_list_environment_server_routes_accepts_multi_agent_servers():
     resolved = DictConfig(
         {

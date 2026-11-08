@@ -53,6 +53,7 @@ from nemo_rl.environments.nemo_gym import NemoGymShardSet
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_MODEL_SAMPLING_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
 )
 from nemo_rl.experience.metric_utils import calculate_single_metric, pct
@@ -2868,6 +2869,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             return _Stream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._harness_pool = None
     manager._dispatch_admission_gate = DataPlaneCheckpointBarrier()
     manager._num_generations_per_prompt = 2
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
@@ -2925,6 +2927,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
 
 def test_nemo_gym_rollout_record_persists_runtime_resolved_agent_ref():
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._harness_pool = None
     manager.set_next_nemo_gym_task_index(0)
     manager._dispatch_admission_gate = None
     manager._num_generations_per_prompt = 2
@@ -3012,6 +3015,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
             return _DuplicateStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._harness_pool = None
     manager._dispatch_admission_gate = None
     manager._num_generations_per_prompt = 2
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
@@ -3055,7 +3059,9 @@ def test_prepare_nemo_gym_rows_stamps_distinct_legacy_prompt_groups():
     assert [row["_rowidx"] for row in rows] == [0, 1, 2, 3]
 
 
-def test_prepare_nemo_gym_rows_updates_mixed_materialized_and_flat_inputs():
+def test_prepare_nemo_gym_rows_stamps_sampling_beside_mixed_materialized_and_flat_inputs() -> (
+    None
+):
     materialized_row = {
         "task_id": {"taskset": "workplace:train", "task_id": "17"},
         "task_input": {
@@ -3084,20 +3090,51 @@ def test_prepare_nemo_gym_rows_updates_mixed_materialized_and_flat_inputs():
     }
     assert materialized_row["task_input"]["task_data"] == {"state": ["meeting-1"]}
     assert "responses_create_params" not in materialized_row
-    materialized_params = materialized_row["task_input"]["responses_create_params"]
-    assert materialized_params["metadata"] == {"extra_body": '{"seed": 8}'}
-    for params in (rows[0]["responses_create_params"], materialized_params):
-        assert params["temperature"] == 0.7
-        assert params["top_p"] == 0.9
-        assert params["max_output_tokens"] == 64
+    assert materialized_row["task_input"]["responses_create_params"] == {
+        "input": [{"role": "user", "content": "Check my meetings."}],
+        "max_output_tokens": 128,
+        "metadata": {"extra_body": '{"seed": 8}'},
+    }
+    assert rows[0]["responses_create_params"] == {}
+    for row in rows:
+        assert row[NEMO_GYM_MODEL_SAMPLING_KEY] == {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_output_tokens": 64,
+        }
     assert [row["_rowidx"] for row in rows] == [0, 1]
     assert rows[0][NEMO_GYM_GROUP_ID_KEY] != rows[1][NEMO_GYM_GROUP_ID_KEY]
+
+
+def test_prepare_nemo_gym_rows_carries_validation_sampling_for_harbor_tasks() -> None:
+    rows = [
+        {
+            "task_id": {"taskset": "terminal:val", "task_id": "17"},
+            "task_input": {"task_path": "/tasks/17"},
+        }
+        for _ in range(2)
+    ]
+    original = deepcopy(rows)
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        generation_config={"max_new_tokens": 64},
+        sampling_params=SimpleNamespace(temperature=0.2, top_p=0.8),
+        num_generations=2,
+    )
+    for row, expected in zip(rows, original):
+        assert row["task_input"] == expected["task_input"]
+        assert row[NEMO_GYM_MODEL_SAMPLING_KEY] == {
+            "temperature": 0.2,
+            "top_p": 0.8,
+            "max_output_tokens": 64,
+        }
 
 
 def test_rollout_manager_rotates_replicas_and_reports_group_share():
     first, second = object(), object()
     selected = []
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._harness_pool = None
     manager._dispatch_admission_gate = None
     manager._timeouts = RolloutTimeouts()
     manager._max_gym_row_attempts = 1
@@ -3202,6 +3239,7 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
             return _FailedStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._harness_pool = None
     manager._dispatch_admission_gate = None
     manager._timeouts = RolloutTimeouts()
     manager._max_gym_row_attempts = 1
@@ -3252,8 +3290,8 @@ def test_run_async_nemo_gym_rollout(
     assert len(rows) >= 2, "test expects the fixture to provide at least two rows"
 
     max_new_tokens = nemo_gym_vllm_generation.cfg["max_new_tokens"]
-    # Row 0: per-agent override looser than the configured cap — min() should clamp down to max_new_tokens.
-    # Row 1: no per-agent override — should fall back to max_new_tokens.
+    # Row 0: Gym clamps each model call to the configured max_new_tokens cap.
+    # Row 1: Gym supplies max_new_tokens when the call has no smaller limit.
     rows[0]["responses_create_params"]["max_output_tokens"] = max_new_tokens + 1
     assert "max_output_tokens" not in rows[1]["responses_create_params"]
 
@@ -3270,7 +3308,7 @@ def test_run_async_nemo_gym_rollout(
         debug_payload_metrics=True,
     )
     for row in rows:
-        assert row["responses_create_params"]["max_output_tokens"] == max_new_tokens
+        assert row[NEMO_GYM_MODEL_SAMPLING_KEY]["max_output_tokens"] == max_new_tokens
     actual_result = asdict(actual_result)
     actual_result["final_batch"] = actual_result["final_batch"].get_dict()
 
@@ -3501,6 +3539,7 @@ def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
     first, second = object(), object()
     selected = []
     impl = object.__new__(AsyncNemoGymRolloutImpl)
+    impl._harness_pool = None
     impl._dispatch_admission_gate = None
     impl._timeouts = RolloutTimeouts()
     impl._max_gym_row_attempts = 1

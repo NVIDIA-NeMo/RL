@@ -824,6 +824,7 @@ class RolloutReassembler:
         execution_row_multiple: int = 1,
         reward_checks: Optional[list[RewardChecks | None]] = None,
         reward_log_contexts: Optional[list[RewardLogContext | None]] = None,
+        resolved_agent_names: Optional[list[str]] = None,
     ) -> FinalizedGroup:
         """Publish one prompt group, with optional physical rows per logical owner.
 
@@ -844,6 +845,15 @@ class RolloutReassembler:
         assert len(rollout_ids) == len(receipts) == len(rewards) == len(mask_sample), (
             "rollout_ids, receipts, rewards, and mask_sample must be parallel"
         )
+        if resolved_agent_names is not None and (
+            len(resolved_agent_names) != len(rollout_ids)
+            or any(
+                not isinstance(name, str) or not name for name in resolved_agent_names
+            )
+        ):
+            raise ValueError(
+                "resolved_agent_names must contain one non-empty agent name per rollout"
+            )
         if canonical_sample_ids is None:
             canonical_sample_ids = rollout_ids
         assert len(canonical_sample_ids) == len(rollout_ids), (
@@ -1086,6 +1096,7 @@ class RolloutReassembler:
             execution_row_multiple=execution_row_multiple,
             canonical_sample_ids=canonical_sample_ids,
             loss_multiplier=loss_multiplier,
+            resolved_agent_names=resolved_agent_names,
         )
         if finalized.meta is not None:
             finalized.meta.extra_info[ROLLOUT_METRICS] = [token_metrics]
@@ -1108,6 +1119,7 @@ class RolloutReassembler:
         execution_row_multiple: int,
         canonical_sample_ids: list[str],
         loss_multiplier: float,
+        resolved_agent_names: Optional[list[str]],
     ) -> FinalizedGroup:
         """Shared ordinary/Forest tensorization, single publication, and cleanup."""
         valid_rows = [row for row in rows if row.valid]
@@ -1337,6 +1349,15 @@ class RolloutReassembler:
                 raise ValueError("Forest publication IDs differ from the cleanup plan")
             for tag, owner_tag in zip(tags, logical.tags, strict=True):
                 tag.update(owner_tag)
+        if resolved_agent_names is not None:
+            for index, tag in enumerate(tags):
+                slot = (
+                    logical.tags[index]["logical_slot"]
+                    if logical is not None
+                    else index
+                )
+                if slot is not None:
+                    tag["agent_name"] = resolved_agent_names[slot]
         _tensorize_ms = (time.perf_counter() - _tensorize_t0) * 1000.0
         _put_t0 = time.perf_counter()
         self._call_dp(

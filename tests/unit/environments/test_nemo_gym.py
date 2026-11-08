@@ -2336,14 +2336,14 @@ def test_nemo_gym_sanity(
     # Save original input before mutation for writing the actual test data file
     original_input = deepcopy(nemo_gym_sanity_test_data["input"])
 
-    # We need to match NeMo RL generation config params before sending to NeMo-Gym
+    # Rows carry NeMo RL's sampling values, which Gym applies to every policy call.
     generation_config = nemo_gym_vllm_generation.cfg
     examples = nemo_gym_sanity_test_data["input"]
     for idx, example in enumerate(examples):
-        example["responses_create_params"]["temperature"] = generation_config[
-            "temperature"
-        ]
-        example["responses_create_params"]["top_p"] = generation_config["top_p"]
+        example["_ng_model_sampling"] = {
+            "temperature": generation_config["temperature"],
+            "top_p": generation_config["top_p"],
+        }
         example["task_source"] = "example_multi_step_resources_server"
         example["_rowidx"] = idx
 

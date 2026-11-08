@@ -75,7 +75,7 @@ NeMo RL supports two Gym dataset formats. Both enter Gym through an Environment 
 - **Flat rows** identify the Agent through `agent_ref.name` or `task_source`. Gym resolves the Environment Server associated with that Agent, including through `legacy_agent`.
 - **Materialized task rows** contain `task_id` and `task_input`. Set `env.nemo_gym.environment_server_routes` to map each row's `task_id.taskset` to a configured Environment Server entry name.
 
-The taskset mapping can also be supplied in a Gym YAML loaded through `config_paths`; RL reads it from Gym's merged configuration. RL sends each prompt group to an actor hosting the selected server. With the current Gym pin, materialized task rows can target `single_agent_turn` or `single_agent_turn_legacy`.
+The taskset mapping can also be supplied in a Gym YAML loaded through `config_paths`; RL reads it from Gym's merged configuration. RL sends each prompt group to an actor hosting the selected server. Materialized task rows can target `single_agent_turn`, `single_agent_turn_legacy`, or `harbor`. A taskset-specific `harness_pool` supplies its own destinations, as described below.
 
 See [Data Format Translation](#data-format-translation) for the field layout of each format.
 
@@ -94,7 +94,7 @@ See [Data Format Translation](#data-format-translation) for the field layout of 
 }
 ```
 
-`task_input` must contain `responses_create_params`, because NeMo RL writes the policy's `temperature`, `top_p`, and `max_output_tokens` there. A taskset whose rows lack it fails on its first batch.
+`task_input` follows the selected Environment Server's schema. `single_agent_turn` and `single_agent_turn_legacy` require `responses_create_params`; Harbor uses its materialized task input instead. NeMo RL preserves that input and carries policy sampling beside the task, so sampling does not require a `responses_create_params` field.
 
 Rollout metrics for these rows are named after the taskset instead of an agent, for example `openmathreasoning/truncation_rate`.
 
@@ -103,6 +103,144 @@ Taskset names are also the keys for per-environment settings. For materialized r
 Set these keys in a YAML file, where a key such as `weather:train` needs no quoting. A Hydra command-line override cannot express a key that contains `:`: `++rollout_recovery.task_source_target_level_overrides.weather:train=prompt_group` fails to parse, and `{weather:train: prompt_group}` is read as the key `weather`.
 
 An Environment Server can report a failed episode as terminal, meaning a retry cannot succeed. The single controller does not retry such a prompt, and under the default `async_rl.rollout_failure.max_skipped_prompts: 0` the run stops. Non-terminal failures, such as an unavailable model server, are retried as infrastructure failures.
+
+### Route one task's rollouts across session harnesses
+
+SingleController GRPO can choose a session harness independently for each
+generation of a typed Gym task. Configure `env.nemo_gym.harness_pool` with
+**environment instance names**:
+
+| Configuration | Routing |
+| --- | --- |
+| Ordered list, such as `[swe_opencode, swe_pi]` | One pool for all input tasksets; existing list configurations remain supported. |
+| Mapping, such as `{swe_rebench: [swe_opencode, swe_pi]}` | A separate ordered pool for each taskset; every input taskset must have an entry. |
+
+Each pool binds distinct agents and uses one Environment Server family:
+
+| Environment Server | Shared task definition within a pool |
+| --- | --- |
+| Typed `single_agent_turn` | The same resources server and verifier. Different tasksets may use different resources servers. |
+| `harbor` | The same `tasksets[taskset]` folder and task digest mapping. Harbor owns verification and needs no resources server. |
+
+Gym owns sandbox/session creation, verification, and cleanup. Pool routing keeps
+the input taskset as the prompt group's attribution key.
+
+This path requires `token_capture.enabled: true`, one unsharded Gym actor,
+and text tasks. Ordinary GRPO, distillation/teacher routing, and VLM training
+reject the setting. This branch uses the per-rollout sampling contract from
+[NVIDIA-NeMo/RL#5030](https://github.com/NVIDIA-NeMo/RL/pull/5030) and pins the
+Gym implementation from
+[NVIDIA-NeMo/Gym#5463](https://github.com/NVIDIA-NeMo/Gym/pull/5463) at
+`551d355b157db7198d92f09c062cbca54956083c`. Both upstream PRs are still pending;
+keep this Gym revision until the sampling contract is available on Gym's main
+branch.
+
+For example, the following is a configuration fragment for a SingleController
+recipe. Supply the sandbox provider configuration and a typed SWE-rebench task
+dataset separately; this fragment alone is not a complete training recipe.
+
+```yaml
+token_capture:
+  enabled: true
+
+env:
+  should_use_nemo_gym: true
+  nemo_gym:
+    harness_pool:
+      swe_rebench: [swe_opencode, swe_pi]
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - responses_api_agents/opencode_agent/configs/opencode_agent.yaml
+      - responses_api_agents/pi_agent/configs/pi_agent.yaml
+      - resources_servers/swe_rebench/configs/swe_rebench.yaml
+    swe_rebench_resources_server:
+      resources_servers:
+        swe_rebench:
+          allowed_agents: [opencode_agent, pi_agent]
+    swe_opencode:
+      environment_servers:
+        single_agent_turn:
+          entrypoint: app.py
+          agent_server: {type: responses_api_agents, name: opencode_agent}
+          resources_server: {type: resources_servers, name: swe_rebench_resources_server}
+    swe_pi:
+      environment_servers:
+        single_agent_turn:
+          entrypoint: app.py
+          agent_server: {type: responses_api_agents, name: pi_agent}
+          resources_server: {type: resources_servers, name: swe_rebench_resources_server}
+```
+
+For a dataset mixing SWE sources, give each taskset its own pool:
+
+```yaml
+env:
+  nemo_gym:
+    harness_pool:
+      scale_swe: [scale_opencode, scale_pi]
+      swe_rebench: [rebench_opencode, rebench_pi]
+      terminal_bench: [harbor_opencode, harbor_pi]
+```
+
+The `scale_*` environments share the Scale SWE resources server; `rebench_*`
+share the SWE-rebench resources server. The `harbor_*` environments use
+`environment_servers.harbor`, bind their respective `agent_server`, and load
+identical `tasksets.terminal_bench` records from the materialized Harbor taskset.
+Supply each instance's sandbox provider and other required configuration as
+usual. Do not mix `harbor` and `single_agent_turn` within one taskset's pool.
+The mapping supplies destinations for these tasksets without a separate
+`environment_server_routes` entry. A list pool still needs the usual
+`environment_server_routes` mapping so setup can validate dataset coverage.
+
+Input JSONL rows contain `task_id: {taskset: ..., task_id: ...}` and an
+Environment Server-specific `task_input`. For SWE resources servers this includes
+`responses_create_params` and the benchmark's task fields, typically under
+`task_data`. Harbor rows retain the native input produced by its task loader;
+they need no `responses_create_params`. The original dataset need not contain an
+`agent_ref` or a preselected environment. An existing `task_source` must match
+the pool's resources server for SWE; Harbor preserves its task source.
+
+NeMo RL sends `policy.generation.temperature`, `top_p`, and `max_new_tokens`
+(as `max_output_tokens`) on each row as `_ng_model_sampling`, beside the task.
+Gym applies these values to every trained agent model call and keeps a smaller
+output limit requested by that call. This is a per-call cap, not a total token
+budget for an episode. Tasks and session-owned request parameters stay
+unchanged. The pool does not install `sampling_overrides` on `policy_model`,
+so it uses the same sampling contract as #5030. User-specified
+`sampling_overrides` on `policy_model` are rejected; NeMo RL adds only the
+logprob settings required for score centering. Untrained callers, such as a
+verifier's LLM judge, keep their own sampling through Gym's `x-ng-sampling: null`
+marker. SingleController uses the training sampling profile throughout the run
+and has no validation loop.
+
+The selector computes SHA-256 over compact UTF-8 JSON
+`["nemo-rl-harness-v1", taskset, task_id, group_id, generation_index]`, then takes
+the full digest modulo the selected taskset's pool size. The controller supplies the durable group
+and generation index, so a partial sibling retry chooses the same harness even
+when its physical token-capture ID changes. Keep every taskset's pool membership
+and order fixed when resuming a run. Hashing does not guarantee that every prompt group visits
+every harness, and it does not expand the number of generations.
+
+All selected harnesses must use the RL-injected `policy_model` endpoint, so
+weight refits and token/logprob capture stay on the training policy. Setup rejects
+agents with missing, null, or external model-server references, and agents with
+more than one configuration. The result
+retains `ng_agent_server` and `ng_environment_server`; recovery records keep the
+actual agent for each sibling, and finalized training-row tags include that
+agent. Rewards are normalized over the original prompt group, including its
+different harnesses, rather than splitting the group by harness. Metrics are
+attributed to each completion's actual agent; the prompt group retains its
+taskset attribution for recovery and configuration. A handled typed episode failure
+is propagated to the rollout failure policy, never treated as a zero-reward
+success.
+
+Pool support introduces recovery checkpoint schema v8. It reads v2–v7 snapshots
+and preserves their homogeneous-agent behavior; token-capture receipts from
+before v4 still require fresh rollouts. Older RL versions cannot read a
+v8 snapshot. A first smoke should exercise two harnesses, retry one sibling,
+check capture/reward attribution, and complete one optimizer update before
+increasing concurrency. A small coding model is suitable for checking the
+integration but does not establish benchmark quality or training convergence.
 
 ### Shard NeMo Gym across nodes
 
@@ -416,7 +554,7 @@ flowchart LR
 - **Responses API** (NeMo Gym): OpenAI Responses API format with `input`, `tools`, and multi-turn conversation
 - **Chat Completions** (vLLM): OpenAI Chat Completions format for the actual inference call
 
-**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and updates `responses_create_params` with generation parameters (`temperature`, `top_p`) at the row's top level or inside `task_input`. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`; the collector wraps each task in an episode request containing `episode_id` and `task`. Materialized tasks carry no Agent reference, so NeMo RL attributes their metrics, teacher selection, and per-key overrides to `task_id.taskset`.
+**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and adds `_ng_model_sampling` beside the unchanged task: `temperature` and `top_p` for training, `val_temperature` and `val_top_p` for validation, and `max_new_tokens` as `max_output_tokens`. Gym applies these values to every trained agent model call, preserving a smaller per-call output cap. The vLLM server checks trained calls against the configured train or validation values; untrained callers such as judges retain their own sampling through Gym's `x-ng-sampling: null` marker. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`, or through that taskset's `harness_pool`; the collector wraps each task in an episode request containing `episode_id`, `task`, and the sampling values. NeMo RL attributes prompt-group metrics, teacher selection, and per-key overrides to `task_id.taskset`. Harness pools additionally retain each completion's selected agent and environment.
 
 The Agent sends Responses API requests to the Model Server, which translates Responses API ↔ Chat Completions (converting message formats, extracting reasoning content, attaching token IDs). NeMo RL validates materialized-task episode replies and extracts successful results before the usual result processing. Token IDs, logprobs, and rewards then populate the final Result.
 

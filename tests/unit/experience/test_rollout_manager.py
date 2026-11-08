@@ -48,6 +48,7 @@ from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.environments.nemo_gym_harnesses import HarnessPool
 from nemo_rl.experience.failures import (
     GenerationUnavailable,
     GymTerminalEpisodeFailure,
@@ -55,6 +56,7 @@ from nemo_rl.experience.failures import (
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_MODEL_SAMPLING_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     Completion,
@@ -359,6 +361,7 @@ def _make_manager(
     these tests keep exercising the no-retry path unless they ask for otherwise.
     """
     mgr = object.__new__(RolloutManager)
+    mgr._harness_pool = None
     mgr._impl = impl
     mgr._tokenizer = None
     mgr._num_generations_per_prompt = 1
@@ -1011,6 +1014,7 @@ def _nemo_gym_impl(
     reward_penalty_config=None,
     *,
     log_full_result_tables=False,
+    harness_pool=None,
 ):
     return AsyncNemoGymRolloutImpl(
         tokenizer=None,
@@ -1028,6 +1032,7 @@ def _nemo_gym_impl(
         },
         mask_env_flagged_samples=mask_env_flagged_samples,
         log_full_result_tables=log_full_result_tables,
+        harness_pool=harness_pool,
         reward_penalty_config=reward_penalty_config,
     )
 
@@ -1497,6 +1502,178 @@ def test_nemo_gym_build_inputs_preserves_explicit_group_identity():
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1]
 
 
+def test_harness_pool_build_inputs_preserves_retry_identity_and_nested_params():
+    impl = _nemo_gym_impl(True, harness_pool=["env-a", "env-b"])
+    impl._num_generations_per_prompt = 3
+    sample = {
+        "extra_env_info": {
+            "task_id": {"taskset": "tasks", "task_id": "task-7"},
+            "task_input": {"responses_create_params": {"input": "Fix the task"}},
+            NEMO_GYM_GROUP_ID_KEY: "stable-group",
+            NEMO_GYM_GROUP_ATTEMPT_KEY: 2,
+        }
+    }
+    original = deepcopy(sample)
+    rows = impl._build_inputs(
+        sample,
+        task_index=0,
+        rollout_ids=["attempt-0", "attempt-1", "attempt-2"],
+        generation_indices=[2],
+    )
+
+    assert sample == original
+    assert len(rows) == 1
+    assert rows[0]["task_input"]["responses_create_params"] == {"input": "Fix the task"}
+    assert "responses_create_params" not in rows[0]
+    assert rows[0][NEMO_GYM_GROUP_ID_KEY] == "stable-group"
+    assert rows[0][NEMO_GYM_GROUP_ATTEMPT_KEY] == 2
+    assert rows[0][NEMO_GYM_ROLLOUT_INDEX_KEY] == 2
+    assert rows[0]["_rowidx"] == 2
+    assert rows[0]["_ng_rollout_id"] == "attempt-2"
+
+
+def test_ordinary_gym_build_inputs_carries_sampling_beside_the_task() -> None:
+    impl = _nemo_gym_impl(True)
+    sample = {"extra_env_info": {"responses_create_params": {"max_output_tokens": 7}}}
+    rows = impl._build_inputs(sample, task_index=0)
+    assert rows[0]["responses_create_params"] == {"max_output_tokens": 7}
+    assert rows[0][NEMO_GYM_MODEL_SAMPLING_KEY] == {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_output_tokens": impl._generation_config["max_new_tokens"],
+    }
+    assert sample["extra_env_info"]["responses_create_params"] == {
+        "max_output_tokens": 7
+    }
+
+
+@pytest.mark.parametrize(
+    "harness_pool",
+    [["harbor-a", "harbor-b"], {"terminal:train": ["harbor-a", "harbor-b"]}],
+)
+def test_harness_pool_build_inputs_preserves_harbor_task_and_stamps_sampling(
+    harness_pool: HarnessPool,
+) -> None:
+    impl = _nemo_gym_impl(True, harness_pool=harness_pool)
+    impl._num_generations_per_prompt = 2
+    impl._generation_config.update(temperature=0.6, top_p=0.85, max_new_tokens=48)
+    sample = {
+        "extra_env_info": {
+            "task_id": {"taskset": "terminal:train", "task_id": "task-7"},
+            "task_input": {"task_path": "/tasks/task-7"},
+        }
+    }
+    original = deepcopy(sample)
+    rows = impl._build_inputs(sample, task_index=7)
+    assert sample == original
+    assert len(rows) == 2
+    for row in rows:
+        assert row["task_input"] == original["extra_env_info"]["task_input"]
+        assert row[NEMO_GYM_MODEL_SAMPLING_KEY] == {
+            "temperature": 0.6,
+            "top_p": 0.85,
+            "max_output_tokens": 48,
+        }
+    rows[0][NEMO_GYM_MODEL_SAMPLING_KEY]["temperature"] = 0.9
+    assert rows[1][NEMO_GYM_MODEL_SAMPLING_KEY]["temperature"] == 0.6
+
+
+def test_harness_pool_stream_keeps_per_completion_attribution_and_group_metrics():
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, pending, timer_prefix, per_prompt=False):
+            async def result_ref(row):
+                index = row["_rowidx"]
+                result = _mask_gate_receipt_result()
+                result["input_message_log"] = []
+                result["rollout_id"] = row["_ng_rollout_id"]
+                result["receipt"] = {
+                    "capture_key": row["_ng_rollout_id"],
+                    "manifest": [{"cum_len": 10 + index, "delta_len": 2 + index}],
+                }
+                result["full_result"]["reward"] = float(index)
+                result["full_result"]["_ng_environment_server"] = f"env-{index}"
+                return index, {"name": f"agent-{index}"}, result, None
+
+            async def stream():
+                for row in reversed(pending):
+                    yield result_ref(row)
+
+            return stream()
+
+    impl = _nemo_gym_impl(True, harness_pool=["env-0", "env-1"])
+    impl._num_generations_per_prompt = 2
+    impl._task_to_env = {"nemo_gym": SimpleNamespace(run_rollouts=_RunRolloutsRemote())}
+    sample = {
+        "idx": 7,
+        "message_log": [],
+        "extra_env_info": {
+            "task_id": {"taskset": "tasks", "task_id": "task-7"},
+            "task_input": {"responses_create_params": {}},
+        },
+    }
+    streamed = []
+
+    async def on_completion(index, completion):
+        streamed.append((index, completion.env_extras["agent_ref"]["name"]))
+
+    record = _run(
+        impl.run_rollout(
+            sample,
+            rollout_ids=["physical-0", "physical-1"],
+            on_completion=on_completion,
+        )
+    )
+
+    assert streamed == [(1, "agent-1"), (0, "agent-0")]
+    assert record.extra_env_info == {
+        **sample["extra_env_info"],
+        "attribution_key": "tasks",
+    }
+    assert [c.env_extras["agent_ref"]["name"] for c in record.completions] == [
+        "agent-0",
+        "agent-1",
+    ]
+    assert [c.env_extras["attribution_key"] for c in record.completions] == [
+        "tasks",
+        "tasks",
+    ]
+    assert [c.env_extras["ng_rollout_id"] for c in record.completions] == [
+        "physical-0",
+        "physical-1",
+    ]
+    assert record.rollout_metrics["agent-0/total_tokens_per_sample/mean"] == 10
+    assert record.rollout_metrics["agent-1/total_tokens_per_sample/mean"] == 11
+    for index, completion in enumerate(record.completions):
+        assert (
+            completion.env_extras["ng_reward_log_context"].agent_name
+            == f"agent-{index}"
+        )
+    # Rewards and output-token counts are authoritative only after finalization.
+    assert not any(
+        "reward/mean" in key or "gen_tokens_per_sample" in key
+        for key in record.rollout_metrics
+    )
+
+
+def test_harness_pool_metrics_reject_misaligned_names():
+    impl = _nemo_gym_impl(True)
+    completions, _ = impl._results_to_completions([_mask_gate_receipt_result()])
+    with pytest.raises(ValueError, match="agent_names must align"):
+        impl._compute_rollout_metrics(completions, "agent", agent_names=[])
+
+
+def test_harness_pool_checkpoint_selects_the_unsharded_actor_before_agent_routing():
+    impl = _nemo_gym_impl(True, harness_pool=["env-0", "env-1"])
+    impl._task_to_env = {"nemo_gym": object()}
+    assert (
+        impl.select_checkpoint_instance({"extra_env_info": {}}) == "nemo_gym/replica-0"
+    )
+
+
 @pytest.mark.parametrize("dataset_task_index", [None, 99])
 def test_nemo_gym_attempt_ids_are_fresh_and_resume_from_counter(
     monkeypatch: pytest.MonkeyPatch, dataset_task_index: int | None
@@ -1576,7 +1753,9 @@ def test_rollout_manager_task_counter_only_applies_to_gym(use_nemo_gym: bool) ->
     assert manager.get_next_nemo_gym_task_index() == (42 if use_nemo_gym else 0)
 
 
-def test_nemo_gym_build_inputs_preserves_materialized_task_and_clamps_sampling():
+def test_nemo_gym_build_inputs_preserves_materialized_task_and_stamps_sampling() -> (
+    None
+):
     impl = _nemo_gym_impl(True)
     impl._num_generations_per_prompt = 2
     impl._generation_config.update(temperature=0.7, top_p=0.9, max_new_tokens=64)
@@ -1602,11 +1781,12 @@ def test_nemo_gym_build_inputs_preserves_materialized_task_and_clamps_sampling()
     for row in rows:
         assert row["task_id"] == original["extra_env_info"]["task_id"]
         assert row["task_input"]["task_data"] == {"state": ["meeting-1"]}
-        params = row["task_input"]["responses_create_params"]
-        assert params["temperature"] == 0.7
-        assert params["top_p"] == 0.9
-        assert params["max_output_tokens"] == 32
-        assert params["metadata"] == {"extra_body": '{"seed": 8}'}
+        assert row["task_input"] == original["extra_env_info"]["task_input"]
+        assert row[NEMO_GYM_MODEL_SAMPLING_KEY] == {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_output_tokens": 64,
+        }
         assert "responses_create_params" not in row
     assert [row["_rowidx"] for row in rows] == [0, 1]
     rows[0]["task_input"]["task_data"]["state"].append("meeting-2")
@@ -2275,6 +2455,7 @@ def _make_capture_manager(
     recovery_config: RolloutRecoveryConfig | None = None,
 ):
     mgr = object.__new__(RolloutManager)
+    mgr._harness_pool = None
     mgr._forest_training = False
     mgr._execution_row_multiple = 1
     mgr._tokenizer = None
@@ -2788,6 +2969,47 @@ def test_capture_completion_preserves_checks_and_raw_reward_until_finalization()
     assert impl._compute_reward_penalty_metrics(counts, 0) == {}
     metrics = impl._compute_rollout_metrics(completions, "agent")
     assert not any(k.startswith(("total_reward/", "agent/reward/")) for k in metrics)
+
+
+@pytest.mark.parametrize("granularity", list(RecoveryGranularity))
+def test_harness_pool_capture_manager_restores_per_sibling_agents(granularity):
+    prompt = {"idx": 7, "extra_env_info": {"task_source": "shared-resources"}}
+    manager = _make_capture_manager(
+        _FakeCaptureBuffer(),
+        recovery_config=RolloutRecoveryConfig(default_granularity=granularity),
+        verify_fields=[
+            {"agent_ref": {"name": "agent-a"}, "attribution_key": "tasks"},
+            {"agent_ref": {"name": "agent-b"}, "attribution_key": "tasks"},
+        ],
+    )
+    manager._harness_pool = ["env-a", "env-b"]
+    request = _run(manager.generate_for_finalization(prompt))
+    assert request.resolved_agent_name is None
+    assert request.resolved_agent_names == ("agent-a", "agent-b")
+    assert request.attribution_key == "tasks"
+
+    async def unexpected_rollout(_sample):
+        pytest.fail("sealed pool siblings must retain attribution without rerunning")
+
+    restored = _make_capture_manager(_FakeCaptureBuffer(), on_run=unexpected_rollout)
+    restored._harness_pool = ["env-a", "env-b"]
+    _with_cut(
+        restored._tq_buffer,
+        lambda cut: restored.recovery_ledger.load_state_dict(
+            cut, manager.recovery_ledger.state_dict()
+        ),
+    )
+    _with_cut(
+        restored._tq_buffer,
+        lambda cut: restored.recovery_ledger.prepare_for_restart(cut),
+    )
+    recovered = _run(
+        restored.generate_for_finalization(prompt, lineage_group_id=request.group_id)
+    )
+    assert recovered.resolved_agent_name is None
+    assert recovered.resolved_agent_names == ("agent-a", "agent-b")
+    assert recovered.attribution_key == "tasks"
+    assert recovered.receipts == request.receipts
 
 
 @pytest.mark.parametrize("granularity", list(RecoveryGranularity))

@@ -828,8 +828,9 @@ def _spinup_gym(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     enable_router_replay = router_replay_enabled(policy_config)
+    env_config = master_config.env
     shard_set = build_nemo_gym_actors(
-        master_config.env,
+        env_config,
         base_urls=base_urls,
         model_name=generation_config["model_name"],
         tokenizer=tokenizer,
@@ -2329,6 +2330,7 @@ def setup_single_controller(
         policy_generation=generation,
         generation_config=generation_config,
         use_nemo_gym=use_nemo_gym,
+        harness_pool=master_config.env.get("nemo_gym", {}).get("harness_pool"),
         mask_env_flagged_samples=should_mask_flagged_samples(master_config.env),
         log_full_result_tables=should_log_nemo_gym_full_result_tables(
             wandb_enabled=master_config.logger.wandb_enabled,
