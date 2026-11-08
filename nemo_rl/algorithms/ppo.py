@@ -535,6 +535,10 @@ def setup(
         ), (
             "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
         )
+        # Later epochs on the same batch would train without any trust region.
+        assert ppo_config.ppo_epochs == 1, (
+            f"force_on_policy_ratio requires ppo.ppo_epochs=1, got {ppo_config.ppo_epochs}"
+        )
         os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
         print("  ✓ force_on_policy_ratio enabled")
 
