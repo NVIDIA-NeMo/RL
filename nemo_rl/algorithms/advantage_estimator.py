@@ -99,6 +99,13 @@ class GAEConfig(BaseModel, extra="allow"):
 
     @model_validator(mode="after")
     def validate_whitening_population(self) -> "GAEConfig":
+        # Only GAE reads these population options.
+        if self.name != "gae" and (
+            self.normalize_over != "kept_rows" or self.whiten_execution_padding
+        ):
+            raise ValueError(
+                "normalize_over and whiten_execution_padding require name=gae"
+            )
         # normalize_over only picks the whitening population.
         if self.normalize_over == "all_rows" and not self.normalize_advantages:
             raise ValueError(

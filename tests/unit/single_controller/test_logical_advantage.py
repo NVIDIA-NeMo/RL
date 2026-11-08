@@ -960,6 +960,18 @@ def test_gae_all_rows_requires_whitening() -> None:
         GAEConfig(normalize_over="all_rows", normalize_advantages=False)
 
 
+@pytest.mark.parametrize("whiten_padding", [False, True])
+def test_raw_reward_rejects_gae_population_options(whiten_padding) -> None:
+    with pytest.raises(ValueError, match="require name=gae"):
+        GAEConfig(
+            name="raw_reward",
+            normalize_over="all_rows",
+            whiten_execution_padding=whiten_padding,
+        )
+    assert GAEConfig(name="raw_reward")
+    assert GAEConfig(normalize_over="all_rows", whiten_execution_padding=whiten_padding)
+
+
 def _step_padded(source: str, multiple: int = 4):
     """Five real rows in two groups, padded once for the whole batch."""
     meta, data = _batch([("a", [(0.0, 2), (1.0, 1)]), ("b", [(2.0, 1), (3.0, 1)])])
