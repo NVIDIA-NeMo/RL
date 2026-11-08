@@ -914,6 +914,41 @@ def test_forest_ppo_normalize_over_all_rows_excludes_execution_padding() -> None
     assert results["all_rows"][2:].count_nonzero() == 0
 
 
+def test_ppo_keeps_gae_advantages_for_weighted_rows() -> None:
+    """Dataset loss weights reach GAE through the mask; the stage must not reapply them."""
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.tensor([[17, 42]] * 2),
+            "total_reward": torch.tensor([2.0, 6.0]),
+            "token_mask": torch.tensor([[0.0, 1.0, 1.0]] * 2),
+            "sample_mask": torch.tensor([0.5, 1.0]),
+            "mask_sample": torch.zeros(2, dtype=torch.bool),
+            "truncated": torch.zeros(2, dtype=torch.bool),
+            "values": torch.zeros(2, 3),
+        },
+        batch_size=[2],
+    )
+    meta = KVBatchMeta(
+        "train",
+        "train",
+        ["r0", "r1"],
+        fields=list(data.keys()),
+        tags=[{GROUP_ID_TAG: "a"}, {GROUP_ID_TAG: "a"}],
+    )
+    inputs = data.clone()
+    ctrl = _ppo_controller(meta, data, normalize_advantages=False)
+    _, valid = asyncio.run(ctrl._advantage_stage(meta))
+    assert valid
+    expected, returns = ctrl._advantage_estimator.compute_advantage(
+        prompt_ids=None,
+        rewards=inputs["total_reward"],
+        mask=inputs["token_mask"] * inputs["sample_mask"].unsqueeze(-1),
+        values=inputs["values"],
+    )
+    torch.testing.assert_close(data["advantages"], expected)
+    torch.testing.assert_close(data["returns"], returns)
+
+
 def test_gae_whitening_padding_requires_all_rows() -> None:
     assert GAEConfig(normalize_over="all_rows", whiten_execution_padding=True)
     with pytest.raises(ValueError, match="normalize_over=all_rows"):
