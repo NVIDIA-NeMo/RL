@@ -1,0 +1,47 @@
+# Fresh native GRPO comparison; no historical training settings or grader.
+defaults: grpo_logra.yaml
+grpo:
+  num_prompts_per_step: 16
+  num_generations_per_prompt: 8
+  max_num_steps: 100
+  max_num_epochs: 10
+  val_period: 10
+  val_at_start: true
+  val_at_end: true
+  max_val_samples: 256
+  val_batch_size: 256
+  seed: 42
+policy:
+  train_global_batch_size: 128
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  max_total_sequence_length: 2048
+  dtensor_cfg:
+    activation_checkpointing: true
+  generation:
+    max_new_tokens: 2048
+    vllm_cfg:
+      enforce_eager: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 4
+data:
+  train:
+    dataset_name: gsm8k
+    split: train
+    split_validation_size: 0
+  validation:
+    dataset_name: gsm8k
+    split: test
+logger:
+  tensorboard_enabled: true
+  log_dir: logs/logra-7b
+checkpointing:
+  enabled: true
+  save_period: 25
+  keep_top_k: 1
+  checkpoint_dir: checkpoints/logra-7b
+cluster:
+  num_nodes: 1
+  gpus_per_node: 8
