@@ -15,20 +15,24 @@
 
 Each case sends one call to the native vLLM server (its real routes, over ASGI)
 and through Dynamo (NeMo RL's chat engine, a spawned render pool, and the
-engine adapter), over the same tiny Qwen3 checkpoint, the same scripted engine
-and Gym's real capture core. Both must run the engine on the same prompt with
-the same SamplingParams, stage the same capture record, and answer Gym with the
-same message and token fields.
+engine adapter), with the same kit (a checkpoint and the chat settings both
+paths serve), the same scripted engine and Gym's real capture core. Both must
+run the engine on the same prompt, media and SamplingParams, stage the same
+capture record, and answer Gym with the same message and token fields.
 
-Not covered here: media (the checkpoint is text-only; the VLM functional
-overlay runs it) and a model whose EOS is not its turn end.
+Not covered here: staging an image's pixels, which needs the Omni processor
+and its gated checkpoint.
 """
 
 import asyncio
+import base64
+import io
 import json
+import shutil
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable, Optional
 
 import pytest
 import torch
@@ -41,6 +45,7 @@ pytest.importorskip("nemo_gym.token_id_capture.staging")
 import httpx  # noqa: E402
 from dynamo.llm.exceptions import HttpError  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
+from PIL import Image  # noqa: E402
 from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter  # noqa: E402
 from nemo_gym.token_id_capture.replay import (  # noqa: E402
     replay_context,
@@ -53,7 +58,7 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     CaptureAdmission,
     StageResult,
 )
-from transformers import AutoTokenizer  # noqa: E402
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer  # noqa: E402
 from vllm.config import CacheConfig, LoadConfig, VllmConfig  # noqa: E402
 from vllm.engine.arg_utils import AsyncEngineArgs  # noqa: E402
 from vllm.logprobs import Logprob  # noqa: E402
@@ -121,6 +126,42 @@ REPLY = (
     '{"name": "get_weather", "arguments": {"city": "Lyon"}}\n</tool_call>'
 )
 TURN_1_REPLY = "<think>\neasy\n</think>\n\nIt is sunny."
+# Turn 1 as a tool call, which Gym's source history recorded with empty
+# content and the harness now sends with none.
+TOOL_TURN = {
+    "role": "assistant",
+    "content": None,
+    "tool_calls": [
+        {
+            "id": "call-0",
+            "type": "function",
+            "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'},
+        }
+    ],
+}
+TOOL_HISTORY = [HISTORY[0], {**TOOL_TURN, "content": ""}]
+TOOL_RESULT = {"role": "tool", "tool_call_id": "call-0", "content": "sunny"}
+
+
+def _image_url() -> str:
+    image = Image.new("RGB", (56, 56))
+    image.putdata([(4 * x, 4 * y, 128) for y in range(56) for x in range(56)])
+    png = io.BytesIO()
+    image.save(png, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(png.getvalue()).decode()
+
+
+IMAGE_TURN = {
+    "role": "user",
+    "content": [
+        {"type": "image_url", "image_url": {"url": _image_url()}},
+        {"type": "text", "text": "And here?"},
+    ],
+}
+NANO_V3_PLUGIN = str(
+    Path(__file__).parents[4]
+    / "nemo_rl/models/generation/vllm/reasoning_parsers/nano_v3_reasoning_parser.py"
+)
 
 
 @dataclass
@@ -128,6 +169,8 @@ class _Kit:
     """The checkpoint, and the vLLM objects both paths share."""
 
     path: str
+    generation: dict[str, Any]
+    capture_media: bool
     tokenizer: Any
     engine_args: Any
     model_config: Any
@@ -157,11 +200,11 @@ class _Engine:
         self.io_processor = None
         self.errored = False
         self._kit = kit
-        self.runs: list[tuple[list[int], Any]] = []
+        self.runs: list[tuple[list[int], Any, Any]] = []
 
     async def generate(self, prompt, sampling_params, request_id, **kwargs):
         prompt_token_ids = list(prompt["prompt_token_ids"])
-        self.runs.append((prompt_token_ids, sampling_params))
+        self.runs.append((prompt_token_ids, sampling_params, _media(prompt)))
         reply_ids = self._kit.ids(REPLY)
         logprobs = None
         if sampling_params.logprobs is not None:
@@ -203,6 +246,36 @@ class _Engine:
         pass
 
 
+def _media(prompt) -> Any:
+    """The processed media an engine prompt runs: its token ranges and tensors."""
+    if "mm_kwargs" not in prompt:
+        return None
+    return (
+        {
+            modality: [(item.offset, item.length) for item in ranges]
+            for modality, ranges in prompt["mm_placeholders"].items()
+        },
+        {
+            modality: [{key: elem.data for key, elem in item.items()} for item in items]
+            for modality, items in prompt["mm_kwargs"].items()
+        },
+    )
+
+
+def _assert_same_media(dynamo, native) -> None:
+    if native is None:
+        assert dynamo is None
+        return
+    assert dynamo[0] == native[0]
+    assert dynamo[1].keys() == native[1].keys()
+    for modality, items in native[1].items():
+        assert len(dynamo[1][modality]) == len(items)
+        for dynamo_item, item in zip(dynamo[1][modality], items):
+            assert dynamo_item.keys() == item.keys()
+            for key, tensor in item.items():
+                assert torch.equal(dynamo_item[key], tensor), (modality, key)
+
+
 class _Sink:
     def __init__(self) -> None:
         self.staged: list[tuple[Any, Any]] = []
@@ -230,19 +303,19 @@ class _Outcome:
 
     status: int
     reply: dict[str, Any]
-    runs: list[tuple[list[int], Any]]
+    runs: list[tuple[list[int], Any, Any]]
     staged: list[tuple[Any, Any]]
     failed: list[str] = field(default_factory=list)
 
 
 def _host(kit: _Kit, deltas: dict[str, list[int]], top_logprobs: int):
     host = object.__new__(VllmAsyncGenerationWorkerImpl)
-    host.cfg = GENERATION
+    host.cfg = kit.generation
     host.llm = host._http_engine_client = _Engine(kit)
     host.llm_async_engine_args = kit.engine_args
     host.model_name = "model"
     host.routed_experts_dtype = torch.int16
-    host._capture_media = False
+    host._capture_media = kit.capture_media
     host._capture_calls = {}
     host._capture_top_logprobs = top_logprobs
     host._staging_source = None
@@ -270,10 +343,12 @@ async def _native(kit, host, sink, failed, body, *, measure: bool) -> _Outcome:
         host,
         engine_client=host._http_engine_client,
         model_config=kit.model_config,
-        cfg=GENERATION,
+        cfg=kit.generation,
     )
     app = FastAPI()
-    chat_server.register_routes(app, server, host=host, generation_config=GENERATION)
+    chat_server.register_routes(
+        app, server, host=host, generation_config=kit.generation
+    )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://native"
     ) as client:
@@ -323,6 +398,9 @@ class SimpleItem:
 
 async def _dynamo(kit, host, sink, failed, body, extras) -> _Outcome:
     request = {k: v for k, v in body.items() if k not in extras}
+    # Dynamo's request names the template kwargs chat_template_args.
+    if "chat_template_kwargs" in request:
+        request["chat_template_args"] = request.pop("chat_template_kwargs")
     request["nvext"] = {
         "annotations": [GYM_EXTRAS_ANNOTATION_PREFIX + json.dumps(extras)]
     }
@@ -345,10 +423,80 @@ async def _dynamo(kit, host, sink, failed, body, extras) -> _Outcome:
     return _Outcome(200, chunk, host.llm.runs, sink.staged, failed)
 
 
-@pytest.fixture(scope="module")
-def kit(tiny_qwen3_model_path):
+def _generation(*, vllm_cfg=None, **chat_settings) -> dict[str, Any]:
+    """GENERATION with the native chat settings a recipe changes."""
+    base = GENERATION["vllm_cfg"]
+    return {
+        **GENERATION,
+        "vllm_cfg": {
+            **base,
+            **(vllm_cfg or {}),
+            "http_server_serving_chat_kwargs": {
+                **base["http_server_serving_chat_kwargs"],
+                **chat_settings,
+            },
+        },
+    }
+
+
+def _turn_end_not_eos(path: str, tmp_path_factory) -> str:
+    """The checkpoint, shaped like gpt-oss: its turns end on a generation-config
+    EOS (<|im_end|>) that is not the tokenizer's (<|endoftext|>)."""
+    copy = tmp_path_factory.mktemp("turn_end_not_eos")
+    shutil.copytree(path, copy, dirs_exist_ok=True)
+    tokenizer_config = json.loads((copy / "tokenizer_config.json").read_text())
+    tokenizer = AutoTokenizer.from_pretrained(path)
+    eos = tokenizer.convert_tokens_to_ids(["<|im_end|>", "<|endoftext|>"])
+    tokenizer_config["eos_token"] = "<|endoftext|>"
+    (copy / "tokenizer_config.json").write_text(json.dumps(tokenizer_config))
+    (copy / "generation_config.json").write_text(json.dumps({"eos_token_id": eos}))
+    return str(copy)
+
+
+def _vlm(path: str, tmp_path_factory) -> str:
+    """Qwen2.5-VL's config and processor: rendering never loads weights."""
+    del path
+    checkpoint = tmp_path_factory.mktemp("qwen2_5_vl")
+    AutoConfig.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct").save_pretrained(
+        checkpoint
+    )
+    AutoProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct").save_pretrained(
+        checkpoint
+    )
+    return str(checkpoint)
+
+
+@dataclass(frozen=True)
+class _KitSpec:
+    generation: dict[str, Any]
+    # The checkpoint, from the tiny Qwen3's path.
+    checkpoint: Callable[..., str] = lambda path, _: path
+    capture_media: bool = False
+
+
+KITS = {
+    "qwen3": _KitSpec(GENERATION),
+    "turn_end_not_eos": _KitSpec(GENERATION, _turn_end_not_eos),
+    # The template gets structured content parts instead of strings.
+    "structured_content": _KitSpec(_generation(chat_template_content_format="openai")),
+    # Nemotron-3-Nano's parser, a plugin file the native recipe loads.
+    "nano_v3": _KitSpec(
+        _generation(
+            vllm_cfg={"reasoning_parser_plugin": NANO_V3_PLUGIN},
+            reasoning_parser="nano_v3",
+        )
+    ),
+    # Qwen2.5's tokenizer has no thinking tokens for Qwen3's reasoning parser.
+    "vlm": _KitSpec(_generation(reasoning_parser=""), _vlm),
+}
+
+
+def _build_kit(kit_spec: _KitSpec, path: str) -> _Kit:
+    generation = kit_spec.generation
+    # No processor cache: each case's engine gets the media itself, not a handle
+    # to media an earlier case processed.
     engine_args = AsyncEngineArgs(
-        model=tiny_qwen3_model_path, max_model_len=MAX_MODEL_LEN
+        model=path, max_model_len=MAX_MODEL_LEN, mm_processor_cache_gb=0
     )
     model_config = engine_args.create_model_config()
     vllm_config = VllmConfig(
@@ -360,21 +508,39 @@ def kit(tiny_qwen3_model_path):
     spec = json.loads(
         json.dumps(
             chat_runtime_data(
-                SimpleNamespace(llm_async_engine_args=engine_args, cfg=GENERATION)
+                SimpleNamespace(llm_async_engine_args=engine_args, cfg=generation)
             )
         )
     )[chat_engine.RUNTIME_DATA_KEY]
-    pool = RenderPool(spec, tiny_qwen3_model_path, workers=1)
-    yield _Kit(
-        path=tiny_qwen3_model_path,
-        tokenizer=AutoTokenizer.from_pretrained(tiny_qwen3_model_path),
+    return _Kit(
+        path=path,
+        generation=generation,
+        capture_media=kit_spec.capture_media,
+        tokenizer=AutoTokenizer.from_pretrained(path),
         engine_args=engine_args,
         model_config=model_config,
         vllm_config=vllm_config,
         renderer=renderer_from_config(vllm_config),
-        pool=pool,
+        pool=RenderPool(spec, path, workers=1),
     )
-    pool.shutdown()
+
+
+@pytest.fixture(scope="module")
+def kits(tiny_qwen3_model_path, tmp_path_factory):
+    """Each kit in KITS, built on first use."""
+    built: dict[str, _Kit] = {}
+
+    def kit(name: str) -> _Kit:
+        if name not in built:
+            spec = KITS[name]
+            built[name] = _build_kit(
+                spec, spec.checkpoint(tiny_qwen3_model_path, tmp_path_factory)
+            )
+        return built[name]
+
+    yield kit
+    for built_kit in built.values():
+        built_kit.pool.shutdown()
 
 
 def _admission(**fields) -> dict[str, Any]:
@@ -394,81 +560,164 @@ def _staged_turn_1(kit: _Kit, **fields) -> dict[str, Any]:
     )
 
 
-def _candidate(kit: _Kit, messages: list[dict]) -> dict[str, Any]:
+def _candidate(
+    kit: _Kit,
+    messages: list[dict],
+    source: list[dict] = HISTORY,
+    *,
+    empty_tool_content: bool = False,
+) -> dict[str, Any]:
     """Gym's candidate: turn 1's source, and this request's, for RL to check the cut."""
     return _staged_turn_1(
         kit,
         mode="candidate",
-        requires_empty_tool_content_equivalence=False,
+        requires_empty_tool_content_equivalence=empty_tool_content,
         candidate_replay=summarize_replay(
-            replay_context(HISTORY, render_digest="b" * 64)
+            replay_context(source, render_digest="b" * 64)
         ),
         request_replay=replay_context(messages, render_digest="b" * 64),
     )
 
 
-# id, messages, extras(kit), request fields, capture top-k
+@dataclass(frozen=True)
+class _Case:
+    """One Gym call, and what both paths must do with it."""
+
+    id: str
+    messages: list[dict] = field(default_factory=lambda: [*HISTORY, OBSERVATION])
+    extras: Callable[[_Kit], dict[str, Any]] = lambda kit: {}
+    fields: dict[str, Any] = field(default_factory=dict)
+    # The sampler top-k capture stages, for score centering.
+    top_logprobs: int = 0
+    # 200, or the 400 both paths refuse the call with before it runs.
+    status: int = 200
+    # The mode capture stages the call in; None when the call is not captured.
+    mode: Optional[str] = None
+    kit: str = "qwen3"
+
+
+def _off_policy(name: str, value: Any) -> _Case:
+    return _Case(f"off_policy_{name}", fields={name: value}, status=400)
+
+
 CASES = [
     # A plain call: the render and the reply's reasoning and tool parsers (C39).
-    ("plain", [*HISTORY, OBSERVATION], lambda kit: {}, {}, 0),
+    _Case("plain"),
     # Gym's echo of turn 1 without capture: the model's tokens replace the
     # template's re-render of that turn (C16's turn-end cut).
-    (
+    _Case(
         "inline_prefix",
-        [*HISTORY, OBSERVATION],
-        lambda kit: {"required_prefix_token_ids": kit.turn_1_tokens()},
-        {},
-        0,
+        extras=lambda kit: {"required_prefix_token_ids": kit.turn_1_tokens()},
+    ),
+    # The same, for a model whose turns end on a token that is not its
+    # tokenizer's EOS, as gpt-oss's <|call|> (C16).
+    _Case(
+        "turn_end_not_eos",
+        extras=lambda kit: {"required_prefix_token_ids": kit.turn_1_tokens()},
+        kit="turn_end_not_eos",
     ),
     # Token capture: turn 1's staged tokens, read from TQ.
-    (
+    _Case(
         "token_in",
-        [*HISTORY, OBSERVATION],
-        lambda kit: {"ng_capture": _staged_turn_1(kit, mode="token_in")},
-        {},
-        0,
+        extras=lambda kit: {"ng_capture": _staged_turn_1(kit, mode="token_in")},
+        mode="token_in",
     ),
     # Gym's candidate whose cut holds is served token-in (C26)...
-    (
+    _Case(
         "candidate_cut_holds",
-        [*HISTORY, OBSERVATION],
-        lambda kit: {"ng_capture": _candidate(kit, [*HISTORY, OBSERVATION])},
-        {},
-        0,
+        extras=lambda kit: {"ng_capture": _candidate(kit, [*HISTORY, OBSERVATION])},
+        mode="token_in",
     ),
     # ...and one whose conversion moved the cut roots a new text segment.
-    (
+    _Case(
         "candidate_cut_fails",
-        [*HISTORY, OBSERVATION, HISTORY[-1]],
-        lambda kit: {"ng_capture": _candidate(kit, [*HISTORY, OBSERVATION])},
-        {},
-        0,
+        messages=[*HISTORY, OBSERVATION, HISTORY[-1]],
+        extras=lambda kit: {"ng_capture": _candidate(kit, [*HISTORY, OBSERVATION])},
+        mode="text",
+    ),
+    # A candidate whose tool call had empty content and now has none: string
+    # content renders both alike, so the cut holds (C26)...
+    _Case(
+        "empty_tool_content",
+        messages=[HISTORY[0], TOOL_TURN, TOOL_RESULT],
+        extras=lambda kit: {
+            "ng_capture": _candidate(
+                kit,
+                [HISTORY[0], TOOL_TURN, TOOL_RESULT],
+                TOOL_HISTORY,
+                empty_tool_content=True,
+            )
+        },
+        mode="token_in",
+    ),
+    # ...and structured content cannot prove that, so it roots a new segment.
+    _Case(
+        "empty_tool_content_structured",
+        messages=[HISTORY[0], TOOL_TURN, TOOL_RESULT],
+        extras=lambda kit: {
+            "ng_capture": _candidate(
+                kit,
+                [HISTORY[0], TOOL_TURN, TOOL_RESULT],
+                TOOL_HISTORY,
+                empty_tool_content=True,
+            )
+        },
+        mode="text",
+        kit="structured_content",
     ),
     # Score centering stages the sampler's top-k with the call (C29).
-    (
+    _Case(
         "score_centering",
-        [*HISTORY, OBSERVATION],
-        lambda kit: {"ng_capture": _admission(mode="text")},
-        {"top_logprobs": 2},
-        2,
+        extras=lambda kit: {"ng_capture": _admission(mode="text")},
+        fields={"top_logprobs": 2},
+        top_logprobs=2,
+        mode="text",
     ),
-    # Off-policy sampling is refused before anything runs (C41).
-    ("off_policy", [*HISTORY, OBSERVATION], lambda kit: {}, {"temperature": 0.5}, 0),
+    # An image after the echoed turn 1: processed once in the frontend, both
+    # engines run the same pixels, and the splice moves its tokens (C30).
+    _Case(
+        "image_after_echoed_turn",
+        messages=[*HISTORY, IMAGE_TURN],
+        extras=lambda kit: {"required_prefix_token_ids": kit.turn_1_tokens()},
+        kit="vlm",
+    ),
+    # Nemotron-3-Nano's reasoning parser plugin, with thinking off (C39).
+    _Case(
+        "nano_v3_thinking_off",
+        fields={"chat_template_kwargs": {"enable_thinking": False}},
+        kit="nano_v3",
+    ),
+    # The sampling the trainer replays, set explicitly (C41)...
+    _Case(
+        "on_policy_sampling",
+        fields={
+            "top_k": -1,
+            "min_p": 0.0,
+            "repetition_penalty": 1.0,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
+            "logit_bias": {},
+        },
+    ),
+    # ...and any it does not is refused before anything runs.
+    _off_policy("temperature", 0.5),
+    _off_policy("top_p", 0.5),
+    _off_policy("top_k", 50),
+    _off_policy("min_p", 0.1),
+    _off_policy("repetition_penalty", 1.05),
+    _off_policy("presence_penalty", 0.5),
+    _off_policy("frequency_penalty", 0.5),
+    _off_policy("logit_bias", {"10": 5.0}),
 ]
 
 
-@pytest.mark.parametrize(
-    ("messages", "extras", "fields", "top_logprobs"),
-    [case[1:] for case in CASES],
-    ids=[case[0] for case in CASES],
-)
-def test_a_gym_call_takes_the_same_steps_through_dynamo_as_natively(
-    kit, messages, extras, fields, top_logprobs
-) -> None:
-    extras = extras(kit)
+@pytest.mark.parametrize("case", CASES, ids=[case.id for case in CASES])
+def test_a_gym_call_takes_the_same_steps_through_dynamo_as_natively(kits, case) -> None:
+    kit = kits(case.kit)
+    extras = case.extras(kit)
     body = {
         "model": kit.path,
-        "messages": messages,
+        "messages": case.messages,
         "tools": TOOLS,
         "temperature": 0.7,
         "top_p": 0.9,
@@ -476,33 +725,40 @@ def test_a_gym_call_takes_the_same_steps_through_dynamo_as_natively(
         # Gym's token information.
         "logprobs": True,
         "top_logprobs": 0,
-        **fields,
+        **case.fields,
         **extras,
     }
     deltas = {"rollout-1/c1": kit.turn_1_tokens()}
 
     async def both():
         native = await _native(
-            kit, *_host(kit, deltas, top_logprobs), body, measure=False
+            kit, *_host(kit, deltas, case.top_logprobs), body, measure=False
         )
-        dynamo = await _dynamo(kit, *_host(kit, deltas, top_logprobs), body, extras)
+        dynamo = await _dynamo(
+            kit, *_host(kit, deltas, case.top_logprobs), body, extras
+        )
         return native, dynamo
 
     native, dynamo = asyncio.run(both())
 
-    assert (native.status, dynamo.status) == (
-        native.status,
-        native.status,
-    ), (native.reply, dynamo.reply)
-    if native.status != 200:
+    assert (native.status, dynamo.status) == (case.status, case.status), (
+        native.reply,
+        dynamo.reply,
+    )
+    if case.status != 200:
         assert native.runs == dynamo.runs == []
         return
-    # The engine ran the same prompt with the same SamplingParams.
-    ((native_prompt, native_params),) = native.runs
-    ((dynamo_prompt, dynamo_params),) = dynamo.runs
+    # The engine ran the same prompt, media and SamplingParams.
+    ((native_prompt, native_params, native_media),) = native.runs
+    ((dynamo_prompt, dynamo_params, dynamo_media),) = dynamo.runs
     assert dynamo_prompt == native_prompt
+    _assert_same_media(dynamo_media, native_media)
+    assert (native_media is not None) == (case.kit == "vlm")
     assert dynamo_params == native_params
-    # Capture staged the same record and tensors.
+    # Capture staged the same record and tensors, in the expected mode.
+    assert [record.mode for record, _ in native.staged] == (
+        [case.mode] if case.mode else []
+    )
     assert len(dynamo.staged) == len(native.staged)
     for (native_record, native_tensors), (dynamo_record, dynamo_tensors) in zip(
         native.staged, dynamo.staged
@@ -518,8 +774,8 @@ def test_a_gym_call_takes_the_same_steps_through_dynamo_as_natively(
     assert choice["finish_reason"] == native.reply["choices"][0]["finish_reason"]
     assert choice["delta"]["content"] == message["content"]
     assert choice["delta"].get("reasoning_content") == message.get("reasoning")
-    assert [call["function"] for call in choice["delta"]["tool_calls"]] == [
-        call["function"] for call in message["tool_calls"]
+    assert [call["function"] for call in choice["delta"].get("tool_calls") or []] == [
+        call["function"] for call in message.get("tool_calls") or []
     ]
     result = dynamo.reply["nvext"]["nemo_rl"]
     if native.staged:
@@ -535,7 +791,8 @@ def test_a_gym_call_takes_the_same_steps_through_dynamo_as_natively(
         }
 
 
-def test_a_measure_call_counts_the_prompt_the_call_would_run(kit) -> None:
+def test_a_measure_call_counts_the_prompt_the_call_would_run(kits) -> None:
+    kit = kits("qwen3")
     extras = {"required_prefix_token_ids": kit.turn_1_tokens()}
     body = {
         "model": kit.path,
