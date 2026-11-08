@@ -348,3 +348,52 @@ def test_runtime_guard_detects_missing_session_api(monkeypatch):
     assert guard.check_runtime() == ["nemo_gym.resources_server_sandbox_sessions"]
     with pytest.raises(SystemExit, match="stock RL Gym pin"):
         guard.main()
+
+
+def test_legacy_image_drift_is_refused_without_partial_dataset(tmp_path):
+    image = tmp_path / "reference.png"
+    Image.new("RGB", (8, 8), "red").save(image)
+    original = image.read_bytes()
+    task = {
+        "benchmark": "chart2code",
+        "task_id": "one",
+        "prompt": "draw",
+        "references": [str(image)],
+    }
+    source = tmp_path / "legacy.jsonl"
+    source.write_text(
+        json.dumps(
+            {
+                "agent_ref": {"type": "responses_api_agents", "name": "old"},
+                "route": "single",
+                "task": task,
+                "responses_create_params": {
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_image",
+                                    "image_url": "data:image/png;base64,"
+                                    + base64.b64encode(original).decode(),
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
+        )
+        + "\n"
+    )
+    Image.new("RGB", (8, 8), "blue").save(image)
+    output = tmp_path / "converted.jsonl"
+    with pytest.raises(ValueError, match="bytes differ"):
+        adapter.export(
+            source,
+            output,
+            reference_root=tmp_path,
+            split="train",
+            max_output_tokens=8192,
+            input_format="legacy-row",
+        )
+    assert not output.exists()

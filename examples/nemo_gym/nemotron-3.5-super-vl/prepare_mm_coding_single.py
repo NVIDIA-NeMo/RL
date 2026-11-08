@@ -79,6 +79,47 @@ class SourceGymRow(BaseModel):
     route: Literal["single", "opencode", "codex", "hermes"]
     responses_create_params: dict[str, object]
 
+    def validate_image_binding(self, expected_sha256: str | None) -> None:
+        """Reject drift between a legacy single row's inline image and its current asset."""
+        if self.route != "single":
+            return
+        images = []
+        messages = self.responses_create_params.get("input")
+        if isinstance(messages, list):
+            for message in messages:
+                if not isinstance(message, dict):
+                    continue
+                content = message.get("content")
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "input_image":
+                        images.append(part.get("image_url"))
+        if len(images) != (1 if expected_sha256 is not None else 0):
+            raise ValueError("Legacy input image count differs from the prepared task")
+        if not images:
+            return
+        value = images[0]
+        if (
+            not isinstance(value, str)
+            or not value.startswith("data:image/")
+            or ";base64," not in value
+        ):
+            raise ValueError(
+                "Legacy reference must be an inline image, not a network URL"
+            )
+        encoded = value.split(";base64,", 1)[1]
+        if len(encoded) > 45 * 1024 * 1024:
+            raise ValueError("Legacy reference exceeds the image budget")
+        raw = base64.b64decode(encoded, validate=True)
+        if (
+            len(raw) > 32 * 1024 * 1024
+            or hashlib.sha256(raw).hexdigest() != expected_sha256
+        ):
+            raise ValueError(
+                "Legacy reference image bytes differ from the current asset"
+            )
+
 
 HARNESS_NAMES = ("opencode", "codex", "hermes")
 MULTI_FRACTIONS = {
@@ -261,10 +302,12 @@ def export(
                 for line in source:
                     if not line.strip():
                         continue
+                    legacy_row = None
                     if input_format == "task":
                         task = ExperimentTask.model_validate_json(line)
                     elif input_format == "legacy-row":
-                        task = SourceGymRow.model_validate_json(line).task
+                        legacy_row = SourceGymRow.model_validate_json(line)
+                        task = legacy_row.task
                     else:
                         raise ValueError("input_format must be task or legacy-row")
                     identity = (task.benchmark, task.task_id)
@@ -280,6 +323,15 @@ def export(
                             task, mode=mode, seed=seed, epoch=epoch, harnesses=harnesses
                         ),
                     )
+                    if legacy_row is not None:
+                        metadata = (
+                            row["task_input"]["task_data"]["task"]
+                            if "task_input" in row
+                            else row["task"]
+                        )
+                        legacy_row.validate_image_binding(
+                            metadata.get("reference_sha256")
+                        )
                     stream.write(json.dumps(row) + "\n")
             if not seen:
                 raise ValueError("Input task collection is empty")
