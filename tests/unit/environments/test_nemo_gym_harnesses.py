@@ -26,7 +26,6 @@ from nemo_rl.environments.nemo_gym_harnesses import (
     attribute_harness_result,
     parse_harness_pool,
     resolve_harness_pool,
-    responses_create_params,
     route_harness_rows,
 )
 from nemo_rl.experience.failures import GymTransportError, RolloutDataFailure
@@ -108,12 +107,64 @@ def resolved_config():
     return config
 
 
+def _harbor_config() -> dict:
+    config = resolved_config()
+    for route in ROUTES:
+        config[route.environment_name]["environment_servers"] = {
+            "harbor": {
+                "agent_server": {
+                    "type": "responses_api_agents",
+                    "name": route.agent_name,
+                },
+                "tasksets": {
+                    "smoke": {
+                        "folder": "/datasets/harbor",
+                        "tasks": {"task-1": "digest-1"},
+                    }
+                },
+            }
+        }
+    return config
+
+
+def _harbor_task(index: int) -> dict:
+    row = task(index)
+    row["task_input"] = {
+        "task_data": {"_ng_digest": "digest-1"},
+        "turns": [
+            {
+                "name": "fix",
+                "responses_create_params": {"input": "Fix the bug"},
+            }
+        ],
+    }
+    return row
+
+
 @pytest.mark.parametrize(
     "value", [[], "swe_pi", ["swe_pi", "swe_pi"], [""], [False], [["nested"]]]
 )
 def test_pool_rejects_invalid_names(value):
     with pytest.raises(ValueError, match="nonempty list of distinct"):
         parse_harness_pool(value)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [{}, {"": ["env"]}, {1: ["env"]}, {"smoke": []}, {"smoke": "env"}, {"smoke": None}],
+)
+def test_pool_rejects_invalid_taskset_mappings(value: object) -> None:
+    with pytest.raises(ValueError):
+        parse_harness_pool(value)
+
+
+def test_pool_parses_taskset_lists_without_sharing_mutable_config() -> None:
+    names = {"scale_swe": ["scale_pi", "scale_opencode"], "swe_rebench": ["rebench_pi"]}
+    parsed = parse_harness_pool(names)
+    assert parsed == names
+    assert isinstance(parsed, dict)
+    parsed["scale_swe"].append("another")
+    assert names["scale_swe"] == ["scale_pi", "scale_opencode"]
 
 
 def test_pool_resolution_preserves_order_and_validates_pairing():
@@ -166,6 +217,148 @@ def test_pool_rejects_multiple_agent_configurations():
         resolve_harness_pool([route.environment_name for route in ROUTES], config)
 
 
+def test_taskset_pools_route_mixed_swe_sources_to_their_own_resources() -> None:
+    config = resolved_config()
+    config["scale"] = {"resources_servers": {"scale_swe": {}}}
+    scale_routes = tuple(
+        HarnessRoute(f"scale_{route.environment_name}", route.agent_name, "scale")
+        for route in ROUTES
+    )
+    for original, route in zip(ROUTES, scale_routes):
+        entry = copy.deepcopy(config[original.environment_name])
+        entry["environment_servers"]["single_agent_turn"]["resources_server"][
+            "name"
+        ] = "scale"
+        config[route.environment_name] = entry
+    names = {
+        "scale_swe": [route.environment_name for route in scale_routes],
+        "swe_rebench": [route.environment_name for route in ROUTES],
+    }
+    resolved = resolve_harness_pool(names, config)
+    assert resolved == {"scale_swe": scale_routes, "swe_rebench": ROUTES}
+    rows = [task(index) for index in range(32)]
+    for index, row in enumerate(rows):
+        row["task_id"]["taskset"] = "scale_swe" if index % 2 else "swe_rebench"
+    original_inputs = [copy.deepcopy(row["task_input"]) for row in rows]
+    route_harness_rows(rows, resolved)
+    for row, original_input in zip(rows, original_inputs):
+        scale = row["task_id"]["taskset"] == "scale_swe"
+        assert row["task_source"] == ("scale" if scale else "swe")
+        assert row["_ng_environment_server"] in {
+            route.environment_name for route in (scale_routes if scale else ROUTES)
+        }
+        assert row["task_input"] == original_input
+    selected = [(row["_ng_environment_server"], row["agent_ref"]) for row in rows]
+    retry = copy.deepcopy(rows[7:13])
+    for row in retry:
+        row["_ng_group_attempt"] += 1
+        row["_ng_rollout_id"] += "-retry"
+    route_harness_rows(retry, resolved)
+    assert [
+        (row["_ng_environment_server"], row["agent_ref"]) for row in retry
+    ] == selected[7:13]
+
+
+def test_taskset_pool_rejects_unknown_taskset_and_wrong_resources() -> None:
+    names = {"smoke": [route.environment_name for route in ROUTES]}
+    routes = resolve_harness_pool(names, resolved_config())
+    row = task()
+    row["task_id"]["taskset"] = "unconfigured"
+    with pytest.raises(ValueError, match="No harness_pool.*unconfigured"):
+        route_harness_rows([row], routes)
+    row = task()
+    row["task_source"] = "another_resources_server"
+    with pytest.raises(ValueError, match="does not match harness resources"):
+        route_harness_rows([row], routes)
+
+
+@pytest.mark.parametrize("mapped", [False, True])
+def test_harbor_pool_routes_opaque_tasks_without_resources_or_model_params(
+    mapped: bool,
+) -> None:
+    names = [route.environment_name for route in ROUTES]
+    routes = resolve_harness_pool(
+        {"smoke": names} if mapped else names, _harbor_config()
+    )
+    rows = [_harbor_task(index) for index in range(32)]
+    original_inputs = [copy.deepcopy(row["task_input"]) for row in rows]
+    rows[0]["task_source"] = "original-harbor-source"
+    route_harness_rows(rows, routes)
+    assert {row["agent_ref"]["name"] for row in rows} == {"opencode_agent", "pi_agent"}
+    assert rows[0]["task_source"] == "original-harbor-source"
+    assert all(row["task_source"] == "smoke" for row in rows[1:])
+    assert [row["task_input"] for row in rows] == original_inputs
+    assert all(row["_ng_environment_server"] in names for row in rows)
+    selected = [(row["_ng_environment_server"], row["agent_ref"]) for row in rows]
+    retry = copy.deepcopy(rows[3:7])
+    for row in retry:
+        row["_ng_group_attempt"] += 1
+        row["_ng_rollout_id"] += "-retry"
+    route_harness_rows(retry, routes)
+    assert [
+        (row["_ng_environment_server"], row["agent_ref"]) for row in retry
+    ] == selected[3:7]
+
+
+@pytest.mark.parametrize("mapped", [False, True])
+def test_harbor_pool_rejects_different_taskset_data(mapped: bool) -> None:
+    config = _harbor_config()
+    config["swe_pi"]["environment_servers"]["harbor"]["tasksets"]["smoke"]["tasks"][
+        "task-1"
+    ] = "other"
+    names = [route.environment_name for route in ROUTES]
+    with pytest.raises(ValueError, match="same taskset data"):
+        resolve_harness_pool({"smoke": names} if mapped else names, config)
+
+
+def test_harbor_taskset_pool_allows_unrelated_tasksets_to_differ() -> None:
+    config = _harbor_config()
+    config["swe_pi"]["environment_servers"]["harbor"]["tasksets"]["other"] = {
+        "folder": "/datasets/other",
+        "tasks": {"other-task": "other-digest"},
+    }
+    names = [route.environment_name for route in ROUTES]
+    resolved = resolve_harness_pool({"smoke": names}, config)
+    route_harness_rows([task()], resolved)
+
+
+@pytest.mark.parametrize("mapped", [False, True])
+def test_harbor_pool_rejects_unserved_taskset(mapped: bool) -> None:
+    names = [route.environment_name for route in ROUTES]
+    if mapped:
+        with pytest.raises(ValueError, match="does not serve taskset 'unknown'"):
+            resolve_harness_pool({"unknown": names}, _harbor_config())
+    else:
+        routes = resolve_harness_pool(names, _harbor_config())
+        row = task()
+        row["task_id"]["taskset"] = "unknown"
+        with pytest.raises(ValueError, match="does not serve taskset 'unknown'"):
+            route_harness_rows([row], routes)
+
+
+def test_pool_rejects_mixed_harbor_and_swe_environments() -> None:
+    config = resolved_config()
+    config["swe_pi"] = _harbor_config()["swe_pi"]
+    with pytest.raises(ValueError, match="all use Harbor"):
+        resolve_harness_pool([route.environment_name for route in ROUTES], config)
+
+
+def test_harbor_pool_requires_distinct_training_agents() -> None:
+    names = [route.environment_name for route in ROUTES]
+    config = _harbor_config()
+    config["pi_agent"]["responses_api_agents"]["pi_agent"]["model_server"]["name"] = (
+        "external"
+    )
+    with pytest.raises(ValueError, match="responses_api_models:policy_model"):
+        resolve_harness_pool(names, config)
+    config = _harbor_config()
+    config["swe_pi"]["environment_servers"]["harbor"]["agent_server"]["name"] = (
+        "opencode_agent"
+    )
+    with pytest.raises(ValueError, match="distinct agent"):
+        resolve_harness_pool(names, config)
+
+
 def test_hash_covers_harnesses_and_is_stable_on_sibling_retry():
     rows = [task(i) for i in range(32)]
     route_harness_rows(rows, ROUTES)
@@ -192,15 +385,6 @@ def test_routing_requires_controller_identity(key, value):
     row[key] = value
     with pytest.raises(ValueError):
         route_harness_rows([row], ROUTES)
-
-
-def test_flat_and_typed_sampling_parameters_are_mutable_without_flattening_tasks():
-    row = task()
-    responses_create_params(row)["temperature"] = 0.4
-    assert row["task_input"]["responses_create_params"]["temperature"] == 0.4
-    assert "responses_create_params" not in row
-    flat = {"responses_create_params": {"input": "hello"}}
-    assert responses_create_params(flat) is flat["responses_create_params"]
 
 
 @pytest.mark.nemo_gym
@@ -246,7 +430,10 @@ def test_result_rejects_wrong_identity_or_unscored_payload(mismatch):
 
 
 @pytest.mark.nemo_gym
-def test_actor_dispatches_typed_rows_and_fetches_each_physical_capture_receipt():
+@pytest.mark.parametrize("pool_kind", ["list", "mapped", "harbor", "mixed"])
+def test_actor_dispatches_typed_rows_and_fetches_each_physical_capture_receipt(
+    pool_kind: str,
+) -> None:
     from nemo_gym.rollout_collection import (
         _EagerCompletionIterator,
         _episode_request_body,
@@ -255,19 +442,37 @@ def test_actor_dispatches_typed_rows_and_fetches_each_physical_capture_receipt()
 
     from nemo_rl.environments.nemo_gym import NemoGym
 
+    config = _harbor_config() if pool_kind == "harbor" else resolved_config()
+    names = [r.environment_name for r in ROUTES]
+    pool = names if pool_kind == "list" else {"smoke": names}
+    rows = [(_harbor_task(i) if pool_kind == "harbor" else task(i)) for i in range(8)]
+    if pool_kind == "mixed":
+        harbor_config = _harbor_config()
+        harbor_names = []
+        for name in names:
+            entry = harbor_config[name]
+            tasksets = entry["environment_servers"]["harbor"]["tasksets"]
+            tasksets["harbor-smoke"] = tasksets.pop("smoke")
+            config[f"harbor_{name}"] = entry
+            harbor_names.append(f"harbor_{name}")
+        pool["harbor-smoke"] = harbor_names
+        for i in range(1, len(rows), 2):
+            rows[i] = _harbor_task(i)
+            rows[i]["task_id"]["taskset"] = "harbor-smoke"
+    original_inputs = [copy.deepcopy(row["task_input"]) for row in rows]
     actor = NemoGym.__ray_metadata__.modified_class(
         {
             "model_name": "policy",
             "base_urls": [],
             "initial_global_config_dict": {},
-            "harness_pool": [r.environment_name for r in ROUTES],
+            "harness_pool": pool,
         }
     )
     actor.rh = object()
     actor._tokenizer = object()
     actor.head_server_config = "head"
     actor._token_capture_enabled = True
-    actor._harness_routes = ROUTES
+    actor._harness_routes = resolve_harness_pool(pool, config)
     actor._environment_server_routes = {}
     actor._control = AsyncMock(return_value={"rows": [], "failures": []})
 
@@ -291,7 +496,6 @@ def test_actor_dispatches_typed_rows_and_fetches_each_physical_capture_receipt()
             )
 
     actor.rch = Helper()
-    rows = [task(i) for i in range(8)]
 
     async def collect():
         return [item async for item in actor.run_rollouts(rows, "test")]
@@ -302,7 +506,8 @@ def test_actor_dispatches_typed_rows_and_fetches_each_physical_capture_receipt()
         row = rows[index]
         assert ref == row["agent_ref"]
         assert result["full_result"]["ng_agent_server"] == ref["name"]
-        assert result["attribution_key"] == "smoke"
+        assert result["attribution_key"] == row["task_id"]["taskset"]
+        assert row["task_input"] == original_inputs[index]
         assert result["full_result"]["_ng_task_id"] == row["task_id"]
         assert result["receipt"]["reward"] == 0.75
         assert result["rollout_id"] == row["_ng_rollout_id"]

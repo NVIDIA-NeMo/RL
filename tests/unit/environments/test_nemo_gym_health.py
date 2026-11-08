@@ -26,6 +26,7 @@ state and previously surfaced it as an AttributeError from deep inside a rollout
 
 import asyncio
 from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock
@@ -271,3 +272,88 @@ def test_run_rollouts_echoes_resolved_agent_ref_with_streamed_result():
         "type": "responses_api_agents",
         "name": "workplace_assistant_simple_agent",
     }
+
+
+@pytest.mark.nemo_gym
+def test_sampling_names_match_gym() -> None:
+    from nemo_gym.config import MODEL_SAMPLING_KEY_NAME
+    from nemo_gym.core import MODEL_SAMPLING_HEADER, MODEL_SAMPLING_NULL
+
+    from nemo_rl.experience.interfaces import (
+        NEMO_GYM_MODEL_SAMPLING_HEADER,
+        NEMO_GYM_MODEL_SAMPLING_KEY,
+        NEMO_GYM_MODEL_SAMPLING_NULL,
+    )
+
+    assert (
+        NEMO_GYM_MODEL_SAMPLING_KEY,
+        NEMO_GYM_MODEL_SAMPLING_HEADER,
+        NEMO_GYM_MODEL_SAMPLING_NULL,
+    ) == (MODEL_SAMPLING_KEY_NAME, MODEL_SAMPLING_HEADER, MODEL_SAMPLING_NULL)
+
+
+@pytest.mark.nemo_gym
+@pytest.mark.parametrize("score_centering", [False, True])
+def test_spinup_requires_per_rollout_sampling_and_preserves_score_centering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, score_centering: bool
+) -> None:
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_collection
+    import nemo_gym.server_utils as gym_utils
+    from omegaconf import OmegaConf
+
+    import nemo_rl.environments.nemo_gym as env_module
+
+    monkeypatch.setattr(env_module, "_get_node_ip_local", lambda: "127.0.0.1")
+    monkeypatch.setattr(env_module, "_get_free_port_local", lambda *_: 11000)
+    monkeypatch.setattr(env_module.ray, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        env_module.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(gcs_address="127.0.0.1:1200"),
+    )
+    start = MagicMock()
+    monkeypatch.setattr(gym_cli, "RunHelper", lambda: SimpleNamespace(start=start))
+    monkeypatch.setattr(gym_collection, "RolloutCollectionHelper", MagicMock())
+    monkeypatch.setattr(gym_utils.ServerClient, "load_from_global_config", MagicMock())
+    cfg = {
+        "initial_global_config_dict": {},
+        "model_name": "policy",
+        "base_urls": ["http://127.0.0.1:1/v1"],
+    }
+    if score_centering:
+        cfg["token_capture"] = {
+            "enabled": True,
+            "generation_backend": "vllm",
+            "top_logprobs": 4,
+            "capture_dir": str(tmp_path),
+            "control_auth_token": "test-token",
+        }
+    env = NemoGymClass(cfg)
+    env._spinup()
+    config = OmegaConf.to_container(
+        start.call_args.kwargs[
+            "global_config_dict_parser_config"
+        ].initial_global_config_dict,
+        resolve=False,
+    )
+    assert config["model_call_sampling"] == {"required_model_servers": ["policy_model"]}
+    pins = (
+        config.get("policy_model", {})
+        .get("responses_api_models", {})
+        .get("vllm_model", {})
+        .get("sampling_overrides", {})
+    )
+    assert pins == ({"logprobs": True, "top_logprobs": 4} if score_centering else {})
+
+    cfg["initial_global_config_dict"] = {
+        "policy_model": {
+            "responses_api_models": {
+                "vllm_model": {"sampling_overrides": {"temperature": 0.9}}
+            }
+        }
+    }
+    start.reset_mock()
+    with pytest.raises(ValueError, match="sampling_overrides"):
+        NemoGymClass(cfg)._spinup()
+    start.assert_not_called()

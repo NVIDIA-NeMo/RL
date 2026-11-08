@@ -235,9 +235,9 @@ def _make_master_config(
 
 
 @pytest.mark.parametrize("use_pool", [False, True])
-def test_spinup_gym_applies_sampling_at_model_only_for_harness_pool(
-    monkeypatch, use_pool
-):
+def test_spinup_gym_preserves_model_config_without_pinning_harness_sampling(
+    monkeypatch: pytest.MonkeyPatch, use_pool: bool
+) -> None:
     env = {
         "should_use_nemo_gym": True,
         "nemo_gym": {
@@ -284,23 +284,8 @@ def test_spinup_gym_applies_sampling_at_model_only_for_harness_pool(
     assert result is actor
     assert cfg.env == original
     actual = captured[0]
-    if use_pool:
-        assert actual is not cfg.env
-        assert (
-            actual["nemo_gym"]["config_paths"]
-            is not cfg.env["nemo_gym"]["config_paths"]
-        )
-        assert actual["nemo_gym"]["policy_model"]["responses_api_models"]["vllm_model"][
-            "sampling_overrides"
-        ] == {
-            "temperature": 0.7,
-            "top_p": 0.8,
-            "max_tokens": 64,
-            "frequency_penalty": 0.1,
-        }
-    else:
-        assert actual is cfg.env
-        assert actual == original
+    assert actual is cfg.env
+    assert actual == original
 
 
 def _native_tq_metadata(

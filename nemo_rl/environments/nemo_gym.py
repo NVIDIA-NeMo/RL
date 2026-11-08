@@ -73,7 +73,8 @@ from nemo_rl.environments.gym_checkpoint_adapter import (
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym_harnesses import (
-    HarnessRoute,
+    HarnessPool,
+    ResolvedHarnessPool,
     attribute_harness_result,
     parse_harness_pool,
     resolve_harness_pool,
@@ -726,7 +727,7 @@ class NemoGymConfig(TypedDict):
     # from the manifest control route. None/absent = legacy token-echo path.
     token_capture: NotRequired[Dict[str, Any] | None]
     # Ordered typed Environment instances; consumed by RL, not Gym global config.
-    harness_pool: NotRequired[list[str] | None]
+    harness_pool: NotRequired[HarnessPool | None]
     # Internal checkpoint topology. These are derived by the actor builder,
     # never read from user YAML.
     checkpoint_instance: GymCheckpointInstance
@@ -1151,7 +1152,7 @@ class NemoGym(EnvironmentInterface):
         # _spinup replaces this from cfg. Keep restarted/unspun actors internally
         # complete so diagnostics and focused tests do not fail with AttributeError.
         self._token_capture_enabled = False
-        self._harness_routes: tuple[HarnessRoute, ...] = ()
+        self._harness_routes: ResolvedHarnessPool = ()
         self._pad_dynamic_image_shapes = bool(cfg.get("pad_dynamic_image_shapes"))
         # Reconstruct the processor inside the actor (rather than serializing it
         # per rollout call) for full-trajectory multimodal postprocessing.
@@ -1210,6 +1211,7 @@ class NemoGym(EnvironmentInterface):
         self.head_server_port = _get_free_port_local(_gym_port_low, _gym_port_high)
 
         from nemo_gym.cli import GlobalConfigDictParserConfig, RunHelper
+        from nemo_gym.config import MODEL_CALL_SAMPLING_BLOCK
         from nemo_gym.rollout_collection import RolloutCollectionHelper
         from nemo_gym.server_utils import (
             HEAD_SERVER_KEY_NAME,
@@ -1292,6 +1294,23 @@ Depending on your data shape, you may want to change these values."""
             "host": self.node_ip,
             "port": self.head_server_port,
         }
+
+        # Gym carries each rollout's sampling profile to every trained model call.
+        initial_global_config_dict[MODEL_CALL_SAMPLING_BLOCK] = {
+            "required_model_servers": [_POLICY_SERVER_NAME]
+        }
+        policy_model_server = (
+            (initial_global_config_dict.get(_POLICY_SERVER_NAME) or {})
+            .get("responses_api_models", {})
+            .get("vllm_model", {})
+        )
+        if policy_model_server.get("sampling_overrides"):
+            raise ValueError(
+                f"env.nemo_gym.{_POLICY_SERVER_NAME} sets sampling_overrides, but "
+                "trained agents use policy.generation (val_temperature and "
+                "val_top_p for validation). Remove sampling_overrides; use a "
+                "separate model server to pin an untrained judge's sampling."
+            )
 
         # Ledger-authoritative token capture: enable external staging in the
         # policy model server (via the policy_model global-config override
@@ -1683,6 +1702,13 @@ Depending on your data shape, you may want to change these values."""
                 "to non-empty Environment Server names."
             )
         self._environment_server_routes = dict(routes)
+        if isinstance(self._harness_routes, dict):
+            # The driver needs one hosted destination per taskset; the actor
+            # chooses the actual harness separately for each generation.
+            self._environment_server_routes = {
+                taskset: pool[0].environment_name
+                for taskset, pool in self._harness_routes.items()
+            }
         return dict(self._environment_server_routes)
 
     @accepts_trace_context

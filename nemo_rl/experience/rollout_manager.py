@@ -44,7 +44,7 @@ from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
-from nemo_rl.environments.nemo_gym_harnesses import responses_create_params
+from nemo_rl.environments.nemo_gym_harnesses import HarnessPool
 from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
 )
@@ -64,6 +64,7 @@ from nemo_rl.experience.failures import (
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_MODEL_SAMPLING_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     Completion,
@@ -1048,7 +1049,7 @@ class AsyncNemoGymRolloutImpl:
         log_full_result_tables: bool = False,
         forest_training: bool = False,
         *,
-        harness_pool: Optional[list[str]] = None,
+        harness_pool: Optional[HarnessPool] = None,
         **kwargs: Any,
     ) -> None:
         self._tokenizer = tokenizer
@@ -1241,20 +1242,13 @@ class AsyncNemoGymRolloutImpl:
         # sample. Row-level redispatch reuses these rows and keeps the same ID.
         template_row[NEMO_GYM_TASK_INDEX_KEY] = task_index
 
-        response_params = responses_create_params(template_row)
-        if not self._harness_pool:
-            response_params["temperature"] = self._generation_config["temperature"]
-            response_params["top_p"] = self._generation_config["top_p"]
-
-            # This is a per-call output limit, not the total sequence length.
-            existing = response_params.get("max_output_tokens")
-            response_params["max_output_tokens"] = (
-                min(existing, self._generation_config["max_new_tokens"])
-                if existing is not None
-                else self._generation_config["max_new_tokens"]
-            )
-        # Session harnesses reject row-level sampling overrides. Pool setup
-        # applies the training profile to the shared policy model server.
+        # Carry the sampling profile beside the task so session harnesses receive
+        # the same policy values on every model call, including validation.
+        template_row[NEMO_GYM_MODEL_SAMPLING_KEY] = {
+            "temperature": self._generation_config["temperature"],
+            "top_p": self._generation_config["top_p"],
+            "max_output_tokens": self._generation_config["max_new_tokens"],
+        }
 
         # Build N rows with distinct rowidxs so run_rollouts can sort them correctly.
         if rollout_ids is not None:
@@ -2218,7 +2212,7 @@ class RolloutManager:
         forest_training: bool = False,
         execution_row_multiple: int = 1,
         *,
-        harness_pool: Optional[list[str]] = None,
+        harness_pool: Optional[HarnessPool] = None,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"

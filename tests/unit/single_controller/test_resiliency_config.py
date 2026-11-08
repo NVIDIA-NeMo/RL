@@ -85,13 +85,14 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
     )
 
 
-def test_harness_pool_accepts_text_grpo_with_token_capture():
+@pytest.mark.parametrize("pool", [["env-a", "env-b"], {"tasks": ["env-a", "env-b"]}])
+def test_harness_pool_accepts_text_grpo_with_token_capture(pool):
     cfg = _master_config()
     cfg.policy["generation"]["vllm_cfg"] = {
         "async_engine": True,
         "expose_http_server": True,
     }
-    cfg.env["nemo_gym"] = {"harness_pool": ["env-a", "env-b"]}
+    cfg.env["nemo_gym"] = {"harness_pool": pool}
     cfg.token_capture = TokenCaptureConfig(enabled=True)
     validate_single_controller_config(cfg)
 

@@ -21,7 +21,6 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 
 from __future__ import annotations
 
-import copy
 import os
 import time
 import warnings
@@ -830,24 +829,6 @@ def _spinup_gym(
     generation_config = policy_config["generation"]
     enable_router_replay = router_replay_enabled(policy_config)
     env_config = master_config.env
-    gym_config = env_config.get("nemo_gym")
-    if gym_config is not None and gym_config.get("harness_pool"):
-        # Session harnesses own their row parameters; enforce training sampling
-        # at the shared model server, without changing the caller's config.
-        env_config = copy.deepcopy(env_config)
-        model_config = (
-            env_config["nemo_gym"]
-            .setdefault("policy_model", {})
-            .setdefault("responses_api_models", {})
-            .setdefault("vllm_model", {})
-        )
-        sampling_overrides = dict(model_config.get("sampling_overrides") or {})
-        sampling_overrides.update(
-            temperature=generation_config["temperature"],
-            top_p=generation_config["top_p"],
-            max_tokens=generation_config["max_new_tokens"],
-        )
-        model_config["sampling_overrides"] = sampling_overrides
     shard_set = build_nemo_gym_actors(
         env_config,
         base_urls=base_urls,

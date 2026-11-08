@@ -48,6 +48,7 @@ from nemo_rl.data.processors import nemo_gym_data_processor
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.environments.nemo_gym_harnesses import HarnessPool
 from nemo_rl.experience.failures import (
     GenerationUnavailable,
     GymTerminalEpisodeFailure,
@@ -55,6 +56,7 @@ from nemo_rl.experience.failures import (
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
+    NEMO_GYM_MODEL_SAMPLING_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     Completion,
@@ -1530,18 +1532,50 @@ def test_harness_pool_build_inputs_preserves_retry_identity_and_nested_params():
     assert rows[0]["_ng_rollout_id"] == "attempt-2"
 
 
-def test_ordinary_gym_build_inputs_still_applies_row_sampling_parameters():
+def test_ordinary_gym_build_inputs_carries_sampling_beside_the_task() -> None:
     impl = _nemo_gym_impl(True)
     sample = {"extra_env_info": {"responses_create_params": {"max_output_tokens": 7}}}
     rows = impl._build_inputs(sample, task_index=0)
-    assert rows[0]["responses_create_params"] == {
-        "max_output_tokens": 7,
+    assert rows[0]["responses_create_params"] == {"max_output_tokens": 7}
+    assert rows[0][NEMO_GYM_MODEL_SAMPLING_KEY] == {
         "temperature": 1.0,
         "top_p": 1.0,
+        "max_output_tokens": impl._generation_config["max_new_tokens"],
     }
     assert sample["extra_env_info"]["responses_create_params"] == {
         "max_output_tokens": 7
     }
+
+
+@pytest.mark.parametrize(
+    "harness_pool",
+    [["harbor-a", "harbor-b"], {"terminal:train": ["harbor-a", "harbor-b"]}],
+)
+def test_harness_pool_build_inputs_preserves_harbor_task_and_stamps_sampling(
+    harness_pool: HarnessPool,
+) -> None:
+    impl = _nemo_gym_impl(True, harness_pool=harness_pool)
+    impl._num_generations_per_prompt = 2
+    impl._generation_config.update(temperature=0.6, top_p=0.85, max_new_tokens=48)
+    sample = {
+        "extra_env_info": {
+            "task_id": {"taskset": "terminal:train", "task_id": "task-7"},
+            "task_input": {"task_path": "/tasks/task-7"},
+        }
+    }
+    original = deepcopy(sample)
+    rows = impl._build_inputs(sample, task_index=7)
+    assert sample == original
+    assert len(rows) == 2
+    for row in rows:
+        assert row["task_input"] == original["extra_env_info"]["task_input"]
+        assert row[NEMO_GYM_MODEL_SAMPLING_KEY] == {
+            "temperature": 0.6,
+            "top_p": 0.85,
+            "max_output_tokens": 48,
+        }
+    rows[0][NEMO_GYM_MODEL_SAMPLING_KEY]["temperature"] = 0.9
+    assert rows[1][NEMO_GYM_MODEL_SAMPLING_KEY]["temperature"] == 0.6
 
 
 def test_harness_pool_stream_keeps_per_completion_attribution_and_group_metrics():
@@ -1719,7 +1753,9 @@ def test_rollout_manager_task_counter_only_applies_to_gym(use_nemo_gym: bool) ->
     assert manager.get_next_nemo_gym_task_index() == (42 if use_nemo_gym else 0)
 
 
-def test_nemo_gym_build_inputs_preserves_materialized_task_and_clamps_sampling():
+def test_nemo_gym_build_inputs_preserves_materialized_task_and_stamps_sampling() -> (
+    None
+):
     impl = _nemo_gym_impl(True)
     impl._num_generations_per_prompt = 2
     impl._generation_config.update(temperature=0.7, top_p=0.9, max_new_tokens=64)
@@ -1745,11 +1781,12 @@ def test_nemo_gym_build_inputs_preserves_materialized_task_and_clamps_sampling()
     for row in rows:
         assert row["task_id"] == original["extra_env_info"]["task_id"]
         assert row["task_input"]["task_data"] == {"state": ["meeting-1"]}
-        params = row["task_input"]["responses_create_params"]
-        assert params["temperature"] == 0.7
-        assert params["top_p"] == 0.9
-        assert params["max_output_tokens"] == 32
-        assert params["metadata"] == {"extra_body": '{"seed": 8}'}
+        assert row["task_input"] == original["extra_env_info"]["task_input"]
+        assert row[NEMO_GYM_MODEL_SAMPLING_KEY] == {
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "max_output_tokens": 64,
+        }
         assert "responses_create_params" not in row
     assert [row["_rowidx"] for row in rows] == [0, 1]
     rows[0]["task_input"]["task_data"]["state"].append("meeting-2")

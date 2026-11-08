@@ -1213,6 +1213,37 @@ def _route_through_full_generator(serving_chat, result_generator) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("top_k", [None, 20])
+@pytest.mark.parametrize("gym_sampling_header", [None, "null"])
+async def test_only_trained_calls_must_match_policy_sampling(
+    monkeypatch: pytest.MonkeyPatch, gym_sampling_header: str | None, top_k: int | None
+) -> None:
+    _, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    reached = []
+
+    async def create_chat_completion(request, _raw_request):
+        reached.append((request.temperature, request.top_p, request.top_k))
+        raise ValueError("Input length (2) exceeds model's maximum context length (1).")
+
+    serving_chat.create_chat_completion = create_chat_completion
+    request = _fake_chat_request()
+    request.temperature, request.top_p, request.top_k = 0.0, 0.5, top_k
+    raw_request = MagicMock(
+        headers={"x-ng-sampling": gym_sampling_header} if gym_sampling_header else {}
+    )
+    if gym_sampling_header is None:
+        with pytest.raises(
+            AssertionError, match="Top k" if top_k else "matches neither"
+        ):
+            await chat_handler(request, raw_request)
+        assert reached == []
+    else:
+        response = await chat_handler(request, raw_request)
+        assert response.status_code == 400
+        assert reached == [(0.0, 0.5, top_k)]
+
+
+@pytest.mark.asyncio
 async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
     """Overflow from _clamp_max_tokens must be HTTP 400 that NeMo Gym recognizes."""
     _, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
