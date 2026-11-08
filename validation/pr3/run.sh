@@ -11,7 +11,7 @@ if [[ "${PR3_MODE:-train}" == exploratory-train ]]; then
   # Explicit research lane: preserve the failed original gate and use a
   # separate run identity. The default qualification path stays unchanged.
   report_file=validation/pr3/results/ep16-normalizer-control/normalizer-control.json
-  config_file=validation/pr3/streaming_qwen35_exploratory.yaml
+  config_file=${PR3_CONFIG:-validation/pr3/streaming_qwen35_exploratory.yaml}
 elif [[ "${PR3_MODE:-train}" == train ]]; then
   report_file=validation/pr3/results/ep16-fixed-input/parity.json
   config_file=validation/pr3/streaming_qwen35.yaml
@@ -19,11 +19,12 @@ else
   echo "Unknown PR3 mode: $PR3_MODE" >&2
   exit 2
 fi
-uv run --no-project --python /opt/nemo_rl_venv/bin/python python - "$report_file" "${PR3_MODE:-train}" <<'PY'
+uv run --no-project --python /opt/nemo_rl_venv/bin/python python - "$report_file" "${PR3_MODE:-train}" "$config_file" "${PR3_TARGET_STEPS:-300}" <<'PY'
 import hashlib
 import json
 import sys
 from pathlib import Path
+from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
 report = json.loads(Path(sys.argv[1]).read_text())
 assert report['passed']
 if sys.argv[2] == 'exploratory-train':
@@ -34,6 +35,8 @@ else:
     assert report['contract'] == 'bf16_gradient_and_optimizer_oracle_v2'
 for name, expected in report['source_file_sha256'].items():
     assert hashlib.sha256(Path(name).read_bytes()).hexdigest() == expected, name
+register_omegaconf_resolvers()
+assert int(load_config(sys.argv[3]).grpo.max_num_steps) == int(sys.argv[4])
 PY
 # Read the requested account's key without echoing it or passing it on the CLI.
 export WANDB_API_KEY
