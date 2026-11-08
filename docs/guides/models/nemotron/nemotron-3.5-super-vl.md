@@ -127,8 +127,9 @@ with `--config examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_single.yaml`.
 
 The recipe uses learner TP1/CP1 without packing or sequence parallelism, keeps
 the model's image processor and raw vLLM logprobs, and masks invalid Gym
-measurements. Existing NeMo RL model support is reused; no private trainer
-patches, dependency upgrades or changes to the GRPO loss are required.
+measurements. Existing NeMo RL model support is reused; the trainer, optimizer
+and GRPO loss are unchanged. The compatible Gym runtime described above must
+still be provisioned and validated.
 Renderer/judge failures are excluded; measured model execution failures remain
 eligible zero rewards. The quality reward is distinct from official evaluation
 metrics, whose EFB configurations remain separate.
