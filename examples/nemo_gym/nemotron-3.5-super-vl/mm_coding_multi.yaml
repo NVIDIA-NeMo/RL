@@ -1,0 +1,17 @@
+# Multi coding harness routes share the single recipe's Super VL learner and reward.
+defaults: mm_coding_single.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-super35-mm-coding-multi
+
+env:
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/mm_coding_training/configs/mm_coding_multi.yaml
+    - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+
+logger:
+  log_dir: logs/grpo-super35-mm-coding-multi
+  wandb:
+    name: super35-mm-coding-multi-acceptance

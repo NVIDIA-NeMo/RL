@@ -58,6 +58,70 @@ configured.
 
 ## Example Recipes
 
+### Single-answer multimodal coding through NeMo Gym
+
+The internal Gym `mm_coding_training` component supports Chart2Code, MMSVG
+Img2SVG/Text2SVG, Image2Struct LaTeX and Design2Code. The recipe
+[`mm_coding_single.yaml`](../../../../examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_single.yaml)
+inherits the Super Automodel/vLLM setup and replaces the task, data and Gym
+bindings. It is a **two-step acceptance recipe**, not a production training
+budget or a claim of improved benchmark performance. It uses 8 training and
+8 generation nodes, 4 GPUs per node, as inherited from the agentic recipe.
+No jobs are started by preparing or resolving it.
+
+Install the internal Gym contribution in the runtime used by the driver and
+Gym server workers. Its component and config must be visible from every node;
+a stock public Gym checkout alone does not supply the internal component.
+Configure the remote sandbox provider and quality judge on the trusted Gym
+side, following that component's README. Do not put judge or registry keys in
+training rows, model requests or candidate sandboxes.
+
+Source-owned acquisition and split conversion remain upstream. Adapt prepared
+`nemo-rl-mm-coding` task records with:
+
+```bash
+uv run examples/nemo_gym/nemotron-3.5-super-vl/prepare_mm_coding_single.py \
+  --input /approved/source/train-tasks.jsonl --output /shared/coding/train.jsonl \
+  --reference-root /shared/coding/assets --split train --max-output-tokens 8192
+```
+
+Run it separately for an approved validation split. The adapter preserves
+prompt text and image bytes, puts reference source only in verifier metadata,
+rejects duplicate task IDs and refuses to overwrite an existing dataset. It
+does not prove that a caller-labeled split is free of held-out evaluation data.
+
+Set `MM_CODING_TRAIN_DATA` and `MM_CODING_VALIDATION_DATA` to the adapted files,
+and `MM_CODING_REFERENCE_ROOT` to their shared reference root. Both data paths
+are required; the recipe never falls back to the synthetic examples or an
+evaluation test set. Then launch through `examples/nemo_gym/run_grpo_nemo_gym.py`
+with `--config examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_single.yaml`.
+
+The recipe uses learner TP1/CP1 without packing or sequence parallelism, keeps
+the model's image processor and raw vLLM logprobs, and masks invalid Gym
+measurements. Existing NeMo RL model support is reused; no private trainer
+patches, dependency upgrades or changes to the GRPO loss are required.
+Renderer/judge failures are excluded; measured model execution failures remain
+eligible zero rewards. The quality reward is distinct from official evaluation
+metrics, whose EFB configurations remain separate.
+
+Use `--mode multi` for one selected OpenCode/Codex/Hermes harness per task, or
+`--mode mixed` for the source task-family single/multi proportions. `--seed`
+and `--epoch` freeze routing when preparing the file, before GRPO siblings are
+expanded. The model-visible task prompt is preserved; multi adds workspace and
+preview instructions. Private grading metadata stays outside model input.
+Use the matching [`mm_coding_multi.yaml`](../../../../examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_multi.yaml)
+or [`mm_coding_mixed.yaml`](../../../../examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_mixed.yaml)
+recipe. All three recipes share the learner, optimizer and reward settings.
+Multi rows route typed tasksets to Gym's existing sandboxed harnesses; single
+rows use the existing simple-agent relay. This contribution does not port the
+experimental V2 asynchronous controller or change GRPO loss/optimizer behavior.
+
+The source experiments passed two-step Super acceptance on a different pinned
+runtime and checkpoint. The recipe selects the documented public Super 3.5 VL
+BF16 model; the historical row90 Base result is not a new GPU acceptance for
+this recipe. Record exact source/model/image pins, real smoke rollouts and any
+new training/recovery results with the draft before advancing it to merge.
+
 Automodel training with vLLM generation. The text and image recipes colocate
 generation with training; the agentic recipe runs async GRPO with generation on
 its own node pool. The recipe YAMLs are the source of truth.

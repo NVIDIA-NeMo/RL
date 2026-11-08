@@ -1,0 +1,60 @@
+defaults: workplace_assistant_automodel.yaml
+grpo:
+  num_prompts_per_step: 4
+  max_num_steps: 2
+  val_at_start: false
+  val_period: 0
+checkpointing:
+  checkpoint_dir: results/grpo-super35-mm-coding-single
+  save_period: 1
+policy:
+  train_global_batch_size: 64
+  automodel_cfg:
+    context_parallel_size: 1
+  generation:
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: 2
+data:
+  _override_: true
+  max_input_seq_length: null
+  shuffle: true
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    data_path: ${oc.env:MM_CODING_TRAIN_DATA}
+  validation:
+    data_path: ${oc.env:MM_CODING_VALIDATION_DATA}
+  default:
+    dataset_name: NemoGymDataset
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    processor: nemo_gym_data_processor
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: false
+  should_mask_flagged_samples: true
+  nemo_gym:
+    skip_venv_if_present: false
+    is_trajectory_collection: false
+    port_range_low: 5000
+    port_range_high: 5999
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/mm_coding_training/configs/mm_coding_training.yaml
+    - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          chat_template_kwargs:
+            enable_thinking: true
+            truncate_history_thinking: false
+logger:
+  log_dir: logs/grpo-super35-mm-coding-single
+  wandb_enabled: false
+  wandb:
+    project: visual-coding
+    name: super35-mm-coding-single-acceptance
