@@ -92,12 +92,15 @@ class _Pool:
         }
         self.bodies: list[dict] = []
         self.responded: list[tuple] = []
+        self.error: Exception | None = None
 
     async def info(self) -> dict:
         return {"turn_end_token_ids": [EOS], "max_model_len": MAX_MODEL_LEN}
 
     async def render(self, body: dict) -> RenderedCall:
         self.bodies.append(body)
+        if self.error is not None:
+            raise self.error
         return self.rendered
 
     async def respond(self, request, prompt_token_ids, output) -> dict:
@@ -368,6 +371,32 @@ def test_gym_calls_nemo_rl_cannot_serve_are_refused_with_a_400(
 
     assert refused.value.code == 400
     assert router.requests == []
+
+
+@pytest.mark.nemo_gym
+@pytest.mark.parametrize("captured", [True, False])
+@pytest.mark.parametrize("refused_by", ["render", "clamp"])
+def test_a_call_refused_before_it_runs_acknowledges_its_capture_to_gym(
+    captured, refused_by
+) -> None:
+    from nemo_gym.token_id_capture.external_capture import (
+        split_dynamo_capture_refusal,
+    )
+    from vllm.exceptions import VLLMValidationError
+
+    # The prompt alone fills the context.
+    pool = _Pool(_rendered(template_token_ids=list(range(MAX_MODEL_LEN))))
+    if refused_by == "render":
+        pool.error = VLLMValidationError("maximum context length is 16 tokens")
+    extras = {"ng_capture": TOKEN_IN} if captured else {}
+
+    with pytest.raises(HttpError) as refused:
+        _serve(pool, _Router(), _call(extras))
+
+    # Gym reads the acknowledgement off the message, as natively off the header.
+    message, refused_call = split_dynamo_capture_refusal(refused.value.message)
+    assert (refused.value.code, "maximum context length" in message) == (400, True)
+    assert refused_call == (TOKEN_IN["model_call_id"] if captured else None)
 
 
 def test_an_engine_error_fails_the_call() -> None:

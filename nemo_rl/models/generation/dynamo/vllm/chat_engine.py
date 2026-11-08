@@ -76,6 +76,22 @@ class _ContextLengthError(ValueError):
     """The prompt leaves no room for output; Gym reads "context length" in a 400."""
 
 
+def _capture_refusal_ack(extras: GymCallExtras) -> str:
+    """Gym's acknowledgement that a capture call was refused before it ran.
+
+    The native route sends it as a header; Dynamo's frontend forwards only an
+    error's status and message, so it ends the message instead.
+    """
+    if extras.ng_capture is None:
+        return ""
+    # Deferred: Gym is installed wherever a call carries ng_capture.
+    from nemo_gym.token_id_capture.external_capture import (
+        dynamo_capture_refusal_suffix,
+    )
+
+    return dynamo_capture_refusal_suffix(extras.ng_capture["model_call_id"])
+
+
 def _drop_none(value: Any) -> Any:
     """Dynamo hands Python unset fields as None, which vLLM's models reject."""
     if isinstance(value, dict):
@@ -179,19 +195,6 @@ class NemoRLChatEngine:
         from nemo_rl.data.captured_media import MediaCaptureRejected
         from nemo_rl.models.generation.vllm.utils import OffPolicySamplingError
 
-        try:
-            yield await self._serve(request, context)
-        except (
-            OffPolicySamplingError,
-            _ContextLengthError,
-            MediaCaptureRejected,
-            VLLMValidationError,
-        ) as error:
-            raise HttpError(400, str(error)) from error
-
-    async def _serve(self, request: dict[str, Any], context: Any) -> dict[str, Any]:
-        from nemo_rl.models.generation.vllm.utils import on_policy_sampling
-
         extras = GymCallExtras.from_annotations(
             (request.get("nvext") or {}).get("annotations") or ()
         )
@@ -202,6 +205,19 @@ class NemoRLChatEngine:
                 "nemo_rl:gym: annotation) on chat; NeMo RL's own rollouts use "
                 "/v1/completions.",
             )
+        try:
+            yield await self._serve(request, extras, context)
+        except (OffPolicySamplingError, MediaCaptureRejected) as error:
+            raise HttpError(400, str(error)) from error
+        except (_ContextLengthError, VLLMValidationError) as error:
+            # Refused before the engine ran, so nothing was staged: as natively.
+            raise HttpError(400, str(error) + _capture_refusal_ack(extras)) from error
+
+    async def _serve(
+        self, request: dict[str, Any], extras: GymCallExtras, context: Any
+    ) -> dict[str, Any]:
+        from nemo_rl.models.generation.vllm.utils import on_policy_sampling
+
         body = _drop_none(
             {k: v for k, v in request.items() if k not in _DYNAMO_ONLY_FIELDS}
         )

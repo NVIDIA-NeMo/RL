@@ -108,9 +108,10 @@ same record and return the same reply.
 Where the behavior differs from the native endpoint:
 
 - The frontend refuses more than 4 `stop` strings or `stop_token_ids` (HTTP 500).
-- A token-capture call refused for its context length is answered without the
-  native endpoint's `x-ng-capture-refused` header, which Dynamo's errors cannot
-  carry.
+- A token-capture call refused for its context length acknowledges the refusal
+  at the end of the error message instead of in the native endpoint's
+  `x-ng-capture-refused` header, which Dynamo's errors cannot carry. Gym's
+  dialect moves it back to the header, so the harness sees the native error.
 - A call's processed media travels to the engine inside the request.
 
 ## Not supported
