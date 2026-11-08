@@ -2096,11 +2096,14 @@ class TestFinalizerStateRelease:
 class TestPeriodicRolloutCheckpoint:
     @pytest.mark.parametrize("anchor_step", [0, 1])
     @pytest.mark.parametrize("claimed", [False, True])
+    @pytest.mark.parametrize("step_padding_copy", [False, True])
     def test_forest_snapshot_preserves_buffered_and_training_owned_rows(
-        self, tmp_path: Path, anchor_step: int, claimed: bool
+        self, tmp_path: Path, anchor_step: int, claimed: bool, step_padding_copy: bool
     ) -> None:
         actor = self._actor(tmp_path)
         actor._master_config.token_capture.forest_training = True
+        if step_padding_copy:
+            actor._master_config.token_capture.forest_padding_scope = "step"
         actor._master_config.async_rl.sampler = InOrderSamplerConfig(
             max_lookahead_versions=0
         )
@@ -2137,6 +2140,11 @@ class TestPeriodicRolloutCheckpoint:
                 expected_manifest_digest=state["manifest_digest"],
             )
             actor._dp_client.sample_ids = list(group["meta"].sample_ids)
+            if step_padding_copy:
+                # A streamed step's padding copy; only a snapshot may hold it.
+                actor._dp_client.sample_ids.append(
+                    f"{group['meta'].sample_ids[0]}_pad0"
+                )
             if claimed:
                 assert await actor._buffer.claim_for_training([0]) == 1
             assert await actor._rollout_snapshots.save_snapshot(force=True)
@@ -3408,6 +3416,11 @@ class TestDataPlaneCheckpoint:
                 ["g0-0", "g0-1", "orphan-0"],
                 r"unexpected=\['orphan-0'\]",
             ),
+            # Step padding copies belong only in rollout snapshots.
+            (
+                ["g0-0", "g0-1", "g0-0_pad0"],
+                r"unexpected=\['g0-0_pad0'\]",
+            ),
         ],
     )
     def test_tq_save_rejects_inventory_mismatch(
@@ -3420,6 +3433,7 @@ class TestDataPlaneCheckpoint:
             buffer_checkpoint=True,
             data_plane_checkpoint=True,
         )
+        mc.token_capture.forest_padding_scope = "step"
         sample_ids = ["g0-0", "g0-1"]
         replay_metadata = {
             "schema_version": REPLAY_BUFFER_METADATA_SCHEMA_VERSION,
@@ -3448,12 +3462,19 @@ class TestDataPlaneCheckpoint:
             ],
         }
 
+        async def _no_step_padding(train_meta):
+            return train_meta, None
+
         with pytest.raises(RuntimeError, match=error_fragment):
             _run_train_pump(
                 mc,
                 _make_actor_args(
                     dp_client=_FakeDPClient(sample_ids=actual_sample_ids),
                     tq_buffer=_FakeTQBuffer(metadata_state=replay_metadata),
+                ),
+                # The fake batch has no Forest rows to pad.
+                seed=lambda actor: setattr(
+                    actor, "_pad_forest_step_rows", _no_step_padding
                 ),
             )
 
@@ -4745,6 +4766,11 @@ class TestReplayBufferPersistence:
                 ["g0-0", "g0-1", "orphan-0"],
                 r"unexpected=\['orphan-0'\]",
             ),
+            # Step padding copies belong only in rollout snapshots.
+            (
+                ["g0-0", "g0-1", "g0-0_pad0"],
+                r"unexpected=\['g0-0_pad0'\]",
+            ),
         ],
     )
     def test_native_restore_rejects_tq_inventory_mismatch(
@@ -4780,17 +4806,21 @@ class TestReplayBufferPersistence:
             buffer_checkpoint=True,
             data_plane_checkpoint=True,
         )
+        mc.token_capture.forest_padding_scope = "step"
+        dp_client = _FakeDPClient(sample_ids=actual_sample_ids)
 
         with pytest.raises(RuntimeError, match=error_fragment):
             _run_actor_run(
                 mc,
                 _make_actor_args(
                     tq_buffer=_FakeTQBuffer(load_return=1),
-                    dp_client=_FakeDPClient(sample_ids=actual_sample_ids),
+                    dp_client=dp_client,
                     last_checkpoint_path=str(ckpt_dir),
                     data_plane_checkpoint_metadata=tq_metadata,
                 ),
             )
+        # A full checkpoint never deletes rows it does not expect.
+        assert dp_client.clear_calls == []
 
     def test_native_replay_metadata_requires_setup_side_tq_restore(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"

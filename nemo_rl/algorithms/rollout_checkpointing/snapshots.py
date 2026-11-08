@@ -378,14 +378,16 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     saved_capacity=self._async_cfg.max_buffered_rollouts,
                     additional_groups=training_owned_groups,
                 )
-                # Training may hold step padding copies; restore deletes them.
+                # Only a mid-step snapshot may hold step padding copies;
+                # restore deletes them.
                 await validate_replay_inventory(
                     replay_metadata,
                     dp_client=self._dp_client,
                     partition_id=self._partition_id,
                     step_padding=(
                         "allow"
-                        if self._master_config.token_capture.forest_padding_scope
+                        if snapshot
+                        and self._master_config.token_capture.forest_padding_scope
                         == "step"
                         else "reject"
                     ),
