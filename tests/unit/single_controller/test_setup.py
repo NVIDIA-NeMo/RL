@@ -3473,6 +3473,34 @@ def test_forest_row_multiple_depends_on_packing(packing: bool, logprobs: bool) -
         forest_execution_row_multiple(mc.policy, dp_size=2, logprobs_required=logprobs)
 
 
+def test_grpo_setup_rejects_a_chunk_cap_that_cannot_shard_across_policy_dp(
+    patched_factories,
+) -> None:
+    """Setup reaches the guard, which the pure-function tests cannot show.
+
+    The policy DP size is only known once the trainer is built, so the guard
+    has to be wired into setup; without this, deleting that call leaves every
+    test green.
+    """
+    mc = _make_master_config(megatron_enabled=True)
+    mc.grpo.num_generations_per_prompt = 2
+    mc.async_rl.min_groups_for_streaming_train = 1
+    # 3 groups x 2 generations is 6 samples, which DP 4 cannot shard.
+    mc.async_rl.max_groups_for_streaming_train = 3
+    trainer = patched_factories["fake_policy"]
+    trainer.cfg = mc.policy
+    trainer.sharding_annotations.get_axis_size.return_value = 4
+    patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()),
+        patch.object(sc_setup_mod.ray, "get", return_value=None),
+        pytest.raises(ValueError, match="max_groups_for_streaming_train"),
+    ):
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+
 @pytest.mark.parametrize("forest_training", [False, True])
 @pytest.mark.parametrize("supported_router", [False, True])
 @pytest.mark.parametrize("packing", [False, True])
