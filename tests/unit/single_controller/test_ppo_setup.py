@@ -419,26 +419,39 @@ class TestPPOValidation:
 
         validate_single_controller_config(mc)
 
-    @pytest.mark.parametrize(
-        ("importance_correction", "force_on_policy_ratio", "match"),
-        [
-            (False, False, "use_importance_sampling_correction=true"),
-            (True, True, "force_on_policy_ratio=false"),
-        ],
-    )
-    def test_ready_first_requires_sampling_policy_correction(
-        self,
-        importance_correction: bool,
-        force_on_policy_ratio: bool,
-        match: str,
-    ) -> None:
+    def test_ready_first_requires_sampling_policy_correction(self) -> None:
         mc = _ppo_master_config()
         mc.async_rl.sampler = ReadyFirstSamplerConfig()
-        mc.loss_fn.use_importance_sampling_correction = importance_correction
-        mc.loss_fn.force_on_policy_ratio = force_on_policy_ratio
+        mc.loss_fn.use_importance_sampling_correction = False
+        mc.loss_fn.force_on_policy_ratio = False
 
-        with pytest.raises(ValueError, match=match):
+        with pytest.raises(ValueError, match="use_importance_sampling_correction=true"):
             validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("ready_first", [False, True])
+    def test_forced_ratio_requires_one_policy_epoch(self, ready_first: bool) -> None:
+        mc = _ppo_master_config()
+        if ready_first:
+            mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        mc.loss_fn.use_importance_sampling_correction = True
+        mc.loss_fn.force_on_policy_ratio = True
+        mc.ppo.ppo_epochs = 4
+
+        with pytest.raises(ValueError, match="requires ppo.ppo_epochs=1"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("ready_first", [False, True])
+    def test_accepts_forced_ratio_with_one_policy_epoch(
+        self, ready_first: bool
+    ) -> None:
+        mc = _ppo_master_config()
+        if ready_first:
+            mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        mc.loss_fn.use_importance_sampling_correction = True
+        mc.loss_fn.force_on_policy_ratio = True
+        mc.ppo.ppo_epochs = 1
+
+        validate_single_controller_config(mc)
 
     @staticmethod
     def _warmup_ckpt_config(*, constant_structure: bool) -> MasterConfig:
