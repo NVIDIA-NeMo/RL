@@ -774,6 +774,193 @@ def test_worker_restart_validates_retained_media(
         assert excinfo.value.code == "retained_media_changed"
 
 
+# OpenCode 1.17.11 with @ai-sdk/openai-compatible (session/message-v2.ts) keeps
+# only text in a tool message. The tool's images follow it in one user message,
+# "Attached media from tool result:", and every later call re-sends them.
+# Tokens: 10 user, 11 tool, 12 assistant, 2 end of message; 31 is the tool call
+# that stage() generates.
+OPENCODE_TOOL_CALL = [12, 31, 2]
+OPENCODE_TOOL_TEXT = [11, 52, 2]
+
+
+def opencode_attached_media(*images):
+    return [10, 51, *images, 2]
+
+
+def opencode_prompt(*messages):
+    """Render messages and the generation prompt; a tensor is one Omni image.
+
+    Like the Omni processor, an image renders as ``<img>`` (16), its ``<image>``
+    pads (18) and ``</img>`` (17), and only the pads are embeddings.
+    """
+    tokens, images = [], []
+    for part in (part for message in messages for part in message):
+        if isinstance(part, torch.Tensor):
+            mask = torch.tensor([False, True, True, False])
+            images.append((Span(len(tokens), 4, mask), part))
+            tokens += [16, 18, 18, 17]
+        else:
+            tokens.append(part)
+    return engine_prompt(tokens + [12], images)
+
+
+def capture_opencode_call(dp, prompt, *chain, call_id):
+    """Capture a Gym-managed token-in call the way the worker does before inference."""
+    source = TQTokenSource(dp, staging_partition="staging", capture_media=True)
+    worker = SimpleNamespace(
+        _capture_media=True,
+        _capture_image_token_id=18,
+        _capture_patch_size=1,
+        _staging_source=source,
+    )
+    parent = chain[-1]
+    prefix = prompt["prompt_token_ids"][: parent.cum_len]
+    admission = CaptureAdmission(
+        capture_key="r0",
+        model_call_id=call_id,
+        parent_call_id=parent.model_call_id,
+        prev_len=parent.cum_len,
+        mode="token_in",
+        parent_chain_hash=parent.chain_hash,
+        staging_chain=[call.staging_key for call in chain],
+    )
+    # The template re-renders the earlier calls exactly, so the splice keeps them.
+    splice = splice_prefix_tokens(
+        tokenizer=SimpleNamespace(eos_token_id=2),
+        model_prefix_token_ids=prefix,
+        template_prefix_token_ids=prefix,
+        template_token_ids=prompt["prompt_token_ids"],
+    )
+    return VllmAsyncGenerationWorkerImpl._capture_request_media(
+        worker,
+        prompt,
+        admission=admission,
+        splice=splice,
+        verify_retained_media=True,
+    )
+
+
+def test_opencode_tool_images_are_captured_once_across_calls(dp):
+    a = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3)
+    b = torch.arange(24, dtype=torch.float32).reshape(3, 4, 2) + 100
+    c = torch.full((3, 2, 2), 7.0)
+    history = [[10, 50, a, 2]]
+    c1, media1 = stage(dp, opencode_prompt(*history))
+
+    history += [OPENCODE_TOOL_CALL, OPENCODE_TOOL_TEXT, opencode_attached_media(b)]
+    second = capture_opencode_call(dp, opencode_prompt(*history), c1, call_id="c2")
+    # Image A is re-sent unchanged; B, after the tool text and caption, is new.
+    assert [item.placeholder_offset for item in second.items] == [c1.cum_len + 5]
+    assert second.tensors["imgs_sizes"].tolist() == [[4, 2]]
+    torch.testing.assert_close(second.tensors["imgs"][0], packed(b), rtol=0, atol=0)
+    c2, media2 = stage(
+        dp,
+        opencode_prompt(*history),
+        parent=c1,
+        retained=media1.items,
+        call_id="c2",
+    )
+    assert media2.items == second.items
+
+    history += [OPENCODE_TOOL_CALL, OPENCODE_TOOL_TEXT, opencode_attached_media(c)]
+    third = capture_opencode_call(dp, opencode_prompt(*history), c1, c2, call_id="c3")
+    assert [item.placeholder_offset for item in third.items] == [c2.cum_len + 5]
+    assert third.tensors["imgs_sizes"].tolist() == [[2, 2]]
+    torch.testing.assert_close(third.tensors["imgs"][0], packed(c), rtol=0, atol=0)
+    c3, _ = stage(
+        dp,
+        opencode_prompt(*history),
+        parent=c2,
+        retained=media1.items + media2.items,
+        call_id="c3",
+    )
+
+    row = finalizer(dp).finalize_rollout("r0", receipt(c1, c2, c3), reward=1.0)
+    assert row.valid, row.rejection_reason
+    assert row.media["imgs_sizes"].as_tensor().tolist() == [[2, 3], [4, 2], [2, 2]]
+    torch.testing.assert_close(
+        row.media["pixel_values"].as_tensor(),
+        torch.cat([packed(a), packed(b), packed(c)]),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "change, message",
+    [
+        ("pixels", "Retained processed media changed"),
+        ("size", "Retained media geometry or tokens changed"),
+    ],
+)
+def test_opencode_changed_earlier_tool_image_is_rejected(dp, change, message):
+    a = torch.arange(18, dtype=torch.float32).reshape(3, 2, 3)
+    b = torch.arange(24, dtype=torch.float32).reshape(3, 4, 2) + 100
+    c = torch.full((3, 2, 2), 7.0)
+    changed_b = b + 1 if change == "pixels" else b.reshape(3, 2, 4)
+    first = [[10, 50, a, 2]]
+    c1, media1 = stage(dp, opencode_prompt(*first))
+    tool_round = [OPENCODE_TOOL_CALL, OPENCODE_TOOL_TEXT]
+    c2, _ = stage(
+        dp,
+        opencode_prompt(*first, *tool_round, opencode_attached_media(b)),
+        parent=c1,
+        retained=media1.items,
+        call_id="c2",
+    )
+    prompt = opencode_prompt(
+        *first,
+        *tool_round,
+        opencode_attached_media(changed_b),
+        *tool_round,
+        opencode_attached_media(c),
+    )
+    with pytest.raises(MediaCaptureRejected, match=message) as excinfo:
+        capture_opencode_call(dp, prompt, c1, c2, call_id="c3")
+    assert excinfo.value.code == "retained_media_changed"
+
+
+def test_opencode_parallel_tool_images_share_one_attached_message(dp):
+    b = torch.arange(24, dtype=torch.float32).reshape(3, 4, 2)
+    c = torch.full((3, 2, 2), 7.0)
+    history = [[10, 50, 2]]
+    c1, _ = stage(dp, opencode_prompt(*history))
+
+    # Two tool calls in one step: two tool messages, then one user message with
+    # both images.
+    history += [
+        OPENCODE_TOOL_CALL,
+        OPENCODE_TOOL_TEXT,
+        OPENCODE_TOOL_TEXT,
+        opencode_attached_media(b, c),
+    ]
+    second = capture_opencode_call(dp, opencode_prompt(*history), c1, call_id="c2")
+    assert [item.placeholder_offset for item in second.items] == [
+        c1.cum_len + 8,
+        c1.cum_len + 12,
+    ]
+    assert second.tensors["imgs_sizes"].tolist() == [[4, 2], [2, 2]]
+    torch.testing.assert_close(
+        second.tensors["imgs"][0], torch.cat([packed(b), packed(c)]), rtol=0, atol=0
+    )
+    c2, media2 = stage(dp, opencode_prompt(*history), parent=c1, call_id="c2")
+
+    history += [OPENCODE_TOOL_CALL, OPENCODE_TOOL_TEXT]
+    third = capture_opencode_call(dp, opencode_prompt(*history), c1, c2, call_id="c3")
+    assert third.items == ()
+    assert third.tensors is None
+    c3, _ = stage(
+        dp,
+        opencode_prompt(*history),
+        parent=c2,
+        retained=media2.items,
+        call_id="c3",
+    )
+    row = finalizer(dp).finalize_rollout("r0", receipt(c1, c2, c3), reward=1.0)
+    assert row.valid, row.rejection_reason
+    assert row.media["imgs_sizes"].as_tensor().tolist() == [[4, 2], [2, 2]]
+
+
 @pytest.mark.parametrize("with_routed_experts", [False, True])
 def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(
     dp, monkeypatch, with_routed_experts
