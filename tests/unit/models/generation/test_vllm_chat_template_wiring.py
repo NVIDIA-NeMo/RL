@@ -37,6 +37,7 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from pydantic import BaseModel, ConfigDict
 
 from nemo_rl.data.captured_media import capture_processed_media
 from nemo_rl.models.generation import vllm as vllm_generation_pkg
@@ -128,7 +129,12 @@ def _install_fake_vllm(monkeypatch):
     )
     module(
         "vllm.entrypoints.openai.chat_completion.protocol",
-        ChatCompletionRequest=placeholder("ChatCompletionRequest"),
+        # A pydantic model that keeps unknown fields, as vLLM's request models are.
+        ChatCompletionRequest=type(
+            "ChatCompletionRequest",
+            (BaseModel,),
+            {"model_config": ConfigDict(extra="allow")},
+        ),
         ChatCompletionResponse=placeholder("ChatCompletionResponse"),
     )
     module(
@@ -698,10 +704,12 @@ def test_prefix_overflow_precedes_media_validation(
     renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
     renderer.model_config = SimpleNamespace(max_model_len=8 if overflows else 16)
     endpoint = next(fn for path, fn in app.routes if path == "/v1/chat/completions")
-    request = endpoint.__annotations__["request"]()
-    request.required_prefix_token_ids = [10, 77, 31, 2]
-    request.max_tokens, request.max_completion_tokens = 4, None
-    request.model_copy = lambda **kwargs: request
+    request = endpoint.__annotations__["request"].model_construct(
+        messages=[],
+        required_prefix_token_ids=[10, 77, 31, 2],
+        max_tokens=4,
+        max_completion_tokens=None,
+    )
     message = "maximum context length" if overflows else "retiled media"
 
     with pytest.raises(ValueError, match=message):
