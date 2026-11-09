@@ -1,0 +1,41 @@
+{
+  "observed_at": "2026-11-09T07:21:50.744551-08:00",
+  "job_id": "21579059",
+  "resume_from": 524,
+  "stage_target_steps": 900,
+  "first_resumed_step": 525,
+  "trainer_version": 525,
+  "lag": 0,
+  "wandb_state": "running",
+  "wandb_step": 525,
+  "native_wandb_selected_metrics_exact": true,
+  "selected_metrics": {
+    "gen_kl_error": 0.000473203530735299,
+    "policy_kl_error": 0.0004858482698161451,
+    "grad_norm": 0.4004182815551758,
+    "lr": 2.0000000000000003e-06,
+    "weight_version_lag": 0,
+    "policy_train_dispatches": 2,
+    "reward": 0.439453125
+  },
+  "first_resumed_receipt": {
+    "gen_kl_error": 0.000473203530735299,
+    "policy_kl_error": 0.0004858482698161451,
+    "grad_norm": 0.4004182815551758,
+    "lr": 2.0000000000000003e-06,
+    "weight_version_lag": 0,
+    "policy_train_dispatches": 2,
+    "reward": 0.439453125,
+    "advantages/max": 3.7499847412109375,
+    "advantages/min": -3.7499847412109375,
+    "num_valid_samples": 512.0
+  },
+  "recovery_log": {
+    "unfinished_rollout_groups": 64,
+    "canonical_groups": 0,
+    "redispatch_before_new_dataloader_work": true
+  },
+  "preflight": "results/resume900-provenance-21579059.json",
+  "saved_checkpoint_audit": "results/checkpoint524-state.json",
+  "scope": "First-step receipt/selected metrics continuity with unfinished work observed; not independent all-group recovery uniqueness or raw optimizer/fixed-input parity."
+}

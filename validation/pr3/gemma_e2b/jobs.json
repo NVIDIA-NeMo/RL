@@ -1,5 +1,5 @@
 {
-  "observed_at": "2026-11-09T07:16:58.168842-08:00",
+  "observed_at": "2026-11-09T07:22:15.330420-08:00",
   "state": "RUNNING",
   "target_steps": 900,
   "job_id": 21579059,
@@ -23,7 +23,7 @@
     "SC full-batch LA0": "96779513"
   },
   "baseline_config_checks_passed": true,
-  "observed_committed_steps": 524,
+  "observed_committed_steps": 525,
   "gemma_fixed_input_streaming_parity": "NOT ASSESSED",
   "original_qwen_bf16_1pct_gate": "FAILED (unchanged)",
   "source_worker_sha256": "7f59824258aafb13f5540810776dfa18c86a623856c9c89e4c6e26881259f74d",
@@ -31,20 +31,21 @@
   "monitor_pid": 4008027,
   "launcher_pid": 470490,
   "latest_receipt": {
-    "step": 524,
-    "version": 524,
+    "step": 525,
+    "version": 525,
     "lag": "0",
     "metrics": {
-      "gen_kl_error": 0.0004482503970703517,
-      "policy_kl_error": 0.00046431306747871467,
-      "grad_norm": 0.4129963219165802,
+      "gen_kl_error": 0.000473203530735299,
+      "policy_kl_error": 0.0004858482698161451,
+      "grad_norm": 0.4004182815551758,
       "lr": 2.0000000000000003e-06,
+      "weight_version_lag": 0,
       "policy_train_dispatches": 2,
-      "reward": 0.58203125
+      "reward": 0.439453125
     }
   },
-  "wandb_state": "finished",
-  "wandb_committed_step": 524,
+  "wandb_state": "running",
+  "wandb_committed_step": 525,
   "monitor_child_pid": 4008224,
   "durable_checkpoint_step": 524,
   "early_summary": "validation/pr3/gemma_e2b/results/early-10-summary.json",
@@ -102,17 +103,19 @@
       "phase": "RUNNING_DRIVER",
       "driver_prefix": "resume900",
       "target_steps": 900,
-      "launcher_pid": 470490
+      "launcher_pid": 470490,
+      "first_resumed_step": 525
     }
   ],
-  "wandb_transition_note": "Segment524 finished; first900-stage SDK resume/first525 pending.",
+  "wandb_transition_note": "Same run resumed524->525 with900 target; selected native/W&B metrics exact.",
   "active_stage_resume_from": 524,
-  "active_stage_first_recovered_step": null,
+  "active_stage_first_recovered_step": 525,
   "active_stage_preflight": "validation/pr3/gemma_e2b/results/resume900-provenance-21579059.json",
   "previous_target_steps": 650,
   "target_extended_on": "2026-11-09",
   "max_additional_allocations": 6,
   "continuation_document": "validation/pr3/gemma_e2b/RESUME900.md",
   "configuration_check": "validation/pr3/gemma_e2b/results/resume900-config-check.json",
-  "latest_completed_segment_summary": "validation/pr3/gemma_e2b/results/resume900-progress-524.json"
+  "latest_completed_segment_summary": "validation/pr3/gemma_e2b/results/resume900-progress-524.json",
+  "active_stage_first_recovery_proof": "validation/pr3/gemma_e2b/results/resume900-first-recovery-21579059.json"
 }

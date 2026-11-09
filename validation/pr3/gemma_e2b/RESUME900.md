@@ -16,7 +16,12 @@ pool0-01905,start07:13:19PSTNov9,end11:13:19. Its target is900 and driver_prefix
 resume900. The container/direct attachment started and actual checkpoint524
 preflight passed: only target/display name changed, saved counters and frozen
 model/config/numerical source matched. The driver is restoring the saved data
-loader and loading weights; first525/W&B continuity remain pending.
+loader and weights, then first525 committed with trainer_v525,lag0,two dispatches,
+512 valid samples,nonzero advantages/gradient and LR2e-6. The SAME W&B run resumed
+with the900 display name and525 selected metrics matched the native receipt
+exactly. See results/resume900-first-recovery-21579059.json. The log restored64
+unfinished groups next to0 canonical groups; this observation is not an
+independent all-group recovery uniqueness or completed canonical replay test.
 Inspect live state/logs before acting; do not duplicate this job. W&B temporarily
 finished524 with metrics matching the native final receipt during the transition;
 this is not completion of900. See results/checkpoint524-state.json,
