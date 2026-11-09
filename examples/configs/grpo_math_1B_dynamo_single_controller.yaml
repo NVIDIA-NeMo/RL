@@ -19,19 +19,6 @@ policy:
       # async_rl.rollout_failure.native.generation_timeout_s bounds both paths.
       # NeMo-Gym's own calls keep Gym's timeouts.
       request_timeout_s: null
-      worker_args:
-        # Dynamo's built-in parser names. null follows the native server's
-        # vllm_cfg.http_server_serving_chat_kwargs (tool_parser, reasoning_parser).
-        tool_call_parser: null
-        reasoning_parser: null
-        exclude_tools_when_tool_choice_none: false
-        enable_structural_tag: false
-        structural_tag_scope: auto
-        structural_tag_schema: auto
-        # A chat template that replaces the model's own. null follows
-        # vllm_cfg.http_server_serving_chat_kwargs.chat_template.
-        custom_jinja_template: null
-        endpoint_types: [chat, completions]
       frontend_args:
         # kv: route each request to the engine holding most of its prefix.
         router_mode: kv
@@ -43,8 +30,10 @@ policy:
         # Frontends, spread over the generation nodes; more than one syncs their
         # routers' in-flight load.
         num_frontends: 1
+        # Processes that render NeMo-Gym's chat calls and build their replies.
+        render_workers: 8
         extra_cli_args: []
-        # Extra frontend environment, e.g. DYN_TOKENIZER_CACHE_BYTES.
+        # Extra frontend environment, e.g. DYN_TCP_LISTEN_BACKLOG.
         extra_env: {}
 
 logger:

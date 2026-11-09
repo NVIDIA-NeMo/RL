@@ -128,7 +128,6 @@ def test_score_centering_rejects_zero_candidates():
         (2**31, -1.0),
         (1, float("nan")),
         (1, float("inf")),
-        (1, -float("inf")),
         (1, 0.1),
         (1, True),
         (1, -1e300),
@@ -142,6 +141,25 @@ def test_score_centering_rejects_invalid_probabilities(token_id, logprob):
     )
     with pytest.raises(ValueError, match="Invalid sampler"):
         extract_score_centering_samples(output, num_candidates=1)
+
+
+def test_score_centering_keeps_candidates_the_sampler_filtered_out():
+    """With top-k/top-p, processed logprobs put -inf on filtered candidates."""
+    output = SimpleNamespace(
+        index=0,
+        token_ids=[1],
+        logprobs=[
+            {
+                1: SimpleNamespace(rank=1, logprob=0.0),
+                5: SimpleNamespace(rank=2, logprob=-float("inf")),
+            }
+        ],
+    )
+    sampler_ids, sampler_logprobs = extract_score_centering_samples(
+        output, num_candidates=2
+    )
+    assert sampler_ids.tolist() == [[1, 5]]
+    assert sampler_logprobs.tolist() == [[0.0, -float("inf")]]
 
 
 def test_score_centering_rejects_excess_probability_mass():

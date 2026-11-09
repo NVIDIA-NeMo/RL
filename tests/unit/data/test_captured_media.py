@@ -447,6 +447,7 @@ def test_splice_coordinates_handle_reasoning_shift_and_repeated_pad_runs():
         model_prefix_token_ids=original,
         template_prefix_token_ids=template[:6],
         template_token_ids=template,
+        eos_token_id=2,
     )
     prompt = engine_prompt(template, [(Span(1, 2), a), (Span(7, 2), b)])
     captured = capture_processed_media(
@@ -471,6 +472,7 @@ def test_continuation_captures_only_new_media_and_rejects_changed_pixels():
         model_prefix_token_ids=original,
         template_prefix_token_ids=template[:6],
         template_token_ids=template,
+        eos_token_id=2,
     )
     retained = (StagedMediaTensors(**first.tensors, num_frames=None),)
     prompt = engine_prompt(template, [(Span(1, 2), a), (Span(7, 2), b)])
@@ -540,6 +542,7 @@ def test_changed_retained_pad_run_cannot_steal_the_next_image():
         model_prefix_token_ids=original,
         template_prefix_token_ids=template_prefix,
         template_token_ids=template,
+        eos_token_id=2,
     )
     with pytest.raises(ValueError, match="Retained media"):
         capture_processed_media(
@@ -568,6 +571,7 @@ def test_span_mask_is_preserved_on_remap():
         model_prefix_token_ids=[10, 77, 31, 2],
         template_prefix_token_ids=[10, 31, 2],
         template_token_ids=[10, 31, 2, 11, 18, 18, 12],
+        eos_token_id=2,
     )
     prompt = engine_prompt(
         [10, 31, 2, 11, 18, 18, 12], [(Span(3, 4, mask), torch.ones(3, 2, 3))]
@@ -959,6 +963,7 @@ def test_video_placeholder_remap_preserves_all_timestamp_tokens():
         model_prefix_token_ids=original,
         template_prefix_token_ids=template_prefix,
         template_token_ids=template,
+        eos_token_id=2,
     )
     prompt = video_prompt(template, [(Span(1, 4), frames), (Span(7, 4), frames)])
     added = capture_processed_media(
@@ -1402,7 +1407,13 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
     worker.__dict__.update(state.__dict__)
     worker.cfg = dict(
-        temperature=1.0, top_p=1.0, val_temperature=0.0, val_top_p=1.0, vllm_cfg={}
+        temperature=1.0,
+        top_p=1.0,
+        top_k=None,
+        val_temperature=0.0,
+        val_top_p=1.0,
+        val_top_k=None,
+        vllm_cfg={},
     )
     worker.token_capture = MagicMock(adapter=VLLMCaptureAdapter())
     worker._capture_calls = {}
@@ -1429,6 +1440,11 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     handler = dict(app.routes)["/v1/chat/completions"]
     request = SimpleNamespace(
         top_k=-1,
+        min_p=None,
+        repetition_penalty=None,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        logit_bias=None,
         top_p=1.0,
         temperature=1.0,
         ng_capture=admission.model_dump(),

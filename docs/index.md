@@ -83,7 +83,7 @@ Configure and launch NeMo RL on multi-node Slurm or Kubernetes clusters for dist
 :link: guides/dynamo-generation
 :link-type: doc
 
-Serve non-colocated vLLM generation through Dynamo's frontend and KV-aware router with `dynamo: true`.
+Serve the SingleController's non-colocated vLLM generation through Dynamo's frontend and KV-aware router with `dynamo: true`.
 :::
 
 ::::
@@ -350,6 +350,7 @@ guides/refit.md
 guides/checkpoint-engine-refit.md
 guides/dynamo-generation.md
 guides/router-replay.md
+guides/sampler-replay.md
 guides/muon-optimizer.md
 guides/automodel-tp-accuracy.md
 guides/ft-launcher-guide.md
@@ -404,11 +405,13 @@ design-docs/nemo-gym-integration.md
 design-docs/modelopt-real-quant-architecture.md
 design-docs/te-nvfp4-per-token-rollout.md
 design-docs/nccl-reshard-refit.md
+design-docs/nixl-data-plane.md
 design-docs/dspark-auxiliary-heads.md
 design-docs/media-token-validity-mask.md
 design-docs/automodel-context-parallel.md
 design-docs/token-capture-ledger.md
 design-docs/dflash-draft-body.md
+design-docs/single-controller-rollout-checkpointing.md
 ```
 
 ```{toctree}

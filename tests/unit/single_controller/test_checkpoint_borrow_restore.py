@@ -27,14 +27,16 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DATA_PLANE_CHECKPOINT_DIR,
     REPLAY_BUFFER_METADATA_FILENAME,
     DataPlaneCheckpointBarrier,
     TQReplayBuffer,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.rollout_checkpointing.state import ResumeSource
 from nemo_rl.algorithms.single_controller import (
-    DATA_PLANE_CHECKPOINT_DIR,
+    RolloutRuntimeState,
     SingleControllerActor,
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
@@ -53,6 +55,9 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
 )
 from tests.unit.single_controller import _checkpoint_scenarios as scenarios
+from tests.unit.single_controller._rollout_checkpoints import (
+    attach_rollout_checkpointing,
+)
 
 _GROUP_SIZE = 2
 _PROMPTS_PER_STEP = 3
@@ -197,6 +202,7 @@ def _controller(
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
+    controller._rollout_runtime = RolloutRuntimeState()
     controller._data_plane_checkpoint_barrier = barrier
     controller._buffer = buffer
     controller._dp_client = client
@@ -241,26 +247,22 @@ def _controller(
     controller._trainer_version = 0
     controller._train_steps = 0
     controller._current_epoch = 0
-    controller._sampler_stamps_target_steps = False
     controller._rollout_recovery_enabled = True
-    controller._restored_replay_groups_to_regenerate = []
-    controller._batch_shortfall = {}
     controller._batch_replacements = {}
     controller._batch_promotions = {}
     controller._finalizer_actors = []
-    controller._finalizer_metrics_by_group = {}
-    controller._finalizer_rewards_by_group = {}
-    controller._replacement_reserve = deque(replacement_reserve or [])
+    controller._rollout_runtime.replacement_reserve = deque(replacement_reserve or [])
     controller._rollout_slot_waiters = 0
     controller._rollout_permitted_waiters = 0
     controller._buffer_capacity_waiters = 0
     controller._rollout_completion_durations_s = deque(maxlen=10_000)
     controller._rollout_queue_wait_durations_s = deque(maxlen=10_000)
     controller._logger = MagicMock()
-    controller._last_checkpoint_path = (
-        str(checkpoint_path) if checkpoint_path is not None else None
+    controller._resume = ResumeSource(
+        path=str(checkpoint_path) if checkpoint_path is not None else None,
+        data_plane_metadata=checkpoint_metadata,
     )
-    controller._data_plane_checkpoint_metadata = checkpoint_metadata
+    attach_rollout_checkpointing(controller)
     return controller
 
 
@@ -342,7 +344,9 @@ async def _exercise_round_trip(
     checkpoint_path = tmp_path / "step_0"
     checkpoint_path.mkdir()
     async with first._data_plane_checkpoint_barrier.checkpoint() as cut:
-        snapshot = await first._capture_rollout_checkpoint_cut(cut, checkpoint_path)
+        snapshot = await first._rollout_snapshots.capture(
+            cut, checkpoint_path, "rollout_snapshot"
+        )
     assert snapshot.replay_metadata is not None
     assert snapshot.rollout_recovery_payload is not None
     torch.save(
@@ -368,11 +372,12 @@ async def _exercise_round_trip(
         checkpoint_path=checkpoint_path,
         checkpoint_metadata=checkpoint_metadata,
     )
-    restored_group_count = await restored._maybe_restore_replay_buffer()
-    await restored._maybe_restore_rollout_recovery(
+    attach_rollout_checkpointing(restored)
+    restored_group_count = await restored._rollout_restorer._restore_replay_buffer()
+    await restored._rollout_restorer._restore_recovery_ledger(
         restored_replay_groups=restored_group_count
     )
-    restored._validate_restored_sampler_cursor()
+    restored._rollout_restorer._validate_sampler_cursor()
     assert restored._sampler.dispatch_index == snapshot.sampler_dispatch_index
     restored._rollout_manager.prompt_by_group_id.update(
         first._rollout_manager.prompt_by_group_id
@@ -399,7 +404,7 @@ async def _exercise_round_trip(
         ).values()
         for prompt_idx in prompt_indices
     }
-    spares = {prompt["idx"] for prompt in restored._replacement_reserve}
+    spares = {prompt["idx"] for prompt in restored._rollout_runtime.replacement_reserve}
     assert present | spares | {1} == set(range(15))
 
     recovery_metrics: dict[str, float] = {}

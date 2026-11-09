@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import defaultdict
+from collections import ChainMap, defaultdict
 from collections.abc import Mapping
 from dataclasses import is_dataclass, replace
 from typing import Any, Optional, cast
 
+import numpy as np
 import torch
 
 from nemo_rl.data.multimodal_utils import (
@@ -69,6 +70,18 @@ _GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
 )
+
+
+def model_stop_token_ids(model_config: Any, cfg: dict[str, Any]) -> frozenset[int]:
+    """The configured stops plus the generation config's EOS, read once per server.
+
+    ``model_config`` is vLLM's ``ModelConfig``; ``cfg`` is ``policy.generation``.
+    """
+    stop_token_ids = set(cfg.get("stop_token_ids") or ())
+    generation_eos = model_config.try_get_generation_config().get("eos_token_id")
+    if isinstance(generation_eos, int):
+        generation_eos = [generation_eos]
+    return frozenset(stop_token_ids | set(generation_eos or ()))
 
 
 def assert_reload_refit_config_supported(config: VllmConfig) -> None:
@@ -327,7 +340,7 @@ def check_sampling_param(
     top_p: Optional[float],
     top_k: Optional[int],
     generation_config: Any,
-) -> None:
+) -> int:
     """Reject an HTTP rollout request that would sample off-policy.
 
     Request sampling must match NeMo RL's exactly, or inference runs off-policy and
@@ -339,23 +352,20 @@ def check_sampling_param(
     Args:
         temperature: The request's temperature.
         top_p: The request's top_p. It must be explicit: vLLM resolves an unset top_p
-            from the model's generation_config.json (``ModelConfig.generation_config``
-            defaults to ``"auto"``), not necessarily 1.0.
-        top_k: The request's top_k, which must be unset or -1 (disabled), matching
-            ``BaseVllmGenerationWorker._build_sampling_params``. vLLM resolves an
-            unset top_k from generation_config.json too, so None means on-policy only
-            once the caller sends the request with top_k=-1.
+            from the model's generation_config.json, not necessarily 1.0.
+        top_k: The request's top_k, which must be unset or equal the matched
+            profile's top_k (``top_k`` or ``val_top_k``; -1 when that is None).
         generation_config: ``policy.generation``, with the train and validation
             sampling parameters.
 
+    Returns:
+        The top_k to serve the request with: the matched profile's, as
+        ``BaseVllmGenerationWorker._build_sampling_params`` sets it (-1 disables).
+
     Raises:
-        ValueError: The request's top_k is set, its top_p is unset, or its
-            temperature and top_p match neither sampling profile.
+        ValueError: The request's top_p is unset, its temperature and top_p match
+            neither sampling profile, or its top_k differs from the profile's.
     """
-    if top_k not in (None, -1):
-        raise ValueError(
-            f"Top k sampling parameter must be unset, empty, or -1. Got `{top_k}`"
-        )
     if top_p is None:
         raise ValueError(
             "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
@@ -370,15 +380,119 @@ def check_sampling_param(
         temperature == generation_config["val_temperature"]
         and top_p == generation_config["val_top_p"]
     )
-    if is_train_sampling or is_val_sampling:
-        return
-    raise ValueError(
-        f"request sampling (temperature={temperature}, top_p={top_p}) matches neither "
-        f"the train sampling params (temperature={generation_config['temperature']}, "
-        f"top_p={generation_config['top_p']}) nor the validation sampling params "
-        f"(val_temperature={generation_config['val_temperature']}, "
-        f"val_top_p={generation_config['val_top_p']})"
+    if not (is_train_sampling or is_val_sampling):
+        raise ValueError(
+            f"request sampling (temperature={temperature}, top_p={top_p}) matches "
+            "neither the train sampling params "
+            f"(temperature={generation_config['temperature']}, "
+            f"top_p={generation_config['top_p']}) nor the validation sampling params "
+            f"(val_temperature={generation_config['val_temperature']}, "
+            f"val_top_p={generation_config['val_top_p']})"
+        )
+    # Train wins a tie: grpo.setup() rejects a val_top_k that differs from top_k
+    # when the two profiles share temperature and top_p.
+    profile_top_k = generation_config["top_k" if is_train_sampling else "val_top_k"]
+    profile_top_k = -1 if profile_top_k is None else profile_top_k
+    if top_k not in (None, profile_top_k):
+        raise ValueError(
+            f"request top_k={top_k} must be unset or match the configured top_k "
+            f"({profile_top_k})"
+        )
+    return profile_top_k
+
+
+class OffPolicySamplingError(ValueError):
+    """A NeMo-Gym call that would sample off-policy; the trainer replays none of it."""
+
+
+# Sampling a NeMo-Gym call may not change, and the value it is served with: vLLM
+# would otherwise fill min_p and the repetition penalty from the model's
+# generation_config.json, and the trainer replays none of these.
+_FIXED_SAMPLING = {
+    "min_p": 0.0,
+    "repetition_penalty": 1.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+}
+
+
+def _f32(value: Optional[float]) -> Optional[float]:
+    return None if value is None else float(np.float32(value))
+
+
+def on_policy_sampling(
+    *,
+    temperature: Optional[float],
+    top_p: Optional[float],
+    top_k: Optional[int],
+    min_p: Optional[float],
+    repetition_penalty: Optional[float],
+    presence_penalty: Optional[float],
+    frequency_penalty: Optional[float],
+    logit_bias: Optional[Mapping[Any, float]],
+    generation_config: Any,
+) -> dict[str, Any]:
+    """The sampling a NeMo-Gym chat call is served with, on every serving path.
+
+    The request must match the train or validation profile
+    (:func:`check_sampling_param`) and set no sampling the trainer does not
+    replay. Floats are compared at f32: Dynamo's frontend carries them as f32,
+    so 0.7 arrives as 0.69999998.
+
+    Args:
+        temperature, top_p, top_k, min_p, repetition_penalty, presence_penalty,
+            frequency_penalty, logit_bias: The request's values.
+        generation_config: ``policy.generation``.
+
+    Returns:
+        The ``SamplingParams`` fields to serve with: the matched profile's exact
+        temperature, top_p and top_k, and the fixed min_p and penalties.
+
+    Raises:
+        OffPolicySamplingError: The request would sample off-policy.
+    """
+    # The profile's floats at f32; top_k and val_top_k as configured.
+    profile = ChainMap(
+        {
+            key: _f32(generation_config[key])
+            for key in ("temperature", "top_p", "val_temperature", "val_top_p")
+        },
+        generation_config,
     )
+    try:
+        served_top_k = check_sampling_param(
+            temperature=_f32(temperature),
+            top_p=_f32(top_p),
+            top_k=top_k,
+            generation_config=profile,
+        )
+    except ValueError as error:
+        raise OffPolicySamplingError(str(error)) from error
+    requested = {
+        "min_p": min_p,
+        "repetition_penalty": repetition_penalty,
+        "presence_penalty": presence_penalty,
+        "frequency_penalty": frequency_penalty,
+    }
+    for key, served in _FIXED_SAMPLING.items():
+        if requested[key] not in (None, served):
+            raise OffPolicySamplingError(
+                f"request {key}={requested[key]} is not supported; leave it unset"
+            )
+    if logit_bias:
+        raise OffPolicySamplingError("request logit_bias is not supported")
+    is_train = (_f32(temperature), _f32(top_p)) == (
+        profile["temperature"],
+        profile["top_p"],
+    )
+    prefix = "" if is_train else "val_"
+    return {
+        "temperature": generation_config[f"{prefix}temperature"],
+        "top_p": generation_config[f"{prefix}top_p"],
+        "top_k": served_top_k,
+        "min_p": _FIXED_SAMPLING["min_p"],
+        "repetition_penalty": _FIXED_SAMPLING["repetition_penalty"],
+    }
 
 
 def validate_rollout_prompt(expected: list[int], actual: list[int] | None) -> None:
