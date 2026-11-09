@@ -116,20 +116,33 @@ Enable `token_capture.enabled: true` and `token_capture.forest_training: true` o
   completion checks can mask the rollout. Missing required completion metadata
   remains an error. Length-limited calls remain eligible, subject to the existing
   logical-rollout `overlong_filtering` policy. This policy does not require the
-  full execution history, but still requires an attributable scored
-  terminal through `terminal_response_id` or the
-  returned response's identity/content. Capture order is not a terminal witness.
+  full execution history. The scored terminal is named by `terminal_response_id`
+  or the returned response's identity/content; without such a witness, the
+  parent-link heuristic names the single continued leaf. A declared terminal that
+  no witness confirms, or a rollout neither stage resolves, is masked. Capture
+  order is not a terminal witness.
   For `A → B` and `A → C`, both branches train; it does not choose the latest
   sibling. Shared `A` contributes loss once, and both rows share the rollout's
   reward and advantage.
+- `continued_chains` trains every independent session (for example, subagents)
+  as its own row. The scored chain comes first and holds only the scored call's
+  ancestors; each other root, in admission order, descends to a unique leaf,
+  preferring children that were continued. An ambiguous fork drops that root, a
+  leaf whose cumulative hash repeats an earlier chain is dropped as a
+  byte-identical retry, and calls that did not finish trainably end a chain
+  instead of masking the rollout. It names the scored terminal as `all_captured`
+  does.
 
-Both policies reuse capture validation, completion checks, forest reconstruction,
+`token_capture.max_rows_per_rollout` (Forest only) keeps the scored root plus the
+first N-1 other selected roots; with `continued_chains` this caps rows per rollout.
+
+All built-in policies reuse capture validation, completion checks, forest reconstruction,
 and once-only loss ownership for shared ancestors. Pending calls, lost capture
 evidence, and failed selected executions still mask the logical rollout. A failure
 record does not acknowledge a pending worker's writes or transfer them to cleanup.
-Failed parents and failed scored calls remain invalid. Neither policy infers
-agent roles. `all_captured` requires `forest_training: true`; it does not enable
-per-agent rewards or remove the execution restrictions below.
+Failed parents and failed scored calls remain invalid. No built-in policy infers
+agent roles. Non-default policies require `forest_training: true`; they do not
+enable per-agent rewards or remove the execution restrictions below.
 
 A cancellation recorded as `request_finished_without_staged_coordinates` does
 not mask the rollout when the call already has a committed capture, no calls

@@ -288,7 +288,8 @@ token_capture:
   enabled: false
   # Optional multi-path reconstruction; one reward per rollout, GAE per row.
   forest_training: false
-  # returned_history (default) or all_captured, including discarded attempts.
+  # returned_history (default), all_captured (including discarded attempts),
+  # or continued_chains (one row per independent session).
   selection_policy: returned_history
   # Forest only. Keep execution padding and borrowed inputs out of MoE expert-bias statistics.
   exclude_padding_from_router_stats: false
@@ -296,6 +297,8 @@ token_capture:
   forest_padding_scope: group
   # Step padding only. Rows the padding copies: row0 or cyclic.
   forest_pad_source: row0
+  # Forest only. Max rows per rollout, scored root first; null keeps all.
+  max_rows_per_rollout: null
   # Forest only. Segments the token penalties check: scored_segment or all_segments.
   forest_penalty_scope: scored_segment
   staging_partition: rollout_staging

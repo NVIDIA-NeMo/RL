@@ -22,7 +22,11 @@ from responses_api_models.vllm_model.tests import test_framework_context as gym
 from nemo_rl.algorithms.grpo import RewardPenaltyConfig
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTER_EXCLUDED_ROWS
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
-from nemo_rl.environments.call_selection import select_captured_calls
+from nemo_rl.environments.call_selection import (
+    cap_selected_roots,
+    select_captured_calls,
+    select_continued_chains,
+)
 from nemo_rl.experience.reward_penalties import (
     RewardChecks,
     RewardLogContext,
@@ -151,7 +155,9 @@ def assert_loss_once(forest: ForestCapture, selected: list, all_records: list) -
     assert counts == expected
 
 
-@pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
+@pytest.mark.parametrize(
+    "policy", ["returned_history", "all_captured", "continued_chains"]
+)
 @pytest.mark.parametrize("reverse_manifest", [False, True])
 def test_selection_policy_reuses_forest_publication(forest, policy, reverse_manifest):
     # A -> abandoned B; A -> scored C; independent D -> E.
@@ -717,19 +723,17 @@ def test_all_captured_attributes_exported_content(
         for index, item in enumerate(result["response"]["output"])
     ]
     result["reward"] = 1.0
-    if not cumulative and not unique_output:
-        # This fixture otherwise returns the same "answer" on every call.
-        # Its final text alone cannot identify which call was scored.
-        with pytest.raises(ValueError, match="content_ambiguous"):
-            asyncio.run(
-                env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
-            )
-        assert not any(partition == "canonical" for partition, _ in forest.plane.rows)
-        return
     processed = asyncio.run(
         env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
     )
     assert processed["receipt"]["terminal_model_call_id"] == records[1].model_call_id
+    # The fixture returns the same "answer" on every call, so the final text
+    # alone is ambiguous; the parent-link heuristic then names the continued leaf.
+    ambiguous = not cumulative and not unique_output
+    assert processed["receipt"]["terminal_selection"] == (
+        "heuristic" if ambiguous else "content"
+    )
+    assert not processed["receipt"]["capture_poisoned"]
     assert set(processed["logical_selection"].response_ids) == {
         record.response_id for record in records
     }
@@ -748,18 +752,42 @@ def test_all_captured_attributes_exported_content(
     assert_loss_once(forest, records, records)
 
 
-@pytest.mark.parametrize("contradictory", [False, True])
-def test_all_captured_never_guesses_scored_terminal(forest, contradictory):
-    records, replies = forest.capture([None, None])
+@pytest.mark.parametrize("policy", ["all_captured", "continued_chains"])
+@pytest.mark.parametrize(
+    "parents,contradictory,terminal",
+    [
+        # No witness: the heuristic follows the continued root to its leaf.
+        ([None, 0, None], False, 1),
+        # No witness and a fork with two leaves: the heuristic cannot choose.
+        ([None, 0, 0], False, None),
+        # A declared terminal that the scored response contradicts never falls back.
+        ([None, None], True, None),
+    ],
+)
+def test_unattributed_terminal_falls_back_or_masks(
+    forest, policy, parents, contradictory, terminal
+):
+    records, replies = forest.capture(parents)
     env = _env(forest.harness)
-    env._selection_policy = "all_captured"
+    env._selection_policy = policy
     result = {"reward": 1.0}
     if contradictory:
         result.update(response=replies[0], terminal_response_id=replies[1]["id"])
-    with pytest.raises(ValueError, match="identifiable scored terminal"):
-        asyncio.run(
-            env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+    )
+    receipt = processed["receipt"]
+    if terminal is None:
+        assert receipt["capture_poisoned"]
+        assert receipt["failure_reason"] == "terminal_not_identified"
+        assert receipt["terminal_selection"] == (
+            "declared" if contradictory else "heuristic"
         )
+        assert processed["logical_selection"].response_ids == ()
+    else:
+        assert not receipt["capture_poisoned"]
+        assert receipt["terminal_selection"] == "heuristic"
+        assert receipt["terminal_model_call_id"] == records[terminal].model_call_id
 
 
 @pytest.mark.parametrize("final_text,empty", [("Done.", False), ("", True)])
@@ -1377,6 +1405,68 @@ def test_forest_penalty_scope_combines_segment_token_checks(
         )
     # Counted once per owner, however many segments hit.
     assert result.metrics["finalize/penalty_count/unwanted_token"] == float(penalized)
+
+
+def _continued(
+    forest: ForestCapture, parents: list[int | None], scored: int, **updates
+):
+    """Capture ``parents``, apply per-index record updates, and run the policy."""
+    records, replies = forest.capture(parents)
+    records = [
+        record.model_copy(update=updates.get(f"r{index}", {}))
+        for index, record in enumerate(records)
+    ]
+    selected, terminal = select_continued_chains(
+        records, ordinary(replies, terminal=replies[scored]["id"])
+    )
+    assert terminal == records[scored].response_id
+    return [records.index(record) for record in selected]
+
+
+def test_continued_chains_trains_scored_ancestors_then_each_root(forest):
+    # A -> side B; A -> C -> scored D; root E -> F -> G; single-call root H.
+    parents = [None, 0, 0, 2, None, 4, 5, None]
+    assert _continued(forest, parents, 3) == [0, 2, 3, 4, 5, 6, 7]
+
+
+@pytest.mark.parametrize(
+    "parents,expected",
+    [
+        # Root B forks into two leaves: ambiguous, so B is dropped.
+        ([None, None, 1, 1], [0]),
+        # The continued branch D -> E wins over the leaf C.
+        ([None, None, 1, 1, 3], [0, 1, 3, 4]),
+    ],
+)
+def test_continued_chains_follows_the_continued_branch(forest, parents, expected):
+    assert _continued(forest, parents, 0) == expected
+
+
+def test_continued_chains_treats_failed_calls_as_absent(forest):
+    # Root B -> C -> failed D ends at C; a failed root E is dropped entirely.
+    failed = {"response_status": "failed"}
+    selected = _continued(forest, [None, None, 1, 2, None], 0, r3=failed, r4=failed)
+    assert selected == [0, 1, 2]
+
+
+def test_continued_chains_drops_byte_identical_retries(forest):
+    records, replies = forest.capture([None, None, None])
+    # Root C repeats root B's tokens exactly.
+    records[2] = records[2].model_copy(
+        update={"cumulative_hash": records[1].cumulative_hash}
+    )
+    selected, _ = select_continued_chains(
+        records, ordinary(replies, terminal=replies[0]["id"])
+    )
+    assert selected == records[:2]
+
+
+@pytest.mark.parametrize("max_roots,expected", [(1, [3, 4]), (2, [0, 1, 3, 4])])
+def test_cap_keeps_the_scored_root_first(forest, max_roots, expected):
+    records, _ = forest.capture([None, 0, None, None, 3])
+    # Selection order puts roots A and C before the scored root D.
+    capped = cap_selected_roots(records, records[4].response_id, max_roots)
+    assert [records.index(record) for record in capped] == expected
 
 
 def test_publication_identity_drift_preserves_staging(forest, monkeypatch):
