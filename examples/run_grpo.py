@@ -168,18 +168,11 @@ def main() -> None:
         try:
             # Check if async mode is enabled
             if config.grpo.async_grpo.enabled:
-                # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
+                # Async GRPO does not support dynamic sampling; reward scaling and
+                # reward shaping are applied in async_grpo_train.
                 if config.grpo.use_dynamic_sampling:
                     raise NotImplementedError(
                         "use_dynamic_sampling is not supported with async GRPO"
-                    )
-                if config.grpo.reward_scaling.enabled:
-                    raise NotImplementedError(
-                        "reward_scaling is not supported with async GRPO"
-                    )
-                if config.grpo.reward_shaping.enabled:
-                    raise NotImplementedError(
-                        "reward_shaping is not supported with async GRPO"
                     )
 
                 # Async GRPO does not support multiple dataloaders
