@@ -9828,3 +9828,48 @@ def test_trainers_never_let_over_length_prompts_vote(
     counterfactual = all_rows[response] / all_rows[response].var(correction=0).sqrt()
     assert counterfactual.abs().max().item() == pytest.approx(2.236, abs=1e-3)
     assert not torch.allclose(counterfactual[:2], advantages[0][response[0]])
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_async_grpo_scales_rewards_once_before_advantages(
+    mock_grpo_components, monkeypatch, enabled
+):
+    """async_grpo_train applies DAPO reward scaling exactly once, to ``total_reward``
+    and to the ``reward/<name>`` components, before the advantage computation — the
+    same point at which ``grpo_train`` applies it."""
+    captured: dict[str, torch.Tensor] = {}
+    mock_adv_estimator = MagicMock()
+
+    def _capture_and_zero(**kwargs):
+        captured["rewards"] = kwargs["rewards"].clone()
+        captured["total_reward"] = kwargs["repeated_batch"]["total_reward"].clone()
+        captured["component"] = kwargs["repeated_batch"]["reward/math"].clone()
+        return torch.zeros_like(kwargs["mask"], dtype=torch.float32)
+
+    mock_adv_estimator.compute_advantage.side_effect = _capture_and_zero
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.grpo._create_advantage_estimator",
+        lambda _cfg: mock_adv_estimator,
+    )
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_batch["total_reward"] = torch.tensor([0.25])
+    mock_batch["reward/math"] = torch.tensor([0.75])
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.reward_scaling = RewardScalingConfig.model_construct(
+        enabled=enabled,
+        source_min=0.0,
+        source_max=1.0,
+        target_min=-1.0,
+        target_max=1.0,
+    )
+
+    _run_single_grpo_train_step(mock_grpo_components, async_grpo_train, monkeypatch)
+
+    mock_adv_estimator.compute_advantage.assert_called_once()
+    # [0, 1] -> [-1, 1] applied once: 0.25 -> -0.5 and 0.75 -> 0.5.
+    # Applying it twice would give -1.0 / 0.0; skipping it leaves 0.25 / 0.75.
+    expected_total = [-0.5] if enabled else [0.25]
+    expected_component = [0.5] if enabled else [0.75]
+    assert captured["rewards"].tolist() == pytest.approx(expected_total)
+    assert captured["total_reward"].tolist() == pytest.approx(expected_total)
+    assert captured["component"].tolist() == pytest.approx(expected_component)
