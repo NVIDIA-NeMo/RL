@@ -39,9 +39,15 @@ training update. The teardown warning is retained in the original log.
 The supervisor then acquired ONLY stage4 allocation21594351,pool0-00826,
 start11:02:06PSTNov9,end15:02:06,target900,resume_from709. At this snapshot its
 container/direct attachment started and actual checkpoint709 preflight passed
-with unchanged model/config/numerical source. The driver is restoring the data
-loader and weights; first710/W&B continuity remain pending. See
-results/resume900-provenance-21594351.json and checkpoint709-state.json.
+with unchanged model/config/numerical source. The first recovered710 committed
+with trainer_v710,lag0,two dispatches,512 valid samples,nonzero advantages/gradient
+and LR2e-6. Unsampled W&B history709,710,711 exists and selected metrics match
+native receipts exactly on this SAME run. Checkpoint710 independently has all505
+optimizer counters710,scheduler/trainer/sampler710,LR2e-6 and22720 consumed prompts.
+See results/resume900-first-recovery-21594351.json,checkpoint710-state.json and
+resume900-provenance-21594351.json. The log explicitly redispatched64 unfinished
+groups before new dataloader work, next to0 canonical groups; this is not an
+independent all-group consumption/uniqueness or raw optimizer parity oracle.
 Inspect live state and per-job logs before acting; do not duplicate this allocation.
 
 resume900.yaml inherits streaming.yaml and changes ONLY max_num_steps900 and

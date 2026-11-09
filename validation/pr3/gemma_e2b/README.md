@@ -3,8 +3,11 @@
 The active user target is900, superseding650/150. Stage3 allocation21579059
 completed709 normally, with driver exit0 and saved-state audit, then released
 its node. Stage4 allocation21594351,pool0-00826,has started from checkpoint709;
-actual preflight passed and the driver is loading saved data/weights. First710
-recovery remains pending in this snapshot. The previous final online
+actual preflight and first710 recovery passed with version710,lag0,two dispatches,
+512 valid samples,nonzero signal and LR2e-6. W&B history709/710/711 matches native
+selected metrics exactly. See [stage4 recovery](results/resume900-first-recovery-21594351.json)
+and [checkpoint710 scalar audit](results/checkpoint710-state.json).
+The previous final online
 step709 had trainer_v709,lag0,two dispatches and LR2e-6. See
 [RESUME900.md](RESUME900.md), jobs.json and live slurm/resume650/state.json.
 The historical650 directory name does not change target_steps900.
