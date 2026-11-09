@@ -1864,9 +1864,9 @@ class TestSaveTrigger:
         def _seed(actor):
             publish = actor._publish_when_policy_write_done
 
-            async def _record(checkpoint_path):
+            async def _record(checkpoint_path, **kwargs):
                 at_publish.append(_files(checkpoint_path))
-                await publish(checkpoint_path)
+                await publish(checkpoint_path, **kwargs)
 
             actor._publish_when_policy_write_done = _record
 
@@ -2102,7 +2102,9 @@ class TestPeriodicRolloutCheckpoint:
         forced: list[bool] = []
         attempted = asyncio.Event()
 
-        async def _save(*, force: bool = False) -> RolloutCheckpointSaveResult:
+        async def _save(
+            *, force: bool = False, staged: bool = False
+        ) -> RolloutCheckpointSaveResult:
             forced.append(force)
             attempted.set()
             return RolloutCheckpointSaveResult(saved=True, reason="completed")
@@ -2394,7 +2396,9 @@ class TestPeriodicRolloutCheckpoint:
             done = asyncio.Event()
             calls = 0
 
-            async def _save(*, force: bool = False) -> RolloutCheckpointSaveResult:
+            async def _save(
+                *, force: bool = False, staged: bool = False
+            ) -> RolloutCheckpointSaveResult:
                 nonlocal calls
                 del force
                 reason = reasons[min(calls, len(reasons) - 1)]
@@ -2850,7 +2854,7 @@ class TestPeriodicRolloutCheckpoint:
         async def _main() -> None:
             attempted = asyncio.Event()
 
-            async def _save(*, force: bool = False) -> Any:
+            async def _save(*, force: bool = False, staged: bool = False) -> Any:
                 del force
                 attempted.set()
                 return SimpleNamespace(saved=False, reason="no_data_plane_mutations")
@@ -2969,7 +2973,9 @@ class TestPeriodicRolloutCheckpoint:
         actor._rollout_snapshots._wakeup.set()
         forced: list[bool] = []
 
-        async def _save(*, force: bool = False) -> RolloutCheckpointSaveResult:
+        async def _save(
+            *, force: bool = False, staged: bool = False
+        ) -> RolloutCheckpointSaveResult:
             forced.append(force)
             if isinstance(outcome, Exception):
                 raise outcome
@@ -3001,6 +3007,73 @@ class TestPeriodicRolloutCheckpoint:
         assert not actor._rollout_snapshots._wakeup.is_set()
         assert bool(deadline_warnings) is (expected == "warns")
 
+    def _staged_actor(self, tmp_path: Path, on_environment_save=lambda: None):
+        """An actor at step 1 whose environment save runs ``on_environment_save``."""
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+
+        @contextlib.asynccontextmanager
+        async def snapshot(_path):
+            on_environment_save()
+            yield _FakeEnvironmentSnapshot()
+
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        attach_rollout_checkpointing(actor)
+        actor._train_steps = actor._trainer_version = 1
+        return actor
+
+    def test_a_staged_snapshot_overlaps_the_policy_write_then_moves_into_step_n(
+        self, tmp_path: Path
+    ):
+        checkpoints = tmp_path / "checkpoints"
+        write_landed = threading.Event()
+        published_at_environment_save: list[bool] = []
+
+        def environment_save() -> None:
+            published_at_environment_save.append((checkpoints / "step_1").exists())
+            write_landed.set()
+
+        actor = self._staged_actor(tmp_path, environment_save)
+        # A staged snapshot a killed run left behind.
+        (checkpoints / "tmp_rollout_snapshot_step_0").mkdir(parents=True)
+        (checkpoints / "tmp_step_1").mkdir()
+        # step_1's policy write lands only once the environment has been saved.
+        actor._checkpointer.begin_finalization(
+            checkpoints / "tmp_step_1", wait_fn=lambda: write_landed.wait(5.0)
+        )
+        try:
+            result = asyncio.run(
+                actor._rollout_snapshots.save_snapshot(force=True, staged=True)
+            )
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert result.saved
+        assert published_at_environment_save == [False]
+        snapshot = checkpoints / "step_1" / "rollout_snapshots" / "snapshot_000001"
+        assert (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).is_file()
+        assert list(checkpoints.glob("tmp_rollout_snapshot_step_*")) == []
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["trainer_publish_wait_seconds"] >= 0.0
+
+    def test_a_staged_snapshot_without_a_published_step_n_is_dropped(
+        self, tmp_path: Path
+    ):
+        """A failed or missing policy write publishes no step_N; nothing is left."""
+        actor = self._staged_actor(tmp_path)
+        try:
+            result = asyncio.run(
+                actor._rollout_snapshots.save_snapshot(force=True, staged=True)
+            )
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert not result.saved
+        assert result.reason == "missing_trainer_anchor"
+        checkpoints = tmp_path / "checkpoints"
+        assert not (checkpoints / "step_1").exists()
+        assert list(checkpoints.glob("tmp_rollout_snapshot_step_*")) == []
+
     def test_periodic_pump_reports_each_consecutive_failure(
         self,
         tmp_path: Path,
@@ -3014,7 +3087,9 @@ class TestPeriodicRolloutCheckpoint:
             two_failures = asyncio.Event()
             calls = 0
 
-            async def _failing_save(*, force: bool = False) -> bool:
+            async def _failing_save(
+                *, force: bool = False, staged: bool = False
+            ) -> bool:
                 nonlocal calls
                 del force
                 calls += 1
@@ -3049,7 +3124,9 @@ class TestPeriodicRolloutCheckpoint:
         actor._train_steps = 1
 
         async def _main() -> None:
-            async def _failing_save(*, force: bool = False) -> bool:
+            async def _failing_save(
+                *, force: bool = False, staged: bool = False
+            ) -> bool:
                 del force
                 raise OSError("storage unavailable")
 
@@ -3100,7 +3177,9 @@ class TestPeriodicRolloutCheckpoint:
             two_failures = asyncio.Event()
             calls = 0
 
-            async def _failing_save(*, force: bool = False) -> bool:
+            async def _failing_save(
+                *, force: bool = False, staged: bool = False
+            ) -> bool:
                 nonlocal calls
                 del force
                 calls += 1
@@ -3137,7 +3216,9 @@ class TestPeriodicRolloutCheckpoint:
         calls = 0
 
         async def _main() -> None:
-            async def _failing_save(*, force: bool = False) -> bool:
+            async def _failing_save(
+                *, force: bool = False, staged: bool = False
+            ) -> bool:
                 nonlocal calls
                 del force
                 calls += 1
@@ -3169,7 +3250,9 @@ class TestPeriodicRolloutCheckpoint:
         calls = 0
 
         async def _main() -> None:
-            async def _failing_save(*, force: bool = False) -> bool:
+            async def _failing_save(
+                *, force: bool = False, staged: bool = False
+            ) -> bool:
                 nonlocal calls
                 del force
                 calls += 1
@@ -3820,9 +3903,9 @@ class TestPPOSaveOrder:
         actor = _ppo_save_actor(tmp_path, calls)
         publish = actor._publish_when_policy_write_done
 
-        async def _record_publish(checkpoint_path):
+        async def _record_publish(checkpoint_path, **kwargs):
             calls.append("publish")
-            await publish(checkpoint_path)
+            await publish(checkpoint_path, **kwargs)
 
         actor._publish_when_policy_write_done = _record_publish
 

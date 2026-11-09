@@ -3988,6 +3988,7 @@ def test_ppo_checkpoint_saves_both_updates_without_repeating_early_refit(
         assert kwargs == {
             "is_policy_training_step": True,
             "is_final_checkpoint": True,
+            "publish_now": False,
         }
         assert "critic.finish_training" in calls
         assert len(ctrl._dp_client.cleared_ids) == len(metas)

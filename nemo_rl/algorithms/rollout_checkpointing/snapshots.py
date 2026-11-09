@@ -72,9 +72,11 @@ from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     ROLLOUT_SNAPSHOT_SCHEMA_VERSION,
     BootstrapCompatibilityIdentity,
     RolloutSnapshotManifest,
+    adopt_staged_snapshot,
     commit_snapshot,
     ensure_bootstrap_anchor,
     prepare_snapshot_paths,
+    prepare_staged_snapshot_path,
     prune_bootstrap_snapshots,
 )
 from nemo_rl.algorithms.rollout_checkpointing.state import (
@@ -602,9 +604,18 @@ class RolloutSnapshotter(_UsesRolloutParts):
         )
 
     async def save_snapshot(
-        self, *, force: bool = False
+        self, *, force: bool = False, staged: bool = False
     ) -> RolloutCheckpointSaveResult:
-        """Publish one rollout-only snapshot anchored to durable trainer state."""
+        """Publish one rollout-only snapshot anchored to durable trainer state.
+
+        Args:
+            force: Save even when the data plane has not changed since the last
+                snapshot.
+            staged: The trainer checkpoint for the current step is still being
+                written. Write the snapshot beside it meanwhile, then wait for
+                step_N to be published and move the snapshot in; skip it if
+                step_N never appears.
+        """
         async with self._save_lock:
             if self._optimizer_commit_in_progress:
                 return RolloutCheckpointSaveResult(
@@ -624,20 +635,37 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 )
 
             save_started = time.monotonic()
-            await asyncio.to_thread(self._checkpointer.finalize_pending)
-            anchor = await self._resolve_anchor()
-            if anchor is None:
-                return RolloutCheckpointSaveResult(
-                    saved=False,
-                    reason="missing_trainer_anchor",
-                )
-            anchor_path, snapshot_fingerprint = anchor
-
             expected_train_step = self._read_progress().train_steps
             expected_trainer_version = self._read_progress().trainer_version
-            tmp_path, final_path, snapshot_sequence = await asyncio.to_thread(
-                prepare_snapshot_paths, anchor_path
-            )
+            final_path: Optional[Path] = None
+            if staged:
+                if expected_train_step == 0 or (
+                    expected_trainer_version != expected_train_step
+                ):
+                    raise RuntimeError(
+                        "a staged rollout snapshot needs a trainer checkpoint: "
+                        f"step={expected_train_step}, "
+                        f"trainer_version={expected_trainer_version}"
+                    )
+                checkpoint_dir = self._checkpointer.checkpoint_dir
+                anchor_path = checkpoint_dir / f"step_{expected_train_step}"
+                snapshot_fingerprint = None
+                tmp_path = await asyncio.to_thread(
+                    prepare_staged_snapshot_path, checkpoint_dir, expected_train_step
+                )
+            else:
+                await asyncio.to_thread(self._checkpointer.finalize_pending)
+                anchor = await self._resolve_anchor()
+                if anchor is None:
+                    return RolloutCheckpointSaveResult(
+                        saved=False,
+                        reason="missing_trainer_anchor",
+                    )
+                anchor_path, snapshot_fingerprint = anchor
+                tmp_path, final_path, snapshot_sequence = await asyncio.to_thread(
+                    prepare_snapshot_paths, anchor_path
+                )
+            trainer_publish_wait_seconds = 0.0
             try:
                 environment_pause_started = time.monotonic()
                 async with contextlib.AsyncExitStack() as environment_phase:
@@ -681,6 +709,23 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 environment_paused_seconds = (
                     time.monotonic() - environment_pause_started
                 )
+                if final_path is None:
+                    # Only now wait for step_N's policy write and rename; a failed
+                    # write re-raises here.
+                    publish_wait_started = time.monotonic()
+                    await asyncio.to_thread(self._checkpointer.finalize_pending)
+                    trainer_publish_wait_seconds = (
+                        time.monotonic() - publish_wait_started
+                    )
+                    if not anchor_path.is_dir():
+                        await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
+                        return RolloutCheckpointSaveResult(
+                            saved=False,
+                            reason="missing_trainer_anchor",
+                        )
+                    tmp_path, final_path, snapshot_sequence = await asyncio.to_thread(
+                        adopt_staged_snapshot, tmp_path, anchor_path
+                    )
 
                 (
                     controller_sidecar_bytes,
@@ -720,6 +765,8 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 "exclusive_hold_seconds": barrier_released - barrier_acquired,
                 "sidecar_save_seconds": sidecar_save_seconds,
                 "snapshot_commit_seconds": snapshot_commit_seconds,
+                # How long a staged snapshot then waited for step_N; 0 otherwise.
+                "trainer_publish_wait_seconds": trainer_publish_wait_seconds,
                 "replay_groups": float(
                     len(snapshot_cut.replay_metadata["groups"])
                     if snapshot_cut.replay_metadata is not None
@@ -838,11 +885,13 @@ class RolloutSnapshotter(_UsesRolloutParts):
             return "gym_unavailable"
         return "invariant_error"
 
-    async def _attempt(self, *, force: bool) -> RolloutCheckpointSaveResult | Exception:
+    async def _attempt(
+        self, *, force: bool, staged: bool = False
+    ) -> RolloutCheckpointSaveResult | Exception:
         """Run and log one snapshot attempt; return a retryable error, raise the rest."""
         started = time.monotonic()
         try:
-            result = await self.save_snapshot(force=force)
+            result = await self.save_snapshot(force=force, staged=staged)
         except Exception as error:
             reason = self._failure_reason(error)
             self._log_outcome(
@@ -960,7 +1009,9 @@ class RolloutSnapshotter(_UsesRolloutParts):
             return
         # The pump need not also answer the trainer checkpoint's wakeup.
         self._wakeup.clear()
-        outcome = await self._attempt(force=True)
+        # Runs while step_N's policy write is still landing; the snapshot is
+        # moved under step_N once it is published.
+        outcome = await self._attempt(force=True, staged=True)
         if isinstance(outcome, Exception):
             problem = f"failed: {type(outcome).__name__}: {outcome}"
         elif not outcome.saved:
