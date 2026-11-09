@@ -18,11 +18,6 @@ from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.automodel_policy_worker import (
     AutomodelPolicyWorkerImpl,
 )
-from speechlm_gspo.model import register_speechlm
-
-# Ray imports this module in every worker process before constructing the
-# actor, so the generic Automodel setup can resolve the native model by name.
-register_speechlm()
 
 
 @ray.remote(
@@ -30,3 +25,10 @@ register_speechlm()
 )  # pragma: no cover
 class SpeechLMPolicyWorker(AutomodelPolicyWorkerImpl):
     """Generic Automodel policy worker in the SpeechLM policy environment."""
+
+    def __init__(self, *args, **kwargs):
+        from speechlm_gspo.model import register_speechlm
+
+        # Register in the actor process, not only its isolated initializer.
+        register_speechlm()
+        super().__init__(*args, **kwargs)
