@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import os
 import pickle
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -49,6 +51,10 @@ class _FakeProcess:
 
     @staticmethod
     def poll():
+        return None
+
+    @staticmethod
+    def stop():
         return None
 
 
@@ -218,8 +224,57 @@ def test_stop_process_escalates_its_process_group(monkeypatch) -> None:
         lambda pid, sig: signals.append((pid, sig)),
     )
     process = EscalatingProcess()
-    ManagedDynamoRuntime._stop_process(process, "frontend", timeout_s=0.01)
+    managed_runtime._stop_process(process, "frontend", timeout_s=0.01)
     assert signals == [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)]
+
+
+def _exited(pid: int) -> bool:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return True
+    return stat.rsplit(")", 1)[1].split()[0] == "Z"
+
+
+def test_a_service_stops_when_the_process_that_started_it_is_sigkilled() -> None:
+    # The service prints its own PID (exec keeps it) to the starter's stdout.
+    starter_code = (
+        "import os, time\n"
+        "from nemo_rl.models.generation.dynamo.managed_runtime import _ServiceProcess\n"
+        "_ServiceProcess(['sh', '-c', 'echo $$; exec sleep 600'],"
+        " env=dict(os.environ), label='sleep')\n"
+        "time.sleep(600)\n"
+    )
+    with subprocess.Popen(
+        [sys.executable, "-c", starter_code],
+        cwd=Path(__file__).resolve().parents[4],
+        stdout=subprocess.PIPE,
+        text=True,
+    ) as starter:
+        assert starter.stdout is not None
+        line = starter.stdout.readline()
+        assert line, "the starter exited before it started the service"
+        service_pid = int(line)
+        # SIGKILL runs no shutdown or atexit handler, and the service's own
+        # session keeps it out of the starter's process group.
+        starter.send_signal(signal.SIGKILL)
+    deadline = time.monotonic() + 20
+    try:
+        while not _exited(service_pid):
+            assert time.monotonic() < deadline, "the service outlived its starter"
+            time.sleep(0.1)
+    finally:
+        if not _exited(service_pid):
+            os.killpg(service_pid, signal.SIGKILL)
+
+
+def test_stopping_a_service_also_stops_its_watchdog() -> None:
+    service = managed_runtime._ServiceProcess(
+        ["sleep", "600"], env=dict(os.environ), label="sleep"
+    )
+    service.stop()
+    assert service.poll() == -signal.SIGTERM
+    assert service._watchdog.returncode is not None
 
 
 def test_shutdown_guards_each_owned_resource_independently(
@@ -229,22 +284,23 @@ def test_shutdown_guards_each_owned_resource_independently(
     healthy = _FakeFrontendHost()
     runtime = _started(_runtime(), failing, healthy)
     monkeypatch.setattr(runtime, "_log_router_kv_events", lambda: None)
-    runtime._nats_process = object()
-    runtime._etcd_process = object()
-    calls = []
+    stopped = []
 
-    def stop_process(process, label, timeout_s=15):
-        if process is None:
-            return
-        calls.append(label)
+    class _Service(_FakeProcess):
+        def __init__(self, label):
+            self.label = label
 
-    monkeypatch.setattr(runtime, "_stop_process", stop_process)
+        def stop(self):
+            stopped.append(self.label)
+
+    runtime._nats_process = _Service("NATS")
+    runtime._etcd_process = _Service("etcd")
     runtime.shutdown()
     runtime.shutdown()
 
     # The failing frontend does not keep the others, NATS or etcd running.
     assert fake_ray == [healthy]
-    assert calls == ["NATS", "etcd"]
+    assert stopped == ["NATS", "etcd"]
     assert runtime._frontend_hosts == [] and runtime._frontend_urls == []
     assert runtime._nats_process is None
     assert runtime._etcd_process is None
@@ -400,9 +456,10 @@ def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
 ) -> None:
     launched = []
     monkeypatch.setattr(
-        managed_runtime.subprocess,
-        "Popen",
-        lambda command, **kwargs: launched.append((command, kwargs)) or _FakeProcess(),
+        managed_runtime,
+        "_ServiceProcess",
+        lambda command, *, env, label: launched.append((command, env))
+        or _FakeProcess(),
     )
     monkeypatch.setattr(
         managed_runtime, "_get_free_port_local", lambda *args, **kwargs: 3000
@@ -421,7 +478,7 @@ def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
     host.publish_chat_capture({"staging_partition": "staging"})
 
     assert url == "http://10.0.0.2:3000/v1"
-    ((command, kwargs),) = launched
+    ((command, env),) = launched
     # Dynamo's frontend, with NeMo RL's chat engine serving chat calls.
     assert command[:3] == [
         "/venvs/vllm/bin/python",
@@ -429,12 +486,12 @@ def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
         "nemo_rl.models.generation.dynamo.vllm.frontend",
     ]
     assert command[command.index("--http-port") + 1] == "3000"
-    assert kwargs["env"]["DYN_NAMESPACE"] == "nemo-rl-test"
-    assert "DYN_STALE_SETTING" not in kwargs["env"]
+    assert env["DYN_NAMESPACE"] == "nemo-rl-test"
+    assert "DYN_STALE_SETTING" not in env
     assert host.returncode() is None
     # Capture is set up after the engines register; the chat engine reads it
     # from the file on its own node that the frontend was told about.
-    with open(kwargs["env"][managed_runtime.CAPTURE_FILE_ENV], "rb") as capture_file:
+    with open(env[managed_runtime.CAPTURE_FILE_ENV], "rb") as capture_file:
         assert pickle.load(capture_file) == {"staging_partition": "staging"}
 
 
@@ -461,7 +518,6 @@ def test_shutdown_logs_the_kv_events_the_router_applied(
         "urllib.request.urlopen",
         lambda url, timeout: urls.append(url) or _Metrics(None),
     )
-    monkeypatch.setattr(runtime, "_stop_process", lambda *args, **kwargs: None)
 
     runtime.shutdown()
 

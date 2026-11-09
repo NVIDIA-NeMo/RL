@@ -30,6 +30,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -129,6 +130,93 @@ def _managed_namespace() -> str:
     return re.sub(r"[^a-zA-Z0-9_-]+", "-", raw).strip("-_").lower()
 
 
+# How long a managed service has after SIGTERM before it gets SIGKILL.
+_STOP_TIMEOUT_S = 15
+_WATCHDOG_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "service_watchdog.py"
+)
+
+
+def _stop_process(
+    process: subprocess.Popen, label: str, timeout_s: float = _STOP_TIMEOUT_S
+) -> None:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    if process.poll() is None:
+        try:
+            process.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+    print(f"  [Dynamo] {label} stopped pid={process.pid}", flush=True)
+
+
+class _ServiceProcess:
+    """A managed service in its own session, stopped even if this process is SIGKILLed.
+
+    The session keeps a Ctrl-C at the driver's terminal from reaching the
+    service. :meth:`stop` stops it on a clean shutdown; otherwise its watchdog
+    (``service_watchdog.py``) stops it once this process is gone. Ray reaps a
+    worker's children only when the worker exits through Ray, not when the
+    worker is SIGKILLed. The watchdog is the service's sibling, not its parent,
+    so Ray's reaping still kills the service itself.
+    """
+
+    def __init__(
+        self, command: Sequence[str], *, env: dict[str, str], label: str
+    ) -> None:
+        self._label = label
+        # This process holds the only write end and never writes to it, so the
+        # watchdog reads EOF once this process is gone.
+        lifeline_read, self._lifeline = os.pipe()
+        try:
+            self._process = subprocess.Popen(command, env=env, start_new_session=True)
+            try:
+                self._watchdog = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-S",
+                        _WATCHDOG_SCRIPT,
+                        str(lifeline_read),
+                        str(self._process.pid),
+                        str(_STOP_TIMEOUT_S),
+                    ],
+                    pass_fds=(lifeline_read,),
+                    start_new_session=True,
+                )
+            except BaseException:
+                _stop_process(self._process, label)
+                raise
+        except BaseException:
+            os.close(self._lifeline)
+            raise
+        finally:
+            os.close(lifeline_read)
+
+    @property
+    def returncode(self) -> int | None:
+        return self._process.returncode
+
+    def poll(self) -> int | None:
+        """The service's exit code, or None while it runs."""
+        return self._process.poll()
+
+    def stop(self) -> None:
+        """Stop the service, then its watchdog."""
+        try:
+            _stop_process(self._process, self._label)
+        finally:
+            self._watchdog.kill()
+            self._watchdog.wait()
+            os.close(self._lifeline)
+
+
 # The frontend process's environment for NeMo RL's chat engine
 # (dynamo/vllm/chat_engine.py): its render workers, where setup_token_capture
 # writes the capture config, and the Ray cluster its TQ reads go through.
@@ -141,12 +229,12 @@ class FrontendHost:
     """One frontend on the node a Ray actor (``_FrontendHostActor``) runs on.
 
     It runs Dynamo's frontend with NeMo RL's chat engine serving chat calls
-    (``dynamo/vllm/frontend.py``). If the actor dies, Ray kills the frontend
-    with it (Ray reaps an exiting worker's child processes).
+    (``dynamo/vllm/frontend.py``). The frontend stops when the actor dies,
+    however it dies (see ``_ServiceProcess``).
     """
 
     def __init__(self) -> None:
-        self._process: subprocess.Popen | None = None
+        self._process: _ServiceProcess | None = None
         self._chat_dir: str | None = None
 
     def start(
@@ -176,9 +264,7 @@ class FrontendHost:
         self._chat_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_chat_")
         frontend_env = _service_env(env)
         frontend_env[CAPTURE_FILE_ENV] = os.path.join(self._chat_dir, "capture.pkl")
-        self._process = subprocess.Popen(
-            command, env=frontend_env, start_new_session=True
-        )
+        self._process = _ServiceProcess(command, env=frontend_env, label="frontend")
         host = _get_node_ip_local()
         host = f"[{host}]" if ":" in host else host
         return f"http://{host}:{port}/v1"
@@ -203,8 +289,9 @@ class FrontendHost:
         return self._process.poll()
 
     def stop(self) -> None:
-        ManagedDynamoRuntime._stop_process(self._process, "frontend")
-        self._process = None
+        if self._process is not None:
+            self._process.stop()
+            self._process = None
         if self._chat_dir is not None:
             shutil.rmtree(self._chat_dir, ignore_errors=True)
             self._chat_dir = None
@@ -256,8 +343,8 @@ class ManagedDynamoRuntime:
         self._nats_port = 0
         self._manager_env: dict[str, str] = {}
         self._started = False
-        self._etcd_process: subprocess.Popen | None = None
-        self._nats_process: subprocess.Popen | None = None
+        self._etcd_process: _ServiceProcess | None = None
+        self._nats_process: _ServiceProcess | None = None
         self._frontend_hosts: list[ray.actor.ActorHandle] = []
         self._frontend_urls: list[str] = []
         self._etcd_data_dir: str | None = None
@@ -290,9 +377,8 @@ class ManagedDynamoRuntime:
         """
         if self._started:
             raise RuntimeError("Managed Dynamo runtime is already started")
-        # Managed services use new process groups and would survive an
-        # exception that escapes setup. Keep an interpreter-exit fallback in
-        # addition to the normal explicit shutdown path.
+        # An exception that escapes setup skips shutdown(): stop the services at
+        # interpreter exit too. Their watchdogs cover a process killed outright.
         atexit.register(self.shutdown)
         self._host = _get_node_ip_local()
         control = (
@@ -340,27 +426,6 @@ class ManagedDynamoRuntime:
             self.shutdown()
             raise
 
-    @staticmethod
-    def _stop_process(
-        process: subprocess.Popen | None, label: str, timeout_s: float = 15
-    ) -> None:
-        if process is None:
-            return
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        if process.poll() is None:
-            try:
-                process.wait(timeout=timeout_s)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                process.wait(timeout=5)
-        print(f"  [Dynamo] {label} stopped pid={process.pid}", flush=True)
-
     def _service_env(self) -> dict[str, str]:
         return _service_env(self._manager_env)
 
@@ -382,8 +447,8 @@ class ManagedDynamoRuntime:
             "--data-dir",
             self._etcd_data_dir,
         ]
-        self._etcd_process = subprocess.Popen(
-            command, env=self._service_env(), start_new_session=True
+        self._etcd_process = _ServiceProcess(
+            command, env=self._service_env(), label="etcd"
         )
         self._wait_for_etcd()
         print(f"  [Dynamo] etcd ready on {self._host}:{self._etcd_port}", flush=True)
@@ -406,7 +471,7 @@ class ManagedDynamoRuntime:
 
     def _start_nats(self) -> None:
         self._nats_data_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_nats_")
-        self._nats_process = subprocess.Popen(
+        self._nats_process = _ServiceProcess(
             [
                 _service_executable("nats-server"),
                 "-js",
@@ -416,13 +481,13 @@ class ManagedDynamoRuntime:
                 str(self._nats_port),
             ],
             env=self._service_env(),
-            start_new_session=True,
+            label="NATS",
         )
         self._wait_for_port(self._nats_port, "NATS", self._nats_process)
         print(f"  [Dynamo] NATS ready on {self._host}:{self._nats_port}", flush=True)
 
     def _wait_for_port(
-        self, port: int, label: str, process: subprocess.Popen | None = None
+        self, port: int, label: str, process: _ServiceProcess | None = None
     ) -> None:
         deadline = time.monotonic() + min(self._dynamo_cfg.startup_timeout_s, 60)
         while time.monotonic() < deadline:
@@ -621,12 +686,14 @@ class ManagedDynamoRuntime:
         self._frontend_hosts = []
         self._frontend_urls = []
         try:
-            self._stop_process(self._nats_process, "NATS")
+            if self._nats_process is not None:
+                self._nats_process.stop()
         except Exception:
             LOGGER.exception("Failed to stop managed Dynamo NATS")
         self._nats_process = None
         try:
-            self._stop_process(self._etcd_process, "etcd")
+            if self._etcd_process is not None:
+                self._etcd_process.stop()
         except Exception:
             LOGGER.exception("Failed to stop managed Dynamo etcd")
         self._etcd_process = None
