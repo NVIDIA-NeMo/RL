@@ -319,3 +319,54 @@ def get_mtp_metrics(loss_scale: float = 1.0) -> dict[str, Any]:
 
         MTPLossLoggingHelper.clean_metrics_in_tracker()
     return metrics
+
+
+def clear_transient_megatron_caches(model: torch.nn.Module) -> None:
+    """Release GPU tensors that outlive a step and pin memory across an offload.
+
+    - RotaryEmbedding's ``@lru_cache(maxsize=32)`` keeps one GPU sin/cos tensor per
+      unique (max_seq_len, offset, packed_seq). With training and logprob passes at
+      different sequence lengths it fills quickly and anchors large CUDA segments.
+    - MoE token dispatchers are plain Python objects (not ``nn.Module``), reached
+      through the ``token_dispatcher`` attribute of the MoE layers, and keep
+      persistent routing tensors. When the MLP runs under activation recompute,
+      the checkpoint (``te_checkpoint`` under fp8/fp4,
+      ``tensor_parallel.checkpoint`` otherwise) recomputes the forward with grad
+      enabled and stores ``dispatcher.probs`` with a ``grad_fn``, closing a
+      reference cycle ``checkpoint backward -> ctx.run_function=mlp ->
+      mlp.token_dispatcher.probs -> probs.grad_fn -> ...``. Nulling the attributes
+      frees both the routing tensors and the checkpoint context's saved tensors.
+
+    Both steps are best effort: a Megatron version without these attributes is
+    left untouched.
+
+    Args:
+        model: The Megatron model (or model chunk) whose caches are released.
+    """
+    try:
+        from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+            RotaryEmbedding,
+        )
+
+        RotaryEmbedding.forward.cache_clear()
+    except Exception:
+        pass
+
+    try:
+        for module in model.modules():
+            if not hasattr(module, "token_dispatcher"):
+                continue
+            dispatcher = module.token_dispatcher
+            if dispatcher is None:
+                continue
+            for attr in (
+                "probs",  # AllToAll + AllGather
+                "routing_map",  # AllToAll
+                "reversed_local_input_permutation_mapping",  # AllToAll
+                "local_probs",  # AllGather
+                "local_map",  # AllGather
+            ):
+                if isinstance(getattr(dispatcher, attr, None), torch.Tensor):
+                    setattr(dispatcher, attr, None)
+    except Exception:
+        pass

@@ -464,6 +464,8 @@ def test_subagent_failures_reach_final_training_rows(
     )
     assert_loss_once(forest, [] if masked else selected, records)
     assert result.valid_row_count == (0 if masked else (5 if len(selected) == 8 else 4))
+    # Termination rates count the rollout once, not once per segment row.
+    assert result.metrics["finalize/truncated_count"] == float(truncated and not masked)
     if result.meta is not None:
         for key, tag in zip(result.meta.sample_ids, result.meta.tags, strict=True):
             row = forest.plane.rows["canonical", key]
@@ -1308,7 +1310,8 @@ def test_capture_lengths_count_unique_generations_before_padding(
         reward_log_contexts=[RewardLogContext("agent", None)],
     )
     assert result.meta is not None and result.meta.size == 4
-    metrics = result.meta.extra_info[ROLLOUT_METRICS][0]
+    assert ROLLOUT_METRICS not in result.meta.extra_info
+    metrics = result.token_metrics
     # This harness generates exactly one token per model call. Contexts and
     # duplicated ancestors in sibling rows must not change that population.
     assert metrics["gen_tokens_per_sample/histogram"] == [len(selected)]

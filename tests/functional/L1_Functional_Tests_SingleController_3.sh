@@ -36,12 +36,17 @@ run_test() {
 
 # Native TQ + metadata-only completed replay recovery (#3480).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh
-# Same recovery flow with Mooncake CPU storage; skips without an RDMA device.
+# Same recovery flow with Mooncake CPU storage and SSD offload on; skips
+# without an RDMA device.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_mooncake_tq_recovery.sh
 # Same flows with storage units: SimpleStorageUnits pinned by placement, and
 # Mooncake CPU storage units as the only memory owners (skips without RDMA).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh simple_placed
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_mooncake_tq_recovery.sh mooncake_units
+# Same recovery flow on the nixl data plane, with its SSD tier off and on
+# (skip without an RDMA device).
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_nixl_tq_recovery.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_nixl_tq_recovery.sh nixl_ssd
 # Deterministic process restart with an admitted group held before canonical TQ
 # commit, followed by exact-once redispatch at its stable group ID.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_unfinished_recovery.sh
@@ -51,6 +56,7 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true
 # Score centering through capture, canonical TQ columns, trainer gather and loss.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_gym_single_controller.sh
+run_test fast uv run --no-sync bash ./tests/functional/grpo_score_centering_filtered_gym_single_controller.sh
 # BrowseComp hides old tool results; valid rows must prove a context boundary.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_context_compaction.sh
 # Two-process token-capture recovery: preserve one sealed sibling in TQ and

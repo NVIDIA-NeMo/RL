@@ -15,6 +15,9 @@ Let `p(v)` be the current training policy, `q(v)` the rollout sampler, and `H`
 the sampler's top-k token set at one generated position. The sampler supplies
 both token IDs and logprobs for `H`. The trainer computes its own logprobs at
 those same IDs, normalized over the full vocabulary rather than just `H`.
+With top-k/top-p sampling, `q` is the filtered sampler distribution and `p`
+is the trainer's distribution renormalized over the same support (see
+[Sampling filters](#sampling-filters)).
 
 The estimator models the unobserved sampler tail as a rescaled training-policy
 tail:
@@ -41,13 +44,20 @@ coefficients depend on the importance-sampling mode:
 | Untruncated token-level IS | `p(v)` | `1` |
 | Token-level TIS with bounds `[lo, hi]` | `clamp(p(v), lo*q(v), hi*q(v))` | `clamp(1, lo*rho, hi*rho)` |
 | Token-level ICEPOP with bounds `[lo, hi]` | `p(v)` if `p(v)/q(v)` is in bounds, otherwise `0` | `1` if `1/rho` is in bounds, otherwise `0` |
+| Token-level adaptive-ppo-clip with bounds `lo`, `hi + k`, and outer bound `o` | `p(v)` if `p(v)/q(v)` is kept for the sign of `A`, otherwise `0` | `1` if `1/rho` is kept for the sign of `A`, otherwise `0` |
+
+adaptive-ppo-clip keeps a ratio `r` when `r <= o` and, for `A < 0`, `r >= lo`
+or, for `A > 0`, `r <= hi + k`; a zero advantage is held to `o` only. These are
+the bounds its filter applies to the sampled token at the same step, with the
+controller's current offset `k`.
 
 Only `log p(v)` carries gradients through this correction. The captured head
 retains its original probability mass; it is not renormalized to one. The loss
 applies the existing token/sample masks and normalization to `A * C`.
-Masked logprobs are neutralized before exponentiation. An ICEPOP rejection of
-the sampled token does not mask the head/tail correction. Under untruncated
-IS, the head and tail coefficients cancel and the correction is zero.
+Masked logprobs are neutralized before exponentiation. An ICEPOP or
+adaptive-ppo-clip rejection of the sampled token does not mask the head/tail
+correction. Under untruncated IS, the head and tail coefficients cancel and the
+correction is zero.
 
 This implementation adds a correction to the existing clipped objective; it
 does not replace it with centered REINFORCE or exactly center every possible
@@ -101,10 +111,28 @@ score centering and token capture. Requests must omit nonempty
 head, even if the list contains K IDs. Such requests are rejected.
 Use positive temperature and
 `processed_logprobs` to keep the reported sampler probabilities consistent
-with the distribution being sampled. Startup validation checks the top-p and
-top-k filters and rejects nonpositive/nonfinite temperatures. Raw/default logprobs
-are accepted only at temperature 1; non-unit temperatures require processed
-logprobs. Other sampling processors must not change the distribution when using raw logprobs.
+with the distribution being sampled. Startup validation rejects
+nonpositive/nonfinite temperatures. Raw/default logprobs are accepted only at
+temperature 1 without sampling filters; non-unit temperatures and top-k/top-p
+filtering require processed logprobs. Other sampling processors must not change
+the distribution when using raw logprobs.
+
+### Sampling filters
+
+Score centering under top-k or top-p sampling requires
+[Sampler Replay](sampler-replay.md): set
+`policy.generation.sampler_replay.enabled: true` and meet its requirements,
+including `top_logprobs >= top_k`. Score centering with a filter and replay
+disabled is rejected at setup.
+
+With replay, `p` is the trainer's distribution renormalized over the sampler's
+kept set `S_q`, the same support as `q`, and the captured head holds all of
+`S_q`:
+
+- Head slots the sampler filtered out (`-inf`) carry no coefficient.
+- The head holds all of `p`, so the estimator has no tail (`rho = 0`) and is
+  exact for every IS mode and for both token- and sequence-level loss.
+- The sampled token and the head are scored in one pass over `S_q`.
 
 To enable TIS, replace the four IS settings with:
 
@@ -120,6 +148,13 @@ For untruncated IS, set `use_importance_sampling_correction: true` and leave
 the truncation type and both bounds `null`. For ICEPOP, use the TIS example
 with `truncated_importance_sampling_type: icepop`; out-of-bounds weights become
 zero instead of being clamped. Both the head and modeled tail use this rule.
+For adaptive-ppo-clip, use the TIS example with
+`truncated_importance_sampling_type: adaptive-ppo-clip` and
+`force_on_policy_ratio: true`, which that mode requires; the
+`truncated_importance_sampling_adaptive_*` settings work as described in the
+[GRPO guide](grpo.md#adaptive-ppo-clip). The head and modeled tail are filtered
+by the sign of each position's advantage, with the upper bound the controller
+set for the step.
 `seq-mask-tis` and sequence-level IS remain unsupported with score centering.
 
 ## Data Flow
@@ -155,7 +190,7 @@ on-policy distillation.
 ### Extending Candidate Collection
 
 [The sampler adapter](../../nemo_rl/models/generation/score_centering.py)
-keeps request preparation and extraction behind three standalone functions:
+keeps request preparation and extraction behind standalone functions:
 
 - `build_score_centering_request_overrides(num_candidates=K)` supplies the
   HTTP fields that Gym merges into each policy request.
@@ -164,6 +199,10 @@ keeps request preparation and extraction behind three standalone functions:
 - `extract_score_centering_samples(output, num_candidates=K)` returns CPU
   `(sampler_ids, sampler_logprobs)` tensors with shape `[generated_len, K]`,
   int32 IDs, and float32 logprobs under the sampler distribution.
+  `extract_flat_score_centering_samples` returns the same pair from vLLM
+  `FlatLogprobs`, which requests use when
+  `policy.generation.vllm_cfg.flat_logprobs` is true. It avoids walking the
+  logprobs one position at a time. Keep the two extractors in sync.
 
 Today these functions implement top-k collection. A future candidate-selection
 strategy can change request preparation, validation, and extraction together
@@ -180,12 +219,17 @@ sampling without replacement or change the current top-k estimator.
   logprobs, and CP shards are reconstructed separately for each padded sequence.
   Externally prepacked inputs are rejected. The example above uses the ordinary
   unpacked path; enable both packing and `fuse_loss` for the packed path.
+- With sampling filters, the sampled token and the head are scored in one pass
+  over the captured support: a gather of the `K` head logits and a logsumexp
+  over the finite ones (under tensor parallelism, one all-reduce of those `K`
+  logits per position), with no vocabulary top-k or softmax.
 - Automodel context-parallel sharding and DTensor logits are unsupported.
 - Full-vocabulary on-policy distillation and fused linear logprobs are
   rejected because this path needs ordinary vocabulary logits.
 - Extraction checks the generated-token count, candidate count, unique IDs,
-  nonnegative int32-compatible IDs, finite float32-representable logprobs, logprobs no larger
-  than `1e-5`, and head mass no larger than `1.0001`. Finite sampler logprobs
+  nonnegative int32-compatible IDs, float32-representable logprobs (`-inf` is
+  kept for candidates the sampler filtered out), logprobs no larger
+  than `1e-5`, and head mass no larger than `1.0001`. Sampler logprobs
   are preserved without flooring or renormalization. These checks apply before
   staging; ignored prompt/tool positions are still zero-filled by the finalizer.
 
@@ -207,16 +251,19 @@ uv run --no-sync bash tests/functional/grpo_score_centering_gym_single_controlle
 The test adapts the existing SingleController Gym token-capture smoke. It
 requires two GPUs, the Gym dependencies, model/data access, and `HF_TOKEN` for
 the Workplace Assistant data preparation. It runs three training steps each
-with IS off, untruncated IS, TIS, and ICEPOP, using Qwen3-0.6B, Megatron, and
-async vLLM. TIS and ICEPOP enable internal packing with `fuse_loss=true`; the
-other two modes use unpacked preparation.
+with IS off, untruncated IS, TIS, ICEPOP, and adaptive-ppo-clip, using
+Qwen3-0.6B, Megatron, and async vLLM. TIS, ICEPOP, and adaptive-ppo-clip enable
+internal packing with `fuse_loss=true`; the other two modes use unpacked
+preparation.
 It is registered in the full `L1_Functional_Tests_SingleController_3.sh` suite.
 
 The checks require three loss/head-mass records, finite loss and gradient
 norms, positive valid-token counts, head mass in `(0, 1.0001]`, finalizer
 activity, and zero invalid-row and poisoned-rollout metrics. The
 `train/score_centering_head_mass` metric proves the score-centering loss path
-executed. This smoke does not establish convergence, large-K performance, or
+executed. The adaptive-ppo-clip run also requires three
+`train/cur_adaptive_ppo_clip_k` records, one per step, from its controller.
+This smoke does not establish convergence, large-K performance, or
 TP/CP correctness. Separate packed TP/CP unit tests compare values and gradients
 against an unpacked, full-vocabulary reference.
 
