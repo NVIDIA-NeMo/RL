@@ -3,6 +3,8 @@
 """Plot Gemma batch512 against the existing V1 and SC full-batch runs."""
 
 import csv
+import hashlib
+import io
 import json
 import os
 import re
@@ -14,8 +16,10 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import torch
 import wandb
 from matplotlib.lines import Line2D
+from torch.distributed.checkpoint import FileSystemReader
 
 from validation.pr3.plot_comparison import (
     KEYS,
@@ -31,8 +35,85 @@ HERE = Path(__file__).resolve().parent
 LABEL = "SC streaming LA0 (exploratory)"
 
 
+def audit_checkpoint(step: int) -> dict:
+    """Read only saved scalar state before releasing the debug allocation."""
+    assert os.environ["USER"] == "root" and os.environ.get("SLURM_JOB_ID")
+    assert step >= 10
+    checkpoint = HERE / f"results/streaming-la0/checkpoints/step_{step}"
+    for name in (
+        "policy/weights",
+        "policy/optimizer",
+        "train_dataloader.pt",
+        "replay_buffer_metadata.pt",
+        "rollout_recovery.pt",
+        "data_plane",
+    ):
+        assert (checkpoint / name).exists(), name
+    info = json.loads((checkpoint / "training_info.json").read_text())
+    assert (
+        info["total_steps"]
+        == info["trainer_version"]
+        == info["sampler_dispatch_index"]
+        == step
+    )
+    assert info["consumed_samples"] == step * 32 and info["current_epoch"] == 0
+    base = checkpoint / "policy/optimizer/optim"
+    metadata = FileSystemReader(base).read_metadata()
+    steps, rates, scheduler = [], [], {}
+    for index, storage in metadata.storage_data.items():
+        key = index.fqn
+        selected = key.startswith("sched.") or (
+            key.startswith("optim.param_groups.") and key.endswith((".step", ".lr"))
+        )
+        if (
+            not selected
+            or type(metadata.state_dict_metadata[key]).__name__
+            != "BytesStorageMetadata"
+        ):
+            continue
+        assert storage.length < 65536
+        with (base / storage.relative_path).open("rb") as file:
+            file.seek(storage.offset)
+            value = torch.load(
+                io.BytesIO(file.read(storage.length)),
+                map_location="cpu",
+                weights_only=False,
+            )
+        if key.startswith("sched."):
+            scheduler[key] = value
+        elif key.endswith(".step"):
+            steps.append(value)
+        else:
+            rates.append(value)
+    assert steps and all(value == step for value in steps)
+    assert rates and all(value == 2e-6 for value in rates)
+    assert scheduler["sched.last_epoch"] == step
+    shards = len(list(base.glob("*.distcp")))
+    assert shards == 4
+    proof = {
+        "step": step,
+        "training_info": info,
+        "optimizer_shards": shards,
+        "optimizer_step_entries": len(steps),
+        "all_saved_optimizer_steps_match": True,
+        "optimizer_lr_entries": len(rates),
+        "all_saved_lrs_2e_6": True,
+        "scheduler": scheduler,
+        "metadata_sha256": hashlib.sha256(
+            (base / ".metadata").read_bytes()
+        ).hexdigest(),
+        "analyzed_inside_job": os.environ["SLURM_JOB_ID"],
+        "scope": "Saved scalar state only; not live per-rank raw optimizer parity.",
+    }
+    (HERE / f"results/checkpoint{step}-state.json").write_text(
+        json.dumps(proof, indent=2) + "\n"
+    )
+    return proof
+
+
 def main() -> None:
     assert os.environ["USER"] == "root" and os.environ.get("SLURM_JOB_ID")
+    audit_checkpoint(150)
     output = HERE / "results/curve-comparison"
     output.mkdir(parents=True, exist_ok=True)
     baselines = json.loads((HERE / "results/baselines.json").read_text())

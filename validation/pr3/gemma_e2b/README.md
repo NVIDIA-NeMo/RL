@@ -14,6 +14,15 @@ peak LR. No convergence/speedup conclusion from these startup steps.
 See results/startup.json. Always inspect current logs rather than treating this
 snapshot as live progress.
 
+At20:47PST checkpoint10 was durable (trainer/sampler versions10,320 consumed
+prompts). Inside the allocated container, its four optimizer shards and all505
+saved optimizer step entries10 were checked; saved learning rates2e-6 and
+scheduler last_epoch10 match the end of warmup. All first10 updates have finite
+plotted metrics, lag0, two dispatches,512 valid sequences and nonzero advantages
+and gradients. GenKL mean0.000385428, range0.000342696..0.000424718. These are
+early observations, not convergence qualification or a checkpoint/resume test.
+See results/checkpoint10-state.json and results/early-10-summary.json.
+
 - Model: local google/gemma-4-E2B-it, same path as both baselines.
 - One interactive debug allocation21546953, pool0-00343,8H100,4h walltime.
   Four training GPUs/FSDP2/EP1 and four async-vLLM rollout GPUs; TP=CP1.
@@ -56,7 +65,9 @@ After150, run.sh generates eight panels (reward, length, generation/policy KL,
 loss, entropy, preclip gradient norm, measured step time) with plot.py inside the
 allocated container. It validates committed-step/version/lag/finite plot coverage.
 Native histories/CSV/PNG/SVG and common1..150 statistics go under
-results/curve-comparison/. launch.sh releases ONLY this debug allocation after
+results/curve-comparison/. Before plotting, plot.py checks checkpoint150's saved
+optimizer/scheduler scalar state and data cursor, writing checkpoint150-state.json;
+this does not compare live per-rank raw optimizer buffers. launch.sh releases ONLY this debug allocation after
 successful training+plotting and durable checkpoint150. The allocation will then
 show CANCELLED because it was an idle interactive Ray allocation, not a failed
 training job. Confirm driver exit0,checkpoint150 and W&B finished independently.

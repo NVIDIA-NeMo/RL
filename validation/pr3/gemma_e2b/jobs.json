@@ -1,5 +1,5 @@
 {
-  "observed_at": "2026-11-08T20:36:00-08:00",
+  "observed_at": "2026-11-08T20:48:00-08:00",
   "state": "RUNNING",
   "target_steps": 150,
   "job_id": 21546953,
@@ -23,7 +23,7 @@
     "SC full-batch LA0": "96779513"
   },
   "baseline_config_checks_passed": true,
-  "observed_committed_steps": 2,
+  "observed_committed_steps": 11,
   "gemma_fixed_input_streaming_parity": "NOT ASSESSED",
   "original_qwen_bf16_1pct_gate": "FAILED (unchanged)",
   "source_worker_sha256": "7f59824258aafb13f5540810776dfa18c86a623856c9c89e4c6e26881259f74d",
@@ -31,22 +31,25 @@
   "monitor_pid": 804583,
   "launcher_pid": 654939,
   "latest_receipt": {
-    "step": 2,
-    "version": 2,
+    "step": 11,
+    "version": 11,
     "lag": "0",
     "metrics": {
-      "gen_kl_error": "0.0003819518603288954",
-      "policy_kl_error": "0.0003950342759684334",
-      "reward": "0.310546875",
-      "grad_norm": "0.29009079933166504",
-      "mean_gen_tokens_per_sample": "1797.265625",
+      "gen_kl_error": "0.0003978945045322549",
+      "policy_kl_error": "0.00040655113888241957",
+      "reward": "0.361328125",
+      "grad_norm": "0.40852639079093933",
+      "mean_gen_tokens_per_sample": "1750.958984375",
       "policy_train_dispatches": "2",
-      "lr": "2.0000001800000003e-07",
+      "lr": "2.0000000000000003e-06",
       "num_masked_seqs_by_logprob_error": "0",
       "global_valid_seqs": "512.0"
     }
   },
   "wandb_state": "running",
   "wandb_committed_step": 2,
-  "monitor_child_pid": 804613
+  "monitor_child_pid": 804613,
+  "durable_checkpoint_step": 10,
+  "early_summary": "validation/pr3/gemma_e2b/results/early-10-summary.json",
+  "saved_checkpoint_audit": "validation/pr3/gemma_e2b/results/checkpoint10-state.json"
 }
