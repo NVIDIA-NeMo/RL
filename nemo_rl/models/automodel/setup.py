@@ -390,7 +390,7 @@ def validate_and_prepare_config(
 
     # NeMoAutoModelForCausalLM uses flash_attention_2 by default
     # so we need to set it to None if sequence packing is disabled
-    # See https://github.com/NVIDIA-NeMo/Automodel/blob/7e748be260651349307862426c0c168cebdeeec3/nemo_automodel/components/_transformers/auto_model.py#L180
+    # See https://github.com/NVIDIA-NeMo/Automodel/blob/41f926247376f282bfe7c7e3a0a1e4d07229e0b3/nemo_automodel/_transformers/auto_model.py#L717-L721
     cp_size_cfg = config["automodel_cfg"]["context_parallel_size"]
     attn_impl = (
         "flash_attention_2"
@@ -908,7 +908,7 @@ def setup_model_and_optimizer(
 
     if cp_size > 1:
         # Match Automodel's CP context: MATH is incompatible with DTensor.
-        # https://github.com/NVIDIA-NeMo/Automodel/blob/b916107a5ce8e77a3f18682f8b0eaa46a4b54389/nemo_automodel/components/distributed/context_parallel/utils.py#L103-L109
+        # https://github.com/NVIDIA-NeMo/Automodel/blob/41f926247376f282bfe7c7e3a0a1e4d07229e0b3/nemo_automodel/components/distributed/context_parallel/utils.py#L103-L107
         sdpa_method = [
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,
