@@ -392,6 +392,7 @@ def test_streamed_capture_seals_raw_reward_and_original_reward_checks(usage) -> 
             },
         },
         "receipt": {"capture_key": "rollout-0", "manifest": []},
+        "scored_text_checks": (True, True),
         "rollout_id": "rollout-0",
     }
 

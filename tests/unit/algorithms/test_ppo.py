@@ -34,6 +34,7 @@ from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
+from nemo_rl.models.generation.interfaces import SamplerReplayConfig
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.utils.logger import LoggerConfig
 
@@ -1781,6 +1782,38 @@ def test_ppo_rejects_in_loss_filter_before_cluster_creation(
     cluster_cls.assert_not_called()
 
 
+def test_ppo_rejects_sampler_support_replay_before_cluster_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Replay reads the captured sampler head, which only SingleController stages."""
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config()
+    config.policy["generation"]["sampler_replay"] = SamplerReplayConfig(enabled=True)
+
+    with pytest.raises(ValueError, match="sampler_replay.*legacy PPO trainer"):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
+def test_ppo_forced_ratio_requires_one_policy_epoch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ppo_mod = _patch_ppo_setup_prerequisites(monkeypatch)
+    cluster_cls = MagicMock()
+    monkeypatch.setattr(ppo_mod, "RayVirtualCluster", cluster_cls)
+    config = _make_noncolocated_setup_config()
+    config.loss_fn = config.loss_fn.model_copy(update={"force_on_policy_ratio": True})
+    config.ppo = config.ppo.model_copy(update={"ppo_epochs": 4})
+
+    with pytest.raises(AssertionError, match="requires ppo.ppo_epochs=1"):
+        ppo_mod.setup(config, MagicMock(), _setup_dataset(), None)
+
+    cluster_cls.assert_not_called()
+
+
 def test_ppo_rejects_adaptive_ppo_clip_before_cluster_creation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2526,6 +2559,48 @@ def test_legacy_ppo_entrypoint_rejects_split_value_training(
     monkeypatch.setattr(run_ppo, "init_ray", init_ray)
 
     with pytest.raises(ValueError, match="value_training_mode=split.*SingleController"):
+        run_ppo.main()
+
+    init_ray.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "adv_estimator",
+    [
+        {"normalize_over": "all_rows", "whiten_execution_padding": False},
+        {"normalize_over": "all_rows", "whiten_execution_padding": True},
+    ],
+)
+def test_legacy_ppo_entrypoint_rejects_forest_whitening_options(
+    adv_estimator: dict,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from examples import run_ppo
+
+    init_ray = MagicMock()
+    monkeypatch.setattr(run_ppo, "register_omegaconf_resolvers", MagicMock())
+    monkeypatch.setattr(
+        run_ppo,
+        "parse_args",
+        lambda: (SimpleNamespace(config="test.yaml"), []),
+    )
+    monkeypatch.setattr(run_ppo, "load_config", lambda _: {})
+    monkeypatch.setattr(run_ppo.OmegaConf, "to_container", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(run_ppo, "check_outdated_config", MagicMock())
+    monkeypatch.setattr(
+        run_ppo,
+        "MasterConfig",
+        lambda **_: SimpleNamespace(
+            ppo=SimpleNamespace(
+                async_ppo={},
+                value_training_mode="whole_batch",
+                adv_estimator=SimpleNamespace(**adv_estimator),
+            )
+        ),
+    )
+    monkeypatch.setattr(run_ppo, "init_ray", init_ray)
+
+    with pytest.raises(ValueError, match="normalize_over.*SingleController"):
         run_ppo.main()
 
     init_ray.assert_not_called()

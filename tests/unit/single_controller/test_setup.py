@@ -67,6 +67,10 @@ from nemo_rl.algorithms.opd import (
     opd_full_teacher_index_field,
 )
 from nemo_rl.algorithms.ppo import PPOConfig
+from nemo_rl.algorithms.rollout_checkpointing.manifest import (
+    bootstrap_compatibility_identity,
+    ensure_bootstrap_anchor,
+)
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -84,10 +88,6 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     logprob_passes_required,
     validate_single_controller_config,
 )
-from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
-    bootstrap_compatibility_identity,
-    ensure_bootstrap_anchor,
-)
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import (
@@ -99,6 +99,7 @@ from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.nemo_gym import validate_dataset_agent_coverage
 from nemo_rl.experience.rollout_recovery import RecoveryTargetLevel
 from nemo_rl.experience.rollouts import EffortLevelsConfig
+from nemo_rl.models.generation.interfaces import SamplerReplayConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
 from nemo_rl.utils.config import (
     load_config,
@@ -756,22 +757,71 @@ def test_token_capture_top_logprobs_rejects_megatron_generation():
         validate_single_controller_config(mc)
 
 
-def test_score_centering_requires_top_logprobs_and_unfiltered_sampling():
+def test_score_centering_requires_top_logprobs():
     mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
 
     with pytest.raises(ValueError, match="policy.generation.top_logprobs > 0"):
         validate_single_controller_config(mc)
 
+
+def test_score_centering_with_filtered_sampling_requires_head_covering_top_k():
+    """The captured head must be at least top_k wide to hold the sampler's kept set."""
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
     mc.token_capture.enabled = True
-    mc.policy["generation"]["top_logprobs"] = 4
-    mc.policy["generation"]["vllm_kwargs"] = {"max_logprobs": 4}
-    mc.policy["generation"]["top_p"] = 0.9
-    mc.policy["generation"]["temperature"] = 1.0
-    mc.policy["generation"]["top_k"] = None
-    with pytest.raises(ValueError, match="unfiltered sampling"):
+    generation = mc.policy["generation"]
+    generation.update(
+        top_logprobs=4,
+        vllm_kwargs={"max_logprobs": 20},
+        temperature=1.0,
+        top_p=0.9,
+        top_k=20,
+        sampler_replay=SamplerReplayConfig(enabled=True),
+    )
+    generation.setdefault("vllm_cfg", {})["logprobs_mode"] = "processed_logprobs"
+    for top_logprobs in (4, 19):
+        generation["top_logprobs"] = top_logprobs
+        with pytest.raises(ValueError, match="top_logprobs >= policy.generation.top_k"):
+            validate_single_controller_config(mc)
+
+    generation["top_logprobs"] = 20
+    validate_single_controller_config(mc)
+
+
+def test_score_centering_with_filtered_sampling_requires_sampler_support_replay():
+    """Centering under filters is exact only over the sampler's realized support."""
+    mc = _make_master_config(loss_cfg=ClippedPGLossConfig(score_centering=True))
+    mc.token_capture.enabled = True
+    generation = mc.policy["generation"]
+    generation.update(
+        top_logprobs=20,
+        vllm_kwargs={"max_logprobs": 20},
+        temperature=1.0,
+        top_p=0.9,
+        top_k=20,
+    )
+    generation.setdefault("vllm_cfg", {})["logprobs_mode"] = "processed_logprobs"
+    with pytest.raises(ValueError, match="sampler_replay.enabled=true"):
         validate_single_controller_config(mc)
 
-    mc.policy["generation"]["top_p"] = 1.0
+
+def test_sampler_support_replay_without_score_centering():
+    """Replay alone reads the captured head, which must hold the whole kept set."""
+    mc = _make_master_config()
+    mc.token_capture.enabled = True
+    generation = mc.policy["generation"]
+    generation.update(
+        top_logprobs=19,
+        vllm_kwargs={"max_logprobs": 20},
+        temperature=1.0,
+        top_p=0.9,
+        top_k=20,
+        sampler_replay=SamplerReplayConfig(enabled=True),
+    )
+    generation.setdefault("vllm_cfg", {})["logprobs_mode"] = "processed_logprobs"
+    with pytest.raises(ValueError, match="top_logprobs >= policy.generation.top_k"):
+        validate_single_controller_config(mc)
+
+    generation["top_logprobs"] = 20
     validate_single_controller_config(mc)
 
 
@@ -1098,41 +1148,10 @@ class TestSetup:
         with pytest.raises(NotImplementedError, match="backend='future_backend'"):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
-    @pytest.mark.parametrize("token_capture_enabled", [False, True])
-    @pytest.mark.parametrize("snapshot_interval", [None, 1.0])
-    @pytest.mark.parametrize("fleet_health_enabled", [False, True])
-    def test_mooncake_checkpointing_rejects_generation_shard_restarts(
-        self,
-        patched_factories: dict[str, MagicMock],
-        token_capture_enabled: bool,
-        snapshot_interval: float | None,
-        fleet_health_enabled: bool,
-    ) -> None:
-        mc = _make_master_config()
-        mc.data_plane["backend"] = "mooncake_cpu"
-        mc.checkpointing.update(enabled=True, save_data_plane=True)
-        mc.async_rl.generation_fleet_health.enabled = fleet_health_enabled
-        mc.async_rl.generation_fleet_health.restart_dead_shards = True
-        mc.token_capture = TokenCaptureConfig(enabled=token_capture_enabled)
-        mc.rollout_checkpointing = RolloutCheckpointConfig(
-            snapshot_attempt_interval_s=snapshot_interval
-        )
-
-        with pytest.raises(ValueError, match="restart_dead_shards=false"):
-            setup_single_controller(mc, MagicMock(pad_token_id=0))
-
-        for factory in (
-            "setup_response_data",
-            "_build_clusters",
-            "_build_generation",
-            "_build_trainer",
-            "build_data_plane_client",
-        ):
-            patched_factories[factory].assert_not_called()
-
     @pytest.mark.parametrize(
         "backend,checkpointing_enabled,save_data_plane,restart_dead_shards",
         [
+            ("mooncake_cpu", True, True, True),
             ("mooncake_cpu", True, True, False),
             ("simple", True, True, True),
             ("mooncake_cpu", False, True, True),
@@ -1140,7 +1159,7 @@ class TestSetup:
             ("mooncake_cpu", True, False, True),
         ],
     )
-    def test_generation_shard_restart_guard_leaves_other_configs_unchanged(
+    def test_generation_shard_restarts_are_accepted_with_any_checkpointing(
         self,
         patched_factories: dict[str, MagicMock],
         backend: str,
@@ -1954,15 +1973,8 @@ class TestSetup:
                 {"use_importance_sampling_correction": False},
                 "use_importance_sampling_correction=true",
             ),
-            (
-                {
-                    "use_importance_sampling_correction": True,
-                    "force_on_policy_ratio": True,
-                },
-                "force_on_policy_ratio=false",
-            ),
         ],
-        ids=["no_is_correction", "forced_on_policy_ratio"],
+        ids=["no_is_correction"],
     )
     def test_ready_first_sampler_rejects_incompatible_loss_config(
         self,
@@ -1970,9 +1982,8 @@ class TestSetup:
         match: str,
         patched_factories,
     ):
-        # ready_first is only valid with use_importance_sampling_correction=true
-        # and force_on_policy_ratio=false; anything else is rejected at setup,
-        # before any factory allocates resources.
+        # ready_first requires use_importance_sampling_correction=true; anything
+        # else is rejected at setup, before any factory allocates resources.
         mc = _make_master_config(
             sampler_cfg=ReadyFirstSamplerConfig(max_staleness_versions=1),
             loss_cfg=ClippedPGLossConfig(**loss_overrides),
@@ -1983,6 +1994,18 @@ class TestSetup:
 
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
+
+    def test_ready_first_sampler_accepts_forced_ratio_for_grpo(self):
+        # GRPO takes one optimizer step per RL step, so the ratio is 1 anyway.
+        mc = _make_master_config(
+            sampler_cfg=ReadyFirstSamplerConfig(max_staleness_versions=1),
+            loss_cfg=ClippedPGLossConfig(
+                use_importance_sampling_correction=True,
+                force_on_policy_ratio=True,
+            ),
+        )
+
+        validate_single_controller_config(mc)
 
     def test_invalid_dynamo_config_fails_before_clusters(self, patched_factories):
         mc = _make_master_config(backend="dynamo")
@@ -2421,7 +2444,12 @@ class TestSetup:
         patched_factories["_build_trainer"].side_effect = _build_trainer
         patched_factories["setup_response_data"].side_effect = _setup_response_data
 
-        with self._gym_patches():
+        # Longer than the load's 30 s wait below: a trainer with no Megatron
+        # train_iters must not wait for the dataset at all.
+        with (
+            self._gym_patches(),
+            patch.object(sc_setup_mod, "_TRAINER_BUILD_DATASET_WAIT_S", 60.0),
+        ):
             actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         assert actor_args.dataloader is patched_factories["dataloader"]
@@ -2474,26 +2502,37 @@ class TestSetup:
         fake_policy.shutdown.assert_not_called()
         assert mc.policy["megatron_cfg"]["train_iters"] == 2
 
-    def test_gym_vllm_rebuilds_trainer_when_clamp_binds(
+    def test_gym_vllm_rebuilds_trainer_when_a_slow_load_shows_the_clamp_binds(
         self, patched_factories, capsys
     ):
-        """More steps than the data holds: the speculative trainer is replaced."""
+        """The dataset outlasts the trainer's wait and the data holds fewer steps than
+        asked for: the speculative trainer is replaced."""
         mc = self._gym_vllm_config(
             megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
         )
-        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
         train_iters_at_build: list[int] = []
         stale_policy = MagicMock(name="stale_policy")
         final_policy = patched_factories["fake_policy"]
         policies = iter([stale_policy, final_policy])
+        trainer_started = threading.Event()
 
         def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
             train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            trainer_started.set()
             return next(policies), 0.0
 
-        patched_factories["_build_trainer"].side_effect = _build_trainer
+        def _setup_response_data(*args: Any, **kwargs: Any) -> tuple[list[int], None]:
+            # Slow: not done until the speculative trainer has started.
+            assert trainer_started.wait(timeout=30)
+            return list(range(8)), None
 
-        with self._gym_patches():
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+        patched_factories["setup_response_data"].side_effect = _setup_response_data
+
+        with (
+            self._gym_patches(),
+            patch.object(sc_setup_mod, "_TRAINER_BUILD_DATASET_WAIT_S", 0.0),
+        ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
         # patched dataloader has len() == 4 → 2 * 4 = 8 < 1000.
@@ -2503,6 +2542,34 @@ class TestSetup:
         assert mc.grpo.max_num_steps == 8
         assert mc.policy["megatron_cfg"]["train_iters"] == 8
         assert "Rebuilding the trainer" in capsys.readouterr().out
+
+    def test_gym_vllm_builds_trainer_once_when_the_dataset_arrives_in_time(
+        self, patched_factories, capsys
+    ):
+        """More steps than the data holds, but the dataset is ready within the
+        trainer's wait: the trainer is built once, for the clamped count."""
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
+        )
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        train_iters_at_build: list[int] = []
+        fake_policy = patched_factories["fake_policy"]
+
+        def _build_trainer(*args: Any, **kwargs: Any) -> tuple[Any, float]:
+            train_iters_at_build.append(mc.policy["megatron_cfg"]["train_iters"])
+            return fake_policy, 0.0
+
+        patched_factories["_build_trainer"].side_effect = _build_trainer
+
+        with self._gym_patches():
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        # patched dataloader has len() == 4 -> 2 * 4 = 8 < 1000.
+        assert train_iters_at_build == [8]
+        fake_policy.shutdown.assert_not_called()
+        assert mc.grpo.max_num_steps == 8
+        assert mc.policy["megatron_cfg"]["train_iters"] == 8
+        assert "Rebuilding the trainer" not in capsys.readouterr().out
 
     def test_gym_vllm_dataset_load_failure_shuts_down_gym(self, patched_factories):
         mc = self._gym_vllm_config()
@@ -2517,6 +2584,28 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+        fake_gym_shards.shutdown.assert_called_once()
+
+    def test_gym_vllm_dataset_load_failure_before_trainer_starts_shuts_down_gym(
+        self, patched_factories
+    ):
+        """The load fails while the Megatron trainer waits for it: the trainer is
+        never built, and Gym is still shut down."""
+        mc = self._gym_vllm_config(
+            megatron_enabled=True, max_num_steps=1000, max_num_epochs=2
+        )
+        fake_gym_shards = MagicMock(name="nemo_gym_shards")
+        patched_factories["setup_response_data"].side_effect = RuntimeError(
+            "bad data path"
+        )
+
+        with (
+            self._gym_patches(fake_gym_shards),
+            pytest.raises(RuntimeError, match="bad data path"),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+        patched_factories["_build_trainer"].assert_not_called()
         fake_gym_shards.shutdown.assert_called_once()
 
     def test_gym_vllm_resume_builds_trainer_once_with_clamped_train_iters(
@@ -2809,7 +2898,9 @@ class TestSetup:
             assert actor_config.reward_penalty_config == mc.reward_penalties
             assert actor_config.tokenizer_config is None
             assert actor_config.thinking_tags is None
-        assert actor_kwargs == {"num_workers": 3}
+        assert actor_kwargs == {
+            "num_workers": 3,
+        }
         assert actor_args.finalizer_actors == fake_actors
         assert actor_args.tq_buffer._per_token_multimodal_fields == ()
         assert not hasattr(actor_args.rollout_manager, "_finalizer")
@@ -3587,10 +3678,12 @@ def test_forest_ppo_validates_policy_and_critic_before_rollout_manager(
     ):
         setup_single_controller(mc, MagicMock(pad_token_id=0))
     assert events == [trainer_check, value_check, ("rollout_manager", 3)]
-    for consumer in (trainer, value):
+    for consumer, method in (
+        (trainer, "validate_forest_execution_padding"),
+        (value, "configure_forest_router_padding"),
+    ):
         consumer.worker_group.run_all_workers_single_data.assert_called_once_with(
-            "validate_forest_execution_padding",
-            exclude_padding_from_router_stats=exclude_router_stats,
+            method, exclude_padding_from_router_stats=exclude_router_stats
         )
 
 
@@ -3854,6 +3947,36 @@ class TestNativeTQRecoverySetup:
             )
 
         policy.load_data_plane_checkpoint.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "field,value,error",
+        [
+            ("replay_manifest_digest", None, "missing replay_manifest_digest"),
+            ("replay_manifest_digest", "", "missing replay_manifest_digest"),
+            ("replay_group_count", None, "invalid replay_group_count"),
+            ("replay_group_count", -1, "invalid replay_group_count"),
+        ],
+    )
+    def test_rejects_tq_checkpoint_without_a_valid_replay_index(
+        self, tmp_path, field, value, error
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        metadata = _native_tq_metadata()
+        if value is None:
+            del metadata[field]
+        else:
+            metadata[field] = value
+
+        with pytest.raises(ValueError, match=error):
+            sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+                load_checkpoint=MagicMock(return_value=metadata),
+                last_checkpoint_path=str(checkpoint_path),
+                save_state=_save_state(),
+                partition_id="rollout_data",
+                sampler_name="in_order",
+            )
 
     def test_checkpoint_without_replay_artifacts_does_not_load_tq(
         self, tmp_path, capsys
@@ -4322,11 +4445,15 @@ def test_forest_startup_accepts_partial_step_policy(forest_config, fraction):
 
 
 @pytest.mark.parametrize("scope", ["scored_segment", "all_segments"])
-def test_forest_startup_accepts_reward_penalties(forest_config, scope):
-    # penalize_malformed_think_tag is rejected for any token capture run.
-    forest_config.reward_penalties = RewardPenaltyConfig(
-        penalize_unwanted_tokens=True, token_ids={"unwanted": [7]}
-    )
+@pytest.mark.parametrize(
+    "penalties",
+    [
+        {"penalize_unwanted_tokens": True, "token_ids": {"unwanted": [7]}},
+        {"penalize_malformed_think_tag": True},
+    ],
+)
+def test_forest_startup_accepts_reward_penalties(forest_config, scope, penalties):
+    forest_config.reward_penalties = RewardPenaltyConfig(**penalties)
     forest_config.token_capture.forest_penalty_scope = scope
     validate_single_controller_config(forest_config)
 
@@ -4345,6 +4472,21 @@ def _forest_ppo_config(mc, **adv_estimator):
 
 def test_forest_startup_accepts_ppo_with_gae(forest_config):
     validate_single_controller_config(_forest_ppo_config(forest_config))
+
+
+@pytest.mark.parametrize("scope", ["group", "step"])
+def test_whiten_execution_padding_requires_step_padding(forest_config, scope):
+    mc = _forest_ppo_config(
+        forest_config, normalize_over="all_rows", whiten_execution_padding=True
+    )
+    mc.token_capture = mc.token_capture.model_copy(
+        update={"forest_padding_scope": scope}
+    )
+    if scope == "step":
+        validate_single_controller_config(mc)
+    else:
+        with pytest.raises(ValueError, match="forest_padding_scope=step"):
+            validate_single_controller_config(mc)
 
 
 def test_forest_startup_rejects_split_value_training(forest_config):
@@ -4658,6 +4800,7 @@ def test_minf_image_preprocessing_emits_float32_pixels():
             }
         },
         {"megatron_cfg": {"enabled": True, "use_fused_linear_logprobs": True}},
+        {"megatron_cfg": {"enabled": True, "reuse_logits_storage": True}},
     ],
 )
 def test_score_centering_rejects_unsupported_trainer_logits(backend_cfg):
@@ -4744,7 +4887,7 @@ def test_score_centering_rejects_invalid_top_logprobs(count):
         validate_single_controller_config(mc)
 
 
-def test_generation_top_logprobs_requires_score_centering():
+def test_generation_top_logprobs_requires_score_centering_or_replay():
     mc = _make_master_config()
     mc.token_capture.enabled = True
     mc.policy["generation"]["top_logprobs"] = 4

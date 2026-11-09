@@ -1006,6 +1006,30 @@ def test_rollout_manager_forwards_log_full_result_tables():
     assert manager._impl._log_full_result_tables is True
 
 
+@pytest.mark.parametrize("backend,accepted", [("vllm", True), ("megatron", False)])
+def test_nemo_gym_rollout_accepts_top_k_only_with_vllm(backend, accepted):
+    """NeMo-Gym requests leave top_k unset; only NeMo-RL's vLLM server pins it."""
+    kwargs = {
+        "tokenizer": None,
+        "task_to_env": {},
+        "num_generations_per_prompt": 1,
+        "max_seq_len": 1,
+        "rollout_recovery_config": RolloutRecoveryConfig(),
+        "generation_config": {
+            "stop_strings": None,
+            "stop_token_ids": None,
+            "top_k": 20,
+            "backend": backend,
+        },
+        "use_nemo_gym": True,
+    }
+    if accepted:
+        RolloutManager(**kwargs)
+    else:
+        with pytest.raises(AssertionError, match="top_k"):
+            RolloutManager(**kwargs)
+
+
 def _nemo_gym_impl(
     mask_env_flagged_samples,
     reward_penalty_config=None,
@@ -1119,6 +1143,7 @@ def _mask_gate_receipt_result():
     return {
         "message_log": [],
         "receipt": {"capture_key": "r0", "manifest": []},
+        "scored_text_checks": (False, True),
         "rollout_id": "r0",
         "full_result": {
             "reward": 1.0,
@@ -2313,7 +2338,7 @@ def _make_capture_manager(
             generation_indices=None,
             on_completion=None,
             recovery_granularity=RecoveryGranularity.SIBLING,
-            gym_instance_id=None,
+            environment_instance_id=None,
             dispatch_recorder=None,
         ):
             self.seen_rollout_ids = rollout_ids
@@ -2539,9 +2564,14 @@ class TestGenerateForFinalizationFlow:
             raise RuntimeError("rollout exploded")
 
         mgr = _make_capture_manager(buf, on_run=_boom)
+        events = []
+        mgr.recovery_ledger.set_event_sink(
+            lambda event, **fields: events.append((event, fields.get("reason")))
+        )
         with pytest.raises(RuntimeError, match="rollout exploded"):
             _run(mgr.generate_for_finalization({"prompt": "p", "idx": 0}))
         assert len(buf.abort_calls) == 1
+        assert ("attempt_abandoned", "failed") in events
 
     def test_failure_after_rollout_aborts_the_reservation(self, monkeypatch):
         buf = _FakeCaptureBuffer()
@@ -2571,7 +2601,7 @@ class TestGenerateForFinalizationFlow:
                 generation_indices=None,
                 on_completion=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
-                gym_instance_id=None,
+                environment_instance_id=None,
                 dispatch_recorder=None,
             ):
                 del _sample, recovery_granularity
@@ -2685,7 +2715,7 @@ class TestGenerateForFinalizationFlow:
                 generation_indices=None,
                 on_completion=None,
                 recovery_granularity=RecoveryGranularity.SIBLING,
-                gym_instance_id=None,
+                environment_instance_id=None,
                 dispatch_recorder=None,
             ):
                 indices = list(generation_indices)

@@ -62,6 +62,7 @@ from nemo_rl.data.multimodal_utils import (
     uses_image_placeholder,
 )
 from nemo_rl.data_plane.schema import MASK_SAMPLE
+from nemo_rl.distributed.actor_environments import NEMO_GYM_ACTOR_FQN
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
@@ -125,6 +126,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
 )
+from nemo_rl.experience.reward_penalties import scored_text_checks
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
     should_use_async_rollouts,
@@ -155,7 +157,6 @@ from nemo_rl.utils.routed_experts_codec import (
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
-NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
 # How long the Gym servers get to exit, from the SIGINT NemoGym.shutdown() sends
 # them, before whatever is still running is killed. At the end of a run
@@ -2105,6 +2106,7 @@ Depending on your data shape, you may want to change these values."""
             "full_result": nemo_gym_result,
             "rollout_id": rollout_id,
             "receipt": receipt,
+            "scored_text_checks": scored_text_checks(nemo_gym_result),
         }
 
     async def _postprocess_captured_history(self, row: dict, result: dict) -> dict:
@@ -2123,7 +2125,6 @@ Depending on your data shape, you may want to change these values."""
             resolve_scored_terminal,
             resolve_selection_policy,
         )
-        from nemo_rl.experience.reward_penalties import scored_text_checks
         from nemo_rl.experience.rollout_reassembler import (
             ActionOutputFlags,
             RolloutSelection,

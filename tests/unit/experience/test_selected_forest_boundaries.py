@@ -1356,7 +1356,7 @@ _UNWANTED = 54321
 
 @pytest.mark.parametrize("penalty", ["unwanted_token", "malformed_think_tag"])
 @pytest.mark.parametrize("scope", ["scored_segment", "all_segments"])
-@pytest.mark.parametrize("hit", [None, "scored", "other"])
+@pytest.mark.parametrize("hit", [None, "scored", "other", "both"])
 def test_forest_penalty_scope_combines_segment_token_checks(
     forest: ForestCapture,
     monkeypatch: pytest.MonkeyPatch,
@@ -1367,10 +1367,11 @@ def test_forest_penalty_scope_combines_segment_token_checks(
     # Calls 0-1 form the scored segment; call 2 opens an independent root.
     complete = gym.RolloutTokenCapture.complete_call
     completed: list[None] = []
+    hit_calls = {None: (), "scored": (2,), "other": (3,), "both": (2, 3)}[hit]
 
     def tagged_completion(capture: Any, active: Any, **kwargs: Any) -> Any:
         completed.append(None)
-        if hit is not None and len(completed) == (2 if hit == "scored" else 3):
+        if len(completed) in hit_calls:
             kwargs["generated_token_ids"] = [_UNWANTED] * len(
                 kwargs["generated_token_ids"]
             )
@@ -1406,7 +1407,9 @@ def test_forest_penalty_scope_combines_segment_token_checks(
         canonical_sample_ids=["group_g0"],
         logical_selections=[selection(records)],
     )
-    penalized = hit == "scored" or (hit == "other" and scope == "all_segments")
+    penalized = hit in ("scored", "both") or (
+        hit == "other" and scope == "all_segments"
+    )
     assert result.valid_row_count == 2
     assert [obs.reward for obs in result.reward_observations] == [
         0.0 if penalized else 1.0
