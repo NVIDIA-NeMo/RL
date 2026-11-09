@@ -20,7 +20,10 @@ planning for non-trivial reshard layouts.
 """
 
 import inspect
+import math
 from contextlib import nullcontext
+from importlib import import_module
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -51,6 +54,64 @@ class _ProcessGroup:
 
 class _Stream:
     cuda_stream = 0xC0FFEE
+
+
+@pytest.mark.parametrize("source_rank", [False, True])
+@pytest.mark.parametrize(
+    "src_shape,dst_shape,native_available,override,expected",
+    [
+        ((8,), (8,), True, None, "native"),
+        ((2, 4), (4, 2), True, None, "native"),
+        ((2, 2, 2), (2, 4), True, None, "python"),
+        ((2, 4), (2, 2, 2), True, None, "python"),
+        ((2, 2, 2), (2, 2, 2), True, None, "python"),
+        ((2, 4), (4, 2), False, None, "python"),
+        ((2, 4), (4, 2), True, "python", "python"),
+        ((2, 2, 2), (2, 4), True, "golden", "golden"),
+        ((2, 4), (4, 2), True, "both", "golden"),
+    ],
+)
+def test_dispatch_selects_the_same_supported_path_on_both_endpoints(
+    monkeypatch: pytest.MonkeyPatch,
+    source_rank: bool,
+    src_shape: tuple[int, ...],
+    dst_shape: tuple[int, ...],
+    native_available: bool,
+    override: str | None,
+    expected: str,
+) -> None:
+    dispatcher = import_module("nemo_rl.weight_sync.xferdtensor")
+    backends = {name: Mock() for name in ("native", "python", "golden")}
+    monkeypatch.setattr(
+        dispatcher, "_reshard", backends["native"] if native_available else None
+    )
+    monkeypatch.setattr(impl, "xferdtensor_python_impl", backends["python"])
+    monkeypatch.setattr(dispatcher, "xferdtensor_golden", backends["golden"])
+    monkeypatch.setattr(dispatcher, "_XFERDTENSOR_PATH_LOGGED", False)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    monkeypatch.setenv(
+        "NRL_XFERDTENSOR_PYTHON", "1" if override in ("python", "both") else "0"
+    )
+    monkeypatch.setenv(
+        "NRL_XFERDTENSOR_GOLDEN", "1" if override in ("golden", "both") else "0"
+    )
+    tensor = _TensorRef(torch.ones(1), (8, 4))
+    dispatcher.xferdtensor(
+        tensor if source_rank else None,
+        _Mesh(list(range(math.prod(src_shape))), src_shape),
+        (Replicate(),) * len(src_shape),
+        None if source_rank else tensor,
+        _Mesh(list(range(math.prod(dst_shape))), dst_shape),
+        (Replicate(),) * len(dst_shape),
+        _ProcessGroup(),
+        _Stream(),
+    )
+
+    for name, backend in backends.items():
+        if name == expected:
+            backend.assert_called_once()
+        else:
+            backend.assert_not_called()
 
 
 @pytest.fixture(autouse=True)
