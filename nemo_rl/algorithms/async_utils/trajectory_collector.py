@@ -978,8 +978,30 @@ class AsyncTrajectoryCollector:
             )
             try:
                 with self._threads_lock:
-                    self._inflight_threads.add(worker)
-                    self._live_threads.add(worker)
+                    # prepare_for_refit clears the pause under this lock, so the
+                    # check and the registration are atomic with respect to it.
+                    # A refit that began, or began and finished, since the pause
+                    # check above would otherwise find no in-flight worker to
+                    # wait for, and this rollout would run across or after the
+                    # weight update labeled with the old
+                    # generation_weight_version.
+                    refit_since_check = (
+                        not self._refit_pause_cleared.is_set()
+                        or self.current_weight_version != generation_weight_version
+                    )
+                    if not refit_since_check:
+                        self._inflight_threads.add(worker)
+                        self._live_threads.add(worker)
+                if refit_since_check:
+                    # Nothing was dispatched: hand the whole batch back so the
+                    # next pass generates it with the post-refit version.
+                    print(
+                        f"⏸️ Refit started after weight version "
+                        f"{generation_weight_version} was captured; deferring "
+                        f"target {reserved_target}"
+                    )
+                    self._release_target(reserved_target)
+                    return batch
                 if dispatched_task_indices:
                     with self._outstanding_lock:
                         self._outstanding_task_indices.update(dispatched_task_indices)
@@ -1058,8 +1080,11 @@ class AsyncTrajectoryCollector:
         start_time = time.time()
         print("🔄 Preparing for refit: pausing new generations...")
 
-        # Pause new generation starts
-        self._refit_pause_cleared.clear()
+        # Pause new generation starts. Cleared under the lock that registers
+        # rollout workers so a worker is either registered before the pause
+        # (and waited for below) or sees the pause and does not start.
+        with self._threads_lock:
+            self._refit_pause_cleared.clear()
         self._generation_pause_requested_for_refit = False
         self._generation_paused_for_refit = False
         print("⏸️ New generation starts paused")
