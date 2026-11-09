@@ -173,10 +173,11 @@ runs the same DAPO recipe with asynchronous generation on dedicated nodes:
   colocated recipe as shipped. Ten further steps with
   `in_flight_weight_updates: true` ran clean (step-10 accuracy 0.4500); the
   switch stays off in the recipe pending a longer run.
-- **Checkpointing**: the 12 training nodes of this layout cannot write a
-  checkpoint — the save copies the CPU-offloaded optimizer state on top of a
-  650–708 GB host-memory steady state and the nodes run out of memory, as the
-  colocated 12-node recipe does. With 16 training nodes
+- **Checkpointing**: the recipe ships with `checkpointing.enabled: false`
+  because the 12 training nodes of this layout cannot write a checkpoint — the
+  save copies the CPU-offloaded optimizer state on top of a 650–708 GB
+  host-memory steady state and the nodes run out of memory, as the colocated
+  12-node recipe does. With 16 training nodes
   (`policy.dtensor_cfg.expert_parallel_size: 64`, `cluster.num_nodes: 18`,
   generation `resources.num_nodes: 2`, `max_num_seqs: 192`) the same recipe ran
   all 50 steps with a checkpoint and a validation every 10 steps in one

@@ -29,6 +29,9 @@ policy:
       resources:
         num_nodes: 4                  # generation nodes; the trainer gets cluster.num_nodes - 4
         gpus_per_node: 4
+checkpointing:
+  enabled: false                    # 12 training nodes run out of host memory at the first save; enable only with the
+                                    # 16-training-node layout described in the guide (EP64, 18 nodes, 2 generation nodes)
 cluster:
   num_nodes: 16
   gpus_per_node: 4
