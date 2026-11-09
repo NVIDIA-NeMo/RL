@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import io
 import json
@@ -32,6 +33,7 @@ import shutil
 import time
 import warnings
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -91,6 +93,11 @@ from nemo_rl.data_plane import (
     DATA_PLANE_CHECKPOINT_SCHEMA_VERSION,
 )
 from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.data_plane.checkpoint import (
+    CheckpointCapture,
+    capture_checkpoint,
+    checkpoint_io,
+)
 from nemo_rl.environments.checkpointing.interfaces import (
     EnvironmentSnapshot,
 )
@@ -107,6 +114,14 @@ from nemo_rl.utils.path_utils import (
     save_checkpoint_object,
 )
 from nemo_rl.utils.timer import TimeoutChecker
+
+
+@dataclass(frozen=True)
+class SnapshotCapture:
+    """Captured recovery state and its temporary data-plane ownership."""
+
+    state: CapturedRolloutState
+    data_plane: CheckpointCapture | None
 
 
 async def write_controller_sidecars(
@@ -266,7 +281,8 @@ class RolloutSnapshotter(_UsesRolloutParts):
         replay_metadata: Optional[TQReplayMetadataState] = None,
         rollout_recovery_payload_sha256: Optional[str] = None,
         rollout_recovery_group_count: Optional[int] = None,
-    ) -> None:
+        allow_deferred: bool = False,
+    ) -> CheckpointCapture | None:
         """Save a required TQ snapshot inside an SC checkpoint bundle.
 
         A sampler with replay-buffer recovery writes an authoritative native
@@ -326,6 +342,14 @@ class RolloutSnapshotter(_UsesRolloutParts):
         started = time.monotonic()
         print(f"data-plane checkpoint save started: {checkpoint_dir}", flush=True)
         try:
+            if allow_deferred:
+                captured = await capture_checkpoint(
+                    self._dp_client,
+                    checkpoint_dir=checkpoint_dir,
+                    metadata=metadata,
+                )
+                if captured is not None:
+                    return captured
             await call_data_plane(
                 self._dp_client,
                 "save_checkpoint",
@@ -354,6 +378,25 @@ class RolloutSnapshotter(_UsesRolloutParts):
         *,
         additional_expected_staging_keys: Optional[set[str]] = None,
     ) -> CapturedRolloutState:
+        """Save a synchronous data-plane cut and return its recovery state."""
+        captured = await self._capture(
+            cut,
+            checkpoint_path,
+            kind,
+            additional_expected_staging_keys=additional_expected_staging_keys,
+            allow_deferred=False,
+        )
+        return captured.state
+
+    async def _capture(
+        self,
+        cut: DataPlaneMutationCut,
+        checkpoint_path: PathLike,
+        kind: CheckpointKind,
+        *,
+        additional_expected_staging_keys: Optional[set[str]] = None,
+        allow_deferred: bool,
+    ) -> SnapshotCapture:
         """Capture restart-facing controller state and save TQ under the barrier.
 
         A trainer checkpoint saves TQ only with ``checkpointing.save_data_plane``,
@@ -379,6 +422,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
         training_owned_groups: list[TQReplayGroupMetadata] = []
         staging_row_count = 0
         tq_save_seconds = 0.0
+        data_plane_capture = None
         if snapshot or self._master_config.checkpointing.save_data_plane:
             training_owned_groups = self._buffer.training_owned_replay_groups()
             if training_owned_groups and not snapshot:
@@ -430,7 +474,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     additional_expected_staging_keys=additional_expected_staging_keys,
                 )
             tq_save_started = time.monotonic()
-            await self._save_data_plane_checkpoint(
+            data_plane_capture = await self._save_data_plane_checkpoint(
                 checkpoint_path,
                 train_steps=self._read_progress().train_steps,
                 trainer_version=self._read_progress().trainer_version,
@@ -438,8 +482,18 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 replay_metadata=replay_metadata,
                 rollout_recovery_payload_sha256=recovery_digest,
                 rollout_recovery_group_count=recovery_group_count,
+                allow_deferred=allow_deferred,
             )
             tq_save_seconds = time.monotonic() - tq_save_started
+            if data_plane_capture is not None:
+                try:
+                    # These containers outlive the barrier while dispatch advances.
+                    dataloader_state = copy.deepcopy(dataloader_state)
+                    replacement_reserve = copy.deepcopy(replacement_reserve)
+                    replay_metadata = copy.deepcopy(replay_metadata)
+                except BaseException:
+                    await checkpoint_io(data_plane_capture.release)
+                    raise
             # A trainer checkpoint holds no environment state, so when the
             # environment keeps some it does not stand in for the next rollout
             # snapshot.
@@ -447,7 +501,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 self._last_snapshot_mutation_version = (
                     self._data_plane_checkpoint_barrier.mutation_version
                 )
-        return CapturedRolloutState(
+        state = CapturedRolloutState(
             dataloader_state=dataloader_state,
             sampler_dispatch_index=self._sampler.dispatch_index,
             next_nemo_gym_task_index=next_nemo_gym_task_index,
@@ -465,6 +519,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
             mutation_version=self._data_plane_checkpoint_barrier.mutation_version,
             tq_save_seconds=tq_save_seconds,
         )
+        return SnapshotCapture(state=state, data_plane=data_plane_capture)
 
     def _begin_optimizer_commit(self) -> None:
         """Mark the step's optimizer update as applied until its counters publish."""
@@ -685,6 +740,10 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     prepare_snapshot_paths, anchor_path
                 )
             trainer_publish_wait_seconds = 0.0
+            captured: SnapshotCapture | None = None
+            capture_released = False
+            tq_persist_seconds = 0.0
+            tq_release_seconds = 0.0
             try:
                 environment_pause_started = time.monotonic()
                 async with contextlib.AsyncExitStack() as environment_phase:
@@ -731,20 +790,32 @@ class RolloutSnapshotter(_UsesRolloutParts):
                             environment_staging_keys = (
                                 await environment_snapshot.check_against_cut(cut)
                             )
-                        snapshot_cut = await self.capture(
+                        captured = await self._capture(
                             cut,
                             tmp_path,
                             "rollout_snapshot",
                             additional_expected_staging_keys=set(
                                 environment_staging_keys
                             ),
+                            allow_deferred=True,
                         )
+                        snapshot_cut = captured.state
                     barrier_released = time.monotonic()
                 # Dispatch reopens and the environment resumes when that block
                 # exits, so this spans every second new rollouts could not start.
                 environment_paused_seconds = (
                     time.monotonic() - environment_pause_started
                 )
+                # Persist before a staged snapshot is adopted: adoption renames
+                # tmp_path, which holds the captured data-plane directory.
+                if captured.data_plane is not None:
+                    persist_started = time.monotonic()
+                    await checkpoint_io(captured.data_plane.persist)
+                    tq_persist_seconds = time.monotonic() - persist_started
+                    release_started = time.monotonic()
+                    await checkpoint_io(captured.data_plane.release)
+                    tq_release_seconds = time.monotonic() - release_started
+                    capture_released = True
                 if final_path is None:
                     # Only now wait for step_N's policy write and rename; a failed
                     # write re-raises here.
@@ -786,6 +857,18 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     ),
                 )
             except BaseException:
+                if (
+                    captured is not None
+                    and captured.data_plane is not None
+                    and not capture_released
+                ):
+                    try:
+                        await checkpoint_io(captured.data_plane.release)
+                    except Exception as error:
+                        warnings.warn(
+                            f"Failed to release captured TQ snapshot: {error}",
+                            stacklevel=2,
+                        )
                 if tmp_path.exists():
                     await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
                 raise
@@ -796,7 +879,10 @@ class RolloutSnapshotter(_UsesRolloutParts):
             checkpoint_metrics = {
                 "snapshot_sequence": float(snapshot_sequence),
                 "total_save_seconds": save_completed - save_started,
-                "tq_save_seconds": snapshot_cut.tq_save_seconds,
+                "tq_save_seconds": snapshot_cut.tq_save_seconds + tq_persist_seconds,
+                "tq_capture_seconds": snapshot_cut.tq_save_seconds,
+                "tq_persist_seconds": tq_persist_seconds,
+                "tq_release_seconds": tq_release_seconds,
                 "barrier_wait_seconds": barrier_acquired - barrier_requested,
                 "exclusive_hold_seconds": barrier_released - barrier_acquired,
                 "sidecar_save_seconds": sidecar_save_seconds,

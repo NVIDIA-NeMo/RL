@@ -758,8 +758,8 @@ failed or cancelled capture cannot confirm its own release, it raises
 cancellation; the caller has no handle to retry with and must stop
 checkpointing.
 
-This API requires caller integration: setting the flag alone does not change
-the existing synchronous `save_checkpoint` calls. Other backends return `None`.
+Existing `save_checkpoint` calls remain synchronous. Rollout snapshots use the
+optional capture API as described below. Other backends return `None`.
 SimpleStorage capture requires SSD offload disabled and writes the existing
 native TQ checkpoint format, so restore does not need a new format.
 
@@ -810,6 +810,28 @@ failure cleanup and restore into fresh actors, runs in
 ```bash
 bash tests/functional/data_plane_simple_checkpoint_cpu.sh
 ```
+
+### Rollout snapshot integration
+
+With `data_plane.simple.async_checkpoint: true`, `RolloutSnapshotter` captures
+the TQ view and matching controller metadata under its mutation barrier, then
+resumes the environment and dispatch before persisting the retained shards.
+Recovery validation and controller serialization remain inside capture. The
+snapshot is published only after persistence and all recovery sidecars finish.
+Full trainer checkpoints retain their synchronous data-plane save path.
+
+Temporary capture ownership lives in `SnapshotCapture`, separate from the
+serializable `CapturedRolloutState`. Failures release the retained views after
+outstanding writes settle and do not publish a partial snapshot.
+
+The snapshot-save lock remains held until publication, so optimizer commits may
+still wait. This setting makes persistence asynchronous relative to rollout
+dispatch and live TQ traffic, not relative to every training operation.
+
+The `timing/rollout_checkpoint` metrics split `tq_capture_seconds`,
+`tq_persist_seconds`, and `tq_release_seconds`; `tq_save_seconds` includes capture
+and persistence. Compare these with `environment_paused_seconds` and
+`exclusive_hold_seconds` to measure time removed from the pause.
 
 ## Async path (proposed)
 
