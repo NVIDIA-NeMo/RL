@@ -789,6 +789,18 @@ def _run_rayjob(
     except Exception as exc:  # noqa: BLE001
         _explain_and_exit(exc, context=f"rayjob {job_name} apply failed")
 
+    # Work around intermittent KubeRay HTTPMode stalls where the RayCluster is
+    # provisioned but the RayJob controller never posts the driver entrypoint.
+    # Run this before both --wait and --no-wait return so background jobs do not
+    # silently sit in Running with an empty dashboard job list.
+    try:
+        k8s.ensure_rayjob_driver_submitted(job_name, namespace, log=click.echo)
+    except (TimeoutError, RuntimeError) as exc:
+        click.echo(
+            f"[run --rayjob] warning: driver-submit guard failed: {exc}",
+            err=True,
+        )
+
     job_id_cmd = f"$(kubectl get rayjob {job_name} -n {namespace} -o jsonpath='{{.status.jobId}}')"
     click.echo(
         f"follow:  kubectl get rayjob {job_name} -n {namespace} -w\n"
