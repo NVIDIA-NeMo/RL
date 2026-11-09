@@ -55,6 +55,8 @@ kubectl apply -f ../examples/endpoint-registry-rbac.yaml
 kubectl apply -f ../examples/rayjob-monolithic.yaml      # single-cluster RayJob
 kubectl apply -f ../examples/disagg-rayclusters.yaml      # disagg via KubeRay
 kubectl apply -f ../examples/disagg-jobset.yaml           # disagg via JobSet
+kubectl apply -f ../examples/rayjob-grpo.yaml             # GRPO via KubeRay + k8s_entry.sh
+kubectl apply -f ../examples/pytorchjob-grpo.yaml         # GRPO via Kubeflow PyTorchJob + k8s_entry.sh
 ```
 
 ### Testing locally with kind
@@ -175,6 +177,8 @@ infra/
 │       └── kuberay-operator.yaml
 ├── examples/                          # Workload examples
 │   ├── rayjob-monolithic.yaml        # Single-cluster RayJob (1 GPU)
+│   ├── rayjob-grpo.yaml              # GRPO via KubeRay + k8s_entry.sh
+│   ├── pytorchjob-grpo.yaml          # GRPO via Kubeflow PyTorchJob + k8s_entry.sh
 │   ├── disagg-rayclusters.yaml       # Disagg RL + Gym via KubeRay RayClusters
 │   ├── disagg-jobset.yaml            # Disagg RL + Gym via JobSet (no KubeRay)
 │   ├── endpoint-registry-rbac.yaml   # RBAC for ConfigMap service discovery
