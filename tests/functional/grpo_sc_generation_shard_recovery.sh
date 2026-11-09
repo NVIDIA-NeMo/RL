@@ -457,13 +457,21 @@ fi
 VICTIM=${GEN_PIDS[0]}
 VICTIM_CMD=$(tr '\0' ' ' < "/proc/$VICTIM/cmdline" 2>/dev/null | sed -E 's/ +$//')
 if [[ "$FREEZE_VICTIM" == "true" ]]; then
-    echo "[recovery] freezing generation shard pid=$VICTIM of ${#GEN_PIDS[@]}: $VICTIM_CMD"
-    kill -STOP "$VICTIM"
+    # The collective runs in the child EngineCore. Stopping only its Ray actor
+    # leaves the GPU participant running and tests an unanswered RPC instead.
+    # Fleet-health runs enable Ray's dedicated worker process groups.
+    VICTIM_PGID=$(ps -o pgid= -p "$VICTIM" | tr -d ' ')
+    if [[ "$VICTIM_PGID" != "$VICTIM" ]]; then
+        echo "[recovery] FAIL: actor $VICTIM has no dedicated process group (pgid=$VICTIM_PGID)"
+        exit 1
+    fi
+    echo "[recovery] freezing generation shard pgid=$VICTIM_PGID of ${#GEN_PIDS[@]}: $VICTIM_CMD"
+    kill -STOP -- "-$VICTIM_PGID"
     sleep 2
-    # State T in field 3 of /proc/PID/stat is the only proof it actually stopped. `kill -0`
+    # State T in /proc/PID/status is proof it actually stopped. `kill -0`
     # succeeds for a running process too, so it cannot tell the two apart -- and a victim
     # that kept running would make this test silently assert nothing.
-    VICTIM_STATE=$(awk '{print $3}' "/proc/$VICTIM/stat" 2>/dev/null || echo "gone")
+    VICTIM_STATE=$(awk '/^State:/{print $2}' "/proc/$VICTIM/status" 2>/dev/null || echo "gone")
     if [[ "$VICTIM_STATE" != "T" ]]; then
         echo "[recovery] FAIL: victim $VICTIM is in state '$VICTIM_STATE', expected T (stopped)."
         echo "[recovery] Without a genuinely frozen rank the collective never stalls and the"
@@ -702,7 +710,9 @@ fi
 
 if (( EXIT_CODE != 0 )); then
     echo "[recovery] FAIL: a surviving shard should have carried the run to completion"
-    grep -E "Error|Traceback|NoSurvivingShards|RayActorError" "$RUN_LOG" | tail -20
+    # Keep stack frames and NCCL warnings; filtering for exception names hides
+    # the cause of failures during communicator reconstruction.
+    cat "$RUN_LOG"
     exit 1
 fi
 
@@ -730,8 +740,8 @@ uv run tests/check_metrics.py "$JSON_METRICS" \
     'max(data["train/reward"]) > 0'
 
 if [[ "$RESTART_DEAD_SHARDS" == "true" ]]; then
-    # Completion plus one rebuild only proves the fleet shrank and carried on. Coming
-    # back is a different claim and needs its own evidence.
+    # Completion alone only proves the survivors carried on. Re-admission needs
+    # evidence that the replacement joined the communicator and became healthy.
     if ! grep -q "supervisor: restarting generation shard" "$RUN_LOG"; then
         echo "[recovery] FAIL: restarts enabled but no restart was ever attempted"
         grep -E "supervisor|fleet:" "$RUN_LOG" | tail -20; exit 1
@@ -740,16 +750,17 @@ if [[ "$RESTART_DEAD_SHARDS" == "true" ]]; then
         echo "[recovery] FAIL: the restart never produced a working engine"
         grep -E "supervisor|fleet:" "$RUN_LOG" | tail -20; exit 1
     fi
-    # Two rebuilds: one dropping the dead shard, one taking the replacement back.
-    REBUILDS=$(grep -Ec "$REBUILD_RE" "$RUN_LOG")
-    if (( REBUILDS < 2 )); then
-        echo "[recovery] FAIL: $REBUILDS rebuild(s); re-admission needs a second one."
-        echo "[recovery] The shard restarted but was never let back into the refit."
+    # A fast restart can finish between two refits, requiring just one rebuild
+    # over the full fleet. Check its membership rather than counting rebuilds.
+    EXPECTED_SHARDS=$(seq -s ', ' 0 $((GEN_GPUS - 1)))
+    if ! grep -Eq "$REBUILD_RE \\[$EXPECTED_SHARDS\\]" "$RUN_LOG"; then
+        echo "[recovery] FAIL: no communicator rebuild included the full fleet [$EXPECTED_SHARDS]"
         grep -E "$REBUILD_RE|supervisor|fleet:" "$RUN_LOG" | tail -20; exit 1
     fi
     # STALE -> HEALTHY only happens via a completed refit, so this is the end of the
     # handover rather than just the engine being up.
-    if ! grep -q "stale -> healthy" "$RUN_LOG"; then
+    RESTARTED_SHARD=$(grep -m1 -oE 'supervisor: shard [0-9]+ back up at' "$RUN_LOG" | awk '{print $3}')
+    if ! grep -q "gen_fleet: shard $RESTARTED_SHARD stale -> healthy" "$RUN_LOG"; then
         echo "[recovery] FAIL: the replacement never returned to the serving set"
         grep -E "fleet: shard" "$RUN_LOG" | tail -20; exit 1
     fi
