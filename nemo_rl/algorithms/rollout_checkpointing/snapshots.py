@@ -377,32 +377,18 @@ class RolloutSnapshotter(_UsesRolloutParts):
         kind: CheckpointKind,
         *,
         additional_expected_staging_keys: Optional[set[str]] = None,
-    ) -> CapturedRolloutState:
-        """Save a synchronous data-plane cut and return its recovery state."""
-        captured = await self._capture(
-            cut,
-            checkpoint_path,
-            kind,
-            additional_expected_staging_keys=additional_expected_staging_keys,
-            allow_deferred=False,
-        )
-        return captured.state
-
-    async def _capture(
-        self,
-        cut: DataPlaneMutationCut,
-        checkpoint_path: PathLike,
-        kind: CheckpointKind,
-        *,
-        additional_expected_staging_keys: Optional[set[str]] = None,
-        allow_deferred: bool,
+        allow_deferred: bool = False,
     ) -> SnapshotCapture:
-        """Capture restart-facing controller state and save TQ under the barrier.
+        """Capture restart-facing controller state under the mutation barrier.
 
         A trainer checkpoint saves TQ only with ``checkpointing.save_data_plane``,
         and refuses rows an unfinished streamed step still owns. A rollout
         snapshot always saves TQ and re-indexes those rows in the persisted cut
         only; the live trainer keeps accumulating gradients without modification.
+
+        With ``allow_deferred``, a supporting backend retains a stable TQ view.
+        The caller must persist it before publication and release it after all
+        persistence work settles. Other backends save inside this call.
         """
         cut.require_live()
         if self._rollout_runtime.shortfall_reconciliation_pending:
@@ -790,7 +776,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
                             environment_staging_keys = (
                                 await environment_snapshot.check_against_cut(cut)
                             )
-                        captured = await self._capture(
+                        captured = await self.capture(
                             cut,
                             tmp_path,
                             "rollout_snapshot",
