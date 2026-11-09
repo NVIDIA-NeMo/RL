@@ -239,6 +239,12 @@ response token and values do not bootstrap across rows, which matters when
 
 Batch cardinality counts logical rollouts; GRPO advantages are per logical rollout, PPO advantages are per physical row. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` or `ppo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping and message-level advantage overrides remain unsupported for forest training. Reward penalties apply once per logical rollout: text checks read the scored response, token checks the scored segment, and `token_capture.forest_penalty_scope: all_segments` extends token checks to every segment. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
 
+`token_capture.invalidate_rewritten_history` (Forest only, vLLM generation;
+default `false`): a later call whose history holds assistant output that matches
+no captured call is still served, but its capture fails, which masks the
+rollout. A subagent's first call holds no assistant output and roots its segment
+as usual.
+
 `token_capture.forest_padding_scope: step` (Forest only; default `group`) pads
 each training batch once to the row multiple, instead of padding every
 published group. With few rollouts per group, per-group padding can multiply

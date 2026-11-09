@@ -11,7 +11,10 @@ from nemo_gym.token_id_capture.replay import replay_context, summarize_replay
 from nemo_gym.token_id_capture.staging.records import CaptureAdmission
 from pydantic import ValidationError
 
-from nemo_rl.models.generation.capture_context import decide_capture_input
+from nemo_rl.models.generation.capture_context import (
+    decide_capture_input,
+    rewrites_history,
+)
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -157,6 +160,46 @@ def test_managed_root_preserves_media_verification_without_serving_prefix():
         )
 
 
+SUBAGENT_TASK = [
+    {"role": "system", "content": "subagent instructions"},
+    {"role": "user", "content": "delegated task"},
+]
+
+
+@pytest.mark.parametrize(
+    "items,root_reason,expected",
+    [
+        # Rewritten history: assistant output that matches no captured call.
+        (HISTORY + [OBSERVATION], "no_prefix_match", True),
+        (HISTORY + [OBSERVATION], "non_user_suffix", True),
+        (HISTORY + [OBSERVATION], "ambiguous_candidate", True),
+        # A subagent's first call and the rollout's first call are kept.
+        (SUBAGENT_TASK, "no_prefix_match", False),
+        (HISTORY + [OBSERVATION], "first_call", False),
+        (HISTORY + [OBSERVATION], None, False),
+    ],
+)
+def test_rewritten_history_is_a_later_root_with_assistant_output(
+    items, root_reason, expected
+):
+    admission = CaptureAdmission(
+        capture_key="a",
+        model_call_id="b",
+        mode="text",
+        request_replay=replay_context(items, render_digest="b" * 64),
+        root_reason=root_reason,
+    )
+    assert rewrites_history(admission) is expected
+
+
+def test_candidates_and_plain_admissions_do_not_rewrite_history():
+    assert not rewrites_history(None)
+    assert not rewrites_history(candidate())
+    assert not rewrites_history(
+        CaptureAdmission(capture_key="a", model_call_id="c", mode="text")
+    )
+
+
 def test_exact_source_match_does_not_require_renderer_equivalence():
     items = tool_history(None) + [OBSERVATION]
     admission = candidate(
@@ -281,6 +324,12 @@ async def test_worker_managed_root_clears_untrusted_prefix_and_keeps_media_check
     )
     monkeypatch.setattr(
         VllmAsyncGenerationWorkerImpl, "_capture_media", True, raising=False
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_invalidate_rewritten_history",
+        False,
+        raising=False,
     )
     capture_media = MagicMock(return_value=None)
     begin = MagicMock()

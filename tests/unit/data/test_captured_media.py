@@ -1412,6 +1412,7 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     )
     worker.token_capture = MagicMock(adapter=VLLMCaptureAdapter())
     worker._capture_calls = {}
+    worker._invalidate_rewritten_history = False
     worker._http_engine_client = MagicMock()
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = SimpleNamespace(

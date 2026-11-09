@@ -199,6 +199,7 @@ class _TokenCaptureSetup:
     staging_partition: str
     capture_media: bool
     top_logprobs: int
+    invalidate_rewritten_history: bool
 
 
 class VllmGeneration(GenerationInterface):
@@ -739,6 +740,7 @@ class VllmGeneration(GenerationInterface):
         *,
         capture_media: bool = False,
         top_logprobs: int = 0,
+        invalidate_rewritten_history: bool = False,
     ) -> "Optional[MediaColumnSpec]":
         """Install ledger-authoritative token capture in every DP-leader worker.
 
@@ -754,7 +756,11 @@ class VllmGeneration(GenerationInterface):
             "is the worker's in-process HTTP server)"
         )
         setup = _TokenCaptureSetup(
-            dp_cfg, staging_partition, capture_media, top_logprobs
+            dp_cfg,
+            staging_partition,
+            capture_media,
+            top_logprobs,
+            invalidate_rewritten_history,
         )
         futures = self.worker_group.run_all_workers_single_data(
             "setup_token_capture",

@@ -94,6 +94,7 @@ class TestRestartShardTokenCapture:
         "staging_partition": "rollout_staging",
         "capture_media": False,
         "top_logprobs": 4,
+        "invalidate_rewritten_history": True,
     }
 
     @staticmethod
