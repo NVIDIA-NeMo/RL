@@ -46,7 +46,6 @@ from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
-    resolve_vllm_video_config,
     validate_nvfp4_pertoken_model,
     vllm_fp32_lm_head_enabled,
 )
@@ -61,9 +60,7 @@ from nemo_rl.models.generation.vllm.utils import (
     pad_and_align_routed_expert_indices,
     validate_rollout_prompt,
 )
-from nemo_rl.models.generation.vllm.video_utils import (
-    register_torchcodec_vllm_video_loader,
-)
+from nemo_rl.models.generation.vllm.video_utils import register_vllm_video_loader
 from nemo_rl.models.generation.vllm.worker_utils import (
     find_tokenizer_required_architectures,
     resolve_distributed_executor_backend,
@@ -810,12 +807,7 @@ class BaseVllmGenerationWorker:
         if logprobs_mode is not None:
             llm_kwargs["logprobs_mode"] = logprobs_mode
 
-        video_config = resolve_vllm_video_config(self.cfg)
-        if video_config is not None:
-            register_torchcodec_vllm_video_loader(
-                sampling_style=video_config.sampling_style,
-                temporal_patch_size=video_config.temporal_patch_size,
-            )
+        register_vllm_video_loader(self.cfg)
         _configure_nvfp4_pertoken_engine_kwargs(self.cfg, llm_kwargs)
         _use_vllm_sampling_defaults(llm_kwargs)
         llm_kwargs.setdefault("worker_extension_cls", default_worker_extension_cls)

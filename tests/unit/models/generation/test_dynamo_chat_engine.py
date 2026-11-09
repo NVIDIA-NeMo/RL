@@ -97,7 +97,7 @@ class _Pool:
     async def info(self) -> dict:
         return {"turn_end_token_ids": [EOS], "max_model_len": MAX_MODEL_LEN}
 
-    async def render(self, body: dict) -> RenderedCall:
+    async def render(self, body: dict, *, measure: bool = False) -> RenderedCall:
         self.bodies.append(body)
         if self.error is not None:
             raise self.error

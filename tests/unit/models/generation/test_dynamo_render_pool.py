@@ -196,3 +196,32 @@ def test_workers_that_cannot_start_fail_the_call_by_name(tiny_qwen3_model_path):
 
     with pytest.raises(RuntimeError, match="before serving a call"):
         asyncio.run(serve())
+
+
+def _nemotron_vl_loader() -> str:
+    """Run in a render worker: the class vLLM decodes nemotron_vl videos with."""
+    from vllm.multimodal.video import VIDEO_LOADER_REGISTRY
+
+    return VIDEO_LOADER_REGISTRY.name2class["nemotron_vl"].__name__
+
+
+def test_workers_decode_videos_with_nemo_rls_loader(tiny_qwen3_model_path) -> None:
+    # The worker decodes a Gym call's videos, so it needs the engine's loader.
+    vllm_cfg = {
+        **SPEC["generation"]["vllm_cfg"],
+        "video": {
+            "sampling_style": "nemotron_vl",
+            "num_frames": 8,
+            "temporal_patch_size": 2,
+        },
+    }
+    spec = {**SPEC, "generation": {**SPEC["generation"], "vllm_cfg": vllm_cfg}}
+
+    async def serve():
+        pool = RenderPool(spec, tiny_qwen3_model_path, workers=1)
+        try:
+            return await pool._submit(_nemotron_vl_loader)
+        finally:
+            pool.shutdown()
+
+    assert asyncio.run(serve()) == "TorchCodecNemotronVLVideoBackend"

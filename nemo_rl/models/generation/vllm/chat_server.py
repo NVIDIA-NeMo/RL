@@ -25,7 +25,7 @@ import asyncio
 import copy
 import logging
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from logging import Filter as LoggingFilter
 from logging import LogRecord
 from typing import Any, List, Literal, Optional, Union
@@ -55,6 +55,7 @@ from vllm.exceptions import VLLMValidationError
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
 from vllm.renderers.hf import HfRenderer
 from vllm.renderers.online_renderer import OnlineRenderer
+from vllm.sampling_params import StructuredOutputsParams
 from vllm.tool_parsers.abstract_tool_parser import ToolParserManager
 from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
@@ -107,6 +108,39 @@ class NeMoRLChatCompletionRequest(NeMoRLOpenAIChatRequestMixin, ChatCompletionRe
     ng_capture: Optional[dict[str, Any]] = None
 
 
+class NeMoRLMeasureChatRequest(NeMoRLChatCompletionRequest):
+    """A chat call Gym measures, counted as ``/tokenize`` counts it.
+
+    vLLM's tokenize request sets no context limit, so a prompt longer than the
+    context is counted instead of refused.
+    """
+
+    def build_tok_params(self, model_config: Any) -> Any:
+        return replace(super().build_tok_params(model_config), max_total_tokens=None)
+
+
+def chat_request_from_render(request: dict[str, Any]) -> NeMoRLChatCompletionRequest:
+    """The chat request a render produced, rebuilt from its JSON without messages.
+
+    vLLM's tool parser sets ``structured_outputs`` during the render (a forced
+    tool's schema), which the request's own validators reject beside a named
+    ``tool_choice``; it is set back after validation, as the render left it.
+    """
+    structured_outputs = request.get("structured_outputs")
+    chat = NeMoRLChatCompletionRequest.model_validate(
+        {
+            **request,
+            "structured_outputs": None,
+            "messages": [{"role": "user", "content": ""}],
+        }
+    )
+    if structured_outputs is not None:
+        chat.structured_outputs = StructuredOutputsParams(
+            **{k: v for k, v in structured_outputs.items() if not k.startswith("_")}
+        )
+    return chat
+
+
 # This MRO is necessary i.e. NeMoRLOpenAIChatRequestMixin > TokenizeRequest
 class NeMoRLTokenizeChatRequest(NeMoRLOpenAIChatRequestMixin, TokenizeChatRequest):
     required_prefix_token_ids: Optional[List[int]] = None
@@ -129,29 +163,41 @@ def set_max_tokens(request: Any, max_tokens: int) -> None:
         request.max_tokens = max_tokens
 
 
+def clamp_max_tokens(
+    request_max_tokens: Optional[int], prompt_len: int, max_model_len: int
+) -> Optional[int]:
+    """The output budget that keeps input + output within ``max_model_len``.
+
+    Refuses a prompt that leaves no room for output, whether or not the call set
+    a budget, and lowers the budget only when it did. Both chat paths call it.
+    """
+    remaining = max_model_len - prompt_len
+    if remaining <= 0:
+        # preserve the literal "context length" in this message to match Gym's overflow handling
+        message = (
+            f"Prompt length ({prompt_len}) fills or exceeds "
+            f"this model's maximum context length ({max_model_len}). "
+            f"No room for output tokens."
+        )
+        LOGGER.warning("Prompt exceeds max_model_len: %s", message)
+        raise VLLMValidationError(message, parameter="input_tokens", value=prompt_len)
+    if request_max_tokens is None:
+        return None
+    return min(request_max_tokens, remaining)
+
+
 class NeMoRLOpenAIServingMixin:
     """The chat preprocessing NeMo RL adds: prefix splice and token capture."""
 
     def _clamp_max_tokens(
-        self, request, request_max_tokens: int, prompt_token_ids: list[int]
+        self, request, request_max_tokens: Optional[int], prompt_token_ids: list[int]
     ) -> None:
         """Clamp the request's max output tokens so that input + output <= max_model_len."""
-        remaining = self.model_config.max_model_len - len(prompt_token_ids)
-        if remaining <= 0:
-            # preserve the literal "context length" in this message to match Gym's overflow handling
-            message = (
-                f"Prompt length ({len(prompt_token_ids)}) fills or exceeds "
-                f"this model's maximum context length ({self.model_config.max_model_len}). "
-                f"No room for output tokens."
-            )
-            LOGGER.warning("Prompt exceeds max_model_len: %s", message)
-            raise VLLMValidationError(
-                message,
-                parameter="input_tokens",
-                value=len(prompt_token_ids),
-            )
-        max_tokens = min(request_max_tokens, remaining)
-        set_max_tokens(request, max_tokens)
+        max_tokens = clamp_max_tokens(
+            request_max_tokens, len(prompt_token_ids), self.model_config.max_model_len
+        )
+        if max_tokens is not None:
+            set_max_tokens(request, max_tokens)
 
     async def _render_chat_call(
         self, request, messages, render_kwargs: dict[str, Any], *, admission
@@ -257,8 +303,10 @@ class NeMoRLOpenAIServingMixin:
 
         # Temporarily set to 1 so vLLM's pre-tokenization length check passes;
         # the actual value will be set through _clamp_max_tokens later.
+        # /tokenize counts a prompt of any length, so only chat calls clamp.
+        clamps_output = isinstance(request, NeMoRLChatCompletionRequest)
         actual_request_max_tokens = None
-        if isinstance(request, NeMoRLChatCompletionRequest):
+        if clamps_output:
             actual_request_max_tokens = (
                 request.max_completion_tokens
                 if request.max_completion_tokens is not None
@@ -306,7 +354,7 @@ class NeMoRLOpenAIServingMixin:
             or request.required_prefix_token_ids is None
         ):
             # Clamp the request's max output tokens so that input + output <= max_model_len.
-            if actual_request_max_tokens is not None:
+            if clamps_output:
                 self._clamp_max_tokens(
                     request,
                     actual_request_max_tokens,
@@ -339,7 +387,7 @@ class NeMoRLOpenAIServingMixin:
         )
         final_prompt_token_ids = splice.token_ids
         # Reject overflows before media validation can mask the length error.
-        if actual_request_max_tokens is not None:
+        if clamps_output:
             self._clamp_max_tokens(
                 request,
                 actual_request_max_tokens,
@@ -428,6 +476,13 @@ class FrontendRenderer(NeMoRLOpenAIServingMixin, OnlineRenderer):
 
     async def render_for_frontend(self, request, *, admission) -> "RenderedChat":
         """Render ``request``; the caller restores its lowered output budget."""
+        if self.use_harmony:
+            # vLLM renders gpt-oss's Harmony format without preprocess_chat, so
+            # NeMo RL's render, capture decision and splice would never run.
+            raise ValueError(
+                "gpt-oss (Harmony) chat calls are not served through NeMo RL's "
+                "Dynamo chat engine; use policy.generation.dynamo=false"
+            )
         self._admission = admission
         # As preprocess_chat does: vLLM's pre-tokenization length check must
         # pass; the frontend clamps the budget after the splice.

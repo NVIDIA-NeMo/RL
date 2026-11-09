@@ -119,6 +119,26 @@ TOOLS = [
         },
     }
 ]
+# A tool whose schema has a null default, as pydantic writes an Optional field.
+NULL_DEFAULT_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            **TOOLS[0]["function"],
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "unit": {
+                        "anyOf": [{"type": "string"}, {"type": "null"}],
+                        "default": None,
+                    },
+                },
+                "required": ["city"],
+            },
+        },
+    }
+]
 # Turn 1 as Gym sends it back: the template drops its reasoning when it
 # re-renders the history, so the model's own tokens differ from the render.
 HISTORY = [
@@ -490,6 +510,8 @@ KITS = {
     ),
     # Qwen2.5's tokenizer has no thinking tokens for Qwen3's reasoning parser.
     "vlm": _KitSpec(_generation(reasoning_parser=""), _vlm),
+    # A tool parser with no structural tag: a forced tool sets structured outputs.
+    "pythonic": _KitSpec(_generation(tool_parser="pythonic")),
 }
 
 
@@ -692,6 +714,16 @@ CASES = [
         extras=lambda kit: {"required_prefix_token_ids": kit.turn_1_tokens()},
         kit="vlm",
     ),
+    # The client's nulls in a tool schema are rendered into the prompt.
+    _Case("tool_schema_null_default", fields={"tools": NULL_DEFAULT_TOOLS}),
+    # A named tool_choice, whose schema the tool parser sets as structured outputs.
+    _Case(
+        "named_tool_choice",
+        fields={
+            "tool_choice": {"type": "function", "function": {"name": "get_weather"}}
+        },
+        kit="pythonic",
+    ),
     # Nemotron-3-Nano's reasoning parser plugin, with thinking off (C39).
     _Case(
         "nano_v3_thinking_off",
@@ -802,12 +834,21 @@ def test_a_gym_call_takes_the_same_steps_through_dynamo_as_natively(kits, case) 
         }
 
 
-def test_a_measure_call_counts_the_prompt_the_call_would_run(kits) -> None:
+@pytest.mark.parametrize(
+    "observation",
+    [
+        OBSERVATION,
+        # Past the context window: Gym measures to decide whether to compact.
+        {"role": "user", "content": "And in Lyon?" + " Lyon" * MAX_MODEL_LEN},
+    ],
+    ids=["fits", "past_the_context"],
+)
+def test_a_measure_call_counts_the_prompt_the_call_would_run(kits, observation) -> None:
     kit = kits("qwen3")
     extras = {"required_prefix_token_ids": kit.turn_1_tokens()}
     body = {
         "model": kit.path,
-        "messages": [*HISTORY, OBSERVATION],
+        "messages": [*HISTORY, observation],
         "tools": TOOLS,
         **extras,
     }
@@ -824,7 +865,8 @@ def test_a_measure_call_counts_the_prompt_the_call_would_run(kits) -> None:
 
     native, dynamo = asyncio.run(both())
 
-    # Native Gym measures with /tokenize; through Dynamo, the chat call (C36).
+    # Native Gym measures with /tokenize; through Dynamo, the chat call.
+    assert (native.status, dynamo.status) == (200, 200), dynamo.reply
     assert (
         dynamo.reply["nvext"]["nemo_rl"]["prompt_token_count"] == native.reply["count"]
     )

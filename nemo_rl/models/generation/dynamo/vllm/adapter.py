@@ -97,22 +97,6 @@ _MAIN_ATTENTION_KINDS = (
     KVCacheSpecKind.MLA_ATTENTION,
     KVCacheSpecKind.SINK_FULL_ATTENTION,
 )
-# The policy.generation keys the frontend's chat engine renders and checks
-# sampling with.
-_CHAT_GENERATION_KEYS = (
-    "temperature",
-    "top_p",
-    "top_k",
-    "val_temperature",
-    "val_top_p",
-    "val_top_k",
-    "stop_token_ids",
-)
-_CHAT_VLLM_CFG_KEYS = (
-    "http_server_serving_chat_kwargs",
-    "tool_parser_plugin",
-    "reasoning_parser_plugin",
-)
 
 
 def dynamo_kv_events_config(
@@ -138,7 +122,8 @@ def chat_runtime_data(host: "VllmAsyncGenerationWorkerImpl") -> dict[str, Any]:
 
     The engine's own args (those a JSON payload can carry, which include every
     one ``ModelConfig`` reads), so the frontend builds the same tokenizer,
-    template and processor; and the chat settings and sampling profiles.
+    template and processor; and all of ``policy.generation``, which the native
+    server's chat helpers read.
     """
     engine_args: dict[str, Any] = {}
     for field in dataclasses.fields(host.llm_async_engine_args):
@@ -158,18 +143,10 @@ def chat_runtime_data(host: "VllmAsyncGenerationWorkerImpl") -> dict[str, Any]:
         engine_args[field.name] = value
     # The frontend renders chat calls, so it always loads the tokenizer.
     engine_args["skip_tokenizer_init"] = False
-    cfg = host.cfg
     return {
         RUNTIME_DATA_KEY: {
             "engine_args": engine_args,
-            "generation": {
-                **{key: cfg[key] for key in _CHAT_GENERATION_KEYS},
-                "vllm_cfg": {
-                    key: cfg["vllm_cfg"][key]
-                    for key in _CHAT_VLLM_CFG_KEYS
-                    if key in cfg["vllm_cfg"]
-                },
-            },
+            "generation": json.loads(json.dumps(host.cfg)),
         }
     }
 
@@ -319,15 +296,11 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         """
         # Deferred: chat_server imports vLLM's OpenAI server stack.
         from nemo_rl.models.generation.vllm.chat_server import (
-            NeMoRLChatCompletionRequest,
+            chat_request_from_render,
         )
 
         host = self._host
-        # The reply never echoes messages; the frontend sends the request
-        # without them.
-        chat = NeMoRLChatCompletionRequest.model_validate(
-            {**plan["request"], "messages": [{"role": "user", "content": ""}]}
-        )
+        chat = chat_request_from_render(plan["request"])
         admission = host._parse_capture_admission(plan["admission"])
         serving_admission = host._parse_capture_admission(plan["serving_admission"])
         if admission is not None and admission.mode == "candidate":

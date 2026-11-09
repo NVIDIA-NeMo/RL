@@ -177,6 +177,10 @@ def _install_fake_vllm(monkeypatch):
 
     module("vllm.exceptions", VLLMValidationError=ValidationError)
     module(
+        "vllm.sampling_params",
+        StructuredOutputsParams=placeholder("StructuredOutputsParams"),
+    )
+    module(
         "vllm.reasoning.abs_reasoning_parsers",
         ReasoningParserManager=type(
             "ReasoningParserManager", (), {"import_reasoning_parser": MagicMock()}

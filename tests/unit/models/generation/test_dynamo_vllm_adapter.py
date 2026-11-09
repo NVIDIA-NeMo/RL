@@ -425,20 +425,8 @@ def test_engines_publish_what_the_frontends_chat_engine_renders_with() -> None:
             host.llm_async_engine_args, field
         ), field
     assert published.skip_tokenizer_init is False
-    # The native server's chat settings and the sampling profiles it checks.
-    assert spec["generation"] == {
-        "temperature": 0.7,
-        "top_p": 0.9,
-        "top_k": None,
-        "val_temperature": 0.0,
-        "val_top_p": 1.0,
-        "val_top_k": None,
-        "stop_token_ids": [EOS],
-        "vllm_cfg": {
-            "http_server_serving_chat_kwargs": serving_chat_kwargs,
-            "reasoning_parser_plugin": "/plugins/reasoning.py",
-        },
-    }
+    # All of policy.generation, which the native server's chat helpers read.
+    assert spec["generation"] == host.cfg
 
 
 # --- NeMo-Gym calls, after the frontend's chat engine rendered them -----------

@@ -73,17 +73,14 @@ PLAN_KEY = "nemo_rl"
 _DYNAMO_ONLY_FIELDS = {"nvext", "chat_template_args", "unsupported_fields"}
 
 
-class _ContextLengthError(ValueError):
-    """The prompt leaves no room for output; Gym reads "context length" in a 400."""
-
-
 def _capture_refusal_ack(extras: GymCallExtras) -> str:
     """Gym's acknowledgement that a capture call was refused before it ran.
 
     The native route sends it as a header; Dynamo's frontend forwards only an
     error's status and message, so it ends the message instead.
     """
-    if extras.ng_capture is None:
+    if extras.ng_capture is None or extras.ng_measure:
+        # Native's /tokenize never acknowledges a measure call.
         return ""
     # Deferred: Gym is installed wherever a call carries ng_capture.
     from nemo_gym.token_id_capture.external_capture import (
@@ -93,30 +90,28 @@ def _capture_refusal_ack(extras: GymCallExtras) -> str:
     return dynamo_capture_refusal_suffix(extras.ng_capture["model_call_id"])
 
 
+# Free-form JSON the client wrote (a tool's parameters, a response_format
+# schema, processor and media kwargs) keeps its nulls, as natively: a schema's
+# `"default": null` is rendered into the prompt.
+_CLIENT_JSON_KEYS = frozenset(
+    {"parameters", "schema", "mm_processor_kwargs", "media_io_kwargs"}
+)
+
+
 def _drop_none(value: Any) -> Any:
-    """Dynamo hands Python unset fields as None, which vLLM's models reject."""
+    """Drop the Nones Dynamo adds for unset struct fields, which vLLM rejects.
+
+    An image part's unset ``detail`` arrives as None, for example.
+    """
     if isinstance(value, dict):
-        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+        return {
+            k: v if k in _CLIENT_JSON_KEYS else _drop_none(v)
+            for k, v in value.items()
+            if v is not None
+        }
     if isinstance(value, list):
         return [_drop_none(v) for v in value]
     return value
-
-
-def _clamp(
-    request_max_tokens: Optional[int], prompt_token_ids: list[int], max_model_len: int
-) -> Optional[int]:
-    """The output budget, as the native server's _clamp_max_tokens sets it."""
-    remaining = max_model_len - len(prompt_token_ids)
-    if remaining <= 0:
-        # Gym reads "context length" in the 400 as an overflow.
-        raise _ContextLengthError(
-            f"Prompt length ({len(prompt_token_ids)}) fills or exceeds this "
-            f"model's maximum context length ({max_model_len}). No room "
-            "for output tokens."
-        )
-    if request_max_tokens is None:
-        return None
-    return min(request_max_tokens, remaining)
 
 
 class _CaptureSource:
@@ -214,13 +209,15 @@ class NemoRLChatEngine:
             yield await self._serve(request, extras, context)
         except (OffPolicySamplingError, MediaCaptureRejected) as error:
             raise HttpError(400, str(error)) from error
-        except (_ContextLengthError, VLLMValidationError) as error:
+        except VLLMValidationError as error:
             # Refused before the engine ran, so nothing was staged: as natively.
             raise HttpError(400, str(error) + _capture_refusal_ack(extras)) from error
 
     async def _serve(
         self, request: dict[str, Any], extras: GymCallExtras, context: Any
     ) -> dict[str, Any]:
+        # Deferred: chat_server imports vLLM's OpenAI server stack.
+        from nemo_rl.models.generation.vllm.chat_server import clamp_max_tokens
         from nemo_rl.models.generation.vllm.utils import on_policy_sampling
 
         body = _drop_none(
@@ -246,7 +243,7 @@ class NemoRLChatEngine:
         body["ng_capture"] = extras.ng_capture
         body["required_prefix_token_ids"] = extras.required_prefix_token_ids
         info = await self._pool.info()
-        rendered = await self._pool.render(body)
+        rendered = await self._pool.render(body, measure=extras.ng_measure)
         prompt_token_ids, splice, prefix = await self._splice(
             rendered, info["turn_end_token_ids"]
         )
@@ -259,8 +256,8 @@ class NemoRLChatEngine:
                 message={"role": "assistant", "content": ""},
                 finish_reason="stop",
             )
-        max_tokens = _clamp(
-            rendered.request_max_tokens, prompt_token_ids, info["max_model_len"]
+        max_tokens = clamp_max_tokens(
+            rendered.request_max_tokens, len(prompt_token_ids), info["max_model_len"]
         )
         engine_request = dict(rendered.request)
         if max_tokens is not None:

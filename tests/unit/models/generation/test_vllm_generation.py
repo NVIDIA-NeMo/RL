@@ -1158,6 +1158,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         ServingTokenization=ServingTokenization,
     )
     make_module("vllm.exceptions", VLLMValidationError=VLLMValidationError)
+    make_module("vllm.sampling_params", StructuredOutputsParams=MagicMock())
     make_module(
         "vllm.reasoning.abs_reasoning_parsers",
         ReasoningParserManager=ReasoningParserManager,

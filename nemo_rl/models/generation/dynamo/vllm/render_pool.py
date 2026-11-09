@@ -101,9 +101,14 @@ class _Worker:
             turn_end_token_ids,
         )
         from nemo_rl.models.generation.vllm import chat_server
+        from nemo_rl.models.generation.vllm.video_utils import (
+            register_vllm_video_loader,
+        )
 
         cfg = spec["generation"]
         chat_server.register_parser_plugins(cfg)
+        # This worker decodes the call's videos; the engine runs its pixels.
+        register_vllm_video_loader(cfg)
         # The engine's own args, with the weight-free snapshot Dynamo fetched.
         args = AsyncEngineArgs(
             **{**spec["engine_args"], "model": model_dir, "tokenizer": model_dir}
@@ -180,15 +185,19 @@ class _Worker:
             model_config=self.model_config,
         )
 
-    def render(self, body: dict[str, Any]) -> RenderedCall:
+    def render(self, body: dict[str, Any], *, measure: bool = False) -> RenderedCall:
         from nemo_gym.token_id_capture.staging.records import CaptureAdmission
 
         from nemo_rl.models.generation.vllm.chat_server import (
             NeMoRLChatCompletionRequest,
+            NeMoRLMeasureChatRequest,
             set_max_tokens,
         )
 
-        chat = NeMoRLChatCompletionRequest.model_validate(body)
+        request_cls = (
+            NeMoRLMeasureChatRequest if measure else NeMoRLChatCompletionRequest
+        )
+        chat = request_cls.model_validate(body)
         request_max_tokens = (
             chat.max_completion_tokens
             if chat.max_completion_tokens is not None
@@ -259,13 +268,10 @@ class _Worker:
         from vllm.outputs import CompletionOutput, RequestOutput
 
         from nemo_rl.models.generation.vllm.chat_server import (
-            NeMoRLChatCompletionRequest,
+            chat_request_from_render,
         )
 
-        # The reply never echoes messages, so the request's are not sent back.
-        chat = NeMoRLChatCompletionRequest.model_validate(
-            {**request, "messages": [{"role": "user", "content": ""}]}
-        )
+        chat = chat_request_from_render(request)
         logprobs = None
         if output.get("logprobs") is not None:
             logprobs = [
@@ -325,9 +331,9 @@ def _init_worker(spec: dict[str, Any], model_dir: str) -> None:
     _WORKER = _Worker(spec, model_dir)
 
 
-def _render(body: dict[str, Any]) -> RenderedCall:
+def _render(body: dict[str, Any], measure: bool) -> RenderedCall:
     assert _WORKER is not None
-    return _WORKER.render(body)
+    return _WORKER.render(body, measure=measure)
 
 
 def _respond(
@@ -395,8 +401,11 @@ class RenderPool:
             self._info = await self._submit(_info)
         return self._info
 
-    async def render(self, body: dict[str, Any]) -> RenderedCall:
-        return await self._submit(_render, body)
+    async def render(
+        self, body: dict[str, Any], *, measure: bool = False
+    ) -> RenderedCall:
+        """Render a call; a measure call is counted past the context, as natively."""
+        return await self._submit(_render, body, measure)
 
     async def respond(
         self,
