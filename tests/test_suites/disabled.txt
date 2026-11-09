@@ -76,6 +76,8 @@ tests/test_suites/vlm/vlm_sft-qwen2.5-vl-3b-instruct-clevr-1n2g-megatrontp1-ener
 # The dedicated-value PPO example uses 2 GPUs per node, which does not match
 # either nightly tier. Run its smoke driver manually before enabling it.
 tests/test_suites/llm/ppo-qwen2.5-1.5b-math-3n2g-megatron-dedicated-value.sh
+# The 3n8g dedicated-value PPO test needs 36 GPU-hours, exceeding the current nightly cap.
+tests/test_suites/llm/ppo-qwen2.5-1.5b-math-3n8g-megatron-dedicated-value.sh
 # The packing variant has no functional twin; run it manually.
 tests/test_suites/vlm/vlm_sft-qwen2.5-vl-3b-instruct-clevr-1n2g-megatrontp1-energon.v1.packing.sh
 
