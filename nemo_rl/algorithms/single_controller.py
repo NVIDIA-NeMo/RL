@@ -78,6 +78,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneMutationCut,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    BaseSampler,
     ReadyFirstSamplerConfig,
     TransactionalAdmissionSampler,
     create_sampler,
@@ -112,7 +113,10 @@ from nemo_rl.algorithms.rollout_checkpointing.state import (
 )
 from nemo_rl.algorithms.rollout_checkpointing.trace import (
     ROLLOUT_TRACE_FILENAME,
+    RefitCuts,
     RolloutTrace,
+    batch_age_group_metrics,
+    pop_batch_age,
 )
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageComputer,
@@ -750,6 +754,8 @@ class SingleControllerActor:
             self._async_cfg.max_buffered_rollouts
         )
 
+        # Where running captured calls switched weights, for batch age.
+        self._refit_cuts = RefitCuts()
         self._rollout_trace = RolloutTrace(
             Path(self._logger.base_log_dir) / ROLLOUT_TRACE_FILENAME
             if master_config.rollout_checkpointing.trace
@@ -1394,7 +1400,18 @@ class SingleControllerActor:
                                 f"group {request.group_id}: rollout and finalizer "
                                 f"metrics both report {sorted(overlap)!r}"
                             )
-                        group_metrics = {**rollout_metrics, **finalized.token_metrics}
+                        # Exact per-version token counts, split at the refits
+                        # that paused the group's calls.
+                        tokens_by_version = (
+                            self._refit_cuts.tokens_by_version(finalized.call_versions)
+                            if finalized.call_versions
+                            else {}
+                        )
+                        group_metrics = {
+                            **rollout_metrics,
+                            **finalized.token_metrics,
+                            **batch_age_group_metrics(tokens_by_version),
+                        }
                         if group_metrics:
                             # Same ROLLOUT_METRICS sidecar the echo path's commit writes.
                             meta = replace(
@@ -1428,6 +1445,11 @@ class SingleControllerActor:
                     # Canonical TQ rows plus replay metadata now own the completed
                     # group; keep only unfinished work in the lineage sidecar.
                     ledger.discard_group(cut, request.group_id)
+                    self._rollout_trace.emit(
+                        "group_published",
+                        group_id=request.group_id,
+                        tokens_by_version=tokens_by_version,
+                    )
                     self._rollout_manager.record_canonical_publication(
                         finalized.canonical_output_tokens
                     )
@@ -3015,6 +3037,13 @@ class SingleControllerActor:
                         per_group_rollout_metrics.setdefault(metric_name, []).append(
                             value
                         )
+                batch_age = pop_batch_age(
+                    per_group_rollout_metrics, version_during_step
+                )
+                if batch_age is not None:
+                    # Token-weighted policy updates between generating a token
+                    # and training on it.
+                    step_metrics["batch_age"] = batch_age
                 step_metrics.update(
                     aggregate_rollout_metrics(per_group_rollout_metrics)
                 )
@@ -3066,6 +3095,8 @@ class SingleControllerActor:
                     "step_trained",
                     step=self._train_steps,
                     trainer_version=self._trainer_version,
+                    # The policy version the optimizer step updated.
+                    trained_version=version_during_step,
                     group_ids=sorted(step_finalizer_group_ids),
                 )
                 self._rollout_snapshots.end_optimizer_commit()
@@ -4536,6 +4567,24 @@ class SingleControllerActor:
             # both paths.
             self._record_refit_landed(participants)
 
+        paused_calls: list[dict[str, Any]] = []
+        if generation_paused_for_refit and self._master_config.token_capture.enabled:
+            # How far each running captured call got on the old weights. Read after
+            # the transfer, still paused, so calls that arrived during it report 0
+            # tokens and count all theirs on the new weights.
+            try:
+                paused_calls = await asyncio.to_thread(
+                    self._gen.captured_call_progress, timeout_s=timeout_s
+                )
+            except Exception as error:
+                # Batch age is not worth a failed refit: these calls count every
+                # token under the version they began on.
+                warnings.warn(
+                    "could not read running calls' token counts at a refit "
+                    f"({type(error).__name__}); batch age counts them under the "
+                    "version they began on",
+                    stacklevel=1,
+                )
         print("▶️ Requesting generation resume after refit", flush=True)
         generation_resumed_after_refit = await asyncio.to_thread(
             self._gen.resume_generation_after_refit, timeout_s=timeout_s
@@ -4566,6 +4615,14 @@ class SingleControllerActor:
             await asyncio.to_thread(
                 self._gen.set_rollout_weight_version, self._trainer_version
             )
+            for progress in paused_calls:
+                self._refit_cuts.record(
+                    progress["weight_version"], self._trainer_version, progress["calls"]
+                )
+            if isinstance(self._sampler, BaseSampler):
+                self._refit_cuts.forget_before(
+                    self._trainer_version - self._sampler.eviction_window
+                )
         self._rollout_trace.emit("weights_synced", weight_version=self._trainer_version)
         self._rollout_permitted.set()
         self._rollout_manager.resume_request_deadlines()

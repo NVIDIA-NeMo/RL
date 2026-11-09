@@ -742,6 +742,22 @@ class GenerationInterface(ABC):
             f"token_capture.enabled is not supported for {type(self).__name__}"
         )
 
+    def captured_call_progress(
+        self, *, timeout_s: Optional[float] = None
+    ) -> list[dict[str, Any]]:
+        """Report how far each running captured call got, while paused for a refit.
+
+        Returns one ``{"weight_version": v, "calls": [[model_call_id,
+        generated_tokens], ...]}`` per serving engine: the tokens each call
+        generated on version ``v`` before the refit replaces it. Backends that
+        cannot report this return nothing, and their calls count every token
+        under the version they began on.
+
+        Args:
+            timeout_s: How long to wait for the engines; ``None`` waits forever.
+        """
+        return []
+
     def invalidate_kv_cache(self) -> bool:
         """Confirm stale KV state cannot be reused after a weight update.
 

@@ -1186,7 +1186,9 @@ def test_sync_weights_keeps_dispatch_paused_when_generation_resume_fails() -> No
     )
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
 
     with pytest.raises(RuntimeError, match="successful refit pause"):
         asyncio.run(ctrl._sync_weights())
@@ -1243,7 +1245,9 @@ def test_sync_weights_does_not_resume_generation_after_failed_refit() -> None:
     )
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
 
     with pytest.raises(RuntimeError, match="refit failed"):
         asyncio.run(ctrl._sync_weights())

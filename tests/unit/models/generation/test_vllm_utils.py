@@ -736,6 +736,47 @@ def test_attach_sampler_topk_logprobs_to_chat_response_choices():
     assert tuple(empty["sampler_topk_logprobs"].shape) == (0, 2)
 
 
+def test_attach_sampler_topk_logprobs_to_chat_response_choices_reads_flat_logprobs():
+    final_res = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[9],
+                logprobs=SimpleNamespace(
+                    start_indices=[0],
+                    end_indices=[3],
+                    token_ids=[9, 1, 2],
+                    logprobs=[-3.0, -0.3, -1.8],
+                ),
+            ),
+            SimpleNamespace(
+                index=1,
+                token_ids=[],
+                logprobs=SimpleNamespace(
+                    start_indices=[], end_indices=[], token_ids=[], logprobs=[]
+                ),
+            ),
+        ]
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=0, message=SimpleNamespace()),
+            SimpleNamespace(index=1, message=SimpleNamespace()),
+        ]
+    )
+
+    attach_sampler_topk_logprobs_to_chat_response_choices(response, final_res, top_k=2)
+
+    message = response.choices[0].message
+    assert message.sampler_topk_token_ids.tolist() == [[1, 2]]
+    torch.testing.assert_close(
+        message.sampler_topk_logprobs, torch.tensor([[-0.3, -1.8]])
+    )
+    empty = response.choices[1].message
+    assert tuple(empty.sampler_topk_token_ids.shape) == (0, 2)
+    assert tuple(empty.sampler_topk_logprobs.shape) == (0, 2)
+
+
 def test_attach_sampler_topk_logprobs_to_chat_response_choices_requires_k_entries():
     final_res = SimpleNamespace(
         outputs=[
