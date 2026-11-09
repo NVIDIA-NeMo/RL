@@ -72,6 +72,18 @@ _GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
 )
 
 
+def model_stop_token_ids(model_config: Any, cfg: dict[str, Any]) -> frozenset[int]:
+    """The configured stops plus the generation config's EOS, read once per server.
+
+    ``model_config`` is vLLM's ``ModelConfig``; ``cfg`` is ``policy.generation``.
+    """
+    stop_token_ids = set(cfg.get("stop_token_ids") or ())
+    generation_eos = model_config.try_get_generation_config().get("eos_token_id")
+    if isinstance(generation_eos, int):
+        generation_eos = [generation_eos]
+    return frozenset(stop_token_ids | set(generation_eos or ()))
+
+
 def assert_reload_refit_config_supported(config: VllmConfig) -> None:
     """Reject pure-config combinations unsupported by vLLM reload refit."""
     vllm_cfg = config.get("vllm_cfg")

@@ -40,7 +40,7 @@ import pickle
 import threading
 import time
 import uuid
-from typing import Any, AsyncGenerator, Optional
+from typing import Any, AsyncGenerator, Optional, TypedDict
 
 from dynamo.llm import PythonAsyncEngine
 from dynamo.llm.exceptions import HttpError
@@ -58,6 +58,7 @@ from nemo_rl.models.generation.gym_call import (
     GYM_RESULT_NVEXT_KEY,
     GymCallExtras,
     GymCallResult,
+    GymRequestFields,
 )
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
 
@@ -67,6 +68,46 @@ RUNTIME_DATA_KEY = "nemo_rl_chat"
 # in extra_args under PLAN_KEY.
 GYM_CALL_ANNOTATION = "nemo_gym:rollout"
 PLAN_KEY = "nemo_rl"
+
+
+class GymCallPlan(TypedDict):
+    """What the chat engine sends the adapter in ``extra_args[PLAN_KEY]``."""
+
+    # The rendered chat request, without messages.
+    request: dict[str, Any]
+    # Capture admissions as JSON: what is stored, and how the prompt is served.
+    admission: Optional[dict[str, Any]]
+    serving_admission: Optional[dict[str, Any]]
+    verify_retained_media: bool
+    # The model's own prefix length at the start of the spliced prompt.
+    prefix_len: Optional[int]
+    template_token_ids: list[int]
+    # PrefixSplice's (model_cut_end, template_cut_start), when spliced.
+    splice: Optional[list[int]]
+    # The render's multimodal input, pickled then base64-encoded.
+    multimodal: Optional[str]
+    reasoning_ended: Optional[bool]
+    reasoning_parser_kwargs: Optional[dict[str, Any]]
+
+
+class GymCallRefusal(TypedDict):
+    """A call the engine refused before it ran, with the native status."""
+
+    status: int
+    message: str
+    # Whether Gym is told the capture call was refused (a native 400).
+    acknowledge: bool
+
+
+class GymEngineReply(TypedDict, total=False):
+    """The adapter's ``engine_data`` for a Gym call: an output, or a refusal."""
+
+    # A served call: the completion the reply is built from, and its
+    # GymCallResult as JSON.
+    output: dict[str, Any]
+    result: dict[str, Any]
+    refusal: GymCallRefusal
+
 
 # Fields of Dynamo's chat request that are not vLLM request fields
 # (chat_template_args is renamed to vLLM's chat_template_kwargs).
@@ -240,8 +281,8 @@ class NemoRLChatEngine:
                 generation_config=self._generation,
             )
         )
-        body["ng_capture"] = extras.ng_capture
-        body["required_prefix_token_ids"] = extras.required_prefix_token_ids
+        request_fields: set[str] = set(GymRequestFields.model_fields)
+        body.update(extras.model_dump(include=request_fields))
         info = await self._pool.info()
         rendered = await self._pool.render(body, measure=extras.ng_measure)
         prompt_token_ids, splice, prefix = await self._splice(
@@ -263,7 +304,7 @@ class NemoRLChatEngine:
         if max_tokens is not None:
             engine_request["max_tokens"] = max_tokens
             engine_request["max_completion_tokens"] = None
-        plan = {
+        plan: GymCallPlan = {
             "request": engine_request,
             "admission": rendered.admission,
             "serving_admission": rendered.serving_admission,
@@ -330,6 +371,8 @@ class NemoRLChatEngine:
             prefix = rendered.required_prefix_token_ids
         if prefix is None:
             return rendered.template_token_ids, None, None
+        # The render includes the history whenever a prefix will be spliced.
+        assert rendered.history_token_ids is not None
         splice = splice_prefix_tokens(
             tokenizer=None,
             model_prefix_token_ids=prefix,
@@ -341,8 +384,8 @@ class NemoRLChatEngine:
 
     async def _call_engine(
         self, preprocessed: dict[str, Any], context: Any
-    ) -> dict[str, Any]:
-        engine_data = None
+    ) -> GymEngineReply:
+        engine_data: Optional[GymEngineReply] = None
         stream = await self._routed_engine.generate(preprocessed, context=context)
         try:
             async for item in stream:
@@ -407,7 +450,6 @@ class ChatEngineFactory:
 
     def __init__(self) -> None:
         self._capture = _CaptureSource()
-        self._pools: list[RenderPool] = []
 
     async def chat_engine_factory(
         self, instance_id: Any, mdc: Any, routed_engine: Any
@@ -424,7 +466,6 @@ class ChatEngineFactory:
         pool = RenderPool(
             spec, mdc.local_dir(), workers=int(os.environ[RENDER_WORKERS_ENV])
         )
-        self._pools.append(pool)
         engine = NemoRLChatEngine(
             pool=pool, routed_engine=routed_engine, spec=spec, capture=self._capture
         )

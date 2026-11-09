@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import multiprocessing
+import os
 import pickle
 import uuid
 from concurrent.futures import ProcessPoolExecutor
@@ -75,14 +76,9 @@ class _Worker:
     """The vLLM objects one worker process renders and responds with."""
 
     def __init__(self, spec: dict[str, Any], model_dir: str):
-        import vllm.platforms
-
-        # A frontend host may have no GPU; vLLM only parses here, as in
-        # Dynamo's own frontend (dynamo.frontend.main.parse_args).
-        if vllm.platforms.current_platform.device_type == "":
-            from vllm.platforms.cpu import CpuPlatform
-
-            vllm.platforms.current_platform = CpuPlatform()
+        # Render workers only parse and render; pin vLLM to its CPU platform so
+        # a frontend host needs no accelerator (an explicit target is final).
+        os.environ["VLLM_TARGET_DEVICE"] = "cpu"
 
         from types import SimpleNamespace
 
@@ -96,11 +92,9 @@ class _Worker:
         from vllm.renderers.registry import renderer_from_config
         from vllm.v1.engine.input_processor import InputProcessor
 
-        from nemo_rl.models.generation.openai_server_utils import (
-            model_stop_token_ids,
-            turn_end_token_ids,
-        )
+        from nemo_rl.models.generation.openai_server_utils import turn_end_token_ids
         from nemo_rl.models.generation.vllm import chat_server
+        from nemo_rl.models.generation.vllm.utils import model_stop_token_ids
         from nemo_rl.models.generation.vllm.video_utils import (
             register_vllm_video_loader,
         )

@@ -52,6 +52,7 @@ from nemo_rl.models.generation.dynamo.vllm.chat_engine import (  # noqa: E402
     GYM_CALL_ANNOTATION,
     PLAN_KEY,
     RUNTIME_DATA_KEY,
+    GymCallPlan,
 )
 from nemo_rl.models.generation.rollout_result import (  # noqa: E402
     rollout_result_from_wire,
@@ -445,7 +446,7 @@ def _chat(**fields) -> dict:
 
 def _gym_call(token_ids: list[int], **plan) -> dict:
     """A Gym call as the chat engine routes it: final token ids and the plan."""
-    plan = {
+    full_plan: GymCallPlan = {
         "request": _chat(),
         "admission": None,
         "serving_admission": None,
@@ -461,7 +462,7 @@ def _gym_call(token_ids: list[int], **plan) -> dict:
     return {
         "token_ids": token_ids,
         "annotations": [GYM_CALL_ANNOTATION],
-        "extra_args": {PLAN_KEY: plan},
+        "extra_args": {PLAN_KEY: full_plan},
     }
 
 

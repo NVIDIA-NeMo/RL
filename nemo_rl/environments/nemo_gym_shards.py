@@ -39,7 +39,6 @@ from omegaconf import OmegaConf
 # The actor factory or rollout code consumes these separately.
 NEMO_RL_DICT_CONFIG_KEYS = frozenset(
     {
-        "dynamo_dialect",
         "effort_levels",
         "external_service_readiness",
         "tokenizer_config",

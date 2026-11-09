@@ -28,7 +28,7 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from logging import Filter as LoggingFilter
 from logging import LogRecord
-from typing import Any, List, Literal, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 import torch
 from fastapi import FastAPI, Request
@@ -61,8 +61,8 @@ from vllm.v1.engine.async_llm import logger as vllm_async_llm_logger
 
 from nemo_rl.data.captured_media import MediaCaptureRejected
 from nemo_rl.models.generation.capture_context import resolve_capture_input
+from nemo_rl.models.generation.gym_call import GymCallResult, GymRequestFields
 from nemo_rl.models.generation.openai_server_utils import (
-    model_stop_token_ids,
     splice_prefix_tokens,
     turn_end_token_ids,
 )
@@ -75,6 +75,7 @@ from nemo_rl.models.generation.vllm.utils import (
     attach_sampler_topk_logprobs_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     model_dump_chat_response_with_dynamic_message_fields,
+    model_stop_token_ids,
     on_policy_sampling,
     remap_multimodal_placeholders,
 )
@@ -101,11 +102,10 @@ class NeMoRLOpenAIChatRequestMixin:
 
 
 # This MRO is necessary i.e. NeMoRLOpenAIChatRequestMixin > ChatCompletionRequest
-class NeMoRLChatCompletionRequest(NeMoRLOpenAIChatRequestMixin, ChatCompletionRequest):
-    required_prefix_token_ids: Optional[List[int]] = None
-    # Ledger-authoritative token capture: the call identity the ledger
-    # attaches (capture_key, call_id, parent_call_id, prev_len, mode).
-    ng_capture: Optional[dict[str, Any]] = None
+class NeMoRLChatCompletionRequest(
+    NeMoRLOpenAIChatRequestMixin, GymRequestFields, ChatCompletionRequest
+):
+    pass
 
 
 class NeMoRLMeasureChatRequest(NeMoRLChatCompletionRequest):
@@ -142,9 +142,9 @@ def chat_request_from_render(request: dict[str, Any]) -> NeMoRLChatCompletionReq
 
 
 # This MRO is necessary i.e. NeMoRLOpenAIChatRequestMixin > TokenizeRequest
-class NeMoRLTokenizeChatRequest(NeMoRLOpenAIChatRequestMixin, TokenizeChatRequest):
-    required_prefix_token_ids: Optional[List[int]] = None
-    ng_capture: Optional[dict[str, Any]] = None
+class NeMoRLTokenizeChatRequest(
+    NeMoRLOpenAIChatRequestMixin, GymRequestFields, TokenizeChatRequest
+):
     ng_measure_only: Literal[True] = True
 
 
@@ -376,6 +376,8 @@ class NeMoRLOpenAIServingMixin:
             )
             return res
 
+        # The render includes the history whenever a prefix will be spliced.
+        assert rendered.history_token_ids is not None
         splice = splice_prefix_tokens(
             tokenizer=self.renderer.tokenizer,
             model_prefix_token_ids=list(request.required_prefix_token_ids),
@@ -961,10 +963,9 @@ def register_routes(
                 and request.ng_capture is not None
             ):
                 return JSONResponse(
-                    content={
-                        "prompt_token_count": generator.count,
-                        "ng_context_measured": True,
-                    }
+                    content=GymCallResult(
+                        prompt_token_count=generator.count, ng_context_measured=True
+                    ).model_dump(exclude_none=True)
                 )
             return JSONResponse(content=generator.model_dump())
 

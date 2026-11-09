@@ -27,18 +27,6 @@ from dataclasses import dataclass
 from typing import Any
 
 
-def model_stop_token_ids(model_config: Any, cfg: dict[str, Any]) -> frozenset[int]:
-    """The configured stops plus the generation config's EOS, read once per server.
-
-    ``model_config`` is vLLM's ``ModelConfig``; ``cfg`` is ``policy.generation``.
-    """
-    stop_token_ids = set(cfg.get("stop_token_ids") or ())
-    generation_eos = model_config.try_get_generation_config().get("eos_token_id")
-    if isinstance(generation_eos, int):
-        generation_eos = [generation_eos]
-    return frozenset(stop_token_ids | set(generation_eos or ()))
-
-
 def turn_end_token_ids(
     stop_token_ids: Collection[int], tokenizer: Any
 ) -> frozenset[int]:
@@ -46,7 +34,8 @@ def turn_end_token_ids(
 
     vLLM stops on the generation config's EOS as well as the configured stops,
     and the chat template closes turns with the tokenizer's EOS, so a turn can
-    end on any of them. ``stop_token_ids`` is :func:`model_stop_token_ids`.
+    end on any of them. ``stop_token_ids`` is vLLM's
+    :func:`nemo_rl.models.generation.vllm.utils.model_stop_token_ids`.
     """
     return frozenset(stop_token_ids) | {tokenizer.eos_token_id}
 
@@ -86,7 +75,7 @@ def splice_prefix_tokens(
     *,
     tokenizer: Any,
     model_prefix_token_ids: list[int],
-    template_prefix_token_ids: list[int] | None,
+    template_prefix_token_ids: list[int],
     template_token_ids: list[int],
     eos_token_id: int | Collection[int],
 ) -> PrefixSplice:
@@ -156,14 +145,6 @@ def splice_prefix_tokens(
     and when the model's prefix ends on one of them that exact id is kept in
     place of the template's, so the spliced prompt still starts with the
     model's tokens verbatim.
-
-    A host that sees only the rendered prompt, not the messages (the Dynamo
-    engine), passes ``template_prefix_token_ids=None``. The prefix render is only
-    used for its EOS count, and every EOS in the model's prefix closed one
-    message, plus the one the template adds to a final assistant turn the model
-    did not close. The counts agree when the history up to that turn is the one
-    the prefix was generated from and the model emitted no EOS text as ordinary
-    tokens.
     """
     if not model_prefix_token_ids:
         return PrefixSplice(template_token_ids, 0, 0)
@@ -181,12 +162,6 @@ def splice_prefix_tokens(
     model_ended_on_eos = model_prefix_token_ids[-1] in eos_token_ids
     if model_ended_on_eos:
         model_cut_end -= 1
-    if template_prefix_token_ids is None:
-        template_prefix_token_ids = (
-            model_prefix_token_ids
-            if model_ended_on_eos
-            else [*model_prefix_token_ids, next(iter(eos_token_ids))]
-        )
 
     # Locate the turn boundary by EOS count rather than token position. Qwen3
     # templates may strip prior reasoning blocks when re-rendering history;

@@ -14,12 +14,14 @@
 
 """The extra fields NeMo RL and NeMo-Gym exchange on a chat call, defined once.
 
-The native vLLM server reads :class:`GymCallExtras` as request fields and
-answers with :class:`GymCallResult`'s fields on the message. Dynamo's frontend
-carries only OpenAI fields plus ``nvext``, so through it NeMo-Gym's Dynamo
-dialect packs the extras into one ``nemo_rl:gym:<json>`` annotation and NeMo
-RL's chat engine returns the result as ``nvext["nemo_rl"]``. A field added here
-reaches both paths.
+The native vLLM server's request classes inherit :class:`GymRequestFields`, and
+it answers with :class:`GymCallResult`'s fields on the message. Dynamo's
+frontend carries only OpenAI fields plus ``nvext``, so through it NeMo-Gym's
+Dynamo dialect packs :class:`GymCallExtras` (those request fields, plus the
+measure flag) into one ``nemo_rl:gym:<json>`` annotation. NeMo RL's chat engine
+hands the request fields to the same render and returns the result as
+``nvext["nemo_rl"]``. A field added to :class:`GymRequestFields` reaches both
+paths.
 """
 
 import json
@@ -34,17 +36,23 @@ GYM_EXTRAS_ANNOTATION_PREFIX = "nemo_rl:gym:"
 GYM_RESULT_NVEXT_KEY = "nemo_rl"
 
 
-class GymCallExtras(BaseModel):
-    """What a NeMo-Gym chat call adds to an OpenAI request."""
-
-    # A field Gym sends that NeMo RL does not know is refused, not ignored.
-    model_config = ConfigDict(extra="forbid")
+class GymRequestFields(BaseModel):
+    """The request fields both paths read; the native request classes inherit them."""
 
     # The token-capture admission (capture_key, call ids, prev_len, mode, ...).
     ng_capture: Optional[dict[str, Any]] = None
     # Without capture: the last echoed assistant turn's prompt + generation ids.
     required_prefix_token_ids: Optional[list[int]] = None
+
+
+class GymCallExtras(GymRequestFields):
+    """What a NeMo-Gym chat call adds to an OpenAI request through Dynamo."""
+
+    # A field Gym sends that NeMo RL does not know is refused, not ignored.
+    model_config = ConfigDict(extra="forbid")
+
     # Return only the prompt's length (Gym's /context/measure); no generation.
+    # Natively Gym calls /tokenize for this instead.
     ng_measure: bool = False
 
     @classmethod

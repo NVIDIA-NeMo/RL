@@ -70,6 +70,8 @@ from nemo_rl.models.generation.dynamo.vllm.chat_engine import (
     GYM_CALL_ANNOTATION,
     PLAN_KEY,
     RUNTIME_DATA_KEY,
+    GymCallPlan,
+    GymEngineReply,
 )
 from nemo_rl.models.generation.gym_call import GymCallResult
 from nemo_rl.models.generation.openai_server_utils import PrefixSplice
@@ -283,7 +285,7 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
             yield chunk
 
     async def _serve_gym_call(
-        self, plan: dict[str, Any], prompt_token_ids: list[int], context: Context
+        self, plan: GymCallPlan, prompt_token_ids: list[int], context: Context
     ) -> Optional[GenerateChunk]:
         """One NeMo-Gym chat call, after the frontend rendered and spliced it.
 
@@ -376,15 +378,16 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
                 result = self._call_result(final_output)
                 if chat.logprobs:
                     output["logprobs"] = _wire_logprobs(completion.logprobs)
+            reply: GymEngineReply = {
+                "output": output,
+                "result": result.model_dump(exclude_none=True),
+            }
             return {
                 "token_ids": output["token_ids"],
                 "index": 0,
                 "finish_reason": completion.finish_reason,
                 "completion_usage": _usage(final_output, len(completion.token_ids)),
-                "engine_data": {
-                    "output": output,
-                    "result": result.model_dump(exclude_none=True),
-                },
+                "engine_data": reply,
             }
         finally:
             # A no-op once the call was staged: staging pops its capture state.
@@ -397,7 +400,7 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
                 )
 
     async def _generate(
-        self, chat: Any, engine_prompt: Any, plan: dict[str, Any], context: Context
+        self, chat: Any, engine_prompt: Any, plan: GymCallPlan, context: Context
     ) -> Any:
         """Generate as the native server does, with the SamplingParams it builds."""
         model_config = self._llm.model_config
@@ -546,17 +549,18 @@ def _refusal(status: int, message: str, *, acknowledge: bool = False) -> Generat
     without its status, so it could only answer 500; the chat engine answers
     this with ``status``, as the native server does.
     """
+    reply: GymEngineReply = {
+        "refusal": {
+            "status": int(status),
+            "message": message,
+            "acknowledge": acknowledge,
+        }
+    }
     return {
         "token_ids": [],
         "index": 0,
         "finish_reason": "stop",
-        "engine_data": {
-            "refusal": {
-                "status": int(status),
-                "message": message,
-                "acknowledge": acknowledge,
-            }
-        },
+        "engine_data": reply,
     }
 
 

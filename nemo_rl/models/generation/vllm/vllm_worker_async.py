@@ -24,7 +24,7 @@ import uuid
 import warnings
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Literal, TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
 import torch
@@ -58,10 +58,11 @@ from nemo_rl.models.generation.interfaces import (
     GenerationOutputSpec,
     verify_right_padding,
 )
-from nemo_rl.models.generation.score_centering import validate_score_centering_request
-from nemo_rl.models.generation.vllm.captured_chat_logprobs import (
-    CapturedChatLogprobsMixin,
+from nemo_rl.models.generation.openai_server_utils import (
+    PrefixSplice,
 )
+from nemo_rl.models.generation.rollout_result import RolloutResult
+from nemo_rl.models.generation.score_centering import validate_score_centering_request
 from nemo_rl.models.generation.vllm.checkpoint_engine import (
     VllmAsyncCheckpointEngineRpcMixin,
 )
@@ -69,27 +70,15 @@ from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
 from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
-from nemo_rl.models.generation.rollout_result import RolloutResult
 from nemo_rl.models.generation.vllm.request_pipeline import (
     rollout_output,
     rollout_result,
 )
 from nemo_rl.models.generation.vllm.utils import (
-    attach_routed_experts_to_chat_response_choices,
-    attach_token_information_to_chat_response_choices,
-    attach_sampler_topk_logprobs_to_chat_response_choices,
     format_prompt_for_vllm_generation,
-    check_sampling_param,
     validate_rollout_prompt,
-    model_dump_chat_response_with_dynamic_message_fields,
-    remap_multimodal_placeholders,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
-from nemo_rl.models.generation.capture_context import decide_capture_input
-from nemo_rl.models.generation.openai_server_utils import (
-    PrefixSplice,
-    splice_prefix_tokens,
-)
 from nemo_rl.telemetry.setup import shutdown_telemetry
 from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
 
@@ -500,7 +489,7 @@ class VllmAsyncGenerationWorkerImpl(
         Controlled by the required vllm_metrics_logger_interval in vllm_cfg.
         Runs only on the model-owner actor.
         """
-        from vllm.v1.metrics.reader import Gauge, Counter, get_metrics_snapshot
+        from vllm.v1.metrics.reader import Counter, Gauge, get_metrics_snapshot
 
         assert self.cfg["vllm_cfg"].get("async_engine", False), (
             "vLLM metrics logger is only supported with async engine enabled"
@@ -1155,7 +1144,6 @@ class VllmAsyncGenerationWorkerImpl(
 
         return {CAPTURE_REFUSAL_HEADER: admission.model_call_id}
 
-    # ruff: noqa
     def _setup_vllm_openai_api_server(self, app: FastAPI) -> FastAPI:
         # Deferred: the chat server imports vLLM's OpenAI server stack.
         from nemo_rl.models.generation.vllm import chat_server
