@@ -1078,6 +1078,17 @@ def _build_retry_policy(master_config: MasterConfig) -> RolloutRetryPolicy:
     )
 
 
+def _start_communicator_early(
+    generation_backend: str, *, colocated: bool, has_teachers: bool
+) -> bool:
+    """Whether the refit communicator may start as soon as the trainer and generation builds return.
+
+    Only non-colocated vLLM without OPD teachers: the teacher LM-head load runs collectives on
+    the student workers that must not interleave with the refit metadata collectives.
+    """
+    return generation_backend == "vllm" and not colocated and not has_teachers
+
+
 def _load_opd_full_teacher_lm_heads(
     trainer: Any,
     teacher_worker_groups: dict[str, Any],
@@ -1367,6 +1378,15 @@ def setup_single_controller(
             )
         if token_capture_cfg.defer_routed_experts_to_policy:
             raise ValueError("VLM token capture requires direct router replay assembly")
+    if (
+        token_capture_cfg.enabled
+        and token_capture_cfg.defer_routed_experts_to_policy
+        and not router_replay_enabled(master_config.policy)
+    ):
+        raise ValueError(
+            "token_capture.defer_routed_experts_to_policy requires "
+            "policy.router_replay.enabled=true"
+        )
     if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
         if not master_config.checkpointing["enabled"]:
             raise ValueError(
@@ -2020,7 +2040,9 @@ def setup_single_controller(
         build_tasks["trainer"] = _build_trainer_and_value
 
     # The communicator needs only the trainer and generation: start it when both return, beside Gym's last stretch.
-    # Non-colocated vLLM generation only; the other paths start it in the tail.
+    start_communicator_early = _start_communicator_early(
+        generation_config["backend"], colocated=colocated, has_teachers=bool(teacher_clusters)
+    )
     tail_lane_secs: dict[str, float] = {}
     communicator_executor = ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="refit-communicator"
@@ -2129,7 +2151,7 @@ def setup_single_controller(
             else:
                 generation, gen_load_time = submitted["generation"].result()
                 trainer, value, time_metrics = submitted["trainer"].result()
-            if not megatron_reserved_urls and not colocated:
+            if start_communicator_early:
                 communicator_future = communicator_executor.submit(_init_communicator)
             if megatron_reserved_urls:
                 # Gym initialization needs a live URL that will respond to health checks.
@@ -2268,15 +2290,6 @@ def setup_single_controller(
     # partition can race kv_retrieve_meta and kill the controller thread
     # (see TQDataPlaneClient.register_partition).
     token_capture_cfg = master_config.token_capture
-    if (
-        token_capture_cfg.enabled
-        and token_capture_cfg.defer_routed_experts_to_policy
-        and not router_replay_enabled(master_config.policy)
-    ):
-        raise ValueError(
-            "token_capture.defer_routed_experts_to_policy requires "
-            "policy.router_replay.enabled=true"
-        )
     if not restore_data_plane_in_actor:
         _register_single_controller_partitions(
             dp_client,
@@ -2417,7 +2430,7 @@ def setup_single_controller(
         finalizer_future = tail_executor.submit(_create_finalizers)
         advantage_future = tail_executor.submit(_create_advantage)
         if communicator_future is None:
-            # Not started with the builds: Megatron generation (synchronized earlier) or colocated generation.
+            # Not started with the builds: colocated, non-vLLM or OPD-teacher setups.
             communicator_future = tail_executor.submit(_init_communicator)
     weight_synchronizer = communicator_future.result()
     finalizer_actors = finalizer_future.result()

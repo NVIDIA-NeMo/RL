@@ -23,7 +23,7 @@ import threading
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from unittest.mock import ANY, MagicMock, patch
 
 import pytest
@@ -2367,6 +2367,7 @@ class TestSetup:
         when both return, not after Gym: Gym's build waits here for the communicator,
         which a start after Gym could never satisfy."""
         mc = self._gym_vllm_config()
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
         communicator_started = threading.Event()
         weight_sync = patched_factories["create_weight_synchronizer"].return_value
         weight_sync.init_communicator.side_effect = communicator_started.set
@@ -2755,15 +2756,10 @@ class TestSetup:
         assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
         fake_gym_shards.shutdown.assert_not_called()
 
-    @pytest.mark.parametrize("colocated", [False, True])
-    def test_setup_tail_starts_communicator_and_actor_pools_together(
-        self, patched_factories, colocated: bool
-    ):
-        """The refit communicator rendezvous and both actor pools have no shared
-        state, so setup starts them together: each waits here for the other two,
-        which a serial order could never satisfy. Colocated generation starts the
-        communicator in the tail; non-colocated vLLM starts it with the builds."""
-        mc = _make_master_config(backend="vllm", colocated=colocated)
+    @staticmethod
+    def _setup_tail_config(patched_factories: dict[str, Any]) -> MasterConfig:
+        """NeMo-Gym + vLLM with token capture and advantage workers: all three tail lanes run."""
+        mc = _make_master_config(backend="vllm")
         mc.policy["generation"].update(
             {
                 "model_name": "test-model",
@@ -2784,22 +2780,15 @@ class TestSetup:
         mc.env = {"should_use_nemo_gym": True, "nemo_gym": {"effort_levels": None}}
         mc.async_rl.num_advantage_workers = 1
         patched_factories["setup_response_data"].return_value = (list(range(8)), None)
-        together = threading.Barrier(3, timeout=30)
-        fake_finalizers = [MagicMock(name="finalizer")]
-        fake_advantage = [MagicMock(name="advantage")]
+        return mc
 
-        def _create_finalizers(*args: Any, **kwargs: Any) -> list[Any]:
-            together.wait()
-            return fake_finalizers
-
-        def _create_advantage(*args: Any, **kwargs: Any) -> list[Any]:
-            together.wait()
-            return fake_advantage
-
-        weight_sync = patched_factories["create_weight_synchronizer"].return_value
-        weight_sync.init_communicator.side_effect = lambda: together.wait()
-        tokenizer = MagicMock(pad_token_id=9)
-
+    @staticmethod
+    @contextlib.contextmanager
+    def _setup_tail_patches(
+        create_finalizers: Callable[..., Any],
+        create_advantage: Callable[..., Any],
+        start_early: bool,
+    ):
         with (
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
@@ -2807,23 +2796,132 @@ class TestSetup:
             ),
             patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch.object(
+                sc_setup_mod, "_start_communicator_early", return_value=start_early
+            ),
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor."
                 "create_rollout_reassembler_actors",
-                side_effect=_create_finalizers,
+                side_effect=create_finalizers,
             ),
             patch(
                 "nemo_rl.algorithms.advantage_actor.create_advantage_actors",
-                side_effect=_create_advantage,
+                side_effect=create_advantage,
             ),
         ):
-            actor_args, _ = setup_single_controller(mc, tokenizer)
+            yield
+
+    @pytest.mark.parametrize("start_early", [True, False])
+    def test_setup_tail_starts_communicator_and_actor_pools_together(
+        self, patched_factories, start_early: bool
+    ):
+        """The refit communicator and both actor pools share no state, so they run
+        together: each waits here for the other two, which a serial order or a
+        thread pool too small for all three could never satisfy. Covers the
+        communicator started with the builds and the one started in the tail."""
+        mc = self._setup_tail_config(patched_factories)
+        together = threading.Barrier(3, timeout=10)
+        arrived: list[str] = []
+        fake_finalizers = [MagicMock(name="finalizer")]
+        fake_advantage = [MagicMock(name="advantage")]
+
+        def _meet(lane: str) -> None:
+            arrived.append(lane)
+            together.wait()
+
+        def _create_finalizers(*args: Any, **kwargs: Any) -> list[Any]:
+            _meet("finalizers")
+            return fake_finalizers
+
+        def _create_advantage(*args: Any, **kwargs: Any) -> list[Any]:
+            _meet("advantage")
+            return fake_advantage
+
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = lambda: _meet("communicator")
+
+        with self._setup_tail_patches(_create_finalizers, _create_advantage, start_early):
+            try:
+                actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=9))
+            except threading.BrokenBarrierError:
+                pytest.fail(f"tail lanes did not run together; arrived: {arrived}")
 
         weight_sync.init_communicator.assert_called_once_with()
         assert actor_args.weight_synchronizer is weight_sync
         assert actor_args.finalizer_actors == fake_finalizers
         assert actor_args.advantage_actors == fake_advantage
-        assert not together.broken
+
+    @pytest.mark.parametrize("start_early", [True, False])
+    def test_setup_tail_raises_a_communicator_failure_after_joining_the_pools(
+        self, patched_factories, start_early: bool
+    ):
+        mc = self._setup_tail_config(patched_factories)
+        pools_done: list[str] = []
+
+        def _create_finalizers(*args: Any, **kwargs: Any) -> list[Any]:
+            pools_done.append("finalizers")
+            return [MagicMock()]
+
+        def _create_advantage(*args: Any, **kwargs: Any) -> list[Any]:
+            pools_done.append("advantage")
+            return [MagicMock()]
+
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = RuntimeError("rendezvous boom")
+
+        with self._setup_tail_patches(_create_finalizers, _create_advantage, start_early):
+            with pytest.raises(RuntimeError, match="rendezvous boom"):
+                setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+        assert sorted(pools_done) == ["advantage", "finalizers"]
+
+    @pytest.mark.parametrize("start_early", [True, False])
+    def test_setup_tail_raises_a_pool_failure_after_joining_the_communicator(
+        self, patched_factories, start_early: bool
+    ):
+        mc = self._setup_tail_config(patched_factories)
+        pool_failed = threading.Event()
+        communicator_done = threading.Event()
+
+        def _init_communicator() -> None:
+            # Still running when the pool fails; setup must wait for it before raising.
+            assert pool_failed.wait(timeout=10), "the pool lane never ran"
+            communicator_done.set()
+
+        def _create_finalizers(*args: Any, **kwargs: Any) -> list[Any]:
+            pool_failed.set()
+            raise RuntimeError("pool boom")
+
+        weight_sync = patched_factories["create_weight_synchronizer"].return_value
+        weight_sync.init_communicator.side_effect = _init_communicator
+
+        with self._setup_tail_patches(
+            _create_finalizers, lambda *a, **k: [MagicMock()], start_early
+        ):
+            with pytest.raises(RuntimeError, match="pool boom"):
+                setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+        assert communicator_done.is_set()
+
+    @pytest.mark.parametrize(
+        ("backend", "colocated", "has_teachers", "expected"),
+        [
+            ("vllm", False, False, True),
+            ("vllm", True, False, False),
+            ("vllm", False, True, False),
+            ("sglang", False, False, False),
+            ("megatron", False, False, False),
+        ],
+    )
+    def test_start_communicator_early_only_for_non_colocated_vllm_without_teachers(
+        self, backend: str, colocated: bool, has_teachers: bool, expected: bool
+    ):
+        assert (
+            sc_setup_mod._start_communicator_early(
+                backend, colocated=colocated, has_teachers=has_teachers
+            )
+            is expected
+        )
 
     @pytest.mark.parametrize("think_tag_penalty", [False, True])
     @pytest.mark.parametrize("with_processor", [True, False])
