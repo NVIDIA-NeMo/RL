@@ -48,7 +48,7 @@ def calendar_sentinel_count(state: dict[str, Any], event_name: str) -> int:
     return sum(str(name).lower() == event_name.lower() for name in names)
 
 
-# Written once, by GenerationCutCapture when a restored prefix is admitted.
+# Written once, by PrefixRecovery when a restored prefix is admitted.
 _RESTORED_PREFIX_LINE = re.compile(
     r"generation prefix restored: rollout_id=(?P<rollout_id>\S+) "
     r"model_call_id=(?P<model_call_id>\S+) "
