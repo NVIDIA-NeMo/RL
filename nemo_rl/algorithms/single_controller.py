@@ -3122,12 +3122,7 @@ class SingleControllerActor:
                                     await asyncio.to_thread(
                                         self._trainer.offload_to_cpu
                                     )
-                            resident_kwargs = (
-                                {"keep_resident": True} if self._value_dedicated else {}
-                            )
-                            await self._ppo_worker_call(
-                                self._value.prepare_for_inference, **resident_kwargs
-                            )
+                            await asyncio.to_thread(self._value.prepare_for_inference)
                         value_inference_prepared = True
 
                 # The loop can leave a wait open on two exits that continue
@@ -3146,12 +3141,7 @@ class SingleControllerActor:
                     # Release its speculative residency and restore policy
                     # residency before the optimizer update and early refit.
                     with self._timer.time("value_inference_prep"):
-                        resident_kwargs = (
-                            {"keep_resident": True} if self._value_dedicated else {}
-                        )
-                        await self._ppo_worker_call(
-                            self._value.finish_inference, **resident_kwargs
-                        )
+                        await asyncio.to_thread(self._value.finish_inference)
                     value_inference_prepared = False
                     if step_open:
                         with self._timer.time("training_prep"):
@@ -4607,12 +4597,9 @@ class SingleControllerActor:
                 await asyncio.to_thread(self._trainer.offload_to_cpu)
             # The value model writes synchronously, so unlike the policy below it is
             # fully on disk when this returns and needs no finalize wait.
-            resident_kwargs = {"keep_resident": True} if self._value_dedicated else {}
-            await self._ppo_worker_call(
-                self._value.prepare_for_training, **resident_kwargs
-            )
+            await asyncio.to_thread(self._value.prepare_for_training)
             try:
-                await self._ppo_worker_call(
+                await asyncio.to_thread(
                     self._value.save_checkpoint,
                     weights_path=os.path.join(checkpoint_path, "value", "weights"),
                     optimizer_path=os.path.join(checkpoint_path, "value", "optimizer")
@@ -4622,9 +4609,7 @@ class SingleControllerActor:
                     is_final_checkpoint=is_final_checkpoint,
                 )
             finally:
-                await self._ppo_worker_call(
-                    self._value.finish_training, **resident_kwargs
-                )
+                await asyncio.to_thread(self._value.finish_training)
             # Also covers a warmup step, which never ran prepare_for_training in
             # the pump and would otherwise save from CPU-resident params.
             if not self._value_dedicated:
@@ -5024,33 +5009,11 @@ class SingleControllerActor:
         Returns:
             The batch metadata with the ``values`` column recorded on it.
         """
-        resident_kwargs = {"keep_resident": True} if self._value_dedicated else {}
         if not already_prepared:
-            await self._ppo_worker_call(
-                self._value.prepare_for_inference, **resident_kwargs
-            )
-        try:
-            await self._ppo_worker_call(self._value.get_values_from_meta, meta)
-        finally:
-            await self._ppo_worker_call(self._value.finish_inference, **resident_kwargs)
+            await asyncio.to_thread(self._value.prepare_for_inference)
+        await asyncio.to_thread(self._value.get_values_from_meta, meta)
+        await asyncio.to_thread(self._value.finish_inference)
         return meta.with_fields([self._advantage_cfg.values_field])
-
-    async def _ppo_worker_call(
-        self, function: Callable[..., Any], *args: Any, **kwargs: Any
-    ) -> Any:
-        """Drain an in-flight worker call before cancellation can abort/offload it.
-
-        Cancelling to_thread does not stop its thread or the Ray RPC. Shield it
-        so epoch cleanup cannot race with a backward pass or optimizer update.
-        """
-        task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            try:
-                await task
-            finally:
-                raise
 
     async def _value_train_epochs(
         self, metas: list[KVBatchMeta], *, num_epochs: int
@@ -5059,33 +5022,23 @@ class SingleControllerActor:
         value_loss_fn = self._value_loss_fn
         if value_loss_fn is None:
             raise RuntimeError("PPO value training requires a value loss function")
-        resident_kwargs = {"keep_resident": True} if self._value_dedicated else {}
-        await self._ppo_worker_call(self._value.prepare_for_training, **resident_kwargs)
+        await asyncio.to_thread(self._value.prepare_for_training)
         result: dict[str, Any] | None = None
-        try:
-            if self._algo_cfg.value_training_mode == "whole_batch":
-                full_meta = metas[0].concat(*metas[1:])
-                for _ in range(num_epochs):
-                    result = await self._ppo_worker_call(
-                        self._value.train_from_meta, full_meta, value_loss_fn
+        if self._algo_cfg.value_training_mode == "whole_batch":
+            full_meta = metas[0].concat(*metas[1:])
+            for _ in range(num_epochs):
+                result = await asyncio.to_thread(
+                    self._value.train_from_meta, full_meta, value_loss_fn
+                )
+        else:
+            for _ in range(num_epochs):
+                await asyncio.to_thread(self._value.begin_train_step, value_loss_fn)
+                for meta in metas:
+                    await asyncio.to_thread(
+                        self._value.train_microbatches_from_meta, meta
                     )
-            else:
-                for _ in range(num_epochs):
-                    try:
-                        await self._ppo_worker_call(
-                            self._value.begin_train_step, value_loss_fn
-                        )
-                        for meta in metas:
-                            await self._ppo_worker_call(
-                                self._value.train_microbatches_from_meta, meta
-                            )
-                        result = await self._ppo_worker_call(
-                            self._value.finish_train_step
-                        )
-                    finally:
-                        await self._ppo_worker_call(self._value.abort_train_step)
-        finally:
-            await self._ppo_worker_call(self._value.finish_training, **resident_kwargs)
+                result = await asyncio.to_thread(self._value.finish_train_step)
+        await asyncio.to_thread(self._value.finish_training)
         assert result is not None
         return result
 

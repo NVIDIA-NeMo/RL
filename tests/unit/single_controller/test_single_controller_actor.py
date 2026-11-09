@@ -3172,25 +3172,26 @@ class _NoOpValue:
         self.calls: list[str] = [] if calls is None else calls
         self._prefix = prefix
         self.resident_calls: list[tuple[str, bool]] = []
+        self._keep_resident = False
         self.trained_sample_ids: list[list[str]] = []
 
     def _record(self, name: str) -> None:
         self.calls.append(f"{self._prefix}{name}")
 
-    def prepare_for_inference(self, keep_resident: bool = False) -> None:
-        self.resident_calls.append(("prepare_for_inference", keep_resident))
+    def prepare_for_inference(self) -> None:
+        self.resident_calls.append(("prepare_for_inference", self._keep_resident))
         self._record("prepare_for_inference")
 
     def get_values_from_meta(self, meta: KVBatchMeta) -> None:
         del meta
         self._record("get_values_from_meta")
 
-    def finish_inference(self, keep_resident: bool = False) -> None:
-        self.resident_calls.append(("finish_inference", keep_resident))
+    def finish_inference(self) -> None:
+        self.resident_calls.append(("finish_inference", self._keep_resident))
         self._record("finish_inference")
 
-    def prepare_for_training(self, keep_resident: bool = False) -> None:
-        self.resident_calls.append(("prepare_for_training", keep_resident))
+    def prepare_for_training(self) -> None:
+        self.resident_calls.append(("prepare_for_training", self._keep_resident))
         self._record("prepare_for_training")
 
     def begin_train_step(self, loss_fn) -> None:
@@ -3219,8 +3220,8 @@ class _NoOpValue:
             "all_mb_metrics": {"vf_clipfrac": [0.0], "values_min": [-1.0]},
         }
 
-    def finish_training(self, keep_resident: bool = False) -> None:
-        self.resident_calls.append(("finish_training", keep_resident))
+    def finish_training(self) -> None:
+        self.resident_calls.append(("finish_training", self._keep_resident))
         self._record("finish_training")
 
 
@@ -3360,6 +3361,7 @@ def test_dedicated_value_keeps_both_models_resident_during_ppo_step(
         sampler=_OneThenEmptySampler(meta), value=value
     )
     ctrl._value_dedicated = True
+    value._keep_resident = True
     ctrl._policy_logprobs_required = policy_logprobs_required
     trainer = _OrderRecordingTrainer(calls)
     trainer.prepare_for_lp_inference = MagicMock(wraps=trainer.prepare_for_lp_inference)
@@ -3849,6 +3851,25 @@ def test_streaming_ppo_split_value_replays_each_chunk_per_epoch(
     assert "critic.train_from_meta" not in calls
     assert calls.index("refit") < calls.index("critic.begin_train_step")
     assert controller._trainer_version == controller._train_steps == 1
+
+
+def test_streaming_ppo_dedicated_value_keeps_policy_resident(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, metas, calls = _streaming_ppo_controller(monkeypatch)
+    controller._value_dedicated = True
+    controller._value._keep_resident = True
+
+    asyncio.run(asyncio.wait_for(controller._train_pump(), timeout=1.0))
+
+    assert calls.count("critic.get_values_from_meta") == len(metas)
+    assert calls.count("policy.train_microbatches_from_meta") == len(metas)
+    assert "policy.pause_train_step_with_offloading" not in calls
+    assert "policy.offload_to_cpu" not in calls
+    assert controller._value.resident_calls == [
+        ("prepare_for_inference", True),
+        ("finish_inference", True),
+    ] * len(metas) + [("prepare_for_training", True), ("finish_training", True)]
 
 
 @pytest.mark.parametrize("warmup", [False, True])

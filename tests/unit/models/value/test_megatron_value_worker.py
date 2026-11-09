@@ -277,6 +277,7 @@ def test_prepare_for_training_leaves_native_cpu_optimizer_placement():
             self.train_called = True
 
     worker = object.__new__(MegatronValueWorkerImpl)
+    worker._keep_resident = False
     model = _TrainableModel()
     worker.model = model
     worker.optimizer = object()
@@ -335,6 +336,7 @@ def test_finish_training_updates_eval_cache_before_parameter_offload(
 
     worker = SimpleNamespace(
         _train_step_state=None,
+        _keep_resident=False,
         model=model,
         optimizer=object(),
         optimizer_cpu_offload=optimizer_cpu_offload,
@@ -363,6 +365,7 @@ def test_resident_value_lifecycle_never_moves_model_or_optimizer():
     model = MagicMock()
     worker = SimpleNamespace(
         _train_step_state=None,
+        _keep_resident=True,
         model=model,
         optimizer=object(),
         optimizer_cpu_offload=False,
@@ -371,10 +374,10 @@ def test_resident_value_lifecycle_never_moves_model_or_optimizer():
         move_optimizer=MagicMock(side_effect=AssertionError("optimizer moved")),
     )
 
-    MegatronValueWorkerImpl.prepare_for_training(worker, keep_resident=True)
-    MegatronValueWorkerImpl.prepare_for_inference(worker, keep_resident=True)
-    MegatronValueWorkerImpl.finish_inference(worker, keep_resident=True)
-    MegatronValueWorkerImpl.finish_training(worker, keep_resident=True)
+    MegatronValueWorkerImpl.prepare_for_training(worker)
+    MegatronValueWorkerImpl.prepare_for_inference(worker)
+    MegatronValueWorkerImpl.finish_inference(worker)
+    MegatronValueWorkerImpl.finish_training(worker)
 
     assert model.train.call_count == 1
     assert model.eval.call_count == 2
@@ -460,6 +463,7 @@ def test_finish_training_preserves_model_move_contract(monkeypatch):
     events = []
     move_kwargs = []
     worker = object.__new__(MegatronValueWorkerImpl)
+    worker._keep_resident = False
     worker._train_step_state = None
     worker.model = _EvalModel()
     worker.optimizer = None
@@ -489,11 +493,12 @@ def test_finish_training_clears_transient_caches_when_configured(
     events: list[str] = []
     model = SimpleNamespace(eval=lambda: events.append("eval"))
     worker = object.__new__(MegatronValueWorkerImpl)
+    worker._keep_resident = False
     worker.model = model
     worker.optimizer = None
     worker._train_step_state = None
     worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": clear_caches}}
-    worker.move_model = lambda m, device, **kwargs: (events.append("move_model") or m)
+    worker.move_model = lambda m, device, **kwargs: events.append("move_model") or m
     monkeypatch.setattr(
         megatron_value_worker,
         "clear_transient_megatron_caches",

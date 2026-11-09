@@ -14,7 +14,7 @@
 
 from typing import Any, NotRequired, TypedDict
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nemo_rl.models.policy import (
     AutomodelConfig,
@@ -35,8 +35,14 @@ from nemo_rl.models.policy import (
 
 
 class ValueResourcesConfig(BaseModel, extra="allow"):
-    dedicated: bool = False
-    num_nodes: int | None = None
+    dedicated: bool = Field(
+        default=False,
+        description="Place the SingleController PPO value model on dedicated GPU nodes.",
+    )
+    num_nodes: int | None = Field(
+        default=None,
+        description="Number of full nodes reserved for a dedicated value model.",
+    )
 
 
 class ValueConfig(TypedDict):

@@ -1628,48 +1628,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "cluster.num_nodes must leave at least one full policy node after "
                 "reserving generation and dedicated value nodes"
             )
-        policy_gpus = (
-            master_config.cluster.num_nodes - value_nodes - inference_nodes
-        ) * cluster_gpus
-        value_gpus = value_nodes * cluster_gpus
-        for role, megatron_config, available_gpus in (
-            ("policy", policy_megatron_cfg, policy_gpus),
-            ("value", value_megatron_cfg, value_gpus),
-        ):
-            parallel_sizes = {
-                name: megatron_config.get(name, 1)
-                for name in (
-                    "tensor_model_parallel_size",
-                    "pipeline_model_parallel_size",
-                    "context_parallel_size",
-                    "expert_model_parallel_size",
-                )
-            }
-            if any(
-                not isinstance(size, int) or size < 1
-                for size in parallel_sizes.values()
-            ):
-                raise ValueError(
-                    f"{role}.megatron_cfg parallel sizes must be positive integers"
-                )
-            validated_parallel_sizes = cast(dict[str, int], parallel_sizes)
-            model_parallel_size = (
-                validated_parallel_sizes["tensor_model_parallel_size"]
-                * validated_parallel_sizes["pipeline_model_parallel_size"]
-                * validated_parallel_sizes["context_parallel_size"]
-            )
-            expert_parallel_size = validated_parallel_sizes[
-                "expert_model_parallel_size"
-            ]
-            if (
-                available_gpus % model_parallel_size
-                or available_gpus % expert_parallel_size
-            ):
-                raise ValueError(
-                    f"Dedicated {role} has {available_gpus} GPUs, incompatible with "
-                    f"model parallel size {model_parallel_size} and expert parallel "
-                    f"size {expert_parallel_size}"
-                )
     if (
         getattr(algo_cfg, "policy_training_start_step", 0) > 0
         and master_config.checkpointing["enabled"]

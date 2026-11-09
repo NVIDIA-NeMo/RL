@@ -3923,11 +3923,12 @@ class _OrderRecordingCritic:
 
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
+        self._keep_resident = False
 
-    def prepare_for_training(self, keep_resident: bool = False) -> None:
+    def prepare_for_training(self) -> None:
         self.calls.append(
             "critic.prepare_for_training:resident"
-            if keep_resident
+            if self._keep_resident
             else "critic.prepare_for_training"
         )
 
@@ -3935,10 +3936,10 @@ class _OrderRecordingCritic:
         self.save_kwargs = kwargs
         self.calls.append("critic.save_checkpoint")
 
-    def finish_training(self, keep_resident: bool = False) -> None:
+    def finish_training(self) -> None:
         self.calls.append(
             "critic.finish_training:resident"
-            if keep_resident
+            if self._keep_resident
             else "critic.finish_training"
         )
 
@@ -3996,6 +3997,7 @@ class TestPPOSaveOrder:
         calls: list[str] = []
         actor = _ppo_save_actor(tmp_path, calls)
         actor._value_dedicated = True
+        actor._value._keep_resident = True
 
         asyncio.run(
             actor._save_checkpoint(
@@ -4014,6 +4016,7 @@ class TestPPOSaveOrder:
         calls: list[str] = []
         actor = _ppo_save_actor(tmp_path, calls)
         actor._value_dedicated = True
+        actor._value._keep_resident = True
         actor._value.save_checkpoint = MagicMock(
             side_effect=RuntimeError("critic save failed")
         )

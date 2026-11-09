@@ -369,6 +369,11 @@ def setup(
     # Extract individual configs for easier access
     policy_config = master_config.policy
     value_config = master_config.value
+    value_resources = value_config.get("resources")
+    if value_resources is not None and value_resources.dedicated:
+        raise ValueError(
+            "value.resources.dedicated=true requires the SingleController PPO entrypoint"
+        )
     generation_config = master_config.policy["generation"]
     env_configs = master_config.env
     loss_config: ClippedPGLossConfig = master_config.loss_fn

@@ -412,32 +412,24 @@ class Value(ValueInterface):
 
         return aggregated_results
 
-    def prepare_for_training(self, keep_resident: bool = False) -> None:
+    def prepare_for_training(self) -> None:
         """Prepare the value model for training (load to GPU)."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "prepare_for_training", keep_resident=keep_resident
-        )
+        futures = self.worker_group.run_all_workers_single_data("prepare_for_training")
         ray.get(futures)
 
-    def prepare_for_inference(self, keep_resident: bool = False) -> None:
+    def prepare_for_inference(self) -> None:
         """Prepare the value model for inference (offload gradients, set eval mode)."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "prepare_for_inference", keep_resident=keep_resident
-        )
+        futures = self.worker_group.run_all_workers_single_data("prepare_for_inference")
         ray.get(futures)
 
-    def finish_inference(self, keep_resident: bool = False) -> None:
+    def finish_inference(self) -> None:
         """Offload value model to CPU after inference."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "finish_inference", keep_resident=keep_resident
-        )
+        futures = self.worker_group.run_all_workers_single_data("finish_inference")
         ray.get(futures)
 
-    def finish_training(self, keep_resident: bool = False) -> None:
+    def finish_training(self) -> None:
         """Offload value model to CPU after training."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "finish_training", keep_resident=keep_resident
-        )
+        futures = self.worker_group.run_all_workers_single_data("finish_training")
         ray.get(futures)
 
     def save_checkpoint(

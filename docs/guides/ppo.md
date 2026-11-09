@@ -44,6 +44,8 @@ By default, PPO uses a colocated architecture where the **policy**, **value mode
 
 PPO also supports non-colocated vLLM generation. In this mode, the policy and value model continue to time-share one training `RayVirtualCluster`, while vLLM runs on a separate inference `RayVirtualCluster` in the same Ray cluster. Updated policy weights are transferred to vLLM through the cross-cluster collective refit path.
 
+SingleController PPO can instead keep the value model on separate, resident GPUs by setting `value.resources.dedicated: true` and `value.resources.num_nodes` to the number of full value nodes. The default is shared placement (`dedicated: false`, `num_nodes: null`). This mode requires a Megatron policy, non-colocated generation occupying full nodes, and at least one full policy node after reserving generation and value nodes. The legacy `run_ppo.py` entrypoint does not support dedicated value placement. See the [dedicated value recipe](../../examples/configs/recipes/llm/ppo-qwen2.5-1.5b-math-3n2g-megatron-dedicated-value.yaml).
+
 ```yaml
 policy:
   generation:

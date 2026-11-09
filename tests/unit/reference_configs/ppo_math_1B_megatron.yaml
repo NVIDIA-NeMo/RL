@@ -332,6 +332,9 @@ policy:
 
 # Value Model with Megatron-Core Backend (for GAE in PPO)
 value:
+  resources:
+    dedicated: false
+    num_nodes: null
   model_name: ${policy.model_name}
   tokenizer:
     name: ${value.model_name}

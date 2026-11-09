@@ -246,6 +246,42 @@ class TestAlgoConfigSelection:
 
 class TestPPOValidation:
     @pytest.mark.parametrize(
+        ("invalid_setting", "message"),
+        [
+            ("policy_backend", "policy.megatron_cfg.enabled=true"),
+            ("colocated", "colocated.enabled=false"),
+            ("missing_value_nodes", "value.resources.num_nodes >= 1"),
+            ("partial_generation_node", "generation to use full nodes"),
+            ("no_policy_node", "at least one full policy node"),
+        ],
+    )
+    def test_rejects_invalid_dedicated_value_layout(
+        self, invalid_setting: str, message: str
+    ) -> None:
+        mc = _ppo_master_config()
+        mc.cluster = ClusterConfig(num_nodes=3, gpus_per_node=8)
+        mc.policy["megatron_cfg"]["enabled"] = True
+        mc.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 8,
+            "num_nodes": 1,
+        }
+        mc.value["resources"] = ValueResourcesConfig(dedicated=True, num_nodes=1)
+
+        if invalid_setting == "policy_backend":
+            mc.policy["megatron_cfg"]["enabled"] = False
+        elif invalid_setting == "colocated":
+            mc.policy["generation"]["colocated"]["enabled"] = True
+        elif invalid_setting == "missing_value_nodes":
+            mc.value["resources"].num_nodes = None
+        elif invalid_setting == "partial_generation_node":
+            mc.policy["generation"]["colocated"]["resources"]["gpus_per_node"] = 4
+        else:
+            mc.cluster = ClusterConfig(num_nodes=2, gpus_per_node=8)
+
+        with pytest.raises(ValueError, match=message):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
         "make_config",
         [
             _ppo_master_config,
@@ -947,6 +983,53 @@ def patched_ppo_factories():
 
 
 class TestSetupBuildsTheCritic:
+    @pytest.mark.parametrize("shared_node", [False, True])
+    def test_dedicated_value_claims_distinct_nodes_and_resident_worker(
+        self, patched_ppo_factories, shared_node: bool
+    ) -> None:
+        mc = _ppo_master_config()
+        mc.cluster = ClusterConfig(num_nodes=3, gpus_per_node=8)
+        mc.policy["megatron_cfg"]["enabled"] = True
+        mc.policy["generation"]["colocated"]["resources"] = {
+            "gpus_per_node": 8,
+            "num_nodes": 1,
+        }
+        mc.value["resources"] = ValueResourcesConfig(dedicated=True, num_nodes=1)
+        train_cluster = MagicMock(name="train_cluster")
+        inference_cluster = MagicMock(name="inference_cluster")
+        value_cluster = MagicMock(name="value_cluster")
+        train_cluster.node_count.return_value = 1
+        value_cluster.node_count.return_value = 1
+        train_cluster.get_available_addresses_and_ports_batch.return_value = [
+            ("policy-node", 1000)
+        ]
+        value_cluster.get_available_addresses_and_ports_batch.return_value = [
+            ("policy-node" if shared_node else "value-node", 1000)
+        ]
+
+        with (
+            patch.object(
+                sc_setup_mod,
+                "_build_clusters",
+                return_value=(train_cluster, inference_cluster, value_cluster, None),
+            ),
+            patch(
+                "nemo_rl.data_plane.mooncake_storage_unit.plan_storage_unit_nodes",
+                return_value=None,
+            ) as plan_storage,
+        ):
+            if shared_node:
+                with pytest.raises(RuntimeError, match="share physical nodes"):
+                    setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+                patched_ppo_factories["_build_value"].assert_not_called()
+                return
+            setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
+
+        assert patched_ppo_factories["_build_value"].call_args.args[0] is value_cluster
+        patched_ppo_factories["value"].prepare_for_training.assert_called_once_with()
+        patched_ppo_factories["policy"].offload_to_cpu.assert_not_called()
+        assert plan_storage.call_args.args[1]["value"] is value_cluster
+
     def test_actor_args_carry_the_critic_and_its_loss(self, patched_ppo_factories):
         mc = _ppo_master_config()
 

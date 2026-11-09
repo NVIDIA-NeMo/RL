@@ -1819,6 +1819,7 @@ def setup_single_controller(
     clusters_by_name: dict[str, RayVirtualCluster] = {
         "train": train_cluster,
         "inference": inference_cluster,
+        **({"value": value_cluster} if value_cluster is not None else {}),
         **{f"teacher:{name}": c for name, c in teacher_clusters.items()},
     }
     storage_unit_node_ids = plan_storage_unit_nodes(dp_config, clusters_by_name)
@@ -1898,7 +1899,7 @@ def setup_single_controller(
             value.sharding_annotations.get_axis_size("data_parallel"),
         )
         if dedicated_value:
-            value.prepare_for_training(keep_resident=True)
+            value.prepare_for_training()
         else:
             value.finish_training()
             trainer.prepare_for_training()
