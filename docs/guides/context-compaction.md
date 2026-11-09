@@ -237,13 +237,14 @@ Each physical row is its own GAE episode: the reward sits on the row's last
 response token and values do not bootstrap across rows, which matters when
 `gae_lambda < 1`.
 
-Batch cardinality counts logical rollouts; GRPO advantages are per logical rollout, PPO advantages are per physical row. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` or `ppo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit, which `token_capture.forest_truncation_scope: row` selects instead. Reward shaping and message-level advantage overrides remain unsupported for forest training. Reward penalties apply once per logical rollout: text checks read the scored response, token checks the scored segment, and `token_capture.forest_penalty_scope: all_segments` extends token checks to every segment. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
+Batch cardinality counts logical rollouts; GRPO advantages are per logical rollout, PPO advantages are per physical row. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` or `ppo.overlong_filtering` then excludes all of its rows. This differs from checking each physical row against the sequence limit, which `token_capture.forest_truncation_scope: row` selects instead. Reward shaping and message-level advantage overrides remain unsupported for forest training. Reward penalties apply once per logical rollout: text checks read the scored response, token checks the scored segment, and `token_capture.forest_penalty_scope: all_segments` extends token checks to every segment. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
 
 These `token_capture` options adjust which rows train and how failures mask
 them. All are Forest-only and off by default:
 
-- `owner_failure_scope: row`: a failed segment, or one that fails
-  sequence-logprob filtering, is masked alone unless it holds the scored call.
+- `owner_failure_scope: row`: a failed segment is masked alone unless it holds
+  the scored call; sequence-logprob and overlong filtering mask each failing row
+  alone, the scored row included.
 - `invalid_group_policy: placeholder`: a group whose rollouts all failed
   publishes masked single-token rows instead of being dropped.
 - `mask_retried_roots`: mask an uncontinued root whose prompt tokens also

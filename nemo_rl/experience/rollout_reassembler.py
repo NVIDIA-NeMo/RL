@@ -1229,6 +1229,9 @@ class RolloutReassembler:
         if logical is not None:
             if valid_rows:
                 dummy_layout = valid_rows[0]
+                if self._invalid_group_policy == "placeholder":
+                    # Report 0 for other groups so the step mean is a rate.
+                    metrics["finalize/placeholder_group"] = 0.0
             elif (
                 self._invalid_group_policy == "placeholder" and not self._capture_media
             ):
@@ -1666,7 +1669,7 @@ class RolloutReassembler:
         receipts: list[Optional[dict[str, Any]]],
         reward_checks: tuple[RewardChecks | None, ...],
     ) -> _LogicalRows:
-        """Verify ordinary segments, then keep all or none of each owner's rows.
+        """Verify ordinary segments, then mask each owner's rows per the failure scope.
 
         A missing initial prompt is a structural group failure: a sibling's
         possibly different post-agent prompt is not evidence for a failed owner.

@@ -75,8 +75,9 @@ class ForestCapture:
         return records, replies
 
 
-@pytest.fixture
-def forest(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> ForestCapture:
+def _forest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, **harness_kwargs: Any
+) -> ForestCapture:
     plane = PublicationDataPlane()
     source = TQTokenSource(plane, staging_partition="staged")
     harness = gym.make_capture_harness(
@@ -85,6 +86,7 @@ def forest(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> ForestCapture:
         sink=TQTokenSink(plane, staging_partition="staged"),
         fetch_prefix=lambda keys: source.fetch_prefix_chains(keys).expanded,
         decide_input=decide_capture_input,
+        **harness_kwargs,
     )
     return ForestCapture(
         harness,
@@ -97,6 +99,11 @@ def forest(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> ForestCapture:
             max_seq_len=1024,
         ),
     )
+
+
+@pytest.fixture
+def forest(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> ForestCapture:
+    return _forest(monkeypatch, tmp_path)
 
 
 def ordinary(replies: list[dict], *, terminal: str | None = None) -> dict:
@@ -1483,6 +1490,60 @@ def test_retried_root_rows_mask_only_uncontinued_duplicates():
     assert _retried_root_rows(rows, [True] * len(rows), "scored") == {1, 3}
     # An already-failed row neither masks nor gets masked.
     assert _retried_root_rows(rows, [True, False, *[True] * 5], "scored") == {3}
+
+
+@pytest.mark.parametrize("mask_retried", [False, True])
+def test_retried_root_is_masked_and_skips_all_segments_penalties(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, mask_retried: bool
+) -> None:
+    # Root A is retried as A' with the same prompt; the session continues A -> B.
+    # Only the abandoned retry A' (the second completion) emits an unwanted token.
+    # The fake engine mints distinct root prompt tokens unless root_prompt is set.
+    forest = _forest(monkeypatch, tmp_path, root_prompt=[7, 8])
+    complete = gym.RolloutTokenCapture.complete_call
+    completed: list[None] = []
+
+    def tagged_completion(capture: Any, active: Any, **kwargs: Any) -> Any:
+        completed.append(None)
+        if len(completed) == 2:
+            kwargs["generated_token_ids"] = [_UNWANTED] * len(
+                kwargs["generated_token_ids"]
+            )
+        return complete(capture, active, **kwargs)
+
+    monkeypatch.setattr(gym.RolloutTokenCapture, "complete_call", tagged_completion)
+    prompt = [{"role": "user", "content": "retried request"}]
+    first = gym.assert_clean(forest.harness.post("attempt", prompt))
+    gym.assert_clean(forest.harness.post("attempt", prompt))
+    gym.assert_clean(
+        forest.harness.post(
+            "attempt",
+            prompt + first["output"] + [{"role": "user", "content": "observation"}],
+        )
+    )
+    records = list(forest.harness.manifest("attempt").records)
+    assert [r.parent_call_id for r in records] == [None, None, records[0].model_call_id]
+    forest.finalizer._reward_penalty_config = RewardPenaltyConfig(
+        penalize_unwanted_tokens=True, token_ids={"unwanted": [_UNWANTED]}
+    )
+    forest.finalizer._forest_penalty_scope = "all_segments"
+    forest.finalizer._mask_retried_roots = mask_retried
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [receipt(records, terminal=records[2])],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[selection(records)],
+    )
+    # A masked retry neither trains nor zeroes the owner's reward.
+    assert result.valid_row_count == (1 if mask_retried else 2)
+    assert [obs.reward for obs in result.reward_observations] == [
+        1.0 if mask_retried else 0.0
+    ]
 
 
 def test_publication_identity_drift_preserves_staging(forest, monkeypatch):

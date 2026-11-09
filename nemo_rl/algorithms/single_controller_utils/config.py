@@ -720,8 +720,9 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     forest_pad_source: Literal["row0", "cyclic"] = "row0"
     # Forest only. What a failed segment invalidates.
     # owner: every row of its logical rollout (default).
-    # row: only that row, unless it holds the scored call; the same scope
-    # applies to sequence-logprob-error filtering.
+    # row: only that row, unless it holds the scored call. Sequence-logprob-error
+    # and overlong filtering then mask each failing row alone, the scored row
+    # included.
     owner_failure_scope: Literal["owner", "row"] = "owner"
     # Forest only. A group whose rollouts all failed has no input layout to
     # borrow. drop: drop the group (default). placeholder: publish masked

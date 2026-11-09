@@ -1397,6 +1397,11 @@ def setup_single_controller(
             )
         if token_capture_cfg.defer_routed_experts_to_policy:
             raise ValueError("VLM token capture requires direct router replay assembly")
+        if token_capture_cfg.invalid_group_policy == "placeholder":
+            raise ValueError(
+                "token_capture.invalid_group_policy=placeholder does not support "
+                "media capture"
+            )
     if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
         if not master_config.checkpointing["enabled"]:
             raise ValueError(

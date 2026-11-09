@@ -2791,6 +2791,19 @@ class TestSetup:
         assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
         fake_gym_shards.shutdown.assert_not_called()
 
+    def test_media_capture_rejects_placeholder_groups(self, patched_factories):
+        mc = _make_master_config(backend="vllm", megatron_enabled=True)
+        mc.token_capture.enabled = True
+        mc.token_capture.invalid_group_policy = "placeholder"
+        tokenizer = MagicMock(pad_token_id=9)
+        with (
+            patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+            pytest.raises(ValueError, match="invalid_group_policy=placeholder"),
+        ):
+            setup_single_controller(
+                mc, tokenizer, processor=MagicMock(tokenizer=tokenizer)
+            )
+
     @pytest.mark.parametrize("think_tag_penalty", [False, True])
     @pytest.mark.parametrize("with_processor", [True, False])
     @pytest.mark.parametrize("with_opd", [True, False])

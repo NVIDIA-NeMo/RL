@@ -107,6 +107,37 @@ def test_from_master_config_uses_typed_logger(
     )
 
 
+@pytest.mark.parametrize(
+    "option,expected",
+    [
+        ({}, False),
+        ({"owner_failure_scope": "row"}, True),
+        ({"mask_retried_roots": True}, True),
+    ],
+)
+def test_finalizer_masks_rows_follows_row_masking_options(
+    tmp_path: Path, option: dict, expected: bool
+) -> None:
+    # Every token_capture option that lets the finalizer mask single rows of a
+    # valid owner must set this flag, or those owners are voided whole.
+    master_config = SimpleNamespace(
+        grpo=GRPOConfig(num_generations_per_prompt=2),
+        ppo=None,
+        loss_fn=ClippedPGLossConfig(),
+        on_policy_distillation=None,
+        policy={"generation": {"top_k": None, "top_p": 1.0}},
+        logger=LoggerConfig(log_dir=str(tmp_path)),
+        token_capture=TokenCaptureConfig(forest_training=True, **option),
+        async_rl=SimpleNamespace(
+            log_full_train_data=False, debug_writer=DebugWriterConfig()
+        ),
+    )
+
+    config = AdvantageStageConfig.from_master_config(master_config)
+
+    assert config.finalizer_masks_rows is expected
+
+
 class TestInputFields:
     def test_only_the_always_present_columns_by_default(self) -> None:
         adv = AdvantageConfig()

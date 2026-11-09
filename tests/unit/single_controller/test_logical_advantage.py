@@ -142,6 +142,8 @@ def test_forest_selection_config(policy):
         {"owner_failure_scope": "row"},
         {"invalid_group_policy": "placeholder"},
         {"mask_retried_roots": True},
+        {"unserved_call_failure": "ignore"},
+        {"forest_truncation_scope": "row"},
         {"forest_penalty_scope": "all_segments"},
         {"exclude_padding_from_router_stats": True},
         {"forest_padding_scope": "step"},
@@ -616,13 +618,20 @@ def test_preserves_existing_grpo_normalization_and_leave_one_out(
     torch.testing.assert_close(data["advantages"], expected[[0, 0, 1, 1, 1, 2]])
 
 
+@pytest.mark.parametrize("scope", ["owner", "row"])
 @pytest.mark.parametrize("filtering", [False, True])
-def test_overlong_filter_flag_is_respected_for_all_owner_segments(filtering):
+def test_overlong_filter_flag_is_respected_for_all_owner_segments(filtering, scope):
     meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])])
     data["truncated"][1] = True
-    ctrl = _controller(meta, data, grpo={"overlong_filtering": filtering})
+    ctrl = _with_failure_scope(
+        _controller(meta, data, grpo={"overlong_filtering": filtering}), scope
+    )
     asyncio.run(ctrl._advantage_stage(meta))
-    assert data["sample_mask"].tolist() == ([0, 0, 1] if filtering else [1, 1, 1])
+    if not filtering:
+        expected = [1, 1, 1]
+    else:
+        expected = [1, 0, 1] if scope == "row" else [0, 0, 1]
+    assert data["sample_mask"].tolist() == expected
 
 
 @pytest.mark.parametrize("filter_field", ["sample_mask", "mask_sample", "truncated"])
