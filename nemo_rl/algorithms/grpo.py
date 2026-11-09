@@ -4671,8 +4671,7 @@ def _grpo_train_impl(
                         # deferred until any async write completes (via wait_fn);
                         # with sync save it renames immediately. Finalization is
                         # flushed at the next save (finalize_pending) or on exit
-                        # (shutdown); a failure that has already happened is
-                        # raised at the start of the next step.
+                        # (shutdown).
                         checkpointer.begin_finalization(
                             checkpoint_path,
                             wait_fn=policy.finalize_async_save,
@@ -6640,8 +6639,6 @@ def async_grpo_train(
 
                         # Defer the directory rename until any async write
                         # completes; flushed at the next save or on training exit.
-                        # A failure that has already happened is raised at the
-                        # start of the next step.
                         checkpointer.begin_finalization(
                             checkpoint_path,
                             wait_fn=policy.finalize_async_save,

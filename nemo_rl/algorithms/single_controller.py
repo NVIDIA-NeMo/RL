@@ -4297,8 +4297,7 @@ class SingleControllerActor:
             self._pending_checkpoint = (checkpoint_path, self._train_steps)
             return
         # Rename happens in the background once the async weight writes
-        # finish; flushed at the next save or on exit. A failure that has
-        # already happened is raised at the start of the next step.
+        # finish; flushed at the next save or on exit.
         self._checkpointer.begin_finalization(
             checkpoint_path,
             wait_fn=self._trainer.finalize_async_save,

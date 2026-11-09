@@ -3515,8 +3515,7 @@ class TestAsyncSaveFinalization:
 
     def test_failed_background_finalization_raises_by_next_save(self, tmp_path):
         # The step-2 checkpoint's background finalization fails; the failure
-        # must surface no later than the step-4 save's finalize_pending, not
-        # vanish.
+        # must surface by the step-4 save's finalize_pending at the latest.
         mc = _actor_master_config(tmp_path, max_num_steps=4, save_period=2)
         trainer = _FailingFinalizeTrainer()
 
@@ -3541,9 +3540,8 @@ class TestAsyncSaveFinalization:
             actor._checkpointer.shutdown()
 
     def test_failed_background_finalization_stops_before_next_step(self, tmp_path):
-        # Once the step-2 checkpoint's background finalization has failed, the
-        # train pump must stop before step 3 instead of training on until the
-        # step-4 save notices.
+        # Once the step-2 finalization has failed, the train pump must stop
+        # before step 3 instead of training on until the step-4 save notices.
         mc = _actor_master_config(tmp_path, max_num_steps=4, save_period=2)
         actors = []
 
