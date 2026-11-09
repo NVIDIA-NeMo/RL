@@ -2422,13 +2422,13 @@ def _prepare_nemo_gym_rows(
     """Apply NeMo-RL sampling parameters and stable row indices in place.
 
     With ``dataset_indices`` (the batch's ``idx``, one per row), a flat row that
-    has no Gym identity, as sync training and validation send, also gets one:
-    a rollout id from its RL group coordinates and the prompt's dataset index as
-    its Gym task index. An Environment Server such as ``single_agent_turn_legacy``
-    needs both to run a flat row as an episode. The explicit rollout id keeps
-    episodes distinct across validation passes, since Gym prefers it over the
-    task and rollout indices. Rows that already carry a rollout id or a task
-    index, and materialized task rows, are left as they are.
+    has neither ``_ng_rollout_id`` nor ``_ng_task_index``, as sync training and
+    validation send, gets both: a rollout id from its RL group coordinates and
+    the prompt's dataset index as its task index. ``single_agent_turn_legacy``
+    needs a task index when the row has no ``task_id``, ``problem_id`` or
+    ``instance_id``. Gym builds the episode id and capture key from the explicit
+    rollout id, so episodes stay distinct across validation passes. Other rows
+    keep their Gym identity.
     """
     if num_generations <= 0 or len(rows) % num_generations != 0:
         raise ValueError("NeMo-Gym rows must contain complete prompt groups")
@@ -3555,14 +3555,14 @@ def _postprocess_single_nemo_gym_group(
         # contract instead and fail fast on a real mismatch.
         validate_reward_components_match_scalar([r["full_result"] for r in results])
 
-    # Each prompt group of ``group_size`` rows must share one task index. The
-    # synchronous path passes several groups in one call, so the result carries
-    # a task index only when the call holds exactly one group.
+    # A group of materialized task rows has no task index and skips the check.
     group_task_index = None
-    if nemo_gym_rows and NEMO_GYM_TASK_INDEX_KEY in nemo_gym_rows[0]:
+    if any(NEMO_GYM_TASK_INDEX_KEY in row for row in nemo_gym_rows):
         identity_size = group_size if group_size is not None else len(nemo_gym_rows)
         for group_start in range(0, len(nemo_gym_rows), identity_size):
             group_rows = nemo_gym_rows[group_start : group_start + identity_size]
+            if all(NEMO_GYM_TASK_INDEX_KEY not in row for row in group_rows):
+                continue
             if any(row.get(NEMO_GYM_TASK_INDEX_KEY) is None for row in group_rows) or (
                 len({int(row[NEMO_GYM_TASK_INDEX_KEY]) for row in group_rows}) != 1
             ):

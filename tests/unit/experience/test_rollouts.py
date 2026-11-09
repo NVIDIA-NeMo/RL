@@ -3112,9 +3112,11 @@ def _prepare_with_dataset_indices(rows: list[dict], dataset_indices, num_generat
     )
 
 
+@pytest.mark.nemo_gym
 def test_prepare_nemo_gym_rows_gives_flat_rows_a_gym_episode_identity():
     """single_agent_turn_legacy needs a rollout id and a task identity for each flat row."""
-    episode_types = pytest.importorskip("nemo_gym.episode_types", reason="Requires Gym")
+    # Gym is an optional extra; only the Nemo_Gym shard installs it.
+    from nemo_gym import episode_types
     from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
     from nemo_gym.task_materialization import materialize_task
 
@@ -3180,6 +3182,109 @@ def test_prepare_nemo_gym_rows_refuses_dataset_indices_of_another_length():
         _prepare_with_dataset_indices(_flat_rows(2), [1])
 
 
+@pytest.mark.parametrize(
+    ("dataset_indices", "num_generations_per_prompt"),
+    [([7, 7, 3, 3], 2), ([0, 1, 2], 1)],
+    ids=["sync_training_batch", "validation_batch"],
+)
+def test_run_nemo_gym_rollout_sync_gives_flat_rows_a_gym_identity(
+    dataset_indices, num_generations_per_prompt
+):
+    """The batch's idx must reach the rows the synchronous path sends to Gym."""
+
+    class _ReadyRef:
+        def __init__(self, value):
+            self.value = value
+
+        def __await__(self):
+            async def _resolve():
+                return self.value
+
+            return _resolve().__await__()
+
+    class _Stream:
+        def __init__(self, values):
+            self.values = iter(values)
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            try:
+                return next(self.values)
+            except StopIteration as error:
+                raise StopAsyncIteration from error
+
+    sent_rows = []
+
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, rows, timer_prefix, deduplicate_multimodal_data):
+            del timer_prefix, deduplicate_multimodal_data
+            sent_rows.extend(deepcopy(rows))
+            return _Stream(
+                [
+                    _ReadyRef(
+                        (
+                            row["_rowidx"],
+                            row["agent_ref"],
+                            {
+                                "input_message_log": [
+                                    {"role": "user", "content": "q", "token_ids": [1]}
+                                ],
+                                "message_log": [
+                                    {"role": "user", "content": "q", "token_ids": [1]},
+                                    {
+                                        "role": "assistant",
+                                        "content": "a",
+                                        "token_ids": [2],
+                                        "generation_logprobs": [-0.1],
+                                    },
+                                ],
+                                "full_result": {"reward": 1.0},
+                            },
+                            None,
+                        )
+                    )
+                    for row in rows
+                ]
+            )
+
+    rows = _flat_rows(len(dataset_indices))
+    rollout_result = run_nemo_gym_rollout_sync(
+        policy_generation=SimpleNamespace(cfg={"vllm_cfg": {"max_model_len": 128}}),
+        input_batch=BatchedDataDict(
+            {
+                "extra_env_info": rows,
+                "idx": dataset_indices,
+                "loss_multiplier": torch.ones(len(rows)),
+            }
+        ),
+        tokenizer=SimpleNamespace(pad_token_id=0),
+        task_to_env={"nemo_gym": SimpleNamespace(run_rollouts=_RunRolloutsRemote())},
+        generation_config={
+            "stop_strings": [],
+            "stop_token_ids": [],
+            "top_k": None,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "max_new_tokens": 32,
+        },
+        log_full_result_tables=False,
+        num_generations_per_prompt=num_generations_per_prompt,
+    )
+
+    assert [row[NEMO_GYM_TASK_INDEX_KEY] for row in sent_rows] == dataset_indices
+    assert [row["_ng_rollout_id"] for row in sent_rows] == [
+        f"{row[NEMO_GYM_GROUP_ID_KEY]}-g{index % num_generations_per_prompt}-t0"
+        for index, row in enumerate(sent_rows)
+    ]
+    assert rollout_result.task_index is None
+
+
 def _postprocess_rows_with_task_indices(task_indices: list, group_size: int):
     rows = []
     results = []
@@ -3223,8 +3328,9 @@ def _postprocess_rows_with_task_indices(task_indices: list, group_size: int):
         ([7, 7], 2, 7),
         ([7, 7, 3, 3], 2, None),
         ([0, 1, 2], 1, None),
+        ([7, 7, None, None], 2, None),
     ],
-    ids=["one_group", "sync_training_batch", "validation_batch"],
+    ids=["one_group", "sync_training_batch", "validation_batch", "flat_then_task_rows"],
 )
 def test_postprocess_nemo_gym_rows_checks_task_indices_per_prompt_group(
     task_indices, group_size, expected_task_index

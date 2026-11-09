@@ -2121,7 +2121,7 @@ def test_async_nemo_gym_rollout_manager_matches_original(
             "loss_multiplier": input_batch["loss_multiplier"][0:1].repeat(
                 num_generations
             ),
-            "idx": list(range(num_generations)),
+            "idx": [0] * num_generations,
             "task_name": ["nemo_gym"] * num_generations,
         }
     )
