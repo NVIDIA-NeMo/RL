@@ -222,7 +222,9 @@ def test_rows_survive_a_clear_that_stock_would_collapse(tq_client_backends):
         put(["a", "b", "c"])
         client.clear_samples(sample_ids=["c"], partition_id=partition_id)
         assert_rows(["a", "b"])
+        client.clear_samples(sample_ids=["b"], partition_id=partition_id)
+        assert_rows(["a"])
         put(["d"])
-        assert_rows(["a", "b", "d"])
+        assert_rows(["a", "d"])
     finally:
-        client.clear_samples(sample_ids=["a", "b", "d"], partition_id=partition_id)
+        client.clear_samples(sample_ids=["a", "d"], partition_id=partition_id)
