@@ -721,9 +721,8 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Step padding only. Which real rows the padding copies: row0 repeats the
     # batch's first row; cyclic takes rows 0, 1, 2, ...
     forest_pad_source: Literal["row0", "cyclic"] = "row0"
-    # Forest only. Keep the scored call's root plus at most this many minus one
-    # other roots, in selection order; under continued_chains this caps rows
-    # per rollout. None keeps every selected root.
+    # continued_chains only. Max rows per rollout: the scored chain plus the
+    # first N-1 other chains, in selection order. None keeps every chain.
     max_rows_per_rollout: Optional[PositiveInt] = None
     # Which Forest segments the token-level reward penalties (unwanted tokens,
     # malformed think tags) check.
@@ -748,6 +747,14 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
         if not self.forest_training and any(forest_only.values()):
             names = ", ".join(name for name, set_ in forest_only.items() if set_)
             raise ValueError(f"token_capture.{names} requires forest_training=true")
+        if (
+            self.max_rows_per_rollout is not None
+            and self.selection_policy != "continued_chains"
+        ):
+            raise ValueError(
+                "token_capture.max_rows_per_rollout requires "
+                "selection_policy=continued_chains"
+            )
         if self.forest_pad_source != "row0" and self.forest_padding_scope != "step":
             raise ValueError(
                 "token_capture.forest_pad_source requires forest_padding_scope=step"

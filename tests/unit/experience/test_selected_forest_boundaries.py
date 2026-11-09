@@ -9,6 +9,7 @@ import asyncio
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -24,6 +25,7 @@ from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTER_EXCLUDED_ROWS
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
 from nemo_rl.environments.call_selection import (
     cap_selected_roots,
+    resolve_scored_terminal,
     select_captured_calls,
     select_continued_chains,
 )
@@ -780,6 +782,7 @@ def test_unattributed_terminal_falls_back_or_masks(
     if terminal is None:
         assert receipt["capture_poisoned"]
         assert receipt["failure_reason"] == "terminal_not_identified"
+        assert receipt["terminal_model_call_id"] is None
         assert receipt["terminal_selection"] == (
             "declared" if contradictory else "heuristic"
         )
@@ -1467,6 +1470,46 @@ def test_cap_keeps_the_scored_root_first(forest, max_roots, expected):
     # Selection order puts roots A and C before the scored root D.
     capped = cap_selected_roots(records, records[4].response_id, max_roots)
     assert [records.index(record) for record in capped] == expected
+
+
+def test_unknown_gym_attribution_method_fails_loudly(forest, monkeypatch):
+    import nemo_gym.token_id_capture.staging as staging
+
+    records, replies = forest.capture([None])
+    attribution = SimpleNamespace(
+        attributed=True,
+        method="new_method",
+        model_call_id=records[0].model_call_id,
+        reason="",
+    )
+    monkeypatch.setattr(staging, "resolve_terminal", lambda *a, **k: attribution)
+    with pytest.raises(ValueError, match="new_method.*_RECEIPT_METHOD"):
+        resolve_scored_terminal(records, ordinary(replies))
+
+
+def test_continued_chains_cap_counts_roots_in_admission_order(forest):
+    # Main A -> scored B; worker C -> failed D; single-call workers E and F.
+    records, replies = forest.capture([None, 0, None, 2, None, None])
+    manifest = forest.harness.manifest("attempt").model_dump(mode="json")
+    # Admission order E, C, F differs from manifest order C, E, F.
+    for index, admitted_at in enumerate([1.0, 2.0, 4.0, 5.0, 3.0, 6.0]):
+        manifest["records"][index]["admitted_at"] = admitted_at
+    manifest["records"][3].update(response_status="failed", finish_reason="stop")
+    env = _env(forest.harness)
+    env._selection_policy = "continued_chains"
+    env._max_rows_per_rollout = 3
+    env._control = AsyncMock(return_value=manifest)
+    output = ordinary(replies[:2])
+    output["reward"] = 1.0
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, output)
+    )
+    # The failed D ends C's chain without masking; the cap keeps the scored
+    # root plus the two earliest-admitted other roots (E, then C) and drops F.
+    assert processed["receipt"]["capture_poisoned"] is False
+    assert processed["logical_selection"].response_ids == tuple(
+        records[i].response_id for i in (0, 1, 4, 2)
+    )
 
 
 def test_publication_identity_drift_preserves_staging(forest, monkeypatch):

@@ -2114,6 +2114,7 @@ Depending on your data shape, you may want to change these values."""
         from nemo_gym.token_id_capture.staging.records import RolloutManifest
 
         from nemo_rl.environments.call_selection import (
+            LENGTH_FINISH_REASONS,
             TerminalNotIdentified,
             cap_selected_roots,
             resolve_scored_terminal,
@@ -2195,16 +2196,13 @@ Depending on your data shape, you may want to change these values."""
                 r.response_status == "completed"
                 or (
                     r.response_status == "incomplete"
-                    and r.finish_reason in ("length", "max_tokens", "max_output_tokens")
+                    and r.finish_reason in LENGTH_FINISH_REASONS
                 )
             )
             for r in selected
         ):
             raise ValueError("Selected capture is missing output validation evidence")
-        truncated = any(
-            r.finish_reason in ("length", "max_tokens", "max_output_tokens")
-            for r in selected
-        )
+        truncated = any(r.finish_reason in LENGTH_FINISH_REASONS for r in selected)
         receipt = self._assemble_receipt(
             owner,
             manifest,
@@ -2232,6 +2230,8 @@ Depending on your data shape, you may want to change these values."""
             receipt.update(
                 capture_poisoned=True,
                 failure_reason="terminal_not_identified",
+                # No call was scored; drop any call _assemble_receipt named.
+                terminal_model_call_id=None,
                 terminal_selection=(
                     "declared" if result.get("terminal_response_id") else "heuristic"
                 ),
@@ -2241,7 +2241,7 @@ Depending on your data shape, you may want to change these values."""
             r.response_status in ("failed", "unknown")
             or (
                 r.response_status == "incomplete"
-                and r.finish_reason not in ("length", "max_tokens", "max_output_tokens")
+                and r.finish_reason not in LENGTH_FINISH_REASONS
             )
             for r in selected
         ):

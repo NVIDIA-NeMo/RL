@@ -138,7 +138,6 @@ def test_forest_selection_config(policy):
 @pytest.mark.parametrize(
     "option",
     [
-        {"max_rows_per_rollout": 16},
         {"forest_penalty_scope": "all_segments"},
         {"exclude_padding_from_router_stats": True},
         {"forest_padding_scope": "step"},
@@ -148,6 +147,18 @@ def test_forest_options_require_forest_training(option):
     assert TokenCaptureConfig(forest_training=True, **option)
     with pytest.raises(ValueError, match=f"{next(iter(option))}.*forest_training"):
         TokenCaptureConfig(**option)
+
+
+def test_max_rows_per_rollout_requires_continued_chains():
+    assert TokenCaptureConfig(
+        forest_training=True,
+        selection_policy="continued_chains",
+        max_rows_per_rollout=16,
+    )
+    with pytest.raises(ValueError, match="max_rows_per_rollout.*forest_training"):
+        TokenCaptureConfig(max_rows_per_rollout=16)
+    with pytest.raises(ValueError, match="max_rows_per_rollout.*continued_chains"):
+        TokenCaptureConfig(forest_training=True, max_rows_per_rollout=16)
 
 
 def test_forest_pad_source_requires_step_padding():

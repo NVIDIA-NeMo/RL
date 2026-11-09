@@ -285,7 +285,8 @@ class TerminalNotIdentified(ValueError):
     """No captured call can be named as the scored terminal; the owner is masked."""
 
 
-# Gym attribution methods, in RolloutReceipt.terminal_selection terms.
+# Gym resolve_terminal attribution methods (nemo_gym/token_id_capture/terminal.py),
+# mapped to RolloutReceipt.terminal_selection values. Add new Gym methods here.
 _RECEIPT_METHOD = {
     "explicit": "declared",
     "declared": "declared",
@@ -316,11 +317,13 @@ def resolve_scored_terminal(
     )
     by_call = {record.model_call_id: record for record in records}
     if attribution.attributed:
-        return (
-            by_call[attribution.model_call_id],
-            _RECEIPT_METHOD[attribution.method],
-            attribution.reason,
-        )
+        method = _RECEIPT_METHOD.get(attribution.method)
+        if method is None:
+            raise ValueError(
+                f"Unknown Gym attribution method {attribution.method!r}; "
+                "add it to call_selection._RECEIPT_METHOD"
+            )
+        return by_call[attribution.model_call_id], method, attribution.reason
     if declared:
         raise TerminalNotIdentified(
             "declared terminal is not attributable: " + attribution.reason
@@ -331,6 +334,9 @@ def resolve_scored_terminal(
             f"no scored terminal: {attribution.reason}; heuristic: {heuristic.reason}"
         )
     return by_call[heuristic.terminal_model_call_id], "heuristic", attribution.reason
+
+
+LENGTH_FINISH_REASONS = ("length", "max_tokens", "max_output_tokens")
 
 
 def select_all_captured(
@@ -346,8 +352,7 @@ def select_all_captured(
         unusable = record.response_status in ("failed", "unknown") or (
             record.response_status == "incomplete"
             and bool(record.finish_reason)
-            and record.finish_reason
-            not in ("length", "max_tokens", "max_output_tokens")
+            and record.finish_reason not in LENGTH_FINISH_REASONS
         )
         if (
             not unusable
@@ -358,14 +363,11 @@ def select_all_captured(
     return selected, terminal_response_id
 
 
-_LENGTH_FINISH_REASONS = ("length", "max_tokens", "max_output_tokens")
-
-
 def _trainable(record: CallRecord) -> bool:
     """Completed, or stopped by a length limit; anything else ends its chain."""
     return record.response_status == "completed" or (
         record.response_status == "incomplete"
-        and record.finish_reason in _LENGTH_FINISH_REASONS
+        and record.finish_reason in LENGTH_FINISH_REASONS
     )
 
 

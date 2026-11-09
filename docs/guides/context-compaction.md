@@ -133,8 +133,8 @@ Enable `token_capture.enabled: true` and `token_capture.forest_training: true` o
   instead of masking the rollout. It names the scored terminal as `all_captured`
   does.
 
-`token_capture.max_rows_per_rollout` (Forest only) keeps the scored root plus the
-first N-1 other selected roots; with `continued_chains` this caps rows per rollout.
+`token_capture.max_rows_per_rollout` (`continued_chains` only) caps rows per
+rollout: the scored chain plus the first N-1 other chains.
 
 All built-in policies reuse capture validation, completion checks, forest reconstruction,
 and once-only loss ownership for shared ancestors. Pending calls, lost capture
