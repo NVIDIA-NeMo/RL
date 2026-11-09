@@ -36,6 +36,7 @@ from nemo_rl.experience import rollout_reassembler
 from nemo_rl.experience.rollout_reassembler import ActionOutputFlags, RolloutSelection
 from nemo_rl.experience.rollout_recovery import (
     _ATTEMPT_STATE_FIELDS,
+    _ATTEMPT_STATE_KEYS,
     _GROUP_STATE_FIELDS,
     _PROMPT_REF_STATE_FIELDS,
     _SIBLING_STATE_FIELDS,
@@ -411,7 +412,8 @@ def test_serialized_state_fields_match_recovery_dataclasses() -> None:
         field.name for field in dataclasses.fields(RolloutSiblingRecord)
     }
     assert _ATTEMPT_STATE_FIELDS == {
-        field.name for field in dataclasses.fields(RolloutAttemptRecord)
+        _ATTEMPT_STATE_KEYS.get(field.name, field.name)
+        for field in dataclasses.fields(RolloutAttemptRecord)
     }
     assert _GROUP_STATE_FIELDS == {
         field.name for field in dataclasses.fields(PromptGroupRecoveryRecord)
@@ -853,6 +855,82 @@ def test_recovery_overrides_may_only_make_the_target_coarser() -> None:
 
 
 @pytest.mark.parametrize(
+    ("taskset", "expected"),
+    [
+        ("weather:train", RecoveryTargetLevel.PROMPT_GROUP),
+        ("weather:eval", RecoveryTargetLevel.SIBLING),
+        ("other:train", RecoveryTargetLevel.SIBLING),
+    ],
+)
+def test_recovery_config_resolves_materialized_taskset(
+    taskset: str, expected: RecoveryTargetLevel
+) -> None:
+    config = RolloutRecoveryConfig(
+        target_level=RecoveryTargetLevel.SIBLING,
+        task_source_target_level_overrides={
+            "weather:train": RecoveryTargetLevel.PROMPT_GROUP,
+            "weather:eval": RecoveryTargetLevel.SIBLING,
+            "stale_source": RecoveryTargetLevel.PROMPT_GROUP,
+        },
+        agent_target_level_overrides={
+            "shared_agent": RecoveryTargetLevel.PROMPT_GROUP,
+        },
+    )
+    policy = config.resolve_for_prompt(
+        {
+            "extra_env_info": {
+                "task_id": {"taskset": taskset, "task_id": "1"},
+                "task_input": {},
+                "task_source": "stale_source",
+                "agent_ref": {"name": "shared_agent"},
+            }
+        }
+    )
+
+    assert policy.task_source == taskset
+    assert policy.restore_level is expected
+    assert policy.granularity is expected.granularity
+
+
+@pytest.mark.parametrize("agent_ref", [None, {"name": "shared_agent"}])
+def test_recovery_config_materialized_task_uses_configured_default(
+    agent_ref: dict[str, str] | None,
+) -> None:
+    config = RolloutRecoveryConfig(
+        target_level=RecoveryTargetLevel.SIBLING,
+        task_source_target_level_overrides={
+            "another:train": RecoveryTargetLevel.PROMPT_GROUP,
+        },
+        agent_target_level_overrides={"shared_agent": RecoveryTargetLevel.PROMPT_GROUP},
+    )
+    policy = config.resolve_for_prompt(
+        {
+            "extra_env_info": {
+                "task_id": {"taskset": "weather:train", "task_id": "1"},
+                "task_input": {},
+                "agent_ref": agent_ref,
+            }
+        }
+    )
+
+    assert policy.task_source == "weather:train"
+    assert policy.restore_level is RecoveryTargetLevel.SIBLING
+
+
+@pytest.mark.parametrize("taskset", [None, "", 7])
+def test_recovery_config_rejects_malformed_materialized_taskset(taskset: Any) -> None:
+    with pytest.raises(ValueError, match="non-empty task_id.taskset"):
+        RolloutRecoveryConfig().resolve_for_prompt(
+            {
+                "extra_env_info": {
+                    "task_id": {"taskset": taskset, "task_id": "1"},
+                    "task_input": {},
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize(
     ("prompt", "error_fragment"),
     [
         (
@@ -1179,7 +1257,7 @@ def test_turn_restart_preserves_sealed_sibling_and_restores_other_from_gym() -> 
         lambda cut: ledger.mark_group_dispatched(
             cut,
             "g7",
-            gym_instance_id="tools/replica-0",
+            environment_instance_id="tools/replica-0",
         )
     )
     sealed_attempt_id = group.siblings[0].current_attempt.attempt_id
@@ -1200,13 +1278,13 @@ def test_turn_restart_preserves_sealed_sibling_and_restores_other_from_gym() -> 
     )
 
     restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
-    inventory = restored.gym_checkpoint_inventory({"tools/replica-0"})
+    inventory = restored.environment_inventory({"tools/replica-0"})
     (unfinished_episode,) = inventory["tools/replica-0"]
 
     _mutate(
         lambda cut: restored.prepare_for_restart(
             cut,
-            restored_gym_episodes={
+            continued_attempts={
                 (
                     "tools/replica-0",
                     unfinished_episode.rollout_id,
@@ -1221,8 +1299,8 @@ def test_turn_restart_preserves_sealed_sibling_and_restores_other_from_gym() -> 
     assert recovered.siblings[0].current_attempt.status is RolloutAttemptStatus.SEALED
     resumed = recovered.siblings[1].current_attempt
     assert resumed.status is RolloutAttemptStatus.RESERVED
-    assert resumed.gym_instance_id == "tools/replica-0"
-    assert resumed.gym_attempt == 1
+    assert resumed.environment_instance_id == "tools/replica-0"
+    assert resumed.environment_attempt == 1
     assert restored.expected_staging_keys() == {"g7/sibling-0/call-0"}
 
     retry = _mutate(lambda cut: restored.prepare_incomplete_retry(cut, "g7"))
@@ -1392,6 +1470,7 @@ def _pre_turn_recovery_state(state: dict[str, Any], version: int) -> dict[str, A
     old = copy.deepcopy(state)
     old["schema_version"] = version
     for group in old["groups"]:
+        group.pop("attribution_key", None)
         group["recovery_granularity"] = group.pop("restore_level")
         for sibling in group["siblings"]:
             for attempt in sibling["attempts"]:
@@ -1441,7 +1520,7 @@ def test_pre_turn_recovery_schemas_upgrade(
     group = restored.get_group("g7")
     assert group.restore_level is level
     attempt = group.siblings[0].current_attempt
-    assert (attempt.gym_instance_id, attempt.gym_attempt) == (None, 0)
+    assert (attempt.environment_instance_id, attempt.environment_attempt) == (None, 0)
     _bind(restored, "g7", _prompt())
     assert restored.state_dict() == current
 
@@ -1472,7 +1551,8 @@ def test_pre_turn_recovery_schemas_refuse_turn_recovery_state(
         RolloutRecoveryLedger.from_state_dict(state)
 
 
-def test_turn_restart_preserves_gym_owner_and_advances_attempt() -> None:
+@pytest.mark.parametrize("version", [6, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+def test_turn_restart_preserves_gym_owner_and_advances_attempt(version: int) -> None:
     ledger = RolloutRecoveryLedger()
     _reserve(
         ledger,
@@ -1490,19 +1570,21 @@ def test_turn_restart_preserves_gym_owner_and_advances_attempt() -> None:
         lambda cut: ledger.mark_group_dispatched(
             cut,
             "g7",
-            gym_instance_id="tools/replica-1",
+            environment_instance_id="tools/replica-1",
         )
     )
 
     state = ledger.state_dict()
+    state["schema_version"] = version
+    if version == 6:
+        state["groups"][0].pop("attribution_key")
     attempt_state = state["groups"][0]["siblings"][0]["attempts"][0]
     assert attempt_state["gym_instance_id"] == "tools/replica-1"
     assert attempt_state["gym_attempt"] == 0
 
     restored = RolloutRecoveryLedger.from_state_dict(state)
-    inventory = restored.gym_checkpoint_inventory(
-        {"judge/replica-0", "tools/replica-1"}
-    )
+    assert restored.get_group("g7").restore_level is RecoveryTargetLevel.TURN
+    inventory = restored.environment_inventory({"judge/replica-0", "tools/replica-1"})
     (episode,) = inventory["tools/replica-1"]
     rollout_id, attempt = episode.rollout_id, episode.attempt
     assert inventory["judge/replica-0"] == ()
@@ -1511,7 +1593,7 @@ def test_turn_restart_preserves_gym_owner_and_advances_attempt() -> None:
     _mutate(
         lambda cut: restored.prepare_for_restart(
             cut,
-            restored_gym_episodes={
+            continued_attempts={
                 ("tools/replica-1", rollout_id, attempt),
             },
         )
@@ -1519,11 +1601,11 @@ def test_turn_restart_preserves_gym_owner_and_advances_attempt() -> None:
     recovered = restored.get_group("g7")
     current = recovered.siblings[0].current_attempt
     assert current.status is RolloutAttemptStatus.RESERVED
-    assert current.gym_instance_id == "tools/replica-1"
-    assert current.gym_attempt == 1
+    assert current.environment_instance_id == "tools/replica-1"
+    assert current.environment_attempt == 1
     assert recovered.gate_rollout_id(0) == f"{rollout_id}-a1"
 
-    repeated_inventory = restored.gym_checkpoint_inventory(
+    repeated_inventory = restored.environment_inventory(
         {"judge/replica-0", "tools/replica-1"}
     )
     assert repeated_inventory["tools/replica-1"] == (
@@ -1533,7 +1615,7 @@ def test_turn_restart_preserves_gym_owner_and_advances_attempt() -> None:
     _mutate(
         lambda cut: restored.prepare_for_restart(
             cut,
-            restored_gym_episodes={
+            continued_attempts={
                 ("tools/replica-1", rollout_id, 1),
             },
         )
@@ -1541,7 +1623,7 @@ def test_turn_restart_preserves_gym_owner_and_advances_attempt() -> None:
     recovered = restored.get_group("g7")
     current = recovered.siblings[0].current_attempt
     assert current.status is RolloutAttemptStatus.RESERVED
-    assert current.gym_attempt == 2
+    assert current.environment_attempt == 2
     assert recovered.gate_rollout_id(0) == f"{rollout_id}-a2"
 
     with pytest.raises(ValueError, match="checkpoint owner"):
@@ -1549,7 +1631,7 @@ def test_turn_restart_preserves_gym_owner_and_advances_attempt() -> None:
             lambda cut: restored.mark_group_dispatched(
                 cut,
                 "g7",
-                gym_instance_id="judge/replica-0",
+                environment_instance_id="judge/replica-0",
             )
         )
 
@@ -1571,18 +1653,18 @@ def test_turn_restart_without_gym_state_starts_a_restored_attempt_over() -> None
     )
     _mutate(
         lambda cut: ledger.mark_group_dispatched(
-            cut, "g7", gym_instance_id="tools/replica-0"
+            cut, "g7", environment_instance_id="tools/replica-0"
         )
     )
-    episode = ledger.get_group("g7").gym_episode(0)
+    episode = ledger.get_group("g7").environment_episode(0)
     rollout_id, attempt = episode.rollout_id, episode.attempt
     _mutate(
         lambda cut: ledger.prepare_for_restart(
             cut,
-            restored_gym_episodes={("tools/replica-0", rollout_id, attempt)},
+            continued_attempts={("tools/replica-0", rollout_id, attempt)},
         )
     )
-    assert ledger.get_group("g7").siblings[0].current_attempt.gym_attempt == 1
+    assert ledger.get_group("g7").siblings[0].current_attempt.environment_attempt == 1
 
     # Crash again; this restart has no Gym state to continue from.
     restarted = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
@@ -1609,19 +1691,19 @@ def _seal_g7(ledger: RolloutRecoveryLedger) -> None:
 
 def test_a_retired_gym_rollout_is_queued_for_forget_until_gym_forgets_it() -> None:
     ledger = RolloutRecoveryLedger()
-    episode = _dispatched_turn_group(ledger, generations=1).gym_episode(0)
+    episode = _dispatched_turn_group(ledger, generations=1).environment_episode(0)
     _mutate(lambda cut: ledger.abandon_unsealed(cut, "g7"))
     instances = frozenset({"tools/replica-0"})
-    retired = ledger.gym_checkpoint_retirements(instances)
+    retired = ledger.environment_retirements(instances)
     assert retired == {"tools/replica-0": (episode,)}
     # Nothing to forget until Gym has retired it.
-    assert ledger.gym_checkpoint_forgets(instances) == {"tools/replica-0": ()}
+    assert ledger.environment_forgets(instances) == {"tools/replica-0": ()}
 
-    ledger.mark_gym_retired(retired)
+    ledger.mark_environment_retired(retired)
 
-    assert ledger.gym_checkpoint_forgets(instances) == {"tools/replica-0": (episode,)}
-    ledger.mark_gym_forgotten({"tools/replica-0": (episode,)})
-    assert ledger.gym_checkpoint_forgets(instances) == {"tools/replica-0": ()}
+    assert ledger.environment_forgets(instances) == {"tools/replica-0": (episode,)}
+    ledger.mark_environment_forgotten({"tools/replica-0": (episode,)})
+    assert ledger.environment_forgets(instances) == {"tools/replica-0": ()}
 
 
 @pytest.mark.parametrize("restored", [False, True])
@@ -1630,28 +1712,28 @@ def test_a_restored_gym_rollout_is_queued_for_forget_once_it_seals(
 ) -> None:
     """Gym's restore refuses the replaced attempt until RL forgets the rollout."""
     ledger = RolloutRecoveryLedger()
-    episode = _dispatched_turn_group(ledger, generations=1).gym_episode(0)
+    episode = _dispatched_turn_group(ledger, generations=1).environment_episode(0)
     if restored:
         _mutate(
             lambda cut: ledger.prepare_for_restart(
                 cut,
-                restored_gym_episodes={
+                continued_attempts={
                     ("tools/replica-0", episode.rollout_id, episode.attempt)
                 },
             )
         )
         _mutate(
             lambda cut: ledger.mark_group_dispatched(
-                cut, "g7", gym_instance_id="tools/replica-0"
+                cut, "g7", environment_instance_id="tools/replica-0"
             )
         )
     instances = frozenset({"tools/replica-0"})
-    assert ledger.gym_checkpoint_forgets(instances) == {"tools/replica-0": ()}
+    assert ledger.environment_forgets(instances) == {"tools/replica-0": ()}
 
     _seal_g7(ledger)
 
     expected = (episode.next_attempt(),) if restored else ()
-    assert ledger.gym_checkpoint_forgets(instances) == {"tools/replica-0": expected}
+    assert ledger.environment_forgets(instances) == {"tools/replica-0": expected}
 
 
 def test_turn_restart_falls_back_to_sibling_when_gym_episode_is_absent() -> None:
@@ -1672,7 +1754,7 @@ def test_turn_restart_falls_back_to_sibling_when_gym_episode_is_absent() -> None
         lambda cut: ledger.mark_group_dispatched(
             cut,
             "g7",
-            gym_instance_id="tools/replica-0",
+            environment_instance_id="tools/replica-0",
         )
     )
 
@@ -1697,7 +1779,7 @@ def test_turn_dispatch_requires_a_gym_owner() -> None:
         admitted=True,
     )
 
-    with pytest.raises(ValueError, match="requires a Gym checkpoint owner"):
+    with pytest.raises(ValueError, match="requires an environment checkpoint owner"):
         _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
 
 
@@ -1873,7 +1955,7 @@ def test_restore_rejects_unsupported_schema_version(version: int) -> None:
         _load(RolloutRecoveryLedger(), state)  # type: ignore[arg-type]
 
 
-@pytest.mark.parametrize("version", [2, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+@pytest.mark.parametrize("version", [2, 3, 4, 5, 6, ROLLOUT_RECOVERY_SCHEMA_VERSION])
 def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
     state = {
         "schema_version": version,
@@ -1881,7 +1963,7 @@ def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
         "batch_shortfall": {},
         "sampler_stamps_target_steps": False,
     }
-    if version == ROLLOUT_RECOVERY_SCHEMA_VERSION:
+    if version >= 3:
         state.update(
             reward_settings=None,
             finalizer_metrics_by_group={},
@@ -1896,13 +1978,16 @@ def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
     assert parsed.sampler_stamps_target_steps is False
 
 
-@pytest.mark.parametrize("version", [2, 3, ROLLOUT_RECOVERY_SCHEMA_VERSION])
+@pytest.mark.parametrize("version", [2, 3, 4, 5, 6, ROLLOUT_RECOVERY_SCHEMA_VERSION])
 def test_restore_without_agent_name_preserves_sealed_inputs(version: int) -> None:
     state = _sealed_attempt_state()
-    if version != ROLLOUT_RECOVERY_SCHEMA_VERSION:
+    if version < 6:
         state = _pre_turn_recovery_state(state, version)
+    else:
+        state["schema_version"] = version
     for group in state["groups"]:
         group.pop("resolved_agent_name", None)
+        group.pop("attribution_key", None)
         if version < 5:
             for sibling in group["siblings"]:
                 for attempt in sibling["attempts"]:
@@ -1921,10 +2006,44 @@ def test_restore_without_agent_name_preserves_sealed_inputs(version: int) -> Non
     upgraded = ledger.state_dict()
     assert upgraded["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
     assert upgraded["groups"][0]["resolved_agent_name"] is None
+    assert upgraded["groups"][0]["attribution_key"] is None
+
+
+@pytest.mark.parametrize("version", [2, 3, 4, 5, 6])
+def test_legacy_flat_checkpoint_restores_attribution_from_agent_name(
+    version: int,
+) -> None:
+    state = _sealed_attempt_state()
+    if version < 6:
+        state = _written_by_schema(state, version)
+    else:
+        state["schema_version"] = version
+    group_state = state["groups"][0]
+    group_state["resolved_agent_name"] = "flat-agent"
+    group_state.pop("attribution_key", None)
+    if version < 4:
+        attempt = group_state["siblings"][0]["attempts"][0]
+        attempt["receipt"] = None
+        attempt["staging_keys"] = []
+    ledger = RolloutRecoveryLedger.from_state_dict(state)
+    group_id = group_state["group_id"]
+    before = ledger.finalization_inputs(group_id)
+    _mutate(lambda cut: ledger.prepare_for_restart(cut))
+    group = ledger.get_group(group_id)
+    assert group.resolved_agent_name == "flat-agent"
+    assert group.attribution_key == "flat-agent"
+    assert ledger.finalization_inputs(group_id) == before
+    _bind(ledger, group_id, _prompt())
+    upgraded = ledger.state_dict()
+    assert upgraded["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
+    assert upgraded["groups"][0]["attribution_key"] == "flat-agent"
 
 
 @pytest.mark.parametrize("granularity", list(RecoveryGranularity))
-def test_seal_rejects_conflicting_agent_names_atomically(granularity) -> None:
+@pytest.mark.parametrize("materialized", [False, True])
+def test_seal_rejects_conflicting_attribution_atomically(
+    granularity, materialized
+) -> None:
     ledger = RolloutRecoveryLedger()
     group = _reserve(
         ledger,
@@ -1945,7 +2064,8 @@ def test_seal_rejects_conflicting_agent_names_atomically(granularity) -> None:
             receipt=None,
             reward=0.0,
             mask_sample=True,
-            resolved_agent_name=f"agent-{index}",
+            resolved_agent_name=None if materialized else f"agent-{index}",
+            attribution_key=f"usersim:split-{index}" if materialized else None,
         )
         for index in range(2)
     }
@@ -1958,9 +2078,15 @@ def test_seal_rejects_conflicting_agent_names_atomically(granularity) -> None:
         # Preserve the route even when only the first sibling survived restart.
         ledger = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
         _bind(ledger, "g7", _prompt())
-        assert ledger.get_group("g7").resolved_agent_name == "agent-0"
+        assert ledger.get_group("g7").resolved_agent_name == (
+            None if materialized else "agent-0"
+        )
+        assert ledger.get_group("g7").attribution_key == (
+            "usersim:split-0" if materialized else "agent-0"
+        )
     before = ledger.state_dict()
-    with pytest.raises(ValueError, match="siblings resolved to different agents"):
+    expected = "attribution keys" if materialized else "agents"
+    with pytest.raises(ValueError, match=f"siblings resolved to different {expected}"):
         _mutate(
             lambda cut: (
                 ledger.mark_group_sealed(cut, "g7", results)
@@ -1978,6 +2104,14 @@ def test_restore_rejects_invalid_resolved_agent_name(agent_name) -> None:
     state = _sealed_attempt_state()
     state["groups"][0]["resolved_agent_name"] = agent_name
     with pytest.raises(ValueError, match="resolved_agent_name"):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
+@pytest.mark.parametrize("attribution_key", ["", 42, {"name": "taskset"}])
+def test_restore_rejects_invalid_attribution_key(attribution_key) -> None:
+    state = _sealed_attempt_state()
+    state["groups"][0]["attribution_key"] = attribution_key
+    with pytest.raises(ValueError, match="attribution_key"):
         RolloutRecoveryLedger.from_state_dict(state)
 
 
@@ -2242,7 +2376,7 @@ def _dispatched_turn_group(
     )
     _mutate(
         lambda cut: ledger.mark_group_dispatched(
-            cut, "g7", gym_instance_id="tools/replica-0"
+            cut, "g7", environment_instance_id="tools/replica-0"
         )
     )
     return group
@@ -2255,8 +2389,7 @@ def test_refused_fresh_dispatch_keeps_identity_and_leaves_gym_inventory() -> Non
     refused_attempt_id = group.siblings[1].current_attempt.attempt_id
     refused_rollout_id = group.gate_rollout_id(1)
     assert (
-        len(ledger.gym_checkpoint_inventory({"tools/replica-0"})["tools/replica-0"])
-        == 2
+        len(ledger.environment_inventory({"tools/replica-0"})["tools/replica-0"]) == 2
     )
 
     _mutate(lambda cut: ledger.release_refused_dispatch(cut, "g7", generation_index=1))
@@ -2269,15 +2402,13 @@ def test_refused_fresh_dispatch_keeps_identity_and_leaves_gym_inventory() -> Non
     assert (
         released.siblings[0].current_attempt.status is RolloutAttemptStatus.DISPATCHED
     )
-    (remaining,) = ledger.gym_checkpoint_inventory({"tools/replica-0"})[
-        "tools/replica-0"
-    ]
-    assert remaining == group.gym_episode(0)
+    (remaining,) = ledger.environment_inventory({"tools/replica-0"})["tools/replica-0"]
+    assert remaining == group.environment_episode(0)
 
     # The same attempt is re-sent once admission reopens.
     _mutate(
         lambda cut: ledger.mark_group_dispatched(
-            cut, "g7", generation_indices=[1], gym_instance_id="tools/replica-0"
+            cut, "g7", generation_indices=[1], environment_instance_id="tools/replica-0"
         )
     )
     assert (
@@ -2291,11 +2422,11 @@ def test_refused_restored_turn_stays_gym_owned() -> None:
     ledger = RolloutRecoveryLedger()
     _dispatched_turn_group(ledger)
     restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
-    episodes = restored.gym_checkpoint_inventory({"tools/replica-0"})["tools/replica-0"]
+    episodes = restored.environment_inventory({"tools/replica-0"})["tools/replica-0"]
     _mutate(
         lambda cut: restored.prepare_for_restart(
             cut,
-            restored_gym_episodes={
+            continued_attempts={
                 ("tools/replica-0", episode.rollout_id, episode.attempt)
                 for episode in episodes
             },
@@ -2303,7 +2434,7 @@ def test_refused_restored_turn_stays_gym_owned() -> None:
     )
     _mutate(
         lambda cut: restored.mark_group_dispatched(
-            cut, "g7", gym_instance_id="tools/replica-0"
+            cut, "g7", environment_instance_id="tools/replica-0"
         )
     )
 
@@ -2313,10 +2444,10 @@ def test_refused_restored_turn_stays_gym_owned() -> None:
 
     attempt = restored.get_group("g7").siblings[1].current_attempt
     assert attempt.status is RolloutAttemptStatus.RESERVED
-    assert attempt.gym_attempt == 1
+    assert attempt.environment_attempt == 1
     assert (
-        restored.get_group("g7").gym_episode(1)
-        in restored.gym_checkpoint_inventory({"tools/replica-0"})["tools/replica-0"]
+        restored.get_group("g7").environment_episode(1)
+        in restored.environment_inventory({"tools/replica-0"})["tools/replica-0"]
     )
 
 
@@ -2342,14 +2473,14 @@ def test_dropping_a_dispatched_group_records_its_gym_episodes_for_retirement() -
     _mutate(lambda cut: discarded_ledger.discard_group(cut, "g7"))
 
     for ledger, group in ((abandoned_ledger, abandoned), (discarded_ledger, discarded)):
-        assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+        assert ledger.environment_retirements({"tools/replica-0"}) == {
             "tools/replica-0": tuple(
-                sorted(group.gym_episode(index) for index in (0, 1))
+                sorted(group.environment_episode(index) for index in (0, 1))
             )
         }
     # Bookkeeping for this process's Gym executions, never persisted.
     reloaded = RolloutRecoveryLedger.from_state_dict(abandoned_ledger.state_dict())
-    assert reloaded.gym_checkpoint_retirements({"tools/replica-0"}) == {
+    assert reloaded.environment_retirements({"tools/replica-0"}) == {
         "tools/replica-0": ()
     }
 
@@ -2370,7 +2501,7 @@ def test_attempts_that_never_reached_gym_are_not_retired() -> None:
     )
     _mutate(lambda cut: ledger.abandon_unsealed(cut, "g7"))
 
-    assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+    assert ledger.environment_retirements({"tools/replica-0"}) == {
         "tools/replica-0": ()
     }
 
@@ -2379,11 +2510,11 @@ def test_dropping_a_restored_reserved_attempt_retires_its_restored_gym_state() -
     ledger = RolloutRecoveryLedger()
     _dispatched_turn_group(ledger)
     restored = RolloutRecoveryLedger.from_state_dict(ledger.state_dict())
-    episodes = restored.gym_checkpoint_inventory({"tools/replica-0"})["tools/replica-0"]
+    episodes = restored.environment_inventory({"tools/replica-0"})["tools/replica-0"]
     _mutate(
         lambda cut: restored.prepare_for_restart(
             cut,
-            restored_gym_episodes={
+            continued_attempts={
                 ("tools/replica-0", episode.rollout_id, episode.attempt)
                 for episode in episodes
             },
@@ -2393,18 +2524,18 @@ def test_dropping_a_restored_reserved_attempt_retires_its_restored_gym_state() -
 
     _mutate(lambda cut: restored.discard_group(cut, "g7"))
 
-    retired = restored.gym_checkpoint_retirements({"tools/replica-0"})[
-        "tools/replica-0"
-    ]
-    assert set(retired) == {group.gym_episode(index) for index in (0, 1)}
+    retired = restored.environment_retirements({"tools/replica-0"})["tools/replica-0"]
+    assert set(retired) == {group.environment_episode(index) for index in (0, 1)}
     assert {episode.attempt for episode in retired} == {1}
 
 
-def test_mark_gym_retired_keeps_drops_recorded_after_the_retire_was_sent() -> None:
+def test_mark_environment_retired_keeps_drops_recorded_after_the_retire_was_sent() -> (
+    None
+):
     ledger = RolloutRecoveryLedger()
     first = _dispatched_turn_group(ledger)
     _mutate(lambda cut: ledger.abandon_unsealed(cut, "g7"))
-    sent = ledger.gym_checkpoint_retirements({"tools/replica-0"})
+    sent = ledger.environment_retirements({"tools/replica-0"})
 
     later = _mutate(
         lambda cut: ledger.reserve_group(
@@ -2422,20 +2553,20 @@ def test_mark_gym_retired_keeps_drops_recorded_after_the_retire_was_sent() -> No
     )
     _mutate(
         lambda cut: ledger.mark_group_dispatched(
-            cut, "g8", gym_instance_id="tools/replica-0"
+            cut, "g8", environment_instance_id="tools/replica-0"
         )
     )
     later = ledger.get_group("g8")
     _mutate(lambda cut: ledger.abandon_unsealed(cut, "g8"))
 
-    ledger.mark_gym_retired(sent)
+    ledger.mark_environment_retired(sent)
 
-    assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
-        "tools/replica-0": (later.gym_episode(0),)
+    assert ledger.environment_retirements({"tools/replica-0"}) == {
+        "tools/replica-0": (later.environment_episode(0),)
     }
     assert (
-        first.gym_episode(0)
-        not in ledger.gym_checkpoint_retirements({"tools/replica-0"})["tools/replica-0"]
+        first.environment_episode(0)
+        not in ledger.environment_retirements({"tools/replica-0"})["tools/replica-0"]
     )
 
 
@@ -2448,8 +2579,8 @@ def test_a_dropped_dispatch_is_queued_for_retirement_and_replaced() -> None:
         lambda cut: ledger.replace_dropped_dispatch(cut, "g7", generation_indices=[1])
     )
 
-    assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
-        "tools/replica-0": (group.gym_episode(1),)
+    assert ledger.environment_retirements({"tools/replica-0"}) == {
+        "tools/replica-0": (group.environment_episode(1),)
     }
     replaced = ledger.get_group("g7")
     assert replaced.siblings[1].attempts[0].status is RolloutAttemptStatus.ABANDONED
@@ -2457,8 +2588,8 @@ def test_a_dropped_dispatch_is_queued_for_retirement_and_replaced() -> None:
     assert replaced.gate_rollout_id(1) != group.gate_rollout_id(1)
     # The sibling that returned keeps its attempt and is not Gym-retired.
     assert replaced.gate_rollout_id(0) == group.gate_rollout_id(0)
-    assert ledger.gym_checkpoint_inventory({"tools/replica-0"}) == {
-        "tools/replica-0": (group.gym_episode(0),)
+    assert ledger.environment_inventory({"tools/replica-0"}) == {
+        "tools/replica-0": (group.environment_episode(0),)
     }
 
 
@@ -2472,7 +2603,7 @@ def test_a_dropped_attempt_that_never_reached_gym_keeps_its_identity() -> None:
     )
 
     assert ledger.get_group("g7").gate_rollout_id(1) == group.gate_rollout_id(1)
-    assert ledger.gym_checkpoint_retirements({"tools/replica-0"}) == {
+    assert ledger.environment_retirements({"tools/replica-0"}) == {
         "tools/replica-0": ()
     }
 
@@ -2493,7 +2624,7 @@ def test_a_prompt_group_cannot_replace_one_dropped_sibling() -> None:
     )
     _mutate(
         lambda cut: ledger.mark_group_dispatched(
-            cut, "g7", gym_instance_id="tools/replica-0"
+            cut, "g7", environment_instance_id="tools/replica-0"
         )
     )
 
@@ -2505,16 +2636,16 @@ def test_a_prompt_group_cannot_replace_one_dropped_sibling() -> None:
         )
 
 
-def test_gym_episodes_still_held_looks_up_only_live_current_attempts() -> None:
+def test_environment_episodes_still_held_looks_up_only_live_attempts() -> None:
     ledger = RolloutRecoveryLedger()
     group = _dispatched_turn_group(ledger)
-    first, second = group.gym_episode(0), group.gym_episode(1)
+    first, second = group.environment_episode(0), group.environment_episode(1)
     # Sibling 1's stream broke: its old attempt is abandoned and re-minted.
     _mutate(
         lambda cut: ledger.replace_dropped_dispatch(cut, "g7", generation_indices=[1])
     )
 
-    held = ledger.gym_episodes_still_held(
+    held = ledger.environment_episodes_still_held(
         {
             "tools/replica-0": [
                 first,
@@ -2527,7 +2658,7 @@ def test_gym_episodes_still_held_looks_up_only_live_current_attempts() -> None:
 
     assert held == {"tools/replica-0": {first}, "tools/replica-1": set()}
     # It agrees with the full inventory it stands in for.
-    inventory = ledger.gym_checkpoint_inventory({"tools/replica-0", "tools/replica-1"})
+    inventory = ledger.environment_inventory({"tools/replica-0", "tools/replica-1"})
     assert held["tools/replica-0"] == set(inventory["tools/replica-0"]) & {
         first,
         second,
@@ -2538,17 +2669,20 @@ def test_an_abandoned_episode_is_not_held_by_its_redispatched_replacement() -> N
     """The on-wire reply drain must not wait on an episode a re-send replaced."""
     ledger = RolloutRecoveryLedger()
     group = _dispatched_turn_group(ledger)
-    old = group.gym_episode(1)
+    old = group.environment_episode(1)
     _mutate(
         lambda cut: ledger.replace_dropped_dispatch(cut, "g7", generation_indices=[1])
     )
     _mutate(
         lambda cut: ledger.mark_group_dispatched(
-            cut, "g7", generation_indices=[1], gym_instance_id="tools/replica-0"
+            cut,
+            "g7",
+            generation_indices=[1],
+            environment_instance_id="tools/replica-0",
         )
     )
-    new = ledger.get_group("g7").gym_episode(1)
+    new = ledger.get_group("g7").environment_episode(1)
 
-    held = ledger.gym_episodes_still_held({"tools/replica-0": [old, new]})
+    held = ledger.environment_episodes_still_held({"tools/replica-0": [old, new]})
 
     assert held == {"tools/replica-0": {new}}

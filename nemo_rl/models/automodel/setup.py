@@ -80,6 +80,7 @@ from nemo_rl.models.automodel.router_replay import (
     validate_automodel_router_replay_config,
 )
 from nemo_rl.models.automodel.utils import resolve_model_class
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import (
     AutomodelPipelineConfig,
@@ -91,6 +92,7 @@ from nemo_rl.models.policy.utils import (
     automodel_pipeline_parallel_size,
     configure_dynamo_cache,
 )
+from nemo_rl.models.value.config import ValueConfig
 
 STRING_TO_DTYPE = {
     "float32": torch.float32,
@@ -290,17 +292,18 @@ def get_tokenizer(
 
 
 def validate_and_prepare_config(
-    config: PolicyConfig,
+    config: PolicyConfig | ValueConfig,
     processor: Optional[AutoProcessor],
     rank: int,
 ) -> RuntimeConfig:
     """Validate configuration and prepare runtime settings.
 
-    This function validates the policy configuration, sets environment variables,
-    determines model configuration, and returns runtime settings as a named tuple.
+    This function validates the shared policy or value-model configuration, sets
+    environment variables, determines model configuration, and returns runtime
+    settings as a named tuple.
 
     Args:
-        config: Policy configuration dictionary
+        config: Policy or PPO value-model configuration dictionary
         processor: Optional processor for multimodal models
         rank: Current process rank
 
@@ -326,6 +329,7 @@ def validate_and_prepare_config(
             top_k=generation_cfg["top_k"],
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
+            sampler_replay=sampler_replay_enabled(generation_cfg),
         )
 
     # Explicitly set NCCL_CUMEM_ENABLE for non-colocated refit.
@@ -343,6 +347,9 @@ def validate_and_prepare_config(
     if precision not in STRING_TO_DTYPE:
         raise ValueError(f"Unknown precision: {precision}")
     dtype = STRING_TO_DTYPE[precision]
+    fsdp_output_dtype = config["automodel_cfg"].get("fsdp_output_dtype", "float32")
+    if fsdp_output_dtype not in STRING_TO_DTYPE:
+        raise ValueError(f"Unknown FSDP output dtype: {fsdp_output_dtype}")
 
     # Get other configuration values
     cpu_offload = config["automodel_cfg"]["cpu_offload"]
@@ -350,6 +357,10 @@ def validate_and_prepare_config(
     max_grad_norm = config["max_grad_norm"]
     enable_seq_packing = config["sequence_packing"]["enabled"]
     model_name = config["model_name"]
+    # PPO values use the shared token-level regression setup.
+    is_reward_model = (
+        "reward_model_cfg" in config and config["reward_model_cfg"]["enabled"]
+    )
 
     # Validate sequence packing
     if enable_seq_packing:
@@ -357,6 +368,11 @@ def validate_and_prepare_config(
             raise ValueError(
                 "Sequence packing is not supported for VLM models. "
                 "Please set policy.sequence_packing.enabled = False to train VLM models."
+            )
+        if dtype not in (torch.float16, torch.bfloat16):
+            raise ValueError(
+                "Sequence packing requires precision='float16' or 'bfloat16' "
+                "because FlashAttention does not support float32 inputs."
             )
         print(f"[Rank {rank}] Sequence packing is enabled for model {model_name}")
         print(f"[Rank {rank}] Using FlashAttention2 for sequence packing")
@@ -397,19 +413,20 @@ def validate_and_prepare_config(
     ):
         allow_flash_attn_args = False
 
-    # Determine if reward model
-    is_reward_model = (
-        "reward_model_cfg" in config and config["reward_model_cfg"]["enabled"]
-    )
-
     if is_reward_model:
         # Validate reward model configuration
-        if enable_seq_packing:
+        rm_type = config["reward_model_cfg"]["reward_model_type"]
+        if rm_type == "bradley_terry" and cp_size_cfg > 1:
             raise NotImplementedError(
-                "Sequence packing is not supported for reward models"
+                "Context parallelism is not supported for Bradley-Terry reward "
+                "models. Set context_parallel_size=1."
+            )
+        if enable_seq_packing and rm_type != "regression":
+            raise NotImplementedError(
+                "Sequence packing is only supported for token-level regression "
+                "reward models"
             )
 
-        rm_type = config["reward_model_cfg"]["reward_model_type"]
         if rm_type == "bradley_terry":
             model_class = NeMoAutoModelForSequenceClassification
             if model_config.num_labels != 1:
@@ -512,6 +529,7 @@ def setup_distributed(
     # Extract configuration values
     dtype = runtime_config.dtype
     cpu_offload = runtime_config.cpu_offload
+    fsdp_output_dtype = config["automodel_cfg"].get("fsdp_output_dtype", "float32")
 
     # Extract parallelization config
     tp_size = config["automodel_cfg"].get("tensor_parallel_size", 1)
@@ -541,7 +559,7 @@ def setup_distributed(
         mp_policy=MixedPrecisionPolicy(
             param_dtype=dtype,
             reduce_dtype=torch.float32,
-            output_dtype=torch.float32,
+            output_dtype=STRING_TO_DTYPE[fsdp_output_dtype],
         ),
         offload_policy=CPUOffloadPolicy(pin_memory=False) if cpu_offload else None,
         activation_checkpointing=config["automodel_cfg"]["activation_checkpointing"],
@@ -890,9 +908,8 @@ def setup_model_and_optimizer(
     from torch.nn.attention import SDPBackend
 
     if cp_size > 1:
-        # Match Automodel's `get_train_context` in
-        # `components/distributed/context_parallel/utils.py`, where only flash
-        # and efficient backends are supported.
+        # Match Automodel's CP context: MATH is incompatible with DTensor.
+        # https://github.com/NVIDIA-NeMo/Automodel/blob/b916107a5ce8e77a3f18682f8b0eaa46a4b54389/nemo_automodel/components/distributed/context_parallel/utils.py#L103-L109
         sdpa_method = [
             SDPBackend.FLASH_ATTENTION,
             SDPBackend.EFFICIENT_ATTENTION,

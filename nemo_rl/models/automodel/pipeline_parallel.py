@@ -152,7 +152,6 @@ def plan_execution_batches(
             _build_model_batch(
                 model,
                 mb.processed_inputs,
-                is_reward_model=False,
                 allow_flash_attn_args=allow_flash_attn_args,
                 clone_model_tensors=False,
             )

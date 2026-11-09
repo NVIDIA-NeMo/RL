@@ -221,6 +221,7 @@ policy:
     checkpoint:
       async_save: true
       ckpt_assume_constant_structure: true
+      parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
     use_fused_linear_logprobs: false
     fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
@@ -268,6 +269,7 @@ policy:
     # gives ~25% training perf speedup with sequence packing and apply_rope_fusion
     bias_activation_fusion: True
     defer_fp32_logits: False
+    reuse_logits_storage: false
     fp32_lm_head: false
     moe_per_layer_logging: False
     moe_enable_deepep: false
@@ -435,7 +437,13 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
-    top_logprobs: 0  # Sampler candidates per token for score centering; 0 disables collection.
+    top_logprobs: 0  # Sampler candidates per token for score centering or replay; 0 disables collection.
+    # Sampler replay: with top-k/top-p, score the trainer's log-probs over the support
+    # the sampler drew from (the finite entries of its captured head) instead of
+    # recomputing the filters. Required by loss_fn.score_centering under top-k/top-p,
+    # and usable without it; needs top_logprobs >= top_k. See docs/guides/sampler-replay.md.
+    sampler_replay:
+      enabled: false
     val_temperature: ${.temperature}
     val_top_p: ${.top_p}
     val_top_k: ${.top_k}
@@ -506,6 +514,8 @@ policy:
       precision: ${policy.precision}
       # MXFP8 + Megatron only: quantize on trainer and stream E4M3 values plus scales.
       refit_prequantize: false
+      # auto, fp8, fp8_e4m3, fp8_ds_mla, or fp8_per_token_head.
+      # fp8_per_token_head requires precision=fp8 and a compatible backend (TRITON_ATTN).
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
       fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head}
@@ -636,7 +646,7 @@ cluster:
 data_plane:
   enabled: false
   impl: transfer_queue
-  backend: "simple"                  # TQ storage backend ('simple' or 'mooncake_cpu')
+  backend: "simple"                  # TQ storage backend ('simple', 'mooncake_cpu' or 'nixl')
   claim_meta_poll_interval_s: 0.5    # blocking-claim poll cadence
   simple:
     storage_capacity: 1000000        # max samples retained per partition
@@ -670,6 +680,38 @@ data_plane:
                                      # serialized groups and cost throughput;
                                      # higher buys little at linear HBM cost.
                                      # GDR needs that headroom to pay off.
+    gdr_keep_teacher_payload_on_gpu: true  # MOPD + use_gdr only: the teacher PUTs what it writes
+                                           # (logprobs; full-vocab hidden states or logits) straight
+                                           # from GPU, holding it in GPU memory until the PUT.
+                                           # false = copy to CPU first.
+  nixl:
+    # NIXL data plane TQ backend (nemo_rl.data_plane.nixl, NixlStore): CPU storage units own pinned DRAM,
+    # clients transfer with one-sided NIXL RDMA. See nemo_rl/data_plane/interfaces.py.
+    num_storage_units: null          # null: one per node; N: round-robin N over nodes
+    storage_units_per_node: null     # set N to place N units on every node instead
+    storage_unit_placement: all      # all, or clusters [inference] / [train]: which nodes get units, in both modes above
+    node_ids: null                   # explicit unit nodes; null: resolved from storage_unit_placement
+    unit_slab_bytes: 17179869184     # 16 GiB pinned per unit
+    max_blob_bytes: null             # a put over this is split; null: a quarter of the put area
+    numa: auto                       # pin unit k on a multi-socket node to socket k % sockets
+    client_staging_bytes: 1073741824 # client pool: 2 x 1 GiB registered buffers
+    client_staging_buffers: 2
+    client_pool_max_bytes: 4294967296  # 4 GiB of kept-registered oversize buffers
+    zero_copy_min_bytes: 1048576     # values in [1, 32] MiB are sent from caller memory
+    zero_copy_max_bytes: 33554432
+    parallel_copy_min_bytes: 16777216  # staged copies >= 16 MiB use parallel torch copy
+    read_pin_s: null                 # null: transfer_timeout_s + lease_margin_s; else must be >= that
+    transfer_timeout_s: 120.0
+    lease_margin_s: 30.0
+    op_timeout_s: null               # deadline of one put / get (all its waits); null: 2 x transfer_timeout_s
+    graveyard_max_bytes: 4294967296  # memory unfinished transfers may retain before fatal
+    debug_check_finite: false        # debug: report non-finite floats / all-False masks on put and get
+    ssd:                             # SSD tier: puts the put area cannot take go to disk
+      enabled: false
+      path: null                     # absolute node-local dir; required when enabled
+      staging_bytes: null            # IO area carved from the slab; null: unit_slab_bytes / 4
+      pickup_s: 10.0
+    nixl: {backend_name: UCX, backend_init_params: {}}
   observability:                      # per-op data-plane timing/volume
     enabled: true                     # per-op timing/volume; cost is below measurement noise
     verify_tensor_hash: false         # debug: per-row hash of each row's values+dtype+shape, wire-in vs wire-out
