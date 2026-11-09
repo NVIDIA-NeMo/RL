@@ -49,26 +49,34 @@ queue waits and initialization outside the measured training step. Online
 validation accuracy is absent from these runs, so no accuracy panel is fabricated.
 The comparison is single-seed and cannot establish convergence equivalence.
 
-Latest snapshot:2026-11-06T14:07:01UTC, refreshed by CPU-only job21389289
-(COMPLETED0:0). All three runs have300 plotted points for every panel; no missing
-steps or repeated streaming commit receipts. Original streaming checkpoint300
-is durable and final training segment21331930 completed normally.
+Latest snapshot:2026-11-09T01:58:02UTC, refreshed by CPU-only job21539655
+(COMPLETED0:0,3m20s). Both historical baselines have500 plotted points and
+streaming has600 for every panel. No missing steps, nonfinite metrics or repeated
+streaming optimizer-step receipts. Shared statistics stop at500;501..600 are
+shaded and show only the observed streaming series. Checkpoint600 is durable,
+the same W&B run is finished at600, and all training segments exited normally.
 
 | Window / metric | V1 synchronous | Full-batch LA0 | Streaming LA0 |
 | --- | --- | --- | --- |
-| Steps281..300 gen_kl_error mean | 0.000811697 | 0.000845502 | 0.001570812 |
-| Steps281..300 reward mean | 0.628125 | 0.621875 | 0.709375 |
-| Steps281..300 generated tokens/sample mean | 1243.67 | 1211.59 | 1059.80 |
-| Steps11..300 measured seconds/update mean | 138.58 | 133.59 | 133.30 |
+| Steps481..500 gen_kl_error mean | 0.000933535 | 0.000938107 | 0.001477997 |
+| Steps481..500 reward mean | 0.675000 | 0.721875 | 0.701563 |
+| Steps481..500 generated tokens/sample mean | 1035.40 | 1063.18 | 982.76 |
+| Steps11..500 measured seconds/update mean | 138.46 | 133.37 | 131.48 |
 
 The generated-token workloads differ. Similar measured step time therefore
 does not demonstrate streaming speedup, and the higher observed reward is not
 a multi-seed convergence claim. See kl_replay/ for the separate fixed-checkpoint,
 same-real-rollout diagnosis; the original1% BF16 gradient gate remains failed.
 
-The same exploratory run was authorized to continue300->600 on2026-11-08.
-The loader merges original /300 and resumed /600 commit receipts. Once600 is
-durable, pass `--max-step 600` to plot_comparison.sh.
-Baseline coverage is taken from actual fetched records; shared-window statistics
-stop at the shortest series. The existing300-step snapshot remains historical
-until a fresh plot is generated. See RESUME600.md for the active job chain.
+The authorized300->600 continuation completed on2026-11-08. Its genKL means for
+301..400,401..500,501..600 are0.001488790,0.001509982,0.001613112; the final20
+mean is0.001720197 (maximum in the last100:0.002385499). This is slow upward drift,
+not observed explosive growth. The gap relative to the baselines remains and
+the original1%BF16 qualification remains FAILED. Last20 streaming reward mean
+is0.690625, generated length999.47 and measured seconds/update125.389; there are
+no baseline observations at581..600 for a matched comparison.
+
+The loader merges original /300 and resumed /600 commit receipts. Pass
+`--max-step 600` to plot_comparison.sh to reproduce. Baselines were refreshed
+with unsampled W&B scan_history, not extrapolated. The older300-step snapshot
+remains in git history. See RESUME600.md for completion and saved-state evidence.

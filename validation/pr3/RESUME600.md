@@ -6,16 +6,55 @@ run stopped. It does not resume the separate held900/MCore/sibling experiments.
 The original1%BF16 numerical qualification remains failed; this is continuation
 of the same exploratory run, not a new qualification result.
 
-Latest handoff on 2026-11-08 around 14:23 PST: segment21509384 COMPLETED0:0
+Completed on 2026-11-08 around17:49PST: segment21509385 COMPLETED0:0 after
+3h36m36s, committing504..600 and saving checkpoint600. Native receipt and
+read-only W&B API both confirm step600/trainer_v600/lag0/two dispatches/LR1e-6.
+Final genKL0.00160220171357, policyKL0.00178326417351, reward0.75.
+W&B reports finished and the native SDK reports successful sync. Checkpoint600
+has total_steps/trainer_version/sampler_dispatch_index600, consumed_samples4800,
+epoch0. Segment21509386 completed in25s after the pre-container guard detected
+600; it did not load another model. The ten-minute watcher exited normally.
+No training allocation remains. See results/resume600/final-wandb.json.
+
+CPU-only finalization job21539655 COMPLETED0:0 in3m20s oncpu1-00099 using
+image1030. All600 optimizer-step receipts are unique and contiguous, match their
+trainer versions, and have lag0, two dispatches and32 valid sequences. All logged
+metrics are finite. All300 continuation updates use LR1e-6. Checkpoint600 has16
+optimizer shards, all693 saved optimizer step entries600, all693 learning rates
+1e-6, scheduler last_epoch600 and active ConstantLR last_epoch590. This checks
+saved scalar state, not live per-rank raw optimizer-buffer equality.
+
+| Continuation window | gen_kl_error mean |
+| --- | --- |
+| 301..400 | 0.001488790 |
+| 401..500 | 0.001509982 |
+| 501..600 | 0.001613112 |
+| 581..600 | 0.001720197 |
+
+GenKL rises slowly in the later windows; no explosive growth was observed.
+The last100 maximum is0.002385499. This does not resolve the earlier baseline
+gap, identify its remaining cause, or change the failed numerical gate. Evidence:
+results/resume600/final-summary.json, segment3-summary.json and
+checkpoint600-state.json. Reproduce on an allocated node with
+`python validation/pr3/summarize_resume600.py` followed by
+`python validation/pr3/plot_comparison.py --max-step 600` in image1030.
+
+The existing eight panels were refreshed at2026-11-09T01:58:02UTC. Both baseline
+runs have500 recorded steps and streaming has600; all eight metrics are complete.
+Shared statistics stop at500 and the plots shade501..600. No baseline was rerun,
+and no validation accuracy was invented. See CURVES.md and
+results/curve-comparison/comparison.png.
+
+Historical handoff on 2026-11-08 around 14:23 PST: segment21509384 COMPLETED0:0
 after3h44m16s, committing402..503 and saving checkpoint503 at its configured
-checkpoint deadline. Segment21509385 is RUNNING onpool0-[00707,00711,00731].
+checkpoint deadline. Segment21509385 ran onpool0-[00707,00711,00731].
 All16 workers loaded503 weights, and the saved data-loader/native TQ state was
 restored. Checkpoint503 has total_steps/trainer_version/sampler_dispatch_index503,
 consumed_samples4024 and epoch0; weights and optimizer shards are present.
 The existing W&B run has resumed online. Step504 committed with trainer_v504,
 lag0, two dispatches and LR1e-6; genKL0.00149343815 and policyKL0.00155217709.
 Read-only W&B API confirmed the same run has received504 with matching metrics
-(results/resume600/segment3-wandb-startup.json). Segment21509386 waits on dependency.
+(results/resume600/segment3-wandb-startup.json). Segment21509386 was dependent.
 
 The checkpoint's16 optimizer shards are present. Reading only DCP scalar state
 inside the allocated container verified all693 saved optimizer step entries503,
@@ -31,8 +70,8 @@ to0.00179282/0.00124514 at502/503. No gen-KL explosion observed through503;
 these are observational results, not numerical qualification or an isolated
 throughput claim. See results/resume600/segment2-summary.json. The preceding
 301..401 segment had first/last20 genKL means0.00153708/0.00154503; its evidence
-is in segment1-summary.json. Continue to600 without new submission or changes
-to training code/configuration.
+is in segment1-summary.json. No additional training submission or numerical
+code/configuration change was needed to reach600.
 
 - Recipe: streaming_qwen35_exploratory_600.yaml inherits the original exploratory
   recipe. Only grpo.max_num_steps changes to600 and the display name says600.

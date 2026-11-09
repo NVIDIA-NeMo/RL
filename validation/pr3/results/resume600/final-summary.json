@@ -1,0 +1,538 @@
+{
+  "analyzed_inside_job": 21539655,
+  "source_log_sha256": {
+    "validation/pr3/slurm/21331883-logs/ray-driver.log": "0cf3084f4bfcf56314eca2c2121786819cc62269e2ed99ca6cd8bd86a76bbb31",
+    "validation/pr3/slurm/21331884-logs/ray-driver.log": "d7720614ee1e1bc3ef6b1b51c56d765541ea0e7c2af5f873f7c0503ca4eee0c6",
+    "validation/pr3/slurm/21331885-logs/ray-driver.log": "f87930e26638a108d3f67d6e46a93c3b3caa86b2e576382dcca65c7b644cdd8b",
+    "validation/pr3/slurm/21331930-logs/ray-driver.log": "33bcdf671bc9ad361fd546c476f7240c968adcfc1098c449d960720638b3bf80",
+    "validation/pr3/slurm/21509383-logs/ray-driver.log": "096c2ce91b280cbc8f00aae2dccad748322166a3e007ab51567f9b3377f4c4c5",
+    "validation/pr3/slurm/21509384-logs/ray-driver.log": "d467a0973165347833d25592fb6d93f1ee7dd0778defb3f85c10c2314ec20497",
+    "validation/pr3/slurm/21509385-logs/ray-driver.log": "bf2f58e5197e59e5cc9d6e3e3434ccb8c762ebf326e4216e27ddee029c67ad1d"
+  },
+  "unchanged_training_source_sha256": {
+    "nemo_rl/models/policy/workers/automodel_policy_worker.py": "7f59824258aafb13f5540810776dfa18c86a623856c9c89e4c6e26881259f74d",
+    "tests/functional/automodel_sc_full_batch_parity.py": "ccb26bda2ad5a1408cbbd125cf2aec5a119d232ecaa1777bebbce0071c0dc399"
+  },
+  "segments": {
+    "21331883": [
+      1,
+      94
+    ],
+    "21331884": [
+      95,
+      195
+    ],
+    "21331885": [
+      196,
+      294
+    ],
+    "21331930": [
+      295,
+      300
+    ],
+    "21509383": [
+      301,
+      401
+    ],
+    "21509384": [
+      402,
+      503
+    ],
+    "21509385": [
+      504,
+      600
+    ]
+  },
+  "committed_updates": 600,
+  "all_steps_unique_and_contiguous": true,
+  "all_lag_zero": true,
+  "all_two_dispatches": true,
+  "all_32_valid_sequences": true,
+  "all_continuation_lr_1e_6": true,
+  "all_metrics_finite": true,
+  "windows": {
+    "1..100": {
+      "gen_kl_error": {
+        "mean": 0.000973697501627626,
+        "min": 0.0007073346859800917,
+        "max": 0.0013867698596940385
+      },
+      "policy_kl_error": {
+        "mean": 0.0018976743274296403,
+        "min": 0.0007200798316004779,
+        "max": 0.08548620663471022
+      },
+      "reward": {
+        "mean": 0.2684375,
+        "min": 0.0,
+        "max": 0.84375
+      },
+      "mean_gen_tokens_per_sample": {
+        "mean": 1788.144375,
+        "min": 736.0,
+        "max": 2048.0
+      },
+      "grad_norm": {
+        "mean": 0.22687522299587726,
+        "min": 0.0,
+        "max": 0.66471928358078
+      },
+      "loss": {
+        "mean": 0.022669376981072416,
+        "min": -0.0025674960090195905,
+        "max": 0.1156722179826545
+      },
+      "approx_entropy": {
+        "mean": 0.5315767406674854,
+        "min": 0.36048330945628737,
+        "max": 0.718435481636824
+      },
+      "step_time": {
+        "mean": 140.0566,
+        "min": 114.56,
+        "max": 289.79
+      }
+    },
+    "101..200": {
+      "gen_kl_error": {
+        "mean": 0.0012405921996370647,
+        "min": 0.0009627889589354007,
+        "max": 0.0017605275896853904
+      },
+      "policy_kl_error": {
+        "mean": 0.0014299131153591201,
+        "min": 0.000991639529248928,
+        "max": 0.01500898848028199
+      },
+      "reward": {
+        "mean": 0.6021875,
+        "min": 0.25,
+        "max": 0.875
+      },
+      "mean_gen_tokens_per_sample": {
+        "mean": 976.9478125,
+        "min": 452.84375,
+        "max": 1806.625
+      },
+      "grad_norm": {
+        "mean": 0.5570742005109787,
+        "min": 0.0,
+        "max": 1.521405577659607
+      },
+      "loss": {
+        "mean": 0.035453769021385514,
+        "min": -0.15481725021556722,
+        "max": 0.16814129088812244
+      },
+      "approx_entropy": {
+        "mean": 0.42398379257197866,
+        "min": 0.26838855772367465,
+        "max": 0.8261238258772836
+      },
+      "step_time": {
+        "mean": 130.0175,
+        "min": 89.05,
+        "max": 259.62
+      }
+    },
+    "201..300": {
+      "gen_kl_error": {
+        "mean": 0.001372962117067649,
+        "min": 0.001030176408635631,
+        "max": 0.001899546579316027
+      },
+      "policy_kl_error": {
+        "mean": 0.0015489056195456177,
+        "min": 0.0010661604017689565,
+        "max": 0.007841568390435072
+      },
+      "reward": {
+        "mean": 0.655625,
+        "min": 0.3125,
+        "max": 1.0
+      },
+      "mean_gen_tokens_per_sample": {
+        "mean": 1114.2403125,
+        "min": 474.1875,
+        "max": 1725.875
+      },
+      "grad_norm": {
+        "mean": 0.5178290065377951,
+        "min": 0.0,
+        "max": 1.4523588418960571
+      },
+      "loss": {
+        "mean": 0.039465552423541966,
+        "min": -0.03244635216558868,
+        "max": 0.17342218972326956
+      },
+      "approx_entropy": {
+        "mean": 0.3546062184475447,
+        "min": 0.207448543618446,
+        "max": 0.49556392645716196
+      },
+      "step_time": {
+        "mean": 132.2775,
+        "min": 108.78,
+        "max": 246.67
+      }
+    },
+    "301..400": {
+      "gen_kl_error": {
+        "mean": 0.0014887901746773189,
+        "min": 0.0010331598779165546,
+        "max": 0.0019238558732123593
+      },
+      "policy_kl_error": {
+        "mean": 0.05213197514339502,
+        "min": 0.0010659671308150393,
+        "max": 5.046486964892457
+      },
+      "reward": {
+        "mean": 0.68125,
+        "min": 0.34375,
+        "max": 0.96875
+      },
+      "mean_gen_tokens_per_sample": {
+        "mean": 1029.003125,
+        "min": 595.96875,
+        "max": 1661.5
+      },
+      "grad_norm": {
+        "mean": 0.6405611743032932,
+        "min": 0.0,
+        "max": 8.324913024902344
+      },
+      "loss": {
+        "mean": 0.027395202484462405,
+        "min": -0.06618361354144522,
+        "max": 0.18393445611290105
+      },
+      "approx_entropy": {
+        "mean": 0.37566804886255023,
+        "min": 0.24879797557404743,
+        "max": 0.5767671383228323
+      },
+      "step_time": {
+        "mean": 129.7673,
+        "min": 98.24,
+        "max": 257.35
+      }
+    },
+    "401..500": {
+      "gen_kl_error": {
+        "mean": 0.0015099819398550127,
+        "min": 0.0011098283386715103,
+        "max": 0.0019867611320512893
+      },
+      "policy_kl_error": {
+        "mean": 0.001615040945668964,
+        "min": 0.0011721288802061486,
+        "max": 0.00317437476640224
+      },
+      "reward": {
+        "mean": 0.6578125,
+        "min": 0.3125,
+        "max": 0.9375
+      },
+      "mean_gen_tokens_per_sample": {
+        "mean": 987.729375,
+        "min": 535.40625,
+        "max": 1478.46875
+      },
+      "grad_norm": {
+        "mean": 0.6183534005284309,
+        "min": 0.0,
+        "max": 1.8651567697525024
+      },
+      "loss": {
+        "mean": 0.031454709855701125,
+        "min": -0.0582133966916698,
+        "max": 0.16984944474037847
+      },
+      "approx_entropy": {
+        "mean": 0.4290959786346457,
+        "min": 0.28557605038714523,
+        "max": 0.651780461888912
+      },
+      "step_time": {
+        "mean": 127.9049,
+        "min": 66.23,
+        "max": 254.3
+      }
+    },
+    "501..600": {
+      "gen_kl_error": {
+        "mean": 0.0016131116326867396,
+        "min": 0.0011081285040376952,
+        "max": 0.002385499073851305
+      },
+      "policy_kl_error": {
+        "mean": 0.002867404678098701,
+        "min": 0.0011309925794807697,
+        "max": 0.05826541673569778
+      },
+      "reward": {
+        "mean": 0.6771875,
+        "min": 0.3125,
+        "max": 0.96875
+      },
+      "mean_gen_tokens_per_sample": {
+        "mean": 968.6534375,
+        "min": 643.09375,
+        "max": 1403.1875
+      },
+      "grad_norm": {
+        "mean": 0.6486695529520512,
+        "min": 0.0,
+        "max": 1.1207846403121948
+      },
+      "loss": {
+        "mean": 0.020922841573246212,
+        "min": -0.048165948914385,
+        "max": 0.16673909432310052
+      },
+      "approx_entropy": {
+        "mean": 0.33433586354185485,
+        "min": 0.21262992257776642,
+        "max": 0.6106376587137641
+      },
+      "step_time": {
+        "mean": 129.3935,
+        "min": 90.11,
+        "max": 283.76
+      }
+    },
+    "301..320": {
+      "gen_kl_error": {
+        "mean": 0.0015370787258058981,
+        "min": 0.001224701383434597,
+        "max": 0.0019238558732123593
+      },
+      "policy_kl_error": {
+        "mean": 0.2544357410962556,
+        "min": 0.001295603652286444,
+        "max": 5.046486964892457
+      },
+      "reward": {
+        "mean": 0.61875,
+        "min": 0.34375,
+        "max": 0.875
+      },
+      "mean_gen_tokens_per_sample": {
+        "mean": 1208.4453125,
+        "min": 763.59375,
+        "max": 1661.5
+      },
+      "grad_norm": {
+        "mean": 0.46426773965358736,
+        "min": 0.0,
+        "max": 0.7297585010528564
+      },
+      "loss": {
+        "mean": 0.027025197265737756,
+        "min": -0.02804760740104744,
+        "max": 0.09143739053166741
+      },
+      "approx_entropy": {
+        "mean": 0.3539685591979837,
+        "min": 0.28221302192013287,
+        "max": 0.4444657858972615
+      },
+      "step_time": {
+        "mean": 138.718,
+        "min": 109.01,
+        "max": 257.35
+      }
+    },
+    "481..500": {
+      "gen_kl_error": {
+        "mean": 0.0014779970343003028,
+        "min": 0.0012167754202307328,
+        "max": 0.0019393058245828331
+      },
+      "policy_kl_error": {
+        "mean": 0.0016953536525514804,
+        "min": 0.001263720486124572,
+        "max": 0.00317437476640224
+      },
+      "reward": {
+        "mean": 0.7015625,
+        "min": 0.40625,
+        "max": 0.875
+      },
+      "mean_gen_tokens_per_sample": {
+        "mean": 982.7640625,
+        "min": 558.9375,
+        "max": 1267.59375
+      },
+      "grad_norm": {
+        "mean": 0.5249174118041993,
+        "min": 0.0,
+        "max": 0.8561121225357056
+      },
+      "loss": {
+        "mean": 0.04235242578656432,
+        "min": -0.012271811921307763,
+        "max": 0.12040448688997989
+      },
+      "approx_entropy": {
+        "mean": 0.4327236019189421,
+        "min": 0.2978799366961481,
+        "max": 0.58674705929477
+      },
+      "step_time": {
+        "mean": 126.3555,
+        "min": 106.03,
+        "max": 143.32
+      }
+    },
+    "581..600": {
+      "gen_kl_error": {
+        "mean": 0.0017201973024152705,
+        "min": 0.0014323470993545208,
+        "max": 0.0021394016195260815
+      },
+      "policy_kl_error": {
+        "mean": 0.001878577787720423,
+        "min": 0.0014593724810882868,
+        "max": 0.002852895853931543
+      },
+      "reward": {
+        "mean": 0.690625,
+        "min": 0.3125,
+        "max": 0.96875
+      },
+      "mean_gen_tokens_per_sample": {
+        "mean": 999.465625,
+        "min": 681.65625,
+        "max": 1403.1875
+      },
+      "grad_norm": {
+        "mean": 0.593218456208706,
+        "min": 0.2923826277256012,
+        "max": 0.918264627456665
+      },
+      "loss": {
+        "mean": 0.016956990691099023,
+        "min": -0.03787780991294094,
+        "max": 0.07285683837770024
+      },
+      "approx_entropy": {
+        "mean": 0.30106013051642005,
+        "min": 0.2241354353713272,
+        "max": 0.3905163060992912
+      },
+      "step_time": {
+        "mean": 125.389,
+        "min": 109.14,
+        "max": 144.4
+      }
+    }
+  },
+  "latest": {
+    "nemo_rl/step": 600,
+    "train/loss": 0.02906392239495229,
+    "train/grad_norm": 0.5503636002540588,
+    "train/token_mult_prob_error": 1.0208829482007937,
+    "train/probs_ratio": 1.0,
+    "train/probs_ratio_clamped": 1.0,
+    "train/probs_ratio_min": 1.0,
+    "train/probs_ratio_max": 1.0,
+    "train/probs_ratio_clamped_min": 1.0,
+    "train/probs_ratio_clamped_max": 1.0,
+    "train/gen_kl_error": 0.0016022017135677823,
+    "train/policy_kl_error": 0.0017832641735099075,
+    "train/js_divergence_error": 0.0004128003471853111,
+    "train/approx_entropy": 0.25414595371408716,
+    "train/sampling_importance_ratio": 0.99941756026856,
+    "train/kl_penalty": 0.0,
+    "train/num_valid_samples": 32.0,
+    "train/positive_nll_loss": 0.0,
+    "train/is_oob_ratio": 2.9808036246572075e-05,
+    "train/policy_support_excluded_tokens": 0.0,
+    "train/lr": 1e-06,
+    "train/global_valid_seqs": 32.0,
+    "train/global_valid_toks": 33548.0,
+    "train/policy_train_dispatches": 2,
+    "train/reward": 0.75,
+    "train/advantages/mean": -0.029167104992605556,
+    "train/advantages/max": 1.4999970197677612,
+    "train/advantages/min": -1.4999970197677612,
+    "train/total_num_tokens": 39460.0,
+    "train/num_mask_sample_filtered": 0.0,
+    "train/max_seq_mult_prob_error": 1.0327666997909546,
+    "train/mean_seq_mult_prob_error": 1.0204441547393799,
+    "train/min_seq_mult_prob_error": 1.011296272277832,
+    "train/max_seq_mult_prob_error_after_mask": 1.0327666997909546,
+    "train/mean_seq_mult_prob_error_after_mask": 1.0204441547393799,
+    "train/min_seq_mult_prob_error_after_mask": 1.011296272277832,
+    "train/num_masked_seqs_by_logprob_error": 0,
+    "train/masked_correct_pct": 0.0,
+    "train/invalid_tool_call_rate": 0.0,
+    "train/malformed_thinking_rate": 0.0,
+    "train/num_invalid_tool_calls": 0.0,
+    "train/num_malformed_thinking": 0.0,
+    "train/num_assistant_messages": 32.0,
+    "train/routed_experts_backfilled_rate": 0.0,
+    "train/num_routed_experts_backfilled": 0.0,
+    "train/total_reward/mean": 0.75,
+    "train/total_reward/max": 1.0,
+    "train/total_reward/min": 0.0,
+    "train/total_reward/median": 0.75,
+    "train/total_reward/stddev": 0.125,
+    "train/total_turns": 32,
+    "train/turns_per_sample/mean": 1.0,
+    "train/turns_per_sample/max": 1,
+    "train/turns_per_sample/min": 1,
+    "train/turns_per_sample/median": 1.0,
+    "train/turns_per_sample/stddev": 0.0,
+    "train/turns_per_sample/p95": 1.0,
+    "train/turns_per_sample/p99": 1.0,
+    "train/total_tokens_per_sample/mean": 1051.375,
+    "train/total_tokens_per_sample/max": 2051,
+    "train/total_tokens_per_sample/min": 187,
+    "train/total_tokens_per_sample/median": 1053.375,
+    "train/total_tokens_per_sample/stddev": 261.59599842967555,
+    "train/gen_tokens_per_sample/mean": 1048.375,
+    "train/gen_tokens_per_sample/max": 2048,
+    "train/gen_tokens_per_sample/min": 184,
+    "train/gen_tokens_per_sample/median": 1050.375,
+    "train/gen_tokens_per_sample/stddev": 261.59599842967555,
+    "train/env_tokens_per_sample/mean": 3.0,
+    "train/env_tokens_per_sample/max": 3,
+    "train/env_tokens_per_sample/min": 3,
+    "train/env_tokens_per_sample/median": 3.0,
+    "train/env_tokens_per_sample/stddev": 0.0,
+    "train/max_gen_tokens_per_turn/max": 2048,
+    "train/max_gen_tokens_per_turn/mean": 1919.75,
+    "train/max_gen_tokens_per_turn/p95": 2048.0,
+    "train/truncation_rate": 0.09375,
+    "train/natural_termination_rate": 1.0,
+    "train/max_turns_reached_rate": 1.0,
+    "train/mean_gen_tokens_per_sample": 1048.375,
+    "timing/rollout/run_rollouts": 76.44518220401369,
+    "timing/rollout/aggregate_metrics": 0.00015719421207904816,
+    "timing/rollout/total": 76.4453811836429,
+    "train/vllm/spec_num_drafts": 0.0,
+    "train/vllm/spec_num_draft_tokens": 0.0,
+    "train/vllm/spec_num_accepted_tokens": 0.0,
+    "train/vllm/spec_acceptance_length": 1.0,
+    "train/vllm/spec_acceptance_rate": 0.0,
+    "train/vllm/prompt_tokens": 0.0,
+    "train/vllm/generation_tokens": 1225.0,
+    "train/vllm/prompt_length_mean": 278.7142857142857,
+    "train/vllm/generation_length_mean": 1922.142857142857,
+    "train/vllm/generations_ok": 7.0,
+    "train/vllm/generations_failed": 0.0,
+    "train/evicted_stale_prompt_groups": 0,
+    "train/aborted_stale_inflight_groups": 0,
+    "train/dropped_prompt_groups": 0,
+    "train/replaced_prompt_groups": 0,
+    "train/promoted_prompt_groups": 0,
+    "train/weight_version_lag": 0,
+    "timing/train/total_step_time": 144.4
+  },
+  "qualification_passed": false,
+  "scope": "Exploratory single-seed continuation; original BF16 1% gate remains FAILED."
+}

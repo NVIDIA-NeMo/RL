@@ -1,0 +1,29 @@
+{
+  "state": "finished",
+  "run_id": "yuekaiz5090explorela0s42",
+  "observed_at": "2026-11-08T17:54:00-08:00",
+  "metrics": {
+    "nemo_rl/step": 600,
+    "train/gen_kl_error": 0.0016022017135677823,
+    "train/policy_kl_error": 0.0017832641735099075,
+    "train/lr": 1e-06,
+    "train/weight_version_lag": 0,
+    "train/reward": 0.75,
+    "train/grad_norm": 0.5503636002540588,
+    "train/policy_train_dispatches": 2
+  },
+  "native_receipt": {
+    "step": 600,
+    "trainer_version": 600,
+    "lag": "0",
+    "metrics": {
+      "gen_kl_error": "0.0016022017135677823",
+      "policy_kl_error": "0.0017832641735099075",
+      "reward": "0.75",
+      "grad_norm": "0.5503636002540588",
+      "mean_gen_tokens_per_sample": "1048.375",
+      "policy_train_dispatches": "2",
+      "lr": "1e-06"
+    }
+  }
+}

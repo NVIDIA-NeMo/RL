@@ -1,0 +1,55 @@
+{
+  "training_info": {
+    "consumed_samples": 4800,
+    "current_step": 600,
+    "current_epoch": 0,
+    "total_steps": 600,
+    "total_valid_tokens": 21967099.0,
+    "trainer_version": 600,
+    "sampler_name": "in_order",
+    "sampler_dispatch_index": 600,
+    "cur_adaptive_ppo_clip_k": null
+  },
+  "optimizer_step_entries": 693,
+  "all_saved_optimizer_steps_600": true,
+  "optimizer_lr_entries": 693,
+  "all_saved_optimizer_lrs_1e_6": true,
+  "optimizer_shards": 16,
+  "scheduler": {
+    "sched._schedulers.0._is_initial": false,
+    "sched._schedulers.0._get_lr_called_within_step": false,
+    "sched._schedulers.0._last_lr": [
+      9.000000010000003e-07
+    ],
+    "sched._schedulers.1.factor": 1.0,
+    "sched._schedulers.1.total_iters": 10000000000,
+    "sched._schedulers.1.base_lrs": [
+      1e-06
+    ],
+    "sched._milestones": [
+      10
+    ],
+    "sched._schedulers.1.last_epoch": 590,
+    "sched.last_epoch": 600,
+    "sched._schedulers.1._step_count": 591,
+    "sched._last_lr": [
+      1e-06
+    ],
+    "sched._schedulers.1._is_initial": false,
+    "sched._schedulers.0.start_factor": 1e-08,
+    "sched._schedulers.1._get_lr_called_within_step": false,
+    "sched._schedulers.0.end_factor": 1.0,
+    "sched._schedulers.1._last_lr": [
+      1e-06
+    ],
+    "sched._schedulers.0.total_iters": 10,
+    "sched._schedulers.0.base_lrs": [
+      1e-06
+    ],
+    "sched._schedulers.0.last_epoch": 9,
+    "sched._schedulers.0._step_count": 10
+  },
+  "metadata_sha256": "0d940974df862730f164060492a980b6985877d945c10f4c4d693155b36233d5",
+  "analyzed_inside_job": 21539655,
+  "scope": "Saved scalar state only; not a live per-rank raw optimizer-buffer comparison."
+}
