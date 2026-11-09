@@ -139,13 +139,11 @@ def test_forest_selection_config(policy):
 @pytest.mark.parametrize(
     "option",
     [
-        {"max_rows_per_rollout": 16},
         {"owner_failure_scope": "row"},
         {"invalid_group_policy": "placeholder"},
         {"mask_retried_roots": True},
         {"forest_penalty_scope": "all_segments"},
         {"exclude_padding_from_router_stats": True},
-        {"invalidate_rewritten_history": True},
         {"forest_padding_scope": "step"},
     ],
 )

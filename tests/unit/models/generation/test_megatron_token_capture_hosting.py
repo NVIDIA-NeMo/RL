@@ -93,20 +93,6 @@ def test_generation_setup_token_capture_returns_the_coordinators_media_spec(
     )
 
 
-def test_generation_setup_token_capture_rejects_rewritten_history_invalidation():
-    generation = object.__new__(MegatronGeneration)
-    generation.cfg = {"mcore_generation_config": {"expose_http_server": True}}
-    worker_group = _WorkerGroup()
-    generation._policy = SimpleNamespace(worker_group=worker_group)
-    with pytest.raises(NotImplementedError, match="requires vLLM"):
-        generation.setup_token_capture(
-            {"backend": "simple"},
-            "rollout_staging",
-            invalidate_rewritten_history=True,
-        )
-    assert worker_group.calls == []
-
-
 def test_generation_setup_token_capture_requires_exposed_http_server() -> None:
     generation = object.__new__(MegatronGeneration)
     generation.cfg = {"mcore_generation_config": {"expose_http_server": False}}

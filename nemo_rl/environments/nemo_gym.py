@@ -1153,9 +1153,6 @@ class NemoGym(EnvironmentInterface):
         self._selection_policy = (
             capture_config["selection_policy"] if self._forest_training else None
         )
-        self._max_rows_per_rollout = (
-            capture_config["max_rows_per_rollout"] if self._forest_training else None
-        )
         self._unserved_call_failure = (
             capture_config["unserved_call_failure"] if self._forest_training else None
         )
@@ -2119,12 +2116,7 @@ Depending on your data shape, you may want to change these values."""
         )
         from nemo_gym.token_id_capture.staging.records import RolloutManifest
 
-        from nemo_rl.environments.call_selection import (
-            TerminalNotIdentified,
-            cap_selected_roots,
-            resolve_scored_terminal,
-            resolve_selection_policy,
-        )
+        from nemo_rl.environments.call_selection import resolve_selection_policy
         from nemo_rl.experience.rollout_reassembler import (
             ActionOutputFlags,
             RolloutSelection,
@@ -2167,7 +2159,6 @@ Depending on your data shape, you may want to change these values."""
         )
         selected = []
         terminal_response_id = None
-        terminal_failure = None
         if not capture_failed:
             try:
                 assert self._selection_policy is not None
@@ -2187,16 +2178,6 @@ Depending on your data shape, you may want to change these values."""
                 if any(f.model_call_id in selected_call_ids for f in parsed.failures):
                     capture_failed = True
                     selected = []
-                elif self._max_rows_per_rollout is not None:
-                    selected = cap_selected_roots(
-                        selected, terminal_response_id, self._max_rows_per_rollout
-                    )
-            except TerminalNotIdentified as error:
-                # Mask the owner rather than fail the run; reported per step.
-                print(f"⚠️ Rollout {owner!r} masked: {error}", file=sys.stderr)
-                terminal_failure = str(error)
-                selected = []
-                terminal_response_id = None
             except ValueError as error:
                 raise ValueError(f"Rollout {owner!r}: {error}") from error
         if any(r.response_status is None for r in selected):
@@ -2229,31 +2210,8 @@ Depending on your data shape, you may want to change these values."""
             ignored_failure_reasons=ignored_reasons,
         )
         selected_call_ids = {r.model_call_id for r in selected}
-        if selected:
-            # The receipt sees the selection's terminal as declared; record the
-            # stage that actually named it when the policy chose the same call.
-            try:
-                named, terminal_selection, attribution_reason = resolve_scored_terminal(
-                    list(parsed.records), result
-                )
-            except TerminalNotIdentified:
-                named = None
-            if named is not None and named.response_id == terminal_response_id:
-                receipt.update(
-                    terminal_selection=terminal_selection,
-                    terminal_attribution_reason=attribution_reason or None,
-                )
         if capture_failed:
             receipt.update(capture_poisoned=True, failure_reason="capture_incomplete")
-        elif terminal_failure is not None:
-            receipt.update(
-                capture_poisoned=True,
-                failure_reason="terminal_not_identified",
-                terminal_selection=(
-                    "declared" if result.get("terminal_response_id") else "heuristic"
-                ),
-                terminal_attribution_reason=terminal_failure,
-            )
         elif any(
             r.response_status in ("failed", "unknown")
             or (

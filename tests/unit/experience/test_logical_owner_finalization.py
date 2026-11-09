@@ -380,7 +380,6 @@ def test_gym_adapter_returns_one_real_receipt_and_rl_selection(monkeypatch, tmp_
     env = object.__new__(NemoGym.__ray_metadata__.modified_class)
     env._forest_training = True
     env._selection_policy = "returned_history"
-    env._max_rows_per_rollout = None
     env._unserved_call_failure = "poison"
     env.cfg = {}
 

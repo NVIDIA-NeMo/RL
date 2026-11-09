@@ -122,20 +122,14 @@ Enable `token_capture.enabled: true` and `token_capture.forest_training: true` o
   For `A → B` and `A → C`, both branches train; it does not choose the latest
   sibling. Shared `A` contributes loss once, and both rows share the rollout's
   reward and advantage.
-- `continued_chains` trains every independent session (for example, subagents)
-  as its own row. The scored chain comes first and holds only the scored call's ancestors; each other root, in
-  admission order, descends to a unique leaf, preferring children that were
-  continued. An ambiguous fork drops that root, a leaf whose cumulative hash
-  repeats an earlier chain is dropped as a byte-identical retry, and calls that
-  did not finish trainably end a chain instead of masking the rollout.
 
-All built-in policies reuse capture validation, completion checks, forest reconstruction,
+Both policies reuse capture validation, completion checks, forest reconstruction,
 and once-only loss ownership for shared ancestors. Pending calls, lost capture
 evidence, and failed selected executions still mask the logical rollout. A failure
 record does not acknowledge a pending worker's writes or transfer them to cleanup.
-Failed parents and failed scored calls remain invalid. No built-in policy infers
-agent roles. Non-default policies require `forest_training: true`; they do not
-enable per-agent rewards or remove the execution restrictions below.
+Failed parents and failed scored calls remain invalid. Neither policy infers
+agent roles. `all_captured` requires `forest_training: true`; it does not enable
+per-agent rewards or remove the execution restrictions below.
 
 A cancellation recorded as `request_finished_without_staged_coordinates` does
 not mask the rollout when the call already has a committed capture, no calls
@@ -248,8 +242,6 @@ Batch cardinality counts logical rollouts; GRPO advantages are per logical rollo
 These `token_capture` options adjust which rows train and how failures mask
 them. All are Forest-only and off by default:
 
-- `max_rows_per_rollout`: keep the scored root plus the first N-1 other selected
-  roots; with `continued_chains` this caps rows per rollout.
 - `owner_failure_scope: row`: a failed segment, or one that fails
   sequence-logprob filtering, is masked alone unless it holds the scored call.
 - `invalid_group_policy: placeholder`: a group whose rollouts all failed
@@ -264,10 +256,6 @@ them. All are Forest-only and off by default:
   `max_seq_len` are truncated, instead of every row of a rollout with any
   length stop. With `owner_failure_scope: row`, overlong filtering then drops
   only those rows.
-- `invalidate_rewritten_history` (vLLM generation only): a later call whose
-  history holds assistant output that matches no captured call is still served,
-  but its capture fails, which masks the rollout. A subagent's first call holds
-  no assistant output and roots its segment as usual.
 
 `token_capture.forest_padding_scope: step` (Forest only; default `group`) pads
 each training batch once to the row multiple, instead of padding every

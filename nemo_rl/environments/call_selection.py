@@ -281,64 +281,28 @@ def select_captured_calls(
     return selected, terminal_response_id
 
 
-class TerminalNotIdentified(ValueError):
-    """No captured call can be named as the scored terminal; the owner is masked."""
-
-
-# Gym attribution methods, in RolloutReceipt.terminal_selection terms.
-_RECEIPT_METHOD = {
-    "explicit": "declared",
-    "declared": "declared",
-    "response_id": "response_id",
-    "content": "content",
-    "item_id": "content",
-    "content_output": "content",
-    "content_cumulative": "content",
-    "content_tool_ids": "content",
-}
-
-
-def resolve_scored_terminal(
-    records: list[CallRecord], result: dict[str, Any]
-) -> tuple[CallRecord, str, str]:
-    """Name the scored call: witness attribution, else the parent-link heuristic.
-
-    Returns ``(record, terminal_selection, attribution_reason)``. A declared
-    terminal that no witness confirms never falls back to the heuristic.
-    Raises ``TerminalNotIdentified`` when neither stage names a call.
-    """
-    # Defer the optional Gym dependency until the policy is executed.
-    from nemo_gym.token_id_capture.staging import resolve_terminal, select_terminal_call
-
-    declared = result.get("terminal_response_id")
-    attribution = resolve_terminal(
-        records, result.get("response"), declared_response_id=declared
-    )
-    by_call = {record.model_call_id: record for record in records}
-    if attribution.attributed:
-        return (
-            by_call[attribution.model_call_id],
-            _RECEIPT_METHOD[attribution.method],
-            attribution.reason,
-        )
-    if declared:
-        raise TerminalNotIdentified(
-            "declared terminal is not attributable: " + attribution.reason
-        )
-    heuristic = select_terminal_call(records)
-    if heuristic.terminal_model_call_id is None:
-        raise TerminalNotIdentified(
-            f"no scored terminal: {attribution.reason}; heuristic: {heuristic.reason}"
-        )
-    return by_call[heuristic.terminal_model_call_id], "heuristic", attribution.reason
-
-
 def select_all_captured(
     records: list[CallRecord], result: dict[str, Any]
 ) -> tuple[list[CallRecord], str | None]:
     """Include all calls except unusable, unscored leaves, retaining attribution."""
-    terminal, _, _ = resolve_scored_terminal(records, result)
-    terminal_response_id = terminal.response_id
+    # Defer the optional Gym dependency until the policy is executed.
+    from nemo_gym.token_id_capture.staging import resolve_terminal
+
+    attribution = resolve_terminal(
+        records,
+        result.get("response"),
+        declared_response_id=result.get("terminal_response_id"),
+    )
+    if not attribution.attributed:
+        raise ValueError(
+            "all_captured requires an identifiable scored terminal: "
+            + attribution.reason
+        )
+    terminal_response_id = next(
+        record.response_id
+        for record in records
+        if record.model_call_id == attribution.model_call_id
+    )
     # Unusable parents or the scored call still invalidate the owner downstream.
     parents = {record.parent_call_id for record in records}
     selected = []
@@ -351,113 +315,16 @@ def select_all_captured(
         )
         if (
             not unusable
-            or record.model_call_id == terminal.model_call_id
+            or record.model_call_id == attribution.model_call_id
             or record.model_call_id in parents
         ):
             selected.append(record)
     return selected, terminal_response_id
 
 
-_LENGTH_FINISH_REASONS = ("length", "max_tokens", "max_output_tokens")
-
-
-def _trainable(record: CallRecord) -> bool:
-    """Completed, or stopped by a length limit; anything else ends its chain."""
-    return record.response_status == "completed" or (
-        record.response_status == "incomplete"
-        and record.finish_reason in _LENGTH_FINISH_REASONS
-    )
-
-
-def select_continued_chains(
-    records: list[CallRecord], result: dict[str, Any]
-) -> tuple[list[CallRecord], str | None]:
-    """Train the scored chain and one continued chain per other root.
-
-    Every independent session (for example, a subagent) becomes its own
-    chain. The scored chain comes first and holds only the scored call's
-    ancestors; the scored call is named by ``resolve_scored_terminal``. Every
-    other root, in
-    admission order, descends to a unique leaf, preferring children that were
-    continued; an ambiguous fork drops that root. Calls that did not finish
-    trainably count as absent, so they end a chain instead of poisoning the
-    owner. A leaf whose cumulative hash repeats an earlier chain is a
-    byte-identical retry and is dropped. Retries with identical prompts need
-    token evidence and are handled at finalization
-    (``token_capture.mask_retried_roots``).
-    """
-    terminal, _, _ = resolve_scored_terminal(records, result)
-    by_call = {record.model_call_id: record for record in records}
-    scored_chain = [terminal]
-    while scored_chain[-1].parent_call_id is not None:
-        parent = by_call.get(scored_chain[-1].parent_call_id)
-        if parent is None or parent in scored_chain:
-            raise ValueError("Scored chain has a missing or cyclic ancestor")
-        scored_chain.append(parent)
-    scored_chain.reverse()
-
-    position = {record.model_call_id: index for index, record in enumerate(records)}
-    children: dict[str, list[CallRecord]] = defaultdict(list)
-    for record in records:
-        if record.parent_call_id is not None and _trainable(record):
-            children[record.parent_call_id].append(record)
-    roots = sorted(
-        (
-            record
-            for record in records
-            if record.parent_call_id is None
-            and record is not scored_chain[0]
-            and _trainable(record)
-        ),
-        key=lambda record: (
-            record.admitted_at is None,
-            record.admitted_at or 0.0,
-            position[record.model_call_id],
-        ),
-    )
-    selected = list(scored_chain)
-    seen_leaves = {scored_chain[-1].cumulative_hash}
-    for root in roots:
-        path = [root]
-        while candidates := children[path[-1].model_call_id]:
-            continued = [c for c in candidates if children[c.model_call_id]]
-            pool = continued or candidates
-            if len(pool) != 1:
-                break
-            path.append(pool[0])
-        else:
-            if path[-1].cumulative_hash not in seen_leaves:
-                seen_leaves.add(path[-1].cumulative_hash)
-                selected.extend(path)
-    return selected, scored_chain[-1].response_id
-
-
-def cap_selected_roots(
-    selected: list[CallRecord], terminal_response_id: str, max_roots: int
-) -> list[CallRecord]:
-    """Keep the scored call's root and the first ``max_roots - 1`` other roots.
-
-    Roots are counted in selection order. Under ``continued_chains`` each root
-    yields one training row, so this caps rows per rollout.
-    """
-    by_call = {record.model_call_id: record for record in selected}
-
-    def root_of(record: CallRecord) -> str:
-        while record.parent_call_id is not None and record.parent_call_id in by_call:
-            record = by_call[record.parent_call_id]
-        return record.model_call_id
-
-    roots = list(dict.fromkeys(root_of(record) for record in selected))
-    scored = next(r for r in selected if r.response_id == terminal_response_id)
-    scored_root = root_of(scored)
-    kept = {scored_root, *[r for r in roots if r != scored_root][: max_roots - 1]}
-    return [record for record in selected if root_of(record) in kept]
-
-
 SELECTION_POLICIES: dict[str, SelectionPolicy] = {
     "returned_history": select_captured_calls,
     "all_captured": select_all_captured,
-    "continued_chains": select_continued_chains,
 }
 
 

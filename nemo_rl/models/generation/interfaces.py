@@ -705,7 +705,6 @@ class GenerationInterface(ABC):
         *,
         capture_media: bool = False,
         top_logprobs: int = 0,
-        invalidate_rewritten_history: bool = False,
     ) -> "Optional[MediaColumnSpec]":
         """Install token capture in the serving workers (``token_capture.enabled``).
 
@@ -721,9 +720,6 @@ class GenerationInterface(ABC):
             capture_media: Whether the staging partition carries media columns and
                 the workers must stage the media the engine consumed beside each
                 call's tokens.
-            invalidate_rewritten_history: Whether workers fail the capture of a
-                call whose assistant history matches no captured call, masking
-                its rollout (``token_capture.invalidate_rewritten_history``).
 
         Returns:
             With ``capture_media``, the pixel dtype and patch size the workers

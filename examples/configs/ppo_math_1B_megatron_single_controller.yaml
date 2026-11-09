@@ -296,6 +296,16 @@ token_capture:
   forest_padding_scope: group
   # Step padding only. Rows the padding copies: row0 or cyclic.
   forest_pad_source: row0
+  # Forest only. What a failed segment masks: owner (whole rollout) or row.
+  owner_failure_scope: owner
+  # Forest only. A group whose rollouts all failed: drop or placeholder (masked rows).
+  invalid_group_policy: drop
+  # Forest only. Mask an uncontinued root that repeats a continued root's prompt.
+  mask_retried_roots: false
+  # Forest only. Calls that served no completion: poison (mask rollout) or ignore.
+  unserved_call_failure: poison
+  # Forest only. Which rows a length stop truncates: rollout or row.
+  forest_truncation_scope: rollout
   # Forest only. Segments the token penalties check: scored_segment or all_segments.
   forest_penalty_scope: scored_segment
   staging_partition: rollout_staging

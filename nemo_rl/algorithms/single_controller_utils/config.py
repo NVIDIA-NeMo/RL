@@ -704,9 +704,6 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     forest_training: bool = False
     # returned_history preserves the harness-selected trajectory (default).
     # all_captured includes every captured call, including abandoned attempts.
-    # continued_chains trains the scored chain plus one continued chain per other
-    # root, dropping ambiguous forks and byte-identical retries (see
-    # call_selection.select_continued_chains).
     # Custom policies use an importable package.module:function path.
     selection_policy: str = "returned_history"
     # Forest only. Keep execution padding and failed owners' borrowed inputs out
@@ -721,10 +718,6 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Step padding only. Which real rows the padding copies: row0 repeats the
     # batch's first row; cyclic takes rows 0, 1, 2, ...
     forest_pad_source: Literal["row0", "cyclic"] = "row0"
-    # Forest only. Keep the scored call's root plus at most this many minus one
-    # other roots, in selection order; under continued_chains this caps rows
-    # per rollout. None keeps every selected root.
-    max_rows_per_rollout: Optional[PositiveInt] = None
     # Forest only. What a failed segment invalidates.
     # owner: every row of its logical rollout (default).
     # row: only that row, unless it holds the scored call; the same scope
@@ -756,12 +749,6 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # all_segments: every segment; a hit in any of them zeroes the owner's reward.
     # Text penalties run once per rollout, on the scored response.
     forest_penalty_scope: Literal["scored_segment", "all_segments"] = "scored_segment"
-    # Forest only, vLLM generation. Mask the whole rollout when a later call
-    # carries assistant history that matches no captured call (rewritten
-    # history), instead of rooting it as a new segment, so earlier generations
-    # never train as prompt. A subagent's first call carries no assistant
-    # history and is kept.
-    invalidate_rewritten_history: bool = False
 
     @model_validator(mode="after")
     def validate_selection_policy(self) -> "TokenCaptureConfig":
@@ -771,7 +758,6 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
                 f"selection_policy={self.selection_policy} requires forest_training=true"
             )
         forest_only = {
-            "max_rows_per_rollout": self.max_rows_per_rollout is not None,
             "owner_failure_scope": self.owner_failure_scope != "owner",
             "invalid_group_policy": self.invalid_group_policy != "drop",
             "mask_retried_roots": self.mask_retried_roots,
@@ -779,7 +765,6 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
             "forest_truncation_scope": self.forest_truncation_scope != "rollout",
             "forest_penalty_scope": self.forest_penalty_scope != "scored_segment",
             "exclude_padding_from_router_stats": self.exclude_padding_from_router_stats,
-            "invalidate_rewritten_history": self.invalidate_rewritten_history,
             "forest_padding_scope": self.forest_padding_scope != "group",
         }
         if not self.forest_training and any(forest_only.values()):
