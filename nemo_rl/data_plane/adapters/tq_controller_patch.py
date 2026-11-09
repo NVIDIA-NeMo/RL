@@ -20,14 +20,17 @@ method with one ``.all(dim=0).tolist()`` instead; results are identical.
 Stock ``FieldMeta.remove_samples`` re-checks every nested field's label on every clear: it scans
 all live rows and, if they share one shape, relabels the field from nested to regular. That costs
 O(live rows) on the controller's only request thread. The situation that triggers a relabel does
-happen in NeMo-RL (for example, one row left), but nothing in NeMo-RL reads the label. Data is
-rebuilt from the stored rows, so skipping the relabel changes no data a run sees.
-``remove_samples`` below skips it, so a clear costs O(cleared rows).
+happen in NeMo-RL (for example, one row left), but nothing in NeMo-RL reads the label. Readers
+of row shapes (TQ storage, and the Mooncake read path patched in ``transfer_queue.py``) get them
+from ``BatchMeta.get_shapes``, which serves the same shape for every row under either label, so
+skipping the relabel changes no data a run sees. ``remove_samples`` below skips it, so a clear
+costs O(cleared rows).
 
-Code in this repo must not read a field's ``is_nested`` or ``shape`` label from TQ metadata;
-``test_no_code_reads_the_tq_field_label`` enforces that. Read row shapes from the tensors
-(``_from_wire``) or ship them on ``KVBatchMeta.tags`` (``multimodal_row_tags``). TQ's own
-``test_clear_data_nested_field_becomes_regular`` fails under this override by design.
+``test_remove_samples_serves_the_same_shapes_as_stock`` and
+``test_rows_survive_a_clear_that_stock_would_collapse`` pin that. Only ``nemo_rl/data_plane`` may
+import ``transfer_queue`` (``test_only_the_data_plane_imports_transfer_queue``), so no other code
+can read the label. TQ's own ``test_clear_data_nested_field_becomes_regular`` fails under this
+override by design.
 
 The controller is a Ray actor, so both are applied in a subclass started by ``tq.init``.
 
@@ -120,10 +123,9 @@ def kv_retrieve_meta(
 
 def remove_samples(self: FieldMeta, indexes: list[int]) -> None:
     """Stock ``FieldMeta.remove_samples`` without the nested-to-regular relabel."""
-    if self.per_sample_shapes:
-        for idx in indexes:
-            self.per_sample_shapes.pop(idx, None)
-    self.global_indexes.difference_update(indexes)
+    for idx in indexes:
+        self.per_sample_shapes.pop(idx, None)
+        self.global_indexes.discard(idx)
 
     if len(self.global_indexes) == 0:
         self.is_nested = None

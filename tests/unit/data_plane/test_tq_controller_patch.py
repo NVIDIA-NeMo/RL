@@ -19,8 +19,10 @@ pytest.importorskip("transfer_queue")
 from transfer_queue.controller import FieldMeta, TransferQueueController  # noqa: E402
 
 from nemo_rl.data_plane.adapters import tq_controller_patch as patch  # noqa: E402
+from tests.unit.data_plane._rollout_shapes import register_train_partition  # noqa: E402
 
 CONTROLLER = TransferQueueController.__ray_metadata__.modified_class
+STOCK_REMOVE = FieldMeta.remove_samples
 
 
 def test_installed_tq_is_the_version_the_overrides_were_copied_from():
@@ -56,9 +58,6 @@ def _served_shapes(field_meta, indexes):
     ]
 
 
-STOCK_REMOVE = FieldMeta.remove_samples
-
-
 def test_remove_samples_never_collapses_a_nested_field():
     field_meta = _nested_field(40)
 
@@ -69,22 +68,23 @@ def test_remove_samples_never_collapses_a_nested_field():
     assert field_meta.per_sample_shapes == {i: (256,) for i in range(39)}
 
 
-def test_remove_samples_serves_the_same_shapes_as_stock():
-    stock, patched = _nested_field(40), _nested_field(40)
-    remaining = list(range(40))
+def _replay(remove):
+    field_meta, remaining, served = _nested_field(40), list(range(40)), []
     for new in range(40, 60, 2):
         cleared, remaining = remaining[:4], remaining[4:]
-        added = [new, new + 1]
-        schema = _nested_schema({new: (512,), new + 1: (256,)})
-        for field_meta, remove in (
-            (stock, STOCK_REMOVE),
-            (patched, patch.remove_samples),
-        ):
-            remove(field_meta, cleared)
-            field_meta.update(schema, added)
-        remaining += added
-        assert _served_shapes(patched, remaining) == _served_shapes(stock, remaining)
-        assert patched.global_indexes == stock.global_indexes
+        remove(field_meta, cleared)
+        field_meta.update(
+            _nested_schema({new: (512,), new + 1: (256,)}), [new, new + 1]
+        )
+        remaining += [new, new + 1]
+        served.append(
+            (_served_shapes(field_meta, remaining), set(field_meta.global_indexes))
+        )
+    return served
+
+
+def test_remove_samples_serves_the_same_shapes_as_stock():
+    assert _replay(patch.remove_samples) == _replay(STOCK_REMOVE)
 
 
 def test_remove_samples_resets_an_emptied_field_like_stock():
@@ -171,18 +171,8 @@ def test_patched_controller_installs_both_overrides_on_start(monkeypatch):
     # Building the class patches nothing; starting the controller does.
     assert FieldMeta.remove_samples is STOCK_REMOVE
 
-    ctl = patched(polling_mode=True)
+    patched(polling_mode=True)
     assert FieldMeta.remove_samples is patch.remove_samples
-
-    indexes = list(
-        ctl.kv_retrieve_meta(["a", "b", "c"], "p", create=True).global_indexes
-    )
-    schema = {"tok": _nested_schema({g: (10 + i,) for i, g in enumerate(indexes)})}
-    ctl.update_production_status("p", indexes, schema, {g: {} for g in indexes})
-    ctl.clear_meta(indexes[:2], ["p", "p"])
-    field_meta = ctl._get_partition("p").field_metadata["tok"]
-    assert field_meta.is_nested is True
-    assert field_meta.per_sample_shapes == {indexes[2]: (12,)}
 
 
 def test_rows_survive_a_clear_that_stock_would_collapse(tq_client_backends):
@@ -193,11 +183,8 @@ def test_rows_survive_a_clear_that_stock_would_collapse(tq_client_backends):
         k: torch.randint(0, 50000, (n,), generator=g)
         for k, n in (("a", 256), ("b", 256), ("c", 128), ("d", 512))
     }
-    client.register_partition(
-        partition_id=partition_id,
-        fields=["input_ids"],
-        num_samples=len(rows),
-        consumer_tasks=["train"],
+    register_train_partition(
+        client, num_samples=len(rows), fields=["input_ids"], partition_id=partition_id
     )
 
     def put(keys):

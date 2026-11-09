@@ -521,9 +521,9 @@ The SC path splits the async-GRPO loop across a rollout pump and a train pump th
 The TransferQueue controller serves every data-plane request on one thread, so `tq.init` starts it with two overrides of the pinned TransferQueue:
 
 - `kv_retrieve_meta` reads the field mask with one `.tolist()` instead of one tensor read per field. Results are identical.
-- `FieldMeta.remove_samples` skips the nested-to-regular relabel. Stock TransferQueue re-checks every nested field's label on every clear, at a cost of O(live rows). The situation that triggers a relabel does happen in NeMo-RL, but nothing in NeMo-RL reads the label. Data is rebuilt from the stored rows, so skipping the relabel changes no data a run sees, and a clear costs O(cleared rows).
+- `FieldMeta.remove_samples` skips the nested-to-regular relabel. Stock TransferQueue re-checks every nested field's label on every clear, at a cost of O(live rows). The situation that triggers a relabel does happen in NeMo-RL, but nothing in NeMo-RL reads the label. Readers of row shapes get them from `BatchMeta.get_shapes`, which serves the same shape for every row under either label. So skipping the relabel changes no data a run sees, and a clear costs O(cleared rows).
 
-Do not read a field's `is_nested` or `shape` label from TransferQueue metadata in NeMo-RL code. Read row shapes from the tensors or ship them on `KVBatchMeta.tags`. `test_no_code_reads_the_tq_field_label` in `tests/unit/data_plane/test_architecture_invariants.py` enforces this.
+Only `nemo_rl/data_plane` may import `transfer_queue`, so no other code can read that label. `test_only_the_data_plane_imports_transfer_queue` in `tests/unit/data_plane/test_architecture_invariants.py` enforces this. `test_rows_survive_a_clear_that_stock_would_collapse` checks that rows round-trip unchanged on the `simple` and `mooncake_cpu` backends.
 
 ### Coordination Flow
 

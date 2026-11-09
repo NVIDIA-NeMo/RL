@@ -18,15 +18,14 @@
 * Every launcher picks trainer *and* policy through those shared helpers,
   so the two choices cannot drift apart.
 * The ``DataPlaneClient`` ABC carries every method adapters depend on.
-* No code reads TQ's per-field ``is_nested``/``shape`` label: the controller patch
-  keeps a uniform nested field labeled nested.
+* Only ``nemo_rl/data_plane`` imports ``transfer_queue``.
 """
 
 from __future__ import annotations
 
 import importlib
+import ast
 import pathlib
-import re
 from argparse import Namespace
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -271,22 +270,25 @@ def test_data_plane_client_abc_method_present(method: str) -> None:
     )
 
 
-def test_no_code_reads_the_tq_field_label():
-    """``tq_controller_patch`` stops TQ relabeling a nested field as regular.
+def test_only_the_data_plane_imports_transfer_queue():
+    """Only ``nemo_rl/data_plane`` may import ``transfer_queue``.
 
-    Row shapes come from the tensors (``_from_wire``) or from
-    ``KVBatchMeta.tags``, never from TQ's ``field_schema`` label.
+    So no other code can read TQ metadata, such as the nested label that
+    ``tq_controller_patch`` stops relabeling.
     """
-    label_read = re.compile(
-        r"\.field_schema\b|\bget_shapes\(|[\[(]\s*[\"']is_nested[\"']"
-    )
-    offenders = [
-        f"{path.relative_to(REPO)}:{lineno}"
-        for path in sorted((REPO / "nemo_rl").rglob("*.py"))
-        if path.name != "tq_controller_patch.py"
-        for lineno, line in enumerate(path.read_text().splitlines(), 1)
-        if label_read.search(line)
-    ]
+    offenders = []
+    for path in sorted((REPO / "nemo_rl").rglob("*.py")):
+        if path.is_relative_to(REPO / "nemo_rl" / "data_plane"):
+            continue
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import):
+                names = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                names = [node.module or ""]
+            else:
+                continue
+            if any(n.split(".")[0] == "transfer_queue" for n in names):
+                offenders.append(f"{path.relative_to(REPO)}:{node.lineno}")
     assert offenders == [], (
-        f"reads TQ's field label, which tq_controller_patch leaves nested: {offenders}"
+        f"import transfer_queue outside nemo_rl/data_plane: {offenders}"
     )
