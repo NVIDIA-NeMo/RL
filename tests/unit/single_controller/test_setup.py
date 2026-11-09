@@ -2799,6 +2799,8 @@ class TestSetup:
             patch.object(
                 sc_setup_mod, "_start_communicator_early", return_value=start_early
             ),
+            # The partial test config does not build a real stage config; the lane only needs one.
+            patch.object(sc_setup_mod, "AdvantageStageConfig"),
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor."
                 "create_rollout_reassembler_actors",
