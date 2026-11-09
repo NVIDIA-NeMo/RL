@@ -1,0 +1,33 @@
+{
+  "state": "running",
+  "native_receipt": {
+    "step": 2,
+    "version": 2,
+    "lag": "0",
+    "metrics": {
+      "gen_kl_error": "0.0003819518603288954",
+      "policy_kl_error": "0.0003950342759684334",
+      "reward": "0.310546875",
+      "grad_norm": "0.29009079933166504",
+      "mean_gen_tokens_per_sample": "1797.265625",
+      "policy_train_dispatches": "2",
+      "lr": "2.0000001800000003e-07",
+      "num_masked_seqs_by_logprob_error": "0",
+      "global_valid_seqs": "512.0"
+    }
+  },
+  "remote_metrics": {
+    "nemo_rl/step": 2,
+    "train/gen_kl_error": 0.0003819518603288954,
+    "train/policy_kl_error": 0.0003950342759684334,
+    "train/lr": 2.0000001800000003e-07,
+    "train/weight_version_lag": 0,
+    "train/policy_train_dispatches": 2,
+    "train/reward": 0.310546875,
+    "train/grad_norm": 0.29009079933166504,
+    "train/advantages/max": 3.7499847412109375,
+    "train/advantages/min": -3.7499847412109375
+  },
+  "remote_committed_step_seen": true,
+  "native_and_remote_metrics_match": true
+}

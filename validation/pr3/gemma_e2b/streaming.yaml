@@ -1,0 +1,30 @@
+defaults: ../../../examples/configs/recipes/llm/grpo-gemma4-e2b-it-1n8g-automodel-single-controller-full-batch.yaml
+grpo:
+  seed: 42
+  max_num_steps: 150
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  val_at_start: false
+  val_at_end: false
+policy:
+  model_name: /lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/shuangy/models/google/gemma-4-E2B-it
+  tokenizer:
+    name: ${policy.model_name}
+async_rl:
+  min_groups_for_streaming_train: 16
+  max_inflight_prompts: 32
+  max_buffered_rollouts: 32
+checkpointing:
+  checkpoint_dir: validation/pr3/gemma_e2b/results/streaming-la0/checkpoints
+  save_period: 10
+  keep_top_k: 2
+  checkpoint_must_save_by: 00:03:45:00
+logger:
+  log_dir: validation/pr3/gemma_e2b/results/streaming-la0/logs
+  wandb:
+    entity: yuekaiz
+    project: nemo-rl-automodel-sc
+    group: yuekaiz-pr5090-gemma-streaming-la0-exploratory
+    id: yuekaiz5090gemmala0s42
+    name: yuekaiz-gemma4-e2b-streaming-la0-b512-150-s42-exploratory
+    resume: allow

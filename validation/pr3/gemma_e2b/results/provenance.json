@@ -1,0 +1,12 @@
+{
+  "job_id": "21546953",
+  "git_head": "8b9fae1fd0964809e06f632419f98d0aa60e514d",
+  "training_source_sha256": {
+    "nemo_rl/models/policy/workers/automodel_policy_worker.py": "7f59824258aafb13f5540810776dfa18c86a623856c9c89e4c6e26881259f74d",
+    "tests/functional/automodel_sc_full_batch_parity.py": "ccb26bda2ad5a1408cbbd125cf2aec5a119d232ecaa1777bebbce0071c0dc399"
+  },
+  "recipe_sha256": "4400f3f94af4d0967c35897bf803facc176299329425b3ad1d8ffa58d0e15876",
+  "model_config_sha256": "1b28f3d2c3100f6c594754b81107428bd7b822a7f48272ca681dae9d2ec38330",
+  "baseline_config_checks_passed": true,
+  "qualification": "exploratory; does not change the failed Qwen BF16 1% gate"
+}
