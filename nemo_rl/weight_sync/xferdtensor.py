@@ -109,13 +109,15 @@ def xferdtensor(
     global _XFERDTENSOR_PATH_LOGGED
     use_golden = _use_golden_api()
     force_python = _use_python_api()
-    # nccl-extensions 0.1.0 supports at most two mesh axes. Both endpoints
-    # select from the same global meshes before any transfer starts.
+    # nccl-extensions 0.1.0 supports at most two mesh axes and one shard axis.
+    # Both endpoints select from the same global layout before transfer starts.
     use_python = (
         force_python
         or _reshard is None
         or src_mesh.mesh.ndim > 2
         or dst_mesh.mesh.ndim > 2
+        or sum(isinstance(p, Shard) for p in src_placement) > 1
+        or sum(isinstance(p, Shard) for p in dst_placement) > 1
     )
     if not _XFERDTENSOR_PATH_LOGGED:
         if use_golden:
