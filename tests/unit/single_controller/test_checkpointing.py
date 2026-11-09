@@ -3086,6 +3086,146 @@ class TestPeriodicRolloutCheckpoint:
 
 
 class TestDataPlaneCheckpoint:
+    @pytest.mark.parametrize("failure", [None, "persist", "release", "cancel"])
+    def test_trainer_persists_retained_tq_after_barrier_before_publication(
+        self, tmp_path: Path, failure: str | None
+    ) -> None:
+        actor = _ACTOR_CLS(
+            _actor_master_config(tmp_path, buffer_checkpoint=True),
+            _make_actor_args(),
+            SetupTimingMetrics(),
+        )
+        actor._train_steps = actor._trainer_version = 1
+        live_cursor = {"cursor": {"offset": 1}}
+        actor._dataloader.state_dict = lambda: live_cursor
+        entered = threading.Event()
+        proceed = threading.Event()
+        events = []
+        cuts = []
+        original_capture = actor._rollout_snapshots.capture
+
+        async def capture(cut, *args, **kwargs):
+            cuts.append(cut)
+            return await original_capture(cut, *args, **kwargs)
+
+        actor._rollout_snapshots.capture = capture
+
+        class Capture(CheckpointCapture):
+            def persist(self) -> None:
+                with pytest.raises(RuntimeError):
+                    cuts[0].require_live()
+                events.append("persist")
+                entered.set()
+                assert proceed.wait(timeout=10)
+                events.append("persist_settled")
+                if failure == "persist":
+                    raise OSError("persist failed")
+
+            def release(self) -> None:
+                assert events[-1] == "persist_settled"
+                events.append("release")
+                if failure == "release":
+                    raise OSError("release failed")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            cuts[0].require_live()
+            events.append("capture")
+            return Capture()
+
+        @contextlib.asynccontextmanager
+        async def unexpected_environment_snapshot(_path):
+            raise AssertionError("trainer checkpoints must not snapshot Gym")
+            yield  # pragma: no cover
+
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(
+            unexpected_environment_snapshot
+        )
+        actor._rollout_snapshots._environment_checkpoint = actor._environment_checkpoint
+
+        async def exercise() -> None:
+            task = asyncio.create_task(
+                actor._save_checkpoint(
+                    {}, is_policy_training_step=True, is_final_checkpoint=False
+                )
+            )
+            try:
+                assert await asyncio.to_thread(entered.wait, 10)
+                assert not actor._trainer.save_calls
+                assert not (tmp_path / "checkpoints" / "step_1").exists()
+
+                async def mutate() -> None:
+                    async with actor._data_plane_checkpoint_barrier.mutation():
+                        live_cursor["cursor"]["offset"] = 2
+
+                await asyncio.wait_for(mutate(), timeout=5)
+                if failure == "cancel":
+                    task.cancel()
+                    await asyncio.sleep(0)
+                    assert not task.done()
+                    assert "release" not in events
+                proceed.set()
+                if failure == "cancel":
+                    with pytest.raises(asyncio.CancelledError):
+                        await task
+                elif failure is not None:
+                    with pytest.raises(OSError, match=f"{failure} failed"):
+                        await task
+                else:
+                    await task
+                await asyncio.to_thread(actor._checkpointer.finalize_pending)
+            finally:
+                proceed.set()
+                await asyncio.gather(task, return_exceptions=True)
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            actor._checkpointer.shutdown()
+        assert events == ["capture", "persist", "persist_settled", "release"]
+        assert not actor._dp_client.save_calls
+        published = tmp_path / "checkpoints" / "step_1"
+        assert published.exists() == (failure is None)
+        assert len(actor._trainer.save_calls) == int(failure is None)
+        if failure is None:
+            assert torch.load(published / "train_dataloader.pt", weights_only=True) == {
+                "cursor": {"offset": 1}
+            }
+
+    def test_trainer_native_fallback_stays_inside_barrier(self, tmp_path: Path) -> None:
+        actor = _ACTOR_CLS(
+            _actor_master_config(tmp_path),
+            _make_actor_args(),
+            SetupTimingMetrics(),
+        )
+        actor._train_steps = actor._trainer_version = 1
+        cuts = []
+        original_capture = actor._rollout_snapshots.capture
+        original_save = actor._dp_client.save_checkpoint
+
+        async def capture(cut, *args, **kwargs):
+            cuts.append(cut)
+            captured = await original_capture(cut, *args, **kwargs)
+            assert captured.data_plane is None
+            return captured
+
+        def save_checkpoint(*args, **kwargs):
+            cuts[0].require_live()
+            return original_save(*args, **kwargs)
+
+        actor._rollout_snapshots.capture = capture
+        actor._dp_client.save_checkpoint = save_checkpoint
+        try:
+            asyncio.run(
+                actor._save_checkpoint(
+                    {}, is_policy_training_step=True, is_final_checkpoint=False
+                )
+            )
+        finally:
+            actor._checkpointer.shutdown()
+        assert len(actor._dp_client.save_calls) == 1
+        assert (tmp_path / "checkpoints" / "step_1").exists()
+
     @pytest.mark.nemo_gym
     @pytest.mark.parametrize(
         "damage",
