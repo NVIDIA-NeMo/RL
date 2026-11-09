@@ -115,8 +115,8 @@ class FinalizedRollout:
     staging_keys: list[str]
     min_wv: Optional[int] = None
     max_wv: Optional[int] = None
-    # Router replay (R3): [len(token_ids), num_moe_layers, topk] int16 from
-    # the executed route plan; None when the rollout staged no routes.
+    # Router replay (R3): [len(token_ids), num_moe_layers, topk] in the carry
+    # dtype, from the executed route plan; None when the rollout staged no routes.
     routed_experts: Optional[torch.Tensor] = None
     route_plan: Optional[RouteAssemblyPlan] = None
     # Gym validates the receipt chain; RL validates selected-call membership.
@@ -419,10 +419,11 @@ class RolloutReassembler:
                 "defer_routed_experts_to_policy requires router replay to be enabled"
             )
         self._staging_partition = staging_partition
-        # (num_moe_layers, topk), learned from the first rebuilt row that
-        # carries routes; placeholder-only groups need it to shape their
-        # sentinel tensors consistently with the model.
+        # (num_moe_layers, topk) and the carry dtype, learned from the first
+        # rebuilt row that carries routes; placeholder-only groups need them
+        # to shape their sentinel tensors consistently with the model.
         self._routed_dims: Optional[tuple[int, int]] = None
+        self._routed_dtype = torch.int16
         self._source = TQTokenSource(
             dp_client, staging_partition=staging_partition, capture_media=capture_media
         )
@@ -818,13 +819,16 @@ class RolloutReassembler:
             if first.dim() != 3:
                 return None, "fragment_rank"
             self._routed_dims = (int(first.shape[1]), int(first.shape[2]))
+            self._routed_dtype = first.dtype
         if self._routed_dims is None:
             return None, "missing_fragment"
         return execute_route_plan(
             plan,
             fragments,
             layout=RouteLayout.compressed(
-                num_moe_layers=self._routed_dims[0], top_k=self._routed_dims[1]
+                num_moe_layers=self._routed_dims[0],
+                top_k=self._routed_dims[1],
+                dtype=self._routed_dtype,
             ),
             canonical_len=plan.expected_token_length,
         )
@@ -1829,15 +1833,15 @@ class RolloutReassembler:
         max_len: int,
         metrics: dict[str, float],
     ) -> torch.Tensor:
-        """[n, max_len, L, K] int16 routes for the group; sentinel elsewhere.
+        """[n, max_len, L, K] carry-dtype routes for the group; sentinel elsewhere.
 
         Padding, placeholder rows, and valid rows whose rebuild carried no
         routes are all-sentinel: Megatron's replay falls back to its own
-        router for exactly those positions. (L, K) is learned from the first
-        rebuilt row that carries routes and cached for placeholder-only
-        groups; a group arriving before any routed row has been seen cannot
-        be shaped and fails loudly (unreachable once the first real rollout
-        of the run finalizes).
+        router for exactly those positions. (L, K) and the dtype are learned
+        from the first rebuilt row that carries routes and cached for
+        placeholder-only groups; a group arriving before any routed row has
+        been seen cannot be shaped and fails loudly (unreachable once the
+        first real rollout of the run finalizes).
         """
         for row in rows:
             if row.valid and row.routed_experts is not None:
@@ -1845,6 +1849,7 @@ class RolloutReassembler:
                     int(row.routed_experts.shape[1]),
                     int(row.routed_experts.shape[2]),
                 )
+                self._routed_dtype = row.routed_experts.dtype
                 break
         if self._routed_dims is None:
             raise RuntimeError(
@@ -1857,7 +1862,7 @@ class RolloutReassembler:
         routed = torch.full(
             (len(rows), max_len, num_moe_layers, topk),
             ROUTE_MISSING_SENTINEL,
-            dtype=torch.int16,
+            dtype=self._routed_dtype,
         )
         rows_with_routes = 0
         valid_rows = 0

@@ -453,7 +453,7 @@ class TQWorkerMixin:
         return None
 
     def _routed_experts_layout(self) -> RouteLayout:
-        """Return the model-owned route layout (MoE layer numbers, total layers, top-k)."""
+        """Return the model-owned route layout (MoE layers, total layers, top-k, dtype)."""
         raise NotImplementedError(
             "the router-replay policy worker must provide the route layout"
         )
@@ -788,7 +788,7 @@ class TQWorkerMixin:
         values = torch.full(
             (int(offsets[-1]), num_moe_layers, top_k),
             ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
-            dtype=torch.int16,
+            dtype=layout.dtype,
         )
         request_fallbacks: Counter[str] = Counter()
         for row_index, (plan, fragments) in enumerate(zip(plans, fragments_by_row)):

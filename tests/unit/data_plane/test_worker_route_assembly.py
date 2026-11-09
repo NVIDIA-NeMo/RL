@@ -202,6 +202,33 @@ def test_worker_coalesces_keys_and_replays_full_tail_and_placeholder(
     assert not worker._route_fallback_counts
 
 
+@pytest.mark.parametrize(
+    ("dtype", "expert_id"), [(torch.int8, 127), (torch.int32, 40_000)]
+)
+def test_worker_assembles_routes_in_the_layout_dtype(
+    dtype: torch.dtype, expert_id: int
+) -> None:
+    """int8 routes must not widen to int16, and an int32 id must not wrap."""
+    client = _RouteClient(
+        {"r/c0": torch.tensor([[[expert_id, 0]], [[1, 2]]], dtype=dtype)}
+    )
+    worker = _Worker(
+        client, RouteLayout.compressed(num_moe_layers=1, top_k=2, dtype=dtype)
+    )
+    plans = [
+        _plan((_span(client, "r/c0", 0, 2, 2),), expected=2, cleanup=("r/c0",)),
+        _plan((), expected=1, cleanup=("r/rejected",)),
+    ]
+    meta, data = _meta(plans, [2, 1])
+
+    routed = worker._maybe_assemble_routed_experts(meta, data)[ROUTED_EXPERTS_FIELD]
+
+    assert routed.dtype == dtype
+    rows = routed.unbind()
+    assert rows[0][:, 0].tolist() == [[expert_id, 0], [1, 2]]
+    assert bool(rows[1].eq(-1).all())
+
+
 def test_wrong_model_shape_falls_back_for_entire_rollout() -> None:
     client = _RouteClient({"r/c0": torch.tensor([[[10]], [[11]]], dtype=torch.int16)})
     worker = _Worker(client)

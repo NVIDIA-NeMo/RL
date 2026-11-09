@@ -51,12 +51,14 @@ pytestmark = pytest.mark.nemo_gym
 NO_ROUTE = [-1, -1]  # vLLM never routes a call's last sampled token (top_k=2)
 
 
-def _routes(*rows: list[int]) -> torch.Tensor:
+def _routes(*rows: list[int], dtype: torch.dtype = torch.int16) -> torch.Tensor:
     """One MoE layer, top_k=2: ``[len(rows), 1, 2]``."""
-    return torch.tensor([[row] for row in rows], dtype=torch.int16)
+    return torch.tensor([[row] for row in rows], dtype=dtype)
 
 
-def _assemble(calls: list[tuple[torch.Tensor, int, int]]) -> torch.Tensor:
+def _assemble(
+    calls: list[tuple[torch.Tensor, int, int]], *, dtype: torch.dtype = torch.int16
+) -> torch.Tensor:
     """Stage each call like the vLLM worker, then run the route executor.
 
     Each call is ``(vllm_routes, prev_len, prompt_len)``.
@@ -97,7 +99,7 @@ def _assemble(calls: list[tuple[torch.Tensor, int, int]]) -> torch.Tensor:
     routed, reason = execute_route_plan(
         plan,
         fragments,
-        layout=RouteLayout.compressed(num_moe_layers=1, top_k=2),
+        layout=RouteLayout.compressed(num_moe_layers=1, top_k=2, dtype=dtype),
         canonical_len=total_len,
     )
     assert reason is None, reason
@@ -133,4 +135,20 @@ def test_turn_boundary_gets_the_next_calls_route(monkeypatch) -> None:
     routed = _assemble([(call1, 0, 2), (call2, 4, 5)])
 
     assert routed[3].tolist() == [[16, 17]], "boundary token has no route"
+    assert torch.equal(routed, call2)
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expert_id"), [(torch.int8, 127), (torch.int32, 40_000)]
+)
+def test_routes_keep_the_layout_dtype(dtype: torch.dtype, expert_id: int) -> None:
+    """int8 routes must not widen to int16, and an int32 id must not wrap."""
+    call1 = _routes([expert_id, 0], [1, 2], [3, 4], NO_ROUTE, dtype=dtype)
+    call2 = _routes(
+        [expert_id, 0], [1, 2], [3, 4], [5, 6], [7, 8], NO_ROUTE, dtype=dtype
+    )
+
+    routed = _assemble([(call1, 0, 2), (call2, 4, 5)], dtype=dtype)
+
+    assert routed.dtype == dtype
     assert torch.equal(routed, call2)
