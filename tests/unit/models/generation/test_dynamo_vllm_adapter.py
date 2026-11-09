@@ -54,6 +54,7 @@ from nemo_rl.models.generation.dynamo.vllm.chat_engine import (  # noqa: E402
     RUNTIME_DATA_KEY,
     GymCallPlan,
 )
+from nemo_rl.models.generation.interfaces import SamplerReplayConfig  # noqa: E402
 from nemo_rl.models.generation.rollout_result import (  # noqa: E402
     rollout_result_from_wire,
     rollout_result_to_wire,
@@ -413,6 +414,8 @@ def test_engines_publish_what_the_frontends_chat_engine_renders_with() -> None:
         "http_server_serving_chat_kwargs": serving_chat_kwargs,
         "reasoning_parser_plugin": "/plugins/reasoning.py",
     }
+    # MasterConfig validates this block into a pydantic model.
+    host.cfg["sampler_replay"] = SamplerReplayConfig(enabled=True)
 
     # Dynamo carries runtime_data as JSON.
     spec = json.loads(json.dumps(vllm_adapter.chat_runtime_data(host)))[
@@ -427,7 +430,7 @@ def test_engines_publish_what_the_frontends_chat_engine_renders_with() -> None:
         ), field
     assert published.skip_tokenizer_init is False
     # All of policy.generation, which the native server's chat helpers read.
-    assert spec["generation"] == host.cfg
+    assert spec["generation"] == {**host.cfg, "sampler_replay": {"enabled": True}}
 
 
 # --- NeMo-Gym calls, after the frontend's chat engine rendered them -----------

@@ -50,6 +50,7 @@ from dynamo.common.backend import (
 )
 from dynamo.common.backend.publisher import ComponentSnapshot, KvEventSource, ZmqSource
 from dynamo.llm.exceptions import InvalidArgument
+from pydantic_core import to_jsonable_python
 from vllm.entrypoints.serve.exception_handling.error_response import (
     create_error_response,
 )
@@ -148,7 +149,9 @@ def chat_runtime_data(host: "VllmAsyncGenerationWorkerImpl") -> dict[str, Any]:
     return {
         RUNTIME_DATA_KEY: {
             "engine_args": engine_args,
-            "generation": json.loads(json.dumps(host.cfg)),
+            # MasterConfig validates some blocks into pydantic models
+            # (sampler_replay); anything else that is not JSON fails here.
+            "generation": to_jsonable_python(host.cfg),
         }
     }
 

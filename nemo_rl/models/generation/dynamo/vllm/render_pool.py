@@ -76,9 +76,16 @@ class _Worker:
     """The vLLM objects one worker process renders and responds with."""
 
     def __init__(self, spec: dict[str, Any], model_dir: str):
-        # Render workers only parse and render; pin vLLM to its CPU platform so
-        # a frontend host needs no accelerator (an explicit target is final).
-        os.environ["VLLM_TARGET_DEVICE"] = "cpu"
+        import vllm.platforms
+
+        # A frontend host may have no accelerator; vLLM only renders here, as in
+        # Dynamo's own frontend. vLLM's explicit CPU target selects its CPU
+        # platform. An accelerator host keeps its own, which validates the
+        # engine's args (quantization, for one) as the engine does.
+        if vllm.platforms.resolve_current_platform_cls_qualname().endswith(
+            ".UnspecifiedPlatform"
+        ):
+            os.environ["VLLM_TARGET_DEVICE"] = "cpu"
 
         from types import SimpleNamespace
 
@@ -104,8 +111,15 @@ class _Worker:
         # This worker decodes the call's videos; the engine runs its pixels.
         register_vllm_video_loader(cfg)
         # The engine's own args, with the weight-free snapshot Dynamo fetched.
+        # Sleep mode is the engine's memory management, and vLLM's CPU platform
+        # refuses it.
         args = AsyncEngineArgs(
-            **{**spec["engine_args"], "model": model_dir, "tokenizer": model_dir}
+            **{
+                **spec["engine_args"],
+                "model": model_dir,
+                "tokenizer": model_dir,
+                "enable_sleep_mode": False,
+            }
         )
         self.model_config = args.create_model_config()
         vllm_config = VllmConfig(
