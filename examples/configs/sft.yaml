@@ -70,7 +70,7 @@ policy:
 
     # Automodel kwargs passed to from_pretrained.
     # Uncomment force_hf if the custom model's adapter doesn't support per-tensor
-    # weight conversion (e.g. Qwen2, Llama). Auto-detected if not set.
+    # weight conversion. Auto-detected if not set; Llama, Qwen2 and Qwen3 default to HF.
     # See https://github.com/NVIDIA-NeMo/RL/issues/2072
     automodel_kwargs: {}
       # force_hf: true

@@ -91,6 +91,12 @@ STRING_TO_DTYPE = {
     "float16": torch.float16,
 }
 
+# Dense architectures that default to the HF implementation even though Automodel ships a
+# custom one: RL numerics for these models were validated on HF. Set force_hf=false to opt in.
+HF_DEFAULT_ARCHITECTURES = frozenset(
+    {"LlamaForCausalLM", "Qwen2ForCausalLM", "Qwen3ForCausalLM"}
+)
+
 
 def _has_optimizer_fp32_master(
     optimizer_cls: type[torch.optim.Optimizer], optimizer_kwargs: dict[str, Any]
@@ -115,13 +121,14 @@ def _has_optimizer_fp32_master(
 def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
     """Validate and maybe auto-set force_hf based on adapter compatibility.
 
-    Custom model implementations (e.g. Qwen2, Llama) use state_dict_adapters to
-    convert between native and HF weight formats. NeMo RL's weight syncing requires
-    the adapter to implement `convert_single_tensor_to_hf`. Some adapters (like
-    CombinedProjectionStateDictAdapter) don't implement this yet.
+    Some custom model implementations use state_dict_adapters to convert between
+    native and HF weight formats. NeMo RL's weight syncing requires the adapter to
+    implement `convert_single_tensor_to_hf`.
 
     This function checks the adapter BEFORE model loading to avoid wasting time:
     - force_hf=True: no check needed, HF model won't have an adapter.
+    - architecture in HF_DEFAULT_ARCHITECTURES: default force_hf to True; an explicit
+      force_hf=False selects the custom implementation.
     - force_hf not set + adapter incompatible: auto-set force_hf=True with a warning.
     - force_hf=False + adapter incompatible: raise an error telling the user to set
       force_hf=True or file an issue to NeMo-Automodel.
@@ -142,6 +149,10 @@ def _maybe_set_force_hf(automodel_kwargs: dict, model_config) -> None:
         return
 
     arch = architectures[0]
+    if arch in HF_DEFAULT_ARCHITECTURES:
+        automodel_kwargs.setdefault("force_hf", True)
+        return
+
     model_cls = ModelRegistry.model_arch_name_to_cls[arch]
 
     # Check the adapter class from the model's sibling state_dict_adapter module.
