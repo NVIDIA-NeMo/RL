@@ -252,7 +252,7 @@ validate_external_vllm_submission \"\$COMMAND\" $NUM_EXTERNAL_SERVICE_NODES
             # run_in_allocation.sh has no #SBATCH lines. Pass ray.sub's singleton
             # dependency here, so runs with the same job name do not overlap.
             DEPENDENCY_ARG="--dependency=singleton "
-            HET_ARGS=": --nodes=$NUM_EXTERNAL_SERVICE_NODES ${EXTERNAL_SEGMENT_ARG}--account=$ACCOUNT --job-name=$ACCOUNT:${JOB_NAME}${SLURM_JOB_SUFFIX:-} --partition=$PARTITION --time=0:${NUM_MINUTES}:0 ${GRES_ARG}${COMMENT_ARG}"
+            HET_ARGS="--exclusive : --nodes=$NUM_EXTERNAL_SERVICE_NODES --exclusive ${EXTERNAL_SEGMENT_ARG}--account=$ACCOUNT --job-name=$ACCOUNT:${JOB_NAME}${SLURM_JOB_SUFFIX:-} --partition=$PARTITION --time=0:${NUM_MINUTES}:0 ${GRES_ARG}${COMMENT_ARG}"
             BATCH_SCRIPT=tools/external_gym_vllm/run_in_allocation.sh
         fi
 
