@@ -58,8 +58,8 @@ dependencies = [
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range compatible with every backend-specific pin (5.5.4 through
-  # 5.16.1). Environments without a backend extra resolve to the upper bound.
-  "transformers>=5.5.0,<=5.16.1",
+  # 5.18.0). Environments without a backend extra resolve to the upper bound.
+  "transformers>=5.5.0,<=5.18.0",
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -150,12 +150,11 @@ automodel = [
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
-  # Mirrors nemo-automodel's own `transformers==5.12.1` pin (Automodel r0.6.0).
-  "transformers==5.12.1",
+  # Mirrors nemo-automodel's own `transformers==5.18.0` pin (Automodel 0.8.0).
+  "transformers==5.18.0",
   "mistral-common>=1.11.0",
   "mamba-ssm",
   "causal-conv1d",
-  "nv-grouped-gemm",
   "transformer-engine[pytorch,core_cu13] @ git+https://github.com/NVIDIA/TransformerEngine.git@v2.14.1",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
 ]
@@ -361,7 +360,6 @@ triton = [
 ]
 causal-conv1d = { git = "https://github.com/Dao-AILab/causal-conv1d", rev = "4f6ae4e26ae5fe8af9372f8d312ab25cc4595223" }
 mamba-ssm = { git = "https://github.com/state-spaces/mamba.git", rev = "a14b1dff0454a3bc27d9eb31355dc01e4b2490ec" }
-nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v1.1.4.post7" }
 # FlashMLA derives its version from the Git revision in setup.py. Keep this pin
 # synchronized with the static dependency metadata below.
 flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" }
@@ -429,7 +427,6 @@ no-build-isolation-package = [
   "deep_gemm",
   "deep_ep",
   "flash_mla",
-  "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
   "tensorrt-llm",             # custom PEP 517 backend calls build-custom-trtllm.sh; needs torch/CUDA from main venv
 ]
 # Always apply the build group since dependencies like TE/mcore/nemo-run require build dependencies
@@ -531,7 +528,7 @@ constraint-dependencies = [
   # Megatron-LM's [tool.uv.sources] (uv errors loudly on mismatch after a submodule bump).
   "emerging-optimizers @ git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git@v0.3.0",
   "fast-hadamard-transform @ git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca",
-  # Same story for megatron-fsdp, which nemo-automodel (r0.6.0) resolves from a
+  # Same story for megatron-fsdp, which nemo-automodel (0.8.0) resolves from a
   # Megatron-LM fork via its own [tool.uv.sources] instead of PyPI. Keep this URL/rev
   # in sync with 3rdparty/Automodel-workspace/Automodel/pyproject.toml.
   "megatron-fsdp @ git+https://github.com/yuhezhang-ai/Megatron-LM.git@455389c480af6b3acdca74c7830c68b3274eb083#subdirectory=megatron/core/distributed/fsdp/src",
@@ -601,7 +598,6 @@ transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
 fast-hadamard-transform = [{ requirement = "torch", match-runtime = true }]
-nv-grouped-gemm = [{ requirement = "torch", match-runtime = true }]
 flash_mla = [{ requirement = "torch", match-runtime = true }]
 
 # torch-memory-saver's build backend reads TMS_CUDA_MAJOR at build time. Keep this in
@@ -654,12 +650,6 @@ name = "deep_gemm"
 # This version has to match the version in the commit/rev/tag used
 version = "2.5.0"
 requires-dist = ["torch", "packaging", "ninja"]
-
-[[tool.uv.dependency-metadata]]
-name = "nv-grouped-gemm"
-# This version has to match the version in the commit/rev/tag used
-version = "v1.1.4.post7"
-requires-dist = ["setuptools", "wheel", "torch", "numpy"]
 
 # Override logsage metadata to:
 # 1. Remove numpy<=2.0.2 and pandas<=2.3.3 upper bounds
