@@ -687,7 +687,9 @@ def test_prefix_overflow_precedes_media_validation(
     )
     renderers, _, _ = _build_server(monkeypatch, {}, app=app)
     # The server module was just imported against the fakes; patch that copy.
-    monkeypatch.setattr(sys.modules[_CHAT_SERVER], "remap_multimodal_placeholders", remap)
+    monkeypatch.setattr(
+        sys.modules[_CHAT_SERVER], "remap_multimodal_placeholders", remap
+    )
     renderer = renderers[0]
     renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
     renderer.model_config = SimpleNamespace(max_model_len=8 if overflows else 16)

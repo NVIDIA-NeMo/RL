@@ -45,7 +45,6 @@ pytest.importorskip("nemo_gym.token_id_capture.staging")
 import httpx  # noqa: E402
 from dynamo.llm.exceptions import HttpError  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
-from PIL import Image  # noqa: E402
 from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter  # noqa: E402
 from nemo_gym.token_id_capture.replay import (  # noqa: E402
     replay_context,
@@ -58,6 +57,7 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     CaptureAdmission,
     StageResult,
 )
+from PIL import Image  # noqa: E402
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer  # noqa: E402
 from vllm.config import CacheConfig, LoadConfig, VllmConfig  # noqa: E402
 from vllm.engine.arg_utils import AsyncEngineArgs  # noqa: E402
@@ -66,14 +66,19 @@ from vllm.outputs import CompletionOutput, RequestOutput  # noqa: E402
 from vllm.renderers.registry import renderer_from_config  # noqa: E402
 from vllm.v1.engine.input_processor import InputProcessor  # noqa: E402
 
-from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache, StagedPrefix  # noqa: E402
+from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
+    ChainPrefixCache,
+    StagedPrefix,
+)
 from nemo_rl.models.generation.dynamo.vllm import chat_engine  # noqa: E402
 from nemo_rl.models.generation.dynamo.vllm.adapter import (  # noqa: E402
     DynamoVllmAdapter,
     chat_runtime_data,
 )
 from nemo_rl.models.generation.dynamo.vllm.render_pool import RenderPool  # noqa: E402
-from nemo_rl.models.generation.gym_call import GYM_EXTRAS_ANNOTATION_PREFIX  # noqa: E402
+from nemo_rl.models.generation.gym_call import (  # noqa: E402
+    GYM_EXTRAS_ANNOTATION_PREFIX,
+)
 from nemo_rl.models.generation.vllm import chat_server  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
