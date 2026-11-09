@@ -18,12 +18,15 @@
 * Every launcher picks trainer *and* policy through those shared helpers,
   so the two choices cannot drift apart.
 * The ``DataPlaneClient`` ABC carries every method adapters depend on.
+* No code reads TQ's per-field ``is_nested``/``shape`` label: the controller patch
+  keeps a uniform nested field labeled nested.
 """
 
 from __future__ import annotations
 
 import importlib
 import pathlib
+import re
 from argparse import Namespace
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -265,4 +268,25 @@ def test_data_plane_client_abc_method_present(method: str) -> None:
     assert hasattr(DataPlaneClient, method), (
         f"DataPlaneClient ABC is missing required method {method!r}. "
         "This is a breaking change for every adapter."
+    )
+
+
+def test_no_code_reads_the_tq_field_label():
+    """``tq_controller_patch`` stops TQ relabeling a nested field as regular.
+
+    Row shapes come from the tensors (``_from_wire``) or from
+    ``KVBatchMeta.tags``, never from TQ's ``field_schema`` label.
+    """
+    label_read = re.compile(
+        r"\.field_schema\b|\bget_shapes\(|[\[(]\s*[\"']is_nested[\"']"
+    )
+    offenders = [
+        f"{path.relative_to(REPO)}:{lineno}"
+        for path in sorted((REPO / "nemo_rl").rglob("*.py"))
+        if path.name != "tq_controller_patch.py"
+        for lineno, line in enumerate(path.read_text().splitlines(), 1)
+        if label_read.search(line)
+    ]
+    assert offenders == [], (
+        f"reads TQ's field label, which tq_controller_patch leaves nested: {offenders}"
     )

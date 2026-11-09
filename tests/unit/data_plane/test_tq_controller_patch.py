@@ -13,6 +13,7 @@
 # limitations under the License.
 import pytest
 import torch
+from tensordict import TensorDict
 
 pytest.importorskip("transfer_queue")
 from transfer_queue.controller import FieldMeta, TransferQueueController  # noqa: E402
@@ -182,3 +183,46 @@ def test_patched_controller_installs_both_overrides_on_start(monkeypatch):
     field_meta = ctl._get_partition("p").field_metadata["tok"]
     assert field_meta.is_nested is True
     assert field_meta.per_sample_shapes == {indexes[2]: (12,)}
+
+
+def test_rows_survive_a_clear_that_stock_would_collapse(tq_client_backends):
+    client = tq_client_backends
+    partition_id = "tq-patch-no-collapse"
+    g = torch.Generator().manual_seed(0)
+    rows = {
+        k: torch.randint(0, 50000, (n,), generator=g)
+        for k, n in (("a", 256), ("b", 256), ("c", 128), ("d", 512))
+    }
+    client.register_partition(
+        partition_id=partition_id,
+        fields=["input_ids"],
+        num_samples=len(rows),
+        consumer_tasks=["train"],
+    )
+
+    def put(keys):
+        value = torch.nested.as_nested_tensor(
+            [rows[k] for k in keys], layout=torch.jagged
+        )
+        client.put_samples(
+            sample_ids=keys,
+            partition_id=partition_id,
+            fields=TensorDict({"input_ids": value}, batch_size=[len(keys)]),
+        )
+
+    def assert_rows(keys):
+        value = client.get_samples(
+            sample_ids=keys, partition_id=partition_id, select_fields=["input_ids"]
+        )["input_ids"]
+        got = list(value.unbind()) if value.is_nested else list(value)
+        for have, key in zip(got, keys, strict=True):
+            assert torch.equal(have, rows[key]), key
+
+    try:
+        put(["a", "b", "c"])
+        client.clear_samples(sample_ids=["c"], partition_id=partition_id)
+        assert_rows(["a", "b"])
+        put(["d"])
+        assert_rows(["a", "b", "d"])
+    finally:
+        client.clear_samples(sample_ids=["a", "b", "d"], partition_id=partition_id)
