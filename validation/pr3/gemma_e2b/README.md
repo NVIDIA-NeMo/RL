@@ -1,10 +1,49 @@
 # Gemma4 E2B IT streaming LA0 comparison
 
 Latest user target is650 (requested2026-11-08), superseding150. The original
-150-step process finishes normally, then resumes the same experiment on
-sequential debug allocations. See [RESUME650.md](RESUME650.md) and the live
-slurm/resume650/state.json. Historical150 instructions below describe that first
-segment, not the new stopping point.
+150-step segment completed normally: driver exit0, durable checkpoint150,
+optimizer/scheduler scalar audit and eight-panel plot all verified. Its idle
+interactive allocation21546953 was released at23:31PST on2026-11-08; Slurm
+CANCELLED0:0 records this expected cleanup, not a training failure.
+
+Continuation allocation21557906 is RUNNING on pool0-00941, directly attached
+after the original node was released. Preflight passed from checkpoint150:
+4800 consumed prompts, trainer/sampler versions150, unchanged numerical source
+and model hashes, and only the target/display name changed. The driver restored
+the data loader, weights, native TQ and replay metadata, and resumed the SAME
+W&B identity. First recovered update151 committed with trainer_v151,lag0,
+two dispatches, nonzero advantages/gradient and LR2e-6. The W&B API independently
+matched the native selected metrics at151 exactly; see
+[recovery evidence](results/resume650-first-recovery-21557906.json).
+See [RESUME650.md](RESUME650.md) and live
+slurm/resume650/state.json;650 has not completed.
+
+The [first150 eight-panel comparison](results/curve-comparison/comparison.png)
+uses existing V1/full-batch SC histories, not additional experiments. Its
+[summary](results/curve-comparison/comparison-summary.json) compares steps1..150:
+
+| Metric | V1 synchronous | Full-batch SC LA0 | Streaming LA0 |
+| --- | ---: | ---: | ---: |
+| Mean reward |0.41572|0.41558|0.41274|
+| Mean generation tokens/sample |1437.94|1432.71|1391.99|
+| Mean gen_kl_error |0.000392934|0.000386456|0.000405351|
+| Mean step time, steps11..150 (s) |72.85|71.99|69.87|
+
+Streaming gen_kl_error remained finite (maximum0.000495362); its last20 mean
+0.000411399 exceeds V1's0.000380272 and full SC's0.000376436. Policy KL has
+isolated larger outliers, notably step18=2.28353 and step93=2.41500; these are
+present in the raw committed metrics, not just plot smoothing. Their cause is
+unresolved. Lower measured step time also accompanies shorter outputs and
+different historical runs, so it does not isolate a streaming speedup.
+
+All150 committed updates have finite plotted metrics, lag0, nonzero advantages
+and gradients.149 updates used two dispatches; step12 used one. Valid samples
+range511..512: the audit retains the affected step rather than asserting every
+update had512 valid samples (step108 had511). See [metric audit](results/first150-metrics-audit.json)
+and [checkpoint150 scalar audit](results/checkpoint150-state.json): four saved
+optimizer shards, all505 optimizer counters150, LR2e-6, scheduler last_epoch150
+and4800 consumed prompts. These audits do not compare live raw optimizer buffers
+or establish fixed-input numerical parity.
 
 User authorized a direct debug-node run on2026-11-08. Target150 updates, reusing
 the existing batch512 baselines; no additional full-batch experiment. Numerical
@@ -68,9 +107,11 @@ archive old native logs before resuming so all committed steps remain available.
 On failure repair in this allocation and resume the same checkpoint/W&B identity.
 Do not duplicate a live driver or act on other user jobs.
 
-Read-only session/20261105_pr3_design/monitor_gemma.py checks every10minutes and
-queues milestone/failure/stall/completion notices into the SAME current thread.
-It does not submit, cancel or restart anything. Respect later user cancellation.
+The old150-only monitor is stopped. resume650_supervisor.py monitors the current
+stage and queues10minute/milestone/failure notices into the SAME current thread.
+It owns sequential debug continuation/cleanup under the650 authorization, stops
+on failures for diagnosis and respects the HOLD flag before new allocations or
+launches. See RESUME650.md; respect later user cancellation.
 
 After150, run.sh generates eight panels (reward, length, generation/policy KL,
 loss, entropy, preclip gradient norm, measured step time) with plot.py inside the

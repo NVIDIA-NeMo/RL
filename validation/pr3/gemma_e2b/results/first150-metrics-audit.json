@@ -1,0 +1,83 @@
+{
+  "analyzed_inside_job": "21557906",
+  "source_log_sha256": "c64b10b2fc31c47ae3cce490d1d76ea009d8655be039dcdca0022d2c799a536b",
+  "committed_steps": [
+    1,
+    150
+  ],
+  "all_metrics_finite": true,
+  "all_lag_zero": true,
+  "dispatch_frequency": {
+    "2": 149,
+    "1": 1
+  },
+  "all_nonzero_gradients": true,
+  "valid_sequence_counts": [
+    511.0,
+    512.0
+  ],
+  "policy_kl_largest_steps": [
+    {
+      "nemo_rl/step": 93,
+      "train/policy_kl_error": 2.414997579979995,
+      "train/gen_kl_error": 0.00046344565247323586,
+      "train/grad_norm": 1.1533405780792236,
+      "train/reward": 0.390625
+    },
+    {
+      "nemo_rl/step": 18,
+      "train/policy_kl_error": 2.2835300422155784,
+      "train/gen_kl_error": 0.00037704628793753885,
+      "train/grad_norm": 0.38473477959632874,
+      "train/reward": 0.322265625
+    },
+    {
+      "nemo_rl/step": 108,
+      "train/policy_kl_error": 0.32259938434029395,
+      "train/gen_kl_error": 0.00041345028083175476,
+      "train/grad_norm": 0.6036089658737183,
+      "train/reward": 0.45401174168297453
+    },
+    {
+      "nemo_rl/step": 26,
+      "train/policy_kl_error": 0.01651931701264353,
+      "train/gen_kl_error": 0.0003574285581660877,
+      "train/grad_norm": 0.33001890778541565,
+      "train/reward": 0.365234375
+    },
+    {
+      "nemo_rl/step": 31,
+      "train/policy_kl_error": 0.015725400679845934,
+      "train/gen_kl_error": 0.00038042761570443527,
+      "train/grad_norm": 1.601277232170105,
+      "train/reward": 0.37890625
+    }
+  ],
+  "scope": "Committed metric receipts only; not same-input numerical parity or measured GPU overlap.",
+  "advantage_fields": [
+    "train/advantages/mean",
+    "train/advantages/max",
+    "train/advantages/min"
+  ],
+  "advantage_extrema": {
+    "train/advantages/mean": {
+      "min": -0.05035268488148472,
+      "max": -0.0009334419056411691
+    },
+    "train/advantages/max": {
+      "min": 1.6770471334457397,
+      "max": 3.7499847412109375
+    },
+    "train/advantages/min": {
+      "min": -3.7499847412109375,
+      "max": -1.6770471334457397
+    }
+  },
+  "all_nonzero_advantages": true,
+  "steps_with_valid_samples_below_512": [
+    {
+      "nemo_rl/step": 108,
+      "valid_samples": 511.0
+    }
+  ]
+}

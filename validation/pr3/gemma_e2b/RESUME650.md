@@ -4,11 +4,18 @@ On2026-11-08 the user requested more than600 steps. Target650 supersedes the
 previous150-step stopping point. This remains the same experiment and W&B run:
 https://wandb.ai/yuekaiz/nemo-rl-automodel-sc/runs/yuekaiz5090gemmala0s42.
 
-The current healthy allocation21546953 continues its already-loaded150 target.
-There is no public hot-update API for that actor's training limit. Let it finish,
-save150, generate the first150 comparison and release its node normally; do not
-kill or duplicate it. A supervisor waits for its driver exit0, durable150,
-comparison PNG and terminal allocation state before acquiring another node.
+Initial allocation21546953 completed150 and the first150 comparison with driver
+exit0, then released its idle node normally at23:31PST on2026-11-08. Saved state
+audit found trainer/sampler/optimizer counters150, scheduler last_epoch150,
+LR2e-6 and4800 consumed prompts. The supervisor waited for its terminal state
+and removal from squeue before requesting continuation allocation21557906.
+That allocation is RUNNING on pool0-00941, directly attached to checkpoint150;
+preflight and the same W&B resume passed. First recovered update151 committed
+with trainer_v151,lag0,two dispatches,nonzero advantages/gradient and LR2e-6;
+the same W&B run's151 metrics independently matched the native receipt exactly.
+See results/resume650-first-recovery-21557906.json.
+Read the live state.json/native log before acting; this snapshot
+does not establish completion of650.
 
 resume650.yaml inherits streaming.yaml and changes ONLY max_num_steps650 and
 the W&B display name. Same local Gemma4 E2B IT,32x16=batch512,4training/4rollout,
