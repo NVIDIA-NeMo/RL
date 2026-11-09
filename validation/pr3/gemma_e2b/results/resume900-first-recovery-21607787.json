@@ -1,0 +1,89 @@
+{
+  "observed_at": "2026-11-09T14:58:34.845303-08:00",
+  "job_id": "21607787",
+  "resume_from": 893,
+  "stage_target_steps": 900,
+  "first_resumed_step": 894,
+  "trainer_version": 894,
+  "lag": 0,
+  "wandb_state": "running",
+  "wandb_step": 894,
+  "native_wandb_selected_metrics_exact": true,
+  "selected_metrics": {
+    "gen_kl_error": 0.000556193237170803,
+    "policy_kl_error": 0.0005900655819333559,
+    "grad_norm": 0.5397517681121826,
+    "lr": 2.0000000000000003e-06,
+    "weight_version_lag": 0,
+    "policy_train_dispatches": 2,
+    "reward": 0.505859375
+  },
+  "first_resumed_receipt": {
+    "gen_kl_error": 0.000556193237170803,
+    "policy_kl_error": 0.0005900655819333559,
+    "grad_norm": 0.5397517681121826,
+    "lr": 2.0000000000000003e-06,
+    "weight_version_lag": 0,
+    "policy_train_dispatches": 2,
+    "reward": 0.505859375,
+    "advantages/max": 3.7499847412109375,
+    "advantages/min": -3.7499847412109375,
+    "num_valid_samples": 512.0
+  },
+  "recovery_log": {
+    "unfinished_rollout_groups": 64,
+    "canonical_groups": 0,
+    "redispatch_before_new_dataloader_work_confirmed": true
+  },
+  "preflight": "results/resume900-provenance-21607787.json",
+  "saved_checkpoint_audit": "results/checkpoint893-state.json",
+  "scope": "First-step receipt/selected metrics continuity, not independent all-group recovery/raw optimizer/fixed-input parity.",
+  "wandb_boundary_steps_verified": [
+    893,
+    894,
+    895
+  ],
+  "first_resumed_metrics_in_wandb_exact": true,
+  "boundary_history_selected_rows": [
+    {
+      "nemo_rl/step": 893,
+      "train/reward": 0.6171875,
+      "train/mean_gen_tokens_per_sample": 1218.548828125,
+      "train/gen_kl_error": 0.0004967298504054806,
+      "train/policy_kl_error": 0.0005386530951255863,
+      "train/loss": 0.03424125402614049,
+      "train/approx_entropy": 0.14540711174253174,
+      "train/grad_norm": 18.810062408447266,
+      "train/lr": 2.0000000000000003e-06,
+      "train/weight_version_lag": 0,
+      "train/policy_train_dispatches": 2
+    },
+    {
+      "nemo_rl/step": 894,
+      "train/reward": 0.505859375,
+      "train/mean_gen_tokens_per_sample": 1344.400390625,
+      "train/gen_kl_error": 0.000556193237170803,
+      "train/policy_kl_error": 0.0005900655819333559,
+      "train/loss": 0.01572192493172392,
+      "train/approx_entropy": 0.17444052563228496,
+      "train/grad_norm": 0.5397517681121826,
+      "train/lr": 2.0000000000000003e-06,
+      "train/weight_version_lag": 0,
+      "train/policy_train_dispatches": 2
+    },
+    {
+      "nemo_rl/step": 895,
+      "train/reward": 0.453125,
+      "train/mean_gen_tokens_per_sample": 1359.095703125,
+      "train/gen_kl_error": 0.0005270598869537206,
+      "train/policy_kl_error": 0.0005577038140266387,
+      "train/loss": 0.006690701822354378,
+      "train/approx_entropy": 0.16860341393475137,
+      "train/grad_norm": 0.4901556074619293,
+      "train/lr": 2.0000000000000003e-06,
+      "train/weight_version_lag": 0,
+      "train/policy_train_dispatches": 2
+    }
+  ],
+  "history_checked_inside_job": "21607787"
+}

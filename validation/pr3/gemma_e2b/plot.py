@@ -201,13 +201,13 @@ def main() -> None:
         ),
         "streaming_all_lag_zero": True,
         "streaming_integrity": {
-            "all_nonzero_gradients": all(row["train/grad_norm"] > 0 for row in stream),
+            "all_nonzero_gradients": all(row["train/grad_norm"] > 0 for row in raw),
             "all_nonzero_advantages": all(
                 row["train/advantages/max"] > 0 and row["train/advantages/min"] < 0
-                for row in stream
+                for row in raw
             ),
             "valid_sample_frequency": dict(
-                Counter(int(row["train/num_valid_samples"]) for row in stream)
+                Counter(int(row["train/num_valid_samples"]) for row in raw)
             ),
             "scope": "Committed metrics only; not fixed-input or raw optimizer parity.",
         },

@@ -1,0 +1,59 @@
+{
+  "step": 800,
+  "training_info": {
+    "consumed_samples": 25600,
+    "current_step": 800,
+    "current_epoch": 0,
+    "total_steps": 800,
+    "total_valid_tokens": 557480183.0,
+    "trainer_version": 800,
+    "sampler_name": "in_order",
+    "sampler_dispatch_index": 800,
+    "cur_adaptive_ppo_clip_k": null
+  },
+  "optimizer_shards": 4,
+  "optimizer_step_entries": 505,
+  "all_saved_optimizer_steps_match": true,
+  "optimizer_lr_entries": 505,
+  "all_saved_lrs_match_scheduler": true,
+  "saved_lr": 2e-06,
+  "configured_peak_lr": 2e-06,
+  "saved_lr_matches_peak_within_float_rounding": true,
+  "scheduler": {
+    "sched._last_lr": [
+      2e-06
+    ],
+    "sched._schedulers.0.total_iters": 10,
+    "sched._schedulers.0._step_count": 10,
+    "sched._schedulers.0._last_lr": [
+      1.8000000020000006e-06
+    ],
+    "sched._schedulers.1.base_lrs": [
+      2e-06
+    ],
+    "sched._schedulers.1._is_initial": false,
+    "sched._milestones": [
+      10
+    ],
+    "sched._schedulers.0.start_factor": 1e-08,
+    "sched._schedulers.0.base_lrs": [
+      2e-06
+    ],
+    "sched._schedulers.0._is_initial": false,
+    "sched._schedulers.1.factor": 1.0,
+    "sched._schedulers.1.last_epoch": 790,
+    "sched._schedulers.1._get_lr_called_within_step": false,
+    "sched.last_epoch": 800,
+    "sched._schedulers.0.end_factor": 1.0,
+    "sched._schedulers.0.last_epoch": 9,
+    "sched._schedulers.0._get_lr_called_within_step": false,
+    "sched._schedulers.1.total_iters": 10000000000,
+    "sched._schedulers.1._step_count": 791,
+    "sched._schedulers.1._last_lr": [
+      2e-06
+    ]
+  },
+  "metadata_sha256": "b1d31c543451a5f855dee3c21a07c6d20160a2491d8a21f5e26db60e7c8a7f5b",
+  "analyzed_inside_job": "21594351",
+  "scope": "Saved scalar state only; not live per-rank raw optimizer parity."
+}

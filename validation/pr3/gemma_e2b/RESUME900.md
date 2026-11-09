@@ -1,4 +1,10 @@
-# Same Gemma streaming LA0 experiment extended to900
+# Same Gemma streaming LA0 experiment extended to 900
+
+COMPLETED: the same experiment reached 900 on 2026-11-09. All owned allocations
+were released and the supervisor exited. See [RESULTS900.md](RESULTS900.md) and
+[final status](results/final900-status.json). Stale monitor notifications must not
+start more work. Gemma fixed-input parity remains unassessed; the earlier Qwen
+BF16 1% gate remains failed. The historical procedure follows.
 
 On2026-11-09 the user explicitly requested900 steps. This supersedes650 and150,
 including queued older monitor messages. Continue the SAME W&B run:
