@@ -291,8 +291,7 @@ def replay_routes(
             gate.handle._nrl_consulted = False
         yield
         # A gate class that builds a RouterReplay handle but never calls
-        # replay_selection (e.g. Automodel's KimiK3Gate) would otherwise route live
-        # without any error.
+        # replay_selection would otherwise route live without any error.
         skipped = [g.name for g in gates if not g.handle._nrl_consulted]
         if skipped:
             raise RuntimeError(

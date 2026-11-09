@@ -13,8 +13,8 @@
 # limitations under the License.
 #
 # Extends nemo_automodel/components/speculative/dspark/loss.py (3rdparty
-# Automodel r0.6.0, byte-identical to vendor base 6f423feb0). Kept as a local
-# module because the loss normalization contract differs:
+# Automodel). Kept as a local module because the loss normalization contract
+# differs:
 # denominators are all-reduced over an explicit data-parallel process group and
 # the loss is returned globally normalized WITHOUT the upstream world-size
 # multiply, because nemo-rl's automodel_forward_backward already scales each

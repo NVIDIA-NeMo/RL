@@ -13,9 +13,9 @@
 # limitations under the License.
 #
 # Extends nemo_automodel/components/speculative/dspark/draft_qwen3.py
-# (3rdparty Automodel r0.6.0, byte-identical to vendor base 6f423feb0). Kept
-# as a local module because the RL deltas are interleaved through forward();
-# byte-identical helpers are imported from nemo_automodel instead.
+# (3rdparty Automodel). Kept as a local module because the RL deltas are
+# interleaved through forward(); unchanged helpers are imported from
+# nemo_automodel instead.
 # Local modifications:
 # forward() additionally accepts an optional teacher_logits tensor [B, S, V].
 # When provided, aligned_target_logits are gathered from it (detached) at the
