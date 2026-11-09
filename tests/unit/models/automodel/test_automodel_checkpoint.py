@@ -1295,40 +1295,51 @@ class TestSaveLoadIntegration:
 
 
 @pytest.mark.automodel
-def test_qwen_vl_vision_key_mapping_workaround_still_needed():
-    """Tripwire for the temporary Qwen-VL vision-tower key-mapping workaround.
+@pytest.mark.parametrize(
+    ("model_cls_name", "config_cls_name"),
+    [
+        ("Qwen2_5_VLForConditionalGeneration", "Qwen2_5_VLConfig"),
+        ("Qwen2VLForConditionalGeneration", "Qwen2VLConfig"),
+    ],
+)
+def test_qwen_vl_base_load_maps_vision_and_language_keys(
+    model_cls_name, config_cls_name
+):
+    """Automodel's base-load key mapping places Qwen-VL checkpoint keys under ``model.``.
 
-    ``_patch_qwen_vl_vision_key_mapping`` (checkpoint.py) re-injects the
-    ``^visual.`` -> ``model.visual.`` rename that transformers v5.5.0 (#44627) dropped, so
-    the vision tower loads instead of being left randomly initialized. transformers #45358
-    (v5.6) fixed the upstream mapping; the workaround is needed only while the automodel pin
-    uses the broken transformers 5.5.x.
-
-    This calls the *unwrapped* real ``get_combined_key_mapping`` and asserts it still lacks the
-    ``model.visual`` target (bug present). It runs under ``@pytest.mark.automodel`` (the
-    automodel-extra venv, transformers 5.5.x, where the patch matters). It FAILS — telling us
-    to remove ``_patch_qwen_vl_vision_key_mapping`` (and this test) — once that transformers
-    pin includes #45358 (>=5.6) and the real mapping targets ``model.visual``.
+    Without the ``visual.*`` -> ``model.visual.*`` rename, FSDP2's non-strict load drops
+    the vision tower and leaves it randomly initialized. The mapping is built the way
+    ``Checkpointer.load_base_model`` builds it for an HF model.
     """
-    import nemo_automodel.components.checkpoint.checkpointing as ckpt
+    import transformers
+    from nemo_automodel.components.checkpoint.checkpointing import (
+        _apply_key_mapping,
+        get_combined_key_mapping,
+    )
 
-    import nemo_rl.models.automodel.checkpoint  # noqa: F401  (import applies the patch)
+    config = getattr(transformers, config_cls_name)()
+    with torch.device("meta"):
+        model = getattr(transformers, model_cls_name)(config)
 
-    fn = ckpt.get_combined_key_mapping
-    # Unwrap to the real automodel mapping fn (Change 3 exposes it as _nrl_orig); if the patch
-    # was never applied, fn is already the original.
-    orig = getattr(fn, "_nrl_orig", fn)
+    key_mapping = get_combined_key_mapping(
+        config.model_type,
+        getattr(model, "_checkpoint_conversion_mapping", None),
+        model=model,
+    )
+    renamed = _apply_key_mapping(
+        {
+            "visual.blocks.0.attn.qkv.weight": None,
+            "model.layers.0.self_attn.q_proj.weight": None,
+            "lm_head.weight": None,
+        },
+        key_mapping,
+    )
 
-    for model_type in ("qwen2_5_vl", "qwen2_vl"):
-        mapping = orig(model_type) or {}
-        assert not any(
-            str(target).startswith("model.visual") for target in mapping.values()
-        ), (
-            f"Automodel/transformers now maps visual->model.visual for {model_type} "
-            "(likely transformers #45358 / >=5.6); the _patch_qwen_vl_vision_key_mapping "
-            "workaround in nemo_rl/models/automodel/checkpoint.py is obsolete - remove it "
-            "and this test."
-        )
+    assert set(renamed) == {
+        "model.visual.blocks.0.attn.qkv.weight",
+        "model.language_model.layers.0.self_attn.q_proj.weight",
+        "lm_head.weight",
+    }
 
 
 def _manager_with_stub_config(monkeypatch):
