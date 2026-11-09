@@ -66,6 +66,7 @@ import numpy as np
 import torch
 from tensordict import NonTensorData, NonTensorStack, TensorDict, TensorDictBase
 
+from nemo_rl.data_plane.checkpoint import CheckpointCapture
 from nemo_rl.data_plane.codec import drain_codec_ms
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
 from nemo_rl.telemetry.instrumentation import (
@@ -2012,6 +2013,18 @@ class MetricsDataPlaneClient(DataPlaneClient):
         )
         self._record_clear(partition_id, sample_ids_list)
         self._bill_self(entered)
+
+    def capture_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> CheckpointCapture | None:
+        return self._run(
+            "capture_checkpoint",
+            "",
+            lambda: self._inner.capture_checkpoint(checkpoint_dir, metadata=metadata),
+        )
 
     def save_checkpoint(
         self,
