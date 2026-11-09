@@ -1333,6 +1333,49 @@ class VllmAsyncGenerationWorkerImpl(
                 # prefix to the request, so the inline-prefix branch below is
                 # the single splice path for staged and inline prefixes.
                 admission = worker_self._capture_admission(request)
+                actual_corresponding_token_ids = None
+                if (
+                    admission is not None
+                    and admission.mode in ("candidate", "token_in")
+                ) or (
+                    (admission is None or admission.request_replay is None)
+                    and getattr(request, "required_prefix_token_ids", None) is not None
+                ):
+                    last_assistant_message_idx = None
+                    for i in reversed(range(len(messages_for_replace_prefix_tokens))):
+                        if messages_for_replace_prefix_tokens[i]["role"] == "assistant":
+                            last_assistant_message_idx = i
+                            break
+
+                    if last_assistant_message_idx is None:
+                        messages_to_last_assistant_message = (
+                            messages_for_replace_prefix_tokens
+                        )
+                    else:
+                        messages_to_last_assistant_message = (
+                            messages_for_replace_prefix_tokens[
+                                : last_assistant_message_idx + 1
+                            ]
+                        )
+
+                    modified_request = request.model_copy(
+                        update={"add_generation_prompt": False}
+                    )
+
+                    corresponding_res = await super().preprocess_chat(
+                        request=modified_request,
+                        messages=messages_to_last_assistant_message,
+                        default_template=default_template,
+                        default_template_content_format=default_template_content_format,
+                        default_template_kwargs=default_template_kwargs,
+                        tool_dicts=tool_dicts,
+                        parser=parser,
+                        skip_mm_cache=skip_mm_cache,
+                    )
+                    actual_corresponding_token_ids = corresponding_res[1][0][
+                        "prompt_token_ids"
+                    ]
+
                 serving_admission = admission
                 verify_retained_media = False
                 if admission is not None and (
@@ -1344,6 +1387,13 @@ class VllmAsyncGenerationWorkerImpl(
                     decision = decide_capture_input(
                         admission,
                         messages=messages_for_replace_prefix_tokens,
+                        rendered_prefix_is_stable=(
+                            bool(actual_corresponding_token_ids)
+                            and res[1][0]["prompt_token_ids"][
+                                : len(actual_corresponding_token_ids)
+                            ]
+                            == actual_corresponding_token_ids
+                        ),
                         # HF/string parsing maps null and empty tool content to
                         # identical template inputs. Structured content and
                         # other renderers cannot authorize that equivalence.
@@ -1397,41 +1447,7 @@ class VllmAsyncGenerationWorkerImpl(
 
                 model_prefix_token_ids = list(request.required_prefix_token_ids)
 
-                # Token-in splice path — shared by staging_chain and direct prefix.
-                last_assistant_message_idx = None
-                for i in reversed(range(len(messages_for_replace_prefix_tokens))):
-                    if messages_for_replace_prefix_tokens[i]["role"] == "assistant":
-                        last_assistant_message_idx = i
-                        break
-
-                if last_assistant_message_idx is None:
-                    messages_to_last_assistant_message = (
-                        messages_for_replace_prefix_tokens
-                    )
-                else:
-                    messages_to_last_assistant_message = (
-                        messages_for_replace_prefix_tokens[
-                            : last_assistant_message_idx + 1
-                        ]
-                    )
-
-                modified_request = request.model_copy(
-                    update={"add_generation_prompt": False}
-                )
-
-                corresponding_res = await super().preprocess_chat(
-                    request=modified_request,
-                    messages=messages_to_last_assistant_message,
-                    default_template=default_template,
-                    default_template_content_format=default_template_content_format,
-                    default_template_kwargs=default_template_kwargs,
-                    tool_dicts=tool_dicts,
-                    parser=parser,
-                    skip_mm_cache=skip_mm_cache,
-                )
-                actual_corresponding_token_ids = corresponding_res[1][0][
-                    "prompt_token_ids"
-                ]
+                assert actual_corresponding_token_ids is not None
 
                 engine_prompt = res[1][0]
 

@@ -27,6 +27,7 @@ def decide_capture_input(
     *,
     messages: list[dict[str, Any]],
     allow_empty_tool_content: bool = False,
+    rendered_prefix_is_stable: bool = False,
 ) -> CaptureInputDecision:
     """Verify the converted boundary and renderer for a Gym-selected candidate.
 
@@ -35,6 +36,8 @@ def decide_capture_input(
     Managed roots retain media validation; legacy admissions are unchanged.
     ``allow_empty_tool_content`` is a worker-proven rendering fact, not a
     harness option. It permits only null/empty Chat assistant tool content.
+    System suffixes also require the worker to prove that the full tokenized
+    prompt starts with the separately rendered historical prefix.
     """
     # Optional Gym contracts are required only on a captured serving request.
     from nemo_gym.token_id_capture.staging.records import CaptureAdmission
@@ -61,6 +64,12 @@ def decide_capture_input(
         return CaptureInputDecision(root, None, True)
     suffix = current.items[previous.item_count :]
     suffix_roles = [item.role for item in suffix]
+    if "system" in suffix_roles and not rendered_prefix_is_stable:
+        LOGGER.warning(
+            "Call %s rewrites the rendered prefix before its system suffix; rooting a new segment.",
+            admission.model_call_id,
+        )
+        return CaptureInputDecision(root, None, True)
     # The supported converter preserves these observations as separate messages.
     # Prove its cut explicitly; counting EOS tokens cannot establish this boundary.
     boundary = len(messages) - len(suffix)
