@@ -72,7 +72,7 @@ writeback() {
 sidecar() {
   local src="$1" dst="$2" interval="${3:-60}" stop="${4:-}" last=0
   until (( last )); do
-    sleep "${interval}"
+    sleep "${interval}" || return  # e.g. the container is gone
     [[ -n "${stop}" && -e "${stop}" ]] && last=1
     writeback "${src}" "${dst}"
   done
@@ -96,7 +96,7 @@ sidecar_types() {
   local root="$1" persistent="$2" interval="$3" stop="$4" cache_type last=0
   shift 4
   until (( last )); do
-    sleep "${interval}"
+    sleep "${interval}" || return  # e.g. the container is gone
     [[ -e "${stop}" ]] && last=1
     for cache_type in "$@"; do
       [[ -e "${root}/${cache_type}.seeded" ]] && writeback "${root}/${cache_type}" "${persistent}/${cache_type}"
