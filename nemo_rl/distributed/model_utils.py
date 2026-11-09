@@ -1094,6 +1094,7 @@ def get_cp_sharded_next_token_logprobs(
     *,
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    shift_labels: bool = True,
 ) -> torch.Tensor:
     """Next-token log probabilities using Automodel's context-parallel layout.
 
@@ -1110,9 +1111,13 @@ def get_cp_sharded_next_token_logprobs(
             model batch, i.e. the owner of the layout ``logits`` was produced in.
         chunk_size: Optional sequence chunk size for the vocab-parallel kernels.
         sampling_params: Optional top-k/top-p filtering configuration.
+        shift_labels: If True (default), score the next token and omit the last
+            position. If False, score each target at the same position and retain
+            the full sequence (for diffusion models).
 
     Returns:
-        Canonical-order log probabilities with shape ``[B, S - 1]``.
+        Canonical-order log probabilities with shape ``[B, S - 1]`` when
+        shifting labels, otherwise ``[B, S]``.
     """
     if isinstance(logits, DTensor):
         tp_group = logits.device_mesh.get_group("tp")
@@ -1130,7 +1135,7 @@ def get_cp_sharded_next_token_logprobs(
     # Shift on the canonical sequence, then map into the model's layout with the
     # same ShardLayout the batch went through. ``fill`` only lands on CP padding,
     # which the trim below removes.
-    global_targets = input_ids.roll(shifts=-1, dims=1)
+    global_targets = input_ids.roll(shifts=-1, dims=1) if shift_labels else input_ids
     local_targets = cp_sharder.shard_token_tensor(global_targets, seq_dim=1, fill=0)
 
     local_logprobs = _tp_target_logprobs(
@@ -1146,7 +1151,7 @@ def get_cp_sharded_next_token_logprobs(
 
     # Differentiable gather back to canonical order, minus Automodel's CP padding.
     logprobs = cp_sharder.gather_token_tensor(local_logprobs, seq_dim=1, trim=True)
-    return logprobs[:, :-1]
+    return logprobs[:, :-1] if shift_labels else logprobs
 
 
 def from_parallel_logits_to_logprobs(
@@ -1159,6 +1164,8 @@ def from_parallel_logits_to_logprobs(
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    *,
+    shift_labels: bool = True,
 ) -> torch.Tensor:
     """Get log probabilities from TP+CP sharded vocab logits.
 
@@ -1166,7 +1173,7 @@ def from_parallel_logits_to_logprobs(
         vocab_parallel_logits (torch.Tensor): Logits tensor with shape [batch_size, seq_len // CP, vocab_size // TP]
             where TP is the tensor parallel size.
         target (torch.Tensor): Target token indices with shape [batch_size, seq_len].
-            NOTE: Must be the unmodified targets as this function will shift them internally.
+            NOTE: Pass unmodified targets; shifting is controlled by ``shift_labels``.
         vocab_start_index (int): Starting vocabulary index for this worker's partition.
         vocab_end_index (int): Ending vocabulary index for this worker's partition.
         tp_group (torch.distributed.ProcessGroup): Process group for distributed communication.
@@ -1174,14 +1181,18 @@ def from_parallel_logits_to_logprobs(
         cp_group (torch.distributed.ProcessGroup, optional): Context parallelism process group. Defaults to None.
         chunk_size (int, optional): Sequence dimension chunk size for computing the log probabilities.
         sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering and temperature scaling.
+        shift_labels: If True (default), score the next token and omit the last
+            position. If False, score each target at the same position and retain
+            the full sequence (for diffusion models).
 
     Returns:
-        torch.Tensor: Log probabilities tensor with shape [batch_size, seq_len-1].
-            The sequence dimension is reduced by 1 due to the target shifting.
+        torch.Tensor: Log probabilities with shape [batch_size, seq_len-1] when
+            shifting labels, otherwise [batch_size, seq_len].
 
     Taken from: https://github.com/NVIDIA/NeMo-Aligner/blob/9faab404f21994a7eb1d6ed5890b76152b941636/nemo_aligner/utils/distributed.py#L354
     """
-    target = target.roll(shifts=-1, dims=-1)
+    if shift_labels:
+        target = target.roll(shifts=-1, dims=-1)
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
     pad_len = 0
     # if cp_size > 1:
@@ -1244,7 +1255,7 @@ def from_parallel_logits_to_logprobs(
     if pad_len > 0:
         logprobs = logprobs[:, :-pad_len]
 
-    return logprobs[:, :-1]
+    return logprobs[:, :-1] if shift_labels else logprobs
 
 
 def from_parallel_logits_to_logprobs_packed_sequences(
@@ -1756,6 +1767,8 @@ def get_logprobs_from_vocab_parallel_logits(
     input_ids: torch.Tensor | DTensor,
     chunk_size: Optional[int] = None,
     sampling_params: Optional[TrainingSamplingParams] = None,
+    *,
+    shift_labels: bool = True,
 ):
     """Computes log probabilities from vocabulary-parallel logits.
 
@@ -1770,6 +1783,9 @@ def get_logprobs_from_vocab_parallel_logits(
             function will shift them internally.
         chunk_size (Optional[int]): Sequence dimension chunk size for computing log probabilities.
         sampling_params (TrainingSamplingParams, optional): Sampling parameters for Top-k/Top-p filtering and temperature scaling.
+        shift_labels: If True (default), score the next token and omit the last
+            position. If False, score each target at the same position and retain
+            the full sequence (for diffusion models).
 
     Returns:
         torch.Tensor: Log probabilities for the given input IDs, with shape
@@ -1794,7 +1810,7 @@ def get_logprobs_from_vocab_parallel_logits(
 
     logprobs = _tp_target_logprobs(
         vocab_parallel_logits.to_local(),
-        input_ids.roll(shifts=-1, dims=-1),
+        input_ids.roll(shifts=-1, dims=-1) if shift_labels else input_ids,
         vocab_start_index=vocab_interval_per_rank * tp_rank,
         vocab_end_index=(tp_rank + 1) * vocab_interval_per_rank,
         tp_group=tp_group,
@@ -1803,7 +1819,7 @@ def get_logprobs_from_vocab_parallel_logits(
         inference_only=not torch.is_grad_enabled(),
     )
 
-    return logprobs[:, :-1]
+    return logprobs[:, :-1] if shift_labels else logprobs
 
 
 def get_next_token_logprobs_from_logits(
@@ -1815,6 +1831,8 @@ def get_next_token_logprobs_from_logits(
     sampling_params: Optional[TrainingSamplingParams] = None,
     chunk_size: Optional[int] = None,
     cp_sharder: Optional["ContextParallelSharder"] = None,
+    *,
+    shift_labels: bool = True,
 ) -> torch.Tensor:
     """Compute token log-probabilities from logits, handling parallel and non-parallel cases.
 
@@ -1837,9 +1855,13 @@ def get_next_token_logprobs_from_logits(
             forward's model batch; set only when cp_size > 1. When set,
             ``next_token_logits`` is this rank's CP-local shard and the
             sharder owns the sequence layout.
+        shift_labels: If True (default), score the next token and omit the last
+            position. If False, score each target at the same position and retain
+            the full sequence (for diffusion models).
 
     Returns:
-        Token log-probabilities of shape [batch_size, seq_len - 1]
+        Token log-probabilities of shape [batch_size, seq_len - 1] when
+        shifting labels, otherwise [batch_size, seq_len].
     """
     # ChunkedDistributedLogprob casts each chunk to float32 internally.
     use_chunking = (
@@ -1863,10 +1885,11 @@ def get_next_token_logprobs_from_logits(
             inference_only=False,
             cp_group=context_parallel_group,
             sampling_params=sampling_params,
+            shift_labels=shift_labels,
             chunk_size=chunk_size if use_chunking else None,
         )
         # slice off to the correct length to remove potential CP padding
-        logprobs = logprobs[:, : input_ids.shape[1] - 1]
+        logprobs = logprobs[:, : input_ids.shape[1] - int(shift_labels)]
 
     elif cp_sharder is not None:
         logprobs = get_cp_sharded_next_token_logprobs(
@@ -1875,6 +1898,7 @@ def get_next_token_logprobs_from_logits(
             cp_sharder,
             chunk_size=chunk_size,
             sampling_params=sampling_params,
+            shift_labels=shift_labels,
         )
 
     elif isinstance(next_token_logits, torch.distributed.tensor.DTensor):
@@ -1882,24 +1906,23 @@ def get_next_token_logprobs_from_logits(
             next_token_logits,
             input_ids,
             sampling_params=sampling_params,
+            shift_labels=shift_labels,
         )
 
     else:
-        # Remove last position's logits
-        next_token_logits_wo_last = next_token_logits[:, :-1]
+        target_logits = next_token_logits[:, :-1] if shift_labels else next_token_logits
         # Apply top-k and top-p filtering
-        next_token_logits_wo_last, _ = apply_top_k_top_p(
-            next_token_logits_wo_last,
+        target_logits, _ = apply_top_k_top_p(
+            target_logits,
             top_k=sampling_params.top_k if sampling_params is not None else None,
             top_p=sampling_params.top_p if sampling_params is not None else 1.0,
         )
         # Compute logprobs
-        next_token_logprobs = torch.nn.functional.log_softmax(
-            next_token_logits_wo_last, dim=-1
-        )
-        next_tokens = input_ids[:, 1:].to(next_token_logits.device)  # Skip first token
+        next_token_logprobs = torch.nn.functional.log_softmax(target_logits, dim=-1)
+        targets = input_ids[:, 1:] if shift_labels else input_ids
+        targets = targets.to(target_logits.device)
         logprobs = next_token_logprobs.gather(
-            dim=-1, index=next_tokens.unsqueeze(-1)
+            dim=-1, index=targets.unsqueeze(-1)
         ).squeeze(-1)
 
     return logprobs

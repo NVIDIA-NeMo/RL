@@ -147,11 +147,6 @@ def _stage_conversion(path) -> None:
 def test_import_model_from_hf_name_calls_bridge_save(monkeypatch, tmp_path):
     module = _load_community_import_module(monkeypatch)
     _install_runtime_stubs_for_hf_import(monkeypatch)
-    # Force this import path to stay unavailable even if real megatron modules
-    # were preloaded by earlier tests in the same process.
-    monkeypatch.setitem(
-        sys.modules, "megatron.core.dist_checkpointing.strategies.torch", None
-    )
 
     class FakeProvider:
         def __init__(self):
