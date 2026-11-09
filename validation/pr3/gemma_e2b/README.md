@@ -1,5 +1,11 @@
 # Gemma4 E2B IT streaming LA0 comparison
 
+Latest user target is650 (requested2026-11-08), superseding150. The original
+150-step process finishes normally, then resumes the same experiment on
+sequential debug allocations. See [RESUME650.md](RESUME650.md) and the live
+slurm/resume650/state.json. Historical150 instructions below describe that first
+segment, not the new stopping point.
+
 User authorized a direct debug-node run on2026-11-08. Target150 updates, reusing
 the existing batch512 baselines; no additional full-batch experiment. Numerical
 worker unchanged from8b9fae1fd (PR3 based on PR1 revision047d31a7). Latest PR1

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Plot Gemma batch512 against the existing V1 and SC full-batch runs."""
 
+import argparse
 import csv
 import hashlib
 import io
@@ -120,7 +121,11 @@ def audit_checkpoint(step: int) -> dict:
 
 def main() -> None:
     assert os.environ["USER"] == "root" and os.environ.get("SLURM_JOB_ID")
-    audit_checkpoint(150)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--max-step", type=int, choices=(150, 650), default=150)
+    args = parser.parse_args()
+    target = args.max_step
+    audit_checkpoint(target)
     output = HERE / "results/curve-comparison"
     output.mkdir(parents=True, exist_ok=True)
     baselines = json.loads((HERE / "results/baselines.json").read_text())
@@ -143,23 +148,29 @@ def main() -> None:
         (output / f"{spec['run_id']}-history.json").write_text(
             json.dumps(series[label], indent=2) + "\n"
         )
-    logs = sorted((HERE / "slurm").glob("driver*.log"))
-    raw = [row for path in logs for row in committed_log_rows(path)]
+    logs = sorted((HERE / "slurm").glob("driver*.log")) + sorted(
+        (HERE / "slurm").glob("resume650-driver-*.log")
+    )
+    raw = [
+        row for path in logs for row in committed_log_rows(path) if row[STEP] <= target
+    ]
     stream = merge_records(raw)
-    assert [row[STEP] for row in stream] == list(range(1, 151))
+    assert [row[STEP] for row in stream] == list(range(1, target + 1))
     assert len(raw) == len(stream), "Repeated optimizer-step receipts"
     assert all(row["train/weight_version_lag"] == 0 for row in stream)
     receipts = [
         match
         for path in logs
         for match in re.findall(
-            r"train step (\d+)/150\s+trainer_v=(\d+)\s+lag=(\d+)",
+            r"train step (\d+)/(?:150|650)\s+trainer_v=(\d+)\s+lag=(\d+)",
             path.read_text(errors="replace"),
         )
+        if int(match[0]) <= target
     ]
-    assert len(receipts) == 150
+    assert len(receipts) == target
     assert all(step == version and lag == "0" for step, version, lag in receipts)
     series[LABEL] = stream
+    common_last = min(target, *(int(rows[-1][STEP]) for rows in series.values()))
     sources[LABEL] = {
         "files": [str(path) for path in logs],
         "url": "https://wandb.ai/yuekaiz/nemo-rl-automodel-sc/runs/yuekaiz5090gemmala0s42",
@@ -169,7 +180,9 @@ def main() -> None:
     summary = {
         "generated_utc": snapshot,
         "analyzed_inside_job": os.environ["SLURM_JOB_ID"],
-        "matched_window": [1, 150],
+        "max_plot_step": target,
+        "streaming_last_step": target,
+        "matched_window": [1, common_last],
         "sources": sources,
         "metrics": {},
         "streaming_dispatch_counts": sorted(
@@ -189,6 +202,7 @@ def main() -> None:
             "Step time includes measured checkpoint/cold-step overhead; workloads differ.",
             "No online validation accuracy is recorded.",
             "Readiness threshold16 does not force fixed chunks; some steps may use a full dispatch.",
+            "Absent baselines are not extrapolated; common statistics stop at shared observed coverage.",
         ],
     }
     colors = ("#4c78a8", "#ef8a23", "#119b83")
@@ -197,27 +211,41 @@ def main() -> None:
         summary["metrics"][key] = {}
         positive = True
         for color, (label, rows) in zip(colors, series.items()):
-            points = metric_values(rows, key, first=1, last=150)
-            assert list(points) == list(range(1, 151)), (label, key)
+            last = min(target, int(rows[-1][STEP]))
+            points = metric_values(rows, key, first=1, last=last)
+            assert list(points) == list(range(1, last + 1)), (label, key)
             positive &= min(points.values()) > 0
             ax.plot(
                 list(points), list(points.values()), color=color, alpha=0.17, lw=0.7
             )
             ax.plot(list(points), trailing_mean(points, 10), color=color, lw=1.9)
+            matched = metric_values(rows, key, first=1, last=common_last)
             summary["metrics"][key][label] = {
-                "mean": statistics.mean(points.values()),
+                "plotted_count": len(points),
+                "matched_count": len(matched),
+                "mean": statistics.mean(matched.values()),
                 "first50_mean": statistics.mean(points[i] for i in range(1, 51)),
-                "last50_mean": statistics.mean(points[i] for i in range(101, 151)),
-                "last20_mean": statistics.mean(points[i] for i in range(131, 151)),
-                "steps11_to150_mean": statistics.mean(
-                    points[i] for i in range(11, 151)
+                "last50_mean": statistics.mean(
+                    matched[i] for i in range(common_last - 49, common_last + 1)
                 ),
-                "min": min(points.values()),
-                "max": max(points.values()),
+                "last20_mean": statistics.mean(
+                    matched[i] for i in range(common_last - 19, common_last + 1)
+                ),
+                "steps11_to_common_mean": statistics.mean(
+                    matched[i] for i in range(11, common_last + 1)
+                ),
+                "min": min(matched.values()),
+                "max": max(matched.values()),
+                "run_last20_mean": statistics.mean(
+                    points[i] for i in range(last - 19, last + 1)
+                ),
             }
-        ax.set(title=title, ylabel=ylabel, xlim=(1, 150))
+        ax.set(title=title, ylabel=ylabel, xlim=(1, target))
         ax.grid(alpha=0.22)
         ax.spines[["top", "right"]].set_visible(False)
+        if common_last < target:
+            ax.axvspan(common_last, target, color="#808080", alpha=0.07)
+            ax.axvline(common_last, color="#777777", linestyle=":", linewidth=0.9)
         if key == "train/policy_kl_error" and positive:
             ax.set_yscale("log")
         if key == "train/gen_kl_error":
@@ -226,7 +254,7 @@ def main() -> None:
         ax.set_xlabel("Optimizer step")
     fig.suptitle(
         "Gemma4 E2B IT: synchronous / full-batch LA0 / streaming LA0\n"
-        "32 prompts x 16 responses | 8 H100 (4 training + 4 rollout) | 150 updates",
+        f"32 prompts x 16 responses | 8 H100 (4 training + 4 rollout) | {target} updates",
         fontsize=15,
         y=0.995,
     )
@@ -243,7 +271,7 @@ def main() -> None:
     fig.text(
         0.5,
         0.018,
-        f"Faint: raw. Solid: trailing 10-step means. Snapshot {snapshot}.\n"
+        f"Faint: raw. Solid: trailing 10-step means. Shared coverage1..{common_last}. Snapshot {snapshot}.\n"
         "Exploratory, single seed; Gemma fixed-input streaming parity not assessed. Different rollout workloads.",
         ha="center",
         fontsize=9,
@@ -257,11 +285,18 @@ def main() -> None:
         writer = csv.DictWriter(file, fieldnames=["run", *KEYS], lineterminator="\n")
         writer.writeheader()
         for label, rows in series.items():
-            writer.writerows({"run": label, **row} for row in rows if row[STEP] <= 150)
+            writer.writerows(
+                {"run": label, **row} for row in rows if row[STEP] <= target
+            )
     (output / "comparison-summary.json").write_text(
         json.dumps(summary, indent=2) + "\n"
     )
-    print(json.dumps({"output": str(output), "steps": 150}), flush=True)
+    print(
+        json.dumps(
+            {"output": str(output), "steps": target, "common_last": common_last}
+        ),
+        flush=True,
+    )
 
 
 if __name__ == "__main__":
