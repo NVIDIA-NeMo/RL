@@ -253,6 +253,16 @@ class SpeechLMPolicy(SALMAutomodel):
         if dummy_audio_loss is not None:
             # Keeps every perception parameter in the graph for FSDP reduction.
             logits = logits + dummy_audio_loss * 0
+        # The tokenizer adds the audio placeholder after the native vocabulary.
+        # Generic post-processors gather every input token before loss masking.
+        # Expose that impossible output without changing real-token probabilities
+        # or adding a parameter/checkpoint row to the frozen native head.
+        if self.audio_locator_tag_id >= logits.shape[-1]:
+            logits = F.pad(
+                logits,
+                (0, self.audio_locator_tag_id + 1 - logits.shape[-1]),
+                value=float("-inf"),
+            )
         return logits
 
 

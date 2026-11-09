@@ -45,7 +45,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (  # noqa: E402
     TrainingSamplingParams,
 )
 
-PAD, AUDIO = 0, 11
+PAD, AUDIO = 0, 12
 IDS = torch.tensor([[1, AUDIO, 2, 3, 4, PAD], [1, AUDIO, 2, 5, PAD, PAD]])
 RESPONSE_MASK = torch.tensor([[0, 0, 0, 1, 1, 0], [0, 0, 0, 1, 0, 0]])
 AUDIO_KWARGS = {
@@ -186,7 +186,9 @@ def test_forward_returns_text_aligned_logits():
     torch.manual_seed(42)
     model = NativeFixture().train()
     logits = model(IDS, **AUDIO_KWARGS)
-    assert logits.shape == (*IDS.shape, 12)
+    assert logits.shape == (*IDS.shape, 13)
+    assert torch.isneginf(logits[..., AUDIO]).all()
+    assert model.llm.lm_head.weight.shape[0] == 12
     logprobs = torch.log_softmax(logits[:, :-1], dim=-1).gather(-1, IDS[:, 1:, None])
     actual = torch.zeros(IDS.shape)
     actual[:, 1:] = logprobs.squeeze(-1)
@@ -194,11 +196,33 @@ def test_forward_returns_text_aligned_logits():
     torch.testing.assert_close(
         actual[response], _dense_response_logprobs(model, 1.0)[response]
     )
+    parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    reference_gradients = torch.autograd.grad(
+        _dense_response_logprobs(model, 1.0)[response].sum(), parameters
+    )
     actual[response].sum().backward()
+    for parameter, reference in zip(parameters, reference_gradients):
+        assert torch.isfinite(parameter.grad).all()
+        torch.testing.assert_close(parameter.grad, reference)
     assert torch.count_nonzero(model.perception.proj.weight.grad) > 0
     assert model.llm.lm_head.weight.grad is None
     assert all(parameter.grad is None for parameter in model.llm.mtp.parameters())
     assert not model.perception.training
+
+
+def test_forward_keeps_native_width_for_in_vocab_placeholder():
+    class InVocabFixture(NativeFixture):
+        @property
+        def audio_locator_tag_id(self):
+            return 11
+
+    model = InVocabFixture()
+    ids = IDS.masked_fill(IDS == AUDIO, 11)
+    logits = model(ids, **AUDIO_KWARGS)
+    assert logits.shape == (*IDS.shape, 12)
+    assert torch.isfinite(logits).all()
 
 
 def test_forward_rejects_expanded_overflow_and_kv_cache():
@@ -210,9 +234,26 @@ def test_forward_rejects_expanded_overflow_and_kv_cache():
         model(IDS, **AUDIO_KWARGS)
 
 
-def test_standard_microbatch_dispatch_runs_gspo_loss_and_audio_gradient():
+@pytest.fixture
+def singleton_tp_mesh(tmp_path):
+    from torch.distributed.device_mesh import init_device_mesh
+
+    torch.distributed.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'rendezvous'}", rank=0, world_size=1
+    )
+    try:
+        yield init_device_mesh("cpu", (1,), mesh_dim_names=("tp",))
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize("chunk_size", [None, 2])
+def test_standard_microbatch_dispatch_runs_gspo_loss_and_audio_gradient(
+    chunk_size, singleton_tp_mesh
+):
     from nemo_rl.algorithms.loss import ClippedPGLossFn
     from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig
+    from nemo_rl.algorithms.utils import compute_seq_logprob_errors
     from nemo_rl.distributed.batched_data_dict import BatchedDataDict
     from nemo_rl.models.automodel.data import ProcessedInputs, ProcessedMicrobatch
     from nemo_rl.models.automodel.train import (
@@ -252,7 +293,9 @@ def test_standard_microbatch_dispatch_runs_gspo_loss_and_audio_gradient():
     old, metrics, returned = forward_with_post_processing_fn(
         model=model,
         prepared=prepared,
-        post_processing_fn=LogprobsPostProcessor(cfg={}, sampling_params=sampling),
+        post_processing_fn=LogprobsPostProcessor(
+            cfg={"logprob_chunk_size": chunk_size}, sampling_params=sampling
+        ),
         processed_mb=microbatch,
         global_valid_seqs=None,
         global_valid_toks=None,
@@ -261,13 +304,22 @@ def test_standard_microbatch_dispatch_runs_gspo_loss_and_audio_gradient():
     assert returned is microbatch
     assert old.shape == IDS.shape
     assert torch.count_nonzero(old[:, 0]) == 0
+    assert torch.isneginf(old[IDS == AUDIO]).all()
     response = RESPONSE_MASK.bool()
     with torch.no_grad():
         expected = _dense_response_logprobs(model, sampling.temperature)
     torch.testing.assert_close(old[response], expected[response])
 
     data["prev_logprobs"] = old.detach()
-    data["generation_logprobs"] = data["prev_logprobs"].clone()
+    data["generation_logprobs"] = torch.where(response, old.detach(), 0.0)
+    errors, valid = compute_seq_logprob_errors(
+        policy_logprobs=old[:, 1:],
+        generation_logprobs=data["generation_logprobs"][:, 1:],
+        token_mask=RESPONSE_MASK[:, 1:],
+        sample_mask=data["sample_mask"],
+    )
+    assert valid.all()
+    torch.testing.assert_close(errors, torch.ones(2))
     data["advantages"] = torch.tensor([[1.0], [-0.5]]).expand_as(IDS)
     loss_fn = ClippedPGLossFn(
         ClippedPGLossConfig(
@@ -276,18 +328,20 @@ def test_standard_microbatch_dispatch_runs_gspo_loss_and_audio_gradient():
             reference_policy_kl_penalty=0.0,
             ratio_clip_min=0.2,
             ratio_clip_max=0.2,
+            metrics_level="full",
         )
     )
-    loss, _, returned = forward_with_post_processing_fn(
+    loss, metrics, returned = forward_with_post_processing_fn(
         model=model,
         prepared=prepared,
         post_processing_fn=LossPostProcessor(
             loss_fn=loss_fn,
-            cfg={},
+            cfg={"logprob_chunk_size": chunk_size},
             cp_mesh=None,
             cp_size=1,
             dp_size=1,
             sampling_params=sampling,
+            tp_mesh=singleton_tp_mesh,
         ),
         processed_mb=microbatch,
         global_valid_seqs=torch.tensor(2.0),
@@ -297,7 +351,22 @@ def test_standard_microbatch_dispatch_runs_gspo_loss_and_audio_gradient():
     # Ratios are one, so the GSPO sequence mean is -(1 - .5) / 2.
     torch.testing.assert_close(loss, torch.tensor(-0.25))
     assert returned is microbatch
+    assert all(
+        torch.isfinite(torch.as_tensor(value)).all() for value in metrics.values()
+    )
+    reference_logprobs = _dense_response_logprobs(model, sampling.temperature)
+    sequence_logratios = (
+        (reference_logprobs - expected) * RESPONSE_MASK
+    ).sum(1) / RESPONSE_MASK.sum(1)
+    reference_loss = -(sequence_logratios.exp() * torch.tensor([1.0, -0.5])).mean()
+    parameters = [
+        parameter for parameter in model.parameters() if parameter.requires_grad
+    ]
+    reference_gradients = torch.autograd.grad(reference_loss, parameters)
     loss.backward()
+    for parameter, reference in zip(parameters, reference_gradients):
+        assert torch.isfinite(parameter.grad).all()
+        torch.testing.assert_close(parameter.grad, reference)
     assert torch.count_nonzero(model.perception.proj.weight.grad) > 0
     assert model.llm.lm_head.weight.grad is None
     assert all(parameter.grad is None for parameter in model.llm.mtp.parameters())
