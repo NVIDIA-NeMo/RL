@@ -62,10 +62,41 @@ def test_seed_copies_once_per_node_from_the_type_dir(caches, monkeypatch):
     assert local.read_text() == "changed here"
 
 
-def test_engine_folder_is_filled_from_the_node_copy(caches):
+def test_engine_folder_is_filled_from_the_node_copy(caches, monkeypatch):
+    monkeypatch.setattr(
+        compile_cache,
+        "_vllm_patches",
+        lambda: {"_patch_vllm_compile_cache_relative_artifacts": lambda logger: None},
+    )
     (caches / "shared/vllm/vllm/torch_compile_cache").mkdir(parents=True)
     (caches / "shared/vllm/vllm/torch_compile_cache/entry").write_text("compiled")
     engine = compile_cache.vllm_engine_dir(0)
 
     compile_cache._prepare_vllm_engine_on_this_node(engine)
     assert (caches / "local/vllm_engines/0/torch_compile_cache/entry").exists()
+
+
+def test_relative_artifact_backport(tmp_path, monkeypatch):
+    import logging
+
+    patches = compile_cache._vllm_patches()
+    source = tmp_path / "compiler_interface.py"
+    original = (
+        "        assert isinstance(handle[1], str)\n"
+        "        path = handle[1]\n"
+        "        inductor_compiled_graph = torch._inductor.CompiledArtifact.load(\n"
+    )  # vLLM 0.25.1 and 0.29.0
+    source.write_text(original)
+    backport = patches["_patch_vllm_compile_cache_relative_artifacts"]
+    backport.__globals__["_get_vllm_file"] = lambda relative_path: str(source)
+    log = logging.getLogger("test")
+
+    backport(log)
+    backport(log)  # idempotent
+    patched = source.read_text()
+    assert patched.count("path = os.path.join(self.cache_dir, handle[0])") == 1
+    assert "path = handle[1]" not in patched
+
+    source.write_text("        path = something_else\n")
+    with pytest.raises(RuntimeError):
+        backport(log)
