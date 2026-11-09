@@ -1,11 +1,11 @@
 {
-  "generated_utc": "2026-11-09T07:31:12+00:00",
-  "analyzed_inside_job": "21546953",
-  "max_plot_step": 150,
-  "streaming_last_step": 150,
+  "generated_utc": "2026-11-09T17:59:52+00:00",
+  "analyzed_inside_job": "21579059",
+  "max_plot_step": 650,
+  "streaming_last_step": 650,
   "matched_window": [
     1,
-    150
+    157
   ],
   "sources": {
     "V1 synchronous": {
@@ -20,7 +20,10 @@
     },
     "SC streaming LA0 (exploratory)": {
       "files": [
-        "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/single_controller/RL-pr5090-streaming/validation/pr3/gemma_e2b/slurm/driver.log"
+        "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/single_controller/RL-pr5090-streaming/validation/pr3/gemma_e2b/slurm/driver.log",
+        "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/single_controller/RL-pr5090-streaming/validation/pr3/gemma_e2b/slurm/resume650-driver-21557906.log",
+        "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/single_controller/RL-pr5090-streaming/validation/pr3/gemma_e2b/slurm/resume650-driver-21568255.log",
+        "/lustre/fs1/portfolios/coreai/projects/coreai_dlalgo_nemorl/users/yuekaiz/single_controller/RL-pr5090-streaming/validation/pr3/gemma_e2b/slurm/resume900-driver-21579059.log"
       ],
       "url": "https://wandb.ai/yuekaiz/nemo-rl-automodel-sc/runs/yuekaiz5090gemmala0s42",
       "source": "committed native SC logs"
@@ -29,306 +32,306 @@
   "metrics": {
     "train/reward": {
       "V1 synchronous": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.41571614583333333,
+        "plotted_count": 157,
+        "matched_count": 157,
+        "mean": 0.4184912420382166,
         "first50_mean": 0.3653125,
-        "last50_mean": 0.4494140625,
-        "last20_mean": 0.4513671875,
-        "steps11_to_common_mean": 0.42255859375,
+        "last50_mean": 0.4555078125,
+        "last20_mean": 0.460546875,
+        "steps11_to_common_mean": 0.4251966411564626,
         "min": 0.21484375,
         "max": 0.654296875,
-        "run_last20_mean": 0.4513671875
+        "run_last20_mean": 0.460546875
       },
       "SC full-batch LA0": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.4155779874021526,
+        "plotted_count": 164,
+        "matched_count": 157,
+        "mean": 0.41842828591060366,
         "first50_mean": 0.3653125,
-        "last50_mean": 0.4451714622064579,
-        "last20_mean": 0.4460341242661448,
-        "steps11_to_common_mean": 0.42250822310944924,
+        "last50_mean": 0.4520288802592955,
+        "last20_mean": 0.46060057638209395,
+        "steps11_to_common_mean": 0.42522240825146107,
         "min": 0.23046875,
         "max": 0.630859375,
-        "run_last20_mean": 0.4460341242661448
+        "run_last20_mean": 0.4667529201320939
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.4127402866112198,
+        "plotted_count": 650,
+        "matched_count": 157,
+        "mean": 0.4154365795648597,
         "first50_mean": 0.365703125,
-        "last50_mean": 0.4417755473336595,
-        "last20_mean": 0.43759765625,
-        "steps11_to_common_mean": 0.41942597672630694,
+        "last50_mean": 0.44783023483365947,
+        "last20_mean": 0.4515625,
+        "steps11_to_common_mean": 0.42198732477335354,
         "min": 0.2265625,
         "max": 0.666015625,
-        "run_last20_mean": 0.43759765625
+        "run_last20_mean": 0.43580295988258316
       }
     },
     "train/mean_gen_tokens_per_sample": {
       "V1 synchronous": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 1437.9427864583333,
+        "plotted_count": 157,
+        "matched_count": 157,
+        "mean": 1429.9009131170383,
         "first50_mean": 1653.9883203125,
-        "last50_mean": 1284.8576171875,
-        "last20_mean": 1282.069140625,
-        "steps11_to_common_mean": 1412.0999720982143,
+        "last50_mean": 1276.575234375,
+        "last20_mean": 1276.16376953125,
+        "steps11_to_common_mean": 1404.7416427508504,
         "min": 1102.6328125,
         "max": 1906.12109375,
-        "run_last20_mean": 1282.069140625
+        "run_last20_mean": 1276.16376953125
       },
       "SC full-batch LA0": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 1432.7092578125,
+        "plotted_count": 164,
+        "matched_count": 157,
+        "mean": 1424.118580812102,
         "first50_mean": 1665.67484375,
-        "last50_mean": 1294.7929296875,
-        "last20_mean": 1306.92919921875,
-        "steps11_to_common_mean": 1406.3646344866072,
+        "last50_mean": 1284.3346875,
+        "last20_mean": 1283.02705078125,
+        "steps11_to_common_mean": 1398.444063562925,
         "min": 1089.04296875,
         "max": 1900.974609375,
-        "run_last20_mean": 1306.92919921875
+        "run_last20_mean": 1255.1310546875
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 1391.9934765625,
+        "plotted_count": 650,
+        "matched_count": 157,
+        "mean": 1384.0492013335988,
         "first50_mean": 1657.5837890625,
-        "last50_mean": 1208.5027734375,
-        "last20_mean": 1193.92939453125,
-        "steps11_to_common_mean": 1363.110825892857,
+        "last50_mean": 1204.0292578125,
+        "last20_mean": 1211.53818359375,
+        "steps11_to_common_mean": 1356.001488095238,
         "min": 1058.861328125,
         "max": 1902.78125,
-        "run_last20_mean": 1193.92939453125
+        "run_last20_mean": 1286.21708984375
       }
     },
     "train/gen_kl_error": {
       "V1 synchronous": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.0003929339922270151,
+        "plotted_count": 157,
+        "matched_count": 157,
+        "mean": 0.00039237742068792575,
         "first50_mean": 0.00040233941281157646,
-        "last50_mean": 0.00037946268226868085,
-        "last20_mean": 0.0003802716749762958,
-        "steps11_to_common_mean": 0.0003932404305599015,
+        "last50_mean": 0.0003801210080834494,
+        "last20_mean": 0.0003814812723809347,
+        "steps11_to_common_mean": 0.00039263140470978424,
         "min": 0.0003355279312451387,
         "max": 0.000453024816700065,
-        "run_last20_mean": 0.0003802716749762958
+        "run_last20_mean": 0.0003814812723809347
       },
       "SC full-batch LA0": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.0003864562553070853,
+        "plotted_count": 164,
+        "matched_count": 157,
+        "mean": 0.00038646622939193575,
         "first50_mean": 0.0003878054147528065,
-        "last50_mean": 0.0003797540543303235,
-        "last20_mean": 0.00037643640323068437,
-        "steps11_to_common_mean": 0.0003860565439217359,
+        "last50_mean": 0.00038050689427880256,
+        "last20_mean": 0.000381820574201619,
+        "steps11_to_common_mean": 0.0003860862303912527,
         "min": 0.00032809856249471636,
         "max": 0.0004533999062701355,
-        "run_last20_mean": 0.00037643640323068437
+        "run_last20_mean": 0.00038744302367899053
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.000405351145979258,
+        "plotted_count": 650,
+        "matched_count": 157,
+        "mean": 0.00040558395215327327,
         "first50_mean": 0.0003908205738401885,
-        "last50_mean": 0.00040870691245376863,
-        "last20_mean": 0.000411398651287536,
-        "steps11_to_common_mean": 0.00040677423489197717,
+        "last50_mean": 0.0004094217032934642,
+        "last20_mean": 0.0004138928633142621,
+        "steps11_to_common_mean": 0.00040695511208198646,
         "min": 0.00034269647859331344,
         "max": 0.0004953615865924497,
-        "run_last20_mean": 0.000411398651287536
+        "run_last20_mean": 0.0005784180434263782
       }
     },
     "train/policy_kl_error": {
       "V1 synchronous": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.001082716096049546,
+        "plotted_count": 157,
+        "matched_count": 157,
+        "mean": 0.0010518861624426539,
         "first50_mean": 0.0006709057471020863,
-        "last50_mean": 0.002156356719054564,
-        "last20_mean": 0.0004057398492316899,
-        "steps11_to_common_mean": 0.0010855493932065753,
-        "min": 0.0003442898580701126,
+        "last50_mean": 0.0004871238296515301,
+        "last20_mean": 0.00040712135036526933,
+        "steps11_to_common_mean": 0.0010524872662924169,
+        "min": 0.0003428551006265934,
         "max": 0.08386214395658165,
-        "run_last20_mean": 0.0004057398492316899
+        "run_last20_mean": 0.00040712135036526933
       },
       "SC full-batch LA0": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.001449006999025683,
+        "plotted_count": 164,
+        "matched_count": 157,
+        "mean": 0.0014026206237589107,
         "first50_mean": 0.002857578334348183,
-        "last50_mean": 0.0008189478739259925,
-        "last20_mean": 0.00042234397104596867,
-        "steps11_to_common_mean": 0.0012903517763131526,
+        "last50_mean": 0.0007469937083767598,
+        "last20_mean": 0.00041245675106029724,
+        "steps11_to_common_mean": 0.0012483648759193053,
         "min": 0.00033627194395791093,
         "max": 0.083458730504546,
-        "run_last20_mean": 0.00042234397104596867
+        "run_last20_mean": 0.00042005423997402145
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.03419801097244835,
+        "plotted_count": 650,
+        "matched_count": 157,
+        "mean": 0.032692185578078965,
         "first50_mean": 0.04672289375771551,
-        "last50_mean": 0.006944058698605,
-        "last20_mean": 0.0005977083153747225,
-        "steps11_to_common_mean": 0.036611145003864906,
+        "last50_mean": 0.006944712413482964,
+        "last20_mean": 0.0004446717844326322,
+        "steps11_to_common_mean": 0.034887971363484566,
         "min": 0.00034660875060342294,
         "max": 2.414997579979995,
-        "run_last20_mean": 0.0005977083153747225
+        "run_last20_mean": 0.0007137523887393527
       }
     },
     "train/loss": {
       "V1 synchronous": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.02495348160426753,
+        "plotted_count": 157,
+        "matched_count": 157,
+        "mean": 0.02471009350166201,
         "first50_mean": 0.02820817033905769,
-        "last50_mean": 0.021868645821814425,
-        "last20_mean": 0.022242674980225273,
-        "steps11_to_common_mean": 0.02468921027788643,
+        "last50_mean": 0.02201779825045378,
+        "last20_mean": 0.0219628645634657,
+        "steps11_to_common_mean": 0.024441849510373505,
         "min": -0.0004166582366451621,
         "max": 0.04990508680930361,
-        "run_last20_mean": 0.022242674980225273
+        "run_last20_mean": 0.0219628645634657
       },
       "SC full-batch LA0": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.02505165817347006,
+        "plotted_count": 164,
+        "matched_count": 157,
+        "mean": 0.024633502257848085,
         "first50_mean": 0.030189693913271184,
-        "last50_mean": 0.020492957833921535,
-        "last20_mean": 0.019794335162441713,
-        "steps11_to_common_mean": 0.024812587035505984,
+        "last50_mean": 0.01967302307486534,
+        "last20_mean": 0.021109810048073996,
+        "steps11_to_common_mean": 0.024377369479132504,
         "min": -0.0014991785574238747,
         "max": 0.05376558222633321,
-        "run_last20_mean": 0.019794335162441713
+        "run_last20_mean": 0.018766252693149
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.025896248942519306,
+        "plotted_count": 650,
+        "matched_count": 157,
+        "mean": 0.02554180230342687,
         "first50_mean": 0.029499203777254845,
-        "last50_mean": 0.023293656074134646,
-        "last20_mean": 0.0218226110397212,
-        "steps11_to_common_mean": 0.025926560655577524,
+        "last50_mean": 0.023173817321512802,
+        "last20_mean": 0.021225399313405717,
+        "steps11_to_common_mean": 0.025546558585312764,
         "min": 0.0009467800492815241,
         "max": 0.05029900460184204,
-        "run_last20_mean": 0.0218226110397212
+        "run_last20_mean": 0.019617510481511398
       }
     },
     "train/approx_entropy": {
       "V1 synchronous": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.19559082673257763,
+        "plotted_count": 157,
+        "matched_count": 157,
+        "mean": 0.1949142687744738,
         "first50_mean": 0.19798063209645989,
-        "last50_mean": 0.18495167320789732,
-        "last20_mean": 0.1857060008992903,
-        "steps11_to_common_mean": 0.19654275693781073,
-        "min": 0.15032103255180118,
+        "last50_mean": 0.18450948129258904,
+        "last20_mean": 0.18292727544294393,
+        "steps11_to_common_mean": 0.1957748446190425,
+        "min": 0.1450977725780831,
         "max": 0.2474468304626498,
-        "run_last20_mean": 0.1857060008992903
+        "run_last20_mean": 0.18292727544294393
       },
       "SC full-batch LA0": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.18194960195603016,
+        "plotted_count": 164,
+        "matched_count": 157,
+        "mean": 0.1820835568025017,
         "first50_mean": 0.17996365900740785,
-        "last50_mean": 0.17892029332360834,
-        "last20_mean": 0.17644116216049496,
-        "steps11_to_common_mean": 0.18192719795699108,
+        "last50_mean": 0.1796953980215403,
+        "last20_mean": 0.18029470487608706,
+        "steps11_to_common_mean": 0.18207133223514965,
         "min": 0.14480659284527064,
         "max": 0.23284564113419037,
-        "run_last20_mean": 0.17644116216049496
+        "run_last20_mean": 0.18555202635820933
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.20008855698662475,
+        "plotted_count": 650,
+        "matched_count": 157,
+        "mean": 0.19963440123517814,
         "first50_mean": 0.18695407233808295,
-        "last50_mean": 0.19287407681062085,
-        "last20_mean": 0.18813642363110206,
-        "steps11_to_common_mean": 0.2013827750480495,
-        "min": 0.15647196214325856,
+        "last50_mean": 0.19014977205565553,
+        "last20_mean": 0.18989886914663046,
+        "steps11_to_common_mean": 0.20083609491602847,
+        "min": 0.15006080276853723,
         "max": 0.29083197597540206,
-        "run_last20_mean": 0.18813642363110206
+        "run_last20_mean": 0.23168508223398104
       }
     },
     "train/grad_norm": {
       "V1 synchronous": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.6476828889052073,
+        "plotted_count": 157,
+        "matched_count": 157,
+        "mean": 0.6407647700446426,
         "first50_mean": 0.7976425737142563,
-        "last50_mean": 0.6083614468574524,
-        "last20_mean": 0.5623191878199577,
-        "steps11_to_common_mean": 0.5941734837634223,
+        "last50_mean": 0.6007896983623504,
+        "last20_mean": 0.5903552263975144,
+        "steps11_to_common_mean": 0.5893328114837205,
         "min": 0.20101112127304077,
         "max": 9.667587280273438,
-        "run_last20_mean": 0.5623191878199577
+        "run_last20_mean": 0.5903552263975144
       },
       "SC full-batch LA0": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.5231947954495748,
+        "plotted_count": 164,
+        "matched_count": 157,
+        "mean": 0.5272865853491863,
         "first50_mean": 0.5053751188516616,
-        "last50_mean": 0.5757274031639099,
-        "last20_mean": 0.6907952964305878,
-        "steps11_to_common_mean": 0.5130837225488254,
+        "last50_mean": 0.5881746393442154,
+        "last20_mean": 0.7289397165179252,
+        "steps11_to_common_mean": 0.5179353451647726,
         "min": 0.20703454315662384,
         "max": 2.935317039489746,
-        "run_last20_mean": 0.6907952964305878
+        "run_last20_mean": 0.6019397839903832
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 0.6003875320156415,
+        "plotted_count": 650,
+        "matched_count": 157,
+        "mean": 0.5978666468980206,
         "first50_mean": 0.46891335159540176,
-        "last50_mean": 0.5236194503307342,
-        "last20_mean": 0.4951893463730812,
-        "steps11_to_common_mean": 0.615434440863984,
+        "last50_mean": 0.4898469257354736,
+        "last20_mean": 0.5180455043911933,
+        "steps11_to_common_mean": 0.6120255474938827,
         "min": 0.18407617509365082,
         "max": 3.370628833770752,
-        "run_last20_mean": 0.4951893463730812
+        "run_last20_mean": 1.0246821850538255
       }
     },
     "timing/train/total_step_time": {
       "V1 synchronous": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 73.39297467946385,
+        "plotted_count": 157,
+        "matched_count": 157,
+        "mean": 73.34767529687838,
         "first50_mean": 75.17905894936993,
-        "last50_mean": 72.08668552521617,
-        "last20_mean": 72.13477077879944,
-        "steps11_to_common_mean": 72.8547021411958,
+        "last50_mean": 72.1415433024615,
+        "last20_mean": 72.28031542878598,
+        "steps11_to_common_mean": 72.83195319359007,
         "min": 67.26780396513641,
         "max": 104.27009156020358,
-        "run_last20_mean": 72.13477077879944
+        "run_last20_mean": 72.28031542878598
       },
       "SC full-batch LA0": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 72.53638986939565,
+        "plotted_count": 164,
+        "matched_count": 157,
+        "mean": 72.39176519333154,
         "first50_mean": 74.56513849584385,
-        "last50_mean": 71.27569277144968,
-        "last20_mean": 71.15704923998564,
-        "steps11_to_common_mean": 71.99246623343123,
+        "last50_mean": 70.99575307749211,
+        "last20_mean": 70.59892889508046,
+        "steps11_to_common_mean": 71.86390426955154,
         "min": 66.5861337594688,
         "max": 104.44541712291539,
-        "run_last20_mean": 71.15704923998564
+        "run_last20_mean": 71.06936462963931
       },
       "SC streaming LA0 (exploratory)": {
-        "plotted_count": 150,
-        "matched_count": 150,
-        "mean": 70.32966666666667,
+        "plotted_count": 650,
+        "matched_count": 157,
+        "mean": 70.22535031847134,
         "first50_mean": 73.8898,
-        "last50_mean": 67.0956,
-        "last20_mean": 66.726,
-        "steps11_to_common_mean": 69.87064285714285,
+        "last50_mean": 67.2108,
+        "last20_mean": 67.6615,
+        "steps11_to_common_mean": 69.78108843537414,
         "min": 61.03,
         "max": 86.04,
-        "run_last20_mean": 66.726
+        "run_last20_mean": 68.2365
       }
     }
   },
@@ -337,10 +340,10 @@
     2
   ],
   "streaming_dispatch_frequency": {
-    "2": 149,
+    "2": 649,
     "1": 1
   },
-  "multiple_dispatch_updates": 149,
+  "multiple_dispatch_updates": 649,
   "streaming_all_lag_zero": true,
   "notes": [
     "Historical baselines; independent rollouts and one seed.",

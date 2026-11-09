@@ -1,150 +1,98 @@
 # Gemma4 E2B IT streaming LA0 comparison
 
-Latest user target is900 (requested2026-11-09), superseding650/150. See
-[RESUME900.md](RESUME900.md) and live slurm/resume650/state.json. The current
-650-config segment completed524 normally and its idle node was released.
-Stage3 allocation21579059 is RUNNING on pool0-01905 and directly attached with
-resume900.yaml. Actual checkpoint524 preflight and first525 recovery passed:
-trainer_v525,lag0,two dispatches,512 valid samples,nonzero advantages/gradient and
-LR2e-6; selected W&B/native525 metrics matched exactly. See
-[first900-stage recovery](results/resume900-first-recovery-21579059.json).
-No reset of optimizer/scheduler/data/W&B identity. Saved524 scalar
-audit is in [checkpoint524-state.json](results/checkpoint524-state.json).
-Historical650/150 snapshots below are not the new stopping point. The original
-150-step segment completed normally: driver exit0, durable checkpoint150,
-optimizer/scheduler scalar audit and eight-panel plot all verified. Its idle
-interactive allocation21546953 was released at23:31PST on2026-11-08; Slurm
-CANCELLED0:0 records this expected cleanup, not a training failure.
+The active user target is900, superseding650/150. Training has continued beyond
+650 on allocation21579059,pool0-01905; latest independently checked W&B/native
+snapshot656 had trainer_v656,lag0,two dispatches and LR2e-6. See
+[RESUME900.md](RESUME900.md), jobs.json and live slurm/resume650/state.json.
+The historical650 directory name does not change target_steps900.
 
-Continuation allocation21557906 completed150->340 on pool0-00941 with driver
-exit0, then released its node normally. Preflight passed from checkpoint150:
-4800 consumed prompts, trainer/sampler versions150, unchanged numerical source
-and model hashes, and only the target/display name changed. The driver restored
-the data loader, weights, native TQ and replay metadata, and resumed the SAME
-W&B identity. First recovered update151 committed with trainer_v151,lag0,
-two dispatches, nonzero advantages/gradient and LR2e-6. The W&B API independently
-matched the native selected metrics at151 exactly; see
-[recovery evidence](results/resume650-first-recovery-21557906.json).
-The [checkpoint340 audit](results/checkpoint340-state.json) confirms all505 saved
-optimizer counters340, scheduler last_epoch340, LR2e-6 and10880 consumed prompts;
-the optimizer metadata hash matches. W&B matched the native final340 receipt.
-Next interactive allocation21568255 is RUNNING on pool0-00671 from03:23:49PSTNov9.
-Direct attachment and checkpoint340 preflight passed with unchanged configuration
-and numerical source. First recovered341 committed with trainer_v341,lag0,two
-dispatches,512valid,nonzero advantages/gradient and LR2e-6; selected W&B metrics
-matched native341 exactly. See [second recovery evidence](results/resume650-first-recovery-21568255.json).
-The log restored64 unfinished rollout groups next to0 canonical groups; their
-redispatch was observed, but an independent all-group uniqueness audit was not
-performed. The supervisor acquired this node after the previous node was released.
-See [RESUME650.md](RESUME650.md) and live
-slurm/resume650/state.json;650 has not completed.
+The [eight-panel comparison](results/curve-comparison/comparison.png) is updated
+through650 at2026-11-09T17:59:52UTC. It shows reward, generation length,
+generation/policy KL diagnostics, policy loss, approximate entropy, preclip
+gradient norm and measured step time. Raw curves and trailing10-step means are
+shown. This is an intermediate snapshot; final900 plots remain pending.
 
-The [first150 eight-panel comparison](results/curve-comparison/comparison.png)
-uses existing V1/full-batch SC histories, not additional experiments. Its
-[summary](results/curve-comparison/comparison-summary.json) compares steps1..150:
+Both baselines are the original PR author's EXISTING batch512 runs, not new
+experiments launched here:
 
-| Metric | V1 synchronous | Full-batch SC LA0 | Streaming LA0 |
+- V1 synchronous: https://wandb.ai/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/74860be5
+  (157 observed steps).
+- Full-batch SC LA0: https://wandb.ai/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/96779513
+  (164 observed steps).
+- Streaming LA0: https://wandb.ai/yuekaiz/nemo-rl-automodel-sc/runs/yuekaiz5090gemmala0s42
+  (same run throughout all continuations).
+
+The [summary](results/curve-comparison/comparison-summary.json) and
+[CSV](results/curve-comparison/comparison.csv) use actual endpoint coverage.
+Shared comparison statistics below stop at157. The plot shades unshared coverage,
+retains the full SC baseline's observed tail to164 and extrapolates nothing.
+
+| Metric, common steps1..157 | V1 synchronous | Full-batch SC LA0 | Streaming LA0 |
 | --- | ---: | ---: | ---: |
-| Mean reward |0.41572|0.41558|0.41274|
-| Mean generation tokens/sample |1437.94|1432.71|1391.99|
-| Mean gen_kl_error |0.000392934|0.000386456|0.000405351|
-| Mean step time, steps11..150 (s) |72.85|71.99|69.87|
+| Mean reward |0.41849|0.41843|0.41544|
+| Mean generation tokens/sample |1429.90|1424.12|1384.05|
+| Mean gen_kl_error |0.000392377|0.000386466|0.000405584|
+| Mean step time, steps11..157 (s) |72.83|71.86|69.78|
 
-Streaming gen_kl_error remained finite (maximum0.000495362); its last20 mean
-0.000411399 exceeds V1's0.000380272 and full SC's0.000376436. Policy KL has
-isolated larger outliers, notably step18=2.28353 and step93=2.41500; these are
-present in the raw committed metrics, not just plot smoothing. Their cause is
-unresolved. Lower measured step time also accompanies shorter outputs and
-different historical runs, so it does not isolate a streaming speedup.
+Streaming tail statistics have a different window: steps631..650 gen_kl_error
+mean0.000578418 and approximate entropy0.231685. The generation KL trace rises
+around600 while entropy also rises; this is an observation, not a causal result.
+The largest generation KL value through650 remains392=0.000959170. Policy KL
+has isolated large outliers including18=2.28353,93=2.41500,538=1.81858.
+Preclip gradient spikes include571=13.7712 and subsequently return lower.
+The actual AutoModel max_grad_norm is1.0; the plotted metric is before clipping.
+Causes of these diagnostic differences remain unresolved. Shorter generated
+outputs, independent rollouts, one seed and historical runs prevent an isolated
+streaming speedup or convergence-equivalence claim.
 
-All150 committed updates have finite plotted metrics, lag0, nonzero advantages
-and gradients.149 updates used two dispatches; step12 used one. Valid samples
-range511..512: the audit retains the affected step rather than asserting every
-update had512 valid samples (step108 had511). See [metric audit](results/first150-metrics-audit.json)
-and [checkpoint150 scalar audit](results/checkpoint150-state.json): four saved
-optimizer shards, all505 optimizer counters150, LR2e-6, scheduler last_epoch150
-and4800 consumed prompts. These audits do not compare live raw optimizer buffers
-or establish fixed-input numerical parity.
+All first650 committed metrics are finite and lag0; the full audit through656
+also found nonzero advantages/gradients and unique, contiguous step/version
+receipts.649 of the first650 updates used two dispatches; step12 selected all32
+already-ready groups in one dispatch. Readiness16 is a threshold, not a fixed
+chunk cap or a forced overlap gate. Actual warmed GPU overlap was not measured
+for this Gemma long run. No online validation/accuracy is recorded.
 
-User authorized a direct debug-node run on2026-11-08. Target150 updates, reusing
-the existing batch512 baselines; no additional full-batch experiment. Numerical
-worker unchanged from8b9fae1fd (PR3 based on PR1 revision047d31a7). Latest PR1
-097524718 was inspected, not rebased into this active experiment. Image1030.
+The [checkpoint650 audit](results/checkpoint650-state.json) checked four saved
+optimizer shards, all505 counters650, scheduler/trainer/sampler650,LR2e-6 and
+20800 consumed prompts. The [progress audit](results/resume900-progress-650.json)
+records the slightly later656 snapshot. These are saved scalar/metric checks,
+not a live all-rank raw optimizer or per-prompt read-ahead cursor oracle.
+Initial150 scalar/metric evidence remains in checkpoint150-state.json and
+first150-metrics-audit.json; saved source/model provenance is retained separately.
 
-At20:36PST, updates1and2 committed with trainer versions1/2,lag0 and two
-dispatches each (16+16 groups). All512 samples valid; nonzero advantages and
-preclip gradients observed. GenKL0.000402249/0.000381952. The existing W&B
-API confirmed step2 and all selected metrics match native records. Learning rate
-follows the saved recipe's initial warmup (2e-14 then2.00000018e-7), not a changed
-peak LR. No convergence/speedup conclusion from these startup steps.
-See results/startup.json. Always inspect current logs rather than treating this
-snapshot as live progress.
+Recovery evidence is retained for [150->151](results/resume650-first-recovery-21557906.json),
+[340->341](results/resume650-first-recovery-21568255.json) and
+[524->525](results/resume900-first-recovery-21579059.json). Each first recovered
+receipt had the expected version,lag0,nonzero signal,LR continuity and exact
+selected W&B/native metrics. Later recoveries observed64 unfinished groups next
+to0 canonical groups. Independent all-group uniqueness and completed canonical
+replay recovery were not established by these observations. The older idle
+allocations were released only after driver exit0,durable progress and audit;
+Slurm CANCELLED0:0 records normal cleanup.
 
-At20:47PST checkpoint10 was durable (trainer/sampler versions10,320 consumed
-prompts). Inside the allocated container, its four optimizer shards and all505
-saved optimizer step entries10 were checked; saved learning rates2e-6 and
-scheduler last_epoch10 match the end of warmup. All first10 updates have finite
-plotted metrics, lag0, two dispatches,512 valid sequences and nonzero advantages
-and gradients. GenKL mean0.000385428, range0.000342696..0.000424718. These are
-early observations, not convergence qualification or a checkpoint/resume test.
-See results/checkpoint10-state.json and results/early-10-summary.json.
+The unchanged recipe uses local google/gemma-4-E2B-it,one8H100 debug node with
+4training/FSDP2/EP1 and4async-vLLM rollout GPUs,TP=CP1,32prompts x16responses
+=batch512,seed42,train/logprob MBS1,seq4096/gen2048,LR2e-6/FusedAdamBF16states,
+warmup10 then ConstantLR,save every10/keep2/deadline3h45,image1030.
+LA0/in_order/readiness16/buffer32; max_num_epochs1 with the original1791700-row
+loader. Preflight matched the original model/optimizer/scheduler/data/sampling/
+loss/resources against both baseline configs; only target/display name changed
+for continuation. The numerical worker remains7f598242... and parity harness
+ccb26bda... from this PR3 branch (base PR1 revision047d31a7). Newer PR1 revision
+097524718 was inspected but not rebased into this active experiment.
 
-Step12 selected all32 already-ready groups in one dispatch; first11 used two.
-This follows the unchanged sampler readiness contract. The comparison summary
-records dispatch-count frequencies and the number of multiple-dispatch updates;
-the experiment does not force two equal chunks or claim measured GPU overlap.
+The900-aware resume650_supervisor.py retains the historical runtime/lock/HOLD
+paths under slurm/resume650. It adopts existing stages, uses new900-prefixed
+launch/log files for later stages, polls30s and records10minute snapshots and
+milestone/failure notifications in this SAME conversation. One owned node at a
+time, direct attach on sequential interactive allocations, no batch training
+chain or additional baseline. On failure inspect preserved per-job logs before
+repair; on user hold/cancel create HOLD first and handle active work as requested.
+Do not clear it without user resume authorization. See RESUME900.md for details.
 
-- Model: local google/gemma-4-E2B-it, same path as both baselines.
-- One interactive debug allocation21546953, pool0-00343,8H100,4h walltime.
-  Four training GPUs/FSDP2/EP1 and four async-vLLM rollout GPUs; TP=CP1.
-  The allocation only starts Ray; launch.sh attaches and directly runs run.sh.
-  No batch training job or dependency chain was submitted.
-- Batch512=32 prompts x16 responses, train/logprob MBS1, seed42, total4096,
-  generation2048, LR2e-6, warmup10 then ConstantLR, recipe FusedAdam BF16 states.
-  Checkpoint every10 updates, optimizer/data-plane retained, deadline3h45.
-- LA0/in_order, min_groups_for_streaming_train16, buffer/inflight32. This is a
-  readiness threshold rather than a fixed chunk cap; inspect actual dispatches.
-- Same model/optimizer/scheduler/sampling/data/loss/resource/checkpoint-frequency
-  settings as both baselines checked before startup. Dataset dict-versus-list
-  representation normalized with the repository's update_single_dataset_config;
-  no training input change. Two failed preflight checks are retained under slurm;
-  no model training or W&B run was started by those checks.
-- Own W&B: https://wandb.ai/yuekaiz/nemo-rl-automodel-sc/runs/yuekaiz5090gemmala0s42
-- V1 baseline: https://wandb.ai/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/74860be5
-  (157 updates). Full-batch SC LA0 baseline:
-  https://wandb.ai/ys_fishcool-nvidia/nemo-rl-automodel-sc/runs/96779513 (164).
-  Compare their existing first150 updates using unsampled history exports.
-
-This is exploratory training evidence. Fixed-input streaming parity for this
-Gemma batch512 recipe has not been assessed. The previous Qwen BF16 1% gate
-remains FAILED; completion/finite metrics do not change numerical qualification.
-Independent rollouts, one seed and historical baselines do not isolate speedup
-or prove convergence equivalence. No online validation/accuracy is recorded.
-
-Runtime: slurm/driver.log, launcher.pid, driver-exit-code, monitor/status.json.
-Resolved config/source/model-config hashes are in results/provenance.json and
-results/resolved-config.json. Inspect existing job/driver before any restart;
-archive old native logs before resuming so all committed steps remain available.
-On failure repair in this allocation and resume the same checkpoint/W&B identity.
-Do not duplicate a live driver or act on other user jobs.
-
-The old150-only monitor is stopped. resume650_supervisor.py monitors the current
-stage and queues10minute/milestone/failure notices into the SAME current thread.
-It owns sequential debug continuation/cleanup under the650 authorization, stops
-on failures for diagnosis and respects the HOLD flag before new allocations or
-launches. See RESUME650.md; respect later user cancellation.
-
-After150, run.sh generates eight panels (reward, length, generation/policy KL,
-loss, entropy, preclip gradient norm, measured step time) with plot.py inside the
-allocated container. It validates committed-step/version/lag/finite plot coverage.
-Native histories/CSV/PNG/SVG and common1..150 statistics go under
-results/curve-comparison/. Before plotting, plot.py checks checkpoint150's saved
-optimizer/scheduler scalar state and data cursor, writing checkpoint150-state.json;
-this does not compare live per-rank raw optimizer buffers. launch.sh releases ONLY this debug allocation after
-successful training+plotting and durable checkpoint150. The allocation will then
-show CANCELLED because it was an idle interactive Ray allocation, not a failed
-training job. Confirm driver exit0,checkpoint150 and W&B finished independently.
-
-Keep the completed Qwen600 results and old900/MCore/sibling KL investigations
-separate; do not cancel/restart their jobs. Their live state may differ from old
-session notes (old900 first segment was already RUNNING when this task began).
+This remains exploratory. Gemma fixed-input streaming parity is NOT ASSESSED;
+the original Qwen BF16 1% gate remains FAILED. Finite training, scalar recovery
+checks and visual curves do not constitute numerical acceptance. Keep Qwen600,
+old900,MCore and sibling RL-pr4963 investigations separate; do not act on their
+jobs. At900 verify final saved state and W&B, regenerate/review these eight plots,
+release this experiment's node and publish on the existing branch.

@@ -1,5 +1,5 @@
 {
-  "observed_at": "2026-11-09T07:22:15.330420-08:00",
+  "observed_at": "2026-11-09T10:03:01.125567-08:00",
   "state": "RUNNING",
   "target_steps": 900,
   "job_id": 21579059,
@@ -23,7 +23,7 @@
     "SC full-batch LA0": "96779513"
   },
   "baseline_config_checks_passed": true,
-  "observed_committed_steps": 525,
+  "observed_committed_steps": 661,
   "gemma_fixed_input_streaming_parity": "NOT ASSESSED",
   "original_qwen_bf16_1pct_gate": "FAILED (unchanged)",
   "source_worker_sha256": "7f59824258aafb13f5540810776dfa18c86a623856c9c89e4c6e26881259f74d",
@@ -31,25 +31,24 @@
   "monitor_pid": 4008027,
   "launcher_pid": 470490,
   "latest_receipt": {
-    "step": 525,
-    "version": 525,
+    "step": 661,
+    "version": 661,
     "lag": "0",
     "metrics": {
-      "gen_kl_error": 0.000473203530735299,
-      "policy_kl_error": 0.0004858482698161451,
-      "grad_norm": 0.4004182815551758,
-      "lr": 2.0000000000000003e-06,
-      "weight_version_lag": 0,
-      "policy_train_dispatches": 2,
-      "reward": 0.439453125
+      "gen_kl_error": "0.0005325783606425049",
+      "policy_kl_error": "0.0010987034018640368",
+      "reward": "0.5546875",
+      "grad_norm": "16.388286590576172",
+      "policy_train_dispatches": "2",
+      "lr": "2.0000000000000003e-06"
     }
   },
   "wandb_state": "running",
-  "wandb_committed_step": 525,
+  "wandb_committed_step": 656,
   "monitor_child_pid": 4008224,
-  "durable_checkpoint_step": 524,
+  "durable_checkpoint_step": 660,
   "early_summary": "validation/pr3/gemma_e2b/results/early-10-summary.json",
-  "saved_checkpoint_audit": "validation/pr3/gemma_e2b/results/checkpoint524-state.json",
+  "saved_checkpoint_audit": "validation/pr3/gemma_e2b/results/checkpoint650-state.json",
   "initial_target_steps": 150,
   "continuation_recipe": "validation/pr3/gemma_e2b/resume900.yaml",
   "continuation_supervisor_pid": 4008027,
@@ -117,5 +116,12 @@
   "continuation_document": "validation/pr3/gemma_e2b/RESUME900.md",
   "configuration_check": "validation/pr3/gemma_e2b/results/resume900-config-check.json",
   "latest_completed_segment_summary": "validation/pr3/gemma_e2b/results/resume900-progress-524.json",
-  "active_stage_first_recovery_proof": "validation/pr3/gemma_e2b/results/resume900-first-recovery-21579059.json"
+  "active_stage_first_recovery_proof": "validation/pr3/gemma_e2b/results/resume900-first-recovery-21579059.json",
+  "latest_progress_audit": "validation/pr3/gemma_e2b/results/resume900-progress-650.json",
+  "comparison_plot_steps": 650,
+  "comparison_shared_steps": [
+    1,
+    157
+  ],
+  "comparison_plot": "validation/pr3/gemma_e2b/results/curve-comparison/comparison.png"
 }
