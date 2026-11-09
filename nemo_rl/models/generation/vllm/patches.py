@@ -157,8 +157,10 @@ def _patch_vllm_compile_cache_relative_artifacts(logger) -> None:
     file_to_patch = _get_vllm_file("compilation/compiler_interface.py")
     marker = "NeMo-RL: vllm#52142"
     old_snippet = "        path = handle[1]\n"
+    # A plain string, not an f-string: the anchor test reads it out of this source.
     new_snippet = (
-        f"        path = os.path.join(self.cache_dir, handle[0])  # {marker}\n"
+        "        path = os.path.join(self.cache_dir, handle[0])"
+        "  # NeMo-RL: vllm#52142\n"
     )
     with _locked_file_patch(file_to_patch) as (content, write_back):
         if marker in content:
