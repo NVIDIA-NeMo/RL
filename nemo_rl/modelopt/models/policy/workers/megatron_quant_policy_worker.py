@@ -538,7 +538,11 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             hf_param = task.mapping.hf_param
             names = hf_param.values() if isinstance(hf_param, dict) else (hf_param,)
             for name in names:
-                if matches_quant_ignore_pattern(name, ignore):
+                if matches_quant_ignore_pattern(
+                    name, ignore
+                ) and not matches_quant_ignore_pattern(
+                    name, plan.quantization_config["ignore"]
+                ):
                     ignored_weights.append(name)
         # Expert conversion tasks are local; reject conflicts on every rank
         # before any rank enters Bridge's export collectives.
