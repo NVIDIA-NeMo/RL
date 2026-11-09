@@ -160,5 +160,9 @@
   "final_stage_first_recovered_step": 894,
   "final_stage_preflight": "validation/pr3/gemma_e2b/results/resume900-provenance-21607787.json",
   "final_stage_first_recovery_proof": "validation/pr3/gemma_e2b/results/resume900-first-recovery-21607787.json",
-  "training_source_commit_scope": "Initial training revision; per-stage preflight commits and unchanged numerical hashes are recorded separately."
+  "training_source_commit_scope": "Initial training revision; per-stage preflight commits and unchanged numerical hashes are recorded separately.",
+  "final_slurm_state": "CANCELLED",
+  "final_slurm_exit_code": "0:9",
+  "final_slurm_derived_exit_code": "0:15",
+  "final_slurm_note": "Final accounting supersedes early0:0 snapshot; cleanup signals with separately verified driver0/checkpoint900/online900."
 }

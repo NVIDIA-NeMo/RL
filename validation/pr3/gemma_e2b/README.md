@@ -48,7 +48,9 @@ Verified runtime evidence:
 - [Online verification](results/final900-online-verification.json): all 900
   unsampled steps and ten training metrics exactly match native records.
 - [Slurm verification](results/final900-slurm-verification.json): six sequential
-  allocations, successful driver/Slurm exit codes, and no owned allocation left.
+  allocations, successful training driver exits, and no owned allocation left.
+  Final Slurm accounting for the last allocation is CANCELLED `0:9` during
+  cleanup (Ray step `0:15`), superseding the initial `0:0` snapshot.
 
 Recoveries 150→151, 340→341, 524→525, 709→710, and 893→894 preserved observed
 version, LR, and same-run logging continuity. Later runs explicitly redispatched

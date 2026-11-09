@@ -101,11 +101,14 @@ scheduler, data cursor, rollout recovery state, and the same W&B identity.
 | 21568255 | 340→524 | pool0-00671 | 0 | 0:0 |
 | 21579059 | 524→709 | pool0-01905 | 0 | 0:0 |
 | 21594351 | 709→893 | pool0-00826 | 0 | 0:0 |
-| 21607787 | 893→900 | pool0-01223 | 0 | 0:0 |
+| 21607787 | 893→900 | pool0-01223 | 0 | 0:9 |
 
 All six allocations were sequential and are absent from squeue. Slurm CANCELLED
-records the expected release of idle interactive Ray allocations after successful
-driver exits and durable progress. Direct attach was used; no batch-training
+records the release of interactive Ray allocations after successful driver exits
+and durable progress. A later accounting refresh changed the final allocation
+from the initial `0:0` snapshot to `0:9` (batch `0:9`, Ray step `.0` `0:15`); its
+steps `.1`–`.5` completed `0:0`. These cleanup signals do not replace the separately
+verified driver exit 0, checkpoint 900, or full online history. Direct attach was used; no batch-training
 chain was submitted. A bounded release gate retained the final allocation for
 read-only checks before resuming the supervisor. The final node and monitor
 have exited. No unrelated jobs were changed.

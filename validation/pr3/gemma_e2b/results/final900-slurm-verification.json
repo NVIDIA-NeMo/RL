@@ -1,5 +1,4 @@
 {
-  "verified_utc": "2026-11-09T23:12:55.667386+00:00",
   "owned_job_ids": [
     "21546953",
     "21557906",
@@ -10,7 +9,7 @@
   ],
   "all_owned_allocations_absent_from_queue": true,
   "all_driver_exit_codes_zero": true,
-  "all_slurm_exit_codes_zero": true,
+  "all_slurm_exit_codes_zero": false,
   "sequential_allocation_intervals": true,
   "jobs": [
     {
@@ -60,13 +59,59 @@
     },
     {
       "job_id": "21607787",
-      "slurm_state": "CANCELLED by 46652",
-      "slurm_exit_code": "0:0",
+      "slurm_state": "CANCELLED",
+      "slurm_exit_code": "0:9",
       "start_local": "2026-11-09T14:50:12",
       "end_local": "2026-11-09T15:08:49",
       "elapsed_seconds": 1117,
-      "node": "pool0-01223"
+      "node": "pool0-01223",
+      "slurm_derived_exit_code": "0:15",
+      "accounting_scope": "Allocation cleanup signals; successful training driver separately recorded as0."
     }
   ],
-  "note": "Slurm CANCELLED records expected release of idle Ray allocations after successful training/audits; no batch training chain."
+  "note": "Final accounting refresh: last allocation21607787 is CANCELLED0:9 (batch0:9, idle Ray step .0 cancelled0:15); steps .1-.5 completed0:0. Driver exit0, checkpoint900 and all900 online rows were independently verified before allocation release. Initial accounting snapshot recorded0:0; it is superseded by this final accounting state. No restart required.",
+  "initial_verified_utc": "2026-11-09T23:12:55.667386+00:00",
+  "verified_utc": "2026-11-09T23:22:58.019244+00:00",
+  "final_job_steps": [
+    {
+      "job_id": "21607787.batch",
+      "state": "CANCELLED",
+      "exit_code": "0:9"
+    },
+    {
+      "job_id": "21607787.extern",
+      "state": "COMPLETED",
+      "exit_code": "0:0"
+    },
+    {
+      "job_id": "21607787.0",
+      "state": "CANCELLED",
+      "exit_code": "0:15"
+    },
+    {
+      "job_id": "21607787.1",
+      "state": "COMPLETED",
+      "exit_code": "0:0"
+    },
+    {
+      "job_id": "21607787.2",
+      "state": "COMPLETED",
+      "exit_code": "0:0"
+    },
+    {
+      "job_id": "21607787.3",
+      "state": "COMPLETED",
+      "exit_code": "0:0"
+    },
+    {
+      "job_id": "21607787.4",
+      "state": "COMPLETED",
+      "exit_code": "0:0"
+    },
+    {
+      "job_id": "21607787.5",
+      "state": "COMPLETED",
+      "exit_code": "0:0"
+    }
+  ]
 }
