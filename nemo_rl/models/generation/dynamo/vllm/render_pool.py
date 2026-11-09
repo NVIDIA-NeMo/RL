@@ -194,8 +194,6 @@ class _Worker:
         )
 
     def render(self, body: dict[str, Any], *, measure: bool = False) -> RenderedCall:
-        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
-
         from nemo_rl.models.generation.vllm.chat_server import (
             NeMoRLChatCompletionRequest,
             NeMoRLMeasureChatRequest,
@@ -211,11 +209,12 @@ class _Worker:
             if chat.max_completion_tokens is not None
             else chat.max_tokens
         )
-        admission = (
-            None
-            if chat.ng_capture is None
-            else CaptureAdmission.model_validate(chat.ng_capture)
-        )
+        admission = None
+        if chat.ng_capture is not None:
+            # Deferred: only captured calls need it, and capture already imports nemo_gym.
+            from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+            admission = CaptureAdmission.model_validate(chat.ng_capture)
         rendered = self.loop.run_until_complete(
             self.online_renderer.render_for_frontend(chat, admission=admission)
         )
