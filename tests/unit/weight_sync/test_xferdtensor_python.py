@@ -58,17 +58,23 @@ class _Stream:
 
 @pytest.mark.parametrize("source_rank", [False, True])
 @pytest.mark.parametrize(
-    "src_shape,dst_shape,native_available,override,expected",
+    "src_shape,dst_shape,src_shards,dst_shards,native_available,override,expected",
     [
-        ((8,), (8,), True, None, "native"),
-        ((2, 4), (4, 2), True, None, "native"),
-        ((2, 2, 2), (2, 4), True, None, "python"),
-        ((2, 4), (2, 2, 2), True, None, "python"),
-        ((2, 2, 2), (2, 2, 2), True, None, "python"),
-        ((2, 4), (4, 2), False, None, "python"),
-        ((2, 4), (4, 2), True, "python", "python"),
-        ((2, 2, 2), (2, 4), True, "golden", "golden"),
-        ((2, 4), (4, 2), True, "both", "golden"),
+        ((8,), (8,), (), (), True, None, "native"),
+        ((2, 4), (4, 2), (), (), True, None, "native"),
+        ((2, 4), (4, 2), (0,), (1,), True, None, "native"),
+        ((2, 4), (4, 2), (0, 1), (), True, None, "python"),
+        ((2, 4), (4, 2), (), (0, 1), True, None, "python"),
+        ((2, 4), (4, 2), (0, 1), (0, 1), True, None, "python"),
+        ((2, 4), (4, 2), (0, 0), (), True, None, "python"),
+        ((2, 2, 2), (2, 4), (), (), True, None, "python"),
+        ((2, 4), (2, 2, 2), (), (), True, None, "python"),
+        ((2, 2, 2), (2, 2, 2), (), (), True, None, "python"),
+        ((2, 4), (4, 2), (), (), False, None, "python"),
+        ((2, 4), (4, 2), (), (), True, "python", "python"),
+        ((2, 2, 2), (2, 4), (), (), True, "golden", "golden"),
+        ((2, 4), (4, 2), (0, 1), (0, 1), True, "golden", "golden"),
+        ((2, 4), (4, 2), (), (), True, "both", "golden"),
     ],
 )
 def test_dispatch_selects_the_same_supported_path_on_both_endpoints(
@@ -76,6 +82,8 @@ def test_dispatch_selects_the_same_supported_path_on_both_endpoints(
     source_rank: bool,
     src_shape: tuple[int, ...],
     dst_shape: tuple[int, ...],
+    src_shards: tuple[int, ...],
+    dst_shards: tuple[int, ...],
     native_available: bool,
     override: str | None,
     expected: str,
@@ -99,10 +107,12 @@ def test_dispatch_selects_the_same_supported_path_on_both_endpoints(
     dispatcher.xferdtensor(
         tensor if source_rank else None,
         _Mesh(list(range(math.prod(src_shape))), src_shape),
-        (Replicate(),) * len(src_shape),
+        tuple(Shard(dim) for dim in src_shards)
+        + (Replicate(),) * (len(src_shape) - len(src_shards)),
         None if source_rank else tensor,
         _Mesh(list(range(math.prod(dst_shape))), dst_shape),
-        (Replicate(),) * len(dst_shape),
+        tuple(Shard(dim) for dim in dst_shards)
+        + (Replicate(),) * (len(dst_shape) - len(dst_shards)),
         _ProcessGroup(),
         _Stream(),
     )
