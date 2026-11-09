@@ -1,4 +1,4 @@
-python-version = "3.13.14"
+python-version = "3.13.18"
 search-path = [".", "../.."]
 project-includes = ["flow_grpo/**/*.py", "run_flow_grpo.py"]
 # Match core's treatment of optional libraries and untyped actor APIs.
