@@ -1,7 +1,7 @@
 # nemo_rl.data_plane
 
 Stable boundary between NeMo-RL and the underlying data-plane backend
-(currently `transfer_queue`; future: `nv-dataplane`). Every call site in
+(currently `transfer_queue`). Every call site in
 `nemo_rl/algorithms`, `nemo_rl/experience`, `nemo_rl/models` goes through
 `DataPlaneClient`. No code imports `transfer_queue` directly outside the
 adapter.
@@ -53,7 +53,7 @@ data_plane/{column_io, preshard}   ← producer/consumer helpers
 data_plane/interfaces.py           ← stable boundary (DataPlaneClient)
         │
         ▼
-data_plane/adapters/               ← TransferQueue / NoOp / future nv-dataplane
+data_plane/adapters/               ← TransferQueue / NoOp
 ```
 
 ---
@@ -463,6 +463,7 @@ data_plane:
     staging_buffer_size:  536870912    # 512 MiB/pool slot; bigger payloads register per transfer
     use_gdr: false                      # GPU-memory RDMA staging in CUDA clients
     gdr_staging_buffer_mb: 1024         # persistent MiB per active GDR client
+    gdr_keep_teacher_payload_on_gpu: true  # MOPD only, with use_gdr: teacher outputs stay on GPU until the PUT
     storage_unit_segment_size: 0       # >0: storage units on (see "Storage layout")
     num_storage_units: null            # total units; null = 2 per selected node
     storage_unit_placement: all        # all, or cluster names: [inference], [train, teacher:<name>]
@@ -646,7 +647,11 @@ rollout actor (registered via `TQPolicy.add_data_plane_snapshot_source`,
 since it builds its own client off the worker group), and logs the combined
 result under `data_plane/cluster/` instead of the driver's own, so
 `kv_first_write` is in these totals. It falls back to `data_plane/driver/` when the fan-out finds only one
-process. Measured: **~2.4 ms and ~1 kB per process per step** for 10
+process. The single controller logs the same `data_plane/cluster/` series and
+adds the processes that do its I/O: the trainer's workers and own client, the
+finalizer and advantage actors, the vLLM token-capture clients, and the PPO
+critic and OPD/MOPD teacher workers. Without these, a run with token capture and
+advantage workers reported `0.0 MB moved`. Measured: **~2.4 ms and ~1 kB per process per step** for 10
 processes, against a 6x wider view of the traffic. The fan-out is
 best-effort — a rank that cannot answer is dropped rather than failing the
 step.
@@ -884,6 +889,16 @@ into groups. In the mixed CPU-producer/GDR-receiver flow used by
 SingleController, however, each individual tensor must currently fit because
 the CPU PUT path does not create the chunk metadata required by an oversized
 GDR GET.
+
+`mooncake_cpu.gdr_keep_teacher_payload_on_gpu` only matters for MOPD with
+`use_gdr: true`; every other run ignores it. When it is on (the default), the
+MOPD teacher keeps what it writes on the GPU until the PUT: its logprobs and,
+with full-vocabulary MOPD, its hidden-state or logits payload. The PUT then
+copies them GPU to GPU into the GDR staging buffer instead of going
+GPU → CPU → GPU. The cost is teacher GPU memory: each last-stage teacher GPU
+holds its data-parallel share of one prompt group's payload until the PUT, and
+briefly about twice that while it is joined and packed. Set it to `false` to
+copy them to CPU first, as without GDR.
 
 ### Mooncake storage layout: clients vs storage units
 

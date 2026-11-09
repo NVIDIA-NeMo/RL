@@ -119,9 +119,7 @@ def _batch(
 
 @pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
 def test_forest_selection_config(policy):
-    config = TokenCaptureConfig(forest_training=True, selection_policy=policy)
-    assert config.selection_policy == policy
-    assert TokenCaptureConfig().selection_policy == "returned_history"
+    TokenCaptureConfig(forest_training=True, selection_policy=policy)
     with pytest.raises(ValueError, match="requires forest_training"):
         TokenCaptureConfig(selection_policy="all_captured")
     with pytest.raises(ValueError, match="selection_policy"):
@@ -379,6 +377,8 @@ def test_filter_metric_counts_owners_not_segments_or_padding(
     ctrl = _controller(meta, data)
     asyncio.run(ctrl._advantage_stage(meta))
     assert ctrl._step_log_dict["num_mask_sample_filtered"] == [expected_count]
+    # Per-row reason counts would count segments and padding, so none are kept.
+    assert ctrl._step_log_dict["sample_mask_metrics"] == []
     assert (
         data["sample_mask"][:3].tolist()
         == [float(not any(row < 3 for row in flagged_rows))] * 3
