@@ -303,8 +303,17 @@ def test_paired_root_append_root_append_keeps_exact_tokens(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "enabled,root_reason,expected",
+    [
+        (False, None, False),
+        (True, None, False),
+        (False, "no_prefix_match", False),
+        (True, "no_prefix_match", True),
+    ],
+)
 async def test_worker_managed_root_clears_untrusted_prefix_and_keeps_media_check(
-    monkeypatch,
+    monkeypatch, enabled, root_reason, expected
 ):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
@@ -328,7 +337,7 @@ async def test_worker_managed_root_clears_untrusted_prefix_and_keeps_media_check
     monkeypatch.setattr(
         VllmAsyncGenerationWorkerImpl,
         "_invalidate_rewritten_history",
-        False,
+        enabled,
         raising=False,
     )
     capture_media = MagicMock(return_value=None)
@@ -353,6 +362,7 @@ async def test_worker_managed_root_clears_untrusted_prefix_and_keeps_media_check
         model_call_id="b",
         mode="text",
         request_replay=replay_context(HISTORY, render_digest="b" * 64),
+        root_reason=root_reason,
     )
     request = SimpleNamespace(
         ng_capture=admission.model_dump(), required_prefix_token_ids=[999]
@@ -366,3 +376,5 @@ async def test_worker_managed_root_clears_untrusted_prefix_and_keeps_media_check
     assert capture_media.call_args.kwargs["admission"].mode == "text"
     begin.assert_called_once()
     assert begin.call_args.args[1] == [10, 11]
+    # Computed from Gym's admission, before decide_capture_input replaces it.
+    assert begin.call_args.kwargs["invalidate"] is expected

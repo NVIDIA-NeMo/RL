@@ -243,7 +243,11 @@ Batch cardinality counts logical rollouts; GRPO advantages are per logical rollo
 default `false`): a later call whose history holds assistant output that matches
 no captured call is still served, but its capture fails, which masks the
 rollout. A subagent's first call holds no assistant output and roots its segment
-as usual.
+as usual. With a compacting harness (BrowseComp `keep_rounds`,
+`simple_agent_with_compaction`) this masks every rollout that compacts, so
+enable it only for harnesses whose new roots are subagents. Masked rollouts count
+in `finalize/capture_failure_reason_rollout_failed_count`, together with other
+worker capture failures.
 
 `token_capture.forest_padding_scope: step` (Forest only; default `group`) pads
 each training batch once to the row multiple, instead of padding every
