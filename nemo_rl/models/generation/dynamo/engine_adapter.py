@@ -42,6 +42,7 @@ from dynamo.common.backend import (
     Worker,
     WorkerConfig,
 )
+from dynamo.common.backend import worker as dynamo_worker
 from dynamo.common.backend.publisher import KvEventSource
 from dynamo.llm.exceptions import InvalidArgument
 
@@ -70,6 +71,14 @@ class ServedRollout:
     finish_reason: str
     # The OpenAI completion usage; None when no new token fit.
     usage: Optional[dict[str, Any]]
+
+
+def _keep_host_logging(*args: object, **kwargs: object) -> None:
+    """Replaces Dynamo's ``configure_dynamo_logging`` (ai-dynamo/dynamo#18447).
+
+    ``Worker.run()`` calls it first, and it would replace this process's Python
+    logging: NeMo RL's root handler and level, and vLLM's handlers.
+    """
 
 
 def _annotation_value(request: GenerateRequest, prefix: str) -> Optional[str]:
@@ -193,6 +202,8 @@ def start_dynamo_endpoint(
     """
     # The Rust runtime reads these when the first Worker is constructed.
     os.environ.update(engine_env)
+    # The generation worker keeps its own logging until WorkerConfig can opt out.
+    dynamo_worker.configure_dynamo_logging = _keep_host_logging
     config = WorkerConfig(
         namespace=namespace,
         component=DYNAMO_COMPONENT,

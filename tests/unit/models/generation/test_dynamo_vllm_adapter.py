@@ -22,6 +22,7 @@ import asyncio
 import base64
 import importlib.util
 import json
+import logging
 import pickle
 from pathlib import Path
 from types import SimpleNamespace
@@ -287,6 +288,12 @@ def _start_worker_config(monkeypatch, host) -> engine_adapter.WorkerConfig:
             return None
 
     monkeypatch.setattr(engine_adapter, "Worker", _Worker)
+    # Registered so the engine's replacement of Dynamo's logging setup is undone.
+    monkeypatch.setattr(
+        engine_adapter.dynamo_worker,
+        "configure_dynamo_logging",
+        engine_adapter.dynamo_worker.configure_dynamo_logging,
+    )
     env = {
         "DYN_DISCOVERY_BACKEND": "etcd",
         "DYN_REQUEST_PLANE": "tcp",
@@ -321,6 +328,17 @@ def test_engines_register_for_rollouts_and_nemo_gym_chat(monkeypatch) -> None:
     )
     # NeMo RL's rollouts go to /v1/completions, NeMo-Gym's calls to chat.
     assert config.endpoint_types == "chat,completions"
+    # Worker.run() starts with Dynamo's logging setup, which keeps the worker's.
+    handlers = logging.getLogger().handlers[:]
+    engine_adapter.dynamo_worker.configure_dynamo_logging()
+    assert logging.getLogger().handlers == handlers
+
+
+def test_worker_run_still_calls_the_logging_setup_the_engine_replaces() -> None:
+    # Otherwise a Dynamo bump would silently take over the worker's logging again.
+    run = engine_adapter.Worker.run
+    assert run.__globals__ is vars(engine_adapter.dynamo_worker)
+    assert "configure_dynamo_logging" in run.__code__.co_names
 
 
 def test_requests_other_than_nemo_rls_are_refused() -> None:
