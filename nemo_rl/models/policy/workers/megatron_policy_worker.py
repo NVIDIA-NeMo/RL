@@ -905,9 +905,10 @@ class MegatronPolicyWorkerImpl(
         # save; Megatron-Bridge only sees msc:// URLs once MSC is enabled.
         maybe_enable_msc(weights_path, optimizer_path)
         make_empty_cache_best_effort_under_expandable_segments()
-        # Copy the trainer's persistent compile cache in the background: its
-        # kernels are first compiled at the first logprob/training step.
-        compile_cache.seed("megatron", background=True)
+        # Wait for the trainer's persistent compile cache before anything compiles
+        # (kernels are compiled during setup); kernels compiled before the copy
+        # lands miss the cache and get compiled again.
+        compile_cache.seed("megatron")
         self.is_refit_destination = is_refit_destination
         self._bulk_refit_conversion_tasks: list[Any] = []
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does

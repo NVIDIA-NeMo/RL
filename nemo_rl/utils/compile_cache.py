@@ -71,19 +71,16 @@ def env_overrides(cache_type: str) -> dict[str, str]:
     return env
 
 
-def seed(cache_type: str, background: bool = False) -> None:
+def seed(cache_type: str) -> None:
     """Copy ``cache_type``'s persistent cache onto this node once (no-op if off).
 
-    Blocking, it also waits for a copy another process on this node started. A
-    failed copy only warns (in cache_sync.sh); a missing script or variable raises.
+    Returns when the copy is done, also one another process on this node started
+    (e.g. the launcher, to overlap Ray start-up). A failed copy only warns (in
+    cache_sync.sh); a missing script or variable raises.
     """
     if local_dir() is None:
         return
-    cmd = ["bash", script(), "seed-type", cache_type]
-    if background:
-        subprocess.Popen(cmd, start_new_session=True)
-    else:
-        subprocess.run(cmd, check=True)
+    subprocess.run(["bash", script(), "seed-type", cache_type], check=True)
 
 
 def vllm_engine_dir(seed: int) -> str | None:
