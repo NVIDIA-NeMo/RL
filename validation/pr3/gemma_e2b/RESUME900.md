@@ -4,13 +4,23 @@ On2026-11-09 the user explicitly requested900 steps. This supersedes650 and150,
 including queued older monitor messages. Continue the SAME W&B run:
 https://wandb.ai/yuekaiz/nemo-rl-automodel-sc/runs/yuekaiz5090gemmala0s42.
 
-The healthy current allocation21568255 keeps its already-loaded650 target and
-its original run_resume650.sh/launch_resume650.sh/config unchanged. Its3h45
-deadline will normally save around step520 before the07:23:49PST hard limit.
-Do not interrupt or duplicate it just to change the target. The replacement
-supervisor adopts its existing launcher1864121 and per-job650 logs/exit marker.
-After normal save, driver exit0 and scalar audit, release that node and only then
-acquire the next interactive debug node, directly attaching the900 launcher.
+Allocation21568255 completed340->524 normally with its already-loaded650 target
+and unchanged run_resume650.sh/launch_resume650.sh/config. Driver exit0 and
+checkpoint524 scalar audit passed before its idle node was released: Slurm
+CANCELLED0:0 after3h45m37s is expected cleanup. All505 saved optimizer counters,
+scheduler/trainer/sampler counters524,LR2e-6 and16768 consumed prompts match;
+the saved optimizer metadata SHA matches the audit on readback.
+
+The900 supervisor then acquired ONLY stage3 interactive allocation21579059,
+pool0-01905,start07:13:19PSTNov9,end11:13:19. Its target is900 and driver_prefix
+resume900. The container/direct attachment started and actual checkpoint524
+preflight passed: only target/display name changed, saved counters and frozen
+model/config/numerical source matched. The driver is restoring the saved data
+loader and loading weights; first525/W&B continuity remain pending.
+Inspect live state/logs before acting; do not duplicate this job. W&B temporarily
+finished524 with metrics matching the native final receipt during the transition;
+this is not completion of900. See results/checkpoint524-state.json,
+resume900-progress-524.json and resume900-provenance-21579059.json.
 
 resume900.yaml inherits streaming.yaml and changes ONLY max_num_steps900 and
 the W&B display name. Keep Gemma4 E2B IT,32prompts x16responses=batch512,

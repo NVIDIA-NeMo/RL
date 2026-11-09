@@ -2,8 +2,11 @@
 
 Latest user target is900 (requested2026-11-09), superseding650/150. See
 [RESUME900.md](RESUME900.md) and live slurm/resume650/state.json. The current
-healthy650-config segment finishes normally before subsequent direct-debug
-segments use resume900.yaml; no reset of optimizer/scheduler/data/W&B identity.
+650-config segment completed524 normally and its idle node was released.
+Stage3 allocation21579059 is RUNNING on pool0-01905 and directly attached with
+resume900.yaml. Actual checkpoint524 preflight passed; first525 recovery/W&B
+continuity remain pending in this snapshot. No reset of optimizer/scheduler/data/W&B identity. Saved524 scalar
+audit is in [checkpoint524-state.json](results/checkpoint524-state.json).
 Historical650/150 snapshots below are not the new stopping point. The original
 150-step segment completed normally: driver exit0, durable checkpoint150,
 optimizer/scheduler scalar audit and eight-panel plot all verified. Its idle

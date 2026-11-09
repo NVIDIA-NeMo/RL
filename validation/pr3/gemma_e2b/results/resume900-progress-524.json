@@ -1,0 +1,28 @@
+{
+  "analyzed_inside_job": "21579059",
+  "completed_segment_job": "21568255",
+  "committed_steps": [
+    1,
+    524
+  ],
+  "all_receipt_versions_match": true,
+  "all_plotted_metrics_finite": true,
+  "all_lag_zero": true,
+  "dispatch_frequency": {
+    "2": 523,
+    "1": 1
+  },
+  "zero_gradient_steps": [],
+  "zero_advantage_steps": [],
+  "gen_kl_error": {
+    "last20_mean": 0.0004785204522901521,
+    "max": 0.0009591699464752604
+  },
+  "last20_means": {
+    "train/reward": 0.49658203125,
+    "train/mean_gen_tokens_per_sample": 1386.5654296875,
+    "train/grad_norm": 1.0445097133517265,
+    "timing/train/total_step_time": 70.0225
+  },
+  "scope": "Committed metric/receipt continuity only; not fixed-input or raw optimizer parity."
+}
