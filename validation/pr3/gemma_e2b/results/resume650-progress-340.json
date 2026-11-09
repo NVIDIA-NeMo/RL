@@ -1,0 +1,35 @@
+{
+  "analyzed_inside_job": "21568255",
+  "completed_segment_job": "21557906",
+  "committed_steps": [
+    1,
+    340
+  ],
+  "all_plotted_metrics_finite": true,
+  "all_lag_zero": true,
+  "dispatch_frequency": {
+    "2": 339,
+    "1": 1
+  },
+  "zero_gradient_steps": [],
+  "zero_advantage_steps": [],
+  "gen_kl_error": {
+    "last20_mean": 0.0004556499746402283,
+    "max": 0.0005365157940355162
+  },
+  "post300_policy_kl_largest_steps": [
+    {
+      "nemo_rl/step": 314,
+      "policy_kl_error": 0.02854057698157301
+    },
+    {
+      "nemo_rl/step": 301,
+      "policy_kl_error": 0.02847670539063541
+    },
+    {
+      "nemo_rl/step": 337,
+      "policy_kl_error": 0.0037442893081941144
+    }
+  ],
+  "scope": "Committed metrics only; not same-input or raw optimizer numerical parity."
+}

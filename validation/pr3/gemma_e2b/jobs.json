@@ -1,10 +1,10 @@
 {
-  "observed_at": "2026-11-08T23:45:47.097847-08:00",
+  "observed_at": "2026-11-09T03:27:11.405564-08:00",
   "state": "RUNNING",
   "target_steps": 650,
-  "job_id": 21557906,
+  "job_id": 21568255,
   "partition": "interactive",
-  "node": "pool0-00941",
+  "node": "pool0-00671",
   "image": "containers/nemo_rl.1030.sqsh",
   "launch_type": "direct attach into an interactive debug allocation; no batch training job",
   "nodes": 1,
@@ -23,32 +23,32 @@
     "SC full-batch LA0": "96779513"
   },
   "baseline_config_checks_passed": true,
-  "observed_committed_steps": 153,
+  "observed_committed_steps": 340,
   "gemma_fixed_input_streaming_parity": "NOT ASSESSED",
   "original_qwen_bf16_1pct_gate": "FAILED (unchanged)",
   "source_worker_sha256": "7f59824258aafb13f5540810776dfa18c86a623856c9c89e4c6e26881259f74d",
   "training_source_commit": "8b9fae1fd0964809e06f632419f98d0aa60e514d",
   "monitor_pid": 1802685,
-  "launcher_pid": 3137445,
+  "launcher_pid": 1864121,
   "latest_receipt": {
-    "step": 153,
-    "version": 153,
+    "step": 340,
+    "version": 340,
     "lag": "0",
     "metrics": {
-      "gen_kl_error": "0.0004789971104978191",
-      "policy_kl_error": "0.0004941825806874367",
-      "reward": "0.45703125",
-      "grad_norm": "0.50422203540802",
+      "gen_kl_error": "0.00040019337881086063",
+      "policy_kl_error": "0.0007062922380355451",
+      "grad_norm": "0.5857862234115601",
+      "lr": "2.0000000000000003e-06",
       "policy_train_dispatches": "2",
-      "lr": "2.0000000000000003e-06"
+      "reward": "0.63671875"
     }
   },
-  "wandb_state": "running",
-  "wandb_committed_step": 151,
+  "wandb_state": "finished",
+  "wandb_committed_step": 340,
   "monitor_child_pid": 1802724,
-  "durable_checkpoint_step": 150,
+  "durable_checkpoint_step": 340,
   "early_summary": "validation/pr3/gemma_e2b/results/early-10-summary.json",
-  "saved_checkpoint_audit": "validation/pr3/gemma_e2b/results/checkpoint150-state.json",
+  "saved_checkpoint_audit": "validation/pr3/gemma_e2b/results/checkpoint340-state.json",
   "initial_target_steps": 150,
   "continuation_recipe": "validation/pr3/gemma_e2b/resume650.yaml",
   "continuation_supervisor_pid": 1802685,
@@ -69,5 +69,28 @@
     "slurm_state": "CANCELLED",
     "slurm_exit_code": "0:0",
     "reason": "Normal release of idle interactive allocation after training, audit and plotting."
-  }
+  },
+  "continuation_stages": [
+    {
+      "job_id": "21557906",
+      "index": 1,
+      "resume_from": 150,
+      "phase": "COMPLETED",
+      "launcher_pid": 3137445,
+      "first_resumed_step": 151,
+      "driver_exit": "0",
+      "durable_checkpoint": 340
+    },
+    {
+      "job_id": "21568255",
+      "index": 2,
+      "resume_from": 340,
+      "phase": "RUNNING_DRIVER",
+      "launcher_pid": 1864121
+    }
+  ],
+  "wandb_transition_note": "Previous segment finished340; same-run stage2 SDK resume/first341 pending.",
+  "active_stage_resume_from": 340,
+  "active_stage_first_recovered_step": null,
+  "active_stage_preflight": "validation/pr3/gemma_e2b/results/resume650-provenance-21568255.json"
 }

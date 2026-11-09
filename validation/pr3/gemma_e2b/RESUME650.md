@@ -9,11 +9,19 @@ exit0, then released its idle node normally at23:31PST on2026-11-08. Saved state
 audit found trainer/sampler/optimizer counters150, scheduler last_epoch150,
 LR2e-6 and4800 consumed prompts. The supervisor waited for its terminal state
 and removal from squeue before requesting continuation allocation21557906.
-That allocation is RUNNING on pool0-00941, directly attached to checkpoint150;
-preflight and the same W&B resume passed. First recovered update151 committed
+That allocation completed150->340 on pool0-00941 with driver exit0 and was
+released normally after3h45. Preflight and the same W&B resume passed. First recovered update151 committed
 with trainer_v151,lag0,two dispatches,nonzero advantages/gradient and LR2e-6;
 the same W&B run's151 metrics independently matched the native receipt exactly.
 See results/resume650-first-recovery-21557906.json.
+Checkpoint340's four optimizer shards/all505 counters340, scheduler last_epoch340,
+LR2e-6 and10880 consumed prompts were audited before release. The stored optimizer
+metadata hash still matches the audit. W&B finished this segment at340 with metrics
+matching the final native receipt; a finished segment is not completion of650.
+The supervisor then acquired21568255 on pool0-00671, starting03:23:49PSTNov9.
+Its container is ready and direct attachment has started. Checkpoint340 preflight
+passed with unchanged model/config/numerical source and the same W&B identity;
+first recovered341/W&B continuity remain to be verified.
 Read the live state.json/native log before acting; this snapshot
 does not establish completion of650.
 
@@ -67,8 +75,8 @@ new allocation and launch. Do not remove it without a later user resume request.
 
 At650, plot.py --max-step650 merges original/continuation committed receipts,
 checks contiguous versions and lag0, audits checkpoint650 (expected20800
-consumed prompts) and generates the same8panels. The default remains150 so the
-still-running original post-hook works unchanged. Both actual baseline histories
+consumed prompts) and generates the same8panels. The default remains150 for the
+original first-segment post-hook. Both actual baseline histories
 are retained: V174860be5 ends157, fullSC96779513 ends164. Shared statistics stop
 at157 if those histories remain unchanged; absent baseline values are not
 extrapolated and the unshared region is shaded. No new baseline training and no

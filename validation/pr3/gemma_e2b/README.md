@@ -6,8 +6,8 @@ optimizer/scheduler scalar audit and eight-panel plot all verified. Its idle
 interactive allocation21546953 was released at23:31PST on2026-11-08; Slurm
 CANCELLED0:0 records this expected cleanup, not a training failure.
 
-Continuation allocation21557906 is RUNNING on pool0-00941, directly attached
-after the original node was released. Preflight passed from checkpoint150:
+Continuation allocation21557906 completed150->340 on pool0-00941 with driver
+exit0, then released its node normally. Preflight passed from checkpoint150:
 4800 consumed prompts, trainer/sampler versions150, unchanged numerical source
 and model hashes, and only the target/display name changed. The driver restored
 the data loader, weights, native TQ and replay metadata, and resumed the SAME
@@ -15,6 +15,13 @@ W&B identity. First recovered update151 committed with trainer_v151,lag0,
 two dispatches, nonzero advantages/gradient and LR2e-6. The W&B API independently
 matched the native selected metrics at151 exactly; see
 [recovery evidence](results/resume650-first-recovery-21557906.json).
+The [checkpoint340 audit](results/checkpoint340-state.json) confirms all505 saved
+optimizer counters340, scheduler last_epoch340, LR2e-6 and10880 consumed prompts;
+the optimizer metadata hash matches. W&B matched the native final340 receipt.
+Next interactive allocation21568255 is RUNNING on pool0-00671 from03:23:49PSTNov9.
+Direct attachment and checkpoint340 preflight passed with unchanged configuration
+and numerical source; first recovered341/W&B continuity are pending in this
+snapshot. The supervisor acquired it after the previous node had been released.
 See [RESUME650.md](RESUME650.md) and live
 slurm/resume650/state.json;650 has not completed.
 
