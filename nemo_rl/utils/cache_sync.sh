@@ -146,13 +146,15 @@ seed_type() {
 }
 
 # Merge each vLLM engine's own folder into <local>/vllm/vllm. Settled files only,
-# and without their times, so the next write-back sees them as new.
+# and without their times, so the next write-back sees them as new. FlashInfer's
+# autotune results stay out: an engine whose ranks start from them can stop
+# agreeing on which tuning steps to run, and its startup hangs.
 merge_vllm_engines() {
   local root="$1" engine list
   for engine in "${root}"/vllm_engines/*/; do
     [[ -d "${engine}" ]] || continue
     list="$(mktemp)"
-    (cd "${engine}" && find . -type f -mmin "+$(min_age)") >"${list}"
+    (cd "${engine}" && find . -type f -mmin "+$(min_age)" -not -path "./flashinfer_autotune_cache/*") >"${list}"
     if [[ -s "${list}" ]]; then
       mkdir -p "${root}/vllm/vllm"
       rsync -rl --ignore-existing --files-from="${list}" "${engine}" "${root}/vllm/vllm/"

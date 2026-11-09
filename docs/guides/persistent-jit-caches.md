@@ -41,6 +41,8 @@ Not covered: the DTensor/Automodel trainer, SGLang, and kernels compiled in the 
 
 The cache only helps a job that compiles the same thing: same model, parallelism, `max_model_len`, batch and CUDA graph sizes, GPU type, container image and vLLM version. Anything else compiles as usual; the compilers key their files by these inputs, so a job never uses a wrong entry.
 
+Runtime tuning results are not cached. FlashInfer's MoE autotune results (`flashinfer_autotune_cache` in each engine's folder) are never published or copied into an engine: all ranks of an engine must run the same tuning steps, and an engine whose ranks start from earlier results can hang at startup. The engines tune again in every job.
+
 ## How it behaves
 
 - Files on the shared folder are never replaced or deleted, only added. A file appears there whole or not at all (written under a temporary name, then renamed).
