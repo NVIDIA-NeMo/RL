@@ -1226,6 +1226,7 @@ class MegatronGenerationMixin:
         )
 
         return SamplingParams(
+            stop_token_ids=self.cfg["generation"]["stop_token_ids"],
             temperature=self.cfg["generation"]["temperature"] if not greedy else 0,
             top_k=top_k_val,
             top_p=top_p_val,
