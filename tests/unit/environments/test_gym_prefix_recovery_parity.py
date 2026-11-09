@@ -238,22 +238,36 @@ def test_prefix_completion_retires_old_keys() -> None:
     assert _HELPER._assert_prefix_boundary(selection, log, _trained_records(12)) == {
         ("g", 0): 2
     }
+    trained = [{"staging_sample_ids": ["prefix-base", "prefix-routes"], "rows": []}]
     _HELPER._assert_retired_prefix_keys(
-        selection, [{"staging_sample_ids": ["new-active-key"], "rows": []}]
+        selection, trained, [{"epoch": 1, "staging_sample_ids": ["new-active-key"]}]
     )
 
 
-def test_restored_prefix_keys_must_not_be_live_when_training_begins() -> None:
+@pytest.mark.parametrize(
+    ("live_at_training", "live_after_flush", "match"),
+    [
+        # Deleted at the terminal write, before any snapshot could.
+        ([], [], "deleted before any snapshot"),
+        (["prefix-base"], None, "took no snapshot"),
+        (["prefix-base"], ["prefix-base"], "outlived the next snapshot"),
+    ],
+)
+def test_restored_prefix_keys_are_deleted_by_the_next_snapshot(
+    live_at_training, live_after_flush, match
+) -> None:
     selection = {
         "cuts": [{"model_call_id": "source-call", "staging_keys": ["prefix-base"]}]
     }
+    trained = [{"staging_sample_ids": live_at_training, "rows": []}]
+    flushes = (
+        []
+        if live_after_flush is None
+        else [{"epoch": 1, "staging_sample_ids": live_after_flush}]
+    )
 
-    _HELPER._assert_retired_prefix_keys(selection, [])
-
-    with pytest.raises(AssertionError, match="still live when training began"):
-        _HELPER._assert_retired_prefix_keys(
-            selection, [{"staging_sample_ids": ["prefix-base"], "rows": []}]
-        )
+    with pytest.raises(AssertionError, match=match):
+        _HELPER._assert_retired_prefix_keys(selection, trained, flushes)
 
 
 @pytest.mark.parametrize(

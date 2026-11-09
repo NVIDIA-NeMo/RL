@@ -28,9 +28,11 @@ prove that a restored episode returns to the same Gym instance under
 wording.
 
 When ``SC_PREFIX_RECOVERY_STAGING_KEYS`` is set, the hook also records the live
-token-capture staging keys before each training chunk, so a prefix-recovery run
-can prove restored prefix rows were retired before training. The trained rows
-themselves come from ``async_rl.log_full_train_data``.
+token-capture staging keys before each training chunk, and with
+``SC_PREFIX_RECOVERY_FLUSH_KEYS`` right after each snapshot's delete of ended
+calls' generation chunk rows. A prefix-recovery run can then prove restored
+prefix rows are retired at their terminal write and deleted by the next
+snapshot. The trained rows themselves come from ``async_rl.log_full_train_data``.
 """
 
 from __future__ import annotations
@@ -86,6 +88,37 @@ class _StagingKeyProbe:
             }
             stream.write(json.dumps(record) + "\n")
         return self._delegate.train_microbatches_from_meta(meta, *args, **kwargs)
+
+
+class _FlushKeyProbe:
+    """Test-only generation wrapper that records live staging keys after each flush."""
+
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        dp_client: Any,
+        output_path: Path,
+        partition: str,
+    ) -> None:
+        self._delegate = delegate
+        self._dp_client = dp_client
+        self._output_path = output_path
+        self._partition = partition
+
+    def __getattr__(self, name: str) -> Any:
+        delegate = self.__dict__.get("_delegate")
+        if delegate is None:
+            raise AttributeError(name)
+        return getattr(delegate, name)
+
+    def flush_obsolete_generation_cut_rows(self, epoch: int, **kwargs: Any) -> Any:
+        result = self._delegate.flush_obsolete_generation_cut_rows(epoch, **kwargs)
+        keys = self._dp_client.list_sample_ids(partition_id=self._partition)
+        with self._output_path.open("a") as stream:
+            record = {"epoch": epoch, "staging_sample_ids": sorted(keys)}
+            stream.write(json.dumps(record) + "\n")
+        return result
 
 
 class _InstrumentedNemoGymRolloutImpl:
@@ -312,6 +345,14 @@ def _setup_with_gym_recovery_hook(*args: Any, **kwargs: Any) -> Any:
             actor_args.trainer_handle,
             output_path=Path(staging_keys_path),
             initial_train_step=int(actor_args.save_state.current_step),
+            partition=master_config.token_capture.staging_partition,
+        )
+    flush_keys_path = os.environ.get("SC_PREFIX_RECOVERY_FLUSH_KEYS")
+    if flush_keys_path is not None:
+        actor_args.gen_handle = _FlushKeyProbe(
+            actor_args.gen_handle,
+            dp_client=actor_args.dp_client,
+            output_path=Path(flush_keys_path),
             partition=master_config.token_capture.staging_partition,
         )
     return actor_args, timing_metrics

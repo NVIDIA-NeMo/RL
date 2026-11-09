@@ -27,6 +27,7 @@ BASELINE_LOG_DIR=$TEST_DIR/baseline-logs
 PHASE1_LOG_DIR=$TEST_DIR/phase1-logs
 RECOVERY_LOG_DIR=$TEST_DIR/recovery-logs
 RECOVERY_STAGING_KEYS=$TEST_DIR/recovery-staging-keys.jsonl
+RECOVERY_FLUSH_KEYS=$TEST_DIR/recovery-flush-keys.jsonl
 PHASE2_METRICS=$TEST_DIR/phase2-metrics.json
 SELECTION_FILE=$TEST_DIR/selected-snapshot.json
 SELECTED_BACKUP=$TEST_DIR/selected-snapshot
@@ -52,6 +53,10 @@ PHASE2_SNAPSHOT_INTERVAL_S=${SC_PREFIX_RECOVERY_PHASE2_INTERVAL_S:-600}
 SNAPSHOT_TIMEOUT_S=${SC_PREFIX_RECOVERY_TIMEOUT_S:-2400}
 PHASE2_TIMEOUT_S=${SC_PREFIX_RECOVERY_PHASE2_TIMEOUT_S:-2400}
 MAX_STEPS=${SC_PREFIX_RECOVERY_MAX_STEPS:-1}
+# Phase two trains one step past the reference, so the snapshot after its last
+# compared step deletes the restored calls' retired prefix rows while the run
+# is still alive to record it.
+PHASE2_STEPS=$((MAX_STEPS + 1))
 TRAIN_GLOBAL_BATCH_SIZE=$((NUM_PROMPTS * NUM_GENERATIONS))
 # Gym refuses dispatches that land during a checkpoint and those rollouts start
 # later, so require a recoverable prefix in every Workplace prompt group rather
@@ -145,6 +150,9 @@ COMMON_OVERRIDES=(
     ++rollout_checkpointing.snapshot_attempt_interval_s="$SNAPSHOT_INTERVAL_S"
     ++rollout_checkpointing.keep_latest_k=16
     ++rollout_checkpointing.restore_mode=latest
+    # Phase two trains one step longer than phase one (PHASE2_STEPS); the step
+    # count only decides when the run stops, so restore must accept it.
+    '++rollout_checkpointing.extra_fingerprint_excluded_paths=[grpo.max_num_steps]'
     async_rl.sampler.name=in_order
     async_rl.sampler.max_lookahead_versions=0
     async_rl.min_groups_for_streaming_train="$NUM_PROMPTS"
@@ -245,15 +253,18 @@ for index in "${!COMMON_OVERRIDES[@]}"; do
 done
 
 echo "=== Phase 2: restore the prefix and generate its remaining suffix ==="
+: > "$RECOVERY_FLUSH_KEYS"
 timeout --signal=TERM --kill-after=30s "${PHASE2_TIMEOUT_S}s" \
     env \
         SC_TEST_ENTRYPOINT="$RECOVERY_HOOK" \
         SC_TEST_CONFIG="$TEST_CONFIG" \
         SC_GYM_RECOVERY_TEST_EVENTS="$PHASE2_EVENTS" \
         SC_PREFIX_RECOVERY_STAGING_KEYS="$RECOVERY_STAGING_KEYS" \
+        SC_PREFIX_RECOVERY_FLUSH_KEYS="$RECOVERY_FLUSH_KEYS" \
         RUN_CONVERGENCE_CHECKS=0 \
     bash "$BASE_TEST" \
         "${COMMON_OVERRIDES[@]}" \
+        grpo.max_num_steps="$PHASE2_STEPS" \
         logger.log_dir="$RECOVERY_LOG_DIR" \
         "$@"
 cp "$BASE_RUN_LOG" "$PHASE2_LOG"
@@ -262,7 +273,7 @@ grep -Fq "Selected rollout recovery snapshot: $SNAPSHOT_DIR" "$PHASE2_LOG"
 grep -q "Native TQ checkpoint restored and validated" "$PHASE2_LOG"
 grep -q "Loaded .* unfinished rollout group(s)" "$PHASE2_LOG"
 grep -q "generation prefix restored:" "$PHASE2_LOG"
-grep -q "train step $MAX_STEPS/$MAX_STEPS" "$PHASE2_LOG"
+grep -q "train step $PHASE2_STEPS/$PHASE2_STEPS" "$PHASE2_LOG"
 
 uv run --directory "$PROJECT_ROOT" --no-sync tests/json_dump_tb_logs.py \
     "$RECOVERY_LOG_DIR" \
@@ -276,13 +287,14 @@ uv run --directory "$PROJECT_ROOT" --no-sync python "$SNAPSHOT_HELPER" verify-re
     "$PHASE1_EVENTS" \
     "$PHASE2_EVENTS" \
     "$PHASE2_LOG" \
-    "$CHECKPOINT_DIR/step_$MAX_STEPS/training_info.json" \
-    "$MAX_STEPS"
+    "$CHECKPOINT_DIR/step_$PHASE2_STEPS/training_info.json" \
+    "$PHASE2_STEPS"
 
 uv run --directory "$PROJECT_ROOT" --no-sync python "$PARITY_HELPER" \
     --baseline-log-dir "$BASELINE_LOG_DIR" \
     --recovery-log-dir "$RECOVERY_LOG_DIR" \
     --recovery-staging-keys "$RECOVERY_STAGING_KEYS" \
+    --recovery-flush-keys "$RECOVERY_FLUSH_KEYS" \
     --selection "$SELECTION_FILE" \
     --recovery-log "$PHASE2_LOG" \
     --steps "$MAX_STEPS" \

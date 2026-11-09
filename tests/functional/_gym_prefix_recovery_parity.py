@@ -369,8 +369,13 @@ def _assert_prefix_boundary(
 def _assert_retired_prefix_keys(
     selection: Mapping[str, Any],
     recovery_records: Sequence[Mapping[str, Any]],
+    flush_records: Sequence[Mapping[str, Any]],
 ) -> None:
-    """Require old prefix rows to be absent from every batch the trainer consumed."""
+    """Require old prefix rows to outlive training only until the next snapshot.
+
+    A restored call's terminal write only retires its prefix rows, because a
+    snapshot in progress may still name them; the next snapshot deletes them.
+    """
 
     old_keys: set[str] = set()
     for cut in selection["cuts"]:
@@ -380,13 +385,20 @@ def _assert_retired_prefix_keys(
                 f"restored prefix {cut['model_call_id']!r} has no staging keys"
             )
         old_keys |= keys
-    for batch in recovery_records:
-        leaked = old_keys.intersection(batch.get("staging_sample_ids", []))
-        if leaked:
-            raise AssertionError(
-                "restored prefix rows were still live when training began: "
-                f"{sorted(leaked)!r}"
-            )
+    # No snapshot runs between the restore and the first training step.
+    missing = old_keys.difference(recovery_records[0].get("staging_sample_ids", []))
+    if missing:
+        raise AssertionError(
+            "restored prefix rows were deleted before any snapshot: "
+            f"{sorted(missing)!r}"
+        )
+    if not flush_records:
+        raise AssertionError("phase two took no snapshot after training")
+    leaked = old_keys.intersection(flush_records[0]["staging_sample_ids"])
+    if leaked:
+        raise AssertionError(
+            f"restored prefix rows outlived the next snapshot: {sorted(leaked)!r}"
+        )
 
 
 def _closing_prefix_sha256(
@@ -524,9 +536,15 @@ def _assert_generation_logprob_agreement(
 
 def compare(args: argparse.Namespace) -> None:
     baseline_records = load_training_records(args.baseline_log_dir)
-    recovery_records = load_training_records(
-        args.recovery_log_dir, staging_keys=args.recovery_staging_keys
-    )
+    # Phase two trains past the reference so a snapshot follows the restored
+    # calls; only the reference's steps are compared.
+    recovery_records = [
+        record
+        for record in load_training_records(
+            args.recovery_log_dir, staging_keys=args.recovery_staging_keys
+        )
+        if record["train_step"] <= args.steps
+    ]
     selection = read_json(args.selection)
 
     recovery_log = args.recovery_log.read_text()
@@ -569,7 +587,9 @@ def compare(args: argparse.Namespace) -> None:
         max_abs_diff=args.logprob_max_abs_diff,
     )
     # _rows_diverged_before_cut already ran _assert_prefix_boundary.
-    _assert_retired_prefix_keys(selection, recovery_records)
+    _assert_retired_prefix_keys(
+        selection, recovery_records, read_jsonl(args.recovery_flush_keys)
+    )
     print(
         "validated uninterrupted-vs-prefix-recovery parity: "
         f"rows={args.steps * args.prompts_per_step * args.generations_per_prompt}",
@@ -582,6 +602,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--baseline-log-dir", type=Path, required=True)
     parser.add_argument("--recovery-log-dir", type=Path, required=True)
     parser.add_argument("--recovery-staging-keys", type=Path, required=True)
+    parser.add_argument("--recovery-flush-keys", type=Path, required=True)
     parser.add_argument("--selection", type=Path, required=True)
     parser.add_argument("--recovery-log", type=Path, required=True)
     parser.add_argument("--steps", type=int, required=True)
