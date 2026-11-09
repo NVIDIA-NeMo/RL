@@ -19,6 +19,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from torchdata.stateful_dataloader import StatefulDataLoader
+from transformers import PretrainedConfig
 
 import nemo_rl.algorithms.distillation as distil_mod
 from nemo_rl.algorithms.distillation import (
@@ -64,7 +65,7 @@ def mock_components():
     # This makes NEED_REFIT = False, so refit_policy_generation won't be called
     student_generation = None
 
-    # Create a proper message log structure with token_ids (similar to SFT)
+    # Simulate a completed rollout, including logprobs on its generated turn.
     # Use BatchedDataDict instead of regular dict to support repeat_interleave
     mock_batch = BatchedDataDict[DatumSpec](
         {
@@ -79,6 +80,7 @@ def mock_components():
                         "token_ids": torch.tensor([4, 5, 6]),
                         "role": "assistant",
                         "content": "The answer is 2.",
+                        "generation_logprobs": torch.zeros(3),
                     },
                 ]
             ],
@@ -394,6 +396,89 @@ def test_distillation_train_uses_nemo_gym_rollout_when_enabled(mock_components):
     ]
     assert train_metric_calls
     assert train_metric_calls[-1].args[0]["mean_gen_tokens_per_sample"] == 3.0
+
+
+@pytest.mark.parametrize("rollout_mode", ["sync", "async", "nemo_gym"])
+def test_distillation_excludes_prompt_history_from_loss_masks(
+    mock_components: dict, monkeypatch: pytest.MonkeyPatch, rollout_mode: str
+) -> None:
+    """Train and teacher inference see only generated assistant tokens as targets."""
+    config = mock_components["master_config"]
+    config.distillation.max_num_steps = 1
+    config.distillation.max_num_epochs = 1
+    config.distillation.val_period = 0
+    config.distillation.max_rollout_turns = 2
+    config.env["should_use_nemo_gym"] = rollout_mode == "nemo_gym"
+    config.policy["generation"].update(
+        backend="vllm",
+        vllm_cfg={"async_engine": rollout_mode != "sync", "expose_http_server": True},
+    )
+    batch = next(iter(mock_components["train_dataloader"]))
+    messages = batch["message_log"][0]
+    messages[1:1] = [
+        {
+            "role": "assistant",
+            "content": "history",
+            "token_ids": torch.ones(100, dtype=torch.long),
+        },
+        {
+            "role": "user",
+            "content": "follow-up",
+            "token_ids": torch.ones(5, dtype=torch.long),
+        },
+    ]
+    messages[-1]["token_ids"] = torch.ones(15, dtype=torch.long)
+    messages[-1]["generation_logprobs"] = torch.zeros(15)
+    messages.extend(
+        [
+            {
+                "role": "tool",
+                "content": "result",
+                "token_ids": torch.ones(2, dtype=torch.long),
+            },
+            {
+                "role": "assistant",
+                "content": "final",
+                "token_ids": torch.ones(10, dtype=torch.long),
+                "generation_logprobs": torch.zeros(10),
+            },
+        ]
+    )
+    runner_name = {
+        "sync": "run_multi_turn_rollout",
+        "async": "run_async_multi_turn_rollout",
+        "nemo_gym": "run_nemo_gym_rollout_sync",
+    }[rollout_mode]
+    rollout_result = (
+        SimpleNamespace(
+            final_batch=batch, rollout_metrics={"mean_gen_tokens_per_sample": 25.0}
+        )
+        if rollout_mode == "nemo_gym"
+        else (batch, {"mean_gen_tokens_per_sample": 25.0})
+    )
+    runner = MagicMock(return_value=rollout_result)
+    monkeypatch.setattr(distil_mod, runner_name, runner)
+    distillation_train(
+        mock_components["student_policy"],
+        mock_components["teacher_policy"],
+        mock_components["student_generation"],
+        mock_components["train_dataloader"],
+        mock_components["val_dataloader"],
+        mock_components["tokenizer"],
+        mock_components["loss_fn"],
+        mock_components["task_to_env"],
+        mock_components["val_task_to_env"],
+        mock_components["logger"],
+        mock_components["checkpointer"],
+        _initial_distillation_save_state(),
+        config,
+    )
+    runner.assert_called_once()
+    expected = torch.tensor([[0] * 108 + [1] * 15 + [0] * 2 + [1] * 10 + [0]])
+    train_data = mock_components["student_policy"].train.call_args.args[0]
+    teacher_data = mock_components["teacher_policy"].get_topk_logits.call_args.args[0]
+    torch.testing.assert_close(train_data["token_mask"], expected)
+    torch.testing.assert_close(teacher_data["token_mask"], expected)
 
 
 def test_exit_on_timeout(mock_components, capsys, tmp_path):
@@ -763,7 +848,11 @@ def test_validate_works_without_logger(mock_components):
     assert "avg_length" in val_metrics
 
 
-def test_check_vocab_equality_pass(monkeypatch):
+@pytest.mark.parametrize("student_composite", [False, True])
+@pytest.mark.parametrize("teacher_composite", [False, True])
+def test_check_vocab_equality_pass(
+    monkeypatch, student_composite: bool, teacher_composite: bool
+):
     student_tokenizer = MagicMock()
     student_tokenizer.get_vocab.return_value = {"a": 0, "b": 1}
     student_tokenizer.__len__.return_value = 2
@@ -772,10 +861,12 @@ def test_check_vocab_equality_pass(monkeypatch):
     teacher_tokenizer.get_vocab.return_value = {"a": 0, "b": 1}
     teacher_tokenizer.__len__.return_value = 2
 
-    student_config = MagicMock()
-    student_config.vocab_size = 2
-    teacher_config = MagicMock()
-    teacher_config.vocab_size = 2
+    student_config = PretrainedConfig(vocab_size=2)
+    teacher_config = PretrainedConfig(vocab_size=2)
+    if student_composite:
+        student_config = PretrainedConfig(text_config=student_config)
+    if teacher_composite:
+        teacher_config = PretrainedConfig(text_config=teacher_config)
 
     monkeypatch.setattr(
         distil_mod.AutoTokenizer,
@@ -852,7 +943,11 @@ def test_check_vocab_equality_length_mismatch_raises(monkeypatch):
         check_vocab_equality(student_tokenizer, "student-model", "teacher-model")
 
 
-def test_check_vocab_equality_config_vocab_size_mismatch_raises(monkeypatch):
+@pytest.mark.parametrize("student_composite", [False, True])
+@pytest.mark.parametrize("teacher_composite", [False, True])
+def test_check_vocab_equality_config_vocab_size_mismatch_raises(
+    monkeypatch, student_composite: bool, teacher_composite: bool
+):
     vocab = {"a": 0, "b": 1}
     student_tokenizer = MagicMock()
     student_tokenizer.get_vocab.return_value = vocab
@@ -862,10 +957,12 @@ def test_check_vocab_equality_config_vocab_size_mismatch_raises(monkeypatch):
     teacher_tokenizer.get_vocab.return_value = vocab
     teacher_tokenizer.__len__.return_value = 2
 
-    student_config = MagicMock()
-    student_config.vocab_size = 2
-    teacher_config = MagicMock()
-    teacher_config.vocab_size = 3
+    student_config = PretrainedConfig(vocab_size=2)
+    teacher_config = PretrainedConfig(vocab_size=3)
+    if student_composite:
+        student_config = PretrainedConfig(text_config=student_config)
+    if teacher_composite:
+        teacher_config = PretrainedConfig(text_config=teacher_config)
 
     monkeypatch.setattr(
         distil_mod.AutoTokenizer,
@@ -1116,7 +1213,7 @@ def test_distillation_setup_non_colocated_smoke(
         def __init__(self, *args, **kwargs):
             pass
 
-        def prepare_refit_info(self, *, refit_payload_mode):
+        def prepare_refit_info(self):
             return {}
 
         def offload_after_refit(self):
@@ -1138,9 +1235,6 @@ def test_distillation_setup_non_colocated_smoke(
 
         def prepare_refit_info(self, *args, **kwargs):
             return None
-
-        def get_refit_payload_mode(self):
-            return "hf_export"
 
         def init_collective(self, *args, **kwargs):
             self.collective_calls.append((args, kwargs))
@@ -1271,7 +1365,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         def offload_after_refit(self):
             return None
 
-        def prepare_refit_info(self, *, refit_payload_mode):
+        def prepare_refit_info(self):
             return {}
 
     class DummyVllmGeneration:
@@ -1298,14 +1392,11 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         def prepare_refit_info(self, *args, **kwargs):
             self.prepare_refit_info_called = True
 
-        def get_refit_payload_mode(self):
-            return "hf_export"
-
     nemo_gym_actor = MagicMock()
 
     with (
         patch.object(distil_mod, "RayVirtualCluster", DummyCluster),
-        patch.object(distil_mod, "Logger"),
+        patch.object(distil_mod, "Logger") as mock_logger_cls,
         patch.object(distil_mod, "CheckpointManager") as mock_ckpt_mgr,
         patch.object(distil_mod, "StatefulDataLoader"),
         patch.object(distil_mod, "Policy", DummyPolicy),
@@ -1315,6 +1406,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         ) as mock_spinup_nemo_gym,
         patch.object(distil_mod, "ray") as mock_ray,
     ):
+        mock_logger_cls.return_value.base_log_dir = "/tmp/distillation-test-logs"
         mock_ckpt_mgr.return_value.get_latest_checkpoint_path.return_value = None
         mock_ckpt_mgr.return_value.get_resume_paths.return_value = (None, None)
         mock_ray.get_runtime_context.return_value.get_node_id.return_value = "a" * 56
@@ -1350,8 +1442,14 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         enable_router_replay=False,
         use_fastokens=False,
         policy_api_key="k",
+        turn_checkpointing_enabled=False,
     )
-    assert master_config.env["nemo_gym"] == nemo_gym_env_before
+    # Building the actor leaves the configured keys alone. setup() adds only the
+    # Gym log dir, under this run's log dir.
+    assert master_config.env["nemo_gym"] == {
+        **nemo_gym_env_before,
+        "nemo_gym_log_dir": "/tmp/distillation-test-logs/nemo_gym",
+    }
 
 
 def test_nemo_gym_distillation_runner_uses_setup_actor():

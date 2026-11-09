@@ -18,7 +18,7 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, create_autospec, patch
+from unittest.mock import MagicMock, call, create_autospec, patch
 
 import pytest
 
@@ -87,13 +87,16 @@ def _valid_setup_config(
         "val_period": 0,
         "val_at_start": False,
         "val_at_end": False,
+        "defer_async_checkpoint_finalize": False,
     }
     sft.update(sft_overrides or {})
     data = {
         "backend": "energon",
         "validation": None,
         "max_input_seq_length": 128,
-        "energon": SimpleNamespace(task_encoder=SimpleNamespace(packing=None)),
+        "energon": SimpleNamespace(
+            task_encoder=SimpleNamespace(packing=None), topology_mapper="default"
+        ),
     }
     data.update(data_overrides or {})
     policy = {
@@ -102,18 +105,31 @@ def _valid_setup_config(
             "context_parallel_size": 1,
             "tensor_model_parallel_size": 1,
             "sequence_parallel": False,
+            "use_fused_linear_logprobs": True,
         },
         "sequence_packing": {"enabled": False},
         "dynamic_batching": {"enabled": False},
         "make_sequence_length_divisible_by": 1,
+        "tokenizer": {},
+        "train_global_batch_size": 8,
     }
     for section, values in (policy_overrides or {}).items():
         policy[section].update(values)
+    # Most callers raise during validation and never read the rest. The fields below are
+    # what `setup_sft_v2` needs once it gets past that, so one config serves both.
     return SimpleNamespace(
         sft=SimpleNamespace(**sft),
         data=data,
         policy=policy,
         checkpointing={"metric_name": metric_name},
+        cluster=SimpleNamespace(
+            num_nodes=1,
+            segment_size=1,
+            gpus_per_node=8,
+            master_port_range_low=1,
+            master_port_range_high=2,
+        ),
+        data_plane=SimpleNamespace(),
     )
 
 
@@ -263,6 +279,185 @@ def test_save_checkpoint_uses_policy_signature_and_terminal_step(
     )
 
 
+def _deferred_save_controller(tmp_path: Path) -> object:
+    controller = _save_controller()
+    controller._save_state.total_steps = 10
+    controller._defer_checkpoint_finalize = True
+    controller._trainer = create_autospec(Policy, instance=True)
+    controller._placement_plan = SimpleNamespace(logical_world_size=2)
+    controller._loader_state_dicts = MagicMock(return_value=[{}, {}])
+    controller._checkpointer = MagicMock()
+    controller._checkpointer.init_tmp_checkpoint.return_value = str(tmp_path)
+    controller._checkpointer.save_optimizer = True
+    return controller
+
+
+def test_save_checkpoint_finalizes_in_background_by_default(tmp_path: Path) -> None:
+    controller = _deferred_save_controller(tmp_path)
+    controller._defer_checkpoint_finalize = False
+
+    controller._save_checkpoint({})
+
+    controller._checkpointer.begin_finalization.assert_called_once_with(
+        str(tmp_path), wait_fn=controller._trainer.finalize_async_save
+    )
+    assert controller._pending_checkpoint_path is None
+
+
+def test_deferred_save_leaves_the_checkpoint_pending(tmp_path: Path) -> None:
+    controller = _deferred_save_controller(tmp_path)
+
+    controller._save_checkpoint({})
+
+    controller._trainer.save_checkpoint.assert_called_once()
+    controller._trainer.finalize_async_save.assert_not_called()
+    controller._checkpointer.begin_finalization.assert_not_called()
+    assert controller._pending_checkpoint_path == str(tmp_path)
+
+
+def test_pending_save_publishes_only_after_a_successful_poll(tmp_path: Path) -> None:
+    controller = _deferred_save_controller(tmp_path)
+    controller._pending_checkpoint_path = str(tmp_path)
+    controller._trainer.poll_async_save.side_effect = [False, True]
+
+    # Writes still running: training continues, nothing is published.
+    controller._finish_pending_save(blocking=False)
+    controller._checkpointer.begin_finalization.assert_not_called()
+    assert controller._pending_checkpoint_path == str(tmp_path)
+
+    controller._finish_pending_save(blocking=False)
+    controller._checkpointer.begin_finalization.assert_called_once_with(str(tmp_path))
+    assert controller._pending_checkpoint_path is None
+    controller._trainer.finalize_async_save.assert_not_called()
+
+    # Nothing pending: no further worker calls.
+    controller._finish_pending_save(blocking=False)
+    assert controller._trainer.poll_async_save.call_count == 2
+
+
+def test_blocking_finish_waits_for_the_write_then_publishes(tmp_path: Path) -> None:
+    controller = _deferred_save_controller(tmp_path)
+    controller._pending_checkpoint_path = str(tmp_path)
+    order = MagicMock()
+    order.attach_mock(controller._trainer.finalize_async_save, "finalize")
+    order.attach_mock(controller._checkpointer.begin_finalization, "publish")
+
+    controller._finish_pending_save(blocking=True)
+
+    assert order.mock_calls == [call.finalize(), call.publish(str(tmp_path))]
+    controller._trainer.poll_async_save.assert_not_called()
+    assert controller._pending_checkpoint_path is None
+
+
+def test_next_save_publishes_the_pending_one_first(tmp_path: Path) -> None:
+    controller = _deferred_save_controller(tmp_path)
+    previous = str(tmp_path / "tmp_step_5")
+    controller._pending_checkpoint_path = previous
+    order = MagicMock()
+    order.attach_mock(controller._trainer.finalize_async_save, "finalize")
+    order.attach_mock(controller._checkpointer.begin_finalization, "publish")
+    order.attach_mock(controller._trainer.save_checkpoint, "save")
+
+    controller._save_checkpoint({})
+
+    assert [c[0] for c in order.mock_calls] == ["finalize", "publish", "save"]
+    assert order.mock_calls[1] == call.publish(previous)
+    assert controller._pending_checkpoint_path == str(tmp_path)
+
+
+def test_run_polls_before_each_step_and_finalizes_at_exit() -> None:
+    controller = _save_controller()
+    controller._max_steps = 3
+    controller._logger = MagicMock()
+    controller._checkpointer = MagicMock()
+    controller._close_loaders = MagicMock()
+    controller._save_checkpoint = MagicMock()
+    controller._timeout = MagicMock()
+    controller._timeout.check_save.return_value = False
+    controller._finish_pending_save = MagicMock()
+    order = MagicMock()
+    order.attach_mock(controller._finish_pending_save, "finish")
+
+    def advance() -> dict[str, Any]:
+        order.step()
+        controller._save_state.total_steps += 1
+        return {}
+
+    controller._run_train_step = MagicMock(side_effect=advance)
+    with patch("nemo_rl.algorithms.sft_v2.shutdown_telemetry"):
+        controller.run()
+
+    assert order.mock_calls == [
+        call.finish(blocking=False),
+        call.step(),
+        call.finish(blocking=False),
+        call.step(),
+        call.finish(blocking=False),
+        call.step(),
+        call.finish(blocking=True),
+        # Teardown's publish; a no-op once the exit path has published.
+        call.finish(blocking=True),
+    ]
+
+
+def _failing_run_controller(tmp_path: Path) -> object:
+    """Deferred-save controller whose step after a pending save raises."""
+    controller = _deferred_save_controller(tmp_path)
+    controller._pending_checkpoint_path = str(tmp_path)
+    # The step-10 save is pending; step 11 then raises.
+    controller._max_steps = controller._save_state.total_steps + 1
+    controller._logger = MagicMock()
+    controller._close_loaders = MagicMock()
+    controller._timeout = MagicMock()
+    controller._run_train_step = MagicMock(
+        side_effect=RuntimeError("injected train failure")
+    )
+    # The writes are still running at the step's poll.
+    controller._trainer.poll_async_save.return_value = False
+    return controller
+
+
+def test_run_failure_still_publishes_the_pending_save(tmp_path: Path) -> None:
+    controller = _failing_run_controller(tmp_path)
+    order = MagicMock()
+    order.attach_mock(controller._trainer.finalize_async_save, "finalize")
+    order.attach_mock(controller._checkpointer.begin_finalization, "publish")
+    order.attach_mock(controller._checkpointer.shutdown, "close")
+
+    with (
+        patch("nemo_rl.algorithms.sft_v2.shutdown_telemetry"),
+        pytest.raises(RuntimeError, match="injected train failure"),
+    ):
+        controller.run()
+
+    # Published before checkpoint close, which joins the rename.
+    assert order.mock_calls == [
+        call.finalize(),
+        call.publish(str(tmp_path)),
+        call.close(),
+    ]
+    assert controller._pending_checkpoint_path is None
+
+
+def test_failed_teardown_publish_does_not_mask_the_run_failure(
+    tmp_path: Path,
+) -> None:
+    controller = _failing_run_controller(tmp_path)
+    controller._trainer.finalize_async_save.side_effect = RuntimeError(
+        "injected finalize failure"
+    )
+
+    with (
+        patch("nemo_rl.algorithms.sft_v2.shutdown_telemetry"),
+        pytest.raises(RuntimeError, match="injected train failure"),
+        pytest.warns(UserWarning, match="pending checkpoint publish failed"),
+    ):
+        controller.run()
+
+    controller._checkpointer.begin_finalization.assert_not_called()
+    controller._checkpointer.shutdown.assert_called_once()
+
+
 def test_checkpoint_metric_tags_the_configured_train_metric() -> None:
     controller = _save_controller(metric_name="train:loss")
 
@@ -299,6 +494,19 @@ def test_checkpoint_metric_rejects_a_metric_no_step_produces() -> None:
             "fixed batching",
         ),
         ({"sft_overrides": {"val_period": 10}}, "has no validation loop"),
+        (
+            {"sft_overrides": {"defer_async_checkpoint_finalize": True}},
+            "requires policy.megatron_cfg.checkpoint.async_save",
+        ),
+        (
+            {
+                "sft_overrides": {"defer_async_checkpoint_finalize": True},
+                "policy_overrides": {
+                    "megatron_cfg": {"checkpoint": {"async_save": False}}
+                },
+            },
+            "requires policy.megatron_cfg.checkpoint.async_save",
+        ),
         (
             {"data_overrides": {"validation": {"path": "/dataset"}}},
             "reads no validation source",
@@ -474,6 +682,7 @@ def test_setup_loaders_passes_canonical_geometry_and_nested_packing(
         placement_hash="placement",
     )
     controller._loader_states = [{"shard": 0}, {"shard": 1}] if restored else None
+    controller._tracer = None
     controller._trainer = MagicMock()
     futures = [object(), object()]
     controller._trainer.worker_group.run_all_workers_single_data.return_value = futures
@@ -602,3 +811,82 @@ def test_setup_rejects_nonpositive_canonical_packing_alignment(
     config.policy["make_sequence_length_divisible_by"] = pad_multiple
     with pytest.raises(ValueError, match="to be positive"):
         setup_sft_v2(config, MagicMock())
+
+
+@pytest.mark.parametrize(
+    "pretrained", [None, {"format": "megatron_bridge", "path": "/checkpoint"}]
+)
+def test_setup_propagates_pretrained_checkpoint_before_validation(pretrained):
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    config = _valid_setup_config(data_overrides={"backend": "invalid"})
+    config.checkpointing["pretrained_checkpoint"] = pretrained
+    with pytest.raises(ValueError, match="data.backend=energon"):
+        setup_sft_v2(config, MagicMock())
+    assert config.policy.get("pretrained_checkpoint") == pretrained
+
+
+def test_setup_keeps_policy_pretrained_checkpoint_when_checkpointing_is_null():
+    from nemo_rl.algorithms.sft_v2 import setup_sft_v2
+
+    existing = {"format": "megatron_bridge", "path": "/policy-level"}
+    config = _valid_setup_config(data_overrides={"backend": "invalid"})
+    config.policy["pretrained_checkpoint"] = existing
+    config.checkpointing["pretrained_checkpoint"] = None
+    with pytest.raises(ValueError, match="data.backend=energon"):
+        setup_sft_v2(config, MagicMock())
+    assert config.policy["pretrained_checkpoint"] == existing
+
+
+def test_setup_charges_the_placement_wait_to_cluster_init() -> None:
+    """The placement wait is charged to cluster_init, not policy_init (fake clock gives exact phases)."""
+    from nemo_rl.algorithms import sft_v2
+
+    calls: list[str] = []
+    clock = {"t": 0.0}
+
+    def advance(label: str, seconds: float, result: Any = None):
+        def _advance(*args: Any, **kwargs: Any) -> Any:
+            calls.append(label)
+            clock["t"] += seconds
+            return result
+
+        return _advance
+
+    cluster = MagicMock()
+    cluster.get_placement_groups.side_effect = advance("placement", 7.0)
+    probe = MagicMock()
+    probe.get_latest_checkpoint_path.return_value = None
+    probe.load_training_info.return_value = None
+    probe.get_resume_paths.return_value = (None, None)
+
+    with (
+        patch.object(sft_v2, "time", SimpleNamespace(monotonic=lambda: clock["t"])),
+        patch.object(sft_v2, "set_seed"),
+        patch.object(sft_v2, "CheckpointManager", return_value=probe),
+        patch.object(
+            sft_v2, "prepare_segment_topology", return_value=(None, None, None)
+        ),
+        patch.object(sft_v2, "RayVirtualCluster", return_value=cluster),
+        patch.object(
+            sft_v2, "TQPolicy", side_effect=advance("policy", 3.0, MagicMock())
+        ),
+        patch.object(sft_v2, "resolve_topology_mapper") as resolve_mapper,
+        patch.object(sft_v2, "NLLLossFn"),
+        patch.object(sft_v2, "_restore_save_state"),
+        patch.object(sft_v2, "_max_train_steps", return_value=10),
+    ):
+        resolve_mapper.return_value.map.return_value = SimpleNamespace(
+            logical_world_size=4, placement_hash="hash"
+        )
+        actor_args = sft_v2.setup_sft_v2(_valid_setup_config(), MagicMock())
+
+    assert calls == ["placement", "policy"], (
+        f"the placement wait must be taken before the policy build, got {calls}"
+    )
+    timing = actor_args.setup_timing
+    assert timing.cluster_init_time_s == 7.0
+    assert timing.policy_init_time_s == 3.0, (
+        "policy_init must cover the policy build alone, not the placement wait"
+    )
+    assert timing.total_setup_time_s == 10.0

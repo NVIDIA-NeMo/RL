@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import math
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -25,18 +27,22 @@ from nemo_rl.models.generation.interfaces import (
     get_num_routed_experts,
     resolve_routed_experts_dtype,
 )
+from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.utils import (
     R3_MISSING_ROUTE_SENTINEL,
     aggregate_spec_decode_counters,
     attach_routed_experts_to_chat_response_choices,
+    attach_sampler_topk_logprobs_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
+    check_sampling_param,
     compute_engine_step_metrics,
     compute_spec_decode_metrics,
     encode_counter_key,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
+    remap_multimodal_placeholders,
 )
 from nemo_rl.utils.routed_experts_codec import decode_routed_experts
 
@@ -457,7 +463,18 @@ def test_normalize_routed_experts_strict_mode_rejects_surplus_routes():
         )
 
 
-def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_index():
+@pytest.mark.parametrize("encode_for_wire", [False, True])
+def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_index(
+    monkeypatch, encode_for_wire
+):
+    if not encode_for_wire:
+
+        def reject_codec(*args, **kwargs):
+            pytest.fail("worker-owned capture must retain native route tensors")
+
+        monkeypatch.setattr(
+            "nemo_rl.models.generation.vllm.utils.encode_routed_experts", reject_codec
+        )
     final_res = SimpleNamespace(
         prompt_token_ids=[101, 102, 103],
         prompt_routed_experts=torch.tensor(
@@ -491,17 +508,26 @@ def test_attach_routed_experts_to_chat_response_choices_reassociates_by_choice_i
         response,
         final_res,
         device=torch.device("cpu"),
+        encode_for_wire=encode_for_wire,
     )
 
-    # Routes travel as a base64 string envelope, one opaque object per choice.
-    assert isinstance(response.choices[0].message.routed_experts, str)
-    assert _decoded_routes(response.choices[0].message.routed_experts) == [
+    def route_values(choice):
+        routes = choice.message.routed_experts
+        if encode_for_wire:
+            assert isinstance(routes, str)
+            return _decoded_routes(routes)
+        assert isinstance(routes, torch.Tensor)
+        assert routes.device.type == "cpu"
+        assert routes.dtype == ROUTED_EXPERTS_FALLBACK_DTYPE
+        return routes.tolist()
+
+    assert route_values(response.choices[0]) == [
         [[10]],
         [[11]],
         [[30]],
         [[R3_MISSING_ROUTE_SENTINEL]],
     ]
-    assert _decoded_routes(response.choices[1].message.routed_experts) == [
+    assert route_values(response.choices[1]) == [
         [[10]],
         [[11]],
         [[31]],
@@ -660,6 +686,113 @@ def test_attach_token_information_to_chat_response_choices():
     assert response_dict["choices"][1]["message"]["generation_log_probs"] == []
 
 
+def _ranked(*entries):
+    """One position's engine log-probs as vLLM reports them: sampled token first."""
+    return {
+        token_id: SimpleNamespace(logprob=logprob, rank=rank)
+        for token_id, logprob, rank in entries
+    }
+
+
+def test_attach_sampler_topk_logprobs_to_chat_response_choices():
+    final_res = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[7, 9, 5],
+                logprobs=[
+                    # Sampled token inside the top-2: exactly k entries; finite logprobs are retained.
+                    _ranked((7, -0.2, 1), (8, -10000.0, 2)),
+                    # Sampled token outside the top-2: k + 1 entries, ranks pick the head.
+                    _ranked((9, -3.0, 7), (1, -0.7, 1), (2, -0.9, 2)),
+                    # A tie at the boundary still yields exactly k entries.
+                    _ranked((5, -1.2, 2), (3, -0.8, 1), (4, -1.2, 2)),
+                ],
+            ),
+            SimpleNamespace(index=1, token_ids=[], logprobs=[]),
+        ]
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=0, message=SimpleNamespace()),
+            SimpleNamespace(index=1, message=SimpleNamespace()),
+        ],
+        model_dump=lambda: {"choices": [{"message": {}}, {"message": {}}]},
+    )
+
+    attach_sampler_topk_logprobs_to_chat_response_choices(response, final_res, top_k=2)
+    response_dict = model_dump_chat_response_with_dynamic_message_fields(response)
+
+    ids = response_dict["choices"][0]["message"]["sampler_topk_token_ids"]
+    logprobs = response_dict["choices"][0]["message"]["sampler_topk_logprobs"]
+    assert ids.dtype == torch.int32
+    assert logprobs.dtype == torch.float32
+    assert ids.tolist() == [[7, 8], [1, 2], [3, 5]]
+    torch.testing.assert_close(
+        logprobs, torch.tensor([[-0.2, -10000.0], [-0.7, -0.9], [-0.8, -1.2]])
+    )
+    empty = response_dict["choices"][1]["message"]
+    assert tuple(empty["sampler_topk_token_ids"].shape) == (0, 2)
+    assert tuple(empty["sampler_topk_logprobs"].shape) == (0, 2)
+
+
+def test_attach_sampler_topk_logprobs_to_chat_response_choices_reads_flat_logprobs():
+    final_res = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[9],
+                logprobs=SimpleNamespace(
+                    start_indices=[0],
+                    end_indices=[3],
+                    token_ids=[9, 1, 2],
+                    logprobs=[-3.0, -0.3, -1.8],
+                ),
+            ),
+            SimpleNamespace(
+                index=1,
+                token_ids=[],
+                logprobs=SimpleNamespace(
+                    start_indices=[], end_indices=[], token_ids=[], logprobs=[]
+                ),
+            ),
+        ]
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=0, message=SimpleNamespace()),
+            SimpleNamespace(index=1, message=SimpleNamespace()),
+        ]
+    )
+
+    attach_sampler_topk_logprobs_to_chat_response_choices(response, final_res, top_k=2)
+
+    message = response.choices[0].message
+    assert message.sampler_topk_token_ids.tolist() == [[1, 2]]
+    torch.testing.assert_close(
+        message.sampler_topk_logprobs, torch.tensor([[-0.3, -1.8]])
+    )
+    empty = response.choices[1].message
+    assert tuple(empty.sampler_topk_token_ids.shape) == (0, 2)
+    assert tuple(empty.sampler_topk_logprobs.shape) == (0, 2)
+
+
+def test_attach_sampler_topk_logprobs_to_chat_response_choices_requires_k_entries():
+    final_res = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(index=0, token_ids=[7], logprobs=[_ranked((7, -0.2, 1))])
+        ]
+    )
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(index=0, message=SimpleNamespace())]
+    )
+
+    with pytest.raises(RuntimeError, match="fewer than top_k"):
+        attach_sampler_topk_logprobs_to_chat_response_choices(
+            response, final_res, top_k=2
+        )
+
+
 @pytest.mark.parametrize(
     ("token_ids", "logprobs", "error_match"),
     [
@@ -747,7 +880,10 @@ def test_attach_token_information_to_chat_response_choices_rejects_invalid_struc
         attach_token_information_to_chat_response_choices(response, final_res)
 
 
-def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fields():
+@pytest.mark.parametrize("encode_for_wire", [False, True])
+def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fields(
+    encode_for_wire,
+):
     final_res = SimpleNamespace(
         prompt_token_ids=[101, 102],
         prompt_routed_experts=torch.tensor(
@@ -791,11 +927,12 @@ def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fiel
         response,
         final_res,
         device=torch.device("cpu"),
+        encode_for_wire=encode_for_wire,
     )
     response_dict = model_dump_chat_response_with_dynamic_message_fields(response)
 
     message = response_dict["choices"][0]["message"]
-    assert message["routed_experts"] == response.choices[0].message.routed_experts
+    assert message["routed_experts"] is response.choices[0].message.routed_experts
     assert message["prompt_token_ids"] == [101, 102]
     assert message["generation_token_ids"] == [201]
     assert message["generation_log_probs"] == [-0.1]
@@ -1179,3 +1316,306 @@ def test_step_metrics_are_returned_when_the_snapshot_reads_cleanly():
 
     assert isinstance(metrics, dict)
     assert stub._step_metrics_snapshot is None
+
+
+@dataclass(frozen=True)
+class _PlaceholderRange:
+    offset: int
+    length: int
+    is_embed: object | None = None
+
+
+def test_remap_multimodal_placeholders_handles_accumulated_per_item_shift():
+    embed_mask = object()
+    media_tokens = [19, 18, 18, 20]
+    template_token_ids = [1, *media_tokens, 13, 2, *media_tokens, 13, 3, 21, 21, 22]
+    final_token_ids = [1, *media_tokens, 2, *media_tokens, 3, 21, 21, 22]
+    placeholders = {
+        # Deliberately list modalities in the opposite order from prompt order.
+        "audio": [_PlaceholderRange(offset=13, length=3)],
+        "image": [
+            _PlaceholderRange(offset=1, length=4),
+            _PlaceholderRange(offset=7, length=4, is_embed=embed_mask),
+        ],
+    }
+
+    result = remap_multimodal_placeholders(
+        template_token_ids=template_token_ids,
+        final_token_ids=final_token_ids,
+        mm_placeholders=placeholders,
+    )
+
+    assert [item.offset for item in result["image"]] == [1, 6]
+    assert result["image"][1].is_embed is embed_mask
+    assert result["audio"] == [_PlaceholderRange(offset=11, length=3)]
+
+
+def test_remap_multimodal_placeholders_reuses_a_span_shared_by_two_modalities():
+    """Coincident ranges must both land on the one span they describe.
+
+    vLLM's Qwen2.5-Omni use_audio_in_video path derives the audio range from
+    its paired video range, reusing start_idx and tokens and differing only in
+    is_embed -- so the two ranges are identical. Consuming the span for the
+    first would leave the second unfindable.
+    """
+    media_tokens = [19, 18, 18]
+    template_token_ids = [1, 2, *media_tokens, 9]
+    final_token_ids = [1, *media_tokens, 9]
+    embed_mask = object()
+
+    result = remap_multimodal_placeholders(
+        template_token_ids=template_token_ids,
+        final_token_ids=final_token_ids,
+        mm_placeholders={
+            "video": [_PlaceholderRange(offset=2, length=3)],
+            "audio": [_PlaceholderRange(offset=2, length=3, is_embed=embed_mask)],
+        },
+    )
+
+    assert [item.offset for item in result["video"]] == [1]
+    assert [item.offset for item in result["audio"]] == [1]
+    assert result["audio"][0].is_embed is embed_mask
+
+
+def test_remap_multimodal_placeholders_without_media_returns_empty():
+    """The shortcut also covers a changed prompt that carries no media."""
+    assert (
+        remap_multimodal_placeholders(
+            template_token_ids=[1, 2, 3],
+            final_token_ids=[9, 9, 1, 2, 3],
+            mm_placeholders={},
+        )
+        == {}
+    )
+
+
+def test_remap_multimodal_placeholders_fails_closed_when_span_is_missing():
+    with pytest.raises(ValueError, match="Could not locate image placeholder range 0"):
+        remap_multimodal_placeholders(
+            template_token_ids=[1, 18, 18, 2],
+            final_token_ids=[1, 2],
+            mm_placeholders={"image": [_PlaceholderRange(offset=1, length=2)]},
+        )
+
+
+def test_remap_multimodal_placeholders_noop_returns_detached_containers():
+    """The unchanged-prompt shortcut must still hand back its own lists.
+
+    Returning the caller's lists aliases them into engine_prompt, so a later
+    in-place edit of one silently rewrites the other.
+    """
+    original = _PlaceholderRange(offset=1, length=2)
+    placeholders = {"image": [original]}
+
+    result = remap_multimodal_placeholders(
+        template_token_ids=[1, 18, 18, 2],
+        final_token_ids=[1, 18, 18, 2],
+        mm_placeholders=placeholders,
+    )
+
+    assert result == placeholders
+    assert result["image"] is not placeholders["image"]
+    assert result["image"][0] is original
+
+
+@pytest.mark.parametrize(
+    "offset,length",
+    [(-1, 2), (1, 0), (2, 3)],
+    ids=["negative-offset", "zero-length", "runs-past-template"],
+)
+def test_remap_multimodal_placeholders_rejects_out_of_range_input(offset, length):
+    """A range vLLM never could have produced is a bug, not something to remap.
+
+    Without the guard, ``template_token_ids[offset : offset + length]`` slices
+    silently short (or wraps for a negative offset) and the span is then
+    matched -- and moved -- against the wrong tokens.
+    """
+    with pytest.raises(ValueError, match="Invalid image placeholder range 0"):
+        remap_multimodal_placeholders(
+            template_token_ids=[1, 18, 18, 2],
+            final_token_ids=[1, 18, 18],
+            mm_placeholders={"image": [{"offset": offset, "length": length}]},
+        )
+
+
+def test_remap_multimodal_placeholders_rejects_unsupported_range_type():
+    """Only mappings and dataclasses can be rebuilt with a new offset."""
+
+    class _OpaqueRange:
+        offset = 1
+        length = 2
+
+    with pytest.raises(TypeError, match="got _OpaqueRange"):
+        remap_multimodal_placeholders(
+            template_token_ids=[1, 18, 18, 2],
+            final_token_ids=[9, 1, 18, 18, 2],
+            mm_placeholders={"image": [_OpaqueRange()]},
+        )
+
+
+def test_remap_multimodal_placeholders_uses_splice_for_exact_suffix_shift():
+    """With the splice known, suffix spans move arithmetically.
+
+    The exact prefix [11, 12, 13, 2] replaces the template history
+    [11, 1001, 2]; the suffix (including the image run) is copied verbatim and
+    shifts by model_cut_end - template_cut_start = 3 - 2 = +1. A search would
+    find the same span here, but the arithmetic remap also disambiguates
+    identical pad runs that happen to appear earlier in the final prompt.
+    """
+    template_token_ids = [11, 1001, 2, 21, 18, 18, 18, 22]
+    final_token_ids = [11, 12, 13, 2, 21, 18, 18, 18, 22]
+    splice = PrefixSplice(final_token_ids, model_cut_end=3, template_cut_start=2)
+
+    result = remap_multimodal_placeholders(
+        template_token_ids=template_token_ids,
+        final_token_ids=final_token_ids,
+        mm_placeholders={"image": [_PlaceholderRange(offset=4, length=3)]},
+        splice=splice,
+    )
+
+    assert [item.offset for item in result["image"]] == [5]
+
+
+def test_remap_multimodal_placeholders_locates_prefix_media_inside_exact_prefix():
+    """Spans before the cut are searched only inside the exact model prefix."""
+    media = [18, 18]
+    # history: <image run> then an assistant answer retokenized by the template
+    template_token_ids = [1, *media, 1001, 2, 5, *media, 6]
+    # exact prefix keeps the run and the model's own answer tokens
+    final_token_ids = [1, *media, 12, 13, 2, 5, *media, 6]
+    splice = PrefixSplice(final_token_ids, model_cut_end=6, template_cut_start=5)
+
+    result = remap_multimodal_placeholders(
+        template_token_ids=template_token_ids,
+        final_token_ids=final_token_ids,
+        mm_placeholders={
+            "image": [
+                _PlaceholderRange(offset=1, length=2),
+                _PlaceholderRange(offset=6, length=2),
+            ]
+        },
+        splice=splice,
+    )
+
+    assert [item.offset for item in result["image"]] == [1, 7]
+
+
+@pytest.mark.parametrize("prefix_shift", [0, 3])
+@pytest.mark.parametrize(
+    "history,spans",
+    [
+        ([1, 7, 8, 9, 9, 9, 10, 7, 8, 9, 9, 9, 10, 7, 2], [(1, 7), (7, 7)]),
+        ([1, 18, 18, 18, 18, 18, 18, 11, 2], [(1, 3), (4, 3)]),
+    ],
+    ids=["shared-delimiter", "adjacent-pad-runs"],
+)
+def test_remap_multimodal_placeholders_keeps_adjacent_prefix_ranges(
+    history, spans, prefix_shift
+):
+    """Preserve actual overlaps without introducing overlaps in bare pad runs."""
+    final_tokens = [*([99] * prefix_shift), *history, 31, 32, 2, 5, 6]
+    result = remap_multimodal_placeholders(
+        template_token_ids=[*history, 1001, 2, 5, 6],
+        final_token_ids=final_tokens,
+        mm_placeholders={
+            "image": [_PlaceholderRange(offset=o, length=n) for o, n in spans]
+        },
+        splice=PrefixSplice(
+            final_tokens,
+            model_cut_end=prefix_shift + len(history) + 2,
+            template_cut_start=len(history) + 1,
+        ),
+    )
+
+    assert [item.offset for item in result["image"]] == [
+        offset + prefix_shift for offset, _ in spans
+    ]
+
+
+def test_remap_multimodal_placeholders_rejects_span_crossing_splice_boundary():
+    template_token_ids = [1, 18, 18, 2, 3]
+    final_token_ids = [1, 9, 18, 18, 2, 3]
+    splice = PrefixSplice(final_token_ids, model_cut_end=3, template_cut_start=2)
+
+    with pytest.raises(ValueError, match="crosses the prefix splice boundary"):
+        remap_multimodal_placeholders(
+            template_token_ids=template_token_ids,
+            final_token_ids=final_token_ids,
+            mm_placeholders={"image": [_PlaceholderRange(offset=1, length=2)]},
+            splice=splice,
+        )
+
+
+def test_remap_multimodal_placeholders_fails_closed_on_suffix_token_mismatch():
+    """An arithmetic shift that lands on different tokens is a bug, not a hit."""
+    template_token_ids = [1, 2, 18, 18, 3]
+    final_token_ids = [1, 7, 7, 2, 18, 18, 3]
+    # Deliberately wrong splice coordinates: claims a +1 shift when it is +2.
+    splice = PrefixSplice(final_token_ids, model_cut_end=2, template_cut_start=1)
+
+    with pytest.raises(ValueError, match="does not match the final prompt"):
+        remap_multimodal_placeholders(
+            template_token_ids=template_token_ids,
+            final_token_ids=final_token_ids,
+            mm_placeholders={"image": [_PlaceholderRange(offset=2, length=2)]},
+            splice=splice,
+        )
+
+
+@pytest.mark.vllm
+def test_remap_multimodal_placeholders_rebuilds_real_vllm_placeholder_range():
+    """Guard the stand-in above against vLLM's actual PlaceholderRange.
+
+    ``dataclasses.replace`` is what moves a dataclass range, and it breaks if
+    vLLM ever adds an ``init=False`` field or ``__slots__``; is_embed is a real
+    tensor there, and it must survive the move untouched.
+    """
+    from vllm.multimodal.inputs import PlaceholderRange
+
+    is_embed = torch.tensor([True, False, True])
+    result = remap_multimodal_placeholders(
+        template_token_ids=[1, 18, 18, 18, 2],
+        final_token_ids=[9, 9, 1, 18, 18, 18, 2],
+        mm_placeholders={
+            "image": [PlaceholderRange(offset=1, length=3, is_embed=is_embed)]
+        },
+    )
+
+    moved = result["image"][0]
+    assert isinstance(moved, PlaceholderRange)
+    assert (moved.offset, moved.length) == (3, 3)
+    assert moved.is_embed is is_embed
+
+
+@pytest.mark.parametrize(
+    ("temperature", "top_p", "top_k", "error"),
+    [
+        (1.0, 1.0, None, None),  # train profile
+        (0.0, 0.9, -1, None),  # validation profile
+        (0.7, 1.0, None, "matches neither"),
+        (1.0, None, None, "top_p must be set explicitly"),
+        (1.0, 1.0, 5, "must be unset or match the configured top_k \\(20\\)"),
+        (1.0, 1.0, 20, None),  # the train profile pins top_k=20
+        (0.0, 0.9, 20, "must be unset or match the configured top_k \\(-1\\)"),
+    ],
+)
+def test_check_sampling_param(temperature, top_p, top_k, error) -> None:
+    generation_config = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": 20,
+        "val_temperature": 0.0,
+        "val_top_p": 0.9,
+        "val_top_k": None,
+    }
+    with (
+        contextlib.nullcontext()
+        if error is None
+        else pytest.raises(ValueError, match=error)
+    ):
+        check_sampling_param(
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            generation_config=generation_config,
+        )

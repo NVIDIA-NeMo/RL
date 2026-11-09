@@ -15,6 +15,8 @@
 """Tests for vLLM checkpoint-engine worker lifecycle helpers."""
 
 import asyncio
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -95,7 +97,20 @@ def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypat
     worker._load_weights = lambda batch: events.append(
         ("load", [name for name, _weight in batch])
     )
-    worker._maybe_process_fp8_kv_cache = lambda: events.append(("fp8",))
+
+    @contextmanager
+    def weight_update_lifecycle(
+        transport: str,
+    ) -> Iterator[Callable[[], None]]:
+        events.append(("setup", transport))
+
+        def finalize() -> None:
+            events.append(("finalize",))
+
+        yield finalize
+        events.append(("teardown", transport))
+
+    worker._weight_update_lifecycle = weight_update_lifecycle
     monkeypatch.setattr(
         torch.cuda,
         "current_stream",
@@ -104,11 +119,13 @@ def test_update_weights_from_checkpoint_engine_async_loads_all_batches(monkeypat
 
     assert asyncio.run(worker._update_weights_from_checkpoint_engine_async()) is True
     assert events == [
+        ("setup", "checkpoint_engine"),
         ("load", ["a"]),
         ("sync",),
         ("load", ["b", "c"]),
         ("sync",),
-        ("fp8",),
+        ("finalize",),
+        ("teardown", "checkpoint_engine"),
     ]
 
 
@@ -124,6 +141,32 @@ def test_checkpoint_engine_rejects_native_trtllm_refit():
     worker._uses_unquantized_flashinfer_trtllm = lambda: True
 
     with pytest.raises(RuntimeError, match="checkpoint-engine"):
+        asyncio.run(worker._update_weights_from_checkpoint_engine_async())
+
+
+@pytest.mark.vllm
+def test_checkpoint_engine_rejects_native_mxfp8_linear_refit(monkeypatch):
+    from nemo_rl.models.generation.vllm.vllm_backend import (
+        VllmInternalWorkerExtensionWithCheckpointEngine,
+    )
+
+    kernel_type = type("FlashInferTrtllmMxfp8LinearKernel", (), {})
+    monkeypatch.setattr(
+        "vllm.model_executor.kernels.linear.mxfp8.flashinfer.FlashInferTrtllmMxfp8LinearKernel",
+        kernel_type,
+        raising=False,
+    )
+    linear = torch.nn.Linear(1, 1)
+    linear.quant_method = SimpleNamespace(kernel=kernel_type())
+    model = torch.nn.Module()
+    model.add_module("linear", linear)
+
+    worker = VllmInternalWorkerExtensionWithCheckpointEngine.__new__(
+        VllmInternalWorkerExtensionWithCheckpointEngine
+    )
+    worker.model_runner = SimpleNamespace(model=model)
+
+    with pytest.raises(RuntimeError, match="native MXFP8 linear kernels"):
         asyncio.run(worker._update_weights_from_checkpoint_engine_async())
 
 

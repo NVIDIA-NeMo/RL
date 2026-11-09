@@ -46,7 +46,7 @@ git commit -s -m "prompt: compact answer schema"
 Example commit messages:
 - `recipe: increase rollout batch size`
 - `prompt: compact reasoning template`
-- `backend: switch generation path to dtensor`
+- `backend: switch generation path to automodel`
 - `stability: lower fp16 risk with bf16`
 
 ## Keep Or Discard

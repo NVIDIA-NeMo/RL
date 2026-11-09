@@ -11,10 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Storage-unit placement: cluster names -> one Ray node ID per unit."""
+"""Storage-unit placement (cluster names -> one Ray node ID per unit) and teardown."""
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -175,3 +176,50 @@ def test_unit_startup_failure_kills_started_units(monkeypatch, started) -> None:
     with pytest.raises(RuntimeError, match="Each unit needs 1 free CPU"):
         msu.start_storage_units({"backend": "mooncake_cpu"}, [N2, N3])
     assert len(killed) == 2
+
+
+class _Unit:
+    """A storage-unit handle whose ``close`` records the call or fails."""
+
+    def __init__(self, calls: list[str], name: str, fail: bool = False) -> None:
+        async def _close() -> None:
+            calls.append(name)
+            if fail:
+                raise RuntimeError(f"{name} is gone")
+
+        self.close = SimpleNamespace(remote=_close)
+
+
+def test_stop_storage_units_closes_every_unit_and_never_raises(caplog) -> None:
+    calls: list[str] = []
+    units = [_Unit(calls, "u0"), _Unit(calls, "u1", fail=True), _Unit(calls, "u2")]
+
+    asyncio.run(msu.stop_storage_units(units))
+
+    # One unit failing must not skip the others or mask the run's own error.
+    assert sorted(calls) == ["u0", "u1", "u2"]
+    assert "u1 is gone" in caplog.text
+
+
+def test_stop_storage_units_without_units_is_a_noop() -> None:
+    asyncio.run(msu.stop_storage_units(()))
+
+
+def test_stop_storage_units_does_not_wait_forever_on_a_busy_unit(
+    monkeypatch, caplog
+) -> None:
+    """A unit stuck in a long call must not block the rest of shutdown."""
+    monkeypatch.setattr(msu, "_UNIT_CLOSE_TIMEOUT_S", 0.05)
+    calls: list[str] = []
+
+    class _Stuck:
+        def __init__(self) -> None:
+            async def _never() -> None:
+                await asyncio.Event().wait()
+
+            self.close = SimpleNamespace(remote=_never)
+
+    asyncio.run(msu.stop_storage_units([_Stuck(), _Unit(calls, "u1")]))
+
+    assert calls == ["u1"]
+    assert "did not finish" in caplog.text

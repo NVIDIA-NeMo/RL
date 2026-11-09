@@ -1,0 +1,109 @@
+# TRT-LLM counterpart of grpo-qwen3-30ba3b-thinking-swe1-16n8g-megatron-cp2-r3-async-gym.
+#
+# Same model, same SWE1 pivot data and same Gym environment as the vLLM nightly;
+# only the generation backend differs, so a divergence between the two runs points
+# at the backend rather than at the workload. Scaled from 16n8g to 4n4g: the layer
+# parallelism (TP2, PP2) and the rollout TP are kept, context parallel drops 4 -> 2
+# and the batch shrinks with the node count.
+defaults: ../../../nemo_gym/grpo_qwen3_30ba3b_thinking_swe1.yaml
+grpo:
+  num_prompts_per_step: 4
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-thinking-swe1-4n4g-megatron-trtllm-noncolocated-gym
+  enabled: false
+data_plane: null
+policy:
+  train_global_batch_size: 32
+  megatron_cfg:
+    # 8 training GPUs: TP2 x PP2 x CP2. The vLLM recipe has 64 and uses CP4.
+    context_parallel_size: 2
+    # Megatron needs expert_tensor x expert_model x pipeline to divide the
+    # training world size; the base's EP8 gives 1 x 8 x 2 = 16 against 8 GPUs.
+    expert_model_parallel_size: 4
+  generation:
+    backend: trtllm
+    trtllm_cfg:
+      # vLLM: vllm_cfg.tensor_parallel_size
+      tensor_parallel_size: 2
+      # Qwen3-30B-A3B is an MoE, so the engine's 2 ranks are spent on experts.
+      moe_tensor_parallel_size: 1
+      moe_expert_parallel_size: 2
+      # No trtllm_cfg to inherit (the shared base is a vLLM config), so the
+      # engine's required knobs are spelled out here. vLLM sizes its batch from
+      # max_num_seqs/scheduler defaults; these match the cuda-graph sizes above.
+      max_batch_size: 64
+      # SWE1 prompts are large (p50 ~26k tokens, max ~64k). The vLLM recipe turns
+      # chunked prefill off, where vLLM sizes its batched-token budget from
+      # max_model_len; TRT-LLM instead rejects any prompt longer than
+      # max_num_tokens, so it has to cover the whole context to match.
+      max_num_tokens: ${policy.max_total_sequence_length}
+      # vLLM runs at 0.8; a little lower here because the KV cache for a 131072
+      # context shares each GPU with a larger per-rank weight shard at TP2.
+      gpu_memory_utilization: 0.7
+      max_model_len: ${policy.max_total_sequence_length}
+      precision: bfloat16
+      async_engine: true
+      expose_http_server: true
+      # vLLM: vllm_cfg.enable_thinking
+      default_chat_template_kwargs:
+        enable_thinking: true
+      # vLLM names this parser "deepseek_r1"; TRT-LLM registers it as "deepseek-r1"
+      # with reasoning_at_start, which is what a Thinking model needs.
+      reasoning_parser: deepseek-r1
+      # vLLM uses its generic "hermes" parser; TRT-LLM has no such key, and
+      # qwen3 reads the same <tool_call>{...}</tool_call> wire format the shared
+      # chat template emits.
+      tool_parser: qwen3
+      # Interpolated rather than copied: the two backends must render the exact
+      # same template, and the SWE blends depend on one that keeps <think> on
+      # every assistant turn (the stock Qwen3 template drops it from history).
+      chat_template: ${policy.generation.vllm_cfg.http_server_serving_chat_kwargs.chat_template}
+    trtllm_kwargs:
+      # vLLM: vllm_kwargs.moe_backend
+      moe_config:
+        backend: TRITON
+      # vLLM: vllm_cfg.enable_prefix_caching
+      kv_cache_config:
+        enable_block_reuse: true
+      # vLLM: vllm_kwargs.compilation_config.cudagraph_capture_sizes
+      cuda_graph_config:
+        batch_sizes: [1, 2, 4, 8, 16, 32, 64]
+    colocated:
+      # enabled is already false in the base; only the split differs.
+      # 2 nodes x 4 GPUs for generation, leaving 8 GPUs for training.
+      resources:
+        gpus_per_node: 4
+        num_nodes: 2
+data:
+  train:
+    data_path: "${oc.env:HF_HOME}/superv3_data/swe1/train-split.jsonl"
+  validation:
+    data_path: "${oc.env:HF_HOME}/superv3_data/swe1/val-split.jsonl"
+env:
+  nemo_gym:
+    # The staged SWE1 data uses this legacy agent name. Register it as an
+    # alias for the current SWE pivot server instead of rewriting the data.
+    single_step_tool_use_with_argument_comparison_swe:
+      responses_api_agents:
+        tool_simulation_agent:
+          entrypoint: app.py
+          resources_server:
+            type: resources_servers
+            name: swe_pivot_single_step_tool_use_with_argument_comparison_resources_server
+          model_server:
+            type: responses_api_models
+            name: policy_model
+    single_step_tool_use_with_argument_comparison_swe_environment_server:
+      environment_servers:
+        legacy_agent:
+          entrypoint: app.py
+          agent_server:
+            type: responses_api_agents
+            name: single_step_tool_use_with_argument_comparison_swe
+cluster:
+  gpus_per_node: 4
+  num_nodes: 4
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-thinking-swe1-4n4g-megatron-trtllm-noncolocated-gym
+  wandb:
+    name: grpo-qwen3-30ba3b-thinking-swe1-4n4g-megatron-trtllm-noncolocated-gym

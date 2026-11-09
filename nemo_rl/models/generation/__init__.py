@@ -17,7 +17,16 @@ from typing import cast
 
 from transformers import PreTrainedTokenizerBase
 
-from nemo_rl.models.generation.interfaces import GenerationConfig, GenerationInterface
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    check_top_p_has_top_k,
+    need_top_k_or_top_p_filtering,
+)
+from nemo_rl.models.generation.interfaces import (
+    GenerationConfig,
+    GenerationInterface,
+    sampler_replay_enabled,
+)
 from nemo_rl.models.generation.trtllm.config import (
     TrtllmConfig,
     resolve_role_overrides,
@@ -25,7 +34,9 @@ from nemo_rl.models.generation.trtllm.config import (
 from nemo_rl.models.generation.vllm import VllmConfig
 from nemo_rl.models.generation.vllm.config import (
     VLLM_SPARSE_REFIT_TRANSPORTS,
+    resolve_vllm_logprobs_mode,
     validate_nvfp4_pertoken_generation,
+    validate_vllm_quantization_config,
 )
 
 TokenizerType = PreTrainedTokenizerBase
@@ -112,12 +123,34 @@ def resolve_generation_class(
     raise ValueError(f"Unknown generation backend: {backend!r}")
 
 
+def draft_full_refit_enabled(policy_cfg: dict) -> bool:
+    """Whether the trainer streams the drafter's FULL weight set on refit.
+
+    True for Automodel draft co-training (dspark/dflash/eagle3), which
+    exports the drafter's entire state_dict under the ``draft.`` prefix; the
+    megatron eagle3 path streams a partial set instead. Feeds the
+    ``draft_full_refit`` argument of :func:`configure_generation_config`.
+
+    automodel_cfg.enabled alone identifies the Automodel path.
+    """
+    from nemo_rl.models.policy.draft_config import coerce_draft_config
+
+    draft_config = coerce_draft_config(policy_cfg.get("draft"))
+    automodel_cfg = policy_cfg.get("automodel_cfg") or {}
+    return (
+        draft_config is not None
+        and bool(draft_config.enabled)
+        and bool(automodel_cfg.get("enabled", False))
+    )
+
+
 def configure_generation_config(
     config: GenerationConfig,
     tokenizer: TokenizerType,
     is_eval: bool = False,
     has_refit_draft_weights: bool = False,
     trains_mtp: bool = False,
+    draft_full_refit: bool = False,
 ) -> GenerationConfig:
     """Apply specific configurations to generation config."""
     if (
@@ -129,6 +162,30 @@ def configure_generation_config(
             f"got backend={config['backend']!r}. Use policy.worker_extension_cls_fqn to "
             "extend the training worker instead."
         )
+
+    if not is_eval and sampler_replay_enabled(config):
+        # Only vLLM returns the processed top-K log-probs replay reads; say so
+        # before asking for top_k/top_logprobs, which other backends reject anyway.
+        if config["backend"] != "vllm":
+            raise ValueError(
+                "policy.generation.sampler_replay.enabled requires the vllm "
+                f"generation backend (got backend={config['backend']!r})"
+            )
+        # Replaying the sampler's support needs top_k to bound it.
+        check_top_p_has_top_k(config["top_k"], config["top_p"])
+        if not need_top_k_or_top_p_filtering(
+            TrainingSamplingParams(top_k=config["top_k"], top_p=config["top_p"])
+        ):
+            raise ValueError(
+                "policy.generation.sampler_replay.enabled needs top-k/top-p "
+                "sampling (policy.generation.top_k/top_p)"
+            )
+        if not config.get("top_logprobs"):
+            raise ValueError(
+                "policy.generation.sampler_replay.enabled reads the sampler's "
+                "support from the captured sampler head: set "
+                "policy.generation.top_logprobs >= top_k"
+            )
 
     # tokenizer setting
     if "_pad_token_id" in config:
@@ -144,11 +201,33 @@ def configure_generation_config(
     # vLLM setting shared by the standard and managed Dynamo backends.
     if config["backend"] in ("vllm", "dynamo"):
         vllm_backed_config = cast(VllmConfig, config)
-        vllm_backed_config["vllm_cfg"]["load_format"] = "auto" if is_eval else "dummy"
+        # Respect explicit checkpoint-loading overrides. Dummy loading relies
+        # on startup refit to initialize all generator weights, including frozen
+        # vision parameters; freezing alone does not exclude them from refit.
+        vllm_backed_config["vllm_cfg"].setdefault(
+            "load_format", "auto" if is_eval else "dummy"
+        )
 
     if config["backend"] == "vllm":
         config = cast(VllmConfig, config)
+        validate_vllm_quantization_config(config)
         validate_nvfp4_pertoken_generation(config, is_eval=is_eval)
+        # Training replays the sampler's top-k/top-p on the policy logits,
+        # which only matches logprobs vLLM reports after filtering.
+        logprobs_mode = resolve_vllm_logprobs_mode(config)
+        if (
+            not is_eval
+            and logprobs_mode != "processed_logprobs"
+            and need_top_k_or_top_p_filtering(
+                TrainingSamplingParams(top_k=config["top_k"], top_p=config["top_p"])
+            )
+        ):
+            raise ValueError(
+                "generation.top_k/top_p filtering requires "
+                "generation.vllm_cfg.logprobs_mode=processed_logprobs, since the "
+                "trainer replays the filters on the policy logits "
+                f"(got {logprobs_mode!r}; unset means vLLM's raw_logprobs)."
+            )
         if config.get("real_quant"):
             export_cpu_offload = config.get("real_quant_export_cpu_offload")
             if not isinstance(export_cpu_offload, bool):
@@ -189,6 +268,12 @@ def configure_generation_config(
         config["_draft_weights_from_refit"] = has_refit_draft_weights
         config["_mtp_weights_from_refit"] = trains_mtp
 
+        # Whether the trainer streams the drafter's FULL weight set (incl.
+        # embed_tokens/lm_head) on every refit — true for Automodel draft
+        # co-training. The megatron eagle3 path streams a partial set and
+        # relies on drafter module sharing instead.
+        config["_draft_full_refit"] = draft_full_refit
+
         # Respect the skip_tokenizer_init setting from the config. VLMs for example, require this to be False.
         if "skip_tokenizer_init" not in config["vllm_cfg"]:
             # set skip_tokenizer_init
@@ -202,6 +287,12 @@ def configure_generation_config(
                 config["vllm_cfg"]["skip_tokenizer_init"] = True
 
     elif config["backend"] == "trtllm":
+        # Resolve loading before the role engines copy the shared config.
+        trtllm_cfg = cast(TrtllmConfig, config)["trtllm_cfg"]
+        trtllm_cfg.setdefault(
+            "load_format",
+            "dummy" if trtllm_cfg.get("precision") == "fp8" or not is_eval else "auto",
+        )
         config = resolve_role_overrides(cast(TrtllmConfig, config))
 
     return config

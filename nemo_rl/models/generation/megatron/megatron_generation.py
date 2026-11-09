@@ -28,7 +28,6 @@ from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
     GenerationOutputSpec,
-    RefitPayloadMode,
     agreed_media_columns,
     reject_unenforceable_refit_deadline,
 )
@@ -392,10 +391,6 @@ class MegatronGeneration(GenerationInterface):
         """Whether non-colocated refit uses Megatron Core's native mechanism."""
         return self.cfg.get("refit_transport") == "mcore"
 
-    def get_refit_payload_mode(self) -> RefitPayloadMode:
-        """Megatron inference receives logical weights on every refit path."""
-        return "logical_weights"
-
     @property
     def worker_group(self) -> "RayWorkerGroup":
         """The underlying policy's worker group (fleet-health probes read dp_size)."""
@@ -653,12 +648,17 @@ class MegatronGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        top_logprobs: int = 0,
     ) -> "Optional[MediaColumnSpec]":
         """Install MInf's canonical prompt and completion capture hooks.
 
         Returns the media column spec the coordinators pinned (``None`` for
         text-only capture).
         """
+        if top_logprobs != 0:
+            raise NotImplementedError(
+                "Megatron generation does not capture sampler top-k"
+            )
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
             raise ValueError(
                 "Megatron token capture requires mcore_generation_config."
@@ -728,7 +728,9 @@ class MegatronGeneration(GenerationInterface):
             self._policy.worker_group.run_all_workers_single_data("resume_after_refit")
         )
 
-    def prepare_refit_info(self, state_dict_info: Optional[dict[str, Any]]) -> None:
+    def prepare_refit_info(
+        self, state_dict_info: Optional[dict[str, Any]]
+    ) -> Optional[list[str]]:
         """Prepare Bridge conversion tasks on every dedicated inference worker."""
         if not self._owns_policy or self.uses_native_refit:
             return

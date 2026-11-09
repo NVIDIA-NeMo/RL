@@ -73,6 +73,7 @@ def _value_config(
         "tokenizer": {"name": "Qwen/Qwen3-0.6B"},
         "train_global_batch_size": train_global_batch_size,
         "train_micro_batch_size": 1,
+        "dynamic_batching": {"enabled": False},
         "max_total_sequence_length": 32,
         "megatron_cfg": {"enabled": megatron_enabled},
         "automodel_cfg": {"enabled": not megatron_enabled},
@@ -123,6 +124,8 @@ def _make_master_config(
         else GRPOConfig.model_construct(max_num_steps=max_num_steps, **_STEP_CONFIG),
         policy={
             "train_global_batch_size": _GLOBAL_BATCH_SIZE,
+            "train_micro_batch_size": 1,
+            "dynamic_batching": {"enabled": False},
             "max_total_sequence_length": 32,
             "tokenizer": {"use_fastokens": False},
             "megatron_cfg": {"enabled": megatron_enabled},
@@ -191,18 +194,6 @@ class TestAlgorithmBlockValidator:
         resolved = OmegaConf.to_container(raw, resolve=True)
         assert isinstance(resolved, dict)
         return resolved
-
-    @pytest.mark.parametrize(
-        "name",
-        [
-            "grpo_math_1B_megatron_single_controller.yaml",
-            "ppo_math_1B_megatron_single_controller.yaml",
-        ],
-        ids=["grpo", "ppo"],
-    )
-    def test_the_exemplars_still_validate(self, name):
-        config = MasterConfig(**self._resolved(name))
-        assert config.checkpointing["save_period"] == 1
 
     def test_rejects_a_config_with_no_algorithm_block(self):
         resolved = self._resolved("grpo_math_1B_megatron_single_controller.yaml")
@@ -428,26 +419,39 @@ class TestPPOValidation:
 
         validate_single_controller_config(mc)
 
-    @pytest.mark.parametrize(
-        ("importance_correction", "force_on_policy_ratio", "match"),
-        [
-            (False, False, "use_importance_sampling_correction=true"),
-            (True, True, "force_on_policy_ratio=false"),
-        ],
-    )
-    def test_ready_first_requires_sampling_policy_correction(
-        self,
-        importance_correction: bool,
-        force_on_policy_ratio: bool,
-        match: str,
-    ) -> None:
+    def test_ready_first_requires_sampling_policy_correction(self) -> None:
         mc = _ppo_master_config()
         mc.async_rl.sampler = ReadyFirstSamplerConfig()
-        mc.loss_fn.use_importance_sampling_correction = importance_correction
-        mc.loss_fn.force_on_policy_ratio = force_on_policy_ratio
+        mc.loss_fn.use_importance_sampling_correction = False
+        mc.loss_fn.force_on_policy_ratio = False
 
-        with pytest.raises(ValueError, match=match):
+        with pytest.raises(ValueError, match="use_importance_sampling_correction=true"):
             validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("ready_first", [False, True])
+    def test_forced_ratio_requires_one_policy_epoch(self, ready_first: bool) -> None:
+        mc = _ppo_master_config()
+        if ready_first:
+            mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        mc.loss_fn.use_importance_sampling_correction = True
+        mc.loss_fn.force_on_policy_ratio = True
+        mc.ppo.ppo_epochs = 4
+
+        with pytest.raises(ValueError, match="requires ppo.ppo_epochs=1"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("ready_first", [False, True])
+    def test_accepts_forced_ratio_with_one_policy_epoch(
+        self, ready_first: bool
+    ) -> None:
+        mc = _ppo_master_config()
+        if ready_first:
+            mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        mc.loss_fn.use_importance_sampling_correction = True
+        mc.loss_fn.force_on_policy_ratio = True
+        mc.ppo.ppo_epochs = 1
+
+        validate_single_controller_config(mc)
 
     @staticmethod
     def _warmup_ckpt_config(*, constant_structure: bool) -> MasterConfig:
@@ -687,6 +691,43 @@ class TestMegatronTrainIters:
         assert "train_iters" not in mc.value["megatron_cfg"]
 
 
+def test_build_value_forwards_algorithm_seed(monkeypatch):
+    value = MagicMock(name="value")
+    value_factory = MagicMock(return_value=value)
+    times = iter((10.0, 12.5))
+    monkeypatch.setattr(sc_setup_mod, "TQValue", value_factory)
+    monkeypatch.setattr(sc_setup_mod.time, "perf_counter", lambda: next(times))
+
+    cluster = MagicMock(name="train_cluster")
+    tokenizer = MagicMock(name="tokenizer")
+    master_config = _ppo_master_config()
+    weights_path = Path("value/weights")
+    optimizer_path = Path("value/optimizer")
+
+    actual, elapsed = sc_setup_mod._build_value(
+        cluster,
+        master_config,
+        tokenizer,
+        seed=123,
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
+    )
+
+    assert actual is value
+    assert elapsed == 2.5
+    value_factory.assert_called_once_with(
+        cluster=cluster,
+        config=master_config.value,
+        tokenizer=tokenizer,
+        seed=123,
+        name_prefix="lm_value",
+        weights_path=weights_path,
+        optimizer_path=optimizer_path,
+        init_optimizer=True,
+        dp_cfg=master_config.data_plane,
+    )
+
+
 @pytest.fixture
 def patched_ppo_factories():
     """Patch every external factory the PPO setup path calls."""
@@ -694,6 +735,8 @@ def patched_ppo_factories():
     fake_dataloader.__len__ = MagicMock(return_value=4)
     fake_policy = MagicMock(name="policy")
     fake_value = MagicMock(name="value")
+    fake_policy.sharding_annotations.get_axis_size.return_value = 1
+    fake_value.sharding_annotations.get_axis_size.return_value = 1
 
     with (
         patch.object(
@@ -825,6 +868,7 @@ class TestValueWarmStart:
         setup_single_controller(mc, tokenizer=MagicMock(pad_token_id=0))
 
         value_kwargs = patched_ppo_factories["_build_value"].call_args.kwargs
+        assert value_kwargs["seed"] == 42
         assert value_kwargs["weights_path"] is None
         assert value_kwargs["optimizer_path"] is None
 

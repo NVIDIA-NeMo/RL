@@ -1,7 +1,7 @@
 # nemo_rl.data_plane
 
 Stable boundary between NeMo-RL and the underlying data-plane backend
-(currently `transfer_queue`; future: `nv-dataplane`). Every call site in
+(currently `transfer_queue`). Every call site in
 `nemo_rl/algorithms`, `nemo_rl/experience`, `nemo_rl/models` goes through
 `DataPlaneClient`. No code imports `transfer_queue` directly outside the
 adapter.
@@ -53,7 +53,7 @@ data_plane/{column_io, preshard}   ← producer/consumer helpers
 data_plane/interfaces.py           ← stable boundary (DataPlaneClient)
         │
         ▼
-data_plane/adapters/               ← TransferQueue / NoOp / future nv-dataplane
+data_plane/adapters/               ← TransferQueue / NoOp
 ```
 
 ---
@@ -463,9 +463,14 @@ data_plane:
     staging_buffer_size:  536870912    # 512 MiB/pool slot; bigger payloads register per transfer
     use_gdr: false                      # GPU-memory RDMA staging in CUDA clients
     gdr_staging_buffer_mb: 1024         # persistent MiB per active GDR client
+    gdr_keep_teacher_payload_on_gpu: true  # MOPD only, with use_gdr: teacher outputs stay on GPU until the PUT
     storage_unit_segment_size: 0       # >0: storage units on (see "Storage layout")
     num_storage_units: null            # total units; null = 2 per selected node
     storage_unit_placement: all        # all, or cluster names: [inference], [train, teacher:<name>]
+    ssd_offload:                       # see "Mooncake SSD offload"
+      enabled: false                   # true: spill memory to local SSD
+      path: null                       # absolute node-local dir; required if enabled
+      offload_threshold: 0.5           # offload above this share of segment memory
   observability:                       # NotRequired
     enabled: true                      # per-op timing / latency percentiles / volume
     verify_tensor_hash: false          # debug: wire-in vs wire-out tensor check
@@ -642,7 +647,11 @@ rollout actor (registered via `TQPolicy.add_data_plane_snapshot_source`,
 since it builds its own client off the worker group), and logs the combined
 result under `data_plane/cluster/` instead of the driver's own, so
 `kv_first_write` is in these totals. It falls back to `data_plane/driver/` when the fan-out finds only one
-process. Measured: **~2.4 ms and ~1 kB per process per step** for 10
+process. The single controller logs the same `data_plane/cluster/` series and
+adds the processes that do its I/O: the trainer's workers and own client, the
+finalizer and advantage actors, the vLLM token-capture clients, and the PPO
+critic and OPD/MOPD teacher workers. Without these, a run with token capture and
+advantage workers reported `0.0 MB moved`. Measured: **~2.4 ms and ~1 kB per process per step** for 10
 processes, against a 6x wider view of the traffic. The fan-out is
 best-effort — a rank that cannot answer is dropped rather than failing the
 step.
@@ -881,6 +890,16 @@ SingleController, however, each individual tensor must currently fit because
 the CPU PUT path does not create the chunk metadata required by an oversized
 GDR GET.
 
+`mooncake_cpu.gdr_keep_teacher_payload_on_gpu` only matters for MOPD with
+`use_gdr: true`; every other run ignores it. When it is on (the default), the
+MOPD teacher keeps what it writes on the GPU until the PUT: its logprobs and,
+with full-vocabulary MOPD, its hidden-state or logits payload. The PUT then
+copies them GPU to GPU into the GDR staging buffer instead of going
+GPU → CPU → GPU. The cost is teacher GPU memory: each last-stage teacher GPU
+holds its data-parallel share of one prompt group's payload until the PUT, and
+briefly about twice that while it is joined and packed. Set it to `false` to
+copy them to CPU first, as without GDR.
+
 ### Mooncake storage layout: clients vs storage units
 
 Every Mooncake process plays one or both of two roles:
@@ -965,6 +984,73 @@ CPU units rather than in every client.
 random start (at most 100 of them), and once the units are full puts fail — there are no client segments to fall
 back on.
 
+### Mooncake SSD offload
+
+`mooncake_cpu.ssd_offload.enabled: true` lets Mooncake move objects from
+memory to node-local SSD. Once memory use across all segments passes
+`offload_threshold`, Mooncake's master writes objects to the SSD of the
+process owning their segment and drops them from memory, 10% of the memory
+per round. Reads of an offloaded object go through that owner transparently.
+
+```
+memory > offload_threshold ──> SSD copy written ──> memory copy dropped
+                                 (fails? object stays in memory)
+```
+
+- **Every segment owner runs offload**, since Mooncake offloads an object
+  only to its owner's SSD:
+
+  | `storage_unit_segment_size` | segment owners (each gets an SSD dir) |
+  |---|---|
+  | `> 0` | the storage units only |
+  | `0` | every client mounting `global_segment_size`: driver, trainers, rollout actors (generation workers mount none) |
+
+- **Data-plane checkpoints work.** Offload needs evictable replicas, so a
+  save copies each object through Mooncake's normal read (`batch_get_into`)
+  instead of reading pinned memory in place. That read also fetches objects
+  already on SSD. A restore retries a write that finds memory full while
+  eviction frees space. See "Experimental Mooncake storage checkpoints".
+- **A put that finds memory full waits; it does not fail.** Mooncake
+  accepts a put only into free segment memory, and offload frees memory in
+  the background, so a burst of writes can briefly fill every segment. Each
+  client then retries the keys that did not fit (`NO_AVAILABLE_HANDLE`) with
+  backoff, logging one warning per waiting put, for up to 600 s. Sustained
+  writes therefore run at most as fast as offload frees memory; bursts
+  become stalls, not crashes. A new object can be evicted once its 1 s
+  lease expires; that lease must cover one whole batch read (up to
+  `staging_buffer_size`), or the read fails with `LEASE_EXPIRED`. The
+  0.5 default `offload_threshold` leaves room for a
+  burst while offload catches up.
+- **Directories:** each owner writes to
+  `<path>/nemo_rl_mooncake_offload/<ray job>-<pid>-<random>` (mode 0700).
+  At the end of a run the SingleController asks each storage unit to delete
+  its directory, and every client deletes its own in `close()`. Mooncake's
+  SIGTERM handler exits without running Python cleanup, so an owner that
+  crashes or is killed before that leaves its directory behind. Each owner
+  holds a lock on its directory while it lives, and the next run's owners
+  on that node delete any directory whose lock is free.
+- **Cleared data:** Mooncake's remove drops only the master's record, so
+  each owner deletes the SSD files of cleared keys itself, every 30 s.
+  Mooncake still counts those files toward its 90% disk quota until the
+  key is offloaded again; see the warning below.
+
+> **Warning: a full disk stops the run.** Offloaded files are deleted only
+> by the 30 s sweep of cleared keys or at shutdown. When a process's own
+> offload files pass 90% of the disk holding `path`, Mooncake's per-key
+> backend deletes its oldest offloaded files, and Mooncake 0.3.13 cannot
+> turn this off. A deleted file can be the only copy of an object. The
+> master counts these eviction requests
+> (`master_evict_disk_replica_requests_total`). With offload on, the process
+> that started the master checks that counter every 30 s and stops the run
+> at the first deletion. If instead free space falls below one object plus
+> 256 MiB, Mooncake fails the SSD write and keeps the object in memory;
+> memory then stops being freed, and a put that has waited 600 s for it
+> fails with an error naming `path`. Either way, give `path` enough free
+> disk: about (segment owners on the node) x (peak data offloaded at once).
+> Mooncake's own quota count still includes swept files (it has no per-key
+> delete), so its 90% eviction can fire on files already gone and stop the
+> run although nothing live was lost.
+
 ### Experimental Mooncake storage checkpoints
 
 With storage units on, the `MooncakeStorageUnit` actors are the only
@@ -983,9 +1069,17 @@ On `tq.save_checkpoint(...)`, existing workers query disjoint slices of the
 controller's object keys and group their location metadata by destination.
 Ray object references route those groups directly to the storage processes;
 the coordinator forwards references, not per-object addresses or sizes. Each
-storage process writes directly from its own hard-pinned CPU memory into one
-packed shard and an offset/size index. SAVE performs no native GET, staging-buffer copy, or
-buffer registration. Only metadata moves between processes. For multiple
+storage process writes its objects into one packed shard and an
+offset/size index. With hard-pinned replicas (the default) it writes directly
+from its own CPU memory: no native GET, staging-buffer copy, or buffer
+registration. With `mooncake_cpu.ssd_offload` the replicas are evictable, so
+a borrowed address could be freed mid-write. Each storage process instead
+copies its objects through native `batch_get_into` into one registered
+buffer. The read holds a lease per object and also serves objects already
+offloaded to SSD. Python cannot see which process holds an SSD-only object,
+so the process that discovered it saves it. Payload bytes then cross
+processes over Mooncake's own transfers (never through Ray); with pinned
+replicas only metadata moves between processes. For multiple
 complete replicas, a canonical live storage process is selected; this prioritizes
 locality, not global byte balancing. The coordinator publishes the small shard
 manifest after every storage process has flushed, fsynced, and acknowledged its shard.
@@ -1018,7 +1112,10 @@ destination, but Mooncake may place an object on another current participant
 when that segment lacks capacity. Saved process and segment identities are
 provenance only and are not reused after restart. TQ restores controller
 metadata only after every object has a complete, correctly sized memory replica
-on a current checkpoint participant. No separate Mooncake `storage_root` is
+on a current checkpoint participant. With SSD offload, an object may already
+be evicted by then, so a COMPLETE SSD replica is also accepted. Its owner and
+size are not visible from Python, so that check is weaker: it relies on only
+current participants owning segments. No separate Mooncake `storage_root` is
 configured; the explicit TQ checkpoint destination is the persistent location.
 
 Checkpoints use checksum-free format v3: no payload or index hashes are computed
@@ -1035,9 +1132,11 @@ while commits and destructive clears wait at the existing checkpoint barrier.
 Direct SAVE supports the TCP/RDMA CPU segments created by TQ's Mooncake client,
 including when GDR staging is enabled. Overwrites, replica movement, segment
 unmount and store close
-affecting selected objects must also wait until SAVE finishes: hard pinning
-prevents eviction, not explicit mutation, and the writer borrows local addresses
-rather than acquiring a new native memory lease. Same-host peer addresses are
+affecting selected objects must also wait until SAVE finishes. With pinned
+replicas, hard pinning prevents eviction, not explicit mutation, and the
+writer borrows local addresses rather than acquiring a new native memory
+lease. With SSD offload, eviction is allowed, and each native read takes its
+own lease. Same-host peer addresses are
 not local process addresses. The checkpoint contains every controller-referenced
 TQ field as encoded raw objects, including log probabilities, router indices,
 non-tensor values, and GDR chunks. It does
@@ -1048,12 +1147,17 @@ contributes Mooncake memory capacity first, keep the saved GDR mode and staging
 size unchanged, call `tq.load_checkpoint` before starting producers, and restart
 from an empty master before retrying a failed load. Multi-node validation must
 exercise save, process restart, load, and read on the intended training topology.
-The adapter internally enables hard-pinned memory replicas and disables Mooncake
-offload for runs that save or resume checkpoints; these are not additional user
-configuration knobs. Workers inherit this storage mode from TQ's controller.
+For runs that save or resume checkpoints, the adapter pins memory replicas
+(or leaves them evictable when `mooncake_cpu.ssd_offload` is on) and keeps TQ's
+own Mooncake offload client off. These are not additional user
+configuration knobs. With SSD offload, restore waits on a write that finds
+memory full (`NO_AVAILABLE_HANDLE`) like any put, for up to 600 s, while
+eviction moves older objects to SSD. Verification then accepts an object that is
+already on SSD. Workers inherit this storage mode from TQ's controller.
 Other jobs keep TQ's storage defaults. A checkpoint saved with
 `simple.ssd_offload.enabled: true` must be resumed with it enabled (TQ raises
-at load otherwise); `path` and `threshold_bytes` may change. This version supports NeMo-RL's HTTP
+at load otherwise); `path` and `threshold_bytes` may change.
+This version supports NeMo-RL's HTTP
 metadata mode and rejects `P2PHANDSHAKE`,
 whose public Mooncake API does not expose the local transfer endpoint needed for
 exact storage-process matching.

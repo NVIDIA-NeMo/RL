@@ -114,7 +114,7 @@ class RewardModelEnvironment(EnvironmentInterface):
             "Sequence packing is currently not supported with reward model environment."
         )
         assert (self.config.get("automodel_cfg") or {}).get("enabled"), (
-            "Reward model environment currently only support with DTensor. You can show your interest in mcore path by upvoting on https://github.com/NVIDIA-NeMo/RL/issues/1154"
+            "Reward model environment currently only support with Automodel. You can show your interest in mcore path by upvoting on https://github.com/NVIDIA-NeMo/RL/issues/1154"
         )
         assert self.config["max_grad_norm"] == None, (
             "Max grad norm must be None in reward model environment."
@@ -135,7 +135,7 @@ class RewardModelEnvironment(EnvironmentInterface):
         self.config["dynamic_batching"]["enabled"] = False
         self.config["sequence_packing"]["enabled"] = False
         self.config["max_grad_norm"] = None
-        # Reward model environment is always using DTensor
+        # Reward model environment is always using Automodel
         self.config["automodel_cfg"]["enabled"] = True
         self.config["automodel_cfg"]["cpu_offload"] = False
         self.config["automodel_cfg"]["activation_checkpointing"] = False

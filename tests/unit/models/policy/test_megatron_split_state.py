@@ -175,10 +175,12 @@ def _make_worker(loss_type):
     w._opd_full_lm_head_evicted = False
     w.media_placeholder_token_id = None
     # Model-capability flags __init__ derives from self.model, which
-    # object.__new__ skips. train_microbatch passes all four straight through
+    # object.__new__ skips. train_microbatch passes these straight through
     # to get_microbatch_iterator, so the plain-model defaults (NeMo-RL owns
     # packing and CP sharding, no MTP) have to be spelled out here.
     w.delegate_pack_to_model = False
+    w.create_router_padding_mask = False
+    w.allow_unmasked_chunkwise_cp = False
     w.delegate_mtp_loss_mask_to_model = False
     w.model_slices_context_parallel_inputs = False
     w.mtp_enabled = False
@@ -432,13 +434,20 @@ class TestAssertStepOpen:
 
 
 class TestTrainMicrobatch:
-    def test_forwards_multimodal_iterator_capabilities(self, mock_module_symbols):
+    @pytest.mark.parametrize("create_router_padding_mask", [False, True])
+    def test_forwards_multimodal_iterator_capabilities(
+        self,
+        mock_module_symbols: dict[str, MagicMock],
+        create_router_padding_mask: bool,
+    ) -> None:
         from nemo_rl.algorithms.loss.interfaces import LossType
 
         w = _make_worker(LossType.TOKEN_LEVEL)
         w.media_placeholder_token_id = 42
         w.delegate_pack_to_model = True
         w.delegate_mtp_loss_mask_to_model = True
+        w.create_router_padding_mask = create_router_padding_mask
+        w.allow_unmasked_chunkwise_cp = not create_router_padding_mask
         batch = _fake_batch()
 
         with patch(
@@ -449,9 +458,15 @@ class TestTrainMicrobatch:
 
         attach_validity_mask.assert_called_once_with(batch, 42)
         iterator_kwargs = mock_module_symbols["gmi"].call_args.kwargs
+        assert iterator_kwargs["allow_unmasked_chunkwise_cp"] is (
+            not create_router_padding_mask
+        )
         assert iterator_kwargs["delegate_pack_to_model"] is True
         assert iterator_kwargs["delegate_mtp_loss_mask_to_model"] is True
         assert iterator_kwargs["model_slices_context_parallel_inputs"] is False
+        assert (
+            iterator_kwargs["create_router_padding_mask"] is create_router_padding_mask
+        )
 
     def test_wraps_forward_backward_in_no_sync(self, mock_module_symbols):
         """The single most important assertion in this file. Without the
@@ -1232,6 +1247,78 @@ class TestFinish:
         assert m["loss"] == pytest.approx(1.0)  # ÷ toks (loss_type)
         assert m["is_oob_ratio"] == pytest.approx(1.0)  # ÷ seqs, NOT toks
         assert m["sampling_importance_ratio"] == pytest.approx(1.0)  # ÷ toks
+
+
+def _in_loss_seq_filter_loss_fn():
+    from nemo_rl.algorithms.loss.loss_functions import (
+        ClippedPGLossConfig,
+        ClippedPGLossFn,
+    )
+
+    return ClippedPGLossFn(
+        ClippedPGLossConfig(
+            seq_logprob_error_in_loss=True,
+            force_on_policy_ratio=True,
+            token_level_loss=True,
+            reference_policy_kl_penalty=0,
+        ),
+        seq_logprob_error_threshold=2.0,
+    )
+
+
+class TestFinishInLossSeqFilter:
+    def test_divides_by_survivor_counts_summed_across_chunks(self, mock_module_symbols):
+        """Survivor counts from the loss, not the pre-filter masks, set 1/N."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        mock_module_symbols["mfb"].return_value = [
+            {
+                "loss": 3.0,
+                "seq_logprob_error_valid_seqs": 2.0,
+                "seq_logprob_error_valid_tokens": 300.0,
+                "num_masked_seqs_by_logprob_error": 6.0,
+                "unadvertised_metric": 300.0,
+            }
+        ]
+        w.begin_train_step(loss_fn=_in_loss_seq_filter_loss_fn())
+        # Each chunk has 8 seqs / 2048 tokens before filtering.
+        w.train_microbatch(_fake_batch())
+        w.train_microbatch(_fake_batch())
+        w.finish_train_step()
+
+        reduced = mock_module_symbols["all_reduce"].call_args_list[0].args[0]
+        assert reduced.tolist() == [4.0, 600.0]
+        w.model.scale_gradients.assert_called_once()
+        assert w.model.scale_gradients.call_args.args[0] == pytest.approx(1 / 600)
+        metrics = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"]
+        assert [m["loss"] for m in metrics] == pytest.approx([3 / 600] * 2)
+        assert [m["num_masked_seqs_by_logprob_error"] for m in metrics] == [6.0] * 2
+        assert [m["unadvertised_metric"] for m in metrics] == pytest.approx([0.5] * 2)
+        assert {m["global_valid_toks"] for m in metrics} == {600.0}
+        assert {m["global_valid_seqs"] for m in metrics} == {4.0}
+
+    def test_empty_survivor_step_raises_before_any_update(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        mock_module_symbols["mfb"].return_value = [
+            {
+                "loss": 0.0,
+                "seq_logprob_error_valid_seqs": 0.0,
+                "seq_logprob_error_valid_tokens": 0.0,
+                "num_masked_seqs_by_logprob_error": 8.0,
+            }
+        ]
+        w.begin_train_step(loss_fn=_in_loss_seq_filter_loss_fn())
+        w.train_microbatch(_fake_batch())
+        with pytest.raises(RuntimeError, match="No valid response tokens remain"):
+            w.finish_train_step()
+
+        w.model.scale_gradients.assert_not_called()
+        w.optimizer.step.assert_not_called()
+        w.scheduler.step.assert_not_called()
+        assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
 
 
 # ── abort_train_step ─────────────────────────────────────────────────────

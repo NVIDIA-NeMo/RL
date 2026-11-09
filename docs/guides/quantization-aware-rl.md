@@ -30,6 +30,36 @@ The following workflow + quantization recipe combinations have been validated en
 
 The `nvfp4_a16.yaml` custom YAML enables NVFP4 e2m1 weight quantization (with dynamic e4m3 micro-block scales) and leaves activations unquantized; weights are still exercised through both Megatron training and vLLM generation. The `nvfp4_a16_mlp_only.yaml` recipe restricts W4A16 to MLP weights for real-quant rollout. The Nano3 `nano3_nvfp4_weightonly.yaml` recipe applies the same W4A16 weight-only format to the supported MLP/MoE weights while keeping Nano3-sensitive Mamba, attention, gate/router, shared-expert, norm, and selected layer paths in BF16 through the model-specific `real_quant_ignore` list in the example config.
 
+## Dynamic FP8 KV Cache
+
+For vLLM rollouts with FP8 precision (including MXFP8 weights), configure:
+
+```yaml
+policy:
+  generation:
+    vllm_cfg:
+      precision: fp8
+      kv_cache_dtype: fp8_per_token_head
+    vllm_kwargs:
+      attention_backend: TRITON_ATTN
+```
+
+K and V scales are computed independently for each token and KV head when
+writing the cache, and stored alongside the FP8 cache. Static policy KV scales
+are not synchronized during weight refits. This requires a vLLM build supporting
+`fp8_per_token_head`. Explicitly incompatible attention backends raise an error;
+when no backend is specified, vLLM selects or rejects the backend. NeMo RL does
+not override the configured backend.
+
+DeepSeek's specialized MLA cache and ModelOpt `real_quant` rollout are not
+supported. Mamba state caches are unaffected. This configures rollout cache
+storage; it does not change policy training attention.
+
+For command-line overrides, use
+`policy.generation.vllm_cfg.kv_cache_dtype=fp8_per_token_head` and
+`++policy.generation.vllm_kwargs.attention_backend=TRITON_ATTN`.
+The default `kv_cache_dtype: auto` preserves the existing cache behavior.
+
 ## Simulated KV-Cache Quantization
 
 QARL can apply ModelOpt fake quantization to the attention K/V tensors in both
@@ -419,7 +449,7 @@ uv run --extra mcore --extra modelopt \
 ## Limitations
 
 - **Generation**: Currently only vLLM is supported for generation.
-- **DTensor backend**: Quantization support for the DTensor policy worker is not yet implemented.
+- **Automodel backend**: Quantization support for the Automodel policy worker is not yet implemented.
 - **Real-quant rollout**: W4A4 and W4A16 are supported for dense and fused-MoE vLLM ModelOpt NVFP4 layers exported from the Megatron policy path. Fused MoE currently requires all experts local to each vLLM rank. Hybrid MoE/Mamba recipes should keep unsupported or sensitive non-MLP paths in BF16 via `real_quant_ignore`.
 - **Router Replay (R3)**: R3 is supported on the Megatron policy path.
 - **Input quantization**: W4A4 real rollout supports ModelOpt's block-16 E2M1 input format with a global scale per projection; other activation formats remain fake-quant only.
