@@ -6,9 +6,11 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import statistics
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -86,7 +88,9 @@ def audit_checkpoint(step: int) -> dict:
         else:
             rates.append(value)
     assert steps and all(value == step for value in steps)
-    assert rates and all(value == 2e-6 for value in rates)
+    saved_rate = scheduler["sched._last_lr"][0]
+    assert rates and all(value == saved_rate for value in rates)
+    assert math.isclose(saved_rate, 2e-6, rel_tol=1e-12, abs_tol=0.0)
     assert scheduler["sched.last_epoch"] == step
     shards = len(list(base.glob("*.distcp")))
     assert shards == 4
@@ -97,7 +101,10 @@ def audit_checkpoint(step: int) -> dict:
         "optimizer_step_entries": len(steps),
         "all_saved_optimizer_steps_match": True,
         "optimizer_lr_entries": len(rates),
-        "all_saved_lrs_2e_6": True,
+        "all_saved_lrs_match_scheduler": True,
+        "saved_lr": saved_rate,
+        "configured_peak_lr": 2e-6,
+        "saved_lr_matches_peak_within_float_rounding": True,
         "scheduler": scheduler,
         "metadata_sha256": hashlib.sha256(
             (base / ".metadata").read_bytes()
@@ -168,6 +175,12 @@ def main() -> None:
         "streaming_dispatch_counts": sorted(
             {row["train/policy_train_dispatches"] for row in stream}
         ),
+        "streaming_dispatch_frequency": dict(
+            Counter(int(row["train/policy_train_dispatches"]) for row in stream)
+        ),
+        "multiple_dispatch_updates": sum(
+            row["train/policy_train_dispatches"] > 1 for row in stream
+        ),
         "streaming_all_lag_zero": True,
         "notes": [
             "Historical baselines; independent rollouts and one seed.",
@@ -175,6 +188,7 @@ def main() -> None:
             "The earlier Qwen BF16 1% gate remains FAILED; this is a separate exploratory run.",
             "Step time includes measured checkpoint/cold-step overhead; workloads differ.",
             "No online validation accuracy is recorded.",
+            "Readiness threshold16 does not force fixed chunks; some steps may use a full dispatch.",
         ],
     }
     colors = ("#4c78a8", "#ef8a23", "#119b83")

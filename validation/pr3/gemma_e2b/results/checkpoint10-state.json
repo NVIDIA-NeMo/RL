@@ -15,7 +15,10 @@
   "optimizer_step_entries": 505,
   "all_saved_optimizer_steps_match": true,
   "optimizer_lr_entries": 505,
-  "all_saved_lrs_2e_6": true,
+  "all_saved_lrs_match_scheduler": true,
+  "saved_lr": 2e-06,
+  "configured_peak_lr": 2e-06,
+  "saved_lr_matches_peak_within_float_rounding": true,
   "scheduler": {
     "sched._last_lr": [
       2e-06

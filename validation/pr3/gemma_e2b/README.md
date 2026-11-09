@@ -23,6 +23,11 @@ and gradients. GenKL mean0.000385428, range0.000342696..0.000424718. These are
 early observations, not convergence qualification or a checkpoint/resume test.
 See results/checkpoint10-state.json and results/early-10-summary.json.
 
+Step12 selected all32 already-ready groups in one dispatch; first11 used two.
+This follows the unchanged sampler readiness contract. The comparison summary
+records dispatch-count frequencies and the number of multiple-dispatch updates;
+the experiment does not force two equal chunks or claim measured GPU overlap.
+
 - Model: local google/gemma-4-E2B-it, same path as both baselines.
 - One interactive debug allocation21546953, pool0-00343,8H100,4h walltime.
   Four training GPUs/FSDP2/EP1 and four async-vLLM rollout GPUs; TP=CP1.
