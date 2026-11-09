@@ -1288,7 +1288,8 @@ class TestFinishInLossSeqFilter:
         w.finish_train_step()
 
         reduced = mock_module_symbols["all_reduce"].call_args_list[0].args[0]
-        assert reduced.tolist() == [4.0, 600.0]
+        # [kept seqs, kept tokens, pre-filter tokens for MTP]
+        assert reduced.tolist() == [4.0, 600.0, 4096.0]
         w.model.scale_gradients.assert_called_once()
         assert w.model.scale_gradients.call_args.args[0] == pytest.approx(1 / 600)
         metrics = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"]
