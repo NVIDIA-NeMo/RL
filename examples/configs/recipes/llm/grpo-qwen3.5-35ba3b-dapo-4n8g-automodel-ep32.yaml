@@ -63,7 +63,7 @@ policy:
         attn: sdpa
         linear: torch
         rms_norm: torch
-        experts: gmm
+        experts: torch_mm
         dispatcher: hybridep
         fake_balanced_gate: false
         rope_fusion: false

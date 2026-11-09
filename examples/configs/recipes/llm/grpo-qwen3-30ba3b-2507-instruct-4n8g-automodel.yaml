@@ -35,7 +35,7 @@ policy:
     automodel_kwargs:
       backend:
         _target_: nemo_automodel.components.models.common.utils.BackendConfig
-        experts: gmm
+        experts: torch_mm
         # HybridEP, not plain DeepEP: this container's deep_ep is built with
         # HYBRID_EP_MULTINODE=1 (NVIDIA-NeMo/RL#4038); plain "deepep" hangs
         # with "DeepEP error: timeout (dispatch CPU)" on this EP=32,

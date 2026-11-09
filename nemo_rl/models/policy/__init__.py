@@ -135,7 +135,7 @@ class AutomodelBackendConfig(TypedDict):
     # RMSNorm implementation: "te" (Transformer Engine), etc.
     rms_norm: NotRequired[str]
     # MoE expert GEMM backend: "torch" (per-expert loop), "te" (TE GroupedLinear),
-    # "gmm" (grouped_gemm.ops.gmm), "torch_mm" (torch._grouped_mm).
+    # "torch_mm" (torch._grouped_mm), "torch_mm_mxfp8" (torchao MXFP8 grouped GEMM).
     experts: NotRequired[str]
     # MoE token dispatcher: "torch" (DTensor all-gather/reduce-scatter) or "hybridep".
     dispatcher: NotRequired[str]
