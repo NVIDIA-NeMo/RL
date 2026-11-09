@@ -516,6 +516,15 @@ The SC path splits the async-GRPO loop across a rollout pump and a train pump th
 - `_rollout_pump`: pulls prompts from the dataloader, calls `sampler.admit`, dispatches `RolloutManager.generate_and_push`, and honours `max_inflight_prompts` as a backpressure cap.
 - `_train_pump`: for each chunk, `sampler.evict → sampler.select → _value_stage (PPO only) → policy/reference logprobs → _advantage_stage → TQPolicy backward`. Streaming PPO accumulates gradients with `begin_train_step / train_microbatches_from_meta` across chunks, then runs `finish_train_step → policy refit → _value_train_epochs (assembled or split) → dp_client.clear_samples`.
 
+#### 6. TransferQueue controller overrides (`nemo_rl/data_plane/adapters/tq_controller_patch.py`)
+
+The TransferQueue controller serves every data-plane request on one thread, so `tq.init` starts it with two overrides of the pinned TransferQueue:
+
+- `kv_retrieve_meta` reads the field mask with one `.tolist()` instead of one tensor read per field. Results are identical.
+- `FieldMeta.remove_samples` skips the nested-to-regular relabel. Stock TransferQueue re-checks every nested field's label on every clear, at a cost of O(live rows). The situation that triggers a relabel does happen in NeMo-RL, but nothing in NeMo-RL reads the label. Data is rebuilt from the stored rows, so skipping the relabel changes no data a run sees, and a clear costs O(cleared rows).
+
+Do not read a field's `is_nested` or `shape` label from TransferQueue metadata in NeMo-RL code. Read row shapes from the tensors or ship them on `KVBatchMeta.tags`. `test_no_code_reads_the_tq_field_label` in `tests/unit/data_plane/test_architecture_invariants.py` enforces this.
+
 ### Coordination Flow
 
 1. **Driver setup**: `setup_single_controller` builds the worker groups, virtual cluster, dp client, dataloader, `TQReplayBuffer`, `RolloutManager`, and weight synchronizer, and packs them into a `SingleControllerActorArgs` that the entrypoint cloudpickles into the actor.

@@ -17,17 +17,17 @@ The stock ``kv_retrieve_meta`` reads a torch tensor once per field, about a quar
 cycle on the single-threaded controller. ``kv_retrieve_meta`` below is the stock
 method with one ``.all(dim=0).tolist()`` instead; results are identical.
 
-The stock ``FieldMeta.remove_samples`` rescans every remaining shape of a nested field on each
-clear, only to see whether the field can collapse to non-nested, so ``CLEAR_META`` costs
-O(live samples) on the controller's only request thread. ``remove_samples`` below never collapses,
-so a clear costs O(cleared samples). A nested field whose shapes became uniform stays nested; it
-still reports the right shape for every sample, and storage rebuilds tensors from the stored rows.
+Stock ``FieldMeta.remove_samples`` re-checks every nested field's label on every clear: it scans
+all live rows and, if they share one shape, relabels the field from nested to regular. That costs
+O(live rows) on the controller's only request thread. The situation that triggers a relabel does
+happen in NeMo-RL (for example, one row left), but nothing in NeMo-RL reads the label. Data is
+rebuilt from the stored rows, so skipping the relabel changes no data a run sees.
+``remove_samples`` below skips it, so a clear costs O(cleared rows).
 
-This drops a documented TQ behavior: relabeling a nested field as regular once its odd-shaped rows
-are cleared (TQ's ``test_clear_data_nested_field_becomes_regular`` fails under this override). Code
-in this repo must not read a field's ``is_nested`` or ``shape`` label from TQ metadata. Read row
-shapes from the tensors (``_from_wire``) or ship them on ``KVBatchMeta.tags``
-(``multimodal_row_tags``).
+Code in this repo must not read a field's ``is_nested`` or ``shape`` label from TQ metadata;
+``test_no_code_reads_the_tq_field_label`` enforces that. Read row shapes from the tensors
+(``_from_wire``) or ship them on ``KVBatchMeta.tags`` (``multimodal_row_tags``). TQ's own
+``test_clear_data_nested_field_becomes_regular`` fails under this override by design.
 
 The controller is a Ray actor, so both are applied in a subclass started by ``tq.init``.
 
@@ -119,7 +119,7 @@ def kv_retrieve_meta(
 
 
 def remove_samples(self: FieldMeta, indexes: list[int]) -> None:
-    """Stock ``FieldMeta.remove_samples`` without the O(live samples) collapse to non-nested."""
+    """Stock ``FieldMeta.remove_samples`` without the nested-to-regular relabel."""
     if self.per_sample_shapes:
         for idx in indexes:
             self.per_sample_shapes.pop(idx, None)
