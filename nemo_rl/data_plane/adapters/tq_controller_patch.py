@@ -18,13 +18,14 @@ cycle on the single-threaded controller. ``kv_retrieve_meta`` below is the stock
 method with one ``.all(dim=0).tolist()`` instead; results are identical.
 
 The stock ``FieldMeta.remove_samples`` rescans every remaining shape of a nested field on each
-clear, so ``CLEAR_META`` grows with the number of live samples. ``remove_samples`` below rescans
-only after ``RESCAN_REMOVED_FRACTION`` of them is gone.
+clear, only to see whether the field can collapse to non-nested, so ``CLEAR_META`` costs
+O(live samples) on the controller's only request thread. ``remove_samples`` below never collapses,
+so a clear costs O(cleared samples). A nested field whose shapes became uniform stays nested; it
+still reports the right shape for every sample, and storage rebuilds tensors from the stored rows.
 
 The controller is a Ray actor, so both are applied in a subclass started by ``tq.init``.
 
-Delete this module once the pinned TransferQueue includes both changes, proposed upstream on
-https://github.com/ZhiyuLi-Nvidia/TransferQueue/tree/perf/throttle-nested-shape-rescan.
+Delete this module once the pinned TransferQueue includes both changes.
 """
 
 from typing import Any
@@ -41,9 +42,6 @@ logger = get_logger(__name__)
 
 # The TransferQueue version the overrides below were copied from (see the pin in pyproject.toml).
 STOCK_TQ_VERSION = "0.1.11"
-
-# A nested field rescans its shapes once this fraction of its live samples was removed.
-RESCAN_REMOVED_FRACTION = 1 / 8
 
 
 def kv_retrieve_meta(
@@ -114,13 +112,12 @@ def kv_retrieve_meta(
     )
 
 
-def remove_samples(self, indexes: list[int]) -> None:
-    """Stock ``FieldMeta.remove_samples`` that rescans nested shapes only after ``RESCAN_REMOVED_FRACTION``."""
-    before = len(self.global_indexes)
-    for idx in indexes:
-        self.per_sample_shapes.pop(idx, None)
-        self.global_indexes.discard(idx)
-    self.removed_since_scan += before - len(self.global_indexes)
+def remove_samples(self: FieldMeta, indexes: list[int]) -> None:
+    """Stock ``FieldMeta.remove_samples`` without the O(live samples) collapse to non-nested."""
+    if self.per_sample_shapes:
+        for idx in indexes:
+            self.per_sample_shapes.pop(idx, None)
+    self.global_indexes.difference_update(indexes)
 
     if len(self.global_indexes) == 0:
         self.is_nested = None
@@ -128,26 +125,11 @@ def remove_samples(self, indexes: list[int]) -> None:
         self.shape = None
         self.dtype = None
         self.per_sample_shapes.clear()
-    else:
-        # Scanning every remaining shape is O(live), so only rescan after a fraction of them is gone.
-        if self.is_nested and self.removed_since_scan >= RESCAN_REMOVED_FRACTION * len(
-            self.global_indexes
-        ):
-            self.removed_since_scan = 0
-            remaining_shapes = set(
-                tuple(shape) if isinstance(shape, list) else shape
-                for shape in self.per_sample_shapes.values()
-            )
-            if len(remaining_shapes) == 1:
-                self.is_nested = False
-                self.shape = next(iter(remaining_shapes))
-                self.per_sample_shapes.clear()
 
 
 def patch_field_meta() -> None:
     """Install ``remove_samples`` on ``FieldMeta`` in this process; the controller calls it on start."""
     FieldMeta.remove_samples = remove_samples
-    FieldMeta.removed_since_scan = 0
 
 
 def assert_stock_tq_version() -> None:
@@ -159,10 +141,10 @@ def assert_stock_tq_version() -> None:
     if transfer_queue.__version__ != STOCK_TQ_VERSION:
         raise RuntimeError(
             f"transfer_queue is {transfer_queue.__version__}, but tq_controller_patch copies methods from "
-            f"{STOCK_TQ_VERSION}. If this TQ includes the upstream change named in the module docstring, "
-            "delete this module and its call in _init_tq. Otherwise diff kv_retrieve_meta and "
-            "FieldMeta.remove_samples against this TQ, re-copy them only if they changed, then update "
-            "STOCK_TQ_VERSION."
+            f"{STOCK_TQ_VERSION}. If this TQ no longer rescans shapes in FieldMeta.remove_samples and "
+            "reads the kv_retrieve_meta field mask once, delete this module and its call in _init_tq. "
+            "Otherwise diff kv_retrieve_meta and FieldMeta.remove_samples against this TQ, re-copy them "
+            "only if they changed, then update STOCK_TQ_VERSION."
         )
 
 
