@@ -625,18 +625,18 @@ def _off_policy(name: str, value: Any) -> _Case:
 
 
 CASES = [
-    # A plain call: the render and the reply's reasoning and tool parsers (C39).
+    # A plain call: the render and the reply's reasoning and tool parsers.
     _Case("plain"),
     # No max_tokens: each path fills the budget the way vLLM's server does.
     _Case("no_max_tokens", fields={"max_tokens": None}),
     # Gym's echo of turn 1 without capture: the model's tokens replace the
-    # template's re-render of that turn (C16's turn-end cut).
+    # template's re-render of that turn (the turn-end cut).
     _Case(
         "inline_prefix",
         extras=lambda kit: {"required_prefix_token_ids": kit.turn_1_tokens()},
     ),
     # The same, for a model whose turns end on a token that is not its
-    # tokenizer's EOS, as gpt-oss's <|call|> (C16).
+    # tokenizer's EOS, as gpt-oss's <|call|>.
     _Case(
         "turn_end_not_eos",
         extras=lambda kit: {"required_prefix_token_ids": kit.turn_1_tokens()},
@@ -648,7 +648,7 @@ CASES = [
         extras=lambda kit: {"ng_capture": _staged_turn_1(kit, mode="token_in")},
         mode="token_in",
     ),
-    # Gym's candidate whose cut holds is served token-in (C26)...
+    # Gym's candidate whose cut holds is served token-in...
     _Case(
         "candidate_cut_holds",
         extras=lambda kit: {"ng_capture": _candidate(kit, [*HISTORY, OBSERVATION])},
@@ -662,7 +662,7 @@ CASES = [
         mode="text",
     ),
     # A candidate whose tool call had empty content and now has none: string
-    # content renders both alike, so the cut holds (C26)...
+    # content renders both alike, so the cut holds...
     _Case(
         "empty_tool_content",
         messages=[HISTORY[0], TOOL_TURN, TOOL_RESULT],
@@ -691,7 +691,7 @@ CASES = [
         mode="text",
         kit="structured_content",
     ),
-    # Score centering stages the sampler's top-k with the call (C29).
+    # Score centering stages the sampler's top-k with the call.
     _Case(
         "score_centering",
         extras=lambda kit: {"ng_capture": _admission(mode="text")},
@@ -709,7 +709,7 @@ CASES = [
         kit="vlm",
     ),
     # An image after the echoed turn 1: processed once in the frontend, both
-    # engines run the same pixels, and the splice moves its tokens (C30).
+    # engines run the same pixels, and the splice moves its tokens.
     _Case(
         "image_after_echoed_turn",
         messages=[*HISTORY, IMAGE_TURN],
@@ -726,13 +726,13 @@ CASES = [
         },
         kit="pythonic",
     ),
-    # Nemotron-3-Nano's reasoning parser plugin, with thinking off (C39).
+    # Nemotron-3-Nano's reasoning parser plugin, with thinking off.
     _Case(
         "nano_v3_thinking_off",
         fields={"chat_template_kwargs": {"enable_thinking": False}},
         kit="nano_v3",
     ),
-    # The sampling the trainer replays, set explicitly (C41)...
+    # The sampling the trainer replays, set explicitly...
     _Case(
         "on_policy_sampling",
         fields={

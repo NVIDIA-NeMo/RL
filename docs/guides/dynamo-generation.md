@@ -53,8 +53,8 @@ shows them all:
 | `startup_timeout_s` | 600 | Bounds service start-up and engine registration |
 | `request_timeout_s` | null | Deadline for one NeMo RL rollout through the frontend. null waits as long as generation takes, as native does; on the SingleController, `async_rl.rollout_failure.native.generation_timeout_s` bounds both paths |
 | `frontend_args.router_mode` | `kv` | Frontend routing policy |
-| `frontend_args.session_affinity_ttl_secs` | 300 | Keeps a NeMo-Gym token-capture rollout on one engine while it is idle for up to this many seconds; null disables it. Dynamo keeps at most 65,536 sessions and answers a new one past that with HTTP 529 |
-| `frontend_args.render_workers` | 8 | Processes in the frontend that render NeMo-Gym's chat calls and build their replies. Each serves about 640 single-turn calls/s, 45 for a 21K-token agentic history, or 200 with 1-4 images |
+| `frontend_args.session_affinity_ttl_secs` | 300 | Keeps a NeMo-Gym token-capture rollout on one engine while it is idle for up to this many seconds; null disables it. Takes effect from Dynamo 1.7: Dynamo 1.5.1 drops the session id of a chat call served by NeMo RL's chat engine. Dynamo keeps at most 65,536 sessions and answers a new one past that with HTTP 529 |
+| `frontend_args.render_workers` | 8 | Processes in the frontend that render NeMo-Gym's chat calls and build their replies; every Gym call in the fleet shares them. Each holds its own tokenizer and processor, about 1.7–2.3 GB. On one Grace core of a GB200, one serves about 640 single-turn calls/s, 45 for a 21K-token agentic history (22 with its prefix splice), or 200 with 1–4 images |
 | `frontend_args.extra_cli_args` | `[]` | Extra `dynamo.frontend` flags. `--dyn-chat-processor` and `--custom-jinja-template` are rejected: NeMo RL renders chat itself |
 
 The etcd and nats-server binaries are found in `NEMO_RL_DYNAMO_BIN_DIR` when it
@@ -80,8 +80,9 @@ NeMo-Gym's policy model calls the frontend. Setup turns on Gym's Dynamo dialect
 (`dynamo_frontend` in Gym's
 [`vllm_model`](https://github.com/NVIDIA-NeMo/Gym/tree/main/responses_api_models/vllm_model)
 config). The frontend takes only OpenAI fields plus `nvext`, so Gym sends the native
-request's extra fields (`ng_capture`, `required_prefix_token_ids`, `ng_measure`)
-in one `nemo_rl:gym:` annotation, and reads the call's token fields
+request's extra fields (`ng_capture`, `required_prefix_token_ids`), and
+`ng_measure` for the measure call it makes in place of `/tokenize`, in one
+`nemo_rl:gym:` annotation, and reads the call's token fields
 (`prompt_token_ids`, `generation_token_ids`, `generation_log_probs`,
 `routed_experts`, `ng_commit_coords`) from `nvext.nemo_rl`.
 
@@ -107,7 +108,10 @@ same record and return the same reply.
 
 Where the behavior differs from the native endpoint:
 
-- The frontend refuses more than 4 `stop` strings or `stop_token_ids` (HTTP 500).
+- The frontend refuses more than 32 `stop` strings, and vLLM request fields its
+  own request type lacks (for example `structured_outputs`, `return_token_ids`,
+  `truncate_prompt_tokens`, `priority`, `chat_template`), with HTTP 400.
+- gpt-oss (Harmony) chat calls are refused with HTTP 400.
 - A token-capture call refused for its context length acknowledges the refusal
   at the end of the error message instead of in the native endpoint's
   `x-ng-capture-refused` header, which Dynamo's errors cannot carry. Gym's
@@ -128,6 +132,11 @@ Startup rejects these with `dynamo: true`:
   (`env.nemo_gym.policy_model.responses_api_models.vllm_model`): the frontend
   answers every request carrying it with HTTP 400. Startup checks only this
   overlay, not Gym's own YAMLs.
+- `extra_body` `stop_token_ids`, `allowed_token_ids`, `bad_words_token_ids`,
+  `cache_salt`, `logprob_token_ids` or `detokenize` on the policy model: the
+  frontend accepts them but drops them before NeMo RL's chat engine sees them.
+- `vllm_cfg.skip_tokenizer_init: true` with NeMo-Gym: the engine detokenizes
+  the replies Gym's calls get through the frontend.
 - `vllm_cfg.expert_parallel_size > tensor_parallel_size`: that runs data
   parallelism inside vLLM, which Dynamo does not serve yet. Above data-parallel
   rank 0, vLLM rejects each engine's `ipc://` KV-event endpoint.
@@ -164,8 +173,7 @@ bash docker/dynamo/install.sh
 
 ## Run
 
-Use any non-colocated SingleController vLLM recipe that does not use NeMo-Gym,
-and add the switch:
+Use any non-colocated SingleController vLLM recipe and add the switch:
 
 ```bash
 uv run examples/run_grpo_single_controller.py \

@@ -40,14 +40,13 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
         "device-aware-weighted",
     ] = "kv"
     # Idle seconds a NeMo-Gym token-capture session stays on one engine, as native
-    # pins each Gym session to one server; None disables it. Dynamo keeps at most
-    # 65,536 sessions (HTTP 529 past that), so keep (captured rollouts started per
-    # second) x TTL below that.
+    # pins each Gym session to one server; None disables it. Needs Dynamo 1.7
+    # (ai-dynamo/dynamo#15333): 1.5.1 drops a chat call's session id. Dynamo keeps
+    # at most 65,536 sessions (HTTP 529 past that).
     session_affinity_ttl_secs: Annotated[int, Field(gt=0, le=31_536_000)] | None = 300
     # Processes that render NeMo-Gym's chat calls and build their replies (the
-    # checkpoint's template, tokenizer, HF processor and vLLM's parsers). Each
-    # serves on one core: about 640 single-turn calls/s, 45 for a 21K-token
-    # agentic history (22 with its prefix splice), or 200 with 1-4 images.
+    # checkpoint's template, tokenizer, HF processor and vLLM's parsers); each
+    # uses one core. See docs/guides/dynamo-generation.md for sizing.
     render_workers: PositiveInt = 8
     extra_cli_args: list[str] = Field(default_factory=list)
 

@@ -306,7 +306,7 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         admission = host._parse_capture_admission(plan["admission"])
         serving_admission = host._parse_capture_admission(plan["serving_admission"])
         if admission is not None and admission.mode == "candidate":
-            # C26: the frontend's chat engine decides a candidate; a request
+            # The frontend's chat engine decides a candidate; a request
             # still marked one skipped that decision.
             raise InvalidArgument(
                 "a candidate admission reached the engine undecided; NeMo RL's "
@@ -485,7 +485,7 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         if routes is not None:
             message["routed_experts"] = routes
         if self._host._capture_top_logprobs:
-            # C29: score centering stages the sampler's top-k with the call.
+            # Score centering stages the sampler's top-k with the call.
             (
                 message["sampler_topk_token_ids"],
                 message["sampler_topk_logprobs"],

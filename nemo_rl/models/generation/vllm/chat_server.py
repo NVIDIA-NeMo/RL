@@ -206,7 +206,7 @@ class NeMoRLOpenAIServingMixin:
 
         The steps every host of the chat path shares, before any TQ read: the
         render with the checkpoint's template and processor, the capture
-        decision for a Gym candidate (C26 on #4979), and, when a prefix will be
+        decision for a Gym candidate, and, when a prefix will be
         spliced, the render of the history up to the last assistant turn that
         the splice cuts against.
         """
