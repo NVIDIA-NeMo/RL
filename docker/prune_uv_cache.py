@@ -30,12 +30,15 @@ Removed, matched against uv.lock (layout per uv's crates/uv-cache/src/wheel.rs):
   sdists-v*/{pypi,index/<digest>}/<name>/<version>[...]
       kept iff (<name>, <version>) is pinned by uv.lock.
   sdists-v*/git/<digest>/<first 16 hex of commit>
-  git-v*/checkouts/<digest>/<short commit>
+  git-v*/checkouts/<digest>/<short commit>[.ok]
       kept iff the commit prefixes a git commit uv.lock pins.
   archive-v0/<id>
       kept iff any link left under wheels-v*/ or sdists-v*/ resolves to it --
       the same reachability scan uv's own `uv cache prune` uses, so archives
       behind entries this script never touches (url/, path/, editable/) stay.
+  files-v*/<shard>/<digest>
+      kept iff something still hardlinks it (link count > 1), as uv's own
+      `uv cache prune` decides.
 
 Never removed: url/, path/, editable/ trees (keyed by URL digest, no version to
 match), git-v*/db, and every other bucket. That keeps it safe to run before
@@ -141,6 +144,10 @@ def plan_removals(
     for commit_dir in commit_dirs:
         if commit_dir.is_dir() and not _sha_kept(commit_dir.name, shas):
             removals.append(commit_dir)
+            # uv >= 0.12 marks a finished checkout with a sibling `<short sha>.ok` file.
+            ready = commit_dir.with_name(f"{commit_dir.name}.ok")
+            if ready.is_file():
+                removals.append(ready)
     return removals
 
 
@@ -175,6 +182,28 @@ def _reachable_archives(cache_dir: Path, removed: set[Path]) -> set[str]:
     return reachable
 
 
+def _remove_unlinked_files(cache_dir: Path, *, verbose: bool) -> int:
+    """Drop content-addressed file objects no archive hardlinks any more.
+
+    With uv's `content-addressed-cache` preview feature (on under `preview = true`),
+    every file in archive-v0/<id>/ is a hardlink to files-v0/<shard>/<digest>, so
+    removing an archive frees nothing until its objects go too. An object with a
+    link count of 1 has no archive (and no hardlinked venv) left -- the same rule
+    as uv's own `uv cache prune` (Cache::prune_archive_files).
+    """
+    removed = 0
+    for obj in cache_dir.glob("files-v*/*/*"):
+        if not obj.is_symlink() and obj.is_file() and obj.stat().st_nlink == 1:
+            if verbose:
+                print(f"remove: {obj}")
+            obj.unlink()
+            removed += 1
+    for shard in cache_dir.glob("files-v*/*"):
+        if shard.is_dir() and not shard.is_symlink() and not any(shard.iterdir()):
+            shard.rmdir()
+    return removed
+
+
 def prune(
     cache_dir: Path,
     versions: set[tuple[str, str]],
@@ -201,6 +230,8 @@ def prune(
             path.unlink()
         else:
             shutil.rmtree(path)
+    if not dry_run:
+        _remove_unlinked_files(cache_dir, verbose=verbose)
     return len(removals), len(orphaned)
 
 

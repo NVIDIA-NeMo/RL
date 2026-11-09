@@ -29,8 +29,8 @@ prune_uv_cache = importlib.util.module_from_spec(_SPEC)
 sys.modules["prune_uv_cache"] = prune_uv_cache
 _SPEC.loader.exec_module(prune_uv_cache)
 
-SHA_KEPT = "17cfb817bccec3a9c247013360cc550c2bac441e"
-SHA_STALE = "0123456789abcdef0123456789abcdef01234567"
+SHA_KEPT = "17cfb817bccec3a9c247013360cc550c2bac441e"  # pragma: allowlist secret
+SHA_STALE = "0123456789abcdef0123456789abcdef01234567"  # pragma: allowlist secret
 TAG = "cp313-cp313-linux_x86_64"
 
 
@@ -126,7 +126,7 @@ def test_entry_version(entry: str, expected: str | None) -> None:
 
 
 def test_prunes_stale_pypi_wheels_and_their_archives(cache: Path) -> None:
-    pypi = cache / "wheels-v6" / "pypi"
+    pypi = cache / "wheels-v7" / "pypi"
     _wheel(pypi, "orjson", f"3.11.3-{TAG}", "old-1")
     _wheel(pypi, "orjson", f"3.11.9-{TAG}", "old-2")
     _wheel(pypi, "orjson", f"3.12.0-{TAG}", "kept")
@@ -143,7 +143,7 @@ def test_prunes_stale_pypi_wheels_and_their_archives(cache: Path) -> None:
 
 def test_does_not_confuse_version_prefixes(cache: Path) -> None:
     # Removing 1.0 must not touch 1.0.1's files (a prefix glob would).
-    pypi = cache / "wheels-v6" / "pypi"
+    pypi = cache / "wheels-v7" / "pypi"
     _wheel(pypi, "pkg", "1.0-py3-none-any", "stale")
     _wheel(pypi, "pkg", "1.0.1-py3-none-any", "kept")
 
@@ -157,8 +157,8 @@ def test_does_not_confuse_version_prefixes(cache: Path) -> None:
 
 
 def test_prunes_alternative_index_trees(cache: Path) -> None:
-    # torch & co. come from download.pytorch.org: wheels-v6/index/<digest>/...
-    index = cache / "wheels-v6" / "index" / "d1g3st"
+    # torch & co. come from download.pytorch.org: wheels-v7/index/<digest>/...
+    index = cache / "wheels-v7" / "index" / "d1g3st"
     _wheel(index, "torch", f"2.8.0+cu130-{TAG}", "torch-old")
     _wheel(index, "torch", f"2.9.0+cu130-{TAG}", "torch-kept")
 
@@ -174,7 +174,7 @@ def test_prunes_alternative_index_trees(cache: Path) -> None:
 def test_keeps_archives_referenced_by_untouched_trees(cache: Path) -> None:
     # url/ and editable/ entries carry no version to match, so they are left
     # alone -- and so must the archives they point at.
-    wheels = cache / "wheels-v6"
+    wheels = cache / "wheels-v7"
     _link(wheels / "url" / "abc" / "vllm" / f"0.29.0-{TAG}", _archive(cache, "url"))
     _link(wheels / "editable" / "def" / "proj" / "0.1.0", _archive(cache, "edit"))
 
@@ -187,7 +187,7 @@ def test_keeps_archives_referenced_by_untouched_trees(cache: Path) -> None:
 def test_prunes_stale_sdist_versions_keeping_built_wheel_archives(
     cache: Path,
 ) -> None:
-    sdists = cache / "sdists-v9" / "pypi" / "flash-attn"
+    sdists = cache / "sdists-v10" / "pypi" / "flash-attn"
     _link(sdists / "2.7.0" / "rev1" / "wheel", _archive(cache, "built-old"))
     _link(sdists / "2.8.3" / "rev1" / "wheel", _archive(cache, "built-kept"))
     (sdists / "2.8.3" / "rev1" / "src").mkdir()
@@ -199,26 +199,60 @@ def test_prunes_stale_sdist_versions_keeping_built_wheel_archives(
 
 
 def test_prunes_git_builds_and_checkouts_by_commit(cache: Path) -> None:
-    git_builds = cache / "sdists-v9" / "git" / "repo"
-    _link(git_builds / SHA_KEPT[:16] / "rev" / "wheel", _archive(cache, "git-kept"))
-    _link(git_builds / SHA_STALE[:16] / "rev" / "wheel", _archive(cache, "git-old"))
-    checkouts = cache / "git-v0" / "checkouts" / "repo"
-    (checkouts / SHA_KEPT[:7]).mkdir(parents=True)
-    (checkouts / SHA_STALE[:7]).mkdir()
+    # uv >= 0.13: sdists-v10/git/<url digest>/<16-hex commit>/<BuildInfo digest>/
+    # holds the built wheel, its unzipped link and metadata.msgpack (astral-sh/uv#22404).
+    git_builds = cache / "sdists-v10" / "git" / "repo"
+    for sha, archive in ((SHA_KEPT, "git-kept"), (SHA_STALE, "git-old")):
+        shard = git_builds / sha[:16] / "b1nf0d1g3st"
+        _link(shard / "pkg-1.0-py3-none-any", _archive(cache, archive))
+        (shard / "metadata.msgpack").write_text("metadata")
+    # git-v1/checkouts/<repo>/<7-hex commit>/ plus its `<7-hex commit>.ok` marker.
+    checkouts = cache / "git-v1" / "checkouts" / "repo"
+    for sha in (SHA_KEPT, SHA_STALE):
+        (checkouts / sha[:7]).mkdir(parents=True, exist_ok=True)
+        (checkouts / f"{sha[:7]}.ok").touch()
     (checkouts / "not-a-sha").mkdir()
-    (cache / "git-v0" / "db" / "repo").mkdir(parents=True)
+    (cache / "git-v1" / "db" / "repo").mkdir(parents=True)
 
     removed, archives = prune_uv_cache.prune(cache, set(), {SHA_KEPT}, dry_run=False)
 
-    assert (removed, archives) == (2, 1)
+    assert (removed, archives) == (3, 1)
     assert _names(git_builds) == {SHA_KEPT[:16]}
-    assert _names(checkouts) == {SHA_KEPT[:7], "not-a-sha"}
-    assert (cache / "git-v0" / "db" / "repo").is_dir()
+    assert _names(git_builds / SHA_KEPT[:16] / "b1nf0d1g3st") == {
+        "pkg-1.0-py3-none-any",
+        "metadata.msgpack",
+    }
+    assert _names(checkouts) == {SHA_KEPT[:7], f"{SHA_KEPT[:7]}.ok", "not-a-sha"}
+    assert (cache / "git-v1" / "db" / "repo").is_dir()
     assert _names(cache / "archive-v0") == {"git-kept"}
 
 
+def test_removes_content_addressed_files_no_archive_links(cache: Path) -> None:
+    # uv's content-addressed-cache preview (on under `preview = true`) hardlinks every
+    # archive file to files-v0/<shard>/<digest>; dropping the archive alone frees nothing.
+    pypi = cache / "wheels-v7" / "pypi"
+    _wheel(pypi, "orjson", f"3.11.3-{TAG}", "old")
+    _wheel(pypi, "orjson", f"3.12.0-{TAG}", "kept")
+    files = cache / "files-v0"
+    for archive in ("old", "kept"):
+        obj = files / archive[:2] / f"{archive}-digest"
+        obj.parent.mkdir(parents=True, exist_ok=True)
+        os.link(cache / "archive-v0" / archive / "payload.txt", obj)
+    # An object restored without its hardlink (e.g. `rsync -a` without -H) is unlinked too.
+    (files / "zz").mkdir()
+    (files / "zz" / "split-copy").write_text("x")
+
+    assert prune_uv_cache.prune(
+        cache, {("orjson", "3.12.0")}, set(), dry_run=False
+    ) == (2, 1)
+
+    assert _names(files) == {"ke"}
+    assert _names(files / "ke") == {"kept-digest"}
+    assert (cache / "archive-v0" / "kept" / "payload.txt").stat().st_nlink == 2
+
+
 def test_dry_run_reports_same_counts_without_removing(cache: Path) -> None:
-    pypi = cache / "wheels-v6" / "pypi"
+    pypi = cache / "wheels-v7" / "pypi"
     _wheel(pypi, "orjson", f"3.11.3-{TAG}", "old")
     _wheel(pypi, "orjson", f"3.12.0-{TAG}", "kept")
     keep = {("orjson", "3.12.0")}
@@ -230,7 +264,7 @@ def test_dry_run_reports_same_counts_without_removing(cache: Path) -> None:
 
 
 def test_second_run_is_a_no_op(cache: Path) -> None:
-    pypi = cache / "wheels-v6" / "pypi"
+    pypi = cache / "wheels-v7" / "pypi"
     _wheel(pypi, "orjson", f"3.11.3-{TAG}", "old")
     _wheel(pypi, "orjson", f"3.12.0-{TAG}", "kept")
     keep = {("orjson", "3.12.0")}
@@ -285,7 +319,7 @@ def test_dockerfile_prunes_the_seed_before_any_sync() -> None:
 @pytest.mark.parametrize("suffix", [".http", ".msgpack", ".lock", ".rev"])
 def test_compares_sdist_version_directories_verbatim(cache: Path, suffix: str) -> None:
     version = f"1.0+foo{suffix}"
-    sdists = cache / "sdists-v9" / "pypi" / "pkg"
+    sdists = cache / "sdists-v10" / "pypi" / "pkg"
     _link(sdists / version / "rev" / "wheel", _archive(cache, "built"))
 
     prune_uv_cache.prune(cache, {("pkg", version)}, set(), dry_run=False)
@@ -299,10 +333,10 @@ def test_compares_sdist_version_directories_verbatim(cache: Path, suffix: str) -
 
 
 def test_keeps_archives_of_a_package_named_src(cache: Path) -> None:
-    pypi = cache / "wheels-v6" / "pypi"
+    pypi = cache / "wheels-v7" / "pypi"
     _wheel(pypi, "src", "1.0-py3-none-any", "wheel-kept")
     _wheel(pypi, "src", "0.9-py3-none-any", "wheel-old")
-    sdists = cache / "sdists-v9" / "pypi"
+    sdists = cache / "sdists-v10" / "pypi"
     _link(sdists / "src" / "1.0" / "rev" / "wheel", _archive(cache, "sdist-kept"))
     _link(sdists / "src" / "0.9" / "rev" / "wheel", _archive(cache, "sdist-old"))
     # A link inside an unpacked source tree does not keep its target alive.
@@ -318,7 +352,7 @@ def test_keeps_archives_of_a_package_named_src(cache: Path) -> None:
 def test_main_refuses_a_suspiciously_small_lock(
     cache: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _wheel(cache / "wheels-v6" / "pypi", "orjson", f"3.11.3-{TAG}", "old")
+    _wheel(cache / "wheels-v7" / "pypi", "orjson", f"3.11.3-{TAG}", "old")
     lock = tmp_path / "uv.lock"
     lock.write_text('version = 1\n[[package]]\nname = "a"\nversion = "1"\n')
     monkeypatch.setattr(

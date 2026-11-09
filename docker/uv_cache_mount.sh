@@ -37,7 +37,7 @@
 uv_cache_restore() {
     if [ "${1:-}" = "force" ] || [ ! -d "${UV_CACHE_DIR}" ]; then
         mkdir -p "${UV_CACHE_DIR}"
-        rsync -a /root/.uv-cache-store/ "${UV_CACHE_DIR}/"
+        rsync -aH /root/.uv-cache-store/ "${UV_CACHE_DIR}/"
     fi
 }
 
@@ -54,9 +54,9 @@ uv_cache_restore() {
 # should degrade the next build's cache hit rate, not fail this build.
 uv_cache_persist() {
     if [ "${1:-}" = "prune" ]; then
-        rsync -a --delete "${UV_CACHE_DIR}/" /root/.uv-cache-store/ 2>/dev/null || true
+        rsync -aH --delete "${UV_CACHE_DIR}/" /root/.uv-cache-store/ 2>/dev/null || true
     else
-        rsync -a "${UV_CACHE_DIR}/" /root/.uv-cache-store/ 2>/dev/null || true
+        rsync -aH "${UV_CACHE_DIR}/" /root/.uv-cache-store/ 2>/dev/null || true
     fi
     if [ -n "${STRIP_UV_CACHE:-}" ]; then rm -rf "${UV_CACHE_DIR}"; fi
 }

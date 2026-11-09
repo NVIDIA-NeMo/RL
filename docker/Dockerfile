@@ -159,7 +159,7 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
 # Install uv and python outside /root so an unprivileged runtime UID (for example
 # 65532) can execute them: /root is not traversable by other users, and the project
 # venv's python is a symlink into uv's managed-Python directory.
-ARG UV_VERSION=0.11.28
+ARG UV_VERSION=0.13.6
 ARG PYTHON_VERSION=3.13.14
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 # One uv cache for the build and for every runtime identity. It holds every wheel the venvs are
@@ -870,7 +870,7 @@ echo "Exporting uv cache for build ${UV_CACHE_EXPORT_NONCE:-local}"
 # RUN command, leaving this builder-local mount empty. Restore the seed only in
 # that case; unconditionally merging it would resurrect wheels uv evicted.
 if [[ -z "$(find /root/.uv-cache-store -mindepth 1 -print -quit)" ]]; then
-    rsync -a /tmp/uv-cache-seed/ /root/.uv-cache-store/
+    rsync -aH /tmp/uv-cache-seed/ /root/.uv-cache-store/
 fi
 mkdir -p /tmp/uv-cache-export
 cp -a /root/.uv-cache-store/. /tmp/uv-cache-export/
