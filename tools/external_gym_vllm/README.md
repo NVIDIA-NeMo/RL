@@ -217,6 +217,10 @@ sbatch \
   tools/external_gym_vllm/run_in_allocation.sh
 ```
 
+Test-suite scripts submit this way through `tools/launch` when their CONFIG
+section sets `NUM_EXTERNAL_SERVICE_NODES`; see "External vLLM pools" in
+`tests/test_suites/README.md`.
+
 Slurm gang-schedules the two components. Replica `srun` steps explicitly use
 hetgroup 1 and load-balancer steps explicitly use hetgroup 0. When starting
 `ray.sub`, the wrapper scopes its unsuffixed Slurm nodelist and node-count
