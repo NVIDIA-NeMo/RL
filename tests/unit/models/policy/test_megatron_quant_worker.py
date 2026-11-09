@@ -85,13 +85,14 @@ class _FakeModelOptBridge:
         self.calls = []
         self.plan_calls = []
         self.quant_algo = "W4A16_NVFP4"
+        self.ignore = []
         self.conversion_tasks = []
 
     def build_hf_modelopt_export_plan(self, model, conversion_tasks=None):
         tasks = self.conversion_tasks if conversion_tasks is None else conversion_tasks
         plan = SimpleNamespace(
             conversion_tasks=tasks,
-            quantization_config={"quant_algo": self.quant_algo},
+            quantization_config={"quant_algo": self.quant_algo, "ignore": self.ignore},
             quantized_params=frozenset(task.global_param_name for task in tasks),
         )
         self.plan_calls.append((model, conversion_tasks, plan))
@@ -492,6 +493,30 @@ def test_iter_real_quant_refit_params_rejects_ignored_packed_weight(
         list(worker._iter_real_quant_refit_params())
 
     assert not worker.megatron_bridge.calls
+
+
+@requires_weight_folding
+@pytest.mark.parametrize("ignored_output", ["qkv", "z", "b", "a"])
+def test_real_quant_refit_respects_canonical_fused_output_exclusions(
+    ignored_output: str,
+) -> None:
+    worker = _make_real_quant_worker()
+    prefix = "model.layers.0.linear_attn.in_proj_"
+    worker.refit_conversion_tasks[0].mapping.hf_param = {
+        name: f"{prefix}{name}.weight" for name in ("qkv", "z", "b", "a")
+    }
+    worker.megatron_bridge.ignore = [f"{prefix}b", f"{prefix}a"]
+    worker.cfg["generation"]["real_quant_ignore"] = [f"*.in_proj_{ignored_output}"]
+
+    if ignored_output in ("qkv", "z"):
+        with pytest.raises(
+            ValueError, match="conflict with generation.real_quant_ignore"
+        ):
+            list(worker._iter_real_quant_refit_params())
+        assert not worker.megatron_bridge.calls
+    else:
+        list(worker._iter_real_quant_refit_params())
+        assert len(worker.megatron_bridge.calls) == 1
 
 
 @requires_weight_folding
