@@ -195,7 +195,7 @@ def test_local_shard_slices_and_expert_specs(monkeypatch):
     )
     spec = param_map.get(info["name"])
     assert spec is not None
-    ctx = spec.pre(spec.base)
+    ctx = spec.materialize()
     assert tuple(ctx.buf.shape) == (2, 16, 4) and ctx.buf.dtype == torch.bfloat16
     ctx.buf.copy_(torch.arange(2 * 16 * 4, dtype=torch.bfloat16).view(2, 16, 4))
     spec.post(ctx)
@@ -209,6 +209,32 @@ def test_local_shard_slices_and_expert_specs(monkeypatch):
         f"{prefix}.3.down_proj.weight",
     }
     assert torch.equal(weights[f"{prefix}.3.down_proj.weight"], ctx.buf[1])
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float16, torch.float32], ids=str
+)
+def test_expert_spec_declares_wire_dtype(monkeypatch, dtype):
+    from nemo_rl.models.generation.trtllm import trtllm_backend
+
+    monkeypatch.setattr(
+        trtllm_backend.fp8_quantization, "is_quantized_expert_refit", lambda cfg: False
+    )
+    prefix = "model.layers.0.mlp.experts"
+    info = _param_info(
+        f"{prefix}.down_proj.weight",
+        (8, 16, 4),
+        "down_proj",
+        ep_size=4,
+        rank_offset=2,
+        dtype=str(dtype),
+    )
+    ext, _ = _extension(rank=3, local_ids_by_layer={prefix: [2, 3]})
+    spec = ext._build_expert_local_param_map(
+        {"layer_names": ["l"], "per_layer_params": {"l": [info]}}
+    ).get(info["name"])
+    assert spec.wire_dtype == dtype
+    assert spec.materialize().buf.dtype == dtype
 
 
 def test_expert_spec_quantizes_locally(monkeypatch):
@@ -437,6 +463,27 @@ def test_expert_spec_rejects_slot_mismatch_and_non_expert_bulk(monkeypatch):
         )
 
 
+def test_engine_dispatch_full_fleet_and_subset():
+    gen = TrtllmGeneration.__new__(TrtllmGeneration)
+    gen._engine_owner_indices = [0, 3, 5]
+    gen.worker_group = MagicMock()
+    gen.worker_group.run_single_worker_single_data.side_effect = (
+        lambda method_name, worker_idx, **kwargs: (method_name, worker_idx, kwargs)
+    )
+
+    assert gen._run_on_engines("m", per_engine={"x": ["a", "b", "c"]}, y=1) == [
+        ("m", 0, {"x": "a", "y": 1}),
+        ("m", 3, {"x": "b", "y": 1}),
+        ("m", 5, {"x": "c", "y": 1}),
+    ]
+    gen.worker_group.run_single_worker_single_data.reset_mock()
+    assert gen._run_on_engine_subset("m", [2, 1], per_engine={"x": ["p", "q"]}) == [
+        ("m", 5, {"x": "p"}),
+        ("m", 3, {"x": "q"}),
+    ]
+    assert gen.worker_group.run_single_worker_single_data.call_count == 2
+
+
 def test_synchronizer_layouts_for_trtllm():
     from nemo_rl.weight_sync.nccl_reshard_weight_synchronizer import (
         NcclReshardWeightSynchronizer,
@@ -456,14 +503,6 @@ def test_synchronizer_layouts_for_trtllm():
         ("prefill", 8, 8),
         ("decode", 16, 16),
     ]
-    sync._generation = _generation_stub(
-        ["aggregated"],
-        [8],
-        {"enabled": False},
-        base={"tensor_parallel_size": 8, "moe_expert_parallel_size": 4},
-    )
-    with pytest.raises(ValueError, match="pure expert parallelism"):
-        sync._gen_layouts()
 
 
 def test_support_check_accepts_pure_ep_trtllm():

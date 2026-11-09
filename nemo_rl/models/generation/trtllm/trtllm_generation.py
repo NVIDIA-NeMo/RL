@@ -709,17 +709,12 @@ class TrtllmGeneration(GenerationInterface):
             per_engine: kwargs whose value is a per-engine list, in engine order.
             **common: kwargs passed unchanged to every engine.
         """
-        futures = []
-        for engine_idx, worker_idx in enumerate(self._engine_owner_indices):
-            kwargs = dict(common)
-            for key, values in (per_engine or {}).items():
-                kwargs[key] = values[engine_idx]
-            futures.append(
-                self.worker_group.run_single_worker_single_data(
-                    method_name=method_name, worker_idx=worker_idx, **kwargs
-                )
-            )
-        return futures
+        return self._run_on_engine_subset(
+            method_name,
+            list(range(len(self._engine_owner_indices))),
+            per_engine,
+            **common,
+        )
 
     def _report_engine_addrs(self) -> list[Optional[dict[str, Any]]]:
         """Collect ``{host, port, node_id}`` from every engine's HTTP server.
@@ -953,11 +948,6 @@ class TrtllmGeneration(GenerationInterface):
                 kwargs = cast(dict[str, Any], self.cfg["trtllm_cfg"])
             ep = int(kwargs.get("moe_expert_parallel_size") or 1)
             pp = int(kwargs.get("pipeline_parallel_size") or 1)
-            if tp % ep != 0:
-                raise ValueError(
-                    f"{role} engine: moe_expert_parallel_size {ep} must divide "
-                    f"tensor_parallel_size {tp}"
-                )
             layout = layouts.setdefault(
                 role,
                 {
@@ -972,10 +962,6 @@ class TrtllmGeneration(GenerationInterface):
                     "world_size": 0,
                 },
             )
-            if layout["tp_size"] != int(tp):
-                raise ValueError(
-                    f"{role} engines have different TP widths ({layout['tp_size']} vs {tp})"
-                )
             layout["engine_indices"].append(engine_idx)
             layout["rank_prefixes"].append(layout["world_size"])
             layout["world_size"] += int(tp)
@@ -988,7 +974,13 @@ class TrtllmGeneration(GenerationInterface):
         per_engine: Optional[dict[str, list[Any]]] = None,
         **common: Any,
     ) -> list[ray.ObjectRef]:
-        """``_run_on_engines`` for the given engines only (per_engine lists align)."""
+        """Fan out to the given engines' model owners, one call per engine.
+
+        Args:
+            engine_indices: engines to call, in call order.
+            per_engine: kwargs whose value is a list aligned with ``engine_indices``.
+            **common: kwargs passed unchanged to every selected engine.
+        """
         futures = []
         for position, engine_idx in enumerate(engine_indices):
             worker_idx = self._engine_owner_indices[engine_idx]

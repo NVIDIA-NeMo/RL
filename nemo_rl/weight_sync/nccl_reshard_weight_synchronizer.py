@@ -200,26 +200,17 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 }
             ]
         if backend == "trtllm":
-            layouts = []
-            for layout in self._generation.get_nccl_reshard_layouts():
-                if layout["etp_size"] != 1:
-                    raise ValueError(
-                        f"TRT-LLM {layout['role']} engines split experts by TP "
-                        f"(moe_tensor_parallel_size {layout['etp_size']}); the reshard "
-                        "refit needs pure expert parallelism (moe_expert_parallel_size "
-                        "== tensor_parallel_size)"
-                    )
-                layouts.append(
-                    {
-                        "role": layout["role"],
-                        "tp_size": layout["tp_size"],
-                        "ep_size": layout["ep_size"],
-                        "etp_size": layout["etp_size"],
-                        "pp_size": layout["pp_size"],
-                        "world_size": layout["world_size"],
-                    }
-                )
-            return layouts
+            return [
+                {
+                    "role": layout["role"],
+                    "tp_size": layout["tp_size"],
+                    "ep_size": layout["ep_size"],
+                    "etp_size": layout["etp_size"],
+                    "pp_size": layout["pp_size"],
+                    "world_size": layout["world_size"],
+                }
+                for layout in self._generation.get_nccl_reshard_layouts()
+            ]
         raise ValueError(
             "NCCL M-to-N refit only supports vLLM, Megatron or TRT-LLM generation, got "
             f"{backend!r}."

@@ -555,7 +555,9 @@ class NcclExtension(WorkerExtension):
                         prefix, projection, expert_ids, ctx.buf
                     )
 
-                specs[name] = LocalParamSpec(base=None, pre=pre, post=post)
+                specs[name] = LocalParamSpec(
+                    base=None, pre=pre, post=post, wire_dtype=dtype
+                )
         return HFToLocalParamMap(specs=specs)
 
     def _convert_received_experts(
@@ -720,7 +722,6 @@ class NcclExtension(WorkerExtension):
 
     def _recv_bulk_params(self) -> None:
         """Receive every bulk param of every PP stage into its local slots."""
-        from nemo_rl.weight_sync.nccl_reshard_utils import RefitCtx
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
         refit_info = self.nccl_reshard_refit_info
@@ -747,11 +748,7 @@ class NcclExtension(WorkerExtension):
                         f"nccl_reshard_refit: {param_info['name']!r} has no local spec "
                         "(its weights would be discarded)"
                     )
-                    ctx = (
-                        spec.pre(spec.base)
-                        if spec.pre is not None
-                        else RefitCtx(buf=spec.base)
-                    )
+                    ctx = spec.materialize()
                     xferdtensor(
                         None,
                         param_info["src_mesh_info"],
