@@ -3,5 +3,5 @@
 EADDRINUSE|[Aa]ddress already in use
 Server error '5[0-9]{2} [^']*' for url 'https://huggingface\.co/
 5[0-9]{2} Server Error: [^:]* for url: https://huggingface\.co/
-5[0-9]{2} Internal Server Error'? for url '?https?://router/generate
+5[0-9]{2} [^']*'? for url '?https?://[^/]+/generate([?'[:space:]]|$)
 Failed: Timeout \(>[0-9.]+s\) from pytest-timeout
