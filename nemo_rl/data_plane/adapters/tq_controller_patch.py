@@ -23,6 +23,12 @@ O(live samples) on the controller's only request thread. ``remove_samples`` belo
 so a clear costs O(cleared samples). A nested field whose shapes became uniform stays nested; it
 still reports the right shape for every sample, and storage rebuilds tensors from the stored rows.
 
+This drops a documented TQ behavior: relabeling a nested field as regular once its odd-shaped rows
+are cleared (TQ's ``test_clear_data_nested_field_becomes_regular`` fails under this override). Code
+in this repo must not read a field's ``is_nested`` or ``shape`` label from TQ metadata. Read row
+shapes from the tensors (``_from_wire``) or ship them on ``KVBatchMeta.tags``
+(``multimodal_row_tags``).
+
 The controller is a Ray actor, so both are applied in a subclass started by ``tq.init``.
 
 Delete this module once the pinned TransferQueue includes both changes.
