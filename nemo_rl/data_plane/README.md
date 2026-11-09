@@ -741,6 +741,29 @@ For the no-data-plane path use the legacy `nemo_rl.algorithms.grpo.grpo_train`; 
 
 ---
 
+## Two-phase data-plane checkpoints
+
+| Key | Default | Behavior |
+|---|---|---|
+| `data_plane.simple.async_checkpoint` | `false` | Enable the optional stable-view capture API for in-memory SimpleStorage. |
+
+`DataPlaneClient.capture_checkpoint` returns a temporary handle or `None` when
+the adapter requests synchronous fallback. The caller must hold a global mutation
+barrier while capturing. After capture returns, it may resume live traffic,
+call `persist()`, and then `release()` after all writes settle, including on
+failure or cancellation. Publication remains the caller's responsibility.
+
+This API requires caller integration: setting the flag alone does not change
+the existing synchronous `save_checkpoint` calls. Other backends return `None`.
+SimpleStorage capture requires SSD offload disabled and writes the existing
+native TQ checkpoint format, so restore does not need a new format.
+
+Capture copies storage indexes, not tensor payloads. References retain the old
+values while live puts replace them and clears remove them. Retained values may
+temporarily increase host-memory use until persistence finishes. This contract
+is audited against the pinned TQ 0.1.11 implementation; a dependency update needs
+the same audit. Only one snapshot may be retained at a time.
+
 ## Async path (proposed)
 
 The data-plane interface covers both sync and async, but the **sync trainer uses only half of it**. The task-mediated half (`claim_meta` / `get_data` / `check_consumption_status`) is reserved for the async trainer, which is not yet wired into production.
