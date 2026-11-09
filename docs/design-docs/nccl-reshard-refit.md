@@ -32,7 +32,8 @@ single `ValueError` listing every violation. The current requirements are:
   must be `vllm`, `megatron` or `trtllm` (SGLang is not supported yet). TensorRT-LLM
   moves only routed MoE experts shard-to-shard, needs pure expert parallelism
   (`moe_expert_parallel_size == tensor_parallel_size`, `pipeline_parallel_size: 1`)
-  on every engine role, and rejects models with dense MLP layers.
+  on every engine role, and rejects models with dense MLP layers. Generation-side
+  expert TP is tracked in [#5131](https://github.com/NVIDIA-NeMo/RL/issues/5131).
 * Training-side Megatron supports expert tensor parallelism when the generation
   destination is Megatron. A vLLM or TensorRT-LLM destination still requires
   `expert_tensor_parallel_size: 1`. Custom PP layouts
