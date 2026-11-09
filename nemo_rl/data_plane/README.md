@@ -1218,7 +1218,7 @@ barrier while capturing. After capture returns, it may resume live traffic,
 call `persist()`, and then `release()` after all writes settle, including on
 failure or cancellation. Publication remains the caller's responsibility.
 
-Existing `save_checkpoint` calls remain synchronous. Rollout snapshots use the
+Existing `save_checkpoint` calls remain synchronous. SC checkpoints use the
 optional capture API as described below. Other backends return `None`.
 SimpleStorage capture requires SSD offload disabled and writes the existing
 native TQ checkpoint format, so restore does not need a new format.
@@ -1229,14 +1229,25 @@ temporarily increase host-memory use until persistence finishes. This contract
 is audited against the pinned TQ 0.1.11 implementation; a dependency update needs
 the same audit. Only one snapshot may be retained at a time.
 
-### Rollout snapshot integration
+### Single-controller checkpoint integration
 
 With `data_plane.simple.async_checkpoint: true`, `RolloutSnapshotter` captures
 the TQ view and matching controller metadata under its mutation barrier, then
 resumes the environment and dispatch before persisting the retained shards.
 Recovery validation and controller serialization remain inside capture. The
 snapshot is published only after persistence and all recovery sidecars finish.
-Full trainer checkpoints retain their synchronous data-plane save path.
+
+Full trainer checkpoints use the same retained-view path when
+`checkpointing.save_data_plane: true`. Capture and validation run under the
+controller mutation barrier; persistence and release run after that barrier
+opens, before saving models or publishing the checkpoint. Canonical TQ writes
+can resume during persistence, but the trainer save itself still awaits it.
+Unsupported backends and configurations keep their synchronous save path.
+
+Trainer checkpoints do not pause Gym or capture in-progress Gym sessions. Their
+barrier protects recovery-owned rows and controller ownership, not every live
+staging write. Unreferenced staging rows do not become recoverable work and are
+cleaned during restore; environment recovery still requires a rollout snapshot.
 
 Temporary capture ownership lives in `SnapshotCapture`, separate from the
 serializable `CapturedRolloutState`. Failures release the retained views after

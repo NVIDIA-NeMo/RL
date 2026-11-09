@@ -158,6 +158,7 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
     configure_checkpoint_workers,
 )
 from nemo_rl.data_plane.async_utils import call_data_plane
+from nemo_rl.data_plane.checkpoint import checkpoint_io
 from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
 from nemo_rl.data_plane.observability import (
     log_step_metrics,
@@ -4211,29 +4212,40 @@ class SingleControllerActor:
         # contain a cursor without its prompt owner, or two durable owners for one
         # canonical group. The environment keeps running: its state lives only
         # in rollout snapshots taken after this checkpoint.
-        async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
-            save_state.current_step = self._train_steps
-            save_state.total_steps = self._train_steps
-            save_state.trainer_version = self._trainer_version
-            save_state.current_epoch = self._current_epoch
-            save_state.consumed_samples = self._consumed_samples
-            save_state.total_valid_tokens = self._total_valid_tokens
-            _save_adaptive_loss_state(save_state, self._loss_fn)
-            save_state.sampler_name = self._async_cfg.sampler.name
-            save_state.sampler_dispatch_index = self._sampler.dispatch_index
-            save_state.next_nemo_gym_task_index = (
-                self._rollout_manager.get_next_nemo_gym_task_index()
-            )
+        async with contextlib.AsyncExitStack() as capture_resources:
+            async with self._data_plane_checkpoint_barrier.checkpoint() as cut:
+                save_state.current_step = self._train_steps
+                save_state.total_steps = self._train_steps
+                save_state.trainer_version = self._trainer_version
+                save_state.current_epoch = self._current_epoch
+                save_state.consumed_samples = self._consumed_samples
+                save_state.total_valid_tokens = self._total_valid_tokens
+                _save_adaptive_loss_state(save_state, self._loss_fn)
+                save_state.sampler_name = self._async_cfg.sampler.name
+                save_state.sampler_dispatch_index = self._sampler.dispatch_index
+                save_state.next_nemo_gym_task_index = (
+                    self._rollout_manager.get_next_nemo_gym_task_index()
+                )
 
-            checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
-                self._checkpointer.init_tmp_checkpoint,
-                self._train_steps,
-                vars(save_state),
-                self._master_config,
-            )
-            captured = await self._rollout_snapshots.capture(
-                cut, checkpoint_path, "trainer_checkpoint"
-            )
+                checkpoint_path: PathLike = await asyncio.to_thread(  # pyrefly: ignore[bad-assignment]  the PathLike alias resolves inconsistently under pyrefly's import-cycle breaking
+                    self._checkpointer.init_tmp_checkpoint,
+                    self._train_steps,
+                    vars(save_state),
+                    self._master_config,
+                )
+                captured_snapshot = await self._rollout_snapshots.capture(
+                    cut, checkpoint_path, "trainer_checkpoint", allow_deferred=True
+                )
+                captured = captured_snapshot.state
+                if captured_snapshot.data_plane is not None:
+                    capture_resources.push_async_callback(
+                        checkpoint_io, captured_snapshot.data_plane.release
+                    )
+
+            # Canonical publication can resume while the retained TQ cut is saved.
+            # Checkpoint persistence still finishes before model save/publication.
+            if captured_snapshot.data_plane is not None:
+                await checkpoint_io(captured_snapshot.data_plane.persist)
 
         # Save value model
         if self._is_ppo:
