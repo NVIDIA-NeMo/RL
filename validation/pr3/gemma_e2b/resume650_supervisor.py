@@ -415,10 +415,12 @@ class Supervisor:
     def run(self) -> None:
         if not self.state["stages"]:
             self.wait_initial()
-        while checkpoint() < TARGET and not self.held():
+        while not self.held():
             stages = self.state["stages"]
             if stages and stages[-1]["phase"] != "COMPLETED":
                 stage = stages[-1]
+            elif checkpoint() == TARGET:
+                break
             else:
                 assert len(stages) < MAX_ALLOCATIONS, (
                     "Debug segment budget exhausted; inspect progress"
@@ -426,6 +428,12 @@ class Supervisor:
                 stage = self.acquire(len(stages) + 1)
             self.run_stage(stage)
         if checkpoint() == TARGET:
+            assert all(stage["phase"] == "COMPLETED" for stage in self.state["stages"])
+            summary = json.loads(
+                (HERE / "results/curve-comparison/comparison-summary.json").read_text()
+            )
+            assert summary["max_plot_step"] == TARGET
+            assert (HERE / "results/checkpoint650-state.json").exists()
             self.state["phase"] = "COMPLETE_COMPUTE_PENDING_REVIEW"
             self.save()
             self.notify(
