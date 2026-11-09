@@ -55,6 +55,7 @@ from tensordict import TensorDict
 from nemo_rl.data_plane.adapters import mooncake_ssd_offload
 from nemo_rl.data_plane.adapters.tq_controller_patch import configure_controller_patch
 from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
+from nemo_rl.data_plane.checkpoint import CheckpointCapture
 from nemo_rl.data_plane.codec import timed_codec
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
@@ -996,6 +997,13 @@ def _init_tq(
                 },
             },
         }
+        if simple_cfg.async_checkpoint:
+            # Load the SimpleStorage-only hook only when it is requested.
+            from nemo_rl.data_plane.adapters.tq_simple_checkpoint import (
+                configure_simple_checkpoint,
+            )
+
+            configure_simple_checkpoint()
         if storage_unit_node_ids is not None:
             _pin_simple_storage_units(storage_unit_node_ids)
         ssd = simple_cfg.ssd_offload
@@ -1646,6 +1654,30 @@ class TQDataPlaneClient(DataPlaneClient):
         tq.kv_clear(keys=list(sample_ids), partition_id=partition_id)
 
     # ── (C) lifecycle ──────────────────────────────────────────────────
+
+    def capture_checkpoint(
+        self,
+        checkpoint_dir: str | Path,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> CheckpointCapture | None:
+        if self._backend != "simple":
+            return None
+        simple_cfg = backend_config(self._cfg)
+        if not simple_cfg.async_checkpoint:
+            return None
+        # The capture implementation depends on pinned SimpleStorage internals.
+        from nemo_rl.data_plane.adapters.tq_simple_checkpoint import (
+            capture_simple_checkpoint,
+        )
+
+        self._require_checkpointing_support()
+        _connect_existing()
+        return capture_simple_checkpoint(
+            checkpoint_dir,
+            num_storage_units=simple_cfg.num_storage_units,
+            metadata=metadata,
+        )
 
     def save_checkpoint(
         self,
