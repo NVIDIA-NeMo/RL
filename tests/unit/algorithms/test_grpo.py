@@ -6411,3 +6411,54 @@ def test_grpo_train_sync_logs_data_plane_metrics_before_committing_the_step(
         if f"data_plane/{scope}/breakdown" in c.args
     ], "the per-op breakdown table was not logged"
     client.close()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_async_grpo_applies_dapo_reward_transforms_before_advantages(
+    mock_grpo_components, monkeypatch, enabled
+):
+    """async_grpo_train applies DAPO reward scaling and then overlong reward shaping,
+    each exactly once and in that order, before the advantage computation — the same
+    order as ``grpo_train``."""
+    captured: dict[str, torch.Tensor] = {}
+    mock_adv_estimator = MagicMock()
+
+    def _capture_and_zero(**kwargs):
+        captured["rewards"] = kwargs["rewards"].clone()
+        captured["total_reward"] = kwargs["repeated_batch"]["total_reward"].clone()
+        return torch.zeros_like(kwargs["mask"], dtype=torch.float32)
+
+    mock_adv_estimator.compute_advantage.side_effect = _capture_and_zero
+    monkeypatch.setattr(
+        "nemo_rl.algorithms.grpo._create_advantage_estimator",
+        lambda _cfg: mock_adv_estimator,
+    )
+    mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
+    mock_batch["total_reward"] = torch.tensor([1.0])
+    # 6 response tokens against max_response_length 8 - overlong_buffer_length 4:
+    # 2 tokens over -> overlong penalty -2/4 * 1.0 = -0.5
+    mock_batch["response_token_lengths"] = torch.tensor([6])
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.reward_scaling = RewardScalingConfig.model_construct(
+        enabled=enabled,
+        source_min=0.0,
+        source_max=1.0,
+        target_min=-1.0,
+        target_max=1.0,
+    )
+    master_config.grpo.reward_shaping = RewardShapingConfig.model_construct(
+        enabled=enabled,
+        overlong_buffer_length=4,
+        overlong_buffer_penalty=1.0,
+        max_response_length=8,
+        stop_properly_penalty_coef=None,
+    )
+
+    _run_single_grpo_train_step(mock_grpo_components, async_grpo_train, monkeypatch)
+
+    mock_adv_estimator.compute_advantage.assert_called_once()
+    # scale then shape: 1.0 -> 1.0 -> 0.5. Shape then scale would give 0.0;
+    # scaling twice would give 1.0 -> 1.0 -> 0.5 -> 0.0 as well; neither applied: 1.0.
+    expected = [0.5] if enabled else [1.0]
+    assert captured["rewards"].tolist() == pytest.approx(expected)
+    assert captured["total_reward"].tolist() == pytest.approx(expected)
