@@ -148,6 +148,34 @@ class RLSpanGroup:
     ``instrumentation.efficiency_span``.
     """
 
+    WORKER_TRAIN = "worker_train"
+    """Training phases as each policy worker rank sees them.
+
+    A cardinality axis like ``PER_PROMPT``, not a phase: ``POLICY_UPDATE``
+    already names this work, but it names the *driver's* one span per step,
+    where these are emitted by every rank. Their count scales with world size
+    times microbatches, so a 576-rank job with 16 microbatches emits ~11k per
+    step where every group in ``per_step`` emits a fixed handful.
+
+    Kept out of both shipped presets for that reason — see
+    ``test_per_prompt_is_absent_from_both_shipped_presets`` for the same
+    argument applied to the other axis. Ask for it with
+    ``span_groups: "per_step,worker_train"``.
+
+    What it buys, and the reason it exists at all: the vision encoder is not
+    separately timeable here, because both backends make one fused
+    ``model(..., **multimodal_data)`` call and let the upstream model own the
+    vision tower. ``rl.policy.train_microbatch`` is the narrowest span that
+    contains the encoder, and it carries the microbatch's image counts, so
+    encoder cost is recoverable by comparing image-heavy microbatches against
+    text-only ones rather than by reading a span off the encoder itself.
+
+    An umbrella group, so its spans carry no ``rl.bucket``: every rank spans
+    the same step concurrently, so any bucket would multiply that step's
+    wall clock by the rank count. The driver-side ``POLICY_UPDATE`` span
+    remains the bucketed view of the same work.
+    """
+
     # ------------------------------------------------------------------ #
     # Umbrella aliases
     # ------------------------------------------------------------------ #
@@ -184,6 +212,15 @@ class RLSpanGroup:
     startup rather than measure it. The flat number lives in the
     ``rl.setup.duration`` metric at ``phase=total_setup``, which is the one
     value that cannot double-count. These spans are for shape only.
+    """
+
+    U_WORKER_TRAIN = WORKER_TRAIN
+    """Every rank spans the same step, so a bucket would multiply it.
+
+    Unlike ``U_PER_PROMPT``, these do not overlap *within* a rank — a rank runs
+    its microbatches in sequence — but they overlap across ranks, which has the
+    same effect on a rollup. The summable view of this work is the driver's
+    ``POLICY_UPDATE`` span.
     """
 
     U_PER_PROMPT = PER_PROMPT
@@ -264,6 +301,10 @@ class RLSpanGroup:
                 # cost scales with steps; per-prompt spans would make it scale
                 # with dataset size instead (~2 per prompt). Ask for them
                 # explicitly with "per_step,per_prompt", or take "all".
+                #
+                # WORKER_TRAIN is absent for the same reason on the other axis:
+                # its spans come from every rank, so the count scales with world
+                # size times microbatches. "per_step,worker_train" opts in.
             ]
         ),
     }

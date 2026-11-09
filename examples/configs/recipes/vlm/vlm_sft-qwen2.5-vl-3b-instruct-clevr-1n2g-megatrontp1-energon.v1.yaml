@@ -58,3 +58,15 @@ logger:
     name: sft-qwen2.5-vl-3b-clevr-energon-v2
   mlflow:
     run_name: sft-qwen2.5-vl-3b-clevr-energon-v2
+telemetry:
+  enabled: true
+  # worker_train on top of per_step because the vision encoder has no span of
+  # its own: rl.policy.train_microbatch is the narrowest span containing it, and
+  # it carries the microbatch's rl.vision.* counts, so encoder cost is read by
+  # comparing image-heavy microbatches against text-only ones. per_step alone
+  # stops at the driver's one rl.sft_v2.policy_training span per step.
+  #
+  # Affordable here and not in general: these recipes are 2-8 GPUs, where
+  # worker_train is a handful of spans per step. The group is out of both
+  # presets because that count scales with world size.
+  span_groups: per_step,worker_train

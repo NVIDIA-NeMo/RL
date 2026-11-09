@@ -1,6 +1,6 @@
 # Metrics
 
-NeMo-RL emits seven namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), per-host memory (`rl.host.memory.*`), and rollout checkpoint metrics (`rl.checkpoint.*`).
+NeMo-RL emits eight namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), per-host memory (`rl.host.memory.*`), rollout checkpoint metrics (`rl.checkpoint.*`), and vision workload (`rl.vision.*`).
 
 Metrics are emitted **only when telemetry is exporting**. Most pass through the metrics logger of the process that logs them, via its process-local telemetry handle: the driver in the v1 loops, and the Single-Controller actor in v2, which owns the Logger there and so emits the training scalars, `rl.setup.duration` and `rl.checkpoint.*`. `rl.host.memory.*` is scraped from every node by a driver-side monitor on its own timer. Resource attributes identify the producing process.
 
@@ -40,6 +40,28 @@ Representative phases: `generation_init` (and its `generation_init_reserve` / `g
 Unlike `rl.efficiency.seconds`, these phases overlap each other by construction: `total_setup` contains the rest, `parallel_wall` covers the generation and policy builds running concurrently, and `generation_init_reserve` / `generation_init_load` are parts of `generation_init`. Anything summing them by bucket would count startup several times over.
 
 Read one phase at a time. For "what did startup cost", use `phase=total_setup` — that is the one value that cannot double-count. The `rl.setup.*` spans give the same phases their shape in a trace; see [Span groups — Startup](span-groups.md#startup-what-happens-before-the-first-step).
+
+## Vision workload (`rl.vision.*`)
+
+On a VLM run, how much vision work a batch carried. Three gauges, declared in `nemo_rl/telemetry/vision.py`, each tagged with `rl.vision.stage`:
+
+| Metric | Unit | Meaning |
+|---|---|---|
+| `rl.vision.images` | `{image}` | images in one batch |
+| `rl.vision.image_rows` | `{row}` | rows of it carrying at least one image |
+| `rl.vision.rows` | `{row}` | rows in it, image-bearing or not |
+
+`rl.vision.stage` is `loader_batch` (an Energon loader owner, measured after `prepare_sft_batch`) or `train_microbatch` (a policy worker rank, measured per `forward_backward_func` invocation). One instrument per quantity with the stage as an attribute, rather than a series per producer, because the useful question is how the two compare — whether the loader fed fewer images or the step consumed them more slowly — and that is a filter on one series rather than a join of two.
+
+These are **recorded, not teed**: both producers are worker-side and neither owns a `Logger`, so they go through `record_rl_metrics` instead of the `log_metrics` path the training scalars use.
+
+`rl.vision.rows` is emitted alongside the other two rather than left to be joined against a batch-size series, because the loader and the policy worker count rows differently once sequence packing is on, and a ratio built across that boundary would be wrong without saying so.
+
+**Under sequence packing only `rl.vision.images` is emitted.** Packing concatenates rows into one THD sequence, after which per-row counts no longer correspond to the batch's rows, so the two row series are dropped while the total — which is still well-defined — is kept. Three of the five shipped Energon VLM recipes pack, so this is the normal case rather than an edge one.
+
+Nothing at all is emitted for a batch whose image layout cannot be read. A gap in the series is intended there; a zero would be a wrong number. A text-only batch is *not* that case — it reports zero images, which is what makes it usable as the baseline an image-heavy batch is read against.
+
+The same counts appear as attributes on `rl.policy.train_microbatch`, which is what makes a microbatch's duration comparable against the vision load that produced it. See [Worker-side training spans](span-groups.md#worker-side-training-spans) for why there is no span on the vision encoder itself.
 
 ## W&B history step axes
 

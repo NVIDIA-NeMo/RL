@@ -42,6 +42,10 @@ from nemo_rl.telemetry.instrumentation import (
     umbrella_span,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.telemetry.vision import (
+    VISION_STAGE_LOADER_BATCH,
+    record_vision_workload,
+)
 
 # Span attributes on rl.sft_v2.build_loader: which logical loader shard this
 # is, out of how many, and whether it resumed from a checkpoint.
@@ -149,12 +153,21 @@ class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
                 self._sft_loader_iterator = iter(self._sft_loader)
                 batch = next(self._sft_loader_iterator)
 
-        with managed_span(RLSpanGroup.DATA_PROCESSING, "rl.sft_v2.prepare_batch"):
+        with managed_span(
+            RLSpanGroup.DATA_PROCESSING, "rl.sft_v2.prepare_batch"
+        ) as span:
             prepared = prepare_sft_batch(
                 batch,
                 tokenizer=self.tokenizer,
                 only_unmask_final=only_unmask_final,
                 make_sequence_length_divisible_by=make_sequence_length_divisible_by,
+            )
+            # After prepare rather than after read: this is where the processor
+            # output has been flattened into the fields the counts are read off.
+            # Paired with the train-side stage, this is what separates "the
+            # loader fed fewer images" from "the step consumed them slower".
+            record_vision_workload(
+                prepared, prepared.size, stage=VISION_STAGE_LOADER_BATCH, span=span
             )
         batch_size = prepared.size
         source_ids = self._source_ids(prepared, batch_size=batch_size)
