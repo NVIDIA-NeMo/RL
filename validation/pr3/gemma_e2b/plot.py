@@ -182,6 +182,9 @@ def main() -> None:
     summary = {
         "generated_utc": snapshot,
         "analyzed_inside_job": os.environ["SLURM_JOB_ID"],
+        "analysis_source_sha256": hashlib.sha256(
+            Path(__file__).read_bytes()
+        ).hexdigest(),
         "max_plot_step": target,
         "streaming_last_step": target,
         "matched_window": [1, common_last],
@@ -197,6 +200,28 @@ def main() -> None:
             row["train/policy_train_dispatches"] > 1 for row in stream
         ),
         "streaming_all_lag_zero": True,
+        "streaming_integrity": {
+            "all_nonzero_gradients": all(row["train/grad_norm"] > 0 for row in stream),
+            "all_nonzero_advantages": all(
+                row["train/advantages/max"] > 0 and row["train/advantages/min"] < 0
+                for row in stream
+            ),
+            "valid_sample_frequency": dict(
+                Counter(int(row["train/num_valid_samples"]) for row in stream)
+            ),
+            "scope": "Committed metrics only; not fixed-input or raw optimizer parity.",
+        },
+        "streaming_diagnostic_peaks": {
+            key: [
+                {STEP: row[STEP], "value": row[key]}
+                for row in sorted(stream, key=lambda row: row[key], reverse=True)[:3]
+            ]
+            for key in (
+                "train/gen_kl_error",
+                "train/policy_kl_error",
+                "train/grad_norm",
+            )
+        },
         "notes": [
             "Historical baselines; independent rollouts and one seed.",
             "Fixed-input streaming parity for this Gemma recipe has not been assessed.",
@@ -241,6 +266,12 @@ def main() -> None:
                 "run_last20_mean": statistics.mean(
                     points[i] for i in range(last - 19, last + 1)
                 ),
+                "run_mean": statistics.mean(points.values()),
+                "run_last50_mean": statistics.mean(
+                    points[i] for i in range(last - 49, last + 1)
+                ),
+                "run_min": min(points.values()),
+                "run_max": max(points.values()),
             }
         ax.set(title=title, ylabel=ylabel, xlim=(1, target))
         ax.grid(alpha=0.22)
