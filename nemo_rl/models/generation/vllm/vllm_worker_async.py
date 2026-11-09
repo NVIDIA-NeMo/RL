@@ -18,6 +18,7 @@ import copy
 import functools
 import gc
 import importlib.metadata
+import inspect
 import logging
 import secrets
 import sys
@@ -107,7 +108,6 @@ from nemo_rl.telemetry.setup import shutdown_telemetry
 from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
 
 LOGGER = logging.getLogger(__name__)
-_RESTORED_PREFIX_TERMINAL_PROMPT_KEY = "__nemo_rl_restored_prefix_terminal__"
 # Gym owns this route (nemo_gym._checkpoint.generation_cut.GENERATION_CUT_ROUTE),
 # but nemo_gym is an optional extra. A drifted copy would 404 every cut, which Gym
 # treats as "regenerate", so test_generation_cut_route_matches_gym pins it.
@@ -171,33 +171,6 @@ def _bad_words_can_straddle_a_cut(sampling_params: Any, tokenizer: Any) -> bool:
     return any(len(token_ids) > 1 for token_ids in params._bad_words_token_ids or ())
 
 
-def _record_terminal_reason(
-    state: _RequestCaptureState, finish_reason: Any, stop_reason: Any
-) -> None:
-    """Record how vLLM finished a call; the caller holds ``state.lock``."""
-    if finish_reason is None:
-        return
-    if finish_reason not in ("stop", "length"):
-        state.observation_error = (
-            f"unsupported terminal finish_reason {finish_reason!r}"
-        )
-    elif (
-        state.terminal_finish_reason is not None
-        and state.terminal_finish_reason != finish_reason
-    ):
-        state.observation_error = (
-            "conflicting terminal finish reasons: "
-            f"{state.terminal_finish_reason!r} and {finish_reason!r}"
-        )
-    elif not isinstance(stop_reason, (str, int, type(None))):
-        state.observation_error = (
-            "terminal stop_reason must be a string, integer, or None"
-        )
-    else:
-        state.terminal_finish_reason = finish_reason
-        state.terminal_stop_reason = stop_reason
-
-
 def _generation_cut_blockers(sampling_params: Any, tokenizer: Any) -> list[str]:
     """Sampling settings a resumed tail cannot honor across a generation cut.
 
@@ -234,6 +207,12 @@ def _generation_cut_blockers(sampling_params: Any, tokenizer: Any) -> list[str]:
 _CAPTURED_MODEL_CALL: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "nemo_rl_captured_model_call", default=None
 )
+# A restored call whose saved prefix already finished. Set the same way, when
+# the chat is prepared, and read by the engine client, which answers it without
+# decoding. It never rides in vLLM's prompt, which vLLM may rebuild.
+_RESTORED_PREFIX_TERMINAL: contextvars.ContextVar[
+    Optional["_RestoredPrefixTerminal"]
+] = contextvars.ContextVar("nemo_rl_restored_prefix_terminal", default=None)
 
 
 @dataclass(frozen=True)
@@ -454,6 +433,39 @@ class _RestoredPrefixParser:
             [*self.prefix_token_ids, *token_ids]
         )
 
+    def __getattr__(self, name: str) -> Any:
+        # Anything else vLLM reads from its parser is the delegate's.
+        if name == "delegate":
+            raise AttributeError(name)
+        return getattr(self.delegate, name)
+
+
+# chat_completion_full_generator arguments a restored call rewrites or reads.
+_FULL_GENERATOR_RESTORE_PARAMETERS = ("parser", "request_metadata")
+
+
+def _full_generator_signature(method: Callable[..., Any]) -> inspect.Signature:
+    """vLLM's ``chat_completion_full_generator`` signature, checked at startup.
+
+    A restored call wraps ``parser`` so tool calls and reasoning are parsed
+    from the whole output, and writes the corrected usage to
+    ``request_metadata``. Both are bound by name, so a vLLM that renames or
+    drops either fails here instead of silently on restored calls.
+    """
+    signature = inspect.signature(method)
+    missing = [
+        name
+        for name in _FULL_GENERATOR_RESTORE_PARAMETERS
+        if name not in signature.parameters
+    ]
+    if missing:
+        raise RuntimeError(
+            "vLLM's OpenAIServingChat.chat_completion_full_generator has no "
+            f"{missing} parameter, which restored generation prefixes rewrite; "
+            "update NeMoRLOpenAIServingChatMixin.chat_completion_full_generator"
+        )
+    return signature
+
 
 # Paths the bearer-token check protects: the OpenAI-compatible routes this module
 # registers, which NeMo-Gym's model server calls. The sparse-refit routes the
@@ -562,12 +574,8 @@ class _AsyncLLMHTTPClient:
         request_id: str,
         kwargs: dict[str, Any],
     ) -> AsyncGenerator[Any, None]:
-        terminal = (
-            prompt.get(_RESTORED_PREFIX_TERMINAL_PROMPT_KEY)
-            if isinstance(prompt, dict)
-            else None
-        )
-        if isinstance(terminal, _RestoredPrefixTerminal):
+        terminal = _RESTORED_PREFIX_TERMINAL.get()
+        if terminal is not None:
             yield _build_restored_prefix_terminal_output(request_id, terminal)
             return
 
@@ -1435,19 +1443,19 @@ class VllmAsyncGenerationWorkerImpl(
         )
         _CAPTURED_MODEL_CALL.set(call.model_call_id)
         state = _RequestCaptureState(
-            call=call,
-            prompt_token_ids=list(prompt_token_ids),
+            call,
+            prompt_token_ids,
             media=media,
-            resumed_generation_token_ids=list(resumed_generation_token_ids or ()),
+            resumed_generation_token_ids=resumed_generation_token_ids or (),
             effective_output_limit=(
                 admission.generation_cut.effective_output_limit
                 if admission.generation_cut is not None
                 else None
             ),
-            generation_cut_staging_keys=(
-                list(admission.generation_cut.staging_keys)
+            staging_keys=(
+                admission.generation_cut.staging_keys
                 if admission.generation_cut is not None
-                else []
+                else ()
             ),
         )
         with self._capture_registry_lock:
@@ -1474,8 +1482,7 @@ class VllmAsyncGenerationWorkerImpl(
         outputs = getattr(request_output, "outputs", None)
         if not outputs:
             return
-        with state.lock:
-            observed = state.observed_generation_token_count
+        observed = state.recorded_token_count
         try:
             output = outputs[0]
             # Finished, so vLLM appends to these lists no more.
@@ -1488,12 +1495,15 @@ class VllmAsyncGenerationWorkerImpl(
             finish_reason = getattr(output, "finish_reason", None)
             stop_reason = getattr(output, "stop_reason", None)
         except (RuntimeError, TypeError, ValueError) as error:
-            with state.lock:
-                state.observation_error = f"{type(error).__name__}: {error}"
+            state.record_error(f"{type(error).__name__}: {error}")
             return
-        with state.lock:
-            state.observe(generation_token_ids, generation_logprobs, start=observed)
-            _record_terminal_reason(state, finish_reason, stop_reason)
+        state.record(
+            generation_token_ids,
+            generation_logprobs,
+            start=observed,
+            finish_reason=finish_reason,
+            stop_reason=stop_reason,
+        )
 
     def _record_generation_progress(
         self, states: list[_RequestCaptureState], *, deadline: float | None
@@ -1507,16 +1517,10 @@ class VllmAsyncGenerationWorkerImpl(
         read whole, with its finish reason. One vLLM does not hold (not yet
         submitted, or aborted) keeps what it has recorded.
         """
-        pending = []
-        for state in states:
-            with state.lock:
-                pending.append(
-                    (
-                        state,
-                        state.call.model_call_id,
-                        state.observed_generation_token_count,
-                    )
-                )
+        pending = [
+            (state, state.call.model_call_id, state.recorded_token_count)
+            for state in states
+        ]
         if not pending:
             return
         try:
@@ -1551,14 +1555,15 @@ class VllmAsyncGenerationWorkerImpl(
                     progress.token_ids, progress.logprobs, start=start
                 )
             except (RuntimeError, TypeError, ValueError) as error:
-                with state.lock:
-                    state.observation_error = f"{type(error).__name__}: {error}"
+                state.record_error(f"{type(error).__name__}: {error}")
                 continue
-            with state.lock:
-                state.observe(progress.token_ids, generated_logprobs, start=start)
-                _record_terminal_reason(
-                    state, progress.finish_reason, progress.stop_reason
-                )
+            state.record(
+                progress.token_ids,
+                generated_logprobs,
+                start=start,
+                finish_reason=progress.finish_reason,
+                stop_reason=progress.stop_reason,
+            )
 
     def _restore_response_prefix(
         self, request: Any, request_output: Any, *, tokenizer: Any
@@ -1576,9 +1581,8 @@ class VllmAsyncGenerationWorkerImpl(
         # whole sequence would restore both, so replay only the prefix, with
         # the same settings, and prepend it to the processed tail. A call that
         # had already stopped has no tail, so its stop is stripped here.
-        with state.lock:
-            prefix_token_ids = list(state.resumed_generation_token_ids)
-            engine_prompt_token_ids = list(state.prompt_token_ids)
+        prefix_token_ids = state.resumed_generation_token_ids
+        engine_prompt_token_ids = state.prompt_token_ids
         # The engine prompt ends with the spliced prefix; what precedes it is
         # the prompt vLLM decoded the prefix against the first time.
         if len(engine_prompt_token_ids) < len(prefix_token_ids):
@@ -1626,8 +1630,7 @@ class VllmAsyncGenerationWorkerImpl(
         if state is None:
             return
         reason = f"{', '.join(blockers)} do not carry across a generation cut"
-        with state.lock:
-            state.uncuttable_reason = reason
+        state.mark_uncuttable(reason)
         if reason not in _LOGGED_UNCUTTABLE_REASONS:
             _LOGGED_UNCUTTABLE_REASONS.add(reason)
             LOGGER.warning(
@@ -1644,9 +1647,7 @@ class VllmAsyncGenerationWorkerImpl(
         state = self._get_request_capture(request)
         if state is None:
             return
-        with state.lock:
-            if state.effective_output_limit is None:
-                state.effective_output_limit = effective_output_limit
+        state.set_effective_output_limit(effective_output_limit)
 
     def _capture_request_media(
         self,
@@ -1850,17 +1851,12 @@ class VllmAsyncGenerationWorkerImpl(
         state = self._get_request_capture(request)
         if state is None:
             return content
-        with state.lifecycle_lock:
-            if state.terminal_started:
-                raise RuntimeError(
-                    f"model call {state.call.model_call_id!r} already started "
-                    "terminal token capture"
-                )
-            state.terminal_started = True
-            content, obsolete_staging_keys = (
-                self._finish_request_capture_with_lifecycle_owned(
-                    state, request, content, sampler_topk=sampler_topk
-                )
+        with state.lifecycle() as owned:
+            # A failed call is retried from its task or its previous boundary,
+            # never from these rows, so they go whether or not its row stages.
+            obsolete_staging_keys = owned.begin_terminal()
+            content = self._finish_request_capture_with_lifecycle_owned(
+                state, request, content, sampler_topk=sampler_topk
             )
         self._retire_generation_cut_rows(obsolete_staging_keys)
         return content
@@ -1872,8 +1868,8 @@ class VllmAsyncGenerationWorkerImpl(
         content: dict,
         *,
         sampler_topk: tuple[Any, Any] | None = None,
-    ) -> tuple[dict, tuple[str, ...]]:
-        """Stage a terminal call while owning ``state.lifecycle_lock``."""
+    ) -> dict:
+        """Stage a terminal call while its lifecycle is owned."""
         call, prompt_token_ids = state.call, state.prompt_token_ids
         payload = dict(content)
         # vLLM's OpenAI response carries no prompt ids; the adapter reads the
@@ -1936,10 +1932,10 @@ class VllmAsyncGenerationWorkerImpl(
                 len(generated_token_ids),
                 total_generation_token_count,
             )
-        with state.lock:
-            effective_output_limit = state.effective_output_limit
-            terminal_finish_reason = state.terminal_finish_reason
-            terminal_stop_reason = state.terminal_stop_reason
+        progress = state.snapshot()
+        effective_output_limit = progress.effective_output_limit
+        terminal_finish_reason = progress.terminal_finish_reason
+        terminal_stop_reason = progress.terminal_stop_reason
         if terminal_finish_reason is None:
             choices = content.get("choices") or []
             finish_reason = choices[0].get("finish_reason") if choices else None
@@ -1955,9 +1951,6 @@ class VllmAsyncGenerationWorkerImpl(
             terminal_stop_reason=terminal_stop_reason,
         )
         self._pop_request_capture(request)
-        # A failed call is retried from its task or its previous boundary, never
-        # from these rows, so they go whether or not the terminal row staged.
-        obsolete_staging_keys = tuple(state.generation_cut_staging_keys)
         for choice in content.get("choices") or []:
             choice.pop("logprobs", None)
             choice.pop("routed_experts", None)
@@ -1973,7 +1966,7 @@ class VllmAsyncGenerationWorkerImpl(
                 ):
                     message.pop(field, None)
         content["ng_commit_coords"] = coords.model_dump()
-        return content, obsolete_staging_keys
+        return content
 
     def _context_refusal_headers(self, request: Any) -> dict[str, str]:
         """Acknowledge a validation refusal after draining capture state, before staging."""
@@ -2003,6 +1996,10 @@ class VllmAsyncGenerationWorkerImpl(
         )
         from vllm.entrypoints.openai.chat_completion.serving import (
             OpenAIServingChat,
+        )
+
+        full_generator_signature = _full_generator_signature(
+            OpenAIServingChat.chat_completion_full_generator
         )
 
         # vLLM 0.29 moved this out of the openai package (vllm-project/vllm#54492).
@@ -2443,11 +2440,12 @@ class VllmAsyncGenerationWorkerImpl(
                 )
 
                 if restored_prefix_terminal is not None:
+                    # The engine client answers it without decoding; one
+                    # token is the smallest budget vLLM accepts, so a missed
+                    # marker costs one token, not the whole call.
                     request.min_tokens = 0
                     self._set_max_tokens(request, 1)
-                    engine_prompt[_RESTORED_PREFIX_TERMINAL_PROMPT_KEY] = (
-                        restored_prefix_terminal
-                    )
+                    _RESTORED_PREFIX_TERMINAL.set(restored_prefix_terminal)
                     if len(final_prompt_token_ids) == self.model_config.max_model_len:
                         engine_prompt["prompt_token_ids"] = final_prompt_token_ids[:-1]
                     request._restored_prefix_terminal = restored_prefix_terminal
@@ -2594,21 +2592,18 @@ class VllmAsyncGenerationWorkerImpl(
                         cancelled = True
                         raise
 
+                # Bound by name: vLLM passes request_metadata by position and
+                # parser by keyword, and either may move.
+                bound = full_generator_signature.bind_partial(
+                    self, request, capture_result_generator(), *args, **kwargs
+                )
                 restored_parser_prefix = request._restored_generation_token_ids
-                if restored_parser_prefix:
-                    if len(args) >= 6 and args[5] is not None:
-                        mutable_args = list(args)
-                        mutable_args[5] = _RestoredPrefixParser(
-                            delegate=args[5],
-                            prefix_token_ids=restored_parser_prefix,
-                        )
-                        args = tuple(mutable_args)
-                    elif kwargs.get("parser") is not None:
-                        kwargs = dict(kwargs)
-                        kwargs["parser"] = _RestoredPrefixParser(
-                            delegate=kwargs["parser"],
-                            prefix_token_ids=restored_parser_prefix,
-                        )
+                parser = bound.arguments.get("parser")
+                if restored_parser_prefix and parser is not None:
+                    bound.arguments["parser"] = _RestoredPrefixParser(
+                        delegate=parser,
+                        prefix_token_ids=restored_parser_prefix,
+                    )
 
                 # Capture stages the raw arrays below and strips OpenAI logprobs
                 # after the terminal PUT. Skip only their object construction;
@@ -2621,10 +2616,7 @@ class VllmAsyncGenerationWorkerImpl(
                 )
                 with self._bypass_chat_logprobs(enabled=bypass_logprobs):
                     response = await super().chat_completion_full_generator(
-                        request,
-                        capture_result_generator(),
-                        *args,
-                        **kwargs,
+                        *bound.args[1:], **bound.kwargs
                     )
                 if cancelled:
                     # vLLM's chat_completion_full_generator catches the
@@ -2669,9 +2661,7 @@ class VllmAsyncGenerationWorkerImpl(
                     )
                     if prompt_token_ids is not None:
                         response.prompt_token_ids = prompt_token_ids
-                    request_metadata = (
-                        args[4] if len(args) >= 5 else kwargs.get("request_metadata")
-                    )
+                    request_metadata = bound.arguments.get("request_metadata")
                     if request_metadata is not None:
                         request_metadata.final_usage_info = response.usage
 

@@ -42,8 +42,8 @@ import torch
 from nemo_rl.data.captured_media import capture_processed_media
 from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
-    _RESTORED_PREFIX_TERMINAL_PROMPT_KEY,
     VllmAsyncGenerationWorkerImpl,
+    _AsyncLLMHTTPClient,
 )
 
 # The server subclasses each of these (NeMoRLOnlineRenderer, and so on), so the
@@ -63,7 +63,25 @@ def _recorder(slot: str):
 
 
 _OnlineRenderer = _recorder("renderer")
-_OpenAIServingChat = _recorder("chat")
+
+
+class _OpenAIServingChat(_recorder("chat")):
+    async def chat_completion_full_generator(
+        self,
+        request,
+        result_generator,
+        request_id=None,
+        model_name=None,
+        conversation=None,
+        tokenizer=None,
+        request_metadata=None,
+        parser=None,
+        mm_token_counts=None,
+    ):
+        """vLLM 0.29's parameters, which setup checks; tests patch the body."""
+        raise NotImplementedError
+
+
 _ServingTokenization = _recorder("tokenize")
 
 
@@ -404,7 +422,11 @@ async def test_captured_chat_logprobs_bypass(
 
 @pytest.mark.asyncio
 async def test_resumed_call_reports_usage_as_the_uninterrupted_call(monkeypatch):
-    """The restored prefix the engine served as prompt is counted as completion."""
+    """The restored prefix the engine served as prompt is counted as completion.
+
+    vLLM's parser sees the restored tokens before the tail, and the corrected
+    usage reaches request_metadata, both bound by name.
+    """
     serving, _ = _serving_chat_without_capture_state(monkeypatch)
     serving.return_tokens_as_token_ids = False
     request = types.SimpleNamespace(
@@ -418,9 +440,33 @@ async def test_resumed_call_reports_usage_as_the_uninterrupted_call(monkeypatch)
         return_tokens_as_token_ids=False,
     )
 
+    class Parser:
+        name = "hermes"
+
+        def __init__(self) -> None:
+            self.seen_token_ids: list[int] = []
+
+        def parse(
+            self, model_output, request, *, enable_auto_tools, model_output_token_ids
+        ):
+            self.seen_token_ids = list(model_output_token_ids)
+            return model_output
+
+    parser = Parser()
+    request_metadata = types.SimpleNamespace(final_usage_info=None)
+
     async def format_response(self, upstream_request, results, *args, **kwargs):
         async for _ in results:
             pass
+        # As vLLM's full generator does: parse the tail, read other attributes.
+        wrapped = kwargs["parser"]
+        wrapped.parse(
+            "tail",
+            upstream_request,
+            enable_auto_tools=True,
+            model_output_token_ids=[6, 7],
+        )
+        assert wrapped.name == "hermes"
         response = sys.modules[
             "vllm.entrypoints.openai.chat_completion.protocol"
         ].ChatCompletionResponse()
@@ -457,8 +503,12 @@ async def test_resumed_call_reports_usage_as_the_uninterrupted_call(monkeypatch)
             ],
         )
 
-    response = await serving.chat_completion_full_generator(request, results())
+    response = await serving.chat_completion_full_generator(
+        request, results(), request_metadata=request_metadata, parser=parser
+    )
 
+    assert parser.seen_token_ids == [4, 5, 6, 7]
+    assert request_metadata.final_usage_info is response.usage
     usage = response.usage
     assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (
         3,
@@ -905,15 +955,60 @@ def test_restored_call_reaches_the_engine_with_the_remaining_budget(
     request.max_tokens, request.max_completion_tokens, request.min_tokens = 6, None, 4
     request.model_copy = lambda **kwargs: request
 
-    _, (engine_prompt,) = asyncio.run(
-        renderer.preprocess_chat(
+    # vLLM may rebuild the prompt before it reaches the engine client.
+    built = []
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async."
+        "_build_restored_prefix_terminal_output",
+        lambda request_id, finished: built.append(finished) or "finished output",
+    )
+
+    class EngineThatMustNotDecode:
+        model_config = renderer = input_processor = vllm_config = None
+
+        def generate(self, *args, **kwargs):
+            raise AssertionError("a finished restored call reached the engine")
+
+    async def prepare_then_generate():
+        # One task, as on the server: the chat is prepared, then submitted.
+        _, (engine_prompt,) = await renderer.preprocess_chat(
             request, [{"role": "assistant"}, {"role": "tool"}], None, None, {}
         )
-    )
+        if terminal is None:
+            return engine_prompt, None
+        client = _AsyncLLMHTTPClient(
+            EngineThatMustNotDecode(), MagicMock(), flat_logprobs=False
+        )
+        outputs = [
+            output
+            async for output in client._generate(
+                {"prompt_token_ids": list(engine_prompt["prompt_token_ids"])},
+                None,
+                "chatcmpl-1",
+                {},
+            )
+        ]
+        return engine_prompt, outputs
+
+    engine_prompt, outputs = asyncio.run(prepare_then_generate())
 
     assert engine_prompt["prompt_token_ids"] == conversation + delta
     assert (request.max_tokens, request.min_tokens) == (max_tokens, min_tokens)
     assert request._original_min_tokens == 4
     assert begin.call_args.kwargs["resumed_generation_token_ids"] == delta[:-1]
-    restored = engine_prompt.get(_RESTORED_PREFIX_TERMINAL_PROMPT_KEY)
-    assert (restored and restored.reason) == terminal
+    if terminal is not None:
+        # Answered from the saved prefix, without decoding a token.
+        assert outputs == ["finished output"]
+        assert [finished.reason for finished in built] == [terminal]
+
+
+def test_setup_refuses_a_full_generator_without_the_restored_call_arguments():
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        _full_generator_signature,
+    )
+
+    async def renamed(self, request, result_generator, request_metadata, parsers=None):
+        pass
+
+    with pytest.raises(RuntimeError, match=r"no \['parser'\] parameter"):
+        _full_generator_signature(renamed)

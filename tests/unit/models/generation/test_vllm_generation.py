@@ -1046,7 +1046,16 @@ def _install_fake_vllm_openai_modules(monkeypatch):
             self.instances.append(self)
 
         async def chat_completion_full_generator(
-            self, request, result_generator, *args, **kwargs
+            self,
+            request,
+            result_generator,
+            request_id=None,
+            model_name=None,
+            conversation=None,
+            tokenizer=None,
+            request_metadata=None,
+            parser=None,
+            mm_token_counts=None,
         ):
             """Drain the engine generator the way vLLM 0.29 does.
 
@@ -1396,13 +1405,10 @@ def test_chat_request_rejects_unreplayed_sampling_params(
 
 def _track_request_capture(worker, request):
     """Register in-flight capture state for request; return the sink and its call."""
+    from nemo_rl.models.generation.generation_cut_capture import _RequestCaptureState
+
     call = types.SimpleNamespace(model_call_id="call")
-    worker._capture_calls[id(request)] = types.SimpleNamespace(
-        call=call,
-        lifecycle_lock=threading.Lock(),
-        terminal_started=False,
-        generation_cut_staging_keys=[],
-    )
+    worker._capture_calls[id(request)] = _RequestCaptureState(call, [])
     worker._capture_calls_by_model_call_id = {}
     worker._completed_capture_calls = {}
     worker.token_capture = MagicMock()
@@ -1743,7 +1749,7 @@ async def test_capture_abort_waits_for_the_call_lifecycle_off_the_event_loop(
     serving_chat.create_chat_completion = create_chat_completion
     request = _fake_chat_request()
     token_capture, call = _track_request_capture(worker, request)
-    lifecycle_lock = worker._capture_calls[id(request)].lifecycle_lock
+    lifecycle_lock = worker._capture_calls[id(request)]._lifecycle_lock
     # Stands in for a generation cut or terminal write staging this call to TQ.
     lifecycle_lock.acquire()
     # Bounds the stall if the abort ever blocks the loop again.

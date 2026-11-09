@@ -137,3 +137,13 @@ def test_prompt_truncation_happens_only_while_the_chat_is_tokenized():
     assert "_validate_tokens" in inspect.getsource(
         TokenizeParams.apply_post_tokenization
     )
+
+
+def test_full_generator_takes_the_arguments_a_restored_call_rewrites():
+    from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
+
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        _full_generator_signature,
+    )
+
+    _full_generator_signature(OpenAIServingChat.chat_completion_full_generator)
