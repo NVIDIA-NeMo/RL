@@ -132,6 +132,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
     GenerationSamplingParams,
+    sampler_replay_enabled,
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
@@ -356,7 +357,8 @@ _REWARD_PENALTY_FLAGS = (
 class GRPOConfig(BaseModel, extra="allow"):
     num_prompts_per_step: int = 32
     num_generations_per_prompt: int = 16
-    max_num_epochs: int = 1
+    # None trains until max_num_steps, cycling the dataset as needed.
+    max_num_epochs: int | None = 1
     max_num_steps: int = 1000000
     max_rollout_turns: int = 1
     normalize_rewards: bool = True
@@ -455,6 +457,9 @@ class GRPOSaveState:
     # adaptive-ppo-clip's upper-bound offset k. None when adaptive-ppo-clip is
     # off and on checkpoints that predate it.
     cur_adaptive_ppo_clip_k: Optional[float] = None
+    # SingleController NeMo-Gym only: next per-attempt task ID. Zero keeps
+    # checkpoints written before the counter was introduced loadable.
+    next_nemo_gym_task_index: int = 0
 
 
 def _initial_grpo_save_state() -> GRPOSaveState:
@@ -555,8 +560,48 @@ class MasterConfig(BaseModel, extra="allow"):
 # ===============================================================================
 
 
-def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
-    """Validate the single-forward threshold path before allocating workers."""
+def _validate_val_sampling(master_config: MasterConfig) -> None:
+    """Reject validation sampling params that rollouts cannot honor.
+
+    Validation-only sampling is honored only on the NeMo-Gym vLLM and TRT-LLM
+    rollout paths; everywhere else validation must sample exactly like training.
+    """
+    generation_config = master_config.policy["generation"]
+    val_sampling_overridden = (
+        generation_config["val_temperature"] != generation_config["temperature"]
+        or generation_config["val_top_p"] != generation_config["top_p"]
+        or generation_config["val_top_k"] != generation_config["top_k"]
+    )
+    if not val_sampling_overridden:
+        return
+    assert generation_config["backend"] in ("vllm", "trtllm") and should_use_nemo_gym(
+        master_config
+    ), (
+        "generation.val_temperature/val_top_p/val_top_k differing from the "
+        "train sampling params is only supported for vLLM and TRT-LLM "
+        "NeMo-Gym rollouts."
+    )
+    # NeMo-Gym requests carry only temperature/top_p; the vLLM and TRT-LLM
+    # servers pin top_k to the train or validation profile, telling them apart
+    # by those two.
+    assert (
+        generation_config["val_top_k"] == generation_config["top_k"]
+        or generation_config["val_temperature"] != generation_config["temperature"]
+        or generation_config["val_top_p"] != generation_config["top_p"]
+    ), (
+        "generation.val_top_k differs from top_k while val_temperature/val_top_p "
+        "equal the train values: the Gym server cannot tell validation requests "
+        "apart and would sample them with top_k. Change val_temperature or "
+        "val_top_p too, or keep val_top_k equal to top_k."
+    )
+
+
+def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
+    """Validate the single-forward threshold path before allocating workers.
+
+    Shared by the GRPO and SingleController trainers, whose master configs are
+    separate classes with the fields read here.
+    """
     if not master_config.loss_fn.seq_logprob_error_in_loss:
         return
     if master_config.grpo.seq_logprob_error_threshold is None:
@@ -698,6 +743,10 @@ def setup(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     loss_config: ClippedPGLossConfig = master_config.loss_fn
+    if loss_config.score_centering or sampler_replay_enabled(generation_config):
+        raise ValueError(
+            "Score centering and policy.generation.sampler_replay.enabled require SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy GRPO trainer does not capture sampler tensors."
+        )
     env_configs = master_config.env
     data_config = master_config.data
     grpo_config = master_config.grpo
@@ -766,27 +815,7 @@ def setup(
     _validate_seq_logprob_error_in_loss(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
 
-    # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
-    # path; everywhere else validation must sample exactly like training.
-    val_sampling_overridden = (
-        generation_config["val_temperature"] != generation_config["temperature"]
-        or generation_config["val_top_p"] != generation_config["top_p"]
-        or generation_config["val_top_k"] != generation_config["top_k"]
-    )
-    if val_sampling_overridden:
-        assert generation_config["backend"] == "vllm" and should_use_nemo_gym(
-            master_config
-        ), (
-            "generation.val_temperature/val_top_p/val_top_k differing from the "
-            "train sampling params is only supported for vLLM NeMo-Gym rollouts."
-        )
-        # The NeMo-Gym path only stamps temperature/top_p onto requests and
-        # rejects any top_k at rollout time, so a val_top_k override can never
-        # be honored — fail here instead of at the first validation step.
-        assert not generation_config["val_top_k"], (
-            "generation.val_top_k is not supported: the NeMo-Gym rollout path "
-            "only honors val_temperature/val_top_p. Leave val_top_k null."
-        )
+    _validate_val_sampling(master_config)
     assert grpo_config.val_num_generations_per_prompt >= 1, (
         "grpo.val_num_generations_per_prompt must be >= 1"
     )
@@ -1043,6 +1072,7 @@ def setup(
             enable_router_replay=router_replay_enabled(policy_config),
             use_fastokens=bool(policy_config["tokenizer"].get("use_fastokens")),
             policy_api_key=policy_api_key,
+            turn_checkpointing_enabled=False,
         )
         train_splits = (
             {f"train[{name}]": split for name, split in dataset.items()}
@@ -1430,10 +1460,11 @@ def setup(
 
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = min(
-            grpo_config.max_num_steps,
-            grpo_config.max_num_epochs * train_sample_count,
-        )
+        total_train_iters = grpo_config.max_num_steps
+        if grpo_config.max_num_epochs is not None:
+            total_train_iters = min(
+                total_train_iters, grpo_config.max_num_epochs * train_sample_count
+            )
         policy_config["megatron_cfg"]["train_iters"] = total_train_iters
 
     # Megatron generation expresses recompute-after-refit engine-side via
@@ -2379,6 +2410,7 @@ def extract_initial_prompt_messages(
 
 def add_grpo_token_loss_masks_and_generation_logprobs(
     message_logs: list[LLMMessageLogType | VLMMessageLogType],
+    per_token_multimodal_fields: tuple[str, ...] = (),
 ) -> None:
     """Add GRPO loss masks and ensure generation logprobs exist in message logs.
 
@@ -2399,6 +2431,8 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
         message_logs: Batch of tokenized message logs. Each message must contain a
             ``role`` and ``token_ids`` field. Messages that already contain
             ``generation_logprobs`` are treated as rollout-generated messages.
+        per_token_multimodal_fields: A multimodal run's fixed per-token schema;
+            messages missing one of these fields get zeros (text).
     """
     backfill_missing_routed_experts(message_logs)
 
@@ -2413,7 +2447,8 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
     # Only add masks if some message has non-empty media. Overlength messages keep
     # empty media, which is not stored; storing their mask anyway would make
     # reading them together with text-only messages fail on the missing mask.
-    has_media = any(
+    # A multimodal run's schema writes it on every message instead.
+    has_media = "media_token_validity_mask" in per_token_multimodal_fields or any(
         _owns_media(message) for message_log in message_logs for message in message_log
     )
     for message_log in message_logs:
@@ -2443,6 +2478,9 @@ def add_grpo_token_loss_masks_and_generation_logprobs(
                     fill_value=_owns_media(message),
                     dtype=torch.bool,
                 )
+            for key in per_token_multimodal_fields:
+                if key not in message:
+                    message[key] = torch.zeros_like(token_ids)
 
 
 def _resolve_message_level_advantage_penalties(
@@ -2775,6 +2813,107 @@ def _apply_mask_sample_filter(repeated_batch: BatchedDataDict[DatumSpec]) -> int
     loss_multiplier[mask_sample_bool] = 0
     repeated_batch["loss_multiplier"] = loss_multiplier
     return num_masked
+
+
+def _apply_async_sample_masks(
+    repeated_batch: BatchedDataDict[DatumSpec],
+    overlong_filtering: bool,
+    timer: Optional[Timer] = None,
+) -> tuple[dict[str, int], int]:
+    """Zero loss_multiplier for masked async rows and attribute each mask once.
+
+    Reasons are applied in precedence order (pre-existing zero loss multiplier,
+    overlong filtering, rollout ``mask_sample``), and each masked row counts
+    toward exactly one ``num_masked_seqs_by_*`` metric.
+    The final set of masked rows is the same as applying each filter
+    independently; only the attribution is exclusive.
+
+    Args:
+        repeated_batch: Training batch; ``loss_multiplier`` is updated in place.
+        overlong_filtering: Whether truncated rows are masked. When enabled,
+            ``truncated`` is required, as in the sync path.
+        timer: Optional timer. The overlong and mask_sample steps keep their
+            historical ``overlong_filter`` / ``mask_sample_filter`` labels.
+
+    Returns:
+        Tuple of the per-reason metrics (including ``num_masked_seqs_total``,
+        which excludes logprob-error masking applied later) and the legacy
+        ``num_mask_sample_filtered`` count: all rows flagged by ``mask_sample``,
+        including those already masked for another reason.
+    """
+    loss_multiplier = repeated_batch["loss_multiplier"].clone()
+    if loss_multiplier.ndim != 1:
+        raise ValueError(
+            "loss_multiplier must be one-dimensional, got "
+            f"shape={tuple(loss_multiplier.shape)}"
+        )
+    batch_size = loss_multiplier.numel()
+    eligible = loss_multiplier != 0
+    sample_mask_metrics = {
+        "num_masked_seqs_by_loss_multiplier": int((~eligible).sum().item()),
+        "num_masked_seqs_by_overlong_filtering": 0,
+        "num_masked_seqs_by_rollout": 0,
+    }
+    num_mask_sample_filtered = 0
+
+    def timed(label: str):
+        return timer.time(label) if timer is not None else nullcontext()
+
+    # TODO: support empty NeMo-Gym responses (response.output == []). Today
+    # _postprocess_nemo_gym_to_nemo_rl_result raises for these rows. Recovering
+    # them (see #4001 on super-v3.5-posttraining) needs a producer that emits a
+    # placeholder row plus a row-aligned marker column, and a reason here that
+    # masks marked rows ahead of overlong filtering and reports
+    # num_masked_seqs_by_empty_response_output. The producer runs in the shared
+    # Gym actor, so it must be opt-in until the sync, grpo_sync, distillation,
+    # and single-controller paths also mask the placeholder rows.
+    # (field, metric, timer label, required, enabled)
+    mask_reasons = [
+        (
+            "truncated",
+            "num_masked_seqs_by_overlong_filtering",
+            "overlong_filter",
+            True,
+            overlong_filtering,
+        ),
+        (
+            "mask_sample",
+            "num_masked_seqs_by_rollout",
+            "mask_sample_filter",
+            False,
+            True,
+        ),
+    ]
+    for field_name, metric_name, timer_label, required, enabled in mask_reasons:
+        with timed(timer_label):
+            if not enabled:
+                continue
+            if field_name not in repeated_batch:
+                if required:
+                    raise KeyError(
+                        f"{field_name!r} is required to apply async sample masking"
+                    )
+                continue
+            candidate_mask = repeated_batch[field_name]
+            if not isinstance(candidate_mask, torch.Tensor):
+                candidate_mask = torch.as_tensor(candidate_mask)
+            candidate_mask = candidate_mask.reshape(-1)
+            if candidate_mask.numel() != batch_size:
+                raise ValueError(
+                    f"{field_name} has {candidate_mask.numel()} rows; "
+                    f"expected {batch_size}"
+                )
+            candidate_mask = candidate_mask.to(device=eligible.device, dtype=torch.bool)
+            if field_name == "mask_sample":
+                num_mask_sample_filtered = int(candidate_mask.sum().item())
+            newly_masked = eligible & candidate_mask
+            sample_mask_metrics[metric_name] = int(newly_masked.sum().item())
+            loss_multiplier[newly_masked] = 0
+            eligible &= ~newly_masked
+
+    repeated_batch["loss_multiplier"] = loss_multiplier
+    sample_mask_metrics["num_masked_seqs_total"] = sum(sample_mask_metrics.values())
+    return sample_mask_metrics, num_mask_sample_filtered
 
 
 def _binary_participation(loss_weights: torch.Tensor) -> torch.Tensor:
@@ -3263,6 +3402,7 @@ def compute_and_apply_seq_logprob_error_masking(
     seq_logprob_error_threshold: Optional[float],
     *,
     filtering_on: bool = False,
+    row_owner: Optional[torch.Tensor] = None,
 ) -> dict:
     """Compute sequence-level logprob error metrics and optionally mask high-error sequences.
 
@@ -3279,6 +3419,9 @@ def compute_and_apply_seq_logprob_error_masking(
                                     exceeding this threshold. None disables threshold
                                     filtering, but token/sample validity still applies.
         filtering_on: Whether policy top-k/top-p can produce unsupported -inf tokens.
+        row_owner: Optional logical owner index per row (-1 for padding). When
+            supplied, threshold the token-weighted error across each owner's
+            rows and mask them together. Diagnostics remain per physical row.
 
     Returns:
         Dict with keys: max_seq_mult_prob_error, mean_seq_mult_prob_error,
@@ -3334,16 +3477,37 @@ def compute_and_apply_seq_logprob_error_masking(
 
         original_sample_mask = sample_mask.clone()
 
-        # Create mask for sequences below threshold
+        threshold_errors = seq_mult_prob_error
+        if row_owner is not None:
+            if row_owner.shape != sample_mask.shape or row_owner.dtype != torch.long:
+                raise ValueError("row_owner must be an int64 index per sample")
+            # Only generated tokens owned by this rollout contribute. Use the
+            # narrowed diagnostic mask above so unsupported tokens cannot dilute
+            # the pooled error when top-k/top-p filtering is enabled.
+            counts = (token_mask * sample_mask.unsqueeze(-1)).sum(dim=-1)
+            counts = torch.where(row_owner >= 0, counts, 0.0)
+            owners, inverse = torch.unique(row_owner, return_inverse=True)
+            error_sums = counts.new_zeros(owners.numel()).scatter_add_(
+                0,
+                inverse,
+                torch.where(counts > 0, seq_mult_prob_error * counts, 0.0),
+            )
+            token_counts = counts.new_zeros(owners.numel()).scatter_add_(
+                0, inverse, counts
+            )
+            threshold_errors = (error_sums / token_counts.clamp_min(1))[inverse]
+
+        # Create mask for sequences whose owner (or row) passes the threshold.
         seq_error_mask = (
-            seq_mult_prob_error <= seq_logprob_error_threshold
+            threshold_errors <= seq_logprob_error_threshold
         ).float() * original_sample_mask
 
-        diff_mask = original_sample_mask - seq_error_mask
-        num_masked_seqs = int(diff_mask.sum().item())
+        # Count rows, not mask mass, so non-binary sample masks cannot skew
+        # the number of masked sequences.
+        diff_mask_bool = original_sample_mask.bool() & ~seq_error_mask.bool()
+        num_masked_seqs = int(diff_mask_bool.sum().item())
 
         if num_masked_seqs > 0:
-            diff_mask_bool = diff_mask.bool()
             masked_correct_count = int(
                 (rewards.view(-1)[diff_mask_bool] == 1).sum().item()
             )
@@ -3366,7 +3530,7 @@ def compute_and_apply_seq_logprob_error_masking(
         train_data["sample_mask"] = seq_error_mask
 
         print(
-            f"  Masked {num_masked_seqs} sequences with mult_prob_error > {seq_logprob_error_threshold}",
+            f"  Masked {num_masked_seqs} sequences by logprob error (threshold={seq_logprob_error_threshold})",
             flush=True,
         )
         if num_masked_seqs > 0:
@@ -3548,7 +3712,9 @@ def _grpo_train_impl(
 
     ft_save_period = master_config.checkpointing.get("ft_save_period")
 
-    while current_epoch < max_num_epochs and total_steps < max_num_steps:
+    while (
+        max_num_epochs is None or current_epoch < max_num_epochs
+    ) and total_steps < max_num_steps:
         memory_tracker.snapshot_start_of_stage("Preparing batch", dir())
         print(f"\n{'=' * 25} Epoch {current_epoch + 1}/{max_num_epochs} {'=' * 25}")
         # batch cache is used for DAPO. We store prompts with non-zero standard deviation in this cache.
@@ -4524,6 +4690,8 @@ def _grpo_train_impl(
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
+                if "attribution_key" in repeated_batch:
+                    log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages["content"]
                 log_data["rewards"] = rewards.tolist()
                 if master_config.grpo.use_dynamic_sampling:
@@ -4776,15 +4944,20 @@ def validate(
         )
 
         total_rewards = []
-        total_lengths = []
+        # Sum of per-batch mean length x rollouts, so a partial batch weighs less.
+        total_length_tokens = 0.0
         all_message_logs = []  # Collect all message logs
 
-        max_batches = (
-            master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
-        )
+        max_val_samples = master_config.grpo.max_val_samples
+        val_batch_size = master_config.grpo.val_batch_size
+        # Include the partial final batch, then trim it to the prompt cap.
+        max_batches = -(-max_val_samples // val_batch_size)
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
+            num_left = max_val_samples - batch_idx * val_batch_size
+            if val_batch.size > num_left:
+                val_batch = val_batch.slice(0, num_left)
 
             if val_num_generations_per_prompt > 1:
                 val_batch = val_batch.repeat_interleave(val_num_generations_per_prompt)
@@ -4870,8 +5043,11 @@ def validate(
                     ),
                 )
 
-            total_rewards.extend(val_batch["total_reward"].tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+            batch_rewards = val_batch["total_reward"].tolist()
+            total_rewards.extend(batch_rewards)
+            total_length_tokens += gen_metrics["mean_gen_tokens_per_sample"] * len(
+                batch_rewards
+            )
 
             # Collect message logs for later display
             to_env = [
@@ -4906,9 +5082,7 @@ def validate(
         else:
             accuracy = 0.0
 
-        avg_length = (
-            sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
-        )
+        avg_length = total_length_tokens / num_samples if num_samples > 0 else 0.0
 
         val_metrics = {
             "accuracy": accuracy,
@@ -5627,6 +5801,7 @@ def async_grpo_train(
                 ),
             ):
                 num_mask_sample_filtered = 0
+                sample_mask_metrics: dict[str, int] = {}
 
                 # Sample trajectories from replay buffer
                 print("📦 Sampling from replay buffer...")
@@ -5839,23 +6014,16 @@ def async_grpo_train(
                     # filters rewrite the column: the include population
                     # (see _include_valid_mask).
                     dataset_loss_multiplier = repeated_batch["loss_multiplier"]
-                    # Apply overlong filtering - mask out truncated sequences from loss computation
-                    with timer.time("overlong_filter"):
-                        use_overlong_filtering = master_config.grpo.overlong_filtering
-                        if use_overlong_filtering:
-                            loss_multiplier = repeated_batch["loss_multiplier"].clone()
-                            truncated = repeated_batch["truncated"]
-
-                            if isinstance(truncated, list):
-                                truncated = torch.tensor(truncated, dtype=torch.bool)
-
-                            loss_multiplier[truncated] = 0
-                            repeated_batch["loss_multiplier"] = loss_multiplier
-
-                    with timer.time("mask_sample_filter"):
-                        num_mask_sample_filtered = _apply_mask_sample_filter(
-                            repeated_batch
+                    # Mask overlong and rollout-flagged rows, attributing each
+                    # masked row (including rows that arrive with a zero
+                    # loss_multiplier) to exactly one reason.
+                    sample_mask_metrics, num_mask_sample_filtered = (
+                        _apply_async_sample_masks(
+                            repeated_batch,
+                            overlong_filtering=master_config.grpo.overlong_filtering,
+                            timer=timer,
                         )
+                    )
 
                     # Add loss mask to each message
                     # Only unmask assistant messages that were actually generated (have generation_logprobs),
@@ -5985,6 +6153,21 @@ def async_grpo_train(
                         seq_logprob_error_metrics[
                             "num_masked_seqs_by_logprob_error"
                         ] = seq_logprob_error_metrics.pop("num_masked_seqs")
+                # Fold pre-training logprob-error masking into the per-reason
+                # totals. With seq_logprob_error_in_loss the metrics are {} here:
+                # the loss reports num_masked_seqs_by_logprob_error through
+                # all_mb_metrics, and num_masked_seqs_total then covers only the
+                # pre-training reasons.
+                if "num_masked_seqs_by_logprob_error" in seq_logprob_error_metrics:
+                    num_logprob_error_masks = int(
+                        seq_logprob_error_metrics["num_masked_seqs_by_logprob_error"]
+                    )
+                    sample_mask_metrics["num_masked_seqs_by_logprob_error"] = (
+                        num_logprob_error_masks
+                    )
+                    sample_mask_metrics["num_masked_seqs_total"] += (
+                        num_logprob_error_masks
+                    )
 
                 # Pad teacher logprobs to match train_data sequence length.
                 if trajectory_teacher_logprobs is not None:
@@ -6271,6 +6454,7 @@ def async_grpo_train(
                     LOSS_KEY: train_results["loss"].numpy(),
                     REWARD_KEY: rewards.numpy(),
                     "num_mask_sample_filtered": num_mask_sample_filtered,
+                    **sample_mask_metrics,
                     GRAD_NORM_KEY: train_results["grad_norm"].numpy(),
                     "mean_prompt_length": repeated_batch["length"].numpy(),
                     "total_num_tokens": input_lengths.numpy(),
@@ -6488,6 +6672,8 @@ def async_grpo_train(
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
+                if "attribution_key" in repeated_batch:
+                    log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages_content
                 log_data["rewards"] = rewards.tolist()
                 if master_config.grpo.use_dynamic_sampling:

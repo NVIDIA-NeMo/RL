@@ -195,22 +195,6 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             megatron_enabled=megatron_enabled,
             automodel_enabled=automodel_enabled,
         )
-        hf_config = None
-        hf_config_overrides = config.get("hf_config_overrides") or {}
-        generation_config = config.get("generation")
-        if generation_config is not None and generation_config["backend"] == "vllm":
-            vllm_cfg = generation_config.get("vllm_cfg")
-            if vllm_cfg is not None and vllm_cfg.get("fp32_lm_head"):
-                hf_config = get_hf_config(
-                    config["model_name"],
-                    **hf_config_overrides,
-                )
-                validate_fp32_lm_head_config(
-                    config,
-                    megatron_enabled=megatron_enabled,
-                    automodel_enabled=automodel_enabled,
-                    model_config=hf_config,
-                )
         if reserved_http_server_ports is not None and not megatron_enabled:
             raise ValueError(
                 "reserved_http_server_ports is only supported by the Megatron "
@@ -510,14 +494,12 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
         # initialize FLOPs tracker
         try:
-            if hf_config is None:
-                hf_config = get_hf_config(
-                    config["model_name"],
-                    **hf_config_overrides,
-                )
             self.flops_tracker = FLOPTracker.from_config(
                 config["model_name"],
-                hf_config,
+                get_hf_config(
+                    config["model_name"],
+                    **(config.get("hf_config_overrides") or {}),
+                ),
             )
         except ValueError as e:
             self.flops_tracker = None
@@ -1552,6 +1534,21 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
         """
         futures = self.worker_group.run_all_workers_single_data("finalize_async_save")
         ray.get(futures)
+
+    def poll_async_save(self) -> bool:
+        """Finalize the in-flight async checkpoint write if every worker finished it.
+
+        Does not wait for the write. Returns True when no async save is pending,
+        after which the checkpoint directory may be renamed from tmp_step_N/ to
+        step_N/.
+        """
+        futures = self.worker_group.run_all_workers_single_data("poll_async_save")
+        results = ray.get(futures)
+        if len(set(results)) != 1:
+            raise RuntimeError(
+                f"Workers disagree on async checkpoint completion: {results}"
+            )
+        return results[0]
 
     def shutdown(self) -> bool:
         """Shut down all HF workers and clean up resources."""

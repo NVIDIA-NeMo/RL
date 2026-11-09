@@ -68,14 +68,16 @@ class VllmSpecificArgs(TypedDict):
     video: NotRequired[VllmVideoConfig]
     load_format: NotRequired[str]
     precision: NotRequired[str]
-    # Whether vLLM returns logprobs before or after generation-time logit
-    # processors. RL policy recomputation uses raw model logits, so recipes
-    # with generation-time processors should request ``raw_logprobs`` when
-    # comparing generation and policy logprobs.
+    # Whether vLLM returns logprobs before or after temperature, top-k/top-p
+    # filtering and other generation-time logit processors. The trainer replays
+    # top-k/top-p (not penalties, logit bias or bad words) on its
+    # temperature-scaled logits, so training with a filter requires
+    # ``processed_logprobs``.
     logprobs_mode: NotRequired[Literal["processed_logprobs", "raw_logprobs"]]
-    # Nemotron-H only: compute vLLM Nemotron-H logits with an fp32 LM head.
-    # Pair this with policy.megatron_cfg.fp32_lm_head when using a Megatron
-    # trainer.
+    # Compute the logits with an fp32 LM head: bf16 operands, fp32 GEMM output,
+    # via vLLM's head_dtype="float32" hf_override (any model whose lm_head is
+    # unquantized). Pair this with policy.megatron_cfg.fp32_lm_head when using
+    # a Megatron trainer.
     fp32_lm_head: NotRequired[bool]
     # Cap each request's generated tokens so the training prompt plus response
     # fits within max_model_len. This is needed when multimodal processing makes
@@ -93,12 +95,28 @@ class VllmSpecificArgs(TypedDict):
     # MXFP8 exclusion patterns forwarded through vLLM's quantization config.
     # Supports exact names, substrings, and fnmatch wildcards.
     quantization_ignore_patterns: NotRequired[list[str]]
-    kv_cache_dtype: Literal["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]
+    # Dynamic per-(token, head) scales require FP8 precision and Triton attention.
+    kv_cache_dtype: Literal[
+        "auto", "fp8", "fp8_e4m3", "fp8_ds_mla", "fp8_per_token_head"
+    ]
     enforce_eager: NotRequired[bool]
     enable_return_routed_experts: NotRequired[bool]
     # Collect vLLM request, cache, and cumulative token counters in a model-owner
     # background thread for performance diagnostics.
     enable_vllm_metrics_logger: NotRequired[bool]
+    # Store each request's logprobs in vLLM's FlatLogprobs (a few flat lists per
+    # request) instead of a dict plus one Logprob object per generated token. Same
+    # values; avoids long full GC pauses on the generation actor when many requests
+    # with logprobs are in flight. Applies to requests through the exposed HTTP
+    # server that ask for logprobs but not prompt logprobs, so it requires
+    # async_engine: true and expose_http_server: true. Default false.
+    flat_logprobs: NotRequired[bool]
+    # Bound how long vLLM's front-end output loops may hold the generation actor's
+    # event loop under a backlog: output_handler yields once per engine step and the
+    # output-socket reader after this many ms of continuous work (20 is a good value).
+    # Keeps refit and other control calls responsive. Requires async_engine: true.
+    # None (default) disables it.
+    output_loop_yield_budget_ms: NotRequired[float | None]
     # Sampling cadence for the optional vLLM metrics logger.
     vllm_metrics_logger_interval: NotRequired[float]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
@@ -142,10 +160,15 @@ class VllmSpecificArgs(TypedDict):
     reasoning_parser_plugin: NotRequired[str]
 
 
-def vllm_nemotron_h_fp32_lm_head_enabled(
+# Read by the removed Nemotron-H fp32 LM-head source patch. Rejected in configs
+# so recipes that still set it fail instead of silently running a bf16 head.
+LEGACY_VLLM_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
+
+
+def vllm_fp32_lm_head_enabled(
     vllm_cfg: VllmSpecificArgs | dict[str, Any],
 ) -> bool:
-    """Return whether vLLM should run Nemotron-H logits with an fp32 head."""
+    """Return whether vLLM should compute logits with an fp32 LM head."""
     return bool(vllm_cfg.get("fp32_lm_head"))
 
 
@@ -251,11 +274,47 @@ class VllmConfig(GenerationConfig):
     worker_extension_cls_fqn: NotRequired[str | None]
 
 
+def resolve_vllm_logprobs_mode(config: VllmConfig) -> str | None:
+    """The engine's logprobs_mode; vllm_cfg overrides vllm_kwargs as in the worker.
+
+    None means vLLM's default, raw_logprobs.
+    """
+    logprobs_mode = (config.get("vllm_cfg") or {}).get("logprobs_mode")
+    if logprobs_mode is None:
+        logprobs_mode = (config.get("vllm_kwargs") or {}).get("logprobs_mode")
+    return logprobs_mode
+
+
+def resolve_vllm_kv_cache_dtype(vllm_cfg: VllmSpecificArgs) -> str:
+    """Return the selected cache format and validate dynamic FP8 precision."""
+    kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
+    if kv_cache_dtype == "fp8_per_token_head" and vllm_cfg.get("precision") != "fp8":
+        raise ValueError("fp8_per_token_head requires precision='fp8'")
+    return kv_cache_dtype
+
+
 def validate_vllm_quantization_config(config: VllmConfig) -> None:
     """Reject quantization options that would otherwise be silently ignored."""
     vllm_cfg = config.get("vllm_cfg")
     if vllm_cfg is None:
         return
+    if vllm_cfg.get("kv_cache_dtype") == "fp8_per_token_head":
+        resolve_vllm_kv_cache_dtype(vllm_cfg)
+        if config.get("real_quant"):
+            raise ValueError("fp8_per_token_head does not support real_quant")
+        vllm_kwargs = config.get("vllm_kwargs") or {}
+        attention_config = vllm_kwargs.get("attention_config") or {}
+        for backend in (
+            vllm_kwargs.get("attention_backend"),
+            attention_config.get("backend"),
+        ):
+            if backend is not None and backend != "TRITON_ATTN":
+                raise ValueError(
+                    "kv_cache_dtype='fp8_per_token_head' requires TRITON_ATTN; "
+                    "set vllm_kwargs.attention_backend or "
+                    "vllm_kwargs.attention_config.backend to 'TRITON_ATTN'. "
+                    f"Got {backend!r}."
+                )
     refit_prequantize = vllm_cfg.get("refit_prequantize")
     if refit_prequantize is not None and not isinstance(refit_prequantize, bool):
         raise ValueError(
@@ -278,6 +337,34 @@ def validate_vllm_quantization_config(config: VllmConfig) -> None:
             "policy.generation.vllm_cfg.refit_prequantize is not supported with "
             "refit_with_reload_api; prequantized refit uses receiver scale names "
             "that are not accepted by vLLM's native reload path."
+        )
+
+
+def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
+    """Reject async-actor options that would otherwise be silently ignored."""
+    vllm_cfg = config.get("vllm_cfg")
+    if vllm_cfg is None:
+        return
+    if vllm_cfg.get("flat_logprobs") and not (
+        vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
+    ):
+        raise ValueError(
+            "policy.generation.vllm_cfg.flat_logprobs only applies to requests "
+            "through the async engine's HTTP server; it requires async_engine: true "
+            "and expose_http_server: true."
+        )
+    budget_ms = vllm_cfg.get("output_loop_yield_budget_ms")
+    if budget_ms is None:
+        return
+    if not vllm_cfg.get("async_engine"):
+        raise ValueError(
+            "policy.generation.vllm_cfg.output_loop_yield_budget_ms requires "
+            "async_engine: true."
+        )
+    if budget_ms <= 0:
+        raise ValueError(
+            "policy.generation.vllm_cfg.output_loop_yield_budget_ms must be positive "
+            f"(or null to disable), got {budget_ms}."
         )
 
 
@@ -524,6 +611,40 @@ def validate_nvfp4_pertoken_model(hf_config: Any) -> None:
         )
 
 
+NATIVE_MXFP8_LINEAR_KERNELS = {
+    "flashinfer_cutedsl": "FlashInferCutedslMxfp8LinearKernel",
+    "flashinfer_trtllm": "FlashInferTrtllmMxfp8LinearKernel",
+}
+
+
+def _requested_linear_backend(config: VllmConfig) -> str | None:
+    vllm_kwargs = config.get("vllm_kwargs") or {}
+    kernel_config = vllm_kwargs.get("kernel_config") or {}
+    backend = vllm_kwargs.get("linear_backend")
+    if isinstance(backend, str):
+        backend = backend.lower().replace("-", "_")
+    if backend in (None, "auto") and isinstance(kernel_config, Mapping):
+        backend = kernel_config.get("linear_backend") or backend
+    return backend.lower().replace("-", "_") if isinstance(backend, str) else None
+
+
+def _reject_native_mxfp8_linear_refit_transport(
+    config: VllmConfig, transport: str
+) -> None:
+    """Reject native MXFP8 linear kernels on refit transports that bypass reload."""
+    vllm_cfg = config.get("vllm_cfg") or {}
+    if not (vllm_cfg.get("precision") == "fp8" and vllm_cfg.get("is_mx") is True):
+        return
+    linear_backend = _requested_linear_backend(config)
+    if linear_backend not in NATIVE_MXFP8_LINEAR_KERNELS:
+        return
+    raise ValueError(
+        f"refit_transport={transport!r} does not support native MXFP8 linear "
+        f"kernels (linear_backend={linear_backend!r}). Use refit_transport=null "
+        "(collective/IPC) or a non-native linear_backend."
+    )
+
+
 def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
     """Validate the selected refit transport and resolve its scoped defaults."""
     validate_vllm_quantization_config(config)
@@ -541,6 +662,7 @@ def normalize_vllm_refit_config(config: VllmConfig) -> VllmRefitConfig | None:
         )
     if transport is None:
         return None
+    _reject_native_mxfp8_linear_refit_transport(config, transport)
     if transport == "nccl_reshard":
         # nccl_reshard doesn't takes refit_cfg.
         return None

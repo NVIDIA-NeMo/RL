@@ -19,10 +19,11 @@
 #
 # EXTERNAL_VLLM_MODE=serve runs the pools on their own instead, as a plain
 # (non-heterogeneous) job that outlives any training job: replicas on this job's
-# nodes, load balancers on its first node. Once every pool is healthy it
-# publishes the pools to EXTERNAL_VLLM_POOL_DIR, and training jobs attach to
-# them with attach_and_run.sh, so a training job can crash and be resubmitted
-# without the judges reloading. See README.md, "Persistent pools".
+# nodes, load balancers on its first node. It publishes the pools to
+# EXTERNAL_VLLM_POOL_DIR as soon as the load balancers are placed and writes
+# READY once every pool is healthy; training jobs attach to them with
+# attach_and_run.sh, so a training job can crash and be resubmitted without the
+# judges reloading. See README.md, "Persistent pools".
 
 set -euo pipefail
 
@@ -75,6 +76,18 @@ fi
 RAY_SUB="${RAY_SUB:-${SLURM_SUBMIT_DIR}/ray.sub}"
 export GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
 EXTERNAL_VLLM_LB_PYTHON="${EXTERNAL_VLLM_LB_PYTHON:-/opt/nemo_rl_venv/bin/python}"
+# Image for the load-balancer steps. Each pool's LB is its own srun step on the
+# Ray head node, so with CONTAINER the head unpacks one extra copy of the training
+# image per pool. The LB needs only Python and aiohttp (see README.md).
+EXTERNAL_VLLM_LB_CONTAINER="${EXTERNAL_VLLM_LB_CONTAINER:-${CONTAINER}}"
+lb_python="${EXTERNAL_VLLM_LB_PYTHON}"
+if [[ "${EXTERNAL_VLLM_LB_CONTAINER}" != "${CONTAINER}" ]]; then
+  lb_python="${EXTERNAL_VLLM_LB_CONTAINER_PYTHON:-/usr/local/bin/python3}"
+  if [[ "${EXTERNAL_VLLM_LB_CONTAINER}" == [/.]* && ! -r "${EXTERNAL_VLLM_LB_CONTAINER}" ]]; then
+    echo "[FATAL] EXTERNAL_VLLM_LB_CONTAINER is not readable: ${EXTERNAL_VLLM_LB_CONTAINER}" >&2
+    exit 1
+  fi
+fi
 EXTERNAL_VLLM_SHARED_ROOT="${EXTERNAL_VLLM_SHARED_ROOT:-/lustre}"
 EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS="${EXTERNAL_VLLM_READINESS_POLL_INTERVAL_SECONDS:-5}"
 EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS="${EXTERNAL_VLLM_READINESS_REQUEST_TIMEOUT_SECONDS:-10}"
@@ -764,7 +777,7 @@ launch_lb() {
     "${het_ray[@]}" \
     --no-container-mount-home \
     --container-name="external-vllm-lb-${pool,,}-${SLURM_JOB_ID}" \
-    --container-image="${CONTAINER}" \
+    --container-image="${EXTERNAL_VLLM_LB_CONTAINER}" \
     --container-mounts="${lb_mounts}" \
     --container-workdir="${SLURM_SUBMIT_DIR}" \
     --mpi=pmix \
@@ -777,7 +790,7 @@ launch_lb() {
     --cpus-per-task=2 \
     --output="${pool_log_dirs[${pool}]}/load_balancer.log" \
     --open-mode=append \
-    bash -lc "PYTHON='${EXTERNAL_VLLM_LB_PYTHON}' /opt/external-vllm-tools/lb_watchdog.sh '${lb_ports[${pool}]}' '${lb_state_dirs[${pool}]}' '${group_ids[${pool}]}'" &
+    bash -lc "PYTHON='${lb_python}' /opt/external-vllm-tools/lb_watchdog.sh '${lb_ports[${pool}]}' '${lb_state_dirs[${pool}]}' '${group_ids[${pool}]}'" &
   pid=$!
   if [[ -z "${slot}" ]]; then
     lb_step_pids+=("${pid}")
@@ -812,6 +825,31 @@ for pool in "${pool_names[@]}"; do
     readiness_separator=","
   fi
 done
+
+# publish_manifest: write manifest.tsv, pools.env and <pool>_url. Serve mode only. The URLs are fixed as soon as every
+# load balancer is placed, which is long before any replica is healthy, so this runs right after placement and an
+# attaching job can start ray.sub then. READY, written only once every replica is healthy, stays the "usable" signal.
+publish_manifest() {
+  {
+    echo "# External vLLM pools from Slurm job ${SLURM_JOB_ID}, generation ${pool_generation}"
+    printf '# pool\tbase_url\thealth_url\texpected_backends\tserved_model_name\tstartup_timeout\n'
+    for pool in "${pool_names[@]}"; do
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${pool}" "${pool_urls[${pool}]}" "${health_urls[${pool}]}" \
+        "${replicas[${pool}]}" "${served_model_names[${pool}]}" "${startup_timeouts[${pool}]}"
+    done
+  } > "${EXTERNAL_VLLM_POOL_DIR}/manifest.tsv.tmp"
+  mv "${EXTERNAL_VLLM_POOL_DIR}/manifest.tsv.tmp" "${EXTERNAL_VLLM_POOL_DIR}/manifest.tsv"
+  : > "${EXTERNAL_VLLM_POOL_DIR}/pools.env.tmp"
+  for pool in "${pool_names[@]}"; do
+    echo "${pool_urls[${pool}]}" > "${EXTERNAL_VLLM_POOL_DIR}/${pool,,}_url"
+    echo "${pool}=${pool_urls[${pool}]}" >> "${EXTERNAL_VLLM_POOL_DIR}/pools.env.tmp"
+  done
+  mv "${EXTERNAL_VLLM_POOL_DIR}/pools.env.tmp" "${EXTERNAL_VLLM_POOL_DIR}/pools.env"
+}
+if [[ "${EXTERNAL_VLLM_MODE}" == serve ]]; then
+  publish_manifest
+  echo "[INFO] $(date -Iseconds) manifest published (URLs fixed); replicas still loading"
+fi
 
 if [[ "${EXTERNAL_VLLM_MODE}" == inline ]]; then
   external_service_readiness_override+='],timeout_seconds:'
@@ -908,24 +946,8 @@ if [[ "${EXTERNAL_VLLM_MODE}" == serve ]]; then
     sleep 5
   done
 
-  # Publish, READY last. manifest.tsv is what attach_and_run.sh reads; the
-  # <pool>_url files and pools.env are for launchers that read single URLs.
-  {
-    echo "# External vLLM pools from Slurm job ${SLURM_JOB_ID}, generation ${pool_generation}"
-    printf '# pool\tbase_url\thealth_url\texpected_backends\tserved_model_name\tstartup_timeout\n'
-    for pool in "${pool_names[@]}"; do
-      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "${pool}" "${pool_urls[${pool}]}" "${health_urls[${pool}]}" \
-        "${replicas[${pool}]}" "${served_model_names[${pool}]}" "${startup_timeouts[${pool}]}"
-    done
-  } > "${EXTERNAL_VLLM_POOL_DIR}/manifest.tsv.tmp"
-  mv "${EXTERNAL_VLLM_POOL_DIR}/manifest.tsv.tmp" "${EXTERNAL_VLLM_POOL_DIR}/manifest.tsv"
-  : > "${EXTERNAL_VLLM_POOL_DIR}/pools.env.tmp"
-  for pool in "${pool_names[@]}"; do
-    echo "${pool_urls[${pool}]}" > "${EXTERNAL_VLLM_POOL_DIR}/${pool,,}_url"
-    echo "${pool}=${pool_urls[${pool}]}" >> "${EXTERNAL_VLLM_POOL_DIR}/pools.env.tmp"
-  done
-  mv "${EXTERNAL_VLLM_POOL_DIR}/pools.env.tmp" "${EXTERNAL_VLLM_POOL_DIR}/pools.env"
-
+  # manifest.tsv, pools.env and the <pool>_url files were published right after the load balancers were placed;
+  # only READY is written here, last.
   ready_published=0
   publish_ready() {
     echo "${pool_generation} $(date -Iseconds)" > "${EXTERNAL_VLLM_POOL_DIR}/READY.tmp"

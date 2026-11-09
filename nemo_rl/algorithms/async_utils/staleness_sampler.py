@@ -280,6 +280,11 @@ class BaseSampler(abc.ABC):
     def is_on_policy(self) -> bool:
         return self._eviction_window() == 0
 
+    @property
+    def eviction_window(self) -> int:
+        """Weight versions a group stays trainable for; older groups are evicted."""
+        return self._eviction_window()
+
     def required_buffer_capacity(self, groups_per_step: int) -> Optional[int]:
         return None
 
