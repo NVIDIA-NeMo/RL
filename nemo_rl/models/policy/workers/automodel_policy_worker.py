@@ -25,6 +25,9 @@ from nemo_automodel.components.distributed.tensor_utils import (
     get_cpu_state_dict,
     to_local_if_dtensor,
 )
+from nemo_automodel.components.distributed.tp_replicas import (
+    synchronize_tp_replica_gradients,
+)
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from torch import nn
@@ -823,6 +826,7 @@ class AutomodelPolicyWorkerImpl(
                     # a shared global clip let the draft's larger gradients
                     # scale down the policy's updates on every step. The draft
                     # is clipped separately below.
+                    synchronize_tp_replica_gradients([self.model], self.device_mesh)
                     grad_norm = scale_grads_and_clip_grad_norm(
                         self.max_grad_norm,
                         [self.model],
@@ -847,6 +851,9 @@ class AutomodelPolicyWorkerImpl(
                     # Independent draft clip with the same max norm; the
                     # returned pre-clip norm doubles as the reported metric.
                     if draft_runtime is not None:
+                        synchronize_tp_replica_gradients(
+                            [self.draft_model], self.device_mesh
+                        )
                         draft_grad_norm = float(
                             scale_grads_and_clip_grad_norm(
                                 self.max_grad_norm,
