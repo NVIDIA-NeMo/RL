@@ -12,22 +12,22 @@ cp -r research/template_project research/my_new_project
 
 The template includes:
 - A minimal train-and-generate loop example:
-    - Main loop: [single_update.py](research/template_project/single_update.py)
-    - Utilities used by the main loop: [template_project/](research/template_project/template_project)
-- Configuration examples: [configs/](research/template_project/configs)
-    - The subdirectory [configs/recipes/](research/template_project/configs/recipes) is used only for test suites
-- Documentation template: [README.md](research/template_project/README.md)
-- Complete test suite structure (unit, functional, and test suites): [tests/](research/template_project/tests)
-- Dependency specification: [.python-version](research/template_project/.python-version) and [pyproject.toml](research/template_project/pyproject.toml)
+    - Main loop: [single_update.py](template_project/single_update.py)
+    - Utilities used by the main loop: [template_project/](template_project/template_project)
+- Configuration examples: [configs/](template_project/configs)
+    - The subdirectory [configs/recipes/](template_project/configs/recipes) is used only for test suites
+- Documentation template: [README.md](template_project/README.md)
+- Complete test suite structure (unit, functional, and test suites): [tests/](template_project/tests)
+- Dependency specification: [.python-version](template_project/.python-version) and [pyproject.toml](template_project/pyproject.toml)
 
 ## What Needs To Be Provided
 
 A new research project needs to include at least:
 - Driver script and main loop
-    - You can refer to [run_grpo.py](examples/run_grpo.py) and [grpo.py](nemo_rl/algorithms/grpo.py) in the core repository, and [single_update.py](research/template_project/single_update.py) in the research template for examples.
+    - You can refer to [run_grpo.py](../examples/run_grpo.py) and [grpo.py](../nemo_rl/algorithms/grpo.py) in the core repository, and [single_update.py](template_project/single_update.py) in the research template for examples.
 - Configuration
     - A runnable `config.yaml` that defines the experiment.
-    - You can refer to [examples/configs/](examples/configs) in the core repository and [configs/](research/template_project/configs) in the research template for examples.
+    - You can refer to [examples/configs/](../examples/configs) in the core repository and [configs/](template_project/configs) in the research template for examples.
 - Documentation
     - A `README.md` that describes the project, how to run it, and how to reproduce results.
 - Functional test
