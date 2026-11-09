@@ -63,6 +63,8 @@ class VllmSpecificArgs(TypedDict):
     # Additional arguments for vLLM inserted by nemo rl based on the context of when vllm is used
     skip_tokenizer_init: bool
     async_engine: bool
+    # Opt-in incremental rendering for source-history capture. None keeps native preprocessing.
+    tito_model: NotRequired[Literal["qwen3"] | None]
     # Optional video contract. When present, NeMo RL registers its TorchCodec
     # loader and uses these exact sampling values on both sides of GRPO.
     video: NotRequired[VllmVideoConfig]
@@ -345,6 +347,14 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
     vllm_cfg = config.get("vllm_cfg")
     if vllm_cfg is None:
         return
+    tito_model = vllm_cfg.get("tito_model")
+    if tito_model is not None:
+        if tito_model != "qwen3":
+            raise ValueError("vllm_cfg.tito_model must be null or qwen3")
+        if not (vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")):
+            raise ValueError(
+                "vllm_cfg.tito_model requires async_engine and expose_http_server"
+            )
     if vllm_cfg.get("flat_logprobs") and not (
         vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
     ):

@@ -1,0 +1,96 @@
+# Two-GPU compatibility smoke: one learner and one vLLM rollout worker.
+# Prepare Gym SWE-bench Verified rows and sandbox infrastructure as documented
+# in docs/guides/captured-tito.md. This is not a benchmark-quality model recipe.
+defaults: grpo_qwen3_0_6b_megatron_generation_single_controller.yaml
+
+grpo:
+  num_prompts_per_step: 1
+  num_generations_per_prompt: 2
+  max_num_steps: 2
+  calculate_advantages_on_gpu: false
+  invalid_tool_call_advantage: null
+  malformed_thinking_advantage: null
+
+loss_fn:
+  token_level_loss: true
+  sequence_level_importance_ratios: false
+
+policy:
+  train_global_batch_size: 2
+  max_total_sequence_length: 16384
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  logprob_batch_size: 1
+  generation:
+    backend: vllm
+    refit_transport: null
+    max_new_tokens: 1024
+    vllm_cfg:
+      tito_model: qwen3
+      async_engine: true
+      expose_http_server: true
+      tensor_parallel_size: 1
+      pipeline_parallel_size: 1
+      expert_parallel_size: 1
+      precision: bfloat16
+      enforce_eager: true
+      http_server_serving_chat_kwargs:
+        _override_: true
+        enable_auto_tools: true
+        tool_parser: hermes
+        reasoning_parser: qwen3
+        default_chat_template_kwargs:
+          enable_thinking: false
+    vllm_kwargs:
+      _override_: true
+
+async_rl:
+  rollout_failure:
+    min_step_batch_fraction: 1
+  min_groups_for_streaming_train: 1
+  max_inflight_prompts: 1
+  max_buffered_rollouts: 1
+
+token_capture:
+  num_reassembler_workers: 1
+  enabled: true
+  forest_training: true
+  selection_policy: returned_history
+
+data:
+  train:
+    data_path: /path/to/swe_tito_smoke.jsonl
+  validation:
+    data_path: /path/to/swe_tito_smoke.jsonl
+
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  nemo_gym:
+    skip_venv_if_present: true
+    port_range_low: 5000
+    port_range_high: 5999
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - benchmarks/swebench/verified/opencode.yaml
+      - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+    swebench_verified_opencode_sandboxed_agent:
+      responses_api_agents:
+        opencode_sandboxed_agent:
+          opencode_max_context_window: 16384
+          num_workers: 1
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: true
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: false
+
+logger:
+  wandb:
+    name: qwen3-0.6b-swe-tito-smoke
