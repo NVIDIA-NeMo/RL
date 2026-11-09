@@ -1,6 +1,10 @@
 # Gemma4 E2B IT streaming LA0 comparison
 
-Latest user target is650 (requested2026-11-08), superseding150. The original
+Latest user target is900 (requested2026-11-09), superseding650/150. See
+[RESUME900.md](RESUME900.md) and live slurm/resume650/state.json. The current
+healthy650-config segment finishes normally before subsequent direct-debug
+segments use resume900.yaml; no reset of optimizer/scheduler/data/W&B identity.
+Historical650/150 snapshots below are not the new stopping point. The original
 150-step segment completed normally: driver exit0, durable checkpoint150,
 optimizer/scheduler scalar audit and eight-panel plot all verified. Its idle
 interactive allocation21546953 was released at23:31PST on2026-11-08; Slurm

@@ -19,9 +19,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 SLURM = HERE / "slurm"
+# Keep the existing runtime directory/lock while adopting the live650 segment.
 OUT = SLURM / "resume650"
-TARGET = 650
-MAX_ALLOCATIONS = 4
+TARGET = 900
+MAX_ALLOCATIONS = 6
 TERMINAL = {
     "COMPLETED",
     "CANCELLED",
@@ -88,7 +89,7 @@ def receipt(path: Path) -> dict:
         if "step_metrics=" in line:
             pending = line
         match = re.search(
-            r"train step (\d+)/(?:150|650)\s+trainer_v=(\d+)\s+lag=(\S+)", line
+            r"train step (\d+)/(?:150|650|900)\s+trainer_v=(\d+)\s+lag=(\S+)", line
         )
         if match:
             metrics = {}
@@ -130,7 +131,19 @@ class Supervisor:
         self.last_tick = 0.0
         self.last_progress = -1
         self.progress_at = time.time()
+        assert self.state["target_steps"] in (650, TARGET)
+        for stage in self.state["stages"]:
+            if "driver_prefix" not in stage:
+                stage.update(driver_prefix="resume650", target_steps=650)
+            assert stage["driver_prefix"] in ("resume650", "resume900")
+        if self.state["target_steps"] != TARGET:
+            self.state["target_extension"] = {
+                "previous_target": self.state["target_steps"],
+                "new_target": TARGET,
+                "authorized_on": "2026-11-09",
+            }
         self.state.update(
+            target_steps=TARGET,
             supervisor_pid=os.getpid(),
             thread=thread,
             max_additional_allocations=MAX_ALLOCATIONS,
@@ -149,16 +162,16 @@ class Supervisor:
         if key in self.state["notified"]:
             return
         message = (
-            "[已授权任务十分钟监控：Gemma streaming LA0续到650] " + reason + "。"
-            "继续当前会话，无需新会话/子agent。用户已授权超过600步，当前目标650，覆盖旧150目标。"
-            "先读validation/pr3/gemma_e2b/RESUME650.md、slurm/resume650/state.json和session/20261105_pr3_design/session_state.md最新段。"
+            "[已授权任务十分钟监控：Gemma streaming LA0续到900] " + reason + "。"
+            "继续当前会话，无需新会话/子agent。用户2026-11-09明确授权900步，覆盖旧650/150目标。"
+            "先读validation/pr3/gemma_e2b/RESUME900.md、slurm/resume650/state.json和session/20261105_pr3_design/session_state.md最新段。"
             f"工作目录{REPO}。先查现有Slurm/driver/supervisor避免重复启动。保持Gemma4 E2B IT、batch512(32x16)、"
             "LA0/阈值16、4训练+4rollout、镜像1030和同一W&B yuekaiz/nemo-rl-automodel-sc/yuekaiz5090gemmala0s42。"
             "只使用逐次interactive debug allocation直接attach运行，不提batch训练，不并占两节点。"
             "核实checkpoint/optimizer/scheduler/数据游标和恢复后首步、lag0/真实dispatch、KL/W&B连续性。"
             "失败先定位修复再恢复，保留日志；尊重用户后续hold/cancel，HOLD标志禁止新分配。"
             "不动Qwen600/旧900/MCore/另一个RL-pr4963调查，不补baseline。历史Gemma baseline仅157/164步，"
-            "650完成后按实际共同区间更新八图和报告、释放本实验节点、推送原分支。"
+            "900完成后按实际共同区间更新八图和报告、释放本实验节点、推送原分支。"
             "Gemma fixed-input streaming parity未验证，原Qwen1%BF16门禁仍FAILED，不能宣称验收通过。"
         )
         environment = dict(os.environ)
@@ -219,7 +232,7 @@ class Supervisor:
             self.last_tick = time.time()
             with (OUT / "snapshots.jsonl").open("a") as file:
                 file.write(json.dumps(self.state) + "\n")
-            for mark in (100, 150, 200, 300, 400, 500, 600, TARGET):
+            for mark in (100, 150, 200, 300, 400, 500, 600, 650, 700, 800, TARGET):
                 if progress["step"] >= mark:
                     self.notify(
                         f"step{mark}",
@@ -265,7 +278,7 @@ class Supervisor:
     def acquire(self, index: int) -> dict:
         if self.held():
             raise HoldRequested
-        name = f"yuekaiz-gemma650-debug-{index}"
+        name = f"yuekaiz-gemma900-debug-{index}"
         existing = command(["squeue", "-h", "-u", "yuekaiz", "-n", name, "-o", "%i"])
         existing.check_returncode()
         jobs = existing.stdout.split()
@@ -274,7 +287,7 @@ class Supervisor:
             job = jobs[0]
             info = command(["scontrol", "show", "job", job, "--oneliner"])
             info.check_returncode()
-            assert "Comment=yuekaiz5090gemmala0s42-resume650" in info.stdout
+            assert "Comment=yuekaiz5090gemmala0s42-resume900" in info.stdout
             directory = re.search(r"\bWorkDir=(\S+)", info.stdout)
             assert directory and Path(directory[1]).resolve() == REPO.resolve()
         else:
@@ -298,7 +311,7 @@ class Supervisor:
                     "--time=4:00:00",
                     "--gres=gpu:8",
                     f"--job-name={name}",
-                    "--comment=yuekaiz5090gemmala0s42-resume650",
+                    "--comment=yuekaiz5090gemmala0s42-resume900",
                     f"--output={SLURM}/slurm-%j.out",
                     f"--error={SLURM}/slurm-%j.err",
                     str(REPO / "ray.sub"),
@@ -313,6 +326,8 @@ class Supervisor:
             "index": index,
             "resume_from": checkpoint(),
             "phase": "WAITING_CONTAINER",
+            "driver_prefix": "resume900",
+            "target_steps": TARGET,
         }
         self.state["stages"].append(stage)
         self.state["phase"] = "WAITING_CONTAINER"
@@ -327,8 +342,10 @@ class Supervisor:
         self.state["phase"] = stage["phase"]
         self.save()
         job = stage["job_id"]
-        log = SLURM / f"resume650-driver-{job}.log"
-        exit_path = SLURM / f"resume650-exit-{job}"
+        prefix = stage["driver_prefix"]
+        assert prefix in ("resume650", "resume900")
+        log = SLURM / f"{prefix}-driver-{job}.log"
+        exit_path = SLURM / f"{prefix}-exit-{job}"
         if stage["phase"] == "WAITING_CONTAINER":
             while (
                 not (SLURM / f"{job}-logs/STARTED_RAY_HEAD").exists()
@@ -342,9 +359,9 @@ class Supervisor:
                 time.sleep(15)
             if self.held():
                 return
-            with (SLURM / f"resume650-launcher-{job}.log").open("a") as file:
+            with (SLURM / f"{prefix}-launcher-{job}.log").open("a") as file:
                 process = subprocess.Popen(
-                    ["bash", str(HERE / "launch_resume650.sh"), job],
+                    ["bash", str(HERE / f"launch_{prefix}.sh"), job],
                     cwd=REPO,
                     stdout=file,
                     stderr=subprocess.STDOUT,
@@ -370,7 +387,7 @@ class Supervisor:
                 )
                 if "first_resumed_step" not in stage:
                     first = re.search(
-                        r"train step (\d+)/650\s+trainer_v=(\d+)\s+lag=(\d+)",
+                        r"train step (\d+)/(?:650|900)\s+trainer_v=(\d+)\s+lag=(\d+)",
                         log.read_text(errors="replace"),
                     )
                     assert (
@@ -433,12 +450,12 @@ class Supervisor:
                 (HERE / "results/curve-comparison/comparison-summary.json").read_text()
             )
             assert summary["max_plot_step"] == TARGET
-            assert (HERE / "results/checkpoint650-state.json").exists()
+            assert (HERE / f"results/checkpoint{TARGET}-state.json").exists()
             self.state["phase"] = "COMPLETE_COMPUTE_PENDING_REVIEW"
             self.save()
             self.notify(
-                "completed650",
-                "Gemma已完成650步、最终checkpoint保存状态检查和八图，本实验debug节点已释放；请核实W&B并更新发布报告",
+                f"completed{TARGET}",
+                f"Gemma已完成{TARGET}步、最终checkpoint保存状态检查和八图，本实验debug节点已释放；请核实W&B并更新发布报告",
             )
 
 

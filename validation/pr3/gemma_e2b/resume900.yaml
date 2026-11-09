@@ -1,0 +1,6 @@
+defaults: streaming.yaml
+grpo:
+  max_num_steps: 900
+logger:
+  wandb:
+    name: yuekaiz-gemma4-e2b-streaming-la0-b512-900-s42-exploratory

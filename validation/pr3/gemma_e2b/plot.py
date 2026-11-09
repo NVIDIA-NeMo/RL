@@ -122,7 +122,7 @@ def audit_checkpoint(step: int) -> dict:
 def main() -> None:
     assert os.environ["USER"] == "root" and os.environ.get("SLURM_JOB_ID")
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--max-step", type=int, choices=(150, 650), default=150)
+    parser.add_argument("--max-step", type=int, choices=(150, 650, 900), default=150)
     args = parser.parse_args()
     target = args.max_step
     audit_checkpoint(target)
@@ -148,8 +148,10 @@ def main() -> None:
         (output / f"{spec['run_id']}-history.json").write_text(
             json.dumps(series[label], indent=2) + "\n"
         )
-    logs = sorted((HERE / "slurm").glob("driver*.log")) + sorted(
-        (HERE / "slurm").glob("resume650-driver-*.log")
+    logs = (
+        sorted((HERE / "slurm").glob("driver*.log"))
+        + sorted((HERE / "slurm").glob("resume650-driver-*.log"))
+        + sorted((HERE / "slurm").glob("resume900-driver-*.log"))
     )
     raw = [
         row for path in logs for row in committed_log_rows(path) if row[STEP] <= target
@@ -162,7 +164,7 @@ def main() -> None:
         match
         for path in logs
         for match in re.findall(
-            r"train step (\d+)/(?:150|650)\s+trainer_v=(\d+)\s+lag=(\d+)",
+            r"train step (\d+)/(?:150|650|900)\s+trainer_v=(\d+)\s+lag=(\d+)",
             path.read_text(errors="replace"),
         )
         if int(match[0]) <= target

@@ -1,0 +1,66 @@
+# Same Gemma streaming LA0 experiment extended to900
+
+On2026-11-09 the user explicitly requested900 steps. This supersedes650 and150,
+including queued older monitor messages. Continue the SAME W&B run:
+https://wandb.ai/yuekaiz/nemo-rl-automodel-sc/runs/yuekaiz5090gemmala0s42.
+
+The healthy current allocation21568255 keeps its already-loaded650 target and
+its original run_resume650.sh/launch_resume650.sh/config unchanged. Its3h45
+deadline will normally save around step520 before the07:23:49PST hard limit.
+Do not interrupt or duplicate it just to change the target. The replacement
+supervisor adopts its existing launcher1864121 and per-job650 logs/exit marker.
+After normal save, driver exit0 and scalar audit, release that node and only then
+acquire the next interactive debug node, directly attaching the900 launcher.
+
+resume900.yaml inherits streaming.yaml and changes ONLY max_num_steps900 and
+the W&B display name. Keep Gemma4 E2B IT,32prompts x16responses=batch512,
+4training+4rollout H100,FSDP2/EP1/TP1/CP1,LA0/in_order/readiness16,buffer32,
+seed42,train/logprob MBS1,seq4096/gen2048,LR2e-6/FusedAdamBF16states,
+saved warmup10+ConstantLR,checkpoint every10/keep2/deadline3h45,image1030.
+max_num_epochs remains1; actual original loader1791700rows covers900x32=28800
+consumed prompts. Restore weights, optimizer, scheduler, dataloader and TQ/recovery;
+never restart warmup or reset the cursor. Allocated-root configuration validation
+compares the entire original config except target/display name and checks frozen
+worker/harness hashes. Each future preflight also checks its saved stage/counters.
+
+For continuity, runtime state, global lock and HOLD flag KEEP their historical
+paths under slurm/resume650/. The executable remains resume650_supervisor.py,
+but its current TARGET is900. Do not launch another supervisor or create a second
+runtime directory. Read state.json before acting. The old650 supervisor was
+stopped without stopping the independently-sessioned training launcher; the new
+process adopts that job and preserves all completed stage records. Stages record
+their driver_prefix and target_steps explicitly: old stages resume650/650,
+new stages resume900/900. New job names are yuekaiz-gemma900-debug-N, comment
+yuekaiz5090gemmala0s42-resume900, and this repository workdir is mandatory.
+
+The bounded allocation budget is now six continuation allocations TOTAL,
+including the two already recorded, to allow the longer900 target. This is a
+maximum, not six immediate requests or blind retries. One node at a time;
+no batch training, dependency chain or new baseline. On failure, persist cause
+and notify this SAME thread; diagnose preserved logs before any repair/restart.
+
+New-stage files: launch_resume900.sh/run_resume900.sh/preflight_resume900.py;
+slurm/resume900-driver-JOB.log,resume900-exit-JOB,resume900-launcher-JOB.log;
+results/resume900-provenance-JOB.json. Old650 logs and proof files stay intact.
+Monitoring polls30s and records10minute snapshots/milestones/failures in the same
+conversation. Check first recovered step=checkpoint+1, trainer version,lag0,
+nonzero advantages/gradients,LR2e-6 and exact selected W&B/native metrics.
+
+On user hold/cancel, create slurm/resume650/HOLD FIRST to prevent new allocation
+or launch, then handle the active owned work as requested. The flag alone does
+not kill active training. Do not clear it without user resume authorization.
+
+At900, require saved optimizer/scheduler/trainer/sampler counters900 and28800
+consumed prompts, driver exit0, final same-run W&B state/metrics and eight plots.
+plot.py --max-step900 merges original+650+900 native logs with strict contiguous,
+unique receipts/versions/lag checks. Historical V1/fullSC baselines end157/164;
+common statistics stop157 and plots shade absent coverage. No extrapolated
+baselines, extra baseline training or fabricated validation accuracy. Release
+only the owned node after successful audit/plot; inspect the figure/report and
+push the existing yuekaiz/pr5090-automodel-streaming branch.
+
+This remains exploratory. Gemma fixed-input streaming parity NOT ASSESSED;
+original Qwen BF16 1% gate FAILED. Policy KL spikes and gradual generation KL
+drift remain unresolved; completion does not establish numerical acceptance,
+convergence equivalence or controlled speedup. Do not touch Qwen600,old900,MCore
+or sibling RL-pr4963 experiments. Later user hold/cancel takes precedence.

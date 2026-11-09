@@ -1,5 +1,10 @@
 # Authorized continuation of the same Gemma streaming LA0 run to650
 
+SUPERSEDED: the user extended this SAME experiment to900 on2026-11-09.
+Read [RESUME900.md](RESUME900.md) first. The runtime state/lock/HOLD paths retain
+their historical slurm/resume650 names; target_steps900 is now authoritative.
+Older650 monitor messages do not override900 authorization. History follows.
+
 On2026-11-08 the user requested more than600 steps. Target650 supersedes the
 previous150-step stopping point. This remains the same experiment and W&B run:
 https://wandb.ai/yuekaiz/nemo-rl-automodel-sc/runs/yuekaiz5090gemmala0s42.
