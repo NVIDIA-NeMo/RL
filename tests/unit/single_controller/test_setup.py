@@ -1321,15 +1321,23 @@ class TestSetup:
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
+    # Every feature `prefix` cannot do yet; the PR that adds one deletes its case.
     @pytest.mark.parametrize(
         ("feature", "match"),
         [
             ("router_replay", "does not yet support router replay"),
             ("multimodal", "does not yet support multimodal capture"),
+            (
+                "megatron",
+                "target_level='prefix' currently supports only the vllm generation",
+            ),
         ],
     )
     def test_prefix_recovery_rejects_unsupported_features(self, feature, match):
-        mc = _make_master_config(env={"should_use_nemo_gym": True})
+        mc = _make_master_config(
+            env={"should_use_nemo_gym": True},
+            backend="megatron" if feature == "megatron" else "vllm",
+        )
         mc.policy["generation"]["vllm_cfg"] = {
             "async_engine": True,
             "expose_http_server": True,
@@ -1342,7 +1350,7 @@ class TestSetup:
         processor = None
         if feature == "router_replay":
             mc.policy["router_replay"] = {"enabled": True}
-        else:
+        elif feature == "multimodal":
             processor = MagicMock()
 
         with pytest.raises(NotImplementedError, match=match):

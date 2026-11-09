@@ -68,35 +68,8 @@ R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 G_ROUTED_EXPERTS_RANGE_CHECKED = False
 
 
-def _extract_selected_token_logprobs(
-    generation_token_ids: list[int],
-    generation_logprob_details: list[Any],
-    *,
-    where: str = "",
-) -> list[float]:
-    """Extract the sampled token's log probability at every output position.
-
-    Args:
-        generation_token_ids: The sampled token at each output position.
-        generation_logprob_details: vLLM's per-position logprob mapping.
-        where: Context prepended to the token in a missing-token error.
-    """
-    selected_logprobs: list[float] = []
-    for token_id, position_logprobs in zip(
-        generation_token_ids, generation_logprob_details, strict=True
-    ):
-        selected = position_logprobs.get(token_id)
-        if selected is None:
-            raise RuntimeError(
-                "vLLM generation log probabilities did not include the selected "
-                f"token: {where}token_id={token_id}"
-            )
-        selected_logprobs.append(max(float(selected.logprob), VLLM_LOGPROB_FLOOR))
-    return selected_logprobs
-
-
 def extract_generation_logprobs(
-    token_ids: Sequence[int], logprobs: Any, *, start: int
+    token_ids: Sequence[int], logprobs: Any, *, start: int, where: str = ""
 ) -> list[float]:
     """Read the sampled log probabilities of the generated tokens from ``start`` on.
 
@@ -111,6 +84,7 @@ def extract_generation_logprobs(
         logprobs: vLLM's per-position logprobs for the whole generation, or
             None if vLLM sent none.
         start: Generated position of ``token_ids[0]``.
+        where: Context prepended to the token in a missing-token error.
 
     Returns:
         The sampled token's log probability at each of those positions.
@@ -130,9 +104,17 @@ def extract_generation_logprobs(
             f"token_count={end}, logprob_count={published}"
         )
     if flat is not None:
-        return _select_flat_logprobs(token_ids, flat, start=start)
-    details = [logprobs[position] for position in range(start, end)]
-    return _extract_selected_token_logprobs(list(token_ids), details)
+        return _select_flat_logprobs(token_ids, flat, start=start, where=where)
+    selected_logprobs: list[float] = []
+    for position, token_id in enumerate(token_ids, start):
+        selected = logprobs[position].get(token_id)
+        if selected is None:
+            raise RuntimeError(
+                "vLLM generation log probabilities did not include the selected "
+                f"token: {where}token_id={token_id}"
+            )
+        selected_logprobs.append(max(float(selected.logprob), VLLM_LOGPROB_FLOOR))
+    return selected_logprobs
 
 
 def _flat_logprob_arrays(
@@ -162,24 +144,22 @@ def _select_flat_logprobs(
     flat: tuple[list[int], list[int], list[int], list[float]],
     *,
     start: int,
+    where: str = "",
 ) -> list[float]:
     """Read each sampled token's log probability straight from flat arrays.
 
-    A position's candidates sit at ``[start_indices[p], end_indices[p])``.
-    Scanning from the end keeps vLLM's mapping behavior when a token repeats
-    at one position: the last occurrence wins.
+    vLLM's sampler writes the sampled token first at each position, then its
+    top-k (the layout ``extract_flat_score_centering_samples`` also checks), so
+    the sampled log probability is the slot at ``start_indices[p]``.
     """
-    starts, ends, candidate_ids, values = flat
+    starts, _, candidate_ids, values = flat
     selected_logprobs: list[float] = []
     for position, token_id in enumerate(token_ids, start):
-        begin = starts[position]
-        index = ends[position] - 1
-        while index >= begin and candidate_ids[index] != token_id:
-            index -= 1
-        if index < begin:
+        index = starts[position]
+        if candidate_ids[index] != token_id:
             raise RuntimeError(
                 "vLLM generation log probabilities did not include the selected "
-                f"token: token_id={token_id}"
+                f"token first: {where}token_id={token_id}"
             )
         selected_logprobs.append(max(float(values[index]), VLLM_LOGPROB_FLOOR))
     return selected_logprobs
@@ -879,22 +859,12 @@ def chat_generation_tokens(generation_details: Any) -> tuple[list[int], list[flo
             f"token_count={len(generation_token_ids)}, "
             f"logprob_count={len(generation_logprob_details)}."
         )
-    generation_log_probs = []
-    for token_id, position_logprobs in zip(
-        generation_token_ids, generation_logprob_details
-    ):
-        selected_token_logprob = position_logprobs.get(token_id)
-        if selected_token_logprob is None:
-            raise RuntimeError(
-                "vLLM generation log probabilities did not include the "
-                "selected token while attaching token information to "
-                "the OpenAI-compatible chat response: "
-                f"choice_idx={choice_index}, token_id={token_id}."
-            )
-        generation_log_probs.append(
-            max(float(selected_token_logprob.logprob), VLLM_LOGPROB_FLOOR)
-        )
-    return generation_token_ids, generation_log_probs
+    return generation_token_ids, extract_generation_logprobs(
+        generation_token_ids,
+        generation_logprob_details,
+        start=0,
+        where=f"choice_idx={choice_index}, ",
+    )
 
 
 def attach_sampler_topk_logprobs_to_chat_response_choices(

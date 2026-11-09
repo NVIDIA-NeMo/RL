@@ -51,8 +51,10 @@ from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data_plane.interfaces import DataPlaneClient
     from nemo_rl.experience.rollout_manager import RolloutManager
     from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
+    from nemo_rl.models.generation.interfaces import GenerationInterface
 
 # Rollout-deadline pause owned by a Gym checkpoint while it holds rollouts parked.
 _GYM_CHECKPOINT_DEADLINE_HOLDER = "gym_checkpoint"
@@ -63,46 +65,33 @@ _GYM_EPISODE_SAMPLE_SIZE = 5
 
 @dataclass
 class GenerationCutStats:
-    """What one snapshot's generation cut cost and achieved."""
+    """What one snapshot's generation cut achieved."""
 
-    # From the terminal-capture fence's acquisition to its release.
-    fence_hold_seconds: Optional[float] = None
     # Gym's ``cut`` / ``cut_failed`` / ``cut_skipped`` counts.
     counts: dict[str, int] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
-class GenerationCutFence:
-    """Holds terminal token-capture writes on every generation worker.
+@dataclass
+class ObsoleteGenerationCutRows:
+    """Deletes ended calls' generation chunk rows when a snapshot starts.
 
-    Decoding continues; only terminal staging waits, so the TQ cut and Gym's
-    generation cut see the same live calls.
+    A call's terminal write only retires its chunk rows, since the snapshot in
+    progress may name them; each snapshot deletes the ones retired before it.
     """
 
-    generation: Any
+    generation: GenerationInterface
     timeout_s: Optional[float]
+    # Numbers each snapshot's flush, so a worker skips a late one.
+    _epoch: int = 0
 
-    @contextlib.asynccontextmanager
-    async def held(self, stats: GenerationCutStats) -> AsyncIterator[None]:
-        """Fence for the context; record the hold time in ``stats`` on release."""
-        acquired: Optional[float] = None
-        try:
-            await asyncio.to_thread(
-                self.generation.begin_token_capture_snapshot_fence,
-                timeout_s=self.timeout_s,
-            )
-            acquired = time.monotonic()
-            yield
-        finally:
-            # Idempotent, so it also releases workers a failed begin had
-            # already fenced. A failed release keeps the error it interrupted
-            # as its __context__.
-            await asyncio.to_thread(
-                self.generation.end_token_capture_snapshot_fence,
-                timeout_s=self.timeout_s,
-            )
-            if acquired is not None:
-                stats.fence_hold_seconds = time.monotonic() - acquired
+    async def flush(self) -> None:
+        """Return once every worker deleted them; TQ saves no clear mid-way."""
+        self._epoch += 1
+        await asyncio.to_thread(
+            self.generation.flush_obsolete_generation_cut_rows,
+            self._epoch,
+            timeout_s=self.timeout_s,
+        )
 
 
 def _summarize_gym_episodes(
@@ -128,13 +117,13 @@ def build_gym_environment_checkpoint(
     *,
     env_handles: dict[str, Any],
     rollout_manager: RolloutManager,
-    dp_client: Any,
-    generation: Any = None,
+    dp_client: DataPlaneClient,
+    generation: Optional[GenerationInterface] = None,
 ) -> GymEnvironmentCheckpoint:
     """Build the Gym checkpoint and close Gym dispatch through its admission gate.
 
-    ``generation`` is required with prefix recovery: its workers' terminal
-    capture writes are fenced across each snapshot.
+    ``generation`` is required with prefix recovery: its workers delete ended
+    calls' generation chunk rows before each snapshot.
     """
     staging_partition = master_config.token_capture.staging_partition
 
@@ -146,14 +135,14 @@ def build_gym_environment_checkpoint(
             partition_id=staging_partition,
         )
 
-    generation_fence: Optional[GenerationCutFence] = None
+    obsolete_cut_rows: Optional[ObsoleteGenerationCutRows] = None
     if master_config.rollout_recovery.generation_prefix_cuts_enabled:
         if generation is None:
             raise ValueError(
-                "prefix rollout recovery needs the generation handle to fence "
-                "terminal token-capture writes across a snapshot"
+                "prefix rollout recovery needs the generation handle to delete "
+                "ended calls' generation chunk rows"
             )
-        generation_fence = GenerationCutFence(
+        obsolete_cut_rows = ObsoleteGenerationCutRows(
             generation, master_config.token_capture.control_timeout_s
         )
     environment_checkpoint = GymEnvironmentCheckpoint(
@@ -168,7 +157,7 @@ def build_gym_environment_checkpoint(
         allow_restart_only_servers=(
             master_config.rollout_recovery.allow_restart_only_gym_servers
         ),
-        generation_fence=generation_fence,
+        obsolete_cut_rows=obsolete_cut_rows,
     )
     rollout_manager.set_rollout_dispatch_admission_gate(
         environment_checkpoint.admission_gate
@@ -183,7 +172,7 @@ class GymEnvironmentSnapshot:
     checkpoint: GymEnvironmentCheckpoint
     commit: GymCheckpointCommitResult
     checkpoint_path: Path
-    # Filled in while the snapshot runs; the fence hold ends after Gym resumes.
+    # Filled in while the snapshot runs.
     generation_cut: GenerationCutStats = field(default_factory=GenerationCutStats)
 
     @property
@@ -277,10 +266,6 @@ class GymEnvironmentSnapshot:
             # Episodes Gym could not capture; they start over after a crash.
             "gym_restarted_episodes": float(self.restarted_rollouts),
         }
-        if self.generation_cut.fence_hold_seconds is not None:
-            metrics["generation_cut_fence_hold_seconds"] = (
-                self.generation_cut.fence_hold_seconds
-            )
         for name, count in self.generation_cut.counts.items():
             metrics[f"generation_{name}_calls"] = float(count)
         return metrics
@@ -297,7 +282,7 @@ class GymEnvironmentCheckpoint:
         rollout_manager: Any,
         list_staging_keys: Callable[[], Awaitable[Iterable[str]]],
         allow_restart_only_servers: bool = False,
-        generation_fence: Optional[GenerationCutFence] = None,
+        obsolete_cut_rows: Optional[ObsoleteGenerationCutRows] = None,
     ) -> None:
         """Wrap ``coordinator``.
 
@@ -309,15 +294,15 @@ class GymEnvironmentCheckpoint:
                 to check the ones the committed episodes reference still exist.
             allow_restart_only_servers: Accept Gym servers whose rollouts start
                 over after a crash, with a warning, instead of refusing them.
-            generation_fence: Holds terminal capture writes from before Gym
-                parks until after it resumes; set with prefix recovery.
+            obsolete_cut_rows: Deletes ended calls' generation chunk rows
+                before Gym prepares; set with prefix recovery.
         """
         self.coordinator = coordinator
         self._ledger = ledger
         self._rollout_manager = rollout_manager
         self._list_staging_keys = list_staging_keys
         self._allow_restart_only_servers = allow_restart_only_servers
-        self._generation_fence = generation_fence
+        self._obsolete_cut_rows = obsolete_cut_rows
         # Separate from the data-plane barrier: it pauses only Gym /run
         # submissions while a Gym checkpoint is prepared.
         self.admission_gate = DataPlaneCheckpointBarrier()
@@ -353,7 +338,7 @@ class GymEnvironmentCheckpoint:
         """Refuse, or warn about, Gym servers whose rollouts start over after a crash.
 
         Such a server's in-flight rollouts are reported as restarts at every
-        checkpoint, so turn-level recovery would quietly become
+        checkpoint, so turn- or prefix-level recovery would quietly become
         restart-from-task for them.
         """
         allowed = self._allow_restart_only_servers
@@ -366,7 +351,7 @@ class GymEnvironmentCheckpoint:
         }
         if restart_only and not allowed:
             raise ValueError(
-                "rollout_recovery.target_level='turn' cannot continue rollouts on "
+                "Turn and prefix recovery cannot continue rollouts on "
                 "these restart-only Gym servers, which start every in-flight "
                 f"rollout over after a crash: {restart_only!r}. Set "
                 "rollout_recovery.allow_restart_only_gym_servers=true to accept "
@@ -525,12 +510,9 @@ class GymEnvironmentCheckpoint:
         )
         coordinator = self.coordinator
         generation_cut = GenerationCutStats()
-        async with (
-            self._generation_fence.held(generation_cut)
-            if self._generation_fence is not None
-            else contextlib.nullcontext(),
-            self.admission_gate.checkpoint(),
-        ):
+        if self._obsolete_cut_rows is not None:
+            await self._obsolete_cut_rows.flush()
+        async with self.admission_gate.checkpoint():
             # Gym parks every live rollout until resume, so the wait must not
             # count against their deadlines. A separate holder keeps a
             # colocated engine's own pause intact when this one ends.

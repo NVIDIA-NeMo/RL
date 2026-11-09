@@ -2908,7 +2908,7 @@ def test_train_pump_logs_generation_prefix_restores_with_prefix_cuts(
     ctrl._gen.get_generation_prefix_counts = lambda: {
         "restored_calls": 3,
         "restored_prefix_tokens": 120,
-        "failed_cuts_control_deadline": 2,
+        "progress_read_hold_us": 2,
     }
     ctrl._master_config.rollout_recovery.generation_prefix_cuts_enabled = True
     ctrl._sync_weights = AsyncMock(return_value=0)
@@ -2920,7 +2920,7 @@ def test_train_pump_logs_generation_prefix_restores_with_prefix_cuts(
     train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
     assert train_metrics["generation_prefix/restored_calls"] == 3.0
     assert train_metrics["generation_prefix/restored_prefix_tokens"] == 120.0
-    assert train_metrics["generation_prefix/failed_cuts_control_deadline"] == 2.0
+    assert train_metrics["generation_prefix/progress_read_hold_us"] == 2.0
 
 
 @pytest.mark.parametrize(

@@ -63,7 +63,6 @@ from nemo_rl.models.generation.generation_cut_capture import (
     _CompletedCaptureState,
     _remaining_generation_limits_after_prefix,
     _RequestCaptureState,
-    _TokenCaptureSnapshotGate,
     initial_generation_cut_counts,
 )
 from nemo_rl.models.generation.interfaces import (
@@ -155,10 +154,6 @@ class _FinishedEngineRequest:
     stop_reason: str | int | None
 
 
-# vLLM's _SAMPLING_EPS: below this temperature a request decodes greedily.
-_GREEDY_TEMPERATURE = 1e-5
-
-
 def _bad_words_can_straddle_a_cut(sampling_params: Any, tokenizer: Any) -> bool:
     """Whether any bad word vLLM enforces spans more than one token.
 
@@ -207,16 +202,15 @@ def _generation_cut_blockers(sampling_params: Any, tokenizer: Any) -> list[str]:
     """Sampling settings a resumed tail cannot honor across a generation cut.
 
     After a restore the prefix is part of the prompt, but vLLM matches stop
-    strings and multi-token bad words, and counts presence/frequency penalties,
-    over the output tokens only. A resumed tail would therefore miss a stop
-    string or bad word that straddles the cut and stop penalizing the prefix's
-    tokens.
+    strings and multi-token bad words over the output tokens only. A resumed
+    tail would therefore miss a stop string or bad word that straddles the cut.
+    (The chat route refuses presence and frequency penalties outright.)
 
     A request-level ``seed`` gives the call its own random generator, seeded
     when vLLM admits it. The restored call would start that generator over and
     reuse the draws that chose its prefix. Greedy decoding draws nothing, and
     an unseeded call draws from the engine's shared generator, so neither is
-    affected.
+    affected; vLLM's ``SamplingType.RANDOM_SEED`` is exactly the affected case.
     """
     blockers = []
     if getattr(sampling_params, "stop", None):
@@ -225,15 +219,11 @@ def _generation_cut_blockers(sampling_params: Any, tokenizer: Any) -> list[str]:
         sampling_params, tokenizer
     ):
         blockers.append("multi-token bad_words")
-    if getattr(sampling_params, "presence_penalty", 0.0):
-        blockers.append("presence_penalty")
-    if getattr(sampling_params, "frequency_penalty", 0.0):
-        blockers.append("frequency_penalty")
-    if (
-        getattr(sampling_params, "seed", None) is not None
-        and getattr(sampling_params, "temperature", 1.0) >= _GREEDY_TEMPERATURE
-    ):
-        blockers.append("seed")
+    if getattr(sampling_params, "seed", None) is not None:
+        from vllm.sampling_params import SamplingType
+
+        if sampling_params.sampling_type == SamplingType.RANDOM_SEED:
+            blockers.append("seed")
     return blockers
 
 
@@ -626,14 +616,16 @@ class _AsyncLLMHTTPClient:
         on it (router-replay route reads measured 52 ms median, 588 ms p95 and
         40 s worst that way, against 1-4 ms read directly). Instead, each
         ``OutputProcessor.process_outputs`` call runs under ``_progress_lock``,
-        so a read under the same lock sees whole decode steps and waits for at
-        most one. ``_finish_request`` keeps a finished request's state until
-        its consumer has the final output, so a call vLLM just finished is
-        still read whole.
+        so a read under the same lock sees each call between output chunks (up
+        to ``VLLM_V1_OUTPUT_PROC_CHUNK_SIZE`` requests; different calls may be
+        one decode step apart) and waits for at most one chunk.
+        ``_finish_request`` keeps a finished request's state until its consumer
+        has the final output, so a call vLLM just finished is still read whole.
 
         Raises:
             RuntimeError: The interpreter or vLLM is not one these private
-                reads were checked on.
+                reads were checked on, or another client already wraps this
+                engine's output processor.
         """
         if self._progress_reads_enabled:
             return
@@ -650,10 +642,23 @@ class _AsyncLLMHTTPClient:
                 f"checked on vLLM {expected}.x; vLLM {installed} is installed. "
                 "Re-check _AsyncLLMHTTPClient.enable_generation_progress_reads."
             )
-        # vLLM is pinned to that release, which has every field read here.
-        processor = self._engine_client.output_processor
-        process_outputs = processor.process_outputs
-        finish_request = processor._finish_request
+        try:
+            processor = self._engine_client.output_processor
+            process_outputs = processor.process_outputs
+            finish_request = processor._finish_request
+        except AttributeError as e:
+            raise RuntimeError(
+                "generation-prefix cuts wrap vLLM's OutputProcessor.process_outputs "
+                "and _finish_request, which the installed vLLM does not have; "
+                "update _AsyncLLMHTTPClient.enable_generation_progress_reads"
+            ) from e
+        # Marked on the processor, not this client: a second wrap would read
+        # under a lock vLLM no longer takes.
+        if getattr(processor, "_nrl_progress_reads", False):
+            raise RuntimeError(
+                "another client already wraps this vLLM OutputProcessor for "
+                "generation-progress reads"
+            )
 
         def locked_process_outputs(*args: Any, **kwargs: Any) -> Any:
             with self._progress_lock:
@@ -683,6 +688,7 @@ class _AsyncLLMHTTPClient:
 
         processor.process_outputs = locked_process_outputs
         processor._finish_request = retaining_finish_request
+        processor._nrl_progress_reads = True
         self._progress_reads_enabled = True
 
     def read_generation_progress(
@@ -854,66 +860,7 @@ class VllmAsyncGenerationWorkerImpl(
         self._engine_loop = None
         self._http_engine_client = None
 
-        # Ledger-authoritative token capture (dormant until the
-        # setup_token_capture fan-out runs). The weight
-        # version is stamped per model call at begin_call time and rotated by
-        # the set_rollout_weight_version fan-out from the SC's _sync_weights.
-        self.token_capture = None
-        self._rollout_weight_version = 0
-        # In-flight calls are indexed by both the request object and Gym's
-        # stable model-call ID. The second index is what a checkpoint inventory
-        # uses while the original HTTP request remains active.
-        self._capture_calls: dict[int, _RequestCaptureState] = {}
-        self._capture_calls_by_model_call_id: dict[str, _RequestCaptureState] = {}
-        self._completed_capture_calls: dict[str, _CompletedCaptureState] = {}
-        self._generation_cut_receipts: dict[tuple[str, str], Any] = {}
-        self._capture_registry_lock = threading.Lock()
-        self._capture_sink: Any | None = None
-        self._generation_prefix_cuts_enabled = False
-        self._generation_cut_control_token: str | None = None
-        self._generation_cut_control_timeout_s: float | None = None
-        self._generation_cut_tokenizer: Any | None = None
-        # Calls this process resumed from a restored generation prefix, and
-        # their prefix tokens; the driver logs the sums each step.
-        self._restored_generation_prefix_calls = 0
-        self._restored_generation_prefix_tokens = 0
-        self._generation_cut_counts = initial_generation_cut_counts()
-        self._token_capture_snapshot_gate = _TokenCaptureSnapshotGate()
-        # A dedicated executor prevents completions waiting on the closed gate
-        # from consuming all threads needed to create the checkpoint cut.
-        self._generation_cut_control_executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="nrl-generation-cut-control",
-        )
-        # Fence closes get their own thread so a stale cut still staging rows
-        # cannot delay the next checkpoint's fence past the driver's timeout.
-        self._token_capture_fence_executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="nrl-token-capture-fence",
-        )
-        # An aborted call's chunk rows are cleared here, off the serving loop;
-        # the clear waits at the snapshot gate like a terminal write.
-        self._generation_cut_cleanup_executor = ThreadPoolExecutor(
-            max_workers=1,
-            thread_name_prefix="nrl-generation-cut-cleanup",
-        )
-        self._capture_media = False
-        self._capture_patch_size: int | None = None
-        self._capture_image_token_id: int | None = None
-        # TQTokenSource installed by setup_token_capture. The media path reads
-        # parent-chain rows through it directly; prefix resolution goes through
-        # the shared ChainPrefixCache below.
-        self._staging_source: Any | None = None
-        self._capture_dp_client: Any | None = None
-        # Resolved staging-chain prefixes, shared implementation with the Megatron
-        # preparer. Installed by setup_token_capture; fetch runs on executor threads.
-        # Deferred import: tq_token_sink pulls in the data-plane stack.
-        from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache
-
-        self._chain_prefix = ChainPrefixCache()
-        # policy.generation.top_logprobs: sampler top-k log-probs staged next to each
-        # captured call's delta; 0 leaves captured calls as they are.
-        self._capture_top_logprobs = 0
+        self._init_token_capture_state()
 
         super().__init__(
             config,
@@ -935,6 +882,68 @@ class VllmAsyncGenerationWorkerImpl(
 
         self.llm = None
         self.vllm_device_ids = None
+
+    def _init_token_capture_state(self) -> None:
+        """Token-capture and generation-cut state, dormant until setup_token_capture.
+
+        Separate from ``__init__`` so tests can build a worker without vLLM:
+        ``object.__new__`` plus this method.
+        """
+        # Ledger-authoritative token capture. The weight version is stamped
+        # per model call at begin_call time and rotated by the
+        # set_rollout_weight_version fan-out from the SC's _sync_weights.
+        self.token_capture = None
+        self._rollout_weight_version = 0
+        # In-flight calls are indexed by both the request object and Gym's
+        # stable model-call ID. The second index is what a checkpoint inventory
+        # uses while the original HTTP request remains active.
+        self._capture_calls: dict[int, _RequestCaptureState] = {}
+        self._capture_calls_by_model_call_id: dict[str, _RequestCaptureState] = {}
+        self._completed_capture_calls: dict[str, _CompletedCaptureState] = {}
+        self._generation_cut_receipts: dict[tuple[str, str], Any] = {}
+        self._capture_registry_lock = threading.Lock()
+        self._capture_sink: Any | None = None
+        self._generation_prefix_cuts_enabled = False
+        self._generation_cut_control_token: str | None = None
+        self._generation_cut_control_timeout_s: float | None = None
+        self._generation_cut_tokenizer: Any | None = None
+        # Calls this process resumed from a restored generation prefix, and
+        # their prefix tokens; the driver logs the sums each step.
+        self._restored_generation_prefix_calls = 0
+        self._restored_generation_prefix_tokens = 0
+        self._generation_cut_counts = initial_generation_cut_counts()
+        # Chunk rows of ended calls, deleted when the next snapshot starts, and
+        # the latest snapshot that deleted them.
+        self._obsolete_generation_cut_keys: list[str] = []
+        self._flushed_generation_cut_epoch = 0
+        # A dedicated executor keeps completions' TQ writes from consuming the
+        # threads needed to create the checkpoint cut.
+        self._generation_cut_control_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="nrl-generation-cut-control",
+        )
+        # Obsolete chunk rows are deleted here, off the serving loop.
+        self._generation_cut_cleanup_executor = ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="nrl-generation-cut-cleanup",
+        )
+        self._capture_media = False
+        self._capture_patch_size: int | None = None
+        self._capture_image_token_id: int | None = None
+        # TQTokenSource installed by setup_token_capture. The media path reads
+        # parent-chain rows through it directly; prefix resolution goes through
+        # the shared ChainPrefixCache below.
+        self._staging_source: Any | None = None
+        self._capture_dp_client: Any | None = None
+        # Resolved staging-chain prefixes, shared implementation with the Megatron
+        # preparer. Installed by setup_token_capture; fetch runs on executor threads.
+        # Deferred import: tq_token_sink pulls in the data-plane stack.
+        from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache
+
+        self._chain_prefix = ChainPrefixCache()
+        # policy.generation.top_logprobs: sampler top-k log-probs staged next to each
+        # captured call's delta; 0 leaves captured calls as they are.
+        self._capture_top_logprobs = 0
 
     async def start_gpu_profiling(self) -> None:
         """Start GPU profiling on the inner TP workers.
@@ -1818,16 +1827,6 @@ class VllmAsyncGenerationWorkerImpl(
         return routed
 
     def _finish_request_capture(self, request: Any, content: dict) -> dict:
-        """Run terminal token staging outside an active checkpoint cut."""
-        self._token_capture_snapshot_gate.enter()
-        try:
-            return self._finish_request_capture_after_snapshot_fence(request, content)
-        finally:
-            self._token_capture_snapshot_gate.exit()
-
-    def _finish_request_capture_after_snapshot_fence(
-        self, request: Any, content: dict
-    ) -> dict:
         """Stage one canonical terminal row and retire its prefix chunks.
 
         Tokens, routes, and the call's new media tensors go to TQ in one write
@@ -1863,9 +1862,7 @@ class VllmAsyncGenerationWorkerImpl(
                     state, request, content, sampler_topk=sampler_topk
                 )
             )
-        GenerationCutCaptureMixin._clear_generation_cut_rows(
-            self, state.call.model_call_id, obsolete_staging_keys
-        )
+        self._retire_generation_cut_rows(obsolete_staging_keys)
         return content
 
     def _finish_request_capture_with_lifecycle_owned(
@@ -2220,8 +2217,6 @@ class VllmAsyncGenerationWorkerImpl(
                 generation_cut = None
                 resumed_generation_token_ids: list[int] = []
                 restored_request_output_tokens: int | None = None
-                # A candidate decision rebuilds the admission without a cut, so a
-                # restored prefix rides only an admission served as Gym sent it.
                 if serving_admission is not None:
                     capture_prefix_token_ids = await asyncio.to_thread(
                         worker_self._resolve_admission_prefix, serving_admission
@@ -2349,6 +2344,9 @@ class VllmAsyncGenerationWorkerImpl(
                 if generation_cut is not None:
                     # The durable prefix is the exact engine prompt at the cut;
                     # rendering/splicing it again could add or drop tokens.
+                    # truncate_prompt_tokens already applied when the original
+                    # call's chat was tokenized, and vLLM does not truncate
+                    # this list again (test_vllm_progress_read_layout.py).
                     final_prompt_token_ids = model_prefix_token_ids
                 else:
                     splice = splice_prefix_tokens(
@@ -3630,18 +3628,16 @@ class VllmAsyncGenerationWorkerImpl(
         await self.llm.pause_generation(mode="keep", clear_cache=clear_cache)
         return True
 
-    async def begin_token_capture_snapshot_fence_async(self) -> bool:
-        """Fence terminal staging without pausing vLLM decoding."""
-        if not self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError(
-                "begin_token_capture_snapshot_fence_async requires async_engine=True"
-            )
-        gate = self._token_capture_snapshot_gate
-        # Take the epoch on the loop, in call order with the matching end: if
-        # the driver times out and releases first, the late close is a no-op.
-        epoch = gate.begin_epoch()
+    async def flush_obsolete_generation_cut_rows_async(self, epoch: int) -> bool:
+        """Delete the chunk rows of calls that ended before snapshot ``epoch``.
+
+        Returns once the delete is done: TQ must not clear rows while the
+        snapshot is saved.
+        """
         await asyncio.get_running_loop().run_in_executor(
-            self._token_capture_fence_executor, gate.close_and_wait, epoch
+            self._generation_cut_cleanup_executor,
+            self._flush_obsolete_generation_cut_rows,
+            epoch,
         )
         return True
 
@@ -3657,15 +3653,6 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
         await self.llm.resume_generation()
-        return True
-
-    async def end_token_capture_snapshot_fence_async(self) -> bool:
-        """Release terminal token staging after the TQ snapshot is durable."""
-        if not self.cfg["vllm_cfg"]["async_engine"]:
-            raise RuntimeError(
-                "end_token_capture_snapshot_fence_async requires async_engine=True"
-            )
-        self._token_capture_snapshot_gate.reopen()
         return True
 
     async def sleep_async(self):
@@ -3714,18 +3701,9 @@ class VllmAsyncGenerationWorkerImpl(
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
-            # A terminal write may be waiting at the TQ snapshot fence when the
-            # actor is asked to stop. Release it before retiring the isolated
-            # cut-control and fence executors; waiting for a wedged TQ write
-            # here would otherwise make actor shutdown hang indefinitely.
-            token_capture_snapshot_gate = getattr(
-                self, "_token_capture_snapshot_gate", None
-            )
-            if token_capture_snapshot_gate is not None:
-                token_capture_snapshot_gate.reopen()
+            # Waiting for a wedged TQ write here would make actor shutdown hang.
             for executor_name in (
                 "_generation_cut_control_executor",
-                "_token_capture_fence_executor",
                 "_generation_cut_cleanup_executor",
             ):
                 executor = getattr(self, executor_name, None)

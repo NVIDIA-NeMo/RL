@@ -27,6 +27,7 @@ import hashlib
 import logging
 import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import asdict
@@ -55,25 +56,22 @@ from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
 
 from nemo_rl.data.captured_media import MediaColumnSpec  # noqa: E402
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
-    ChainPrefixCache,
     StagedPrefix,
     TQTokenSink,
 )
 from nemo_rl.models.generation.generation_cut_capture import (  # noqa: E402
     _remaining_generation_limits_after_prefix,
     _RequestCaptureState,
-    _TokenCaptureSnapshotGate,
-    initial_generation_cut_counts,
 )
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
-    _GENERATION_CUT_ROUTE,
     _CAPTURED_MODEL_CALL,
-    _EngineProgressRead,
-    _AsyncLLMHTTPClient,
+    _GENERATION_CUT_ROUTE,
     VllmAsyncGenerationWorkerImpl,
+    _AsyncLLMHTTPClient,
     _classify_restored_prefix_terminal,
     _count_restored_prefix_as_completion,
+    _EngineProgressRead,
     _generation_cut_blockers,
     _RestoredPrefixTerminal,
 )
@@ -137,36 +135,13 @@ class _NoCallsInVllm:
         return _EngineProgressRead([None] * len(calls), 0.0, 0.0)
 
 
-def _fake_worker(*, is_model_owner: bool = True) -> SimpleNamespace:
-    """The attribute surface setup_token_capture touches, minus the engine."""
-    worker = SimpleNamespace(
-        is_model_owner=is_model_owner,
-        token_capture=None,
-        _rollout_weight_version=0,
-        _chain_prefix=ChainPrefixCache(),
-        _capture_calls={},
-        _capture_calls_by_model_call_id={},
-        _completed_capture_calls={},
-        _generation_cut_receipts={},
-        _capture_registry_lock=threading.Lock(),
-        _capture_sink=None,
-        _generation_prefix_cuts_enabled=False,
-        _generation_cut_control_token=None,
-        _generation_cut_control_timeout_s=None,
-        _generation_cut_tokenizer=_ByteTokenizer(),
-        _restored_generation_prefix_calls=0,
-        _restored_generation_prefix_tokens=0,
-        _http_engine_client=_NoCallsInVllm(),
-        _generation_cut_counts=initial_generation_cut_counts(),
-        _token_capture_snapshot_gate=_TokenCaptureSnapshotGate(),
-        _generation_cut_cleanup_executor=ThreadPoolExecutor(max_workers=1),
-        _staging_source=None,
-        _capture_top_logprobs=0,
-        _capture_media=False,
-    )
-    worker.install_token_capture = lambda capture: setattr(
-        worker, "token_capture", capture
-    )
+def _fake_worker(*, is_model_owner: bool = True) -> VllmAsyncGenerationWorkerImpl:
+    """A real worker's token-capture state, minus the engine."""
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._init_token_capture_state()
+    worker.is_model_owner = is_model_owner
+    worker._http_engine_client = _NoCallsInVllm()
+    worker._generation_cut_tokenizer = _ByteTokenizer()
     return worker
 
 
@@ -302,22 +277,7 @@ def test_generation_setup_token_capture_requires_async_engine():
         gen.setup_token_capture({}, "rollout_staging", top_logprobs=0)
 
 
-@pytest.mark.parametrize(
-    ("operation", "worker_method"),
-    [
-        (
-            "begin_token_capture_snapshot_fence",
-            "begin_token_capture_snapshot_fence_async",
-        ),
-        (
-            "end_token_capture_snapshot_fence",
-            "end_token_capture_snapshot_fence_async",
-        ),
-    ],
-)
-def test_token_capture_snapshot_fence_control_fans_out(
-    monkeypatch, operation: str, worker_method: str
-):
+def test_obsolete_generation_cut_row_flush_fans_out(monkeypatch):
     gen = _generation_with_mock_group()
     gen.worker_group.workers = [object()]
     gen.worker_group.run_all_workers_single_data.return_value = [True]
@@ -326,10 +286,11 @@ def test_token_capture_snapshot_fence_control_fans_out(
         lambda futures, timeout=None: futures,
     )
 
-    assert getattr(gen, operation)(timeout_s=17.0)
+    assert gen.flush_obsolete_generation_cut_rows(3, timeout_s=17.0)
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
-        worker_method,
+        "flush_obsolete_generation_cut_rows_async",
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        epoch=3,
     )
 
 
@@ -337,8 +298,8 @@ def test_generation_prefix_restore_counts_sum_over_workers(monkeypatch):
     gen = _generation_with_mock_group()
     gen.worker_group.workers = [object(), object()]
     gen.worker_group.run_all_workers_single_data.return_value = [
-        {"restored_calls": 2, "restored_prefix_tokens": 50, "failed_cuts": 1},
-        {"restored_calls": 1, "restored_prefix_tokens": 7, "failed_cuts": 0},
+        {"restored_calls": 2, "restored_prefix_tokens": 50, "progress_reads": 1},
+        {"restored_calls": 1, "restored_prefix_tokens": 7, "progress_reads": 0},
     ]
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
@@ -348,7 +309,7 @@ def test_generation_prefix_restore_counts_sum_over_workers(monkeypatch):
     assert gen.get_generation_prefix_counts() == {
         "restored_calls": 3,
         "restored_prefix_tokens": 57,
-        "failed_cuts": 1,
+        "progress_reads": 1,
     }
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
         "get_generation_prefix_counts",
@@ -440,16 +401,54 @@ def test_terminal_restored_prefix_is_the_whole_completion():
     assert prompt_token_ids == [1, 2, 3]
 
 
-def test_restored_prefix_at_output_limit_is_terminal():
+@pytest.mark.parametrize(
+    ("requested", "model_max", "finish", "reason"),
+    [
+        # Room left on both limits: the call resumes decoding.
+        (8, 8, None, None),
+        (2, 8, None, "output_limit"),
+        (None, 4, None, "model_limit"),
+        (2, 4, None, "output_and_model_limit"),
+        # A finish Gym recorded wins over the limits.
+        (2, 4, "stop", "observed_stop"),
+    ],
+)
+def test_restored_prefix_terminal_outcomes(requested, model_max, finish, reason):
+    # Two prompt tokens, then the two-token restored prefix.
     terminal = _classify_restored_prefix_terminal(
         prompt_token_ids=[1, 2, 3, 4],
         prefix_token_count=2,
-        requested_output_tokens=2,
-        model_max_tokens=8,
+        requested_output_tokens=requested,
+        model_max_tokens=model_max,
+        terminal_finish_reason=finish,
     )
-    assert terminal is not None
-    assert terminal.reason == "output_limit"
+
+    if reason is None:
+        assert terminal is None
+        return
+    assert terminal.reason == reason
+    assert terminal.finish_reason == (finish or "length")
     assert terminal.original_prompt_token_count == 2
+
+
+@pytest.mark.parametrize(
+    ("prefix", "requested", "model_max", "match"),
+    [
+        (5, None, 8, "more generated tokens than the restored engine prompt"),
+        (3, 2, 8, r"exceeds the restored request output budget \(2\)"),
+        (2, None, 3, r"exceeds restored model capacity \(3\)"),
+    ],
+)
+def test_restored_prefix_that_cannot_fit_is_refused(
+    prefix, requested, model_max, match
+):
+    with pytest.raises(ValueError, match=match):
+        _classify_restored_prefix_terminal(
+            prompt_token_ids=[1, 2, 3, 4],
+            prefix_token_count=prefix,
+            requested_output_tokens=requested,
+            model_max_tokens=model_max,
+        )
 
 
 def _stopped_terminal(
@@ -725,6 +724,29 @@ def test_progress_reads_refuse_an_unchecked_vllm(monkeypatch):
         client.enable_generation_progress_reads()
 
 
+def test_progress_reads_refuse_a_vllm_without_the_wrapped_hooks(monkeypatch):
+    class Processor:  # no process_outputs / _finish_request
+        pass
+
+    client = _progress_client(monkeypatch, Processor(), enable=False)
+
+    with pytest.raises(RuntimeError, match="does not have"):
+        client.enable_generation_progress_reads()
+
+
+def test_progress_reads_wrap_an_output_processor_once(monkeypatch):
+    processor = _OutputProcessor()
+    client = _progress_client(monkeypatch, processor)
+    # The same client again is a no-op.
+    client.enable_generation_progress_reads()
+    second = _progress_client(monkeypatch, processor, enable=False)
+
+    with pytest.raises(RuntimeError, match="already wraps"):
+        second.enable_generation_progress_reads()
+    processor.process_outputs(client)
+    assert processor.processed_under_lock == [True]
+
+
 def test_cut_reads_each_call_progress_from_vllm_request_state(monkeypatch):
     worker = _worker_with_capture(_MemorySink())
     decoding, resumed, finished, unsubmitted = (
@@ -769,7 +791,7 @@ def test_cut_reads_each_call_progress_from_vllm_request_state(monkeypatch):
         state.observation_error is None
         for state in (decoding, resumed, finished, unsubmitted)
     )
-    counts = _cut_counts(worker, progress_reads=True)
+    counts = worker.get_generation_prefix_counts()
     assert (counts["progress_reads"], counts["progress_read_calls"]) == (1, 4)
 
 
@@ -851,106 +873,67 @@ def test_generation_cut_stages_only_tokens_past_the_last_sealed_cut():
     assert (key, sequence, chunk) == ("active/c3/2", 2, [12, 13])
 
 
-def test_token_capture_snapshot_fence_does_not_pause_decoding():
-    class FakeLLM:
-        pause_calls = 0
+def _flush_retired_rows(worker) -> None:
+    """Run the next snapshot's delete of retired chunk rows."""
+    worker._flush_obsolete_generation_cut_rows(worker._flushed_generation_cut_epoch + 1)
 
-        async def pause_generation(self, **kwargs):
-            self.pause_calls += 1
+
+def test_flush_deletes_rows_retired_before_its_snapshot_once():
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    worker._retire_generation_cut_rows(("a/0", "a/1"))
+    worker._retire_generation_cut_rows(("b/0",))
+
+    assert asyncio.run(worker.flush_obsolete_generation_cut_rows_async(1))
+    # One clear for every call that ended before the snapshot.
+    assert sink.cleared_generation_prefix_keys == ["a/0", "a/1", "b/0"]
+
+    # A late flush from that snapshot must not delete rows retired since.
+    worker._retire_generation_cut_rows(("c/0",))
+    assert asyncio.run(worker.flush_obsolete_generation_cut_rows_async(1))
+    assert sink.cleared_generation_prefix_keys == ["a/0", "a/1", "b/0"]
+    assert asyncio.run(worker.flush_obsolete_generation_cut_rows_async(2))
+    assert sink.cleared_generation_prefix_keys == ["a/0", "a/1", "b/0", "c/0"]
+
+
+class _BlockingClearSink(_MemorySink):
+    def __init__(self) -> None:
+        super().__init__()
+        self.clearing = threading.Event()
+        self.release = threading.Event()
+
+    def clear(self, staging_keys: list[str]) -> None:
+        self.clearing.set()
+        assert self.release.wait(10)
+        super().clear(staging_keys)
+
+
+def test_flush_returns_only_once_its_clear_is_done():
+    """TQ must not clear rows while the snapshot that follows is saved."""
 
     async def scenario():
-        worker = object.__new__(VllmAsyncGenerationWorkerImpl)
-        worker.cfg = {"vllm_cfg": {"async_engine": True}}
-        worker.llm = FakeLLM()
-        worker._token_capture_snapshot_gate = _TokenCaptureSnapshotGate()
-        worker._token_capture_fence_executor = ThreadPoolExecutor(max_workers=1)
+        sink = _BlockingClearSink()
+        worker = _worker_with_capture(sink)
+        worker._retire_generation_cut_rows(("a/0",))
         try:
-            assert await worker.begin_token_capture_snapshot_fence_async()
-            assert worker.llm.pause_calls == 0
-            entered = threading.Event()
-            released = threading.Event()
-
-            def terminal_write():
-                entered.set()
-                worker._token_capture_snapshot_gate.enter()
-                released.set()
-                worker._token_capture_snapshot_gate.exit()
-
-            thread = threading.Thread(target=terminal_write)
-            thread.start()
-            assert entered.wait(timeout=5)
-            assert not released.wait(timeout=0.05)
-            assert await worker.end_token_capture_snapshot_fence_async()
-            assert released.wait(timeout=5)
-            thread.join(timeout=5)
+            flush = asyncio.ensure_future(
+                worker.flush_obsolete_generation_cut_rows_async(1)
+            )
+            assert await asyncio.to_thread(sink.clearing.wait, 5)
+            assert not flush.done()
+            sink.release.set()
+            assert await asyncio.wait_for(flush, timeout=5)
+            assert sink.cleared_generation_prefix_keys == ["a/0"]
         finally:
-            worker._token_capture_snapshot_gate.reopen()
-            worker._token_capture_fence_executor.shutdown()
+            sink.release.set()
 
     asyncio.run(scenario())
 
 
-def _gate_admits_write(gate: _TokenCaptureSnapshotGate, *, timeout: float) -> bool:
-    """Whether a terminal write passes the gate within ``timeout`` seconds."""
-    admitted = threading.Event()
-
-    def terminal_write():
-        gate.enter()
-        admitted.set()
-        gate.exit()
-
-    threading.Thread(target=terminal_write, daemon=True).start()
-    return admitted.wait(timeout=timeout)
-
-
-def test_snapshot_gate_close_after_its_release_is_a_no_op():
-    gate = _TokenCaptureSnapshotGate()
-    epoch = gate.begin_epoch()
-    # The driver timed out and released before the worker ran the close.
-    gate.reopen()
-    gate.close_and_wait(epoch)
-    assert _gate_admits_write(gate, timeout=5)
-
-    # A later fence still closes the gate normally.
-    gate.close_and_wait(gate.begin_epoch())
-    assert not _gate_admits_write(gate, timeout=0.05)
-    gate.reopen()
-
-
-def test_snapshot_gate_release_unblocks_a_close_still_draining():
-    gate = _TokenCaptureSnapshotGate()
-    gate.enter()
-    closer = threading.Thread(
-        target=gate.close_and_wait, args=(gate.begin_epoch(),), daemon=True
-    )
-    closer.start()
-    closer.join(timeout=0.05)
-    assert closer.is_alive()
-    gate.reopen()
-    closer.join(timeout=5)
-    assert not closer.is_alive()
-    gate.exit()
-    assert _gate_admits_write(gate, timeout=5)
-
-
-def _fence_worker() -> VllmAsyncGenerationWorkerImpl:
-    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.cfg = {"vllm_cfg": {"async_engine": True}}
-    worker._token_capture_snapshot_gate = _TokenCaptureSnapshotGate()
-    worker._generation_cut_control_executor = ThreadPoolExecutor(max_workers=1)
-    worker._token_capture_fence_executor = ThreadPoolExecutor(max_workers=1)
-    return worker
-
-
-def _shutdown_fence_worker(worker: VllmAsyncGenerationWorkerImpl) -> None:
-    worker._token_capture_snapshot_gate.reopen()
-    worker._generation_cut_control_executor.shutdown()
-    worker._token_capture_fence_executor.shutdown()
-
-
-def test_snapshot_fence_is_not_queued_behind_a_running_cut():
+def test_flush_is_not_queued_behind_a_running_cut():
     async def scenario():
-        worker = _fence_worker()
+        worker = _worker_with_capture(_MemorySink())
+        worker._generation_cut_control_executor = ThreadPoolExecutor(max_workers=1)
         stale_cut_running = threading.Event()
         release_stale_cut = threading.Event()
         try:
@@ -961,40 +944,33 @@ def test_snapshot_fence_is_not_queued_behind_a_running_cut():
             )
             assert await asyncio.to_thread(stale_cut_running.wait, 5)
             await asyncio.wait_for(
-                worker.begin_token_capture_snapshot_fence_async(), timeout=5
+                worker.flush_obsolete_generation_cut_rows_async(1), timeout=5
             )
             assert not stale_cut.done()
             release_stale_cut.set()
             await stale_cut
         finally:
             release_stale_cut.set()
-            _shutdown_fence_worker(worker)
+            worker._generation_cut_control_executor.shutdown()
 
     asyncio.run(scenario())
 
 
-def test_snapshot_fence_closed_after_its_release_leaves_the_gate_open():
-    async def scenario():
-        worker = _fence_worker()
-        release_fence_thread = threading.Event()
-        try:
-            # Hold the fence thread so the close is still queued when the
-            # driver gives up and releases the fence.
-            worker._token_capture_fence_executor.submit(release_fence_thread.wait, 10)
-            begin = asyncio.ensure_future(
-                worker.begin_token_capture_snapshot_fence_async()
-            )
-            await asyncio.sleep(0)
-            assert not begin.done()
-            assert await worker.end_token_capture_snapshot_fence_async()
-            release_fence_thread.set()
-            assert await asyncio.wait_for(begin, timeout=5)
-            assert _gate_admits_write(worker._token_capture_snapshot_gate, timeout=5)
-        finally:
-            release_fence_thread.set()
-            _shutdown_fence_worker(worker)
+class _FailingClearSink(_MemorySink):
+    def clear(self, staging_keys: list[str]) -> None:
+        raise RuntimeError("tq unavailable")
 
-    asyncio.run(scenario())
+
+def test_failed_flush_clear_is_logged_and_dropped(caplog):
+    worker = _worker_with_capture(_FailingClearSink())
+    worker._retire_generation_cut_rows(("a/0",))
+
+    with caplog.at_level(logging.ERROR):
+        assert asyncio.run(worker.flush_obsolete_generation_cut_rows_async(1))
+
+    # The next restore clears what a failed delete left behind.
+    assert "failed to clear 1 obsolete generation chunk rows" in caplog.text
+    assert worker._obsolete_generation_cut_keys == []
 
 
 @pytest.mark.parametrize(
@@ -1141,20 +1117,15 @@ class _FakeRequest(SimpleNamespace):
     pass
 
 
-def _cut_counts(worker, *, progress_reads: bool = False) -> dict[str, int]:
-    """The worker's nonzero generation-cut counters.
-
-    Every cut reads vLLM's progress first; those counters are left out unless
-    ``progress_reads`` asks for them.
-    """
-    counts = VllmAsyncGenerationWorkerImpl.get_generation_prefix_counts(worker)
-    return {
-        name: count
-        for name, count in counts.items()
-        if count
-        and name not in ("restored_calls", "restored_prefix_tokens")
-        and (progress_reads or not name.startswith("progress_read"))
-    }
+def _uncut_reasons(caplog) -> dict[str, int]:
+    """Why calls were left uncut, from the cut's one INFO summary line."""
+    (summary,) = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.INFO
+        and record.getMessage().startswith("generation cut ")
+    ]
+    return summary.args[-1]
 
 
 def _single_call_inventory(
@@ -1183,10 +1154,7 @@ def _worker_with_capture(sink: _MemorySink):
     """A real worker, minus the engine, with in-memory token capture."""
     from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
 
-    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
-    fake = vars(_fake_worker())
-    fake.pop("install_token_capture")
-    vars(worker).update(fake)
+    worker = _fake_worker()
     worker._capture_sink = sink
     worker.token_capture = RolloutTokenCapture(
         sink=sink,
@@ -1348,6 +1316,9 @@ def test_generation_cut_stages_prefix_then_terminal_row_replaces_it():
     )
     assert content["ng_commit_coords"]["disposition"] == "staged"
     assert sink.records[-1].token_ids_delta == [10, 11, 20, 21, 22]
+    # The snapshot in progress may name the chunk rows; the next one deletes them.
+    assert sink.cleared_generation_prefix_keys == []
+    _flush_retired_rows(worker)
     assert sink.cleared_generation_prefix_keys == sink.generation_prefix_keys
     assert worker._capture_calls == {}
     assert worker._capture_calls_by_model_call_id == {}
@@ -1385,6 +1356,7 @@ def test_completed_retry_is_matched_by_its_attempt_qualified_capture_key(
 ):
     """A retry's terminal row is keyed ``<rollout>-a<attempt>``, as Gym keys it."""
     worker = _worker_with_capture(_MemorySink())
+    worker._generation_prefix_cuts_enabled = True
     worker._remember_completed_capture(
         "c2",
         SimpleNamespace(
@@ -1407,15 +1379,16 @@ def test_completed_retry_is_matched_by_its_attempt_qualified_capture_key(
 
     if not matches:
         with pytest.raises(RuntimeError, match="does not match the completed call"):
-            worker._completed_generation_cut_ack(prefix, "checkpoint-1")
+            worker._completed_generation_cut_ack(prefix, "checkpoint-1", Counter())
         return
-    ack = worker._completed_generation_cut_ack(prefix, "checkpoint-1")
+    uncut: Counter[str] = Counter()
+    ack = worker._completed_generation_cut_ack(prefix, "checkpoint-1", uncut)
 
     assert ack.disposition == "durable_prefix"
     assert ack.cut_kind == "terminal_completion"
     assert ack.staging_keys == ("terminal-key",)
     assert ack.prefix_token_count == 3
-    assert _cut_counts(worker) == {"completed_cuts_kept": 1}
+    assert not uncut
 
 
 def test_generation_cut_past_its_deadline_fails_uncut_calls_without_staging(caplog):
@@ -1425,7 +1398,7 @@ def test_generation_cut_past_its_deadline_fails_uncut_calls_without_staging(capl
     inventory = _single_call_inventory()
 
     # Gym has already stopped waiting: the queued cut must not stage rows.
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         receipt = worker._checkpoint_generation_cut(
             inventory, deadline=time.monotonic() - 1.0
         )
@@ -1436,7 +1409,7 @@ def test_generation_cut_past_its_deadline_fails_uncut_calls_without_staging(capl
     assert state.frozen_cut is None
     assert state.generated_token_ids == [11, 12]
     assert "uncut=1 of 1 model_call_ids=['c1']" in caplog.text
-    assert _cut_counts(worker) == {"failed_cuts_control_deadline": 1, "failed_cuts": 1}
+    assert _uncut_reasons(caplog) == {"control_deadline": 1}
 
 
 def _active_call_inventory(
@@ -1487,7 +1460,7 @@ def test_generation_cut_refuses_a_prefix_ending_inside_a_character(caplog):
         ("whole", list(b"Sure ") + dinosaur),
     )
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.INFO):
         receipt = worker._checkpoint_generation_cut(inventory)
 
     # vLLM would prime the resumed tail on half a character and echo the
@@ -1505,10 +1478,7 @@ def test_generation_cut_refuses_a_prefix_ending_inside_a_character(caplog):
         "multi-byte character"
     ) in caplog.text
     assert "model call whole" not in caplog.text
-    assert _cut_counts(worker) == {
-        "failed_cuts_incomplete_utf8_boundary": 1,
-        "failed_cuts": 1,
-    }
+    assert _uncut_reasons(caplog) == {"incomplete_utf8_boundary": 1}
 
 
 def test_generation_cut_of_a_call_with_no_tokens_logs_at_debug(caplog):
@@ -1522,16 +1492,24 @@ def test_generation_cut_of_a_call_with_no_tokens_logs_at_debug(caplog):
         receipt = worker._checkpoint_generation_cut(inventory)
 
     assert [ack.disposition for ack in receipt.prefixes] == ["durable_failure"]
-    assert _cut_counts(worker) == {
-        "failed_cuts_zero_generated_tokens": 1,
-        "failed_cuts": 1,
-    }
+    assert _uncut_reasons(caplog) == {"zero_generated_tokens": 1}
     assert sink.generation_prefix_records == []
     assert empty.frozen_cut is None
     # Still prefilling is expected, so it stays out of WARNING.
     [record] = [r for r in caplog.records if "model call empty" in r.getMessage()]
     assert record.levelno == logging.DEBUG
     assert "it has no generated tokens yet" in record.getMessage()
+
+
+def test_completed_calls_are_not_kept_without_prefix_cuts():
+    """Only a generation cut reads completed calls, so turn runs keep none."""
+    worker = _worker_with_capture(_MemorySink())
+
+    worker._remember_completed_capture(
+        "c2", SimpleNamespace(capture_key="r0", disposition="staged"), 3
+    )
+
+    assert worker._completed_capture_calls == {}
 
 
 @pytest.mark.parametrize(
@@ -1559,6 +1537,7 @@ def test_completed_call_that_cannot_be_cut_logs_why(
     completed, reason, category, caplog
 ):
     worker = _worker_with_capture(_MemorySink())
+    worker._generation_prefix_cuts_enabled = True
     if completed is not None:
         worker._remember_completed_capture(
             "c2",
@@ -1580,15 +1559,16 @@ def test_completed_call_that_cannot_be_cut_logs_why(
         admitted_at=1.0,
     )
 
+    uncut: Counter[str] = Counter()
     with caplog.at_level(logging.WARNING):
-        ack = worker._completed_generation_cut_ack(prefix, "checkpoint-1")
+        ack = worker._completed_generation_cut_ack(prefix, "checkpoint-1", uncut)
 
     assert ack.disposition == "durable_failure"
     assert f"cannot cut completed model call c2: {reason}" in caplog.text
-    assert _cut_counts(worker) == {f"failed_cuts_{category}": 1, "failed_cuts": 1}
+    assert uncut == {category: 1}
 
 
-def test_call_with_a_recording_error_is_not_cut():
+def test_call_with_a_recording_error_is_not_cut(caplog):
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     inventory, (poisoned, healthy) = _active_call_inventory(
@@ -1596,7 +1576,8 @@ def test_call_with_a_recording_error_is_not_cut():
     )
     poisoned.observation_error = "RuntimeError: vLLM returned no logprobs"
 
-    receipt = worker._checkpoint_generation_cut(inventory)
+    with caplog.at_level(logging.INFO):
+        receipt = worker._checkpoint_generation_cut(inventory)
 
     assert [ack.disposition for ack in receipt.prefixes] == [
         "durable_failure",
@@ -1604,7 +1585,7 @@ def test_call_with_a_recording_error_is_not_cut():
     ]
     assert poisoned.frozen_cut is None
     assert healthy.generation_cut_staging_keys == sink.generation_prefix_keys
-    assert _cut_counts(worker) == {"failed_cuts_observation_error": 1, "failed_cuts": 1}
+    assert _uncut_reasons(caplog) == {"observation_error": 1}
 
 
 class _WordTokenizer:
@@ -1631,7 +1612,7 @@ class _SamplingParams(SimpleNamespace):
 
 
 def _sampling_params(**overrides) -> _SamplingParams:
-    defaults = dict(stop=[], bad_words=[], presence_penalty=0.0, frequency_penalty=0.0)
+    defaults = dict(stop=[], bad_words=[], seed=None)
     return _SamplingParams(**{**defaults, **overrides})
 
 
@@ -1651,13 +1632,10 @@ def _record_cut_constraints(state, sampling_params) -> None:
     [
         {"stop": ["</answer>"]},
         {"bad_words": ["forbidden word"]},
-        {"presence_penalty": 0.5},
-        {"frequency_penalty": -0.2},
-        {"seed": 7, "temperature": 1.0},
     ],
 )
 def test_sampling_settings_a_resumed_tail_cannot_honor_keep_the_call_uncut(
-    setting, monkeypatch
+    setting, monkeypatch, caplog
 ):
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_worker_async._LOGGED_UNCUTTABLE_REASONS",
@@ -1673,7 +1651,8 @@ def test_sampling_settings_a_resumed_tail_cannot_honor_keep_the_call_uncut(
     assert constrained.uncuttable_reason is not None
     assert plain.uncuttable_reason is None
 
-    receipt = worker._checkpoint_generation_cut(inventory)
+    with caplog.at_level(logging.INFO):
+        receipt = worker._checkpoint_generation_cut(inventory)
 
     # The constrained call regenerates after a restore instead of resuming a
     # tail that would miss a straddling stop string or uncount its prefix.
@@ -1684,17 +1663,17 @@ def test_sampling_settings_a_resumed_tail_cannot_honor_keep_the_call_uncut(
     assert constrained.frozen_cut is None
     assert constrained.generated_token_ids == [11, 12]
     assert plain.generation_cut_staging_keys == sink.generation_prefix_keys
-    assert _cut_counts(worker) == {
-        "failed_cuts_uncuttable_request": 1,
-        "failed_cuts": 1,
-    }
+    assert _uncut_reasons(caplog) == {"uncuttable_request": 1}
 
 
+@pytest.mark.vllm
 @pytest.mark.parametrize(
     ("seed", "temperature", "blocked"),
     [
         # A restored call would restart the seeded generator and reuse its draws.
         (7, 1.0, True),
+        # vLLM raises this to its minimum temperature and still samples.
+        (7, 1e-6, True),
         # Greedy decoding draws nothing, so the seed is irrelevant.
         (7, 0.0, False),
         # Unseeded calls draw from the engine's shared generator.
@@ -1702,8 +1681,12 @@ def test_sampling_settings_a_resumed_tail_cannot_honor_keep_the_call_uncut(
     ],
 )
 def test_only_a_seeded_sampled_call_is_kept_out_of_cuts(seed, temperature, blocked):
+    """vLLM's own sampling type decides, so a change to its rule fails here."""
+    pytest.importorskip("vllm")
+    from vllm import SamplingParams
+
     blockers = _generation_cut_blockers(
-        _sampling_params(seed=seed, temperature=temperature), _WordTokenizer()
+        SamplingParams(seed=seed, temperature=temperature), _WordTokenizer()
     )
 
     assert ("seed" in blockers) is blocked
@@ -1781,7 +1764,7 @@ class _FailOncePrefixSink(_MemorySink):
         return super().stage_generation_prefix(*args, **kwargs)
 
 
-def test_generation_cut_rolls_back_tokens_after_staging_failure():
+def test_generation_cut_rolls_back_tokens_after_staging_failure(caplog):
     sink = _FailOncePrefixSink()
     worker = _worker_with_capture(sink)
     _, state = _live_call(worker, [11, 12], [-0.1, -0.2], prompt_token_ids=(10,))
@@ -1790,15 +1773,19 @@ def test_generation_cut_rolls_back_tokens_after_staging_failure():
         return _single_call_inventory(checkpoint_id=checkpoint_id)
 
     # The failed call is acknowledged, not raised, and its buffer rolls back.
-    failed = worker._checkpoint_generation_cut(inventory("checkpoint-1"))
+    with caplog.at_level(logging.INFO):
+        failed = worker._checkpoint_generation_cut(inventory("checkpoint-1"))
     assert [ack.disposition for ack in failed.prefixes] == ["durable_failure"]
     assert state.frozen_cut is None
     assert state.generated_token_ids == [11, 12]
     assert state.staged_token_count == 0
-    assert _cut_counts(worker) == {"failed_cuts_cut_error": 1, "failed_cuts": 1}
+    assert _uncut_reasons(caplog) == {"cut_error": 1}
 
-    receipt = worker._checkpoint_generation_cut(inventory("checkpoint-2"))
+    with caplog.at_level(logging.INFO):
+        receipt = worker._checkpoint_generation_cut(inventory("checkpoint-2"))
     assert receipt.prefixes[0].prefix_token_count == 2
+    # A cut that leaves no call uncut adds no summary line.
+    assert _uncut_reasons(caplog) == {"cut_error": 1}
     assert sink.generation_prefix_records[-1][1].token_ids_delta == [10, 11, 12]
 
 
@@ -1819,39 +1806,36 @@ def test_one_failed_call_does_not_fail_the_rest_of_the_cut():
     assert healthy.generation_cut_staging_keys == sink.generation_prefix_keys
 
 
-def test_call_without_an_output_limit_is_not_frozen_for_the_cut():
+def test_call_without_an_output_limit_is_not_frozen_for_the_cut(caplog):
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     inventory, (state,) = _active_call_inventory(worker, ("c1", [11, 12]))
     with state.lock:
         state.effective_output_limit = None
 
-    receipt = worker._checkpoint_generation_cut(inventory)
+    with caplog.at_level(logging.INFO):
+        receipt = worker._checkpoint_generation_cut(inventory)
 
     assert [ack.disposition for ack in receipt.prefixes] == ["durable_failure"]
     assert state.frozen_cut is None
     assert sink.generation_prefix_records == []
-    assert _cut_counts(worker) == {
-        "failed_cuts_missing_output_limit": 1,
-        "failed_cuts": 1,
-    }
+    assert _uncut_reasons(caplog) == {"missing_output_limit": 1}
 
 
-def test_call_that_finishes_while_being_cut_counts_one_race():
+def test_call_that_finishes_while_being_cut_falls_back_to_its_completed_record(
+    caplog,
+):
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     inventory, (state,) = _active_call_inventory(worker, ("c1", [11, 12]))
     state.terminal_started = True  # its terminal write won the lifecycle lock
 
-    receipt = worker._checkpoint_generation_cut(inventory)
+    with caplog.at_level(logging.INFO):
+        receipt = worker._checkpoint_generation_cut(inventory)
 
     # It falls back to the completed-call path, which has no record of it yet.
     assert [ack.disposition for ack in receipt.prefixes] == ["durable_failure"]
-    assert _cut_counts(worker) == {
-        "cut_lifecycle_races": 1,
-        "failed_cuts_no_capture_or_completed_state": 1,
-        "failed_cuts": 1,
-    }
+    assert _uncut_reasons(caplog) == {"no_capture_or_completed_state": 1}
 
 
 def test_unexpected_error_after_the_freeze_rolls_the_call_back():
@@ -1910,6 +1894,7 @@ def _restorable_cut(sink: _MemorySink):
 
 def _resumed_worker(sink, *, records, weight_version: int = 9):
     worker = _worker_with_capture(sink)
+    worker._generation_prefix_cuts_enabled = True
     worker._rollout_weight_version = weight_version
     worker._staging_source = _MemoryPrefixSource({}, records=records)
     return worker
@@ -1925,7 +1910,7 @@ def test_usable_restored_prefix_is_resumed():
 
     assert served is admission
     assert snapshot.digest == cut_record.digest
-    _drain_cleanup(worker)
+    _flush_retired_rows(worker)
     assert sink.cleared_generation_prefix_keys == []
 
 
@@ -1962,8 +1947,8 @@ def test_unusable_restored_prefix_regenerates_instead_of_failing(failure, caplog
         worker, request, [10], admission=served, prefix_token_ids=[]
     )
     assert worker._capture_calls[id(request)].generation_cut_staging_keys == []
-    # The restored rows it will never extend are retired through the gate.
-    _drain_cleanup(worker)
+    # The restored rows it will never extend are retired for the next snapshot.
+    _flush_retired_rows(worker)
     assert sink.cleared_generation_prefix_keys == [cut_key]
 
 
@@ -2061,6 +2046,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
     assert final_record.weight_version == 7
     assert content["ng_commit_coords"]["weight_version"] == 7
     assert resumed_worker._completed_capture_calls["c2"].generation_token_count == 3
+    _flush_retired_rows(resumed_worker)
     assert sink.cleared_generation_prefix_keys == list(
         second_receipt.prefixes[0].staging_keys
     )
@@ -2420,26 +2406,17 @@ def _cut_active_call(worker, sink, model_call_id: str = "c1"):
     return request
 
 
-def _drain_cleanup(worker) -> None:
-    worker._generation_cut_cleanup_executor.submit(lambda: None).result(timeout=5)
-
-
-def test_aborted_call_clears_its_rows_only_after_the_snapshot_fence():
+def test_aborted_call_clears_its_rows_at_the_next_snapshot():
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     request = _cut_active_call(worker, sink)
-    gate = worker._token_capture_snapshot_gate
-    gate.close_and_wait(gate.begin_epoch())
 
-    # The abort itself never waits for the fence.
     assert VllmAsyncGenerationWorkerImpl._abort_request_capture(
         worker, request, reason="client_disconnected", blocking=False
     )
-    time.sleep(0.2)
     assert sink.cleared_generation_prefix_keys == []
 
-    gate.reopen()
-    _drain_cleanup(worker)
+    _flush_retired_rows(worker)
     assert sink.generation_prefix_keys
     assert sink.cleared_generation_prefix_keys == sink.generation_prefix_keys
 
@@ -2463,6 +2440,7 @@ def test_call_whose_terminal_staging_fails_clears_its_cut_rows():
     )
 
     assert content["ng_commit_coords"]["disposition"] == "capture_failed"
+    _flush_retired_rows(worker)
     assert sink.cleared_generation_prefix_keys == sink.generation_prefix_keys
 
 
@@ -2476,7 +2454,7 @@ def test_request_capture_abort_fails_the_call_and_drains_state():
     assert worker._capture_calls == {}
     assert sink.records == []
     # A call that was never cut has no chunk rows to clear.
-    _drain_cleanup(worker)
+    _flush_retired_rows(worker)
     assert sink.cleared_generation_prefix_keys == []
     # A late finish after abort is a no-op (state already drained).
     out = VllmAsyncGenerationWorkerImpl._finish_request_capture(

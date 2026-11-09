@@ -358,8 +358,8 @@ leaves them out of the commit, does not wait for them, and records them in
 their tasks. If any other candidate is neither exported by Gym nor drained before
 the deadline, the checkpoint aborts and every deployment is resumed.
 
-Because a restart-only server would make turn-level recovery quietly restart its
-rollouts, SC reads every Gym participant's checkpoint `mode` from discovery
+Because a restart-only server would make turn- or prefix-level recovery quietly
+restart its rollouts, SC reads every Gym participant's checkpoint `mode` from discovery
 before the first rollout. If any server's mode is `restart_only` (the default for
 agents and resources servers), setup fails and names it, unless
 `rollout_recovery.allow_restart_only_gym_servers` is true, which accepts it with
@@ -417,12 +417,18 @@ turn- and prefix-level rollouts restart from their tasks. A rollout snapshot wit
 `gym_checkpoint.json` is refused.
 
 The `prefix` target needs everything the `turn` target needs (listed below),
-and does not yet support multimodal capture or router replay. Each cut must
-finish within `token_capture.control_timeout_s`; a call that is not cut in time
-restarts from its last saved turn. Calls using stop strings, `bad_words`, or a
-presence or frequency penalty are never cut, because a resumed call could not
-apply them to the tokens it already decoded; they also restart from their last
-saved turn.
+and does not yet support multimodal capture, router replay, or
+`policy.generation.top_logprobs > 0`. Each cut must finish within
+`token_capture.control_timeout_s`; a call that is not cut in time restarts from
+its last saved turn. Some calls are never cut and also restart from their last
+saved turn:
+
+- Calls using stop strings, multi-token `bad_words`, or a per-request `seed`
+  while sampling, because a resumed call could not apply them to the tokens it
+  already decoded.
+- Calls with structured output (a non-text `response_format`, `guided_*` or
+  `structured_outputs`) or a `tool_choice` other than `auto` or `none`, which
+  NeMo Gym leaves uncut.
 
 The `turn` target currently requires vLLM generation, NeMo Gym, token capture,
 periodic rollout snapshots, `restore_mode: latest`, and the same named Gym

@@ -933,11 +933,12 @@ class _FlatLogprobs:
 
 
 def test_extract_generation_logprobs_reads_flat_arrays_without_mappings():
+    # vLLM's layout: the sampled token first, then the top-k, which may
+    # repeat the sampled token with the same log probability.
     logprobs = _FlatLogprobs(
         [
             [(12, -0.1), (7, -2.0)],
-            # A token repeated at one position: vLLM's mapping keeps the last.
-            [(13, -0.5), (13, -0.2)],
+            [(13, -0.2), (5, -1.0), (13, -0.2)],
             [(14, -1e9)],
             [(15, -0.4)],
         ]
@@ -955,13 +956,15 @@ def test_extract_generation_logprobs_reads_flat_arrays_without_mappings():
     ("token_ids", "error_match"),
     [
         ([12, 13], "token_count=2, logprob_count=1"),
-        ([99], "did not include the selected token"),
+        ([99], "did not include the selected token first"),
+        # Present only among the top-k: not the layout this read relies on.
+        ([7], "did not include the selected token first"),
     ],
 )
 def test_extract_generation_logprobs_rejects_inconsistent_flat_arrays(
     token_ids, error_match
 ):
-    logprobs = _FlatLogprobs([[(12, -0.1)]])
+    logprobs = _FlatLogprobs([[(12, -0.1), (7, -2.0)]])
     # A position whose end index is not yet appended is not published.
     logprobs.start_indices.append(len(logprobs.token_ids))
 
@@ -971,21 +974,34 @@ def test_extract_generation_logprobs_rejects_inconsistent_flat_arrays(
 
 @pytest.mark.vllm
 def test_flat_logprob_read_matches_vllm_mappings():
-    from vllm.logprobs import FlatLogprobs, Logprob
+    """Both of vLLM's containers, filled the way its sampler fills them."""
+    from vllm.logprobs import FlatLogprobs, append_logprobs_for_next_position
 
     generator = random.Random(0)
-    logprobs = FlatLogprobs()
+    flat, mappings = FlatLogprobs(), []
     sampled = []
     for _ in range(64):
-        candidates = {
-            token_id: Logprob(logprob=-generator.random() * 5, rank=rank + 1)
-            for rank, token_id in enumerate(generator.sample(range(1000), 4))
-        }
-        logprobs.append(candidates)
-        sampled.append(generator.choice(list(candidates)))
+        top_k = generator.sample(range(1000), 4)
+        values = {token_id: -generator.random() * 5 for token_id in top_k}
+        # The sampler writes the sampled token first; it is often also top-k.
+        token_id = generator.choice([*top_k, generator.randrange(1000, 2000)])
+        values.setdefault(token_id, -generator.random() * 5)
+        row = [token_id, *top_k]
+        for container in (flat, mappings):
+            append_logprobs_for_next_position(
+                container,
+                row,
+                [values[candidate] for candidate in row],
+                [None] * len(row),
+                rank=1,
+                num_logprobs=len(top_k),
+            )
+        sampled.append(token_id)
 
-    assert extract_generation_logprobs(sampled[10:], logprobs, start=10) == [
-        max(logprobs[position][token_id].logprob, vllm_utils.VLLM_LOGPROB_FLOOR)
+    expected = extract_generation_logprobs(sampled[10:], mappings, start=10)
+    assert extract_generation_logprobs(sampled[10:], flat, start=10) == expected
+    assert expected == [
+        max(mappings[position][token_id].logprob, vllm_utils.VLLM_LOGPROB_FLOOR)
         for position, token_id in enumerate(sampled[10:], 10)
     ]
 

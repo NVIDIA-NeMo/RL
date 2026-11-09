@@ -978,7 +978,7 @@ def test_gym_state_recovery_rejects_target_overrides(
 @pytest.mark.parametrize(
     "target_level", [RecoveryTargetLevel.SIBLING, RecoveryTargetLevel.PROMPT_GROUP]
 )
-def test_restart_only_gym_servers_opt_in_requires_turn_recovery(
+def test_restart_only_gym_servers_opt_in_requires_gym_checkpoints(
     target_level: RecoveryTargetLevel,
 ) -> None:
     """Below turn level every unfinished rollout starts over anyway."""
@@ -986,9 +986,20 @@ def test_restart_only_gym_servers_opt_in_requires_turn_recovery(
         RolloutRecoveryConfig(
             target_level=target_level, allow_restart_only_gym_servers=True
         )
-    RolloutRecoveryConfig(
-        target_level=RecoveryTargetLevel.TURN, allow_restart_only_gym_servers=True
+
+
+@pytest.mark.parametrize(
+    "target_level", [RecoveryTargetLevel.TURN, RecoveryTargetLevel.PREFIX]
+)
+def test_restart_only_gym_servers_opt_in_accepts_gym_checkpoint_levels(
+    target_level: RecoveryTargetLevel,
+) -> None:
+    """Prefix checks Gym servers at startup too, so it must accept the opt-in."""
+    config = RolloutRecoveryConfig(
+        target_level=target_level, allow_restart_only_gym_servers=True
     )
+
+    assert config.allow_restart_only_gym_servers
 
 
 @pytest.mark.parametrize("timeout_s", [0.0, -1.0])
@@ -2420,7 +2431,7 @@ def test_only_a_dispatched_prefix_attempt_grows_a_recoverable_prefix(
 
     _mutate(
         lambda cut: ledger.mark_group_dispatched(
-            cut, "g7", gym_instance_id="tools/replica-0"
+            cut, "g7", environment_instance_id="tools/replica-0"
         )
     )
     assert ledger.has_dispatched_generation_prefix() is expected

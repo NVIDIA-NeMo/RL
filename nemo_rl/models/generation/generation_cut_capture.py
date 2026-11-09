@@ -19,7 +19,8 @@ import hashlib
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections import Counter
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -31,38 +32,18 @@ LOGGER = logging.getLogger(__name__)
 # than 100k calls, while still bounding idle-job memory growth.
 _COMPLETED_CAPTURE_RETENTION_S = 60.0 * 60.0
 
-# Why a model call was left uncut, one counter each. Fixed names only: no error
-# message or call identity ever becomes a metric name.
-GENERATION_CUT_FAILURE_REASONS = (
-    # The worker has no live or finished record of the call, e.g. Gym admitted
-    # it before its request reached this worker.
-    "no_capture_or_completed_state",
-    "completed_not_staged",
-    "completed_missing_output_limit",
-    "completed_missing_finish_reason",
-    "uncuttable_request",
-    "observation_error",
-    "missing_output_limit",
-    "zero_generated_tokens",
-    "incomplete_utf8_boundary",
-    # Staging, identity or any other error while cutting this one call.
-    "cut_error",
-    "control_deadline",
-)
-
 
 def initial_generation_cut_counts() -> dict[str, int]:
-    """Zeroed cut counters, so every category is reported from the first step."""
+    """Zeroed progress-read counters, so each is reported from the first step.
+
+    How many reads of vLLM's decoding progress, for how many calls, and the total
+    microseconds spent waiting for and holding vLLM's output lock.
+    """
     return {
-        "completed_cuts_kept": 0,
-        "cut_lifecycle_races": 0,
-        # Reads of vLLM's decoding progress: how many, for how many calls, and
-        # the total time spent waiting for and holding vLLM's output lock.
         "progress_reads": 0,
         "progress_read_calls": 0,
         "progress_read_wait_us": 0,
         "progress_read_hold_us": 0,
-        **{f"failed_cuts_{reason}": 0 for reason in GENERATION_CUT_FAILURE_REASONS},
     }
 
 
@@ -238,53 +219,6 @@ def _ends_inside_character(tokenizer: Any, generated_token_ids: list[int]) -> bo
     return tokenizer.decode(tail, skip_special_tokens=False).endswith("\ufffd")
 
 
-class _TokenCaptureSnapshotGate:
-    """Drain active terminal writes and block new ones across a TQ snapshot.
-
-    Each fence takes an epoch before its close is queued. ``reopen`` releases
-    every epoch issued so far, so a close that runs after the driver already
-    timed out and released its fence is a no-op instead of a stuck gate.
-    """
-
-    def __init__(self) -> None:
-        self._condition = threading.Condition()
-        self._open = True
-        self._active = 0
-        self._epoch = 0
-        self._released_epoch = 0
-
-    def enter(self) -> None:
-        with self._condition:
-            while not self._open:
-                self._condition.wait()
-            self._active += 1
-
-    def exit(self) -> None:
-        with self._condition:
-            self._active -= 1
-            if self._active == 0:
-                self._condition.notify_all()
-
-    def begin_epoch(self) -> int:
-        with self._condition:
-            self._epoch += 1
-            return self._epoch
-
-    def close_and_wait(self, epoch: int) -> None:
-        with self._condition:
-            if epoch <= self._released_epoch:
-                return
-            self._open = False
-            while self._active and self._released_epoch < epoch:
-                self._condition.wait()
-
-    def reopen(self) -> None:
-        with self._condition:
-            self._released_epoch = self._epoch
-            self._open = True
-            self._condition.notify_all()
-
-
 class GenerationCutCaptureMixin:
     """Registry, checkpoint-cut, and resume logic shared by generation backends.
 
@@ -297,9 +231,12 @@ class GenerationCutCaptureMixin:
     _completed_capture_calls: dict[str, _CompletedCaptureState]
     _generation_cut_receipts: dict[tuple[str, str], Any]
     _generation_cut_tokenizer: Any
+    _generation_prefix_cuts_enabled: bool
     _restored_generation_prefix_calls: int
     _restored_generation_prefix_tokens: int
     _generation_cut_counts: dict[str, int]
+    _obsolete_generation_cut_keys: list[str]
+    _flushed_generation_cut_epoch: int
 
     def _pop_request_capture(self, request: Any) -> _RequestCaptureState | None:
         with self._capture_registry_lock:
@@ -322,6 +259,9 @@ class GenerationCutCaptureMixin:
         terminal_finish_reason: Literal["stop", "length"] | None = None,
         terminal_stop_reason: str | int | None = None,
     ) -> None:
+        # Only a generation cut reads this map; without cuts it would only grow.
+        if not self._generation_prefix_cuts_enabled:
+            return
         now = time.monotonic()
         with self._capture_registry_lock:
             # Dict insertion order is completion order. Remove only entries old
@@ -472,9 +412,7 @@ class GenerationCutCaptureMixin:
         if continuation is None:
             return admission, None
         try:
-            snapshot = GenerationCutCaptureMixin._resolve_generation_cut(
-                self, admission, prefix_token_ids
-            )
+            snapshot = self._resolve_generation_cut(admission, prefix_token_ids)
             # Checked here, before the prefix is spliced into the prompt; Gym's
             # begin_call repeats it and would otherwise fail the call.
             if snapshot.digest != continuation.prefix_digest:
@@ -495,49 +433,32 @@ class GenerationCutCaptureMixin:
             )
         # The regenerated call will not extend these rows, so they are retired
         # here instead of by its terminal write.
-        self._generation_cut_cleanup_executor.submit(
-            GenerationCutCaptureMixin._clear_generation_cut_rows_after_snapshot_fence,
-            self,
-            admission.model_call_id,
-            tuple(continuation.staging_keys),
-        )
+        self._retire_generation_cut_rows(continuation.staging_keys)
         return admission.model_copy(update={"generation_cut": None}), None
 
     def get_generation_prefix_counts(self) -> dict[str, int]:
         """Generation-prefix restore and cut counts since this process started.
 
         Returns:
-            ``restored_calls`` and their total ``restored_prefix_tokens``;
-            ``completed_cuts_kept``, finished calls a cut kept whole;
-            ``cut_lifecycle_races``, calls that finished while being cut;
+            ``restored_calls`` and their total ``restored_prefix_tokens``, plus
             ``progress_reads``, ``progress_read_calls`` and the microseconds
-            they waited for and held vLLM's output lock; and ``failed_cuts``
-            with one ``failed_cuts_<reason>`` per
-            ``GENERATION_CUT_FAILURE_REASONS`` entry.
+            they waited for and held vLLM's output lock.
         """
         with self._capture_registry_lock:
-            cut_counts = dict(self._generation_cut_counts)
             return {
                 "restored_calls": self._restored_generation_prefix_calls,
                 "restored_prefix_tokens": self._restored_generation_prefix_tokens,
-                **cut_counts,
-                "failed_cuts": sum(
-                    cut_counts[f"failed_cuts_{reason}"]
-                    for reason in GENERATION_CUT_FAILURE_REASONS
-                ),
+                **self._generation_cut_counts,
             }
 
-    def _count_generation_cut(self, name: str) -> None:
-        with self._capture_registry_lock:
-            self._generation_cut_counts[name] += 1
-
-    def _failed_generation_cut_ack(self, prefix: Any, *, reason: str) -> Any:
-        """Acknowledge one uncut call and count it under ``reason``."""
+    @staticmethod
+    def _failed_generation_cut_ack(
+        prefix: Any, *, reason: str, uncut: Counter[str]
+    ) -> Any:
+        """Acknowledge one uncut call and tally it under ``reason``."""
         from nemo_gym._checkpoint.generation_cut import GenerationCutPrefixAck
 
-        if reason not in GENERATION_CUT_FAILURE_REASONS:
-            raise ValueError(f"unknown generation-cut failure reason {reason!r}")
-        self._count_generation_cut(f"failed_cuts_{reason}")
+        uncut[reason] += 1
         return GenerationCutPrefixAck.failure(prefix)
 
     def _abort_request_capture(
@@ -568,48 +489,45 @@ class GenerationCutCaptureMixin:
                     obsolete_staging_keys = tuple(state.generation_cut_staging_keys)
         finally:
             state.lifecycle_lock.release()
-        if obsolete_staging_keys:
-            # Off the caller's thread: the clear may wait at the snapshot gate,
-            # and the fast abort runs on the serving event loop.
-            self._generation_cut_cleanup_executor.submit(
-                GenerationCutCaptureMixin._clear_generation_cut_rows_after_snapshot_fence,
-                self,
-                state.call.model_call_id,
-                obsolete_staging_keys,
-            )
+        self._retire_generation_cut_rows(obsolete_staging_keys)
         return True
 
-    def _clear_generation_cut_rows_after_snapshot_fence(
-        self, model_call_id: str, staging_keys: tuple[str, ...]
-    ) -> None:
-        """Delete an ended call's chunk rows outside any cut-to-snapshot window."""
-        gate = self._token_capture_snapshot_gate
-        gate.enter()
-        try:
-            GenerationCutCaptureMixin._clear_generation_cut_rows(
-                self, model_call_id, staging_keys
-            )
-        finally:
-            gate.exit()
+    def _retire_generation_cut_rows(self, staging_keys: Sequence[str]) -> None:
+        """Queue an ended call's chunk rows for the next snapshot to delete.
 
-    def _clear_generation_cut_rows(
-        self, model_call_id: str, staging_keys: tuple[str, ...]
-    ) -> None:
-        """Delete a call's chunk rows; the caller holds a snapshot-gate permit.
-
-        Once the call has ended no live reader needs them, and a committed
-        snapshot that names them saved its own copy of TransferQueue, so only a
-        snapshot still in progress must be waited out.
+        A snapshot in progress may still name them, so they wait until the
+        next one starts, after this one is saved.
         """
+        if not staging_keys:
+            return
+        with self._capture_registry_lock:
+            self._obsolete_generation_cut_keys.extend(staging_keys)
+
+    def _flush_obsolete_generation_cut_rows(self, epoch: int) -> None:
+        """Delete the chunk rows retired before snapshot ``epoch`` started.
+
+        They belong to calls that ended before Gym froze this snapshot's
+        inventory, which names a finished call by its terminal row only, and a
+        saved snapshot keeps its own copy of TransferQueue.
+        """
+        with self._capture_registry_lock:
+            # A late flush from an older snapshot must not delete rows retired
+            # since a newer one started; that snapshot may still name them.
+            if epoch <= self._flushed_generation_cut_epoch:
+                return
+            self._flushed_generation_cut_epoch = epoch
+            staging_keys = self._obsolete_generation_cut_keys
+            self._obsolete_generation_cut_keys = []
         sink = self._capture_sink
         if not staging_keys or sink is None:
             return
         try:
-            sink.clear(list(staging_keys))
-        except Exception:  # noqa: BLE001 - the call has already ended
+            sink.clear(staging_keys)
+        except Exception:  # noqa: BLE001 - the calls have already ended
+            # A failed clear only leaves rows the next restore clears.
             LOGGER.exception(
-                "failed to clear obsolete generation chunks for model call %s",
-                model_call_id,
+                "failed to clear %d obsolete generation chunk rows",
+                len(staging_keys),
             )
 
     async def _run_generation_cut_control(
@@ -624,7 +542,9 @@ class GenerationCutCaptureMixin:
             *args,
         )
 
-    def _completed_generation_cut_ack(self, prefix: Any, checkpoint_id: str) -> Any:
+    def _completed_generation_cut_ack(
+        self, prefix: Any, checkpoint_id: str, uncut: Counter[str]
+    ) -> Any:
         """Describe a call whose terminal path won the cut/abort race."""
         from nemo_gym._checkpoint.generation_cut import (
             GenerationCutPrefixAck,
@@ -653,7 +573,6 @@ class GenerationCutCaptureMixin:
             reason = "completed_missing_finish_reason"
             unusable_reason = "it finished without a stop or length finish reason"
         else:
-            self._count_generation_cut("completed_cuts_kept")
             return GenerationCutPrefixAck(
                 **prefix.model_dump(mode="json"),
                 disposition="durable_prefix",
@@ -672,13 +591,14 @@ class GenerationCutCaptureMixin:
             prefix.model_call_id,
             unusable_reason,
         )
-        return self._failed_generation_cut_ack(prefix, reason=reason)
+        return self._failed_generation_cut_ack(prefix, reason=reason, uncut=uncut)
 
     def _checkpoint_active_generation_cut(
         self,
         prefix: Any,
         state: _RequestCaptureState,
         checkpoint_id: str,
+        uncut: Counter[str],
     ) -> Any | None:
         """Cut one live call, or return ``None`` if abort won the race."""
         from nemo_gym._checkpoint.generation_cut import (
@@ -696,7 +616,6 @@ class GenerationCutCaptureMixin:
             with self._capture_registry_lock:
                 current = self._capture_calls_by_model_call_id.get(prefix.model_call_id)
             if current is not state or state.terminal_started:
-                self._count_generation_cut("cut_lifecycle_races")
                 return None
 
             _require_inventory_identity(
@@ -730,7 +649,7 @@ class GenerationCutCaptureMixin:
                     uncuttable_reason,
                 )
                 return self._failed_generation_cut_ack(
-                    prefix, reason="uncuttable_request"
+                    prefix, reason="uncuttable_request", uncut=uncut
                 )
             if observation_error is not None:
                 # Its recorded tokens or logprobs are inconsistent with vLLM's.
@@ -741,7 +660,7 @@ class GenerationCutCaptureMixin:
                     observation_error,
                 )
                 return self._failed_generation_cut_ack(
-                    prefix, reason="observation_error"
+                    prefix, reason="observation_error", uncut=uncut
                 )
             if effective_output_limit is None:
                 # Checked before freezing, so the call's buffer is untouched.
@@ -751,7 +670,7 @@ class GenerationCutCaptureMixin:
                     prefix.model_call_id,
                 )
                 return self._failed_generation_cut_ack(
-                    prefix, reason="missing_output_limit"
+                    prefix, reason="missing_output_limit", uncut=uncut
                 )
             inherited_prefix_token_count = (
                 state.call.admission.generation_cut.prefix_token_count
@@ -788,6 +707,7 @@ class GenerationCutCaptureMixin:
                     reason="zero_generated_tokens"
                     if total_generation_token_count == 0
                     else "incomplete_utf8_boundary",
+                    uncut=uncut,
                 )
             staged_key = None
             try:
@@ -895,6 +815,8 @@ class GenerationCutCaptureMixin:
             ]
         self._record_generation_progress(active_states, deadline=deadline)
         acknowledgements = []
+        # Why each uncut call was left uncut; Gym counts them per checkpoint.
+        uncut: Counter[str] = Counter()
         for index, prefix in enumerate(inventory.active_prefixes):
             if deadline is not None and time.monotonic() >= deadline:
                 remaining = inventory.active_prefixes[index:]
@@ -904,11 +826,13 @@ class GenerationCutCaptureMixin:
                     inventory.checkpoint_id,
                     len(remaining),
                     len(inventory.active_prefixes),
-                    [uncut.model_call_id for uncut in remaining],
+                    [call.model_call_id for call in remaining],
                 )
                 acknowledgements.extend(
-                    self._failed_generation_cut_ack(uncut, reason="control_deadline")
-                    for uncut in remaining
+                    self._failed_generation_cut_ack(
+                        call, reason="control_deadline", uncut=uncut
+                    )
+                    for call in remaining
                 )
                 break
             with self._capture_registry_lock:
@@ -916,14 +840,14 @@ class GenerationCutCaptureMixin:
             try:
                 acknowledgement = (
                     self._checkpoint_active_generation_cut(
-                        prefix, state, inventory.checkpoint_id
+                        prefix, state, inventory.checkpoint_id, uncut
                     )
                     if state is not None
                     else None
                 )
                 if acknowledgement is None:
                     acknowledgement = self._completed_generation_cut_ack(
-                        prefix, inventory.checkpoint_id
+                        prefix, inventory.checkpoint_id, uncut
                     )
             # Gym acknowledges cuts per call, so one call's failure (a TQ write,
             # an identity mismatch) regenerates that call alone after a restore
@@ -937,9 +861,17 @@ class GenerationCutCaptureMixin:
                     with state.lock:
                         state.rollback_frozen_cut_if_owned(inventory.checkpoint_id)
                 acknowledgement = self._failed_generation_cut_ack(
-                    prefix, reason="cut_error"
+                    prefix, reason="cut_error", uncut=uncut
                 )
             acknowledgements.append(acknowledgement)
+        if uncut:
+            LOGGER.info(
+                "generation cut %s left %d of %d model calls uncut: %s",
+                inventory.checkpoint_id,
+                uncut.total(),
+                len(inventory.active_prefixes),
+                dict(sorted(uncut.items())),
+            )
         receipt = GenerationCutReceipt(
             checkpoint_id=inventory.checkpoint_id,
             cut_id=f"worker-{inventory.inventory_digest}",

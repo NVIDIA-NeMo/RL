@@ -15,7 +15,6 @@
 
 import inspect
 import json
-import threading
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -790,17 +789,8 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(
         "nemo_rl.experience.route_assembly.encode_routed_experts",
     ):
         monkeypatch.setattr(target, forbidden_codec)
-    from nemo_rl.models.generation.generation_cut_capture import (
-        _TokenCaptureSnapshotGate,
-    )
-
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
-    worker._capture_calls = {}
-    worker._capture_top_logprobs = 0
-    worker._capture_calls_by_model_call_id = {}
-    worker._completed_capture_calls = {}
-    worker._capture_registry_lock = threading.Lock()
-    worker._token_capture_snapshot_gate = _TokenCaptureSnapshotGate()
+    worker._init_token_capture_state()
     sink = TQTokenSink(
         dp,
         staging_partition="staging",
@@ -1410,6 +1400,7 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     )
     _install_fake_vllm(monkeypatch)
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._init_token_capture_state()
     worker.__dict__.update(state.__dict__)
     worker.cfg = dict(
         temperature=1.0,
@@ -1421,10 +1412,6 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
         vllm_cfg={},
     )
     worker.token_capture = MagicMock(adapter=VLLMCaptureAdapter())
-    worker._capture_calls = {}
-    worker._capture_calls_by_model_call_id = {}
-    worker._completed_capture_calls = {}
-    worker._capture_registry_lock = threading.Lock()
     worker._http_engine_client = MagicMock()
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = SimpleNamespace(

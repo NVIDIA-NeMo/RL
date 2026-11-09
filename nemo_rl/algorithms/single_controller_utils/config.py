@@ -759,9 +759,9 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     )
     # Seconds Gym gets to park its in-flight steps; see the exemplar YAML.
     gym_prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
-    # With target_level='turn', a Gym server whose checkpoint mode is
-    # restart_only (the default for agents and resources servers) starts every
-    # in-flight rollout over after a crash. False fails setup and names such
+    # With target_level='turn' or 'prefix', a Gym server whose checkpoint mode
+    # is restart_only (the default for agents and resources servers) starts
+    # every in-flight rollout over after a crash. False fails setup and names such
     # servers; true accepts them with a warning.
     allow_restart_only_gym_servers: bool = False
 
@@ -770,11 +770,11 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         """Reject the restart-only opt-in where Gym does not checkpoint rollouts."""
         if (
             self.allow_restart_only_gym_servers
-            and self.target_level is not RecoveryTargetLevel.TURN
+            and not self.target_level.requires_environment_checkpoint
         ):
             raise ValueError(
                 "rollout_recovery.allow_restart_only_gym_servers applies only to "
-                "target_level='turn'; with "
+                "target_level='turn' or 'prefix'; with "
                 f"target_level={self.target_level.value!r} every unfinished "
                 "rollout already starts over"
             )

@@ -1386,24 +1386,6 @@ def test_prefix_checkpointing_policy_overrides_are_gym_fields(detected_uv_dirs):
     assert set(model["checkpoint"]) <= set(checkpoint_config.model_fields)
 
 
-def test_generation_prefix_cuts_require_turn_checkpointing(detected_uv_dirs):
-    with pytest.raises(ValueError, match="require Gym turn checkpointing"):
-        build_nemo_gym_config(
-            _env_configs(),
-            base_urls=["http://vllm-0"],
-            model_name="test-model",
-            enable_router_replay=False,
-            use_fastokens=False,
-            turn_checkpointing_enabled=False,
-            generation_prefix_cuts_enabled=True,
-            token_capture={
-                "enabled": True,
-                "capture_dir": "/capture",
-                "control_auth_token": "secret",
-            },
-        )
-
-
 def test_checkpointing_requires_token_capture(detected_uv_dirs):
     with pytest.raises(ValueError, match="requires token capture"):
         build_nemo_gym_config(

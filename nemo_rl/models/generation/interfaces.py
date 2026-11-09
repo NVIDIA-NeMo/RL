@@ -828,19 +828,15 @@ class GenerationInterface(ABC):
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
 
-    def begin_token_capture_snapshot_fence(
-        self, *, timeout_s: Optional[float] = None
+    def flush_obsolete_generation_cut_rows(
+        self, epoch: int, *, timeout_s: Optional[float] = None
     ) -> bool:
-        """Fence terminal token writes while a coordinated TQ snapshot is taken."""
-        raise NotImplementedError(
-            "generation-prefix checkpointing is not supported for "
-            f"{type(self).__name__}"
-        )
+        """Delete chunk rows of calls that ended before snapshot ``epoch``.
 
-    def end_token_capture_snapshot_fence(
-        self, *, timeout_s: Optional[float] = None
-    ) -> bool:
-        """Release terminal token writes after the coordinated TQ snapshot."""
+        Returns once every worker's delete is done, so none overlaps the
+        snapshot's TQ save. A worker ignores an epoch no newer than one it
+        already flushed.
+        """
         raise NotImplementedError(
             "generation-prefix checkpointing is not supported for "
             f"{type(self).__name__}"
@@ -851,7 +847,7 @@ class GenerationInterface(ABC):
 
         Returns:
             Counts since the workers started: ``restored_calls`` and their
-            ``restored_prefix_tokens``, and the cut counts named by
+            ``restored_prefix_tokens``, and the progress-read counts named by
             ``GenerationCutCaptureMixin.get_generation_prefix_counts``.
         """
         raise NotImplementedError(

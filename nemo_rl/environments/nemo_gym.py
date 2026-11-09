@@ -3096,10 +3096,6 @@ def _build_gym_actor_config(
                 checkpoint_instance.live_capture_dir(capture_root)
             )
 
-    if generation_prefix_cuts_enabled and not turn_checkpointing_enabled:
-        raise ValueError(
-            "generation-prefix cuts require Gym turn checkpointing to be enabled"
-        )
     if turn_checkpointing_enabled:
         if instance_token_capture is None or not instance_token_capture.get("enabled"):
             raise ValueError(

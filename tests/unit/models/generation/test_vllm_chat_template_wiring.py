@@ -42,6 +42,7 @@ import torch
 from nemo_rl.data.captured_media import capture_processed_media
 from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    _RESTORED_PREFIX_TERMINAL_PROMPT_KEY,
     VllmAsyncGenerationWorkerImpl,
 )
 
@@ -828,3 +829,91 @@ def test_prefix_overflow_precedes_media_validation(
     else:
         capture.assert_called_once()
         assert remap.call_count == (failure_stage == "remap")
+
+
+@pytest.mark.parametrize(
+    ("prefix_tokens", "max_tokens", "min_tokens", "terminal"),
+    [
+        # Two of six tokens restored: the tail may decode four, and owes two more.
+        (2, 4, 2, None),
+        # The restored prefix already used the whole budget: decode one token
+        # the response drops, with no minimum.
+        (6, 1, 0, "output_limit"),
+    ],
+)
+def test_restored_call_reaches_the_engine_with_the_remaining_budget(
+    monkeypatch, prefix_tokens, max_tokens, min_tokens, terminal
+):
+    """The engine sees the durable prefix as prompt and only what is left to decode."""
+    app = _FakeApp()
+    conversation = [10, 31, 2]
+    # The cut's rows: the generated tokens, with one non-generated token that
+    # a resumed call must not count as its own output.
+    delta = [40 + i for i in range(prefix_tokens)] + [99]
+    mask = [1.0] * prefix_tokens + [0.0]
+    admission = SimpleNamespace(
+        mode="token_in",
+        request_replay=None,
+        capture_key="r0",
+        model_call_id="c1",
+        generation_cut=SimpleNamespace(
+            prefix_token_count=prefix_tokens,
+            effective_output_limit=6,
+            terminal_finish_reason=None,
+            terminal_stop_reason=None,
+        ),
+    )
+
+    async def preprocess(self, *, messages, **kwargs):
+        return None, [{"prompt_token_ids": conversation + [11]}]
+
+    monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", preprocess, raising=False)
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_media", False, raising=False
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_admission", lambda self, r: admission
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_resolve_admission_prefix",
+        lambda self, admission: list(conversation),
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_resolve_usable_generation_cut",
+        lambda self, admission, prefix: (
+            admission,
+            SimpleNamespace(token_ids_delta=delta, token_mask_delta=mask),
+        ),
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_enter_request_prefix",
+        lambda self, request, prefix: setattr(
+            request, "required_prefix_token_ids", prefix
+        ),
+    )
+    begin = MagicMock()
+    monkeypatch.setattr(VllmAsyncGenerationWorkerImpl, "_begin_request_capture", begin)
+    renderers, _, _ = _build_server(monkeypatch, {}, app=app)
+    renderer = renderers[0]
+    renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
+    renderer.model_config = SimpleNamespace(max_model_len=64)
+    endpoint = next(fn for path, fn in app.routes if path == "/v1/chat/completions")
+    request = endpoint.__annotations__["request"]()
+    request.max_tokens, request.max_completion_tokens, request.min_tokens = 6, None, 4
+    request.model_copy = lambda **kwargs: request
+
+    _, (engine_prompt,) = asyncio.run(
+        renderer.preprocess_chat(
+            request, [{"role": "assistant"}, {"role": "tool"}], None, None, {}
+        )
+    )
+
+    assert engine_prompt["prompt_token_ids"] == conversation + delta
+    assert (request.max_tokens, request.min_tokens) == (max_tokens, min_tokens)
+    assert request._original_min_tokens == 4
+    assert begin.call_args.kwargs["resumed_generation_token_ids"] == delta[:-1]
+    restored = engine_prompt.get(_RESTORED_PREFIX_TERMINAL_PROMPT_KEY)
+    assert (restored and restored.reason) == terminal
