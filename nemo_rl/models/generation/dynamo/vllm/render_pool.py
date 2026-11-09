@@ -31,12 +31,16 @@ Jobs queue FIFO in the pool; nothing renders on the event loop.
 from __future__ import annotations
 
 import asyncio
+import logging
 import multiprocessing
 import pickle
 import uuid
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
+
+LOGGER = logging.getLogger(__name__)
 
 # Set in each worker process by _init_worker.
 _WORKER: Optional["_Worker"] = None
@@ -345,14 +349,41 @@ class RenderPool:
     """``workers`` processes that render and answer chat calls, FIFO."""
 
     def __init__(self, spec: dict[str, Any], model_dir: str, *, workers: int):
-        self._executor = ProcessPoolExecutor(
-            max_workers=workers,
+        self._spec = spec
+        self._model_dir = model_dir
+        self._workers = workers
+        self._executor = self._start()
+        self._info: Optional[dict[str, Any]] = None
+
+    def _start(self) -> ProcessPoolExecutor:
+        return ProcessPoolExecutor(
+            max_workers=self._workers,
             # Fork would copy the frontend's Rust runtime and event loop.
             mp_context=multiprocessing.get_context("spawn"),
             initializer=_init_worker,
-            initargs=(spec, model_dir),
+            initargs=(self._spec, self._model_dir),
         )
-        self._info: Optional[dict[str, Any]] = None
+
+    async def _submit(self, fn: Callable[..., Any], *args: Any) -> Any:
+        executor = self._executor
+        try:
+            return await asyncio.wrap_future(executor.submit(fn, *args))
+        except BrokenProcessPool as error:
+            if self._info is None:
+                # No worker ever served a job: most often _init_worker failed (a
+                # config error, which a restart cannot fix), so do not restart.
+                raise RuntimeError(
+                    "the render pool's workers died before serving a call; see "
+                    "this log for an 'Exception in initializer' traceback or a "
+                    "kill (e.g. OOM)"
+                ) from error
+            if self._executor is executor:
+                # A worker died (e.g. OOM-killed). The calls in flight fail;
+                # later calls get a fresh pool instead of this broken one.
+                LOGGER.error("A render-pool worker died; restarting the pool")
+                executor.shutdown(wait=False, cancel_futures=True)
+                self._executor = self._start()
+            raise
 
     async def info(self) -> dict[str, Any]:
         """The model's turn-end ids and context length, from a started worker.
@@ -361,11 +392,11 @@ class RenderPool:
         builds them.
         """
         if self._info is None:
-            self._info = await asyncio.wrap_future(self._executor.submit(_info))
+            self._info = await self._submit(_info)
         return self._info
 
     async def render(self, body: dict[str, Any]) -> RenderedCall:
-        return await asyncio.wrap_future(self._executor.submit(_render, body))
+        return await self._submit(_render, body)
 
     async def respond(
         self,
@@ -373,9 +404,7 @@ class RenderPool:
         prompt_token_ids: list[int],
         output: dict[str, Any],
     ) -> dict[str, Any]:
-        return await asyncio.wrap_future(
-            self._executor.submit(_respond, request, prompt_token_ids, output)
-        )
+        return await self._submit(_respond, request, prompt_token_ids, output)
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)

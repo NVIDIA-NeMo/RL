@@ -394,9 +394,6 @@ class SimpleItem:
     def __init__(self, data) -> None:
         self._data = data
 
-    def is_error(self) -> bool:
-        return False
-
     def data(self):
         return self._data
 

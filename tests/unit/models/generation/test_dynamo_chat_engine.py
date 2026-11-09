@@ -111,17 +111,11 @@ class _Pool:
 class _Item:
     """One annotated response from Dynamo's router."""
 
-    def __init__(self, data=None, comments=None) -> None:
-        self._data, self._comments = data, comments
-
-    def is_error(self) -> bool:
-        return self._comments is not None
+    def __init__(self, data) -> None:
+        self._data = data
 
     def data(self):
         return self._data
-
-    def comments(self):
-        return self._comments
 
 
 class _Router:
@@ -138,8 +132,8 @@ class _Router:
 
         async def stream():
             if self.error is not None:
-                yield _Item(comments=[self.error])
-                return
+                # Dynamo's binding raises an engine's error frame as a ValueError.
+                raise ValueError(self.error)
             yield _Item({"token_ids": [10], "engine_data": self.engine_data})
 
         return stream()
@@ -413,7 +407,11 @@ def test_a_call_refused_before_it_runs_acknowledges_its_capture_to_gym(
 @pytest.mark.parametrize(
     ("router", "status", "message"),
     [
-        (_Router(error="engine died"), 500, "engine died"),
+        (
+            _Router(error="BackendInvalidArgument: RuntimeError: engine died"),
+            500,
+            "engine died",
+        ),
         # Refused before it ran, with the status the native server answers.
         (
             _Router(

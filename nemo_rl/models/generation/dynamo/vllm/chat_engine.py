@@ -37,6 +37,7 @@ import asyncio
 import base64
 import os
 import pickle
+import threading
 import time
 import uuid
 from typing import Any, AsyncGenerator, Optional
@@ -127,6 +128,8 @@ class _CaptureSource:
 
     def __init__(self) -> None:
         self._prefix_cache: Any = None
+        # Calls run resolve_prefix on several threads at once; connect once.
+        self._connect_lock = threading.Lock()
 
     def resolve_prefix(self, serving_admission: dict[str, Any]) -> list[int]:
         """The admission's prefix, read from TQ (blocking; run off the loop)."""
@@ -135,7 +138,9 @@ class _CaptureSource:
         from nemo_rl.data_plane.tq_token_sink import resolve_admission_prefix
 
         if self._prefix_cache is None:
-            self._prefix_cache = self._connect()
+            with self._connect_lock:
+                if self._prefix_cache is None:
+                    self._prefix_cache = self._connect()
         return resolve_admission_prefix(
             CaptureAdmission.model_validate(serving_admission), self._prefix_cache
         )
@@ -342,13 +347,16 @@ class NemoRLChatEngine:
     ) -> dict[str, Any]:
         engine_data = None
         stream = await self._routed_engine.generate(preprocessed, context=context)
-        async for item in stream:
-            if item.is_error():
-                comments = item.comments() or []
-                raise HttpError(500, "; ".join(comments) or "engine error")
-            data = item.data()
-            if data and data.get("engine_data"):
-                engine_data = data["engine_data"]
+        try:
+            async for item in stream:
+                data = item.data()
+                if data and data.get("engine_data"):
+                    engine_data = data["engine_data"]
+        except ValueError as error:
+            # Dynamo raises an engine's error as a ValueError, which it would
+            # answer with 400. The engine sends every status it means as a
+            # refusal, so anything raised is an engine failure: 500, as natively.
+            raise HttpError(500, str(error)) from error
         if engine_data is None:
             raise HttpError(500, "the engine returned no result for this call")
         return engine_data

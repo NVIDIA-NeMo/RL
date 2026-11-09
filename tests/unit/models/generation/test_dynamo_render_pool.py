@@ -20,6 +20,9 @@ checkpoint's own chat template, replies against vLLM's Qwen3 parsers.
 
 import asyncio
 import json
+import os
+import signal
+from concurrent.futures.process import BrokenProcessPool
 
 import pytest
 
@@ -150,3 +153,46 @@ def test_the_pool_renders_and_answers_with_the_checkpoints_template_and_parsers(
     (tool_call,) = choice["message"]["tool_calls"]
     assert tool_call["function"]["name"] == "get_weather"
     assert json.loads(tool_call["function"]["arguments"]) == {"city": "Lyon"}
+
+
+def test_a_dead_worker_fails_only_its_calls(tiny_qwen3_model_path) -> None:
+    body = {
+        "model": "model",
+        "messages": MESSAGES[:1],
+        "max_tokens": 8,
+        "temperature": 0.7,
+        "top_p": 0.9,
+    }
+
+    async def serve():
+        pool = RenderPool(SPEC, tiny_qwen3_model_path, workers=1)
+        try:
+            await pool.info()
+            (pid,) = pool._executor._processes
+            # As the OOM killer would.
+            os.kill(pid, signal.SIGKILL)
+            with pytest.raises(BrokenProcessPool):
+                await pool.render(body)
+            # The next call gets a fresh pool, not the broken one.
+            return await pool.render(body)
+        finally:
+            pool.shutdown()
+
+    rendered = asyncio.run(serve())
+
+    assert rendered.template_token_ids
+
+
+def test_workers_that_cannot_start_fail_the_call_by_name(tiny_qwen3_model_path):
+    vllm_cfg = {"http_server_serving_chat_kwargs": {"reasoning_parser": "no_such"}}
+    spec = {**SPEC, "generation": {**SPEC["generation"], "vllm_cfg": vllm_cfg}}
+
+    async def serve():
+        pool = RenderPool(spec, tiny_qwen3_model_path, workers=1)
+        try:
+            await pool.info()
+        finally:
+            pool.shutdown()
+
+    with pytest.raises(RuntimeError, match="before serving a call"):
+        asyncio.run(serve())
