@@ -20,7 +20,10 @@ import pytest
 pytestmark = pytest.mark.nemo_gym
 pytest.importorskip("nemo_gym.token_id_capture.external_capture")
 
-from nemo_gym.openai_utils import TOKEN_METADATA_FIELDS  # noqa: E402
+from nemo_gym.openai_utils import (  # noqa: E402
+    TOKEN_METADATA_FIELDS,
+    NeMoGymAsyncOpenAI,
+)
 from nemo_gym.token_id_capture import (  # noqa: E402
     NG_CAPTURE_FIELD,
     NG_COMMIT_COORDS_FIELD,
@@ -31,6 +34,9 @@ from nemo_gym.token_id_capture.external_capture import (  # noqa: E402
     pop_dynamo_call_result,
 )
 from responses_api_models.vllm_model.app import VLLMModel  # noqa: E402
+from responses_api_models.vllm_model.tests import (  # noqa: E402
+    test_framework_context as gym_harness,
+)
 
 from nemo_rl.models.generation.gym_call import (  # noqa: E402
     GYM_EXTRAS_ANNOTATION_PREFIX,
@@ -87,3 +93,45 @@ def test_gym_lifts_the_call_result_nemo_rl_returns() -> None:
     assert pop_dynamo_call_result({"nvext": {GYM_RESULT_NVEXT_KEY: result}}) == result
     # The fields Gym copies onto the message, and its capture acknowledgement.
     assert TOKEN_METADATA_FIELDS | {NG_COMMIT_COORDS_FIELD} <= result.keys()
+
+
+def test_gyms_measure_call_is_the_one_nemo_rl_answers(monkeypatch, tmp_path) -> None:
+    # Gym's own /context/measure, in its Dynamo dialect.
+    harness = gym_harness.make_capture_harness(monkeypatch, tmp_path, dynamo=True)
+    first = gym_harness.assert_clean(harness.post("attempt", gym_harness.HISTORY))
+    seen = []
+
+    async def frontend(client, *, extra_headers=None, **body):
+        # Unknown names are refused, so a measure flag Gym renames fails here.
+        seen.append(GymCallExtras.from_annotations(body["nvext"]["annotations"]))
+        result = GymCallResult(prompt_token_count=19, ng_context_measured=True)
+        return {
+            "id": "chatcmpl-measure",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": "stop",
+                    "message": {"role": "assistant", "content": ""},
+                }
+            ],
+            "nvext": {GYM_RESULT_NVEXT_KEY: result.model_dump(exclude_none=True)},
+        }
+
+    monkeypatch.setattr(NeMoGymAsyncOpenAI, "create_chat_completion", frontend)
+    response = harness.client.post(
+        "/ng-rollout/attempt/training-token-capture/context/measure",
+        json={
+            "input": gym_harness.HISTORY
+            + first["output"]
+            + [{"role": "user", "content": "next"}]
+        },
+    )
+
+    # Gym read the result back by NeMo RL's names; a renamed one answers 502.
+    assert response.status_code == 200, response.text
+    assert response.json() == {"prompt_token_count": 19}
+    (extras,) = seen
+    assert extras.ng_measure is True

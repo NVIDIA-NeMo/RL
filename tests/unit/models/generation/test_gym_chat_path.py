@@ -627,6 +627,8 @@ def _off_policy(name: str, value: Any) -> _Case:
 CASES = [
     # A plain call: the render and the reply's reasoning and tool parsers (C39).
     _Case("plain"),
+    # No max_tokens: each path fills the budget the way vLLM's server does.
+    _Case("no_max_tokens", fields={"max_tokens": None}),
     # Gym's echo of turn 1 without capture: the model's tokens replace the
     # template's re-render of that turn (C16's turn-end cut).
     _Case(

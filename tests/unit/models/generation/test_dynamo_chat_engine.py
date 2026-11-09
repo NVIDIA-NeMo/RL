@@ -436,6 +436,15 @@ def test_an_engine_that_does_not_serve_the_call_fails_it(router, status, message
     assert failed.value.code == status
 
 
+def test_dynamos_frontend_still_builds_its_entrypoint_by_the_name_nemo_rl_wraps():
+    import dynamo.frontend.main as frontend_main
+
+    # frontend.main() swaps this module global for one that adds NeMo RL's
+    # chat_engine_factory; if Dynamo stops reading it there, Dynamo's own
+    # preprocessor serves chat and every NeMo-Gym call is refused.
+    assert "EntrypointArgs" in frontend_main.async_main.__code__.co_names
+
+
 def test_only_nemo_rls_engines_are_served() -> None:
     model = SimpleNamespace(
         runtime_config=lambda: {"runtime_data": {}},
