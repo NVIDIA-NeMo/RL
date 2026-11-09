@@ -41,6 +41,9 @@ COMPILER_DIRS = {
     "CUDA_CACHE_PATH": "cuda",
     "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": "fa4_cute",
 }
+# Not copied into an engine's folder (cache_sync.sh never publishes them either):
+# FlashInfer's MoE autotune results, which every rank of an engine must agree on.
+ENGINE_FOLDER_EXCLUDES = ("flashinfer_autotune_cache",)
 
 
 def local_dir() -> str | None:
@@ -110,7 +113,16 @@ def _prepare_vllm_engine_on_this_node(engine_dir: str) -> None:
     shared = Path(os.environ[LOCAL_VAR]) / "vllm" / "vllm"
     if shared.is_dir() and not os.path.exists(engine_dir):
         tmp = f"{engine_dir}.tmp{os.getpid()}"
-        shutil.copytree(shared, tmp, symlinks=True)  # copy2 keeps mtimes
+        shutil.copytree(
+            shared,
+            tmp,
+            symlinks=True,  # copy2 keeps mtimes
+            ignore=lambda d, names: (
+                [n for n in names if n in ENGINE_FOLDER_EXCLUDES]
+                if Path(d) == shared
+                else []
+            ),
+        )
         os.rename(tmp, engine_dir)
     os.makedirs(engine_dir, exist_ok=True)
 

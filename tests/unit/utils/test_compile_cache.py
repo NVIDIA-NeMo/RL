@@ -76,6 +76,27 @@ def test_engine_folder_is_filled_from_the_node_copy(caches, monkeypatch):
     assert (caches / "local/vllm_engines/0/torch_compile_cache/entry").exists()
 
 
+def test_engine_folder_leaves_out_flashinfer_autotune(caches, monkeypatch):
+    monkeypatch.setattr(
+        compile_cache,
+        "_vllm_patches",
+        lambda: {"_patch_vllm_compile_cache_relative_artifacts": lambda logger: None},
+    )
+    node_copy = caches / "shared/vllm/vllm"
+    for rel in (
+        "torch_compile_cache/entry",
+        "flashinfer_autotune_cache/v/configs.json",
+    ):
+        (node_copy / rel).parent.mkdir(parents=True)
+        (node_copy / rel).write_text("x")
+    engine = compile_cache.vllm_engine_dir(0)
+
+    compile_cache._prepare_vllm_engine_on_this_node(engine)
+    filled = caches / "local/vllm_engines/0"
+    assert (filled / "torch_compile_cache/entry").exists()
+    assert not (filled / "flashinfer_autotune_cache").exists()
+
+
 def test_relative_artifact_backport(tmp_path, monkeypatch):
     import logging
 

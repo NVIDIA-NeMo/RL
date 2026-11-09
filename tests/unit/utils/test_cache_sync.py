@@ -120,6 +120,28 @@ def test_seed_type_and_vllm_engine_merge(tmp_path: Path):
     assert published.read_text() == "compiled"
 
 
+def test_vllm_engine_merge_skips_flashinfer_autotune(tmp_path: Path):
+    env = {
+        "NRL_COMPILE_CACHE_SHARED_DIR": str(tmp_path / "shared"),
+        "NRL_COMPILE_CACHE_LOCAL_DIR": str(tmp_path / "local"),
+        "NRL_COMPILE_CACHE_FORCE_FRESH": "1",
+    }
+    _run("seed-type", "vllm", env=env)
+    engine = tmp_path / "local/vllm_engines/0"
+    autotune = engine / "flashinfer_autotune_cache/v/gpu/key/autotune_configs.json"
+    for path in (engine / "torch_compile_cache/entry", autotune):
+        path.parent.mkdir(parents=True)
+        path.write_text("x")
+        _set_age(path, 2)
+    stop = tmp_path / "ENDED"
+    stop.touch()
+
+    _run("sidecar-types", 0, stop, "vllm", env=env)
+    merged = tmp_path / "local/vllm/vllm"
+    assert (merged / "torch_compile_cache/entry").exists()
+    assert not (merged / "flashinfer_autotune_cache").exists()
+
+
 def test_missing_flock_fails(tmp_path: Path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
