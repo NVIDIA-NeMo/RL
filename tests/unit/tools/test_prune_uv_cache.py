@@ -274,12 +274,7 @@ def test_second_run_is_a_no_op(cache: Path) -> None:
 
 
 def test_dockerfile_prunes_the_seed_before_any_sync() -> None:
-    # Deleting cache files in a later layer only hides them; the image still ships
-    # them. So the prune runs inside the dependency RUN -- right after the cache
-    # mount's content is restored and before the first sync, so it only judges
-    # restored content and never deletes the build-isolation deps (setuptools, a
-    # build-time torch, ...) the syncs resolve outside uv.lock. The RUN's
-    # `uv_cache_persist prune` trap then mirrors the pruned cache into the mount.
+    # Prune restored content in its importing layer, before syncs add build dependencies.
     lines = (REPO_ROOT / "docker" / "Dockerfile").read_text().splitlines()
     code = [(i, line) for i, line in enumerate(lines) if not line.startswith("#")]
 
