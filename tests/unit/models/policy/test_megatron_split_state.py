@@ -162,6 +162,10 @@ def _make_worker(loss_type):
     w.dp_size = 2
     w.cp_size = 1
     w.sampling_params = None
+    w.prepare_microbatch_fn = None
+    from nemo_rl.models.policy.workers.megatron_policy_worker import LossPostProcessor
+
+    w.loss_postprocessor_factory = LossPostProcessor
     w.draft_model = None
     w.defer_fp32_logits = False
     w.dtype = torch.float32
@@ -679,9 +683,12 @@ class TestFinish:
 
         w = self._setup_open_step(mock_module_symbols, LossType.TOKEN_LEVEL)
         w.finish_train_step()
-        # scale_gradients should have been called with some 1/N scalar < 1
+        # MCore requires a scalar tensor, including on the streaming path.
         w.model.scale_gradients.assert_called_once()
         arg = w.model.scale_gradients.call_args.args[0]
+        assert isinstance(arg, torch.Tensor)
+        assert arg.ndim == 0
+        assert arg.dtype == torch.float64
         assert 0 < arg <= 1.0
 
     def test_restores_first_step_param_sync_after_success(self, mock_module_symbols):
@@ -792,7 +799,7 @@ class TestFinish:
         # local_valid_toks accumulated = 2048; with mocked all_reduce as no-op,
         # global_valid_toks == 2048 → inv_n = 1/2048
         arg = w.model.scale_gradients.call_args.args[0]
-        assert arg == pytest.approx(1.0 / 2048.0, rel=1e-4)
+        assert arg.item() == pytest.approx(1.0 / 2048.0, rel=1e-4)
 
     def test_picks_global_valid_seqs_for_sequence_level_loss(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
@@ -801,7 +808,7 @@ class TestFinish:
         w.finish_train_step()
         # local_valid_seqs = 8 → inv_n = 1/8
         arg = w.model.scale_gradients.call_args.args[0]
-        assert arg == pytest.approx(1.0 / 8.0, rel=1e-4)
+        assert arg.item() == pytest.approx(1.0 / 8.0, rel=1e-4)
 
     @pytest.mark.parametrize("token_level_loss", [False, True])
     @pytest.mark.parametrize("draft_loss_weight", [0.0, 0.5, 1.0])
@@ -1012,7 +1019,9 @@ class TestFinish:
         w.finish_train_step()
 
         # The main loss gets 1/8; MTP additionally gets 8/2048, for net 1/2048.
-        assert w.model.scale_gradients.call_args.args[0] == pytest.approx(1.0 / 8.0)
+        assert w.model.scale_gradients.call_args.args[0].item() == pytest.approx(
+            1.0 / 8.0
+        )
         expected_mtp_grad = torch.full((4,), 8.0 / 2048.0)
         torch.testing.assert_close(mtp_param.main_grad, expected_mtp_grad)
         torch.testing.assert_close(grad_seen_by_finalize[0], expected_mtp_grad)
@@ -2143,3 +2152,30 @@ class TestPrepareForLpInference:
         w.finish_train_step()
         assert self._grad_offload_calls(w) == []
         assert sentinel.call_count == 1
+
+
+@pytest.mark.parametrize("num_levels", [4, 16])
+def test_partitioned_token_masks_normalize_once_across_levels(
+    mock_module_symbols, num_levels
+):
+    """Standard and Fast diffusion views partition the loss-bearing positions."""
+    from nemo_rl.algorithms.loss.interfaces import LossType
+
+    worker = _make_worker(LossType.TOKEN_LEVEL)
+    worker.begin_train_step(loss_fn=worker._test_loss_fn)
+    for level in range(num_levels):
+        data = _fake_batch()
+        data["sample_mask"][-1] = 0
+        data["token_mask"].zero_()
+        # A nonempty prompt precedes two 16-token response blocks.
+        # Each sample chooses its own offset; no target appears in two views.
+        for row in range(8):
+            offset = (level + row) % 16
+            data["token_mask"][row, 16 + offset] = 1
+            data["token_mask"][row, 32 + offset] = 1
+        worker.train_microbatch(data)
+    worker.finish_train_step()
+    selected_tokens = 7 * 2 * num_levels
+    worker.model.scale_gradients.assert_called_once_with(1 / selected_tokens)
+    worker.optimizer.step.assert_called_once()
+    worker.scheduler.step.assert_called_once()

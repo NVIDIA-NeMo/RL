@@ -612,8 +612,9 @@ def test_score_centering_adaptive_ppo_clip_filters_by_each_positions_advantage()
         ("adaptive-ppo-clip", True),
     ],
 )
+@pytest.mark.parametrize("shift_labels", [True, False])
 def test_score_centering_masks_nonfinite_positions_and_keeps_filtered_correction(
-    mode, force_on_policy
+    mode, force_on_policy, shift_labels
 ):
     lp = torch.tensor([0.6, -0.2, 0.1, -0.7]).log_softmax(-1)
     token_lp = torch.tensor([[lp[0], float("nan")]], requires_grad=True)
@@ -638,6 +639,13 @@ def test_score_centering_masks_nonfinite_positions_and_keeps_filtered_correction
             ).log(),
         }
     )
+    if not shift_labels:
+        data = BatchedDataDict(
+            {
+                key: value[:, 1:] if value.ndim > 1 else value
+                for key, value in data.items()
+            }
+        )
     truncated = mode in ("tis", "icepop", "adaptive-ppo-clip")
     cfg = ClippedPGLossConfig(
         score_centering=True,
@@ -649,6 +657,7 @@ def test_score_centering_masks_nonfinite_positions_and_keeps_filtered_correction
         truncated_importance_sampling_ratio_min=0.5 if truncated else None,
     )
     loss, _ = ClippedPGLossFn(cfg)(
+        shift_labels=shift_labels,
         next_token_logprobs=token_lp,
         policy_logprobs_at_sampler_topk=head_lp,
         data=data,
