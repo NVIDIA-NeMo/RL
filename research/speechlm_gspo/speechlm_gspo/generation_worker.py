@@ -13,15 +13,9 @@
 # limitations under the License.
 
 import ray
-from nemo.collections.speechlm2.vllm.salm.config import NeMoSpeechLMConfig
-from transformers import AutoConfig
 
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorkerImpl
-
-# The generic worker probes AutoConfig before vLLM loads its configured plugins.
-# Register only the serving config here; policy model registration is separate.
-AutoConfig.register(NeMoSpeechLMConfig.model_type, NeMoSpeechLMConfig, exist_ok=True)
 
 
 @ray.remote(
@@ -32,3 +26,14 @@ class SpeechLMVllmGenerationWorker(VllmGenerationWorkerImpl):
 
     The recipe enables the plugin with ``VLLM_PLUGINS=nemo_speechlm``.
     """
+
+    def __init__(self, *args, **kwargs):
+        from nemo.collections.speechlm2.vllm.salm.config import NeMoSpeechLMConfig
+        from transformers import AutoConfig
+
+        # Ray deserializes the actor in a different process from its initializer.
+        # Register before the generic worker probes AutoConfig or loads vLLM.
+        AutoConfig.register(
+            NeMoSpeechLMConfig.model_type, NeMoSpeechLMConfig, exist_ok=True
+        )
+        super().__init__(*args, **kwargs)
