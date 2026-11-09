@@ -56,6 +56,7 @@ def _env(harness):
     env = object.__new__(NemoGym.__ray_metadata__.modified_class)
     env._forest_training = True
     env._selection_policy = "returned_history"
+    env._unserved_call_failure = "poison"
     env.cfg = {}
 
     async def control(method, path):

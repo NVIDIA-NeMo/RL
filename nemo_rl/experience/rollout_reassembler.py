@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import math
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, replace
 from graphlib import CycleError, TopologicalSorter
@@ -366,6 +366,54 @@ def _media_fields_for_group(rows: list[FinalizedRollout]) -> dict[str, PackedTen
     return stacked
 
 
+def _masked_segment(
+    row: FinalizedRollout, reason: str, *, reward: float
+) -> FinalizedRollout:
+    """A segment row that keeps its owner's reward but carries no training data."""
+    return replace(
+        row,
+        valid=False,
+        rejection_reason=reason,
+        token_ids=[],
+        token_mask=[],
+        logprobs=[],
+        prompt_len=0,
+        model_call_ids=(),
+        routed_experts=None,
+        route_plan=None,
+        media=None,
+        output_masks={},
+        reward=reward,
+        penalty_counts={},
+    )
+
+
+def _retried_root_rows(
+    rows: list[FinalizedRollout], rows_ok: list[bool], scored_call: str
+) -> set[int]:
+    """Rows of uncontinued roots whose prompt also started a continued root.
+
+    A retried first request leaves an abandoned root beside the attempt the
+    session went on with; both carry the same prompt tokens. A root is
+    continued when its row spans several calls or holds the scored call.
+    """
+
+    def continued(row: FinalizedRollout) -> bool:
+        return len(row.model_call_ids) > 1 or scored_call in row.model_call_ids
+
+    pools: dict[tuple[int, ...], list[int]] = defaultdict(list)
+    for index, (row, ok) in enumerate(zip(rows, rows_ok, strict=True)):
+        if ok and row.prompt_len:
+            pools[tuple(row.token_ids[: row.prompt_len])].append(index)
+    return {
+        index
+        for pool in pools.values()
+        if any(continued(rows[index]) for index in pool)
+        for index in pool
+        if not continued(rows[index])
+    }
+
+
 class RolloutReassembler:
     """Receipts -> verified rows -> N-row publish, off the generation hot path."""
 
@@ -389,9 +437,17 @@ class RolloutReassembler:
         forest_penalty_scope: Literal["scored_segment", "all_segments"] = (
             "scored_segment"
         ),
+        owner_failure_scope: Literal["owner", "row"] = "owner",
+        invalid_group_policy: Literal["drop", "placeholder"] = "drop",
+        mask_retried_roots: bool = False,
+        forest_truncation_scope: Literal["rollout", "row"] = "rollout",
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
         self._forest_penalty_scope = forest_penalty_scope
+        self._owner_failure_scope = owner_failure_scope
+        self._invalid_group_policy = invalid_group_policy
+        self._mask_retried_roots = mask_retried_roots
+        self._forest_truncation_scope = forest_truncation_scope
         # Decodes generations for the malformed-think-tag string check.
         self._tokenizer = tokenizer
         self._thinking_tags = thinking_tags
@@ -1138,12 +1194,16 @@ class RolloutReassembler:
     ) -> list[bool]:
         """Per-row truncation, shared by the TRUNCATED column and termination rates.
 
-        Forest rows carry their rollout's Gym-reported truncation; ordinary rows
-        count as truncated when they fill ``max_seq_len``.
+        Forest rows carry their rollout's Gym-reported truncation, or with
+        ``forest_truncation_scope=row`` their own fill of ``max_seq_len``; ordinary
+        rows count as truncated when they fill ``max_seq_len``.
         """
-        if logical is not None:
+        if logical is None:
+            return [len(row.token_ids) == self._max_seq_len for row in rows]
+        if self._forest_truncation_scope == "rollout":
             return list(logical.truncated)
-        return [len(row.token_ids) == self._max_seq_len for row in rows]
+        # Padding and failed owners borrow inputs; they are never truncated.
+        return [row.valid and len(row.token_ids) == self._max_seq_len for row in rows]
 
     def _publish_rows(
         self,
@@ -1167,7 +1227,29 @@ class RolloutReassembler:
         valid_rows = [row for row in rows if row.valid]
         real_row_count = len(rows)
         if logical is not None:
-            if not valid_rows:
+            if valid_rows:
+                dummy_layout = valid_rows[0]
+                if self._invalid_group_policy == "placeholder":
+                    # Report 0 for other groups so the step mean is a rate.
+                    metrics["finalize/placeholder_group"] = 0.0
+            elif (
+                self._invalid_group_policy == "placeholder" and not self._capture_media
+            ):
+                # Every owner failed: publish masked single-token rows so the
+                # step keeps its size, as ordinary capture does.
+                dummy_layout = FinalizedRollout(
+                    rollout_id="",
+                    valid=False,
+                    rejection_reason="placeholder_layout",
+                    token_ids=[self._pad_token_id],
+                    token_mask=[0.0],
+                    logprobs=[0.0],
+                    prompt_len=1,
+                    reward=0.0,
+                    staging_keys=[],
+                )
+                metrics["finalize/placeholder_group"] = 1.0
+            else:
                 self._clear_staging(staging_keys)
                 metrics["finalize/group_dropped"] = 1.0
                 return FinalizedGroup(
@@ -1190,7 +1272,6 @@ class RolloutReassembler:
                 execution_row_multiple=execution_row_multiple,
             )
             padding_count = len(planned_ids) - real_row_count
-            dummy_layout = valid_rows[0]
             for ordinal in range(padding_count):
                 rows.append(
                     replace(
@@ -1588,7 +1669,7 @@ class RolloutReassembler:
         receipts: list[Optional[dict[str, Any]]],
         reward_checks: tuple[RewardChecks | None, ...],
     ) -> _LogicalRows:
-        """Verify ordinary segments, then keep all or none of each owner's rows.
+        """Verify ordinary segments, then mask each owner's rows per the failure scope.
 
         A missing initial prompt is a structural group failure: a sibling's
         possibly different post-agent prompt is not evidence for a failed owner.
@@ -1629,7 +1710,7 @@ class RolloutReassembler:
             ).terminal_model_call_id
             reward_row: FinalizedRollout | None = None
             parsed_receipts = []
-            owner_valid = True
+            rows_ok: list[bool] = []
             owner_records = {}
             owner_flags = {}
             owner_responses: set[str] = set()
@@ -1711,10 +1792,18 @@ class RolloutReassembler:
                         (call_id, record_by_call[call_id])
                         for call_id in row.model_call_ids
                     )
-                owner_valid = owner_valid and row.valid and selection_valid
+                rows_ok.append(row.valid and selection_valid)
                 rebuilt.append(row)
                 parsed_receipts.append(parsed)
             seen_responses.update(owner_responses)
+            if self._owner_failure_scope == "row":
+                # Only the scored segment decides the owner; others drop alone.
+                owner_valid = any(
+                    ok and row is reward_row
+                    for ok, row in zip(rows_ok, rebuilt, strict=True)
+                )
+            else:
+                owner_valid = all(rows_ok)
 
             first = rebuilt[0]
             parsed = parsed_receipts[0]
@@ -1769,27 +1858,40 @@ class RolloutReassembler:
             if owner_valid:
                 if reward_row is None:
                     raise ValueError(f"{owner_id}: missing scored-call reward evidence")
+                # Rows masked inside a valid owner: failed segments (row scope)
+                # and, when configured, retried roots.
+                masked = {
+                    index: "logical_segment_invalid"
+                    for index, ok in enumerate(rows_ok)
+                    if not ok
+                }
+                if self._mask_retried_roots:
+                    for index in _retried_root_rows(rebuilt, rows_ok, scored_call):
+                        masked.setdefault(index, "retried_root")
+                kept = [row for index, row in enumerate(rebuilt) if index not in masked]
                 owner_reward, owner_counts = (
                     reward_row.reward,
                     reward_row.penalty_counts,
                 )
                 if self._forest_penalty_scope == "all_segments":
                     owner_counts = {
-                        name: max(row.penalty_counts.get(name, 0) for row in rebuilt)
+                        name: max(row.penalty_counts.get(name, 0) for row in kept)
                         for name in {
-                            name for row in rebuilt for name in row.penalty_counts
+                            name for row in kept for name in row.penalty_counts
                         }
                     }
                     if any(owner_counts.values()):
                         owner_reward = 0.0
                 # Counts ride the scored row so metrics count each owner once.
                 rebuilt = [
-                    replace(
+                    _masked_segment(row, masked[index], reward=owner_reward)
+                    if index in masked
+                    else replace(
                         row,
                         reward=owner_reward,
                         penalty_counts=owner_counts if row is reward_row else {},
                     )
-                    for row in rebuilt
+                    for index, row in enumerate(rebuilt)
                 ]
                 prepared.valid_owner_count += 1
             else:

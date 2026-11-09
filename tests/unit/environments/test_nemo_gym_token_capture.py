@@ -35,6 +35,7 @@ def _capture_env() -> NemoGym:
     env_cls = NemoGym.__ray_metadata__.modified_class
     env = object.__new__(env_cls)
     env._forest_training = False
+    env._unserved_call_failure = "poison"
     return env
 
 

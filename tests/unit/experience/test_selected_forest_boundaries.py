@@ -75,8 +75,9 @@ class ForestCapture:
         return records, replies
 
 
-@pytest.fixture
-def forest(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> ForestCapture:
+def _forest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, **harness_kwargs: Any
+) -> ForestCapture:
     plane = PublicationDataPlane()
     source = TQTokenSource(plane, staging_partition="staged")
     harness = gym.make_capture_harness(
@@ -85,6 +86,7 @@ def forest(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> ForestCapture:
         sink=TQTokenSink(plane, staging_partition="staged"),
         fetch_prefix=lambda keys: source.fetch_prefix_chains(keys).expanded,
         decide_input=decide_capture_input,
+        **harness_kwargs,
     )
     return ForestCapture(
         harness,
@@ -97,6 +99,11 @@ def forest(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> ForestCapture:
             max_seq_len=1024,
         ),
     )
+
+
+@pytest.fixture
+def forest(monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> ForestCapture:
+    return _forest(monkeypatch, tmp_path)
 
 
 def ordinary(replies: list[dict], *, terminal: str | None = None) -> dict:
@@ -1326,11 +1333,13 @@ def test_forest_rows_flag_padding_for_router_statistics(forest: ForestCapture) -
 _UNWANTED = 54321
 
 
+@pytest.mark.parametrize("penalty", ["unwanted_token", "malformed_think_tag"])
 @pytest.mark.parametrize("scope", ["scored_segment", "all_segments"])
 @pytest.mark.parametrize("hit", [None, "scored", "other", "both"])
 def test_forest_penalty_scope_combines_segment_token_checks(
     forest: ForestCapture,
     monkeypatch: pytest.MonkeyPatch,
+    penalty: str,
     scope: str,
     hit: str | None,
 ) -> None:
@@ -1349,9 +1358,22 @@ def test_forest_penalty_scope_combines_segment_token_checks(
 
     monkeypatch.setattr(gym.RolloutTokenCapture, "complete_call", tagged_completion)
     records, _ = forest.capture([None, 0, None])
-    forest.finalizer._reward_penalty_config = RewardPenaltyConfig(
-        penalize_unwanted_tokens=True, token_ids={"unwanted": [_UNWANTED]}
-    )
+    if penalty == "unwanted_token":
+        forest.finalizer._reward_penalty_config = RewardPenaltyConfig(
+            penalize_unwanted_tokens=True, token_ids={"unwanted": [_UNWANTED]}
+        )
+    else:
+        # The tag check itself is covered in test_capture_reward_penalties; here a
+        # tagged generation stands in for a malformed one.
+        forest.finalizer._reward_penalty_config = RewardPenaltyConfig(
+            penalize_malformed_think_tag=True
+        )
+        forest.finalizer._tokenizer = object()
+        forest.finalizer._thinking_tags = ("<think>", "</think>")
+        monkeypatch.setattr(
+            "nemo_rl.experience.reward_penalties.has_malformed_think_tag",
+            lambda prompt, generation, **_: _UNWANTED in generation,
+        )
     forest.finalizer._forest_penalty_scope = scope
     result = forest.finalizer.finalize_group(
         "group",
@@ -1376,7 +1398,152 @@ def test_forest_penalty_scope_combines_segment_token_checks(
             0.0 if penalized else 1.0
         )
     # Counted once per owner, however many segments hit.
-    assert result.metrics["finalize/penalty_count/unwanted_token"] == float(penalized)
+    assert result.metrics[f"finalize/penalty_count/{penalty}"] == float(penalized)
+
+
+def _publish_with_broken_segment(forest, monkeypatch, *, broken: int):
+    """Two roots, scored first; the finalizer rejects the segment holding ``broken``."""
+    records, _ = forest.capture([None, 0, None])
+    finalize = forest.finalizer.finalize_rollout
+
+    def reject_one(*args: Any, **kwargs: Any) -> Any:
+        row = finalize(*args, **kwargs)
+        if records[broken].model_call_id in row.model_call_ids:
+            return replace(row, valid=False, rejection_reason="corrupt")
+        return row
+
+    monkeypatch.setattr(forest.finalizer, "finalize_rollout", reject_one)
+    return forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [receipt(records, terminal=records[1])],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[selection(records)],
+    )
+
+
+@pytest.mark.parametrize("scope", ["owner", "row"])
+@pytest.mark.parametrize("broken", [1, 2])
+def test_owner_failure_scope(forest, monkeypatch, scope, broken):
+    forest.finalizer._owner_failure_scope = scope
+    forest.finalizer._invalid_group_policy = "placeholder"
+    result = _publish_with_broken_segment(forest, monkeypatch, broken=broken)
+    # Row scope keeps the owner unless the scored segment broke.
+    owner_kept = scope == "row" and broken == 2
+    assert result.valid_row_count == (1 if owner_kept else 0)
+    assert len(result.reward_observations) == int(owner_kept)
+    rows = [forest.plane.rows["canonical", key] for key in result.meta.sample_ids]
+    assert [row["sample_mask"].item() for row in rows] == [float(owner_kept), 0.0]
+    if owner_kept:
+        # The masked segment still shares its owner's reward.
+        assert [row["total_reward"].item() for row in rows] == [1.0, 1.0]
+
+
+@pytest.mark.parametrize("policy", ["drop", "placeholder"])
+def test_invalid_group_policy(forest, monkeypatch, policy):
+    forest.finalizer._invalid_group_policy = policy
+    result = _publish_with_broken_segment(forest, monkeypatch, broken=1)
+    if policy == "drop":
+        assert result.dropped and result.meta is None
+        return
+    assert not result.dropped
+    assert result.metrics["finalize/placeholder_group"] == 1.0
+    for key in result.meta.sample_ids:
+        row = forest.plane.rows["canonical", key]
+        assert row["sample_mask"].item() == 0.0
+        assert row[ROUTER_EXCLUDED_ROWS].item()
+
+
+def test_retried_root_rows_mask_only_uncontinued_duplicates():
+    from nemo_rl.experience.rollout_reassembler import (
+        FinalizedRollout,
+        _retried_root_rows,
+    )
+
+    def row(prompt, calls):
+        return FinalizedRollout(
+            rollout_id="r",
+            valid=True,
+            rejection_reason=None,
+            token_ids=[*prompt, 99],
+            token_mask=[0.0] * len(prompt) + [1.0],
+            logprobs=[0.0] * (len(prompt) + 1),
+            prompt_len=len(prompt),
+            reward=1.0,
+            staging_keys=[],
+            model_call_ids=tuple(calls),
+        )
+
+    rows = [
+        row([1, 2], ["scored"]),  # Scored single call: continued by definition.
+        row([1, 2], ["retry"]),  # Same prompt, never continued: masked.
+        row([3], ["a", "b"]),  # Continued subagent.
+        row([3], ["c"]),  # Its abandoned first attempt: masked.
+        row([4], ["d"]),  # A genuine single-call subagent: kept.
+        row([5], ["e"]),  # Duplicates without a continued member: kept.
+        row([5], ["f"]),
+    ]
+    assert _retried_root_rows(rows, [True] * len(rows), "scored") == {1, 3}
+    # An already-failed row neither masks nor gets masked.
+    assert _retried_root_rows(rows, [True, False, *[True] * 5], "scored") == {3}
+
+
+@pytest.mark.parametrize("mask_retried", [False, True])
+def test_retried_root_is_masked_and_skips_all_segments_penalties(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any, mask_retried: bool
+) -> None:
+    # Root A is retried as A' with the same prompt; the session continues A -> B.
+    # Only the abandoned retry A' (the second completion) emits an unwanted token.
+    # The fake engine mints distinct root prompt tokens unless root_prompt is set.
+    forest = _forest(monkeypatch, tmp_path, root_prompt=[7, 8])
+    complete = gym.RolloutTokenCapture.complete_call
+    completed: list[None] = []
+
+    def tagged_completion(capture: Any, active: Any, **kwargs: Any) -> Any:
+        completed.append(None)
+        if len(completed) == 2:
+            kwargs["generated_token_ids"] = [_UNWANTED] * len(
+                kwargs["generated_token_ids"]
+            )
+        return complete(capture, active, **kwargs)
+
+    monkeypatch.setattr(gym.RolloutTokenCapture, "complete_call", tagged_completion)
+    prompt = [{"role": "user", "content": "retried request"}]
+    first = gym.assert_clean(forest.harness.post("attempt", prompt))
+    gym.assert_clean(forest.harness.post("attempt", prompt))
+    gym.assert_clean(
+        forest.harness.post(
+            "attempt",
+            prompt + first["output"] + [{"role": "user", "content": "observation"}],
+        )
+    )
+    records = list(forest.harness.manifest("attempt").records)
+    assert [r.parent_call_id for r in records] == [None, None, records[0].model_call_id]
+    forest.finalizer._reward_penalty_config = RewardPenaltyConfig(
+        penalize_unwanted_tokens=True, token_ids={"unwanted": [_UNWANTED]}
+    )
+    forest.finalizer._forest_penalty_scope = "all_segments"
+    forest.finalizer._mask_retried_roots = mask_retried
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [receipt(records, terminal=records[2])],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[selection(records)],
+    )
+    # A masked retry neither trains nor zeroes the owner's reward.
+    assert result.valid_row_count == (1 if mask_retried else 2)
+    assert [obs.reward for obs in result.reward_observations] == [
+        1.0 if mask_retried else 0.0
+    ]
 
 
 def test_publication_identity_drift_preserves_staging(forest, monkeypatch):
@@ -1432,3 +1599,102 @@ def test_capture_lengths_count_unique_generations_before_padding(
     assert metrics["max_gen_tokens_per_turn/max"] == 1
     assert metrics["total_tokens_per_sample/max"] == max(r.cum_len for r in selected)
     assert result.canonical_output_tokens == len(selected)
+
+
+@pytest.mark.parametrize("policy", ["poison", "ignore"])
+@pytest.mark.parametrize(
+    "reason", ["uncommitted", "engine_refused", "capture_lost", "pending"]
+)
+def test_unserved_call_failure_policy(
+    forest: ForestCapture, policy: str, reason: str
+) -> None:
+    from nemo_gym.token_id_capture import (
+        ENGINE_REFUSED_CALL_REASON,
+        UNCOMMITTED_CALL_REASON,
+    )
+
+    records, replies = forest.capture([None, 0, None])
+    if reason == "pending":
+        # A pending write may still land, so it masks under either policy.
+        asyncio.run(forest.harness.ledger.begin_call("attempt", "lost"))
+        asyncio.run(
+            forest.harness.ledger.record_failure(
+                "attempt", "lost", UNCOMMITTED_CALL_REASON
+            )
+        )
+        assert forest.harness.manifest("attempt").pending_call_ids == ["lost"]
+        forest.plane.rows["staged", "attempt/lost"] = forest.plane.rows[
+            "staged", records[0].staging_key
+        ].clone()
+    else:
+        asyncio.run(
+            forest.harness.ledger.record_failure(
+                "attempt",
+                "unserved",
+                {
+                    "uncommitted": UNCOMMITTED_CALL_REASON,
+                    "engine_refused": ENGINE_REFUSED_CALL_REASON,
+                    "capture_lost": "capture_lost",
+                }[reason],
+            )
+        )
+        assert not forest.harness.manifest("attempt").pending_call_ids
+    env = _env(forest.harness)
+    env._selection_policy = "all_captured"
+    env._unserved_call_failure = policy
+    processed = asyncio.run(
+        env._postprocess_receipt_mode(
+            {"_ng_rollout_id": "attempt"},
+            {"terminal_response_id": replies[1]["id"], "reward": 1.0},
+        )
+    )
+    masked = reason in ("capture_lost", "pending") or policy == "poison"
+    assert processed["receipt"]["capture_poisoned"] is masked
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [processed["receipt"]],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[processed["logical_selection"]],
+    )
+    assert result.valid_row_count == (0 if masked else 2)
+
+
+@pytest.mark.parametrize("scope", ["rollout", "row"])
+def test_forest_truncation_scope(forest: ForestCapture, scope: str) -> None:
+    # Calls 0-1 form the scored segment; call 2 opens a shorter root.
+    records, _ = forest.capture([None, 0, None])
+    lengths = [r.prev_len + r.delta_len for r in (records[1], records[2])]
+    assert lengths[0] != lengths[1]
+    forest.finalizer._forest_truncation_scope = scope
+    # Only the scored segment fills the sequence limit.
+    forest.finalizer._max_seq_len = lengths[0]
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [receipt(records, terminal=records[1])],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[replace(selection(records), truncated=True)],
+        execution_row_multiple=4,
+    )
+    assert result.meta is not None
+    flags = {}
+    for key, tag in zip(result.meta.sample_ids, result.meta.tags, strict=True):
+        row = forest.plane.rows["canonical", key]
+        if tag["is_execution_padding"]:
+            assert not row["truncated"].item()
+        else:
+            flags[int(row["input_lengths"].item())] = row["truncated"].item()
+    assert flags == (
+        {lengths[0]: True, lengths[1]: True}
+        if scope == "rollout"
+        else {lengths[0]: True, lengths[1]: False}
+    )

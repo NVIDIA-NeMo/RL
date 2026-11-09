@@ -15,6 +15,7 @@
 """Exercise logical-owner GRPO and PPO through the actual SingleController stage."""
 
 import asyncio
+import dataclasses
 import math
 from collections import defaultdict
 from types import SimpleNamespace
@@ -138,6 +139,11 @@ def test_forest_selection_config(policy):
 @pytest.mark.parametrize(
     "option",
     [
+        {"owner_failure_scope": "row"},
+        {"invalid_group_policy": "placeholder"},
+        {"mask_retried_roots": True},
+        {"unserved_call_failure": "ignore"},
+        {"forest_truncation_scope": "row"},
         {"forest_penalty_scope": "all_segments"},
         {"exclude_padding_from_router_stats": True},
         {"forest_padding_scope": "step"},
@@ -612,13 +618,20 @@ def test_preserves_existing_grpo_normalization_and_leave_one_out(
     torch.testing.assert_close(data["advantages"], expected[[0, 0, 1, 1, 1, 2]])
 
 
+@pytest.mark.parametrize("scope", ["owner", "row"])
 @pytest.mark.parametrize("filtering", [False, True])
-def test_overlong_filter_flag_is_respected_for_all_owner_segments(filtering):
+def test_overlong_filter_flag_is_respected_for_all_owner_segments(filtering, scope):
     meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])])
     data["truncated"][1] = True
-    ctrl = _controller(meta, data, grpo={"overlong_filtering": filtering})
+    ctrl = _with_failure_scope(
+        _controller(meta, data, grpo={"overlong_filtering": filtering}), scope
+    )
     asyncio.run(ctrl._advantage_stage(meta))
-    assert data["sample_mask"].tolist() == ([0, 0, 1] if filtering else [1, 1, 1])
+    if not filtering:
+        expected = [1, 1, 1]
+    else:
+        expected = [1, 0, 1] if scope == "row" else [0, 0, 1]
+    assert data["sample_mask"].tolist() == expected
 
 
 @pytest.mark.parametrize("filter_field", ["sample_mask", "mask_sample", "truncated"])
@@ -1165,3 +1178,54 @@ def test_gae_advantage_stage_is_never_sharded() -> None:
     assert valid
     # Two prompt groups and two actors, yet one call over every row.
     assert sorted(n for actor in actors for n in actor.calls) == [meta.size]
+
+
+def _with_failure_scope(ctrl, scope: str, *, retried_roots: bool = False):
+    ctrl._advantage_stage_config = dataclasses.replace(
+        ctrl._advantage_stage_config,
+        owner_failure_scope=scope,
+        finalizer_masks_rows=scope == "row" or retried_roots,
+    )
+    ctrl._advantage_computer = AdvantageComputer(
+        ctrl._dp_client,
+        config=ctrl._advantage_stage_config,
+        advantage_estimator=ctrl._advantage_estimator,
+    )
+    return ctrl
+
+
+@pytest.mark.parametrize("scope", ["owner", "row"])
+def test_finalizer_masked_rows_stay_masked_without_failing_their_owner(scope):
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])])
+    data["sample_mask"][1] = 0  # A retried root the finalizer masked.
+    ctrl = _with_failure_scope(_controller(meta, data), scope, retried_roots=True)
+    asyncio.run(ctrl._advantage_stage(meta))
+    assert data["sample_mask"].tolist() == [1.0, 0.0, 1.0]
+    expected = torch.tensor([-0.5, 0.0, 0.5])
+    torch.testing.assert_close(data["advantages"][:, 0], expected)
+
+
+@pytest.mark.parametrize("scope", ["owner", "row"])
+def test_row_scope_filters_logprob_errors_per_segment(scope):
+    meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])])
+    data["prev_logprobs"] = torch.zeros(3, 3)
+    data["generation_logprobs"] = torch.zeros(3, 3)
+    data["generation_logprobs"][1, 2] = -5.0  # Only slot 0's second segment.
+    ctrl = _with_failure_scope(
+        _controller(
+            meta,
+            data,
+            grpo={"seq_logprob_error_threshold": 2.0},
+            policy_logprobs_required=True,
+        ),
+        scope,
+    )
+    asyncio.run(ctrl._advantage_stage(meta))
+    if scope == "row":
+        assert data["sample_mask"].tolist() == [1.0, 0.0, 1.0]
+        torch.testing.assert_close(
+            data["advantages"][:, 0], torch.tensor([-0.5, 0.0, 0.5])
+        )
+    else:
+        assert data["sample_mask"].tolist() == [0.0, 0.0, 1.0]
+        torch.testing.assert_close(data["advantages"][:, 0], torch.zeros(3))

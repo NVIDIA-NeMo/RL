@@ -718,6 +718,32 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Step padding only. Which real rows the padding copies: row0 repeats the
     # batch's first row; cyclic takes rows 0, 1, 2, ...
     forest_pad_source: Literal["row0", "cyclic"] = "row0"
+    # Forest only. What a failed segment invalidates.
+    # owner: every row of its logical rollout (default).
+    # row: only that row, unless it holds the scored call. Sequence-logprob-error
+    # and overlong filtering then mask each failing row alone, the scored row
+    # included.
+    owner_failure_scope: Literal["owner", "row"] = "owner"
+    # Forest only. A group whose rollouts all failed has no input layout to
+    # borrow. drop: drop the group (default). placeholder: publish masked
+    # single-token rows so the step keeps its configured size.
+    invalid_group_policy: Literal["drop", "placeholder"] = "drop"
+    # Forest only. Mask a root segment that was never continued when another
+    # root started from the same prompt tokens and was continued (a retried
+    # first request).
+    mask_retried_roots: bool = False
+    # Forest only. Failure rows for calls that served no completion (the engine
+    # refused the request, or it finished before the worker committed).
+    # poison: mask the whole rollout (default).
+    # ignore: treat the call as never made; the rollout trains on its other calls.
+    # A rollout whose harness kept such a call still fails terminal selection.
+    unserved_call_failure: Literal["poison", "ignore"] = "poison"
+    # Forest only. Which rows a length stop marks truncated, the input to
+    # overlong filtering.
+    # rollout: every row, when any selected call stops for a length limit (default).
+    # row: only rows that fill the generation max_seq_len, as on the non-Forest
+    # path; with owner_failure_scope=row, overlong filtering then drops only them.
+    forest_truncation_scope: Literal["rollout", "row"] = "rollout"
     # Which Forest segments the token-level reward penalties (unwanted tokens,
     # malformed think tags) check.
     # scored_segment: only the segment holding the scored call (default).
@@ -733,6 +759,11 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
                 f"selection_policy={self.selection_policy} requires forest_training=true"
             )
         forest_only = {
+            "owner_failure_scope": self.owner_failure_scope != "owner",
+            "invalid_group_policy": self.invalid_group_policy != "drop",
+            "mask_retried_roots": self.mask_retried_roots,
+            "unserved_call_failure": self.unserved_call_failure != "poison",
+            "forest_truncation_scope": self.forest_truncation_scope != "rollout",
             "forest_penalty_scope": self.forest_penalty_scope != "scored_segment",
             "exclude_padding_from_router_stats": self.exclude_padding_from_router_stats,
             "forest_padding_scope": self.forest_padding_scope != "group",

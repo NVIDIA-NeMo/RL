@@ -145,8 +145,12 @@ class RolloutReassemblerActorConfig:
     # media rows in this geometry for groups without media), ``None`` otherwise.
     media_columns: Optional[MediaColumnSpec]
     top_logprobs: int
-    # ``token_capture.forest_penalty_scope``.
+    # ``token_capture`` Forest parity options.
     forest_penalty_scope: Literal["scored_segment", "all_segments"]
+    owner_failure_scope: Literal["owner", "row"]
+    invalid_group_policy: Literal["drop", "placeholder"]
+    mask_retried_roots: bool
+    forest_truncation_scope: Literal["rollout", "row"]
     reward_penalty_config: RewardPenaltyConfig | None = None
     effort_config: EffortLevelsConfig | None = None
     # Policy tokenizer and resolved think tags, set only when
@@ -193,6 +197,10 @@ class RolloutReassemblerActor:  # pragma: no cover
             thinking_tags=config.thinking_tags,
             top_logprobs=config.top_logprobs,
             forest_penalty_scope=config.forest_penalty_scope,
+            owner_failure_scope=config.owner_failure_scope,
+            invalid_group_policy=config.invalid_group_policy,
+            mask_retried_roots=config.mask_retried_roots,
+            forest_truncation_scope=config.forest_truncation_scope,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:

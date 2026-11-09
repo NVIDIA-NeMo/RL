@@ -441,6 +441,7 @@ def test_spinup_passes_parent_resolution_to_gym(forest_training, tmp_path, monke
                 "enabled": True,
                 "forest_training": forest_training,
                 "selection_policy": "returned_history",
+                "unserved_call_failure": "poison",
                 "generation_backend": "vllm",
                 "capture_dir": str(tmp_path),
                 "control_auth_token": "test-control",

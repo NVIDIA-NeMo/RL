@@ -1153,6 +1153,9 @@ class NemoGym(EnvironmentInterface):
         self._selection_policy = (
             capture_config["selection_policy"] if self._forest_training else None
         )
+        self._unserved_call_failure = (
+            capture_config["unserved_call_failure"] if self._forest_training else None
+        )
         # Populated by _spinup. Declared here so a restarted actor -- Ray recreates it
         # through __init__, which does not start the Gym servers -- reports what
         # actually happened instead of an AttributeError from deep inside a rollout.
@@ -2107,7 +2110,10 @@ Depending on your data shape, you may want to change these values."""
         """Select capture paths while retaining the scored terminal's identity."""
         # Optional Gym dependencies remain confined to the Gym adapter.
         from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
-        from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
+        from nemo_gym.token_id_capture import (
+            UNCOMMITTED_CALL_REASON,
+            UNSERVED_CALL_FAILURE_REASONS,
+        )
         from nemo_gym.token_id_capture.staging.records import RolloutManifest
 
         from nemo_rl.environments.call_selection import resolve_selection_policy
@@ -2134,10 +2140,20 @@ Depending on your data shape, you may want to change these values."""
         by_call = {r.model_call_id: r for r in parsed.records}
         # Cancellation can follow a durable commit. Only that settled failure
         # may reach selection; pending writes and missing custody still mask.
+        # unserved_call_failure=ignore also lets calls that served nothing reach it.
+        ignored_reasons = (
+            UNSERVED_CALL_FAILURE_REASONS
+            if self._unserved_call_failure == "ignore"
+            else frozenset()
+        )
         capture_failed = bool(
             parsed.pending_call_ids
             or any(
-                f.reason != UNCOMMITTED_CALL_REASON or f.model_call_id not in by_call
+                f.reason not in ignored_reasons
+                and (
+                    f.reason != UNCOMMITTED_CALL_REASON
+                    or f.model_call_id not in by_call
+                )
                 for f in parsed.failures
             )
         )
@@ -2191,6 +2207,7 @@ Depending on your data shape, you may want to change these values."""
             manifest,
             terminal_response_id=terminal_response_id,
             reward=float(reward),
+            ignored_failure_reasons=ignored_reasons,
         )
         selected_call_ids = {r.model_call_id for r in selected}
         if capture_failed:
@@ -2257,6 +2274,7 @@ Depending on your data shape, you may want to change these values."""
         terminal_response_id: Optional[str],
         scored_response: Optional[dict] = None,
         reward: float,
+        ignored_failure_reasons: frozenset[str] = frozenset(),
     ) -> dict:
         """Build the token-free RolloutReceipt payload from a ledger manifest.
 
@@ -2361,10 +2379,12 @@ Depending on your data shape, you may want to change these values."""
                     terminal_record = deduped[selection.terminal_model_call_id]
                 else:
                     selection_reason = selection.reason
+        # Forest's unserved_call_failure=ignore passes the unserved reasons here.
         poisoning_failures = [
             failure
             for failure in failures
             if str(failure.get("reason") or "") != UNCOMMITTED_CALL_REASON
+            and str(failure.get("reason") or "") not in ignored_failure_reasons
         ]
         failure_reason = None
         if poisoning_failures:
