@@ -279,7 +279,7 @@ def main() -> None:
         if common_last < target:
             ax.axvspan(common_last, target, color="#808080", alpha=0.07)
             ax.axvline(common_last, color="#777777", linestyle=":", linewidth=0.9)
-        if key == "train/policy_kl_error" and positive:
+        if key in ("train/policy_kl_error", "train/grad_norm") and positive:
             ax.set_yscale("log")
         if key == "train/gen_kl_error":
             ax.ticklabel_format(axis="y", style="sci", scilimits=(-3, 3))
