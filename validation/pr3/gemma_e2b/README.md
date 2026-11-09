@@ -1,10 +1,19 @@
 # Gemma4 E2B IT streaming LA0 comparison
 
-The active user target is900, superseding650/150. Training has continued beyond
-650 on allocation21579059,pool0-01905; latest independently checked W&B/native
-snapshot656 had trainer_v656,lag0,two dispatches and LR2e-6. See
+The active user target is900, superseding650/150. Stage3 allocation21579059
+completed709 normally, with driver exit0 and saved-state audit, then released
+its node. Stage4 allocation21594351,pool0-00826,has started from checkpoint709;
+actual preflight passed and the driver is loading saved data/weights. First710
+recovery remains pending in this snapshot. The previous final online
+step709 had trainer_v709,lag0,two dispatches and LR2e-6. See
 [RESUME900.md](RESUME900.md), jobs.json and live slurm/resume650/state.json.
 The historical650 directory name does not change target_steps900.
+
+The [checkpoint709 scalar audit](results/checkpoint709-state.json) checks all505
+saved optimizer counters709,scheduler/trainer/sampler709,LR2e-6 and22688 consumed
+prompts. A W&B service-close atexit BrokenPipeError appeared during stage3
+teardown; final W&B709 and durable state were independently verified. The log
+is retained; no numerical code or environment was changed for this warning.
 
 The [eight-panel comparison](results/curve-comparison/comparison.png) is updated
 through650 at2026-11-09T17:59:52UTC. It shows reward, generation length,

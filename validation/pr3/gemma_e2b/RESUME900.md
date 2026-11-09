@@ -15,7 +15,7 @@ The900 supervisor then acquired ONLY stage3 interactive allocation21579059,
 pool0-01905,start07:13:19PSTNov9,end11:13:19. Its target is900 and driver_prefix
 resume900. The container/direct attachment started and actual checkpoint524
 preflight passed: only target/display name changed, saved counters and frozen
-model/config/numerical source matched. The driver is restoring the saved data
+model/config/numerical source matched. The driver restored the saved data
 loader and weights, then first525 committed with trainer_v525,lag0,two dispatches,
 512 valid samples,nonzero advantages/gradient and LR2e-6. The SAME W&B run resumed
 with the900 display name and525 selected metrics matched the native receipt
@@ -26,6 +26,23 @@ Inspect live state/logs before acting; do not duplicate this job. W&B temporaril
 finished524 with metrics matching the native final receipt during the transition;
 this is not completion of900. See results/checkpoint524-state.json,
 resume900-progress-524.json and resume900-provenance-21579059.json.
+
+Stage3 subsequently completed524->709 with driver exit0 and a durable709 scalar
+audit, then released its idle node normally. All505 optimizer counters and
+scheduler/trainer/sampler counters709,LR2e-6 and22688 consumed prompts match;
+the stored optimizer metadata SHA matches the audit. W&B finished709 and the
+selected final metrics agree with the native receipt. An ignored W&B atexit
+BrokenPipeError occurred while closing its service connection; saved state and
+the final online step were independently checked, so this was not a failed
+training update. The teardown warning is retained in the original log.
+
+The supervisor then acquired ONLY stage4 allocation21594351,pool0-00826,
+start11:02:06PSTNov9,end15:02:06,target900,resume_from709. At this snapshot its
+container/direct attachment started and actual checkpoint709 preflight passed
+with unchanged model/config/numerical source. The driver is restoring the data
+loader and weights; first710/W&B continuity remain pending. See
+results/resume900-provenance-21594351.json and checkpoint709-state.json.
+Inspect live state and per-job logs before acting; do not duplicate this allocation.
 
 resume900.yaml inherits streaming.yaml and changes ONLY max_num_steps900 and
 the W&B display name. Keep Gemma4 E2B IT,32prompts x16responses=batch512,

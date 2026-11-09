@@ -1,0 +1,24 @@
+{
+  "job_id": "21594351",
+  "git_head": "55987fffd28d28b013b9d5654bbe896da804237f",
+  "resume_checkpoint_step": 709,
+  "training_info": {
+    "consumed_samples": 22688,
+    "current_step": 709,
+    "current_epoch": 0,
+    "total_steps": 709,
+    "total_valid_tokens": 493490994.0,
+    "trainer_version": 709,
+    "sampler_name": "in_order",
+    "sampler_dispatch_index": 709,
+    "cur_adaptive_ppo_clip_k": null
+  },
+  "training_source_sha256": {
+    "nemo_rl/models/policy/workers/automodel_policy_worker.py": "7f59824258aafb13f5540810776dfa18c86a623856c9c89e4c6e26881259f74d",
+    "tests/functional/automodel_sc_full_batch_parity.py": "ccb26bda2ad5a1408cbbd125cf2aec5a119d232ecaa1777bebbce0071c0dc399"
+  },
+  "recipe_sha256": "1e2356c9715642967efc5d2352da815499aa3ad99f647a1dc321f92f4bbff685",
+  "model_config_sha256": "1b28f3d2c3100f6c594754b81107428bd7b822a7f48272ca681dae9d2ec38330",
+  "only_target_and_display_name_changed": true,
+  "fixed_input_streaming_parity": "NOT ASSESSED; original Qwen BF16 gate remains FAILED"
+}
