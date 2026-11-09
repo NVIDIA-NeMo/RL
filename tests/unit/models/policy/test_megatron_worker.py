@@ -3496,6 +3496,7 @@ def test_worker_initialization_preserves_only_restored_rng(
         setup_model_and_optimizer=MagicMock(return_value=components),
         setup_reference_model_state=MagicMock(side_effect=reference),
         finalize_megatron_setup=MagicMock(side_effect=finalize),
+        compile_cache=SimpleNamespace(seed=MagicMock()),
     )
     exec(
         compile(
@@ -3536,6 +3537,7 @@ def test_worker_initialization_preserves_only_restored_rng(
         init_reference_model
     )
     namespace["finalize_megatron_setup"].assert_called_once()
+    namespace["compile_cache"].seed.assert_called_once_with("megatron")
 
 
 @pytest.mark.parametrize("update_successful", [False, True])
