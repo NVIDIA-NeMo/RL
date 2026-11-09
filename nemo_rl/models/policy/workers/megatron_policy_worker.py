@@ -879,8 +879,7 @@ class MegatronPolicyWorkerImpl(
         del num_gpus_per_node  # not needed; one GPU per worker
         resources: dict[str, Any] = {"num_gpus": num_gpus}
         env_vars: dict[str, str] = {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
-        # The trainer's own JIT cache dirs (NRL_MEGATRON_<VAR>).
-        env_vars.update(compile_cache.env_overrides("MEGATRON"))
+        env_vars.update(compile_cache.env_overrides("megatron"))
         init_kwargs: dict[str, Any] = {}
         return resources, env_vars, init_kwargs, {}
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,51 +13,122 @@
 # limitations under the License.
 """Persistent JIT compile caches for NeMo RL's vLLM and Megatron workers (opt-in).
 
-Each worker type keeps its caches in ``${NRL_COMPILE_CACHE_ROOT}/<type>`` on a
-shared filesystem; a node uses a local copy, ``${NRL_LOCAL_COMPILE_CACHE}/<type>``,
-made once per node by ``cache_sync.sh seed-once`` (``NRL_CACHE_SYNC``). A launcher
-can start that copy in its node setup, in the background; ``seed()`` then just
-waits for it. ``NRL_<PREFIX>_<VAR>`` points one worker type's compilers at its
-copy (e.g. ``NRL_VLLM_TRITON_CACHE_DIR``). Writing new entries back is the
-launcher's job (``cache_sync.sh sidecar-types``).
+Set ``NRL_COMPILE_CACHE_SHARED_DIR`` (kept between jobs, on a shared filesystem)
+and ``NRL_COMPILE_CACHE_LOCAL_DIR`` (node-local). Each cache type (``vllm``,
+``megatron``) lives in ``<shared>/<type>``, or in ``NRL_COMPILE_CACHE_<TYPE>_DIR``
+if set; a node copies it once to ``<local>/<type>`` (``cache_sync.sh seed-type``)
+and points that type's compilers there. Writing new entries back is the
+launcher's job (``cache_sync.sh sidecar-types``). See
+docs/guides/persistent-jit-caches.md.
 """
 
 import os
+import shutil
 import subprocess
+import sys
+from pathlib import Path
 
-CACHE_VARS = (
-    "TORCHINDUCTOR_CACHE_DIR",
-    "TRITON_CACHE_DIR",
-    "FLASHINFER_WORKSPACE_BASE",
-    "CUDA_CACHE_PATH",
-    "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR",
-    "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED",
-)
-_SEED_VARS = ("NRL_CACHE_SYNC", "NRL_COMPILE_CACHE_ROOT", "NRL_LOCAL_COMPILE_CACHE")
+SHARED_VAR = "NRL_COMPILE_CACHE_SHARED_DIR"
+LOCAL_VAR = "NRL_COMPILE_CACHE_LOCAL_DIR"
+SCRIPT_VAR = "NRL_COMPILE_CACHE_SYNC_SCRIPT"
+# Compiler cache variables and their folder under <local>/<type>.
+COMPILER_DIRS = {
+    "TORCHINDUCTOR_CACHE_DIR": "inductor",
+    "TRITON_CACHE_DIR": "triton",
+    "FLASHINFER_WORKSPACE_BASE": "flashinfer",
+    "CUDA_CACHE_PATH": "cuda",
+    "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": "fa4_cute",
+}
 
 
-def env_overrides(prefix: str) -> dict[str, str]:
-    """Map the set ``NRL_<prefix>_<VAR>`` variables to ``<VAR>``."""
-    return {
-        var: os.environ[f"NRL_{prefix}_{var}"]
-        for var in CACHE_VARS
-        if os.environ.get(f"NRL_{prefix}_{var}")
-    }
+def local_dir() -> str | None:
+    """The node-local cache root, or None if persistent caches are off."""
+    shared, local = os.environ.get(SHARED_VAR), os.environ.get(LOCAL_VAR)
+    if bool(shared) != bool(local):
+        raise ValueError(
+            f"Persistent compile caches need both {SHARED_VAR} and {LOCAL_VAR}"
+        )
+    return local or None
+
+
+def script() -> str:
+    """The cache_sync.sh to run: the one next to this module unless overridden."""
+    path = os.environ.get(SCRIPT_VAR) or str(Path(__file__).with_name("cache_sync.sh"))
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Persistent compile cache script not found: {path}")
+    return path
+
+
+def env_overrides(cache_type: str) -> dict[str, str]:
+    """Point the compilers at ``<local>/<cache_type>``; {} if persistent caches are off."""
+    local = local_dir()
+    if local is None:
+        return {}
+    env = {var: f"{local}/{cache_type}/{sub}" for var, sub in COMPILER_DIRS.items()}
+    env["FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED"] = "1"
+    return env
 
 
 def seed(cache_type: str, background: bool = False) -> None:
-    """Copy ``cache_type``'s persistent cache onto this node once (no-op if unset).
+    """Copy ``cache_type``'s persistent cache onto this node once (no-op if off).
 
-    Blocking, it also waits for a copy another process on this node started.
+    Blocking, it also waits for a copy another process on this node started. A
+    failed copy only warns (in cache_sync.sh); a missing script or variable raises.
     """
-    values = [os.environ.get(var) for var in _SEED_VARS]
-    if not any(values):
+    if local_dir() is None:
         return
-    if not all(values):
-        raise ValueError(f"Persistent compile caches need all of {_SEED_VARS}")
-    script, root, local = values
-    cmd = ["bash", script, "seed-once", f"{root}/{cache_type}", f"{local}/{cache_type}"]
+    cmd = ["bash", script(), "seed-type", cache_type]
     if background:
         subprocess.Popen(cmd, start_new_session=True)
     else:
         subprocess.run(cmd, check=True)
+
+
+def vllm_engine_dir(seed: int) -> str | None:
+    """This engine's own VLLM_CACHE_ROOT under the local root, or None if off.
+
+    Engines on one node must not share a folder (vLLM writes its cache index
+    without locking), so each gets its own, filled from ``<local>/vllm/vllm``.
+    """
+    local = local_dir()
+    return None if local is None else f"{local}/vllm_engines/{seed}"
+
+
+def _prepare_vllm_engine_on_this_node(engine_dir: str) -> None:
+    seed("vllm")
+    shared = Path(os.environ[LOCAL_VAR]) / "vllm" / "vllm"
+    if shared.is_dir() and not os.path.exists(engine_dir):
+        tmp = f"{engine_dir}.tmp{os.getpid()}"
+        shutil.copytree(shared, tmp, symlinks=True)  # copy2 keeps mtimes
+        os.rename(tmp, engine_dir)
+    os.makedirs(engine_dir, exist_ok=True)
+
+
+def prepare_vllm_engine(bundle_indices: list[int] | None) -> None:
+    """Before an engine compiles: seed every node it runs on and fill its folder.
+
+    Runs one task per node of the engine's placement-group bundles (the vLLM
+    process's own node included) and waits for all of them.
+    """
+    engine_dir = os.environ.get("VLLM_CACHE_ROOT")
+    if local_dir() is None or not engine_dir:
+        return
+    import ray
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    node_ids = {ray.get_runtime_context().get_node_id()}
+    pg = ray.util.get_current_placement_group()
+    if pg is not None and bundle_indices:
+        bundle_nodes = ray.util.placement_group_table(pg)["bundles_to_node_id"]
+        node_ids.update(bundle_nodes[i] for i in bundle_indices)
+    task = ray.remote(_prepare_vllm_engine_on_this_node)
+    ray.get(
+        [
+            task.options(
+                num_cpus=0,
+                scheduling_strategy=NodeAffinitySchedulingStrategy(node_id, soft=False),
+                runtime_env={"py_executable": sys.executable},
+            ).remote(engine_dir)
+            for node_id in sorted(node_ids)
+        ]
+    )
