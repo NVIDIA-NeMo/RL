@@ -27,7 +27,6 @@ module tree, inspect consumer configuration, and exercise captured raw responses
 
 import asyncio
 import sys
-import threading
 import types
 from collections.abc import AsyncIterator
 from copy import deepcopy
@@ -40,6 +39,7 @@ import pytest
 import torch
 
 from nemo_rl.data.captured_media import capture_processed_media
+from nemo_rl.models.generation.prefix_recovery import NoPrefixRecovery
 from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
@@ -206,6 +206,19 @@ def _install_fake_vllm(monkeypatch):
         built.clear()
 
 
+class _AdmittedRequests:
+    """The capture registry's membership test, over requests admitted by ID."""
+
+    def __init__(self, admitted: dict) -> None:
+        self._admitted = admitted
+
+    def __contains__(self, request) -> bool:
+        return id(request) in self._admitted
+
+    def get(self, request):
+        return self._admitted.get(id(request))
+
+
 def _build_server(monkeypatch, serving_chat_kwargs, *, capture_requests=(), app=None):
     """Run the real server setup and hand back the three consumer stubs."""
     _install_fake_vllm(monkeypatch)
@@ -224,7 +237,11 @@ def _build_server(monkeypatch, serving_chat_kwargs, *, capture_requests=(), app=
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
         served_model_name="served-model", model="model-path"
     )
-    worker._capture_calls = {id(request): None for request in capture_requests}
+    worker._capture_registry = _AdmittedRequests(
+        {id(request): None for request in capture_requests}
+    )
+    # Its hooks do nothing, as a worker without generation-prefix cuts.
+    worker._prefix_recovery = NoPrefixRecovery()
     worker.routed_experts_dtype = torch.int16
 
     worker._setup_vllm_openai_api_server(app if app is not None else _FakeApp())
@@ -232,38 +249,17 @@ def _build_server(monkeypatch, serving_chat_kwargs, *, capture_requests=(), app=
     return _BUILT["renderer"], _BUILT["chat"], _BUILT["tokenize"]
 
 
-def _serving_chat_without_capture_state(monkeypatch: Any) -> tuple[Any, dict]:
-    """The real serving chat class, with capture bookkeeping reduced to stubs."""
+def _serving_chat_without_capture_state(monkeypatch: Any) -> Any:
+    """The real serving chat class, with no call admitted to capture."""
     _, chats, _ = _build_server(monkeypatch, {})
     serving = chats[0]
     serving.renderer = types.SimpleNamespace(tokenizer=None)
-    capture_calls: dict = {}
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "_capture_calls", capture_calls, raising=False
-    )
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl,
-        "_capture_registry_lock",
-        threading.Lock(),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl,
-        "_generation_prefix_cuts_enabled",
-        False,
-        raising=False,
-    )
-    # An admitted marker is a placeholder, not capture state to observe.
-    for method in ("_observe_request_capture", "_restore_response_prefix"):
-        monkeypatch.setattr(
-            VllmAsyncGenerationWorkerImpl, method, lambda *_args, **_kwargs: None
-        )
     monkeypatch.setattr(
         VllmAsyncGenerationWorkerImpl,
         "_return_routed_experts_enabled",
         lambda _self: False,
     )
-    return serving, capture_calls
+    return serving
 
 
 @pytest.mark.asyncio
@@ -302,23 +298,6 @@ async def test_captured_chat_logprobs_bypass(
     invalid_raw: bool,
 ) -> None:
     """Drive the real serving MRO and retain engine-native arrays unchanged."""
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl,
-        "_capture_registry_lock",
-        threading.Lock(),
-        raising=False,
-    )
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl,
-        "_generation_prefix_cuts_enabled",
-        False,
-        raising=False,
-    )
-    # The admitted marker below is a placeholder, not capture state to observe.
-    for method in ("_observe_request_capture", "_restore_response_prefix"):
-        monkeypatch.setattr(
-            VllmAsyncGenerationWorkerImpl, method, lambda *_args, **_kwargs: None
-        )
     monkeypatch.setattr(
         VllmAsyncGenerationWorkerImpl,
         "_return_routed_experts_enabled",
@@ -427,7 +406,7 @@ async def test_resumed_call_reports_usage_as_the_uninterrupted_call(monkeypatch)
     vLLM's parser sees the restored tokens before the tail, and the corrected
     usage reaches request_metadata, both bound by name.
     """
-    serving, _ = _serving_chat_without_capture_state(monkeypatch)
+    serving = _serving_chat_without_capture_state(monkeypatch)
     serving.return_tokens_as_token_ids = False
     request = types.SimpleNamespace(
         ng_capture=None,
@@ -930,8 +909,8 @@ def test_restored_call_reaches_the_engine_with_the_remaining_budget(
         lambda self, admission: list(conversation),
     )
     monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl,
-        "_resolve_usable_generation_cut",
+        NoPrefixRecovery,
+        "resolve_restore",
         lambda self, admission, prefix: (
             admission,
             SimpleNamespace(token_ids_delta=delta, token_mask_delta=mask),
@@ -1003,7 +982,7 @@ def test_restored_call_reaches_the_engine_with_the_remaining_budget(
 
 
 def test_setup_refuses_a_full_generator_without_the_restored_call_arguments():
-    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    from nemo_rl.models.generation.prefix_recovery.restore import (
         _full_generator_signature,
     )
 

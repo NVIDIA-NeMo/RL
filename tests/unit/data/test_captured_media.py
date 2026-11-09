@@ -830,7 +830,7 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(
     assert "media" not in response and MEDIA_SPANS_FIELD not in response
     assert "routed_experts" not in response["choices"][0]["message"]
     json.dumps(response)
-    assert worker._capture_calls == {}
+    assert len(worker._capture_registry) == 0
     [media] = staged_media(dp, "r0/c1")
     torch.testing.assert_close(media.imgs, torch.ones(1, 6, 3))
     if with_routed_experts:
@@ -1466,7 +1466,7 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     inference.assert_not_awaited()
     worker.token_capture.begin_call.assert_not_called()
     worker.token_capture.complete_call_from_response.assert_not_called()
-    assert worker._capture_calls == {}
+    assert len(worker._capture_registry) == 0
 
     # Exercise Gym's actual middleware, which wraps upstream 400s as 500s.
     upstream = ClientResponseError(

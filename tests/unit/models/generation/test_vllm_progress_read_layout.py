@@ -26,7 +26,7 @@ import inspect
 import pytest
 from packaging.version import Version
 
-from nemo_rl.models.generation.vllm.vllm_worker_async import (
+from nemo_rl.models.generation.vllm.progress_reader import (
     _PROGRESS_READ_VLLM_RELEASE,
 )
 
@@ -34,9 +34,9 @@ pytestmark = pytest.mark.vllm
 
 _RECHECK = """\
 Before moving _PROGRESS_READ_VLLM_RELEASE, re-read against the new vLLM:
-  - _AsyncLLMHTTPClient.enable_generation_progress_reads: the process_outputs
+  - VllmProgressReader.__init__ (vllm/progress_reader.py): the process_outputs
     lock wrap and the _finish_request retention hook;
-  - _AsyncLLMHTTPClient._read_one_request: request_states, external_req_ids,
+  - VllmProgressReader._read_one_request: request_states, external_req_ids,
     detokenizer.output_token_ids, logprobs_processor.logprobs;
   - vllm/utils.py _flat_logprob_arrays: FlatLogprobs' arrays;
   - _bad_words_can_straddle_a_cut: SamplingParams._bad_words_token_ids;
@@ -142,7 +142,7 @@ def test_prompt_truncation_happens_only_while_the_chat_is_tokenized():
 def test_full_generator_takes_the_arguments_a_restored_call_rewrites():
     from vllm.entrypoints.openai.chat_completion.serving import OpenAIServingChat
 
-    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    from nemo_rl.models.generation.prefix_recovery.restore import (
         _full_generator_signature,
     )
 

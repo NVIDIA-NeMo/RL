@@ -57,13 +57,13 @@ from nemo_rl.models.generation.vllm.config import (
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
+from nemo_rl.models.generation.vllm.generation_cut_route import GENERATION_CUT_ROUTE
 from nemo_rl.models.generation.vllm.vllm_worker import (
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
-    _GENERATION_CUT_ROUTE,
     VllmAsyncGenerationWorkerImpl,
     _AsyncLLMHTTPClient,
 )
@@ -1283,10 +1283,14 @@ def _setup_fake_vllm_app(
     }
     worker.llm = MagicMock(model_config="model-config", renderer="renderer")
     worker._http_engine_client = worker.llm
-    worker._capture_calls = {}
+    from nemo_rl.models.generation.prefix_recovery import (
+        CaptureRegistry,
+        NoPrefixRecovery,
+    )
+
+    worker._capture_registry = CaptureRegistry()
+    worker._prefix_recovery = NoPrefixRecovery()
     worker._capture_top_logprobs = 0
-    worker._capture_registry_lock = threading.Lock()
-    worker._generation_prefix_cuts_enabled = False
     worker.token_capture = None
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
@@ -1405,12 +1409,10 @@ def test_chat_request_rejects_unreplayed_sampling_params(
 
 def _track_request_capture(worker, request):
     """Register in-flight capture state for request; return the sink and its call."""
-    from nemo_rl.models.generation.generation_cut_capture import _RequestCaptureState
+    from nemo_rl.models.generation.prefix_recovery.state import _RequestCaptureState
 
     call = types.SimpleNamespace(model_call_id="call")
-    worker._capture_calls[id(request)] = _RequestCaptureState(call, [])
-    worker._capture_calls_by_model_call_id = {}
-    worker._completed_capture_calls = {}
+    worker._capture_registry.add(request, _RequestCaptureState(call, []))
     worker.token_capture = MagicMock()
     return worker.token_capture, call
 
@@ -1519,9 +1521,7 @@ def test_clamp_max_tokens_sets_the_limit_the_request_uses(
 def test_captured_requests_keep_vllm_output_kind(monkeypatch, stream, expected_kind):
     """Cuts read progress from vLLM's request state, not from its outputs."""
     worker, _, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
-    worker._generation_prefix_cuts_enabled = True
-    worker._record_request_effective_output_limit = MagicMock()
-    worker._record_request_cut_constraints = MagicMock()
+    worker._prefix_recovery = MagicMock()
     monkeypatch.setattr(
         sys.modules[
             "vllm.entrypoints.openai.chat_completion.protocol"
@@ -1553,21 +1553,37 @@ def _generation_cut_route(
     Returns:
         The route handler and the ``(inventory, deadline)`` of each cut it ran.
     """
+    from nemo_rl.models.generation.prefix_recovery import (
+        NoPrefixRecovery,
+        PrefixRecovery,
+        PrefixRecoveryParts,
+    )
+
     worker, _, app = _setup_fake_vllm_app(monkeypatch)
-    worker._generation_prefix_cuts_enabled = enabled
-    worker._generation_cut_control_token = token
-    worker._generation_cut_control_timeout_s = timeout_s
     cuts = []
 
-    def checkpoint_generation_cut(inventory, *, deadline):
+    def checkpoint_cut(inventory, *, deadline):
         cuts.append((inventory, deadline))
         return types.SimpleNamespace(model_dump=lambda mode: {"acked": inventory})
 
-    async def run_generation_cut_control(operation, *args):
-        return operation(*args)
-
-    worker._checkpoint_generation_cut = checkpoint_generation_cut
-    worker._run_generation_cut_control = run_generation_cut_control
+    if enabled:
+        recovery = PrefixRecovery(
+            PrefixRecoveryParts(
+                capture=None,
+                sink=None,
+                staging_source=None,
+                registry=None,
+                tokenizer=None,
+                weight_version=lambda: 0,
+                control_token=token,
+                control_timeout_s=timeout_s,
+                progress_reader=None,
+            )
+        )
+        recovery.checkpoint_cut = checkpoint_cut
+        worker._prefix_recovery = recovery
+    else:
+        worker._prefix_recovery = NoPrefixRecovery()
     # nemo_gym is an optional extra; the route only uses it to type the inventory.
     generation_cut = types.ModuleType("nemo_gym._checkpoint.generation_cut")
     generation_cut.GenerationCutInventory = types.SimpleNamespace(
@@ -1576,7 +1592,7 @@ def _generation_cut_route(
     monkeypatch.setitem(
         sys.modules, "nemo_gym._checkpoint.generation_cut", generation_cut
     )
-    return _route_handler(app, _GENERATION_CUT_ROUTE), cuts
+    return _route_handler(app, GENERATION_CUT_ROUTE), cuts
 
 
 @pytest.mark.asyncio
@@ -1695,7 +1711,7 @@ async def test_context_refusal_acknowledges_unstaged_capture(
     response = await chat_handler(request, MagicMock())
     assert response.status_code == 400
     assert response.headers[CAPTURE_REFUSAL_HEADER] == "refused"
-    assert worker._capture_calls == {}
+    assert len(worker._capture_registry) == 0
     sink.stage.assert_not_called()
 
 
@@ -1749,7 +1765,7 @@ async def test_capture_abort_waits_for_the_call_lifecycle_off_the_event_loop(
     serving_chat.create_chat_completion = create_chat_completion
     request = _fake_chat_request()
     token_capture, call = _track_request_capture(worker, request)
-    lifecycle_lock = worker._capture_calls[id(request)]._lifecycle_lock
+    lifecycle_lock = worker._capture_registry.get(request)._lifecycle_lock
     # Stands in for a generation cut or terminal write staging this call to TQ.
     lifecycle_lock.acquire()
     # Bounds the stall if the abort ever blocks the loop again.
@@ -1848,7 +1864,7 @@ async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch, logpr
         token_capture.fail_call.assert_called_once_with(
             call, reason="client_disconnect"
         )
-        assert id(request) not in worker._capture_calls
+        assert request not in worker._capture_registry
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
@@ -1900,7 +1916,7 @@ def test_chat_disconnect_releases_capture_queued_for_finalization(
             token_capture.fail_call.assert_called_once_with(
                 call, reason="client_disconnect"
             )
-            assert id(request) not in worker._capture_calls
+            assert request not in worker._capture_registry
         finally:
             if task is not None and not task.done():
                 task.cancel()
@@ -1981,7 +1997,7 @@ async def test_pinned_with_cancellation_aborts_chat_completion_on_http_disconnec
     await asyncio.wait_for(released.wait(), 1)
     assert cancelled.is_set()
     token_capture.fail_call.assert_called_once_with(call, reason="client_disconnect")
-    assert id(request) not in worker._capture_calls
+    assert request not in worker._capture_registry
 
 
 def test_nano_v3_reasoning_parser_swaps_reasoning_when_thinking_disabled(

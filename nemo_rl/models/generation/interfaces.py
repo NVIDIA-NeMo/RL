@@ -848,7 +848,7 @@ class GenerationInterface(ABC):
         Returns:
             Counts since the workers started: ``restored_calls`` and their
             ``restored_prefix_tokens``, and the progress-read counts named by
-            ``GenerationCutCaptureMixin.get_generation_prefix_counts``.
+            ``PrefixRecovery.counts``.
         """
         raise NotImplementedError(
             "generation-prefix checkpointing is not supported for "

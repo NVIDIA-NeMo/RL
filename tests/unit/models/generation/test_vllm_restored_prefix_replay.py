@@ -28,7 +28,7 @@ detokenizer = pytest.importorskip("vllm.v1.engine.detokenizer")
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers  # noqa: E402
 from transformers import PreTrainedTokenizerFast  # noqa: E402
 
-from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
+from nemo_rl.models.generation.prefix_recovery.restore import (  # noqa: E402
     _detokenize_restored_prefix,
     _RestoredPrefixTerminal,
 )
