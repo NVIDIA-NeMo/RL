@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from nemo_rl.distributed.virtual_cluster import _get_node_ip_local
+from nemo_rl.models.generation.gym_call import GymCallExtras
 from tests.functional._single_controller_hook_utils import append_event
 
 _SKIPPED_REQUEST_HEADERS = frozenset({"host", "content-length", "connection"})
@@ -84,6 +85,12 @@ def _tool_results(body: dict[str, Any]) -> dict[str, Any]:
 
 def _rollout_id(body: dict[str, Any]) -> Optional[str]:
     capture = body.get("ng_capture")
+    if capture is None:
+        # Gym's Dynamo dialect carries it in the nemo_rl:gym: annotation.
+        extras = GymCallExtras.from_annotations(
+            (body.get("nvext") or {}).get("annotations")
+        )
+        capture = extras.ng_capture if extras is not None else None
     if isinstance(capture, dict):
         # Gym names it capture_key; Gyms before NVIDIA-NeMo/Gym#4128 sent rollout_id.
         rollout_id = capture.get("capture_key", capture.get("rollout_id"))
