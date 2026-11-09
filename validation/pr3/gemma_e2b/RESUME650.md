@@ -21,7 +21,13 @@ matching the final native receipt; a finished segment is not completion of650.
 The supervisor then acquired21568255 on pool0-00671, starting03:23:49PSTNov9.
 Its container is ready and direct attachment has started. Checkpoint340 preflight
 passed with unchanged model/config/numerical source and the same W&B identity;
-first recovered341/W&B continuity remain to be verified.
+first recovered341 committed with trainer_v341,lag0,two dispatches,512 valid
+samples,nonzero advantages/gradient and LR2e-6. The same W&B run resumed and its
+341 selected metrics matched the native receipt exactly. See
+results/resume650-first-recovery-21568255.json. The recovery log contained64
+unfinished rollout groups next to0 canonical groups and redispatched unfinished
+work before reading new prompts. This observation does not independently prove
+all-group recovery uniqueness or exercise completed canonical replay groups.
 Read the live state.json/native log before acting; this snapshot
 does not establish completion of650.
 

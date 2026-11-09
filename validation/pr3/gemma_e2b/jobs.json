@@ -1,5 +1,5 @@
 {
-  "observed_at": "2026-11-09T03:27:11.405564-08:00",
+  "observed_at": "2026-11-09T03:33:56.037588-08:00",
   "state": "RUNNING",
   "target_steps": 650,
   "job_id": 21568255,
@@ -23,7 +23,7 @@
     "SC full-batch LA0": "96779513"
   },
   "baseline_config_checks_passed": true,
-  "observed_committed_steps": 340,
+  "observed_committed_steps": 341,
   "gemma_fixed_input_streaming_parity": "NOT ASSESSED",
   "original_qwen_bf16_1pct_gate": "FAILED (unchanged)",
   "source_worker_sha256": "7f59824258aafb13f5540810776dfa18c86a623856c9c89e4c6e26881259f74d",
@@ -31,20 +31,21 @@
   "monitor_pid": 1802685,
   "launcher_pid": 1864121,
   "latest_receipt": {
-    "step": 340,
-    "version": 340,
+    "step": 341,
+    "version": 341,
     "lag": "0",
     "metrics": {
-      "gen_kl_error": "0.00040019337881086063",
-      "policy_kl_error": "0.0007062922380355451",
-      "grad_norm": "0.5857862234115601",
-      "lr": "2.0000000000000003e-06",
-      "policy_train_dispatches": "2",
-      "reward": "0.63671875"
+      "gen_kl_error": 0.0004875395879142832,
+      "policy_kl_error": 0.0005261197984773021,
+      "grad_norm": 0.3707341253757477,
+      "lr": 2.0000000000000003e-06,
+      "weight_version_lag": 0,
+      "policy_train_dispatches": 2,
+      "reward": 0.345703125
     }
   },
-  "wandb_state": "finished",
-  "wandb_committed_step": 340,
+  "wandb_state": "running",
+  "wandb_committed_step": 341,
   "monitor_child_pid": 1802724,
   "durable_checkpoint_step": 340,
   "early_summary": "validation/pr3/gemma_e2b/results/early-10-summary.json",
@@ -86,11 +87,13 @@
       "index": 2,
       "resume_from": 340,
       "phase": "RUNNING_DRIVER",
-      "launcher_pid": 1864121
+      "launcher_pid": 1864121,
+      "first_resumed_step": 341
     }
   ],
-  "wandb_transition_note": "Previous segment finished340; same-run stage2 SDK resume/first341 pending.",
+  "wandb_transition_note": "Same run resumed340->341; selected native/W&B metrics exact.",
   "active_stage_resume_from": 340,
-  "active_stage_first_recovered_step": null,
-  "active_stage_preflight": "validation/pr3/gemma_e2b/results/resume650-provenance-21568255.json"
+  "active_stage_first_recovered_step": 341,
+  "active_stage_preflight": "validation/pr3/gemma_e2b/results/resume650-provenance-21568255.json",
+  "active_stage_first_recovery_proof": "validation/pr3/gemma_e2b/results/resume650-first-recovery-21568255.json"
 }

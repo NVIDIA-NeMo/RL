@@ -1,0 +1,40 @@
+{
+  "observed_at": "2026-11-09T03:33:02.273856-08:00",
+  "job_id": "21568255",
+  "resume_from": 340,
+  "first_resumed_step": 341,
+  "trainer_version": 341,
+  "lag": 0,
+  "wandb_state": "running",
+  "wandb_step": 341,
+  "native_wandb_selected_metrics_exact": true,
+  "selected_metrics": {
+    "gen_kl_error": 0.0004875395879142832,
+    "policy_kl_error": 0.0005261197984773021,
+    "grad_norm": 0.3707341253757477,
+    "lr": 2.0000000000000003e-06,
+    "weight_version_lag": 0,
+    "policy_train_dispatches": 2,
+    "reward": 0.345703125
+  },
+  "first_resumed_receipt": {
+    "gen_kl_error": 0.0004875395879142832,
+    "policy_kl_error": 0.0005261197984773021,
+    "grad_norm": 0.3707341253757477,
+    "lr": 2.0000000000000003e-06,
+    "weight_version_lag": 0,
+    "policy_train_dispatches": 2,
+    "reward": 0.345703125,
+    "advantages/max": 3.7499847412109375,
+    "advantages/min": -3.7499847412109375,
+    "num_valid_samples": 512.0
+  },
+  "recovery_log": {
+    "unfinished_rollout_groups": 64,
+    "canonical_groups": 0,
+    "redispatch_before_new_dataloader_work": true
+  },
+  "preflight": "results/resume650-provenance-21568255.json",
+  "saved_checkpoint_audit": "results/checkpoint340-state.json",
+  "scope": "First-step receipt and selected metrics continuity; outstanding groups observed, not an independent all-group recovery uniqueness oracle or raw optimizer parity."
+}

@@ -20,8 +20,12 @@ optimizer counters340, scheduler last_epoch340, LR2e-6 and10880 consumed prompts
 the optimizer metadata hash matches. W&B matched the native final340 receipt.
 Next interactive allocation21568255 is RUNNING on pool0-00671 from03:23:49PSTNov9.
 Direct attachment and checkpoint340 preflight passed with unchanged configuration
-and numerical source; first recovered341/W&B continuity are pending in this
-snapshot. The supervisor acquired it after the previous node had been released.
+and numerical source. First recovered341 committed with trainer_v341,lag0,two
+dispatches,512valid,nonzero advantages/gradient and LR2e-6; selected W&B metrics
+matched native341 exactly. See [second recovery evidence](results/resume650-first-recovery-21568255.json).
+The log restored64 unfinished rollout groups next to0 canonical groups; their
+redispatch was observed, but an independent all-group uniqueness audit was not
+performed. The supervisor acquired this node after the previous node was released.
 See [RESUME650.md](RESUME650.md) and live
 slurm/resume650/state.json;650 has not completed.
 
