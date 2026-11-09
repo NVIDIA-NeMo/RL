@@ -114,6 +114,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
 from nemo_rl.data.utils import load_dataloader_state
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
+from nemo_rl.data_plane.checkpoint import CheckpointCapture
 from nemo_rl.data_plane.schema import GROUP_ID_TAG, ROUTE_PLAN_TAG
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
 from nemo_rl.environments.checkpointing.interfaces import NoEnvironmentCheckpoint
@@ -482,6 +483,9 @@ class _RestoredGroupsSampler(_FakeSampler):
 
 
 class _FakeDPClient:
+    def capture_checkpoint(self, checkpoint_dir, *, metadata=None):
+        return None
+
     def __init__(
         self,
         *,
@@ -1933,6 +1937,75 @@ class TestFinalizerStateRelease:
 
 
 class TestPeriodicRolloutCheckpoint:
+    @pytest.mark.parametrize("failure", [None, "persist", "resume", "publish"])
+    def test_deferred_tq_persists_after_resume_and_releases_on_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events = []
+        live_cursor = {"cursor": {"offset": 1}}
+        actor._dataloader.state_dict = lambda: live_cursor
+        environment_snapshot = _FakeEnvironmentSnapshot()
+
+        @contextlib.asynccontextmanager
+        async def snapshot(_path):
+            events.append("pause")
+            yield environment_snapshot
+            events.append("resume")
+            live_cursor["cursor"]["offset"] = 2
+            if failure == "resume":
+                raise OSError("resume failed")
+
+        class Capture(CheckpointCapture):
+            def persist(self) -> None:
+                assert events == ["pause", "capture", "resume"]
+                with pytest.raises(RuntimeError):
+                    environment_snapshot.checked_cuts[0].require_live()
+                events.append("persist")
+                if failure == "persist":
+                    raise OSError("persist failed")
+
+            def release(self) -> None:
+                events.append("release")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            assert events == ["pause"]
+            environment_snapshot.checked_cuts[0].require_live()
+            events.append("capture")
+            return Capture()
+
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        attach_rollout_checkpointing(actor)
+        if failure == "publish":
+
+            async def fail_publish(*args, **kwargs):
+                raise OSError("publish failed")
+
+            monkeypatch.setattr(actor._rollout_snapshots, "_publish", fail_publish)
+        try:
+            if failure is None:
+                assert asyncio.run(
+                    actor._rollout_snapshots.save_snapshot(force=True)
+                ).saved
+            else:
+                with pytest.raises(OSError, match=f"{failure} failed"):
+                    asyncio.run(actor._rollout_snapshots.save_snapshot(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+        assert events.count("release") == 1
+        assert events[-1] == "release"
+        assert not actor._dp_client.save_calls
+        snapshots = tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
+        assert not list(snapshots.glob("tmp_snapshot_*"))
+        published = list(snapshots.glob("snapshot_*"))
+        assert len(published) == int(failure is None)
+        if published:
+            saved_cursor = torch.load(
+                published[0] / "train_dataloader.pt", weights_only=True
+            )
+            assert saved_cursor["cursor"]["offset"] == 1
+
     @pytest.mark.parametrize("anchor_step", [0, 1])
     @pytest.mark.parametrize("claimed", [False, True])
     def test_forest_snapshot_preserves_buffered_and_training_owned_rows(
