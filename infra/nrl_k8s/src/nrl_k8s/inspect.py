@@ -69,16 +69,29 @@ def collect_status(loaded: LoadedConfig) -> list[ClusterStatus]:
 
 
 def _status_for(role: str, cluster: ClusterSpec, infra: InfraConfig) -> ClusterStatus:
+    # In `--rayjob` mode KubeRay creates the RayCluster with a random suffix
+    # (`<cluster.name>-<5 chars>`) and writes the suffixed name to the
+    # owning RayJob's `.status.rayClusterName`. A bare lookup on cluster.name
+    # 404s, so fall through to the RayJob to find the actual cluster.
     obj = k8s.get_raycluster(cluster.name, infra.namespace)
+    resolved_name = cluster.name
+    if obj is None:
+        rayjob = k8s.get_rayjob(cluster.name, infra.namespace)
+        suffixed = (rayjob or {}).get("status", {}).get("rayClusterName")
+        if suffixed:
+            obj = k8s.get_raycluster(suffixed, infra.namespace)
+            if obj is not None:
+                resolved_name = suffixed
+
     state = (obj or {}).get("status", {}).get("state", "—") if obj else "(not found)"
 
-    pods = list_cluster_pods(cluster.name, infra.namespace)
+    pods = list_cluster_pods(resolved_name, infra.namespace)
 
     daemon_id: str | None = None
     daemon_status: str | None = None
     if obj is not None and state == "ready" and cluster.daemon is not None:
         daemon_id, daemon_status = _latest_daemon_job(
-            cluster.name, infra.namespace, cluster.daemon.submissionId
+            resolved_name, infra.namespace, cluster.daemon.submissionId
         )
 
     return ClusterStatus(
