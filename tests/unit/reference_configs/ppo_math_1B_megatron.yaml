@@ -87,7 +87,7 @@ loss_fn:
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false
-  seq_logprob_error_in_loss: false  # Only supported by non-streaming Megatron GRPO.
+  seq_logprob_error_in_loss: false  # Only supported by Megatron GRPO trainers.
   use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)
   use_cispo: false  # CISPO (https://arxiv.org/abs/2506.13585): clipped IS-weight policy optimization
   # VAPO: NLL loss on correct samples. 0 = disabled.
@@ -199,6 +199,7 @@ policy:
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
+    reuse_logits_storage: false
     fp32_lm_head: false
     moe_per_layer_logging: False
 
@@ -270,7 +271,13 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
-    top_logprobs: 0  # Sampler candidates per token for score centering; 0 disables collection.
+    top_logprobs: 0  # Sampler candidates per token for score centering or replay; 0 disables collection.
+    # Sampler replay: with top-k/top-p, score the trainer's log-probs over the support
+    # the sampler drew from (the finite entries of its captured head) instead of
+    # recomputing the filters. Required by loss_fn.score_centering under top-k/top-p,
+    # and usable without it; needs top_logprobs >= top_k. See docs/guides/sampler-replay.md.
+    sampler_replay:
+      enabled: false
     val_temperature: ${.temperature}
     val_top_p: ${.top_p}
     val_top_k: ${.top_k}

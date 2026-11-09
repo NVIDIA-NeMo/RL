@@ -91,6 +91,7 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
+    sampler_replay_enabled,
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.sglang.config import SGLangConfig
@@ -371,9 +372,9 @@ def setup(
     generation_config = master_config.policy["generation"]
     env_configs = master_config.env
     loss_config: ClippedPGLossConfig = master_config.loss_fn
-    if loss_config.score_centering:
+    if loss_config.score_centering or sampler_replay_enabled(generation_config):
         raise ValueError(
-            "Score centering requires SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy PPO trainer does not capture sampler tensors."
+            "Score centering and policy.generation.sampler_replay.enabled require SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy PPO trainer does not capture sampler tensors."
         )
     ppo_config = master_config.ppo
     data_config = master_config.data
@@ -383,7 +384,7 @@ def setup(
     if loss_config.seq_logprob_error_in_loss:
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss is not supported by PPO. "
-            "Use the non-streaming GRPO trainer."
+            "Use a GRPO trainer (legacy or SingleController)."
         )
 
     assert generation_config is not None, (
@@ -533,6 +534,10 @@ def setup(
             == policy_config["train_global_batch_size"]
         ), (
             "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
+        )
+        # Later epochs on the same batch would train without any trust region.
+        assert ppo_config.ppo_epochs == 1, (
+            f"force_on_policy_ratio requires ppo.ppo_epochs=1, got {ppo_config.ppo_epochs}"
         )
         os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
         print("  ✓ force_on_policy_ratio enabled")
