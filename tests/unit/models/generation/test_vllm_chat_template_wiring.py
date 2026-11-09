@@ -37,8 +37,10 @@ from unittest.mock import MagicMock
 
 import pytest
 import torch
+from pydantic import BaseModel, ConfigDict
 
 from nemo_rl.data.captured_media import capture_processed_media
+from nemo_rl.models.generation import vllm as vllm_generation_pkg
 from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
@@ -49,6 +51,7 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 # A class attribute would be shadowed by the subclass and the construction would
 # be recorded somewhere the assertions never look.
 _BUILT: dict[str, list] = {"renderer": [], "chat": [], "tokenize": []}
+_CHAT_SERVER = "nemo_rl.models.generation.vllm.chat_server"
 
 
 def _recorder(slot: str):
@@ -87,6 +90,12 @@ class _FakeApp:
 
 def _install_fake_vllm(monkeypatch):
     """Stub exactly the vLLM surface _setup_vllm_openai_api_server imports."""
+    # chat_server imports vLLM at module level: drop the cached copy (and the
+    # package attribute an earlier import set) so the server is built against
+    # these fakes; monkeypatch restores both afterwards.
+    monkeypatch.setitem(sys.modules, _CHAT_SERVER, None)
+    del sys.modules[_CHAT_SERVER]
+    monkeypatch.delattr(vllm_generation_pkg, "chat_server", raising=False)
     for name in (
         "vllm",
         "vllm.entrypoints",
@@ -120,7 +129,12 @@ def _install_fake_vllm(monkeypatch):
     )
     module(
         "vllm.entrypoints.openai.chat_completion.protocol",
-        ChatCompletionRequest=placeholder("ChatCompletionRequest"),
+        # A pydantic model that keeps unknown fields, as vLLM's request models are.
+        ChatCompletionRequest=type(
+            "ChatCompletionRequest",
+            (BaseModel,),
+            {"model_config": ConfigDict(extra="allow")},
+        ),
         ChatCompletionResponse=placeholder("ChatCompletionResponse"),
     )
     module(
@@ -168,6 +182,10 @@ def _install_fake_vllm(monkeypatch):
             super().__init__(message)
 
     module("vllm.exceptions", VLLMValidationError=ValidationError)
+    module(
+        "vllm.sampling_params",
+        StructuredOutputsParams=placeholder("StructuredOutputsParams"),
+    )
     module(
         "vllm.reasoning.abs_reasoning_parsers",
         ReasoningParserManager=type(
@@ -677,19 +695,21 @@ def test_prefix_overflow_precedes_media_validation(
     monkeypatch.setattr(
         VllmAsyncGenerationWorkerImpl, "_capture_request_media", capture
     )
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async.remap_multimodal_placeholders",
-        remap,
-    )
     renderers, _, _ = _build_server(monkeypatch, {}, app=app)
+    # The server module was just imported against the fakes; patch that copy.
+    monkeypatch.setattr(
+        sys.modules[_CHAT_SERVER], "remap_multimodal_placeholders", remap
+    )
     renderer = renderers[0]
     renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
     renderer.model_config = SimpleNamespace(max_model_len=8 if overflows else 16)
     endpoint = next(fn for path, fn in app.routes if path == "/v1/chat/completions")
-    request = endpoint.__annotations__["request"]()
-    request.required_prefix_token_ids = [10, 77, 31, 2]
-    request.max_tokens, request.max_completion_tokens = 4, None
-    request.model_copy = lambda **kwargs: request
+    request = endpoint.__annotations__["request"].model_construct(
+        messages=[],
+        required_prefix_token_ids=[10, 77, 31, 2],
+        max_tokens=4,
+        max_completion_tokens=None,
+    )
     message = "maximum context length" if overflows else "retiled media"
 
     with pytest.raises(ValueError, match=message):

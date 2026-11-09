@@ -922,27 +922,21 @@ def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() ->
 @pytest.mark.parametrize(
     ("vllm_model", "expected"),
     [
-        ({}, {"enable_thinking": True, "truncate_history_thinking": False}),
+        # NeMo RL's chat engine renders with the native default template kwargs
+        # beneath these, as the native server does; Gym sends them as written.
         (
             {"chat_template_kwargs": {"enable_thinking": False}},
-            {"enable_thinking": False, "truncate_history_thinking": False},
-        ),
-        (
-            {"extra_body": {"chat_template_kwargs": {"force_nonempty_content": True}}},
-            {
-                "enable_thinking": True,
-                "truncate_history_thinking": False,
-                "force_nonempty_content": True,
-            },
+            {"enable_thinking": False},
         ),
         # The frontend answers every request carrying bad_words with a 400.
-        ({"extra_body": {"bad_words": ["x"]}}, None),
+        ({"extra_body": {"bad_words": ["x"]}}, "bad_words"),
+        # The frontend accepts stop_token_ids but drops it before our chat engine.
+        ({"extra_body": {"stop_token_ids": [7]}}, "stop_token_ids"),
     ],
 )
-def test_gym_actor_config_dynamo_sends_the_native_default_template_kwargs(
-    vllm_model: dict, expected: dict | None
+def test_gym_actor_config_dynamo_turns_on_gyms_dynamo_dialect(
+    vllm_model: dict, expected: dict | str
 ) -> None:
-    """The native server's default template kwargs sit under the ones Gym sends."""
     from responses_api_models.vllm_model.app import VLLMModelConfig
 
     from nemo_rl.algorithms.grpo import MasterConfig
@@ -992,8 +986,8 @@ def test_gym_actor_config_dynamo_sends_the_native_default_template_kwargs(
             turn_checkpointing_enabled=False,
         )["initial_global_config_dict"]
 
-    if expected is None:
-        with pytest.raises(ValueError, match="bad_words"):
+    if isinstance(expected, str):
+        with pytest.raises(ValueError, match=expected):
             build()
         return
     gym_config = build()

@@ -1247,7 +1247,8 @@ def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
     """With Dynamo, each actor's composed config speaks Gym's Dynamo dialect.
 
     The dialect is not a policy_model overlay, which a sharded plan would reject
-    as unowned. A shard's own template kwargs still win over the native defaults.
+    as unowned. The frontend applies the native default template kwargs, so only
+    a shard's own kwargs reach Gym.
     """
     from nemo_rl.algorithms.grpo import MasterConfig
 
@@ -1288,14 +1289,18 @@ def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
             turn_checkpointing_enabled=False,
         )
 
-    thinking = [
+    template_kwargs = [
         cfg["initial_global_config_dict"]["policy_model"]["responses_api_models"][
             "vllm_model"
-        ]["chat_template_kwargs"]["enable_thinking"]
+        ].get("chat_template_kwargs")
         for cfg in cluster.actor_configs
     ]
     # judged, then the tools shard's two replicas with their own override.
-    assert thinking == [True, False, False]
+    assert template_kwargs == [
+        None,
+        {"enable_thinking": False},
+        {"enable_thinking": False},
+    ]
     for cfg in cluster.actor_configs:
         gym_config = cfg["initial_global_config_dict"]
         vllm_model = gym_config["policy_model"]["responses_api_models"]["vllm_model"]

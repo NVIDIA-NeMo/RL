@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import pickle
 import signal
 import subprocess
 import sys
@@ -20,8 +21,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from nemo_rl.models.generation.dynamo.config import DynamoCfg
 from nemo_rl.models.generation.dynamo import managed_runtime
+from nemo_rl.models.generation.dynamo.config import DynamoCfg, DynamoFrontendArgs
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     FrontendHost,
     ManagedDynamoRuntime,
@@ -34,11 +35,12 @@ FRONTEND_URLS = ["http://10.0.0.2:3000/v1", "http://10.0.0.3:3000/v1"]
 
 def _runtime(**frontend_args) -> ManagedDynamoRuntime:
     return ManagedDynamoRuntime(
-        dynamo_cfg=DynamoCfg.model_validate(
-            {"startup_timeout_s": 5, "frontend_args": frontend_args}
+        dynamo_cfg=DynamoCfg(
+            startup_timeout_s=5, frontend_args=DynamoFrontendArgs(**frontend_args)
         ),
         model_name="model",
         frontend_python="/venvs/vllm/bin/python",
+        ray_address="10.0.0.1:6379",
     )
 
 
@@ -329,6 +331,7 @@ class _FakeFrontendHostActor:
     def __init__(self):
         self.node_ids: list[str] = []
         self.envs: list[dict[str, str]] = []
+        self.captures: list[dict] = []
 
     def options(self, scheduling_strategy):
         self.node_ids.append(scheduling_strategy.node_id)
@@ -344,6 +347,11 @@ class _FakeFrontendHostActor:
                     actor.envs.append(kwargs["env"])
                     return f"http://frontend-{len(actor.envs)}/v1"
 
+            class publish_chat_capture:
+                @staticmethod
+                def remote(capture):
+                    actor.captures.append(capture)
+
         return _Host()
 
 
@@ -353,19 +361,33 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
     hosts = _FakeFrontendHostActor()
     monkeypatch.setattr(managed_runtime, "_FrontendHostActor", hosts)
     runtime = _runtime(
-        num_frontends=3, extra_env={"DYN_TOKENIZER_CACHE_BYTES": str(1 << 30)}
+        num_frontends=3, render_workers=3, extra_env={"DYN_TCP_LISTEN_BACKLOG": "8192"}
     )
     runtime._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
 
     node_a, node_b = "a" * 56, "b" * 56  # Ray node IDs are hex
     runtime._start_frontends([node_a, node_b])
+    runtime._started = True
+    runtime.publish_chat_capture(
+        dp_cfg={"backend": "simple"}, staging_partition="staging", capture_media=False
+    )
 
     assert hosts.node_ids == [node_a, node_b, node_a]
     assert runtime._frontend_urls == [f"http://frontend-{i}/v1" for i in (1, 2, 3)]
     for env in hosts.envs:
-        assert env["DYN_TOKENIZER_CACHE_BYTES"] == str(1 << 30)
+        assert env["DYN_TCP_LISTEN_BACKLOG"] == "8192"
         assert env["DYN_NAMESPACE"] == "nemo-rl-test"
         assert env["VIRTUAL_ENV"] == "/venvs/vllm"
+        assert env[managed_runtime.RENDER_WORKERS_ENV] == "3"
+        assert env[managed_runtime.RAY_ADDRESS_ENV] == "10.0.0.1:6379"
+    # Every frontend's chat engine reads token-capture prefixes the same way.
+    assert hosts.captures == 3 * [
+        {
+            "data_plane": {"backend": "simple"},
+            "staging_partition": "staging",
+            "capture_media": False,
+        }
+    ]
 
     clashing = _runtime(extra_env={"DYN_NAMESPACE": "mine"})
     clashing._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
@@ -373,7 +395,9 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
         clashing._start_frontends([node_a])
 
 
-def test_frontend_host_serves_on_a_free_port_of_its_node(monkeypatch) -> None:
+def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
+    monkeypatch, tmp_path
+) -> None:
     launched = []
     monkeypatch.setattr(
         managed_runtime.subprocess,
@@ -384,6 +408,7 @@ def test_frontend_host_serves_on_a_free_port_of_its_node(monkeypatch) -> None:
         managed_runtime, "_get_free_port_local", lambda *args, **kwargs: 3000
     )
     monkeypatch.setattr(managed_runtime, "_get_node_ip_local", lambda: "10.0.0.2")
+    monkeypatch.setattr(managed_runtime.tempfile, "tempdir", str(tmp_path))
     monkeypatch.setenv("DYN_STALE_SETTING", "remove-me")
     host = FrontendHost()
 
@@ -393,14 +418,24 @@ def test_frontend_host_serves_on_a_free_port_of_its_node(monkeypatch) -> None:
         dynamo_cfg=DynamoCfg(),
         env={"DYN_NAMESPACE": "nemo-rl-test"},
     )
+    host.publish_chat_capture({"staging_partition": "staging"})
 
     assert url == "http://10.0.0.2:3000/v1"
     ((command, kwargs),) = launched
-    assert command[:3] == ["/venvs/vllm/bin/python", "-m", "dynamo.frontend"]
+    # Dynamo's frontend, with NeMo RL's chat engine serving chat calls.
+    assert command[:3] == [
+        "/venvs/vllm/bin/python",
+        "-m",
+        "nemo_rl.models.generation.dynamo.vllm.frontend",
+    ]
     assert command[command.index("--http-port") + 1] == "3000"
     assert kwargs["env"]["DYN_NAMESPACE"] == "nemo-rl-test"
     assert "DYN_STALE_SETTING" not in kwargs["env"]
     assert host.returncode() is None
+    # Capture is set up after the engines register; the chat engine reads it
+    # from the file on its own node that the frontend was told about.
+    with open(kwargs["env"][managed_runtime.CAPTURE_FILE_ENV], "rb") as capture_file:
+        assert pickle.load(capture_file) == {"staging_partition": "staging"}
 
 
 def test_shutdown_logs_the_kv_events_the_router_applied(
@@ -409,9 +444,11 @@ def test_shutdown_logs_the_kv_events_the_router_applied(
     runtime = _started(_runtime())
     metrics = (
         "# HELP dynamo_component_kv_cache_events_applied KV events applied\n"
-        'dynamo_component_kv_cache_events_applied{status="ok",worker_id="1"} 40\n'
-        'dynamo_component_kv_cache_events_applied{status="ok",worker_id="2"} 2\n'
-        'dynamo_component_kv_cache_events_applied{status="parent_block_not_found"} 3\n'
+        'dynamo_component_kv_cache_events_applied{event_type="stored",status="ok",worker_id="1"} 40\n'
+        'dynamo_component_kv_cache_events_applied{event_type="stored",status="ok",worker_id="2"} 2\n'
+        'dynamo_component_kv_cache_events_applied{event_type="stored",status="parent_block_not_found"} 3\n'
+        # Every prefix-cache reset applies one; it says nothing about block events.
+        'dynamo_component_kv_cache_events_applied{event_type="cleared",status="ok",worker_id="1"} 5\n'
         'dynamo_component_requests_total{status="ok"} 9\n'
     )
 

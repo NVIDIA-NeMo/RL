@@ -62,6 +62,7 @@ from nemo_rl.data.multimodal_utils import (
     uses_image_placeholder,
 )
 from nemo_rl.data_plane.schema import MASK_SAMPLE
+from nemo_rl.distributed.actor_environments import NEMO_GYM_ACTOR_FQN
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GYM_PORT_RANGE_HIGH,
     DEFAULT_GYM_PORT_RANGE_LOW,
@@ -127,7 +128,6 @@ from nemo_rl.experience.interfaces import (
 )
 from nemo_rl.models.generation.dynamo.config import (
     dynamo_enabled,
-    native_default_chat_template_kwargs,
 )
 from nemo_rl.models.generation.interfaces import (
     resolve_routed_experts_dtype_name_for_model,
@@ -159,7 +159,6 @@ from nemo_rl.utils.routed_experts_codec import (
 from nemo_rl.utils.timer import Timer
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
-NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
 NEMO_GYM_GRACEFUL_SHUTDOWN_TIMEOUT_S = 120
 # How long the Gym servers get to exit, from the SIGINT NemoGym.shutdown() sends
 # them, before whatever is still running is killed. At the end of a run
@@ -1357,7 +1356,8 @@ Depending on your data shape, you may want to change these values."""
             )
             policy_overrides["return_token_id_information"] = False
             if (
-                _external_staging_backend(token_capture) == "vllm_worker"
+                _external_staging_backend(token_capture)
+                in ("vllm_worker", "dynamo_worker")
                 and token_capture.get("top_logprobs", 0) > 0
             ):
                 policy_overrides.setdefault("sampling_overrides", {}).update(
@@ -2946,13 +2946,10 @@ def setup_nemo_gym_config(config, tokenizer) -> None:
     generation_config["stop_token_ids"] = None
 
     if dynamo_enabled(generation_config):
-        # Gym's policy model calls the Dynamo frontend in Gym's Dynamo dialect,
-        # with the native server's default template kwargs. Each actor applies it
-        # to its own composed config (_apply_dynamo_dialect), so it never becomes
-        # a policy_model overlay that a shard must claim.
-        config.env.setdefault("nemo_gym", {})["dynamo_dialect"] = (
-            native_default_chat_template_kwargs(generation_config)
-        )
+        # Gym's policy model calls the Dynamo frontend in Gym's Dynamo dialect.
+        # Each actor applies it to its own composed config (_apply_dynamo_dialect),
+        # so it never becomes a policy_model overlay that a shard must claim.
+        config.env.setdefault("nemo_gym", {})["dynamo_dialect"] = True
 
     # For VLM runs, plumb the tokenizer config into the gym env config so the
     # NemoGym actor can reconstruct the processor inside itself (needed for
@@ -3030,10 +3027,8 @@ def build_nemo_gym_config(
     )
 
 
-def _apply_dynamo_dialect(
-    nemo_gym_dict: dict[str, Any], default_chat_template_kwargs: Mapping[str, Any]
-) -> None:
-    """Point one actor's policy model at the Dynamo frontend, in Gym's Dynamo dialect.
+def _apply_dynamo_dialect(nemo_gym_dict: dict[str, Any]) -> None:
+    """Point Gym's `policy_model` server in one NemoGym actor's config at the Dynamo frontend.
 
     The frontend takes token data in nvext instead of vLLM's request extensions.
     Applied to the actor's composed config (a shard's overrides included), so
@@ -3044,27 +3039,36 @@ def _apply_dynamo_dialect(
     policy_model = dict(nemo_gym_dict.get("policy_model") or {})
     models = dict(policy_model.get("responses_api_models") or {})
     vllm_model = dict(models.get("vllm_model") or {})
-    if "bad_words" in (vllm_model.get("extra_body") or {}):
+    extra_body = vllm_model.get("extra_body") or {}
+    if "bad_words" in extra_body:
         raise ValueError(
             "vllm_model.extra_body.bad_words is not supported with "
             "policy.generation.dynamo=true: the Dynamo frontend answers every "
             "request carrying it with HTTP 400."
         )
+    # Dynamo accepts these vLLM fields (its PASSTHROUGH_EXTRA_FIELDS) but never
+    # serializes them to a Python chat engine, so ours would never see them.
+    dropped = sorted(
+        {
+            "allowed_token_ids",
+            "bad_words_token_ids",
+            "cache_salt",
+            "detokenize",
+            "logprob_token_ids",
+            "stop_token_ids",
+        }
+        & extra_body.keys()
+    )
+    if dropped:
+        raise ValueError(
+            f"vllm_model.extra_body {dropped} is not supported with "
+            "policy.generation.dynamo=true: the Dynamo frontend accepts these "
+            "fields but drops them before NeMo RL's chat engine sees them."
+        )
     vllm_model["dynamo_frontend"] = True
     # The frontend reads `reasoning` as another name for `reasoning_content` and
     # refuses an echoed assistant turn that carries both, Gym's default.
     vllm_model.setdefault("reasoning_field", "reasoning_content")
-    # The native server merges these under every request's own template
-    # kwargs; the frontend has no such default, so Gym sends them. They sit
-    # under the kwargs Gym sends: vllm_model's own, else extra_body's.
-    if default_chat_template_kwargs:
-        gym_kwargs = vllm_model.get("chat_template_kwargs") or (
-            (vllm_model.get("extra_body") or {}).get("chat_template_kwargs") or {}
-        )
-        vllm_model["chat_template_kwargs"] = {
-            **default_chat_template_kwargs,
-            **gym_kwargs,
-        }
     models["vllm_model"] = vllm_model
     policy_model["responses_api_models"] = models
     nemo_gym_dict["policy_model"] = policy_model
@@ -3100,9 +3104,8 @@ def _build_gym_actor_config(
     invalid_tool_call_patterns = nemo_gym_dict.pop("invalid_tool_call_patterns", None)
     thinking_tags = nemo_gym_dict.pop("thinking_tags", None)
     tokenizer_config = nemo_gym_dict.pop("tokenizer_config", None)
-    dynamo_dialect = nemo_gym_dict.pop("dynamo_dialect", None)
-    if dynamo_dialect is not None:
-        _apply_dynamo_dialect(nemo_gym_dict, dynamo_dialect)
+    if nemo_gym_dict.pop("dynamo_dialect", False):
+        _apply_dynamo_dialect(nemo_gym_dict)
     external_service_readiness = extract_external_service_readiness(nemo_gym_dict)
     port_range = {
         key: value

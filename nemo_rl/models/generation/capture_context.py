@@ -89,3 +89,34 @@ def decide_capture_input(
         required_prefix_token_ids=admission.required_prefix_token_ids,
     )
     return CaptureInputDecision(serving, serving, True)
+
+
+def resolve_capture_input(
+    admission: "CaptureAdmission",
+    *,
+    messages: list[dict[str, Any]],
+    conversation: list[dict[str, Any]],
+    renderer_is_hf: bool,
+) -> CaptureInputDecision:
+    """:func:`decide_capture_input` with the rendering fact the serving host proves.
+
+    Shared by every host of the Gym chat path, which calls it after rendering
+    the conversation. HF/string parsing maps null and empty tool content to
+    identical template inputs; structured content and other renderers cannot
+    authorize that equivalence.
+
+    Args:
+        admission: The call's capture admission.
+        messages: The request's messages, before rendering.
+        conversation: The rendered conversation the template saw.
+        renderer_is_hf: The host renders with vLLM's ``HfRenderer``.
+    """
+    return decide_capture_input(
+        admission,
+        messages=messages,
+        allow_empty_tool_content=(
+            renderer_is_hf
+            and bool(conversation)
+            and all(isinstance(item.get("content"), str) for item in conversation)
+        ),
+    )
