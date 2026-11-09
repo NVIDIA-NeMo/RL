@@ -6434,7 +6434,9 @@ def test_async_grpo_applies_dapo_reward_transforms_before_advantages(
         lambda _cfg: mock_adv_estimator,
     )
     mock_batch = next(iter(mock_grpo_components["train_dataloader"]))
-    mock_batch["total_reward"] = torch.tensor([1.0])
+    # 0.75 is not a fixed point of [0, 1] -> [-1, 1], so a missing scaling call
+    # is detected as well (1.0 would map to itself).
+    mock_batch["total_reward"] = torch.tensor([0.75])
     # 6 response tokens against max_response_length 8 - overlong_buffer_length 4:
     # 2 tokens over -> overlong penalty -2/4 * 1.0 = -0.5
     mock_batch["response_token_lengths"] = torch.tensor([6])
@@ -6457,8 +6459,8 @@ def test_async_grpo_applies_dapo_reward_transforms_before_advantages(
     _run_single_grpo_train_step(mock_grpo_components, async_grpo_train, monkeypatch)
 
     mock_adv_estimator.compute_advantage.assert_called_once()
-    # scale then shape: 1.0 -> 1.0 -> 0.5. Shape then scale would give 0.0;
-    # scaling twice would give 1.0 -> 1.0 -> 0.5 -> 0.0 as well; neither applied: 1.0.
-    expected = [0.5] if enabled else [1.0]
+    # scale then shape: 0.75 -> 0.5 -> 0.0. Shape then scale: 0.75 -> 0.25 -> -0.5;
+    # scaling missing: 0.25; scaled twice before shaping: -0.5; both disabled: 0.75.
+    expected = [0.0] if enabled else [0.75]
     assert captured["rewards"].tolist() == pytest.approx(expected)
     assert captured["total_reward"].tolist() == pytest.approx(expected)
