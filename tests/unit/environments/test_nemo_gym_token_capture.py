@@ -929,11 +929,13 @@ def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() ->
             {"enable_thinking": False},
         ),
         # The frontend answers every request carrying bad_words with a 400.
-        ({"extra_body": {"bad_words": ["x"]}}, None),
+        ({"extra_body": {"bad_words": ["x"]}}, "bad_words"),
+        # The frontend accepts stop_token_ids but drops it before our chat engine.
+        ({"extra_body": {"stop_token_ids": [7]}}, "stop_token_ids"),
     ],
 )
 def test_gym_actor_config_dynamo_turns_on_gyms_dynamo_dialect(
-    vllm_model: dict, expected: dict | None
+    vllm_model: dict, expected: dict | str
 ) -> None:
     from responses_api_models.vllm_model.app import VLLMModelConfig
 
@@ -984,8 +986,8 @@ def test_gym_actor_config_dynamo_turns_on_gyms_dynamo_dialect(
             turn_checkpointing_enabled=False,
         )["initial_global_config_dict"]
 
-    if expected is None:
-        with pytest.raises(ValueError, match="bad_words"):
+    if isinstance(expected, str):
+        with pytest.raises(ValueError, match=expected):
             build()
         return
     gym_config = build()

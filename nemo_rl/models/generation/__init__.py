@@ -321,8 +321,6 @@ def configure_generation_config(
                 is_eval
                 or config["stop_strings"] is not None
                 or config["vllm_cfg"].get("expose_http_server", None)
-                # Dynamo serves OpenAI clients as the exposed server does.
-                or dynamo_enabled(config)
             ):
                 config["vllm_cfg"]["skip_tokenizer_init"] = False
             else:

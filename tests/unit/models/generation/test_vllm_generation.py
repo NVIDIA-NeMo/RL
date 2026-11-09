@@ -2849,12 +2849,16 @@ def test_vllm_validate_settings_accepts_missing_vllm_cfg_as_refit_disabled():
     VllmGeneration.validate_settings(master_config)
 
 
-def _dynamo_master_config(*, router=False, fleet_health=False):
+def _dynamo_master_config(
+    *, router=False, fleet_health=False, gym=False, skip_tokenizer_init=False
+):
     vllm_config = deepcopy(basic_vllm_test_config)
     vllm_config["dynamo"] = True
     vllm_config["vllm_cfg"]["async_engine"] = True
     vllm_config["vllm_cfg"]["expose_http_server"] = True
+    vllm_config["vllm_cfg"]["skip_tokenizer_init"] = skip_tokenizer_init
     return types.SimpleNamespace(
+        env={"should_use_nemo_gym": gym},
         policy={"generation": vllm_config},
         async_rl=types.SimpleNamespace(
             generation_router=types.SimpleNamespace(enabled=router),
@@ -2869,6 +2873,9 @@ def _dynamo_master_config(*, router=False, fleet_health=False):
         ({}, None),
         ({"router": True}, "routes the whole fleet behind one URL"),
         ({"fleet_health": True}, "Disable fleet health"),
+        # Gym's replies need the engine's tokenizer; NeMo RL's rollouts do not.
+        ({"gym": True, "skip_tokenizer_init": True}, "skip_tokenizer_init"),
+        ({"skip_tokenizer_init": True}, None),
     ],
 )
 def test_vllm_validate_settings_rejects_what_dynamo_cannot_serve(settings, error):

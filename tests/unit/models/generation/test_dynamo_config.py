@@ -50,10 +50,11 @@ def _vllm_config(**overrides) -> dict:
 def test_dynamo_true_alone_is_a_complete_config(dynamo: bool) -> None:
     config = configure_generation_config(_vllm_config(dynamo=dynamo), _Tokenizer())
 
-    # Dynamo serves the AsyncLLM, so the switch selects the async engine, and it
-    # serves OpenAI clients, which need the engine's tokenizer.
+    # Dynamo serves the AsyncLLM, so the switch selects the async engine.
+    # Rollouts read token IDs only, so the engine skips its tokenizer as natively;
+    # NeMo-Gym runs load it through expose_http_server, which Gym requires.
     assert config["vllm_cfg"]["async_engine"] is dynamo
-    assert config["vllm_cfg"]["skip_tokenizer_init"] is (not dynamo)
+    assert config["vllm_cfg"]["skip_tokenizer_init"] is True
     assert "dynamo_cfg" not in config
     assert dynamo_cfg(config) == DynamoCfg()
 

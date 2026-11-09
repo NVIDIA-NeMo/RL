@@ -234,6 +234,14 @@ class VllmGeneration(GenerationInterface):
                     "picks engines itself, and a restarted shard does not register "
                     "with it. Disable fleet health."
                 )
+            if master_config.env.get("should_use_nemo_gym") and generation_config[
+                "vllm_cfg"
+            ].get("skip_tokenizer_init"):
+                raise ValueError(
+                    "vllm_cfg.skip_tokenizer_init=true does not work with NeMo-Gym "
+                    "and policy.generation.dynamo=true: the engine detokenizes the "
+                    "replies Gym's chat calls get through the frontend."
+                )
 
     @staticmethod
     def init_cluster_placement_groups(
