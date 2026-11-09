@@ -31,7 +31,7 @@ from nemo_rl.models.generation.vllm.config import (
     VllmSpecificArgs,
     vllm_fp32_lm_head_enabled,
 )
-from nemo_rl.models.worker_config import resolve_worker_cls
+from nemo_rl.utils.config import resolve_worker_cls
 from nemo_rl.utils.cuda_ipc import normalize_cuda_ipc_handle
 
 if TYPE_CHECKING:

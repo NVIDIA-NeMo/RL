@@ -50,7 +50,7 @@ from nemo_rl.models.generation.vllm.metric_names import (
     PROMPT_TOKENS_KEY,
     REQUEST_SUCCESS_COUNTERS,
 )
-from nemo_rl.models.worker_config import resolve_worker_cls
+from nemo_rl.utils.config import resolve_worker_cls
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
 

@@ -171,7 +171,7 @@ policy:
   offload_policy_before_refit: false
   # Move optimizer state to CPU when the refit offload lifecycle runs.
   offload_optimizer_for_refit: true
-  worker_extension_cls_fqn: null # optional registered policy-worker subclass; mutually exclusive with quant_cfg
+  worker_extension_cls_fqn: null # optional registered policy-worker subclass; quantization requires the exact backend ModelOpt worker (null auto-selects it)
 
   automodel_cfg:
     enabled: true
@@ -525,7 +525,7 @@ policy:
     lora_refit_mode: native
     # vLLM backend only - sglang/megatron/trtllm/dynamo require this to remain null.
     # Selects the NeMo-RL Ray actor class, NOT vLLM's own `worker_extension_cls`.
-    worker_extension_cls_fqn: null # optional registered vLLM generation-worker subclass; mutually exclusive with quant_cfg
+    worker_extension_cls_fqn: null # optional registered vLLM generation-worker subclass; quantization requires the exact backend ModelOpt worker (null auto-selects it)
     # Keep real-quant export tensors on CPU by default. Set false only for
     # colocated CUDA-IPC refit to avoid a GPU -> CPU -> GPU round trip.
     real_quant_export_cpu_offload: true
