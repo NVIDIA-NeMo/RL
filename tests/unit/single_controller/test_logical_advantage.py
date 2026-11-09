@@ -149,6 +149,18 @@ def test_forest_options_require_forest_training(option):
         TokenCaptureConfig(**option)
 
 
+def test_max_rows_per_rollout_requires_continued_chains():
+    assert TokenCaptureConfig(
+        forest_training=True,
+        selection_policy="continued_chains",
+        max_rows_per_rollout=16,
+    )
+    with pytest.raises(ValueError, match="max_rows_per_rollout.*forest_training"):
+        TokenCaptureConfig(max_rows_per_rollout=16)
+    with pytest.raises(ValueError, match="max_rows_per_rollout.*continued_chains"):
+        TokenCaptureConfig(forest_training=True, max_rows_per_rollout=16)
+
+
 def test_forest_pad_source_requires_step_padding():
     assert TokenCaptureConfig(
         forest_training=True, forest_padding_scope="step", forest_pad_source="cyclic"
