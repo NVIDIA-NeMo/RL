@@ -79,7 +79,6 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     BaseSampler,
-    InOrderSampler,
     ReadyFirstSamplerConfig,
     TransactionalAdmissionSampler,
     create_sampler,
@@ -1658,7 +1657,7 @@ class SingleControllerActor:
              is submitted to the finalizer actor pool.
           5. If the prompt was dropped, substitute a spare and repeat step 4 -- for this
              step, or for whichever step lends this one a finished group in its place
-             (see _take_replacement, _take_filtered_replacement, _promote_into_step) --
+             (see _take_replacement, _pop_filtered_replacement, _promote_into_step) --
              or credit the step short so the train pump can close it
           6. Decrement _inflight_rollouts
 
@@ -2032,18 +2031,9 @@ class SingleControllerActor:
             await lock.acquire()
 
         async def wait_for_admission() -> None:
-            if self._dynamic_sampling_enabled:
-                if not isinstance(self._sampler, InOrderSampler):
-                    raise RuntimeError("dynamic sampling requires the in_order sampler")
-                while not self._sampler.can_admit(
-                    trainer_version=self._trainer_version
-                ):
-                    await maybe_refill()
-                    await asyncio.sleep(0.1)
-            else:
-                await self._sampler.wait_until_admissible(
-                    trainer_version_fn=lambda: self._trainer_version
-                )
+            while not self._sampler.can_admit(trainer_version=self._trainer_version):
+                await maybe_refill()
+                await asyncio.sleep(0.1)
 
         async def _launch(
             prompt: DatumSpec,
@@ -2311,7 +2301,7 @@ class SingleControllerActor:
         """A spare prompt to stand in for a dropped group, or None to shrink instead.
 
         For rollout failures only. A group dropped by dynamic sampling goes through
-        ``_take_filtered_replacement``, which spends a different budget.
+        ``_pop_filtered_replacement``, which spends a different budget.
 
         None covers the four ways a replacement can be unavailable: it was not asked
         for, the sampler does not stamp target steps so no step is ever waiting on a
@@ -2371,28 +2361,6 @@ class SingleControllerActor:
             "zero_variance_fraction, then raise the allowance or revisit the "
             "reward/prompt mix."
         )
-
-    async def _take_filtered_replacement(
-        self, target_step: Optional[int]
-    ) -> Optional[DatumSpec]:
-        """A spare prompt for a group dynamic sampling dropped, waiting for a refill.
-
-        Shares none of ``_take_replacement``'s gates. A zero-variance group is a data
-        decision about a rollout that succeeded, so it neither reads
-        ``on_dropped_prompt`` nor spends the fault-tolerance budget, and it draws on
-        dynamic sampling's own pool.
-
-        Blocks while the pool is empty and data remains. Only the pump reads the
-        dataloader; it polls and refills this pool while waiting for admission or
-        dispatch capacity, including during checkpoint recovery.
-
-        Returns:
-            A spare prompt, or None once the dataloader is exhausted and no spare is
-            left. The caller credits the step short, then the trainer applies the
-            configured batch floor to decide whether to train or skip it.
-        """
-        await self._wait_for_filtered_reserve()
-        return self._pop_filtered_replacement(target_step)
 
     async def _wait_for_filtered_reserve(self) -> None:
         """Wait for pump refill without holding a checkpoint mutation cut."""

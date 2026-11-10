@@ -53,6 +53,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutRecoveryConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
 from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -520,8 +521,8 @@ def _pump_controller(
 ):
     """A hand-built controller for the rollout pump.
 
-    ``dynamic_sampling_max_replacements`` None leaves dynamic sampling off; an int
-    turns it on with that many replacement batches beyond the initial batch.
+    ``dynamic_sampling_max_replacements=None`` leaves dynamic sampling off; an int
+    sets the total generation-batch allowance, including the initial batch.
     """
     buffer = _RecordingBuffer() if buffer is None else buffer
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
@@ -616,10 +617,12 @@ class TestDynamicSamplingReplacement:
                 dynamic_sampling_max_replacements=10,
             )
             ctrl._rollout_runtime.sampler_stamps_target_steps = True
-            waiters = [
-                asyncio.create_task(ctrl._take_filtered_replacement(step))
-                for step in range(2)
-            ]
+
+            async def take_replacement(step: int) -> DatumSpec | None:
+                async with ctrl._replacement_mutation(filtered=True):
+                    return ctrl._pop_filtered_replacement(step)
+
+            waiters = [asyncio.create_task(take_replacement(step)) for step in range(2)]
             try:
                 await asyncio.sleep(0)
                 assert all(not waiter.done() for waiter in waiters)
@@ -649,7 +652,12 @@ class TestDynamicSamplingReplacement:
             ctrl._rollout_recovery_enabled = recovery
             ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
             ctrl._rollout_restorer = SimpleNamespace(redispatch_restored=AsyncMock())
-            waiter = asyncio.create_task(ctrl._take_filtered_replacement(0))
+
+            async def take_replacement() -> DatumSpec | None:
+                async with ctrl._replacement_mutation(filtered=True):
+                    return ctrl._pop_filtered_replacement(0)
+
+            waiter = asyncio.create_task(take_replacement())
             try:
                 await asyncio.sleep(0)
                 assert not waiter.done()
@@ -1064,8 +1072,6 @@ class TestTargetGroupsForStep:
             rollout_failure=SimpleNamespace(min_step_batch_fraction=fraction)
         )
         ctrl._rollout_runtime.batch_shortfall = dict(shortfall)
-        # Read by the short-step error, which names the spare pool as a third cause
-        # when filtering is on.
         ctrl._dynamic_sampling_enabled = False
         return ctrl
 
