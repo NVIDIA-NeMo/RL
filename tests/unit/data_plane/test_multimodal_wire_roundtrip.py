@@ -32,6 +32,7 @@ from __future__ import annotations
 from dataclasses import replace
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from nemo_rl.data.multimodal_utils import (
@@ -407,6 +408,30 @@ def test_ref_logprob_dispatch_ships_multimodal_fields(monkeypatch):
     pol.get_reference_policy_logprobs_from_meta(meta)
 
     assert set(mm_fields) <= set(captured["ref_lp"].fields)
+
+
+@pytest.mark.parametrize("replay", [False, True])
+def test_prev_logprob_dispatch_ships_the_sampler_head_under_replay(monkeypatch, replay):
+    """Replay renormalizes prev logprobs over the captured sampler support."""
+    from nemo_rl.data_plane.schema import SAMPLER_TOPK_FIELDS
+
+    meta = KVBatchMeta(
+        partition_id="train",
+        task_name="rollout",
+        sample_ids=["a", "b"],
+        fields=["input_ids", "input_lengths", "token_mask", *SAMPLER_TOPK_FIELDS],
+        sequence_lengths=[8, 8],
+    )
+    captured: dict[str, KVBatchMeta] = {}
+    pol = _stub_tq_policy(monkeypatch, captured)
+    pol.cfg = {"generation": {"sampler_replay": {"enabled": replay}}}
+
+    pol.get_logprobs_from_meta(meta)
+    pol.get_reference_policy_logprobs_from_meta(meta)
+
+    assert (set(SAMPLER_TOPK_FIELDS) <= set(captured["prev_lp"].fields)) == replay
+    # The reference KL stays on the unfiltered full-vocabulary pass.
+    assert not set(SAMPLER_TOPK_FIELDS) & set(captured["ref_lp"].fields)
 
 
 def test_sc_microbatch_dispatch_ships_multimodal_fields(monkeypatch):
