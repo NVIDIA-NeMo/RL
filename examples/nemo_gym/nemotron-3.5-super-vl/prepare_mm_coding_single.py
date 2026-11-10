@@ -242,6 +242,9 @@ def gym_row(
             "Use shell and file tools to inspect and revise. "
             f"Preview with `python /opt/mmrl/render.py {task.benchmark} /workspace/{artifact} /workspace/preview.png`. "
             "You may inspect the preview with your image tool. Finish with a final response. "
+            "Only the final answer file is transferred to a fresh grading sandbox. "
+            "Make it self-contained: it must run without any other task-workspace files. "
+            "Do not read or embed the task reference image as the solution. "
             "Do not change the task requirements."
         )
         return {

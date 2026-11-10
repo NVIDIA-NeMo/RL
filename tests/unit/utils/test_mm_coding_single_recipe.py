@@ -244,6 +244,11 @@ def test_multi_rows_have_private_task_envelope_and_file_instructions(tmp_path, h
     prompt = json.dumps(row["task_input"]["responses_create_params"])
     assert "PRIVATE_GOLD" not in prompt and "/workspace/answer.svg" in prompt
     assert "/opt/mmrl/render.py" in prompt
+    assert (
+        "Only the final answer file is transferred to a fresh grading sandbox" in prompt
+    )
+    assert "without any other task-workspace files" in prompt
+    assert "Do not read or embed the task reference image as the solution" in prompt
 
 
 @pytest.mark.parametrize("harnesses", [(), ("codex", "codex"), ("unknown",)])
@@ -346,8 +351,36 @@ def test_runtime_guard_detects_missing_session_api(monkeypatch):
 
     monkeypatch.setattr(guard.importlib.util, "find_spec", find)
     assert guard.check_runtime() == ["nemo_gym.resources_server_sandbox_sessions"]
+    monkeypatch.setattr("sys.argv", ["check_mm_coding_runtime"])
     with pytest.raises(SystemExit, match="stock RL Gym pin"):
         guard.main()
+
+
+@pytest.mark.parametrize("mode", ["multi", "mixed"])
+def test_runtime_guard_refuses_missing_opencode_capture_support(
+    monkeypatch, capsys, mode
+):
+    spec = importlib.util.spec_from_file_location(
+        "check_mm_coding_runtime", EXAMPLE / "check_mm_coding_runtime.py"
+    )
+    assert spec is not None and spec.loader is not None
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    missing = "nemo_gym.models.token_capture.harness_notes"
+    monkeypatch.setattr(
+        guard.importlib.util,
+        "find_spec",
+        lambda module: None if module == missing else object(),
+    )
+    monkeypatch.setattr("sys.argv", ["check_mm_coding_runtime", "--mode", mode])
+    with pytest.raises(SystemExit, match="5833"):
+        guard.main()
+    assert json.loads(capsys.readouterr().out)["missing_modules"] == [missing]
+    assert guard.check_runtime(mode="single") == []
+    assert guard.check_runtime(mode=mode, harnesses=("codex", "hermes")) == []
+    monkeypatch.setattr(guard.importlib.util, "find_spec", lambda module: object())
+    guard.main()
+    assert json.loads(capsys.readouterr().out)["compatible"]
 
 
 def test_legacy_image_drift_is_refused_without_partial_dataset(tmp_path):

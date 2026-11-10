@@ -13,6 +13,7 @@
 # limitations under the License.
 """Check Gym API and component discovery before allocating Super VL training GPUs."""
 
+import argparse
 import importlib.util
 import json
 
@@ -27,10 +28,17 @@ REQUIRED_MODULES = (
 )
 
 
-def check_runtime() -> list[str]:
+def check_runtime(
+    *,
+    mode: str = "single",
+    harnesses: tuple[str, ...] = ("opencode", "codex", "hermes"),
+) -> list[str]:
     """Return missing API/component modules without starting services or importing candidate code."""
     missing = []
-    for module in REQUIRED_MODULES:
+    modules = list(REQUIRED_MODULES)
+    if mode in {"multi", "mixed"} and "opencode" in harnesses:
+        modules.append("nemo_gym.models.token_capture.harness_notes")
+    for module in modules:
         try:
             found = importlib.util.find_spec(module)
         except (ModuleNotFoundError, ImportError):
@@ -41,13 +49,30 @@ def check_runtime() -> list[str]:
 
 
 def main() -> None:
-    missing = check_runtime()
-    print(json.dumps({"compatible": not missing, "missing_modules": missing}))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--mode", choices=("single", "multi", "mixed"), default="single"
+    )
+    parser.add_argument(
+        "--harnesses",
+        nargs="+",
+        choices=("opencode", "codex", "hermes"),
+        default=("opencode", "codex", "hermes"),
+    )
+    args = parser.parse_args()
+    missing = check_runtime(mode=args.mode, harnesses=tuple(args.harnesses))
+    print(
+        json.dumps(
+            {"compatible": not missing, "mode": args.mode, "missing_modules": missing}
+        )
+    )
     if missing:
         raise SystemExit(
             "Install the submitted internal Gym revision and its dependencies in the driver, "
             "Gym actor, generation actor and component environments. The stock RL Gym pin "
-            "predates these APIs. Re-run this check in every runtime before allocating GPUs."
+            "predates these APIs. OpenCode multi/mixed also needs Gym's harness-note token-capture "
+            "fix (upstream PR #5833 or its merged successor). Re-run this check with the dataset's "
+            "--mode and --harnesses in every runtime before allocating GPUs."
         )
 
 

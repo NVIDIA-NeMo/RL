@@ -98,6 +98,8 @@ interpreter (Gym and generation included):
 
 ```bash
 python examples/nemo_gym/nemotron-3.5-super-vl/check_mm_coding_runtime.py
+# For multi or mixed, match the adapter's mode and optional harness subset:
+python examples/nemo_gym/nemotron-3.5-super-vl/check_mm_coding_runtime.py --mode multi
 ```
 
 The current NeMo RL Gym submodule pin predates the submitted Gym package layout
@@ -118,6 +120,15 @@ Gym pin or assume `NEMO_GYM_EXTRA_ROOTS` alone upgrades core APIs. A supported
 runtime packaging/pin update and real actor startup are merge gates for this
 draft. The check verifies API/component discovery only, not model kernels,
 credentials, network reachability, token capture or optimizer correctness.
+
+OpenCode multi/mixed additionally requires Gym's harness-note token-capture
+support ([Gym #5833](https://github.com/NVIDIA-NeMo/Gym/pull/5833), or the merged
+successor). OpenCode can append its own assistant step-limit note or lowercase
+a tool name; a Gym revision without the fix can lose the model-call parent and
+mask the rollout. The mode-aware preflight refuses the missing module before
+GPU allocation. If the prepared dataset excludes OpenCode, pass the same
+`--harnesses codex hermes` subset. Module discovery is a prerequisite, not proof
+that a rollout's tokens, images and logprobs were captured correctly.
 
 Set `MM_CODING_TRAIN_DATA` and `MM_CODING_VALIDATION_DATA` to the adapted files,
 and `MM_CODING_REFERENCE_ROOT` to their shared reference root. Both data paths
