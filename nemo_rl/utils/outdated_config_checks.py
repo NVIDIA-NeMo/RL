@@ -251,6 +251,24 @@ def reject_outdated_rollout_recovery_granularity(config: dict[str, Any]) -> None
     raise ValueError(message)
 
 
+def reject_outdated_weight_patch_recording(config: dict[str, Any]) -> None:
+    """Reject the removed co-resident weight-patch recording setting.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
+    for path, backend_config in _train_backend_configs(config):
+        generation = backend_config.get("generation")
+        if not isinstance(generation, dict):
+            continue
+        colocated = generation.get("colocated")
+        if isinstance(colocated, dict) and "record_weight_patches" in colocated:
+            raise ValueError(
+                f"{path}.generation.colocated.record_weight_patches has been removed. "
+                "Delete the key; the co-resident backend no longer records weight deltas."
+            )
+
+
 def check_outdated_config(config: dict[str, Any]) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
@@ -267,6 +285,7 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     reject_outdated_dataset_config(config)
     reject_outdated_metric_name_format(config)
     reject_outdated_mcore_generation_keys(config)
+    reject_outdated_weight_patch_recording(config)
     reject_outdated_dynamo_router_reset_states(config)
     reject_outdated_context_compaction(config)
     reject_outdated_rollout_recovery_granularity(config)

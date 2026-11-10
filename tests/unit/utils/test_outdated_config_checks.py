@@ -373,6 +373,42 @@ def test_removed_mcore_generation_keys_report_the_first_and_current_keys_pass():
 
 
 # ============================================================================
+# reject_outdated_weight_patch_recording
+# ============================================================================
+
+
+@pytest.mark.parametrize("value", [None, False, 0, 4])
+def test_removed_weight_patch_recording_is_rejected(value):
+    with pytest.raises(ValueError, match="record_weight_patches has been removed"):
+        check_outdated_config(
+            {"policy": {"generation": {"colocated": {"record_weight_patches": value}}}}
+        )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {},
+        {"policy": {}},
+        {"policy": {"generation": None}},
+        {
+            "policy": {
+                "generation": {
+                    "colocated": {
+                        "enabled": False,
+                        "engine_sm_fraction": 0.42,
+                        "engine_weights": "shared",
+                    }
+                }
+            }
+        },
+    ],
+)
+def test_shared_weight_generation_without_patch_recording_is_accepted(config):
+    check_outdated_config(config)
+
+
+# ============================================================================
 # reject_outdated_dynamo_router_reset_states
 # ============================================================================
 

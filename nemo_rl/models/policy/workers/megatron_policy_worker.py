@@ -929,7 +929,6 @@ class MegatronPolicyWorkerImpl(
         sm_partition.check_worker(
             config, "engine" if is_refit_destination else "learner", rank=local_rank
         )
-        self._weight_patches: Optional[sm_partition.WeightPatchStore] = None
 
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
@@ -2336,19 +2335,8 @@ class MegatronPolicyWorkerImpl(
         state = self._assert_step_open()
         if state.get("offloaded", False):
             raise RuntimeError("prepare_for_training must restore the offloaded step")
-        patches = self._coresident_patch_store()
-        if patches is not None:
-            from megatron.core.resharding.utils import named_refit_tensors
-
-            named = list(named_refit_tensors(sm_partition.refit_core(self.model)))
-            patches.before_write(named)
         try:
             result = self._finish_train_step_body(state)
-            if patches is not None:
-                patches.after_write(named)
-                numel = sum(t.numel() for _, t in named)
-                print(f"[sm_partition] weight patches rank {self.rank}: "
-                      f"{patches.stats(numel, named[0][1].element_size())}", flush=True)
         except Exception:
             # Mid-finish failure: state machine is in a partial state and the
             # mcore hooks may still be nulled (or restored, depending on how far
@@ -4914,20 +4902,6 @@ class MegatronPolicyWorkerImpl(
         self.model.start_param_sync(force_sync=True)
         # Ensure exporters cannot observe a partially gathered buffer.
         torch.cuda.synchronize()
-
-    def _coresident_patch_store(self) -> Optional[sm_partition.WeightPatchStore]:
-        """Return the optional bounded GPU history of learner weight patches.
-
-        policy.generation.colocated.record_weight_patches = K: keep the last K per-step weight patches on the GPU
-        (sm_partition.WeightPatchStore). None when off.
-        """
-        generation = self.cfg.get("generation")  # None for training-only policies
-        keep = generation["colocated"].get("record_weight_patches") if generation else None
-        if not keep:
-            return None
-        if self._weight_patches is None:
-            self._weight_patches = sm_partition.WeightPatchStore(int(keep))
-        return self._weight_patches
 
     def export_coresident_refit_handles(self) -> tuple[str, dict, str, dict]:
         """Export stable CUDA IPC handles for this rank local refit tensors.

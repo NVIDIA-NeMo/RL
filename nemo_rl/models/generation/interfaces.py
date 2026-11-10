@@ -225,17 +225,15 @@ class DisaggConfig(BaseModel, extra="allow"):
 class ColocationConfig(TypedDict):
     enabled: bool
     resources: OptionalResourcesConfig
-    # Co-resident generation (Megatron, with enabled=false): the engine runs as its own processes on the training
-    # GPUs with this share of each GPU's SMs (MPS), the learner with the rest (nemo_rl/models/megatron/sm_partition.py).
+    # Co-resident Megatron generation uses dedicated processes on the training GPUs. With the default MPS backend,
+    # this fraction determines the learner's cap; inference remains uncapped (see sm_partition.py).
     engine_sm_fraction: NotRequired[float | None]
     # How the SMs are split (nemo_rl/models/megatron/sm_partition.py BACKENDS): "mps_percentage" (default, a soft
-    # cap) or "hard" (disjoint SM sets; needs driver support, verified at setup).
+    # cap) or "mps_static" (disjoint SM sets; needs driver support, verified at setup).
     sm_partition_backend: NotRequired[str | None]
     # Co-resident engine weights: "copy" (default; own copy, per-step refit copy) or "shared" (maps the learner's
     # weights where the local shards match; pauses only around the optimizer step).
     engine_weights: NotRequired[str | None]
-    # Measurement: keep the learner's last K per-step weight patches and log their sizes (K > 1 single-copy path).
-    record_weight_patches: NotRequired[int | None]
 
 
 class CheckpointEngineConfig(TypedDict):

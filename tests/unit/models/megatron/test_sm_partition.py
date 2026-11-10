@@ -363,23 +363,6 @@ def test_map_sources_by_resolved_name_and_rank_coordinates():
         smp.map_sources(src, coords, far, coords)
 
 
-def test_weight_patch_store_records_sparse_deltas_and_k_gaps():
-    w = torch.zeros(100)
-    store = smp.WeightPatchStore(keep=3)
-    for step, idx in enumerate(([1, 2], [2, 3], [50])):
-        store.before_write([("w", w)])
-        w[idx] += step + 1
-        store.after_write([("w", w)])
-    st = store.stats(numel=100, element_size=2)
-    assert st["delta_frac_k1"] == 0.01 and st["delta_frac_k2"] == 0.03 and st["delta_frac_k3"] == 0.04
-    idx, old = store.patches[-1]["w"]
-    assert idx.dtype == torch.int32 and idx.tolist() == [50] and old.tolist() == [0.0]
-    snapshot = store._before["w"].data_ptr()
-    store.before_write([("w", w)]); store.after_write([("w", w)])  # no change: empty patch, oldest dropped
-    assert len(store.patches) == 3 and store.patches[-1] == {}
-    assert store._before["w"].data_ptr() == snapshot  # the snapshot buffer is allocated once
-
-
 class _Group:
     """A worker group stand-in that records the calls the synchronizer makes, in order."""
 
