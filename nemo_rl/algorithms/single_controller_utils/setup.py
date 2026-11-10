@@ -51,6 +51,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_training_claims,
 )
 from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
     GRPOSaveState,
     RewardPenaltyConfig,
     _get_effort_config,
@@ -2419,6 +2420,14 @@ def setup_single_controller(
             else 1
         ),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
+        filter_zero_variance_groups=algo_cfg.use_dynamic_sampling,
+        # The advantage stage's participation knobs; None on PPO, which has no group baseline.
+        masked_reward_policy=(
+            None
+            if is_ppo_run(master_config)
+            else cast(GRPOConfig, algo_cfg).masked_reward_policy
+        ),
+        overlong_filtering=algo_cfg.overlong_filtering,
     )
 
     # Print setup timing metrics

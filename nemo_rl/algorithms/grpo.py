@@ -13,6 +13,7 @@
 # limitations under the License.
 import gc
 import json
+import math
 import os
 import time
 import warnings
@@ -295,6 +296,32 @@ class RewardScalingConfig(BaseModel, extra="allow"):
     source_max: float = 1.0
     target_min: float = 0.0
     target_max: float = 1.0
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "RewardScalingConfig":
+        """Validate enabled scaling bounds before any backend consumes them."""
+        if not self.enabled:
+            return self
+        non_finite = [
+            f"{name}={value}"
+            for name, value in (
+                ("source_min", self.source_min),
+                ("source_max", self.source_max),
+                ("target_min", self.target_min),
+                ("target_max", self.target_max),
+            )
+            if not math.isfinite(value)
+        ]
+        if non_finite:
+            raise ValueError(
+                f"reward_scaling bounds must be finite, got {', '.join(non_finite)}."
+            )
+        if self.source_min >= self.source_max:
+            raise ValueError(
+                f"reward_scaling.source_min={self.source_min} must be less "
+                f"than reward_scaling.source_max={self.source_max}."
+            )
+        return self
 
 
 class AsyncGRPOConfig(BaseModel, extra="allow"):
