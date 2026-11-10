@@ -1,5 +1,4 @@
 defaults: ../../../nemo_gym/grpo_qwen3_30ba3b_instruct.yaml
-
 grpo:
   num_prompts_per_step: 256
   num_generations_per_prompt: 4
@@ -8,32 +7,22 @@ grpo:
   val_at_start: false
   async_grpo: null
   skip_reference_policy_logprobs_calculation: false
-
 loss_fn:
   reference_policy_kl_penalty: 0.01
   use_importance_sampling_correction: true
-
 policy:
   model_name: Qwen/Qwen3-0.6B
   train_global_batch_size: ${mul:${grpo.num_prompts_per_step}, ${grpo.num_generations_per_prompt}}
-  train_micro_batch_size: 1
-  logprob_batch_size: 1
   max_total_sequence_length: 2048
   megatron_cfg:
     tensor_model_parallel_size: 1
-    pipeline_model_parallel_size: 1
     expert_model_parallel_size: 1
     context_parallel_size: 1
     sequence_parallel: false
   generation:
-    backend: vllm
     vllm_cfg:
-      async_engine: true
-      expose_http_server: true
       http_api_server_count: 8
       tensor_parallel_size: 2
-      pipeline_parallel_size: 1
-      expert_parallel_size: 1
     vllm_kwargs:
       max_num_seqs: 512
       max_num_batched_tokens: 8192
@@ -42,7 +31,6 @@ policy:
       resources:
         num_nodes: 1
         gpus_per_node: 4
-
 data_plane:
   enabled: true
   impl: transfer_queue
@@ -50,10 +38,8 @@ data_plane:
   claim_meta_poll_interval_s: 0.5
   simple:
     num_storage_units: 2
-
 token_capture:
   enabled: true
-
 async_rl:
   sampler:
     name: in_order
@@ -65,7 +51,6 @@ async_rl:
     enabled: false
   generation_router:
     enabled: false
-
 env:
   nemo_gym:
     policy_model:
@@ -73,15 +58,9 @@ env:
         vllm_model:
           sampling_overrides:
             max_tokens: 256
-
 checkpointing:
   enabled: false
-
 logger:
   log_dir: logs/grpo-qwen3-0.6b-1n8g-megatron-vllm-tp2-single-controller-gym-api8
   wandb:
     name: grpo-qwen3-0.6b-1n8g-megatron-vllm-tp2-single-controller-gym-api8
-
-cluster:
-  num_nodes: 1
-  gpus_per_node: 8
