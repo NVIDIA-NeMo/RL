@@ -32,7 +32,7 @@ import pytest
 import ray
 import requests
 import torch
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from pydantic import ValidationError
 
 from nemo_rl.algorithms.grpo import refit_policy_generation
@@ -1746,9 +1746,11 @@ async def test_pinned_with_cancellation_aborts_chat_completion_on_http_disconnec
     await asyncio.wait_for(started.wait(), 1)
     await receive_queue.put({"type": "http.disconnect"})
 
-    # The wrapper returns None once the disconnect listener wins, as in vLLM's
-    # own routes; the handler task is cancelled behind it.
-    assert await asyncio.wait_for(task, 1) is None
+    # The wrapper returns an empty response once the disconnect listener wins, as
+    # in vLLM's own routes; the handler task is cancelled behind it.
+    response = await asyncio.wait_for(task, 1)
+    assert type(response) is Response
+    assert response.body == b""
     await asyncio.wait_for(released.wait(), 1)
     assert cancelled.is_set()
     token_capture.fail_call.assert_called_once_with("call", reason="client_disconnect")
