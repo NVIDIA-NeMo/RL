@@ -3709,6 +3709,8 @@ def test_vllm_http_server(cluster, tokenizer):
                 "stop_reason": None,
                 "token_ids": None,
                 "routed_experts": None,
+                # Added in vLLM 0.33.
+                "weight_versions": None,
             }
         ],
         "service_tier": None,
