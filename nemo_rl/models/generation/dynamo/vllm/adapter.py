@@ -34,6 +34,7 @@ import base64
 import dataclasses
 import json
 import logging
+import math
 import os
 import pickle
 from collections.abc import AsyncGenerator
@@ -468,6 +469,14 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         generation_log_probs = None
         if completion.logprobs is not None:
             _, generation_log_probs = chat_generation_tokens(completion)
+            for index, log_prob in enumerate(generation_log_probs):
+                if not math.isfinite(log_prob):
+                    # Strict JSON has no NaN or inf (Dynamo sends null). The native
+                    # server's JSONResponse fails this call with 500, which Gym retries.
+                    raise RuntimeError(
+                        f"Generation produced a non-finite log-prob ({log_prob}) at "
+                        f"token {index} of {len(generation_log_probs)}"
+                    )
         return GymCallResult(
             prompt_token_ids=list(final_output.prompt_token_ids),
             generation_token_ids=list(completion.token_ids),
