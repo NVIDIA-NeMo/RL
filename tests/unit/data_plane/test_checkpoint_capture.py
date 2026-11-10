@@ -37,6 +37,37 @@ class _Capture(CheckpointCapture):
         self.released = True
 
 
+def test_context_manager_returns_capture_and_releases_after_success():
+    captured = _Capture()
+    with captured as entered:
+        assert entered is captured
+        assert not captured.released
+        entered.persist()
+    assert captured.released
+
+
+@pytest.mark.parametrize("error", [ValueError("body failed"), KeyboardInterrupt()])
+def test_context_manager_releases_without_suppressing_body_error(error):
+    captured = _Capture()
+    with pytest.raises(type(error)) as raised:
+        with captured:
+            raise error
+    assert raised.value is error
+    assert captured.released
+
+
+def test_context_manager_release_failure_keeps_body_error_as_context():
+    class FailingCapture(_Capture):
+        def release(self):
+            raise TimeoutError("release timed out")
+
+    error = ValueError("body failed")
+    with pytest.raises(TimeoutError, match="release timed out") as raised:
+        with FailingCapture():
+            raise error
+    assert raised.value.__context__ is error
+
+
 @pytest.mark.asyncio
 async def test_cancelled_capture_releases_late_result():
     entered, finish = threading.Event(), threading.Event()

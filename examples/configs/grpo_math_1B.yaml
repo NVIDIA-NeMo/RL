@@ -724,6 +724,7 @@ data_plane:
   # MooncakeCpuConfig in nemo_rl/data_plane/interfaces.py).
   simple:
     async_checkpoint: false  # enable the optional stable-view capture API; RAM-only
+    checkpoint_io_timeout_s: 600.0  # RPC budget per retained-view persist/release
     storage_capacity: 1000000        # max samples retained per partition
     num_storage_units: ${mul:2, ${cluster.num_nodes}}  # TQ wants >= 2 per node
     storage_unit_placement: null     # all, or cluster names like [inference]; null = TQ SPREAD
