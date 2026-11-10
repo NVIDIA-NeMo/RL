@@ -2341,28 +2341,42 @@ def _create_megatron_config(
 
 @contextmanager
 def _hide_extra_state_for_preload(model):
-    """Drop ``._extra_state`` from each chunk's state_dict for the duration of a load.
+    """Drop TE ``_extra_state`` entries for the duration of the draft preload.
 
-    TE's serialized extra state is quantization-dependent and is resized by TE during
-    forwards, so it is not stable across the lifecycle point the draft preload loads at.
-    It carries calibration metadata rather than learned weights.
+    Two details matter and both bit an earlier version of this helper:
+
+    * The dist-checkpoint loader consumes ``sharded_state_dict()``, not
+      ``state_dict()``. (MegatronQuantPolicyWorker._hide_extra_state patches
+      ``state_dict`` because its caller -- the reference-model swap -- uses that one.)
+    * Sharded keys are ``<module>._extra_state/shard_<i>_<n>``, so they do NOT end with
+      ``._extra_state``; match on containment.
+
+    These entries hold ModelOpt calibration metadata appended to TE's serialized extra
+    state, which TE also resizes during forwards. They are not learned weights, so the
+    preload can skip them; the policy weights it exists to load are unaffected.
     """
     chunks = model if isinstance(model, list) else [model]
-    originals = []
+    patched = []
+
+    def _filter(d):
+        return {k: v for k, v in d.items() if "._extra_state" not in k}
+
     try:
         for chunk in chunks:
-            original = chunk.state_dict
+            for attr in ("sharded_state_dict", "state_dict"):
+                original = getattr(chunk, attr, None)
+                if original is None:
+                    continue
 
-            def filtered(*args, _orig=original, **kwargs):
-                sd = _orig(*args, **kwargs)
-                return {k: v for k, v in sd.items() if not k.endswith("._extra_state")}
+                def wrapper(*args, _orig=original, **kwargs):
+                    return _filter(_orig(*args, **kwargs))
 
-            originals.append((chunk, original))
-            chunk.state_dict = filtered
+                patched.append((chunk, attr, original))
+                setattr(chunk, attr, wrapper)
         yield
     finally:
-        for chunk, original in originals:
-            chunk.state_dict = original
+        for chunk, attr, original in patched:
+            setattr(chunk, attr, original)
 
 
 def _create_draft_pre_wrap_hook(
