@@ -51,6 +51,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     sampler_supports_training_claims,
 )
 from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
     GRPOSaveState,
     RewardPenaltyConfig,
     _get_effort_config,
@@ -83,6 +84,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     is_ppo_run,
     logprob_passes_required,
     resolve_ppo_chunk_alignment,
+    rollout_snapshots_enabled,
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.utils import set_seed
@@ -1200,6 +1202,7 @@ def setup_single_controller(
         )
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
+    snapshots_enabled = rollout_snapshots_enabled(master_config)
     if master_config.rollout_recovery.turn_checkpointing_enabled:
         if generation_config["backend"] != "vllm":
             raise NotImplementedError(
@@ -1212,10 +1215,16 @@ def setup_single_controller(
                 "rollout_recovery.target_level='turn' requires the NeMo-Gym "
                 "rollout path (env.should_use_nemo_gym=true)"
             )
-        if rollout_checkpoint_cfg.snapshot_attempt_interval_s is None:
+        if (
+            rollout_checkpoint_cfg.snapshot_attempt_interval_s is None
+            and not rollout_checkpoint_cfg.snapshot_on_trainer_checkpoint
+            and master_config.checkpointing.get("checkpoint_must_save_by") is None
+        ):
             raise ValueError(
-                "rollout_recovery.target_level='turn' requires "
-                "rollout_checkpointing.snapshot_attempt_interval_s"
+                "rollout_recovery.target_level='turn' would never save environment "
+                "state: set rollout_checkpointing.snapshot_on_trainer_checkpoint=true, "
+                "rollout_checkpointing.snapshot_attempt_interval_s, or "
+                "checkpointing.checkpoint_must_save_by"
             )
         if not master_config.token_capture.enabled:
             raise ValueError(
@@ -1228,8 +1237,7 @@ def setup_single_controller(
                 "rollout_checkpointing.restore_mode='latest'"
             )
     if (
-        master_config.checkpointing.get("save_data_plane")
-        or rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
+        master_config.checkpointing.get("save_data_plane") or snapshots_enabled
     ) and not data_plane_checkpointing_supported:
         raise NotImplementedError(
             "SingleController data-plane checkpointing is not supported for "
@@ -1367,7 +1375,7 @@ def setup_single_controller(
             )
         if token_capture_cfg.defer_routed_experts_to_policy:
             raise ValueError("VLM token capture requires direct router replay assembly")
-    if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
+    if snapshots_enabled:
         if not master_config.checkpointing["enabled"]:
             raise ValueError(
                 "rollout checkpointing requires checkpointing.enabled=true"
@@ -1390,7 +1398,10 @@ def setup_single_controller(
                 "rollout checkpointing requires a sampler that explicitly "
                 "supports training-claim ownership"
             )
-        if master_config.checkpointing["save_period"] != 1:
+        if (
+            rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
+            and master_config.checkpointing["save_period"] != 1
+        ):
             warnings.warn(
                 "rollout checkpointing is enabled with "
                 f"checkpointing.save_period={master_config.checkpointing['save_period']}; "
@@ -1524,10 +1535,7 @@ def setup_single_controller(
     restore_mode = rollout_checkpoint_cfg.restore_mode
     recovery_checkpoint_path = trainer_checkpoint_path
     bootstrap_anchor = checkpointer.checkpoint_dir / BOOTSTRAP_DIRNAME
-    needs_bootstrap_identity = (
-        trainer_checkpoint_path is None
-        and rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
-    )
+    needs_bootstrap_identity = trainer_checkpoint_path is None and snapshots_enabled
     bootstrap_identity = (
         bootstrap_compatibility_identity(master_config)
         if needs_bootstrap_identity
@@ -1545,7 +1553,7 @@ def setup_single_controller(
     snapshot_resolution_started = time.monotonic()
     if (
         trainer_checkpoint_path is not None
-        and rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
+        and snapshots_enabled
         and restore_mode == "latest"
     ):
         resolved_snapshot = resolve_latest_snapshot(
@@ -1555,7 +1563,7 @@ def setup_single_controller(
             expected_bootstrap_fingerprint=None,
         )
     elif trainer_checkpoint_path is None:
-        if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
+        if snapshots_enabled:
             assert bootstrap_digest is not None
             assert bootstrap_identity is not None
             if bootstrap_anchor.is_dir():
@@ -1571,11 +1579,7 @@ def setup_single_controller(
                         "restore_mode='latest' to recover it or choose a new "
                         "checkpoint_dir. Existing checkpoint state was not modified."
                     )
-        if (
-            rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
-            and restore_mode == "latest"
-            and bootstrap_anchor.is_dir()
-        ):
+        if snapshots_enabled and restore_mode == "latest" and bootstrap_anchor.is_dir():
             resolved_snapshot = resolve_latest_snapshot(
                 bootstrap_anchor,
                 expected_train_step=0,
@@ -2416,6 +2420,14 @@ def setup_single_controller(
             else 1
         ),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
+        filter_zero_variance_groups=algo_cfg.use_dynamic_sampling,
+        # The advantage stage's participation knobs; None on PPO, which has no group baseline.
+        masked_reward_policy=(
+            None
+            if is_ppo_run(master_config)
+            else cast(GRPOConfig, algo_cfg).masked_reward_policy
+        ),
+        overlong_filtering=algo_cfg.overlong_filtering,
     )
 
     # Print setup timing metrics

@@ -48,6 +48,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
+    RewardScalingConfig,
     _create_advantage_estimator,
     _initial_grpo_save_state,
 )
@@ -2444,6 +2445,8 @@ def _train_pump_controller(*, sampler) -> object:
         set_weight_version=MagicMock(),
         suspend_request_deadlines=MagicMock(),
         resume_request_deadlines=MagicMock(),
+        drain_step_reward_metrics=MagicMock(return_value={}),
+        filter_zero_variance_groups=False,
     )
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
@@ -2454,6 +2457,10 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
+    ctrl._dynamic_sampling_enabled = False
+    ctrl._rollout_runtime.steps_allowed_short = set()
+    ctrl._rollout_runtime.finalizer_metrics_by_group = {}
+    ctrl._rollout_runtime.finalizer_rewards_by_group = {}
     ctrl._log_full_result_tables = False
     ctrl._step_log_dict = {
         "reward_partials": [],
@@ -2592,6 +2599,92 @@ def test_train_pump_closes_a_step_short_when_a_stamped_prompt_is_dropped(
     assert ctrl._rollout_runtime.batch_shortfall == {}
     assert ctrl._batch_replacements == {}
     assert ctrl._batch_promotions == {3: 1}
+
+
+@pytest.mark.parametrize("credit_in_evict", [False, True])
+@pytest.mark.parametrize("fraction, skipped", [(0.5, False), (0.51, True)])
+def test_data_exhausted_step_respects_batch_floor(
+    monkeypatch, credit_in_evict: bool, fraction: float, skipped: bool
+) -> None:
+    ctrl = _dropping_controller(credit_in_evict=credit_in_evict)
+    ctrl._rollout_runtime.steps_allowed_short.add(0)
+    ctrl._async_cfg.rollout_failure.min_step_batch_fraction = fraction
+    ctrl._trainer.abort_train_step = MagicMock()
+    ctrl._trainer.finish_train_step = MagicMock(return_value={})
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._trainer.abort_train_step.call_count == int(skipped)
+    assert ctrl._trainer.finish_train_step.call_count == int(not skipped)
+    assert ctrl._consumed_samples == int(not skipped)
+    assert ctrl._train_steps == ctrl._trainer_version == 1
+    metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert metrics["skipped_step"] == int(skipped)
+    assert ctrl._buffer_capacity._value == 3
+    assert ctrl._sync_weights.await_count == int(not skipped)
+
+
+def test_skipped_exhausted_step_allows_later_admitted_step_to_train(
+    monkeypatch,
+) -> None:
+    metas = [
+        KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"sample-{index}"],
+            fields=[],
+            sequence_lengths=[1],
+            tags=_one_group_tags(1),
+        )
+        for index in range(3)
+    ]
+    ctrl = _train_pump_controller(sampler=_SequenceSampler(metas))
+    ctrl._algo_cfg.max_num_steps = 2
+    ctrl._rollout_runtime.steps_allowed_short.add(0)
+    ctrl._rollout_runtime.batch_shortfall[0] = 1
+    ctrl._trainer.abort_train_step = MagicMock()
+    ctrl._trainer.finish_train_step = MagicMock(return_value={})
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    ctrl._trainer.abort_train_step.assert_called_once()
+    ctrl._trainer.finish_train_step.assert_called_once()
+    assert ctrl._consumed_samples == 2
+    assert ctrl._train_steps == ctrl._trainer_version == 2
+    metrics = [
+        call.args[0]
+        for call in ctrl._logger.log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    ]
+    assert [item["skipped_step"] for item in metrics] == [1, 0]
+    assert ctrl._buffer_capacity._value == 5
+
+
+def test_data_exhausted_step_with_no_groups_skips_without_opening_optimizer(
+    monkeypatch,
+) -> None:
+    ctrl = _train_pump_controller(sampler=_EmptySampler())
+    ctrl._rollout_runtime.steps_allowed_short.add(0)
+    ctrl._rollout_runtime.batch_shortfall[0] = 2
+    ctrl._trainer.begin_train_step = MagicMock()
+    ctrl._trainer.abort_train_step = MagicMock()
+    ctrl._trainer.finish_train_step = MagicMock()
+    ctrl._logger = MagicMock()
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    ctrl._trainer.begin_train_step.assert_not_called()
+    ctrl._trainer.abort_train_step.assert_not_called()
+    ctrl._trainer.finish_train_step.assert_not_called()
+    assert ctrl._consumed_samples == 0
+    assert ctrl._train_steps == ctrl._trainer_version == 1
+    assert ctrl._logger.log_metrics.call_args_list[0].args[0]["skipped_step"] == 1
 
 
 def test_train_pump_prunes_stamps_older_than_the_step_that_just_closed(
@@ -3988,6 +4081,7 @@ def test_ppo_checkpoint_saves_both_updates_without_repeating_early_refit(
         assert kwargs == {
             "is_policy_training_step": True,
             "is_final_checkpoint": True,
+            "publish_now": False,
         }
         assert "critic.finish_training" in calls
         assert len(ctrl._dp_client.cleared_ids) == len(metas)
@@ -4411,15 +4505,8 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
     ctrl._is_ppo = True
-    ctrl._master_config = SimpleNamespace(
-        ppo=SimpleNamespace(
-            seq_logprob_error_threshold=None,
-            overlong_filtering=False,
-            # The shard-decline log names the estimator, so an unshardable
-            # stub has to carry one even though the assertions below ignore it.
-            adv_estimator=SimpleNamespace(name="gae"),
-        )
-    )
+    # Populate stage-read defaults without validating this partial PPO stub.
+    ctrl._master_config = SimpleNamespace(ppo=PPOConfig.model_construct())
     ctrl._algo_cfg = ctrl._master_config.ppo
     ctrl._message_level_advantage_penalties_enabled = False
     # gae normalizes over the whole batch, so it is not shard-invariant.
@@ -4452,6 +4539,75 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     )
     assert "returns" in (result_meta.fields or [])
     assert "advantages" in (result_meta.fields or [])
+
+
+def test_advantage_stage_scales_rewards_off_the_ppo_block_before_gae() -> None:
+    """Scaled PPO rewards must reach the real GAE critic targets."""
+    batch_size, sequence_length = 2, 4
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([1.0, 0.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.ones(batch_size),
+            "values": torch.zeros(batch_size, sequence_length),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    ppo = PPOConfig.model_construct(
+        reward_scaling=RewardScalingConfig(
+            enabled=True,
+            source_min=0.0,
+            source_max=1.0,
+            target_min=-1.0,
+            target_max=1.0,
+        ),
+        adv_estimator=GAEConfig(normalize_advantages=False, gae_gamma=1.0),
+    )
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = GeneralizedAdvantageEstimator(
+        ppo.adv_estimator, ClippedPGLossConfig()
+    )
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._train_data_dump = None
+    ctrl._is_ppo = True
+    ctrl._master_config = SimpleNamespace(ppo=ppo)
+    ctrl._algo_cfg = ppo
+    ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl, shardable=False)
+    ctrl._step_log_dict = {
+        "reward_partials": [],
+        "advantage_partials": [],
+        "sequence_lengths": [],
+        "num_mask_sample_filtered": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    returns = data_plane.written_fields["returns"]
+    torch.testing.assert_close(returns[:, -1], torch.tensor([1.0, -1.0]))
+    partial = ctrl._step_log_dict["reward_partials"][0]
+    assert partial.weighted_total / partial.weight == pytest.approx(0.0)
+    torch.testing.assert_close(data["total_reward"], torch.tensor([1.0, 0.0]))
 
 
 @pytest.mark.parametrize("dump_enabled", [False, True])
@@ -4563,6 +4719,7 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
     state = build_rollout_recovery_state(
         RolloutRecoveryLedger(),
         batch_shortfall={},
+        steps_allowed_short=set(),
         sampler_stamps_target_steps=True,
         finalizer_metrics_by_group=pending,
         finalizer_rewards_by_group={

@@ -25,6 +25,8 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "docker/prune_uv_cache.py",
+  "nemo_rl/experience/dynamic_sampling.py",
   "nemo_rl/environments/call_selection.py",
   "nemo_rl/algorithms/single_controller_utils/logical_advantage.py",
   "nemo_rl/data/captured_media.py",
@@ -368,6 +370,7 @@ project-includes = [
   "nemo_rl/utils/checkpoint_engines/base.py",
   "nemo_rl/utils/checkpoint_engines/nixl.py",
   "nemo_rl/utils/checkpoint_storage.py",
+  "nemo_rl/utils/compile_cache.py",
   "nemo_rl/utils/config.py",
   "nemo_rl/utils/cuda_ipc.py",
   "nemo_rl/utils/fastokens.py",

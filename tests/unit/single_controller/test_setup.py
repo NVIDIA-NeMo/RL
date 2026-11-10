@@ -29,6 +29,7 @@ from unittest.mock import ANY, MagicMock, patch
 import pytest
 import torch
 from omegaconf import OmegaConf
+from pydantic import ValidationError
 
 import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
 from nemo_rl.algorithms.advantage_estimator import (
@@ -1224,7 +1225,7 @@ class TestSetup:
 
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is False
 
-    def test_turn_recovery_requires_periodic_snapshots(self):
+    def test_turn_recovery_rejects_a_config_that_never_saves(self):
         mc = _make_master_config(env={"should_use_nemo_gym": True})
         mc.policy["generation"]["vllm_cfg"] = {
             "async_engine": True,
@@ -1232,10 +1233,13 @@ class TestSetup:
         }
         mc.token_capture.enabled = True
         mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_on_trainer_checkpoint=False
+        )
 
         with pytest.raises(
             ValueError,
-            match="target_level='turn' requires.*snapshot_attempt_interval_s",
+            match="target_level='turn' would never save environment state",
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -1321,10 +1325,18 @@ class TestSetup:
 
         validate_single_controller_config(mc)
 
+    @pytest.mark.parametrize(
+        ("interval_s", "on_trainer_checkpoint", "must_save_by"),
+        [(1.0, True, None), (None, True, None), (None, False, "01:00:00:00")],
+        ids=["periodic", "every-trainer-checkpoint", "deadline-only"],
+    )
     def test_periodic_checkpointing_warns_without_per_step_trainer_anchors(
         self,
         tmp_path: Path,
         patched_factories,
+        interval_s,
+        on_trainer_checkpoint,
+        must_save_by,
     ):
         mc = _make_master_config(colocated=False, backend="vllm")
         mc.checkpointing.update(
@@ -1333,6 +1345,7 @@ class TestSetup:
                 "enabled": True,
                 "save_data_plane": True,
                 "save_period": 2,
+                "checkpoint_must_save_by": must_save_by,
             }
         )
         mc.policy["generation"].update(
@@ -1347,7 +1360,8 @@ class TestSetup:
         mc.token_capture.enabled = True
         mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
         mc.rollout_checkpointing = RolloutCheckpointConfig(
-            snapshot_attempt_interval_s=1.0
+            snapshot_attempt_interval_s=interval_s,
+            snapshot_on_trainer_checkpoint=on_trainer_checkpoint,
         )
         fake_finalizers = [MagicMock(name="finalizer")]
         patched_factories["setup_response_data"].return_value = (
@@ -1356,7 +1370,7 @@ class TestSetup:
         )
 
         with (
-            pytest.warns(UserWarning, match="checkpointing.save_period=2"),
+            warnings.catch_warnings(record=True) as caught,
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
@@ -1368,6 +1382,7 @@ class TestSetup:
                 return_value=fake_finalizers,
             ),
         ):
+            warnings.simplefilter("always")
             actor_args, _ = setup_single_controller(
                 mc,
                 MagicMock(pad_token_id=0),
@@ -1375,6 +1390,11 @@ class TestSetup:
 
         assert actor_args.finalizer_actors == fake_finalizers
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is True
+        # Turn recovery alone snapshots after each trainer checkpoint, so only
+        # a periodic interval needs a step_N for every step.
+        assert any("checkpointing.save_period=2" in str(w.message) for w in caught) is (
+            interval_s is not None
+        )
 
     def test_nemo_gym_log_dir_is_set_before_gym_build(
         self, patched_factories, tmp_path
@@ -4107,6 +4127,31 @@ class TestOPDFullValidation:
         config.policy["megatron_cfg"]["enabled"] = False
         with pytest.raises(ValueError, match="requires the Megatron backend"):
             _validate_opd_full_config(config, config.on_policy_distillation)
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "recipe"),
+    [
+        ("grpo", "examples/configs/grpo_math_1B_megatron_single_controller.yaml"),
+        ("ppo", "examples/configs/ppo_math_1B_megatron_single_controller.yaml"),
+    ],
+)
+def test_master_config_reports_the_reward_scaling_field_path(
+    algorithm: str, recipe: str
+) -> None:
+    register_omegaconf_resolvers()
+    repo_root = Path(__file__).resolve().parents[3]
+    config = OmegaConf.to_container(load_config(repo_root / recipe), resolve=True)
+    config[algorithm]["reward_scaling"] = {
+        "enabled": True,
+        "source_min": 1.0,
+        "source_max": 1.0,
+    }
+
+    with pytest.raises(ValidationError) as error:
+        MasterConfig(**config)
+
+    assert error.value.errors()[0]["loc"] == (algorithm, "reward_scaling")
 
 
 class _FakeTeacherGroup:

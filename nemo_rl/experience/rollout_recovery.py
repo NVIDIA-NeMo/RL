@@ -44,13 +44,14 @@ if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
     from nemo_rl.experience.rollout_reassembler import RolloutSelection
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 7
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 8
 # Schemas 2 to 5 predate turn-level recovery; they load through
 # _upgrade_pre_turn_recovery_groups.
 _PRE_TURN_RECOVERY_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
 SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {
     *_PRE_TURN_RECOVERY_SCHEMA_VERSIONS,
     6,
+    7,
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
 }
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
@@ -61,6 +62,7 @@ _SIDECAR_STATE_FIELDS = frozenset(
     {
         *_LEDGER_STATE_FIELDS,
         "batch_shortfall",
+        "steps_allowed_short",
         "finalizer_metrics_by_group",
         "finalizer_rewards_by_group",
         "reward_settings",
@@ -427,6 +429,7 @@ class ParsedRolloutRecoveryState:
 
     ledger_state: RolloutRecoveryState
     batch_shortfall: dict[int, int]
+    steps_allowed_short: set[int]
     sampler_stamps_target_steps: Optional[bool]
     finalizer_metrics_by_group: dict[str, dict[str, float]]
     finalizer_rewards_by_group: dict[str, list[FinalizedReward]]
@@ -2179,10 +2182,29 @@ def _validate_finalizer_rewards(value: object) -> dict[str, list[FinalizedReward
     return result
 
 
+def _validate_steps_allowed_short(value: object) -> set[int]:
+    """Validate the exhausted steps whose short batch must reach the train pump."""
+    if not isinstance(value, list):
+        raise TypeError("rollout recovery steps_allowed_short must be a list")
+    if any(
+        isinstance(step, bool) or not isinstance(step, int) or step < 0
+        for step in value
+    ):
+        raise ValueError(
+            "rollout recovery steps_allowed_short must contain non-negative integers"
+        )
+    if len(value) != len(set(value)):
+        raise ValueError(
+            "rollout recovery steps_allowed_short contains duplicate steps"
+        )
+    return set(value)
+
+
 def build_rollout_recovery_state(
     ledger: RolloutRecoveryLedger,
     *,
     batch_shortfall: dict[int, int],
+    steps_allowed_short: set[int],
     sampler_stamps_target_steps: bool,
     finalizer_metrics_by_group: dict[str, dict[str, float]] | None = None,
     finalizer_rewards_by_group: dict[str, list[FinalizedReward]] | None = None,
@@ -2196,6 +2218,9 @@ def build_rollout_recovery_state(
         )
     state = ledger.state_dict()
     state["batch_shortfall"] = _validate_batch_shortfall(batch_shortfall)
+    state["steps_allowed_short"] = sorted(
+        _validate_steps_allowed_short(list(steps_allowed_short))
+    )
     state["sampler_stamps_target_steps"] = sampler_stamps_target_steps
     state["finalizer_metrics_by_group"] = _validate_finalizer_metrics(
         finalizer_metrics_by_group or {}
@@ -2289,9 +2314,14 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
     )
     if set(finalizer_rewards) - set(finalizer_metrics):
         raise ValueError("finalized reward observations require matching group metrics")
+    if schema_version >= 8 and "steps_allowed_short" not in state:
+        raise ValueError("rollout recovery sidecar is missing 'steps_allowed_short'")
     return ParsedRolloutRecoveryState(
         ledger_state=ledger_state,
         batch_shortfall=_validate_batch_shortfall(state.get("batch_shortfall", {})),
+        steps_allowed_short=_validate_steps_allowed_short(
+            state.get("steps_allowed_short", [])
+        ),
         sampler_stamps_target_steps=raw_sampler_stamps,
         finalizer_metrics_by_group=finalizer_metrics,
         finalizer_rewards_by_group=finalizer_rewards,
