@@ -119,19 +119,22 @@ class _TrainStepState:
 def _refit_tensor_dtype(
     fqn: str, tensor: torch.Tensor, default_dtype: torch.dtype
 ) -> torch.dtype:
-    """Preserve the dtype of non-floating-point buffers and FP32 MoE router state.
+    """Preserve non-floating buffers and inference-critical FP32 state.
 
     Integer/bool buffers (e.g. the reduced-vocab draft's d2t index map) must
     keep their dtype — token ids are not representable in bf16. FP32
     ``e_score_correction_bias`` tensors are inference-critical MoE router
-    state and must also stay FP32.
+    state and must also stay FP32. SSM ``A_log`` parameters also remain FP32
+    in the inference model; downcasting their refit payload loses precision
+    before the inference loader copies them into FP32 storage.
     """
     if not tensor.is_floating_point():
         return tensor.dtype
-    is_router_correction_bias = fqn.rsplit(".", maxsplit=1)[-1] == (
-        "e_score_correction_bias"
-    )
-    if is_router_correction_bias and tensor.dtype == torch.float32:
+    preserve_fp32 = fqn.rsplit(".", maxsplit=1)[-1] in {
+        "e_score_correction_bias",
+        "A_log",
+    }
+    if preserve_fp32 and tensor.dtype == torch.float32:
         return tensor.dtype
     return default_dtype
 
@@ -240,7 +243,7 @@ def _module_params_generator(
     Args:
         model: The model whose parameters to generate.
         target_dtype: The default dtype for refit tensors. Source-FP32
-            ``e_score_correction_bias`` tensors retain FP32.
+            ``e_score_correction_bias`` and ``A_log`` tensors retain FP32.
 
     Yields:
         Tuples of (fully_qualified_name, tensor) where tensors are converted to
