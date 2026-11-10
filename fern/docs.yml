@@ -1,0 +1,115 @@
+instances:
+  - url: nemo-rl.docs.buildwithfern.com/nemo/rl
+    custom-domain: docs.nvidia.com/nemo/rl
+    multi-source: true
+
+title: NVIDIA NeMo RL
+
+global-theme: nvidia
+
+logo:
+  href: /nemo/rl/0.8.0
+  right-text: NeMo RL
+
+layout:
+  breadcrumbs:
+    current-page: true
+
+libraries:
+  nemo-rl-0-8-0:
+    input:
+      git: https://github.com/NVIDIA-NeMo/RL
+      subpath: nemo_rl
+      ref: v0.8.0
+    output:
+      path: ./api-reference/0.8.0
+    lang: python
+  nemo-rl:
+    input:
+      git: https://github.com/NVIDIA-NeMo/RL
+      subpath: nemo_rl
+    output:
+      path: ./api-reference/nemo-rl
+    lang: python
+  nemo-rl-0-7-0:
+    input:
+      git: https://github.com/NVIDIA-NeMo/RL
+      subpath: nemo_rl
+      ref: v0.7.0
+    output:
+      path: ./api-reference/0.7.0
+    lang: python
+
+navbar-links:
+  - type: github
+    value: https://github.com/NVIDIA-NeMo/RL
+
+versions:
+  - display-name: Nightly
+    path: versions/nightly.yml
+    slug: nightly
+  - display-name: 0.8.0
+    path: versions/0.8.0.yml
+    slug: 0.8.0
+    availability: stable
+  - display-name: 0.7.0
+    path: versions/0.7.0.yml
+    slug: 0.7.0
+    availability: stable
+
+redirects:
+  # Old Sphinx URL -> new Fern page, one hop each. Sources and destinations both include the
+  # /nemo/rl basepath. Order matters (first match wins).
+  # The old /latest/ URLs (still linked from outside) map to 0.8.0, the current release.
+  - source: "/nemo/rl/latest"
+    destination: "/nemo/rl/0.8.0"
+  - source: "/nemo/rl/latest/:path*"
+    destination: "/nemo/rl/0.8.0/:path*"
+  - source: "/nemo/rl/index.html"
+    destination: "/nemo/rl/0.8.0"
+  - source: "/nemo/rl/index"
+    destination: "/nemo/rl/0.8.0"
+  - source: "/nemo/rl/:version/apidocs"
+    destination: "/nemo/rl/:version/api-reference"
+  - source: "/nemo/rl/:version/apidocs/:path*"
+    destination: "/nemo/rl/:version/api-reference"
+  - source: "/nemo/rl/:version/search.html"
+    destination: "/nemo/rl/:version"
+  - source: "/nemo/rl/:version/genindex.html"
+    destination: "/nemo/rl/:version/api-reference"
+  - source: "/nemo/rl/:version/py-modindex.html"
+    destination: "/nemo/rl/:version/api-reference"
+  - source: "/nemo/rl/:version/_modules/:path*"
+    destination: "/nemo/rl/:version/api-reference"
+  - source: "/nemo/rl/:version/adding-new-models.html"
+    destination: "/nemo/rl/:version/guides/adding-new-models"
+  - source: "/nemo/rl/:version/ci-cd.html"
+    destination: "/nemo/rl/:version/development/ci-cd"
+  - source: "/nemo/rl/:version/cluster.html"
+    destination: "/nemo/rl/:version/environment-start/cluster"
+  - source: "/nemo/rl/:version/debugging.html"
+    destination: "/nemo/rl/:version/development/debugging"
+  - source: "/nemo/rl/:version/docker.html"
+    destination: "/nemo/rl/:version/containers/docker"
+  - source: "/nemo/rl/:version/documentation.html"
+    destination: "/nemo/rl/:version/development/documentation"
+  - source: "/nemo/rl/:version/fp8.html"
+    destination: "/nemo/rl/:version/development/fp8"
+  - source: "/nemo/rl/:version/guides/sft-openmathinstruct2.html"
+    destination: "/nemo/rl/:version/e2e-examples/sft-openmathinstruct2"
+  - source: "/nemo/rl/:version/guides/use-custom-vllm.html"
+    destination: "/nemo/rl/:version/development/use-custom-vllm"
+  - source: "/nemo/rl/:version/local-workstation.html"
+    destination: "/nemo/rl/:version/environment-start/local-workstation"
+  - source: "/nemo/rl/:version/model-quirks.html"
+    destination: "/nemo/rl/:version/guides/model-quirks"
+  - source: "/nemo/rl/:version/nsys-profiling.html"
+    destination: "/nemo/rl/:version/development/nsys-profiling"
+  - source: "/nemo/rl/:version/testing.html"
+    destination: "/nemo/rl/:version/development/testing"
+  - source: "/nemo/rl/:path*/index.html"
+    destination: "/nemo/rl/:path*"
+  - source: "/nemo/rl/:path*.html"
+    destination: "/nemo/rl/:path*"
+  - source: "/nemo/rl/:path*.htm"
+    destination: "/nemo/rl/:path*"
