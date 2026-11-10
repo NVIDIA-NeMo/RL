@@ -224,6 +224,7 @@ def run_api_process(
     from vllm.v1.executor.abstract import Executor
     from vllm.v1.metrics.prometheus import shutdown_prometheus
 
+    from nemo_rl.models.generation.vllm.config import resolve_vllm_video_config
     from nemo_rl.models.generation.vllm.vllm_worker_async import (
         VllmAsyncGenerationWorkerImpl,
         _AsyncLLMHTTPClient,
@@ -243,6 +244,17 @@ def run_api_process(
     engine = None
     engine_config.parallel_config._api_process_rank = index
     try:
+        video_config = resolve_vllm_video_config(generation_config)
+        if video_config is not None:
+            # Spawned video frontends need their own process-local loader registration.
+            from nemo_rl.models.generation.vllm.video_utils import (
+                register_torchcodec_vllm_video_loader,
+            )
+
+            register_torchcodec_vllm_video_loader(
+                sampling_style=video_config.sampling_style,
+                temporal_patch_size=video_config.temporal_patch_size,
+            )
         engine = AsyncLLM(
             vllm_config=engine_config,
             executor_class=Executor.get_class(engine_config),
