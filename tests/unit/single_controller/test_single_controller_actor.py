@@ -2371,7 +2371,8 @@ class _StepMetricRecordingGeneration:
     def snapshot_step_metrics(self) -> None:
         self._record("snapshot_step_metrics")
 
-    def get_step_metrics(self) -> dict[str, float]:
+    def get_step_metrics(self, *, keep_snapshot: bool = False) -> dict[str, float]:
+        assert keep_snapshot
         self._record("get_step_metrics")
         return {"vllm/spec_acceptance_rate": 0.8}
 
@@ -2439,7 +2440,7 @@ def _train_pump_controller(*, sampler) -> object:
         requires_kv_scale_sync=False,
         blocks_training=lambda: False,
         snapshot_step_metrics=lambda: None,
-        get_step_metrics=lambda: {},
+        get_step_metrics=lambda *, keep_snapshot=False: {},
     )
     ctrl._rollout_manager = SimpleNamespace(
         set_weight_version=MagicMock(),
@@ -2943,7 +2944,39 @@ def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
     assert "histogram/gen_tokens_length" not in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("dies_in", [None, "snapshot_step_metrics", "get_step_metrics"])
+@pytest.mark.parametrize("snapshot_fails", [False, True])
+def test_run_pumps_snapshots_generation_before_dispatch(
+    monkeypatch, snapshot_fails: bool
+) -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = controller_cls.__new__(controller_cls)
+    ctrl._environment_checkpoint = SimpleNamespace(check_startup=AsyncMock())
+    ctrl._weight_synchronizer = SimpleNamespace(is_stale=False)
+    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._trainer_version = 0
+    ctrl._rollout_restorer = SimpleNamespace(restore=AsyncMock(return_value=False))
+    events = []
+
+    def snapshot() -> None:
+        events.append("snapshot")
+        if snapshot_fails:
+            raise ActorDiedError()
+
+    def stop_before_dispatch(coroutine: Any) -> None:
+        coroutine.close()
+        events.append("dispatch")
+        raise RuntimeError("stop before dispatch")
+
+    ctrl._gen = SimpleNamespace(snapshot_step_metrics=snapshot)
+    monkeypatch.setattr(asyncio, "create_task", stop_before_dispatch)
+
+    with pytest.raises(RuntimeError, match="stop before dispatch"):
+        asyncio.run(ctrl._run_pumps())
+
+    assert events == ["snapshot", "dispatch"]
+
+
+@pytest.mark.parametrize("dies_in", [None, "get_step_metrics"])
 def test_train_pump_collects_generation_metrics_at_step_boundaries(
     monkeypatch, dies_in
 ) -> None:
@@ -2968,7 +3001,6 @@ def test_train_pump_collects_generation_metrics_at_step_boundaries(
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert events == [
-        "snapshot_step_metrics",
         "begin_train_step",
         "train_microbatches",
         "train_microbatches",
@@ -3035,7 +3067,7 @@ def test_train_pump_chunked_step_by_engine_regime(
         blocks_training=lambda: engine_blocks_training,
         finish_generation=_finish_generation,
         snapshot_step_metrics=lambda: None,
-        get_step_metrics=lambda: {},
+        get_step_metrics=lambda *, keep_snapshot=False: {},
     )
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
@@ -3385,7 +3417,7 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
                 ctrl._rollout_permitted.is_set()
             ),
             snapshot_step_metrics=lambda: None,
-            get_step_metrics=lambda: {},
+            get_step_metrics=lambda *, keep_snapshot=False: {},
         )
         ctrl._rollout_permitted = asyncio.Event()
         ctrl._rollout_permitted.set()

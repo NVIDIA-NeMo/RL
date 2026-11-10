@@ -872,6 +872,12 @@ class SingleControllerActor:
         if await self._rollout_restorer.restore():
             self._rollout_recovery_enabled = True
 
+        # Capture the baseline before either pump can dispatch generation.
+        try:
+            await asyncio.to_thread(self._gen.snapshot_step_metrics)
+        except RayActorError as error:
+            log.warning("Skipping generation snapshot metrics: %s", error)
+
         # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
         train_task = asyncio.create_task(self._train_pump())
@@ -2802,14 +2808,6 @@ class SingleControllerActor:
                             train_meta.extra_info.pop(ROLLOUT_METRICS, [])
                         )
 
-                    if groups_dispatched == 0:
-                        try:
-                            await asyncio.to_thread(self._gen.snapshot_step_metrics)
-                        except RayActorError as error:
-                            log.warning(
-                                "Skipping generation snapshot metrics: %s", error
-                            )
-
                     # Safe mid-loop: colocated steps are assembled whole, so the loop closes after this.
                     # The gate reopens at the post-step _sync_weights wake, or after the save on save-bound steps.
                     if self._gen.blocks_training():
@@ -3354,7 +3352,9 @@ class SingleControllerActor:
                         step_metrics[name] = Table(data=data, columns=["Full result"])
                 try:
                     step_metrics.update(
-                        await asyncio.to_thread(self._gen.get_step_metrics)
+                        await asyncio.to_thread(
+                            self._gen.get_step_metrics, keep_snapshot=True
+                        )
                     )
                 except RayActorError as error:
                     log.warning("Skipping generation step metrics: %s", error)

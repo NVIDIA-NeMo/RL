@@ -1319,6 +1319,46 @@ def test_step_metrics_are_returned_when_the_snapshot_reads_cleanly():
     assert stub._step_metrics_snapshot is None
 
 
+def test_step_metrics_reuse_the_end_snapshot_without_gaps():
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    stub = _generation_stub({"vllm:generation_tokens": 10.0})
+    stub._get_raw_spec_counters = MagicMock(
+        side_effect=[
+            {"vllm:generation_tokens": 30.0},
+            {"vllm:generation_tokens": 65.0},
+        ]
+    )
+
+    first = VllmGeneration.get_step_metrics(stub, keep_snapshot=True)
+    second = VllmGeneration.get_step_metrics(stub, keep_snapshot=True)
+
+    assert first["vllm/generation_tokens"] == 20.0
+    assert second["vllm/generation_tokens"] == 35.0
+    assert stub._get_raw_spec_counters.call_count == 2
+    assert stub._step_metrics_snapshot == {"vllm:generation_tokens": 65.0}
+
+
+def test_continuous_step_metrics_recover_after_a_failed_read():
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    stub = _generation_stub({"vllm:generation_tokens": 10.0})
+    stub._get_raw_spec_counters = MagicMock(
+        side_effect=[
+            RuntimeError("reader gone"),
+            {"vllm:generation_tokens": 30.0},
+            {"vllm:generation_tokens": 65.0},
+        ]
+    )
+
+    assert VllmGeneration.get_step_metrics(stub, keep_snapshot=True) == {}
+    assert stub._step_metrics_snapshot is None
+    assert VllmGeneration.get_step_metrics(stub, keep_snapshot=True) == {}
+    assert stub._step_metrics_snapshot == {"vllm:generation_tokens": 30.0}
+    metrics = VllmGeneration.get_step_metrics(stub, keep_snapshot=True)
+    assert metrics["vllm/generation_tokens"] == 35.0
+
+
 @dataclass(frozen=True)
 class _PlaceholderRange:
     offset: int
