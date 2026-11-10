@@ -1050,7 +1050,7 @@ def _init_tq(
             # Stop the run if Mooncake ever deletes an SSD copy for space.
             mooncake_ssd_offload.watch_master_disk_evictions(
                 f"http://{local_ip}:{metrics_port}/metrics",
-                str(mooncake_cfg.ssd_offload.path),
+                mooncake_cfg.ssd_offload.dir(),
             )
         overlay = {
             **controller_overlay,

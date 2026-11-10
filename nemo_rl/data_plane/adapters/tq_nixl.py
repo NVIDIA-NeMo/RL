@@ -67,7 +67,8 @@ from transfer_queue.storage.clients.base import StorageClientFactory, StorageKVC
 from transfer_queue.storage.managers.base import KVStorageManager, StorageManagerFactory
 
 from nemo_rl.data_plane.adapters import tq_nixl_checkpoint
-from nemo_rl.data_plane.interfaces import NixlStoreConfig
+from nemo_rl.data_plane.interfaces import NIXL_SSD_DIRNAME, NixlStoreConfig
+from nemo_rl.data_plane.local_disk import default_ssd_dir
 from nemo_rl.data_plane.nixl import blob_format
 from nemo_rl.data_plane.nixl.blobstore import (
     BUSY_RETRY_MAX_S,
@@ -143,7 +144,8 @@ def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
     """Unit kwargs for the SSD tier, or None when ``ssd.enabled`` is off.
 
     ``ssd: {enabled, path, staging_bytes, pickup_s, io_threads}``: when a unit's put area cannot
-    take a put, the put goes to a file under ``path`` (node-local NVMe) from birth,
+    take a put, the put goes to a file under ``path`` (node-local NVMe; null
+    picks ``/raid`` or ``/tmp``, see ``local_disk.default_ssd_dir``) from birth,
     through an IO area of ``staging_bytes`` carved from the slab; reads of such
     blobs are staged back into the same area, by ``io_threads`` file-I/O threads
     per unit. Data already in the put area never moves.
@@ -171,7 +173,7 @@ def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
             f"NixlStore ssd.pickup_s={pickup_s} must be >= {2 * BUSY_RETRY_MAX_S}"
         )
     return {
-        "ssd_dir": ssd["path"],
+        "ssd_dir": ssd["path"] or default_ssd_dir(NIXL_SSD_DIRNAME),
         "staging_bytes": staging,
         "pickup_s": pickup_s,
         "io_threads": int(ssd["io_threads"]),
