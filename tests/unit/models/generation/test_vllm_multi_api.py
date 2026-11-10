@@ -116,6 +116,7 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                     routed_experts_dtype=dtype,
                 )
             self.assertEqual(hosts[0].routed_experts_dtype, dtype)
+            self.assertEqual(connection.send.call_args_list[0].args, (("ok", None),))
             if video_config is None:
                 register_video_loader.assert_not_called()
             self.assertTrue(http_client.call_args.kwargs["flat_logprobs"])
@@ -184,6 +185,38 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(pool.children, [])
         finally:
             child.close()
+
+    async def test_command_send_failure_cleans_pool_and_engines(self):
+        for alive, send_error, error_type, message in [
+            (False, None, RuntimeError, "exited"),
+            (True, BrokenPipeError("closed pipe"), BrokenPipeError, "closed pipe"),
+        ]:
+            with self.subTest(alive=alive):
+                pool = module.MultiAPIServerPool(SimpleNamespace(), 2)
+                process = Mock()
+                process.is_alive.side_effect = [alive, alive, False]
+                connection = Mock()
+                connection.send.side_effect = send_error
+                engine = Mock()
+                coordinator = Mock()
+                pool.children = [process]
+                pool.connections = [connection]
+                pool.engine_manager = engine
+                pool.coordinator = coordinator
+
+                with self.assertRaisesRegex(error_type, message):
+                    await pool.command("version", 10)
+
+                engine.shutdown.assert_called_once()
+                coordinator.shutdown.assert_called_once()
+                connection.close.assert_called_once()
+                process.join.assert_called_once_with(timeout=10)
+                if alive:
+                    process.terminate.assert_called_once()
+                else:
+                    process.terminate.assert_not_called()
+                self.assertEqual(pool.children, [])
+                self.assertEqual(pool.connections, [])
 
 
 if __name__ == "__main__":
