@@ -197,7 +197,7 @@ class FakeBatch(dict):
 def test_traced_train_phase_stamps_the_batch_it_was_called_with(monkeypatch):
     """The decorator is what carries coverage to every train entrypoint.
 
-    Both backends' ``train`` and Megatron's ``train_microbatch`` go through it,
+    Both backends' ``train`` go through it,
     so a batch it failed to read would silently blank the vision series on
     whichever path used it.
     """
@@ -223,7 +223,7 @@ def test_traced_train_phase_stamps_the_batch_it_was_called_with(monkeypatch):
 
 
 def test_traced_train_phase_accepts_the_batch_by_keyword(monkeypatch):
-    """``train_microbatch_presharded`` dispatches ``data=`` rather than positionally."""
+    """``train_presharded`` and friends dispatch ``data=`` rather than positionally."""
     recorded: list[tuple[dict, dict]] = []
     monkeypatch.setattr(
         "nemo_rl.telemetry.metrics.record_rl_metrics",
@@ -231,13 +231,11 @@ def test_traced_train_phase_accepts_the_batch_by_keyword(monkeypatch):
     )
 
     class Worker:
-        @traced_train_phase(
-            "rl.policy.train_microbatch", stage=VISION_STAGE_TRAIN_MICROBATCH
-        )
-        def train_microbatch(self, data):
+        @traced_train_phase("rl.policy.train", stage=VISION_STAGE_TRAIN_MICROBATCH)
+        def train(self, data):
             return None
 
-    Worker().train_microbatch(data=FakeBatch(rows=1, pixel_values=None))
+    Worker().train(data=FakeBatch(rows=1, pixel_values=None))
 
     assert recorded[0][1] == {RL_VISION_STAGE_ATTR: VISION_STAGE_TRAIN_MICROBATCH}
 
@@ -268,21 +266,17 @@ def test_traced_train_phase_opens_its_span_and_stamps_it(monkeypatch):
     )
 
     class Worker:
-        @traced_train_phase(
-            "rl.policy.train_microbatch", stage=VISION_STAGE_TRAIN_MICROBATCH
-        )
-        def train_microbatch(self, data):
+        @traced_train_phase("rl.policy.train", stage=VISION_STAGE_TRAIN_BATCH)
+        def train(self, data):
             # Stamped before the body runs, so a batch that fails still
             # reports the payload it failed on.
             assert span.attributes[RL_VISION_SEGMENTS_METRIC] == 3
             return "done"
 
-    result = Worker().train_microbatch(
-        FakeBatch(rows=2, pixel_values=FakePackedTensor([2, 1]))
-    )
+    result = Worker().train(FakeBatch(rows=2, pixel_values=FakePackedTensor([2, 1])))
 
     assert result == "done"
-    assert opened == [(RLSpanGroup.U_WORKER_TRAIN, "rl.policy.train_microbatch")]
+    assert opened == [(RLSpanGroup.U_WORKER_TRAIN, "rl.policy.train")]
     assert span.attributes[RL_VISION_ROWS_METRIC] == 2
 
 

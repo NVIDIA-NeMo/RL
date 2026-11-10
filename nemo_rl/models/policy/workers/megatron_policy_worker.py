@@ -171,6 +171,7 @@ from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.telemetry.vision import (
     VISION_STAGE_TRAIN_BATCH,
     VISION_STAGE_TRAIN_MICROBATCH,
+    record_vision_workload,
     traced_train_phase,
 )
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
@@ -2100,11 +2101,6 @@ class MegatronPolicyWorkerImpl(
 
         self._train_step_state = state
 
-    # The narrowest span that contains the vision encoder; see
-    # ``RLSpanGroup.WORKER_TRAIN`` for why that is as close as it gets.
-    @traced_train_phase(
-        "rl.policy.train_microbatch", stage=VISION_STAGE_TRAIN_MICROBATCH
-    )
     @wrap_with_nvtx_name("megatron_policy_worker/train_microbatch")
     def train_microbatch(
         self,
@@ -2125,6 +2121,12 @@ class MegatronPolicyWorkerImpl(
         state = self._assert_step_open()
         if state.get("offloaded", False):
             raise RuntimeError("prepare_for_training must restore the offloaded step")
+        # Counters only, no span: one span per microbatch per rank is finer
+        # than anything reads back usefully. The counters aggregate, so they
+        # cost nothing per sample and are the only train-side vision signal
+        # this path has -- SFT v2 and the single controller drive these phases
+        # directly and never call ``train``.
+        record_vision_workload(data, data.size, stage=VISION_STAGE_TRAIN_MICROBATCH)
         try:
             self._train_microbatch_body(state, data)
         except Exception:

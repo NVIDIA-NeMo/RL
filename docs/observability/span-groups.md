@@ -72,7 +72,7 @@ One consequence worth knowing: registration is an *import side effect*, so a gro
 | `data_processing` | RL | `rl.<algo>.data_processing` |
 | `data_plane` | RL | `rl.data_plane.<op>` — one span per transfer-queue operation from a batch-shaped caller. The eleven ops give `rl.data_plane.register`, `rl.data_plane.claim_meta`, `rl.data_plane.get_data`, `rl.data_plane.check_consumption_status`, `rl.data_plane.put`, `rl.data_plane.get`, `rl.data_plane.list_sample_ids`, `rl.data_plane.clear`, `rl.data_plane.save_checkpoint`, `rl.data_plane.load_checkpoint`, `rl.data_plane.close`. The nixl backend's checkpoint restore adds `rl.data_plane.restore_shards`, which covers reading the saved shards back into the store |
 | `per_prompt` | RL | spans emitted once per prompt: `rl.sc.generate_and_push`, the rollout path's `rl.data_plane.put`, and `rl.gym.run_rollouts` when the single controller dispatches it. A cardinality axis rather than a phase — see [Per-prompt spans](#per-prompt-spans) |
-| `worker_train` | RL | the training step as each policy worker rank sees it: `rl.policy.train`, `rl.policy.begin_train_step`, `rl.policy.train_microbatch`, `rl.policy.finish_train_step`. A cardinality axis rather than a phase — `policy_update` already names this work from the driver's side — see [Worker-side training spans](#worker-side-training-spans) |
+| `worker_train` | RL | the training step as each policy worker rank sees it: `rl.policy.train`, `rl.policy.begin_train_step`, `rl.policy.finish_train_step`. A cardinality axis rather than a phase — `policy_update` already names this work from the driver's side — see [Worker-side training spans](#worker-side-training-spans) |
 | `efficiency` | RL | idle phases on async GRPO — driver-side `rl.idle.buffer_starvation`, `rl.idle.refit_bubble`, and collector-side `rl.idle.refit_event_wait`, `rl.idle.generation_limit_pause` |
 
 ## Examples
@@ -121,7 +121,7 @@ The controlling group is shown for each; a span is emitted whenever its group is
 | **vLLM** (driver-side) | `rl.vllm.generate`, `rl.vllm.generate_text` — `generation` group; nested under the active rollout span |
 | **vLLM** (worker-side) | `rl.vllm.load_model` — `model_init` group; a root span in the generation worker's process, since Ray carries no trace context into `__init__` |
 | **Policy / value** (worker-side) | `rl.policy.load_model`, `rl.value.load_model` — `model_init` group, `rl.backend` attribute; opened by `traced_worker_init` on the worker's `__init__`, and root spans for the same reason |
-| **Policy training** (worker-side) | `rl.policy.train`, `rl.policy.begin_train_step`, `rl.policy.train_microbatch`, `rl.policy.finish_train_step` — `worker_train` group (umbrella, so unbucketed), one set per rank per step, and which of them appear depends on the algorithm. `rl.policy.train_microbatch` and `rl.policy.train` carry `rl.vision.*` — see [Worker-side training spans](#worker-side-training-spans) |
+| **Policy training** (worker-side) | `rl.policy.train`, `rl.policy.begin_train_step`, `rl.policy.finish_train_step` — `worker_train` group (umbrella, so unbucketed), one set per rank per step, and which of them appear depends on the algorithm. `rl.policy.train` carries `rl.vision.*` — see [Worker-side training spans](#worker-side-training-spans) |
 
 `rl.<algo>.job` is a function-level span (via `umbrella_trace_fn`) wrapping the whole run. Both shipped presets enable it, so each `rl.<algo>.step` nests under it. Drop the `job` group from an explicit group list to make every step a root trace instead.
 
@@ -146,7 +146,7 @@ These are set on spans for filtering — they answer "which one?" / "what kind?"
 | `rl.data_plane.partition` | the partition the operation targets |
 | `rl.data_plane.keys` / `rl.data_plane.bytes` | key count and payload size for that one operation. Set after the inner client returns, since neither is known at span open |
 | `rl.data_plane.status` | `ok` / `error` / `timeout` — distinguishes a timeout from a generic failure, which the recorded exception alone does not |
-| `rl.vision.segments` / `rl.vision.media_rows` / `rl.vision.rows` | vision workload of one `rl.policy.train_microbatch` or `rl.policy.train`, so its duration can be read against the media it carried. Absent, not zero, when the batch's layout cannot be read — see [Vision](#vision-why-there-is-no-encoder-span) |
+| `rl.vision.segments` / `rl.vision.media_rows` / `rl.vision.rows` | vision workload of one `rl.policy.train`, so its duration can be read against the media it carried. Absent, not zero, when the batch's layout cannot be read — see [Vision](#vision-why-there-is-no-encoder-span) |
 | `rl.bucket` | goodput bucket: `productive` / `overhead` / `idle` / `wasted` (omit on umbrellas) |
 
 `rl.sc.step` carries `rl.iteration` and `rl.weight_version` but no `rl.epoch`.
@@ -711,10 +711,10 @@ SFT v2 and the single controller drive the phases themselves, and `train()` is n
 
 ```
 rl.policy.begin_train_step           zero_grad, mcore hook swap
-rl.policy.train_microbatch           one forward_backward_func invocation
-rl.policy.train_microbatch           …one per microbatch
 rl.policy.finish_train_step          gradient all-reduce, optimizer step
 ```
+
+**There is deliberately no span per microbatch.** One span per `forward_backward_func` invocation per rank is finer than anything reads back usefully — it is the bulk of the ~11k spans per step a 576-rank job would emit, and the microbatches of one step are interchangeable, so the hundredth tells you nothing the first did not. The `rl.vision.*` counters are still recorded per microbatch, because counters aggregate and cost nothing per sample; for the per-microbatch *timeline*, the NVTX range is still there and nsys is the better tool for it.
 
 Automodel has no split path at all, so it only ever emits `rl.policy.train`.
 
@@ -724,7 +724,7 @@ These are stacked above the existing NVTX ranges, so the same boundaries that an
 
 ### Vision: why there is no encoder span
 
-On a VLM run, whichever of these spans received the batch carries its vision workload — `rl.policy.train_microbatch` on the split path, `rl.policy.train` on the whole-batch one:
+On a VLM run, `rl.policy.train` carries the vision workload of the batch it received:
 
 | Attribute | Meaning |
 |---|---|
@@ -734,7 +734,9 @@ On a VLM run, whichever of these spans received the batch carries its vision wor
 
 There is no span on the vision encoder itself, and there cannot be one from this repository. Both backends make a single fused call — `model(input_ids=..., **multimodal_data)` in `models/megatron/train.py` and `models/automodel/train.py` — and leave the vision tower to the upstream model, which reaches it through a different attribute per family (`model.visual` on Qwen-VL, `vision_tower.vision_model` on Gemma3, `vision_model.radio_model` on RADIO). No call made here contains the encoder and nothing else.
 
-These are the narrowest spans that do contain it, so encoder cost is read by comparison rather than directly: group their durations by `rl.vision.segments` and a text-only batch becomes the baseline an image-heavy one is measured against. The comparison is sharper on the split path, where a microbatch is a smaller envelope around the same encoder call. The same counts are also emitted as [`rl.vision.*` metrics](metrics.md), tagged `rl.vision.stage`, so the loader's view and the step's view of the same batches can be compared without sampling traces.
+`rl.policy.train` is the narrowest span that does contain it, so encoder cost is read by comparison rather than directly: group its durations by `rl.vision.segments` and a text-only batch becomes the baseline an image-heavy one is measured against. The same counts are also emitted as [`rl.vision.*` metrics](metrics.md), tagged `rl.vision.stage`, so the loader's view and the step's view of the same batches can be compared without sampling traces.
+
+**On the split path there is no such span**, because there is no microbatch span to attach a duration to and `train` is never called. SFT v2 and the single controller get the vision *counters* on both the loader and train stages — enough to see volume and where it is lost — but not a duration to read them against. Comparing encoder cost there means nsys, or running the same model through a `train`-path algorithm.
 
 Under sequence packing only `rl.vision.segments` is set: packing concatenates rows into one THD sequence, so the per-row breakdown no longer corresponds to the batch's rows while the total still does. All three are absent — rather than zero — when the batch's layout cannot be read at all. A gap is intended there; a zero would be a wrong number. A text-only batch is not that case: it reports zero segments, which is what makes it the baseline.
 

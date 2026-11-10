@@ -37,8 +37,8 @@ RL_GROUPS = frozenset(
 # ``per_prompt`` scales with the dataset (~2 spans per prompt).
 PER_PROMPT_GROUPS = frozenset({"per_prompt"})
 
-# ``worker_train`` scales with world size times microbatches: every rank spans
-# every microbatch, so a 576-rank job at 16 microbatches emits ~11k per step.
+# ``worker_train`` scales with world size: every rank spans the same phases,
+# so a 576-rank job emits hundreds per step where ``per_step`` emits a handful.
 WORKER_TRAIN_GROUPS = frozenset({"worker_train"})
 
 CARDINALITY_GROUPS = PER_PROMPT_GROUPS | WORKER_TRAIN_GROUPS
@@ -132,10 +132,9 @@ def test_asking_for_per_prompt_keeps_the_step_phases():
 def test_worker_train_is_absent_from_both_shipped_presets():
     """The other group a preset must not turn on for you.
 
-    ``rl.policy.train_microbatch`` is emitted by every rank for every
-    microbatch, so its count scales with world size rather than with steps. A
-    user who picks ``per_step`` for step detail should not silently get
-    ~11k spans per step from a 576-rank job.
+    These are emitted by every rank, so their count scales with world size
+    rather than with steps. A user who picks ``per_step`` for step detail
+    should not silently get hundreds of spans per step from a 576-rank job.
     """
     for preset in ("default", "per_step"):
         assert "worker_train" not in RLSpanGroup.resolve(preset), preset

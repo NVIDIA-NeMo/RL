@@ -100,7 +100,7 @@ Counters rather than gauges because these are recorded once per microbatch: a pu
 | Stage | Producer |
 | --- | --- |
 | `loader_batch` | an Energon loader owner, measured after `prepare_sft_batch` |
-| `train_microbatch` | a policy worker rank on the split begin/microbatch/finish path (SFT v2, single controller), measured per `forward_backward_func` invocation |
+| `train_microbatch` | a policy worker rank on the split begin/microbatch/finish path (SFT v2, single controller), measured per `forward_backward_func` invocation. No matching span, so volume only |
 | `train_batch` | a policy worker rank on the whole-batch path (GRPO, PPO, SFT v1, and everything on Automodel, which has no split path), measured per `train()` call |
 
 `train_microbatch` and `train_batch` are two spellings of the same work by different algorithms, never both for one batch — so filter to one before summing, or the same segments are counted twice.
@@ -117,7 +117,7 @@ Nothing at all is emitted for a batch whose media layout cannot be read. A gap i
 
 The metrics and the span attributes are configured independently: the counters run whenever telemetry is exporting, while the attributes need the emitting span's group (`worker_train` for the train stages) to be enabled. That is deliberate — the loader and train stages sit in different span groups, so no single switch could speak for both.
 
-The same counts appear as attributes on whichever span produced them — `rl.policy.train_microbatch` or `rl.policy.train` — which is what makes that span's duration comparable against the vision load behind it. See [Worker-side training spans](span-groups.md#worker-side-training-spans) for why there is no span on the vision encoder itself.
+The `train_batch` counts also appear as attributes on `rl.policy.train`, which is what makes that span's duration comparable against the vision load behind it. The `train_microbatch` stage has no matching span — there is deliberately no span per microbatch — so it is a volume signal only. See [Worker-side training spans](span-groups.md#worker-side-training-spans) for why there is no span on the vision encoder itself.
 
 ## W&B history step axes
 

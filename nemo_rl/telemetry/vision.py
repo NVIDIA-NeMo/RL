@@ -54,7 +54,8 @@ RL_VISION_STAGE_ATTR = "rl.vision.stage"
 
 #: One training microbatch, as one policy worker rank saw it. Emitted by the
 #: split begin/microbatch/finish path, which SFT v2 and the single controller
-#: drive.
+#: drive. Counters only: there is deliberately no span per microbatch, so this
+#: stage reports volume with no duration to read it against.
 VISION_STAGE_TRAIN_MICROBATCH = "train_microbatch"
 
 #: One whole ``train()`` call on one rank, from the algorithms that hand the
