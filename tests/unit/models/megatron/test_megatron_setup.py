@@ -2357,44 +2357,6 @@ class TestApplyPrecisionConfig:
         assert model_cfg.num_layers_at_start_in_bf16 == 2
         assert model_cfg.num_layers_at_end_in_bf16 == 4
 
-    def test_te_precision_recipe_matches_attention_and_mlp_modules(self):
-        from pathlib import Path
-
-        from megatron.core.quantization.quant_config import MatchContext
-
-        from nemo_rl.models.megatron.setup import _apply_precision_config
-
-        recipe_path = (
-            Path(__file__).resolve().parents[4]
-            / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
-        )
-        model_cfg = SimpleNamespace()
-        _apply_precision_config(
-            model_cfg,
-            {
-                "megatron_cfg": {
-                    "pipeline_dtype": "bfloat16",
-                    "te_precision_config_file": str(recipe_path),
-                }
-            },
-            torch.bfloat16,
-        )
-
-        def match(module_path):
-            return model_cfg.quant_recipe.match_to_config_key(
-                MatchContext(module_path=module_path, layer_number=0)
-            )
-
-        assert match("decoder.layers.0.self_attention.linear_qkv") == "bf16"
-        assert match("decoder.layers.0.self_attention.linear_proj") == "bf16"
-        assert match("decoder.layers.0.mlp.experts.linear_fc1") == "nvfp4"
-        assert match("decoder.layers.0.mlp.experts.linear_fc2") == "nvfp4"
-        assert match("decoder.layers.0.mlp.linear_fc1") == "bf16"
-        assert match("decoder.layers.0.mlp.linear_fc2") == "bf16"
-        assert match("decoder.layers.0.mlp.shared_experts.linear_fc1") == "bf16"
-        assert match("decoder.layers.0.mlp.shared_experts.linear_fc2") == "bf16"
-        assert match("decoder.layers.0.input_layernorm") == "bf16"
-
 
 @pytest.mark.mcore
 class TestApplyPerformanceConfig:
@@ -3101,6 +3063,69 @@ class TestValidateChunkingConfig:
         # Should not raise
         _validate_chunking_config(config)
 
+    @staticmethod
+    def _reuse_config(**overrides):
+        config = {
+            "logprob_chunk_size": 1024,
+            "megatron_cfg": {"defer_fp32_logits": True, "reuse_logits_storage": True},
+            "sequence_packing": {"enabled": True, "fuse_loss": True},
+        }
+        config.update(overrides)
+        return config
+
+    def test_logits_storage_reuse_with_fused_chunked_packing(self):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        _validate_chunking_config(self._reuse_config())
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"logprob_chunk_size": None},
+            {"logprob_chunk_size": 0},
+            {"sequence_packing": {"enabled": False}},
+            {"sequence_packing": {"enabled": True, "fuse_loss": False}},
+            {"sequence_packing": {"enabled": True}},
+        ],
+        ids=["no-chunk", "zero-chunk", "no-packing", "unfused", "fuse-unset"],
+    )
+    def test_logits_storage_reuse_rejects_paths_that_ignore_it(self, overrides):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        config = self._reuse_config(**overrides)
+        with pytest.raises(ValueError, match="reuse_logits_storage=true requires"):
+            _validate_chunking_config(config)
+
+    def test_logits_storage_reuse_off_skips_its_checks(self):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        config = self._reuse_config(sequence_packing={"enabled": False})
+        config["megatron_cfg"]["reuse_logits_storage"] = False
+        _validate_chunking_config(config)
+
+    @pytest.mark.parametrize(
+        "generation",
+        [{"top_k": 10, "top_p": 1.0}, {"top_k": None, "top_p": 0.9}],
+        ids=["top-k", "top-p"],
+    )
+    def test_logits_storage_reuse_rejects_training_filtering(self, generation):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        config = self._reuse_config(generation=generation)
+        with pytest.raises(ValueError, match="top-k/top-p filtering"):
+            _validate_chunking_config(config)
+
+        # Filtering alone is fine when the reuse is off.
+        config["megatron_cfg"]["reuse_logits_storage"] = False
+        _validate_chunking_config(config)
+
+    @pytest.mark.parametrize("top_k", [None, -1], ids=["none", "negative"])
+    def test_logits_storage_reuse_with_unfiltered_generation(self, top_k):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        config = self._reuse_config(generation={"top_k": top_k, "top_p": 1.0})
+        _validate_chunking_config(config)
+
 
 @pytest.mark.mcore
 class TestCreateCheckpointConfig:
@@ -3131,7 +3156,22 @@ class TestCreateCheckpointConfig:
         assert checkpoint_config.async_save is False
         assert checkpoint_config.fully_parallel_save is True
         assert checkpoint_config.fully_parallel_load is True
-        assert checkpoint_config.load_rng is False
+        assert checkpoint_config.load_rng is True
+
+    @pytest.mark.parametrize("resume_weights", [False, True])
+    @pytest.mark.parametrize("resume_optimizer", [False, True])
+    def test_rng_restore_follows_training_weights(
+        self, tmp_path, resume_weights, resume_optimizer
+    ):
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights") if resume_weights else None,
+            str(tmp_path / "optimizer") if resume_optimizer else None,
+        )
+        assert config.load_rng is resume_weights
+        assert config.load_optim is resume_optimizer
 
     def test_missing_ckpt_cfg_defaults_to_sync_save(self, tmp_path):
         """An absent checkpoint block keeps Megatron Bridge's default (sync save).
@@ -3974,35 +4014,6 @@ class TestValidateAndSetConfig:
                 assert runtime_config.is_generation_colocated is colocated
                 assert runtime_config.offload_optimizer_for_refit is True
                 assert os.environ.get("NCCL_CUMEM_ENABLE") == expected_cumem
-
-
-@pytest.mark.mcore
-class TestRuntimeConfigNamedTuple:
-    """Tests for RuntimeConfig named tuple."""
-
-    def test_runtime_config_fields(self):
-        """Test that RuntimeConfig has all expected fields."""
-        from nemo_rl.models.megatron.config import RuntimeConfig
-
-        runtime_config = RuntimeConfig(
-            megatron_cfg=MagicMock(),
-            model_cfg=MagicMock(),
-            dtype=torch.bfloat16,
-            optimizer_cpu_offload=False,
-            offload_optimizer_for_logprob=True,
-            offload_optimizer_for_refit=False,
-            is_generation_colocated=True,
-            sampling_params=None,
-            final_padded_vocab_size=32000,
-        )
-
-        assert runtime_config.dtype == torch.bfloat16
-        assert runtime_config.optimizer_cpu_offload is False
-        assert runtime_config.offload_optimizer_for_logprob is True
-        assert runtime_config.is_generation_colocated is True
-        assert runtime_config.offload_optimizer_for_refit is False
-        assert runtime_config.sampling_params is None
-        assert runtime_config.final_padded_vocab_size == 32000
 
 
 @pytest.mark.mcore

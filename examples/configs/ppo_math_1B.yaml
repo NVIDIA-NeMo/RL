@@ -11,6 +11,10 @@ ppo:
   ppo_epochs: 4  # actor passes over each rollout batch
   # Critic passes over each rollout batch; follows ppo_epochs unless overridden.
   critic_ppo_epochs: ${ppo.ppo_epochs}
+  # SingleController only; legacy PPO always uses whole-batch critic training.
+  # split accumulates chunks through the value split API after policy refit;
+  # whole_batch (default) concatenates chunks and uses the full-batch value API.
+  value_training_mode: whole_batch
   policy_training_start_step: 0  # number of PPO steps of critic-only warmup before policy training begins
   # step_<n> dir of a critic-pretrain run whose value/ seeds the critic.
   # Only a fresh run reads it; a resume ignores it and restores the critic from
@@ -90,12 +94,14 @@ loss_fn:
   sequence_level_importance_ratios: false
   token_level_loss: true
   force_on_policy_ratio: false
-  seq_logprob_error_in_loss: false  # Only supported by non-streaming Megatron GRPO.
+  seq_logprob_error_in_loss: false  # Only supported by Megatron GRPO trainers.
   use_kl_in_reward: false  # No KL in reward (KL penalty is 0 anyway)
   # VAPO: NLL loss on correct samples. 0 = disabled.
   positive_example_nll_weight: 0.0  # VAPO: 0.1
   metrics_level: "full"
   enable_torch_compile: false
+  # Score centering (https://arxiv.org/abs/2609.20807); needs policy.generation.top_logprobs > 0.
+  score_centering: false
 
 value_loss_fn:
   scale: 0.4
@@ -158,7 +164,13 @@ policy:
   megatron_cfg:
     enabled: false
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
     # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
     # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
     fine_grained_activation_offloading: false
@@ -197,6 +209,7 @@ policy:
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
     defer_fp32_logits: False
+    reuse_logits_storage: false
     fp32_lm_head: false # Emit fp32 logits from Megatron's LM head; must match policy.generation.vllm_cfg.fp32_lm_head.
     moe_per_layer_logging: False
 
@@ -284,6 +297,13 @@ policy:
     temperature: 1.0
     top_p: 1.0
     top_k: null
+    top_logprobs: 0  # Sampler candidates per token for score centering or replay; 0 disables collection.
+    # Sampler replay: with top-k/top-p, score the trainer's log-probs over the support
+    # the sampler drew from (the finite entries of its captured head) instead of
+    # recomputing the filters. Required by loss_fn.score_centering under top-k/top-p,
+    # and usable without it; needs top_logprobs >= top_k. See docs/guides/sampler-replay.md.
+    sampler_replay:
+      enabled: false
     val_temperature: ${.temperature}
     val_top_p: ${.top_p}
     val_top_k: ${.top_k}
@@ -314,7 +334,7 @@ policy:
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs
-      fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head} # Compute Nemotron-H logits with an fp32 LM head.
+      fp32_lm_head: ${policy.megatron_cfg.fp32_lm_head} # Compute vLLM logits with an fp32 LM head.
       # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
       refit_with_reload_api: false
       tensor_parallel_size: 1
@@ -328,6 +348,8 @@ policy:
       num_first_layers_in_bf16: 0
       enable_vllm_metrics_logger: true
       vllm_metrics_logger_interval: 0.5
+      flat_logprobs: false # Requires async_engine: true and expose_http_server: true. Store logprobs in vLLM's FlatLogprobs (not for requests asking for prompt logprobs); avoids long GC pauses on the generation actor under large backlogs
+      output_loop_yield_budget_ms: null # Requires async_engine: true. e.g. 20: make vLLM's output loops yield so refit/control calls are not starved under a backlog
     vllm_kwargs: {}
     colocated:
       enabled: true
@@ -383,7 +405,13 @@ value:
   megatron_cfg:
     enabled: false
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
     # Module-level activation CPU offload; see docs/design-docs/training-backends.md.
     # On TE >= 2.10 also set megatron_cfg.env_vars.NVTE_CPU_OFFLOAD_V1: "1".
     fine_grained_activation_offloading: false

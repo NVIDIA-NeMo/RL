@@ -452,8 +452,12 @@ def get_microbatch_iterator(
     elif cfg["sequence_packing"]["enabled"]:
         uses_hybridep = uses_hybridep_flex_dispatcher(cfg["megatron_cfg"])
         # Alignment padding between packed sequences must not reach expert-bias
-        # statistics with any dispatcher, not only HybridEP.
-        create_packed_seq_padding_mask = uses_hybridep or create_router_padding_mask
+        # statistics with any dispatcher, not only HybridEP. A self-packing model
+        # never receives a caller-built mask, so HybridEP alone requests none
+        # there; an expert-bias request still does and is rejected downstream.
+        create_packed_seq_padding_mask = (
+            uses_hybridep and not delegate_pack_to_model
+        ) or create_router_padding_mask
         prepad_packed_seq_for_hybridep = uses_hybridep and cfg["megatron_cfg"].get(
             "moe_hybridep_prepad_packed_inputs"
         )
@@ -2120,6 +2124,17 @@ def get_and_validate_seqlen(data: BatchedDataDict[Any]):
         if k in PACKED_MULTIMODAL_FIELDS or k in OPD_FULL_FIELDS:
             continue
         if torch.is_tensor(v) and not v.is_nested and len(v.shape) > 1:
+            if k in MICROBATCH_PADDED_FIELDS and v.shape[sequence_dim] != seq_dim_size:
+                # These fields are widened in process_microbatches. A dense
+                # single-row fetch can still have its unpadded sequence width.
+                lengths = data.get("input_lengths")
+                assert lengths is not None and (
+                    lengths.numel() == v.shape[0] == data["input_ids"].shape[0]
+                ), f"{k} requires input_lengths aligned with its rows"
+                assert int(lengths.max()) <= v.shape[sequence_dim] <= seq_dim_size, (
+                    f"{k} must cover every real token without exceeding the input width"
+                )
+                continue
             assert v.shape[sequence_dim] == seq_dim_size, (
                 f"Dim 1 must be the sequence dim, expected dim 1={seq_dim_size} but got shape {v.shape} for key {k}"
             )

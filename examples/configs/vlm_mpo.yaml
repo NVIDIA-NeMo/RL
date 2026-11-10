@@ -107,11 +107,18 @@ policy:
     checkpoint:
       async_save: false
       ckpt_assume_constant_structure: false
+      parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
     use_fused_linear_logprobs: false
     fused_linear_logprobs_chunk_size: 256
     force_reconvert_from_hf: false
     empty_unused_memory_level: 1
+    # Megatron-style manual GC: disable automatic Python GC and collect on every rank
+    # together every manual_gc_interval optimizer steps (a positive integer).
+    manual_gc: false
+    manual_gc_interval: 10
     activation_checkpointing: false
+    # Clear the RoPE cache and MoE dispatcher tensors after training; see MegatronConfig.
+    clear_memory_caches_before_refit: false
     cuda_graph_impl: none
     cuda_graph_modules: []
     cuda_graph_warmup_steps: 3
@@ -137,6 +144,7 @@ policy:
     flash_attention_version: 2
     bias_activation_fusion: true
     defer_fp32_logits: false
+    reuse_logits_storage: false
     moe_per_layer_logging: false
     moe_enable_deepep: false
     moe_token_dispatcher_type: alltoall

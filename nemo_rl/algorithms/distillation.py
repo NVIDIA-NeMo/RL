@@ -62,6 +62,7 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
+    sampler_replay_enabled,
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -204,9 +205,9 @@ def check_vocab_equality(
         f"Effective vocab sizes differ between student and teacher. {skip_hint}"
     )
 
-    # 3) Chech model.config.vocab_size to guarantee the last dimension of the logits is the same
-    student_config = AutoConfig.from_pretrained(student_model_name)
-    teacher_config = AutoConfig.from_pretrained(teacher_model_name)
+    # 3) Compare text vocabulary sizes, including nested multimodal configs.
+    student_config = AutoConfig.from_pretrained(student_model_name).get_text_config()
+    teacher_config = AutoConfig.from_pretrained(teacher_model_name).get_text_config()
     assert student_config.vocab_size == teacher_config.vocab_size, (
         f"Model config vocab sizes differ between student and teacher. {skip_hint}"
     )
@@ -240,6 +241,11 @@ def setup(
     # Extract configuration
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
+    if generation_config is not None and sampler_replay_enabled(generation_config):
+        raise ValueError(
+            "policy.generation.sampler_replay.enabled requires SingleController with "
+            "NeMo Gym + vLLM; distillation does not capture sampler tensors."
+        )
     teacher_config = master_config.teacher
     loss_config = master_config.loss_fn
     data_config = master_config.data
@@ -565,6 +571,7 @@ def setup(
                     # The workers enforce this key whenever the recipe asks for
                     # one, so Gym's model server must send the same key.
                     policy_api_key=deferred_vllm.http_server_api_key,
+                    turn_checkpointing_enabled=False,
                 )
                 try:
                     validate_dataset_agent_coverage(
