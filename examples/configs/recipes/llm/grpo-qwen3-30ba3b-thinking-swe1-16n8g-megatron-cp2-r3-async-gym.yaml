@@ -11,7 +11,8 @@ policy:
     enabled: true
   generation:
     vllm_cfg:
-      enable_prefix_caching: false
+      # vLLM returns routed experts through its prefix-cache blocks, so R3 needs this on.
+      enable_prefix_caching: true
     vllm_kwargs:
       enable_chunked_prefill: false
 data:
