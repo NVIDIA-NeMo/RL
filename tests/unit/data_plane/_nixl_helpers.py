@@ -141,6 +141,7 @@ def bare_unit(
     ssd_dir: str | None = None,
     staging_bytes: int = 0,
     pickup_s: float = 10.0,
+    io_threads: int = 4,
 ):
     """A NixlStorageUnit without Ray, NIXL or ZMQ: allocator, blobs and SSD tier."""
     import threading
@@ -165,7 +166,7 @@ def bare_unit(
     u.checkpointing = False
     u.clears_during_save = 0
     u._mu = threading.RLock()
-    u._init_ssd(slab_bytes, ssd_dir, staging_bytes, pickup_s)
+    u._init_ssd(slab_bytes, ssd_dir, staging_bytes, pickup_s, io_threads)
     u._start_ticker()
     return u
 

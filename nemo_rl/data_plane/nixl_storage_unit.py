@@ -185,6 +185,7 @@ class NixlStorageUnit:  # pragma: no cover
         ssd_dir: str | None = None,
         staging_bytes: int = 0,
         pickup_s: float = 10.0,
+        io_threads: int = 4,
         alloc_lease_s: float | None = None,
     ) -> None:
         self.unit_id = int(unit_id)
@@ -212,7 +213,9 @@ class NixlStorageUnit:  # pragma: no cover
         if self.numa_node is not None:
             numa_utils.first_touch(self.slab)
         self._mu = threading.RLock()
-        self._init_ssd(int(slab_bytes), ssd_dir, int(staging_bytes), float(pickup_s))
+        self._init_ssd(
+            int(slab_bytes), ssd_dir, int(staging_bytes), float(pickup_s), int(io_threads)
+        )
         self.ep = NixlEndpoint(
             f"unit-{self.unit_id}-{uuid.uuid4().hex[:6]}",
             backend=nixl_backend,
@@ -250,18 +253,21 @@ class NixlStorageUnit:  # pragma: no cover
     # the put area cannot take goes to disk from birth and data already in the put
     # area never moves: no victims, no pin drain, no eviction policy. The put's
     # WRITE lands in the IO area (carved from the slab, as the staging area was);
-    # its commit is "pending" while ONE worker thread writes the file, and
-    # "done" once it is on disk. A read of a disk blob gets "pending" while the
-    # same worker reads the file into the IO area, then reads it pinned. Disk
-    # I/O is plain blocking file I/O on that worker, outside _mu: a hung disk
-    # stalls spills and cold reads, never the put area. An IO job owns its
-    # IO-area region until it ends, so a region is never freed under it.
+    # its commit is "pending" while an IO worker thread writes the file, and
+    # "done" once it is on disk. A read of a disk blob gets "pending" while a
+    # worker reads the file into the IO area, then reads it pinned. Disk I/O is
+    # plain blocking file I/O on `io_threads` workers, outside _mu: a hung disk
+    # stalls spills and cold reads, never the put area. One thread moves about
+    # 2.5 GB/s on NVMe and a spilled put waits for its write, so a step that
+    # spills half its data needs several. An IO job owns its IO-area region
+    # until it ends, so a region is never freed under it, whichever thread runs it.
     def _init_ssd(
         self,
         slab_bytes: int,
         ssd_dir: str | None,
         staging_bytes: int,
         pickup_s: float,
+        io_threads: int = 4,
     ) -> None:
         self.ssd_dir = None
         self.staging_ = None
@@ -295,7 +301,9 @@ class NixlStorageUnit:  # pragma: no cover
             ssd_dir, f"nixl-unit-{self.unit_id}-{uuid.uuid4().hex[:6]}"
         )
         os.makedirs(self.ssd_dir, exist_ok=True)
-        self._worker = ThreadPoolExecutor(1, thread_name_prefix="nvdp-io")
+        if io_threads < 1:
+            raise ValueError(f"ssd io_threads={io_threads} must be >= 1")
+        self._worker = ThreadPoolExecutor(io_threads, thread_name_prefix="nvdp-io")
 
     def _start_ticker(self) -> None:
         """Start the maintenance ticker; call once the unit is fully built."""
