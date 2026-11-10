@@ -1144,7 +1144,7 @@ class VllmAsyncGenerationWorkerImpl(
 
         from fastapi import Request
         from fastapi.responses import JSONResponse, StreamingResponse
-        from vllm.entrypoints.chat_utils import load_chat_template
+        from vllm.renderers.chat_utils.chat_template import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
             ChatCompletionResponse,
