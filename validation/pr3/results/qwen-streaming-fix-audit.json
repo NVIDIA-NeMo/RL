@@ -1,0 +1,122 @@
+{
+  "audited_utc": "2026-11-10T03:31:21.015458+00:00",
+  "run_id": "yuekaiz5090explorela0s42",
+  "steps": [
+    1,
+    600
+  ],
+  "A_log_fp32_refit_fix": "NOT_ENABLED_THROUGHOUT",
+  "prefill_conv_fp32_product_fix": "NOT_ENABLED_THROUGHOUT",
+  "mixed_fix_regime_between_training_segments": false,
+  "worker_file": "nemo_rl/models/policy/workers/automodel_policy_worker.py",
+  "frozen_worker_sha256": "7f59824258aafb13f5540810776dfa18c86a623856c9c89e4c6e26881259f74d",
+  "startup_guard": "validation/pr3/run.sh verifies worker/parity hashes from ep16-normalizer-control/normalizer-control.json before every executed training segment.",
+  "refit_semantics": "Frozen helper preserves FP32 router correction bias but not A_log; A_log uses configured BF16 payload dtype. Both refit metadata and payload use that helper.",
+  "convolution_image_source": {
+    "image": "/lustre/fsw/portfolios/coreai/users/yuekaiz/containers/nemo_rl.1030.sqsh",
+    "kernel_path": "/opt/ray_venvs/nemo_rl.models.generation.vllm.vllm_worker_async.VllmAsyncGenerationWorker/lib/python3.13/site-packages/vllm/model_executor/layers/mamba/ops/causal_conv1d.py",
+    "original_source_sha256": "044d005cfe59fd0818ed421274e04f3e8dd679b8cdb64fca9f4422f2643484b2",
+    "matches_fresh_prepatch_source": true,
+    "fp32_product_fix_present": false,
+    "scope": "Read original image source, no GPU or training executed."
+  },
+  "segments": [
+    {
+      "job_id": "21331883",
+      "committed_window": [
+        1,
+        94
+      ],
+      "driver_command": "validation/pr3/slurm/21331883-logs/driver_command.sh",
+      "driver_command_sha256": "bcee9f659ba9dc747a9cca00019b8d0972f0f00ee2e8e9f7b1fe41aa83886ba1",
+      "native_log": "validation/pr3/slurm/21331883-logs/ray-driver.log",
+      "native_log_sha256": "0cf3084f4bfcf56314eca2c2121786819cc62269e2ed99ca6cd8bd86a76bbb31",
+      "matches_previous_completed600_log_audit": true,
+      "setup_command_present": false
+    },
+    {
+      "job_id": "21331884",
+      "committed_window": [
+        95,
+        195
+      ],
+      "driver_command": "validation/pr3/slurm/21331884-logs/driver_command.sh",
+      "driver_command_sha256": "bcee9f659ba9dc747a9cca00019b8d0972f0f00ee2e8e9f7b1fe41aa83886ba1",
+      "native_log": "validation/pr3/slurm/21331884-logs/ray-driver.log",
+      "native_log_sha256": "d7720614ee1e1bc3ef6b1b51c56d765541ea0e7c2af5f873f7c0503ca4eee0c6",
+      "matches_previous_completed600_log_audit": true,
+      "setup_command_present": false
+    },
+    {
+      "job_id": "21331885",
+      "committed_window": [
+        196,
+        294
+      ],
+      "driver_command": "validation/pr3/slurm/21331885-logs/driver_command.sh",
+      "driver_command_sha256": "bcee9f659ba9dc747a9cca00019b8d0972f0f00ee2e8e9f7b1fe41aa83886ba1",
+      "native_log": "validation/pr3/slurm/21331885-logs/ray-driver.log",
+      "native_log_sha256": "f87930e26638a108d3f67d6e46a93c3b3caa86b2e576382dcca65c7b644cdd8b",
+      "matches_previous_completed600_log_audit": true,
+      "setup_command_present": false
+    },
+    {
+      "job_id": "21331930",
+      "committed_window": [
+        295,
+        300
+      ],
+      "driver_command": "validation/pr3/slurm/21331930-logs/driver_command.sh",
+      "driver_command_sha256": "bcee9f659ba9dc747a9cca00019b8d0972f0f00ee2e8e9f7b1fe41aa83886ba1",
+      "native_log": "validation/pr3/slurm/21331930-logs/ray-driver.log",
+      "native_log_sha256": "33bcdf671bc9ad361fd546c476f7240c968adcfc1098c449d960720638b3bf80",
+      "matches_previous_completed600_log_audit": true,
+      "setup_command_present": false
+    },
+    {
+      "job_id": "21509383",
+      "committed_window": [
+        301,
+        401
+      ],
+      "driver_command": "validation/pr3/slurm/21509383-logs/driver_command.sh",
+      "driver_command_sha256": "bcee9f659ba9dc747a9cca00019b8d0972f0f00ee2e8e9f7b1fe41aa83886ba1",
+      "native_log": "validation/pr3/slurm/21509383-logs/ray-driver.log",
+      "native_log_sha256": "096c2ce91b280cbc8f00aae2dccad748322166a3e007ab51567f9b3377f4c4c5",
+      "matches_previous_completed600_log_audit": true,
+      "setup_command_present": false
+    },
+    {
+      "job_id": "21509384",
+      "committed_window": [
+        402,
+        503
+      ],
+      "driver_command": "validation/pr3/slurm/21509384-logs/driver_command.sh",
+      "driver_command_sha256": "bcee9f659ba9dc747a9cca00019b8d0972f0f00ee2e8e9f7b1fe41aa83886ba1",
+      "native_log": "validation/pr3/slurm/21509384-logs/ray-driver.log",
+      "native_log_sha256": "d467a0973165347833d25592fb6d93f1ee7dd0778defb3f85c10c2314ec20497",
+      "matches_previous_completed600_log_audit": true,
+      "setup_command_present": false
+    },
+    {
+      "job_id": "21509385",
+      "committed_window": [
+        504,
+        600
+      ],
+      "driver_command": "validation/pr3/slurm/21509385-logs/driver_command.sh",
+      "driver_command_sha256": "bcee9f659ba9dc747a9cca00019b8d0972f0f00ee2e8e9f7b1fe41aa83886ba1",
+      "native_log": "validation/pr3/slurm/21509385-logs/ray-driver.log",
+      "native_log_sha256": "bf2f58e5197e59e5cc9d6e3e3434ccb8c762ebf326e4216e27ddee029c67ad1d",
+      "matches_previous_completed600_log_audit": true,
+      "setup_command_present": false
+    }
+  ],
+  "unused_final_segment": {
+    "job_id": "21509386",
+    "action": "Skipped before container startup because checkpoint600 was already complete."
+  },
+  "scope": "Retrospective source/launch-artifact audit, not newly executed historical per-rank wire-dtype/kernel-hash instrumentation. No training or GPU computation was run for this audit.",
+  "comparison_limit": "Fresh LA1 uses BOTH fixes from initialization. This legacy streaming LA0 vs fresh LA1 comparison changes numerical backend/refit fixes as well as streaming/lookahead; it cannot isolate a streaming effect."
+}

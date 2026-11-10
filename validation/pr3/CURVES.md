@@ -27,6 +27,12 @@ checks are recorded in the expanded JSON files. These historical comparisons do
 not change the failed Qwen BF16 gate, unassessed Gemma fixed-input parity, or
 lack of controlled speedup evidence.
 
+Important fix provenance for Qwen: **streaming LA0 used neither the A_log
+FP32 refit fix nor the prefill-conv FP32-product fix throughout all 600 steps**.
+It did not switch fixes between segments. The fresh LA1 curve uses both from
+initialization, so that comparison does not isolate streaming/lookahead. See
+[the retrospective audit](REFIT_FIX_AUDIT.md) and its per-job evidence.
+
 The original comparison is described below.
 
 The eight panels compare reward, generated length, gen_kl_error,
