@@ -287,7 +287,6 @@ def test_standard_microbatch_dispatch_runs_gspo_loss_and_audio_gradient(
         device_mesh=None,
         cp_size=1,
         padding_token_id=PAD,
-        is_reward_model=False,
         allow_flash_attn_args=False,
     )
     old, metrics, returned = forward_with_post_processing_fn(
