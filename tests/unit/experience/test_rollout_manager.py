@@ -2061,12 +2061,11 @@ def test_async_nemo_gym_rollout_manager(
             None,
         )
         assert last_assistant is not None, f"Completion {i}: no assistant message found"
-        assert torch.equal(
-            last_assistant["token_ids"],
-            torch.tensor([151667, 198, 32313, 11, 279]),
-        ), (
-            f"Completion {i}: last assistant token_ids {last_assistant['token_ids'].tolist()} "
-            f"!= [151667, 198, 32313, 11, 279]"
+        # On vLLM 0.33 the sampled fifth token differs between GPU types (279 on the
+        # CI runners, 1077 on H100), so only the first four ids are fixed.
+        token_ids = last_assistant["token_ids"].tolist()
+        assert len(token_ids) == 5 and token_ids[:4] == [151667, 198, 32313, 11], (
+            f"Completion {i}: last assistant token_ids {token_ids}"
         )
 
         # 3. reward
