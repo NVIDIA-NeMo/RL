@@ -18,11 +18,13 @@ import asyncio
 import inspect
 from types import SimpleNamespace
 from typing import Any, Optional
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     _CAPTURED_MODEL_CALL,
+    VllmAsyncGenerationWorkerImpl,
     _AsyncLLMHTTPClient,
 )
 
@@ -100,6 +102,135 @@ def test_an_engine_without_output_processor_state_reports_nothing() -> None:
         return await client.captured_call_progress()
 
     assert asyncio.run(exercise()) == []
+
+
+@pytest.mark.parametrize("local_capture", [False, True])
+@pytest.mark.parametrize("multiple_frontends", [False, True])
+def test_worker_combines_frontend_progress(
+    local_capture: bool, multiple_frontends: bool
+) -> None:
+    client = SimpleNamespace(
+        captured_call_progress=AsyncMock(return_value=[["owner", 20]])
+    )
+    pool = SimpleNamespace(
+        command=AsyncMock(
+            return_value=[
+                None,
+                {"weight_version": 4, "calls": [["child", 30]]},
+                {"weight_version": 4, "calls": []},
+            ]
+        )
+    )
+    worker = SimpleNamespace(
+        _http_engine_client=client if local_capture else None,
+        token_capture=object() if local_capture else None,
+        _rollout_weight_version=4,
+        _api_server_pool=pool if multiple_frontends else None,
+    )
+    result = asyncio.run(VllmAsyncGenerationWorkerImpl.captured_call_progress(worker))
+    if local_capture or multiple_frontends:
+        assert result == {
+            "weight_version": 4,
+            "calls": ([["owner", 20]] if local_capture else [])
+            + ([["child", 30]] if multiple_frontends else []),
+        }
+    else:
+        assert result is None
+    if multiple_frontends:
+        pool.command.assert_awaited_once_with("progress")
+    else:
+        pool.command.assert_not_awaited()
+
+
+def test_worker_rejects_mixed_frontend_weight_versions() -> None:
+    worker = SimpleNamespace(
+        _http_engine_client=None,
+        token_capture=None,
+        _rollout_weight_version=4,
+        _api_server_pool=SimpleNamespace(
+            command=AsyncMock(return_value=[{"weight_version": 3, "calls": []}])
+        ),
+    )
+    with pytest.raises(RuntimeError, match="different weight versions"):
+        asyncio.run(VllmAsyncGenerationWorkerImpl.captured_call_progress(worker))
+
+
+@pytest.mark.parametrize("multiple_frontends", [False, True])
+def test_worker_collects_separate_frontend_snapshots(multiple_frontends: bool) -> None:
+    owner = {"calls": 2, "by_op": {"put": {"n_bytes": 100, "step_max_ms": 2}}}
+    child = {"calls": 3, "by_op": {"get": {"n_bytes": 200, "step_max_ms": 5}}}
+    pool = SimpleNamespace(command=AsyncMock(return_value=[None, child]))
+    worker = SimpleNamespace(
+        get_data_plane_snapshot=Mock(return_value=owner),
+        _api_server_pool=pool if multiple_frontends else None,
+    )
+    snapshots = asyncio.run(
+        VllmAsyncGenerationWorkerImpl.get_data_plane_snapshots(worker)
+    )
+    assert snapshots == ([owner, child] if multiple_frontends else [owner])
+    worker.get_data_plane_snapshot.assert_called_once_with()
+    if multiple_frontends:
+        pool.command.assert_awaited_once_with("snapshot")
+
+
+def test_generation_flattens_frontend_snapshots() -> None:
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    snapshots = [{"calls": 2}, {"calls": 3}, {"calls": 5}]
+    group = SimpleNamespace(run_all_workers_single_data=Mock(return_value="refs"))
+    with patch(
+        "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
+        return_value=[snapshots[:2], [], snapshots[2:]],
+    ):
+        assert (
+            VllmGeneration.get_data_plane_snapshots(SimpleNamespace(worker_group=group))
+            == snapshots
+        )
+    group.run_all_workers_single_data.assert_called_once_with(
+        "get_data_plane_snapshots",
+        run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+    )
+
+
+def test_multiprocess_metrics_sum_tokens_and_keep_one_engine_gauge(
+    tmp_path, monkeypatch
+) -> None:
+    from prometheus_client.mmap_dict import MmapedDict, mmap_key
+
+    from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
+
+    monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    names = [
+        "vllm:num_requests_running",
+        "vllm:num_requests_waiting",
+        "vllm:kv_cache_usage_perc",
+    ]
+    for pid, tokens, gauge_values in [
+        (1, 20, [4, 8, 0.2]),
+        (2, 30, [5, 9, 0.3]),
+    ]:
+        for kind, samples in [
+            ("counter", [("vllm:generation_tokens", tokens)]),
+            ("gauge_mostrecent", list(zip(names, gauge_values))),
+        ]:
+            data = MmapedDict(str(tmp_path / f"{kind}_{pid}.db"))
+            try:
+                for name, value in samples:
+                    sample_name = name + "_total" if kind == "counter" else name
+                    key = mmap_key(name, sample_name, ["engine"], ["0"], "test")
+                    data.write_value(key, value, float(pid))
+            finally:
+                data.close()
+
+    pool = MultiAPIServerPool(SimpleNamespace(), 2)
+    snapshot = pool.get_metrics_snapshot()
+    assert {metric.name: metric.value for metric in snapshot} == {
+        "vllm:generation_tokens": 50,
+        "vllm:num_requests_running": 5,
+        "vllm:num_requests_waiting": 9,
+        "vllm:kv_cache_usage_perc": 0.3,
+    }
+    assert len(snapshot) == 4
 
 
 def test_vllm_still_has_the_request_state_we_read() -> None:
