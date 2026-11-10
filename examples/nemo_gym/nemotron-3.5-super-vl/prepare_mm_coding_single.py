@@ -76,7 +76,7 @@ class SourceGymRow(BaseModel):
     model_config = ConfigDict(extra="forbid")
     agent_ref: dict[str, str]
     task: ExperimentTask
-    route: Literal["single", "opencode", "codex", "hermes"]
+    route: Literal["single", "opencode"]
     responses_create_params: dict[str, object]
 
     def validate_image_binding(self, expected_sha256: str | None) -> None:
@@ -122,8 +122,6 @@ class SourceGymRow(BaseModel):
 
 
 HARNESS_NAMES = ("opencode",)
-EXPERIMENTAL_HARNESSES = ("codex", "hermes")
-ALL_HARNESSES = (*HARNESS_NAMES, *EXPERIMENTAL_HARNESSES)
 MULTI_FRACTIONS = {
     "chart2code": 0.5,
     "mmsvg_img2svg": 0.5,
@@ -154,7 +152,7 @@ def select_route(
     if (
         not harnesses
         or len(set(harnesses)) != len(harnesses)
-        or set(harnesses) - set(ALL_HARNESSES)
+        or set(harnesses) - set(HARNESS_NAMES)
     ):
         raise ValueError("Choose unique supported harnesses")
     identity = f"{seed}:{epoch}:{task.benchmark}:{task.task_id}"
@@ -177,7 +175,7 @@ def gym_row(
     selected: str = "single",
 ) -> dict:
     """Preserve the task prompt and input image without exposing the reference source."""
-    if selected != "single" and selected not in ALL_HARNESSES:
+    if selected != "single" and selected not in HARNESS_NAMES:
         raise ValueError("Unknown harness route")
     if split not in {"train", "validation", "example"}:
         raise ValueError(
@@ -227,9 +225,6 @@ def gym_row(
             }
         )
     if selected != "single":
-        # These opt-in adapters accept file-based vision, not initial image attachments.
-        if selected in EXPERIMENTAL_HARNESSES:
-            content = [part for part in content if part["type"] != "input_image"]
         # The resource-owned sandbox receives the same reference bytes; no private grade data enters the prompt.
         if task.references:
             content.append(
@@ -241,13 +236,10 @@ def gym_row(
                 }
             )
         artifact = ARTIFACTS[task.benchmark]
-        preview_python = (
-            "/opt/gym/bin/python" if selected in EXPERIMENTAL_HARNESSES else "python"
-        )
         system_prompt = (
             f"Solve the user's task in /workspace. Save your final answer to /workspace/{artifact}. "
             "Use shell and file tools to inspect and revise. "
-            f"Preview with `{preview_python} /opt/mmrl/render.py {task.benchmark} /workspace/{artifact} /workspace/preview.png`. "
+            f"Preview with `python /opt/mmrl/render.py {task.benchmark} /workspace/{artifact} /workspace/preview.png`. "
             "You may inspect the preview with your image tool. Finish with a final response. "
             "Only the final answer file is transferred to a fresh grading sandbox. "
             "Make it self-contained: it must run without any other task-workspace files. "
@@ -373,9 +365,9 @@ def main() -> None:
     parser.add_argument(
         "--harnesses",
         nargs="+",
-        choices=ALL_HARNESSES,
+        choices=HARNESS_NAMES,
         default=list(HARNESS_NAMES),
-        help="Defaults to OpenCode. Explicit Codex/Hermes selection opts into experimental file-based vision.",
+        help="Use the supported OpenCode multimodal session harness.",
     )
     args = parser.parse_args()
     count = export(
@@ -396,9 +388,7 @@ def main() -> None:
                 "rows": count,
                 "output": str(args.output),
                 "split": args.split,
-                "experimental_harnesses": [
-                    h for h in args.harnesses if h in EXPERIMENTAL_HARNESSES
-                ],
+                "harnesses": args.harnesses,
             }
         )
     )

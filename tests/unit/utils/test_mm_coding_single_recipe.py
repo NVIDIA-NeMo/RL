@@ -165,7 +165,7 @@ def test_routes_are_deterministic_and_ignore_order(mode):
         assert 0.15 < sum(v != "single" for v in routes.values()) / len(tasks) < 0.35
 
 
-@pytest.mark.parametrize("harness", ["opencode", "codex", "hermes"])
+@pytest.mark.parametrize("harness", ["opencode"])
 def test_multi_rows_have_private_task_envelope_and_file_instructions(tmp_path, harness):
     task = adapter.ExperimentTask(
         benchmark="mmsvg_text2svg",
@@ -372,51 +372,17 @@ def test_legacy_image_drift_is_refused_without_partial_dataset(tmp_path):
 
 
 @pytest.mark.parametrize("harness", ["codex", "hermes"])
-def test_experimental_image_route_preserves_owner_pixels_and_requires_file_inspection(
-    tmp_path, harness
-):
-    path = tmp_path / "reference.png"
-    Image.new("RGB", (12, 12), "blue").save(path)
+def test_deferred_harness_cannot_silently_become_opencode(tmp_path, harness):
     task = adapter.ExperimentTask(
-        benchmark="mmsvg_img2svg",
-        task_id="experimental-image",
-        prompt="draw this",
-        references=[str(path)],
+        benchmark="mmsvg_text2svg", task_id="unsupported-route", prompt="draw"
     )
-    row = adapter.gym_row(
-        task,
-        reference_root=tmp_path,
-        split="example",
-        max_output_tokens=8192,
-        selected=harness,
-    )
-    params = row["task_input"]["responses_create_params"]
-    owner = row["task_input"]["task_data"]["task"]
-    assert owner["reference_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
-    assert "/workspace/reference.png" in json.dumps(params)
-    assert "Inspect it with your image tool" in json.dumps(params)
-    assert (
-        "Preview with `/opt/gym/bin/python /opt/mmrl/render.py"
-        in params["input"][0]["content"]
-    )
-    assert not any(
-        p.get("type") == "input_image"
-        for message in params["input"]
-        for p in (message["content"] if isinstance(message["content"], list) else [])
-    )
-
-
-def test_experimental_runtime_preflight_refuses_unpatched_stock_adapter(monkeypatch):
-    from types import SimpleNamespace
-
-    spec = importlib.util.spec_from_file_location(
-        "experimental_runtime_guard", EXAMPLE / "check_mm_coding_runtime.py"
-    )
-    guard = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(guard)
-    stock = SimpleNamespace(CodexAgentConfig=SimpleNamespace(model_fields={}))
-    monkeypatch.setattr(guard.importlib, "import_module", lambda name: stock)
-    assert guard.check_experimental_apis(("codex",)) == [
-        "responses_api_agents.codex_agent.app.CodexAgentConfig.forward_sampling_controls"
-    ]
-    assert guard.check_experimental_apis(("opencode",)) == []
+    with pytest.raises(ValueError, match="Unknown harness route"):
+        adapter.gym_row(
+            task,
+            reference_root=tmp_path,
+            split="train",
+            max_output_tokens=8192,
+            selected=harness,
+        )
+    with pytest.raises(ValueError, match="unique supported harnesses"):
+        adapter.select_route(task, mode="multi", harnesses=(harness,))

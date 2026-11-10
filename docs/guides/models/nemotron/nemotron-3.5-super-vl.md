@@ -128,11 +128,9 @@ successor). OpenCode can append its own assistant step-limit note or lowercase
 a tool name; a Gym revision without the fix can lose the model-call parent and
 mask the rollout. The mode-aware preflight refuses the missing module before
 GPU allocation. The default migration path is single + OpenCode multi/mixed;
-Codex/Hermes require the separate experimental Gym adapter extensions and
-`mm_coding_multi_experimental.yaml` or `mm_coding_mixed_experimental.yaml`.
-Select them explicitly with `--harnesses codex hermes`; OpenCode remains the
-default. Their file-based vision protocol and SDK hook are experimental.
-See the Gym component’s `experimental-harnesses.md` for limits and provenance. Module discovery is a prerequisite, not proof
+Codex and Hermes are deferred from this submission. The multimodal session path
+uses OpenCode, matching the Environment Server migration guidance. Module
+discovery is a prerequisite, not proof
 that a rollout's tokens, images and logprobs were captured correctly.
 
 Set `MM_CODING_TRAIN_DATA` and `MM_CODING_VALIDATION_DATA` to the adapted files,
