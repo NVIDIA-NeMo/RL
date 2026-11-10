@@ -74,4 +74,5 @@ uv run tests/check_metrics.py "$JSON_METRICS" \
     'max(data["train/reward"]) > 0.1' \
     'median(data["train/gen_kl_error"]) < 0.002' \
     'all_finite(data["train/loss"])' \
-    'max(data["train/finalize/invalid_row_rate"]) == 0'
+    'max(data["train/finalize/invalid_row_rate"]) == 0' \
+    'min(data["train/vllm/generation_tokens"]) > 0'
