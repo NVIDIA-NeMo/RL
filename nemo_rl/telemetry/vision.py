@@ -64,7 +64,10 @@ VISION_STAGE_TRAIN_MICROBATCH = "train_microbatch"
 #: same work, so summing across stages would double count.
 VISION_STAGE_TRAIN_BATCH = "train_batch"
 
-#: One batch delivered by an Energon loader owner.
+#: One batch delivered by an Energon loader owner. Counted over fewer ranks
+#: than the train stages are: a loader runs on one rank per data-parallel
+#: shard, while the train stages are recorded on every model-parallel replica
+#: of it, so the two totals differ by TP x PP x CP for identical work.
 VISION_STAGE_LOADER_BATCH = "loader_batch"
 
 #: Media *segments*, not images. One ``PackedTensor`` segment may hold several
@@ -113,6 +116,13 @@ VISION_METRICS = (
 )
 register_recorded_metrics(VISION_METRICS)
 
+#: Registry key per series name. The two sinks key differently: span attributes
+#: take the dotted series name, while ``record_rl_metrics`` takes lens registry
+#: keys (``vision_segments``), and a name handed to the meter is dropped with a
+#: log line rather than an error. Derived from the declarations above rather
+#: than written out, so a renamed row cannot keep recording against the old key.
+_KEY_BY_SERIES = {row.name: row.key for row in VISION_METRICS}
+
 __all__ = [
     "RL_VISION_STAGE_ATTR",
     "RL_VISION_SEGMENTS_METRIC",
@@ -136,9 +146,10 @@ def vision_workload(batch: Any, num_rows: int) -> Optional[dict[str, int]]:
     so a count named "images" would be wrong on some of them. See
     ``RL_VISION_SEGMENTS_METRIC``.
 
-    Keyed by series name, so the result doubles as span attributes and as the
-    ``record_rl_metrics`` payload without a second mapping between the two.
-    ``None`` when the batch describes its images in a way this cannot read.
+    Keyed by series name, which is what span attributes take directly;
+    ``record_vision_workload`` re-keys it for the meter, which takes registry
+    keys instead. ``None`` when the batch describes its images in a way this
+    cannot read.
 
     Deliberately not ``data.multimodal_utils.image_counts_by_row``, which this
     otherwise mirrors: that helper returns ``None`` unless its per-row counts
@@ -182,11 +193,10 @@ def record_vision_workload(
 
     The two sinks are independently configured and that is intended. The
     metrics are recorded whenever telemetry is exporting; the span attributes
-    appear only when the caller's span group is enabled, and *span* is a
-    non-recording span otherwise, so the attributes are dropped while the
-    counters keep running. Gating the metrics on a span group would be wrong
-    besides: the loader and train stages sit in different groups, so one
-    switch cannot speak for both.
+    appear only when the caller's span group is enabled, and *span* is ``None``
+    otherwise, so the attributes are dropped while the counters keep running.
+    Gating the metrics on a span group would be wrong besides: the loader and
+    train stages sit in different groups, so one switch cannot speak for both.
     """
     # Imported here rather than at module scope to keep this module's own
     # imports to ``vocabulary`` and ``instrumentation``. ``metrics`` imports
@@ -202,7 +212,10 @@ def record_vision_workload(
     # that no-ops when its group is off, and record_rl_metrics no-ops when
     # nothing is exporting, so the cost on an untraced run is the count itself.
     safe_set_span_attributes(span, workload)
-    record_rl_metrics(workload, {RL_VISION_STAGE_ATTR: stage})
+    record_rl_metrics(
+        {_KEY_BY_SERIES[name]: value for name, value in workload.items()},
+        {RL_VISION_STAGE_ATTR: stage},
+    )
 
 
 def traced_train_phase(span_name: str, *, stage: str) -> Callable[[_F], _F]:

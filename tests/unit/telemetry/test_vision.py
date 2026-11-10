@@ -29,6 +29,7 @@ from nemo_rl.telemetry.vision import (
     traced_train_phase,
     vision_workload,
 )
+from nemo_rl.telemetry.vocabulary import registry_key
 
 
 class FakePackedTensor:
@@ -124,7 +125,13 @@ class FakeSpan:
 
 
 def test_record_stamps_the_span_and_the_metrics_from_one_count(monkeypatch):
-    """Both sinks get the same numbers, so neither can drift from the other."""
+    """Both sinks get the same numbers, under the key each of them takes.
+
+    The span takes the dotted series name and the meter takes the lens registry
+    key, so the one count is spelled two ways on the way out. Asserting both
+    here is what keeps the re-keying from being dropped: the meter logs an
+    unknown key and carries on, so getting it wrong costs nothing visible.
+    """
     recorded: list[tuple[dict, dict]] = []
     monkeypatch.setattr(
         "nemo_rl.telemetry.metrics.record_rl_metrics",
@@ -139,13 +146,17 @@ def test_record_stamps_the_span_and_the_metrics_from_one_count(monkeypatch):
         span=span,
     )
 
-    assert span.attributes[RL_VISION_SEGMENTS_METRIC] == 2
+    assert span.attributes == {
+        RL_VISION_SEGMENTS_METRIC: 2,
+        RL_VISION_MEDIA_ROWS_METRIC: 2,
+        RL_VISION_ROWS_METRIC: 2,
+    }
     assert recorded == [
         (
             {
-                RL_VISION_SEGMENTS_METRIC: 2,
-                RL_VISION_MEDIA_ROWS_METRIC: 2,
-                RL_VISION_ROWS_METRIC: 2,
+                registry_key(RL_VISION_SEGMENTS_METRIC): 2,
+                registry_key(RL_VISION_MEDIA_ROWS_METRIC): 2,
+                registry_key(RL_VISION_ROWS_METRIC): 2,
             },
             {RL_VISION_STAGE_ATTR: VISION_STAGE_TRAIN_MICROBATCH},
         )
@@ -218,7 +229,7 @@ def test_traced_train_phase_stamps_the_batch_it_was_called_with(monkeypatch):
 
     assert Worker().train(batch, loss_fn="fn") == "result"
     assert seen == [(batch, "fn")]
-    assert recorded[0][0][RL_VISION_SEGMENTS_METRIC] == 1
+    assert recorded[0][0][registry_key(RL_VISION_SEGMENTS_METRIC)] == 1
     assert recorded[0][1] == {RL_VISION_STAGE_ATTR: VISION_STAGE_TRAIN_BATCH}
 
 
@@ -342,10 +353,85 @@ def test_traced_train_phase_forwards_arbitrary_arguments():
 
 
 def test_every_declared_series_is_one_vision_workload_can_produce():
-    """A declared row with nothing writing it is an instrument that reports silence.
-
-    The reverse direction is covered by ``vision_workload`` returning its keys
-    by series name, which is what keeps the two from needing a mapping.
-    """
+    """A declared row with nothing writing it is an instrument that reports silence."""
     producible = set(workload([1], num_rows=1)) | set(workload(None, num_rows=1))
     assert {row.name for row in VISION_METRICS} == producible
+
+
+def test_importing_the_package_declares_the_rows_before_telemetry_starts():
+    """The ``__init__`` import is load-bearing and nothing else would catch it.
+
+    Registration closes when telemetry comes up, and the module that records
+    these is not imported until the policy is built, which is after that point.
+    Without the package-level import the rows are declared too late and all
+    three are dropped — invisible at runtime, so it is pinned here.
+
+    In a subprocess because this module imports ``vision`` directly, which
+    declares the rows whatever ``__init__`` does: asserting on the registry
+    in-process would pass with the import deleted.
+    """
+    import subprocess
+
+    probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, nemo_rl.telemetry; "
+            "from nemo_rl.telemetry.vocabulary import recorded_metrics; "
+            "print(sorted(r.name for r in recorded_metrics() if 'vision' in r.name))",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert probe.stdout.strip() == str(sorted(row.name for row in VISION_METRICS)), (
+        probe.stderr
+    )
+
+
+def test_the_counters_reach_a_real_exporter_and_sum_across_microbatches():
+    """Everything above mocks ``record_rl_metrics``, so only this sees the meter.
+
+    Two things can only fail here. The payload has to be keyed the way lens's
+    registry expects — a series name is rejected with a log line and no error,
+    so every mocked test passes while nothing is exported. And the rows have to
+    be counters: these are recorded once per microbatch, and a gauge would
+    report the last one rather than the sum.
+    """
+    from nemo.lens import NemoLensConfig, setup_telemetry
+    from opentelemetry.sdk.metrics.export import InMemoryMetricReader
+
+    import nemo_rl.telemetry.setup as setup_mod
+
+    instruments = pytest.importorskip("nemo.lens.instruments")
+    if not hasattr(instruments, "register_metric_group"):
+        pytest.skip("installed nemo-lens has no metric registry (lens PR #46)")
+
+    reader = InMemoryMetricReader()
+    setup_mod._TELEMETRY_HANDLE = setup_telemetry(
+        NemoLensConfig(enabled=True), metric_reader=reader
+    )
+
+    for counts in ([2, 1], [1, 1], [0, 0]):
+        record_vision_workload(
+            {"pixel_values": FakePackedTensor(counts)},
+            2,
+            stage=VISION_STAGE_TRAIN_MICROBATCH,
+        )
+
+    points = [
+        (metric.name, point)
+        for rm in reader.get_metrics_data().resource_metrics
+        for sm in rm.scope_metrics
+        for metric in sm.metrics
+        for point in metric.data.data_points
+        if metric.name.startswith("rl.vision.")
+    ]
+    assert {name: point.value for name, point in points} == {
+        RL_VISION_SEGMENTS_METRIC: 5,
+        RL_VISION_MEDIA_ROWS_METRIC: 4,
+        RL_VISION_ROWS_METRIC: 6,
+    }
+    assert {point.attributes[RL_VISION_STAGE_ATTR] for _, point in points} == {
+        VISION_STAGE_TRAIN_MICROBATCH
+    }
