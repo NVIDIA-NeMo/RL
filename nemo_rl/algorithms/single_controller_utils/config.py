@@ -1605,14 +1605,18 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         policy = master_config.policy
         if not policy["megatron_cfg"]["enabled"]:
             automodel = policy["automodel_cfg"]
-            if (
-                not automodel["enabled"]
-                or automodel["tensor_parallel_size"] != 1
-                or automodel["context_parallel_size"] != 1
-                or automodel["sequence_parallel"]
-                or policy["sequence_packing"]["enabled"]
-                or automodel["automodel_kwargs"].get("force_hf", False)
-            ):
+            if automodel["enabled"]:
+                enabled_automodel = cast(AutomodelConfig, automodel)
+                unsupported_capture = (
+                    enabled_automodel["tensor_parallel_size"] != 1
+                    or enabled_automodel["context_parallel_size"] != 1
+                    or enabled_automodel["sequence_parallel"]
+                    or policy["sequence_packing"]["enabled"]
+                    or enabled_automodel["automodel_kwargs"].get("force_hf", False)
+                )
+            else:
+                unsupported_capture = True
+            if unsupported_capture:
                 raise ValueError(
                     "Omni media token capture requires Megatron or native Automodel "
                     "with TP=CP=1, no sequence packing/parallelism, and force_hf disabled"
