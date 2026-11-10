@@ -50,7 +50,7 @@ def test_load_diffusion_pipeline_uses_automodel_loader(monkeypatch):
     def fake_from_pretrained(model_name, **kwargs):
         seen["model_name"] = model_name
         seen.update(kwargs)
-        return _FakePipe(), {}
+        return _FakePipe()
 
     monkeypatch.setattr(
         adp.NeMoAutoDiffusionPipeline,
@@ -58,12 +58,11 @@ def test_load_diffusion_pipeline_uses_automodel_loader(monkeypatch):
         staticmethod(fake_from_pretrained),
     )
 
-    pipe, managers = load_diffusion_pipeline(
+    pipe = load_diffusion_pipeline(
         "Qwen/Qwen-Image", dtype=torch.bfloat16, device=torch.device("cpu")
     )
 
     assert isinstance(pipe, _FakePipe)
-    assert managers == {}
     assert seen["model_name"] == "Qwen/Qwen-Image"
     assert seen["torch_dtype"] is torch.bfloat16
     assert seen["device"] == torch.device("cpu")
@@ -72,26 +71,9 @@ def test_load_diffusion_pipeline_uses_automodel_loader(monkeypatch):
     # would cast fp32 rotary buffers to bf16 and skew prompt embeddings.
     assert seen["move_to_device"] is False
     assert pipe.to_calls == [((torch.device("cpu"),), {})]
-    # Stage one keeps the worker's manual DP all-reduce: no parallel managers.
-    assert seen["parallel_scheme"] is None
+    # Stage one keeps the worker's manual DP all-reduce: no Automodel parallelization.
+    assert "mesh_context" not in seen
     assert seen["peft_cfg"] is None
-
-
-def test_load_diffusion_pipeline_returns_two_tuple(monkeypatch):
-    from nemo_automodel._diffusers import auto_diffusion_pipeline as adp
-
-    fake_managers = {"transformer": object()}
-    monkeypatch.setattr(
-        adp.NeMoAutoDiffusionPipeline,
-        "from_pretrained",
-        staticmethod(lambda model_name, **kwargs: (_FakePipe(), fake_managers)),
-    )
-
-    pipe, managers = load_diffusion_pipeline(
-        "Qwen/Qwen-Image", dtype=torch.float32, device=torch.device("cpu")
-    )
-    assert isinstance(pipe, _FakePipe)
-    assert managers is fake_managers
 
 
 # ---------------------------------------------------------------------------

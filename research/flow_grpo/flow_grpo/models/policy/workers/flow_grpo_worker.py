@@ -65,37 +65,28 @@ def calculate_shift(
 
 def load_diffusion_pipeline(
     model_name: str, *, dtype: Any, device: Any, peft_cfg: Any = None
-) -> tuple[Any, dict[str, Any]]:
-    """Load the diffusers pipeline through the NeMo Automodel stack.
-
-    Returns the ``(pipe, managers)`` two-tuple of
-    ``NeMoAutoDiffusionPipeline.from_pretrained``: `pipe` is the real diffusers
-    pipeline (``encode_prompt``/``vae``/private pack helpers all usable),
-    `managers` maps component name -> parallel manager. Stage one of the
-    migration keeps the worker's manual DP all-reduce, so no parallel scheme is
-    requested and `managers` stays empty.
-    """
+) -> Any:
+    """Load the diffusers pipeline through Automodel, unparallelized (the worker all-reduces DP grads)."""
     from nemo_automodel._diffusers.auto_diffusion_pipeline import (
         NeMoAutoDiffusionPipeline,
     )
 
-    pipe, managers = NeMoAutoDiffusionPipeline.from_pretrained(
+    pipe = NeMoAutoDiffusionPipeline.from_pretrained(
         model_name,
         torch_dtype=dtype,
         device=device,
-        # _move_module_to_device (pin auto_diffusion_pipeline.py:178-188) calls
-        # module.to(device, dtype), which also casts the text encoder's fp32
-        # rotary buffers (inv_freq/original_inv_freq) to bf16 and skews prompt
-        # embeddings; keep the load on CPU and move device-only below.
+        # Automodel's _move_module_to_device calls module.to(device, dtype),
+        # which also casts the text encoder's fp32 rotary buffers
+        # (inv_freq/original_inv_freq) to bf16 and skews prompt embeddings;
+        # keep the load on CPU and move device-only below.
         move_to_device=False,
         load_for_training=True,
-        parallel_scheme=None,
         peft_cfg=peft_cfg,
-        # Only consulted on the peft_cfg path (pin 24b47e85 behavior).
+        # Only consulted on the peft_cfg path.
         model_type="qwen_image",
     )
     pipe.to(device)
-    return pipe, managers
+    return pipe
 
 
 def build_checkpointer(*, is_peft: bool, dp_rank: int) -> Any:
@@ -292,7 +283,6 @@ class FlowGRPOPolicyWorker:  # pragma: no cover
     # because those imports are deferred into method bodies).
     device: Any
     _pipe: Any
-    _managers: dict[str, Any]
     transformer: Any
     text_encoder: Any
     tokenizer: Any
@@ -397,7 +387,7 @@ class FlowGRPOPolicyWorker:  # pragma: no cover
         lora_cfg = self.config["lora_cfg"]
         self._lora_enabled = bool(lora_cfg["enabled"])
         model_name = self.config["model_name"]
-        pipe, self._managers = load_diffusion_pipeline(
+        pipe = load_diffusion_pipeline(
             model_name,
             dtype=self.dtype,
             device=self.device,
