@@ -68,7 +68,7 @@ For single-update training, override these fields in the `loss_fn` example above
   truncated_importance_sampling_ratio: 6.0
 ```
 
-Both the GRPO trainer and SingleController skip the previous-policy forward in this mode unless `grpo.seq_logprob_error_threshold` is set (the GRPO trainer also skips it when `loss_fn.seq_logprob_error_in_loss: true`). This mode needs one optimizer update per rollout batch (`policy.train_global_batch_size == grpo.num_prompts_per_step * grpo.num_generations_per_prompt`). A reference-policy forward is still required when reference KL is enabled.
+Both the GRPO trainer and SingleController skip the previous-policy forward in this mode unless `grpo.seq_logprob_error_threshold` is set (both also skip it when `loss_fn.seq_logprob_error_in_loss: true`). This mode needs one optimizer update per rollout batch (`policy.train_global_batch_size == grpo.num_prompts_per_step * grpo.num_generations_per_prompt`). A reference-policy forward is still required when reference KL is enabled.
 
 ## References
 

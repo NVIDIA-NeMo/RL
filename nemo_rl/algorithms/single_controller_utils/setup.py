@@ -66,6 +66,13 @@ from nemo_rl.algorithms.metric_utils import (
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.rollout_checkpointing.manifest import (
+    BOOTSTRAP_DIRNAME,
+    BootstrapCompatibilityIdentity,
+    bootstrap_compatibility_identity,
+    resolve_latest_snapshot,
+    validate_bootstrap_anchor,
+)
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageStageConfig,
 )
@@ -76,14 +83,8 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     is_ppo_run,
     logprob_passes_required,
     resolve_ppo_chunk_alignment,
+    rollout_snapshots_enabled,
     validate_single_controller_config,
-)
-from nemo_rl.algorithms.single_controller_utils.rollout_checkpoint import (
-    BOOTSTRAP_DIRNAME,
-    BootstrapCompatibilityIdentity,
-    bootstrap_compatibility_identity,
-    resolve_latest_snapshot,
-    validate_bootstrap_anchor,
 )
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -1211,6 +1212,7 @@ def setup_single_controller(
         )
     data_plane_checkpointing_supported = data_plane_supports_checkpointing(dp_config)
     rollout_checkpoint_cfg = master_config.rollout_checkpointing
+    snapshots_enabled = rollout_snapshots_enabled(master_config)
     if master_config.rollout_recovery.turn_checkpointing_enabled:
         if generation_config["backend"] != "vllm":
             raise NotImplementedError(
@@ -1223,10 +1225,16 @@ def setup_single_controller(
                 "rollout_recovery.target_level='turn' requires the NeMo-Gym "
                 "rollout path (env.should_use_nemo_gym=true)"
             )
-        if rollout_checkpoint_cfg.snapshot_attempt_interval_s is None:
+        if (
+            rollout_checkpoint_cfg.snapshot_attempt_interval_s is None
+            and not rollout_checkpoint_cfg.snapshot_on_trainer_checkpoint
+            and master_config.checkpointing.get("checkpoint_must_save_by") is None
+        ):
             raise ValueError(
-                "rollout_recovery.target_level='turn' requires "
-                "rollout_checkpointing.snapshot_attempt_interval_s"
+                "rollout_recovery.target_level='turn' would never save environment "
+                "state: set rollout_checkpointing.snapshot_on_trainer_checkpoint=true, "
+                "rollout_checkpointing.snapshot_attempt_interval_s, or "
+                "checkpointing.checkpoint_must_save_by"
             )
         if not master_config.token_capture.enabled:
             raise ValueError(
@@ -1239,8 +1247,7 @@ def setup_single_controller(
                 "rollout_checkpointing.restore_mode='latest'"
             )
     if (
-        master_config.checkpointing.get("save_data_plane")
-        or rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
+        master_config.checkpointing.get("save_data_plane") or snapshots_enabled
     ) and not data_plane_checkpointing_supported:
         raise NotImplementedError(
             "SingleController data-plane checkpointing is not supported for "
@@ -1387,7 +1394,7 @@ def setup_single_controller(
             "token_capture.defer_routed_experts_to_policy requires "
             "policy.router_replay.enabled=true"
         )
-    if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
+    if snapshots_enabled:
         if not master_config.checkpointing["enabled"]:
             raise ValueError(
                 "rollout checkpointing requires checkpointing.enabled=true"
@@ -1410,7 +1417,10 @@ def setup_single_controller(
                 "rollout checkpointing requires a sampler that explicitly "
                 "supports training-claim ownership"
             )
-        if master_config.checkpointing["save_period"] != 1:
+        if (
+            rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
+            and master_config.checkpointing["save_period"] != 1
+        ):
             warnings.warn(
                 "rollout checkpointing is enabled with "
                 f"checkpointing.save_period={master_config.checkpointing['save_period']}; "
@@ -1544,10 +1554,7 @@ def setup_single_controller(
     restore_mode = rollout_checkpoint_cfg.restore_mode
     recovery_checkpoint_path = trainer_checkpoint_path
     bootstrap_anchor = checkpointer.checkpoint_dir / BOOTSTRAP_DIRNAME
-    needs_bootstrap_identity = (
-        trainer_checkpoint_path is None
-        and rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
-    )
+    needs_bootstrap_identity = trainer_checkpoint_path is None and snapshots_enabled
     bootstrap_identity = (
         bootstrap_compatibility_identity(master_config)
         if needs_bootstrap_identity
@@ -1565,7 +1572,7 @@ def setup_single_controller(
     snapshot_resolution_started = time.monotonic()
     if (
         trainer_checkpoint_path is not None
-        and rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
+        and snapshots_enabled
         and restore_mode == "latest"
     ):
         resolved_snapshot = resolve_latest_snapshot(
@@ -1575,7 +1582,7 @@ def setup_single_controller(
             expected_bootstrap_fingerprint=None,
         )
     elif trainer_checkpoint_path is None:
-        if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:
+        if snapshots_enabled:
             assert bootstrap_digest is not None
             assert bootstrap_identity is not None
             if bootstrap_anchor.is_dir():
@@ -1591,11 +1598,7 @@ def setup_single_controller(
                         "restore_mode='latest' to recover it or choose a new "
                         "checkpoint_dir. Existing checkpoint state was not modified."
                     )
-        if (
-            rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None
-            and restore_mode == "latest"
-            and bootstrap_anchor.is_dir()
-        ):
+        if snapshots_enabled and restore_mode == "latest" and bootstrap_anchor.is_dir():
             resolved_snapshot = resolve_latest_snapshot(
                 bootstrap_anchor,
                 expected_train_step=0,
@@ -2321,6 +2324,7 @@ def setup_single_controller(
     loss_fn = ClippedPGLossFn(
         master_config.loss_fn,
         opd_full=opd_module.get_opd_full_config(master_config),
+        seq_logprob_error_threshold=algo_cfg.seq_logprob_error_threshold,
     )
     _restore_adaptive_loss_state(loss_fn, save_state)
     value_loss_fn: Optional[LossFunction] = (

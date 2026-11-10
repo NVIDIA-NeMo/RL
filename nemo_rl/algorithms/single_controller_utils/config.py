@@ -40,6 +40,7 @@ from nemo_rl.algorithms.grpo import (
     _REWARD_PENALTY_FLAGS,
     GRPOConfig,
     RewardPenaltyConfig,
+    _validate_seq_logprob_error_in_loss,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -47,6 +48,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
+from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
@@ -872,8 +874,11 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
 class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     """Frequent rollout-state snapshots anchored to durable trainer state.
 
-    ``snapshot_attempt_interval_s=None`` disables saving and restoring periodic
-    snapshots. A snapshot taken before the first trainer checkpoint is anchored
+    Rollout snapshots are on when ``snapshot_attempt_interval_s`` is set or with
+    turn-level recovery; see docs/guides/single-controller.md for when they are
+    saved.
+
+    A snapshot taken before the first trainer checkpoint is anchored
     to the initial model and a rollout-semantic configuration fingerprint. Later
     snapshots require the durable trainer checkpoint for the controller's
     current completed step; attempts are skipped until that exact anchor exists.
@@ -905,14 +910,22 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     periodic-checkpoint failures are tolerated before the controller aborts the
     run. A successful or skipped attempt resets the counter; checkpoint
     invariant failures still fail immediately.
+
+    ``trace=True`` appends one JSON line per rollout event to
+    ``rollout_trace.jsonl`` in the log directory, to check what a stop and
+    restore cost. Per-rollout events need ``rollout_recovery`` dispatch. It does
+    not enable checkpointing. The events are listed in
+    ``nemo_rl/algorithms/rollout_checkpointing/trace.py``.
     """
 
     snapshot_attempt_interval_s: Annotated[Optional[float], Field(gt=0)] = None
+    snapshot_on_trainer_checkpoint: bool = True
     telemetry_interval_s: Annotated[Optional[float], Field(gt=0)] = None
     max_consecutive_failures: Annotated[int, Field(ge=1)] = 3
     keep_latest_k: Annotated[int, Field(ge=1)] = 2
     restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
     extra_fingerprint_excluded_paths: list[str] = Field(default_factory=list)
+    trace: bool = False
 
     @model_validator(mode="after")
     def validate_extra_fingerprint_excluded_paths(self) -> "RolloutCheckpointConfig":
@@ -985,9 +998,10 @@ def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> No
         == "seq-mask-tis",
         "loss_fn.use_kl_in_reward": loss.use_kl_in_reward,
         "loss_fn.positive_example_nll_weight": loss.positive_example_nll_weight != 0,
+        # The loss filters physical rows; forest training masks whole owners.
+        "loss_fn.seq_logprob_error_in_loss": loss.seq_logprob_error_in_loss,
         "grpo.use_dynamic_sampling": grpo.use_dynamic_sampling,
         "grpo.reward_shaping.enabled": grpo.reward_shaping.enabled,
-        "grpo.reward_scaling.enabled": grpo.reward_scaling.enabled,
         "grpo.calculate_advantages_on_gpu": bool(grpo.calculate_advantages_on_gpu),
         "grpo.invalid_tool_call_advantage": grpo.invalid_tool_call_advantage
         is not None,
@@ -1007,9 +1021,8 @@ def logprob_passes_required(
 ) -> tuple[bool, bool]:
     """Return policy/reference forward requirements for both setup and execution."""
     return (
-        not (
-            master_config.loss_fn.force_on_policy_ratio
-            and algo_cfg.seq_logprob_error_threshold is None
+        not skips_policy_logprob_pass(
+            master_config.loss_fn, algo_cfg.seq_logprob_error_threshold
         ),
         bool(
             master_config.loss_fn.reference_policy_kl_penalty > 0
@@ -1060,6 +1073,18 @@ def is_ppo_run(master_config: MasterConfig) -> bool:
     the attribute can genuinely be missing on a hand-built config.
     """
     return getattr(master_config, "ppo", None) is not None
+
+
+def rollout_snapshots_enabled(master_config: MasterConfig) -> bool:
+    """Whether the run saves and restores rollout snapshots.
+
+    Periodic snapshots turn them on, and so does turn-level recovery, whose
+    environment state only a rollout snapshot holds.
+    """
+    return (
+        master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None
+        or master_config.rollout_recovery.turn_checkpointing_enabled
+    )
 
 
 def algo_config(master_config: MasterConfig) -> GRPOConfig | PPOConfig:
@@ -1296,7 +1321,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
     Both directions on the critic: one the PPO path needs and does not have, and
     one a GRPO run carries and would never build. Plus the reward-shaping and
-    sampling knobs SC reads on neither path.
+    sampling knobs SC reads on neither path, and a range check on the one it
+    does read.
     """
     algo_cfg = algo_config(master_config)
 
@@ -1317,7 +1343,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         name
         for name, enabled in (
             ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
-            ("reward_scaling", algo_cfg.reward_scaling.enabled),
             ("reward_shaping", algo_cfg.reward_shaping.enabled),
             # getattr: PPO's config has no length_penalty field.
             ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
@@ -1473,6 +1498,15 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 stacklevel=2,
             )
 
+    # A forced ratio equals the true one only on the first optimizer step taken
+    # on a batch; later epochs would train without any trust region.
+    if master_config.loss_fn.force_on_policy_ratio and algo_cfg.ppo_epochs != 1:
+        raise ValueError(
+            "loss_fn.force_on_policy_ratio=true requires ppo.ppo_epochs=1, got "
+            f"ppo.ppo_epochs={algo_cfg.ppo_epochs}. Set "
+            "loss_fn.force_on_policy_ratio=false to run multiple policy epochs."
+        )
+
     failure_config = async_config.rollout_failure
     drop_budget = (
         failure_config.max_skipped_prompts
@@ -1577,11 +1611,9 @@ def resolve_ppo_chunk_alignment(
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     if master_config.loss_fn.seq_logprob_error_in_loss:
-        raise ValueError(
-            "loss_fn.seq_logprob_error_in_loss is not supported by SingleController: "
-            "its advantage baselines depend on the pre-training sequence mask. "
-            "Use the non-streaming GRPO trainer."
-        )
+        if is_ppo_run(master_config):
+            raise ValueError("loss_fn.seq_logprob_error_in_loss requires GRPO")
+        _validate_seq_logprob_error_in_loss(master_config)
     _validate_algo_settings(master_config)
 
     async_config = master_config.async_rl
@@ -1603,12 +1635,19 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             )
         # A rollout snapshot needs step_N published while training is still on
         # step N; a deferred finalize publishes it at a later step boundary.
-        if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:
+        # The deadline snapshot is exempt: the run publishes it first, then stops.
+        rollout_checkpoint_cfg = master_config.rollout_checkpointing
+        if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None or (
+            master_config.rollout_recovery.turn_checkpointing_enabled
+            and rollout_checkpoint_cfg.snapshot_on_trainer_checkpoint
+        ):
             raise ValueError(
                 "async_rl.defer_async_checkpoint_finalize cannot be combined with "
-                "rollout_checkpointing.snapshot_attempt_interval_s: rollout snapshots "
-                "need each step's policy checkpoint published before the next "
-                "optimizer step, and a deferred finalize publishes it later."
+                "rollout_checkpointing.snapshot_attempt_interval_s or, with "
+                "rollout_recovery.target_level='turn', "
+                "rollout_checkpointing.snapshot_on_trainer_checkpoint: rollout "
+                "snapshots need each step's policy checkpoint published before the "
+                "next optimizer step, and a deferred finalize publishes it later."
             )
 
     reward_penalties_enabled = any(
@@ -1752,14 +1791,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "the ready_first sampler requires "
                 "loss_fn.use_importance_sampling_correction=true"
             )
-        if (
-            master_config.loss_fn.force_on_policy_ratio
-            and not master_config.loss_fn.use_cispo
-        ):
-            raise ValueError(
-                "the ready_first sampler requires "
-                "loss_fn.force_on_policy_ratio=false unless loss_fn.use_cispo=true"
-            )
+        # TIS corrects generation staleness; a forced ratio stays exact with one
+        # optimizer step per batch (enforced for PPO in _validate_algo_settings).
 
     # Top-k retention keys off checkpointing.metric_name, but SC has no
     # validation loop yet (see _save_checkpoint), so a "val:" metric would

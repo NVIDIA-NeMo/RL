@@ -190,7 +190,7 @@ on-policy distillation.
 ### Extending Candidate Collection
 
 [The sampler adapter](../../nemo_rl/models/generation/score_centering.py)
-keeps request preparation and extraction behind three standalone functions:
+keeps request preparation and extraction behind standalone functions:
 
 - `build_score_centering_request_overrides(num_candidates=K)` supplies the
   HTTP fields that Gym merges into each policy request.
@@ -199,6 +199,10 @@ keeps request preparation and extraction behind three standalone functions:
 - `extract_score_centering_samples(output, num_candidates=K)` returns CPU
   `(sampler_ids, sampler_logprobs)` tensors with shape `[generated_len, K]`,
   int32 IDs, and float32 logprobs under the sampler distribution.
+  `extract_flat_score_centering_samples` returns the same pair from vLLM
+  `FlatLogprobs`, which requests use when
+  `policy.generation.vllm_cfg.flat_logprobs` is true. It avoids walking the
+  logprobs one position at a time. Keep the two extractors in sync.
 
 Today these functions implement top-k collection. A future candidate-selection
 strategy can change request preparation, validation, and extraction together
