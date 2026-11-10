@@ -2904,6 +2904,7 @@ def test_checkpoint_engine_prequant_handshake_exports_mxfp8_weights():
 
     class _Generation:
         def __init__(self) -> None:
+            self.cfg = {"backend": "vllm", "vllm_cfg": {"async_engine": False}}
             self.refit_info: list[dict[str, Any]] = []
 
         def prepare_refit_info(
