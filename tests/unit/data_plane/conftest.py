@@ -49,6 +49,10 @@ def _make_tq_cfg(backend: str) -> dict:
         "mooncake_cpu": {
             "global_segment_size": 8589934592,  # 8 GiB — sized for CI host RAM
             "local_buffer_size": 1073741824,  # 1 GiB
+            # Off here: this process also holds the simple session client, and
+            # TQ builds one store per process, so the (default-on) offload could
+            # never swap it in. test_mooncake_ssd_offload_e2e covers offload.
+            "ssd_offload": {"enabled": False},
             # reuse_registered_buffers omitted on purpose: absent must mean on,
             # so the fixture exercises the default the same way a user config
             # that never mentions the flag does.
