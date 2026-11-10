@@ -536,9 +536,29 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 "generation.vllm_cfg.kv_cache_dtype=auto"
             )
         if self.draft_model is not None:
-            raise NotImplementedError(
-                "ModelOpt real-quant refit does not support speculative draft weights"
-            )
+            # A drafter is allowed: it is NOT part of the ModelOpt export plan.
+            #
+            # This config is injected as vLLM hf_overrides["quantization_config"], which
+            # applies to the MAIN model. vLLM loads the speculative drafter from its own
+            # `speculative_config["model"]` path with that checkpoint's own (bf16) config,
+            # so the policy can be NVFP4 while the drafter stays bf16. Draft weights are
+            # streamed separately by _iter_draft_weights_for_refit / the draft_weights
+            # argument, outside the export plan.
+            #
+            # What WOULD be wrong is a drafter that is itself quantized, since its tensors
+            # would then need deployment metadata this config does not describe. Assert
+            # that narrower invariant instead of refusing every drafter.
+            quantized_draft_params = [
+                name
+                for name, _ in self.draft_model.named_parameters()
+                if "weight_quantizer" in name or "_quantizer." in name
+            ]
+            if quantized_draft_params:
+                raise NotImplementedError(
+                    "ModelOpt real-quant refit does not support a QUANTIZED speculative "
+                    f"drafter; found {len(quantized_draft_params)} quantizer params, e.g. "
+                    f"{quantized_draft_params[0]}"
+                )
         return copy.deepcopy(self._get_modelopt_export_plan().quantization_config)
 
     def _iter_real_quant_refit_groups(
