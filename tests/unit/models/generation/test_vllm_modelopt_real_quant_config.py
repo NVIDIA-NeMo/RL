@@ -38,7 +38,6 @@ from nemo_rl.modelopt.utils import (
     resolve_quant_cfg,
 )
 
-
 _FAKE_K_NVFP4_STATIC = object()
 
 

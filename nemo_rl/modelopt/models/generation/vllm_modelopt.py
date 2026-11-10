@@ -210,6 +210,8 @@ def register_nemo_modelopt_nvfp4() -> None:
         bit ModelOpt exports leave on the block scales.
         """
 
+        kernel: Any
+
         def create_weights(self, layer: Any, *args: Any, **kwargs: Any) -> None:
             super().create_weights(layer, *args, **kwargs)
             self.kernel = MarlinNvFp4LinearKernel(NvFp4LinearLayerConfig())
