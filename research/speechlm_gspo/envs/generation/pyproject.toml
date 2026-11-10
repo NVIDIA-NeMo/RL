@@ -62,7 +62,7 @@ override-dependencies = [
 [tool.uv.sources]
 nemo-rl = { path = "../../../..", editable = true }
 speechlm-gspo = { path = "../..", editable = true }
-nemo-toolkit = { git = "https://github.com/NVIDIA-NeMo/Speech.git", rev = "979cc6c6a3ba7a07195b441b3854b918d08bd2c2" }
+nemo-toolkit = { git = "https://github.com/NVIDIA-NeMo/Speech.git", rev = "732041d294dd432aea2bdca5e6b8bbac5c0fd356" }
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 triton = { index = "pytorch-cu130" }

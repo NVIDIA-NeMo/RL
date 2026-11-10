@@ -2222,8 +2222,8 @@ wheels = [
 
 [[package]]
 name = "nemo-toolkit"
-version = "3.1.0+979cc6c6a"
-source = { git = "https://github.com/NVIDIA-NeMo/Speech.git?rev=979cc6c6a3ba7a07195b441b3854b918d08bd2c2#979cc6c6a3ba7a07195b441b3854b918d08bd2c2" }
+version = "3.1.0+732041d29"
+source = { git = "https://github.com/NVIDIA-NeMo/Speech.git?rev=732041d294dd432aea2bdca5e6b8bbac5c0fd356#732041d294dd432aea2bdca5e6b8bbac5c0fd356" }
 dependencies = [
     { name = "aistore" },
     { name = "cuda-bindings" },
@@ -4011,7 +4011,7 @@ requires-dist = [
     { name = "nemo-automodel", extras = ["moe"], git = "https://github.com/NVIDIA-NeMo/Automodel.git?rev=752a71ebf731f84b19ca9af5e7c242be003082bd" },
     { name = "nemo-rl", editable = "../../../../" },
     { name = "nemo-skills", git = "https://github.com/NVIDIA-NeMo/Skills.git?rev=5ea1990a2d818b29d00f13fee437416343b0d344" },
-    { name = "nemo-toolkit", extras = ["speechlm2"], git = "https://github.com/NVIDIA-NeMo/Speech.git?rev=979cc6c6a3ba7a07195b441b3854b918d08bd2c2" },
+    { name = "nemo-toolkit", extras = ["speechlm2"], git = "https://github.com/NVIDIA-NeMo/Speech.git?rev=732041d294dd432aea2bdca5e6b8bbac5c0fd356" },
     { name = "speechlm-gspo", editable = "../../" },
     { name = "tilelang", marker = "platform_machine == 'x86_64'", specifier = "==0.1.11" },
     { name = "torch", specifier = "==2.13.0", index = "https://download.pytorch.org/whl/cu130" },

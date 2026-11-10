@@ -2478,8 +2478,8 @@ test = [
 
 [[package]]
 name = "nemo-toolkit"
-version = "3.1.0+979cc6c6a"
-source = { git = "https://github.com/NVIDIA-NeMo/Speech.git?rev=979cc6c6a3ba7a07195b441b3854b918d08bd2c2#979cc6c6a3ba7a07195b441b3854b918d08bd2c2" }
+version = "3.1.0+732041d29"
+source = { git = "https://github.com/NVIDIA-NeMo/Speech.git?rev=732041d294dd432aea2bdca5e6b8bbac5c0fd356#732041d294dd432aea2bdca5e6b8bbac5c0fd356" }
 dependencies = [
     { name = "aistore" },
     { name = "cuda-bindings" },
@@ -4332,7 +4332,7 @@ build = [
 [package.metadata]
 requires-dist = [
     { name = "nemo-rl", extras = ["vllm"], editable = "../../../../" },
-    { name = "nemo-toolkit", extras = ["asr"], git = "https://github.com/NVIDIA-NeMo/Speech.git?rev=979cc6c6a3ba7a07195b441b3854b918d08bd2c2" },
+    { name = "nemo-toolkit", extras = ["asr"], git = "https://github.com/NVIDIA-NeMo/Speech.git?rev=732041d294dd432aea2bdca5e6b8bbac5c0fd356" },
     { name = "peft", specifier = ">=0.18.1" },
     { name = "speechlm-gspo", editable = "../../" },
 ]
