@@ -29,24 +29,6 @@ if TYPE_CHECKING:
     from nemo_rl.models.generation.vllm.config import VllmConfig
 
 
-def receive_reply(connection: Connection, timeout: float = 600) -> Any:
-    """Read a child acknowledgement and raise on timeout or reported failure.
-
-    Args:
-        connection: Parent end of the frontend control pipe.
-        timeout: Maximum seconds to wait for a reply.
-
-    Returns:
-        The payload from a successful acknowledgement.
-    """
-    if not connection.poll(timeout):
-        raise TimeoutError("Timed out waiting for an HTTP API process")
-    status, value = connection.recv()
-    if status != "ok":
-        raise RuntimeError(f"HTTP API process failed: {value}")
-    return value
-
-
 class MultiAPIServerPool:
     """Manage child HTTP frontends and their shared vLLM engine.
 
@@ -123,7 +105,7 @@ class MultiAPIServerPool:
                         "tensor_queue": launch.tensor_queue,
                     }
                     process = context.Process(
-                        target=run_api_process,
+                        target=self.run_api_process,
                         name=f"NRL-HTTP-{index}",
                         args=(
                             child,
@@ -177,7 +159,7 @@ class MultiAPIServerPool:
                 launch.watched_frontend_processes = self.children
             engine = parent_result.result(timeout=600)
             for connection in self.connections:
-                receive_reply(connection)
+                self.receive_reply(connection)
             print(f"NRL HTTP API pool ready: {self.count} processes, one engine")
             return engine
         except BaseException:
@@ -210,7 +192,7 @@ class MultiAPIServerPool:
                     connection.send((name, args))
                 replies = await asyncio.gather(
                     *(
-                        asyncio.to_thread(receive_reply, connection)
+                        asyncio.to_thread(self.receive_reply, connection)
                         for connection in self.connections
                     )
                 )
@@ -244,150 +226,173 @@ class MultiAPIServerPool:
             self.coordinator.shutdown()
             self.coordinator = None
 
+    @staticmethod
+    def receive_reply(connection: Connection, timeout: float = 600) -> Any:
+        """Read a child acknowledgement and raise on timeout or reported failure.
 
-def run_api_process(
-    connection: Connection,
-    generation_config: VllmConfig,
-    engine_args: Any,
-    engine_config: Any,
-    client_addresses: dict[str, Any],
-    *,
-    count: int,
-    index: int,
-    listener: socket.socket,
-    node_ip: str,
-    namespace: str,
-    routed_experts_dtype: Any,
-) -> None:
-    """Attach a child frontend to the shared engine and serve control operations.
+        Args:
+            connection: Parent end of the frontend control pipe.
+            timeout: Maximum seconds to wait for a reply.
 
-    Args:
-        connection: Child end of the frontend control pipe.
-        generation_config: NeMo RL configuration used by the frontend.
-        engine_args: vLLM arguments copied for this frontend's process rank.
-        engine_config: vLLM configuration updated with this frontend's rank.
-        client_addresses: Engine input/output addresses and optional tensor queue.
-        count: Total frontend count, including the owning worker.
-        index: This child frontend's client index.
-        listener: Listening socket shared by all frontends.
-        node_ip: Node address used in the advertised HTTP URL.
-        namespace: Ray namespace used when token capture connects to the cluster.
-        routed_experts_dtype: Dtype used to carry captured routed-expert IDs.
-    """
-    # Spawned frontends reuse the capture/renderer implementation without running
-    # the GPU-owning worker constructor or creating a second engine.
-    import ray
-    from vllm.v1.engine.async_llm import AsyncLLM
-    from vllm.v1.executor.abstract import Executor
-    from vllm.v1.metrics.prometheus import shutdown_prometheus
+        Returns:
+            The payload from a successful acknowledgement.
+        """
+        if not connection.poll(timeout):
+            raise TimeoutError("Timed out waiting for an HTTP API process")
+        status, value = connection.recv()
+        if status != "ok":
+            raise RuntimeError(f"HTTP API process failed: {value}")
+        return value
 
-    from nemo_rl.models.generation.vllm.config import resolve_vllm_video_config
-    from nemo_rl.models.generation.vllm.vllm_worker_async import (
-        VllmAsyncGenerationWorkerImpl,
-        _AsyncLLMHTTPClient,
-    )
+    @staticmethod
+    def run_api_process(
+        connection: Connection,
+        generation_config: VllmConfig,
+        engine_args: Any,
+        engine_config: Any,
+        client_addresses: dict[str, Any],
+        *,
+        count: int,
+        index: int,
+        listener: socket.socket,
+        node_ip: str,
+        namespace: str,
+        routed_experts_dtype: Any,
+    ) -> None:
+        """Attach a child frontend to the shared engine and serve control operations.
 
-    host: Any = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    host._init_frontend_state()
-    host.cfg = generation_config
-    host.routed_experts_dtype = routed_experts_dtype
-    host.is_model_owner = True
-    host._sparse_refit_receiver = None
-    host._reserved_socket = listener
-    host._reserved_port = listener.getsockname()[1]
-    host._reserved_node_ip = node_ip
-    host.llm_async_engine_args = copy.deepcopy(engine_args)
-    host.llm_async_engine_args._api_process_rank = index
-    engine = None
-    engine_config.parallel_config._api_process_rank = index
-    try:
-        video_config = resolve_vllm_video_config(generation_config)
-        if video_config is not None:
-            # Spawned video frontends need their own process-local loader registration.
-            from nemo_rl.models.generation.vllm.video_utils import (
-                register_torchcodec_vllm_video_loader,
-            )
+        Args:
+            connection: Child end of the frontend control pipe.
+            generation_config: NeMo RL configuration used by the frontend.
+            engine_args: vLLM arguments copied for this frontend's process rank.
+            engine_config: vLLM configuration updated with this frontend's rank.
+            client_addresses: Engine input/output addresses and optional tensor queue.
+            count: Total frontend count, including the owning worker.
+            index: This child frontend's client index.
+            listener: Listening socket shared by all frontends.
+            node_ip: Node address used in the advertised HTTP URL.
+            namespace: Ray namespace used when token capture connects to the cluster.
+            routed_experts_dtype: Dtype used to carry captured routed-expert IDs.
+        """
+        # Spawned frontends reuse the capture/renderer implementation without running
+        # the GPU-owning worker constructor or creating a second engine.
+        import ray
+        from vllm.v1.engine.async_llm import AsyncLLM
+        from vllm.v1.executor.abstract import Executor
+        from vllm.v1.metrics.prometheus import shutdown_prometheus
 
-            register_torchcodec_vllm_video_loader(
-                sampling_style=video_config.sampling_style,
-                temporal_patch_size=video_config.temporal_patch_size,
-            )
-        engine = AsyncLLM(
-            vllm_config=engine_config,
-            executor_class=Executor.get_class(engine_config),
-            log_stats=not engine_args.disable_log_stats,
-            log_requests=engine_args.enable_log_requests,
-            client_addresses=client_addresses,
-            client_count=count,
-            client_index=index,
+        from nemo_rl.models.generation.vllm.config import resolve_vllm_video_config
+        from nemo_rl.models.generation.vllm.vllm_worker_async import (
+            VllmAsyncGenerationWorkerImpl,
+            _AsyncLLMHTTPClient,
         )
-        budget_ms = host.cfg["vllm_cfg"].get("output_loop_yield_budget_ms")
-        if budget_ms is not None:
-            # Keep the optional output-loop patch local to generation workers.
-            from nemo_rl.models.generation.vllm.patches import install_output_loop_yield
 
-            install_output_loop_yield(engine, reader_budget_s=budget_ms / 1000)
-        host.llm = engine
-        connection.send(("ok", None))
-
-        async def serve() -> None:
-            host._engine_loop = asyncio.get_running_loop()
-            host._http_engine_client = _AsyncLLMHTTPClient(
-                host.llm,
-                host._engine_loop,
-                flat_logprobs=bool(host.cfg["vllm_cfg"].get("flat_logprobs")),
-            )
-            while True:
-                name, args = await asyncio.to_thread(connection.recv)
-                result = None
-                if name == "start":
-                    host.server_thread, host.base_url, host.http_server = (
-                        host._setup_vllm_server()
-                    )
-                    deadline = time.monotonic() + 60
-                    while not host.http_server.started:
-                        if (
-                            not host.server_thread.is_alive()
-                            or time.monotonic() > deadline
-                        ):
-                            raise RuntimeError("HTTP API server failed to start")
-                        await asyncio.sleep(0.05)
-                elif name == "capture":
-                    if not ray.is_initialized():
-                        ray.init(
-                            address="auto", namespace=namespace, log_to_driver=False
-                        )
-                    await host.setup_token_capture(
-                        args[0], args[1], capture_media=args[2], top_logprobs=args[3]
-                    )
-                elif name == "version":
-                    await host.set_rollout_weight_version(args[0])
-                elif name == "progress":
-                    result = await host.captured_call_progress()
-                elif name == "snapshot":
-                    result = host.get_data_plane_snapshot()
-                elif name == "stop":
-                    if host.http_server is not None:
-                        host.http_server.should_exit = True
-                        assert host.server_thread is not None
-                        await asyncio.to_thread(host.server_thread.join, 30)
-                    connection.send(("ok", None))
-                    return
-                else:
-                    raise ValueError(f"Unknown HTTP API command: {name}")
-                connection.send(("ok", result))
-
-        asyncio.run(serve())
-    except BaseException as error:
+        host: Any = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+        host._init_frontend_state()
+        host.cfg = generation_config
+        host.routed_experts_dtype = routed_experts_dtype
+        host.is_model_owner = True
+        host._sparse_refit_receiver = None
+        host._reserved_socket = listener
+        host._reserved_port = listener.getsockname()[1]
+        host._reserved_node_ip = node_ip
+        host.llm_async_engine_args = copy.deepcopy(engine_args)
+        host.llm_async_engine_args._api_process_rank = index
+        engine = None
+        engine_config.parallel_config._api_process_rank = index
         try:
-            connection.send(("error", repr(error)))
+            video_config = resolve_vllm_video_config(generation_config)
+            if video_config is not None:
+                # Spawned video frontends need their own process-local loader registration.
+                from nemo_rl.models.generation.vllm.video_utils import (
+                    register_torchcodec_vllm_video_loader,
+                )
+
+                register_torchcodec_vllm_video_loader(
+                    sampling_style=video_config.sampling_style,
+                    temporal_patch_size=video_config.temporal_patch_size,
+                )
+            engine = AsyncLLM(
+                vllm_config=engine_config,
+                executor_class=Executor.get_class(engine_config),
+                log_stats=not engine_args.disable_log_stats,
+                log_requests=engine_args.enable_log_requests,
+                client_addresses=client_addresses,
+                client_count=count,
+                client_index=index,
+            )
+            budget_ms = host.cfg["vllm_cfg"].get("output_loop_yield_budget_ms")
+            if budget_ms is not None:
+                # Keep the optional output-loop patch local to generation workers.
+                from nemo_rl.models.generation.vllm.patches import (
+                    install_output_loop_yield,
+                )
+
+                install_output_loop_yield(engine, reader_budget_s=budget_ms / 1000)
+            host.llm = engine
+            connection.send(("ok", None))
+
+            async def serve() -> None:
+                host._engine_loop = asyncio.get_running_loop()
+                host._http_engine_client = _AsyncLLMHTTPClient(
+                    host.llm,
+                    host._engine_loop,
+                    flat_logprobs=bool(host.cfg["vllm_cfg"].get("flat_logprobs")),
+                )
+                while True:
+                    name, args = await asyncio.to_thread(connection.recv)
+                    result = None
+                    if name == "start":
+                        host.server_thread, host.base_url, host.http_server = (
+                            host._setup_vllm_server()
+                        )
+                        deadline = time.monotonic() + 60
+                        while not host.http_server.started:
+                            if (
+                                not host.server_thread.is_alive()
+                                or time.monotonic() > deadline
+                            ):
+                                raise RuntimeError("HTTP API server failed to start")
+                            await asyncio.sleep(0.05)
+                    elif name == "capture":
+                        if not ray.is_initialized():
+                            ray.init(
+                                address="auto", namespace=namespace, log_to_driver=False
+                            )
+                        await host.setup_token_capture(
+                            args[0],
+                            args[1],
+                            capture_media=args[2],
+                            top_logprobs=args[3],
+                        )
+                    elif name == "version":
+                        await host.set_rollout_weight_version(args[0])
+                    elif name == "progress":
+                        result = await host.captured_call_progress()
+                    elif name == "snapshot":
+                        result = host.get_data_plane_snapshot()
+                    elif name == "stop":
+                        if host.http_server is not None:
+                            host.http_server.should_exit = True
+                            assert host.server_thread is not None
+                            await asyncio.to_thread(host.server_thread.join, 30)
+                        connection.send(("ok", None))
+                        return
+                    else:
+                        raise ValueError(f"Unknown HTTP API command: {name}")
+                    connection.send(("ok", result))
+
+            asyncio.run(serve())
+        except BaseException as error:
+            try:
+                connection.send(("error", repr(error)))
+            finally:
+                raise
         finally:
-            raise
-    finally:
-        if engine is not None:
-            engine.shutdown()
-        shutdown_prometheus()
-        connection.close()
-        listener.close()
-        if ray.is_initialized():
-            ray.shutdown()
+            if engine is not None:
+                engine.shutdown()
+            shutdown_prometheus()
+            connection.close()
+            listener.close()
+            if ray.is_initialized():
+                ray.shutdown()

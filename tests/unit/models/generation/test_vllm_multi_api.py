@@ -15,7 +15,9 @@
 import asyncio
 import importlib.util
 import multiprocessing
+import pickle
 import sys
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,6 +34,11 @@ spec.loader.exec_module(module)
 
 
 class MultiAPITest(unittest.IsolatedAsyncioTestCase):
+    def test_spawn_target_does_not_capture_pool(self):
+        pool = module.MultiAPIServerPool(threading.Lock(), 2)
+        with patch.dict(sys.modules, {module.__name__: module}):
+            pickle.loads(pickle.dumps(pool.run_api_process))
+
     async def test_spawned_host_preserves_frontend_settings(self):
         # Exercise child initialization without constructing a GPU worker.
         for dtype, video_config in [
@@ -103,7 +110,7 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             }
             with patch.dict(sys.modules, modules):
                 await asyncio.to_thread(
-                    module.run_api_process,
+                    module.MultiAPIServerPool.run_api_process,
                     connection,
                     {
                         "vllm_cfg": {
@@ -155,9 +162,9 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
         try:
             child.send(("error", "capture failed"))
             with self.assertRaisesRegex(RuntimeError, "capture failed"):
-                module.receive_reply(parent, 0.1)
+                module.MultiAPIServerPool.receive_reply(parent, 0.1)
             with self.assertRaises(TimeoutError):
-                module.receive_reply(parent, 0.01)
+                module.MultiAPIServerPool.receive_reply(parent, 0.01)
         finally:
             parent.close()
             child.close()
