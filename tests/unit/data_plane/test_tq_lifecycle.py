@@ -277,6 +277,7 @@ def test_deserialization_rebuilds_mooncake_client_before_attach(monkeypatch) -> 
         "claim_meta_poll_interval_s": 0.5,
         "mooncake_cpu": {
             "reuse_registered_buffers": False,
+            "ssd_offload": {"enabled": False},  # TQ is stubbed here: no store to swap
         },
     }
     events: list[str] = []
