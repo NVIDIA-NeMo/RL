@@ -41,6 +41,7 @@ from nemo_automodel.components.distributed.config import (
     DistributedSetup,
     FSDP2Config,
     MoEParallelizerConfig,
+    MultimodalDistributedConfig,
 )
 from nemo_automodel.components.distributed.mesh import MeshContext, ParallelismSizes
 from nemo_automodel.components.distributed.tensor_utils import get_cpu_state_dict
@@ -558,6 +559,12 @@ def setup_distributed(
         activation_checkpointing=config["automodel_cfg"]["activation_checkpointing"],
         defer_fsdp_grad_sync=config["automodel_cfg"].get("defer_fsdp_grad_sync", True),
     )
+
+    frozen_sharding = config["automodel_cfg"].get("frozen_multimodal_sharding")
+    if frozen_sharding is not None:
+        fsdp2_config.multimodal = MultimodalDistributedConfig(
+            frozen_sharding=frozen_sharding
+        )
 
     # Create MoEParallelizerConfig from nested moe_parallelizer options
     moe_parallelizer_cfg = config["automodel_cfg"].get("moe_parallelizer", {})

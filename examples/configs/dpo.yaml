@@ -60,6 +60,7 @@ policy:
   offload_optimizer_for_refit: true
 
   automodel_cfg:
+    frozen_multimodal_sharding: null  # null uses Automodel default; root/per_layer/replicate override it.
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf
     enabled: true

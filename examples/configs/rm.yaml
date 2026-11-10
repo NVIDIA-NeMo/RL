@@ -46,6 +46,7 @@ policy:
     reward_model_type: "bradley_terry"  # only "bradley_terry" is currently supported
 
   automodel_cfg:
+    frozen_multimodal_sharding: null  # null uses Automodel default; root/per_layer/replicate override it.
     enabled: true
     checkpoint:
       model_save_format: "safetensors"

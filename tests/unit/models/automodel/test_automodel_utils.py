@@ -34,7 +34,7 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 )
 
 from nemo_rl.models.automodel.utils import (
-    initialize_mamba_kernels,
+    initialize_mamba_extensions,
     move_model_buffers_to_device,
     release_moe_dispatcher_state,
     resolve_model_class,
@@ -78,7 +78,7 @@ def test_mamba_registration_preserves_state_and_runs_native_forward() -> None:
         }
         cpu_rng = torch.get_rng_state().clone()
         cuda_rng = torch.cuda.get_rng_state().clone()
-        assert initialize_mamba_kernels(mixer)
+        assert initialize_mamba_extensions(mixer)
         assert torch.equal(torch.get_rng_state(), cpu_rng)
         assert torch.equal(torch.cuda.get_rng_state(), cuda_rng)
         assert all(parameter.grad is None for parameter in mixer.parameters())
@@ -344,3 +344,96 @@ def test_move_distributed_buffers_preserves_state_dict(tmp_path: Path) -> None:
         nprocs=1,
         join=True,
     )
+
+
+class _UnevenImageModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.vision_model = nn.Linear(8, 8, bias=False).requires_grad_(False)
+        self.head = nn.Linear(8, 4, bias=False)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        features = torch.zeros((1, 8), device=inputs.device, dtype=inputs.dtype)
+        for image in inputs:
+            features = features + self.vision_model(image.unsqueeze(0))
+        return self.head(features)
+
+
+def _uneven_frozen_vision_worker(rank: int, port: int) -> None:
+    import copy
+    import os
+
+    from nemo_automodel.components.distributed.parallelizer import (
+        apply_fsdp2_sharding_recursively,
+    )
+    from nemo_automodel.shared.multimodal_fsdp import ignored_params_for_root
+    from torch.distributed.fsdp import fully_shard
+
+    from nemo_rl.models.automodel.setup import setup_distributed
+
+    os.environ.update(
+        MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port), RANK=str(rank), WORLD_SIZE="2"
+    )
+    torch.cuda.set_device(rank)
+    config = {
+        "automodel_cfg": {
+            "sequence_parallel": False,
+            "activation_checkpointing": False,
+            "frozen_multimodal_sharding": "replicate",
+        }
+    }
+    runtime = SimpleNamespace(dtype=torch.float32, cpu_offload=False)
+    context = setup_distributed(config, runtime)
+    try:
+        torch.manual_seed(71)
+        model = _UnevenImageModel().cuda()
+        reference = copy.deepcopy(model)
+        ignored: set[nn.Parameter] = set()
+        mesh = context.device_mesh["dp_shard_cp"]
+        policy = context.fsdp2_config
+        apply_fsdp2_sharding_recursively(
+            model,
+            mesh,
+            policy.mp_policy,
+            frozen_multimodal_sharding=policy.multimodal.frozen_sharding,
+            ignored_multimodal_params=ignored,
+        )
+        fully_shard(
+            model,
+            mesh=mesh,
+            mp_policy=policy.mp_policy,
+            ignored_params=ignored_params_for_root(model, ignored),
+        )
+        original_vision = model.vision_model.weight.detach().clone()
+        for iteration in range(3):
+            # Zero versus multiple images must not change collective ordering.
+            inputs = torch.full((2 * rank, 8), 0.1 * (iteration + 1), device="cuda")
+            output = model(inputs)
+            expected = reference(inputs)
+            torch.testing.assert_close(output, expected)
+            output.square().sum().backward()
+            expected.square().sum().backward()
+            dist.all_reduce(reference.head.weight.grad)
+            reference.head.weight.grad.div_(2)
+            torch.testing.assert_close(
+                model.head.weight.grad.full_tensor(), reference.head.weight.grad
+            )
+            assert model.vision_model.weight.grad is None
+            torch.testing.assert_close(model.vision_model.weight, original_vision)
+            model.zero_grad(set_to_none=True)
+            reference.zero_grad(set_to_none=True)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.automodel
+@pytest.mark.gpu
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Two CUDA devices required")
+def test_frozen_vision_uneven_images_match_unsharded_gradients() -> None:
+    import socket
+
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    mp.spawn(_uneven_frozen_vision_worker, args=(port,), nprocs=2, join=True)

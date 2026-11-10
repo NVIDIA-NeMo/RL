@@ -214,6 +214,10 @@ class AutomodelConfig(TypedDict):
     cpu_offload: bool
     custom_parallel_plan: NotRequired[str | None]
     defer_fsdp_grad_sync: NotRequired[bool]
+    # Replicate frozen vision towers when ranks process different image counts.
+    frozen_multimodal_sharding: NotRequired[
+        Literal["root", "per_layer", "replicate"] | None
+    ]
     # AutoModel FSDP2 output precision (default float32). Master weights/reductions
     # remain FP32. BF16 can reduce residual-stream memory; peak savings depend on
     # the recipe. Unchunked logprobs still materialize full FP32 logits.

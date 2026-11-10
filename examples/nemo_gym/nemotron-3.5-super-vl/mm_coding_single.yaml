@@ -19,6 +19,7 @@ policy:
   train_global_batch_size: 64
   automodel_cfg:
     context_parallel_size: 1
+    frozen_multimodal_sharding: replicate
   generation:
     vllm_kwargs:
       limit_mm_per_prompt:
