@@ -45,6 +45,7 @@ from nemo_rl.algorithms.grpo import (
     _binary_participation,
     _clip_grpo_advantages,
     compute_and_apply_seq_logprob_error_masking,
+    scale_rewards,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -385,6 +386,10 @@ class AdvantageComputer:
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
+        # Scale before baselines/metrics; keep DataPlane rewards raw for replay.
+        rewards = scale_rewards(
+            BatchedDataDict({"total_reward": rewards}), cfg.algo.reward_scaling
+        )["total_reward"]
         token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)

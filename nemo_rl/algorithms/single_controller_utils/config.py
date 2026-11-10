@@ -1002,7 +1002,6 @@ def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> No
         "loss_fn.seq_logprob_error_in_loss": loss.seq_logprob_error_in_loss,
         "grpo.use_dynamic_sampling": grpo.use_dynamic_sampling,
         "grpo.reward_shaping.enabled": grpo.reward_shaping.enabled,
-        "grpo.reward_scaling.enabled": grpo.reward_scaling.enabled,
         "grpo.calculate_advantages_on_gpu": bool(grpo.calculate_advantages_on_gpu),
         "grpo.invalid_tool_call_advantage": grpo.invalid_tool_call_advantage
         is not None,
@@ -1322,7 +1321,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
 
     Both directions on the critic: one the PPO path needs and does not have, and
     one a GRPO run carries and would never build. Plus the reward-shaping and
-    sampling knobs SC reads on neither path.
+    sampling knobs SC reads on neither path, and a range check on the one it
+    does read.
     """
     algo_cfg = algo_config(master_config)
 
@@ -1343,7 +1343,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         name
         for name, enabled in (
             ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
-            ("reward_scaling", algo_cfg.reward_scaling.enabled),
             ("reward_shaping", algo_cfg.reward_shaping.enabled),
             # getattr: PPO's config has no length_penalty field.
             ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
