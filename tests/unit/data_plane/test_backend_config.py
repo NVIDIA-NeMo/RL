@@ -257,10 +257,6 @@ def test_mooncake_checkpointing_pins_replicas_unless_offloading(
     ("mooncake_cpu", "match"),
     [
         (
-            {"storage_unit_segment_size": 1, "ssd_offload": {"enabled": True, "path": None}},
-            "path",
-        ),
-        (
             {
                 "storage_unit_segment_size": 1,
                 "ssd_offload": {"enabled": True, "path": "rel/ssd"},
@@ -330,12 +326,16 @@ def test_mooncake_and_nixl_ssd_offload_are_on_by_default() -> None:
     simple's offload is by value size (every value >= threshold_bytes goes to
     SSD), which is a real cost, so it stays off.
     """
+    from nemo_rl.data_plane import local_disk
     from nemo_rl.data_plane.interfaces import MooncakeCpuConfig, NixlStoreConfig
 
     mc = MooncakeCpuConfig().ssd_offload
-    assert mc.enabled is True and mc.path == "/tmp/nrl_mooncake_ssd_offload"
+    assert mc.enabled is True and mc.path is None
+    assert mc.dir() == local_disk.default_ssd_dir("nrl_mooncake_ssd_offload")
     nx = NixlStoreConfig().ssd
-    assert nx.enabled is True and nx.path == "/tmp/nrl_nixl_ssd"
+    assert nx.enabled is True and nx.path is None
+    assert nx.dir() == local_disk.default_ssd_dir("nrl_nixl_ssd")
+    assert MooncakeCpuConfig(ssd_offload={"path": "/x"}).ssd_offload.dir() == "/x"
 
 
 def test_simple_ssd_offload_is_off_by_default(monkeypatch) -> None:
