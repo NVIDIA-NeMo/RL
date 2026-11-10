@@ -30,6 +30,15 @@ if TYPE_CHECKING:
 
 
 def receive_reply(connection: Connection, timeout: float = 600) -> Any:
+    """Read a child acknowledgement and raise on timeout or reported failure.
+
+    Args:
+        connection: Parent end of the frontend control pipe.
+        timeout: Maximum seconds to wait for a reply.
+
+    Returns:
+        The payload from a successful acknowledgement.
+    """
     if not connection.poll(timeout):
         raise TimeoutError("Timed out waiting for an HTTP API process")
     status, value = connection.recv()
@@ -39,7 +48,14 @@ def receive_reply(connection: Connection, timeout: float = 600) -> Any:
 
 
 class MultiAPIServerPool:
+    """Manage child HTTP frontends and their shared vLLM engine.
+
+    The owning frontend stays in the worker process. The pool owns child
+    processes and the shared engine manager; the caller owns its AsyncLLM client.
+    """
+
     def __init__(self, owner: Any, count: int) -> None:
+        """Initialize a pool whose frontend count includes the owning worker."""
         self.owner = owner
         self.count = count
         self.children: list[Any] = []
@@ -49,6 +65,15 @@ class MultiAPIServerPool:
         self._command_lock = asyncio.Lock()
 
     def create_engine(self, engine_args: Any, stat_loggers: list[Any]) -> Any:
+        """Launch one shared engine and attach its frontend clients.
+
+        Args:
+            engine_args: vLLM arguments updated with the frontend count and rank.
+            stat_loggers: Additional logger factories for the owning client.
+
+        Returns:
+            The owning frontend's AsyncLLM client attached to the shared engine.
+        """
         # vLLM and Ray are optional outside generation workers.
         import ray
         from prometheus_client import values
@@ -161,6 +186,12 @@ class MultiAPIServerPool:
                 parent_thread.join(timeout=1)
 
     async def command(self, name: str, *args: Any) -> None:
+        """Serialize a control operation and wait for every child acknowledgement.
+
+        Args:
+            name: Operation to broadcast: start, capture, version, or stop.
+            *args: Operation-specific positional values sent to each child.
+        """
         async with self._command_lock:
             for process, connection in zip(
                 self.children, self.connections, strict=True
@@ -181,6 +212,7 @@ class MultiAPIServerPool:
                 raise
 
     def stop_children(self) -> None:
+        """Terminate and join child frontends, then close their control pipes."""
         for process in self.children:
             if process.is_alive():
                 process.terminate()
@@ -195,6 +227,7 @@ class MultiAPIServerPool:
         self.connections.clear()
 
     def close_engines(self) -> None:
+        """Shut down the shared engine manager and its coordinator."""
         if self.engine_manager is not None:
             self.engine_manager.shutdown()
             self.engine_manager = None
@@ -217,6 +250,21 @@ def run_api_process(
     namespace: str,
     routed_experts_dtype: Any,
 ) -> None:
+    """Attach a child frontend to the shared engine and serve control operations.
+
+    Args:
+        connection: Child end of the frontend control pipe.
+        generation_config: NeMo RL configuration used by the frontend.
+        engine_args: vLLM arguments copied for this frontend's process rank.
+        engine_config: vLLM configuration updated with this frontend's rank.
+        client_addresses: Engine input/output addresses and optional tensor queue.
+        count: Total frontend count, including the owning worker.
+        index: This child frontend's client index.
+        listener: Listening socket shared by all frontends.
+        node_ip: Node address used in the advertised HTTP URL.
+        namespace: Ray namespace used when token capture connects to the cluster.
+        routed_experts_dtype: Dtype used to carry captured routed-expert IDs.
+    """
     # Spawned frontends reuse the capture/renderer implementation without running
     # the GPU-owning worker constructor or creating a second engine.
     import ray
