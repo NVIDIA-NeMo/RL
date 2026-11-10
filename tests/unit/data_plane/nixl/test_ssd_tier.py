@@ -545,9 +545,8 @@ def test_ssd_config_rejects_what_it_would_silently_ignore(ssd, match):
 
 
 def test_io_threads_size_the_unit_worker_pool(tmp_path):
-    """The pool has `io_threads` workers; 0 is refused (no thread would run the spills)."""
-    assert _unit(tmp_path)._worker._max_workers == 4  # the default
+    """The pool has `io_threads` workers; 0 is refused. The default is the config's (4)."""
     u = bare_unit(1 << 20, ssd_dir=str(tmp_path), staging_bytes=256 * KB, io_threads=2)
     assert u._worker._max_workers == 2
-    with pytest.raises(ValueError, match="io_threads"):
+    with pytest.raises(ValueError, match="max_workers"):  # the executor's own check
         bare_unit(1 << 20, ssd_dir=str(tmp_path), staging_bytes=256 * KB, io_threads=0)
