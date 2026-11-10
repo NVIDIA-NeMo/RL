@@ -67,6 +67,13 @@ _offloading_store_set_up = False
 
 # Mooncake's ErrorCode::NO_AVAILABLE_HANDLE: no segment had room for the put.
 NO_AVAILABLE_HANDLE = -200
+# Mooncake's ErrorCode::BUFFER_OVERFLOW on a read: the owner serving an
+# offloaded object had no room in its read buffer (FileStorage's client buffer,
+# MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES, 1.25 GB by default). Each region is
+# leased to one read in flight and released when that read ends (or after
+# 5 s), so this too is a wait, not an error.
+BUFFER_OVERFLOW = -10
+GET_WAIT_S = 120.0
 # With offload on, a full segment is a wait, not an error: offload frees
 # memory in the background. The bound only turns a stuck offload (disk full,
 # SSD writes failing) into an error instead of a hang.
@@ -160,7 +167,9 @@ def install(cfg: MooncakeCpuConfig, segment_size: int | None) -> None:
 
     from nemo_rl.data_plane.adapters.transfer_queue import _tq_shape_drift_error
 
-    wait_for_memory_on_put(getattr(mooncake_client, "MooncakeStoreClient", None))
+    client_cls = getattr(mooncake_client, "MooncakeStoreClient", None)
+    wait_for_memory_on_put(client_cls)
+    wait_for_buffer_on_get(client_cls)
     if _dir is not None or not cfg.owned_segment_size(segment_size):
         return
 
@@ -240,6 +249,41 @@ def wait_for_memory_on_put(client_cls: Any) -> None:
     client_cls._nrl_waits_for_memory = True
 
 
+def wait_for_buffer_on_get(client_cls: Any) -> None:
+    """Make TQ's reads wait for the owner's read buffer instead of failing.
+
+    A read of an offloaded object is served by its owner from a leased region
+    of that owner's read buffer; when every region is leased to a read in
+    flight, Mooncake answers ``BUFFER_OVERFLOW``. TQ's
+    ``_batch_get_into_with_retry`` gives up after 3 x 1 s. Patches
+    ``client_cls`` once, like :func:`wait_for_memory_on_put`.
+    """
+    if getattr(client_cls, "_nrl_waits_for_buffer", False):
+        return
+    if not hasattr(client_cls, "_batch_get_into_with_retry"):
+        from nemo_rl.data_plane.adapters.transfer_queue import _tq_shape_drift_error
+
+        raise _tq_shape_drift_error(
+            "MooncakeStoreClient._batch_get_into_with_retry is gone",
+            "reads of offloaded objects would fail instead of waiting for the "
+            "owner's read buffer",
+            "get retry",
+        )
+    tq_get = client_cls._batch_get_into_with_retry
+
+    def _batch_get_into_with_retry(self, keys, ptrs, sizes):  # type: ignore[no-untyped-def]
+        get_waiting_for_buffer(
+            lambda k, p, s: self._store.batch_get_into(k, p, s),
+            keys,
+            ptrs,
+            sizes,
+            on_error=lambda k, p, s, _: tq_get(self, k, p, s),
+        )
+
+    client_cls._batch_get_into_with_retry = _batch_get_into_with_retry
+    client_cls._nrl_waits_for_buffer = True
+
+
 def upsert_waiting_for_memory(
     upsert: Callable[[list[str], list[int], list[int]], Any],
     keys: list[str],
@@ -256,38 +300,100 @@ def upsert_waiting_for_memory(
     for up to ``PUT_WAIT_S``, with one warning. ``on_error(keys, ptrs, sizes,
     statuses)`` gets the keys that failed any other way.
     """
-    deadline = time.monotonic() + PUT_WAIT_S
+    _retry_keys_with_code(
+        upsert,
+        keys,
+        ptrs,
+        sizes,
+        on_error=on_error,
+        code=NO_AVAILABLE_HANDLE,
+        wait_s=PUT_WAIT_S,
+        op="batch_upsert_from",
+        waiting="Mooncake memory is full; %d key(s) (e.g. %r) waiting for SSD "
+        "offload to free memory (up to %.0f s).",
+        gave_up="Mooncake memory stayed full for {wait:.0f} s with SSD offload "
+        "on; {n} key(s) not stored, e.g. {key!r}. Either offload is not freeing "
+        "memory (check the disk under data_plane.mooncake_cpu.ssd_offload.path "
+        "and the mooncake_master log) or one object is larger than any "
+        "Mooncake segment.",
+    )
+
+
+def get_waiting_for_buffer(
+    get: Callable[[list[str], list[int], list[int]], Any],
+    keys: list[str],
+    ptrs: list[int],
+    sizes: list[int],
+    *,
+    on_error: Callable[[list[str], list[int], list[int], list[int]], None],
+) -> None:
+    """Get, asking again for keys whose owner's read buffer was full.
+
+    Keys answered ``BUFFER_OVERFLOW`` are read again with capped backoff for
+    up to ``GET_WAIT_S``, with one warning; the leases that block them end
+    when the reads holding them finish. ``on_error`` as in
+    :func:`upsert_waiting_for_memory`.
+    """
+    _retry_keys_with_code(
+        get,
+        keys,
+        ptrs,
+        sizes,
+        on_error=on_error,
+        code=BUFFER_OVERFLOW,
+        wait_s=GET_WAIT_S,
+        op="batch_get_into",
+        waiting="A Mooncake owner's read buffer for offloaded objects is full; "
+        "%d key(s) (e.g. %r) waiting for reads in flight to release it (up to "
+        "%.0f s). More room: MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES in the "
+        "owners' environment.",
+        gave_up="A Mooncake owner's read buffer stayed full for {wait:.0f} s; "
+        "{n} key(s) not read, e.g. {key!r}. Raise "
+        "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES for the segment owners, or "
+        "read with fewer concurrent consumers.",
+    )
+
+
+def _retry_keys_with_code(
+    op_fn: Callable[[list[str], list[int], list[int]], Any],
+    keys: list[str],
+    ptrs: list[int],
+    sizes: list[int],
+    *,
+    on_error: Callable[[list[str], list[int], list[int], list[int]], None],
+    code: int,
+    wait_s: float,
+    op: str,
+    waiting: str,
+    gave_up: str,
+) -> None:
+    """Run ``op_fn`` and repeat it for the keys that answered ``code``.
+
+    ``op_fn`` returns one status per key. Keys with any other non-zero status
+    go to ``on_error(keys, ptrs, sizes, statuses)`` at once; keys with ``code``
+    are tried again with capped backoff until ``wait_s`` has passed, logging
+    ``waiting`` once (``len, first key, wait_s``) and raising ``gave_up``
+    (``wait, n, key``) at the deadline.
+    """
+    deadline = time.monotonic() + wait_s
     backoff = _FIRST_BACKOFF_S
     while True:
-        results = upsert(keys, ptrs, sizes)
+        results = op_fn(keys, ptrs, sizes)
         if not isinstance(results, (list, tuple)) or len(results) != len(keys):
-            raise RuntimeError(
-                f"batch_upsert_from returned {results!r} for {len(keys)} keys"
-            )
-        failed = [i for i, r in enumerate(results) if r not in (0, NO_AVAILABLE_HANDLE)]
+            raise RuntimeError(f"{op} returned {results!r} for {len(keys)} keys")
+        failed = [i for i, r in enumerate(results) if r not in (0, code)]
         if failed:
             on_error(*_pick((keys, ptrs, sizes, list(results)), failed))
-        full = [i for i, r in enumerate(results) if r == NO_AVAILABLE_HANDLE]
-        if not full:
+        again = [i for i, r in enumerate(results) if r == code]
+        if not again:
             return
         if time.monotonic() >= deadline:
             raise RuntimeError(
-                f"Mooncake memory stayed full for {PUT_WAIT_S:.0f} s with SSD "
-                f"offload on; {len(full)} key(s) not stored, e.g. "
-                f"{keys[full[0]]!r}. Either offload is not freeing memory "
-                "(check the disk under data_plane.mooncake_cpu.ssd_offload.path "
-                "and the mooncake_master log) or one object is larger than any "
-                "Mooncake segment."
+                gave_up.format(wait=wait_s, n=len(again), key=keys[again[0]])
             )
         if backoff == _FIRST_BACKOFF_S:
-            LOGGER.warning(
-                "Mooncake memory is full; %d key(s) (e.g. %r) waiting for SSD "
-                "offload to free memory (up to %.0f s).",
-                len(full),
-                keys[full[0]],
-                PUT_WAIT_S,
-            )
-        keys, ptrs, sizes = _pick((keys, ptrs, sizes), full)
+            LOGGER.warning(waiting, len(again), keys[again[0]], wait_s)
+        keys, ptrs, sizes = _pick((keys, ptrs, sizes), again)
         time.sleep(backoff)
         backoff = min(PUT_BACKOFF_MAX_S, 2 * backoff)
 

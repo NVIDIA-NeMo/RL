@@ -183,6 +183,9 @@ def test_remove_dir_without_install_is_a_noop(fake_store) -> None:
 FULL = offload.NO_AVAILABLE_HANDLE
 
 
+OVERFLOW = offload.BUFFER_OVERFLOW
+
+
 def _client_cls(tq_retries):
     """A fresh TQ store-client class (patching is per class) recording TQ's retries."""
 
@@ -192,17 +195,24 @@ def _client_cls(tq_retries):
         def _batch_upsert_with_retry(self, keys, ptrs, sizes):
             tq_retries.append(list(keys))
 
+        def _batch_get_into_with_retry(self, keys, ptrs, sizes):
+            tq_retries.append(list(keys))
+
     return Client
 
 
 class _Store:
-    """Answers each batch_upsert_from with the next scripted result list."""
+    """Answers each batch_upsert_from / batch_get_into with the next scripted result list."""
 
     def __init__(self, *rounds):
         self.rounds = list(rounds)
         self.calls = []
 
     def batch_upsert_from(self, keys, ptrs, sizes, config=None):
+        self.calls.append(list(keys))
+        return self.rounds.pop(0)
+
+    def batch_get_into(self, keys, ptrs, sizes):
         self.calls.append(list(keys))
         return self.rounds.pop(0)
 
@@ -221,6 +231,7 @@ def _waiting_client(monkeypatch, *rounds, step_s=0.0):
 
     Client = _client_cls(tq_retries)
     offload.wait_for_memory_on_put(Client)
+    offload.wait_for_buffer_on_get(Client)
     client = Client()
     client._store = _Store(*rounds)
     return client, tq_retries, sleeps
@@ -259,6 +270,46 @@ def test_other_put_errors_keep_tqs_own_retry(monkeypatch) -> None:
     client._batch_upsert_with_retry(["a", "b"], [1, 2], [8, 8])
     assert tq_retries == [["a"]]
     assert sleeps == []
+
+
+def test_get_waits_for_the_owners_read_buffer(monkeypatch) -> None:
+    client, tq_retries, sleeps = _waiting_client(
+        monkeypatch, [OVERFLOW, 0], [OVERFLOW], [0]
+    )
+    client._batch_get_into_with_retry(["a", "b"], [1, 2], [8, 8])
+    # Only the key whose owner had no buffer room is read again, until it has.
+    assert client._store.calls == [["a", "b"], ["a"], ["a"]]
+    assert tq_retries == []
+    assert sleeps == [0.05, 0.1]
+
+
+def test_a_waiting_get_warns_once_and_names_the_knob(monkeypatch, caplog) -> None:
+    client, _, _ = _waiting_client(monkeypatch, [OVERFLOW], [OVERFLOW], [0])
+    with caplog.at_level("WARNING", logger=offload.LOGGER.name):
+        client._batch_get_into_with_retry(["a"], [1], [8])
+    msgs = [r.getMessage() for r in caplog.records if "read buffer" in r.getMessage()]
+    assert len(msgs) == 1 and "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES" in msgs[0]
+
+
+def test_other_get_errors_keep_tqs_own_retry(monkeypatch) -> None:
+    client, tq_retries, sleeps = _waiting_client(monkeypatch, [-1, 0])
+    client._batch_get_into_with_retry(["a", "b"], [1, 2], [8, 8])
+    assert tq_retries == [["a"]]
+    assert sleeps == []
+
+
+def test_get_fails_once_the_buffer_stays_full_for_the_whole_wait(monkeypatch) -> None:
+    client, _, _ = _waiting_client(monkeypatch, *([[OVERFLOW]] * 100), step_s=100.0)
+    with pytest.raises(RuntimeError, match="(?s)read buffer stayed full.*'a'"):
+        client._batch_get_into_with_retry(["a"], [1], [8])
+
+
+def test_wait_for_buffer_patches_a_class_once() -> None:
+    Client = _client_cls([])
+    offload.wait_for_buffer_on_get(Client)
+    patched = Client._batch_get_into_with_retry
+    offload.wait_for_buffer_on_get(Client)
+    assert Client._batch_get_into_with_retry is patched
 
 
 def test_put_fails_once_memory_stays_full_for_the_whole_wait(monkeypatch) -> None:
