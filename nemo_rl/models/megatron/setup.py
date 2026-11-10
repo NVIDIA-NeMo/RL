@@ -978,6 +978,14 @@ def validate_model_paths(config: PolicyConfig) -> tuple[str, str, bool]:
     if hf_config_overrides:
         overrides_hash = _get_hf_config_overrides_hash(hf_config_overrides)
         hf_model_subdir = f"{hf_model_subdir}__hfovr_{overrides_hash}"
+    # Long absolute HF checkpoint paths can exceed the filesystem's 255-byte
+    # component limit once the conversion staging/displacement suffix is added.
+    # Preserve a deterministic cache key (including HF overrides) with room for
+    # those suffixes; only long names change from the previous layout.
+    if len(os.fsencode(hf_model_subdir)) > 180:
+        cache_key = hashlib.sha256(os.fsencode(hf_model_subdir)).hexdigest()[:24]
+        source_name = os.path.basename(hf_model_name.rstrip(os.sep))[:64]
+        hf_model_subdir = f"model_{source_name}__{cache_key}"
     pretrained_path = os.path.join(get_megatron_checkpoint_dir(), hf_model_subdir)
     pt_checkpoint_exists = megatron_conversion_is_complete(pretrained_path)
     return hf_model_name, pretrained_path, pt_checkpoint_exists

@@ -45,6 +45,10 @@ from nemo_rl.models.generation.vllm.lora_utils import (
     collect_native_lora,
     native_lora_refit_settings,
 )
+from nemo_rl.models.generation.vllm.patches import (
+    finalize_radio_layerscale_loading,
+    radio_layerscale_full_reload,
+)
 from nemo_rl.models.generation.vllm.utils import _format_refit_key_error
 from nemo_rl.models.policy.utils import (
     IPCProtocol,
@@ -1631,6 +1635,7 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
             def finalize() -> None:
                 with torch.device(self.device):
+                    finalize_radio_layerscale_loading(model, self.model_config)
                     finalize_layerwise_reload(model, self.model_config)
                     if use_deepseek_v4_fp8:
                         deepseek_v4_fp8.finalize_refit(model)
@@ -1640,6 +1645,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                         )
                     _refresh_hpc_modules_after_layerwise_reload(model)
                     self._maybe_process_mtp_drafter_after_loading()
+                    if getattr(model, "vision_model", None) is not None:
+                        self.model_runner.reset_encoder_cache()
+                        self.model_runner.reset_mm_cache()
                 torch.cuda.synchronize()
 
             try:
@@ -2120,9 +2128,12 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                     weight_iterator
                 )
                 try:
-                    self.model_runner.reload_weights(
-                        weights_iterator=reload_weight_iterator
-                    )
+                    with radio_layerscale_full_reload(
+                        self.model_runner.get_model(), self.model_config
+                    ):
+                        self.model_runner.reload_weights(
+                            weights_iterator=reload_weight_iterator
+                        )
                 finally:
                     iterators_to_close = [reload_weight_iterator]
                     if reload_weight_iterator is not weight_iterator:

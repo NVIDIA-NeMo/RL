@@ -345,6 +345,44 @@ def _preserve_moe_reload_scales(model: torch.nn.Module) -> None:
 class RealQuantWorker(NixlVllmWorker):
     """vLLM worker with graph-safe native ModelOpt MoE reloads."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        # Worker processes have their own registry. Import only on the native
+        # real-quant route; the fake-quant plugin must remain unchanged.
+        from nemo_rl.modelopt.models.generation.vllm_quant_kv import (
+            register_modelopt_kv_configs,
+        )
+
+        register_modelopt_kv_configs()
+        super().__init__(*args, **kwargs)
+        self._nrl_kv_cache_awake = True
+        self._nrl_kv_graphs_need_recapture = False
+
+    def _on_kv_scales_changed(self) -> None:
+        self._nrl_kv_graphs_need_recapture = True
+        if self._nrl_kv_cache_awake:
+            self._recapture_kv_graphs()
+
+    def _recapture_kv_graphs(self) -> None:
+        from nemo_rl.modelopt.models.generation.vllm_quant_kv import recapture_kv_graphs
+
+        try:
+            recapture_kv_graphs(self.model_runner)
+            self._nrl_kv_graphs_need_recapture = False
+        except Exception as error:
+            self._nrl_layerwise_reload_failure = error
+            raise
+
+    def sleep(self, level: int = 1) -> None:
+        super().sleep(level=level)
+        self._nrl_kv_cache_awake = False
+
+    def wake_up(self, tags: list[str] | None = None) -> None:
+        super().wake_up(tags=tags)
+        if tags is None or "kv_cache" in tags:
+            self._nrl_kv_cache_awake = True
+            if self._nrl_kv_graphs_need_recapture:
+                self._recapture_kv_graphs()
+
     def load_model(self, *, load_dummy_weights: bool = False) -> None:
         super().load_model(load_dummy_weights=load_dummy_weights)
         model = self.model_runner.model

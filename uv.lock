@@ -102,7 +102,7 @@ overrides = [
     { name = "nvidia-cublas", marker = "sys_platform != 'darwin'", specifier = "==13.5.1.27" },
     { name = "nvidia-cudnn-cu13", marker = "sys_platform != 'darwin'", specifier = "==9.26.0.51" },
     { name = "nvidia-cudnn-frontend", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = "==1.25.0" },
-    { name = "nvidia-modelopt", extras = ["torch"], specifier = "==0.48.0rc1", index = "https://pypi.nvidia.com/" },
+    { name = "nvidia-modelopt", git = "https://github.com/NVIDIA/Model-Optimizer.git?rev=b28f61724c930d0db3a1f4734b1965ae01978559" },
     { name = "nvidia-nccl-cu13", specifier = "==2.30.7" },
     { name = "nvidia-nvshmem-cu13", marker = "sys_platform != 'darwin'", specifier = ">=3.6.5" },
     { name = "opencv-python-headless", marker = "sys_platform == 'never'" },
@@ -1388,7 +1388,8 @@ dependencies = [
     { name = "huggingface-hub" },
     { name = "importlib-metadata" },
     { name = "numpy" },
-    { name = "pillow" },
+    { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-nemo-gym') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "regex" },
     { name = "requests" },
     { name = "safetensors" },
@@ -2678,7 +2679,8 @@ version = "2.37.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "numpy" },
-    { name = "pillow" },
+    { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-nemo-gym') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/48/62/aa770a9307508d2a2a2c62d536a49347bffe9e55322db27838d3c93d0b07/imageio-2.37.4.tar.gz", hash = "sha256:e45cbc5e83502047fb138f7f585f7f105a136a57eea5f4b3cfc6ce1b52720bd3", size = 390173, upload-time = "2026-07-20T05:26:11.369Z" }
 wheels = [
@@ -3158,7 +3160,8 @@ dependencies = [
     { name = "kiwisolver" },
     { name = "numpy" },
     { name = "packaging" },
-    { name = "pillow" },
+    { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-nemo-gym') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "pyparsing" },
     { name = "python-dateutil" },
 ]
@@ -3381,13 +3384,13 @@ dev = [
     { name = "multi-storage-client" },
     { name = "nemo-lens", extra = ["aiohttp", "sdk"], marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "nvidia-cudnn-frontend" },
-    { name = "nvidia-modelopt", marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "nvidia-modelopt" },
     { name = "nvidia-resiliency-ext" },
     { name = "onnxscript" },
-    { name = "openai", version = "2.44.0", source = { registry = "https://pypi.org/simple" }, extra = ["aiohttp"], marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "openai", version = "2.6.1", source = { registry = "https://pypi.org/simple" }, extra = ["aiohttp"], marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "opentelemetry-api" },
     { name = "orjson" },
-    { name = "pillow" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" } },
     { name = "quart" },
     { name = "tensorstore" },
     { name = "tqdm" },
@@ -3423,7 +3426,7 @@ requires-dist = [
     { name = "fast-hadamard-transform", marker = "extra == 'dev'", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = "~=0.50" },
     { name = "flash-linear-attention", marker = "extra == 'ssm'", specifier = "==0.5.1" },
-    { name = "flashinfer-python", marker = "extra == 'dev'", specifier = ">=0.5.0,<0.7.0" },
+    { name = "flashinfer-python", marker = "extra == 'dev'", specifier = ">=0.5.0,<0.8.0" },
     { name = "flask-restful", marker = "extra == 'mlm'" },
     { name = "flask-restful", marker = "extra == 'training'" },
     { name = "gigatoken", marker = "extra == 'mlm'" },
@@ -3445,7 +3448,7 @@ requires-dist = [
     { name = "opentelemetry-api", marker = "extra == 'dev'", specifier = ">=1.33.1,<2" },
     { name = "orjson", marker = "extra == 'dev'" },
     { name = "packaging", specifier = ">=24.2" },
-    { name = "pillow", marker = "extra == 'dev'" },
+    { name = "pillow", marker = "extra == 'dev'", specifier = ">=13.0.0" },
     { name = "quart", marker = "extra == 'dev'" },
     { name = "sentencepiece", marker = "extra == 'mlm'" },
     { name = "sentencepiece", marker = "extra == 'training'" },
@@ -3531,7 +3534,7 @@ dependencies = [
     { name = "mfusepy" },
     { name = "multi-storage-client" },
     { name = "numpy" },
-    { name = "pillow" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" } },
     { name = "pyyaml" },
     { name = "rapidyaml" },
     { name = "s3fs" },
@@ -3570,7 +3573,8 @@ source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "jsonschema" },
     { name = "numpy" },
-    { name = "pillow" },
+    { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-trtllm' or extra == 'extra-7-nemo-rl-vllm' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang')" },
     { name = "pydantic" },
     { name = "pydantic-extra-types", extra = ["pycountry"], marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra == 'extra-7-nemo-rl-trtllm' or extra == 'extra-7-nemo-rl-vllm'" },
     { name = "requests" },
@@ -4088,109 +4092,97 @@ source = { editable = "3rdparty/Gym-workspace/Gym" }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic", version = "0.109.2", source = { registry = "https://pypi.org/simple" } },
-    { name = "anyio" },
     { name = "datasets" },
     { name = "devtools" },
     { name = "fastapi", extra = ["standard"], marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or (extra == 'extra-7-nemo-rl-modelopt' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nvrx' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-trtllm')" },
     { name = "fonttools" },
-    { name = "httptools" },
+    { name = "gitpython" },
     { name = "hydra-core" },
     { name = "itsdangerous" },
-    { name = "jsonschema" },
     { name = "mcp" },
+    { name = "mlflow" },
+    { name = "mlflow-skinny" },
     { name = "omegaconf" },
-    { name = "openai", version = "2.44.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "openai", version = "2.6.1", source = { registry = "https://pypi.org/simple" } },
     { name = "orjson" },
     { name = "packaging" },
     { name = "psutil" },
+    { name = "pyarrow" },
     { name = "pyasn1" },
     { name = "pydantic" },
     { name = "pydantic-core" },
     { name = "pydot" },
-    { name = "pyjwt" },
     { name = "python-multipart" },
-    { name = "requests" },
+    { name = "ray", extra = ["default"], marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or (extra == 'extra-7-nemo-rl-modelopt' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nvrx' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-trtllm')" },
     { name = "rich" },
-    { name = "scipy" },
     { name = "tqdm" },
     { name = "urllib3" },
     { name = "uvicorn" },
     { name = "uvloop" },
+    { name = "wandb" },
     { name = "yappi" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "aiohttp", specifier = ">=3.14.4" },
+    { name = "aiohttp", specifier = ">=3.14.1" },
     { name = "anthropic", specifier = "<=0.109.2" },
-    { name = "anyio", specifier = ">=4.15.1" },
     { name = "boto3", marker = "extra == 'sandbox'", specifier = ">=1.34" },
     { name = "coverage", extras = ["toml"], marker = "extra == 'dev'" },
     { name = "datasets" },
     { name = "daytona", marker = "extra == 'sandbox'", specifier = ">=0.179.0" },
     { name = "defusedxml", marker = "extra == 'dev'", specifier = ">=0.7.1" },
     { name = "devtools" },
-    { name = "e2b", marker = "extra == 'sandbox'", specifier = ">=2.36.0,<3.0.0" },
-    { name = "fastapi", specifier = "!=0.142.*" },
-    { name = "flashinfer-python", marker = "extra == 'vllm'", specifier = "==0.6.18" },
+    { name = "fastapi" },
+    { name = "flashinfer-python", marker = "extra == 'vllm'", specifier = "==0.6.12" },
     { name = "fonttools", specifier = ">=4.60.2" },
-    { name = "gitpython", marker = "extra == 'wandb'", specifier = ">=3.1.61" },
-    { name = "httptools" },
-    { name = "huggingface-hub", marker = "extra == 'dev'", specifier = "<2" },
+    { name = "gitpython", specifier = ">=3.1.57" },
+    { name = "gprof2dot", marker = "extra == 'dev'" },
+    { name = "httpx-aiohttp", marker = "extra == 'sandbox'", specifier = ">=0.2.0" },
     { name = "hydra-core" },
     { name = "itsdangerous" },
-    { name = "jinja2", marker = "extra == 'ray'", specifier = ">=3.1" },
-    { name = "jsonschema", specifier = ">=4.18,<5" },
     { name = "mcp", specifier = ">=1.28.1,<2" },
-    { name = "mlflow", marker = "extra == 'mlflow'", specifier = ">=3.16.1" },
-    { name = "mlflow-skinny", marker = "extra == 'mlflow'", specifier = ">=3.16.1" },
+    { name = "mlflow", specifier = ">=3.15.1" },
+    { name = "mlflow-skinny", specifier = ">=3.15.1" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.8.0" },
-    { name = "nemo-gym", extras = ["dev", "mlflow", "ray", "sandbox", "wandb"], marker = "extra == 'all'" },
-    { name = "nemo-lens", extras = ["sdk"], marker = "extra == 'telemetry'", git = "https://github.com/NVIDIA-NeMo/Lens.git?rev=4d045c03186b90afdc815db46b671f6a21bc7e98" },
+    { name = "nemo-gym", extras = ["dev", "sandbox"], marker = "extra == 'all'" },
     { name = "omegaconf" },
-    { name = "openai", specifier = "==2.44.0" },
+    { name = "openai", specifier = "<=2.7.2" },
     { name = "opensandbox", marker = "extra == 'sandbox'", specifier = ">=0.1.15" },
     { name = "openshell", marker = "extra == 'openshell'", specifier = ">=0.0.92,<0.1" },
-    { name = "opentelemetry-instrumentation-fastapi", marker = "extra == 'telemetry'", specifier = ">=0.60b0" },
-    { name = "orjson", specifier = ">=3.11.6" },
+    { name = "orjson" },
     { name = "packaging", specifier = ">=24.2" },
     { name = "pre-commit", marker = "extra == 'dev'", specifier = ">=3.6.0" },
     { name = "psutil" },
-    { name = "pyarrow", marker = "extra == 'mlflow'", specifier = ">=23.0.1" },
+    { name = "pyarrow", specifier = ">=23.0.1" },
     { name = "pyasn1", specifier = ">=0.6.4" },
     { name = "pydantic" },
     { name = "pydantic-core" },
     { name = "pydot" },
-    { name = "pyjwt", specifier = ">=2.15.1" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-asyncio", marker = "extra == 'dev'" },
     { name = "pytest-cov", marker = "extra == 'dev'" },
     { name = "pytest-xdist", marker = "extra == 'dev'" },
-    { name = "python-multipart", specifier = ">=0.0.27" },
-    { name = "ray", extras = ["default"], marker = "extra == 'ray'", specifier = ">=2.58.0" },
-    { name = "requests" },
+    { name = "python-multipart", specifier = ">=0.0.22" },
+    { name = "ray", extras = ["default"], specifier = ">=2.56.1" },
     { name = "requests-mock", marker = "extra == 'dev'" },
     { name = "rich" },
     { name = "ruff", marker = "extra == 'dev'" },
-    { name = "scipy", specifier = ">=1.14.1" },
-    { name = "sqlparse", marker = "extra == 'mlflow'", specifier = ">=0.6.0" },
     { name = "tenacity", marker = "extra == 'sandbox'", specifier = ">=9.1.4" },
     { name = "tqdm" },
-    { name = "urllib3", specifier = ">=2.8.0" },
+    { name = "urllib3", specifier = ">=2.7.0" },
     { name = "uvicorn" },
     { name = "uvloop" },
-    { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.29.0" },
-    { name = "wandb", marker = "extra == 'wandb'", specifier = ">=0.30.0" },
+    { name = "vllm", marker = "extra == 'vllm'", specifier = "==0.24.0" },
+    { name = "wandb" },
     { name = "yappi", specifier = ">=1.7.6" },
 ]
-provides-extras = ["all", "ray", "mlflow", "wandb", "vllm", "sandbox", "openshell", "telemetry", "dev"]
+provides-extras = ["all", "vllm", "sandbox", "openshell", "dev"]
 
 [package.metadata.requires-dev]
 codec = [
     { name = "opencv-python-headless" },
-    { name = "pynvvideocodec" },
     { name = "torchaudio" },
-    { name = "torchcodec" },
     { name = "torchvision" },
 ]
 
@@ -4247,7 +4239,8 @@ dependencies = [
     { name = "nvtx", version = "0.2.16", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-sglang' or extra == 'extra-7-nemo-rl-trtllm' or extra != 'extra-7-nemo-rl-vllm'" },
     { name = "omegaconf" },
     { name = "open-clip-torch" },
-    { name = "pillow" },
+    { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-nemo-gym') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "pip" },
     { name = "plotly" },
     { name = "pybase64" },
@@ -4318,7 +4311,7 @@ mcore = [
     { name = "transformers", version = "5.20.1", source = { registry = "https://pypi.org/simple" } },
 ]
 modelopt = [
-    { name = "nvidia-modelopt", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-modelopt' or extra == 'extra-7-nemo-rl-nemo-gym' or extra == 'extra-7-nemo-rl-nvrx' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-trtllm' or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "nvidia-modelopt" },
 ]
 nemo-gym = [
     { name = "nemo-gym" },
@@ -4468,7 +4461,7 @@ requires-dist = [
     { name = "nvidia-cutlass-dsl-libs-cu12", marker = "extra == 'trtllm'", specifier = "==4.8.0.dev0" },
     { name = "nvidia-cutlass-dsl-libs-cu13", marker = "extra == 'trtllm'", specifier = "==4.8.0.dev0" },
     { name = "nvidia-ml-py" },
-    { name = "nvidia-modelopt", marker = "extra == 'modelopt'", index = "https://pypi.nvidia.com/" },
+    { name = "nvidia-modelopt", marker = "extra == 'modelopt'", git = "https://github.com/NVIDIA/Model-Optimizer.git?rev=b28f61724c930d0db3a1f4734b1965ae01978559" },
     { name = "nvidia-nvshmem-cu13", marker = "(platform_machine == 'aarch64' and sys_platform == 'linux') or (platform_machine == 'x86_64' and sys_platform == 'linux')", specifier = ">=3.6.5" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'nvrx'", git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git?tag=v0.7.0" },
     { name = "nvshmem4py-cu13", marker = "extra == 'mcore'", specifier = ">=0.2.1" },
@@ -5284,8 +5277,8 @@ wheels = [
 
 [[package]]
 name = "nvidia-modelopt"
-version = "0.48.0rc1"
-source = { registry = "https://pypi.nvidia.com/" }
+version = "0.48.0rc1.dev205+gb28f61724"
+source = { git = "https://github.com/NVIDIA/Model-Optimizer.git?rev=b28f61724c930d0db3a1f4734b1965ae01978559#b28f61724c930d0db3a1f4734b1965ae01978559" }
 dependencies = [
     { name = "ninja", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-modelopt' or extra == 'extra-7-nemo-rl-nemo-gym' or extra == 'extra-7-nemo-rl-nvrx' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-trtllm' or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "numpy", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-modelopt' or extra == 'extra-7-nemo-rl-nemo-gym' or extra == 'extra-7-nemo-rl-nvrx' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-trtllm' or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -5303,9 +5296,6 @@ dependencies = [
     { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or (extra == 'extra-7-nemo-rl-modelopt' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nvrx' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-sglang' and extra != 'extra-7-nemo-rl-trtllm')" },
     { name = "tqdm", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-modelopt' or extra == 'extra-7-nemo-rl-nemo-gym' or extra == 'extra-7-nemo-rl-nvrx' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-trtllm' or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
-]
-wheels = [
-    { url = "https://pypi.nvidia.com/nvidia-modelopt/nvidia_modelopt-0.48.0rc1-py3-none-any.whl", hash = "sha256:2b874d94c198d72a1ca299a9d2a45ea5ff61f860ca0bd4ed7656465ce5b5f588" },
 ]
 
 [[package]]
@@ -5532,18 +5522,24 @@ resolution-markers = [
     "platform_machine == 'aarch64' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "anyio" },
-    { name = "distro" },
-    { name = "httpx" },
-    { name = "jiter" },
-    { name = "pydantic" },
-    { name = "sniffio" },
-    { name = "tqdm" },
-    { name = "typing-extensions" },
+    { name = "anyio", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-modelopt' or extra == 'extra-7-nemo-rl-nemo-gym' or extra == 'extra-7-nemo-rl-nvrx' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-trtllm' or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "distro", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-modelopt' or extra == 'extra-7-nemo-rl-nemo-gym' or extra == 'extra-7-nemo-rl-nvrx' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-trtllm' or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "httpx", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-modelopt' or extra == 'extra-7-nemo-rl-nemo-gym' or extra == 'extra-7-nemo-rl-nvrx' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-trtllm' or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "jiter", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-modelopt' or extra == 'extra-7-nemo-rl-nemo-gym' or extra == 'extra-7-nemo-rl-nvrx' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-trtllm' or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pydantic", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-modelopt' or extra == 'extra-7-nemo-rl-nemo-gym' or extra == 'extra-7-nemo-rl-nvrx' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-trtllm' or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "sniffio", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-modelopt' or extra == 'extra-7-nemo-rl-nemo-gym' or extra == 'extra-7-nemo-rl-nvrx' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-trtllm' or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "tqdm", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-modelopt' or extra == 'extra-7-nemo-rl-nemo-gym' or extra == 'extra-7-nemo-rl-nvrx' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-trtllm' or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "typing-extensions", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-modelopt' or extra == 'extra-7-nemo-rl-nemo-gym' or extra == 'extra-7-nemo-rl-nvrx' or extra == 'extra-7-nemo-rl-sglang' or extra != 'extra-7-nemo-rl-trtllm' or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/c4/44/303deb97be7c1c9b53118b52825cbd1557aeeff510f3a52566b1fa66f6a2/openai-2.6.1.tar.gz", hash = "sha256:27ae704d190615fca0c0fc2b796a38f8b5879645a3a52c9c453b23f97141bb49", size = 593043, upload-time = "2025-10-24T13:29:52.79Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/15/0e/331df43df633e6105ff9cf45e0ce57762bd126a45ac16b25a43f6738d8a2/openai-2.6.1-py3-none-any.whl", hash = "sha256:904e4b5254a8416746a2f05649594fa41b19d799843cd134dac86167e094edef", size = 1005551, upload-time = "2025-10-24T13:29:50.973Z" },
+]
+
+[package.optional-dependencies]
+aiohttp = [
+    { name = "aiohttp" },
+    { name = "httpx-aiohttp" },
 ]
 
 [[package]]
@@ -5555,24 +5551,18 @@ resolution-markers = [
     "platform_machine == 'aarch64' and sys_platform == 'linux'",
 ]
 dependencies = [
-    { name = "anyio", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "distro", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "httpx", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "jiter", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "pydantic", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "sniffio", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "tqdm", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "typing-extensions", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "anyio" },
+    { name = "distro" },
+    { name = "httpx" },
+    { name = "jiter" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "tqdm" },
+    { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/49/f5/7c7cb955305cb41f7f3c5fd7e0e38bf6bbf2658468863d4b7b868a5cb8df/openai-2.44.0.tar.gz", hash = "sha256:68a5a5ffad82b8ff7d451c437529fb64f7c3b8123aaf0c021966a882d9e3947d", size = 988753, upload-time = "2026-06-24T20:56:02.293Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/ae/f4/561ed79fd94876160018a5e75254cfcb9b0e62d4dded9dcb20072e86d623/openai-2.44.0-py3-none-any.whl", hash = "sha256:0a2a3ab2e29aeda368700f662ff9ba0f9df17ba4c54577a64e08b8115a3cc0ad", size = 1366216, upload-time = "2026-06-24T20:55:58.882Z" },
-]
-
-[package.optional-dependencies]
-aiohttp = [
-    { name = "aiohttp" },
-    { name = "httpx-aiohttp" },
 ]
 
 [[package]]
@@ -5882,7 +5872,7 @@ dependencies = [
     { name = "jinja2" },
     { name = "jsonschema" },
     { name = "outlines-core" },
-    { name = "pillow" },
+    { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" } },
     { name = "pydantic" },
     { name = "typing-extensions" },
 ]
@@ -5925,7 +5915,8 @@ dependencies = [
     { name = "numpy" },
     { name = "opencv-contrib-python" },
     { name = "opencv-python" },
-    { name = "pillow" },
+    { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-nemo-gym') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "pyclipper" },
     { name = "python-docx" },
     { name = "pyyaml" },
@@ -5952,7 +5943,8 @@ dependencies = [
     { name = "networkx", marker = "platform_machine != 'x86_64' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "numpy", marker = "platform_machine != 'x86_64' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "opt-einsum", marker = "platform_machine != 'x86_64' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "pillow", marker = "platform_machine != 'x86_64' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-automodel') or (platform_machine != 'x86_64' and extra != 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-sglang') or (platform_machine != 'x86_64' and extra != 'extra-7-nemo-rl-mcore' and extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine != 'x86_64' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine != 'x86_64' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-nemo-gym') or (platform_machine != 'x86_64' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "protobuf", marker = "platform_machine != 'x86_64' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "safetensors", marker = "platform_machine != 'x86_64' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "typing-extensions", marker = "platform_machine != 'x86_64' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -5974,7 +5966,8 @@ dependencies = [
     { name = "networkx", marker = "platform_machine == 'x86_64' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "numpy", marker = "platform_machine == 'x86_64' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "opt-einsum", marker = "platform_machine == 'x86_64' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "pillow", marker = "platform_machine == 'x86_64' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-automodel') or (platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" }, marker = "(platform_machine == 'x86_64' and extra == 'extra-7-nemo-rl-mcore') or (platform_machine == 'x86_64' and extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-nemo-gym') or (platform_machine == 'x86_64' and extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "protobuf", marker = "platform_machine == 'x86_64' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "safetensors", marker = "platform_machine == 'x86_64' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "setuptools", marker = "platform_machine == 'x86_64' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
@@ -6093,6 +6086,10 @@ wheels = [
 name = "pillow"
 version = "12.3.0"
 source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "platform_machine == 'aarch64' and sys_platform == 'linux'",
+]
 sdist = { url = "https://files.pythonhosted.org/packages/1c/3d/bb7fca845737cf9d7dbde16ed1843984665ff2e0a518f5db43e77ec540b9/pillow-12.3.0.tar.gz", hash = "sha256:3b8182a766685eaa002637e28b4ec8d6b18819a0c71f579bf0dbaa5830297cce", size = 47025035, upload-time = "2026-07-01T11:56:38.965Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/9d/ac/31fb64e1e7efb5a4b50cd3d92049ba89ac6e4d8d3bb6a74e15048ca3353e/pillow-12.3.0-cp313-cp313-ios_13_0_arm64_iphoneos.whl", hash = "sha256:21900ce7ba264168cd50defae43cd75d25c833ad4ad6e73ffc5596d12e25ac89", size = 4161684, upload-time = "2026-07-01T11:54:25.934Z" },
@@ -6102,6 +6099,25 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/f7/62/de5bdd77d935331f4f802edc11e4d82950f642caad6cb2f949837b8560e2/pillow-12.3.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0847a763afefb695bc912d7c131e7e0632d4edc1d8698f58ddabec8e46b8b6d3", size = 6937129, upload-time = "2026-07-01T11:54:38.216Z" },
     { url = "https://files.pythonhosted.org/packages/70/4d/105627a13300c5e0df1d174230b32fd1273062c96f7745fd552b945d1e1d/pillow-12.3.0-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:571b9fcb07b97ef3a492028fb3d2dc0993ca23a06138b0315286566d29ef718a", size = 6339562, upload-time = "2026-07-01T11:54:40.354Z" },
     { url = "https://files.pythonhosted.org/packages/6b/1d/f13de01a553988ab895ba1c722e06cf3144d4f57656fd5b81b6d881f1179/pillow-12.3.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:756c768d0c9c2955feb7a56c37ea24aea2e369f8d36a88da270b6a9f19e62b5e", size = 7049439, upload-time = "2026-07-01T11:54:42.489Z" },
+]
+
+[[package]]
+name = "pillow"
+version = "13.0.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "platform_machine == 'x86_64' and sys_platform == 'linux'",
+    "platform_machine == 'aarch64' and sys_platform == 'linux'",
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ce/a4/9cc30690a394a8305e8be4c9036aa16d0dfddadd09079860b582f562496d/pillow-13.0.0.tar.gz", hash = "sha256:cdcd1ba258178f7356d74170c9a81ba4eab6a5d55748bc402a5a2a6fe6be3510", size = 47058631, upload-time = "2026-10-16T22:18:09.718Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/82/e2/9132d38df320e8099e2642d9fa538f18a7dfebf68a875a31725dc2a115aa/pillow-13.0.0-cp313-cp313-ios_13_0_arm64_iphoneos.whl", hash = "sha256:e98b4f91f99b24b1da72e10621ba181f7281922384a7403094debb4199de6c00", size = 4190620, upload-time = "2026-10-16T22:16:02.527Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/be/436dac0996876f65ef1916ffb711c5ef4af2ebc57414b6f16642e07f6b47/pillow-13.0.0-cp313-cp313-ios_13_0_arm64_iphonesimulator.whl", hash = "sha256:34fb3db1149c879343861831728c243c432d4a5afc8f1878ca7612ef8de2a033", size = 4290286, upload-time = "2026-10-16T22:16:04.861Z" },
+    { url = "https://files.pythonhosted.org/packages/60/16/7c1007162e4169ea0d5bec47e2e0b2174f56c50cf5b8c02a1dc23e41037e/pillow-13.0.0-cp313-cp313-ios_13_0_x86_64_iphonesimulator.whl", hash = "sha256:2d50500a4a3bc6469adcdb319cf05d688b08ca3bf0f22a05339f3b25b433a599", size = 3723169, upload-time = "2026-10-16T22:16:06.956Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/3c/cd0770e96d20bfd990db024bcbd43897ff3e88da1f4782cf90ea231b1d4f/pillow-13.0.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:19b66ca0a4d25cc0200b381ce824c7ea090db61427315e73cfb05dbf1b35c369", size = 6515908, upload-time = "2026-10-16T22:16:12.896Z" },
+    { url = "https://files.pythonhosted.org/packages/ef/fe/f5cdaa2d1c4086e757430f368c271a58ee29cfe7378e7ae7b9d964015c25/pillow-13.0.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:5f56499c1a74d2b862beb0c33b8016f99d095858455df9d21583bbbc1c15b582", size = 7142544, upload-time = "2026-10-16T22:16:14.844Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/b5/a54f6d44adbcd23737c8c12953f42be107e4cca64e247c0ca3a5b563061c/pillow-13.0.0-cp313-cp313-musllinux_1_2_aarch64.whl", hash = "sha256:a2a14cd73d5e6c927f644b0110ee81f59c4ef506259ec9183904747f2caacc81", size = 6613097, upload-time = "2026-10-16T22:16:16.893Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/b4/9e6c1207c21b2e91db0d15c16d30f3701ce5add1bd4da0e787761e66cb6e/pillow-13.0.0-cp313-cp313-musllinux_1_2_x86_64.whl", hash = "sha256:08b826a9bf1265c76de04a42061d61ea6b109418b7826f28ff1ecdfaa26c5502", size = 7224846, upload-time = "2026-10-16T22:16:19.195Z" },
 ]
 
 [[package]]
@@ -6933,7 +6949,7 @@ version = "0.0.14"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "packaging" },
-    { name = "pillow" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" } },
     { name = "requests" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b6/b1/ad4fc2260a3badd278b38d642f3b987412f1f6682f0ef2b31b0572d5caa8/qwen_vl_utils-0.0.14.tar.gz", hash = "sha256:9c7cad5ae803b3a10f8bb7194deb12aeacdd032f92f4224e880c73587a7346ad", size = 8453, upload-time = "2025-09-23T09:38:57.532Z" }
@@ -7176,7 +7192,8 @@ dependencies = [
     { name = "networkx" },
     { name = "numpy" },
     { name = "packaging" },
-    { name = "pillow" },
+    { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-nemo-gym') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "scipy" },
     { name = "tifffile" },
 ]
@@ -7336,7 +7353,7 @@ dependencies = [
     { name = "outlines" },
     { name = "packaging" },
     { name = "partial-json-parser" },
-    { name = "pillow" },
+    { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" } },
     { name = "prometheus-client" },
     { name = "psutil" },
     { name = "py-spy" },
@@ -7956,7 +7973,8 @@ dependencies = [
     { name = "markdown" },
     { name = "numpy" },
     { name = "packaging" },
-    { name = "pillow" },
+    { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-nemo-gym') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "protobuf" },
     { name = "setuptools" },
     { name = "tensorboard-data-server" },
@@ -8051,7 +8069,7 @@ dependencies = [
     { name = "pandas" },
     { name = "partial-json-parser" },
     { name = "peft", version = "0.18.1", source = { registry = "https://pypi.org/simple" } },
-    { name = "pillow" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" } },
     { name = "plotly" },
     { name = "prometheus-client" },
     { name = "prometheus-fastapi-instrumentator" },
@@ -8617,7 +8635,7 @@ resolution-markers = [
 ]
 dependencies = [
     { name = "numpy", marker = "extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "pillow", marker = "extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torch", version = "2.11.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "extra == 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
 ]
 wheels = [
@@ -8637,7 +8655,8 @@ resolution-markers = [
 ]
 dependencies = [
     { name = "numpy", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
-    { name = "pillow", marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pillow", version = "12.3.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-automodel' or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm') or (extra == 'extra-7-nemo-rl-trtllm' and extra == 'extra-7-nemo-rl-vllm')" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-7-nemo-rl-mcore' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-vllm') or (extra != 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-nemo-gym') or (extra != 'extra-7-nemo-rl-automodel' and extra != 'extra-7-nemo-rl-sglang') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra != 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
     { name = "torch", version = "2.13.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "extra == 'extra-7-nemo-rl-automodel' or extra == 'extra-7-nemo-rl-mcore' or extra == 'extra-7-nemo-rl-nemo-gym' or extra != 'extra-7-nemo-rl-sglang' or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-vllm')" },
 ]
 wheels = [
@@ -9005,7 +9024,7 @@ dependencies = [
     { name = "nvidia-cudnn-frontend" },
     { name = "nvidia-cutlass-dsl", version = "4.6.2", source = { registry = "https://pypi.org/simple" }, extra = ["cu13"], marker = "extra == 'extra-7-nemo-rl-vllm' or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-mcore') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-automodel' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-mcore' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-modelopt' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-sglang') or (extra == 'extra-7-nemo-rl-nemo-gym' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-nvrx' and extra == 'extra-7-nemo-rl-trtllm') or (extra == 'extra-7-nemo-rl-sglang' and extra == 'extra-7-nemo-rl-trtllm')" },
     { name = "nvtx", version = "0.2.15", source = { registry = "https://pypi.org/simple" } },
-    { name = "openai", version = "2.44.0", source = { registry = "https://pypi.org/simple" } },
+    { name = "openai", version = "2.6.1", source = { registry = "https://pypi.org/simple" } },
     { name = "openai-harmony" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp" },
@@ -9013,7 +9032,7 @@ dependencies = [
     { name = "opentelemetry-semantic-conventions-ai" },
     { name = "outlines-core" },
     { name = "partial-json-parser" },
-    { name = "pillow" },
+    { name = "pillow", version = "13.0.0", source = { registry = "https://pypi.org/simple" } },
     { name = "prometheus-client" },
     { name = "prometheus-fastapi-instrumentator" },
     { name = "protobuf" },

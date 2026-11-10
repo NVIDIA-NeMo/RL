@@ -1458,6 +1458,40 @@ def extract_multimodal_model_inputs(
         )
     sequence_length = input_ids.shape[-1]
 
+    # Ragged image tiles are distinct pixel segments. Keep their size and frame
+    # metadata at the same boundaries so coupled PackedTensor rows remain valid
+    # after deduplicated concat/select and teacher materialization.
+    ragged_image_metadata: dict[str, list[torch.Tensor]] = {}
+    pixels = processed.get("pixel_values")
+    if uses_image_placeholder(processor) and isinstance(pixels, list):
+        if not pixels or any(
+            not isinstance(tile, torch.Tensor)
+            or tile.ndim != 4
+            or tile.shape[0] != 1
+            or tile.shape[1] != 3
+            for tile in pixels
+        ):
+            raise ValueError("Ragged pixel_values must contain one [1,3,H,W] tensor per image")
+        image_sizes = processed.get("imgs_sizes")
+        frame_counts = processed.get("num_frames")
+        if not isinstance(image_sizes, torch.Tensor) or tuple(image_sizes.shape) != (len(pixels), 2):
+            raise ValueError("Ragged pixel_values require one [H,W] imgs_sizes row per image")
+        if not isinstance(frame_counts, torch.Tensor) or tuple(frame_counts.shape) != (len(pixels),):
+            raise ValueError("Ragged pixel_values require one num_frames value per image")
+        if not bool(torch.all(frame_counts == 1)):
+            raise ValueError("Ragged image tiles cannot represent multi-frame video")
+        patch_dim = get_preprocess(processor, "pixel_values")["preprocess_kwargs"]["patch_dim"]
+        for index, tile in enumerate(pixels):
+            height, width = map(int, tile.shape[-2:])
+            if height <= 0 or width <= 0 or height % patch_dim or width % patch_dim:
+                raise ValueError("Ragged image tile geometry must be positive and patch-aligned")
+            if image_sizes[index].tolist() != [height, width]:
+                raise ValueError("Ragged pixel_values and imgs_sizes geometry disagree")
+        ragged_image_metadata = {
+            "imgs_sizes": [image_sizes[index : index + 1] for index in range(len(pixels))],
+            "num_frames": [frame_counts[index : index + 1] for index in range(len(pixels))],
+        }
+
     extracted: dict[str, PackedTensor | torch.Tensor] = {}
     multimodal_keys = list(get_multimodal_keys_from_processor(processor))
     # TODO(rohitrango): Let ProcessorInterface declare model-specific media inputs.
@@ -1469,14 +1503,18 @@ def extract_multimodal_model_inputs(
     for key in multimodal_keys:
         if key not in processed:
             continue
-        value = processed[key]
+        value = ragged_image_metadata.get(key, processed[key])
         if not isinstance(value, (torch.Tensor, list)):
             raise ValueError(
                 f"Processor model input {key!r} must be a torch.Tensor, got "
                 f"{type(value).__name__}."
             )
         if key in ("imgs_sizes", "num_frames"):
-            value = value.to(dtype=torch.int32)
+            value = (
+                [segment.to(dtype=torch.int32) for segment in value]
+                if isinstance(value, list)
+                else value.to(dtype=torch.int32)
+            )
         extracted[key] = PackedTensor(
             value,
             dim_to_pack=get_dim_to_pack_along(processor, key),

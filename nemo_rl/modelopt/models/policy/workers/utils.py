@@ -33,6 +33,7 @@ from modelopt.torch.utils.dataset_utils import (
     get_dataset_dataloader,
 )
 from modelopt.torch.utils.plugins import (
+    get_megatron_calibration_dataloader,
     get_megatron_calibration_forward_loop,
     megatron_prefill,
 )
@@ -106,6 +107,36 @@ def get_forward_loop_func(
             )
 
     if dataset_name != "random" and is_megatron:
+        # Nemotron Omni shards global token-aligned tensors inside forward().
+        # The generic ModelOpt helper also CP-splits before forward, which
+        # double-shards input and causes a logits geometry failure.
+        if parallel_state.get_context_parallel_world_size() > 1:
+            dataloader = get_megatron_calibration_dataloader(
+                tokenizer,
+                dataset_name=dataset_name,
+                batch_size=batch_size,
+                num_samples=num_samples,
+                seq_length=sample_length,
+                device=device,
+                apply_chat_template=False,
+                pack=True,
+            )
+
+            def _omni_cp_forward_loop(model):
+                if not getattr(model, "model_slices_context_parallel_inputs", False):
+                    raise RuntimeError("CP calibration expects a model that shards global inputs")
+                model.eval()
+                for sample in dataloader:
+                    input_ids = sample["input_ids"]
+                    position_ids = torch.arange(
+                        input_ids.shape[1], dtype=torch.long, device=input_ids.device
+                    ).unsqueeze(0).expand(input_ids.shape[0], -1)
+                    # Calibration needs activation hooks, not gathered logits.
+                    # The generic prefill broadcasts a full-length logit shape
+                    # even though Omni returns CP-local logits.
+                    model(input_ids, position_ids, None, runtime_gather_output=True)
+
+            return _omni_cp_forward_loop
         return get_megatron_calibration_forward_loop(
             tokenizer,
             dataset_name=dataset_name,
@@ -118,15 +149,27 @@ def get_forward_loop_func(
         )
 
     if dataset_name == "random":
+        # Media placeholders are not valid text-only calibration inputs.
+        special_ids = set(tokenizer.all_special_ids)
+        special_ids.update(
+            token_id
+            for token_id, token in tokenizer.added_tokens_decoder.items()
+            if token.special
+        )
+        ordinary_ids = sorted(set(tokenizer.get_vocab().values()) - special_ids)
+        if not ordinary_ids:
+            raise ValueError("Random calibration requires ordinary tokenizer IDs.")
+        vocab = torch.tensor(ordinary_ids, dtype=torch.long, device=device)
         calib_dataloader = DataLoader(
             _DictDataset(
                 {
-                    "input_ids": torch.randint(
-                        0,
-                        100,
-                        (num_samples, sample_length),
-                        device=device,
-                    )
+                    "input_ids": vocab[
+                        torch.randint(
+                            len(ordinary_ids),
+                            (num_samples, sample_length),
+                            device=device,
+                        )
+                    ]
                 }
             ),
             batch_size=batch_size,

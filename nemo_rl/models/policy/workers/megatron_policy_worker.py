@@ -2612,88 +2612,89 @@ class MegatronPolicyWorkerImpl(
           The logprob of input token i is specified at position i in the output logprobs tensor.
         """
         self.timer.start("get_logprobs")
-        no_grad = torch.no_grad()
-        no_grad.__enter__()
-        logprob_batch_size = (
-            micro_batch_size
-            if micro_batch_size is not None
-            else self.cfg["logprob_batch_size"]
-        )
-
-        self.model.eval()
-
-        # Logprobs run the same forward as training, so a batch that needs the
-        # mask needs it here too -- otherwise these logprobs would be taken
-        # against a different media alignment than the one trained on.
-        attach_media_token_validity_mask(data, self.media_placeholder_token_id)
-
-        (
-            mb_iterator,
-            num_microbatches,
-            micro_batch_size,
-            seq_length,
-            padded_seq_length,
-        ) = get_microbatch_iterator(
-            data,
-            self.cfg,
-            logprob_batch_size,
-            straggler_timer=self.mcore_state.straggler_timer,
-            delegate_pack_to_model=self.delegate_pack_to_model,
-            delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
-            model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
-            mtp_enabled=self.mtp_enabled,
-        )
-
-        use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
-            "use_fused_linear_logprobs", False
-        )
-        sampling_params = self.sampling_params
-        if self._opd_full_enabled and sampling_params is not None:
-            # Full KL has no sampled-target support restriction; leave rollout unchanged.
-            sampling_params = replace(sampling_params, top_k=None, top_p=1.0)
-        logprobs_post_processor = LogprobsPostProcessor(
-            cfg=self.cfg,
-            sampling_params=sampling_params,
-            use_fused_linear_logprobs=use_fused_linear_logprobs,
-        )
-        use_router_replay = _should_use_router_replay(
-            enabled=self._router_replay_enabled,
-            data=data,
-            stage="prev-logprob",
-            require=require_router_replay,
-        )
-
-        with maybe_r3_trace_stage("prev-logprob", enabled=use_router_replay):
-            list_of_logprobs = megatron_forward_backward(
-                model=self.model,
-                data_iterator=mb_iterator,
-                seq_length=padded_seq_length,
-                mbs=micro_batch_size,
-                num_microbatches=num_microbatches,
-                post_processing_fn=logprobs_post_processor,
-                forward_only=True,
-                defer_fp32_logits=self.defer_fp32_logits,
-                sampling_params=sampling_params,
-                straggler_timer=self.mcore_state.straggler_timer,
-                model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
-                use_fused_linear_logprobs=use_fused_linear_logprobs,
-                use_router_replay=use_router_replay,
-                router_replay_train=False,
-            )
-
-        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
-            tensors: dict[str, Optional[torch.Tensor]] = {
-                "logprobs": pad_and_concat(
-                    [l["logprobs"] for l in list_of_logprobs], target_len=seq_length
+        try:
+            with torch.no_grad():
+                logprob_batch_size = (
+                    micro_batch_size
+                    if micro_batch_size is not None
+                    else self.cfg["logprob_batch_size"]
                 )
-            }
-        else:
-            tensors = {"logprobs": None}
-        broadcasted = broadcast_tensors_from_last_stage(tensors)
-        logprobs = broadcasted["logprobs"]
 
-        no_grad.__exit__(None, None, None)
-        self.timer.stop("get_logprobs")
+                self.model.eval()
+
+                # Logprobs run the same forward as training, so a batch that needs the
+                # mask needs it here too -- otherwise these logprobs would be taken
+                # against a different media alignment than the one trained on.
+                attach_media_token_validity_mask(data, self.media_placeholder_token_id)
+
+                (
+                    mb_iterator,
+                    num_microbatches,
+                    micro_batch_size,
+                    seq_length,
+                    padded_seq_length,
+                ) = get_microbatch_iterator(
+                    data,
+                    self.cfg,
+                    logprob_batch_size,
+                    straggler_timer=self.mcore_state.straggler_timer,
+                    delegate_pack_to_model=self.delegate_pack_to_model,
+                    delegate_mtp_loss_mask_to_model=self.delegate_mtp_loss_mask_to_model,
+                    model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+                    mtp_enabled=self.mtp_enabled,
+                )
+
+                use_fused_linear_logprobs = self.cfg["megatron_cfg"].get(
+                    "use_fused_linear_logprobs", False
+                )
+                sampling_params = self.sampling_params
+                if self._opd_full_enabled and sampling_params is not None:
+                    # Full KL has no sampled-target support restriction; leave rollout unchanged.
+                    sampling_params = replace(sampling_params, top_k=None, top_p=1.0)
+                logprobs_post_processor = LogprobsPostProcessor(
+                    cfg=self.cfg,
+                    sampling_params=sampling_params,
+                    use_fused_linear_logprobs=use_fused_linear_logprobs,
+                )
+                use_router_replay = _should_use_router_replay(
+                    enabled=self._router_replay_enabled,
+                    data=data,
+                    stage="prev-logprob",
+                    require=require_router_replay,
+                )
+
+                with maybe_r3_trace_stage("prev-logprob", enabled=use_router_replay):
+                    list_of_logprobs = megatron_forward_backward(
+                        model=self.model,
+                        data_iterator=mb_iterator,
+                        seq_length=padded_seq_length,
+                        mbs=micro_batch_size,
+                        num_microbatches=num_microbatches,
+                        post_processing_fn=logprobs_post_processor,
+                        forward_only=True,
+                        defer_fp32_logits=self.defer_fp32_logits,
+                        sampling_params=sampling_params,
+                        straggler_timer=self.mcore_state.straggler_timer,
+                        model_slices_context_parallel_inputs=self.model_slices_context_parallel_inputs,
+                        use_fused_linear_logprobs=use_fused_linear_logprobs,
+                        use_router_replay=use_router_replay,
+                        router_replay_train=False,
+                    )
+
+                if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                    tensors: dict[str, Optional[torch.Tensor]] = {
+                        "logprobs": pad_and_concat(
+                            [l["logprobs"] for l in list_of_logprobs], target_len=seq_length
+                        )
+                    }
+                else:
+                    tensors = {"logprobs": None}
+                broadcasted = broadcast_tensors_from_last_stage(tensors)
+                logprobs = broadcasted["logprobs"]
+
+
+        finally:
+            self.timer.stop("get_logprobs")
 
         # Only the model-parallel replica leader is consumed by the driver.
         if not self._is_replica_leader():

@@ -635,7 +635,17 @@ class BaseVllmGenerationWorker:
             os.environ["VLLM_DP_MASTER_PORT"] = str(port_list[leader_rank])
 
         load_format = self.cfg["vllm_cfg"]["load_format"]
-        if ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
+        # Native policy refit initializes packed weights and frozen media together.
+        # The BF16 source checkpoint cannot populate packed parameters directly.
+        if self.cfg.get("real_quant"):
+            if load_format != "dummy":
+                raise ValueError(
+                    "ModelOpt real-quant policy refit requires "
+                    "generation.vllm_cfg.load_format='dummy'; "
+                    f"got {load_format!r}. BF16 checkpoint weights cannot be "
+                    "loaded directly into the packed runtime."
+                )
+        elif ModelFlag.VLLM_LOAD_FORMAT_AUTO.matches(self.model_name):
             load_format = "auto"
 
         # MTP speculative decoding with load_format="dummy" gets its policy
@@ -669,7 +679,13 @@ class BaseVllmGenerationWorker:
 
         # Call init_fp8 when precision is fp8
         # (kv_cache_dtype can be fp8/fp8_e4m3 or auto, validated in init_fp8)
-        if self.cfg["vllm_cfg"]["precision"] == "fp8":
+        if self.cfg.get("real_quant") and self.precision == "fp8":
+            # Model dtype remains BF16; canonical ModelOpt metadata, not the
+            # legacy init_fp8 patch, chooses packed weights and KV storage.
+            self.precision = "bfloat16"
+        if self.cfg["vllm_cfg"]["precision"] == "fp8" and not self.cfg.get(
+            "real_quant"
+        ):
             from nemo_rl.models.generation.vllm.quantization.fp8 import init_fp8
 
             fp8_kwargs = init_fp8(
