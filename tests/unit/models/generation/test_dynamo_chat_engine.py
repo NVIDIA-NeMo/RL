@@ -28,7 +28,7 @@ pytestmark = pytest.mark.vllm
 pytest.importorskip("dynamo._core")
 pytest.importorskip("vllm")
 
-from dynamo.llm.exceptions import HttpError  # noqa: E402
+from dynamo.llm.exceptions import HttpError, InvalidArgument  # noqa: E402
 
 from nemo_rl.models.generation.dynamo.vllm import chat_engine  # noqa: E402
 from nemo_rl.models.generation.dynamo.vllm.render_pool import (  # noqa: E402
@@ -131,6 +131,8 @@ class _Router:
         self.requests.append(request)
 
         async def stream():
+            if isinstance(self.error, Exception):
+                raise self.error
             if self.error is not None:
                 # Dynamo's binding raises an engine's error frame as a ValueError.
                 raise ValueError(self.error)
@@ -412,6 +414,13 @@ def test_a_call_refused_before_it_runs_acknowledges_its_capture_to_gym(
             500,
             "engine died",
         ),
+        # From Dynamo 1.7, the engine adapter's InvalidArgument (a RuntimeError it
+        # wrapped, e.g. non-finite log-probs) is raised as itself, not a ValueError.
+        (
+            _Router(error=InvalidArgument("RuntimeError: non-finite log-prob (nan)")),
+            500,
+            "non-finite log-prob",
+        ),
         # Refused before it ran, with the status the native server answers.
         (
             _Router(
@@ -427,7 +436,7 @@ def test_a_call_refused_before_it_runs_acknowledges_its_capture_to_gym(
             "queue full",
         ),
     ],
-    ids=["error", "refusal"],
+    ids=["error", "engine-invalid-argument", "refusal"],
 )
 def test_an_engine_that_does_not_serve_the_call_fails_it(router, status, message):
     with pytest.raises(HttpError, match=message) as failed:
