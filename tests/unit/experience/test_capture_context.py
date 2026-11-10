@@ -91,6 +91,23 @@ def test_a_restored_cut_reaches_the_served_admission(messages, mode):
     assert decision.storage.generation_cut == CUT
 
 
+def test_a_restored_cut_on_a_text_root_is_served():
+    # Forest training's first call: a text root that Gym replays from its
+    # source history, where long cuts usually land.
+    admission = CaptureAdmission(
+        capture_key="attempt",
+        model_call_id="first",
+        mode="text",
+        request_replay=replay_context(HISTORY, render_digest="b" * 64),
+        generation_cut=CUT,
+    )
+    decision = decide_capture_input(admission, messages=HISTORY)
+
+    assert decision.storage.mode == "text"
+    assert decision.serving is decision.storage
+    assert decision.storage.generation_cut == CUT
+
+
 def test_ordinary_admission_is_unchanged():
     admission = CaptureAdmission(capture_key="a", model_call_id="c", mode="text")
     decision = decide_capture_input(admission, messages=[])

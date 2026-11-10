@@ -94,6 +94,16 @@ RESTORE_CASES = (
         stop_reason="</answer>",
     ),
     RestoreCase(
+        name="stop_string_kept_in_the_output",
+        prompt=_PROMPT,
+        output=(" answer", ":", " 4", "</", "answer", ">"),
+        saved=6,
+        finish_reason="stop",
+        stop=("</answer>",),
+        stop_reason="</answer>",
+        include_stop_str_in_output=True,
+    ),
+    RestoreCase(
         name="stop_token_in_the_saved_part",
         prompt=_PROMPT,
         output=(" Hello", " world", _EOS),
