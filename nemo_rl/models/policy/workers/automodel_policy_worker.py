@@ -68,7 +68,7 @@ from nemo_rl.models.automodel.train import (
     prepare_model_forward,
 )
 from nemo_rl.models.automodel.utils import (
-    initialize_mamba_extensions,
+    initialize_mamba_kernels,
     move_model_buffers_to_device,
     release_moe_dispatcher_state,
     warmup_compiled_rms_norm,
@@ -599,8 +599,10 @@ class AutomodelPolicyWorkerImpl(
         # field name (not positional unpacking) so optional fields appended to
         # ModelAndOptimizerState stay backward compatible across workers.
         self.model = model_and_optimizer_state.model
-        if initialize_mamba_extensions(self.model):
-            print("Registered native Mamba CUDA extensions before distributed forwards")
+        if initialize_mamba_kernels(self.model):
+            print(
+                "Initialized native Mamba CUDA and linear kernels before distributed forwards"
+            )
         warmed_norms = warmup_compiled_rms_norm(self.model)
         if warmed_norms:
             print(

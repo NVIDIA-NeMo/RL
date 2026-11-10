@@ -34,7 +34,7 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 )
 
 from nemo_rl.models.automodel.utils import (
-    initialize_mamba_extensions,
+    initialize_mamba_kernels,
     move_model_buffers_to_device,
     release_moe_dispatcher_state,
     resolve_model_class,
@@ -78,7 +78,7 @@ def test_mamba_registration_preserves_state_and_runs_native_forward() -> None:
         }
         cpu_rng = torch.get_rng_state().clone()
         cuda_rng = torch.cuda.get_rng_state().clone()
-        assert initialize_mamba_extensions(mixer)
+        assert initialize_mamba_kernels(mixer)
         assert torch.equal(torch.get_rng_state(), cpu_rng)
         assert torch.equal(torch.cuda.get_rng_state(), cuda_rng)
         assert all(parameter.grad is None for parameter in mixer.parameters())

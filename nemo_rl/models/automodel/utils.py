@@ -59,8 +59,8 @@ def move_model_buffers_to_device(
     return model
 
 
-def initialize_mamba_extensions(model: nn.Module) -> bool:
-    """Register native Mamba CUDA extensions before asynchronous FSDP forwards."""
+def initialize_mamba_kernels(model: nn.Module) -> bool:
+    """Initialize native Mamba extensions and linear kernels before FSDP overlap."""
     # Keep Mamba's optional CUDA dependencies out of unrelated model paths.
     from nemo_automodel.components.models.nemotron_v3.layers import (
         NemotronV3Mamba2Mixer,
@@ -71,6 +71,16 @@ def initialize_mamba_extensions(model: nn.Module) -> bool:
     # CUDA registration can wait for work that another rank has not enqueued yet.
     import mamba_ssm.ops.triton.ssd_combined  # noqa: F401
 
+    device_index = torch.cuda.current_device()
+    # The first cuBLAS handle can synchronize outstanding asynchronous collectives.
+    with torch.random.fork_rng(devices=[device_index]), torch.no_grad():
+        for dtype in (torch.float32, torch.bfloat16):
+            inputs = torch.zeros((16, 16), device=device_index, dtype=dtype)
+            weight = torch.zeros_like(inputs)
+            bias = torch.zeros(16, device=device_index, dtype=dtype)
+            nn.functional.linear(inputs, weight)
+            nn.functional.linear(inputs, weight, bias)
+        torch.cuda.synchronize(device_index)
     return True
 
 
