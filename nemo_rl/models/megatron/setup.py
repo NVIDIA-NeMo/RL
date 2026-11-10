@@ -2339,46 +2339,6 @@ def _create_megatron_config(
     )
 
 
-@contextmanager
-def _hide_extra_state_for_preload(model):
-    """Drop TE ``_extra_state`` entries for the duration of the draft preload.
-
-    Two details matter and both bit an earlier version of this helper:
-
-    * The dist-checkpoint loader consumes ``sharded_state_dict()``, not
-      ``state_dict()``. (MegatronQuantPolicyWorker._hide_extra_state patches
-      ``state_dict`` because its caller -- the reference-model swap -- uses that one.)
-    * Sharded keys are ``<module>._extra_state/shard_<i>_<n>``, so they do NOT end with
-      ``._extra_state``; match on containment.
-
-    These entries hold ModelOpt calibration metadata appended to TE's serialized extra
-    state, which TE also resizes during forwards. They are not learned weights, so the
-    preload can skip them; the policy weights it exists to load are unaffected.
-    """
-    chunks = model if isinstance(model, list) else [model]
-    patched = []
-
-    def _filter(d):
-        return {k: v for k, v in d.items() if "._extra_state" not in k}
-
-    try:
-        for chunk in chunks:
-            for attr in ("sharded_state_dict", "state_dict"):
-                original = getattr(chunk, attr, None)
-                if original is None:
-                    continue
-
-                def wrapper(*args, _orig=original, **kwargs):
-                    return _filter(_orig(*args, **kwargs))
-
-                patched.append((chunk, attr, original))
-                setattr(chunk, attr, wrapper)
-        yield
-    finally:
-        for chunk, attr, original in patched:
-            setattr(chunk, attr, original)
-
-
 def _create_draft_pre_wrap_hook(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -2405,32 +2365,31 @@ def _create_draft_pre_wrap_hook(
                     f"Invalid pretrained checkpoint directory found: {pretrained_checkpoint}"
                 )
             megatron_cfg.checkpoint.finetune = True
-            # Under the ModelOpt quant worker the model carries TE ``_extra_state``
-            # entries the converted checkpoint does not: ModelOpt appends calibration
-            # data to TE's serialized extra state and TE itself resizes it during
-            # forwards (see MegatronQuantPolicyWorker._hide_extra_state, which does the
-            # same filtering for reference-model swaps). A strict load here then fails
-            # with e.g.
+            # Best-effort warm start, so load NON-STRICTLY.
+            #
+            # This runs at a lifecycle point no other load uses: before the draft module is
+            # attached, and under the ModelOpt quant worker before quantization. The model
+            # there carries TE ``_extra_state`` entries the converted checkpoint does not --
+            # ModelOpt appends calibration data to TE's extra state and TE resizes it during
+            # forwards -- so a strict load fails on keys that are metadata, not weights:
             #   Missing key in checkpoint state_dict:
             #     ...layers.1.mlp.experts.experts.linear_fc1._extra_state/shard_192_512
-            # These are calibration metadata, not learned weights, so skipping them is
-            # the same call _hide_extra_state already makes.
             #
-            # The preload itself must stay: it loads the POLICY weights before the draft
-            # module is attached. Skipping it instead makes the later load see
-            # ``draft_model.*`` in the model and demand those keys from a base checkpoint
-            # that cannot contain them.
-            with _hide_extra_state_for_preload(model):
-                _load_checkpoint_from_path(
-                    load_dir=pretrained_checkpoint,
-                    state=state,
-                    model=model,
-                    optimizer=None,
-                    opt_param_scheduler=None,
-                    checkpointing_context={},
-                    skip_load_to_model_and_opt=False,
-                    ignore_ckpt_step=True,
-                )
+            # Filtering those keys out by hand does NOT work: TEGrouped expert weight
+            # resolution reads them, and removing them makes the weights themselves fail to
+            # resolve. strict=False is both simpler and the honest description of this load.
+            # The authoritative load still happens later and is still strict.
+            _load_checkpoint_from_path(
+                load_dir=pretrained_checkpoint,
+                state=state,
+                model=model,
+                optimizer=None,
+                opt_param_scheduler=None,
+                checkpointing_context={},
+                skip_load_to_model_and_opt=False,
+                ignore_ckpt_step=True,
+                strict=False,
+            )
 
         draft_owner = find_draft_owner_chunk(model)
         if draft_owner is None:
