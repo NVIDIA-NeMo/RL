@@ -161,7 +161,6 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.telemetry.instrumentation import (
     accepts_trace_context,
-    umbrella_span,
     umbrella_trace_fn,
 )
 from nemo_rl.telemetry.setup import (
@@ -170,8 +169,9 @@ from nemo_rl.telemetry.setup import (
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.telemetry.vision import (
+    VISION_STAGE_TRAIN_BATCH,
     VISION_STAGE_TRAIN_MICROBATCH,
-    record_vision_workload,
+    traced_train_phase,
 )
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -1406,12 +1406,10 @@ class MegatronPolicyWorkerImpl(
         ]
         return metrics, kept_seqs, kept_toks
 
-    # Stacked above the NVTX range, which is what keeps the Ray trace carrier
-    # working: ``_advertise_carrier`` unwraps to the innermost ``__wrapped__``,
-    # and ``wrap_with_nvtx_name`` sets none, so the unwrap stops at its bare
-    # ``**kwargs`` and the carrier is absorbed there rather than reaching a
-    # strict signature Ray would reject it against.
-    @umbrella_trace_fn(RLSpanGroup.U_WORKER_TRAIN, "rl.policy.train")
+    # The entrypoint GRPO, PPO and SFT v1 use: they hand the worker a batch and
+    # let it microbatch internally, so this is where their vision load is
+    # visible. The split path below reports the same thing per microbatch.
+    @traced_train_phase("rl.policy.train", stage=VISION_STAGE_TRAIN_BATCH)
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -2102,6 +2100,11 @@ class MegatronPolicyWorkerImpl(
 
         self._train_step_state = state
 
+    # The narrowest span that contains the vision encoder; see
+    # ``RLSpanGroup.WORKER_TRAIN`` for why that is as close as it gets.
+    @traced_train_phase(
+        "rl.policy.train_microbatch", stage=VISION_STAGE_TRAIN_MICROBATCH
+    )
     @wrap_with_nvtx_name("megatron_policy_worker/train_microbatch")
     def train_microbatch(
         self,
@@ -2122,41 +2125,28 @@ class MegatronPolicyWorkerImpl(
         state = self._assert_step_open()
         if state.get("offloaded", False):
             raise RuntimeError("prepare_for_training must restore the offloaded step")
-        # Opened here rather than by a decorator because the span carries this
-        # microbatch's image counts and ``data`` is what holds them. This is the
-        # narrowest span that contains the vision encoder; see
-        # ``RLSpanGroup.WORKER_TRAIN`` for why that is as close as it gets.
-        # Stamped before the body so the counts survive a failed microbatch,
-        # which is the one whose payload is worth knowing.
-        with umbrella_span(
-            RLSpanGroup.U_WORKER_TRAIN, "rl.policy.train_microbatch"
-        ) as span:
-            record_vision_workload(
-                data, data.size, stage=VISION_STAGE_TRAIN_MICROBATCH, span=span
-            )
+        try:
+            self._train_microbatch_body(state, data)
+        except Exception:
+            # The body left all three mcore hooks nulled when begin_train_step
+            # opened the step. If we propagate without restoring, future steps
+            # run with the PP scheduler bypass disabled and with no end-of-step
+            # gradient finalization at all. Restore here; the caller is still
+            # expected to invoke abort_train_step (idempotent on the saved
+            # values) to drop ``_train_step_state``.
             try:
-                self._train_microbatch_body(state, data)
+                self._set_mtp_grad_scale_func(None)
             except Exception:
-                # The body left all three mcore hooks nulled when
-                # begin_train_step opened the step. If we propagate without
-                # restoring, future steps run with the PP scheduler bypass
-                # disabled and with no end-of-step gradient finalization at
-                # all. Restore here; the caller is still expected to invoke
-                # abort_train_step (idempotent on the saved values) to drop
-                # ``_train_step_state``.
-                try:
-                    self._set_mtp_grad_scale_func(None)
-                except Exception:
-                    log.exception(
-                        "failed to clear MTP gradient scaling after train_microbatch error"
-                    )
-                try:
-                    self._restore_saved_mcore_hooks(state)
-                except Exception:
-                    log.exception(
-                        "failed to restore mcore hooks after train_microbatch error"
-                    )
-                raise
+                log.exception(
+                    "failed to clear MTP gradient scaling after train_microbatch error"
+                )
+            try:
+                self._restore_saved_mcore_hooks(state)
+            except Exception:
+                log.exception(
+                    "failed to restore mcore hooks after train_microbatch error"
+                )
+            raise
 
     def _train_microbatch_body(
         self,

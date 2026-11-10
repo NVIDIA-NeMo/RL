@@ -321,8 +321,9 @@ def _emitted_span_names(
     if called == "efficiency_span":
         category = _string_arg(node)
         return {f"rl.{category.replace('/', '.')}"} if category else set()
-    if called == "traced_worker_init":
-        # Takes the name directly: the group is fixed at U_MODEL_INIT.
+    if called in ("traced_worker_init", "traced_train_phase"):
+        # Take the name directly; the group is fixed (U_MODEL_INIT and
+        # U_WORKER_TRAIN respectively).
         name = _string_arg(node)
         return {name} if name else set()
     return set()
@@ -435,6 +436,7 @@ def test_every_registered_group_has_an_emitter():
         "checkpoint_finalize_span": RLSpanGroup.CHECKPOINT,
         "efficiency_span": RLSpanGroup.EFFICIENCY,
         "traced_worker_init": RLSpanGroup.MODEL_INIT,
+        "traced_train_phase": RLSpanGroup.U_WORKER_TRAIN,
     }
 
     emitted: set[str] = set()

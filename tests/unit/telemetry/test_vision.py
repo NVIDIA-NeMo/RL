@@ -22,8 +22,10 @@ from nemo_rl.telemetry.vision import (
     RL_VISION_STAGE_ATTR,
     VISION_METRICS,
     VISION_STAGE_LOADER_BATCH,
+    VISION_STAGE_TRAIN_BATCH,
     VISION_STAGE_TRAIN_MICROBATCH,
     record_vision_workload,
+    traced_train_phase,
     vision_workload,
 )
 
@@ -181,6 +183,82 @@ def test_record_without_a_span_still_records(monkeypatch):
     )
 
     assert recorded[0][1] == {RL_VISION_STAGE_ATTR: VISION_STAGE_LOADER_BATCH}
+
+
+class FakeBatch(dict):
+    """A ``BatchedDataDict`` stand-in: dict access plus ``.size``."""
+
+    @property
+    def size(self) -> int:
+        return self["rows"]
+
+
+def test_traced_train_phase_stamps_the_batch_it_was_called_with(monkeypatch):
+    """The decorator is what carries coverage to every train entrypoint.
+
+    Both backends' ``train`` and Megatron's ``train_microbatch`` go through it,
+    so a batch it failed to read would silently blank the vision series on
+    whichever path used it.
+    """
+    recorded: list[tuple[dict, dict]] = []
+    monkeypatch.setattr(
+        "nemo_rl.telemetry.metrics.record_rl_metrics",
+        lambda values, attributes=None: recorded.append((dict(values), attributes)),
+    )
+    seen = []
+
+    class Worker:
+        @traced_train_phase("rl.policy.train", stage=VISION_STAGE_TRAIN_BATCH)
+        def train(self, data, loss_fn=None):
+            seen.append((data, loss_fn))
+            return "result"
+
+    batch = FakeBatch(rows=2, pixel_values=FakePackedTensor([1, 0]))
+
+    assert Worker().train(batch, loss_fn="fn") == "result"
+    assert seen == [(batch, "fn")]
+    assert recorded[0][0][RL_VISION_IMAGES_METRIC] == 1
+    assert recorded[0][1] == {RL_VISION_STAGE_ATTR: VISION_STAGE_TRAIN_BATCH}
+
+
+def test_traced_train_phase_accepts_the_batch_by_keyword(monkeypatch):
+    """``train_microbatch_presharded`` dispatches ``data=`` rather than positionally."""
+    recorded: list[tuple[dict, dict]] = []
+    monkeypatch.setattr(
+        "nemo_rl.telemetry.metrics.record_rl_metrics",
+        lambda values, attributes=None: recorded.append((dict(values), attributes)),
+    )
+
+    class Worker:
+        @traced_train_phase(
+            "rl.policy.train_microbatch", stage=VISION_STAGE_TRAIN_MICROBATCH
+        )
+        def train_microbatch(self, data):
+            return None
+
+    Worker().train_microbatch(data=FakeBatch(rows=1, pixel_values=None))
+
+    assert recorded[0][1] == {RL_VISION_STAGE_ATTR: VISION_STAGE_TRAIN_MICROBATCH}
+
+
+def test_traced_train_phase_keeps_a_var_keyword_signature():
+    """What lets it stack above ``wrap_with_nvtx_name`` without breaking Ray.
+
+    ``instrumentation._advertise_carrier`` leaves a callable alone when it
+    already takes ``**kwargs``. If this wrapper ever narrowed its signature,
+    Ray would start rejecting the trace carrier on every decorated actor
+    method, and the failure would surface as a dispatch TypeError rather than
+    as anything telemetry-shaped.
+    """
+    import inspect
+
+    class Worker:
+        @traced_train_phase("rl.policy.train", stage=VISION_STAGE_TRAIN_BATCH)
+        def train(self, data):
+            return None
+
+    parameters = inspect.signature(Worker.train, follow_wrapped=False).parameters
+    assert any(p.kind is p.VAR_KEYWORD for p in parameters.values())
 
 
 def test_every_declared_series_is_one_vision_workload_can_produce():

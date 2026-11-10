@@ -51,7 +51,17 @@ On a VLM run, how much vision work a batch carried. Three gauges, declared in `n
 | `rl.vision.image_rows` | `{row}` | rows of it carrying at least one image |
 | `rl.vision.rows` | `{row}` | rows in it, image-bearing or not |
 
-`rl.vision.stage` is `loader_batch` (an Energon loader owner, measured after `prepare_sft_batch`) or `train_microbatch` (a policy worker rank, measured per `forward_backward_func` invocation). One instrument per quantity with the stage as an attribute, rather than a series per producer, because the useful question is how the two compare — whether the loader fed fewer images or the step consumed them more slowly — and that is a filter on one series rather than a join of two.
+`rl.vision.stage` is one of:
+
+| Stage | Producer |
+| --- | --- |
+| `loader_batch` | an Energon loader owner, measured after `prepare_sft_batch` |
+| `train_microbatch` | a policy worker rank on the split begin/microbatch/finish path (SFT v2, single controller), measured per `forward_backward_func` invocation |
+| `train_batch` | a policy worker rank on the whole-batch path (GRPO, PPO, SFT v1, and everything on Automodel, which has no split path), measured per `train()` call |
+
+`train_microbatch` and `train_batch` are two spellings of the same work by different algorithms, never both for one batch — so filter to one before summing, or the same images are counted twice.
+
+One instrument per quantity with the stage as an attribute, rather than a series per producer, because the useful question is how the stages compare — whether the loader fed fewer images or the step consumed them more slowly — and that is a filter on one series rather than a join of two.
 
 These are **recorded, not teed**: both producers are worker-side and neither owns a `Logger`, so they go through `record_rl_metrics` instead of the `log_metrics` path the training scalars use.
 
@@ -61,7 +71,7 @@ These are **recorded, not teed**: both producers are worker-side and neither own
 
 Nothing at all is emitted for a batch whose image layout cannot be read. A gap in the series is intended there; a zero would be a wrong number. A text-only batch is *not* that case — it reports zero images, which is what makes it usable as the baseline an image-heavy batch is read against.
 
-The same counts appear as attributes on `rl.policy.train_microbatch`, which is what makes a microbatch's duration comparable against the vision load that produced it. See [Worker-side training spans](span-groups.md#worker-side-training-spans) for why there is no span on the vision encoder itself.
+The same counts appear as attributes on whichever span produced them — `rl.policy.train_microbatch` or `rl.policy.train` — which is what makes that span's duration comparable against the vision load behind it. See [Worker-side training spans](span-groups.md#worker-side-training-spans) for why there is no span on the vision encoder itself.
 
 ## W&B history step axes
 

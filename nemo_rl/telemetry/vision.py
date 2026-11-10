@@ -37,10 +37,14 @@ breakdown is not, and the two halves are reported independently for that reason
 
 from __future__ import annotations
 
-from typing import Any, Optional
+import functools
+from typing import Any, Callable, Optional, TypeVar, cast
 
-from nemo_rl.telemetry.instrumentation import safe_set_span_attributes
+from nemo_rl.telemetry.instrumentation import safe_set_span_attributes, umbrella_span
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.telemetry.vocabulary import RecordedMetric, register_recorded_metrics
+
+_F = TypeVar("_F", bound=Callable[..., Any])
 
 #: Which producer a sample describes. One instrument per quantity with the stage
 #: as an attribute, rather than one series per producer, because the question is
@@ -48,8 +52,16 @@ from nemo_rl.telemetry.vocabulary import RecordedMetric, register_recorded_metri
 #: the step consumed — and that is a filter on one series, not a join of two.
 RL_VISION_STAGE_ATTR = "rl.vision.stage"
 
-#: One training microbatch, as one policy worker rank saw it.
+#: One training microbatch, as one policy worker rank saw it. Emitted by the
+#: split begin/microbatch/finish path, which SFT v2 and the single controller
+#: drive.
 VISION_STAGE_TRAIN_MICROBATCH = "train_microbatch"
+
+#: One whole ``train()`` call on one rank, from the algorithms that hand the
+#: worker a batch and let it do its own microbatching (GRPO, PPO, SFT v1).
+#: Coarser than ``train_microbatch`` and never emitted alongside it for the
+#: same work, so summing across stages would double count.
+VISION_STAGE_TRAIN_BATCH = "train_batch"
 
 #: One batch delivered by an Energon loader owner.
 VISION_STAGE_LOADER_BATCH = "loader_batch"
@@ -91,9 +103,11 @@ __all__ = [
     "RL_VISION_ROWS_METRIC",
     "VISION_METRICS",
     "VISION_STAGE_LOADER_BATCH",
+    "VISION_STAGE_TRAIN_BATCH",
     "VISION_STAGE_TRAIN_MICROBATCH",
     "vision_workload",
     "record_vision_workload",
+    "traced_train_phase",
 ]
 
 
@@ -164,3 +178,35 @@ def record_vision_workload(
     # nothing is exporting, so the cost on an untraced run is the count itself.
     safe_set_span_attributes(span, workload)
     record_rl_metrics(workload, {RL_VISION_STAGE_ATTR: stage})
+
+
+def traced_train_phase(span_name: str, *, stage: str) -> Callable[[_F], _F]:
+    """Span a worker's training entrypoint and stamp its batch's vision load.
+
+    Stacks *above* ``wrap_with_nvtx_name`` rather than replacing it, so the
+    boundaries an nsys profile shows and the ones lens shows stay the same
+    ones. That order also keeps the Ray trace carrier working:
+    ``instrumentation._advertise_carrier`` unwraps to the innermost
+    ``__wrapped__``, and the NVTX wrapper sets none, so the unwrap stops at its
+    bare ``**kwargs`` and the carrier is absorbed there instead of reaching a
+    signature Ray would reject it against.
+
+    ``data`` is named in the wrapper's signature rather than dug out of
+    ``*args``: every entrypoint this decorates takes the batch first, and
+    naming it keeps the dependency visible at the decorator instead of hidden
+    behind an index. Callers pass it either way — ``train_presharded``
+    positionally, ``train_microbatch_presharded`` by keyword.
+    """
+
+    def decorator(func: _F) -> _F:
+        @functools.wraps(func)
+        def wrapper(self: Any, data: Any, *args: Any, **kwargs: Any) -> Any:
+            with umbrella_span(RLSpanGroup.U_WORKER_TRAIN, span_name) as span:
+                # Before the body, so a batch that fails still reports the
+                # payload it failed on -- the one whose size is worth knowing.
+                record_vision_workload(data, data.size, stage=stage, span=span)
+                return func(self, data, *args, **kwargs)
+
+        return cast(_F, wrapper)
+
+    return decorator
