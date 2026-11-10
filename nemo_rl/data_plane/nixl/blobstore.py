@@ -263,9 +263,10 @@ class UnitSlabStore:
     ) -> bool:
         """Awaited commit: the blob's rows are published once it returns True.
 
-        A blob the unit spilled to disk answers ``"pending"`` while its file is
-        written: ask again, inside the put deadline. Commit is idempotent on the
-        unit, so a call whose reply was lost is asked again too. On failure the
+        A unit may answer ``"pending"`` (ask again, inside the put deadline);
+        today's units publish spills at once, so this is kept for protocol
+        compatibility. Commit is idempotent on the unit, so a call whose reply
+        was lost is asked again too. On failure the
         client aborts, which the unit ignores for a blob it did publish.
         """
         ok = False

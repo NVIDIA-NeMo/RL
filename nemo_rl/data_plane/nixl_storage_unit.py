@@ -53,6 +53,7 @@ log = logging.getLogger(__name__)
 # IO jobs (spill writes, stage reads) queued or running at once. Each holds an IO-area
 # region, so the area bounds it; this caps the count when blobs are tiny.
 _MAX_IO_JOBS = 256
+SPILL_RETRY_S = 5.0  # between retries of a spill whose file write failed
 
 # A row's index entry: (blob_id, off_in_blob, len, kind, dtype, shape).
 RowEntry = tuple[str, int, int, str, str | None, tuple[int, ...] | None]
@@ -90,6 +91,10 @@ class BlobRec:
     stage_failed: bool = (
         False  # the last stage read failed; the next resolve says so once
     )
+    # A published spill whose file is not written yet (no IO job could take it, or
+    # the last write failed at spill_failed_at): the ticker submits it again.
+    spill_due: bool = False
+    spill_failed_at: float = 0.0
     staged_at: float = 0.0
     picked_up: bool = False  # a reader pinned the staged copy since it was staged
     wait_since: float = 0.0  # first pending reply of the current stage
@@ -252,14 +257,18 @@ class NixlStorageUnit:  # pragma: no cover
     # Spill, not demote. Data is read oldest first (the FIFO contract), so a put
     # the put area cannot take goes to disk from birth and data already in the put
     # area never moves: no victims, no pin drain, no eviction policy. The put's
-    # WRITE lands in the IO area (carved from the slab, as the staging area was);
-    # its commit is "pending" while an IO worker thread writes the file, and
-    # "done" once it is on disk. A read of a disk blob gets "pending" while a
-    # worker reads the file into the IO area, then reads it pinned. Disk I/O is
-    # plain blocking file I/O on `io_threads` workers, outside _mu: a hung disk
-    # stalls spills and cold reads, never the put area. An IO job owns its
-    # IO-area region (and its file) until it ends, so neither is freed under
-    # it, whichever thread runs it.
+    # WRITE lands in the IO area (carved from the slab, as the staging area was),
+    # and its commit publishes the blob at once: its bytes are in the unit's
+    # memory, the same guarantee a put-area blob has. An IO worker then writes
+    # the file; readers meanwhile read the IO-area copy, which stays after the
+    # write as a staged copy (evictable once unpinned). A write that fails keeps
+    # that copy, which is then the only one, and the ticker retries the write.
+    # A read of a disk blob with no copy gets "pending" while a worker reads the
+    # file into the IO area, then reads it pinned. Disk I/O is plain blocking
+    # file I/O on `io_threads` workers, outside _mu: a hung disk stalls spills
+    # and cold reads, never the put area. An IO job owns its IO-area region
+    # (and its file) until it ends, so neither is freed under it, whichever
+    # thread runs it.
     def _init_ssd(
         self,
         slab_bytes: int,
@@ -276,6 +285,7 @@ class NixlStorageUnit:  # pragma: no cover
             "spilled_bytes": 0,
             "spills": 0,
             "spill_failures": 0,
+            "spill_retries": 0,
             "staged_bytes": 0,
             "stages": 0,
             "stage_failures": 0,
@@ -320,6 +330,7 @@ class NixlStorageUnit:  # pragma: no cover
                     now = time.monotonic()
                     self._reclaim(now)
                     self._sweep(now)
+                    self._submit_due_spills(now)
             except Exception:  # noqa: BLE001 - keep ticking; the next tick retries
                 log.exception("unit %d: tick failed", self.unit_id)
                 continue
@@ -400,6 +411,31 @@ class NixlStorageUnit:  # pragma: no cover
             f"unit {self.unit_id}: {nbytes} B fits neither the put area nor the IO area"
         )
 
+    def _submit_due_spills(self, now: float) -> int:
+        """Queue the file write of published spills that have none running yet.
+
+        A spill is due when its commit found every IO job slot taken, or when
+        its last write failed (retried after ``SPILL_RETRY_S``; the IO copy is
+        the only copy until a write succeeds). Caller holds ``_mu``. Returns
+        the number queued.
+        """
+        queued = 0
+        if self.ssd_dir is None:
+            return queued
+        for b, rec in self.blobs.items():
+            if self._io_jobs >= self._max_io_jobs:
+                break
+            if not rec.spill_due or rec.staging or rec.disk is not None:
+                continue
+            if rec.spill_failed_at and now - rec.spill_failed_at < SPILL_RETRY_S:
+                continue
+            if rec.spill_failed_at:
+                self.ssd_stats["spill_retries"] += 1
+            self._submit_io(self._spill, b, rec)
+            rec.spill_due = False
+            queued += 1
+        return queued
+
     def _submit_io(self, fn: Any, b: str, rec: BlobRec) -> None:
         """Queue an IO job that owns ``rec.staged_off`` (caller holds ``_mu``).
 
@@ -423,15 +459,25 @@ class NixlStorageUnit:  # pragma: no cover
         with self._mu:
             rec.staging = False
             gone = self.blobs.get(b) is not rec
-            self._drop_staged(b, rec, now, now)  # nobody ever read the IO region
-            if ok and not gone:
+            if gone:
+                # Released while the write ran. A checkpoint copying it still
+                # holds it: _dispose frees the region when the last hold ends.
+                if rec.holds == 0:
+                    self._drop_staged(b, rec, rec.pin_expiry(now), now)
+            elif ok:
                 rec.disk = fd
                 self.ssd_stats["spilled_bytes"] += rec.nbytes
                 self.ssd_stats["spills"] += 1
-            elif not gone:
-                # Not acknowledged, so nothing is lost: the put fails ("lost") and
-                # the client tries another unit.
-                del self.blobs[b]
+                # The IO copy stays as a staged copy of the newest data: readers
+                # find it, and it goes when the IO area needs the room.
+                rec.staged_at = now
+                rec.picked_up = True
+                self._staged[b] = rec
+            else:
+                # The blob is published and its IO copy is now the only copy:
+                # keep it (never evicted while rec.disk is None) and retry.
+                rec.spill_due = True
+                rec.spill_failed_at = now
                 self.ssd_stats["spill_failures"] += 1
         if fd is not None and not (ok and not gone):
             _close(fd)
@@ -485,6 +531,7 @@ class NixlStorageUnit:  # pragma: no cover
             (r.staged_at, b, r)
             for b, r in self._staged.items()
             if not r.staging
+            and r.disk is not None  # never the only copy
             and r.pin_expiry(now) <= now
             and (r.picked_up or now - r.staged_at >= self.pickup_s)
         )
@@ -619,8 +666,9 @@ class NixlStorageUnit:  # pragma: no cover
         into the row index, and a key that already pointed elsewhere drops its
         old blob's reference (an overwrite). Idempotent: a published blob
         answers ``"done"`` again, so a client whose reply was lost can ask again.
-        A spilled blob is ``"pending"`` while its disk write runs; ``"lost"`` if
-        the blob is gone (aborted or its write failed), and the put then fails.
+        A spilled blob is published at once too: its bytes are in the IO area,
+        and the file write runs behind the ack. ``"lost"`` if the blob is gone
+        (aborted), and the put then fails.
         """
         rec = self.blobs.get(blob_id)
         if rec is None:
@@ -630,12 +678,16 @@ class NixlStorageUnit:  # pragma: no cover
         if rec.entries is None:
             # Parsed before a spill can free the IO region holding the bytes.
             rec.entries = blob_format.read_index(self._blob_view(rec))
-        if rec.in_slab or rec.disk is not None:
-            self._publish(blob_id, rec)
-            return "done"
-        if not rec.staging and self._io_jobs < self._max_io_jobs:
-            self._submit_io(self._spill, blob_id, rec)  # exactly once: staging is set
-        return "pending"
+        if not rec.in_slab and rec.disk is None and not rec.staging:
+            # A spill: its bytes are complete in the IO area, so publish now and
+            # write the file behind the ack. Submit before publishing: a failed
+            # submit raises and leaves nothing to undo.
+            if self._io_jobs < self._max_io_jobs:
+                self._submit_io(self._spill, blob_id, rec)
+            else:
+                rec.spill_due = True  # the ticker queues it when a slot frees
+        self._publish(blob_id, rec)
+        return "done"
 
     def _blob_view(self, rec: BlobRec) -> memoryview:
         """The blob's bytes in the put area or, for a spill in progress, the IO area."""
@@ -771,10 +823,12 @@ class NixlStorageUnit:  # pragma: no cover
             rec.last_resolve_at = now
             if rec.in_slab:
                 off = rec.off
-            elif rec.disk is None:
-                missing.append(b)  # a spill whose put is not acknowledged yet
+            elif not rec.published:
+                missing.append(b)  # a spill whose WRITE is not committed yet
                 continue
-            elif rec.staged_off is not None and not rec.staging:
+            elif rec.staged_off is not None and (rec.disk is None or not rec.staging):
+                # The IO copy: the put's own bytes (file written or still being
+                # written) or a staged copy. A running *stage* is still filling it.
                 off = self.staging_base + rec.staged_off
                 rec.picked_up = True
             elif rec.staging:
@@ -924,7 +978,7 @@ class NixlStorageUnit:  # pragma: no cover
                     for fld, ent in row.items():
                         live.setdefault(ent[0], []).append(f"{g}@{fld}")
                 for b, rec in self.blobs.items():
-                    if not rec.published or (not rec.in_slab and rec.disk is None):
+                    if not rec.published:
                         continue
                     rec.holds += 1
                     held.append((b, rec, rec.refs))
@@ -938,17 +992,25 @@ class NixlStorageUnit:  # pragma: no cover
                         f.write(view[rec.off : rec.off + rec.nbytes])
                     else:
                         with self._mu:
+                            # A spill whose file is not written yet: its IO copy
+                            # is complete and held, so it is copied from there.
+                            live_io_copy = rec.disk is None and self.blobs.get(b) is rec
+                            io_off = rec.staged_off if live_io_copy else None
                             fd = None if rec.disk is None else os.dup(rec.disk)
-                        if fd is None:
+                        if io_off is not None:
+                            at = self.staging_base + io_off
+                            f.write(view[at : at + rec.nbytes])
+                        elif fd is None:
                             raise RuntimeError(
                                 f"unit {self.unit_id}: blob {b} was released during "
                                 "save_shard; TransferQueue does not support clears "
                                 "during a checkpoint"
                             )
-                        try:
-                            _copy_out(fd, f, rec.nbytes)
-                        finally:
-                            _close(fd)
+                        else:
+                            try:
+                                _copy_out(fd, f, rec.nbytes)
+                            finally:
+                                _close(fd)
                     index[b] = [pos, rec.nbytes, refs]
                     pos += rec.nbytes
                 f.flush()
