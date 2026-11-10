@@ -847,21 +847,25 @@ class VllmGeneration(GenerationInterface):
             )
             self._step_metrics_snapshot = None
 
-    def get_step_metrics(self) -> dict[str, float]:
-        """Get the vLLM engine metrics delta since snapshot_step_metrics().
+    def get_step_metrics(self, *, keep_snapshot: bool = False) -> dict[str, float]:
+        """Get vLLM engine metric deltas for the current window.
 
         Covers the speculative-decoding family plus the engine's token,
         sequence-length and request-outcome series, all derived from the same
         pair of snapshots so the wider coverage costs no extra RPC.
 
+        Args:
+            keep_snapshot: Retain the end counters for the next window. A missing
+                baseline is initialized without emitting deltas.
+
         Returns:
             Dictionary of delta metrics with 'vllm/' prefix.
-            Returns empty dict if snapshot_step_metrics() was not called.
+            Returns empty dict when no baseline is available.
 
         Raises:
-            RuntimeWarning: If called without snapshot_step_metrics() first.
+            RuntimeWarning: If no baseline is available and keep_snapshot is false.
         """
-        if self._step_metrics_snapshot is None:
+        if self._step_metrics_snapshot is None and not keep_snapshot:
             warnings.warn(
                 "get_step_metrics() called without snapshot_step_metrics(). "
                 "Call snapshot_step_metrics() before generation to track metrics.",
@@ -878,10 +882,15 @@ class VllmGeneration(GenerationInterface):
         # vLLM rename must cost observability rather than the run.
         try:
             counters_end = self._get_raw_spec_counters()
+            if counters_start is None:
+                self._step_metrics_snapshot = counters_end
+                return {}
             step_metrics = compute_spec_decode_metrics(counters_start, counters_end)
             step_metrics.update(
                 compute_engine_step_metrics(counters_start, counters_end)
             )
+            if keep_snapshot:
+                self._step_metrics_snapshot = counters_end
         except ray.exceptions.RayActorError:
             # See snapshot_step_metrics: the caller handles a dead actor.
             raise

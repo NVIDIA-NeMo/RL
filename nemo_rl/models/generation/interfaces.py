@@ -864,13 +864,15 @@ class GenerationInterface(ABC):
         Backends without per-step generation metrics may use this default no-op.
         """
 
-    def get_step_metrics(self) -> dict[str, float]:
+    def get_step_metrics(self, *, keep_snapshot: bool = False) -> dict[str, float]:
         """Finish the current metric window and return generation metrics.
 
+        Args:
+            keep_snapshot: Use this window's end as the next window's baseline.
+
         Returns:
-            Metrics accumulated since the matching ``snapshot_step_metrics``
-            call, not running totals. Backends without per-step generation
-            metrics return an empty dictionary.
+            Metrics accumulated since the current baseline. Backends without
+            per-step generation metrics return an empty dictionary.
         """
         return {}
 
