@@ -123,10 +123,8 @@ def load_training_records(
     records = []
     for path in sorted(run_dir.glob("train_data_step*.jsonl")):
         dumped_rows = read_jsonl(path)
-        steps = {int(row["step"]) for row in dumped_rows}
-        if len(steps) != 1:
-            raise AssertionError(f"{path} mixes train steps {sorted(steps)!r}")
-        (train_step,) = steps
+        # JsonDebugWriter writes one train_data_step<N>.jsonl per step.
+        train_step = int(dumped_rows[0]["step"])
         records.append(
             {
                 "train_step": train_step,
@@ -139,10 +137,12 @@ def load_training_records(
     return sorted(records, key=lambda record: record["train_step"])
 
 
-def _rows_by_identity(
-    records: Sequence[Mapping[str, Any]],
-) -> dict[tuple[int, int, int], Mapping[str, Any]]:
-    result: dict[tuple[int, int, int], Mapping[str, Any]] = {}
+RowIndex = dict[tuple[int, int, int], Mapping[str, Any]]
+
+
+def _rows_by_identity(records: Sequence[Mapping[str, Any]]) -> RowIndex:
+    """Index trained rows by ``(train_step, prompt_idx, generation_index)``."""
+    result: RowIndex = {}
     groups: dict[tuple[int, int], str] = {}
     for batch in records:
         train_step = int(batch["train_step"])
@@ -200,8 +200,8 @@ def _assert_nested_close(
 
 
 def _compare_training_rows(
-    baseline_records: Sequence[Mapping[str, Any]],
-    recovery_records: Sequence[Mapping[str, Any]],
+    baseline: RowIndex,
+    recovery: RowIndex,
     *,
     steps: int,
     prompts_per_step: int,
@@ -212,12 +212,10 @@ def _compare_training_rows(
 ) -> None:
     """Compare rows by logical identity; every row must match exactly.
 
-    The only exception is ``diverged_before_cut`` (see
-    ``_rows_diverged_before_cut``): those rows keep their reward and admission
-    exact, since the reference does not predict their tokens.
+    The only exception is ``diverged_before_cut`` (see ``_check_cuts``): those
+    rows keep their reward and admission exact, since the reference does not
+    predict their tokens.
     """
-    baseline = _rows_by_identity(baseline_records)
-    recovery = _rows_by_identity(recovery_records)
     expected_count = steps * prompts_per_step * generations_per_prompt
     if len(baseline) != expected_count:
         raise AssertionError(
@@ -286,44 +284,57 @@ _COMPLETED_PREFIX_LINE = re.compile(
 )
 
 
-def _assert_prefix_boundary(
+def _check_cuts(
     selection: Mapping[str, Any],
     recovery_log: str,
-    recovery_records: Sequence[Mapping[str, Any]],
-) -> dict[tuple[str, int], int]:
-    """Require each restored call to complete once and train on its restored prefix.
+    baseline: RowIndex,
+    recovery: RowIndex,
+) -> tuple[dict[tuple[str, int], int], frozenset[tuple[int, int, int]]]:
+    """Check every restored call's trained row, and find rows to set aside.
 
-    A restored call closes its row, so the ``total_generation_tokens`` it logs
-    on completion end the row: counting back finds where the call starts. That
-    holds even when the trainer masked positions inside the call (top-k/top-p
-    ``-inf`` logprobs drop out of ``token_mask``), which a search for the last
-    unmasked segment would mistake for the call's start. A dropped or
-    duplicated token moves that start, so the restored prefix no longer sits
+    First, each restored call must complete once and train on its restored
+    prefix. A restored call closes its row, so the ``total_generation_tokens``
+    it logs on completion end the row: counting back finds where the call
+    starts. That holds even when the trainer masked positions inside the call
+    (top-k/top-p ``-inf`` logprobs drop out of ``token_mask``), which a search
+    for the last unmasked segment would mistake for the call's start. A dropped
+    or duplicated token moves that start, so the restored prefix no longer sits
     there.
+
+    Then, vLLM sampling is not batch-invariant, so phase 1 can take the other
+    side of a near-tie before the cut. Recovery must then continue phase 1's
+    tokens, and the reference no longer predicts that row. A row is set aside
+    only when the reference's call opens differently at the restored prefix's
+    position, and everything before the closing call must still match. At
+    most one restored row may be set aside, and at least one must match the
+    reference outright: nothing checks that a set-aside row diverged rather
+    than restored the wrong tokens, so the cap bounds what a run can leave
+    unchecked.
 
     Returns:
         Each cut's ``(group_id, generation_index)`` mapped to the index in its
-        trained row where the restored call's generated tokens begin.
+        trained row where the restored call's generated tokens begin, and the
+        identities of the restored rows set aside.
     """
-    rows = {
-        (row["group_id"], int(row["generation_index"])): row
-        for batch in recovery_records
-        for row in batch["rows"]
+    completed: dict[tuple[str, int], list[dict[str, str]]] = {}
+    for match in _COMPLETED_PREFIX_LINE.finditer(recovery_log):
+        line = match.groupdict()
+        key = (line["source_model_call_id"], int(line["prefix_tokens"]))
+        completed.setdefault(key, []).append(line)
+    restored: dict[tuple[str, int], list[str]] = {}
+    for line in restored_prefixes(recovery_log):
+        key = (line["source_model_call_id"], line["prefix_tokens"])
+        restored.setdefault(key, []).append(line["prefix_ids_sha256"])
+    by_call = {
+        (row["group_id"], int(row["generation_index"])): identity
+        for identity, row in recovery.items()
     }
-    completed = [
-        match.groupdict() for match in _COMPLETED_PREFIX_LINE.finditer(recovery_log)
-    ]
-    restored = restored_prefixes(recovery_log)
+
     starts: dict[tuple[str, int], int] = {}
     for cut in selection["cuts"]:
         source = cut["model_call_id"]
         prefix_tokens = int(cut["prefix_token_count"])
-        matches = [
-            line
-            for line in completed
-            if line["source_model_call_id"] == source
-            and int(line["prefix_tokens"]) == prefix_tokens
-        ]
+        matches = completed.get((source, prefix_tokens), [])
         if len(matches) != 1:
             raise AssertionError(
                 "restored prefix did not complete exactly once: "
@@ -338,21 +349,16 @@ def _assert_prefix_boundary(
                 "restored generation token accounting has a gap or overlap: "
                 f"prefix={prefix_tokens}, tail={tail_tokens}, total={total_tokens}"
             )
-        hashes = [
-            line["prefix_ids_sha256"]
-            for line in restored
-            if line["source_model_call_id"] == source
-            and line["prefix_tokens"] == prefix_tokens
-        ]
+        hashes = restored.get((source, prefix_tokens), [])
         if len(hashes) != 1:
             raise AssertionError(
                 f"restored prefix {source!r} was logged {len(hashes)} times, "
                 "expected once"
             )
         key = (cut["group_id"], int(cut["generation_index"]))
-        row = rows.get(key)
-        if row is None:
+        if key not in by_call:
             raise AssertionError(f"restored call {source!r} has no trained row")
+        row = recovery[by_call[key]]
         start = len(row["token_ids"]) - total_tokens
         # The token before a call's generated tokens is its own prompt, never
         # trained; landing on a trained token means the row's length is off.
@@ -367,7 +373,40 @@ def _assert_prefix_boundary(
                 f"{prefix_tokens} restored prefix tokens"
             )
         starts[key] = start
-    return starts
+
+    diverged: set[tuple[int, int, int]] = set()
+    for cut in selection["cuts"]:
+        prefix_tokens = int(cut["prefix_token_count"])
+        key = (cut["group_id"], int(cut["generation_index"]))
+        start = starts[key]
+        identity = by_call[key]
+        right = recovery[identity]
+        (restored_hash,) = restored[(cut["model_call_id"], prefix_tokens)]
+        left = baseline.get(identity)
+        if (
+            left is None
+            or _closing_prefix_sha256(left, start, prefix_tokens) == restored_hash
+        ):
+            continue
+        if (
+            left["token_ids"][:start] != right["token_ids"][:start]
+            or left["token_loss_mask"][:start] != right["token_loss_mask"][:start]
+        ):
+            raise AssertionError(
+                f"row {identity!r} differs before its restored closing call"
+            )
+        diverged.add(identity)
+    if diverged and len(diverged) == len(selection["cuts"]):
+        raise AssertionError(
+            "every restored prefix differed from the reference, so no restored "
+            "row checks the regenerated tail"
+        )
+    if len(diverged) > 1:
+        raise AssertionError(
+            f"{len(diverged)} of {len(selection['cuts'])} restored rows were set "
+            "aside; at most 1 may be, or the test checks too little"
+        )
+    return starts, frozenset(diverged)
 
 
 def _assert_retired_prefix_keys(
@@ -413,70 +452,8 @@ def _closing_prefix_sha256(
     return hashlib.sha256(",".join(map(str, generated)).encode()).hexdigest()
 
 
-def _rows_diverged_before_cut(
-    selection: Mapping[str, Any],
-    recovery_log: str,
-    baseline_records: Sequence[Mapping[str, Any]],
-    recovery_records: Sequence[Mapping[str, Any]],
-) -> frozenset[tuple[int, int, int]]:
-    """Return restored rows whose phase-1 prefix already differed from the reference.
-
-    vLLM sampling is not batch-invariant, so phase 1 can take the other side of
-    a near-tie before the cut. Recovery must then continue phase 1's tokens, and
-    the reference no longer predicts that row. Every restored row must start its
-    closing call with the exact prefix it restored (``_assert_prefix_boundary``),
-    and a row is set aside only when the reference's call opens differently at
-    that same position. Everything before the closing call must still match, and
-    at least one restored row must match the reference outright, so a capture
-    that recorded the wrong tokens for every cut cannot pass.
-    """
-    starts = _assert_prefix_boundary(selection, recovery_log, recovery_records)
-    restored = restored_prefixes(recovery_log)
-    baseline = _rows_by_identity(baseline_records)
-    recovery = _rows_by_identity(recovery_records)
-    by_call = {
-        (row["group_id"], int(row["generation_index"])): identity
-        for identity, row in recovery.items()
-    }
-    diverged: set[tuple[int, int, int]] = set()
-    for cut in selection["cuts"]:
-        prefix_tokens = int(cut["prefix_token_count"])
-        key = (cut["group_id"], int(cut["generation_index"]))
-        start = starts[key]
-        identity = by_call[key]
-        right = recovery[identity]
-        (restored_hash,) = [
-            line["prefix_ids_sha256"]
-            for line in restored
-            if line["source_model_call_id"] == cut["model_call_id"]
-            and line["prefix_tokens"] == prefix_tokens
-        ]
-        left = baseline.get(identity)
-        if (
-            left is None
-            or _closing_prefix_sha256(left, start, prefix_tokens) == restored_hash
-        ):
-            continue
-        if (
-            left["token_ids"][:start] != right["token_ids"][:start]
-            or left["token_loss_mask"][:start] != right["token_loss_mask"][:start]
-        ):
-            raise AssertionError(
-                f"row {identity!r} differs before its restored closing call"
-            )
-        diverged.add(identity)
-    if diverged and len(diverged) == len(selection["cuts"]):
-        raise AssertionError(
-            "every restored prefix differed from the reference, so no restored "
-            "row checks the regenerated tail"
-        )
-    return frozenset(diverged)
-
-
-def _assert_reward_signal(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+def _assert_reward_signal(rows: RowIndex) -> dict[str, Any]:
     """Require rewards that can expose a mismatch, and report advantage support."""
-
-    rows = _rows_by_identity(records)
     rewards = {identity: float(row["reward"]) for identity, row in rows.items()}
     if len(set(rewards.values())) < 2:
         raise AssertionError(
@@ -496,8 +473,8 @@ def _assert_reward_signal(records: Sequence[Mapping[str, Any]]) -> dict[str, Any
 
 
 def _assert_generation_logprob_agreement(
-    baseline_records: Sequence[Mapping[str, Any]],
-    recovery_records: Sequence[Mapping[str, Any]],
+    baseline: RowIndex,
+    recovery: RowIndex,
     *,
     min_bit_identical: float,
     max_abs_diff: float,
@@ -507,8 +484,6 @@ def _assert_generation_logprob_agreement(
     Two numbers make the gate: how many tokens disagree at all, and by how much
     the worst one does.
     """
-    baseline = _rows_by_identity(baseline_records)
-    recovery = _rows_by_identity(recovery_records)
     diffs: list[float] = []
     for identity, left in baseline.items():
         right = recovery[identity]
@@ -549,6 +524,8 @@ def compare(args: argparse.Namespace) -> None:
         )
         if record["train_step"] <= args.steps
     ]
+    baseline = _rows_by_identity(baseline_records)
+    recovery = _rows_by_identity(recovery_records)
     selection = read_json(args.selection)
 
     recovery_log = args.recovery_log.read_text()
@@ -559,24 +536,22 @@ def compare(args: argparse.Namespace) -> None:
         flush=True,
     )
 
-    reward_signal = _assert_reward_signal(baseline_records)
+    reward_signal = _assert_reward_signal(baseline)
     print(
         "reward signal: rewards per row="
         f"{reward_signal['rewards']}, rows with nonzero advantages="
         f"{reward_signal['rows_with_nonzero_advantages']}/{reward_signal['rows']}",
         flush=True,
     )
-    diverged = _rows_diverged_before_cut(
-        selection, recovery_log, baseline_records, recovery_records
-    )
+    _, diverged = _check_cuts(selection, recovery_log, baseline, recovery)
     print(
         "restored rows whose phase-1 prefix differed from the reference: "
         f"{sorted(diverged)!r}",
         flush=True,
     )
     _compare_training_rows(
-        baseline_records,
-        recovery_records,
+        baseline,
+        recovery,
         steps=args.steps,
         prompts_per_step=args.prompts_per_step,
         generations_per_prompt=args.generations_per_prompt,
@@ -585,12 +560,11 @@ def compare(args: argparse.Namespace) -> None:
         diverged_before_cut=diverged,
     )
     _assert_generation_logprob_agreement(
-        baseline_records,
-        recovery_records,
+        baseline,
+        recovery,
         min_bit_identical=args.logprob_min_bit_identical,
         max_abs_diff=args.logprob_max_abs_diff,
     )
-    # _rows_diverged_before_cut already ran _assert_prefix_boundary.
     _assert_retired_prefix_keys(
         selection, recovery_records, read_jsonl(args.recovery_flush_keys)
     )

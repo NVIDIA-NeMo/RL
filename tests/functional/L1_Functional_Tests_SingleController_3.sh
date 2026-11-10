@@ -75,8 +75,10 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 # Gym-v2 active-decode recovery: checkpoint a nonterminal vLLM prefix, restart
 # the process, restore that exact prefix, and generate only its remaining tail.
 # Three launches on 2 GPUs: an uninterrupted reference, the interrupted run and
-# the recovery (7-9 minutes locally).
-run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh
+# the recovery (7-9 minutes locally). Full tier: it depends on three runs making
+# the same near-greedy choices, and local runs have failed for reasons outside
+# recovery, so it stays out of fast lanes until a CI-GPU pass rate is shown.
+run_test uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_prefix_recovery.sh
 
 cd ${PROJECT_ROOT}/tests
 if compgen -G ".coverage*" > /dev/null; then

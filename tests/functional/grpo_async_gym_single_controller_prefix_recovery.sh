@@ -76,32 +76,50 @@ mkdir -p "$TEST_DIR"
 
 # Each step has one Workplace prompt group per LIST_LENGTHS entry. Each episode
 # makes a named calendar_create_event call, then closes by listing the integers
-# 1..N. Gym sees tool_choice auto on every turn, so both calls are cuttable; the
-# test hook's policy proxy sends every call after the tool result to vLLM with
-# tool_choice none and no forced length, so the closing call lists the integers,
-# ends at its natural EOS, and the groups finish in an order fixed by N rather
-# than by scheduling noise.
-# The second Workplace prompt expects a different duration than requested, so
-# its reward is 0 and reward parity is not satisfied by a constant.
-jq -n -c -L "$SCRIPT_DIR" \
+# 1..N. Gym cuts only calls whose decoding is unconstrained, judged from the
+# request the agent sends, so tool_choice stays auto on every turn and the prompt
+# asks for the call instead. The test hook's policy proxy sends every call after
+# the tool result to vLLM with tool_choice none and no forced length, so the
+# closing call lists the integers, ends at its natural EOS, and the groups
+# finish in an order fixed by N rather than by scheduling noise.
+# The prompt always asks for duration 30. The second prompt's ground truth is
+# 60, so its reward is 0 and reward parity is not satisfied by a constant.
+jq -n -c \
     --slurpfile workplace "$GYM_ROOT/resources_servers/workplace_assistant/data/example.jsonl" \
     --argjson steps "$MAX_STEPS" \
     --argjson list_lengths "$LIST_LENGTHS_JSON" \
     --argjson tokens_per_item "$LIST_TOKENS_PER_ITEM" \
     --argjson output_slack "$LIST_OUTPUT_SLACK_TOKENS" \
     --arg event "$SENTINEL_EVENT" '
-      include "_workplace_calendar_rows";
       range(0; $steps) as $step |
         range(0; $list_lengths | length) as $slot
         | $list_lengths[$slot] as $list_length
         | $workplace[0]
-        | workplace_calendar_row(
-            $event;
-            " After the tool result, do not call any more tools: list every integer from 1 to "
+        | .task_source = "workplace_assistant_simple_agent"
+        | .responses_create_params.input = [{
+            "role": "user",
+            "content": ("Call calendar_create_event exactly once with event_name " + $event
+              + ", participant_email checkpoint-recovery@example.com, event_start "
+              + "2025-01-15 10:00:00, and duration 30."
+              + " After the tool result, do not call any more tools: list every integer from 1 to "
               + ($list_length | tostring)
-              + " in increasing order, one per line, with no other text.";
-            (if $slot == 1 then "60" else "30" end)
-          )
+              + " in increasing order, one per line, with no other text.")
+          }]
+        | .responses_create_params.tools = [
+            .responses_create_params.tools[] | select(.name == "calendar_create_event")
+          ]
+        | .responses_create_params.tool_choice = "auto"
+        | .responses_create_params.parallel_tool_calls = false
+        | .ground_truth = [{
+            "name": "calendar_create_event",
+            "arguments": ({
+              "event_name": $event,
+              "participant_email": "checkpoint-recovery@example.com",
+              "event_start": "2025-01-15 10:00:00",
+              "duration": (if $slot == 1 then "60" else "30" end)
+            } | tojson)
+          }]
+        | .category = "workplace_assistant_calendar"
         | .responses_create_params.max_output_tokens = ($list_length * $tokens_per_item + $output_slack)
     ' > "$TEST_DATA"
 

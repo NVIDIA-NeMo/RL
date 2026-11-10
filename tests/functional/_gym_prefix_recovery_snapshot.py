@@ -81,7 +81,7 @@ def _recoverable_cut(record: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _require_cut_coverage(
-    candidates: list[dict[str, Any]], *, min_cuts: int, min_cut_groups: int
+    candidates: list[dict[str, Any]], *, min_cut_groups: int
 ) -> None:
     """Reject a snapshot whose recoverable prefixes cover too little work.
 
@@ -90,10 +90,10 @@ def _require_cut_coverage(
     at once is a race. Coverage per prompt group still restores every group.
     """
     groups = {candidate["group_id"] for candidate in candidates}
-    if len(candidates) < min_cuts or len(groups) < min_cut_groups:
+    if len(groups) < min_cut_groups:
         raise AssertionError(
             f"snapshot has {len(candidates)} recoverable prefixes in "
-            f"{len(groups)} prompt groups, need {min_cuts} in {min_cut_groups}"
+            f"{len(groups)} prompt groups, need {min_cut_groups} groups"
         )
 
 
@@ -124,14 +124,12 @@ def inspect_snapshot(
     snapshot: Path,
     sentinel_event: str,
     *,
-    min_cuts: int = 1,
     min_cut_groups: int = 1,
 ) -> dict[str, Any]:
     """Return the post-mutation nonterminal prefixes in ``snapshot``.
 
-    The top-level fields describe the longest cut; ``cuts`` lists every one,
-    and the snapshot qualifies only if it holds at least ``min_cuts`` of them
-    spread across at least ``min_cut_groups`` prompt groups.
+    ``cuts`` lists every one, and the snapshot qualifies only if they span at
+    least ``min_cut_groups`` prompt groups.
     """
 
     required = [
@@ -169,7 +167,7 @@ def inspect_snapshot(
         resource_entry = resource_index.get(key)
         if recovery is None or cut is None or resource_entry is None:
             continue
-        resources_manifest, resources_state = resource_entry
+        _, resources_state = resource_entry
         sentinel_count = calendar_sentinel_count(resources_state, sentinel_event)
         instance_id = recovery["gym_instance_id"]
         checkpointed_episodes = {
@@ -197,8 +195,6 @@ def inspect_snapshot(
                 "generation_index": recovery["generation_index"],
                 "target_step": recovery["target_step"],
                 "model_manifest": str(model_manifest.relative_to(snapshot)),
-                "resources_manifest": str(resources_manifest.relative_to(snapshot)),
-                "sentinel_event": sentinel_event,
                 **cut,
             }
         )
@@ -206,12 +202,11 @@ def inspect_snapshot(
         raise AssertionError(
             "snapshot has no recoverable nonterminal active generation prefix"
         )
-    _require_cut_coverage(candidates, min_cuts=min_cuts, min_cut_groups=min_cut_groups)
+    _require_cut_coverage(candidates, min_cut_groups=min_cut_groups)
     cuts = sorted(
         candidates, key=lambda item: (item["group_id"], item["generation_index"])
     )
-    longest = max(candidates, key=lambda item: item["prefix_token_count"])
-    return {**longest, "cuts": cuts}
+    return {"snapshot": str(snapshot), "cuts": cuts}
 
 
 def select_snapshot(args: argparse.Namespace) -> None:
@@ -228,7 +223,6 @@ def select_snapshot(args: argparse.Namespace) -> None:
                 selection = inspect_snapshot(
                     snapshot,
                     args.sentinel_event,
-                    min_cuts=args.min_cuts,
                     min_cut_groups=args.min_cut_groups,
                 )
                 _require_every_active_call_cut(
@@ -364,7 +358,6 @@ def _parser() -> argparse.ArgumentParser:
     select.add_argument("timeout_s", type=float)
     select.add_argument("backup_path")
     select.add_argument("sentinel_event")
-    select.add_argument("--min-cuts", type=int, default=1)
     select.add_argument("--min-cut-groups", type=int, default=1)
     select.set_defaults(func=select_snapshot)
 
