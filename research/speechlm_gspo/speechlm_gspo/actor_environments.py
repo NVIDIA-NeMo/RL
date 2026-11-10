@@ -31,8 +31,8 @@ ENVS_DIR = Path(__file__).resolve().parents[1] / "envs"
 def register_actor_environments() -> None:
     """Register project-local actor commands before constructing any workers.
 
-    The policy environment pins Speech, Automodel, Skills and transformers
-    independently of the root lock; the ASR reward also needs Skills.
+    The policy environment pins Speech, Automodel and transformers
+    independently of the root lock; the ASR reward shares it.
     Generation adds the Speech vLLM plugin to the vLLM stack.
     """
     ACTOR_ENVIRONMENT_REGISTRY[POLICY_WORKER] = _uv_project(ENVS_DIR / "policy")

@@ -52,11 +52,28 @@ def test_mandarin_routing():
         asr_reward("你好", "你好", {**MANDARIN_CER, "task": "sot"})
 
 
-def test_mandarin_cer():
-    pytest.importorskip("nemo_skills.evaluation.evaluator.audio")
-    assert asr_reward("今 天 use AI", "今天use AI", MANDARIN_CER) == 1
-    with pytest.raises(ValueError):
-        asr_reward("", "你好", MANDARIN_CER)
+@pytest.mark.parametrize(
+    "reference,hypothesis,reward",
+    [
+        ("今 天 use AI", "今天use AI", 1),
+        ("我 love you", "我loveyou", 8 / 9),
+        ("你好，世界！", "你好 世界", 1),
+        ("我有 twenty one 个", "我有21个", 1),
+        ("colour 和 color", "color和color", 1),
+        ("１２３个", "123个", 1),
+        ("\U00020000 字", "\U00020000字", 1),
+        ("你好", "", 0),
+    ],
+)
+def test_mandarin_cer(reference, hypothesis, reward):
+    pytest.importorskip("whisper_normalizer")
+    assert asr_reward(reference, hypothesis, MANDARIN_CER) == pytest.approx(reward)
+
+
+def test_mandarin_cer_rejects_empty_reference():
+    pytest.importorskip("whisper_normalizer")
+    with pytest.raises(ValueError, match="nonempty"):
+        asr_reward("，", "你好", MANDARIN_CER)
 
 
 def test_ascend_mer():

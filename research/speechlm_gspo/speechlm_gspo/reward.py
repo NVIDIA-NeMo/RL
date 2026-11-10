@@ -14,7 +14,8 @@
 
 """Fractional transcript rewards, separate from benchmark normalization."""
 
-import math
+import functools
+import re
 import unicodedata
 from typing import Any
 
@@ -50,22 +51,7 @@ def asr_reward(reference: str, hypothesis: str, metadata: dict[str, Any]) -> flo
             raise ValueError(
                 "Mandarin ordinary_asr requires cer with han_adjacent whitespace"
             )
-        # Skills is optional for recipes that do not use Mandarin CER.
-        from nemo_skills.evaluation.evaluator.audio import evaluate_cer
-
-        error = evaluate_cer(
-            reference,
-            hypothesis,
-            normalization_mode="standard",
-            normalize_compound=False,
-            whitespace_mode="han_adjacent",
-            lang="cmn",
-            remove_diacritics=True,
-        )["cer"]
-        if error is None or not math.isfinite(error):
-            raise ValueError(
-                "Mandarin CER requires a nonempty normalized reference and finite error"
-            )
+        error = _mandarin_cer(reference, hypothesis)
     else:
         if metric != "wer":
             raise ValueError(
@@ -86,3 +72,49 @@ def _edit_distance(ref: list[str], hyp: list[str]) -> int:
                 min(row[j] + 1, row[j - 1] + 1, diagonal + (ref_token != hyp_token)),
             )
     return row[-1]
+
+
+# Han ideographs (CJK unified, extensions and compatibility blocks) and U+3007.
+_HAN = "\u3007" + "".join(
+    f"{chr(start)}-{chr(end)}"
+    for start, end in (
+        (0x3400, 0x4DBF),
+        (0x4E00, 0x9FFF),
+        (0xF900, 0xFAFF),
+        (0x20000, 0x2A6DF),
+        (0x2A700, 0x2B73F),
+        (0x2B740, 0x2B81F),
+        (0x2B820, 0x2CEAF),
+        (0x2CEB0, 0x2EBEF),
+        (0x2EBF0, 0x2EE5F),
+        (0x2F800, 0x2FA1F),
+        (0x30000, 0x3134F),
+        (0x31350, 0x323AF),
+    )
+)
+_HAN_ADJACENT_SPACE = re.compile(f"(?<=[{_HAN}]) | (?=[{_HAN}])")
+
+
+def _mandarin_cer(reference: str, hypothesis: str) -> float:
+    """Character error rate that ignores whitespace next to Han characters.
+
+    Text is lowercased and Whisper-normalized first; spaces between Latin
+    words remain characters.
+    """
+    ref, hyp = _cer_text(reference), _cer_text(hypothesis)
+    if not ref:
+        raise ValueError("Mandarin CER requires a nonempty normalized reference")
+    return _edit_distance(list(ref), list(hyp)) / len(ref)
+
+
+def _cer_text(text: str) -> str:
+    text = re.sub(r"\s+", " ", _english_normalizer()(text.lower())).strip()
+    return _HAN_ADJACENT_SPACE.sub("", text)
+
+
+@functools.cache
+def _english_normalizer():
+    # Installed only in the policy environment, which runs the ASR reward.
+    from whisper_normalizer.english import EnglishTextNormalizer
+
+    return EnglishTextNormalizer()
