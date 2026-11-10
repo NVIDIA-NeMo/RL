@@ -144,7 +144,7 @@ def exercise(directory: Path) -> dict[str, Any]:
         put(["a", "b", "c"], [1, 2, 3])
         path = directory / "committed"
         captured = capture_simple_checkpoint(
-            path, num_storage_units=2, metadata={"step": 7}
+            path, num_storage_units=2, timeout_s=60.0, metadata={"step": 7}
         )
         assert not (path / "controller_state.pkl").exists()
         gate = directory / "gate"
@@ -173,7 +173,9 @@ def exercise(directory: Path) -> dict[str, Any]:
 
         # A partial persistence failure must not publish the completion marker.
         partial = directory / "failed-persistence"
-        failed = capture_simple_checkpoint(partial, num_storage_units=2, metadata=None)
+        failed = capture_simple_checkpoint(
+            partial, num_storage_units=2, timeout_s=60.0, metadata=None
+        )
         (partial / "controller_state.pkl").touch()
         try:
             try:
@@ -188,10 +190,38 @@ def exercise(directory: Path) -> dict[str, Any]:
         assert ray.get(controller.test_retained.remote()) == 0
         assert checkpoint_hashes(path) == committed_hashes
 
+        timed_path = directory / "timed-out-persistence"
+        timed = capture_simple_checkpoint(
+            timed_path, num_storage_units=2, metadata=None, timeout_s=0.1
+        )
+        timed_gate = directory / "timeout-gate"
+        timed_gate.mkdir()
+        ray.get(controller.test_configure.remote(str(timed_gate)))
+        try:
+            for operation in (timed.persist, timed.release):
+                try:
+                    operation()
+                except TimeoutError:
+                    pass
+                else:
+                    raise AssertionError("Expected an RPC wait timeout")
+            wait_for_file(timed_gate / "entered")
+            assert not (timed_path / "metadata.json").exists()
+        finally:
+            (timed_gate / "release").touch()
+            ray.get(timed._persist_refs, timeout=30)
+            timed.timeout_s = 60.0
+            timed.release()
+        assert not (timed_path / "metadata.json").exists()
+        assert ray.get(controller.test_retained.remote()) == 0
+        ray.get(controller.test_configure.remote(None))
+
         ray.get(controller.test_configure.remote(None, True))
         failed_path = directory / "failed-capture"
         try:
-            capture_simple_checkpoint(failed_path, num_storage_units=2, metadata=None)
+            capture_simple_checkpoint(
+                failed_path, num_storage_units=2, timeout_s=60.0, metadata=None
+            )
         except ray.exceptions.RayTaskError as error:
             assert "injected controller capture failure" in str(error)
         else:
@@ -226,6 +256,8 @@ def exercise(directory: Path) -> dict[str, Any]:
             "fresh_storage_restore": True,
             "capture_failure_checked": True,
             "persistence_failure_checked": True,
+            "persist_and_release_timeout_checked": True,
+            "release_retry_after_late_rpc_checked": True,
             "ray": ray.__version__,
             "torch": torch.__version__,
             "tq": tq.__version__,

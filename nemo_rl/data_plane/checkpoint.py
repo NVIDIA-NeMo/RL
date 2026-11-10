@@ -21,7 +21,8 @@ may run after that barrier opens. Publication remains the caller's responsibilit
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Callable, TypeVar
+from types import TracebackType
+from typing import Any, Callable, Self, TypeVar
 
 from nemo_rl.data_plane.async_utils import call_data_plane
 
@@ -32,13 +33,24 @@ T = TypeVar("T")
 class CheckpointCapture(ABC):
     """One retained snapshot; callers must release it even after failed saves."""
 
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        self.release()
+
     @abstractmethod
     def persist(self) -> None:
         """Write the captured view, without reading mutable live state."""
 
     @abstractmethod
     def release(self) -> None:
-        """Idempotently release retained values after all writers have stopped."""
+        """Release after writers stop; retry release if its wait times out."""
 
 
 async def _settle(task: asyncio.Task[T]) -> T:
@@ -54,8 +66,8 @@ async def _settle(task: asyncio.Task[T]) -> T:
 async def checkpoint_io(operation: Callable[[], T]) -> T:
     """Run blocking snapshot I/O; cancellation waits for outstanding writes.
 
-    The caller may safely remove its temporary directory after this raises:
-    the worker thread will never recreate it or keep writing to it.
+    Cancellation settles the local callable. A backend timeout can leave remote
+    RPCs running; release must succeed before removing its temporary directory.
     """
     task = asyncio.create_task(asyncio.to_thread(operation))
     try:

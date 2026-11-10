@@ -746,6 +746,7 @@ For the no-data-plane path use the legacy `nemo_rl.algorithms.grpo.grpo_train`; 
 | Key | Default | Behavior |
 |---|---|---|
 | `data_plane.simple.async_checkpoint` | `false` | Enable the optional stable-view capture API for in-memory SimpleStorage. |
+| `data_plane.simple.checkpoint_io_timeout_s` | `600.0` | Positive, finite RPC wait budget per retained-view persist/release operation. Does not interrupt filesystem calls. |
 
 `DataPlaneClient.capture_checkpoint` returns a temporary handle or `None` when
 the adapter requests synchronous fallback. The caller must hold a global mutation
@@ -772,6 +773,27 @@ after the caller resumes traffic; neither serializes live controller state or
 returns checkpoint payloads through Ray. The controller bytes remain resident
 until the capture handle is released. File creation is exclusive, and the
 completion marker is written only after all persistence RPCs succeed.
+
+Use the capture as a context manager, or always call `release()` in `finally`.
+`persist()` is single-attempt, including after a partial failure. Reusing the
+handle raises a clear error; release it, discard the failed directory, and
+capture again. Exclusive file creation remains an overwrite guard.
+
+```python
+capture = client.capture_checkpoint(checkpoint_dir, metadata=metadata)
+if capture is not None:
+    with capture:
+        capture.persist()
+```
+
+A timeout raises `TimeoutError` but does not cancel remote RPCs. The handle
+retains their references, and `release()` waits for all persistence RPCs to
+settle before releasing any view. If release also times out, keep the handle
+and retry release, or terminate the job; do not delete/reuse the temporary
+directory or start another capture until release succeeds. Views have no lease
+expiry. The caller must wait for snapshot N's persistence and release before
+taking snapshot N+1's mutation barrier; the one-view error is an invariant,
+not scheduling flow control.
 
 CPU-only real Ray/ZMQ validation, including concurrent PUT/CLEAR requests,
 failure cleanup and restore into fresh actors:

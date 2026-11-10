@@ -18,6 +18,7 @@ import copy
 import json
 import pickle
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -420,13 +421,22 @@ def _remote_unit(unit):
     )
 
 
+def _fake_get(ref, timeout=None):
+    try:
+        return ref.result(timeout)
+    except TimeoutError:
+        if ref.done():
+            raise
+        raise snapshot.ray.exceptions.GetTimeoutError("RPC is not ready") from None
+
+
 @pytest.fixture
 def fake_cluster(monkeypatch):
     units = [_Storage(), _Storage()]
     units[1].storage_unit_id = "unit-1"
     actors = [_remote_unit(unit) for unit in units]
     controller = _Controller()
-    monkeypatch.setattr(snapshot.ray, "get", lambda ref: ref.result())
+    monkeypatch.setattr(snapshot.ray, "get", _fake_get)
     monkeypatch.setattr(
         snapshot.ray,
         "get_actor",
@@ -457,7 +467,7 @@ def test_distributed_capture_native_layout_and_metadata_detachment(
     metadata = {"step": 5, "nested": {"keys": [1]}}
     path = tmp_path / "data_plane"
     captured = snapshot.capture_simple_checkpoint(
-        path, num_storage_units=2, metadata=metadata
+        path, num_storage_units=2, timeout_s=5.0, metadata=metadata
     )
     assert not (path / "metadata.json").exists()
     assert not (path / "controller_state.pkl").exists()
@@ -492,7 +502,7 @@ def test_partial_capture_failure_releases_every_unit(fake_cluster, tmp_path):
     units[0].nrl_capture_snapshot("prior")
     with pytest.raises(RuntimeError, match="Only one"):
         snapshot.capture_simple_checkpoint(
-            tmp_path / "state", num_storage_units=2, metadata=None
+            tmp_path / "state", num_storage_units=2, timeout_s=5.0, metadata=None
         )
     assert set(units[0]._snapshot_views) == {"prior"}
     assert not units[1]._snapshot_views
@@ -510,7 +520,7 @@ def test_controller_serialization_failure_does_not_retain_partial_view(
     monkeypatch.setattr(controller_snapshot.pickle, "dumps", fail)
     with pytest.raises(ValueError, match="invalid metadata"):
         snapshot.capture_simple_checkpoint(
-            tmp_path / "state", num_storage_units=2, metadata=None
+            tmp_path / "state", num_storage_units=2, timeout_s=5.0, metadata=None
         )
     assert not client.controller._controller_snapshot_views
     assert all(not unit._snapshot_views for unit in units)
@@ -521,7 +531,7 @@ def test_controller_release_submission_failure_still_releases_shards(
 ):
     units, _ = fake_cluster
     captured = snapshot.capture_simple_checkpoint(
-        tmp_path / "state", num_storage_units=2, metadata=None
+        tmp_path / "state", num_storage_units=2, timeout_s=5.0, metadata=None
     )
 
     def fail(*args):
@@ -541,7 +551,7 @@ def test_controller_write_failure_settles_shards_and_has_no_completion_marker(
 ):
     units, client = fake_cluster
     captured = snapshot.capture_simple_checkpoint(
-        tmp_path / "state", num_storage_units=2, metadata=None
+        tmp_path / "state", num_storage_units=2, timeout_s=5.0, metadata=None
     )
 
     def fail(*args):
@@ -561,7 +571,7 @@ def test_controller_write_failure_settles_shards_and_has_no_completion_marker(
 def test_persist_failure_has_no_completion_marker(fake_cluster, monkeypatch, tmp_path):
     units, _ = fake_cluster
     captured = snapshot.capture_simple_checkpoint(
-        tmp_path / "state", num_storage_units=2, metadata=None
+        tmp_path / "state", num_storage_units=2, timeout_s=5.0, metadata=None
     )
 
     def fail(*args):
@@ -576,12 +586,134 @@ def test_persist_failure_has_no_completion_marker(fake_cluster, monkeypatch, tmp
     assert all(not unit._snapshot_views for unit in units)
 
 
+@pytest.mark.parametrize("fail_write", [False, True])
+def test_persist_is_single_attempt_even_after_failure(
+    fake_cluster, monkeypatch, tmp_path, fail_write
+):
+    units, _ = fake_cluster
+    captured = snapshot.capture_simple_checkpoint(
+        tmp_path / "state", num_storage_units=2, metadata=None, timeout_s=5.0
+    )
+    if fail_write:
+
+        def fail(*args):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(units[0], "nrl_persist_snapshot", fail)
+        captured.units = [_remote_unit(units[1]), _remote_unit(units[0])]
+        with pytest.raises(OSError, match="disk full"):
+            captured.persist()
+    else:
+        captured.persist()
+    with pytest.raises(RuntimeError, match="single-attempt"):
+        captured.persist()
+    captured.release()
+    captured.release()
+    with pytest.raises(RuntimeError, match="released"):
+        captured.persist()
+
+
+def test_persist_and_release_timeouts_retain_inflight_views(fake_cluster, tmp_path):
+    units, client = fake_cluster
+    captured = snapshot.capture_simple_checkpoint(
+        tmp_path / "state", num_storage_units=2, metadata=None, timeout_s=0.03
+    )
+    entered, finish = threading.Event(), threading.Event()
+
+    def slow_write(*args):
+        entered.set()
+        assert finish.wait(5)
+        return units[1].nrl_persist_snapshot(*args)
+
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        captured.units[0].nrl_persist_snapshot = SimpleNamespace(
+            remote=lambda *args: pool.submit(slow_write, *args)
+        )
+        started = time.monotonic()
+        try:
+            with pytest.raises(TimeoutError, match="RPC wait timed out"):
+                captured.persist()
+            assert entered.is_set()
+            with pytest.raises(TimeoutError, match="RPC wait timed out"):
+                captured.release()
+            assert time.monotonic() - started < 2
+            assert all(unit._snapshot_views for unit in units)
+            assert client.controller._controller_snapshot_views
+            assert not (captured.checkpoint_dir / "metadata.json").exists()
+            with pytest.raises(RuntimeError, match="single-attempt"):
+                captured.persist()
+        finally:
+            finish.set()
+    assert not (captured.checkpoint_dir / "metadata.json").exists()
+    captured.release()
+    assert not client.controller._controller_snapshot_views
+    assert all(not unit._snapshot_views for unit in units)
+
+
+def test_release_ack_timeout_can_be_retried(fake_cluster, tmp_path):
+    units, _ = fake_cluster
+    captured = snapshot.capture_simple_checkpoint(
+        tmp_path / "state", num_storage_units=2, metadata=None, timeout_s=0.02
+    )
+    original = captured.units[0].nrl_release_snapshot
+    pending = concurrent.futures.Future()
+    captured.units[0].nrl_release_snapshot = SimpleNamespace(
+        remote=lambda token: pending
+    )
+    with pytest.raises(TimeoutError, match="RPC wait timed out"):
+        captured.release()
+    assert units[1]._snapshot_views
+    assert not units[0]._snapshot_views
+    captured.units[0].nrl_release_snapshot = original
+    captured.release()
+    assert all(not unit._snapshot_views for unit in units)
+
+
+def test_finished_remote_timeout_error_does_not_prevent_release(fake_cluster, tmp_path):
+    units, client = fake_cluster
+    captured = snapshot.capture_simple_checkpoint(
+        tmp_path / "state", num_storage_units=2, metadata=None, timeout_s=5.0
+    )
+
+    def fail(*args):
+        raise TimeoutError("filesystem operation failed")
+
+    captured.units[0].nrl_persist_snapshot = _RemoteMethod(fail)
+    with pytest.raises(TimeoutError, match="filesystem operation failed"):
+        captured.persist()
+    captured.release()
+    assert not client.controller._controller_snapshot_views
+    assert all(not unit._snapshot_views for unit in units)
+
+
+def test_wait_deadline_covers_all_refs_and_takes_priority_over_write_error(monkeypatch):
+    failed, waiting, completed = (
+        concurrent.futures.Future(),
+        concurrent.futures.Future(),
+        concurrent.futures.Future(),
+    )
+    failed.set_exception(OSError("failed write"))
+    completed.set_result(42)
+    seen = []
+
+    def get(ref, *, timeout):
+        seen.append(ref)
+        return _fake_get(ref, timeout)
+
+    monkeypatch.setattr(snapshot.ray, "get", get)
+    with pytest.raises(TimeoutError, match="remote writes may still be running"):
+        snapshot._wait_all([failed, waiting, completed], timeout_s=0.01)
+    assert seen == [failed, waiting, completed]
+
+
 def test_existing_checkpoint_is_not_overwritten(fake_cluster, tmp_path):
     path = tmp_path / "state"
     path.mkdir()
     (path / "marker").write_text("durable")
     with pytest.raises(FileExistsError):
-        snapshot.capture_simple_checkpoint(path, num_storage_units=2, metadata=None)
+        snapshot.capture_simple_checkpoint(
+            path, num_storage_units=2, timeout_s=5.0, metadata=None
+        )
     assert (path / "marker").read_text() == "durable"
 
 
@@ -604,7 +736,7 @@ def test_wait_all_settles_later_writes_after_early_failure(monkeypatch):
 def test_release_attempts_all_units_after_submission_failure(fake_cluster, tmp_path):
     units, _ = fake_cluster
     captured = snapshot.capture_simple_checkpoint(
-        tmp_path / "state", num_storage_units=2, metadata=None
+        tmp_path / "state", num_storage_units=2, timeout_s=5.0, metadata=None
     )
 
     def fail_submit(*args):

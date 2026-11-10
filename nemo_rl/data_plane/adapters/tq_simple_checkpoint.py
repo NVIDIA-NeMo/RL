@@ -28,13 +28,15 @@ updating TQ; this module must not silently run against another implementation.
 from __future__ import annotations
 
 import copy
+import contextlib
 import json
 import logging
 import pickle
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from collections.abc import Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -52,17 +54,34 @@ from nemo_rl.data_plane.checkpoint import CheckpointCapture
 LOGGER = logging.getLogger(__name__)
 
 
-def _wait_all(refs: list[Any]) -> list[Any]:
-    """Settle every RPC even if one fails, before a caller releases its views."""
+def _wait_all(
+    refs: list[Any], *, timeout_s: float | None = None, raise_errors: bool = True
+) -> list[Any]:
+    """Observe every RPC within one budget; timeout never cancels remote work."""
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
     results = []
     first_error: Exception | None = None
+    first_timeout: Exception | None = None
     for ref in refs:
         try:
-            results.append(ray.get(ref))
+            if deadline is None:
+                results.append(ray.get(ref))
+            else:
+                results.append(
+                    ray.get(ref, timeout=max(0.0, deadline - time.monotonic()))
+                )
+        except ray.exceptions.GetTimeoutError as error:
+            if first_timeout is None:
+                first_timeout = error
         except Exception as error:
             if first_error is None:
                 first_error = error
-    if first_error is not None:
+    if first_timeout is not None:
+        raise TimeoutError(
+            "TQ checkpoint RPC wait timed out; remote writes may still be running. "
+            "Retry release() before deleting the checkpoint directory or capturing again."
+        ) from first_timeout
+    if first_error is not None and raise_errors:
         raise first_error
     return results
 
@@ -165,57 +184,97 @@ class SimpleCheckpointCapture(CheckpointCapture):
     units: list[Any]
     storage_info: list[dict[str, Any]]
     metadata: dict[str, Any]
+    timeout_s: float
+    _persist_started: bool = field(default=False, init=False, repr=False)
+    _released: bool = field(default=False, init=False, repr=False)
+    _persist_refs: list[Any] = field(default_factory=list, init=False, repr=False)
+    _operation_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+
+    @contextlib.contextmanager
+    def _operation(self) -> Iterator[float]:
+        deadline = time.monotonic() + self.timeout_s
+        if not self._operation_lock.acquire(timeout=self.timeout_s):
+            raise TimeoutError(
+                "A checkpoint persist/release operation is still running"
+            )
+        try:
+            yield deadline
+        finally:
+            self._operation_lock.release()
 
     def persist(self) -> None:
-        refs = []
-        try:
-            refs.append(
-                self.controller.nrl_persist_snapshot.remote(
-                    self.token, str(self.checkpoint_dir / "controller_state.pkl")
+        with self._operation() as deadline:
+            if self._released:
+                raise RuntimeError("Cannot persist a released checkpoint capture")
+            if self._persist_started:
+                raise RuntimeError(
+                    "persist() is single-attempt: release the capture, discard the "
+                    "checkpoint directory and capture again"
+                )
+            self._persist_started = True
+            refs = self._persist_refs
+            try:
+                refs.append(
+                    self.controller.nrl_persist_snapshot.remote(
+                        self.token, str(self.checkpoint_dir / "controller_state.pkl")
+                    )
+                )
+                for unit, info in zip(self.units, self.storage_info, strict=True):
+                    path = (
+                        self.checkpoint_dir
+                        / "simple_storage"
+                        / (f"su_{info['position']}_{info['storage_unit_id']}.pkl")
+                    )
+                    refs.append(unit.nrl_persist_snapshot.remote(self.token, str(path)))
+            finally:
+                # Partial submission still leaves owned writes to settle or release.
+                sizes = _wait_all(refs, timeout_s=max(0.0, deadline - time.monotonic()))
+            (
+                self.checkpoint_dir / "simple_storage" / "storage_unit_info.json"
+            ).write_text(json.dumps(self.storage_info, indent=2))
+            # Publication markers must never outlive an unfinished shard write.
+            (self.checkpoint_dir / "metadata.json").write_text(
+                json.dumps(
+                    {"storage_saved": True, "user_metadata": self.metadata}, indent=2
                 )
             )
-            for unit, info in zip(self.units, self.storage_info, strict=True):
-                path = (
-                    self.checkpoint_dir
-                    / "simple_storage"
-                    / (f"su_{info['position']}_{info['storage_unit_id']}.pkl")
-                )
-                refs.append(unit.nrl_persist_snapshot.remote(self.token, str(path)))
-        finally:
-            # Even a submission failure must settle writes already submitted.
-            sizes = _wait_all(refs)
-        (self.checkpoint_dir / "simple_storage" / "storage_unit_info.json").write_text(
-            json.dumps(self.storage_info, indent=2)
-        )
-        # Completion marker is always last. The outer rollout snapshot directory
-        # remains unpublished until sidecars and the manifest are durable too.
-        (self.checkpoint_dir / "metadata.json").write_text(
-            json.dumps(
-                {"storage_saved": True, "user_metadata": self.metadata}, indent=2
+            LOGGER.info(
+                "simple_snapshot persisted total_bytes=%d controller_bytes=%d",
+                sum(sizes),
+                sizes[0],
             )
-        )
-        LOGGER.info(
-            "simple_snapshot persisted total_bytes=%d controller_bytes=%d",
-            sum(sizes),
-            sizes[0],
-        )
 
     def release(self) -> None:
-        refs = []
-        first_error: Exception | None = None
-        for unit in [self.controller, *self.units]:
+        with self._operation() as deadline:
+            if self._released:
+                return
+            # Completed write failures were reported by persist; views can retire.
+            # A wait expiry is different: those RPCs must finish before release.
+            _wait_all(
+                self._persist_refs,
+                timeout_s=max(0.0, deadline - time.monotonic()),
+                raise_errors=False,
+            )
+            refs = []
+            first_error: Exception | None = None
+            for unit in [self.controller, *self.units]:
+                try:
+                    refs.append(unit.nrl_release_snapshot.remote(self.token))
+                except Exception as error:
+                    if first_error is None:
+                        first_error = error
             try:
-                refs.append(unit.nrl_release_snapshot.remote(self.token))
+                _wait_all(refs, timeout_s=max(0.0, deadline - time.monotonic()))
             except Exception as error:
                 if first_error is None:
                     first_error = error
-        try:
-            _wait_all(refs)
-        except Exception as error:
             if first_error is None:
-                first_error = error
-        if first_error is not None:
-            raise first_error
+                self._released = True
+                self._persist_refs.clear()
+            else:
+                raise first_error
 
 
 def capture_simple_checkpoint(
@@ -223,6 +282,7 @@ def capture_simple_checkpoint(
     *,
     num_storage_units: int,
     metadata: dict[str, Any] | None,
+    timeout_s: float,
 ) -> SimpleCheckpointCapture:
     """Detach controller and retain shards while the mutation cut is held.
 
@@ -253,6 +313,7 @@ def capture_simple_checkpoint(
         units=units,
         storage_info=[],
         metadata=captured_metadata,
+        timeout_s=timeout_s,
     )
     setup_finished = time.monotonic()
     try:
