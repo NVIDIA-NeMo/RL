@@ -54,7 +54,7 @@ from tensordict import TensorDict
 
 from nemo_rl.data_plane.adapters import mooncake_ssd_offload
 from nemo_rl.data_plane.adapters.tq_controller_patch import configure_controller_patch
-from nemo_rl.data_plane.adapters.transfer_queue_env import rail_link_layers
+from nemo_rl.data_plane.adapters.transfer_queue_env import rdma_rails
 from nemo_rl.data_plane.codec import timed_codec
 from nemo_rl.data_plane.interfaces import (
     DataPlaneClient,
@@ -115,7 +115,8 @@ def rdma_devices() -> str:
     fabric where each rail is its own subnet, a cross-rail draw has no route and
     dies with "transport retry counter exceeded".
 
-    IB and RoCE are never mixed; InfiniBand is preferred when present.
+    Device choice is ``transfer_queue_env.rdma_rails``: IB over RoCE, never
+    mixed, and without the management interface's RDMA function.
 
     Also the skip predicate for the mooncake tests — ``mooncake_cpu`` is
     RDMA-only, so they cannot run without a device.
@@ -129,11 +130,8 @@ def rdma_devices() -> str:
     # well after setup has begun — so treat a missing verbs node as no device.
     if not glob.glob("/dev/infiniband/uverbs*"):
         return ""
-    layers = rail_link_layers()
-    ib = [n for n, layer in layers.items() if layer == "InfiniBand"]
-    roce = [n for n, layer in layers.items() if layer == "Ethernet"]
     # No space after the comma: mooncake splits on "," only.
-    return ",".join(ib or roce)
+    return ",".join(rdma_rails())
 
 
 def _mooncake_transport_config() -> dict:

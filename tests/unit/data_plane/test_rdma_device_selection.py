@@ -40,7 +40,10 @@ def fake_fabric(monkeypatch):
         *,
         uverbs: bool = True,
         inactive: frozenset[str] = frozenset(),
+        mgmt: str = "",
+        netdevs: dict[str, set[str]] | None = None,
     ):
+        netdevs = netdevs or {}
         def fake_glob(pattern: str):
             if pattern.startswith("/dev/infiniband/uverbs"):
                 return ["/dev/infiniband/uverbs0"] if uverbs else []
@@ -55,6 +58,12 @@ def fake_fabric(monkeypatch):
 
         monkeypatch.setattr(tq_env.glob, "glob", fake_glob)
         monkeypatch.setattr(tq_env.Path, "read_text", fake_read_text)
+        # Each device's netdev is its own name unless the test says otherwise;
+        # the default route sits on `mgmt` (no management RDMA port by default).
+        monkeypatch.setattr(tq_env, "_default_route_netdev", lambda: mgmt)
+        monkeypatch.setattr(
+            tq_env, "_netdevs_of", lambda dev: netdevs.get(dev, {dev})
+        )
         monkeypatch.setattr(os, "environ", dict(os.environ))
         monkeypatch.delenv("MC_MOONCAKE_DEVICE", raising=False)
 
@@ -129,6 +138,31 @@ def test_every_roce_rail_is_offered(fake_fabric):
         }
     )
     assert tq_adapter.rdma_devices() == "mlx5_0,mlx5_1,mlx5_2,mlx5_3"
+
+
+# The real GB300 inventory: mlx5_8 is the RoCE function of eth0, the
+# management interface with the default route; the fabric is rdma_vf_rail*.
+_GB300 = {
+    "mlx5_8": "Ethernet",
+    "rdma_vf_rail0": "Ethernet",
+    "rdma_vf_rail1": "Ethernet",
+    "rdma_vf_rail2": "Ethernet",
+    "rdma_vf_rail3": "Ethernet",
+}
+_GB300_NET = {"mlx5_8": {"eth0"}}
+
+
+def test_management_port_is_left_out_on_gb300(fake_fabric):
+    fake_fabric(_GB300, mgmt="eth0", netdevs=_GB300_NET)
+    assert (
+        tq_adapter.rdma_devices()
+        == "rdma_vf_rail0,rdma_vf_rail1,rdma_vf_rail2,rdma_vf_rail3"
+    )
+
+
+def test_management_port_is_kept_when_it_is_the_only_rdma_device(fake_fabric):
+    fake_fabric({"mlx5_8": "Ethernet"}, mgmt="eth0", netdevs=_GB300_NET)
+    assert tq_adapter.rdma_devices() == "mlx5_8"
 
 
 def test_empty_without_verbs_node(fake_fabric):
@@ -260,6 +294,39 @@ def test_nixl_drops_eth0_from_a_cluster_ucx_net_devices(clean_env, monkeypatch):
     tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
     assert os.environ["UCX_TLS"] == "rc,cuda_copy,cuda_ipc,self,sm"
     assert os.environ["UCX_NET_DEVICES"] == "mlx5_0:1,mlx5_1:1"
+
+
+def test_nixl_names_the_rails_when_ucx_net_devices_is_only_netdevs(
+    clean_env, fake_fabric, monkeypatch
+):
+    """The GB300 job env is UCX_TLS=tcp + UCX_NET_DEVICES=eth0, with no rail named.
+
+    The value must be set to the host's RDMA rails, not deleted: init_ray()
+    copies os.environ into the Ray runtime_env, and a deleted key never reaches
+    the workers, which then keep eth0 and refuse to start.
+    """
+    fake_fabric(_GB300, mgmt="eth0", netdevs=_GB300_NET)
+    monkeypatch.setenv("UCX_TLS", "tcp")
+    monkeypatch.setenv("UCX_NET_DEVICES", "eth0")
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_TLS"] == "rc,cuda_copy,cuda_ipc,self,sm"
+    assert (
+        os.environ["UCX_NET_DEVICES"]
+        == "rdma_vf_rail0:1,rdma_vf_rail1:1,rdma_vf_rail2:1,rdma_vf_rail3:1"
+    )
+
+
+def test_nixl_refuses_netdevs_only_on_a_host_without_rails(
+    clean_env, fake_fabric, monkeypatch
+):
+    """No rail to name: fail at launch instead of leaving eth0 or 'all'."""
+    from nemo_rl.data_plane.nixl.errors import TransportPolicyError
+
+    fake_fabric({})
+    monkeypatch.setenv("UCX_TLS", "tcp")
+    monkeypatch.setenv("UCX_NET_DEVICES", "eth0")
+    with pytest.raises(TransportPolicyError, match="no active RDMA rail"):
+        tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
 
 
 @pytest.mark.parametrize(

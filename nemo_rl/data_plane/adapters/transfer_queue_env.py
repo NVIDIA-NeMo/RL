@@ -77,6 +77,44 @@ def rail_link_layers() -> dict[str, str]:
     return layers
 
 
+def _netdevs_of(device: str) -> set[str]:
+    """Network interfaces that share an RDMA device (sysfs ``device/net``)."""
+    try:
+        return set(os.listdir(f"/sys/class/infiniband/{device}/device/net"))
+    except OSError:
+        return set()
+
+
+def _default_route_netdev() -> str:
+    """The interface that carries the IPv4 default route, or ``""``."""
+    try:
+        for line in Path("/proc/net/route").read_text().splitlines()[1:]:
+            fields = line.split()
+            if len(fields) > 1 and fields[1] == "00000000":
+                return fields[0]
+    except OSError:
+        pass
+    return ""
+
+
+def rdma_rails() -> list[str]:
+    """This host's RDMA rails for the data plane, in sysfs order.
+
+    The one device finder for every backend. InfiniBand is preferred and never
+    mixed with RoCE. The RDMA function of the management interface (the one
+    with the default route; ``eth0`` on GB300, where it is ``mlx5_8``) is left
+    out: it is the cluster's TCP network, not a fabric rail. If it is the only
+    RDMA device it is kept, since RDMA over it still beats no RDMA.
+    """
+    layers = rail_link_layers()
+    ib = [n for n, layer in layers.items() if layer == "InfiniBand"]
+    roce = [n for n, layer in layers.items() if layer == "Ethernet"]
+    rails = ib or roce
+    mgmt = _default_route_netdev()
+    fabric = [n for n in rails if mgmt not in _netdevs_of(n)] if mgmt else rails
+    return fabric or rails
+
+
 def fabric_is_roce_only() -> bool:
     """True when the host has RoCE rails and no InfiniBand.
 
@@ -115,9 +153,10 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
     ``cuda_ipc`` to move GPU memory. Neither carries the data plane's CPU
     bytes off the node, so its cross-node traffic stays on ``rc``. RDMA is
     required, with no opt-out: an unset or non-RDMA ``UCX_TLS`` becomes that
-    list and netdevs such as ``eth0`` are dropped from ``UCX_NET_DEVICES``, so
-    a launcher never has to set them (some clusters inject ``UCX_TLS=tcp`` and
-    an ``eth0`` into every job). Replacing a set value logs a warning.
+    list and netdevs such as ``eth0`` are dropped from ``UCX_NET_DEVICES``
+    (when only netdevs were named, it becomes this host's ``rdma_rails()``),
+    so a launcher never has to set them (some clusters inject ``UCX_TLS=tcp``
+    and an ``eth0`` into every job). Replacing a set value logs a warning.
     ``mooncake_cpu``: the MC_* knobs
     below. ``simple`` has no engine.
     MC_* values already present in the environment are left alone, so a launcher can
@@ -152,11 +191,19 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
             log.warning(
                 "Dropping network interfaces from UCX_NET_DEVICES=%s", ",".join(devs)
             )
-            rdma_devs = [d for d in devs if ":" in d]
-            if rdma_devs:
-                os.environ["UCX_NET_DEVICES"] = ",".join(rdma_devs)
-            else:
-                del os.environ["UCX_NET_DEVICES"]
+            named = [d for d in devs if ":" in d]  # RDMA devices the job named
+            rails = [f"{dev}:1" for dev in rdma_rails()]  # this host's rails
+            rdma_devs = named or rails  # GB300 jobs name only eth0: use the rails
+            if not rdma_devs:
+                raise TransportPolicyError(
+                    f"UCX_NET_DEVICES={','.join(devs)} names no RDMA device and "
+                    "this host has no active RDMA rail; the NIXL data plane is "
+                    "RDMA-only."
+                )
+            # Set, never delete: init_ray() copies os.environ into the Ray
+            # runtime_env, and a deleted key is not in that copy, so workers
+            # would keep the node's value (eth0) and refuse to start.
+            os.environ["UCX_NET_DEVICES"] = ",".join(rdma_devs)
         check_rdma_only()  # asserts the swap above left UCX RDMA-only
         return
     if cfg["backend"] != "mooncake_cpu":
