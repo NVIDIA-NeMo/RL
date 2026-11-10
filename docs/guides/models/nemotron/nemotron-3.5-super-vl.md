@@ -166,7 +166,9 @@ optimizer, token/image/logprob and data-cursor evidence before accepting recover
 
 The recipe uses learner TP1/CP1 without packing or sequence parallelism, keeps
 the model's image processor and raw vLLM logprobs, and masks invalid Gym
-measurements. Existing NeMo RL model support is reused; the trainer, optimizer
+measurements. `policy.is_vlm: true` selects processor loading in the training
+entrypoint, including for mixed batches that also contain text-only tasks.
+Existing NeMo RL model support is reused; the trainer, optimizer
 and GRPO loss are unchanged. The compatible Gym runtime described above must
 still be provisioned and validated.
 Renderer/judge failures are excluded; measured model execution failures remain
