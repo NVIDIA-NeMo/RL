@@ -68,6 +68,39 @@ setting at configuration time rather than ignoring it).
 
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
+### Multiple vLLM HTTP frontends
+
+Set `policy.generation.vllm_cfg.http_api_server_count` to run several HTTP frontend processes for each model-owner worker. They share one vLLM engine, its model weights, and one listening socket, so NeMo Gym keeps using the same URL. The count includes the owning worker's frontend: a value of `8` starts seven additional frontend processes.
+
+| Configuration key | Default | Purpose |
+|---|---|---|
+| `policy.generation.vllm_cfg.http_api_server_count` | `1` | Positive integer specifying the number of frontend processes per shared engine. |
+
+```yaml
+policy:
+  generation:
+    backend: vllm
+    vllm_cfg:
+      async_engine: true
+      expose_http_server: true
+      http_api_server_count: 8
+
+async_rl:
+  generation_fleet_health:
+    enabled: false
+```
+
+Counts greater than one require:
+
+- Async HTTP serving: both `async_engine` and `expose_http_server` must be `true`.
+- Local vLLM internal data parallelism of size one, without the Ray data-parallel backend, and colocated frontend-to-engine IPC connections. Tensor parallelism and multiple NeMo RL generation replicas remain supported.
+- A refit transport other than `vllm_s3_sparse` or `vllm_zmq_sparse`.
+- `async_rl.generation_fleet_health.enabled: false` on the SingleController path.
+
+Use multiple frontends when CPU-side HTTP handling, chat-template rendering, or tokenization limits throughput. Additional frontends consume CPU and host memory; they share GPU inference capacity. A count of one keeps the single-frontend construction path.
+
+See the [TP2 SingleController example with token capture](../../examples/configs/recipes/llm/grpo-qwen3-0.6b-1n8g-megatron-vllm-tp2-single-controller-gym-api8.yaml).
+
 ### Dataset formats and routing
 
 NeMo RL supports two Gym dataset formats. Both enter Gym through an Environment Server:
