@@ -43,6 +43,9 @@ import transfer_queue.interface as interface
 from transfer_queue.storage.bootstrap import simple_storage_bootstrap as bootstrap
 from transfer_queue.storage.simple_storage import StorageUnitData
 
+from nemo_rl.data_plane.adapters.tq_controller_checkpoint import (
+    configure_controller_checkpoint,
+)
 from nemo_rl.data_plane.adapters.tq_controller_patch import assert_stock_tq_version
 from nemo_rl.data_plane.checkpoint import CheckpointCapture
 
@@ -138,6 +141,7 @@ class SnapshotStorageMixin:
 def configure_simple_checkpoint() -> None:
     """Patch bootstrap before tq.init; do not modify an already running actor."""
     assert_stock_tq_version()
+    configure_controller_checkpoint()
     actor_class = bootstrap.SimpleStorageUnit
     base = actor_class.__ray_metadata__.modified_class
     if issubclass(base, SnapshotStorageMixin):
@@ -157,6 +161,7 @@ class SimpleCheckpointCapture(CheckpointCapture):
 
     checkpoint_dir: Path
     token: str
+    controller: Any
     units: list[Any]
     storage_info: list[dict[str, Any]]
     metadata: dict[str, Any]
@@ -164,6 +169,11 @@ class SimpleCheckpointCapture(CheckpointCapture):
     def persist(self) -> None:
         refs = []
         try:
+            refs.append(
+                self.controller.nrl_persist_snapshot.remote(
+                    self.token, str(self.checkpoint_dir / "controller_state.pkl")
+                )
+            )
             for unit, info in zip(self.units, self.storage_info, strict=True):
                 path = (
                     self.checkpoint_dir
@@ -184,12 +194,16 @@ class SimpleCheckpointCapture(CheckpointCapture):
                 {"storage_saved": True, "user_metadata": self.metadata}, indent=2
             )
         )
-        LOGGER.info("simple_snapshot persisted total_bytes=%d", sum(sizes))
+        LOGGER.info(
+            "simple_snapshot persisted total_bytes=%d controller_bytes=%d",
+            sum(sizes),
+            sizes[0],
+        )
 
     def release(self) -> None:
         refs = []
         first_error: Exception | None = None
-        for unit in self.units:
+        for unit in [self.controller, *self.units]:
             try:
                 refs.append(unit.nrl_release_snapshot.remote(self.token))
             except Exception as error:
@@ -210,11 +224,12 @@ def capture_simple_checkpoint(
     num_storage_units: int,
     metadata: dict[str, Any] | None,
 ) -> SimpleCheckpointCapture:
-    """Capture controller and shards while the caller holds its mutation cut.
+    """Detach controller and retain shards while the mutation cut is held.
 
     The native manager's ID order, not Ray actor lookup order, determines shard
     positions. Native restore maps those positions to its newly allocated IDs.
     """
+    capture_started = time.monotonic()
     assert_stock_tq_version()
     directory = Path(checkpoint_dir).resolve()
     # Fail before modifying disk or retaining data on invalid user metadata.
@@ -234,19 +249,22 @@ def capture_simple_checkpoint(
     capture = SimpleCheckpointCapture(
         checkpoint_dir=directory,
         token=uuid.uuid4().hex,
+        controller=ray.get_actor("TransferQueueController", namespace="transfer_queue"),
         units=units,
         storage_info=[],
         metadata=captured_metadata,
     )
+    setup_finished = time.monotonic()
     try:
-        # Retain controller serialization under the freeze in this first version.
-        client.save_controller_checkpoint(str(directory / "controller_state.pkl"))
+        ray.get(capture.controller.nrl_capture_snapshot.remote(capture.token))
+        controller_finished = time.monotonic()
         refs = []
         try:
             for unit in units:
                 refs.append(unit.nrl_capture_snapshot.remote(capture.token))
         finally:
             unit_ids = _wait_all(refs)
+        storage_finished = time.monotonic()
         if len(set(unit_ids)) != len(units) or set(unit_ids) != set(expected_ids):
             raise RuntimeError("Captured SimpleStorage units differ from TQ manager")
         by_id = dict(zip(unit_ids, units, strict=True))
@@ -255,6 +273,18 @@ def capture_simple_checkpoint(
             {"position": position, "storage_unit_id": unit_id}
             for position, unit_id in enumerate(expected_ids)
         ]
+        LOGGER.info(
+            "simple_snapshot capture_summary token=%s units=%d "
+            "setup_s=%.6f controller_capture_rpc_s=%.6f storage_capture_rpc_s=%.6f "
+            "validate_s=%.6f total_s=%.6f",
+            capture.token,
+            len(units),
+            setup_finished - capture_started,
+            controller_finished - setup_finished,
+            storage_finished - controller_finished,
+            time.monotonic() - storage_finished,
+            time.monotonic() - capture_started,
+        )
         return capture
     except BaseException:
         try:
