@@ -104,6 +104,42 @@ Set these keys in a YAML file, where a key such as `weather:train` needs no quot
 
 An Environment Server can report a failed episode as terminal, meaning a retry cannot succeed. The single controller does not retry such a prompt, and under the default `async_rl.rollout_failure.max_skipped_prompts: 0` the run stops. Non-terminal failures, such as an unavailable model server, are retried as infrastructure failures.
 
+### Score rollouts that reach the deadline
+
+`async_rl.rollout_failure.nemo_gym.rollout_timeout_s` is a backstop for the whole prompt group: when it fires, the group is retried or dropped and every row's work is lost. Set `agent_timeout_margin_s` to hand the deadline to the harness instead. Each dispatched row then carries the group's remaining time minus the margin as `responses_create_params.metadata.agent_timeout_sec`, the per-row budget Gym harnesses read through `resolve_agent_timeout`. The value is a string such as `"3300.000"`, because Gym validates Responses `metadata` as string-to-string. A harness that honors it stops at that budget, verifies the work it kept, and returns a scored result that trains like any other.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `async_rl.rollout_failure.nemo_gym.agent_timeout_margin_s` | `null` (off) | Seconds of `rollout_timeout_s` kept back for verification and the result's return. Requires `rollout_timeout_s`, and must be smaller than it. |
+
+```yaml
+async_rl:
+  rollout_failure:
+    nemo_gym:
+      rollout_timeout_s: 3600
+      agent_timeout_margin_s: 300   # harnesses stop after at most 3300 s and are scored
+```
+
+- A smaller `agent_timeout_sec` already in the row's metadata is kept. Each dispatch is handed what is left once it is admitted, so a re-sent row gets only the time the group has left, and time spent waiting at a closed checkpoint gate is not charged to it.
+- A dispatch with no time left beyond the margin ends the group with `RolloutTimeout` instead of being re-sent within it. The prompt-group retry policy then handles it exactly like the deadline firing: it spends one `max_infra_attempts` attempt under the reason `RolloutTimeout`, and the retry starts a fresh deadline and budget.
+- The scored result follows the usual rules: a valid reward, including zero, trains. A harness that reports why it stopped names Gym's `agent_timeout` failure kind on a valid score. That is a failure the policy caused, so the row trains like any other. A verifier that sets `mask_sample` keeps the row masked when `env.should_mask_flagged_samples` is on, and a failed `/run` or `/verify` request is a row failure, not a zero reward. Only the backstop remains an infrastructure `RolloutTimeout`.
+- With token capture, only model calls that completed before the harness stopped train. A call still in flight at the budget is excluded from the trained chain.
+- Only harnesses that read `agent_timeout_sec` benefit, for example `opencode`, `claude_code`, `codex`, `hermes`, `pi`, `openclaw`, `miniswe_sandboxed` and `terminus_2_sandboxed`. Other agents run on their own limits and still meet the backstop. Rows that were handed a budget and were still running when the backstop fired are counted per agent in `rollout/agent_timeout_backstop_rows_total/<agent>`, and the first such row of each agent prints a warning naming it.
+- Setup rejects the margin with colocated generation, whose rollout clock pauses for every train step. Materialized taskset rows are rejected at dispatch, because an Environment Server takes the harness budget from its task configuration rather than from row metadata.
+
+Each prompt group reports how its rows used the budget, under the agent's metric namespace:
+
+| Metric | Meaning |
+| --- | --- |
+| `<agent>/agent_timeout/past_budget_rate` | Fraction of returned rows that came back after their handed budget, meaning the budget most likely stopped them and they were scored on partial work. |
+| `<agent>/agent_timeout/reported_rate` | Fraction of returned rows whose verify response reports the `agent_timeout` failure kind. |
+| `<agent>/agent_timeout/post_budget_s/max` | Longest time a row took to return after its budget ran out: the harness stopping, `/verify`, and the result's return. |
+| `<agent>/agent_timeout/parked_s/max` | Longest time the rollout deadline was paused, for example by a Gym checkpoint, while a row was running. |
+
+To size the margin, start with a margin above your slowest `/verify`, then raise it until `post_budget_s/max` stays well below it and `rollout/agent_timeout_backstop_rows_total` stays flat. Gym does not report verification time separately, so `post_budget_s/max` is the measurement to size against.
+
+With turn-level rollout recovery (`rollout_recovery.target_level: turn`), each Gym checkpoint pauses `rollout_timeout_s`. Every harness that reads `agent_timeout_sec` is restart-only in Gym, so it keeps its wall-clock budget running while the policy server holds its model calls. It therefore stops up to one checkpoint's duration earlier than it could, still inside the deadline and still scored. Setup warns about this combination, and `parked_s/max` reports the time lost.
+
 ### Shard NeMo Gym across nodes
 
 NeMo RL normally starts one NeMo Gym actor for a job. That actor runs every configured Gym server on one node. Use `env.nemo_gym.shards` when the combined environments need more capacity than one node can provide.

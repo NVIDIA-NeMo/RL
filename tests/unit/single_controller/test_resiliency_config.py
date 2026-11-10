@@ -657,3 +657,72 @@ class TestADropBudgetNeedsASamplerThatStamps:
             rollout_failure={"max_consecutive_dropped_prompts": 2},
         )
         validate_single_controller_config(cfg)
+
+
+class TestTheAgentTimeoutMarginIsCarvedFromTheRolloutDeadline:
+    """The margin only means something as a slice of a deadline that runs on the wall clock."""
+
+    def test_a_margin_without_a_rollout_deadline_is_rejected(self):
+        with pytest.raises(ValidationError, match="rollout_timeout_s, which is unset"):
+            RolloutFailureConfig(nemo_gym={"agent_timeout_margin_s": 60.0})
+
+    @pytest.mark.parametrize("margin_s", [600.0, 900.0])
+    def test_a_margin_that_leaves_no_time_to_run_is_rejected(self, margin_s):
+        with pytest.raises(ValidationError, match="must be < rollout_timeout_s"):
+            RolloutFailureConfig(
+                nemo_gym={
+                    "rollout_timeout_s": 600.0,
+                    "agent_timeout_margin_s": margin_s,
+                }
+            )
+
+    def test_a_margin_inside_the_deadline_is_accepted_and_off_by_default(self):
+        assert RolloutFailureConfig().nemo_gym.agent_timeout_margin_s is None
+        cfg = RolloutFailureConfig(
+            nemo_gym={"rollout_timeout_s": 600.0, "agent_timeout_margin_s": 599.0}
+        )
+        assert cfg.nemo_gym.agent_timeout_margin_s == 599.0
+
+    def test_colocated_generation_is_rejected(self):
+        """The rollout clock pauses while the engine trains; the harness's does not."""
+        cfg = _master_config(
+            rollout_failure={
+                "nemo_gym": {"rollout_timeout_s": 300.0, "agent_timeout_margin_s": 60.0}
+            }
+        )
+        cfg.policy["generation"] = {
+            "backend": "megatron",
+            "colocated": {"enabled": True},
+        }
+        with pytest.raises(ValueError, match="not supported with colocated generation"):
+            validate_single_controller_config(cfg)
+
+    def test_a_disaggregated_gym_run_accepts_it(self):
+        validate_single_controller_config(
+            _master_config(
+                rollout_failure={
+                    "nemo_gym": {
+                        "rollout_timeout_s": 300.0,
+                        "agent_timeout_margin_s": 60.0,
+                    }
+                }
+            )
+        )
+
+    def test_turn_level_recovery_warns_that_checkpoints_shorten_the_budget(self):
+        """Gym holds a restart-only harness's model calls while its budget runs."""
+        from nemo_rl.experience.rollout_recovery import RecoveryTargetLevel
+
+        cfg = _master_config(
+            rollout_failure={
+                "nemo_gym": {"rollout_timeout_s": 300.0, "agent_timeout_margin_s": 60.0}
+            },
+            stall_watchdog={"stall_timeout_s": 900.0},
+        )
+        cfg.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+        with pytest.warns(UserWarning, match="restart-only"):
+            validate_single_controller_config(cfg)
+        cfg.async_rl.rollout_failure.nemo_gym.agent_timeout_margin_s = None
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            validate_single_controller_config(cfg)

@@ -2406,6 +2406,7 @@ def setup_single_controller(
             rollout_s=master_config.async_rl.rollout_failure.nemo_gym.rollout_timeout_s,
             generation_s=master_config.async_rl.rollout_failure.native.generation_timeout_s,
             env_s=master_config.async_rl.rollout_failure.native.env_timeout_s,
+            agent_margin_s=master_config.async_rl.rollout_failure.nemo_gym.agent_timeout_margin_s,
         ),
         retry_policy=_build_retry_policy(master_config),
         forest_training=token_capture_cfg.forest_training,
