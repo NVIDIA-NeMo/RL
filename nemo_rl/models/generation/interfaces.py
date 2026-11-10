@@ -238,6 +238,16 @@ class CheckpointEngineConfig(TypedDict):
     engine_kwargs: dict[str, dict[str, Any]]
 
 
+class SamplerReplayConfig(BaseModel, extra="allow"):
+    """Sampler replay, with or without loss_fn.score_centering."""
+
+    # Renormalize the trainer's top-k/top-p log-probs over the support the sampler
+    # actually drew from (its captured top-K head) instead of recomputing the
+    # filters. Requires top_logprobs >= top_k and token capture. False: the
+    # trainer recomputes top_k/top_p on its own logits.
+    enabled: bool = False
+
+
 class GenerationConfig(TypedDict):
     """Configuration for generation."""
 
@@ -246,13 +256,17 @@ class GenerationConfig(TypedDict):
     temperature: float
     top_p: float
     top_k: int | None
+    # Sampler replay (see SamplerReplayConfig); absent means disabled.
+    sampler_replay: NotRequired[SamplerReplayConfig]
     top_logprobs: NotRequired[
         int
     ]  # Sampler candidates per token; 0 disables collection.
     # Validation-only sampling. The exemplar YAMLs default these to the train
     # values above via interpolation (${.temperature}, ...), so validation
     # samples exactly like training unless overridden. Only honored on the
-    # NeMo-Gym vLLM rollout path (guarded in grpo.setup()).
+    # NeMo-Gym vLLM and TRT-LLM rollout paths (guarded in grpo.setup()); a
+    # val_top_k override also needs val_temperature or val_top_p to differ, since
+    # the server tells validation requests apart by those two.
     val_temperature: float
     val_top_p: float
     val_top_k: int | None
@@ -282,6 +296,15 @@ class GenerationConfig(TypedDict):
     # The layout, in the terms every backend shares. How a backend *implements*
     # disaggregation goes in that backend's own block.
     disaggregation: NotRequired[DisaggConfig]
+
+
+def sampler_replay_enabled(config: GenerationConfig) -> bool:
+    """Whether ``policy.generation.sampler_replay.enabled`` is set; absent means off.
+
+    The block is a dict until MasterConfig validates it into a SamplerReplayConfig.
+    """
+    replay = config.get("sampler_replay")
+    return replay is not None and SamplerReplayConfig.model_validate(replay).enabled
 
 
 def should_use_async_rollouts(
@@ -718,6 +741,22 @@ class GenerationInterface(ABC):
         raise NotImplementedError(
             f"token_capture.enabled is not supported for {type(self).__name__}"
         )
+
+    def captured_call_progress(
+        self, *, timeout_s: Optional[float] = None
+    ) -> list[dict[str, Any]]:
+        """Report how far each running captured call got, while paused for a refit.
+
+        Returns one ``{"weight_version": v, "calls": [[model_call_id,
+        generated_tokens], ...]}`` per serving engine: the tokens each call
+        generated on version ``v`` before the refit replaces it. Backends that
+        cannot report this return nothing, and their calls count every token
+        under the version they began on.
+
+        Args:
+            timeout_s: How long to wait for the engines; ``None`` waits forever.
+        """
+        return []
 
     def invalidate_kv_cache(self) -> bool:
         """Confirm stale KV state cannot be reused after a weight update.

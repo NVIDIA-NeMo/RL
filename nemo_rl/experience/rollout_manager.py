@@ -43,9 +43,10 @@ from nemo_rl.data.multimodal_utils import VLLM_CONTENT_KEY, VLLM_PROMPT_KEYS
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import (
-    as_nemo_gym_shard_set,
-    get_nemo_gym_route_name,
+from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
+from nemo_rl.environments.nemo_gym_task import (
+    get_nemo_gym_attribution_key,
+    get_nemo_gym_task_input,
 )
 from nemo_rl.experience.failures import (
     FailureClass,
@@ -58,6 +59,7 @@ from nemo_rl.experience.failures import (
     RolloutRedispatchExhausted,
     RolloutTimeout,
     classify_rollout_failure,
+    is_terminal_gym_episode_failure,
 )
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -182,11 +184,9 @@ _MAX_PARKED_REDISPATCH_BACKOFF_S = 5.0
 
 def _nemo_gym_metric_namespace(row: Mapping[str, Any]) -> str:
     """Return the best available namespace for NeMo-Gym rollout metrics."""
-    agent_ref = row.get("agent_ref")
-    if isinstance(agent_ref, Mapping):
-        agent_name = agent_ref.get("name")
-        if isinstance(agent_name, str) and agent_name:
-            return agent_name
+    attribution_key = get_nemo_gym_attribution_key(row)
+    if attribution_key is not None:
+        return attribution_key
 
     task_source = row.get("task_source")
     if isinstance(task_source, str) and task_source:
@@ -608,7 +608,7 @@ class AsyncRolloutImpl:
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
-        gym_instance_id: Optional[str] = None,
+        environment_instance_id: Optional[str] = None,
         dispatch_recorder: Optional[RolloutDispatchRecorder] = None,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
@@ -632,7 +632,7 @@ class AsyncRolloutImpl:
         assert recovery_granularity is RecoveryGranularity.SIBLING, (
             "recovery granularity is only supported on the NeMo-Gym path"
         )
-        assert gym_instance_id is None, (
+        assert environment_instance_id is None, (
             "Gym checkpoint ownership is only supported on the NeMo-Gym path"
         )
         assert dispatch_recorder is None, (
@@ -1112,7 +1112,7 @@ class AsyncNemoGymRolloutImpl:
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
-        gym_instance_id: Optional[str] = None,
+        environment_instance_id: Optional[str] = None,
         dispatch_recorder: Optional[RolloutDispatchRecorder] = None,
     ) -> PromptGroupRecord:
         """Run num_generations_per_prompt rollouts for one prompt.
@@ -1145,7 +1145,7 @@ class AsyncNemoGymRolloutImpl:
             timer_prefix,
             on_completion=on_completion,
             recovery_granularity=recovery_granularity,
-            gym_instance_id=gym_instance_id,
+            gym_instance_id=environment_instance_id,
             dispatch_recorder=dispatch_recorder,
         )
         # Token-capture receipt rows carry empty message logs by design: the
@@ -1178,17 +1178,23 @@ class AsyncNemoGymRolloutImpl:
         timer.stop(f"{timer_prefix}/total")
         rollout_metrics.update(timer.get_timing_metrics("sum"))
 
-        resolved_agent_ref = rollout_inputs[0].get("agent_ref")
-        if not isinstance(resolved_agent_ref, dict):
-            raise ValueError("NeMo-Gym did not return a resolved agent_ref")
+        attribution_key = get_nemo_gym_attribution_key(rollout_inputs[0])
+        if attribution_key is None:
+            raise ValueError("NeMo-Gym did not return a resolved attribution key")
         if any(
-            row.get("agent_ref") != resolved_agent_ref for row in rollout_inputs[1:]
+            get_nemo_gym_attribution_key(row) != attribution_key
+            for row in rollout_inputs[1:]
         ):
             raise ValueError(
-                "NeMo-Gym resolved one prompt group to inconsistent agent_ref values"
+                "NeMo-Gym resolved one prompt group to inconsistent attribution keys"
             )
         record_extra_env_info = copy.deepcopy(input_sample["extra_env_info"])
-        record_extra_env_info["agent_ref"] = copy.deepcopy(resolved_agent_ref)
+        record_extra_env_info["attribution_key"] = attribution_key
+        resolved_agent_ref = rollout_inputs[0].get("agent_ref")
+        if resolved_agent_ref is not None:
+            record_extra_env_info["agent_ref"] = copy.deepcopy(resolved_agent_ref)
+        else:
+            record_extra_env_info.pop("agent_ref", None)
 
         return PromptGroupRecord(
             prompt_idx=input_sample["idx"],
@@ -1203,10 +1209,16 @@ class AsyncNemoGymRolloutImpl:
     def _validate_init_params(self) -> None:
         """Validate initialization parameters."""
         # Validate generation config.
-        for key in ["stop_strings", "stop_token_ids", "top_k"]:
+        for key in ["stop_strings", "stop_token_ids"]:
             assert not self._generation_config[key], (  # type: ignore
                 f"{key} is not supported in the generation config in NeMo-Gym path!"
             )
+        # NeMo-Gym requests leave top_k unset (it is not OpenAI-compatible); only
+        # NeMo-RL's vLLM server pins it to the configured profile.
+        assert (
+            not self._generation_config["top_k"]
+            or self._generation_config["backend"] == "vllm"
+        ), "top_k in the NeMo-Gym path needs the vLLM generation backend!"
 
         # Validate max_rollout_turns.
         assert self._max_rollout_turns == 1, (
@@ -1235,7 +1247,13 @@ class AsyncNemoGymRolloutImpl:
 
         # We do not translate max_seq_len into row-level max_tokens here because that would
         # change semantics from "total sequence length" to "max new tokens".
-        responses_create_params = template_row["responses_create_params"]
+        responses_create_params = get_nemo_gym_task_input(template_row).get(
+            "responses_create_params"
+        )
+        if not isinstance(responses_create_params, dict):
+            raise TypeError(
+                "Each NeMo-Gym task input must contain a responses_create_params dict"
+            )
         responses_create_params["temperature"] = self._generation_config["temperature"]
         responses_create_params["top_p"] = self._generation_config["top_p"]
 
@@ -1462,7 +1480,22 @@ class AsyncNemoGymRolloutImpl:
                 if rowidx in received:
                     raise ValueError(f"NeMo-Gym returned duplicate row index {rowidx}")
                 received.add(rowidx)
-                inputs_by_rowidx[rowidx]["agent_ref"] = resolved_agent_ref
+                input_row = inputs_by_rowidx[rowidx]
+                if resolved_agent_ref is not None:
+                    input_row["agent_ref"] = resolved_agent_ref
+                    result["agent_ref"] = copy.deepcopy(resolved_agent_ref)
+                else:
+                    input_row.pop("agent_ref", None)
+                    result.pop("agent_ref", None)
+                attribution_key = get_nemo_gym_attribution_key(result)
+                if attribution_key is None:
+                    attribution_key = get_nemo_gym_attribution_key(input_row)
+                if attribution_key is None:
+                    raise ValueError(
+                        "NeMo-Gym did not return a resolved attribution key"
+                    )
+                input_row["attribution_key"] = attribution_key
+                result["attribution_key"] = attribution_key
                 if "receipt" in result:
                     result["reward_checks"] = compute_reward_checks(
                         result["full_result"],
@@ -1493,10 +1526,6 @@ class AsyncNemoGymRolloutImpl:
                     # Completion callbacks are token-capture receipt-only, making this
                     # conversion lightweight and safe to repeat during group metrics.
                     row_completions, _ = self._results_to_completions([result])
-                    assert row_completions[0].env_extras is not None
-                    row_completions[0].env_extras["agent_ref"] = copy.deepcopy(
-                        resolved_agent_ref
-                    )
                     await on_completion(rowidx, row_completions[0])
                 if timing_metrics is not None:
                     env_timing_metrics = timing_metrics
@@ -1588,7 +1617,7 @@ class AsyncNemoGymRolloutImpl:
         # They share one Gym route and must stay on one instance.
         shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
         nemo_gym_env = (
-            shard_set.pick_handle(get_nemo_gym_route_name(inputs[0]))
+            shard_set.pick_handle_for_group(inputs)
             if gym_instance_id is None
             else shard_set.handle_for_checkpoint_instance(gym_instance_id)
         )
@@ -1791,7 +1820,7 @@ class AsyncNemoGymRolloutImpl:
         if not isinstance(extra_env_info, Mapping):
             raise ValueError("NeMo-Gym input must contain extra_env_info")
         shard_set = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"])
-        handle = shard_set.pick_handle(get_nemo_gym_route_name(extra_env_info))
+        handle = shard_set.pick_handle_for_group([dict(extra_env_info)])
         return shard_set.checkpoint_instance_for_handle(handle).instance_id
 
     def _results_to_completions(
@@ -1837,8 +1866,15 @@ class AsyncNemoGymRolloutImpl:
         )
         completions = []
         for result in results:
+            env_extras = dict(completion_extras(result["full_result"]))
+            attribution_key = get_nemo_gym_attribution_key(result)
+            if attribution_key is not None:
+                env_extras["attribution_key"] = attribution_key
+            if result.get("agent_ref") is not None:
+                env_extras["agent_ref"] = copy.deepcopy(result["agent_ref"])
+            else:
+                env_extras.pop("agent_ref", None)
             if "receipt" in result:
-                env_extras = dict(completion_extras(result["full_result"]))
                 env_extras["ng_receipt"] = result["receipt"]
                 env_extras["ng_rollout_id"] = result["rollout_id"]
                 if self._forest_training:
@@ -1869,7 +1905,7 @@ class AsyncNemoGymRolloutImpl:
             completions.append(
                 Completion(
                     message_log=result["message_log"],
-                    env_extras=completion_extras(result["full_result"]),
+                    env_extras=env_extras,
                     truncated=truncated,
                     reward=float(result["full_result"]["reward"]),
                 )
@@ -2079,7 +2115,7 @@ class _LedgerDispatchRecorder:
 
     manager: RolloutManager
     group_id: str
-    gym_instance_id: Optional[str]
+    environment_instance_id: Optional[str]
 
     @asynccontextmanager
     async def submitting(
@@ -2103,7 +2139,7 @@ class _LedgerDispatchRecorder:
                         cut,
                         self.group_id,
                         generation_indices=reserved,
-                        gym_instance_id=self.gym_instance_id,
+                        environment_instance_id=self.environment_instance_id,
                     )
 
             yield mark_dispatched
@@ -2412,14 +2448,14 @@ class RolloutManager:
         generation_indices: Optional[list[int]] = None,
         on_completion: Optional[RolloutCompletionCallback] = None,
         recovery_granularity: RecoveryGranularity = RecoveryGranularity.SIBLING,
-        gym_instance_id: Optional[str] = None,
+        environment_instance_id: Optional[str] = None,
         dispatch_recorder: Optional[RolloutDispatchRecorder] = None,
     ) -> PromptGroupRecord:
         if rollout_ids is None:
             assert generation_indices is None
             assert on_completion is None
             assert recovery_granularity is RecoveryGranularity.SIBLING
-            assert gym_instance_id is None
+            assert environment_instance_id is None
             assert dispatch_recorder is None
             # Legacy path: keep the impl call signature byte-identical.
             return await self._impl.run_rollout(input_sample)
@@ -2429,7 +2465,7 @@ class RolloutManager:
             generation_indices=generation_indices,
             on_completion=on_completion,
             recovery_granularity=recovery_granularity,
-            gym_instance_id=gym_instance_id,
+            environment_instance_id=environment_instance_id,
             dispatch_recorder=dispatch_recorder,
         )
 
@@ -2606,7 +2642,10 @@ class RolloutManager:
                     continue
 
                 data_attempts += 1
-                if data_attempts >= policy.max_data_attempts:
+                if (
+                    is_terminal_gym_episode_failure(error)
+                    or data_attempts >= policy.max_data_attempts
+                ):
                     self._stats.record_data_failure(reason)
                     if self._skipped_prompts >= policy.max_skipped_prompts:
                         # At the default of 0 this fires on the first exhaustion and the
@@ -2778,7 +2817,10 @@ class RolloutManager:
                     continue
 
                 data_attempts += 1
-                if data_attempts >= policy.max_data_attempts:
+                if (
+                    is_terminal_gym_episode_failure(error)
+                    or data_attempts >= policy.max_data_attempts
+                ):
                     self._stats.record_data_failure(reason)
                     raise
                 self._stats.record_data_retry(reason)
@@ -2843,12 +2885,12 @@ class RolloutManager:
         for generation_index in pending_indices:
             owner = recovery_group.siblings[
                 generation_index
-            ].current_attempt.gym_instance_id
+            ].current_attempt.environment_instance_id
             if owner is not None:
                 pending_owners.add(owner)
         if len(pending_owners) > 1:
             raise RuntimeError(
-                f"recovery group {recovery_group.group_id!r} spans multiple Gym "
+                f"recovery group {recovery_group.group_id!r} spans multiple environment "
                 f"checkpoint instances: {sorted(pending_owners)!r}"
             )
         group_id = recovery_group.group_id
@@ -2861,9 +2903,9 @@ class RolloutManager:
             attempt_extra_env_info[NEMO_GYM_GROUP_ATTEMPT_KEY] = (
                 max(len(sibling.attempts) for sibling in recovery_group.siblings) - 1
             )
-        gym_instance_id: Optional[str] = None
+        environment_instance_id: Optional[str] = None
         if pending_owners:
-            gym_instance_id = next(iter(pending_owners))
+            environment_instance_id = next(iter(pending_owners))
         elif (
             pending_indices and recovery_group.restore_level is RecoveryTargetLevel.TURN
         ):
@@ -2871,7 +2913,7 @@ class RolloutManager:
                 raise RuntimeError(
                     "turn-level recovery requires the NeMo-Gym rollout path"
                 )
-            gym_instance_id = self._impl.select_checkpoint_instance(
+            environment_instance_id = self._impl.select_checkpoint_instance(
                 attempt_input_sample
             )
         self._tq_buffer.reserve(
@@ -2895,10 +2937,9 @@ class RolloutManager:
             resolved_agent_name = (
                 agent_ref.get("name") if isinstance(agent_ref, dict) else None
             )
-            if not isinstance(resolved_agent_name, str) or not resolved_agent_name:
-                raise ValueError(
-                    "token-capture completion requires resolved agent_ref.name"
-                )
+            attribution_key = get_nemo_gym_attribution_key(env_extras)
+            if attribution_key is None:
+                raise ValueError("token-capture completion requires an attribution key")
             if "ng_receipt" not in env_extras:
                 raise ValueError("token-capture completion must contain ng_receipt")
             receipt = env_extras["ng_receipt"]
@@ -2954,6 +2995,7 @@ class RolloutManager:
                     reward=completion.reward,
                     mask_sample=mask_sample,
                     resolved_agent_name=resolved_agent_name,
+                    attribution_key=attribution_key,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
                     logical_selection=selection,
@@ -2987,6 +3029,7 @@ class RolloutManager:
                     reward=completion.reward,
                     mask_sample=mask_sample,
                     resolved_agent_name=resolved_agent_name,
+                    attribution_key=attribution_key,
                     reward_checks=env_extras.get("ng_reward_checks"),
                     reward_log_context=env_extras.get("ng_reward_log_context"),
                     logical_selection=selection,
@@ -3005,7 +3048,7 @@ class RolloutManager:
                         dispatch_recorder = _LedgerDispatchRecorder(
                             manager=self,
                             group_id=group_id,
-                            gym_instance_id=gym_instance_id,
+                            environment_instance_id=environment_instance_id,
                         )
                     else:
                         async with self._recovery_mutation() as cut:
@@ -3013,7 +3056,7 @@ class RolloutManager:
                                 cut,
                                 group_id,
                                 generation_indices=pending_indices,
-                                gym_instance_id=gym_instance_id,
+                                environment_instance_id=environment_instance_id,
                             )
                     record = await self.run_rollout(
                         attempt_input_sample,
@@ -3021,7 +3064,7 @@ class RolloutManager:
                         generation_indices=pending_indices,
                         on_completion=_record_streamed_completion,
                         recovery_granularity=recovery_group.recovery_granularity,
-                        gym_instance_id=gym_instance_id,
+                        environment_instance_id=environment_instance_id,
                         dispatch_recorder=dispatch_recorder,
                     )
                     # A retry of only the unsealed siblings would under-report
@@ -3066,6 +3109,9 @@ class RolloutManager:
                 resolved_agent_name=self._recovery_ledger.get_group(
                     group_id
                 ).resolved_agent_name,
+                attribution_key=self._recovery_ledger.get_group(
+                    group_id
+                ).attribution_key,
             )
             assert_metadata_only(request)
             return request, rollout_metrics
@@ -3073,7 +3119,7 @@ class RolloutManager:
             # Neither retry nor abandon an attempt whose capture writes may still
             # be in flight. Surface the failure with its ledger ownership intact.
             raise
-        except BaseException:
+        except BaseException as error:
             # Abandoned dispatch: no receipt will name these rollouts' staged
             # rows, so they leak until the staging partition is torn down at
             # run end (there is no prefix-clear primitive in the data plane
@@ -3085,7 +3131,16 @@ class RolloutManager:
                 # cancelling this task. Preserve the original cancellation rather
                 # than replacing it with "unknown group" during cleanup.
                 if group_id in self._recovery_ledger:
-                    self._recovery_ledger.abandon_unsealed(cut, group_id)
+                    self._recovery_ledger.abandon_unsealed(
+                        cut,
+                        group_id,
+                        # Cancelled, e.g. by the run ending, rather than failed.
+                        reason=(
+                            "cancelled"
+                            if isinstance(error, asyncio.CancelledError)
+                            else "failed"
+                        ),
+                    )
             # The capture ledger has no per-rollout fail endpoint. Rows from
             # abandoned attempts are unreferenced and are swept with the
             # staging partition at run teardown.

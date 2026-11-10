@@ -501,7 +501,7 @@ class AdvantageComputer:
             )
             seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
-            # SingleController rejects seq_logprob_error_in_loss, so this count is
+            # This pass never runs with seq_logprob_error_in_loss, so this count is
             # always pre-training and disjoint from the reasons attributed above.
             sample_mask_metrics["num_masked_seqs_total"] += int(
                 seq_error_metrics["num_masked_seqs_by_logprob_error"]
