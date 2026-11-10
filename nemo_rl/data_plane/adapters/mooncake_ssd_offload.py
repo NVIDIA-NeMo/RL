@@ -161,10 +161,9 @@ def install(cfg: MooncakeCpuConfig, segment_size: int | None) -> None:
                 f"Mooncake SSD offload needs {name}={value}, but the environment "
                 f"sets {os.environ[name]!r}; unset it or turn ssd_offload off"
             )
-    require_disk_backed(
-        str(cfg.ssd_offload.path), setting="data_plane.mooncake_cpu.ssd_offload.path"
-    )
-    parent = os.path.join(str(cfg.ssd_offload.path), "nemo_rl_mooncake_offload")
+    ssd_base = cfg.ssd_offload.dir()
+    require_disk_backed(ssd_base, setting="data_plane.mooncake_cpu.ssd_offload.path")
+    parent = os.path.join(ssd_base, "nemo_rl_mooncake_offload")
     os.makedirs(parent, exist_ok=True)
     _remove_stale_dirs(parent)  # free disk left by earlier runs on this node
     job_id = ray.get_runtime_context().get_job_id()
