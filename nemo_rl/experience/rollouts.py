@@ -65,7 +65,7 @@ from nemo_rl.environments.nemo_gym import (
     as_nemo_gym_shard_set,
     get_pad_dynamic_image_shapes,
 )
-from nemo_rl.environments.nemo_gym_harness_mix import harness_metric_namespace
+from nemo_rl.environments.nemo_gym_multi_harness import harness_metric_namespace
 from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
     get_nemo_gym_task_input,
@@ -3384,7 +3384,7 @@ def _postprocess_single_nemo_gym_group(
             # / batch_size,
         }
     # Namespace metrics by taskset for materialized rows or agent for flat rows,
-    # and by harness within a taskset that mixes harnesses.
+    # and by agent within a multi-harness taskset.
     with timer.time(f"{timer_prefix}/per_agent_misc_metrics"):
         agent_to_results: dict[str, list[dict]] = defaultdict(list)
         agent_to_sample_metrics: dict[str, list[dict]] = defaultdict(list)

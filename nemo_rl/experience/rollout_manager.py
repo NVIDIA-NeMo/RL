@@ -44,7 +44,7 @@ from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
-from nemo_rl.environments.nemo_gym_harness_mix import harness_metric_namespace
+from nemo_rl.environments.nemo_gym_multi_harness import harness_metric_namespace
 from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
     get_nemo_gym_task_input,
