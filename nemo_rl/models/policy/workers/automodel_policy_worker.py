@@ -67,7 +67,10 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
     prepare_model_forward,
 )
-from nemo_rl.models.automodel.utils import release_moe_dispatcher_state
+from nemo_rl.models.automodel.utils import (
+    move_model_buffers_to_device,
+    release_moe_dispatcher_state,
+)
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -1673,11 +1676,8 @@ class AutomodelPolicyWorkerImpl(
     def move_buffer_to_device(
         self, model: nn.Module, device: str | torch.device
     ) -> nn.Module:
-        # FSDP modules do not move buffers to the device automatically
-        for v in model.buffers():
-            torch.utils.swap_tensors(v, v.to(device))
-
-        return model
+        # FSDP modules do not move buffers to the device automatically.
+        return move_model_buffers_to_device(model, device)
 
     def move_to_cuda(self, model: torch.nn.Module) -> torch.nn.Module:
         model = self.move_to_device(model, "cuda")

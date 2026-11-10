@@ -29,6 +29,7 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 )
 
 from nemo_rl.models.automodel.utils import (
+    move_model_buffers_to_device,
     release_moe_dispatcher_state,
     resolve_model_class,
 )
@@ -160,3 +161,36 @@ def test_release_moe_dispatcher_state_ignores_dense_models():
     model = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
     model[0].token_dispatcher = None
     assert release_moe_dispatcher_state(model) == 0
+
+
+@pytest.mark.automodel
+@pytest.mark.parametrize("source_device", ["cpu", "cuda"])
+def test_move_buffers_preserves_aliases_and_readable_state_dict(
+    source_device: str,
+) -> None:
+    if source_device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required for a device-crossing buffer round trip")
+    model = nn.Module()
+    model.child = nn.Module()
+    values = torch.arange(6, dtype=torch.float32, device=source_device)
+    model.register_buffer("persistent", values)
+    model.child.register_buffer("alias", values)
+    model.register_buffer(
+        "indices", torch.arange(3, device=source_device), persistent=False
+    )
+    original_identity = id(model.persistent)
+    assert move_model_buffers_to_device(model, "cpu") is model
+    assert id(model.persistent) == original_identity
+    assert model.child.alias is model.persistent
+    assert model.indices.dtype == torch.int64
+    assert model.indices.device.type == "cpu"
+    state = model.state_dict()
+    assert set(state) == {"persistent", "child.alias"}
+    torch.testing.assert_close(state["persistent"], torch.arange(6).float())
+    torch.testing.assert_close(state["child.alias"], state["persistent"])
+    move_model_buffers_to_device(model, source_device)
+    assert model.persistent.device.type == source_device
+    assert model.child.alias is model.persistent
+    torch.testing.assert_close(
+        model.state_dict()["persistent"].cpu(), torch.arange(6).float()
+    )

@@ -17,6 +17,7 @@ from typing import Any, Dict
 # configs to Mistral3FP8VLM. Without it, HF's stock FP8Linear path runs and produces
 # 0-d weight_scale_inv params that FSDP2 rejects.
 import nemo_automodel.components.models.mistral3_vlm  # noqa: F401
+import torch
 from nemo_automodel._transformers.auto_model import (
     NeMoAutoModelForCausalLM,
     NeMoAutoModelForImageTextToText,
@@ -46,6 +47,16 @@ AUTOMODEL_FACTORY: Dict[str, Any] = {
     "mistral3": NeMoAutoModelForImageTextToText,
     "llama4": NeMoAutoModelForImageTextToText,
 }
+
+
+def move_model_buffers_to_device(
+    model: nn.Module, device: str | torch.device
+) -> nn.Module:
+    """Move registered buffers while preserving their tensor identity and aliases."""
+    for buffer in model.buffers():
+        # Swapping also updates device metadata; .data assignment can leave stale storage.
+        torch.utils.swap_tensors(buffer, buffer.to(device))
+    return model
 
 
 def resolve_model_class(model_name: str) -> Any:
