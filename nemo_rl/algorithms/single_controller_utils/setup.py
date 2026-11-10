@@ -1361,10 +1361,6 @@ def setup_single_controller(
             raise ValueError(
                 "VLM token capture currently supports Omni dynamic images and native video"
             )
-        if not policy_config["megatron_cfg"]["enabled"]:
-            raise ValueError(
-                "Omni media token capture currently requires the Megatron learner"
-            )
         if token_capture_cfg.defer_routed_experts_to_policy:
             raise ValueError("VLM token capture requires direct router replay assembly")
     if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None:

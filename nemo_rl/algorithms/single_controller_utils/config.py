@@ -1601,6 +1601,23 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         _validate_seq_logprob_error_in_loss(master_config)
     _validate_algo_settings(master_config)
 
+    if master_config.token_capture.enabled and master_config.policy.get("is_vlm"):
+        policy = master_config.policy
+        if not policy["megatron_cfg"]["enabled"]:
+            automodel = policy["automodel_cfg"]
+            if (
+                not automodel["enabled"]
+                or automodel["tensor_parallel_size"] != 1
+                or automodel["context_parallel_size"] != 1
+                or automodel["sequence_parallel"]
+                or policy["sequence_packing"]["enabled"]
+                or automodel["automodel_kwargs"].get("force_hf", False)
+            ):
+                raise ValueError(
+                    "Omni media token capture requires Megatron or native Automodel "
+                    "with TP=CP=1, no sequence packing/parallelism, and force_hf disabled"
+                )
+
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
 

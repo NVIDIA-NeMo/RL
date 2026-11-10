@@ -15,6 +15,7 @@
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -2484,3 +2485,115 @@ class TestAggregateTrainingStatistics:
 
         # Verify global_loss is on CPU
         assert metrics["global_loss"].device == torch.device("cpu")
+
+
+class CapturedOmniModel(torch.nn.Module):
+    patch_size = 2
+    downsample_ratio = 0.5
+    img_context_token_id = 18
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(architectures=["NemotronH_Omni_Reasoning_V3"])
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        pixel_values: torch.Tensor | None = None,
+        imgs_sizes: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, dict[str, Any]]:
+        return pixel_values, imgs_sizes, kwargs
+
+
+def _captured_omni_inputs() -> tuple[torch.Tensor, ProcessedInputs]:
+    from nemo_rl.data.captured_media import pack_images
+
+    pixels = torch.arange(2 * 3 * 8 * 8, dtype=torch.float32).reshape(2, 3, 8, 8)
+    sizes = torch.tensor([[4, 8], [8, 4]], dtype=torch.int32)
+    inputs = ProcessedInputs(
+        input_ids=torch.tensor([[1, 18, 18, 18, 18, 2]]),
+        seq_len=6,
+        vlm_kwargs={
+            "pixel_values": pack_images(pixels, sizes, patch_size=2).squeeze(0),
+            "imgs_sizes": sizes,
+            "num_frames": torch.ones(2, dtype=torch.int32),
+        },
+    )
+    return pixels, inputs
+
+
+def test_captured_omni_forward_restores_native_pixels_and_removes_frame_metadata() -> (
+    None
+):
+    pixels, inputs = _captured_omni_inputs()
+    model = CapturedOmniModel()
+    prepared = _prepare_cp1(model, inputs)
+    restored, sizes, kwargs = model(**prepared.model_batch)
+    for index, (h, w) in enumerate(sizes.tolist()):
+        assert torch.equal(restored[index, :, :h, :w], pixels[index, :, :h, :w])
+    assert "num_frames" not in kwargs
+    assert "media_token_validity_mask" not in kwargs
+    assert torch.equal(prepared.model_batch["input_ids"], inputs.input_ids)
+    assert inputs.vlm_kwargs["pixel_values"].ndim == 2
+
+
+@pytest.mark.parametrize(
+    "damage", ["extra_placeholder", "video", "selective_mask", "hf_forward"]
+)
+def test_captured_omni_forward_rejects_unsupported_media(damage: str) -> None:
+    _, inputs = _captured_omni_inputs()
+    model = CapturedOmniModel()
+    if damage == "extra_placeholder":
+        inputs.input_ids[0, 0] = 18
+    elif damage == "video":
+        inputs.vlm_kwargs["num_frames"] = torch.tensor([2])
+    elif damage == "selective_mask":
+        inputs.vlm_kwargs["media_token_validity_mask"] = torch.zeros_like(
+            inputs.input_ids
+        )
+    else:
+        model.config.architectures = ["unsupported_hf_model"]
+    with pytest.raises(ValueError, match="Captured|Automodel|Native"):
+        _prepare_cp1(model, inputs)
+
+
+def test_captured_omni_forward_text_row_skips_empty_vision_encoder() -> None:
+    model = CapturedOmniModel()
+    inputs = ProcessedInputs(
+        input_ids=torch.tensor([[1, 2]]),
+        seq_len=2,
+        vlm_kwargs={
+            "pixel_values": torch.empty(0, 12),
+            "imgs_sizes": torch.empty(0, 2, dtype=torch.int32),
+            "num_frames": torch.empty(0, dtype=torch.int32),
+        },
+    )
+    prepared = _prepare_cp1(model, inputs)
+    assert "pixel_values" not in prepared.model_batch
+    assert "imgs_sizes" not in prepared.model_batch
+    assert "num_frames" not in prepared.model_batch
+
+
+def test_unrelated_flat_pixel_processor_is_not_reinterpreted_as_omni_capture() -> None:
+    class FlatPixelModel(torch.nn.Module):
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            pixel_values: torch.Tensor | None = None,
+            image_grid_thw: torch.Tensor | None = None,
+            **kwargs: Any,
+        ) -> torch.Tensor | None:
+            return pixel_values
+
+    pixels = torch.randn(4, 12)
+    inputs = ProcessedInputs(
+        input_ids=torch.tensor([[1, 2]]),
+        seq_len=2,
+        vlm_kwargs={
+            "pixel_values": pixels,
+            "image_grid_thw": torch.tensor([[1, 2, 2]]),
+        },
+    )
+    prepared = _prepare_cp1(FlatPixelModel(), inputs)
+    assert prepared.model_batch["pixel_values"] is pixels

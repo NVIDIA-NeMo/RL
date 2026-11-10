@@ -39,6 +39,44 @@ if TYPE_CHECKING:
     # ``nemo_rl.data_plane`` and ``nemo_rl.data`` mutually importing.
     from nemo_rl.data_plane.interfaces import KVBatchMeta
 
+
+def unpack_dynamic_image_patches(
+    patches: torch.Tensor, sizes: torch.Tensor, *, patch_size: int
+) -> torch.Tensor:
+    """Restore captured Omni patches to padded NCHW pixels without resampling."""
+    if (
+        patch_size <= 0
+        or patches.ndim != 2
+        or patches.shape[1] != 3 * patch_size**2
+        or sizes.ndim != 2
+        or sizes.shape[1] != 2
+        or sizes.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError(
+            "Captured image patches require [patches, 3*P*P] and integer [images, 2] sizes"
+        )
+    geometry = sizes.tolist()
+    if any(h <= 0 or w <= 0 or h % patch_size or w % patch_size for h, w in geometry):
+        raise ValueError(
+            "Captured image geometry must be positive and divisible by patch_size"
+        )
+    counts = [h // patch_size * (w // patch_size) for h, w in geometry]
+    if sum(counts) != patches.shape[0]:
+        raise ValueError("Captured image patch count does not match imgs_sizes")
+    if not geometry:
+        return patches.new_empty((0, 3, 0, 0))
+    max_h = max(h for h, _ in geometry)
+    max_w = max(w for _, w in geometry)
+    images = []
+    for part, (height, width) in zip(patches.split(counts), geometry, strict=True):
+        image = part.reshape(
+            height // patch_size, width // patch_size, 3, patch_size, patch_size
+        )
+        image = image.permute(2, 0, 3, 1, 4).reshape(3, height, width)
+        images.append(F.pad(image, (0, max_w - width, 0, max_h - height)))
+    return torch.stack(images)
+
+
 VLLM_CONTENT_KEY = "vllm_content"
 VLLM_MULTI_MODAL_DATA_KEY = "vllm_multi_modal_data"
 VLLM_PROMPT_KEYS = frozenset({VLLM_CONTENT_KEY, VLLM_MULTI_MODAL_DATA_KEY})

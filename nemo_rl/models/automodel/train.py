@@ -116,7 +116,9 @@ def _build_model_batch(
 
     if processed_inputs.is_multimodal:
         model_batch.update(
-            filter_multimodal_kwargs_for_model(model, processed_inputs.vlm_kwargs)
+            filter_multimodal_kwargs_for_model(
+                model, processed_inputs.vlm_kwargs, input_ids=processed_inputs.input_ids
+            )
         )
         model_batch.pop("flash_attn_kwargs", None)
 

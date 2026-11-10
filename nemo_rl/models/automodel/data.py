@@ -25,7 +25,10 @@ from torch import nn
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType
-from nemo_rl.data.multimodal_utils import PACKED_MULTIMODAL_FIELDS
+from nemo_rl.data.multimodal_utils import (
+    PACKED_MULTIMODAL_FIELDS,
+    unpack_dynamic_image_patches,
+)
 from nemo_rl.data_plane.codec import pad_field
 from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -73,10 +76,87 @@ def _all_image_sizes_equal(imgs_sizes: torch.Tensor) -> bool:
     return bool((imgs_sizes == imgs_sizes[0]).all())
 
 
+def _restore_captured_omni_images(
+    model: nn.Module, multimodal_kwargs: dict[str, Any], input_ids: torch.Tensor
+) -> dict[str, Any]:
+    """Adapt the captured still-image wire layout to native Automodel Omni inputs."""
+    named = inspect.signature(type(model).forward).parameters
+    config = getattr(model, "config", None)
+    if (
+        not set(getattr(config, "architectures", None) or ()).intersection(
+            {"NemotronH_Nano_Omni_Reasoning_V3", "NemotronH_Omni_Reasoning_V3"}
+        )
+        or "imgs_sizes" not in named
+        or "pixel_values" not in named
+    ):
+        raise ValueError(
+            "Captured Omni patches require the native Automodel NemotronOmni forward with imgs_sizes"
+        )
+    sizes = multimodal_kwargs["imgs_sizes"]
+    frames = multimodal_kwargs["num_frames"]
+    if (
+        frames.ndim != 1
+        or frames.shape[0] != sizes.shape[0]
+        or not bool((frames == 1).all())
+    ):
+        raise ValueError(
+            "Automodel captured media supports still images only; use Megatron for native video"
+        )
+    pixels = unpack_dynamic_image_patches(
+        multimodal_kwargs["pixel_values"], sizes, patch_size=model.patch_size
+    )
+    feature_sizes = [
+        (
+            h / model.patch_size * model.downsample_ratio,
+            w / model.patch_size * model.downsample_ratio,
+        )
+        for h, w in sizes.tolist()
+    ]
+    if any(
+        h <= 0 or w <= 0 or not h.is_integer() or not w.is_integer()
+        for h, w in feature_sizes
+    ):
+        raise ValueError(
+            "Captured image geometry is incompatible with native Omni pixel shuffle"
+        )
+    expected = sum(int(h) * int(w) for h, w in feature_sizes)
+    selected = input_ids.eq(model.img_context_token_id)
+    if int(selected.sum()) != expected:
+        raise ValueError(
+            "Captured image placeholder count does not match native Omni vision features"
+        )
+    mask = multimodal_kwargs.get("media_token_validity_mask")
+    if mask is not None and (
+        mask.shape != input_ids.shape or not torch.equal(mask.bool(), selected)
+    ):
+        raise ValueError(
+            "Native Automodel Omni cannot consume a selective media_token_validity_mask"
+        )
+    result = dict(multimodal_kwargs)
+    result.pop("num_frames")
+    result.pop("media_token_validity_mask", None)
+    if sizes.shape[0] == 0:
+        result.pop("pixel_values")
+        result.pop("imgs_sizes")
+    else:
+        result["pixel_values"] = pixels
+    return result
+
+
 def filter_multimodal_kwargs_for_model(
-    model: nn.Module, multimodal_kwargs: dict[str, Any]
+    model: nn.Module, multimodal_kwargs: dict[str, Any], *, input_ids: torch.Tensor
 ) -> dict[str, Any]:
     """Drop processor metadata that is not accepted by an AutoModel forward."""
+    pixels = multimodal_kwargs.get("pixel_values")
+    if (
+        pixels is not None
+        and pixels.ndim == 2
+        and "imgs_sizes" in multimodal_kwargs
+        and "num_frames" in multimodal_kwargs
+    ):
+        multimodal_kwargs = _restore_captured_omni_images(
+            model, multimodal_kwargs, input_ids
+        )
     accepted_kwargs = _accepted_forward_kwargs(type(model))
     if accepted_kwargs is None:
         return multimodal_kwargs

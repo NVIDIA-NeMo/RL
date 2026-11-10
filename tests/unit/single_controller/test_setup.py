@@ -4603,3 +4603,24 @@ def test_generation_top_logprobs_requires_score_centering_or_replay():
     mc.policy["generation"]["top_logprobs"] = 4
     with pytest.raises(ValueError, match="only read by loss_fn.score_centering"):
         validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["tp", "cp", "sequence_parallel", "packing", "force_hf", "disabled"]
+)
+def test_captured_omni_automodel_rejects_unsupported_backend_before_allocation(
+    invalid: str,
+) -> None:
+    config = _make_master_config()
+    config.token_capture.enabled = True
+    config.policy["is_vlm"] = True
+    config.policy["sequence_packing"] = {"enabled": invalid == "packing"}
+    config.policy["automodel_cfg"] = {
+        "enabled": invalid != "disabled",
+        "tensor_parallel_size": 2 if invalid == "tp" else 1,
+        "context_parallel_size": 2 if invalid == "cp" else 1,
+        "sequence_parallel": invalid == "sequence_parallel",
+        "automodel_kwargs": {"force_hf": invalid == "force_hf"},
+    }
+    with pytest.raises(ValueError, match="Omni media token capture requires"):
+        validate_single_controller_config(config)

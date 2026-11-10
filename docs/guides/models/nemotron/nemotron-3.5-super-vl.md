@@ -148,6 +148,14 @@ and images. The legacy `run_grpo_nemo_gym.py` entrypoint does not support that
 capture path. Recovery uses the existing `sibling` boundary; this does not claim
 in-flight typed-episode turn recovery.
 
+Captured still images use the native Automodel `NemotronOmni` dynamic-resolution
+forward. The learner restores the packed patches to padded pixels without
+resizing or changing pixel values, and keeps each image's native dimensions.
+This path requires TP=CP=1, sequence packing/parallelism disabled, and the custom
+model (`force_hf` disabled). Native video requires Megatron. Geometry, image-token
+counts and selective media masks that the native forward cannot represent fail
+explicitly before a forward; they do not fall back to text-only training.
+
 After provisioning the role environments, run
 `bash tests/functional/mm_coding_super35_train_resume.sh mixed -- <Hydra overrides>`
 inside an approved GPU allocation. Set `MM_CODING_ACCEPTANCE_ROOT` to a new
