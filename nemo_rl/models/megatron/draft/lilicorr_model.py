@@ -21,8 +21,10 @@ other drafters use, and it keeps the head unit-testable on CPU.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
+from types import SimpleNamespace
 
 import torch
 from torch import Tensor
@@ -173,7 +175,28 @@ class LiLiCorrDraftModel(MegatronModule):
         head: Any,
         config: Any,
     ) -> None:
-        super().__init__(config=body.config if hasattr(body, "config") else None)
+        # ModelOpt's Megatron plugin ASSIGNS onto the `.config` of every MegatronModule
+        # it walks (hetereogenous_dist_checkpoint, modelopt_output_layer_untied). The
+        # body's DFlashBodyConfig is frozen AND slots=True, so it rejects both: frozen
+        # blocks assignment, and slots blocks the new attribute even were it mutable.
+        #
+        #   FrozenInstanceError: cannot assign to field 'hetereogenous_dist_checkpoint'
+        #
+        # The failure surfaces deep inside ModelOpt state restore and names neither the
+        # drafter nor this class. Hand MegatronModule a mutable structural copy instead;
+        # readers of `.config` (draft_vocab_size in megatron/draft/utils.py) see the same
+        # values, and the body keeps its frozen config untouched.
+        body_config = getattr(body, "config", None)
+        if dataclasses.is_dataclass(body_config):
+            config_for_megatron = SimpleNamespace(
+                **{
+                    field.name: getattr(body_config, field.name)
+                    for field in dataclasses.fields(body_config)
+                }
+            )
+        else:
+            config_for_megatron = body_config
+        super().__init__(config=config_for_megatron)
         self.body = body
         self.lilicorr = head
         self.draft_config = config
