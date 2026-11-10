@@ -34,7 +34,13 @@ spec.loader.exec_module(module)
 class MultiAPITest(unittest.IsolatedAsyncioTestCase):
     async def test_spawned_host_preserves_frontend_settings(self):
         # Exercise child initialization without constructing a GPU worker.
-        for dtype in ["int16", "int32"]:
+        for dtype, video_config in [
+            ("int16", None),
+            (
+                "int32",
+                SimpleNamespace(sampling_style="nemotron_vl", temporal_patch_size=2),
+            ),
+        ]:
             hosts = []
 
             class Host:
@@ -45,6 +51,15 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                     hosts.append(self)
 
             engine = Mock()
+            register_video_loader = Mock()
+
+            def make_engine(**kwargs):
+                if video_config is not None:
+                    register_video_loader.assert_called_once_with(
+                        sampling_style="nemotron_vl", temporal_patch_size=2
+                    )
+                return engine
+
             connection = Mock()
             connection.recv.side_effect = [
                 ("capture", ({"impl": "transfer_queue"}, "stage", True, 4)),
@@ -57,11 +72,17 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             install_yield = Mock()
             modules = {
                 "ray": SimpleNamespace(is_initialized=lambda: False, init=Mock()),
+                "nemo_rl.models.generation.vllm.config": SimpleNamespace(
+                    resolve_vllm_video_config=Mock(return_value=video_config)
+                ),
+                "nemo_rl.models.generation.vllm.video_utils": SimpleNamespace(
+                    register_torchcodec_vllm_video_loader=register_video_loader
+                ),
                 "nemo_rl.models.generation.vllm.patches": SimpleNamespace(
                     install_output_loop_yield=install_yield
                 ),
                 "vllm.v1.engine.async_llm": SimpleNamespace(
-                    AsyncLLM=Mock(return_value=engine)
+                    AsyncLLM=Mock(side_effect=make_engine)
                 ),
                 "vllm.v1.executor.abstract": SimpleNamespace(
                     Executor=SimpleNamespace(get_class=lambda cfg: object)
@@ -95,6 +116,8 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                     routed_experts_dtype=dtype,
                 )
             self.assertEqual(hosts[0].routed_experts_dtype, dtype)
+            if video_config is None:
+                register_video_loader.assert_not_called()
             self.assertTrue(http_client.call_args.kwargs["flat_logprobs"])
             install_yield.assert_called_once_with(engine, reader_budget_s=0.02)
             hosts[0].setup_token_capture.assert_awaited_once_with(
