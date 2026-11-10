@@ -4343,8 +4343,11 @@ class SingleControllerActor:
         return None if deadline is None else deadline + self._REFIT_UNWIND_GRACE_S
 
     async def _optimizer_step(self) -> Any:
-        """The policy optimizer step. A generation engine that reads the policy's weight memory directly stops before
-        it (before_learner_write) and resumes in the next _sync_weights, the one place a new version is published."""
+        """Apply the optimizer update after shared-weight readers have paused.
+
+        The policy optimizer step. A generation engine that reads the policy's weight memory directly stops before
+        it (before_learner_write) and resumes in the next _sync_weights, the one place a new version is published.
+        """
         await asyncio.to_thread(self._weight_synchronizer.before_learner_write)
         return await asyncio.to_thread(self._trainer.finish_train_step)
 

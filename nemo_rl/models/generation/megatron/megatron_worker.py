@@ -806,8 +806,11 @@ class MegatronGenerationMixin:
     # ---- co-resident engine (nemo_rl/models/megatron/sm_partition.py): refit without stand-down ----
 
     def coresident_pause(self) -> None:
-        """Stop the engine at a step boundary on every rank: no suspend, KV / state / graphs stay. No-op before the
-        engine exists (the first refit initializes it in ``coresident_resume``)."""
+        """Pause at a step boundary while retaining KV, recurrent state and graphs.
+
+        No-op before the engine exists; the first refit initializes it in
+        ``coresident_resume``.
+        """
         if not self._inference_engine_initialized:
             return
         asyncio.run_coroutine_threadsafe(self._coresident_pause(), self._inference_loop).result()
@@ -821,8 +824,11 @@ class MegatronGenerationMixin:
         torch.cuda.synchronize()
 
     def coresident_resume(self) -> None:
-        """Unpause after every rank's ``coresident_refit_copy`` (the driver serializes the phases, so every rank has
-        bumped its weight epoch before any engine runs again). The first call starts the engine instead."""
+        """Resume after every rank publishes its refit weight epoch.
+
+        The driver serializes phases so every rank has updated its epoch before
+        any engine runs again. The first call starts the engine.
+        """
         if not self._inference_engine_initialized:
             self.prepare_for_generation()
             return
@@ -2475,8 +2481,11 @@ class MegatronGenerationRefitMixin:
         torch.cuda.synchronize()
 
     def open_coresident_refit_handles(self, handles_by_device: dict[str, dict], share: bool = False) -> dict:
-        """Co-resident engine, once: map the learner's refit tensors on this GPU (CUDA IPC); with ``share``, bind the
-        matching ones as this engine's own (before its first forward). Returns what was bound."""
+        """Map local learner refit tensors through CUDA IPC and optionally share them.
+
+        Matching engine tensors are bound before their first forward. Returns
+        the bound tensor counts and storage sizes.
+        """
         from megatron.core.resharding.utils import named_refit_tensors
 
         handles, learner_coords = handles_by_device[self.report_device_id()]
@@ -2498,8 +2507,10 @@ class MegatronGenerationRefitMixin:
         return {**stats, **expert_stats}
 
     def coresident_refit_copy(self) -> dict[str, float]:
-        """Co-resident engine, per step (paused on every rank): copy the learner's local tensors into this engine's by
-        name, then everything derived from the weights. Runs on the engine loop thread."""
+        """Copy private weights and refresh derived caches while every rank is paused.
+
+        Runs on the inference-loop thread once the engine has initialized.
+        """
         if not self._inference_engine_initialized:
             return self._coresident_copy_weights()
         return asyncio.run_coroutine_threadsafe(

@@ -4916,8 +4916,11 @@ class MegatronPolicyWorkerImpl(
         torch.cuda.synchronize()
 
     def _coresident_patch_store(self) -> Optional[sm_partition.WeightPatchStore]:
-        """policy.generation.colocated.record_weight_patches = K: keep the last K per-step weight patches on the GPU
-        (sm_partition.WeightPatchStore). None when off."""
+        """Return the optional bounded GPU history of learner weight patches.
+
+        policy.generation.colocated.record_weight_patches = K: keep the last K per-step weight patches on the GPU
+        (sm_partition.WeightPatchStore). None when off.
+        """
         generation = self.cfg.get("generation")  # None for training-only policies
         keep = generation["colocated"].get("record_weight_patches") if generation else None
         if not keep:
@@ -4927,8 +4930,11 @@ class MegatronPolicyWorkerImpl(
         return self._weight_patches
 
     def export_coresident_refit_handles(self) -> tuple[str, dict, str, dict]:
-        """Co-resident learner, once: CUDA IPC handles of this rank's local refit tensors by Megatron's resolved name,
-        keyed by its GPU, the storage fingerprint they were taken at, and its TP / PP coordinates."""
+        """Export stable CUDA IPC handles for this rank local refit tensors.
+
+        Co-resident learner, once: CUDA IPC handles of this rank's local refit tensors by Megatron's resolved name,
+        keyed by its GPU, the storage fingerprint they were taken at, and its TP / PP coordinates.
+        """
         from megatron.core.resharding.utils import named_refit_tensors
 
         core = sm_partition.refit_core(self.model)
@@ -4942,9 +4948,12 @@ class MegatronPolicyWorkerImpl(
         )
 
     def coresident_refit_source_ready(self) -> str:
-        """Co-resident learner, per step: the optimizer step's writes are complete before the engine copies (with
+        """Verify refit storage identity after learner weight writes complete.
+
+        Co-resident learner, per step: the optimizer step's writes are complete before the engine copies (with
         overlap_param_gather the SC's sync_params_before_refit has already gathered them). Returns the storage
-        fingerprint: the engine reads this rank's memory through handles taken once, so it must not have moved."""
+        fingerprint: the engine reads this rank's memory through handles taken once, so it must not have moved.
+        """
         from megatron.core.resharding.utils import named_refit_tensors
 
         torch.cuda.synchronize()

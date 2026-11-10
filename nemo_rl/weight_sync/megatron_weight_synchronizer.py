@@ -238,8 +238,11 @@ class MegatronWeightSynchronizer(WeightSynchronizer):
 
 
 def _get_fail_fast(refs: list, *, timeout_s: Optional[float] = None) -> list:
-    """ray.get that raises the first failure as soon as it lands (a peer of a failed call may otherwise block until its
-    own timeout). O(1) driver calls while nothing fails."""
+    """Return worker results or raise the first failure without waiting for peers.
+
+    ray.get that raises the first failure as soon as it lands (a peer of a failed call may otherwise block until its
+    own timeout). O(1) driver calls while nothing fails.
+    """
     if timeout_s is not None and timeout_s <= 0:
         raise ValueError("co-resident refit timeout must be positive")
     deadline = None if timeout_s is None else time.perf_counter() + timeout_s

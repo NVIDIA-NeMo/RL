@@ -11,7 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Co-resident generation: the Megatron engine and the learner on the same GPUs, as two processes per GPU, each on its
+"""Run Megatron training and inference concurrently on shared GPUs with CUDA MPS.
+
+Co-resident generation: the Megatron engine and the learner on the same GPUs, as two processes per GPU, each on its
 own share of the SMs. This module is the one owner of the mechanism.
 
 The knob: ``policy.generation.colocated.engine_sm_fraction = f`` (with ``colocated.enabled = false`` and
@@ -176,8 +178,11 @@ def partition_backend(policy_cfg: Any) -> str:
 
 
 def engine_weights_mode(policy_cfg: Any) -> str:
-    """``colocated.engine_weights``: "copy" (the engine keeps its own weights, refit = per-step copy) or "shared" (the
-    engine maps the learner's weights wherever the local shards match; see bind_shared)."""
+    """Return whether inference weights are copied or shared.
+
+    ``colocated.engine_weights``: "copy" (the engine keeps its own weights, refit = per-step copy) or "shared" (the
+    engine maps the learner's weights wherever the local shards match; see bind_shared).
+    """
     gen = (policy_cfg or {}).get("generation") or {}
     return (gen.get("colocated") or {}).get("engine_weights") or "copy"
 
@@ -206,8 +211,11 @@ def actor_env(policy_cfg: Any, role: Role, *, env: Optional[dict] = None) -> dic
 
 
 def select_static_partition(policy_cfg: Any, role: Role, gpu_index: int) -> Optional[str]:
-    """``mps_static``: in a co-resident worker BEFORE its first CUDA call, pick this GPU's partition for ``role``
-    (``CUDA_MPS_SM_PARTITION``). No-op for the other backends."""
+    """Select the worker static MPS partition before CUDA initializes.
+
+    ``mps_static``: in a co-resident worker BEFORE its first CUDA call, pick this GPU's partition for ``role``
+    (``CUDA_MPS_SM_PARTITION``). No-op for the other backends.
+    """
     if engine_sm_fraction(policy_cfg) is None or partition_backend(policy_cfg) != "mps_static":
         return None
     import json
@@ -263,9 +271,12 @@ def _check_limit(role: Role, pct: Optional[str], seen: int, full: int, rank: int
 
 
 def _device_sm_count() -> int:
-    """The GPU's full SM count, unaffected by this process's MPS limit: a short CUDA probe in a child process started
+    """Query the physical GPU SM count outside the current MPS client cap.
+
+    The GPU's full SM count, unaffected by this process's MPS limit: a short CUDA probe in a child process started
     without the percentage (under MPS the CUDA attribute shows the limit; NVML's attribute query is MIG-only and raises
-    NotSupported on a full GB200)."""
+    NotSupported on a full GB200).
+    """
     import subprocess
     import sys
 
@@ -306,10 +317,13 @@ def storage_fingerprint(named: Iterable[tuple[str, torch.Tensor]]) -> str:
 
 
 def engine_rank_gpus(world: int, learner_ep: int, engine_ep: int) -> list[int]:
-    """GPU of each engine rank when the engine's EP is m x the learner's: engine rank r (EP rank ep = r % engine_ep,
+    """Map engine ranks to the GPUs that hold their expert weights.
+
+    GPU of each engine rank when the engine's EP is m x the learner's: engine rank r (EP rank ep = r % engine_ep,
     expert-DP rank d = r // engine_ep) goes to the GPU whose learner rank holds its experts (learner EP rank
     ep // m) as a contiguous block, so its experts are views of that GPU's learner tensors. Identity when m == 1.
-    Learner rank g is on GPU g; EP ranks are the fastest-varying expert-group coordinate (TP = ETP = 1)."""
+    Learner rank g is on GPU g; EP ranks are the fastest-varying expert-group coordinate (TP = ETP = 1).
+    """
     m = engine_ep // learner_ep
     gpus = [learner_ep * (m * (r // engine_ep) + (r % engine_ep) % m) + (r % engine_ep) // m for r in range(world)]
     assert sorted(gpus) == list(range(world)), gpus
@@ -317,8 +331,11 @@ def engine_rank_gpus(world: int, learner_ep: int, engine_ep: int) -> list[int]:
 
 
 def refit_names(core: torch.nn.Module) -> dict[str, str]:
-    """{local refit tensor name: Megatron's resolved name} of this process's model: the name Megatron's own refit
-    planner matches tensors by across layouts (per-expert tensors carry their global expert index)."""
+    """Resolve local refit tensor names through Megatron layout metadata.
+
+    {local refit tensor name: Megatron's resolved name} of this process's model: the name Megatron's own refit
+    planner matches tensors by across layouts (per-expert tensors carry their global expert index).
+    """
     from megatron.core.resharding.planner import _extract_module_metadata
 
     metadata = _extract_module_metadata(core, torch.distributed.get_rank(), core.config.num_moe_experts, 0, {})
@@ -341,10 +358,13 @@ def map_sources(
     dst_names: dict[str, str],
     dst_coords: dict[str, tuple[int, int]],
 ) -> dict[str, torch.Tensor]:
-    """The learner tensor behind each engine tensor. ``src``: the learner's tensors on this GPU by resolved name;
+    """Map inference tensors to compatible learner shards on the same GPU.
+
+    The learner tensor behind each engine tensor. ``src``: the learner's tensors on this GPU by resolved name;
     ``dst_names``: the engine's {local name: resolved name}. The two ranks must hold the same TP / PP shard (else a
     dense tensor of equal name and shape would be another rank's shard), and every engine tensor, each expert by its
-    global index, must be on this GPU's learner rank."""
+    global index, must be on this GPU's learner rank.
+    """
     if src_coords != dst_coords:
         raise ValueError(
             f"co-resident refit: the engine rank on this GPU is at {dst_coords} but the learner rank at {src_coords} "
@@ -367,11 +387,14 @@ def open_refit_handles(handles: dict[str, tuple]) -> dict[str, torch.Tensor]:
 def bind_shared(
     src: dict[str, torch.Tensor], named_dst: Iterable[tuple[str, torch.Tensor]], leaf_ids: set[int]
 ) -> dict[str, float]:
-    """Engine side, once, before the engine's first forward: point every engine tensor whose local shard equals the
+    """Bind compatible inference parameters to learner CUDA IPC storage.
+
+    Engine side, once, before the engine's first forward: point every engine tensor whose local shard equals the
     learner's (same shape and dtype, contiguous, and a module's own parameter, not a derived view) at the
     learner's memory. Returns the tensors / bytes bound. The engine may still re-home a bound tensor later (MCore
     concatenates expert weights into its own buffer on the first inference forward); ``copy_refit`` copies whatever
-    no longer aliases its source, so a binding is a memory saving, never a correctness assumption."""
+    no longer aliases its source, so a binding is a memory saving, never a correctness assumption.
+    """
     dst = dict(named_dst)
     _check_names(src, dst)
     bound = 0
@@ -552,9 +575,12 @@ def _aliases(d: torch.Tensor, s: torch.Tensor) -> bool:
 
 
 def copy_refit(src: dict[str, torch.Tensor], named_dst: Iterable[tuple[str, torch.Tensor]]) -> dict[str, float]:
-    """Engine side, per step (engine paused, learner idle): copy every learner tensor into the engine tensor of the
+    """Copy private inference tensors and account for shared storage.
+
+    Engine side, per step (engine paused, learner idle): copy every learner tensor into the engine tensor of the
     same name unless that engine tensor IS the learner's memory. The engine's tensors are enumerated live, so a tensor
-    the engine re-homed after setup is still the one written. Returns the bytes copied and the bytes shared."""
+    the engine re-homed after setup is still the one written. Returns the bytes copied and the bytes shared.
+    """
     dst = dict(named_dst)
     _check_names(src, dst)
     copied = shared = 0
@@ -594,7 +620,9 @@ def copy_refit(src: dict[str, torch.Tensor], named_dst: Iterable[tuple[str, torc
 
 
 class WeightPatchStore:
-    """Sparse per-step weight deltas of the learner's local refit tensors, newest last, at most ``keep`` versions, on
+    """Record a bounded history of sparse per-step weight patches on the GPU.
+
+    Sparse per-step weight deltas of the learner's local refit tensors, newest last, at most ``keep`` versions, on
     the GPU.
 
     One shared weight copy holds only the newest version. An engine whose rows keep the version they started under
@@ -625,8 +653,11 @@ class WeightPatchStore:
         self.patches = (self.patches + [patch])[-self.keep :]
 
     def stats(self, numel: int, element_size: int) -> dict[str, float]:
-        """Changed elements of the newest step and of the union over the last k steps (k = 1..keep), as a fraction of
-        the local weights and in bytes of an (int32 index, value) patch."""
+        """Summarize changed weights and sparse patch sizes across retained versions.
+
+        Changed elements of the newest step and of the union over the last k steps (k = 1..keep), as a fraction of
+        the local weights and in bytes of an (int32 index, value) patch.
+        """
         out = {}
         for k in range(1, len(self.patches) + 1):
             names = set().union(*(p.keys() for p in self.patches[-k:]))

@@ -391,8 +391,11 @@ class MegatronGeneration(GenerationInterface):
     def _coresident_gpu_order(
         config: PolicyConfig, cluster: RayVirtualCluster
     ) -> Optional[list[int]]:
-        """Co-resident engine with an EP that is a multiple of the learner's: the GPU of each engine rank, so that its
-        experts are a block of the co-located learner rank's (sm_partition.engine_rank_gpus); None otherwise."""
+        """Place inference expert ranks beside their matching learner expert shards.
+
+        Co-resident engine with an EP that is a multiple of the learner's: the GPU of each engine rank, so that its
+        experts are a block of the co-located learner rank's (sm_partition.engine_rank_gpus); None otherwise.
+        """
         from nemo_rl.models.megatron import sm_partition
 
         if sm_partition.engine_sm_fraction(config) is None:
