@@ -42,6 +42,7 @@ import asyncio
 import inspect
 import logging
 import os
+import shutil
 import sys
 import types
 from types import SimpleNamespace
@@ -531,6 +532,60 @@ def test_capture_router_fallback_patch_anchor_still_matches_installed_vllm(
         "fused_experts.set_capture_fn"
     ) < monolithic_branch.index("module.router.set_capture_fn")
     ast.parse(content)
+
+
+@pytest.mark.vllm
+def test_every_vllm_source_patch_applies_to_installed_vllm(
+    monkeypatch, tmp_path, caplog
+):
+    """Run the worker's patch entry point on copies of the installed vLLM files.
+
+    Most source patches only log a warning when their anchor is gone, so a vLLM
+    bump can drop one without failing anything until a GPU job hits it. This
+    turns every such warning into a test failure, with the optional
+    routed-experts capture patches required, so a new vLLM pin is checked
+    against every patch at once.
+    """
+    installed = patches._get_vllm_file
+    copies: dict[str, str] = {}
+
+    def copy_of_installed(relative_path: str) -> str:
+        # Patch a copy, so the test never edits site-packages.
+        if relative_path not in copies:
+            copy = tmp_path / "vllm" / relative_path
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(installed(relative_path), copy)
+            copies[relative_path] = str(copy)
+        return copies[relative_path]
+
+    monkeypatch.setattr(patches, "_get_vllm_file", copy_of_installed)
+    # _apply_vllm_patches extends this env var; setenv restores it afterwards.
+    monkeypatch.setenv(
+        "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY",
+        os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", ""),
+    )
+    patch_logger = logging.getLogger("vllm_patch")
+    patch_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger="vllm_patch"):
+            patches._apply_vllm_patches(
+                sys.executable, require_moe_routed_experts_capture=True
+            )
+    finally:
+        patch_logger.removeHandler(caplog.handler)
+
+    misses = sorted(
+        {
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "vllm_patch" and record.levelno >= logging.WARNING
+        }
+    )
+    assert not misses, "vLLM source patches did not apply:\n" + "\n".join(misses)
+    assert copies, "no vLLM file was patched"
+    for path in copies.values():
+        with open(path) as f:
+            ast.parse(f.read(), filename=path)
 
 
 @pytest.mark.vllm
