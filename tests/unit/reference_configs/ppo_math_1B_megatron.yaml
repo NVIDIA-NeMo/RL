@@ -129,7 +129,6 @@ policy:
   offload_optimizer_for_refit: true
 
   automodel_cfg:
-    frozen_multimodal_sharding: null  # null uses Automodel default; root/per_layer/replicate override it.
     enabled: false
     checkpoint:
       model_save_format: "safetensors"
@@ -350,7 +349,6 @@ value:
     reward_model_type: "regression"
 
   automodel_cfg:
-    frozen_multimodal_sharding: null  # null uses Automodel default; root/per_layer/replicate override it.
     enabled: false
     checkpoint:
       model_save_format: "safetensors"

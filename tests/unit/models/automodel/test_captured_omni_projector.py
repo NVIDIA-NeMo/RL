@@ -63,12 +63,35 @@ class _ToyNativeOmni(nn.Module):
         return self.head(output)
 
 
-def _check_mixed_projector(rank: int, dtype: torch.dtype) -> None:
+class _ToyNativeVisionOmni(_ToyNativeOmni):
+    def __init__(self) -> None:
+        super().__init__()
+        self.vision_model = nn.Linear(16, 16, bias=False)
+        self.force_image_size = 4
+
+    def extract_feature_dynamic(self, pixels, sizes):
+        features = [self.vision_model(image.reshape(1, -1, 16)) for image in pixels]
+        return self.vision_projector(torch.cat(features, dim=1))
+
+    def forward(self, input_ids, pixel_values=None):
+        output = self.language_model.get_input_embeddings()(input_ids)
+        if pixel_values is not None:
+            output = output + self.extract_feature_dynamic(pixel_values, None).mean(
+                1, keepdim=True
+            )
+        return self.head(output)
+
+
+def _check_mixed_projector(
+    rank: int, dtype: torch.dtype, *, trainable_vision: bool = False
+) -> None:
     mesh = init_device_mesh("cuda", (2,), mesh_dim_names=("dp",))
     patch_fsdp_accumulated_grad_guard()
     patch_fsdp_uniform_reduce_dtype()
     torch.manual_seed(7)
-    model = _ToyNativeOmni().to(device="cuda", dtype=dtype)
+    model = (_ToyNativeVisionOmni() if trainable_vision else _ToyNativeOmni()).to(
+        device="cuda", dtype=dtype
+    )
     reference = copy.deepcopy(model)
     tokens = torch.tensor([[1, 2]], device="cuda")
     pixels = torch.randn(1, 2, 16, device="cuda", dtype=dtype)
@@ -76,6 +99,10 @@ def _check_mixed_projector(rank: int, dtype: torch.dtype) -> None:
         reference(tokens, pixels)
     torch.cuda.synchronize()
     policy = MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=torch.float32)
+    if trainable_vision:
+        fully_shard(
+            model.vision_model, mesh=mesh, mp_policy=policy, reshard_after_forward=True
+        )
     for module in [
         model.language_model.embedding,
         model.vision_projector,
@@ -87,12 +114,13 @@ def _check_mixed_projector(rank: int, dtype: torch.dtype) -> None:
     reference_optimizer = torch.optim.SGD(
         reference.parameters(), lr=0.01, weight_decay=0.1
     )
-    for step, mixed in enumerate([True, False]):
+    image_counts = [(2, 0), (1, 2), (0, 0)] if trainable_vision else [(1, 0), (0, 0)]
+    for counts in image_counts:
         actual_optimizer.zero_grad(set_to_none=True)
         reference_optimizer.zero_grad(set_to_none=True)
         batch = {"input_ids": tokens}
-        if mixed and rank == 0:
-            batch["pixel_values"] = pixels
+        if counts[rank]:
+            batch["pixel_values"] = pixels.expand(counts[rank], -1, -1)
         expected = reference(**batch)
         expected.sum().backward()
         for parameter in reference.parameters():
@@ -147,7 +175,7 @@ def _check_mixed_projector(rank: int, dtype: torch.dtype) -> None:
                 rtol=0.03 if dtype == torch.bfloat16 else 2e-5,
                 atol=0.003 if dtype == torch.bfloat16 else 2e-5,
             )
-        if not mixed:
+        if not any(counts):
             for name, parameter in model.vision_projector.named_parameters():
                 assert parameter.grad is None
                 assert torch.equal(parameter.full_tensor(), prior_projector[name]), name
@@ -180,6 +208,36 @@ def test_mixed_projector_matches_outputs_gradients_and_all_text_updates(
     mp.spawn(
         _projector_worker,
         args=(str(tmp_path / "rendezvous"), dtype),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _vision_worker(rank: int, rendezvous: str, dtype: torch.dtype) -> None:
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        "nccl",
+        rank=rank,
+        world_size=2,
+        init_method="file://" + rendezvous,
+        timeout=timedelta(seconds=90),
+    )
+    try:
+        _check_mixed_projector(rank, dtype, trainable_vision=True)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.automodel
+@pytest.mark.gpu
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Two CUDA devices required")
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_trainable_vision_uneven_images_preserves_gradients_and_all_text_updates(
+    tmp_path: Path, dtype: torch.dtype
+) -> None:
+    mp.spawn(
+        _vision_worker,
+        args=(str(tmp_path / "vision-rendezvous"), dtype),
         nprocs=2,
         join=True,
     )

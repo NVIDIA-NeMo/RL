@@ -46,7 +46,6 @@ policy:
   offload_policy_before_refit: false
   offload_optimizer_for_refit: true
   automodel_cfg:
-    frozen_multimodal_sharding: null  # null uses Automodel default; root/per_layer/replicate override it.
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: ""
     enabled: false

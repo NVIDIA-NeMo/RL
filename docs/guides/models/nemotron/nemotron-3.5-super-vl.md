@@ -417,9 +417,3 @@ them. `gen_kl_error` stays flat at 0.0022-0.0024 and `token_mult_prob_error` at
 1.02 across every refit. Steps take ~5.5 minutes (rollout and training
 overlap); the run was two 4-hour Slurm jobs that resumed from the latest
 checkpoint (step 32).
-
-The coding recipes set `policy.automodel_cfg.frozen_multimodal_sharding: replicate`.
-Frozen vision weights remain identical on each learner GPU. This avoids vision
-parameter collectives when ranks process different numbers of images. It increases
-vision-weight memory per GPU. The optional setting also accepts `root`, `per_layer`,
-or `null` (Automodel default). Trainable projector and language parameters remain sharded.

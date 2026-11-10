@@ -179,7 +179,6 @@ policy:
   worker_extension_cls_fqn: null
 
   automodel_cfg:
-    frozen_multimodal_sharding: null  # null uses Automodel default; root/per_layer/replicate override it.
     enabled: true
     checkpoint:
       model_save_format: "safetensors"

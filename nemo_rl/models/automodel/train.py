@@ -125,8 +125,21 @@ def _captured_omni_projector_context(
     dist.all_reduce(
         image_ranks, op=dist.ReduceOp.MAX, group=device_mesh["dp"].get_group()
     )
-    if has_images or not bool(image_ranks.item()):
+    if not bool(image_ranks.item()):
         yield
+        return
+
+    vision = getattr(model, "vision_model", None)
+    sharded_vision = isinstance(vision, FSDPModule)
+    if sharded_vision:
+        # RADIO is called once per image; keep one gather per microbatch.
+        vision.set_reshard_after_forward(False, recurse=False)
+    if has_images:
+        try:
+            yield
+        finally:
+            if sharded_vision:
+                vision.reshard()
         return
 
     calls = 0
@@ -138,11 +151,16 @@ def _captured_omni_projector_context(
         calls += 1
         if calls > 1:
             return output
-        width = projector.norm.weight.shape[0]
-        empty = output.new_empty((1, 0, width))
-        # The zero edge keeps mixed-batch gradient collectives aligned without
-        # creating projector gradients (and Adam decay) for an all-text step.
-        projected = projector(empty)
+        if sharded_vision:
+            size = model.force_image_size
+            dummy = output.new_zeros((1, 3, size, size))
+            projected = model.extract_feature_dynamic(dummy, [(size, size)])
+        else:
+            width = projector.norm.weight.shape[0]
+            empty = output.new_empty((1, 0, width))
+            projected = projector(empty)
+        # A zero edge participates in mixed-batch reductions; all-text steps
+        # return before this hook so unused weights retain grad=None.
         return output + projected.sum().to(output.dtype) * 0
 
     embedding = model.language_model.get_input_embeddings()
@@ -155,6 +173,8 @@ def _captured_omni_projector_context(
             )
     finally:
         handle.remove()
+        if sharded_vision:
+            vision.reshard()
 
 
 def _build_model_batch(
