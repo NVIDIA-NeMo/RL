@@ -1833,7 +1833,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
     generation_cfg = master_config.policy["generation"]
     if (
         generation_cfg["backend"] == "vllm"
-        and generation_cfg["vllm_cfg"].get("http_api_server_count", 1) > 1
+        and cast(VllmConfig, generation_cfg)["vllm_cfg"].get("http_api_server_count", 1)
+        > 1
         and async_config.generation_fleet_health.enabled
     ):
         raise ValueError(

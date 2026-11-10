@@ -205,12 +205,13 @@ class MultiAPIServerPool:
                     if not process.is_alive():
                         raise RuntimeError(f"HTTP API process {process.name} exited")
                     connection.send((name, args))
-                return await asyncio.gather(
+                replies = await asyncio.gather(
                     *(
                         asyncio.to_thread(receive_reply, connection)
                         for connection in self.connections
                     )
                 )
+                return list(replies)
             except BaseException:
                 self.stop_children()
                 self.close_engines()
@@ -317,7 +318,7 @@ def run_api_process(
         _AsyncLLMHTTPClient,
     )
 
-    host = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    host: Any = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     host._init_frontend_state()
     host.cfg = generation_config
     host.routed_experts_dtype = routed_experts_dtype
