@@ -154,3 +154,75 @@ The container already has vLLM built and cached in the frozen environments. Usin
 
 > [!TIP]
 > For more details on frozen environments and how they differ from `uv run`, see the [Dependency Management](../design-docs/dependency-management.md#frozen-environments) documentation.
+
+## NIXL prefill KV lease verification backport
+
+A prefill KV lease can expire while decode is waiting to fetch KV. Prefill may
+then reuse those blocks for another request. The backport of
+[vLLM PR #62065](https://github.com/vllm-project/vllm/pull/62065), pinned to
+`03b2648165d24128611cd15818f4ecf51c0a0205`, adds lease-slot nonce verification so
+that decode rejects an expired handoff before using its KV for generation.
+
+This is an opt-in backport for the qualified build
+`0.30.0+g116da885561b.cu132`. NeMo RL's default vLLM dependency is not changed.
+The tool checks exact source SHA-256 values and rejects other builds, including
+unqualified 0.29 builds. The checked-in manifest records the upstream revision,
+original and patched file hashes, and backport wire version `15062065`.
+
+NeMo RL's runtime monkey patches live in
+`nemo_rl/models/generation/vllm/patches.py`. This backport instead belongs in the
+image build, after installing the custom vLLM package and creating frozen worker
+environments, but before importing vLLM or starting any worker. It changes six
+source files spanning scheduler, worker, metadata, and lease handling; rewriting
+files after imports would leave cached modules using different implementations.
+For a different vLLM revision, use the custom build workflow above and validate
+the matching upstream fix instead of bypassing these source checks.
+
+Identify the installed `vllm` package directory using each actual worker
+interpreter (this query does not import vLLM):
+
+```sh
+/path/to/worker/venv/bin/python -c 'import importlib.util; print(next(iter(importlib.util.find_spec("vllm").submodule_search_locations)))'
+```
+
+During image construction, check and apply to **every distinct package root**
+used by P, D, TP ranks, and Ray workers. Replace the example paths with those
+reported by the worker interpreters. The installer uses only Python's standard
+library and requires Git; it does not install or resolve dependencies.
+
+```sh
+python tools/apply_vllm_nixl_lease_patch.py --check \
+  --vllm-package-root /path/to/prefill/venv/lib/python3.13/site-packages/vllm \
+  --vllm-package-root /path/to/decode/venv/lib/python3.13/site-packages/vllm
+
+python tools/apply_vllm_nixl_lease_patch.py --apply \
+  --vllm-package-root /path/to/prefill/venv/lib/python3.13/site-packages/vllm \
+  --vllm-package-root /path/to/decode/venv/lib/python3.13/site-packages/vllm
+```
+
+The check reports `original` or `applied`; rerun it after applying and require
+`applied` for every root. Applying twice is safe. Unsupported or partially
+patched packages fail before source writes; rebuild a partially patched image.
+The installer stages and hashes all resulting files before replacing them,
+preserves file modes, and replaces files atomically to avoid modifying uv cache
+hardlinks. Run it offline: individual replacements are atomic, but the complete
+multi-file installation is not atomic against running readers or process kills.
+Ordinary write failures trigger rollback; a killed installer requires rebuilding
+or rechecking the image. All P/D processes must restart with the same patched
+package; mixed wire versions are unsupported. Rebuilding frozen environments
+can discard the fix and requires applying and checking it again.
+
+After the patch, lease verification is enabled by default through
+`kv_connector_extra_config.kv_lease_verification`. An invalid handoff fails
+safely under the default failure policy. To recover by locally recomputing the
+prompt KV on decode, set the decode engine's
+`kv_transfer_config.kv_load_failure_policy` to `"recompute"`. The policy alone
+does not add lease verification to an unpatched package. Increasing the lease
+can reduce expiry frequency but does not replace validity checking.
+
+Controlled two-node, TP=2 GPU qualification covered a normal handoff, expiry
+without cache pressure, expiry with block reuse, a longer-lease control, and
+expiry followed by decode recomputation. The patched path rejected stale leases
+before model execution; the recompute case produced finite output. This does
+not establish full SWE training correctness, scaling performance, or correctness
+for every NIXL transfer topology.

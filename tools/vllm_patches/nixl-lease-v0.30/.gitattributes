@@ -1,0 +1,2 @@
+# Preserve unified-diff context lines, including their leading space.
+*.patch -whitespace

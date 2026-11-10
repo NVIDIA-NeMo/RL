@@ -1,0 +1,1085 @@
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+@@ -38,6 +38,13 @@
+     KVConnectorTransferResults,
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
++from vllm.distributed.kv_transfer.kv_connector.v1.nixl.lease_slots import (
++    LeaseVerifier,
++    ProducerLeaseSlots,
++    get_num_lease_slots,
++    lease_slot_descs,
++    lease_verification_enabled,
++)
+ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+     GET_META_MSG,
+     NixlAgentMetadata,
+@@ -169,6 +176,12 @@
+     # caches under PP.
+     _supports_pp_hma = False
+ 
++    # Pull-mode lease slots, set in register_kv_caches when DRAM can be
++    # registered: exported to readers / used to verify reads.
++    _lease_slots: ProducerLeaseSlots | None = None
++    _lease_verifier: LeaseVerifier | None = None
++    _lease_verification = True
++
+     def _compute_desc_ids(
+         self,
+         block_ids: BlockIds,
+@@ -818,6 +831,7 @@
+         self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
+         self._recv_failures: set[ReqId] = set()
+         self._pending_recv_notifs: dict[ReqId, list[tuple[str, bytes]]] = {}
++        self._lease_verification = lease_verification_enabled(vllm_config)
+ 
+         # Handshake metadata of this worker for NIXL transfers.
+         self.xfer_handshake_metadata: NixlHandshakePayload | None = None
+@@ -1742,6 +1756,8 @@
+             descs = self.nixl_wrapper.get_reg_descs(ranges_for_mem_type, mem_type)
+             self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
+             self._registered_descs.append(descs)
++        if self._TRANSFER_MODE == "pull":
++            self._register_lease_slots()
+ 
+         self.device_kv_caches = kv_caches
+         self.dst_num_blocks[self.engine_id] = self.num_blocks
+@@ -1770,6 +1786,7 @@
+         self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
+             self.register_local_xfer_handler(self.block_size)
+         )
++        lease_tensor = self._lease_slots.tensor if self._lease_slots else None
+ 
+         # After KV Caches registered, listen for new connections.
+         agent_metadata = NixlAgentMetadata(
+@@ -1796,6 +1813,10 @@
+             dcp_size=self.dcp_size,
+             pcp_size=self.pcp_size,
+             region_members=self.region_members,
++            lease_slots_addr=(
++                lease_tensor.data_ptr() if lease_tensor is not None else None
++            ),
++            lease_num_slots=lease_tensor.numel() if lease_tensor is not None else 0,
+         )
+         # Wrap metadata in payload with hash for defensive decoding
+         assert self.compat_hash is not None
+@@ -1804,6 +1825,40 @@
+             compatibility_hash=self.compat_hash,
+             agent_metadata_bytes=encoder.encode(agent_metadata),
+         )
++
++    def _register_lease_slots(self) -> None:
++        """Register the lease slots and landing cells of pull mode in DRAM.
++
++        Raises:
++            RuntimeError: If they cannot be registered while lease
++                verification is enabled, as no pull could then be verified.
++
++        """
++        slots = ProducerLeaseSlots(
++            get_num_lease_slots(self.vllm_config, self.kv_cache_config)
++        )
++        verifier = LeaseVerifier(self.nixl_wrapper)
++        try:
++            descs = self.nixl_wrapper.register_memory(
++                [slots.tensor, verifier.tensor], backends=self.nixl_backends
++            )
++        except Exception as e:
++            if self._lease_verification:
++                raise RuntimeError(
++                    f"Cannot register NIXL KV lease slots in DRAM ({e}), so "
++                    "pulled KV cannot be verified. Set kv_lease_verification "
++                    "to false in kv_connector_extra_config to pull without it."
++                ) from e
++            logger.exception("Cannot register NIXL KV lease slots in DRAM.")
++            return
++        self._registered_descs.append(descs)
++        verifier.local_handle = self.nixl_wrapper.prep_xfer_dlist(
++            "NIXL_INIT_AGENT",
++            lease_slot_descs(verifier.tensor.data_ptr(), verifier.tensor.numel()),
++            mem_type="DRAM",
++        )
++        self._lease_slots = slots
++        self._lease_verifier = verifier
+ 
+     def _build_mamba_local(self, base_addresses: list[int]) -> np.ndarray:
+         """Build desc regions (conv sub-projections + ssm) per layer for
+@@ -2384,6 +2439,20 @@
+         self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
+             self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
+         )
++        if (
++            self._lease_verifier is not None
++            and nixl_agent_meta.lease_slots_addr is not None
++        ):
++            lease_descs = lease_slot_descs(
++                nixl_agent_meta.lease_slots_addr, nixl_agent_meta.lease_num_slots
++            )
++            self._lease_verifier.add_remote(
++                engine_id,
++                remote_tp_rank,
++                self.nixl_wrapper.prep_xfer_dlist(
++                    remote_agent_name, lease_descs, mem_type="DRAM"
++                ),
++            )
+ 
+         return remote_agent_name
+ 
+@@ -2822,6 +2891,7 @@
+         done_recving, newly_failed = self._pop_done_transfers(self._recving_transfers)
+         if newly_failed:
+             self._recv_failures.update(newly_failed)
++        done_recving = self._verify_read_leases(done_recving)
+ 
+         done_sending.update(self._replicated_pcp_done_sending)
+         self._replicated_pcp_done_sending.clear()
+@@ -2870,6 +2940,8 @@
+             # Skip KV sync and post-processing for failed requests
+             if req_id in failed_recv_reqs:
+                 self._pending_recv_notifs.pop(req_id, None)
++                if self._lease_verifier is not None:
++                    self._lease_verifier.discard(req_id)
+                 # TODO (NickLucche) handle failed transfer for HMA.
+                 if not self._is_hma_required:
+                     self._invalid_block_ids.put(set(meta.local_block_ids[0]))
+@@ -2960,7 +3032,10 @@
+             )
+             self._reqs_to_process.remove(req_id)
+             del self._reqs_to_send[req_id]
++            self._clear_lease_slot(req_id)
+             done_sending.add(req_id)
++        if self._lease_slots is not None:
++            self._lease_slots.publish()
+ 
+         return KVConnectorTransferResults(
+             finished_sending=done_sending,
+@@ -2987,6 +3062,37 @@
+         Subclasses must implement this to handle mode-specific notifications.
+         """
+         raise NotImplementedError
++
++    def _verify_read_leases(self, done_recving: set[ReqId]) -> set[ReqId]:
++        """Hold back finished pulls until their remote leases are checked.
++
++        Returns the requests to report this step: ``done_recving`` minus the
++        pulls whose checks start now, plus the pulls whose checks finished.
++        """
++        verifier = self._lease_verifier
++        if verifier is None:
++            return done_recving
++        reads_done = {
++            req_id
++            for req_id in done_recving
++            if verifier.has_checks(req_id) and req_id not in self._recv_failures
++        }
++        verified, failures = verifier.step(reads_done)
++        for req_id, reason in failures.items():
++            logger.warning(
++                "Declining KV pulled for request %s: %s. The KV load fails.",
++                req_id,
++                reason,
++            )
++            self.xfer_stats.record_lease_check_failure()
++            # The block READs completed, so every source may release its blocks.
++            self._send_pending_recv_notifs(req_id)
++            self._recv_failures.add(req_id)
++        return (done_recving - reads_done) | verified | failures.keys()
++
++    def _clear_lease_slot(self, req_id: ReqId) -> None:
++        if self._lease_slots is not None:
++            self._lease_slots.clear(req_id)
+ 
+     def _handle_heartbeat(self, payload: str) -> None:
+         """Extend leases for requests referenced in a heartbeat.
+@@ -3515,12 +3621,15 @@
+         it runs, so a transfer that outlives the TTL leaves its engine looking
+         idle. A peer that has lost its NIC holds one indefinitely.
+         """
+-        return {
++        busy = {
+             meta.remote.engine_id
+             for req_id in self._recving_transfers
+             if (meta := self._recving_metadata.get(req_id)) is not None
+             and meta.remote is not None
+         }
++        if self._lease_verifier is not None:
++            busy |= self._lease_verifier.busy_engines()
++        return busy
+ 
+     def _cleanup_remote_engine(
+         self, engine_id: EngineId, *, log_eviction: bool = True
+@@ -3536,6 +3645,8 @@
+         # Notif-only engines (push-mode D side) have no descriptor state.
+         for handle in self.dst_xfer_side_handles.pop(engine_id, {}).values():
+             self.nixl_wrapper.release_dlist_handle(handle)
++        if self._lease_verifier is not None:
++            self._lease_verifier.release_engine(engine_id)
+         # Pop under the handshake lock; NIXL teardown stays outside it.
+         with self._handshake_lock:
+             agents = self._remote_agents.pop(engine_id)
+@@ -3612,4 +3723,6 @@
+             for handle in handles:
+                 self.nixl_wrapper.release_xfer_handle(handle)
+         self._recving_transfers.clear()
++        if self._lease_verifier is not None:
++            self._lease_verifier.shutdown()
+         self._finish_shutdown()
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/lease_slots.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/lease_slots.py
+new file mode 100644
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/lease_slots.py
+@@ -0,0 +1,377 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Pull-mode KV lease slots for the NIXL connector.
++
++A producer slot holds the lease nonce until the request's blocks are released,
++so a reader that still sees the nonce after its READ knows the blocks were not
++reused during it.
++"""
++
++import secrets
++from collections import defaultdict
++from collections.abc import Iterable
++from dataclasses import dataclass
++from typing import TYPE_CHECKING, Any
++
++import numpy as np
++import torch
++
++from vllm.distributed.device_communicators.shm_broadcast import memory_fence
++from vllm.distributed.kv_transfer.kv_connector.utils import EngineId
++from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import ReqId
++from vllm.logger import init_logger
++
++if TYPE_CHECKING:
++    from vllm.config import VllmConfig
++    from vllm.v1.kv_cache_interface import KVCacheConfig
++
++logger = init_logger(__name__)
++
++LEASE_SLOT_BYTES = 8
++# Below 2**53 so routers that parse JSON numbers as doubles keep nonces exact.
++_NONCE_LIMIT = 1 << 53
++_NUM_LANDING_CELLS = 4096
++
++
++def get_num_lease_slots(
++    vllm_config: "VllmConfig", kv_cache_config: "KVCacheConfig"
++) -> int:
++    assert vllm_config.kv_transfer_config is not None
++    num_slots = vllm_config.kv_transfer_config.get_from_extra_config(
++        "kv_lease_slots", None
++    )
++    if num_slots is None:
++        # Each scheduled or held prefill owns a block; preempted ones keep
++        # their lease without one.
++        num_slots = (
++            kv_cache_config.num_blocks + vllm_config.scheduler_config.max_num_seqs
++        )
++    if int(num_slots) < 1:
++        raise ValueError(f"kv_lease_slots must be positive, got {num_slots}")
++    return int(num_slots)
++
++
++def lease_verification_enabled(vllm_config: "VllmConfig") -> bool:
++    assert vllm_config.kv_transfer_config is not None
++    enabled = vllm_config.kv_transfer_config.get_from_extra_config(
++        "kv_lease_verification", True
++    )
++    if not isinstance(enabled, bool):
++        raise ValueError(f"kv_lease_verification must be a bool, got {enabled!r}")
++    return enabled
++
++
++class LeaseSlotAllocator:
++    """Scheduler-side lease slots of a producer engine.
++
++    A slot is freed once workers zeroed it (``finished_sending``) or with a
++    clear that workers apply before the arms of the same step.
++    """
++
++    def __init__(self, num_slots: int):
++        self._num_slots = num_slots
++        self._free = list(range(num_slots - 1, -1, -1))
++        self._leases: dict[ReqId, tuple[int, int]] = {}
++        # Not `random`: engines seed it, which would repeat nonces on restart.
++        self._next_nonce = secrets.randbelow(_NONCE_LIMIT // 2) + 1
++        self._to_arm: dict[ReqId, tuple[int, int]] = {}
++        self._to_clear: set[ReqId] = set()
++
++    def get(self, req_id: ReqId) -> tuple[int, int] | None:
++        return self._leases.get(req_id)
++
++    def acquire(self, req_id: ReqId) -> tuple[int, int] | None:
++        """Return the (slot, nonce) lease of ``req_id``, allocating it once."""
++        if (lease := self._leases.get(req_id)) is not None:
++            return lease
++        if not self._free:
++            logger.error(
++                "Out of NIXL lease slots (%d): the KV of request %s gets no "
++                "lease, so readers decline it. Raise kv_lease_slots.",
++                self._num_slots,
++                req_id,
++            )
++            return None
++        nonce = self._next_nonce
++        self._next_nonce = nonce + 1 if nonce + 1 < _NONCE_LIMIT else 1
++        lease = (self._free.pop(), nonce)
++        self._leases[req_id] = lease
++        self._to_arm[req_id] = lease
++        return lease
++
++    def release(self, req_id: ReqId, *, clear: bool) -> None:
++        """Free the lease of ``req_id``.
++
++        Args:
++            req_id: The request whose lease ends.
++            clear: Whether workers must zero the slot themselves, having no
++                send record of the request that would do it.
++
++        """
++        lease = self._leases.pop(req_id, None)
++        if lease is None:
++            return
++        # A lease not sent to workers yet was never written.
++        if clear and self._to_arm.pop(req_id, None) is None:
++            self._to_clear.add(req_id)
++        self._free.append(lease[0])
++
++    def take_updates(self) -> tuple[dict[ReqId, tuple[int, int]], set[ReqId]]:
++        updates = self._to_arm, self._to_clear
++        self._to_arm, self._to_clear = {}, set()
++        return updates
++
++
++def lease_slot_descs(base_addr: int, num_slots: int) -> np.ndarray:
++    """NIXL ``(addr, len, device_id)`` descriptors, one per DRAM slot."""
++    descs = np.zeros((num_slots, 3), dtype=np.uint64)
++    descs[:, 0] = np.uint64(base_addr) + np.uint64(LEASE_SLOT_BYTES) * np.arange(
++        num_slots, dtype=np.uint64
++    )
++    descs[:, 1] = LEASE_SLOT_BYTES
++    return descs
++
++
++def _alloc_slots(num_slots: int) -> torch.Tensor:
++    # Only the CPU and the NIC touch the slots; NIXL pins them on registration.
++    return torch.zeros(num_slots, dtype=torch.int64)
++
++
++class ProducerLeaseSlots:
++    """Lease slots that a producer worker exports to readers."""
++
++    def __init__(self, num_slots: int):
++        self.tensor = _alloc_slots(num_slots)
++        self._slots = self.tensor.numpy()
++        self._leases: dict[ReqId, tuple[int, int]] = {}
++        self._dirty = False
++
++    def nonce(self, req_id: ReqId) -> int | None:
++        lease = self._leases.get(req_id)
++        return None if lease is None else lease[1]
++
++    def update(
++        self, to_clear: Iterable[ReqId], to_arm: dict[ReqId, tuple[int, int]]
++    ) -> None:
++        # Clears first: a cleared slot may be armed again in the same step.
++        for req_id in to_clear:
++            self.clear(req_id)
++        for req_id, (slot, nonce) in to_arm.items():
++            self._slots[slot] = nonce
++            self._leases[req_id] = (slot, nonce)
++            self._dirty = True
++
++    def clear(self, req_id: ReqId) -> None:
++        """Zero the slot of ``req_id``; must precede releasing its blocks."""
++        if (lease := self._leases.pop(req_id, None)) is not None:
++            self._slots[lease[0]] = 0
++            self._dirty = True
++
++    def publish(self) -> None:
++        """Order slot stores before the step results that release blocks."""
++        if self._dirty:
++            memory_fence()
++            self._dirty = False
++
++
++@dataclass
++class _LeaseCheck:
++    engine_id: EngineId
++    remote_rank: int
++    slot: int
++    nonce: int
++
++
++@dataclass
++class _SlotRead:
++    req_id: ReqId
++    slot: int
++    cell: int
++    nonce: int
++
++
++@dataclass
++class _LeaseRead:
++    handle: int
++    remote: tuple[EngineId, int]
++    entries: list[_SlotRead]
++
++
++class LeaseVerifier:
++    """Reader-side check that remote lease slots still hold their nonces.
++
++    Runs after all block READs of a request completed, with one READ per
++    remote rank for all requests checked in a step.
++    """
++
++    def __init__(self, nixl_wrapper: Any, num_cells: int = _NUM_LANDING_CELLS):
++        self.tensor = _alloc_slots(num_cells)
++        self._cells = self.tensor.numpy()
++        self._free_cells = list(range(num_cells - 1, -1, -1))
++        self._nixl = nixl_wrapper
++        self.local_handle: int | None = None
++        self._remote_handles: dict[EngineId, dict[int, int]] = defaultdict(dict)
++        # Requests whose block READs are still running.
++        self._checks: dict[ReqId, list[_LeaseCheck]] = defaultdict(list)
++        # Requests waiting for free landing cells.
++        self._queued: dict[ReqId, list[_LeaseCheck]] = {}
++        self._reads: list[_LeaseRead] = []
++        self._outstanding: dict[ReqId, int] = {}
++        self._reasons: dict[ReqId, str] = {}
++        self._verified: set[ReqId] = set()
++        self._failures: dict[ReqId, str] = {}
++
++    def add_remote(self, engine_id: EngineId, remote_rank: int, handle: int) -> None:
++        self._remote_handles[engine_id][remote_rank] = handle
++
++    def can_verify(self, engine_id: EngineId, remote_ranks: Iterable[int]) -> bool:
++        handles = self._remote_handles.get(engine_id, {})
++        return self.local_handle is not None and all(
++            rank in handles for rank in remote_ranks
++        )
++
++    def add_check(
++        self,
++        req_id: ReqId,
++        engine_id: EngineId,
++        remote_rank: int,
++        slot: int,
++        nonce: int,
++    ) -> None:
++        self._checks[req_id].append(_LeaseCheck(engine_id, remote_rank, slot, nonce))
++
++    def has_checks(self, req_id: ReqId) -> bool:
++        return req_id in self._checks
++
++    def discard(self, req_id: ReqId) -> None:
++        self._checks.pop(req_id, None)
++
++    def busy_engines(self) -> set[EngineId]:
++        return {read.remote[0] for read in self._reads}
++
++    def step(self, reads_done: Iterable[ReqId]) -> tuple[set[ReqId], dict[ReqId, str]]:
++        """Start checks of requests whose block READs completed.
++
++        Returns:
++            Requests whose leases all held, and failed requests with reasons.
++
++        """
++        for req_id in reads_done:
++            self._queued[req_id] = self._checks.pop(req_id)
++        self._post_queued()
++        self._poll()
++        verified, failures = self._verified, self._failures
++        self._verified, self._failures = set(), {}
++        return verified, failures
++
++    def _post_queued(self) -> None:
++        batches: dict[tuple[EngineId, int], list[_SlotRead]] = defaultdict(list)
++        for req_id, checks in list(self._queued.items()):
++            if len(checks) > len(self._free_cells):
++                break
++            del self._queued[req_id]
++            for check in checks:
++                cell = self._free_cells.pop()
++                self._cells[cell] = 0
++                batches[(check.engine_id, check.remote_rank)].append(
++                    _SlotRead(req_id, check.slot, cell, check.nonce)
++                )
++            self._outstanding[req_id] = len(checks)
++        for remote, entries in batches.items():
++            self._post_read(remote, entries)
++
++    def _post_read(
++        self, remote: tuple[EngineId, int], entries: list[_SlotRead]
++    ) -> None:
++        engine_id, remote_rank = remote
++        remote_handle = self._remote_handles.get(engine_id, {}).get(remote_rank)
++        handle = None
++        try:
++            if remote_handle is None:
++                raise RuntimeError("remote engine state was released")
++            assert self.local_handle is not None
++            handle = self._nixl.make_prepped_xfer(
++                "READ",
++                self.local_handle,
++                [entry.cell for entry in entries],
++                remote_handle,
++                [entry.slot for entry in entries],
++            )
++            if self._nixl.transfer(handle) == "ERR":
++                raise RuntimeError("transfer was not posted")
++        except Exception as e:
++            logger.warning(
++                "Failed to post NIXL lease slot READ to engine %s rank %s: %s",
++                engine_id,
++                remote_rank,
++                e,
++            )
++            # The backend may still write the cells of an unreleased handle.
++            reusable = handle is None or self._release(handle)
++            self._resolve(remote, entries, done=False, reusable=reusable)
++            return
++        self._reads.append(_LeaseRead(handle, remote, entries))
++
++    def _poll(self) -> None:
++        for read in list(self._reads):
++            try:
++                state = self._nixl.check_xfer_state(read.handle)
++            except Exception:
++                state = "ERR"
++            if state == "PROC":
++                continue
++            self._reads.remove(read)
++            reusable = self._release(read.handle)
++            self._resolve(read.remote, read.entries, state == "DONE", reusable)
++
++    def _resolve(
++        self,
++        remote: tuple[EngineId, int],
++        entries: list[_SlotRead],
++        done: bool,
++        reusable: bool,
++    ) -> None:
++        for entry in entries:
++            if reusable:
++                self._free_cells.append(entry.cell)
++            req_id = entry.req_id
++            if not done:
++                self._reasons.setdefault(
++                    req_id,
++                    f"the lease slot of engine {remote[0]} rank {remote[1]} "
++                    "could not be read",
++                )
++            elif self._cells[entry.cell] != entry.nonce:
++                self._reasons.setdefault(
++                    req_id,
++                    f"engine {remote[0]} rank {remote[1]} released the KV "
++                    "blocks before the read completed",
++                )
++            self._outstanding[req_id] -= 1
++            if self._outstanding[req_id] == 0:
++                del self._outstanding[req_id]
++                if (reason := self._reasons.pop(req_id, None)) is None:
++                    self._verified.add(req_id)
++                else:
++                    self._failures[req_id] = reason
++
++    def _release(self, handle: int) -> bool:
++        try:
++            self._nixl.release_xfer_handle(handle)
++        except Exception:
++            logger.warning("Failed to release NIXL lease slot READ.", exc_info=True)
++            return False
++        return True
++
++    def release_engine(self, engine_id: EngineId) -> None:
++        """Release the descriptors of a remote engine without in-flight READs."""
++        for handle in self._remote_handles.pop(engine_id, {}).values():
++            self._nixl.release_dlist_handle(handle)
++
++    def shutdown(self) -> None:
++        for read in self._reads:
++            self._release(read.handle)
++        self._reads.clear()
++        if self.local_handle is not None:
++            self._nixl.release_dlist_handle(self.local_handle)
++            self.local_handle = None
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+@@ -48,8 +48,9 @@
+ #  10: Add dense virtual transfer pages for compressed MLA caches
+ #  11: Add per-region transfer geometry and memory types to NixlAgentMetadata
+ #  12: Add per-region member names for PP push
++#  15062065: vLLM0.30 backport of PR62065 pull lease slot verification.
+ #
+-NIXL_CONNECTOR_VERSION: int = 12
++NIXL_CONNECTOR_VERSION: int = 15062065
+ 
+ 
+ @dataclass
+@@ -74,6 +75,9 @@
+     pcp_size: int = 1
+     # Layer names sharing each advertised region, in region order.
+     region_members: list[list[str]] = field(default_factory=list)
++    # Pull-mode lease slots (DRAM, int64 per slot); None when not exported.
++    lease_slots_addr: int | None = None
++    lease_num_slots: int = 0
+ 
+ 
+ @dataclass
+@@ -230,6 +234,9 @@
+     request_id: str
+     blocks_expiry_time: float | None = None
+     num_tokens: int | None = None
++    lease_slot: int | None = None
++    lease_nonce: int | None = None
++    is_turn2: bool = False
+ 
+ 
+ @dataclass
+@@ -270,6 +277,11 @@
+         self.scheduler_clock: float = 0.0
+         self.reqs_in_batch: set[ReqId] = set()
+         self.reqs_not_processed: set[ReqId] = set()
++        # Pull mode (P side): lease slots to write (req -> (slot, nonce)) and
++        # requests whose slots to zero. Workers zero before writing, so a
++        # cleared slot may be reused in the same step.
++        self.lease_slots_to_arm: dict[ReqId, tuple[int, int]] = {}
++        self.lease_slots_to_clear: set[ReqId] = set()
+         # Heartbeat data grouped by remote engine, sent by D worker to P.
+         self.heartbeat_by_engine: dict[EngineId, HeartbeatInfo] = {}
+         # Push mode (D side): registration data the D worker should send to
+@@ -330,5 +342,22 @@
+             port=kv_transfer_params["remote_port"],
+             blocks_expiry_time=kv_transfer_params.get("remote_blocks_expiry_time"),
+             num_tokens=kv_transfer_params.get("remote_num_tokens"),
++            lease_slot=kv_transfer_params.get("remote_lease_slot"),
++            lease_nonce=kv_transfer_params.get("remote_lease_nonce"),
++            is_turn2=bool(kv_transfer_params.get("do_remote_decode")),
+         )
+         self.reqs_to_recv[request_id] = req
++
++
++def make_read_notif(
++    remote_request_id: str, expected_consumers: int, lease_nonce: int | None
++) -> bytes:
++    """Encode a pull read-completion notification for the producer."""
++    nonce = "" if lease_nonce is None else str(lease_nonce)
++    return f"{remote_request_id}:{expected_consumers}:{nonce}".encode()
++
++
++def parse_read_notif(msg: str) -> tuple[str, int, int | None]:
++    """Decode ``make_read_notif`` output; request ids may contain ':'."""
++    req_id, expected_consumers, nonce = msg.rsplit(":", 2)
++    return req_id, int(expected_consumers), int(nonce) if nonce else None
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
+@@ -6,15 +6,25 @@
+ from typing import TYPE_CHECKING, Any
+ 
+ from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
++from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
+ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_scheduler import (
+     NixlBaseConnectorScheduler,
+ )
++from vllm.distributed.kv_transfer.kv_connector.v1.nixl.lease_slots import (
++    LeaseSlotAllocator,
++    get_num_lease_slots,
++)
++from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
++    NixlConnectorMetadata,
++)
+ from vllm.logger import init_logger
+ 
+ if TYPE_CHECKING:
+     from vllm.config import VllmConfig
+     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
++    from vllm.v1.core.sched.output import SchedulerOutput
+     from vllm.v1.kv_cache_interface import KVCacheConfig
++    from vllm.v1.outputs import KVConnectorOutput
+     from vllm.v1.request import Request
+ 
+ logger = init_logger(__name__)
+@@ -30,6 +40,26 @@
+         kv_cache_config: "KVCacheConfig",
+     ):
+         super().__init__(vllm_config, engine_id, kv_cache_config)
++        self._lease_slots = LeaseSlotAllocator(
++            get_num_lease_slots(vllm_config, kv_cache_config)
++        )
++
++    def build_connector_meta(
++        self,
++        scheduler_output: "SchedulerOutput",
++    ) -> KVConnectorMetadata:
++        meta = super().build_connector_meta(scheduler_output)
++        assert isinstance(meta, NixlConnectorMetadata)
++        meta.lease_slots_to_arm, meta.lease_slots_to_clear = (
++            self._lease_slots.take_updates()
++        )
++        return meta
++
++    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
++        super().update_connector_output(connector_output)
++        # Every worker zeroed the slot before reporting the request as sent.
++        for req_id in connector_output.finished_sending or ():
++            self._lease_slots.release(req_id, clear=False)
+ 
+     def get_num_new_matched_tokens(
+         self, request: "Request", num_computed_tokens: int
+@@ -123,6 +153,10 @@
+             params.get("do_remote_prefill") and self.is_bidirectional_kv_xfer_enabled
+         ):
+             self._reqs_in_batch.add(request.request_id)
++        if params.get("do_remote_decode"):
++            # Workers write the nonce in this step, before the request can
++            # finish and hand its lease to a reader.
++            self._lease_slots.acquire(request.request_id)
+         if self.use_host_buffer and params.get("do_remote_decode"):
+             # NOTE: when accelerator is not directly supported by Nixl,
+             # prefilled blocks need to be saved to host memory before transfer.
+@@ -241,6 +275,7 @@
+             self._reqs_not_processed.add(request.request_id)
+             # Clear _reqs_need_save if a request is aborted as partial prefill.
+             self._reqs_need_save.pop(request.request_id, None)
++            self._lease_slots.release(request.request_id, clear=True)
+             return False, None
+ 
+         # TODO: check whether block_ids actually ever be 0. If not we could
+@@ -248,7 +283,12 @@
+         delay_free_blocks = any(len(group) > 0 for group in block_ids)
+         remote_num_tokens = 0
+         blocks_expiry_time = None
+-        if delay_free_blocks:
++        lease = self._lease_slots.get(request.request_id)
++        if not delay_free_blocks:
++            # Nothing is held for a reader, so no worker record zeroes the slot.
++            self._lease_slots.release(request.request_id, clear=True)
++            lease = None
++        else:
+             # Prefill request on remote. It will be read from D upon completion
+             request_kv_blocks_ttl = self._kv_lease_duration
+             if is_d_node:
+@@ -288,5 +328,7 @@
+             pp_size=self.vllm_config.parallel_config.pipeline_parallel_size,
+             remote_num_tokens=remote_num_tokens,
+             remote_blocks_expiry_time=blocks_expiry_time,
++            remote_lease_slot=lease[0] if lease else None,
++            remote_lease_nonce=lease[1] if lease else None,
+             transfer_mode=self._TRANSFER_MODE,
+         )
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py
+@@ -14,6 +14,8 @@
+ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+     NixlConnectorMetadata,
+     ReqMeta,
++    make_read_notif,
++    parse_read_notif,
+ )
+ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
+     ReadSpec,
+@@ -93,6 +95,12 @@
+             # sibling connector inside a MultiConnector) still completes.
+             self._replicated_pcp_done_sending.update(metadata.reqs_to_send)
+             return
++
++        if self._lease_slots is not None:
++            self._lease_slots.update(
++                metadata.lease_slots_to_clear | metadata.reqs_not_processed,
++                metadata.lease_slots_to_arm,
++            )
+ 
+         # Keep around the requests that have been part of a batch. This is
+         # needed because async scheduling pushes the misalignment between the
+@@ -141,6 +149,38 @@
+         deadline = blocks_expiry_time - clock_offset
+         return time.perf_counter() + _KV_BLOCKS_EXPIRY_SAFETY_MARGIN >= deadline
+ 
++    def _should_verify_lease(
++        self, req_id: str, meta: ReqMeta, remote_ranks: tuple[int, ...]
++    ) -> bool | None:
++        """Whether to check the remote lease once the pull completed.
++
++        Returns None when the pull must fail instead, as it cannot be verified.
++        """
++        assert meta.remote is not None
++        if (
++            not self._lease_verification
++            # TODO: export leases for turn-2 readback from the decoder too.
++            or meta.remote.is_turn2
++            or not any(len(group) > 0 for group in meta.local_block_ids)
++        ):
++            return False
++        if meta.remote.lease_slot is None or meta.remote.lease_nonce is None:
++            reason = "kv_transfer_params carry no remote_lease_slot/nonce"
++        elif self._lease_verifier is None or not self._lease_verifier.can_verify(
++            meta.remote.engine_id, remote_ranks
++        ):
++            reason = "the remote engine exports no lease slots"
++        else:
++            return True
++        logger.warning(
++            "Declining KV pull for request %s from engine %s: %s.",
++            req_id,
++            meta.remote.engine_id,
++            reason,
++        )
++        self.xfer_stats.record_lease_check_failure()
++        return None
++
+     def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
+         assert meta.remote is not None and self.transfer_topo is not None
+         engine_id = meta.remote.engine_id
+@@ -157,6 +197,15 @@
+             self.xfer_stats.record_kv_expired_req()
+             # KV expiry is reported separately from transport failures, so only
+             # the state cleanup side of _handle_failed_transfer runs here.
++            self._handle_failed_transfer(
++                req_id, None, self._recv_failures, record_failed_transfer=False
++            )
++            return
++
++        verify_lease = self._should_verify_lease(
++            req_id, meta, self.tp_mappings[engine_id].all_source_ranks
++        )
++        if verify_lease is None:
+             self._handle_failed_transfer(
+                 req_id, None, self._recv_failures, record_failed_transfer=False
+             )
+@@ -362,6 +411,9 @@
+                 remote_xfer_side_handle=remote_xfer_side_handle,
+                 expected_consumers=plan.local_consumers,
+                 awaiting_kvs=meta.awaiting_kvs,
++                lease_slot=meta.remote.lease_slot,
++                lease_nonce=meta.remote.lease_nonce,
++                verify_lease=verify_lease,
+             ):
+                 return
+ 
+@@ -370,7 +422,9 @@
+             # have the blocks we need so they can update the request state.
+             # Same thing for DCP (tp_size == dcp_size), so the raw tp_ratio already
+             # reflects whether any remote replica is left unchosen.
+-            notif_id = f"{meta.remote.request_id}:{plan.local_consumers}".encode()
++            notif_id = make_read_notif(
++                meta.remote.request_id, plan.local_consumers, meta.remote.lease_nonce
++            )
+             remote_agents = self._remote_agents[meta.remote.engine_id]
+             for rank_to_notify, agent in remote_agents.items():
+                 if rank_to_notify != (0, read_specs[0].remote_rank):
+@@ -400,9 +454,15 @@
+         remote_xfer_side_handle: int,
+         expected_consumers: int,
+         awaiting_kvs: bool,
++        lease_slot: int | None = None,
++        lease_nonce: int | None = None,
++        verify_lease: bool = False,
+     ) -> bool:
+         """Post a READ point-to-point xfer request from a single local worker to
+         a single remote worker.
++
++        With ``verify_lease``, the remote is notified only after the READ
++        completed and its lease slot still held ``lease_nonce``.
+ 
+         Returns True when the read was posted (or was unnecessary), False
+         when the request was routed to failure reporting — the caller must
+@@ -438,7 +498,7 @@
+ 
+         # Number of local workers that will notify this producer worker.
+         # Propagate on notification so dst worker can wait before freeing.
+-        notif_id = f"{remote_request_id}:{expected_consumers}".encode()
++        notif_id = make_read_notif(remote_request_id, expected_consumers, lease_nonce)
+ 
+         # Full prefix cache hit: do not need to read remote blocks,
+         # just notify P worker that we have the blocks we need.
+@@ -528,6 +588,7 @@
+ 
+         # Prepare transfer with Nixl.
+         handle = None
++        notif_agent = self._remote_agents[dst_engine_id][(0, remote_rank)]
+         try:
+             if self._mixed_mem_types:
+                 self._read_blocks_mixed(
+@@ -538,24 +599,36 @@
+                     remote_xfer_side_handle=remote_xfer_side_handle,
+                     local_block_descs_ids=local_block_descs_ids,
+                     remote_block_descs_ids=remote_block_descs_ids,
+-                    notif_agent=self._remote_agents[dst_engine_id][(0, remote_rank)],
++                    notif_agent=notif_agent,
+                     notif_id=notif_id,
+                 )
+-                return True
+-            handle = self.nixl_wrapper.make_prepped_xfer(
+-                "READ",
+-                local_xfer_side_handle,
+-                local_block_descs_ids,
+-                remote_xfer_side_handle,
+-                remote_block_descs_ids,
+-                notif_msg=notif_id,
+-            )
+-
+-            # Begin async xfer.
+-            self.nixl_wrapper.transfer(handle)
+-
+-            # Use handle to check completion in future step().
+-            self._recving_transfers[request_id].append(handle)
++            else:
++                handle = self.nixl_wrapper.make_prepped_xfer(
++                    "READ",
++                    local_xfer_side_handle,
++                    local_block_descs_ids,
++                    remote_xfer_side_handle,
++                    remote_block_descs_ids,
++                    # A verified pull notifies once the lease check passed:
++                    # the notification lets the remote zero the lease slot.
++                    notif_msg=b"" if verify_lease else notif_id,
++                )
++
++                # Begin async xfer.
++                self.nixl_wrapper.transfer(handle)
++
++                # Use handle to check completion in future step().
++                self._recving_transfers[request_id].append(handle)
++                if verify_lease:
++                    self._pending_recv_notifs.setdefault(request_id, []).append(
++                        (notif_agent, notif_id)
++                    )
++            if verify_lease:
++                assert self._lease_verifier is not None
++                assert lease_slot is not None and lease_nonce is not None
++                self._lease_verifier.add_check(
++                    request_id, dst_engine_id, remote_rank, lease_slot, lease_nonce
++                )
+             return True
+         except Exception as e:
+             self._log_failure(
+@@ -648,7 +721,7 @@
+                     self._handle_heartbeat(msg[3:])
+                     continue
+ 
+-                req_id, expected_consumers = msg.rsplit(":", 1)
++                req_id, expected_consumers, nonce = parse_read_notif(msg)
+                 if (
+                     req_id not in self._reqs_to_send
+                     and req_id not in self._reqs_to_process
+@@ -656,17 +729,30 @@
+                     logger.error(
+                         "Potentially invalid KV blocks for "
+                         "unrecognized request %s were retrieved by "
+-                        "a decode worker. They may have expired.",
++                        "a decode worker. They may have expired. Decode "
++                        "workers that verify KV leases reject reads of "
++                        "released blocks.",
+                         req_id,
+                     )
+                     continue
++                if (
++                    nonce is not None
++                    and self._lease_slots is not None
++                    and nonce != self._lease_slots.nonce(req_id)
++                ):
++                    # A reader of an earlier request with the same id; counting
++                    # it could release blocks a current reader still needs.
++                    logger.warning(
++                        "Ignoring a read notification for request %s from an "
++                        "earlier lease of the same request id.",
++                        req_id,
++                    )
++                    continue
+ 
+                 # Every reader of this req_id reports the same count (it's
+                 # derived from aggregate topology, not the specific rank),
+                 # so repeated notifications never disagree on it.
+-                self.expected_consumer_notifications_by_req[req_id] = int(
+-                    expected_consumers
+-                )
++                self.expected_consumer_notifications_by_req[req_id] = expected_consumers
+ 
+                 self.consumer_notification_counts_by_req[req_id] += 1
+                 # Wait all consumers (D) to be done reading before freeing.
+@@ -679,4 +765,5 @@
+                     del self.expected_consumer_notifications_by_req[req_id]
+                     self._reqs_to_process.remove(req_id)
+                     self._reqs_to_send.pop(req_id, None)
++                    self._clear_lease_slot(req_id)
+         return notified_req_ids
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/stats.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/stats.py
+--- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/stats.py
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/stats.py
+@@ -41,6 +41,7 @@
+             "num_failed_notifications": [],
+             "num_failed_handshakes": [],
+             "num_kv_expired_reqs": [],
++            "num_lease_check_failures": [],
+         }
+ 
+     def record_transfer(self, res: "nixlXferTelemetry"):
+@@ -65,6 +66,10 @@
+     def record_kv_expired_req(self):
+         """Record a request that had its KV blocks expire."""
+         self.data["num_kv_expired_reqs"].append(1)
++
++    def record_lease_check_failure(self):
++        """Record a pull declined because its KV lease was lost or uncheckable."""
++        self.data["num_lease_check_failures"].append(1)
+ 
+     def clone_and_reset(self) -> "NixlKVConnectorStats":
+         old = copy.copy(self)
+@@ -79,6 +84,7 @@
+             and len(self.data["num_failed_notifications"]) == 0
+             and len(self.data["num_failed_handshakes"]) == 0
+             and len(self.data["num_kv_expired_reqs"]) == 0
++            and len(self.data["num_lease_check_failures"]) == 0
+         )
+ 
+     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
+@@ -101,6 +107,7 @@
+             + len(self.data["num_failed_handshakes"])
+             + len(self.data["num_failed_notifications"]),
+             "Num KV expired reqs": len(self.data["num_kv_expired_reqs"]),
++            "Num lease check failures": len(self.data["num_lease_check_failures"]),
+         }
+         if self.num_successful_transfers == 0:
+             # Timing / throughput stats only cover successful transfers. If
+@@ -260,6 +267,18 @@
+         )
+         self.counter_nixl_num_kv_expired_reqs = create_metric_per_engine(
+             counter_nixl_num_kv_expired_reqs, self.per_engine_labelvalues
++        )
++
++        counter_nixl_num_lease_check_failures = self._counter_cls(
++            name="vllm:nixl_num_lease_check_failures",
++            documentation="Number of KV pulls declined because the remote "
++            "released the KV blocks before the read completed or the lease "
++            "could not be checked. NOTE: This metric is tracked on the D "
++            "instance.",
++            labelnames=labelnames,
++        )
++        self.counter_nixl_num_lease_check_failures = create_metric_per_engine(
++            counter_nixl_num_lease_check_failures, self.per_engine_labelvalues
+         )
+ 
+     def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
+@@ -284,6 +303,7 @@
+                 self.counter_nixl_num_failed_transfers,
+                 self.counter_nixl_num_failed_notifications,
+                 self.counter_nixl_num_kv_expired_reqs,
++                self.counter_nixl_num_lease_check_failures,
+             ],
+             [
+                 # Transfer, handshake and notification failures are grouped:
+@@ -297,6 +317,7 @@
+                 ),
+                 ("num_failed_notifications",),
+                 ("num_kv_expired_reqs",),
++                ("num_lease_check_failures",),
+             ],
+         ):
+             for counter_item_key in counter_item_keys:
