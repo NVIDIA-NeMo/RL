@@ -42,12 +42,13 @@ case "${mode}" in single|multi|mixed) ;; *) echo "Unknown mode: ${mode}" >&2; ex
 if [[ "${1:-}" == -- ]]; then shift; fi
 output="${MM_CODING_ACCEPTANCE_ROOT}/${mode}"
 mkdir -p "${output}"
+checkpoint_dir=${MM_CODING_CHECKPOINT_ROOT:-${output}/checkpoints}
 uv run --no-sync python examples/nemo_gym/nemotron-3.5-super-vl/check_mm_coding_runtime.py \
     --mode "${mode}" > "${output}/runtime-check.json"
 common=(
     examples/run_grpo_single_controller.py
     --config "examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_${mode}.yaml"
-    "checkpointing.checkpoint_dir=${output}/checkpoints"
+    "checkpointing.checkpoint_dir=${checkpoint_dir}"
     checkpointing.enabled=true
     checkpointing.save_period=1
     checkpointing.save_optimizer=true
@@ -60,9 +61,9 @@ common=(
 # These are separate interpreter/driver processes. Both phases use the same split and checkpoint root.
 uv run --no-sync python "${common[@]}" \
     "grpo.max_num_steps=${save_steps}" "logger.log_dir=${output}/save" > "${output}/save.log" 2>&1
-test -d "${output}/checkpoints/step_${save_steps}/policy/weights"
-test -d "${output}/checkpoints/step_${save_steps}/policy/optimizer"
+test -d "${checkpoint_dir}/step_${save_steps}/policy/weights"
+test -d "${checkpoint_dir}/step_${save_steps}/policy/optimizer"
 uv run --no-sync python "${common[@]}" \
     "grpo.max_num_steps=${resume_steps}" "logger.log_dir=${output}/resume" > "${output}/resume.log" 2>&1
-test -d "${output}/checkpoints/step_${resume_steps}/policy/optimizer"
+test -d "${checkpoint_dir}/step_${resume_steps}/policy/optimizer"
 echo "${mode}: save and resume processes exited successfully; inspect native restore, update and data-cursor evidence."

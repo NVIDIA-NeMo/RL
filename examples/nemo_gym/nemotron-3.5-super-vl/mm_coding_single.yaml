@@ -9,6 +9,7 @@ grpo:
   val_period: 0
 checkpointing:
   checkpoint_dir: results/grpo-super35-mm-coding-single
+  metric_name: null
   save_period: 1
   save_data_plane: true
 token_capture:
