@@ -15,10 +15,11 @@ from typing import Optional
 
 import pytest
 
+from nemo_rl.telemetry.span_groups import RLSpanGroup
 from nemo_rl.telemetry.vision import (
-    RL_VISION_IMAGE_ROWS_METRIC,
-    RL_VISION_IMAGES_METRIC,
+    RL_VISION_MEDIA_ROWS_METRIC,
     RL_VISION_ROWS_METRIC,
+    RL_VISION_SEGMENTS_METRIC,
     RL_VISION_STAGE_ATTR,
     VISION_METRICS,
     VISION_STAGE_LOADER_BATCH,
@@ -68,8 +69,8 @@ def workload(counts: Optional[list[int]], num_rows: int) -> Optional[dict[str, i
 
 def test_row_aligned_batch_reports_all_three_series():
     assert workload([2, 0, 1], num_rows=3) == {
-        RL_VISION_IMAGES_METRIC: 3,
-        RL_VISION_IMAGE_ROWS_METRIC: 2,
+        RL_VISION_SEGMENTS_METRIC: 3,
+        RL_VISION_MEDIA_ROWS_METRIC: 2,
         RL_VISION_ROWS_METRIC: 3,
     }
 
@@ -81,7 +82,7 @@ def test_packed_batch_reports_the_total_without_the_row_breakdown():
     corresponding to the batch's rows. The total still does, and dropping it
     too would leave those recipes reporting nothing at all.
     """
-    assert workload([2, 0, 1], num_rows=1) == {RL_VISION_IMAGES_METRIC: 3}
+    assert workload([2, 0, 1], num_rows=1) == {RL_VISION_SEGMENTS_METRIC: 3}
 
 
 def test_text_only_batch_is_a_zero_rather_than_a_gap():
@@ -91,8 +92,8 @@ def test_text_only_batch_is_a_zero_rather_than_a_gap():
     to support.
     """
     assert workload(None, num_rows=4) == {
-        RL_VISION_IMAGES_METRIC: 0,
-        RL_VISION_IMAGE_ROWS_METRIC: 0,
+        RL_VISION_SEGMENTS_METRIC: 0,
+        RL_VISION_MEDIA_ROWS_METRIC: 0,
         RL_VISION_ROWS_METRIC: 4,
     }
 
@@ -138,12 +139,12 @@ def test_record_stamps_the_span_and_the_metrics_from_one_count(monkeypatch):
         span=span,
     )
 
-    assert span.attributes[RL_VISION_IMAGES_METRIC] == 2
+    assert span.attributes[RL_VISION_SEGMENTS_METRIC] == 2
     assert recorded == [
         (
             {
-                RL_VISION_IMAGES_METRIC: 2,
-                RL_VISION_IMAGE_ROWS_METRIC: 2,
+                RL_VISION_SEGMENTS_METRIC: 2,
+                RL_VISION_MEDIA_ROWS_METRIC: 2,
                 RL_VISION_ROWS_METRIC: 2,
             },
             {RL_VISION_STAGE_ATTR: VISION_STAGE_TRAIN_MICROBATCH},
@@ -217,7 +218,7 @@ def test_traced_train_phase_stamps_the_batch_it_was_called_with(monkeypatch):
 
     assert Worker().train(batch, loss_fn="fn") == "result"
     assert seen == [(batch, "fn")]
-    assert recorded[0][0][RL_VISION_IMAGES_METRIC] == 1
+    assert recorded[0][0][RL_VISION_SEGMENTS_METRIC] == 1
     assert recorded[0][1] == {RL_VISION_STAGE_ATTR: VISION_STAGE_TRAIN_BATCH}
 
 
@@ -241,24 +242,109 @@ def test_traced_train_phase_accepts_the_batch_by_keyword(monkeypatch):
     assert recorded[0][1] == {RL_VISION_STAGE_ATTR: VISION_STAGE_TRAIN_MICROBATCH}
 
 
-def test_traced_train_phase_keeps_a_var_keyword_signature():
-    """What lets it stack above ``wrap_with_nvtx_name`` without breaking Ray.
+def test_traced_train_phase_opens_its_span_and_stamps_it(monkeypatch):
+    """The decorator's whole job, and none of it was covered.
 
-    ``instrumentation._advertise_carrier`` leaves a callable alone when it
-    already takes ``**kwargs``. If this wrapper ever narrowed its signature,
-    Ray would start rejecting the trace carrier on every decorated actor
-    method, and the failure would surface as a dispatch TypeError rather than
-    as anything telemetry-shaped.
+    Three things have to line up or the feature is silently inert: the span
+    has to open under ``U_WORKER_TRAIN`` (so ``worker_train`` is the switch
+    that controls it), it has to carry the span name the docs tell people to
+    query, and the vision attributes have to land on *that* span rather than
+    on whatever happened to be current.
     """
-    import inspect
+    import contextlib
+
+    opened: list[tuple] = []
+    span = FakeSpan()
+
+    @contextlib.contextmanager
+    def fake_umbrella_span(group, name, **kwargs):
+        opened.append((group, name))
+        yield span
+
+    monkeypatch.setattr("nemo_rl.telemetry.vision.umbrella_span", fake_umbrella_span)
+    monkeypatch.setattr(
+        "nemo_rl.telemetry.metrics.record_rl_metrics",
+        lambda values, attributes=None: None,
+    )
+
+    class Worker:
+        @traced_train_phase(
+            "rl.policy.train_microbatch", stage=VISION_STAGE_TRAIN_MICROBATCH
+        )
+        def train_microbatch(self, data):
+            # Stamped before the body runs, so a batch that fails still
+            # reports the payload it failed on.
+            assert span.attributes[RL_VISION_SEGMENTS_METRIC] == 3
+            return "done"
+
+    result = Worker().train_microbatch(
+        FakeBatch(rows=2, pixel_values=FakePackedTensor([2, 1]))
+    )
+
+    assert result == "done"
+    assert opened == [(RLSpanGroup.U_WORKER_TRAIN, "rl.policy.train_microbatch")]
+    assert span.attributes[RL_VISION_ROWS_METRIC] == 2
+
+
+def test_traced_train_phase_closes_its_span_when_the_body_raises(monkeypatch):
+    """A failed microbatch is the one whose span is most worth having."""
+    import contextlib
+
+    closed = []
+    span = FakeSpan()
+
+    @contextlib.contextmanager
+    def fake_umbrella_span(group, name, **kwargs):
+        try:
+            yield span
+        finally:
+            closed.append(name)
+
+    monkeypatch.setattr("nemo_rl.telemetry.vision.umbrella_span", fake_umbrella_span)
+    monkeypatch.setattr(
+        "nemo_rl.telemetry.metrics.record_rl_metrics",
+        lambda values, attributes=None: None,
+    )
 
     class Worker:
         @traced_train_phase("rl.policy.train", stage=VISION_STAGE_TRAIN_BATCH)
         def train(self, data):
-            return None
+            raise RuntimeError("boom")
 
-    parameters = inspect.signature(Worker.train, follow_wrapped=False).parameters
-    assert any(p.kind is p.VAR_KEYWORD for p in parameters.values())
+    with pytest.raises(RuntimeError, match="boom"):
+        Worker().train(FakeBatch(rows=1, pixel_values=None))
+
+    assert closed == ["rl.policy.train"]
+
+
+def test_traced_train_phase_forwards_arbitrary_arguments():
+    """These are actor methods with long and varied signatures.
+
+    ``train`` alone takes eval_mode, gbs, mbs and check_dim_skip_keys, passed
+    positionally by some callers and by keyword by others. A wrapper that
+    dropped or reordered any of them would fail at the call site rather than
+    anywhere telemetry-shaped.
+    """
+    seen = {}
+
+    class Worker:
+        @traced_train_phase("rl.policy.train", stage=VISION_STAGE_TRAIN_BATCH)
+        def train(self, data, loss_fn, eval_mode=False, gbs=None, mbs=None):
+            seen.update(
+                loss_fn=loss_fn, eval_mode=eval_mode, gbs=gbs, mbs=mbs, data=data
+            )
+            return "trained"
+
+    batch = FakeBatch(rows=1, pixel_values=None)
+
+    assert Worker().train(batch, "fn", True, mbs=4) == "trained"
+    assert seen == {
+        "data": batch,
+        "loss_fn": "fn",
+        "eval_mode": True,
+        "gbs": None,
+        "mbs": 4,
+    }
 
 
 def test_every_declared_series_is_one_vision_workload_can_produce():

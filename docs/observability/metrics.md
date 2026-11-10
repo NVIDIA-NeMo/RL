@@ -49,13 +49,15 @@ What a span cannot tell you: a span times a phase, but not what fraction of the 
 
 | Metric | Unit | Logger key | Prefix |
 | --- | --- | --- | --- |
-| `rl.performance.fp_utilization` | `1` | `train_fp_utilization` | `performance` |
+| `rl.performance.fp_utilization` | `1` | `train_fp_utilization` | `performance` *and* `train` |
 | `rl.performance.tflops_per_gpu` | `TFLOP/s` | `train_flops_per_gpu` | `performance` |
 | `rl.performance.worker_idle_ratio` | `1` | `training_worker_idle_time_ratio` | `performance` |
 | `rl.performance.token_imbalance` | | `average_token_imbalance` | `performance` |
 | `rl.performance.valid_tokens_per_second_per_gpu` | `{token}/s` | `valid_tokens_per_sec_per_gpu` | `timing/train` |
 
 `rl.performance.fp_utilization` is MFU as a 0–1 ratio, not a percentage. It is emitted only when the run reports `theoretical_tflops`; `rl.performance.tflops_per_gpu` does not depend on that and is always present.
+
+MFU is read from two prefixes because the algorithms disagree on where to put it: GRPO and PPO route it through `print_performance_metrics` into the `performance` dict, while SFT v1, DPO and distillation set it on the step `metrics` dict logged under `train`. Same key, same quantity. The other four rows are GRPO/PPO-only, since only `print_performance_metrics` computes them.
 
 ### Why the rest of `timing/train` is not teed
 
@@ -81,13 +83,17 @@ Read one phase at a time. For "what did startup cost", use `phase=total_setup` �
 
 ## Vision workload (`rl.vision.*`)
 
-On a VLM run, how much vision work a batch carried. Three gauges, declared in `nemo_rl/telemetry/vision.py`, each tagged with `rl.vision.stage`:
+On a VLM run, how much vision work the batches carried. Three **counters**, declared in `nemo_rl/telemetry/vision.py`, each tagged with `rl.vision.stage`:
 
 | Metric | Unit | Meaning |
 |---|---|---|
-| `rl.vision.images` | `{image}` | images in one batch |
-| `rl.vision.image_rows` | `{row}` | rows of it carrying at least one image |
-| `rl.vision.rows` | `{row}` | rows in it, image-bearing or not |
+| `rl.vision.segments` | `{segment}` | media segments carried |
+| `rl.vision.media_rows` | `{row}` | rows carrying at least one segment |
+| `rl.vision.rows` | `{row}` | rows in total, media-bearing or not |
+
+**Segments, not images.** One `PackedTensor` segment can hold more than one image — `PackedTensor(torch.randn(2, 3, 4, 4), dim_to_pack=0)` is a single segment carrying two — and the leading dimension does not mean the same thing across model families (images for a `[N, C, H, W]` tensor, patches for Qwen-VL's flattened `pixel_values`). Segments are the one quantity well defined everywhere, so the series is named for them rather than for an image count it cannot honestly produce. For a family where one segment is one image, the two coincide.
+
+Counters rather than gauges because these are recorded once per microbatch: a pushed gauge reports only the last value set in an export cycle, which on a 16-microbatch step would discard 15 of every 16 samples. The exact per-batch values are on the spans; the counters are the aggregate view. Use `rate()` or `increase()` over a window, not the raw total.
 
 `rl.vision.stage` is one of:
 
@@ -97,17 +103,19 @@ On a VLM run, how much vision work a batch carried. Three gauges, declared in `n
 | `train_microbatch` | a policy worker rank on the split begin/microbatch/finish path (SFT v2, single controller), measured per `forward_backward_func` invocation |
 | `train_batch` | a policy worker rank on the whole-batch path (GRPO, PPO, SFT v1, and everything on Automodel, which has no split path), measured per `train()` call |
 
-`train_microbatch` and `train_batch` are two spellings of the same work by different algorithms, never both for one batch — so filter to one before summing, or the same images are counted twice.
+`train_microbatch` and `train_batch` are two spellings of the same work by different algorithms, never both for one batch — so filter to one before summing, or the same segments are counted twice.
 
-One instrument per quantity with the stage as an attribute, rather than a series per producer, because the useful question is how the stages compare — whether the loader fed fewer images or the step consumed them more slowly — and that is a filter on one series rather than a join of two.
+One instrument per quantity with the stage as an attribute, rather than a series per producer, because the useful question is how the stages compare — whether the loader fed fewer segments or the step consumed them more slowly — and that is a filter on one series rather than a join of two.
 
 These are **recorded, not teed**: both producers are worker-side and neither owns a `Logger`, so they go through `record_rl_metrics` instead of the `log_metrics` path the training scalars use.
 
 `rl.vision.rows` is emitted alongside the other two rather than left to be joined against a batch-size series, because the loader and the policy worker count rows differently once sequence packing is on, and a ratio built across that boundary would be wrong without saying so.
 
-**Under sequence packing only `rl.vision.images` is emitted.** Packing concatenates rows into one THD sequence, after which per-row counts no longer correspond to the batch's rows, so the two row series are dropped while the total — which is still well-defined — is kept. Three of the five shipped Energon VLM recipes pack, so this is the normal case rather than an edge one.
+**Under sequence packing only `rl.vision.segments` is emitted.** Packing concatenates rows into one THD sequence, after which per-row counts no longer correspond to the batch's rows, so the two row series are dropped while the total — which is still well-defined — is kept. Three of the five shipped Energon VLM recipes pack, so this is the normal case rather than an edge one.
 
-Nothing at all is emitted for a batch whose image layout cannot be read. A gap in the series is intended there; a zero would be a wrong number. A text-only batch is *not* that case — it reports zero images, which is what makes it usable as the baseline an image-heavy batch is read against.
+Nothing at all is emitted for a batch whose media layout cannot be read. A gap in the series is intended there; a zero would be a wrong number. A text-only batch is *not* that case — it reports zero segments, which is what makes it usable as the baseline a media-heavy batch is read against.
+
+The metrics and the span attributes are configured independently: the counters run whenever telemetry is exporting, while the attributes need the emitting span's group (`worker_train` for the train stages) to be enabled. That is deliberate — the loader and train stages sit in different span groups, so no single switch could speak for both.
 
 The same counts appear as attributes on whichever span produced them — `rl.policy.train_microbatch` or `rl.policy.train` — which is what makes that span's duration comparable against the vision load behind it. See [Worker-side training spans](span-groups.md#worker-side-training-spans) for why there is no span on the vision encoder itself.
 

@@ -30,6 +30,14 @@ which re-exports them from nemo-lens with ``rl.bucket`` efficiency tagging
 applied.
 """
 
+# Imported for the side effect of declaring the rl.vision.* rows. Registration
+# closes when telemetry comes up, and a row declared after that raises, so the
+# declaring module has to be imported before init_telemetry_driver. The driver
+# builds its policy after that call, and the worker module that records these
+# is only imported then -- so leaving it to that import would turn a VLM run's
+# policy construction into a RuntimeError. Here instead, because every entry
+# point reaches init_telemetry_driver through this package.
+from nemo_rl.telemetry import vision as _vision  # noqa: F401
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import Bucket, bucket_for_span_group
 from nemo_rl.telemetry.setup import (
@@ -39,15 +47,6 @@ from nemo_rl.telemetry.setup import (
     shutdown_telemetry,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-
-# Imported for the side effect of declaring the rl.vision.* rows. Registration
-# closes when telemetry comes up, and a row declared after that raises, so the
-# declaring module has to be imported before init_telemetry_driver. The driver
-# builds its policy after that call, and the worker module that records these
-# is only imported then -- so leaving it to that import would turn a VLM run's
-# policy construction into a RuntimeError. Here instead, because every entry
-# point reaches init_telemetry_driver through this package.
-from nemo_rl.telemetry import vision as _vision  # noqa: F401
 
 __all__ = [
     "TelemetryConfig",

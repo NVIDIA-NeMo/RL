@@ -27,6 +27,12 @@ from transformers import (
     PreTrainedTokenizerBase,
 )
 
+from nemo_rl.algorithms.metric_utils import (
+    TOKEN_IMBALANCE_KEY,
+    TRAIN_FLOPS_PER_GPU_KEY,
+    TRAIN_FP_UTILIZATION_KEY,
+    WORKER_IDLE_RATIO_KEY,
+)
 from nemo_rl.data.chat_templates import COMMON_CHAT_TEMPLATES
 from nemo_rl.data.deepseek_v4_tokenizer import (
     get_deepseek_v4_tokenizer,
@@ -671,7 +677,7 @@ def print_performance_metrics(
         if per_worker_token_counts is not None:
             average_token_imbalance = visualize_per_worker_load(per_worker_token_counts)
             if average_token_imbalance is not None:
-                performance_metrics["average_token_imbalance"] = average_token_imbalance
+                performance_metrics[TOKEN_IMBALANCE_KEY] = average_token_imbalance
 
     if "mean_total_tokens_per_sample" in metrics:
         print(
@@ -850,9 +856,7 @@ def print_performance_metrics(
         print(
             f"  • Training Worker Idle Time Ratio: {100 * training_worker_idle_time_ratio:.2f}%"
         )
-        performance_metrics["training_worker_idle_time_ratio"] = (
-            training_worker_idle_time_ratio
-        )
+        performance_metrics[WORKER_IDLE_RATIO_KEY] = training_worker_idle_time_ratio
 
     number_of_samples_per_step = num_prompts_per_step * num_generations_per_prompt
 
@@ -957,14 +961,14 @@ def print_performance_metrics(
             f"  • Training FLOPS: {total_tflops:.2f} TFLOPS ({total_tflops / num_ranks:.2f} TFLOPS per rank)",
             flush=True,
         )
-        performance_metrics["train_flops_per_gpu"] = total_tflops / num_ranks
+        performance_metrics[TRAIN_FLOPS_PER_GPU_KEY] = total_tflops / num_ranks
         if "theoretical_tflops" in train_results:
             theoretical_tflops = train_results["theoretical_tflops"]
             print(
                 f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%",
                 flush=True,
             )
-            performance_metrics["train_fp_utilization"] = (
+            performance_metrics[TRAIN_FP_UTILIZATION_KEY] = (
                 total_tflops / theoretical_tflops
             )
 

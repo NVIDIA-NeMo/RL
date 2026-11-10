@@ -27,6 +27,10 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.loss_functions import NLLLossFn
+from nemo_rl.algorithms.metric_utils import (
+    TRAIN_FP_UTILIZATION_KEY,
+    VALID_TOKENS_PER_SEC_PER_GPU_KEY,
+)
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -900,7 +904,9 @@ def sft_train(
                     print(
                         f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%"
                     )
-                    metrics["train_fp_utilization"] = total_tflops / theoretical_tflops
+                    metrics[TRAIN_FP_UTILIZATION_KEY] = (
+                        total_tflops / theoretical_tflops
+                    )
             print("\n⏱️  Timing:")
             # Display total time first, separately
             total_time = timing_metrics.get("total_step_time", 0)
@@ -918,11 +924,11 @@ def sft_train(
                 master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
             if total_time > 0:
-                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                timing_metrics[VALID_TOKENS_PER_SEC_PER_GPU_KEY] = (
                     metrics.get("global_valid_toks", 0) / total_time / total_num_gpus
                 )
             else:
-                timing_metrics["valid_tokens_per_sec_per_gpu"] = 0.0
+                timing_metrics[VALID_TOKENS_PER_SEC_PER_GPU_KEY] = 0.0
             logger.log_metrics(metrics, total_steps + 1, prefix="train")
             logger.log_metrics(
                 timing_metrics,

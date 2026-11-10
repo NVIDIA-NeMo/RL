@@ -360,6 +360,7 @@ project-includes = [
   "nemo_rl/telemetry/metrics.py",
   "nemo_rl/telemetry/setup.py",
   "nemo_rl/telemetry/span_groups.py",
+  "nemo_rl/telemetry/vision.py",
   "nemo_rl/telemetry/vocabulary.py",
   "nemo_rl/transformers_compat.py",
   "nemo_rl/utils/__init__.py",

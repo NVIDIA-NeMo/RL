@@ -146,7 +146,7 @@ These are set on spans for filtering — they answer "which one?" / "what kind?"
 | `rl.data_plane.partition` | the partition the operation targets |
 | `rl.data_plane.keys` / `rl.data_plane.bytes` | key count and payload size for that one operation. Set after the inner client returns, since neither is known at span open |
 | `rl.data_plane.status` | `ok` / `error` / `timeout` — distinguishes a timeout from a generic failure, which the recorded exception alone does not |
-| `rl.vision.images` / `rl.vision.image_rows` / `rl.vision.rows` | vision workload of one `rl.policy.train_microbatch` or `rl.policy.train`, so its duration can be read against the images it carried. Absent, not zero, when the batch's layout cannot be read — see [Vision](#vision-why-there-is-no-encoder-span) |
+| `rl.vision.segments` / `rl.vision.media_rows` / `rl.vision.rows` | vision workload of one `rl.policy.train_microbatch` or `rl.policy.train`, so its duration can be read against the media it carried. Absent, not zero, when the batch's layout cannot be read — see [Vision](#vision-why-there-is-no-encoder-span) |
 | `rl.bucket` | goodput bucket: `productive` / `overhead` / `idle` / `wasted` (omit on umbrellas) |
 
 `rl.sc.step` carries `rl.iteration` and `rl.weight_version` but no `rl.epoch`.
@@ -728,15 +728,17 @@ On a VLM run, whichever of these spans received the batch carries its vision wor
 
 | Attribute | Meaning |
 |---|---|
-| `rl.vision.images` | images in this batch |
-| `rl.vision.image_rows` | rows carrying at least one image — omitted under sequence packing |
-| `rl.vision.rows` | rows in the batch, image-bearing or not — omitted under sequence packing |
+| `rl.vision.segments` | media segments in this batch — note one segment may hold several images, see [the metrics page](metrics.md#vision-workload-rlvision) |
+| `rl.vision.media_rows` | rows carrying at least one segment — omitted under sequence packing |
+| `rl.vision.rows` | rows in the batch, media-bearing or not — omitted under sequence packing |
 
 There is no span on the vision encoder itself, and there cannot be one from this repository. Both backends make a single fused call — `model(input_ids=..., **multimodal_data)` in `models/megatron/train.py` and `models/automodel/train.py` — and leave the vision tower to the upstream model, which reaches it through a different attribute per family (`model.visual` on Qwen-VL, `vision_tower.vision_model` on Gemma3, `vision_model.radio_model` on RADIO). No call made here contains the encoder and nothing else.
 
-These are the narrowest spans that do contain it, so encoder cost is read by comparison rather than directly: group their durations by `rl.vision.images` and a text-only batch becomes the baseline an image-heavy one is measured against. The comparison is sharper on the split path, where a microbatch is a smaller envelope around the same encoder call. The same counts are also emitted as [`rl.vision.*` metrics](metrics.md), tagged `rl.vision.stage`, so the loader's view and the step's view of the same batches can be compared without sampling traces.
+These are the narrowest spans that do contain it, so encoder cost is read by comparison rather than directly: group their durations by `rl.vision.segments` and a text-only batch becomes the baseline an image-heavy one is measured against. The comparison is sharper on the split path, where a microbatch is a smaller envelope around the same encoder call. The same counts are also emitted as [`rl.vision.*` metrics](metrics.md), tagged `rl.vision.stage`, so the loader's view and the step's view of the same batches can be compared without sampling traces.
 
-Under sequence packing only `rl.vision.images` is set: packing concatenates rows into one THD sequence, so the per-row breakdown no longer corresponds to the batch's rows while the total still does. All three are absent — rather than zero — when the batch's layout cannot be read at all. A gap is intended there; a zero would be a wrong number. A text-only batch is not that case: it reports zero images, which is what makes it the baseline.
+Under sequence packing only `rl.vision.segments` is set: packing concatenates rows into one THD sequence, so the per-row breakdown no longer corresponds to the batch's rows while the total still does. All three are absent — rather than zero — when the batch's layout cannot be read at all. A gap is intended there; a zero would be a wrong number. A text-only batch is not that case: it reports zero segments, which is what makes it the baseline.
+
+No shipped recipe enables `worker_train`, so these attributes are opt-in: add it to `telemetry.span_groups` (`per_step,worker_train`) on the run you want to look at. The matching `rl.vision.*` counters do not need it — they are recorded whenever telemetry exports.
 
 ## The Energon worker pool
 

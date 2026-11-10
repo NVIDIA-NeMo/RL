@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""How much vision work a batch carries, as spans attributes and metrics.
+"""How much vision work a batch carries, as span attributes and metrics.
 
 The vision encoder cannot be timed directly here. Both training backends make
 one fused ``model(input_ids=..., **multimodal_data)`` call and leave the vision
@@ -66,23 +66,38 @@ VISION_STAGE_TRAIN_BATCH = "train_batch"
 #: One batch delivered by an Energon loader owner.
 VISION_STAGE_LOADER_BATCH = "loader_batch"
 
-RL_VISION_IMAGES_METRIC = "rl.vision.images"
-RL_VISION_IMAGE_ROWS_METRIC = "rl.vision.image_rows"
+#: Media *segments*, not images. One ``PackedTensor`` segment may hold several
+#: images -- ``PackedTensor(torch.randn(2, 3, 4, 4), dim_to_pack=0)`` is one
+#: segment carrying two -- and the leading dimension does not mean the same
+#: thing across families (images for a ``[N, C, H, W]`` tensor, patches for
+#: Qwen-VL's flattened ``pixel_values``). Segments are the one quantity that is
+#: well defined everywhere, so the series is named for them rather than for an
+#: image count it cannot honestly produce.
+RL_VISION_SEGMENTS_METRIC = "rl.vision.segments"
+RL_VISION_MEDIA_ROWS_METRIC = "rl.vision.media_rows"
 RL_VISION_ROWS_METRIC = "rl.vision.rows"
 
+# Counters, not gauges. These are recorded once per microbatch, and a pushed
+# gauge reports only the last value set in an export cycle -- on a 16-microbatch
+# step that silently discards 15 of every 16 samples. A counter sums them, which
+# is also what makes the loader and train stages comparable: the question is how
+# much each stage got through over a window, not what the final one happened to
+# hold when the exporter looked.
 VISION_METRICS = (
     RecordedMetric(
-        RL_VISION_IMAGES_METRIC,
-        unit="{image}",
+        RL_VISION_SEGMENTS_METRIC,
+        kind="counter",
+        unit="{segment}",
         description=(
-            "Images carried by one batch at the stage named by the "
-            "rl.vision.stage attribute."
+            "Media segments carried by batches at the stage named by the "
+            "rl.vision.stage attribute. A segment may hold more than one image."
         ),
     ),
     RecordedMetric(
-        RL_VISION_IMAGE_ROWS_METRIC,
+        RL_VISION_MEDIA_ROWS_METRIC,
+        kind="counter",
         unit="{row}",
-        description="Rows of that batch carrying at least one image.",
+        description="Rows of those batches carrying at least one media segment.",
     ),
     RecordedMetric(
         # The denominator for the two above. Emitted alongside them rather than
@@ -90,16 +105,17 @@ VISION_METRICS = (
         # the policy worker count rows differently once packing is on and a
         # ratio built across that boundary would be wrong without saying so.
         RL_VISION_ROWS_METRIC,
+        kind="counter",
         unit="{row}",
-        description="Rows in that batch, whether or not they carry images.",
+        description="Rows in those batches, whether or not they carry media.",
     ),
 )
 register_recorded_metrics(VISION_METRICS)
 
 __all__ = [
     "RL_VISION_STAGE_ATTR",
-    "RL_VISION_IMAGES_METRIC",
-    "RL_VISION_IMAGE_ROWS_METRIC",
+    "RL_VISION_SEGMENTS_METRIC",
+    "RL_VISION_MEDIA_ROWS_METRIC",
     "RL_VISION_ROWS_METRIC",
     "VISION_METRICS",
     "VISION_STAGE_LOADER_BATCH",
@@ -112,7 +128,12 @@ __all__ = [
 
 
 def vision_workload(batch: Any, num_rows: int) -> Optional[dict[str, int]]:
-    """Images, and the row breakdown when rows still line up, in *batch*.
+    """Media segments, and the row breakdown when rows still line up, in *batch*.
+
+    Segments rather than images: one ``PackedTensor`` segment can hold several
+    images, and the leading dimension means different things across families,
+    so a count named "images" would be wrong on some of them. See
+    ``RL_VISION_SEGMENTS_METRIC``.
 
     Keyed by series name, so the result doubles as span attributes and as the
     ``record_rl_metrics`` payload without a second mapping between the two.
@@ -135,20 +156,20 @@ def vision_workload(batch: Any, num_rows: int) -> Optional[dict[str, int]]:
 
     pixel_values = batch.get("pixel_values", None)
     if pixel_values is None:
-        # A text-only batch genuinely carries no images; that is a zero rather
+        # A text-only batch genuinely carries no media; that is a zero rather
         # than an unreadable batch, and reporting it is what makes a text-only
         # microbatch usable as the baseline an image-heavy one is read against.
         return {
-            RL_VISION_IMAGES_METRIC: 0,
-            RL_VISION_IMAGE_ROWS_METRIC: 0,
+            RL_VISION_SEGMENTS_METRIC: 0,
+            RL_VISION_MEDIA_ROWS_METRIC: 0,
             RL_VISION_ROWS_METRIC: num_rows,
         }
     if not isinstance(pixel_values, PackedTensor):
         return None
     counts = pixel_values.logical_segment_counts_by_row()
-    workload = {RL_VISION_IMAGES_METRIC: sum(counts)}
+    workload = {RL_VISION_SEGMENTS_METRIC: sum(counts)}
     if len(counts) == num_rows:
-        workload[RL_VISION_IMAGE_ROWS_METRIC] = sum(1 for count in counts if count)
+        workload[RL_VISION_MEDIA_ROWS_METRIC] = sum(1 for count in counts if count)
         workload[RL_VISION_ROWS_METRIC] = num_rows
     return workload
 
@@ -158,10 +179,13 @@ def record_vision_workload(
 ) -> None:
     """Record *batch*'s vision workload, and stamp it on *span* when given.
 
-    Both sinks or neither: the span attributes are what make a duration
-    comparable against the load that produced it, and the metrics are what make
-    the load readable without sampling traces. A caller that wanted only one of
-    them would be asking a question the other half already answers.
+    The two sinks are independently configured and that is intended. The
+    metrics are recorded whenever telemetry is exporting; the span attributes
+    appear only when the caller's span group is enabled, and *span* is a
+    non-recording span otherwise, so the attributes are dropped while the
+    counters keep running. Gating the metrics on a span group would be wrong
+    besides: the loader and train stages sit in different groups, so one
+    switch cannot speak for both.
     """
     # Imported here rather than at module scope to keep this module's own
     # imports to ``vocabulary`` and ``instrumentation``. ``metrics`` imports
@@ -185,11 +209,7 @@ def traced_train_phase(span_name: str, *, stage: str) -> Callable[[_F], _F]:
 
     Stacks *above* ``wrap_with_nvtx_name`` rather than replacing it, so the
     boundaries an nsys profile shows and the ones lens shows stay the same
-    ones. That order also keeps the Ray trace carrier working:
-    ``instrumentation._advertise_carrier`` unwraps to the innermost
-    ``__wrapped__``, and the NVTX wrapper sets none, so the unwrap stops at its
-    bare ``**kwargs`` and the carrier is absorbed there instead of reaching a
-    signature Ray would reject it against.
+    ones.
 
     ``data`` is named in the wrapper's signature rather than dug out of
     ``*args``: every entrypoint this decorates takes the batch first, and

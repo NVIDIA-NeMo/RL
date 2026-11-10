@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Optional, get_args
 
 from nemo_rl.telemetry.vocabulary import (
+    DEFAULT_TEED_PREFIXES,
     PERFORMANCE_PREFIX,
     TIMING_TRAIN_PREFIX,
     VALIDATION_PREFIX,
@@ -144,7 +145,12 @@ PERFORMANCE_TEED_METRICS = (
         "rl.performance.fp_utilization",
         unit="1",
         description="Model floating-point utilization (MFU) as a 0-1 ratio.",
-        prefixes=(PERFORMANCE_PREFIX,),
+        # Two prefixes because two conventions: GRPO and PPO route this
+        # through `print_performance_metrics` into the `performance` dict,
+        # while SFT v1, DPO and distillation set it on the step `metrics`
+        # dict logged under `train`. Same key, same quantity, so accepting
+        # both is what makes MFU present for all five rather than two.
+        prefixes=(PERFORMANCE_PREFIX, *DEFAULT_TEED_PREFIXES),
     ),
     TeedMetric(
         TRAIN_FLOPS_PER_GPU_KEY,

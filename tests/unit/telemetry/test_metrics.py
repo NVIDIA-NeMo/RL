@@ -837,6 +837,65 @@ def test_map_teed_scalars_reads_the_performance_keys():
     }
 
 
+@pytest.mark.parametrize(
+    "prefix, metrics, series, expected",
+    [
+        ("validation", {"accuracy": 0.42}, "rl.validation.accuracy", 0.42),
+        (
+            "performance",
+            {"train_fp_utilization": 0.41},
+            "rl.performance.fp_utilization",
+            0.41,
+        ),
+        (
+            "timing/train",
+            {"valid_tokens_per_sec_per_gpu": 5100.0},
+            "rl.performance.valid_tokens_per_second_per_gpu",
+            5100.0,
+        ),
+    ],
+)
+def test_the_new_prefixes_reach_the_backend_through_the_real_tee(
+    prefix, metrics, series, expected
+):
+    """``map_teed_scalars`` alone cannot show a prefix is admitted.
+
+    The gate in ``_tee_rl_metrics_to_otel`` is a separate decision from the
+    per-row prefix filter, and each of these dicts was being dropped at that
+    gate before ever reaching the mapper. Asserting on exported points is the
+    only check that covers both halves.
+    """
+    pytest.importorskip("nemo.lens")
+    _import_teed_metric_owners()
+
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    tee_rl_metrics_to_otel(metrics, prefix)
+
+    points = _gauge_points(reader.get_metrics_data(), series)
+    assert [point.value for point in points] == [expected]
+
+
+def test_mfu_is_teed_from_both_prefixes_that_carry_it():
+    """SFT v1, DPO and distillation put it on the train dict, not performance.
+
+    A row declared for ``performance`` alone gives MFU to GRPO and PPO and
+    silently withholds it from the other three, which is indistinguishable
+    from a run that never computed it.
+    """
+    _import_teed_metric_owners()
+
+    from nemo_rl.telemetry.metrics import map_teed_scalars
+    from nemo_rl.telemetry.vocabulary import PERFORMANCE_PREFIX
+
+    expected = {"performance_fp_utilization": 0.41}
+    assert map_teed_scalars({"train_fp_utilization": 0.41}, "train") == expected
+    assert map_teed_scalars({"train_fp_utilization": 0.41}, PERFORMANCE_PREFIX) == (
+        expected
+    )
+
+
 def test_timing_train_tees_only_its_throughput_key():
     """The phase durations in that dict are deliberately not declared.
 
