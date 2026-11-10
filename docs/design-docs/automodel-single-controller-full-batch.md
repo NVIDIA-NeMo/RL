@@ -11,7 +11,7 @@ controller, sampler, and rollout architecture shared with the Megatron backend.
 This document describes the AutoModel worker contract and its full-batch execution.
 
 Supported scope is text GRPO, full-parameter FSDP2, TP=CP=1, fixed
-microbatches, disaggregated async vLLM, `in_order`, and lookahead zero. Dense and
+microbatches, disaggregated async vLLM, `in_order`, and lookahead zero or one. Dense and
 MoE models use the same lifecycle. Expert parallelism uses AutoModel's existing
 MoE mesh, dispatcher, gradient synchronization, and distributed clipping.
 Configure expert parallelism and the dispatcher through the existing AutoModel
@@ -60,6 +60,31 @@ accumulates gradients over its local microbatches. For example, GBS=32, DP=16,
 and MBS=1 gives two forward/backward microbatches per rank and one optimizer
 update. The full-batch restriction describes the dispatch boundary, not the
 number of model forward/backward calls.
+
+### Enabling lookahead one
+
+The exemplar defaults to lookahead zero. To overlap a future rollout batch with
+training while keeping one complete RL batch per optimizer update, apply these
+overrides to an AutoModel single-controller configuration:
+
+```yaml
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+  max_inflight_prompts: ${mul:2,${grpo.num_prompts_per_step}}
+  max_buffered_rollouts: ${mul:2,${grpo.num_prompts_per_step}}
+loss_fn:
+  force_on_policy_ratio: false
+  use_importance_sampling_correction: true
+```
+
+The capacities cover the current and lookahead prompt batches; each prompt group
+contains `num_generations_per_prompt` responses. Selection remains in target-step
+order and waits for every prompt group in the current batch. Training still
+accumulates the complete batch before one optimizer step. Lookahead values above
+one, sampler warmup overrides, and partial streaming dispatch remain unsupported
+for AutoModel SC.
 
 ## Interfaces and ownership
 

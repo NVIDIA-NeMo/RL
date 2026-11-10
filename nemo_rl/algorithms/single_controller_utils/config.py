@@ -1950,10 +1950,12 @@ def _validate_automodel_single_controller_config(master_config: MasterConfig) ->
     sampler = async_cfg.sampler
     if (
         not isinstance(sampler, InOrderSamplerConfig)
-        or sampler.max_lookahead_versions != 0
+        or sampler.max_lookahead_versions not in (0, 1)
         or sampler.warmup_lookahead_versions is not None
     ):
-        raise ValueError(prefix + "requires in_order with max_lookahead_versions=0")
+        raise ValueError(
+            prefix + "requires in_order with max_lookahead_versions in (0, 1)"
+        )
     if (
         async_cfg.min_groups_for_streaming_train
         != master_config.grpo.num_prompts_per_step
