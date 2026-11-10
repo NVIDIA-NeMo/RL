@@ -13,9 +13,10 @@ NeMo RL extension points:
   tokens, so NeMo RL's logprob and loss code runs unchanged.
 - The checkpoint's processor class is registered with `AutoProcessor`; audio
   features are computed inside the model.
-- The ASR data processor and the WER/CER reward environment are registered as
-  `asr` with `register_processor` and `register_env`. Mandarin `ordinary_asr`
-  rows use NeMo Skills' audio CER.
+- The ASR data processor and the WER/CER/MER reward environment are registered
+  as `asr` with `register_processor` and `register_env`. Mandarin
+  `ordinary_asr` rows use a CER that ignores whitespace next to Han characters;
+  `reward_metric: mer` rows use Speech's mixed error rate.
 - Policy and generation workers are selected with `worker_extension_cls_fqn`
   and run in the separately locked environments below.
 
@@ -24,7 +25,7 @@ NeMo RL extension points:
 | Actor | Project | Key pins |
 | --- | --- | --- |
 | Driver | `research/speechlm_gspo` (root workspace member) | root `uv.lock` |
-| Policy, ASR reward | `envs/policy` | Speech `732041d29`, Automodel `752a71eb`, Skills `5ea1990a`, transformers 5.18.0, TransformerEngine 2.19.0, Torch 2.13.0 |
+| Policy, ASR reward | `envs/policy` | Speech `732041d29`, Automodel `752a71eb`, transformers 5.18.0, TransformerEngine 2.19.0, Torch 2.13.0 |
 | vLLM generation | `envs/generation` | NeMo RL `vllm` extra (vLLM 0.29.0, transformers 5.12.1) and Speech `732041d29` |
 
 Speech and Automodel main require transformers and TransformerEngine versions
