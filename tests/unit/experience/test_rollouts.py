@@ -2512,11 +2512,7 @@ def test_postprocess_nemo_gym_group_reads_profile_metadata_from_task_rows(
         results=results,
         timer=rollouts_mod.Timer(),
         timer_prefix="timing/rollout",
-        policy_generation=type(
-            "_PolicyGeneration",
-            (),
-            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
-        )(),
+        max_total_tokens_per_sample=128,
         input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
         tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
         log_full_result_tables=log_full_result_tables,

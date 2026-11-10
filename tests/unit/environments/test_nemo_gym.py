@@ -1374,6 +1374,7 @@ def test_nemo_gym_stub_module():
 def test_setup_nemo_gym_config_selects_sglang_without_mutating_vllm():
     inactive_vllm_cfg = {"async_engine": False, "expose_http_server": False}
     config = SimpleNamespace(
+        data={},
         policy={
             "generation": {
                 "backend": "sglang",
@@ -1382,7 +1383,7 @@ def test_setup_nemo_gym_config_selects_sglang_without_mutating_vllm():
                 "stop_strings": ["stop"],
                 "stop_token_ids": [1],
             }
-        }
+        },
     )
 
     setup_nemo_gym_config(config, tokenizer=None)
