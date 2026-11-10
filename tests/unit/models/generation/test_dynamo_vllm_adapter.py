@@ -571,6 +571,20 @@ def test_a_gym_call_without_routes_fails_under_router_replay() -> None:
         _collect(engine, _gym_call([1, 3, 4]))
 
 
+def test_an_uncaptured_gym_call_with_non_finite_logprobs_fails_as_natively() -> None:
+    completion = _completion([10, 11], "length")
+    completion.logprobs[1] = {11: _logprob(float("nan"))}
+    llm = _FakeLLM([_output([1, 3, 4], completion)])
+    engine = vllm_adapter.DynamoVllmAdapter(_host(llm), leader_worker_idx=0)
+
+    # Dynamo would hand the frontend a null log-prob. Fail the call instead: the
+    # chat engine answers an engine's error with 500, as natively, and Gym retries.
+    with pytest.raises(
+        InvalidArgument, match=r"non-finite log-prob \(nan\) at token 1"
+    ):
+        _collect(engine, _gym_call([1, 3, 4]))
+
+
 def test_a_gym_call_without_the_chat_engines_plan_is_refused() -> None:
     llm = _FakeLLM()
     engine = vllm_adapter.DynamoVllmAdapter(_host(llm), leader_worker_idx=0)
