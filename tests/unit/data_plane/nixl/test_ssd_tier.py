@@ -522,7 +522,9 @@ def test_ssd_config_validation():
         "ssd_dir": "/x",
         "staging_bytes": 1 << 28,
         "pickup_s": 10.0,
+        "io_threads": 4,
     }
+    assert tq_nixl.ssd_config({**on, "ssd": {**ssd, "io_threads": 8}})["io_threads"] == 8
     with pytest.raises(ValueError, match="pickup_s"):
         tq_nixl.ssd_config({**on, "ssd": {**ssd, "pickup_s": 1.0}})
     with pytest.raises(ValueError, match="staging_bytes"):
@@ -540,3 +542,12 @@ def test_ssd_config_validation():
 def test_ssd_config_rejects_what_it_would_silently_ignore(ssd, match):
     with pytest.raises(ValueError, match=match):
         tq_nixl.ssd_config({"ssd": ssd})
+
+
+def test_io_threads_size_the_unit_worker_pool(tmp_path):
+    """The pool has `io_threads` workers; 0 is refused (no thread would run the spills)."""
+    assert _unit(tmp_path)._worker._max_workers == 4  # the default
+    u = bare_unit(1 << 20, ssd_dir=str(tmp_path), staging_bytes=256 * KB, io_threads=2)
+    assert u._worker._max_workers == 2
+    with pytest.raises(ValueError, match="io_threads"):
+        bare_unit(1 << 20, ssd_dir=str(tmp_path), staging_bytes=256 * KB, io_threads=0)

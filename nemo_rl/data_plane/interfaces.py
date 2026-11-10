@@ -210,12 +210,17 @@ class NixlSsdConfig(BaseModel, extra="forbid"):
 
     A put the unit's RAM cannot take goes to a file under ``path`` (node-local,
     absolute) through an IO area of ``staging_bytes`` carved from the slab.
+    ``io_threads`` file-I/O threads per unit write the spills and read the
+    spilled blobs back; one thread moves about 2.5 GB/s on NVMe, and a spilled
+    put is acknowledged only once its file is written, so a workload that
+    spills a large share of every step needs several.
     """
 
     enabled: bool = False
     path: str | None = None  # absolute; required when enabled
     staging_bytes: PositiveInt | None = None  # None: unit_slab_bytes // 4
     pickup_s: float = 10.0
+    io_threads: PositiveInt = 4
 
     @model_validator(mode="after")
     def _require_absolute_path_when_enabled(self) -> "NixlSsdConfig":

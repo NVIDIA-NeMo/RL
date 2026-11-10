@@ -138,11 +138,11 @@ def check_timeouts(cfg: dict[str, Any]) -> tuple[float, float, float]:
 def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
     """Unit kwargs for the SSD tier, or None when ``ssd.enabled`` is off.
 
-    ``ssd: {enabled, path, staging_bytes, pickup_s}``: when a unit's put area cannot
+    ``ssd: {enabled, path, staging_bytes, pickup_s, io_threads}``: when a unit's put area cannot
     take a put, the put goes to a file under ``path`` (node-local NVMe) from birth,
     through an IO area of ``staging_bytes`` carved from the slab; reads of such
-    blobs are staged back into the same area. Data already in the put area never
-    moves.
+    blobs are staged back into the same area, by ``io_threads`` file-I/O threads
+    per unit. Data already in the put area never moves.
 
     Contract: data is read roughly oldest first (the ``weight_fifo``,
     ``in_order`` and ``ready_first`` samplers), so the oldest data stays in RAM
@@ -170,6 +170,7 @@ def ssd_config(cfg: dict[str, Any]) -> dict[str, Any] | None:
         "ssd_dir": ssd["path"],
         "staging_bytes": staging,
         "pickup_s": pickup_s,
+        "io_threads": int(ssd["io_threads"]),
     }
 
 
