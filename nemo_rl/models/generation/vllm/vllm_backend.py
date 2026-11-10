@@ -195,20 +195,22 @@ def _process_mxfp8_modules_after_native_reload(
     model: torch.nn.Module, reloaded_module_ids: set[int]
 ) -> None:
     """Rebuild MXFP8 layouts outside the partial native reload."""
-    try:
-        from vllm.model_executor.layers.quantization.modelopt import (
-            ModelOptMxFp8FusedMoE,
-            ModelOptMxFp8LinearMethod,
-        )
-    except ImportError:
-        return
+    from vllm.model_executor.layers.quantization.modelopt import (
+        ModelOptLinearMethod,
+        ModelOptMxFp8FusedMoE,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kMxfp8Static,
+    )
 
-    mxfp8_methods = (ModelOptMxFp8FusedMoE, ModelOptMxFp8LinearMethod)
     for module in model.modules():
         if id(module) in reloaded_module_ids:
             continue
         quant_method = getattr(module, "quant_method", None)
-        if isinstance(quant_method, mxfp8_methods):
+        if isinstance(quant_method, ModelOptMxFp8FusedMoE) or (
+            isinstance(quant_method, ModelOptLinearMethod)
+            and quant_method.spec.weight == kMxfp8Static
+        ):
             quant_method.process_weights_after_loading(module)
 
 
