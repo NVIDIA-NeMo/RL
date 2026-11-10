@@ -12,11 +12,8 @@
 #   Local NeMo RL source override:
 #     docker buildx build --build-context nemo-rl=. -f docker/Dockerfile --tag <registry>/nemo-rl:latest --push .
 #
-#   Custom setup:
+#   Custom setup (skipped unless CUSTOM_SETUP_FNAME is set):
 #     docker buildx build --build-context custom-setup=my-setup-dir/ --build-arg CUSTOM_SETUP_FNAME=my_script.sh -f docker/Dockerfile ...
-#
-#   To skip custom setup:
-#     docker buildx build --build-arg CUSTOM_SETUP_FNAME= -f docker/Dockerfile ...
 #
 # Optional build args to skip vLLM or SGLang dependencies:
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
@@ -24,6 +21,8 @@
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
 # Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
 #   --build-arg BUILD_DYNAMO=1
+# Optional Apptainer install (for the SWE sandbox environments):
+#   --build-arg BUILD_APPTAINER=1
 # Optional: drop the uv cache from the image (smaller, but no offline `uv run --extra`):
 #   --build-arg STRIP_UV_CACHE=1
 
@@ -66,9 +65,13 @@ FROM scratch AS trtllm-wheel-cache-output-base
 FROM scratch AS trtllm-ccache-output-base
 FROM scratch AS uv-cache-output-base
 
-# Default custom-setup stage: installs apptainer.
+# Empty default custom-setup stage.
 # Override with: --build-context custom-setup=<your-dir>
 FROM scratch AS custom-setup
+
+# Holds the Apptainer install script for BUILD_APPTAINER=1, separate from custom-setup
+# so overriding that context does not remove it.
+FROM scratch AS apptainer-setup
 COPY docker/install_apptainer.sh /
 
 # Shared helper for the uv cache mount's materialize/sync-back/strip dance
@@ -633,10 +636,20 @@ EOF
 
 ENV PATH="/opt/nemo_rl_venv/bin:$PATH"
 
+# Optional Apptainer install (--build-arg BUILD_APPTAINER=1)
+ARG BUILD_APPTAINER=0
+RUN --mount=from=apptainer-setup,src=/,dst=/tmp/apptainer-setup --mount=type=secret,id=APPTAINER_GITHUB_TOKEN,env=GITHUB_TOKEN <<"EOF" bash -exu
+if [[ "${BUILD_APPTAINER:-0}" != "1" ]]; then
+    echo "BUILD_APPTAINER is not 1; skipping Apptainer"
+    exit 0
+fi
+cp /tmp/apptainer-setup/install_apptainer.sh /opt/install_apptainer.sh
+bash -x /opt/install_apptainer.sh
+EOF
+
 # Custom setup layer (override with: --build-context custom-setup=<dir> --build-arg CUSTOM_SETUP_FNAME=<script>)
-# To skip: --build-arg CUSTOM_SETUP_FNAME=
-ARG CUSTOM_SETUP_FNAME=install_apptainer.sh
-RUN --mount=from=custom-setup,src=/,dst=/tmp/custom-setup --mount=type=secret,id=APPTAINER_GITHUB_TOKEN,env=GITHUB_TOKEN <<"EOF" bash -exu
+ARG CUSTOM_SETUP_FNAME=
+RUN --mount=from=custom-setup,src=/,dst=/tmp/custom-setup <<"EOF" bash -exu
 if [[ -z "${CUSTOM_SETUP_FNAME}" ]]; then
     echo "CUSTOM_SETUP_FNAME is empty, skipping custom setup"
     exit 0
