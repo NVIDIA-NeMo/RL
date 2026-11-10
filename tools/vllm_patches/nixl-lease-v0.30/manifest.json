@@ -1,0 +1,39 @@
+{
+  "upstream_pr": "https://github.com/vllm-project/vllm/pull/62065",
+  "upstream_head": "03b2648165d24128611cd15818f4ecf51c0a0205",
+  "qualified_version": "0.30.0+g116da885561b.cu132",
+  "patch_sha256": "b49a90e569bde8bb2e4cf41b3bf347a99973a68975c19aebe9ab03b9e24ee074",
+  "backport_wire_version": 15062065,
+  "files": [
+    {
+      "path": "distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py",
+      "original_sha256": "84298fe8617a72fc538847e344f145d222fa6fabc4a8d4a87b6337582a665be3",
+      "patched_sha256": "0d8a9d369ede73b70e1872fc2cc38cd5ad2b5dda230339afac9474d74f564c7b"
+    },
+    {
+      "path": "distributed/kv_transfer/kv_connector/v1/nixl/lease_slots.py",
+      "original_sha256": null,
+      "patched_sha256": "1cd6e6e93d3f5f03eb94b061de89aa13b8671ea34a554adac4f4dbcfce8f06ce"
+    },
+    {
+      "path": "distributed/kv_transfer/kv_connector/v1/nixl/metadata.py",
+      "original_sha256": "fc20bf1d2188301ab70ee6c091d2e80025c22d21716fa62b23249d995a7be411",
+      "patched_sha256": "315c7c73a6e37dc7d258215ae50ffbc3c593697cf79e39c27f0b775dba0c1f07"
+    },
+    {
+      "path": "distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py",
+      "original_sha256": "99d01087a209dc292245231a899edecaf66c5f8ef82707f025c6e3f4633a4cc7",
+      "patched_sha256": "cb0537aa414e31e8125517bf4de439ac5b392f3bcae88069169b9d234ac3b39d"
+    },
+    {
+      "path": "distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py",
+      "original_sha256": "9c8461f3301a17f35ed5f52c682054d22f5f8aa2ca09e74ce71368972c5efb81",
+      "patched_sha256": "275af4b56e926efba5644ad419492265f54cb0664ea7a6c6151dd1f1e3d95477"
+    },
+    {
+      "path": "distributed/kv_transfer/kv_connector/v1/nixl/stats.py",
+      "original_sha256": "5068697da0250b1e10540f037e8648008d656b2173e48fd2da7694b8f87c88ef",
+      "patched_sha256": "04a28e84b746e1a841ee49a769c6a4c6d1dc280c5e859cc6228e6520b37104cb"
+    }
+  ]
+}
