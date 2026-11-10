@@ -26,8 +26,6 @@ from multiprocessing.connection import Connection
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from vllm.v1.metrics.reader import Counter, Gauge
-
     from nemo_rl.models.generation.vllm.config import VllmConfig
 
 
@@ -82,7 +80,11 @@ class MultiAPIServerPool:
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
         from vllm.v1.executor.abstract import Executor
-        from vllm.v1.metrics.prometheus import setup_multiprocess_prometheus
+        from vllm.v1.metrics import reader
+        from vllm.v1.metrics.prometheus import (
+            get_prometheus_registry,
+            setup_multiprocess_prometheus,
+        )
 
         engine_args._api_process_count = self.count
         engine_args._api_process_rank = -1
@@ -98,6 +100,7 @@ class MultiAPIServerPool:
         # The owning Ray actor imported prometheus before selecting multi-process
         # serving. New collectors must use the same mmap backend as spawned clients.
         values.ValueClass = values.MultiProcessValue()
+        reader.REGISTRY = get_prometheus_registry()
         executor = Executor.get_class(config)
         # Engine tensor queues and frontend processes must share the spawn
         # context. Never fork a Ray/CUDA worker's live threads.
@@ -216,40 +219,6 @@ class MultiAPIServerPool:
                 self.stop_children()
                 self.close_engines()
                 raise
-
-    def get_metrics_snapshot(self) -> list[Counter | Gauge]:
-        """Read cumulative token counts and shared-engine gauges across frontends.
-
-        Returns:
-            Logger samples from the multiprocess Prometheus registry.
-        """
-        # vLLM metrics are optional outside generation workers.
-        from vllm.v1.metrics.prometheus import get_prometheus_registry
-        from vllm.v1.metrics.reader import Counter, Gauge
-
-        metrics: list[Counter | Gauge] = []
-        gauge_names = {
-            "vllm:num_requests_running",
-            "vllm:num_requests_waiting",
-            "vllm:kv_cache_usage_perc",
-        }
-        for metric in get_prometheus_registry().collect():
-            if metric.type == "gauge" and metric.name in gauge_names:
-                # The registry applies vLLM's mostrecent mode to shared gauges.
-                metrics.extend(
-                    Gauge(name=metric.name, labels=sample.labels, value=sample.value)
-                    for sample in metric.samples
-                    if sample.name == metric.name
-                )
-            elif metric.type == "counter" and metric.name == "vllm:generation_tokens":
-                metrics.extend(
-                    Counter(
-                        name=metric.name, labels=sample.labels, value=int(sample.value)
-                    )
-                    for sample in metric.samples
-                    if sample.name == metric.name + "_total"
-                )
-        return metrics
 
     def stop_children(self) -> None:
         """Terminate and join child frontends, then close their control pipes."""

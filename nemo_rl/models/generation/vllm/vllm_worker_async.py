@@ -656,12 +656,7 @@ class VllmAsyncGenerationWorkerImpl(
             time.sleep(min(2.0, interval_s))
             while True:
                 try:
-                    snapshot = (
-                        self._api_server_pool.get_metrics_snapshot()
-                        if self._api_server_pool is not None
-                        else get_metrics_snapshot()
-                    )
-                    for m in snapshot:
+                    for m in get_metrics_snapshot():
                         with self._vllm_metrics_lock:
                             if isinstance(m, Gauge):
                                 # Log the vllm inflight batch sizes

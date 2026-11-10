@@ -192,14 +192,50 @@ def test_generation_flattens_frontend_snapshots() -> None:
     )
 
 
-def test_multiprocess_metrics_sum_tokens_and_keep_one_engine_gauge(
-    tmp_path, monkeypatch
-) -> None:
-    from prometheus_client.mmap_dict import MmapedDict, mmap_key
+@pytest.fixture
+def multiprocess_metrics_reader(tmp_path, monkeypatch):
+    """Initialize the pool's metrics reader without launching GPU processes."""
+    from prometheus_client import CollectorRegistry, values
+    from vllm.v1.metrics import reader
 
     from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
 
     monkeypatch.setenv("PROMETHEUS_MULTIPROC_DIR", str(tmp_path))
+    monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_size=1, data_parallel_backend="mp"
+        )
+    )
+    engine_args = SimpleNamespace(
+        create_engine_config=lambda: config, disable_log_stats=False
+    )
+    with (
+        patch.object(reader, "REGISTRY", CollectorRegistry()),
+        patch.object(values, "ValueClass"),
+        patch(
+            "ray.get_runtime_context", return_value=SimpleNamespace(namespace="test")
+        ),
+        patch(
+            "vllm.v1.engine.utils.get_engine_zmq_addresses",
+            return_value=SimpleNamespace(inputs=["ipc://owner", "ipc://child"]),
+        ),
+        patch("vllm.v1.executor.abstract.Executor.get_class", return_value=object),
+        patch(
+            "vllm.v1.engine.utils.launch_core_engines",
+            side_effect=RuntimeError("stop before engine launch"),
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="stop before engine launch"):
+            MultiAPIServerPool(SimpleNamespace(), 2).create_engine(engine_args, [])
+        yield reader
+
+
+def test_multiprocess_metrics_sum_tokens_and_keep_one_engine_gauge(
+    tmp_path, multiprocess_metrics_reader
+) -> None:
+    from prometheus_client.mmap_dict import MmapedDict, mmap_key
+
     names = [
         "vllm:num_requests_running",
         "vllm:num_requests_waiting",
@@ -222,8 +258,7 @@ def test_multiprocess_metrics_sum_tokens_and_keep_one_engine_gauge(
             finally:
                 data.close()
 
-    pool = MultiAPIServerPool(SimpleNamespace(), 2)
-    snapshot = pool.get_metrics_snapshot()
+    snapshot = multiprocess_metrics_reader.get_metrics_snapshot()
     assert {metric.name: metric.value for metric in snapshot} == {
         "vllm:generation_tokens": 50,
         "vllm:num_requests_running": 5,
@@ -231,6 +266,91 @@ def test_multiprocess_metrics_sum_tokens_and_keep_one_engine_gauge(
         "vllm:kv_cache_usage_perc": 0.3,
     }
     assert len(snapshot) == 4
+
+
+def test_step_metrics_include_child_counters_and_request_outcomes(
+    tmp_path, multiprocess_metrics_reader
+) -> None:
+    from prometheus_client.mmap_dict import MmapedDict, mmap_key
+
+    from nemo_rl.models.generation.vllm.utils import (
+        aggregate_spec_decode_counters,
+        compute_engine_step_metrics,
+    )
+
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.llm = SimpleNamespace()
+    start = aggregate_spec_decode_counters([worker._get_raw_spec_counters()])
+    for pid, scale in [(1, 1), (2, 2)]:
+        counter = MmapedDict(str(tmp_path / f"counter_{pid}.db"))
+        histogram = MmapedDict(str(tmp_path / f"histogram_{pid}.db"))
+        try:
+            for name, labels, value in [
+                ("vllm:generation_tokens", {}, 20),
+                ("vllm:prompt_tokens", {}, 100),
+                ("vllm:request_success", {"finished_reason": "stop"}, 2),
+                ("vllm:request_success", {"finished_reason": "length"}, 1),
+                ("vllm:request_success", {"finished_reason": "abort"}, 1),
+                ("vllm:spec_decode_num_drafts", {}, 4),
+                (
+                    "vllm:spec_decode_num_accepted_tokens_per_pos",
+                    {"position": "0"},
+                    3,
+                ),
+                (
+                    "vllm:spec_decode_num_accepted_tokens_per_pos",
+                    {"position": "2"},
+                    1,
+                ),
+            ]:
+                key = mmap_key(
+                    name,
+                    name + "_total",
+                    list(labels),
+                    list(labels.values()),
+                    "test",
+                )
+                counter.write_value(key, value * scale, 0.0)
+            for name, total in [
+                ("vllm:request_prompt_tokens", 100),
+                ("vllm:request_generation_tokens", 20),
+            ]:
+                for part, value in [("sum", total), ("count", 2)]:
+                    key = mmap_key(name, f"{name}_{part}", [], [], "test")
+                    histogram.write_value(key, value * scale, 0.0)
+                key = mmap_key(name, name + "_bucket", ["le"], ["+Inf"], "test")
+                histogram.write_value(key, 2 * scale, 0.0)
+        finally:
+            counter.close()
+            histogram.close()
+    end = aggregate_spec_decode_counters([worker._get_raw_spec_counters()])
+
+    assert compute_engine_step_metrics(start, end) == {
+        "vllm/prompt_tokens": 300,
+        "vllm/generation_tokens": 60,
+        "vllm/prompt_length_mean": 50,
+        "vllm/generation_length_mean": 10,
+        "vllm/generations_ok": 9,
+        "vllm/generations_failed": 3,
+    }
+    assert end["vllm:spec_decode_num_drafts"] == 12
+    assert [
+        end["vllm:spec_decode_num_accepted_tokens_per_pos", position]
+        for position in (1, 2, 3)
+    ] == [9, 0, 3]
+
+
+def test_single_frontend_keeps_existing_step_counter_reader() -> None:
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+    worker.llm = SimpleNamespace()
+    with patch(
+        "vllm.v1.metrics.reader.get_metrics_snapshot",
+        return_value=[
+            SimpleNamespace(name="vllm:generation_tokens", labels={}, value=20)
+        ],
+    ) as reader:
+        assert worker._get_raw_spec_counters() == {"vllm:generation_tokens": 20}
+    reader.assert_called_once_with()
 
 
 def test_vllm_still_has_the_request_state_we_read() -> None:

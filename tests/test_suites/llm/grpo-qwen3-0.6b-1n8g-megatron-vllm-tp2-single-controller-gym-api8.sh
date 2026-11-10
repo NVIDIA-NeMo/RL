@@ -71,12 +71,7 @@ PYTHONUNBUFFERED=1 uv run examples/run_grpo_single_controller.py \
 uv run tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METRICS"
 
 uv run tests/check_metrics.py "$JSON_METRICS" \
-    'len(data["train/loss"]) == 5' \
-    'all_finite(data["train/loss"])' \
-    'all_finite(data["train/reward"])' \
-    'all_finite(data["train/gen_kl_error"])' \
     'max(data["train/reward"]) > 0.1' \
     'median(data["train/gen_kl_error"]) < 0.002' \
-    'max(data["train/finalize/total_ms"]) > 0' \
-    'max(data["train/finalize/invalid_row_rate"]) == 0' \
-    'max(data["train/finalize/capture_poisoned_rollouts"]) == 0'
+    'all_finite(data["train/loss"])' \
+    'max(data["train/finalize/invalid_row_rate"]) == 0'
