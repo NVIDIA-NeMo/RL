@@ -616,8 +616,13 @@ def test_capture_bypasses_upstream_route_encoding_without_changing_plain_request
         )
         for _ in range(2)
     ]
+    for request in requests:
+        # NeMoRLChatCompletionRequest's defaults for a call with no restored prefix.
+        request._restored_generation_token_ids = ()
+        request._restored_prefix_terminal = None
     _, chats, _ = _build_server(monkeypatch, {}, capture_requests=[requests[0]])
     chat = chats[0]
+    chat.renderer = types.SimpleNamespace(tokenizer=None)
     results = []
     for request_index in range(2):
         per_request = []
