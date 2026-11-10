@@ -10,9 +10,9 @@ Two things do belong in the environment, because they describe *where* you are r
 
 ```yaml
 telemetry:
-  enabled: false              # master switch; when false, every site is a ~0-cost no-op
+  enabled: true               # master switch; when false, every site is a ~0-cost no-op
   service_name: nemo-rl       # service.name reported to the backend
-  span_groups: default        # preset (default | per_step | all) or a comma-separated group list
+  span_groups: per_step       # preset (default | per_step | all) or a comma-separated group list
   traces_enabled: true        # emit trace spans
   metrics_enabled: true       # emit the rl.* metric instruments
   logs_enabled: false         # bridge Python logging to OTel logs (trace-correlated)
@@ -21,6 +21,16 @@ telemetry:
 ```
 
 The defaults above are the field defaults of `TelemetryConfig` (`nemo_rl/telemetry/config.py`). The endpoint, headers, and protocol are **not** in this block — they come from the standard `OTEL_EXPORTER_OTLP_*` env vars (see below).
+
+### Default on, but only where there is somewhere to send it
+
+`enabled` defaults to true, so a run on a cluster whose `OTEL_EXPORTER_OTLP_*` environment is already set is instrumented without any `telemetry:` block at all — which is the point, since the block is not in the exemplar configs.
+
+That default is paired with a check in `init_telemetry_driver`: if the exporter is `otlp` and **none** of `OTEL_EXPORTER_OTLP_ENDPOINT`, `..._TRACES_ENDPOINT`, `..._METRICS_ENDPOINT`, or `..._LOGS_ENDPOINT` is set, telemetry turns itself back off and logs one line saying so. Without it the SDK would fall back to `http://localhost:4317` and a laptop or CI run that never asked for telemetry would pay a connection retry per batch and then block on the shutdown flush until it timed out.
+
+Writing `enabled: true` yourself (or setting `NEMO_RL_OTEL_ENABLED`) is read as an explicit opt-in: the run is initialised regardless, and a missing endpoint is a warning rather than a veto. `exporter: console` needs no endpoint and is never affected. The verdict is projected into `NEMO_RL_OTEL_ENABLED` so workers, which cannot repeat the check, reach the same conclusion.
+
+`span_groups` defaults to `per_step` because the `step` group is what makes a run legible — without it nothing covers the step itself and a per-step goodput breakdown has no denominator. Every group in that preset emits a bounded number of spans per step, so volume tracks step count rather than dataset size. Drop to `default` for run-level spans only.
 
 Every process that enables telemetry exports — driver, workers, and singleton actors alike. There is no rank-filtering setting; see [Which ranks export](#which-ranks-export).
 
