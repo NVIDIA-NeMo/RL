@@ -40,7 +40,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, NotRequired, Sequence, TypedDict
 
-from pydantic import BaseModel, Field, NonNegativeInt, PositiveInt, model_validator
+from pydantic import (
+    AllowInfNan,
+    BaseModel,
+    Field,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    model_validator,
+)
 from tensordict import TensorDict
 
 from nemo_rl.data_plane.checkpoint import CheckpointCapture
@@ -99,6 +107,8 @@ class SimpleStorageConfig(BaseModel, extra="allow"):
     ssd_offload: SsdOffloadConfig = Field(default_factory=SsdOffloadConfig)
     # Retain an in-memory cut and persist it after rollout dispatch resumes.
     async_checkpoint: bool = False
+    # RPC wait budget for each retained-view persist/release operation.
+    checkpoint_io_timeout_s: Annotated[PositiveFloat, AllowInfNan(False)] = 600.0
 
     @model_validator(mode="after")
     def _validate_async_checkpoint(self) -> "SimpleStorageConfig":

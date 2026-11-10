@@ -1677,6 +1677,7 @@ class TQDataPlaneClient(DataPlaneClient):
             checkpoint_dir,
             num_storage_units=simple_cfg.num_storage_units,
             metadata=metadata,
+            timeout_s=simple_cfg.checkpoint_io_timeout_s,
         )
 
     def save_checkpoint(
