@@ -59,6 +59,7 @@ from nemo_rl.environments.nemo_gym_multimodal import (
     _without_initial_media_sources,
     normalize_media_in_examples,
 )
+from nemo_rl.environments.nemo_gym_request import _policy_connection
 from nemo_rl.environments.nemo_gym_shards import (
     DEFAULT_PLACEMENT_STRATEGY,
     SHARDING_CONFIG_KEYS,
@@ -555,11 +556,14 @@ class NemoGym(EnvironmentInterface):
         initial_global_config_dict.pop("effort_levels", None)
         initial_global_config_dict.pop("pad_dynamic_image_shapes", None)
         # Policy information
-        initial_global_config_dict["policy_model_name"] = self.cfg["model_name"]
+        model_name, base_urls = _policy_connection(
+            model_name=self.cfg["model_name"], base_urls=self.cfg["base_urls"]
+        )
+        initial_global_config_dict["policy_model_name"] = model_name
         initial_global_config_dict["policy_api_key"] = (
             "dummy_key"  # No key necessary for training.
         )
-        initial_global_config_dict["policy_base_url"] = self.cfg["base_urls"]
+        initial_global_config_dict["policy_base_url"] = base_urls
         # In multinode runs, Gym-managed service configs must advertise a real node IP
         # rather than falling back to localhost, or remote workers will connect to
         # their own loopback interface instead of the actor-hosted service.

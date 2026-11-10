@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Helpers for reading and merging NeMo Gym request metadata."""
+"""Helpers for configuring NeMo Gym requests and merging their metadata."""
 
 import copy
 import json
+import os
 from typing import Any
 
 
@@ -153,3 +154,28 @@ def _deep_merge_dict(base: dict[str, Any], update: dict[str, Any]) -> dict[str, 
         else:
             merged[key] = copy.deepcopy(value)
     return merged
+
+
+def _policy_connection(
+    *, model_name: str, base_urls: list[str]
+) -> tuple[str, list[str]]:
+    """Resolve optional Gym endpoint overrides without changing engine ownership.
+
+    NEMO_GYM_POLICY_BASE_URL is a JSON list of OpenAI-compatible base URLs.
+    An unset/empty value or [] keeps the managed endpoints. These overrides
+    do not arrange weight refits or token-capture setup on an external server.
+    """
+    model_name = os.environ.get("NEMO_GYM_POLICY_MODEL_NAME") or model_name
+    raw_urls = os.environ.get("NEMO_GYM_POLICY_BASE_URL")
+    if not raw_urls:
+        return model_name, base_urls
+    error = "NEMO_GYM_POLICY_BASE_URL must be a JSON list of nonempty URL strings"
+    try:
+        urls = json.loads(raw_urls)
+    except json.JSONDecodeError as exc:
+        raise ValueError(error) from exc
+    if not isinstance(urls, list) or any(
+        not isinstance(url, str) or not url.strip() for url in urls
+    ):
+        raise ValueError(error)
+    return model_name, urls or base_urls
