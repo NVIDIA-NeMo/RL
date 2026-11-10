@@ -17,11 +17,6 @@
 The two port patches ship their own suites. This module covers the other
 source-sensitive compatibility patches:
 
-* ``_patch_vllm_tool_parser_namespace_tool`` is the most load-bearing patch in
-  the repo -- it is the only thing that makes vLLM 0.25.1 importable against
-  the pinned ``openai==2.6.1``. If upstream reorders that import block the
-  patch logs a warning and returns, and every engine then dies on
-  ``import vllm.tool_parsers``. So the anchor needs pinning.
 * ``_patch_vllm_glm_decoder_sequence_parallel_moe`` restores the vLLM 0.24
   decoder boundary for GLM-5.1/5.2 while leaving MoE-local SP enabled.
 * the ``VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`` merge replaced the old
@@ -56,9 +51,6 @@ from tests.unit.models.generation.vllm_patch_source_utils import (
     write_unpatched_copy,
 )
 
-_TOOL_PARSER_SOURCE = "tool_parsers/utils.py"
-_PATCH_FN = "_patch_vllm_tool_parser_namespace_tool"
-_MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
 _RADIO_MARKER = "ls_param.data.fill_(initializer_factor)"
@@ -233,15 +225,6 @@ def test_modelopt_moe_amax_aliases_satisfy_installed_vllm_loader(
 
 
 @pytest.fixture
-def patched_tool_parser_source(tmp_path, monkeypatch):
-    """The installed tool_parsers/utils.py, unpatched then patched in tmp."""
-    copied = write_unpatched_copy(_TOOL_PARSER_SOURCE, _PATCH_FN, tmp_path / "utils.py")
-    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
-    patches._patch_vllm_tool_parser_namespace_tool(logging.getLogger(__name__))
-    return copied
-
-
-@pytest.fixture
 def patched_radio_source(tmp_path, monkeypatch):
     """The installed vLLM RADIO loader, unpatched then patched in tmp."""
     copied = write_unpatched_copy(_RADIO_SOURCE, _RADIO_PATCH_FN, tmp_path / "radio.py")
@@ -272,53 +255,6 @@ def patched_moe_source(tmp_path, monkeypatch):
         logging.getLogger(__name__), required=True
     )
     return copied
-
-
-@pytest.mark.vllm
-def test_namespace_tool_patch_anchor_still_matches_installed_vllm(
-    patched_tool_parser_source,
-):
-    """A source edit becomes a silent no-op if upstream reorders the import."""
-    content = patched_tool_parser_source.read_text()
-    assert _MARKER in content, (
-        "the NamespaceTool compat patch did not apply to the installed vLLM; "
-        "its anchor import block has probably changed upstream. Every vLLM "
-        "engine will fail to import tool_parsers against the pinned openai."
-    )
-    ast.parse(content)  # the edit must leave valid Python
-
-
-@pytest.mark.vllm
-def test_namespace_tool_patch_is_idempotent(patched_tool_parser_source, monkeypatch):
-    """Every worker on a node runs the patch against the same file."""
-    before = patched_tool_parser_source.read_text()
-    monkeypatch.setattr(
-        patches, "_get_vllm_file", lambda _relative: str(patched_tool_parser_source)
-    )
-    patches._patch_vllm_tool_parser_namespace_tool(logging.getLogger(__name__))
-    assert patched_tool_parser_source.read_text() == before
-
-
-@pytest.mark.vllm
-def test_namespace_tool_stub_never_matches(patched_tool_parser_source):
-    """The stub must be a plain class, so isinstance() is always False.
-
-    All upstream uses are ``isinstance(tool, NamespaceTool)`` guarding a
-    namespace-tools branch, so degrading to "no namespace tools" is correct for
-    a client that cannot construct them -- but only if nothing can be an
-    instance of the stub.
-    """
-    namespace: dict = {}
-    tree = ast.parse(patched_tool_parser_source.read_text())
-    stub = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ClassDef) and node.name == "NamespaceTool"
-    )
-    exec(compile(ast.Module(body=[stub], type_ignores=[]), "<stub>", "exec"), namespace)
-    stub_cls = namespace["NamespaceTool"]
-    for value in ({}, "tool", 0, None, object()):
-        assert not isinstance(value, stub_cls)
 
 
 @pytest.mark.vllm
@@ -710,7 +646,6 @@ def _stub_vllm_patches(monkeypatch, captured_extra_env_vars):
     )
     for patch_name in (
         "_patch_vllm_llama_eagle3_own_lm_head",
-        "_patch_vllm_tool_parser_namespace_tool",
         "_patch_vllm_ray_executor_v2_tcpstore_port",
         "_patch_vllm_shm_broadcast_bind_retry",
         "_patch_vllm_radio_layerscale_loader",
