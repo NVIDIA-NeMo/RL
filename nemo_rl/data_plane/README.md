@@ -400,8 +400,8 @@ data_plane:
     num_storage_units: null            # total units; null = 2 per selected node
     storage_unit_placement: all        # all, or cluster names: [inference], [train, teacher:<name>]
     ssd_offload:                       # see "Mooncake SSD offload"
-      enabled: false                   # true: spill memory to local SSD
-      path: null                       # absolute node-local dir; required if enabled
+      enabled: true                    # spill memory to local SSD above the threshold
+      path: /tmp/nrl_mooncake_ssd_offload  # absolute node-local dir (a disk, not tmpfs)
       offload_threshold: 0.5           # offload above this share of segment memory
   observability:                       # NotRequired
     enabled: true                      # per-op timing / latency percentiles / volume
@@ -647,7 +647,19 @@ Registered memory is pinned once per RDMA NIC, so per-process buffers add up qui
 
 ### Mooncake SSD offload
 
-`mooncake_cpu.ssd_offload.enabled: true` lets Mooncake move objects from memory to node-local SSD. Once memory use across all segments passes `offload_threshold`, Mooncake's master writes objects to the SSD of the process owning their segment and drops them from memory, 10% of the memory per round. Reads of an offloaded object go through that owner transparently.
+`mooncake_cpu.ssd_offload.enabled: true` (the default) lets Mooncake move objects from memory to node-local SSD. Once memory use across all segments passes `offload_threshold`, Mooncake's master writes objects to the SSD of the process owning their segment and drops them from memory, 10% of the memory per round. Reads of an offloaded object go through that owner transparently.
+
+While memory suffices nothing is written, so the default costs nothing. The
+directory must be on a disk: an owner refuses to start when `path` is on a
+RAM-backed filesystem (tmpfs), since spilling there would consume the memory it
+is meant to relieve. The first time an owner's 30 s sweep finds offloaded files
+in its directory it logs one warning with the count and size: the workload's data-plane footprint passed the
+threshold, and reads of spilled objects now wait for the SSD. Raise
+`storage_unit_segment_size` (or `global_segment_size`), or `offload_threshold`,
+if that trade-off is not wanted. The nixl backend's SSD tier (`nixl.ssd`, also
+on by default) spills only when a unit's put area is full and logs the same
+kind of warning from the driver when `data_plane/nixl/ssd_spills_sum` first
+rises above 0.
 
 ```
 memory > offload_threshold ──> SSD copy written ──> memory copy dropped

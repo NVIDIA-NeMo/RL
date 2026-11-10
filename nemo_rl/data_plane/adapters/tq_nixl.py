@@ -48,6 +48,7 @@ is row-wide; checkpointing goes through
 
 from __future__ import annotations
 
+import logging
 import asyncio
 import contextlib
 import os
@@ -90,6 +91,9 @@ from nemo_rl.data_plane.nixl_storage_unit import NixlStorageUnit, split_key
 
 BACKEND_NAME = "NixlStore"
 DEFAULT_NAMESPACE = "nemo_rl_nixl"
+
+
+log = logging.getLogger(__name__)
 
 
 def _as_dict(cfg: Any) -> dict[str, Any]:
@@ -679,11 +683,30 @@ class NixlKVClient(StorageKVClient):
             self.ep.close()
 
 
+_warned_spill = False  # one warning per driver process, at the first spill
+
+
+def _warn_on_first_spill(metrics: dict[str, float]) -> None:
+    """The first spill means the units' RAM is full: say so once, with the remedy."""
+    global _warned_spill
+    if _warned_spill or metrics["ssd_spills_sum"] == 0:
+        return
+    _warned_spill = True
+    log.warning(
+        "nixl storage units spilled %d blob(s), %.1f MiB, to SSD: their put area "
+        "(data_plane.nixl.unit_slab_bytes) is full, so the data plane is under "
+        "memory pressure. Reads of spilled blobs wait for the SSD. Raise "
+        "unit_slab_bytes or num_storage_units to keep the data in memory.",
+        int(metrics["ssd_spills_sum"]),
+        metrics["ssd_spilled_mb_sum"],
+    )
+
+
 def unit_metrics() -> dict[str, float]:
     """Unit health summed over the units, for the driver to log every step.
 
-    ``retired_mb_sum`` / ``retired_mb_max``, plus ``ssd_spills_sum`` with the
-    SSD tier on. Retired memory is lost to WRITEs that may still land, gone until the unit
+    ``retired_mb_sum`` / ``retired_mb_max``, plus ``ssd_spills_sum`` and
+    ``ssd_spilled_mb_sum`` with the SSD tier on. Retired memory is lost to WRITEs that may still land, gone until the unit
     restarts: a rising line is a slow leak. Read through this process's TQ
     client; ``{}`` when it has no nixl client.
     """
@@ -700,6 +723,10 @@ def unit_metrics() -> dict[str, float]:
     out = {"retired_mb_sum": sum(mb), "retired_mb_max": max(mb, default=0.0)}
     if any("spills" in s for s in stats):  # SSD tier on
         out["ssd_spills_sum"] = float(sum(s.get("spills", 0) for s in stats))
+        out["ssd_spilled_mb_sum"] = (
+            sum(s.get("spilled_bytes", 0) for s in stats) / 2**20
+        )
+        _warn_on_first_spill(out)
     return out
 
 
