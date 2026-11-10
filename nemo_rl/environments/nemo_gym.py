@@ -1378,6 +1378,13 @@ Depending on your data shape, you may want to change these values."""
                 else "fingerprint",
                 "control_auth_token_env": _TOKEN_CAPTURE_CONTROL_ENV,
             }
+            if (
+                self._forest_training
+                and _external_staging_backend(token_capture) == "vllm_worker"
+            ):
+                initial_global_config_dict["token_id_capture"][
+                    "allow_system_suffix"
+                ] = True
             # Gym resolves the credential inside each serving process. Keep
             # only the variable name in serialized config and inherit the
             # secret through the server process environment.

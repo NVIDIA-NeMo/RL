@@ -537,8 +537,10 @@ def test_capture_bypasses_upstream_route_encoding_without_changing_plain_request
             ]
 
 
-@pytest.mark.parametrize("capture_media", [False, True])
-def test_prefix_splice_remaps_image_once(monkeypatch, capture_media):
+@pytest.mark.parametrize(
+    "capture_media,empty_prefix", [(False, False), (True, False), (False, True)]
+)
+def test_prefix_splice_remaps_image_once(monkeypatch, capture_media, empty_prefix):
     """Captured and ordinary requests must use the same final image positions."""
 
     @dataclass(frozen=True)
@@ -626,7 +628,9 @@ def test_prefix_splice_remaps_image_once(monkeypatch, capture_media):
     renderers, _, _ = _build_server(monkeypatch, {})
     renderer = renderers[0]
     renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
-    request = SimpleNamespace(required_prefix_token_ids=[10, 77, 31, 2])
+    request = SimpleNamespace(
+        required_prefix_token_ids=[] if empty_prefix else [10, 77, 31, 2]
+    )
     request.model_copy = lambda **kwargs: request
     result = asyncio.run(
         renderer.preprocess_chat(
@@ -639,8 +643,12 @@ def test_prefix_splice_remaps_image_once(monkeypatch, capture_media):
     )
 
     engine_prompt = result[1][0]
-    assert engine_prompt["prompt_token_ids"] == final_tokens
-    assert engine_prompt["mm_placeholders"]["image"][0].offset == 5
+    assert engine_prompt["prompt_token_ids"] == (
+        template_tokens if empty_prefix else final_tokens
+    )
+    assert engine_prompt["mm_placeholders"]["image"][0].offset == (
+        4 if empty_prefix else 5
+    )
     if capture_media:
         assert captured[0].items[0].placeholder_offset == 5
 
@@ -705,3 +713,79 @@ def test_prefix_overflow_precedes_media_validation(
     else:
         capture.assert_called_once()
         assert remap.call_count == (failure_stage == "remap")
+
+
+@pytest.mark.nemo_gym
+@pytest.mark.parametrize("hoist_system", [False, True])
+def test_system_suffix_checks_actual_rendered_prefix_before_capture(
+    monkeypatch, hoist_system
+):
+    """A system-moving template must keep the full prompt and start a root."""
+    pytest.importorskip("nemo_gym")
+    from nemo_gym.token_id_capture.replay import replay_context, summarize_replay
+    from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+
+    history = [
+        {"role": "user", "content": "task"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    messages = history + [{"role": "system", "content": "budget"}]
+    full_tokens = [99, 2, 10, 31, 2, 7] if hoist_system else [10, 31, 2, 99, 2, 7]
+    expected_tokens = full_tokens if hoist_system else [10, 77, 31, 2, 99, 2, 7]
+    admission = CaptureAdmission(
+        capture_key="attempt",
+        model_call_id="next",
+        mode="candidate",
+        parent_call_id="previous",
+        prev_len=4,
+        required_prefix_token_ids=[10, 77, 31, 2],
+        parent_chain_hash="a" * 64,
+        requires_empty_tool_content_equivalence=False,
+        candidate_replay=summarize_replay(
+            replay_context(history, render_digest="b" * 64)
+        ),
+        request_replay=replay_context(messages, render_digest="b" * 64),
+    )
+
+    async def preprocess(self, *, messages, **kwargs):
+        ids = full_tokens if len(messages) == 3 else [10, 31, 2]
+        return (messages, [{"prompt_token_ids": list(ids)}])
+
+    monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", preprocess, raising=False)
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_media", False, raising=False
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_capture_admission",
+        lambda self, request: admission,
+    )
+    resolve = MagicMock(return_value=[10, 77, 31, 2])
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_resolve_admission_prefix", resolve
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_enter_request_prefix",
+        lambda self, request, prefix: setattr(
+            request, "required_prefix_token_ids", prefix
+        ),
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_capture_request_media",
+        MagicMock(return_value=None),
+    )
+    begin = MagicMock()
+    monkeypatch.setattr(VllmAsyncGenerationWorkerImpl, "_begin_request_capture", begin)
+    renderers, _, _ = _build_server(monkeypatch, {})
+    renderer = renderers[0]
+    renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
+    request = SimpleNamespace(required_prefix_token_ids=None)
+    request.model_copy = lambda **kwargs: request
+    result = asyncio.run(renderer.preprocess_chat(request, messages, None, None, {}))
+    assert result[1][0]["prompt_token_ids"] == expected_tokens
+    assert begin.call_args.kwargs["admission"].mode == (
+        "text" if hoist_system else "token_in"
+    )
+    assert resolve.call_count == int(not hoist_system)
