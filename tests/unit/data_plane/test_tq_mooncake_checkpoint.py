@@ -1998,7 +1998,7 @@ def test_offload_restore_waits_for_eviction_to_free_memory(
 def test_offload_restore_gives_up_when_memory_never_frees(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, no_restore_backoff: list[float]
 ) -> None:
-    monkeypatch.setattr(offload, "PUT_WAIT_S", 0.0)
+    monkeypatch.setattr(offload, "MEMORY_FULL", offload.MEMORY_FULL._replace(wait_s=0.0))
     with pytest.raises(RuntimeError, match="memory stayed full"):
         _restore_with(tmp_path, monkeypatch, full_attempts=1_000)
 

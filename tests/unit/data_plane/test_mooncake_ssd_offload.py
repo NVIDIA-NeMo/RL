@@ -20,6 +20,7 @@ import functools
 import http.client
 import http.server
 import importlib.util
+import math
 import multiprocessing
 import os
 import signal
@@ -181,9 +182,14 @@ def test_remove_dir_without_install_is_a_noop(fake_store) -> None:
 
 
 FULL = offload.NO_AVAILABLE_HANDLE
-
-
 OVERFLOW = offload.BUFFER_OVERFLOW
+
+# TQ client method -> (the wait it gets, the function that installs it)
+_OPS = {
+    "_batch_upsert_with_retry": (offload.MEMORY_FULL, offload.wait_for_memory_on_put),
+    "_batch_get_into_with_retry": (offload.BUFFER_FULL, offload.wait_for_buffer_on_get),
+}
+each_op = pytest.mark.parametrize("method", list(_OPS), ids=["put", "get"])
 
 
 def _client_cls(tq_retries):
@@ -195,8 +201,7 @@ def _client_cls(tq_retries):
         def _batch_upsert_with_retry(self, keys, ptrs, sizes):
             tq_retries.append(list(keys))
 
-        def _batch_get_into_with_retry(self, keys, ptrs, sizes):
-            tq_retries.append(list(keys))
+        _batch_get_into_with_retry = _batch_upsert_with_retry
 
     return Client
 
@@ -212,13 +217,11 @@ class _Store:
         self.calls.append(list(keys))
         return self.rounds.pop(0)
 
-    def batch_get_into(self, keys, ptrs, sizes):
-        self.calls.append(list(keys))
-        return self.rounds.pop(0)
+    batch_get_into = batch_upsert_from
 
 
 def _waiting_client(monkeypatch, *rounds, step_s=0.0):
-    """A store client whose puts wait for memory; returns it, TQ's retries, sleeps."""
+    """A store client whose puts and gets wait; returns it, TQ's retries, sleeps."""
     tq_retries, sleeps, now = [], [], [0.0]
 
     def sleep(seconds):
@@ -237,89 +240,72 @@ def _waiting_client(monkeypatch, *rounds, step_s=0.0):
     return client, tq_retries, sleeps
 
 
-def test_put_waits_for_offload_to_free_memory(monkeypatch) -> None:
-    client, tq_retries, sleeps = _waiting_client(monkeypatch, [FULL, 0], [FULL], [0])
-    client._batch_upsert_with_retry(["a", "b"], [1, 2], [8, 8])
-    # Only the key that found memory full is put again, until it fits.
+@each_op
+def test_a_call_waits_for_the_resource_to_free(monkeypatch, method) -> None:
+    code = _OPS[method][0].code
+    client, tq_retries, sleeps = _waiting_client(monkeypatch, [code, 0], [code], [0])
+    getattr(client, method)(["a", "b"], [1, 2], [8, 8])
+    # Only the key that was told to wait is tried again, until it goes through.
     assert client._store.calls == [["a", "b"], ["a"], ["a"]]
     assert tq_retries == []
     assert sleeps == [0.05, 0.1]
 
 
-def test_put_backoff_is_capped(monkeypatch) -> None:
-    client, _, sleeps = _waiting_client(monkeypatch, *([[FULL]] * 8), [0])
-    client._batch_upsert_with_retry(["a"], [1], [8])
-    assert max(sleeps) == offload.PUT_BACKOFF_MAX_S
-
-
-@pytest.mark.parametrize(
-    ("rounds", "warnings"), [([[FULL], [FULL], [0]], 1), ([[0]], 0)]
-)
-def test_a_waiting_put_warns_once(monkeypatch, caplog, rounds, warnings) -> None:
-    client, _, _ = _waiting_client(monkeypatch, *rounds)
-    with caplog.at_level("WARNING", logger=offload.LOGGER.name):
-        client._batch_upsert_with_retry(["a"], [1], [8])
-    assert [
-        "waiting for SSD offload to free memory" in r.getMessage()
-        for r in caplog.records
-    ] == [True] * warnings
-
-
-def test_other_put_errors_keep_tqs_own_retry(monkeypatch) -> None:
-    client, tq_retries, sleeps = _waiting_client(monkeypatch, [-1, 0])
-    client._batch_upsert_with_retry(["a", "b"], [1, 2], [8, 8])
-    assert tq_retries == [["a"]]
-    assert sleeps == []
-
-
-def test_get_waits_for_the_owners_read_buffer(monkeypatch) -> None:
-    client, tq_retries, sleeps = _waiting_client(
-        monkeypatch, [OVERFLOW, 0], [OVERFLOW], [0]
-    )
+def test_a_get_that_returns_byte_counts_is_done(monkeypatch) -> None:
+    # Mooncake answers a successful get with the bytes read, not 0.
+    client, tq_retries, sleeps = _waiting_client(monkeypatch, [8, 8])
     client._batch_get_into_with_retry(["a", "b"], [1, 2], [8, 8])
-    # Only the key whose owner had no buffer room is read again, until it has.
-    assert client._store.calls == [["a", "b"], ["a"], ["a"]]
+    assert client._store.calls == [["a", "b"]]
     assert tq_retries == []
-    assert sleeps == [0.05, 0.1]
+    assert sleeps == []
 
 
-def test_a_waiting_get_warns_once_and_names_the_knob(monkeypatch, caplog) -> None:
-    client, _, _ = _waiting_client(monkeypatch, [OVERFLOW], [OVERFLOW], [0])
+@each_op
+def test_backoff_is_capped(monkeypatch, method) -> None:
+    wait = _OPS[method][0]
+    client, _, sleeps = _waiting_client(monkeypatch, *([[wait.code]] * 8), [0])
+    getattr(client, method)(["a"], [1], [8])
+    assert max(sleeps) == wait.backoff_max_s
+
+
+@each_op
+@pytest.mark.parametrize("waits", [2, 0])
+def test_a_waiting_call_warns_once(monkeypatch, caplog, method, waits) -> None:
+    wait = _OPS[method][0]
+    client, _, _ = _waiting_client(monkeypatch, *([[wait.code]] * waits), [0])
+    with caplog.at_level("WARNING", logger=offload.LOGGER.name):
+        getattr(client, method)(["a"], [1], [8])
+    first_words = wait.waiting.split("%")[0]
+    assert [r.getMessage().startswith(first_words) for r in caplog.records] == [
+        True
+    ] * min(waits, 1)
+
+
+def test_the_read_buffer_warning_names_the_knob(monkeypatch, caplog) -> None:
+    client, _, _ = _waiting_client(monkeypatch, [OVERFLOW], [0])
     with caplog.at_level("WARNING", logger=offload.LOGGER.name):
         client._batch_get_into_with_retry(["a"], [1], [8])
-    msgs = [r.getMessage() for r in caplog.records if "read buffer" in r.getMessage()]
-    assert len(msgs) == 1 and "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES" in msgs[0]
+    (msg,) = [r.getMessage() for r in caplog.records]
+    assert "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES" in msg
 
 
-def test_other_get_errors_keep_tqs_own_retry(monkeypatch) -> None:
+@each_op
+def test_other_errors_keep_tqs_own_retry(monkeypatch, method) -> None:
     client, tq_retries, sleeps = _waiting_client(monkeypatch, [-1, 0])
-    client._batch_get_into_with_retry(["a", "b"], [1, 2], [8, 8])
+    getattr(client, method)(["a", "b"], [1, 2], [8, 8])
     assert tq_retries == [["a"]]
     assert sleeps == []
 
 
-def test_get_fails_once_the_buffer_stays_full_for_the_whole_wait(monkeypatch) -> None:
-    client, _, _ = _waiting_client(monkeypatch, *([[OVERFLOW]] * 100), step_s=100.0)
-    with pytest.raises(RuntimeError, match="(?s)read buffer stayed full.*'a'"):
-        client._batch_get_into_with_retry(["a"], [1], [8])
-
-
-def test_wait_for_buffer_patches_a_class_once() -> None:
-    Client = _client_cls([])
-    offload.wait_for_buffer_on_get(Client)
-    patched = Client._batch_get_into_with_retry
-    offload.wait_for_buffer_on_get(Client)
-    assert Client._batch_get_into_with_retry is patched
-
-
-def test_put_fails_once_memory_stays_full_for_the_whole_wait(monkeypatch) -> None:
-    rounds = [[FULL]] * 100
-    client, _, _ = _waiting_client(monkeypatch, *rounds, step_s=100.0)
-    with pytest.raises(
-        RuntimeError, match="(?s)stayed full .* SSD offload.*'a'.*larger than any"
-    ):
-        client._batch_upsert_with_retry(["a"], [1], [8])
-    assert len(client._store.calls) == offload.PUT_WAIT_S / 100 + 1
+@each_op
+def test_a_call_fails_once_the_resource_stays_full_for_the_whole_wait(
+    monkeypatch, method
+) -> None:
+    wait = _OPS[method][0]
+    client, _, _ = _waiting_client(monkeypatch, *([[wait.code]] * 100), step_s=100.0)
+    with pytest.raises(RuntimeError, match="(?s)stayed full for .*'a'"):
+        getattr(client, method)(["a"], [1], [8])
+    assert len(client._store.calls) == math.ceil(wait.wait_s / 100) + 1
 
 
 def test_put_rejects_a_short_result_list(monkeypatch) -> None:
@@ -328,12 +314,14 @@ def test_put_rejects_a_short_result_list(monkeypatch) -> None:
         client._batch_upsert_with_retry(["a", "b"], [1, 2], [8, 8])
 
 
-def test_wait_for_memory_patches_a_class_once() -> None:
+@each_op
+def test_a_class_is_patched_once(method) -> None:
     Client = _client_cls([])
-    offload.wait_for_memory_on_put(Client)
-    patched = Client._batch_upsert_with_retry
-    offload.wait_for_memory_on_put(Client)
-    assert Client._batch_upsert_with_retry is patched
+    install_wait = _OPS[method][1]
+    install_wait(Client)
+    patched = getattr(Client, method)
+    install_wait(Client)
+    assert getattr(Client, method) is patched
 
 
 _METRICS = """\
