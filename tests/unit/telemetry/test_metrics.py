@@ -793,6 +793,153 @@ def test_map_teed_scalars_skips_bool_and_non_numeric():
     assert map_teed_scalars({"reward": True, "loss": "nan", "lr": None}) == {}
 
 
+def test_map_teed_scalars_reads_the_validation_keys():
+    """These reached W&B but not lens at all: the tee dropped the prefix."""
+    _import_teed_metric_owners()
+
+    from nemo_rl.telemetry.metrics import map_teed_scalars
+    from nemo_rl.telemetry.vocabulary import VALIDATION_PREFIX
+
+    values = map_teed_scalars(
+        {"accuracy": 0.42, "avg_length": 256.0, "pass_k": 0.61},
+        VALIDATION_PREFIX,
+    )
+
+    assert values == {
+        "validation_accuracy": 0.42,
+        "validation_response_length_mean": 256.0,
+        "validation_pass_k": 0.61,
+    }
+
+
+def test_map_teed_scalars_reads_the_performance_keys():
+    """MFU and TFLOP/s have no span equivalent, and were W&B-only."""
+    _import_teed_metric_owners()
+
+    from nemo_rl.telemetry.metrics import map_teed_scalars
+    from nemo_rl.telemetry.vocabulary import PERFORMANCE_PREFIX
+
+    values = map_teed_scalars(
+        {
+            "train_fp_utilization": 0.41,
+            "train_flops_per_gpu": 380.0,
+            "training_worker_idle_time_ratio": 0.12,
+            "average_token_imbalance": 1.3,
+        },
+        PERFORMANCE_PREFIX,
+    )
+
+    assert values == {
+        "performance_fp_utilization": 0.41,
+        "performance_tflops_per_gpu": 380.0,
+        "performance_worker_idle_ratio": 0.12,
+        "performance_token_imbalance": 1.3,
+    }
+
+
+@pytest.mark.parametrize(
+    "prefix, metrics, series, expected",
+    [
+        ("validation", {"accuracy": 0.42}, "rl.validation.accuracy", 0.42),
+        (
+            "performance",
+            {"train_fp_utilization": 0.41},
+            "rl.performance.fp_utilization",
+            0.41,
+        ),
+        (
+            "timing/train",
+            {"valid_tokens_per_sec_per_gpu": 5100.0},
+            "rl.performance.valid_tokens_per_second_per_gpu",
+            5100.0,
+        ),
+    ],
+)
+def test_the_new_prefixes_reach_the_backend_through_the_real_tee(
+    prefix, metrics, series, expected
+):
+    """``map_teed_scalars`` alone cannot show a prefix is admitted.
+
+    The gate in ``_tee_rl_metrics_to_otel`` is a separate decision from the
+    per-row prefix filter, and each of these dicts was being dropped at that
+    gate before ever reaching the mapper. Asserting on exported points is the
+    only check that covers both halves.
+    """
+    pytest.importorskip("nemo.lens")
+    _import_teed_metric_owners()
+
+    from nemo_rl.telemetry.metrics import tee_rl_metrics_to_otel
+
+    reader = _start_exporting_telemetry()
+    tee_rl_metrics_to_otel(metrics, prefix)
+
+    points = _gauge_points(reader.get_metrics_data(), series)
+    assert [point.value for point in points] == [expected]
+
+
+def test_mfu_is_teed_from_both_prefixes_that_carry_it():
+    """SFT v1, DPO and distillation put it on the train dict, not performance.
+
+    A row declared for ``performance`` alone gives MFU to GRPO and PPO and
+    silently withholds it from the other three, which is indistinguishable
+    from a run that never computed it.
+    """
+    _import_teed_metric_owners()
+
+    from nemo_rl.telemetry.metrics import map_teed_scalars
+    from nemo_rl.telemetry.vocabulary import PERFORMANCE_PREFIX
+
+    expected = {"performance_fp_utilization": 0.41}
+    assert map_teed_scalars({"train_fp_utilization": 0.41}, "train") == expected
+    assert map_teed_scalars({"train_fp_utilization": 0.41}, PERFORMANCE_PREFIX) == (
+        expected
+    )
+
+
+def test_timing_train_tees_only_its_throughput_key():
+    """The phase durations in that dict are deliberately not declared.
+
+    They are the same phases the per-step spans already carry, and the
+    ``idle/*`` ones ``rl.efficiency.seconds`` already reports, so declaring
+    them would give the same seconds two un-reconcilable homes.
+    """
+    _import_teed_metric_owners()
+
+    from nemo_rl.telemetry.metrics import map_teed_scalars
+    from nemo_rl.telemetry.vocabulary import TIMING_TRAIN_PREFIX
+
+    values = map_teed_scalars(
+        {
+            "valid_tokens_per_sec_per_gpu": 5100.0,
+            "policy_training": 12.0,
+            "generation": 30.0,
+            "idle/refit_bubble": 2.0,
+        },
+        TIMING_TRAIN_PREFIX,
+    )
+
+    assert values == {"performance_valid_tokens_per_second_per_gpu": 5100.0}
+
+
+def test_a_prefix_only_reads_the_rows_declared_for_it():
+    """``accuracy`` is not reserved -- a train dict may carry its own.
+
+    Without the per-row prefix the bare-key match would file it under
+    ``rl.validation.accuracy``, which is worse than not having the series:
+    the number is real, plausible, and from the wrong population.
+    """
+    _import_teed_metric_owners()
+
+    from nemo_rl.telemetry.metrics import map_teed_scalars
+    from nemo_rl.telemetry.vocabulary import VALIDATION_PREFIX
+
+    train_side = map_teed_scalars({"accuracy": 0.9, "loss": 1.5}, "train")
+    assert train_side == {"policy_loss": 1.5}
+
+    val_side = map_teed_scalars({"accuracy": 0.9, "loss": 1.5}, VALIDATION_PREFIX)
+    assert val_side == {"validation_accuracy": 0.9}
+
+
 def test_every_declared_scalar_has_a_unique_key_and_name():
     """A duplicate key would make one declaration silently shadow another."""
     _import_teed_metric_owners()

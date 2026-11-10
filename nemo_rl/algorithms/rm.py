@@ -24,6 +24,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from transformers import AutoTokenizer
 
 from nemo_rl.algorithms.loss import PreferenceLossFn
+from nemo_rl.algorithms.metric_utils import VALID_TOKENS_PER_SEC_PER_GPU_KEY
 from nemo_rl.algorithms.utils import maybe_pad_last_batch, set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import preference_collate_fn
@@ -735,7 +736,7 @@ def rm_train(
             total_num_gpus = (
                 master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
-            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+            timing_metrics[VALID_TOKENS_PER_SEC_PER_GPU_KEY] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
             logger.log_metrics(metrics, total_steps + 1, prefix="train")

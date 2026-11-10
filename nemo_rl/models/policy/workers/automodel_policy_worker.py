@@ -94,6 +94,10 @@ from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
 )
+from nemo_rl.telemetry.vision import (
+    VISION_STAGE_TRAIN_BATCH,
+    traced_train_phase,
+)
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.packed_tensor import packed_broadcast_producer
@@ -670,6 +674,10 @@ class AutomodelPolicyWorkerImpl(
         """Record the rollout engine's TP size for later use by weight-streaming refit."""
         self._rollout_num_gpus_per_engine = num_gpus_per_engine
 
+    # This backend has no split begin/microbatch/finish path, so one span per
+    # train() call is the whole of its worker-side training view -- and the
+    # only place a VLM run on Automodel reports its vision load.
+    @traced_train_phase("rl.policy.train", stage=VISION_STAGE_TRAIN_BATCH)
     @wrap_with_nvtx_name("automodel_policy_worker/train")
     def train(
         self,

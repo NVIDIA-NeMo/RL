@@ -94,6 +94,7 @@ from nemo_rl.algorithms.grpo import (
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.metric_utils import (
     SETUP_TIMING_PREFIX,
+    VALID_TOKENS_PER_SEC_PER_GPU_KEY,
     SetupTimingMetrics,
 )
 from nemo_rl.algorithms.ppo import _compute_critic_metrics
@@ -3264,7 +3265,7 @@ class SingleControllerActor:
                 and total_num_gpus > 0
                 and "global_valid_toks" in step_metrics
             ):
-                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                timing_metrics[VALID_TOKENS_PER_SEC_PER_GPU_KEY] = (
                     step_metrics["global_valid_toks"] / total_time / total_num_gpus
                 )
 

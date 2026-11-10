@@ -53,6 +53,7 @@ from nemo_rl.algorithms.metric_utils import (
     MEAN_GEN_TOKENS_PER_SAMPLE_KEY,
     REWARD_KEY,
     SETUP_TIMING_PREFIX,
+    VALID_TOKENS_PER_SEC_PER_GPU_KEY,
     SetupTimingMetrics,
     print_setup_timing_summary,
 )
@@ -4799,7 +4800,7 @@ def _grpo_train_impl(
                     percent = (v / total_time * 100) if total_time > 0 else 0
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
 
-            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+            timing_metrics[VALID_TOKENS_PER_SEC_PER_GPU_KEY] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
             performance_metrics = print_performance_metrics(
@@ -6749,7 +6750,7 @@ def async_grpo_train(
             total_num_gpus = (
                 master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
-            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+            timing_metrics[VALID_TOKENS_PER_SEC_PER_GPU_KEY] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
             performance_metrics = print_performance_metrics(

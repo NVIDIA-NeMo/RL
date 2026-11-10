@@ -41,6 +41,20 @@ if TYPE_CHECKING:
 #: Prefix every NeMo-RL series carries, stripped to form the registry key.
 METRIC_NAME_PREFIX = "rl."
 
+#: Prefixes a per-step training dict arrives under. ``""`` is the same family:
+#: a few call sites log the step dict with no prefix at all.
+DEFAULT_TEED_PREFIXES: tuple[Optional[str], ...] = ("train", "")
+
+#: Prefix the validation dicts arrive under, in every algorithm that has one.
+VALIDATION_PREFIX = "validation"
+
+#: Prefix the per-step throughput/utilization dict arrives under.
+PERFORMANCE_PREFIX = "performance"
+
+#: Prefix the per-step Timer dict arrives under. Only the throughput key is
+#: teed from it; see ``metrics.md`` for why the phase durations are not.
+TIMING_TRAIN_PREFIX = "timing/train"
+
 #: Efficiency category covering startup, measured once before the training loop.
 INIT_TOTAL_CATEGORY = "init/total"
 
@@ -139,6 +153,11 @@ class TeedMetric:
         kind: One of lens's ``gauge`` / ``counter`` / ``histogram`` / ``up_down_counter``.
         unit: UCUM-ish unit string, or empty when dimensionless.
         description: Help text carried to the backend.
+        prefixes: ``Logger.log_metrics`` prefixes this row may be read from.
+            Declared per row rather than assumed, because ``logger_key`` is
+            matched bare: ``accuracy`` means one thing under ``validation``
+            and something else under ``train``, and without this the first
+            row declared for that key would claim both.
     """
 
     logger_key: str
@@ -146,6 +165,7 @@ class TeedMetric:
     kind: str = "gauge"
     unit: str = ""
     description: str = ""
+    prefixes: tuple[Optional[str], ...] = DEFAULT_TEED_PREFIXES
 
     @property
     def key(self) -> str:

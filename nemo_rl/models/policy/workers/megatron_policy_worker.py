@@ -159,10 +159,19 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
-from nemo_rl.telemetry.instrumentation import accepts_trace_context
+from nemo_rl.telemetry.instrumentation import (
+    accepts_trace_context,
+    umbrella_trace_fn,
+)
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
+)
+from nemo_rl.telemetry.span_groups import RLSpanGroup
+from nemo_rl.telemetry.vision import (
+    VISION_STAGE_TRAIN_BATCH,
+    VISION_STAGE_TRAIN_MICROBATCH,
+    traced_train_phase,
 )
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
@@ -1397,6 +1406,10 @@ class MegatronPolicyWorkerImpl(
         ]
         return metrics, kept_seqs, kept_toks
 
+    # The entrypoint GRPO, PPO and SFT v1 use: they hand the worker a batch and
+    # let it microbatch internally, so this is where their vision load is
+    # visible. The split path below reports the same thing per microbatch.
+    @traced_train_phase("rl.policy.train", stage=VISION_STAGE_TRAIN_BATCH)
     @wrap_with_nvtx_name("megatron_policy_worker/train")
     def train(
         self,
@@ -2005,6 +2018,7 @@ class MegatronPolicyWorkerImpl(
                 "saved_finalize_model_grads_func"
             )
 
+    @umbrella_trace_fn(RLSpanGroup.U_WORKER_TRAIN, "rl.policy.begin_train_step")
     @wrap_with_nvtx_name("megatron_policy_worker/begin_train_step")
     def begin_train_step(
         self,
@@ -2086,6 +2100,11 @@ class MegatronPolicyWorkerImpl(
 
         self._train_step_state = state
 
+    # The narrowest span that contains the vision encoder; see
+    # ``RLSpanGroup.WORKER_TRAIN`` for why that is as close as it gets.
+    @traced_train_phase(
+        "rl.policy.train_microbatch", stage=VISION_STAGE_TRAIN_MICROBATCH
+    )
     @wrap_with_nvtx_name("megatron_policy_worker/train_microbatch")
     def train_microbatch(
         self,
@@ -2303,6 +2322,7 @@ class MegatronPolicyWorkerImpl(
             if "loss" in m:
                 state["mb_losses"].append(m["loss"])
 
+    @umbrella_trace_fn(RLSpanGroup.U_WORKER_TRAIN, "rl.policy.finish_train_step")
     @wrap_with_nvtx_name("megatron_policy_worker/finish_train_step")
     def finish_train_step(self) -> dict[str, Any]:
         state = self._assert_step_open()

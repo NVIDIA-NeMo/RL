@@ -50,7 +50,10 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
-from nemo_rl.algorithms.metric_utils import SETUP_TIMING_PREFIX
+from nemo_rl.algorithms.metric_utils import (
+    SETUP_TIMING_PREFIX,
+    VALID_TOKENS_PER_SEC_PER_GPU_KEY,
+)
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
     apply_reward_shaping,
@@ -2182,7 +2185,7 @@ def ppo_train(
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
 
             if "global_valid_toks" in metrics:
-                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                timing_metrics[VALID_TOKENS_PER_SEC_PER_GPU_KEY] = (
                     metrics["global_valid_toks"] / total_time / total_num_gpus
                     if total_time > 0
                     else 0
@@ -3185,7 +3188,7 @@ def async_ppo_train(
                 master_config.cluster.num_nodes * master_config.cluster.gpus_per_node
             )
             if total_time > 0 and "global_valid_toks" in metrics:
-                timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+                timing_metrics[VALID_TOKENS_PER_SEC_PER_GPU_KEY] = (
                     metrics["global_valid_toks"] / total_time / total_num_gpus
                 )
             performance_metrics = print_performance_metrics(

@@ -31,6 +31,10 @@ from nemo_rl.algorithms.loss import (
     DistillationLossDataDict,
     DistillationLossFn,
 )
+from nemo_rl.algorithms.metric_utils import (
+    TRAIN_FP_UTILIZATION_KEY,
+    VALID_TOKENS_PER_SEC_PER_GPU_KEY,
+)
 from nemo_rl.algorithms.utils import set_seed
 from nemo_rl.data import DataConfig
 from nemo_rl.data.collate_fn import rl_collate_fn
@@ -1188,7 +1192,9 @@ def _distillation_train_impl(
                         f"  • Training Model Floating Point Utilization: {100 * total_tflops / theoretical_tflops:.2f}%",
                         flush=True,
                     )
-                    metrics["train_fp_utilization"] = total_tflops / theoretical_tflops
+                    metrics[TRAIN_FP_UTILIZATION_KEY] = (
+                        total_tflops / theoretical_tflops
+                    )
 
             print("\n⏱️  Timing:", flush=True)
             # Display total time first, separately
@@ -1215,7 +1221,7 @@ def _distillation_train_impl(
                     percent = (v / total_time * 100) if total_time > 0 else 0
                     print(f"  • {k}: {v:.2f}s ({percent:.1f}%)", flush=True)
 
-            timing_metrics["valid_tokens_per_sec_per_gpu"] = (
+            timing_metrics[VALID_TOKENS_PER_SEC_PER_GPU_KEY] = (
                 metrics["global_valid_toks"] / total_time / total_num_gpus
             )
             logger.log_metrics(metrics, total_steps + 1, prefix="train")

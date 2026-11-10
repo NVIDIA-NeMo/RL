@@ -18,6 +18,10 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Optional, get_args
 
 from nemo_rl.telemetry.vocabulary import (
+    DEFAULT_TEED_PREFIXES,
+    PERFORMANCE_PREFIX,
+    TIMING_TRAIN_PREFIX,
+    VALIDATION_PREFIX,
     TeedMetric,
     as_scalar,
     register_teed_metrics,
@@ -85,6 +89,99 @@ TRAINING_TEED_METRICS = (
 )
 
 register_teed_metrics(TRAINING_TEED_METRICS)
+
+
+# Keys the validation dicts carry, which GRPO, distillation and the single
+# controller all build the same way. `accuracy` and `avg_length` are always
+# present; `pass_k` only under grouped validation.
+VAL_ACCURACY_KEY = "accuracy"
+VAL_AVG_LENGTH_KEY = "avg_length"
+VAL_PASS_K_KEY = "pass_k"
+
+#: Teed rows for the validation dicts, which reach the Logger under
+#: ``validation`` rather than ``train``. Declared with that prefix because
+#: ``accuracy`` is not a reserved word: a training dict carrying its own
+#: ``accuracy`` must not land on the validation series.
+VALIDATION_TEED_METRICS = (
+    TeedMetric(
+        VAL_ACCURACY_KEY,
+        "rl.validation.accuracy",
+        description="Validation accuracy (mean env reward over the val set).",
+        prefixes=(VALIDATION_PREFIX,),
+    ),
+    TeedMetric(
+        VAL_AVG_LENGTH_KEY,
+        "rl.validation.response.length.mean",
+        unit="{token}",
+        description="Mean validation response length.",
+        prefixes=(VALIDATION_PREFIX,),
+    ),
+    TeedMetric(
+        VAL_PASS_K_KEY,
+        "rl.validation.pass_k",
+        description="Validation pass@k; absent unless validation is grouped.",
+        prefixes=(VALIDATION_PREFIX,),
+    ),
+)
+
+register_teed_metrics(VALIDATION_TEED_METRICS)
+
+
+# Keys `print_performance_metrics` returns, plus the throughput one the step
+# loop injects into its Timer dict. Both arrive under their own prefix.
+TOKEN_IMBALANCE_KEY = "average_token_imbalance"
+WORKER_IDLE_RATIO_KEY = "training_worker_idle_time_ratio"
+TRAIN_FLOPS_PER_GPU_KEY = "train_flops_per_gpu"
+TRAIN_FP_UTILIZATION_KEY = "train_fp_utilization"
+VALID_TOKENS_PER_SEC_PER_GPU_KEY = "valid_tokens_per_sec_per_gpu"
+
+#: Teed rows for the throughput and utilization numbers. These have no span
+#: equivalent -- a span can time a phase but cannot say what fraction of the
+#: GPU's arithmetic the phase used -- so without these the question "is this
+#: run fast for its hardware" is unanswerable from traces alone.
+PERFORMANCE_TEED_METRICS = (
+    TeedMetric(
+        TRAIN_FP_UTILIZATION_KEY,
+        "rl.performance.fp_utilization",
+        unit="1",
+        description="Model floating-point utilization (MFU) as a 0-1 ratio.",
+        # Two prefixes because two conventions: GRPO and PPO route this
+        # through `print_performance_metrics` into the `performance` dict,
+        # while SFT v1, DPO and distillation set it on the step `metrics`
+        # dict logged under `train`. Same key, same quantity, so accepting
+        # both is what makes MFU present for all five rather than two.
+        prefixes=(PERFORMANCE_PREFIX, *DEFAULT_TEED_PREFIXES),
+    ),
+    TeedMetric(
+        TRAIN_FLOPS_PER_GPU_KEY,
+        "rl.performance.tflops_per_gpu",
+        unit="TFLOP/s",
+        description="Achieved training TFLOP/s per GPU.",
+        prefixes=(PERFORMANCE_PREFIX,),
+    ),
+    TeedMetric(
+        WORKER_IDLE_RATIO_KEY,
+        "rl.performance.worker_idle_ratio",
+        unit="1",
+        description="Fraction of the step a training worker spent idle.",
+        prefixes=(PERFORMANCE_PREFIX,),
+    ),
+    TeedMetric(
+        TOKEN_IMBALANCE_KEY,
+        "rl.performance.token_imbalance",
+        description="Mean token-count imbalance across training workers.",
+        prefixes=(PERFORMANCE_PREFIX,),
+    ),
+    TeedMetric(
+        VALID_TOKENS_PER_SEC_PER_GPU_KEY,
+        "rl.performance.valid_tokens_per_second_per_gpu",
+        unit="{token}/s",
+        description="Supervised token throughput per GPU for the step.",
+        prefixes=(TIMING_TRAIN_PREFIX,),
+    ),
+)
+
+register_teed_metrics(PERFORMANCE_TEED_METRICS)
 
 
 @dataclass
