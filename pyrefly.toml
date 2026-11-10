@@ -25,6 +25,7 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "docker/prune_uv_cache.py",
   "nemo_rl/environments/call_selection.py",
   "nemo_rl/algorithms/single_controller_utils/logical_advantage.py",
   "nemo_rl/data/captured_media.py",
