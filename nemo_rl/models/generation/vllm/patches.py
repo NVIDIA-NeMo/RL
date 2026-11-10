@@ -80,68 +80,24 @@ def _locked_file_patch(file_path: str):
         lock_fd.close()
 
 
-def _patch_vllm_init_workers_ray(
-    py_executable: str, extra_env_vars: list[str] | None
-) -> bool:
-    """Patch vLLM's Ray executor env propagation and worker runtime_env.
+def _forward_env_vars_to_ray_workers(extra_env_vars: list[str] | None) -> None:
+    """Forward extra env vars to vLLM's Ray workers.
 
-    1. Pass custom runtime_env in _init_workers_ray call (file patch).
-        - This allows passing custom py_executable to worker initialization.
-    2. Forward extra env vars to the Ray workers via vLLM's additive
-       VLLM_RAY_EXTRA_ENV_VARS_TO_COPY hook (vLLM >= 0.25). NCCL_*, HF_*, and
-       HUGGING_FACE_* vars are already copied by vLLM's default prefix list
-       (this includes the NCCL_CUMEM_ENABLE/NCCL_NVLS_ENABLE workaround from
-       https://github.com/NVIDIA-NeMo/RL/pull/898).
+    Uses vLLM's additive VLLM_RAY_EXTRA_ENV_VARS_TO_COPY hook. NCCL_*, HF_*, and
+    HUGGING_FACE_* vars are already copied by vLLM's default prefix list (this
+    includes the NCCL_CUMEM_ENABLE/NCCL_NVLS_ENABLE workaround from
+    https://github.com/NVIDIA-NeMo/RL/pull/898).
 
-    .. note::
-        Step 1 patches the **v1 Ray executor**, which vLLM 0.25 no longer
-        selects by default: ``VLLM_USE_RAY_V2_EXECUTOR_BACKEND`` flipped from
-        ``"0"`` (0.20) to ``"1"`` (0.25), so ``Executor.get_class`` returns
-        ``RayExecutorV2`` for ray-backed engines. ``RayExecutorV2`` has no
-        ``_init_workers_ray`` at all -- it creates workers inline, and its
-        ``_build_runtime_env`` never sets ``py_executable``.
-
-        The patch is kept because it is still load-bearing when
-        ``VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0`` selects the v1 executor. Under
-        the 0.25 default it is inert, and workers get the right interpreter
-        from Ray's per-field ``runtime_env`` inheritance instead: the parent
-        NeMo-RL actor sets ``py_executable``, and a child created with a
-        ``runtime_env`` that omits it inherits the parent's value.
-
-        So a ``True`` return means "the anchor is in place", not "this is what
-        put the workers on the right interpreter". The caller logs
-        accordingly.
-
-    Returns:
-        Whether the v1 runtime_env source patch is in place. The env-var merge
-        in step 2 cannot fail, but step 1 is anchored on a call-site string; if
-        that moves upstream the py_executable injection silently stops
-        happening, so the caller must not report success unconditionally.
+    The workers' interpreter needs no patch: RayExecutorV2 creates them with a
+    ``runtime_env`` that omits ``py_executable``, so they inherit the value the
+    parent NeMo-RL actor set.
     """
-    file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
-
-    old_line = "self._init_workers_ray(placement_group)"
-    new_line = (
-        "self._init_workers_ray(placement_group, "
-        f'runtime_env={{"py_executable": "{py_executable}"}})'
-    )
-
-    applied = False
-    with _locked_file_patch(file_to_patch) as (content, write_back):
-        if new_line in content:
-            applied = True  # already patched by another worker on this node
-        elif old_line in content:
-            write_back(content.replace(old_line, new_line))
-            applied = True
-
     env_vars_to_copy = ["RAY_ENABLE_UV_RUN_RUNTIME_ENV", *(extra_env_vars or [])]
     existing = os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")
     merged = {
         var.strip() for var in (*existing.split(","), *env_vars_to_copy) if var.strip()
     }
     os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] = ",".join(sorted(merged))
-
-    return applied
 
 
 def _patch_vllm_llama_eagle3_own_lm_head(logger) -> None:
@@ -1320,53 +1276,16 @@ def ensure_vllm_source_compat() -> None:
 
 
 def _apply_vllm_patches(
-    py_executable: str,
     *,
     extra_env_vars: list[str] | None = None,
     require_moe_routed_experts_capture: bool = False,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
-    import vllm.envs as envs
     from vllm.logger import init_logger
 
     patch_logger = init_logger("vllm_patch")
 
-    # Whether the v1 patch matters at all depends on which executor vLLM will
-    # select. 0.25 defaults this to "1" (RayExecutorV2), which has no
-    # _init_workers_ray; the patch is only load-bearing when it is set to "0".
-    # Reporting the same way in both cases either cries wolf or hides a real
-    # break, so branch on it.
-    uses_v1_executor = not envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
-    applied = _patch_vllm_init_workers_ray(py_executable, extra_env_vars)
-
-    if applied and uses_v1_executor:
-        patch_logger.info(
-            "Successfully patched vllm v1 _init_workers_ray; Ray workers will "
-            "launch under %s.",
-            py_executable,
-        )
-    elif applied:
-        patch_logger.info(
-            "Patched vllm v1 _init_workers_ray, but VLLM_USE_RAY_V2_EXECUTOR_"
-            "BACKEND selects RayExecutorV2, which has no such method. The "
-            "patch is inert here; workers inherit py_executable from this "
-            "actor's runtime_env instead."
-        )
-    elif uses_v1_executor:
-        patch_logger.error(
-            "vllm v1 _init_workers_ray patch did NOT apply: the "
-            "'self._init_workers_ray(placement_group)' anchor was not found, "
-            "and VLLM_USE_RAY_V2_EXECUTOR_BACKEND=0 selects the v1 executor "
-            "that depends on it. Ray workers will launch under the wrong "
-            "interpreter. Either the anchor moved upstream, or unset "
-            "VLLM_USE_RAY_V2_EXECUTOR_BACKEND to use RayExecutorV2."
-        )
-    else:
-        patch_logger.info(
-            "vllm v1 _init_workers_ray anchor not found, which is harmless "
-            "here: RayExecutorV2 is selected and does not use it."
-        )
-
+    _forward_env_vars_to_ray_workers(extra_env_vars)
     _patch_vllm_llama_eagle3_own_lm_head(patch_logger)
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)

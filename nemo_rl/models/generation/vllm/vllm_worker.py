@@ -17,7 +17,6 @@ import gc
 import inspect
 import logging
 import os
-import sys
 from typing import Any, Optional, cast
 
 import ray
@@ -529,11 +528,7 @@ class BaseVllmGenerationWorker:
         self._extra_env_vars = extra_env_vars
         self._native_lora_request: Any = None
 
-        # Store the Python executable being used by this worker
-        self.py_executable = sys.executable
-
         _apply_vllm_patches(
-            self.py_executable,
             extra_env_vars=extra_env_vars,
             require_moe_routed_experts_capture=bool(
                 (self.cfg.get("vllm_kwargs") or {}).get(

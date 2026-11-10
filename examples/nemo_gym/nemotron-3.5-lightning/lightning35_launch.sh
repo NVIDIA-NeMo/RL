@@ -697,11 +697,9 @@ if [[ ! -x "\$NRL_VLLM_PY" ]]; then
   patch_status=1
 else
   PYTHONPATH=/opt/nemo-rl "\$NRL_VLLM_PY" - <<'PY' || patch_status=1
-import sys
-
 from nemo_rl.models.generation.vllm.patches import _apply_vllm_patches
 
-_apply_vllm_patches(sys.executable)
+_apply_vllm_patches()
 
 # Verify the import that previously failed before Ray or Gym starts.
 import vllm.entrypoints.openai.api_server  # noqa: F401, E402

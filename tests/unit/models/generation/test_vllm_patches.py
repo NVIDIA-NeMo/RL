@@ -568,9 +568,7 @@ def test_every_vllm_source_patch_applies_to_installed_vllm(
     patch_logger.addHandler(caplog.handler)
     try:
         with caplog.at_level(logging.WARNING, logger="vllm_patch"):
-            patches._apply_vllm_patches(
-                sys.executable, require_moe_routed_experts_capture=True
-            )
+            patches._apply_vllm_patches(require_moe_routed_experts_capture=True)
     finally:
         patch_logger.removeHandler(caplog.handler)
 
@@ -682,22 +680,18 @@ def test_capture_router_fallback_patch_binds_router_for_unsupported_kernel(
 
 def _install_fake_vllm_modules(monkeypatch):
     vllm_module = types.ModuleType("vllm")
-    envs_module = types.ModuleType("vllm.envs")
-    envs_module.VLLM_USE_RAY_V2_EXECUTOR_BACKEND = True
     logger_module = types.ModuleType("vllm.logger")
     logger_module.init_logger = lambda name: logging.getLogger(name)
-    vllm_module.envs = envs_module
     vllm_module.logger = logger_module
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
-    monkeypatch.setitem(sys.modules, "vllm.envs", envs_module)
     monkeypatch.setitem(sys.modules, "vllm.logger", logger_module)
 
 
 def _stub_vllm_patches(monkeypatch, captured_extra_env_vars):
     monkeypatch.setattr(
         patches,
-        "_patch_vllm_init_workers_ray",
-        lambda _py, extra: captured_extra_env_vars.append(extra) or False,
+        "_forward_env_vars_to_ray_workers",
+        lambda extra: captured_extra_env_vars.append(extra),
     )
     for patch_name in (
         "_patch_vllm_llama_eagle3_own_lm_head",
@@ -743,7 +737,6 @@ def test_apply_vllm_patches_threads_routed_experts_capture_requirement(
     )
 
     patches._apply_vllm_patches(
-        "py",
         extra_env_vars=["USER_VAR"],
         require_moe_routed_experts_capture=require_capture,
     )
@@ -765,10 +758,9 @@ def test_vllm_worker_threads_routed_experts_capture_into_source_patches(
     monkeypatch.setattr(
         vllm_worker,
         "_apply_vllm_patches",
-        lambda py, *, extra_env_vars, require_moe_routed_experts_capture: (
+        lambda *, extra_env_vars, require_moe_routed_experts_capture: (
             patch_calls.append(
                 {
-                    "py": py,
                     "extra_env_vars": extra_env_vars,
                     "require_moe_routed_experts_capture": require_moe_routed_experts_capture,
                 }
@@ -794,7 +786,6 @@ def test_vllm_worker_threads_routed_experts_capture_into_source_patches(
 
     assert patch_calls == [
         {
-            "py": sys.executable,
             "extra_env_vars": ["EXPLICIT_VAR"],
             "require_moe_routed_experts_capture": require_capture,
         }
@@ -816,54 +807,20 @@ def test_vllm_worker_threads_routed_experts_capture_into_source_patches(
         ),
     ],
 )
-def test_ray_extra_env_vars_merge_is_additive(
-    monkeypatch, tmp_path, existing, extra, expected
-):
+def test_ray_extra_env_vars_merge_is_additive(monkeypatch, existing, extra, expected):
     """vLLM 0.25 replaced the ADDITIONAL_ENV_VARS source patch with this hook.
 
     It must add to whatever the caller already set rather than overwrite it --
     otherwise user ``extra_env_vars`` silently stop reaching the Ray workers.
     """
-    ray_executor = tmp_path / "ray_executor.py"
-    ray_executor.write_text("self._init_workers_ray(placement_group)\n")
-    monkeypatch.setattr(patches, "_get_vllm_file", lambda _r: str(ray_executor))
-
     if existing is None:
         monkeypatch.delenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", raising=False)
     else:
         monkeypatch.setenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", existing)
 
-    patches._patch_vllm_init_workers_ray("py", extra)
+    patches._forward_env_vars_to_ray_workers(extra)
 
     assert os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] == expected
-
-
-def test_init_workers_ray_reports_a_missing_anchor(monkeypatch, tmp_path):
-    """A reshaped call site must not be reported as a successful patch."""
-    ray_executor = tmp_path / "ray_executor.py"
-    ray_executor.write_text("self._init_workers_ray_renamed(placement_group)\n")
-    monkeypatch.setattr(patches, "_get_vllm_file", lambda _r: str(ray_executor))
-    monkeypatch.delenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", raising=False)
-
-    assert patches._patch_vllm_init_workers_ray("py", None) is False
-    # The env merge still has to happen; it is independent of the file patch.
-    assert os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] == (
-        "RAY_ENABLE_UV_RUN_RUNTIME_ENV"
-    )
-
-
-def test_init_workers_ray_reports_success_and_is_idempotent(monkeypatch, tmp_path):
-    """Patching twice against the same file still reports success."""
-    ray_executor = tmp_path / "ray_executor.py"
-    ray_executor.write_text("self._init_workers_ray(placement_group)\n")
-    monkeypatch.setattr(patches, "_get_vllm_file", lambda _r: str(ray_executor))
-
-    assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
-    once = ray_executor.read_text()
-    assert 'runtime_env={"py_executable": "py-exec"}' in once
-
-    assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
-    assert ray_executor.read_text() == once
 
 
 # install_output_loop_yield
