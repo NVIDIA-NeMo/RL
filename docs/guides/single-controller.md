@@ -220,6 +220,7 @@ checkpointing:
 
 rollout_checkpointing:
   snapshot_attempt_interval_s: 120
+  snapshot_on_trainer_checkpoint: true
   telemetry_interval_s: null
   max_consecutive_failures: 3
   keep_latest_k: 2
@@ -238,6 +239,24 @@ recommended for continuous post-step coverage; with a larger value, attempts
 are skipped until the matching trainer checkpoint exists. Before the first
 training step, snapshots are anchored to the initial model and a fingerprint of
 the rollout-semantic configuration.
+
+With `rollout_recovery.target_level: turn`, rollout snapshots are on even with
+`snapshot_attempt_interval_s: null`, because only a snapshot holds the
+environment's state. A snapshot also follows the trainer checkpoint that
+`checkpointing.checkpoint_must_save_by` triggers, before the run stops. The
+snapshot runs while the policy weights are still being written and is moved
+into `step_N` once it is published, so leave room in that deadline for the
+longer of the two saves. `step_N` never waits for the snapshot: if the job ends
+first, it restores from `step_N` and redoes the unfinished turns.
+
+| Saves environment state | `snapshot_on_trainer_checkpoint` | `snapshot_attempt_interval_s` |
+|---|---|---|
+| After every trainer checkpoint and at the deadline | `true` | `null` |
+| Only at the deadline | `false` | `null` |
+| After every trainer checkpoint, at the deadline, and every 300 s | `true` | `300` |
+
+Setup rejects turn-level recovery that would never save: `false`, no interval,
+and no `checkpoint_must_save_by`.
 
 `telemetry_interval_s` controls an independent wall-clock sampler for rollout
 throughput and checkpoint pressure. It is `null` (disabled) by default; set it
@@ -453,11 +472,11 @@ Pick one of five modes with `sampler.name`. Each mode takes its own knobs, liste
 | `custom`       | Determined by the imported class.                                                                                       | Determined by the imported class.                                                                                 | `target: "module:ClassName"` — bring your own `PromptGroupSampler`.                                          |
 
 
-PPO supports `in_order` and `ready_first`, with full-step batches or streaming chunks. Streaming requires `ppo.ppo_epochs: 1`; the policy accumulates gradients across chunks, then updates and refits before critic training. By default each critic epoch uses the assembled full batch; `ppo.value_training_mode: split` instead replays the same chunks into one critic update per epoch. For `ready_first`, set `loss_fn.use_importance_sampling_correction: true` and `loss_fn.force_on_policy_ratio: false`, unless using `loss_fn.use_cispo: true` with TIS correction as described in the [CISPO guide](cispo.md#configuration). Its `max_staleness_versions` controls admission lookahead, while already-admitted rollouts remain selectable.
+PPO supports `in_order` and `ready_first`, with full-step batches or streaming chunks. Streaming requires `ppo.ppo_epochs: 1`; the policy accumulates gradients across chunks, then updates and refits before critic training. By default each critic epoch uses the assembled full batch; `ppo.value_training_mode: split` instead replays the same chunks into one critic update per epoch. For `ready_first`, set `loss_fn.use_importance_sampling_correction: true`; its `max_staleness_versions` controls admission lookahead, while already-admitted rollouts remain selectable. With any sampler, `loss_fn.force_on_policy_ratio: true` requires `ppo.ppo_epochs: 1`: the forced ratio equals the true one only for the first optimizer step on a batch.
 
 ### Config → behavior map
 
-The shipped exemplars cover three of the five modes:
+The shipped exemplars cover four of the five modes:
 
 
 | Mode                             | `sampler.name` | Sampler knob                   | `min_groups_for_streaming_train` | `max_buffered_rollouts`                               | Exemplar |
@@ -465,7 +484,7 @@ The shipped exemplars cover three of the five modes:
 | Sync / on-policy                 | `in_order`     | `max_lookahead_versions: 0`    | `${grpo.num_prompts_per_step}`   | `num_prompts_per_step × 1`                            | [`grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.yaml`](../../examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-controller-sync.yaml) |
 | Async, exact batch→step matching | `in_order`     | `max_lookahead_versions: >= 1` | `x <= num_prompts_per_step`   | `num_prompts_per_step × (max_lookahead_versions + 1)` | [`grpo_math_1B_megatron_single_controller.yaml`](../../examples/configs/grpo_math_1B_megatron_single_controller.yaml) |
 | Streaming, gated dispatch        | `weight_fifo`  | `max_staleness_versions: >= 1` | `x <= num_prompts_per_step`      | `num_prompts_per_step × (max_staleness_versions + 1)` | — (none shipped) |
-| Streaming, ready-first           | `ready_first`  | `max_staleness_versions: >= 1` | `x <= num_prompts_per_step`      | `num_prompts_per_step × (max_staleness_versions + 1)` | — (none shipped) |
+| Streaming, ready-first           | `ready_first`  | `max_staleness_versions: >= 1` | `x <= num_prompts_per_step`      | `num_prompts_per_step × (max_staleness_versions + 1)` | [`grpo-llama3.1-8b-instruct-2n8g-ready-first-single-controller.yaml`](../../examples/configs/recipes/llm/grpo-llama3.1-8b-instruct-2n8g-ready-first-single-controller.yaml) |
 | Streaming, over-sampled          | `windowed`     | `max_staleness_versions: >= 1` | `x <= num_prompts_per_step`      | Larger than the gated capacity (dispatch is ungated)  | [`grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2.yaml`](../../examples/configs/recipes/llm/grpo-llama3.1-8b-instruct-2n8g-async-1off-single-controller-streaming2.yaml) |
 
 
@@ -476,7 +495,7 @@ Field definitions:
 - `sampler.warmup_lookahead_versions` (PPO, `in_order` only) — lookahead used while `ppo.policy_training_start_step` critic warmup is in progress, shrinking back to `max_lookahead_versions` afterwards. The SC equivalent of `ppo.async_ppo.warmup_generation_lead_steps`.
 - `num_advantage_workers` — CPU Ray actors that run the advantage stage. `0` (the default) keeps it in the controller process, which is correct but both holds a whole cohort's advantage inputs in the controller's heap and blocks the controller's event loop for the duration of the computation — long enough at Ultra scale to miss Ray's actor liveness ping. A positive value moves both costs onto dedicated actors, placed off the dedicated Ray head so their host-memory peak does not land beside the controller. Only `grpo` and `opd` are sharded across the pool: every other `adv_estimator` also reduces over the whole batch, which a shard is not, so those run as one call on one actor and a larger pool buys them nothing. Each stage logs `advantage stage: N row(s) over M shard(s), pool=P` with the reason whenever `M` is 1. Under `data_plane.backend: mooncake_cpu` each actor is its own TransferQueue client and mounts a full `global_segment_size + local_buffer_size`, like each token-capture finalizer, so budget it on top of `gpus_per_node × (segment + buffer)`.
 - `log_full_train_data` — writes every consumed sample to `train_data_step<N>.jsonl` in the log dir. The advantage stage is what holds the untruncated tensors, so the stage writes the dump wherever it runs: with a pool each shard writes its own `train_data_step<N>.jsonl.part-<shard>` and the controller merges them in shard order on a completed optimizer step, assigning `idx` across the merged file. That requires the pool to share a filesystem with the controller: the log dir was controller-only before this, so a node-local one worked and now would not. The controller checks the merged row count against what the shards reported and fails the step rather than publishing a dump that is short a shard. The JSON serialization is the expensive part and scales with batch size × sequence length, so a pool also moves that cost off the controller; it is reported back per call and still shows up under the `train_data_dump` timer. Debug-only — leave it `false` for production runs.
-- `defer_async_checkpoint_finalize` — with `policy.megatron_cfg.checkpoint.async_save: true`, finalizes an async policy checkpoint at a later step boundary, once every rank's background write is done, instead of from a background thread whose blocking finalize holds the policy workers until the write lands. The train pump polls at the top of each step, before the step's first policy-worker call; the next save and training exit still finalize blocking, and so does teardown after a failure. `tmp_step_N` is renamed to `step_N` only after that finalize, and resume reads only `step_N`, so a crash in that window — typically one step — resumes from the previous checkpoint. It cannot be combined with rollout snapshots (`rollout_checkpointing.snapshot_attempt_interval_s`), and setup rejects that combination: a snapshot anchors on `step_N`, which a deferred finalize publishes only after training has moved past step N. Only non-colocated generation gains: a colocated refit, and PPO's per-chunk critic handoff, block on the finalize anyway. Time spent finalizing at a step boundary is reported as `timing/train/checkpoint_finalize`. Leave it `false` (the default) when `async_save` is off; setup rejects that combination.
+- `defer_async_checkpoint_finalize` — with `policy.megatron_cfg.checkpoint.async_save: true`, finalizes an async policy checkpoint at a later step boundary, once every rank's background write is done, instead of from a background thread whose blocking finalize holds the policy workers until the write lands. The train pump polls at the top of each step, before the step's first policy-worker call; the next save and training exit still finalize blocking, and so does teardown after a failure. `tmp_step_N` is renamed to `step_N` only after that finalize, and resume reads only `step_N`, so a crash in that window — typically one step — resumes from the previous checkpoint. It cannot be combined with rollout snapshots taken while training continues (`rollout_checkpointing.snapshot_attempt_interval_s`, or `snapshot_on_trainer_checkpoint` with turn-level recovery), and setup rejects that combination: a snapshot anchors on `step_N`, which a deferred finalize publishes only after training has moved past step N. The snapshot at the `checkpoint_must_save_by` deadline is allowed: that save publishes `step_N` in the background right away, and the run then stops. Only non-colocated generation gains: a colocated refit, and PPO's per-chunk critic handoff, block on the finalize anyway. Time spent finalizing at a step boundary is reported as `timing/train/checkpoint_finalize`. Leave it `false` (the default) when `async_save` is off; setup rejects that combination.
 
 ## Implementation Structure
 

@@ -78,6 +78,7 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
     DataPlaneMutationCut,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    BaseSampler,
     ReadyFirstSamplerConfig,
     TransactionalAdmissionSampler,
     create_sampler,
@@ -112,7 +113,10 @@ from nemo_rl.algorithms.rollout_checkpointing.state import (
 )
 from nemo_rl.algorithms.rollout_checkpointing.trace import (
     ROLLOUT_TRACE_FILENAME,
+    RefitCuts,
     RolloutTrace,
+    batch_age_group_metrics,
+    pop_batch_age,
 )
 from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
     AdvantageComputer,
@@ -127,6 +131,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
     is_ppo_run,
+    rollout_snapshots_enabled,
     validate_forest_objective,
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
@@ -156,7 +161,6 @@ from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import (
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.mooncake_storage_unit import stop_storage_units
 from nemo_rl.data_plane.observability import (
-    is_metrics_client,
     log_step_metrics,
     metrics_never_fail_the_step,
 )
@@ -308,6 +312,16 @@ def _train_fields_for_step(
     if sampler_head_required:
         fields += SAMPLER_TOPK_FIELDS
     return fields
+
+
+def _worker_group_snapshots(worker_group: Any) -> Callable[[], list[dict[str, Any]]]:
+    """Snapshot source reading every rank's data-plane counters in one fan-out."""
+
+    def fan_out() -> list[dict[str, Any]]:
+        futures = worker_group.run_all_workers_single_data("get_data_plane_snapshot")
+        return [s for s in ray.get(futures) if s]
+
+    return fan_out
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -541,6 +555,11 @@ class SingleControllerActor:
         self._gen_fleet = getattr(actor_args, "fleet_monitor", None)
         self._generation_router = getattr(actor_args, "generation_router", None)
         self._finalizer_actors = list(actor_args.finalizer_actors)
+        for actor in (*self._finalizer_actors, *self._advantage_actors):
+            self._trainer.add_data_plane_snapshot_source(actor)
+        gen_snapshots = getattr(self._gen, "get_data_plane_snapshots", None)
+        if gen_snapshots is not None:
+            self._trainer.add_data_plane_snapshot_fn(gen_snapshots)
         self._storage_units = tuple(actor_args.storage_units)
         self._available_finalizers: asyncio.Queue[Any] = asyncio.Queue()
         for actor in self._finalizer_actors:
@@ -566,6 +585,14 @@ class SingleControllerActor:
             self._buffer.set_post_write_enricher(self._teacher_coordinator.enrich)
         else:
             self._teacher_coordinator = None
+        if self._value is not None:
+            self._trainer.add_data_plane_snapshot_fn(
+                _worker_group_snapshots(self._value.worker_group)
+            )
+        for teacher in teacher_worker_groups.values():
+            self._trainer.add_data_plane_snapshot_fn(
+                _worker_group_snapshots(teacher.worker_group)
+            )
         # Only with fleet health: without a ledger nothing ever reaches DEAD, so there
         # is nothing for a supervisor to restart.
         _fleet_health_cfg = master_config.async_rl.generation_fleet_health
@@ -728,6 +755,8 @@ class SingleControllerActor:
             self._async_cfg.max_buffered_rollouts
         )
 
+        # Where running captured calls switched weights, for batch age.
+        self._refit_cuts = RefitCuts()
         self._rollout_trace = RolloutTrace(
             Path(self._logger.base_log_dir) / ROLLOUT_TRACE_FILENAME
             if master_config.rollout_checkpointing.trace
@@ -837,8 +866,7 @@ class SingleControllerActor:
             await self._log_rollout_throughput_metrics(emit=False)
         rollout_checkpoint_task = (
             asyncio.create_task(self._rollout_snapshots.run())
-            if self._master_config.rollout_checkpointing.snapshot_attempt_interval_s
-            is not None
+            if rollout_snapshots_enabled(self._master_config)
             else None
         )
         if rollout_checkpoint_task is not None:
@@ -1372,7 +1400,18 @@ class SingleControllerActor:
                                 f"group {request.group_id}: rollout and finalizer "
                                 f"metrics both report {sorted(overlap)!r}"
                             )
-                        group_metrics = {**rollout_metrics, **finalized.token_metrics}
+                        # Exact per-version token counts, split at the refits
+                        # that paused the group's calls.
+                        tokens_by_version = (
+                            self._refit_cuts.tokens_by_version(finalized.call_versions)
+                            if finalized.call_versions
+                            else {}
+                        )
+                        group_metrics = {
+                            **rollout_metrics,
+                            **finalized.token_metrics,
+                            **batch_age_group_metrics(tokens_by_version),
+                        }
                         if group_metrics:
                             # Same ROLLOUT_METRICS sidecar the echo path's commit writes.
                             meta = replace(
@@ -1406,6 +1445,11 @@ class SingleControllerActor:
                     # Canonical TQ rows plus replay metadata now own the completed
                     # group; keep only unfinished work in the lineage sidecar.
                     ledger.discard_group(cut, request.group_id)
+                    self._rollout_trace.emit(
+                        "group_published",
+                        group_id=request.group_id,
+                        tokens_by_version=tokens_by_version,
+                    )
                     self._rollout_manager.record_canonical_publication(
                         finalized.canonical_output_tokens
                     )
@@ -1479,32 +1523,25 @@ class SingleControllerActor:
         if errors:
             raise BaseExceptionGroup("post-train DataPlane cleanup failed", errors)
 
-    def _log_data_plane_metrics(self, total_step_time: float) -> None:
+    async def _log_data_plane_metrics(self, total_step_time: float) -> None:
         """Log this step's data-plane cost. Never raises.
 
         On by default, so this runs every step of every recipe. Mirrors
         ``grpo_sync._log_data_plane_metrics``.
         """
         with metrics_never_fail_the_step(self._train_steps):
-            self._log_data_plane_metrics_impl(total_step_time)
+            await self._log_data_plane_metrics_impl(total_step_time)
 
-    def _log_data_plane_metrics_impl(self, total_step_time: float) -> None:
+    async def _log_data_plane_metrics_impl(self, total_step_time: float) -> None:
         """Log this step's data-plane cost. No-op unless observability is enabled.
 
-        The synchronous loop logs these series from ``_log_data_plane_metrics``
-        in ``grpo_sync``. Without the same call here the single-controller path
-        builds the metrics client, pays for its counters on every op, and emits
-        nothing -- the failure is silent, because an empty dashboard looks the
-        same as a data plane that cost nothing.
-
-        Driver scope only, and the prefix says so. This client issues the
-        advantage stage's get, the put that writes the advantages back, and
-        the post-train clear; the bulk traffic is
-        the trainer and generation workers' own clients, in their own
-        processes with their own counters, so ``comm_volume_mb`` here is well
-        under what the job actually moved. ``grpo_sync`` gets a cluster view by
-        fanning out over its policy worker group; this loop has no such group to
-        fan out over, so driver scope is all there is here.
+        This client's share depends on the configuration: it writes the rollout
+        rows unless token capture moves that to the finalizer actors, and it
+        issues the advantage get and put unless advantage workers take them.
+        The trainer merges this client's counters with its worker ranks', the
+        finalizer, advantage, generation, critic and teacher sources into one
+        cluster view. The fan-out blocks on ``ray.get``, so it runs off the
+        event loop.
 
         nixl's unit metrics (retired memory, SSD spills) are logged even with
         observability off: a leak only shows over a long run, in the runs that
@@ -1518,11 +1555,15 @@ class SingleControllerActor:
                 self._logger.log_metrics(
                     unit, self._train_steps, prefix="data_plane/nixl"
                 )
-        if not is_metrics_client(self._dp_client):
+        result = await asyncio.to_thread(
+            self._trainer.get_data_plane_step_metrics,
+            total_step_time,
+            self._dp_client,
+        )
+        if result is None:
             return  # observability disabled -> plain adapter
-
-        metrics = self._dp_client.get_step_metrics(total_step_time)
-        log_step_metrics(self._logger, metrics, self._train_steps, "driver")
+        metrics, scope = result
+        log_step_metrics(self._logger, metrics, self._train_steps, scope)
 
     @staticmethod
     def _group_ids_from_meta(meta: KVBatchMeta) -> list[str]:
@@ -2996,6 +3037,13 @@ class SingleControllerActor:
                         per_group_rollout_metrics.setdefault(metric_name, []).append(
                             value
                         )
+                batch_age = pop_batch_age(
+                    per_group_rollout_metrics, version_during_step
+                )
+                if batch_age is not None:
+                    # Token-weighted policy updates between generating a token
+                    # and training on it.
+                    step_metrics["batch_age"] = batch_age
                 step_metrics.update(
                     aggregate_rollout_metrics(per_group_rollout_metrics)
                 )
@@ -3047,6 +3095,8 @@ class SingleControllerActor:
                     "step_trained",
                     step=self._train_steps,
                     trainer_version=self._trainer_version,
+                    # The policy version the optimizer step updated.
+                    trained_version=version_during_step,
                     group_ids=sorted(step_finalizer_group_ids),
                 )
                 self._rollout_snapshots.end_optimizer_commit()
@@ -3185,6 +3235,7 @@ class SingleControllerActor:
                             step_metrics,
                             is_policy_training_step=is_policy_training_step,
                             is_final_checkpoint=is_last_step,
+                            publish_now=should_save_by_timeout,
                         )
                     if defer_refit_for_save:
                         # The save is done; wake the engine unless the loop is about to exit.
@@ -3247,7 +3298,7 @@ class SingleControllerActor:
             # the wandb step, and wandb silently discards anything logged
             # against a step it has already committed -- no exception, no
             # failed return, just an empty chart. grpo_sync had the same bug.
-            self._log_data_plane_metrics(total_time)
+            await self._log_data_plane_metrics(total_time)
             # step_finished=True here since this is the final log of our current step.
             self._logger.log_metrics(
                 timing_metrics,
@@ -3265,6 +3316,12 @@ class SingleControllerActor:
             )
 
             if should_save_by_timeout:
+                if self._master_config.checkpointing["enabled"]:
+                    # The trainer checkpoint holds no environment state, and no
+                    # later step will wake the pump to snapshot it. step_N is
+                    # already being published in the background, so the snapshot
+                    # runs while its policy write lands and moves in after.
+                    await self._rollout_snapshots.save_at_deadline()
                 print("Timeout has been reached, stopping training early", flush=True)
                 break
         await self._finish_pending_save(blocking=True)
@@ -4098,8 +4155,13 @@ class SingleControllerActor:
         *,
         is_policy_training_step: bool,
         is_final_checkpoint: bool,
+        publish_now: bool = False,
     ) -> None:
-        """Serialize full and rollout-only checkpoint publication."""
+        """Serialize full and rollout-only checkpoint publication.
+
+        ``publish_now`` starts publishing step_N in the background even with
+        ``defer_async_checkpoint_finalize``, as the checkpoint deadline needs.
+        """
         # The workers would wait for a still-pending save anyway; publish it first.
         await self._finish_pending_save(blocking=True)
         async with self._rollout_snapshots.trainer_checkpoint():
@@ -4107,6 +4169,7 @@ class SingleControllerActor:
                 step_metrics,
                 is_policy_training_step=is_policy_training_step,
                 is_final_checkpoint=is_final_checkpoint,
+                publish_now=publish_now,
             )
 
     async def _save_checkpoint_impl(
@@ -4115,6 +4178,7 @@ class SingleControllerActor:
         *,
         is_policy_training_step: bool,
         is_final_checkpoint: bool,
+        publish_now: bool = False,
     ) -> None:
         """Write a full checkpoint for the just-finished train step.
 
@@ -4230,15 +4294,19 @@ class SingleControllerActor:
         # Keep this last: the rename it leads to waits only for the policy's async
         # weight write, so anything written into checkpoint_path after it races
         # the rename.
-        await self._publish_when_policy_write_done(checkpoint_path)
+        await self._publish_when_policy_write_done(
+            checkpoint_path, publish_now=publish_now
+        )
 
-    async def _publish_when_policy_write_done(self, checkpoint_path: PathLike) -> None:
+    async def _publish_when_policy_write_done(
+        self, checkpoint_path: PathLike, *, publish_now: bool = False
+    ) -> None:
         """Arrange for tmp_step_N to become step_N once the policy write lands.
 
         The only way a full checkpoint gets published. Call it only after every
         other part of the checkpoint is on disk.
         """
-        if self._defer_checkpoint_finalize:
+        if self._defer_checkpoint_finalize and not publish_now:
             # Published by _finish_pending_save at a later step boundary.
             self._pending_checkpoint = (checkpoint_path, self._train_steps)
             return
@@ -4517,6 +4585,24 @@ class SingleControllerActor:
             # both paths.
             self._record_refit_landed(participants)
 
+        paused_calls: list[dict[str, Any]] = []
+        if generation_paused_for_refit and self._master_config.token_capture.enabled:
+            # How far each running captured call got on the old weights. Read after
+            # the transfer, still paused, so calls that arrived during it report 0
+            # tokens and count all theirs on the new weights.
+            try:
+                paused_calls = await asyncio.to_thread(
+                    self._gen.captured_call_progress, timeout_s=timeout_s
+                )
+            except Exception as error:
+                # Batch age is not worth a failed refit: these calls count every
+                # token under the version they began on.
+                warnings.warn(
+                    "could not read running calls' token counts at a refit "
+                    f"({type(error).__name__}); batch age counts them under the "
+                    "version they began on",
+                    stacklevel=1,
+                )
         print("▶️ Requesting generation resume after refit", flush=True)
         generation_resumed_after_refit = await asyncio.to_thread(
             self._gen.resume_generation_after_refit, timeout_s=timeout_s
@@ -4547,6 +4633,14 @@ class SingleControllerActor:
             await asyncio.to_thread(
                 self._gen.set_rollout_weight_version, self._trainer_version
             )
+            for progress in paused_calls:
+                self._refit_cuts.record(
+                    progress["weight_version"], self._trainer_version, progress["calls"]
+                )
+            if isinstance(self._sampler, BaseSampler):
+                self._refit_cuts.forget_before(
+                    self._trainer_version - self._sampler.eviction_window
+                )
         self._rollout_trace.emit("weights_synced", weight_version=self._trainer_version)
         self._rollout_permitted.set()
         self._rollout_manager.resume_request_deadlines()

@@ -214,7 +214,11 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         gen_handle=SimpleNamespace(
             worker_group=SimpleNamespace(workers=[], dp_leader_worker_indices=[])
         ),
-        trainer_handle=SimpleNamespace(worker_group=SimpleNamespace(workers=[])),
+        trainer_handle=SimpleNamespace(
+            worker_group=SimpleNamespace(workers=[]),
+            add_data_plane_snapshot_source=lambda actor: None,
+            add_data_plane_snapshot_fn=lambda fn: None,
+        ),
         value_handle=None,
         teacher_worker_groups=None,
         dataloader=None,
@@ -1182,7 +1186,9 @@ def test_sync_weights_keeps_dispatch_paused_when_generation_resume_fails() -> No
     )
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
 
     with pytest.raises(RuntimeError, match="successful refit pause"):
         asyncio.run(ctrl._sync_weights())
@@ -1239,7 +1245,9 @@ def test_sync_weights_does_not_resume_generation_after_failed_refit() -> None:
     )
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
 
     with pytest.raises(RuntimeError, match="refit failed"):
         asyncio.run(ctrl._sync_weights())
@@ -3980,6 +3988,7 @@ def test_ppo_checkpoint_saves_both_updates_without_repeating_early_refit(
         assert kwargs == {
             "is_policy_training_step": True,
             "is_final_checkpoint": True,
+            "publish_now": False,
         }
         assert "critic.finish_training" in calls
         assert len(ctrl._dp_client.cleared_ids) == len(metas)
@@ -4947,3 +4956,20 @@ def test_advantage_stage_placeholders_never_vote(
         return torch.stack(written.unbind()[:2])
 
     torch.testing.assert_close(compute(placeholders=True), compute(placeholders=False))
+
+
+def test_worker_group_snapshots_fan_out_and_drop_silent_ranks(monkeypatch) -> None:
+    """The critic and teacher groups join the cluster view through one fan-out each."""
+    calls: list[str] = []
+    group = SimpleNamespace(
+        run_all_workers_single_data=lambda name: calls.append(name) or ["r0", "r1"]
+    )
+    answers = {"r0": {"total_wall_ms": 1.0}, "r1": None}
+    monkeypatch.setattr(
+        single_controller.ray, "get", lambda refs: [answers[r] for r in refs]
+    )
+
+    snapshots = single_controller._worker_group_snapshots(group)()
+
+    assert calls == ["get_data_plane_snapshot"]
+    assert snapshots == [{"total_wall_ms": 1.0}]

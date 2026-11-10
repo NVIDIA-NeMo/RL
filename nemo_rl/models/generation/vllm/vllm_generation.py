@@ -765,6 +765,14 @@ class VllmGeneration(GenerationInterface):
         self._token_capture_setup = setup
         return self._token_capture_media
 
+    def get_data_plane_snapshots(self) -> list[dict[str, Any]]:
+        """Capture-client counters from every DP-leader worker that has one."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_data_plane_snapshot",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return [s for s in ray.get(futures) if s]
+
     def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version refit members stamp on captured model calls.
 
@@ -1903,6 +1911,22 @@ class VllmGeneration(GenerationInterface):
         if not all(results):
             raise RuntimeError("Failed to pause every async vLLM engine")
         return True
+
+    def captured_call_progress(
+        self, *, timeout_s: Optional[float] = None
+    ) -> list[dict[str, Any]]:
+        """Collect each paused engine's running captured calls and their lengths."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            return []
+        futures = [
+            worker.captured_call_progress.remote()
+            for worker in self._refit_leader_workers()
+        ]
+        return [
+            progress
+            for progress in ray.get(futures, timeout=timeout_s)
+            if progress is not None
+        ]
 
     def resume_generation_after_refit(
         self, *, timeout_s: Optional[float] = None

@@ -1224,7 +1224,7 @@ class TestSetup:
 
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is False
 
-    def test_turn_recovery_requires_periodic_snapshots(self):
+    def test_turn_recovery_rejects_a_config_that_never_saves(self):
         mc = _make_master_config(env={"should_use_nemo_gym": True})
         mc.policy["generation"]["vllm_cfg"] = {
             "async_engine": True,
@@ -1232,10 +1232,13 @@ class TestSetup:
         }
         mc.token_capture.enabled = True
         mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+        mc.rollout_checkpointing = RolloutCheckpointConfig(
+            snapshot_on_trainer_checkpoint=False
+        )
 
         with pytest.raises(
             ValueError,
-            match="target_level='turn' requires.*snapshot_attempt_interval_s",
+            match="target_level='turn' would never save environment state",
         ):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
 
@@ -1321,10 +1324,18 @@ class TestSetup:
 
         validate_single_controller_config(mc)
 
+    @pytest.mark.parametrize(
+        ("interval_s", "on_trainer_checkpoint", "must_save_by"),
+        [(1.0, True, None), (None, True, None), (None, False, "01:00:00:00")],
+        ids=["periodic", "every-trainer-checkpoint", "deadline-only"],
+    )
     def test_periodic_checkpointing_warns_without_per_step_trainer_anchors(
         self,
         tmp_path: Path,
         patched_factories,
+        interval_s,
+        on_trainer_checkpoint,
+        must_save_by,
     ):
         mc = _make_master_config(colocated=False, backend="vllm")
         mc.checkpointing.update(
@@ -1333,6 +1344,7 @@ class TestSetup:
                 "enabled": True,
                 "save_data_plane": True,
                 "save_period": 2,
+                "checkpoint_must_save_by": must_save_by,
             }
         )
         mc.policy["generation"].update(
@@ -1347,7 +1359,8 @@ class TestSetup:
         mc.token_capture.enabled = True
         mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
         mc.rollout_checkpointing = RolloutCheckpointConfig(
-            snapshot_attempt_interval_s=1.0
+            snapshot_attempt_interval_s=interval_s,
+            snapshot_on_trainer_checkpoint=on_trainer_checkpoint,
         )
         fake_finalizers = [MagicMock(name="finalizer")]
         patched_factories["setup_response_data"].return_value = (
@@ -1356,7 +1369,7 @@ class TestSetup:
         )
 
         with (
-            pytest.warns(UserWarning, match="checkpointing.save_period=2"),
+            warnings.catch_warnings(record=True) as caught,
             patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
             patch.object(
                 sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
@@ -1368,6 +1381,7 @@ class TestSetup:
                 return_value=fake_finalizers,
             ),
         ):
+            warnings.simplefilter("always")
             actor_args, _ = setup_single_controller(
                 mc,
                 MagicMock(pad_token_id=0),
@@ -1375,6 +1389,11 @@ class TestSetup:
 
         assert actor_args.finalizer_actors == fake_finalizers
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is True
+        # Turn recovery alone snapshots after each trainer checkpoint, so only
+        # a periodic interval needs a step_N for every step.
+        assert any("checkpointing.save_period=2" in str(w.message) for w in caught) is (
+            interval_s is not None
+        )
 
     def test_nemo_gym_log_dir_is_set_before_gym_build(
         self, patched_factories, tmp_path
@@ -1915,15 +1934,8 @@ class TestSetup:
                 {"use_importance_sampling_correction": False},
                 "use_importance_sampling_correction=true",
             ),
-            (
-                {
-                    "use_importance_sampling_correction": True,
-                    "force_on_policy_ratio": True,
-                },
-                "force_on_policy_ratio=false",
-            ),
         ],
-        ids=["no_is_correction", "forced_on_policy_ratio"],
+        ids=["no_is_correction"],
     )
     def test_ready_first_sampler_rejects_incompatible_loss_config(
         self,
@@ -1931,9 +1943,8 @@ class TestSetup:
         match: str,
         patched_factories,
     ):
-        # ready_first is only valid with use_importance_sampling_correction=true
-        # and force_on_policy_ratio=false; anything else is rejected at setup,
-        # before any factory allocates resources.
+        # ready_first requires use_importance_sampling_correction=true; anything
+        # else is rejected at setup, before any factory allocates resources.
         mc = _make_master_config(
             sampler_cfg=ReadyFirstSamplerConfig(max_staleness_versions=1),
             loss_cfg=ClippedPGLossConfig(**loss_overrides),
@@ -1944,6 +1955,18 @@ class TestSetup:
 
         patched_factories["setup_response_data"].assert_not_called()
         patched_factories["_build_clusters"].assert_not_called()
+
+    def test_ready_first_sampler_accepts_forced_ratio_for_grpo(self):
+        # GRPO takes one optimizer step per RL step, so the ratio is 1 anyway.
+        mc = _make_master_config(
+            sampler_cfg=ReadyFirstSamplerConfig(max_staleness_versions=1),
+            loss_cfg=ClippedPGLossConfig(
+                use_importance_sampling_correction=True,
+                force_on_policy_ratio=True,
+            ),
+        )
+
+        validate_single_controller_config(mc)
 
     def test_invalid_dynamo_config_fails_before_clusters(self, patched_factories):
         mc = _make_master_config(backend="dynamo")
