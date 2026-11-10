@@ -1189,6 +1189,44 @@ def test_prepare_refit_info_preserves_fp32_router_correction_bias():
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@pytest.mark.parametrize("source_dtype", [torch.float32, torch.bfloat16, torch.float64])
+def test_refit_ssm_a_log_precision_and_metadata(source_dtype):
+    """Metadata and payload must preserve native FP32 A_log values through refit."""
+    model = nn.Module()
+    model.linear_attn = nn.Module()
+    model.linear_attn.A_log = nn.Parameter(
+        torch.tensor([0.123456, 0.876543], dtype=source_dtype)
+    )
+    model.linear_attn.dt_bias = nn.Parameter(torch.ones(2, dtype=torch.float32))
+    expected_dtype = torch.float32 if source_dtype == torch.float32 else torch.bfloat16
+
+    worker = object.__new__(AutomodelPolicyWorkerImpl)
+    worker.model = model
+    worker.dtype = torch.bfloat16
+    worker.draft_model = None
+    worker.lora_enabled = False
+    metadata = worker.prepare_refit_info()
+    payload = dict(automodel_params_generator(model, worker.dtype))
+
+    assert metadata["linear_attn.A_log"] == (torch.Size([2]), expected_dtype)
+    assert payload["linear_attn.A_log"].dtype == expected_dtype
+    torch.testing.assert_close(
+        payload["linear_attn.A_log"],
+        model.linear_attn.A_log.to(expected_dtype),
+        rtol=0,
+        atol=0,
+    )
+    if source_dtype == torch.float32:
+        assert not torch.equal(
+            payload["linear_attn.A_log"], model.linear_attn.A_log.bfloat16().float()
+        )
+    # dt_bias follows the inference model dtype; its contract differs from A_log.
+    assert metadata["linear_attn.dt_bias"][1] == torch.bfloat16
+    assert payload["linear_attn.dt_bias"].dtype == torch.bfloat16
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 class TestAutocastContext:
     """Tests for the precision context retained by the policy worker."""
 
