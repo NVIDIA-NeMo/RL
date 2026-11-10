@@ -259,13 +259,15 @@ launcher starts a cold pool and reattaches to a warm one.
 `submit_external_vllm_attached_job` submits `attach_and_run.sh` with `COMMAND`
 (it must contain every pool's URL placeholder and
 `__EXTERNAL_SERVICE_READINESS__`). While the pool is not `READY` yet, the job
-also depends on `after:<pool-job>+EXTERNAL_VLLM_ATTACH_AFTER_MIN` (default 15),
-so it does not hold its nodes idle through the pool's queue wait and model load.
+also depends on `after:<pool-job>`, so it does not hold its nodes idle through the
+pool's queue wait. With `EXTERNAL_VLLM_ATTACH_EARLY=0` the dependency adds
+`+EXTERNAL_VLLM_ATTACH_AFTER_MIN` (default 15) to cover the model load too.
 `POOL_DIR` must be under `EXTERNAL_VLLM_SHARED_ROOT`; the training job needs
 `EXTERNAL_VLLM_TOOLS_DIR_HOST`, `BASE_LOG_DIR` and `RAY_SUB` in its environment.
 
 `attach_and_run.sh` resolves everything at job start, never at submission: it
-waits for `READY` from the expected pool job, replaces each URL placeholder, and
+waits for the expected pool job's manifest (for `READY` with
+`EXTERNAL_VLLM_ATTACH_EARLY=0`), replaces each URL placeholder, and
 replaces `__EXTERNAL_SERVICE_READINESS__` with the same backend-count readiness
 gate a heterogeneous job uses, built from the pool's manifest. Then it runs
 `ray.sub`.
@@ -302,7 +304,7 @@ gate a heterogeneous job uses, built from the pool's manifest. Then it runs
   or when `heartbeat` is older than `EXTERNAL_VLLM_HEARTBEAT_STALE_S`. Inline
   mode gets the same guarantee by stopping NeMo RL when a judge exits; without
   it a run could keep training against dead judges with failing rewards.
-- **Slurm cannot be queried.** While waiting for `READY`, a failed `squeue` is
+- **Slurm cannot be queried.** While waiting for the pool, a failed `squeue` is
   only logged; the pool job counts as gone after
   `EXTERNAL_VLLM_POOL_GONE_CHECKS` consecutive "finished or unknown" answers.
 - **The pool ends before the training job.** `attach_and_run.sh` warns when the
@@ -311,6 +313,20 @@ gate a heterogeneous job uses, built from the pool's manifest. Then it runs
 
 Restarting the pool job always changes its URLs; resubmit attached training jobs
 afterwards (a queued one resolves the new URLs when it starts).
+
+### Starting before the pool is READY
+
+A pool job publishes `manifest.tsv` (and `pools.env`) as soon as its load balancers are placed, which fixes every URL,
+and writes `READY` only once every load balancer counts all its replicas healthy. By default `attach_and_run.sh` waits
+for the manifest (the same pool job generation, a fresh heartbeat and no `STOPPED` marker are still required) and starts
+`ray.sub` immediately. The readiness gate that replaces `__EXTERNAL_SERVICE_READINESS__` still holds rollout setup
+until every pool reports its full backend count, so this overlaps initialization with model loading, as an inline
+heterogeneous job does, without letting rollouts start early. `EXTERNAL_VLLM_ATTACH_EARLY=0` waits for `READY` before it
+runs `ray.sub`, so Ray, the trainer and Gym initialization start only after the judges have loaded.
+
+To start the training allocation together with a pool that is still queued, submit the pool job held (`--hold`), submit
+the training job through `submit_external_vllm_attached_job` (it depends on `after:<pool-job>`), then release the pool
+job: the training job becomes eligible once the pool job starts.
 
 ### Settings
 
@@ -322,10 +338,11 @@ afterwards (a queued one resolves the new URLs when it starts).
 | `EXTERNAL_VLLM_MAX_RESTARTS` | `5` | Relaunches per replica or load balancer before the pool job gives up. |
 | `EXTERNAL_VLLM_RESTART_RESET_S` | `1800` | Uptime after which a step's relaunch count resets. |
 | `EXTERNAL_VLLM_POOL_JOB` | set by `submit_external_vllm_attached_job` | Pool job a training job attaches to. |
-| `EXTERNAL_VLLM_ATTACH_TIMEOUT` | `3600` | How long a training job waits for `READY`. |
+| `EXTERNAL_VLLM_ATTACH_TIMEOUT` | `3600` | How long a training job waits for the pool's manifest (`READY` with `EXTERNAL_VLLM_ATTACH_EARLY=0`). |
 | `EXTERNAL_VLLM_ATTACH_POLL_S` | `15` | How often it checks while waiting. |
 | `EXTERNAL_VLLM_ATTACH_WATCH_S` | `30` | How often it checks the pool while training. |
 | `EXTERNAL_VLLM_HEARTBEAT_STALE_S` | `300` | Heartbeat age at which the pool job counts as dead. |
 | `EXTERNAL_VLLM_POOL_GONE_CHECKS` | `3` | Consecutive "finished or unknown" Slurm answers before the pool job counts as gone. |
 | `EXTERNAL_VLLM_ATTACH_REQUIRE_LIFETIME` | `0` | `1` refuses to start a training job that would outlive the pool job. |
-| `EXTERNAL_VLLM_ATTACH_AFTER_MIN` | `15` | Minutes after the pool job starts before a training job submitted against a loading pool may start. |
+| `EXTERNAL_VLLM_ATTACH_AFTER_MIN` | `15` | Minutes after the pool job starts before a training job submitted against a loading pool may start. Ignored with `EXTERNAL_VLLM_ATTACH_EARLY=1`. |
+| `EXTERNAL_VLLM_ATTACH_EARLY` | `1` | `1` starts `ray.sub` as soon as the pool job has published its URLs; `0` waits until every replica is healthy (`READY`). See [Starting before the pool is READY](#starting-before-the-pool-is-ready). |

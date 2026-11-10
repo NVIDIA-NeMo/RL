@@ -79,6 +79,7 @@ from megatron.core.utils import get_model_config
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.model_utils import patch_gpt_model_forward_for_linear_ce_fusion
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
@@ -86,6 +87,7 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     resolve_boundary_ignore_patterns,
 )
+from nemo_rl.models.megatron import ckpt_parallel_read
 from nemo_rl.models.megatron.draft.optimizer import (
     build_draft_optimizer_override_provider,
 )
@@ -307,7 +309,10 @@ def _force_sync_model_from_optimizer_fp32(optimizer):
         )
 
 
-from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.logits_sampling_utils import (
+    TrainingSamplingParams,
+    need_top_k_or_top_p_filtering,
+)
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.generation.megatron.config import (
     dedicated_inference_megatron_cfg,
@@ -584,6 +589,7 @@ def validate_and_set_config(
             top_k=generation_cfg["top_k"],
             top_p=generation_cfg["top_p"],
             temperature=generation_cfg["temperature"],
+            sampler_replay=sampler_replay_enabled(generation_cfg),
         )
 
     # Setup data types
@@ -2088,6 +2094,31 @@ def _validate_chunking_config(config: PolicyConfig) -> None:
         assert config["megatron_cfg"]["defer_fp32_logits"], (
             "defer_fp32_logits must be True if logprob_chunk_size is set"
         )
+    if config["megatron_cfg"].get("reuse_logits_storage"):
+        sequence_packing = config.get("sequence_packing")
+        chunk_size = config.get("logprob_chunk_size")
+        if not (
+            sequence_packing is not None
+            and sequence_packing["enabled"]
+            and sequence_packing.get("fuse_loss")
+            and isinstance(chunk_size, int)
+            and chunk_size > 0
+        ):
+            raise ValueError(
+                "policy.megatron_cfg.reuse_logits_storage=true requires "
+                "sequence_packing.enabled=true, sequence_packing.fuse_loss=true and "
+                "a positive policy.logprob_chunk_size"
+            )
+        # Training top-k/top-p turns chunking off, which would silently drop the reuse.
+        generation = config.get("generation")
+        if generation is not None and need_top_k_or_top_p_filtering(
+            TrainingSamplingParams(top_k=generation["top_k"], top_p=generation["top_p"])
+        ):
+            raise ValueError(
+                "policy.megatron_cfg.reuse_logits_storage=true does not apply with "
+                "training top-k/top-p filtering; set policy.generation.top_k=null "
+                "and policy.generation.top_p=1.0, or disable the reuse"
+            )
 
 
 def _create_checkpoint_config(
@@ -2503,6 +2534,9 @@ def setup_model_and_optimizer(
     state = GlobalState()
     _patch_bridge_signal_handler_for_worker_threads()
     state.cfg = megatron_cfg
+    ckpt_cfg = policy_cfg["megatron_cfg"].get("checkpoint") or {}
+    if "parallel_read_threads" in ckpt_cfg:
+        ckpt_parallel_read.install(ckpt_cfg["parallel_read_threads"])
     # TODO: Freeze state.cfg
 
     # Must be called before initialize_megatron (before CUDA init) so the
