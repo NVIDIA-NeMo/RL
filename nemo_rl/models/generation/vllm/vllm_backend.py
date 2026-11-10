@@ -2465,7 +2465,9 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         from nemo_rl.weight_sync.nccl_reshard_utils import (
             restore_refit_info_placements,
         )
+        from nemo_rl.weight_sync.xferdtensor import follow_source_reshard_path
 
+        follow_source_reshard_path(refit_info["source_uses_real_reshard_op"])
         self.nccl_reshard_refit_info = (  # pyrefly: ignore[implicitly-defined-attribute]
             restore_refit_info_placements(refit_info)
         )

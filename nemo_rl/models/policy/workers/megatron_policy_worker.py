@@ -4286,6 +4286,11 @@ class MegatronPolicyWorkerImpl(
         # Keep the misc_meta in the nccl_reshard_refit_info
         # misc_meta[hf_name] -> [shape, dtype]
         self.nccl_reshard_refit_info["misc_meta"] = misc_meta
+        from nemo_rl.weight_sync.xferdtensor import uses_real_reshard_op
+
+        self.nccl_reshard_refit_info["source_uses_real_reshard_op"] = (
+            uses_real_reshard_op()
+        )
         # Filter conversion_tasks to the misc subset.
         _misc_names = set(misc_meta.keys())
 
