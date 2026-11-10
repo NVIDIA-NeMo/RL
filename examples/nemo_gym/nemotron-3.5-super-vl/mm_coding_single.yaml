@@ -1,7 +1,7 @@
 defaults: workplace_assistant_automodel.yaml
 grpo:
   num_prompts_per_step: 4
-  max_num_steps: 2
+  max_num_steps: 3
   val_at_start: false
   val_period: 0
 checkpointing:

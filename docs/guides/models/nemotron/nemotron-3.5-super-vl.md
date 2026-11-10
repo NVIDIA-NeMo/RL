@@ -103,7 +103,7 @@ python examples/nemo_gym/nemotron-3.5-super-vl/check_mm_coding_runtime.py --mode
 ```
 
 The current NeMo RL Gym submodule pin predates the submitted Gym package layout
-and session helper. Merely adding the resources config does not update actor
+and public session/sandbox-lending APIs. Merely adding the resources config does not update actor
 interpreters: default actor commands use `uv run --locked`. Install the submitted
 internal Gym revision and its dependencies into each deployment-owned runtime,
 and configure the deployment to retain those environments. The existing
@@ -126,8 +126,12 @@ support ([Gym #5833](https://github.com/NVIDIA-NeMo/Gym/pull/5833), or the merge
 successor). OpenCode can append its own assistant step-limit note or lowercase
 a tool name; a Gym revision without the fix can lose the model-call parent and
 mask the rollout. The mode-aware preflight refuses the missing module before
-GPU allocation. If the prepared dataset excludes OpenCode, pass the same
-`--harnesses codex hermes` subset. Module discovery is a prerequisite, not proof
+GPU allocation. The default migration path is single + OpenCode multi/mixed;
+Codex/Hermes require the separate experimental Gym adapter extensions and
+`mm_coding_multi_experimental.yaml` or `mm_coding_mixed_experimental.yaml`.
+Select them explicitly with `--harnesses codex hermes`; OpenCode remains the
+default. Their file-based vision protocol and SDK hook are experimental.
+See the Gym component’s `experimental-harnesses.md` for limits and provenance. Module discovery is a prerequisite, not proof
 that a rollout's tokens, images and logprobs were captured correctly.
 
 Set `MM_CODING_TRAIN_DATA` and `MM_CODING_VALIDATION_DATA` to the adapted files,
@@ -145,7 +149,7 @@ Renderer/judge failures are excluded; measured model execution failures remain
 eligible zero rewards. The quality reward is distinct from official evaluation
 metrics, whose EFB configurations remain separate.
 
-Use `--mode multi` for one selected OpenCode/Codex/Hermes harness per task, or
+Use `--mode multi` for stock OpenCode sessions per task, or
 `--mode mixed` for the source task-family single/multi proportions. `--seed`
 and `--epoch` freeze routing when preparing the file, before GRPO siblings are
 expanded. The model-visible task prompt is preserved; multi adds workspace and
@@ -156,9 +160,22 @@ recipe. All three recipes share the learner, optimizer and reward settings. Mult
 mixed permit up to 32 images per request instead of the single-answer cap of
 2, so retained reference/preview observations do not fail after two images. The
 16384-token context and adapter/model-server request limits still apply.
+The Gym deployment also needs PR #5719 (public lifecycle and `LentSandboxes`)
+and the typed catalog-row validator follow-up, or their merged successors.
+Use the exact reviewed dependency SHAs, not an unpinned moving branch. OpenCode
+must be preinstalled in the remote image; supply pinned ripgrep and plugin
+bundles through the resource owner's runtime files before sandbox activation.
+The task network is `model_only`, so runtime downloads during an episode fail.
+Only the policy model is externally advertised; agent, head and judge stay on
+loopback. Preserve these boundaries in actor deployments.
+
 Multi rows route typed tasksets to Gym's existing sandboxed harnesses; single
-rows use the existing simple-agent relay. This contribution does not port the
+rows use the `single_agent_turn_legacy` simple-agent relay. This contribution does not port the
 experimental V2 asynchronous controller or change GRPO loss/optimizer behavior.
+
+The acceptance recipe prepares three GRPO steps and saves optimizer state at
+each step. This configuration does not establish that those steps or recovery
+have run on the submitted source.
 
 The source experiments passed two-step Super acceptance on a different pinned
 runtime and checkpoint. The recipe selects the documented public Super 3.5 VL

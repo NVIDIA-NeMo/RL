@@ -121,7 +121,9 @@ class SourceGymRow(BaseModel):
             )
 
 
-HARNESS_NAMES = ("opencode", "codex", "hermes")
+HARNESS_NAMES = ("opencode",)
+EXPERIMENTAL_HARNESSES = ("codex", "hermes")
+ALL_HARNESSES = (*HARNESS_NAMES, *EXPERIMENTAL_HARNESSES)
 MULTI_FRACTIONS = {
     "chart2code": 0.5,
     "mmsvg_img2svg": 0.5,
@@ -152,7 +154,7 @@ def select_route(
     if (
         not harnesses
         or len(set(harnesses)) != len(harnesses)
-        or set(harnesses) - set(HARNESS_NAMES)
+        or set(harnesses) - set(ALL_HARNESSES)
     ):
         raise ValueError("Choose unique supported harnesses")
     identity = f"{seed}:{epoch}:{task.benchmark}:{task.task_id}"
@@ -175,7 +177,7 @@ def gym_row(
     selected: str = "single",
 ) -> dict:
     """Preserve the task prompt and input image without exposing the reference source."""
-    if selected != "single" and selected not in HARNESS_NAMES:
+    if selected != "single" and selected not in ALL_HARNESSES:
         raise ValueError("Unknown harness route")
     if split not in {"train", "validation", "example"}:
         raise ValueError(
@@ -225,8 +227,10 @@ def gym_row(
             }
         )
     if selected != "single":
+        # These opt-in adapters accept file-based vision, not initial image attachments.
+        if selected in EXPERIMENTAL_HARNESSES:
+            content = [part for part in content if part["type"] != "input_image"]
         # The resource-owned sandbox receives the same reference bytes; no private grade data enters the prompt.
-        content = [{"type": "input_text", "text": task.prompt}]
         if task.references:
             content.append(
                 {
@@ -237,10 +241,13 @@ def gym_row(
                 }
             )
         artifact = ARTIFACTS[task.benchmark]
+        preview_python = (
+            "/opt/gym/bin/python" if selected in EXPERIMENTAL_HARNESSES else "python"
+        )
         system_prompt = (
             f"Solve the user's task in /workspace. Save your final answer to /workspace/{artifact}. "
             "Use shell and file tools to inspect and revise. "
-            f"Preview with `python /opt/mmrl/render.py {task.benchmark} /workspace/{artifact} /workspace/preview.png`. "
+            f"Preview with `{preview_python} /opt/mmrl/render.py {task.benchmark} /workspace/{artifact} /workspace/preview.png`. "
             "You may inspect the preview with your image tool. Finish with a final response. "
             "Only the final answer file is transferred to a fresh grading sandbox. "
             "Make it self-contained: it must run without any other task-workspace files. "
@@ -364,7 +371,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epoch", type=int, default=0)
     parser.add_argument(
-        "--harnesses", nargs="+", choices=HARNESS_NAMES, default=list(HARNESS_NAMES)
+        "--harnesses",
+        nargs="+",
+        choices=ALL_HARNESSES,
+        default=list(HARNESS_NAMES),
+        help="Defaults to OpenCode. Explicit Codex/Hermes selection opts into experimental file-based vision.",
     )
     args = parser.parse_args()
     count = export(
@@ -379,7 +390,18 @@ def main() -> None:
         epoch=args.epoch,
         harnesses=tuple(args.harnesses),
     )
-    print(json.dumps({"rows": count, "output": str(args.output), "split": args.split}))
+    print(
+        json.dumps(
+            {
+                "rows": count,
+                "output": str(args.output),
+                "split": args.split,
+                "experimental_harnesses": [
+                    h for h in args.harnesses if h in EXPERIMENTAL_HARNESSES
+                ],
+            }
+        )
+    )
 
 
 if __name__ == "__main__":

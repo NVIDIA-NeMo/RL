@@ -63,7 +63,7 @@ def test_resolved_recipe_preserves_super_image_and_gym_contract(
         == config.grpo.num_prompts_per_step * config.grpo.num_generations_per_prompt
         == 64
     )
-    assert config.grpo.max_num_steps == 2 and config.checkpointing.save_optimizer
+    assert config.grpo.max_num_steps == 3 and config.checkpointing.save_optimizer
     assert config.env.should_mask_flagged_samples
     assert config.env.nemo_gym.policy_model.responses_api_models.vllm_model.uses_reasoning_parser
     assert config.policy.generation.vllm_cfg.skip_tokenizer_init is False
@@ -251,7 +251,7 @@ def test_multi_rows_have_private_task_envelope_and_file_instructions(tmp_path, h
     assert "Do not read or embed the task reference image as the solution" in prompt
 
 
-@pytest.mark.parametrize("harnesses", [(), ("codex", "codex"), ("unknown",)])
+@pytest.mark.parametrize("harnesses", [(), ("opencode", "opencode"), ("unknown",)])
 def test_unknown_or_repeated_harness_routes_are_rejected(harnesses):
     task = adapter.ExperimentTask(
         benchmark="mmsvg_text2svg", task_id="1", prompt="draw"
@@ -328,11 +328,11 @@ def test_adapter_cli_writes_multi_dataset(tmp_path, monkeypatch, capsys):
             "--mode",
             "multi",
             "--harnesses",
-            "codex",
+            "opencode",
         ],
     )
     adapter.main()
-    assert json.loads(output.read_text())["task_id"]["taskset"] == "mm-coding:codex"
+    assert json.loads(output.read_text())["task_id"]["taskset"] == "mm-coding:opencode"
     assert json.loads(capsys.readouterr().out)["rows"] == 1
 
 
@@ -345,12 +345,10 @@ def test_runtime_guard_detects_missing_session_api(monkeypatch):
     spec.loader.exec_module(guard)
 
     def find(module):
-        return (
-            None if module == "nemo_gym.resources_server_sandbox_sessions" else object()
-        )
+        return None if module == "nemo_gym.server_runtime.sandbox_lending" else object()
 
     monkeypatch.setattr(guard.importlib.util, "find_spec", find)
-    assert guard.check_runtime() == ["nemo_gym.resources_server_sandbox_sessions"]
+    assert guard.check_runtime() == ["nemo_gym.server_runtime.sandbox_lending"]
     monkeypatch.setattr("sys.argv", ["check_mm_coding_runtime"])
     with pytest.raises(SystemExit, match="stock RL Gym pin"):
         guard.main()
@@ -377,7 +375,6 @@ def test_runtime_guard_refuses_missing_opencode_capture_support(
         guard.main()
     assert json.loads(capsys.readouterr().out)["missing_modules"] == [missing]
     assert guard.check_runtime(mode="single") == []
-    assert guard.check_runtime(mode=mode, harnesses=("codex", "hermes")) == []
     monkeypatch.setattr(guard.importlib.util, "find_spec", lambda module: object())
     guard.main()
     assert json.loads(capsys.readouterr().out)["compatible"]
@@ -430,3 +427,54 @@ def test_legacy_image_drift_is_refused_without_partial_dataset(tmp_path):
             input_format="legacy-row",
         )
     assert not output.exists()
+
+
+@pytest.mark.parametrize("harness", ["codex", "hermes"])
+def test_experimental_image_route_preserves_owner_pixels_and_requires_file_inspection(
+    tmp_path, harness
+):
+    path = tmp_path / "reference.png"
+    Image.new("RGB", (12, 12), "blue").save(path)
+    task = adapter.ExperimentTask(
+        benchmark="mmsvg_img2svg",
+        task_id="experimental-image",
+        prompt="draw this",
+        references=[str(path)],
+    )
+    row = adapter.gym_row(
+        task,
+        reference_root=tmp_path,
+        split="example",
+        max_output_tokens=8192,
+        selected=harness,
+    )
+    params = row["task_input"]["responses_create_params"]
+    owner = row["task_input"]["task_data"]["task"]
+    assert owner["reference_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+    assert "/workspace/reference.png" in json.dumps(params)
+    assert "Inspect it with your image tool" in json.dumps(params)
+    assert (
+        "Preview with `/opt/gym/bin/python /opt/mmrl/render.py"
+        in params["input"][0]["content"]
+    )
+    assert not any(
+        p.get("type") == "input_image"
+        for message in params["input"]
+        for p in (message["content"] if isinstance(message["content"], list) else [])
+    )
+
+
+def test_experimental_runtime_preflight_refuses_unpatched_stock_adapter(monkeypatch):
+    from types import SimpleNamespace
+
+    spec = importlib.util.spec_from_file_location(
+        "experimental_runtime_guard", EXAMPLE / "check_mm_coding_runtime.py"
+    )
+    guard = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(guard)
+    stock = SimpleNamespace(CodexAgentConfig=SimpleNamespace(model_fields={}))
+    monkeypatch.setattr(guard.importlib, "import_module", lambda name: stock)
+    assert guard.check_experimental_apis(("codex",)) == [
+        "responses_api_agents.codex_agent.app.CodexAgentConfig.forward_sampling_controls"
+    ]
+    assert guard.check_experimental_apis(("opencode",)) == []

@@ -1,0 +1,6 @@
+# Explicit opt-in; use --mode mixed with an explicitly selected experimental harness set.
+defaults: mm_coding_multi_experimental.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-super35-mm-coding-mixed-experimental
+logger:
+  log_dir: logs/grpo-super35-mm-coding-mixed-experimental
