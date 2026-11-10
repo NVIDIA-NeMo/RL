@@ -73,9 +73,11 @@ from nemo_rl.telemetry.vocabulary import (
     DEFAULT_TEED_PREFIXES,
     EFFICIENCY_PCT_KEY,
     EFFICIENCY_PCT_PER_STEP_KEY,
+    PERFORMANCE_PREFIX,
     RUN_WINDOW_WALL_CLOCK_CATEGORIES,
     TELEMETRY_TRAIN_STEP_KEY,
     TELEMETRY_WALL_TIME_METRIC,
+    TIMING_TRAIN_PREFIX,
     VALIDATION_PREFIX,
     as_scalar,
     freeze_metrics,
@@ -99,6 +101,17 @@ logger = logging.getLogger(__name__)
 # separately below. Aliased from the vocabulary rather than respelled, so the
 # gate here and the per-row default a ``TeedMetric`` carries cannot drift.
 _TRAIN_PREFIXES: tuple[Optional[str], ...] = DEFAULT_TEED_PREFIXES
+
+# Prefixes whose dicts hold declared scalars and nothing else, so they need the
+# scalar tee alone. ``timing/train`` is here for its one throughput key; its
+# phase durations are deliberately not declared, being the same phases the
+# per-step spans already carry and the ``idle/*`` ones ``rl.efficiency.seconds``
+# already reports.
+_SCALAR_ONLY_PREFIXES: tuple[Optional[str], ...] = (
+    VALIDATION_PREFIX,
+    PERFORMANCE_PREFIX,
+    TIMING_TRAIN_PREFIX,
+)
 
 # One dimensioned gauge rather than an instrument per category, so adding a
 # category needs no instrument change.
@@ -773,7 +786,8 @@ def tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> No
 
     Teed prefixes: the per-step ``train`` dicts (the ``efficiency/*``
     durations, the training scalars and the ``vllm/*`` engine deltas), the
-    ``validation`` dicts, the ``timing/setup`` dict at step 0, and the Single-Controller's
+    ``validation``, ``performance`` and ``timing/train`` dicts, the
+    ``timing/setup`` dict at step 0, and the Single-Controller's
     ``timing/rollout_checkpoint``, ``timing/rollout_recovery`` and
     ``rollout/checkpoint_outcome`` dicts. The OTel instruments are touched only
     when telemetry is actively exporting; everything else short-circuits to a
@@ -794,12 +808,12 @@ def tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> No
 def _tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> None:
     """Body of :func:`tee_rl_metrics_to_otel`, inside its exception guard."""
     is_setup = prefix == SETUP_TIMING_PREFIX
-    is_validation = prefix == VALIDATION_PREFIX
+    is_scalar_only = prefix in _SCALAR_ONLY_PREFIXES
     is_checkpoint_outcome = prefix == ROLLOUT_CHECKPOINT_OUTCOME_PREFIX
     checkpoint_operation = _CHECKPOINT_PREFIXES.get(prefix) if prefix else None
     if (
         not is_setup
-        and not is_validation
+        and not is_scalar_only
         and not is_checkpoint_outcome
         and checkpoint_operation is None
         and prefix not in _TRAIN_PREFIXES
@@ -846,14 +860,14 @@ def _tee_rl_metrics_to_otel(metrics: dict[str, Any], prefix: Optional[str]) -> N
             warn_once("setup", "failed to tee setup timing metrics")
         return
 
-    if is_validation:
-        # Its own branch for the same reason as setup: this dict shares no key
-        # with the efficiency or vLLM families, so scanning it for them would
-        # be dead work on every validation pass.
+    if is_scalar_only:
+        # Their own branch for the same reason as setup: these dicts share no
+        # key with the efficiency or vLLM families, so scanning them for those
+        # would be dead work on every step.
         try:
             _tee_scalars(telemetry.meter, metrics, prefix)
         except Exception:
-            warn_once("validation", "failed to tee validation metrics")
+            warn_once("scalar_only", f"failed to tee {prefix} metrics")
         return
 
     # Separate handlers so one broken family cannot silence the others: a bad

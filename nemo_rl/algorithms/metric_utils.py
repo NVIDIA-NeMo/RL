@@ -18,6 +18,8 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Optional, get_args
 
 from nemo_rl.telemetry.vocabulary import (
+    PERFORMANCE_PREFIX,
+    TIMING_TRAIN_PREFIX,
     VALIDATION_PREFIX,
     TeedMetric,
     as_scalar,
@@ -122,6 +124,58 @@ VALIDATION_TEED_METRICS = (
 )
 
 register_teed_metrics(VALIDATION_TEED_METRICS)
+
+
+# Keys `print_performance_metrics` returns, plus the throughput one the step
+# loop injects into its Timer dict. Both arrive under their own prefix.
+TOKEN_IMBALANCE_KEY = "average_token_imbalance"
+WORKER_IDLE_RATIO_KEY = "training_worker_idle_time_ratio"
+TRAIN_FLOPS_PER_GPU_KEY = "train_flops_per_gpu"
+TRAIN_FP_UTILIZATION_KEY = "train_fp_utilization"
+VALID_TOKENS_PER_SEC_PER_GPU_KEY = "valid_tokens_per_sec_per_gpu"
+
+#: Teed rows for the throughput and utilization numbers. These have no span
+#: equivalent -- a span can time a phase but cannot say what fraction of the
+#: GPU's arithmetic the phase used -- so without these the question "is this
+#: run fast for its hardware" is unanswerable from traces alone.
+PERFORMANCE_TEED_METRICS = (
+    TeedMetric(
+        TRAIN_FP_UTILIZATION_KEY,
+        "rl.performance.fp_utilization",
+        unit="1",
+        description="Model floating-point utilization (MFU) as a 0-1 ratio.",
+        prefixes=(PERFORMANCE_PREFIX,),
+    ),
+    TeedMetric(
+        TRAIN_FLOPS_PER_GPU_KEY,
+        "rl.performance.tflops_per_gpu",
+        unit="TFLOP/s",
+        description="Achieved training TFLOP/s per GPU.",
+        prefixes=(PERFORMANCE_PREFIX,),
+    ),
+    TeedMetric(
+        WORKER_IDLE_RATIO_KEY,
+        "rl.performance.worker_idle_ratio",
+        unit="1",
+        description="Fraction of the step a training worker spent idle.",
+        prefixes=(PERFORMANCE_PREFIX,),
+    ),
+    TeedMetric(
+        TOKEN_IMBALANCE_KEY,
+        "rl.performance.token_imbalance",
+        description="Mean token-count imbalance across training workers.",
+        prefixes=(PERFORMANCE_PREFIX,),
+    ),
+    TeedMetric(
+        VALID_TOKENS_PER_SEC_PER_GPU_KEY,
+        "rl.performance.valid_tokens_per_second_per_gpu",
+        unit="{token}/s",
+        description="Supervised token throughput per GPU for the step.",
+        prefixes=(TIMING_TRAIN_PREFIX,),
+    ),
+)
+
+register_teed_metrics(PERFORMANCE_TEED_METRICS)
 
 
 @dataclass

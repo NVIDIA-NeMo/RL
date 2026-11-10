@@ -1,6 +1,6 @@
 # Metrics
 
-NeMo-RL emits nine namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), validation quality (`rl.validation.*`), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), per-host memory (`rl.host.memory.*`), rollout checkpoint metrics (`rl.checkpoint.*`), and vision workload (`rl.vision.*`).
+NeMo-RL emits ten namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), validation quality (`rl.validation.*`), throughput and utilization (`rl.performance.*`), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), per-host memory (`rl.host.memory.*`), rollout checkpoint metrics (`rl.checkpoint.*`), and vision workload (`rl.vision.*`).
 
 Metrics are emitted **only when telemetry is exporting**. Most pass through the metrics logger of the process that logs them, via its process-local telemetry handle: the driver in the v1 loops, and the Single-Controller actor in v2, which owns the Logger there and so emits the training scalars, `rl.setup.duration` and `rl.checkpoint.*`. `rl.host.memory.*` is scraped from every node by a driver-side monitor on its own timer. Resource attributes identify the producing process.
 
@@ -8,7 +8,7 @@ Every `rl.*` series is **declared by NeMo-RL**, not by lens. lens provides a con
 
 ## The tee
 
-The tee lives outside the algorithm code: `nemo_rl/telemetry/metrics.py` hooks `nemo_rl.utils.logger.Logger.log_metrics`, so after `log_metrics` fans a step out to the file / W&B / MLflow backends it calls `tee_rl_metrics_to_otel(metrics, prefix)`. It is best-effort — the prefixes read include the per-step `train` dicts (`prefix in ("train", "")`), the `validation` dicts, and the one-off `timing/setup` dict at step 0, plus completed `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries and the per-attempt `rollout/checkpoint_outcome` dictionary. Other prefixes are skipped, non-scalar values are ignored, and the whole path is a no-op unless telemetry is actively exporting.
+The tee lives outside the algorithm code: `nemo_rl/telemetry/metrics.py` hooks `nemo_rl.utils.logger.Logger.log_metrics`, so after `log_metrics` fans a step out to the file / W&B / MLflow backends it calls `tee_rl_metrics_to_otel(metrics, prefix)`. It is best-effort — the prefixes read include the per-step `train` dicts (`prefix in ("train", "")`), the `validation`, `performance` and `timing/train` dicts, and the one-off `timing/setup` dict at step 0, plus completed `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries and the per-attempt `rollout/checkpoint_outcome` dictionary. Other prefixes are skipped, non-scalar values are ignored, and the whole path is a no-op unless telemetry is actively exporting.
 
 Each `TeedMetric` row names the prefixes it may be read from, because `logger_key` is matched bare. `accuracy` under `validation` and an `accuracy` a training loop logs are different populations, and without the per-row prefix the first row declared for that key would claim both — producing a number that is real, plausible, and wrong. The numbers you already see in W&B are therefore the same series you get in your OTLP backend, with no double bookkeeping.
 
@@ -42,6 +42,26 @@ The headline numbers a run is judged on, teed from the `validation` dicts that `
 These are emitted only on validation steps, which is `val_period` steps apart rather than every step. Treat a gap as "no validation ran", not as a regression — a dashboard that interpolates between points will imply quality it did not measure.
 
 The `validation` dict also carries whatever an environment adds through `additional_metrics_to_report`. Those are **not** teed: the key set is env-specific and unknown at declaration time, so there is no row to declare. They remain available in W&B.
+
+## Throughput and utilization (`rl.performance.*`)
+
+What a span cannot tell you: a span times a phase, but not what fraction of the GPU's arithmetic that phase used. Declared as `PERFORMANCE_TEED_METRICS` in `nemo_rl/algorithms/metric_utils.py`:
+
+| Metric | Unit | Logger key | Prefix |
+| --- | --- | --- | --- |
+| `rl.performance.fp_utilization` | `1` | `train_fp_utilization` | `performance` |
+| `rl.performance.tflops_per_gpu` | `TFLOP/s` | `train_flops_per_gpu` | `performance` |
+| `rl.performance.worker_idle_ratio` | `1` | `training_worker_idle_time_ratio` | `performance` |
+| `rl.performance.token_imbalance` | | `average_token_imbalance` | `performance` |
+| `rl.performance.valid_tokens_per_second_per_gpu` | `{token}/s` | `valid_tokens_per_sec_per_gpu` | `timing/train` |
+
+`rl.performance.fp_utilization` is MFU as a 0–1 ratio, not a percentage. It is emitted only when the run reports `theoretical_tflops`; `rl.performance.tflops_per_gpu` does not depend on that and is always present.
+
+### Why the rest of `timing/train` is not teed
+
+That dict also carries the per-step `Timer` durations — `policy_training`, `generation`, `data_processing`, `advantage_calculation`, `checkpointing`, `idle/*` and the rest. None are declared, on purpose: those are the same phases the [per-step spans](span-groups.md) already carry with an `rl.bucket`, and the `idle/*` ones are already `rl.efficiency.seconds`. Declaring them here would give the same seconds two homes that nothing reconciles, and the span is the better one — it has the step's structure, which a gauge does not.
+
+Only `valid_tokens_per_sec_per_gpu` is taken, because the step loop injects it into that dict and it is a rate rather than a duration, so it has no span to live on.
 
 ## Startup phases
 

@@ -48,6 +48,13 @@ DEFAULT_TEED_PREFIXES: tuple[Optional[str], ...] = ("train", "")
 #: Prefix the validation dicts arrive under, in every algorithm that has one.
 VALIDATION_PREFIX = "validation"
 
+#: Prefix the per-step throughput/utilization dict arrives under.
+PERFORMANCE_PREFIX = "performance"
+
+#: Prefix the per-step Timer dict arrives under. Only the throughput key is
+#: teed from it; see ``metrics.md`` for why the phase durations are not.
+TIMING_TRAIN_PREFIX = "timing/train"
+
 #: Efficiency category covering startup, measured once before the training loop.
 INIT_TOTAL_CATEGORY = "init/total"
 

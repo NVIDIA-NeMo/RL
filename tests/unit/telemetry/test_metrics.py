@@ -812,6 +812,56 @@ def test_map_teed_scalars_reads_the_validation_keys():
     }
 
 
+def test_map_teed_scalars_reads_the_performance_keys():
+    """MFU and TFLOP/s have no span equivalent, and were W&B-only."""
+    _import_teed_metric_owners()
+
+    from nemo_rl.telemetry.metrics import map_teed_scalars
+    from nemo_rl.telemetry.vocabulary import PERFORMANCE_PREFIX
+
+    values = map_teed_scalars(
+        {
+            "train_fp_utilization": 0.41,
+            "train_flops_per_gpu": 380.0,
+            "training_worker_idle_time_ratio": 0.12,
+            "average_token_imbalance": 1.3,
+        },
+        PERFORMANCE_PREFIX,
+    )
+
+    assert values == {
+        "performance_fp_utilization": 0.41,
+        "performance_tflops_per_gpu": 380.0,
+        "performance_worker_idle_ratio": 0.12,
+        "performance_token_imbalance": 1.3,
+    }
+
+
+def test_timing_train_tees_only_its_throughput_key():
+    """The phase durations in that dict are deliberately not declared.
+
+    They are the same phases the per-step spans already carry, and the
+    ``idle/*`` ones ``rl.efficiency.seconds`` already reports, so declaring
+    them would give the same seconds two un-reconcilable homes.
+    """
+    _import_teed_metric_owners()
+
+    from nemo_rl.telemetry.metrics import map_teed_scalars
+    from nemo_rl.telemetry.vocabulary import TIMING_TRAIN_PREFIX
+
+    values = map_teed_scalars(
+        {
+            "valid_tokens_per_sec_per_gpu": 5100.0,
+            "policy_training": 12.0,
+            "generation": 30.0,
+            "idle/refit_bubble": 2.0,
+        },
+        TIMING_TRAIN_PREFIX,
+    )
+
+    assert values == {"performance_valid_tokens_per_second_per_gpu": 5100.0}
+
+
 def test_a_prefix_only_reads_the_rows_declared_for_it():
     """``accuracy`` is not reserved -- a train dict may carry its own.
 
