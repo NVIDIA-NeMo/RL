@@ -2378,7 +2378,12 @@ def _create_draft_pre_wrap_hook(
             # Filtering those keys out by hand does NOT work: TEGrouped expert weight
             # resolution reads them, and removing them makes the weights themselves fail to
             # resolve. strict=False is both simpler and the honest description of this load.
-            # The authoritative load still happens later and is still strict.
+            # CAVEAT, and it matters: when the preload runs, should_load_checkpoint
+            # below is False, so THIS IS THE ONLY LOAD of policy weights. Non-strict
+            # therefore tolerates ANY mismatch, not just _extra_state -- a genuinely
+            # missing expert weight would be left at init and trained from, silently.
+            # Acceptable for a wiring smoke; verify the weights actually landed before
+            # any real run.
             _load_checkpoint_from_path(
                 load_dir=pretrained_checkpoint,
                 state=state,
