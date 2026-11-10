@@ -206,14 +206,42 @@ class TestSequencePacker:
         assert len(bins) == 0
 
     @pytest.mark.parametrize("algorithm", ALL_ALGORITHMS)
-    def test_error_cases(self, bin_capacity: int, algorithm: PackingAlgorithm):
-        """Test error cases with all algorithms."""
-        # Test with a sequence length that exceeds bin capacity
-        sequence_lengths = [50, 150, 70]  # 150 > bin_capacity (100)
+    def test_oversized_sequence_gets_own_bin(
+        self, bin_capacity: int, algorithm: PackingAlgorithm
+    ):
+        """A sequence longer than bin_capacity is packed alone; the rest pack as usual."""
+        sequence_lengths = [50, 150, 70, 30]  # 150 > bin_capacity (100)
 
         packer = get_packer(algorithm, bin_capacity)
-        with pytest.raises(ValueError):
-            packer.pack(sequence_lengths)
+        bins = packer.pack(sequence_lengths)
+
+        assert [1] in bins
+        assert sorted(i for b in bins for i in b) == [0, 1, 2, 3]
+        for b in bins:
+            if b != [1]:
+                assert sum(sequence_lengths[i] for i in b) <= bin_capacity
+
+    @pytest.mark.parametrize("algorithm", ALL_ALGORITHMS)
+    def test_only_oversized_sequences(
+        self, bin_capacity: int, algorithm: PackingAlgorithm
+    ):
+        packer = get_packer(algorithm, bin_capacity)
+        assert packer.pack([150, 101]) == [[0], [1]]
+
+    @pytest.mark.parametrize("algorithm", ALL_ALGORITHMS)
+    def test_oversized_sequence_with_bin_count_constraints(
+        self, bin_capacity: int, algorithm: PackingAlgorithm
+    ):
+        """Oversized bins count toward min_bin_count / bin_count_multiple."""
+        sequence_lengths = [150, 20, 20, 20, 20]
+        packer = get_packer(
+            algorithm, bin_capacity, min_bin_count=4, bin_count_multiple=4
+        )
+        bins = packer.pack(sequence_lengths)
+
+        assert len(bins) == 4
+        assert [0] in bins
+        assert sorted(i for b in bins for i in b) == [0, 1, 2, 3, 4]
 
     @pytest.mark.parametrize("algorithm", DETERMINISTIC_ALGORITHMS)
     def test_deterministic(
