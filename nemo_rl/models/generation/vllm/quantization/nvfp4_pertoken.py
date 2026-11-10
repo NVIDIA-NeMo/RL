@@ -527,17 +527,14 @@ _HOST_CAPTURED_EXPERTS_CLS: dict[type, type] = {}
 def host_captured_experts_cls(experts_cls: type) -> type:
     """Return ``experts_cls`` with in-kernel routed-experts capture disabled.
 
-    vLLM 0.29 binds ``RoutedExpertsCapturer`` to a monolithic kernel's experts
-    *object* (``supports_routing_replay_capture`` / ``set_capture_fn``) and the
-    FlashInfer launch then fills ``routing_replay_out`` itself.
-    ``ModelOptNvFp4PerTokenFusedMoE.process_weights_after_loading`` rebuilds the
-    kernel on every cold and warm refit, so a capture function bound to the
-    experts object is gone after the first weight update and every later rollout
-    would hand router replay all-zero routes. Reporting no in-kernel capture makes
+    For a monolithic kernel that reports ``supports_routing_replay_capture``,
+    vLLM gives the layer a ``RoutedExpertsSink`` and the FlashInfer launch fills
+    ``routing_replay_out`` itself. The per-token launch has not been validated
+    with a replay buffer attached. Reporting no in-kernel capture makes
     NeMo-RL's binder fallback (``patches._patch_vllm_routed_experts_capture_router_fallback``)
     attach the capture to the layer's router, where
     ``patches._patch_vllm_moe_routed_experts_capture`` fires ``select_experts``
-    on the monolithic branch — the path this method used on vLLM 0.26.
+    on the monolithic branch.
     Non-monolithic experts classes already capture through the router and are
     returned unchanged. The subclass keeps the original name as a suffix
     because vLLM logs and duck-types on ``type(...).__name__``.
@@ -588,8 +585,8 @@ class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
                 f"{NVFP4_PER_TOKEN_METHOD} requires the FlashInfer TRT-LLM MoE "
                 f"backend, got {self.nvfp4_backend}."
             )
-        # Router replay must survive the per-refit kernel rebuild below, so
-        # routed-experts capture goes through the router, not the kernel.
+        # The per-token kernel is not validated with a routing replay buffer,
+        # so routed-experts capture goes through the router, not the kernel.
         assert self.experts_cls is not None
         self.experts_cls = host_captured_experts_cls(self.experts_cls)
 

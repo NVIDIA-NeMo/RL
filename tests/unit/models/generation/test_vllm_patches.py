@@ -525,12 +525,12 @@ def test_capture_router_fallback_patch_anchor_still_matches_installed_vllm(
     monolithic_branch = content.split(_CAPTURER_MARKER, 1)[1]
     monolithic_branch = monolithic_branch.split("not supported with monolithic", 1)[0]
     # In-kernel capture still wins when the kernel supports it ...
-    assert "fused_experts.set_capture_fn(capture_fn)" in monolithic_branch
+    assert "routing_sink = RoutedExpertsSink(" in monolithic_branch
     # ... and a kernel without it now falls back to the router instead of raising.
     assert "module.router.set_capture_fn(capture_fn)" in monolithic_branch
-    assert monolithic_branch.index(
-        "fused_experts.set_capture_fn"
-    ) < monolithic_branch.index("module.router.set_capture_fn")
+    assert monolithic_branch.index("RoutedExpertsSink(") < monolithic_branch.index(
+        "module.router.set_capture_fn"
+    )
     ast.parse(content)
 
 
@@ -626,7 +626,10 @@ def test_capture_router_fallback_patch_binds_router_for_unsupported_kernel(
         "def bind(module, quant_method, fused_experts, capture_fn, "
         "FusedMoEExpertsMonolithic, BaseRouter):\n"
         "    num_bound = 0\n"
-        "    if True:\n" + old_snippet + "        return num_bound\n"
+        "    if True:\n"
+        "        if quant_method.is_monolithic:\n"
+        + old_snippet
+        + "        return num_bound\n"
     )
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
     assert patches._patch_vllm_routed_experts_capture_router_fallback(
@@ -636,15 +639,20 @@ def test_capture_router_fallback_patch_binds_router_for_unsupported_kernel(
     exec(compile(source.read_text(), str(source), "exec"), namespace)
 
     class Monolithic:
+        moe_config = object()
+
         def __init__(self, supports):
             self.supports = supports
-            self.bound = None
 
         def supports_routing_replay_capture(self):
             return self.supports
 
-        def set_capture_fn(self, fn):
-            self.bound = fn
+    class Sink:
+        def __init__(self, moe_config, fn):
+            self.moe_config = moe_config
+            self.capture_fn = fn
+
+    namespace["RoutedExpertsSink"] = Sink
 
     class Router:
         def __init__(self):
@@ -656,24 +664,31 @@ def test_capture_router_fallback_patch_binds_router_for_unsupported_kernel(
     capture_fn = object()
     quant_method = SimpleNamespace(is_monolithic=True)
 
+    def new_module(router):
+        return SimpleNamespace(
+            router=router, routed_experts=SimpleNamespace(routing_sink=None)
+        )
+
     kernel, router = Monolithic(True), Router()
-    module = SimpleNamespace(router=router)
+    module = new_module(router)
     assert (
         namespace["bind"](module, quant_method, kernel, capture_fn, Monolithic, Router)
         == 1
     )
-    assert kernel.bound is capture_fn and router.bound is None
+    sink = module.routed_experts.routing_sink
+    assert sink.capture_fn is capture_fn and sink.moe_config is kernel.moe_config
+    assert router.bound is None
 
     kernel, router = Monolithic(False), Router()
-    module = SimpleNamespace(router=router)
+    module = new_module(router)
     assert (
         namespace["bind"](module, quant_method, kernel, capture_fn, Monolithic, Router)
         == 1
     )
-    assert kernel.bound is None and router.bound is capture_fn
+    assert module.routed_experts.routing_sink is None and router.bound is capture_fn
 
     kernel = Monolithic(False)
-    module = SimpleNamespace(router=object())
+    module = new_module(object())
     with pytest.raises(ValueError, match="not supported with monolithic"):
         namespace["bind"](module, quant_method, kernel, capture_fn, Monolithic, Router)
 
