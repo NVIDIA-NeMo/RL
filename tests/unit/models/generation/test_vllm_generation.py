@@ -3756,16 +3756,14 @@ def test_vllm_http_server(cluster, tokenizer):
     ]
     assert _standardize(expected_result) == _standardize(actual_result)
 
-    # The server default requests token IDs, so top_logprobs=None cannot provide
-    # the log probabilities required by the training response contract.
+    # vLLM 0.33 treats top_logprobs=None like 0, so the response still carries the
+    # log probabilities the training response contract needs.
     response = requests.post(
         url=f"{base_urls[0]}/chat/completions",
         json=body | {"top_logprobs": None},
     )
-    assert response.status_code == 400
-    error = response.json()["error"]
-    assert error["code"] == 400
-    assert "top_logprobs" in error["message"]
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["logprobs"]["content"]
 
     # Check that tokenization route works
     response = requests.post(url=f"{base_urls[0]}/../tokenize", json=body)
