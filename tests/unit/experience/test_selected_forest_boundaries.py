@@ -802,6 +802,51 @@ def test_selected_forest_publishes_once(
     assert_loss_once(forest, selected, records)
 
 
+def _continued_request(records: list, terminal: Any) -> ReassemblyRequest:
+    # A turn restore continued rollout "attempt" as "attempt-a1".
+    return ReassemblyRequest(
+        group_id="group",
+        rollout_ids=("attempt-a1",),
+        canonical_sample_ids=("group_g0",),
+        receipts=(
+            {**receipt(records, terminal=terminal), "capture_key": "attempt-a1"},
+        ),
+        rewards=(1.0,),
+        fallback_weight_version=7,
+        prompt_idx=99,
+        mask_sample=(False,),
+        logical_selections=(selection(records),),
+    )
+
+
+def test_continued_attempt_trains_calls_its_earlier_attempt_staged(
+    forest: ForestCapture,
+) -> None:
+    before, _ = forest.capture([None])
+    after, _ = forest.capture([None], owner="attempt-a1")
+    # The restore carried the earlier call over, stamped with its staging owner.
+    carried = [r.model_copy(update={"source_capture_key": "attempt"}) for r in before]
+    records = carried + after
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    actor._finalizer = forest.finalizer
+
+    result = actor.finalize(_continued_request(records, after[-1]))
+
+    assert result.valid_row_count == 2
+    assert_loss_once(forest, records, records)
+
+
+def test_continued_attempt_refuses_rows_of_another_rollout(
+    forest: ForestCapture,
+) -> None:
+    before, _ = forest.capture([None], owner="other")
+    after, _ = forest.capture([None], owner="attempt-a1")
+    carried = [r.model_copy(update={"source_capture_key": "other"}) for r in before]
+
+    with pytest.raises(ValueError, match="Foreign capture scope"):
+        _continued_request(carried + after, after[-1]).capture_receipts
+
+
 def test_shared_action_masks_counts_and_prompt_are_owned_once(
     forest: ForestCapture,
 ) -> None:

@@ -35,7 +35,10 @@ from nemo_rl.experience.rollout_reassembler import (
     RolloutReassembler,
     RolloutSelection,
 )
-from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+from nemo_rl.experience.rollout_recovery import (
+    _episode_staging_keys,
+    _receipt_staging_keys,
+)
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.venvs import make_actor_runtime_env
 
@@ -78,10 +81,7 @@ class ReassemblyRequest:
         """Return cleanup receipts only after validating Forest capture ownership."""
         if self.logical_selections is None:
             return self.receipts
-        from nemo_gym.token_id_capture.staging.records import (
-            RolloutReceipt,
-            staging_key,
-        )
+        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
         if len(self.logical_selections) != len(self.rollout_ids) or len(
             self.receipts
@@ -105,7 +105,8 @@ class ReassemblyRequest:
             if not selection.response_ids and not parsed.capture_poisoned:
                 raise ValueError("Trainable capture requires a nonempty selection")
             if parsed.capture_key != owner or any(
-                record.staging_key != staging_key(owner, record.model_call_id)
+                record.staging_key
+                not in _episode_staging_keys(owner, record.model_call_id)
                 for record in parsed.manifest
             ):
                 raise ValueError("Foreign capture scope in finalizer request")

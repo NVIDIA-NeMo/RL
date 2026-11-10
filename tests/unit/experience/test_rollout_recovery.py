@@ -52,6 +52,7 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
     RolloutSiblingRecord,
     SiblingSealResult,
+    _receipt_staging_keys,
     _selection_from_state,
     build_rollout_recovery_state,
     parse_rollout_recovery_state,
@@ -283,6 +284,47 @@ def test_forest_recovery_rejects_malformed_saved_ownership(damage: str) -> None:
         selection["unknown"] = 1
     with pytest.raises((ValueError, TypeError)):
         RolloutRecoveryLedger.from_state_dict(state)
+
+
+def _continued_forest_state(call0_owner: str | None = None) -> dict[str, Any]:
+    """A sealed Forest attempt a turn restore continued as ``-a1``.
+
+    ``call0`` was captured before the restore, so it stays under attempt 0's
+    key unless ``call0_owner`` names another.
+    """
+    state = _forest_sealed_ledger().state_dict()
+    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
+    receipt = attempt["receipt"]
+    first_owner = receipt["capture_key"]
+    owner = f"{first_owner}-a1"
+    attempt["gym_instance_id"] = "nemo_gym/replica-0"
+    attempt["gym_attempt"] = 1
+    receipt["capture_key"] = owner
+    for entry in receipt["manifest"]:
+        entry["staging_key"] = f"{owner}/{entry['model_call_id']}"
+    receipt["manifest"][0]["staging_key"] = f"{call0_owner or first_owner}/call0"
+    attempt["staging_keys"] = _receipt_staging_keys(receipt)
+    return state
+
+
+@pytest.mark.nemo_gym
+def test_continued_forest_attempt_keeps_calls_captured_before_the_restore() -> None:
+    ledger = RolloutRecoveryLedger.from_state_dict(_continued_forest_state())
+
+    attempt = ledger.get_group("g7").siblings[0].current_attempt
+    assert attempt.staging_keys[0].endswith("/call0")
+    assert "-a1/" not in attempt.staging_keys[0]
+
+
+@pytest.mark.parametrize("call0_owner", ["later", "other_rollout"])
+@pytest.mark.nemo_gym
+def test_continued_forest_attempt_rejects_rows_of_other_episodes(
+    call0_owner: str,
+) -> None:
+    first_owner = _forest_sealed_ledger().get_group("g7").gate_rollout_id(0)
+    owner = f"{first_owner}-a2" if call0_owner == "later" else "g8_g0_aother"
+    with pytest.raises(ValueError, match="foreign staging ownership"):
+        RolloutRecoveryLedger.from_state_dict(_continued_forest_state(owner))
 
 
 @pytest.mark.parametrize("schema", [2, 3, 4])

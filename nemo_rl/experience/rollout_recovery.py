@@ -547,6 +547,25 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
     return list(dict.fromkeys(staging_keys))
 
 
+def _episode_staging_keys(owner: str, model_call_id: str) -> frozenset[str]:
+    """Return the staging keys one call of ``owner``'s rollout may be stored under.
+
+    A restored attempt (``<rollout_id>-a<N>``) continues its episode and keeps
+    the calls earlier attempts captured, which stay under those attempts' keys.
+    """
+    from nemo_gym.episode_types import EpisodeId
+    from nemo_gym.token_id_capture.staging.records import staging_key
+
+    episode = EpisodeId.from_capture_key(owner)
+    return frozenset(
+        staging_key(
+            EpisodeId(rollout_id=episode.rollout_id, attempt=attempt).capture_key,
+            model_call_id,
+        )
+        for attempt in range(episode.attempt + 1)
+    )
+
+
 def _attempt_staging_keys(
     gate_id: str,
     receipt: dict[str, Any] | None,
@@ -576,7 +595,7 @@ def _attempt_staging_keys(
                 not isinstance(call_id, str)
                 or not call_id
                 or "/" in call_id
-                or entry["staging_key"] != f"{gate_id}/{call_id}"
+                or entry["staging_key"] not in _episode_staging_keys(gate_id, call_id)
             ):
                 raise ValueError(
                     "Forest recovery has foreign staging ownership: "

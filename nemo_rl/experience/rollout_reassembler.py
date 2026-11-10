@@ -78,7 +78,10 @@ from nemo_rl.experience.reward_penalties import (
     RewardLogContext,
     finalize_capture_reward,
 )
-from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+from nemo_rl.experience.rollout_recovery import (
+    _episode_staging_keys,
+    _receipt_staging_keys,
+)
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     RouteFragment,
@@ -1439,7 +1442,6 @@ class RolloutReassembler:
         from nemo_gym.token_id_capture.staging.records import (
             CallRecord,
             RolloutReceipt,
-            staging_key,
         )
 
         if len(selections) != len(rollout_ids):
@@ -1451,7 +1453,8 @@ class RolloutReassembler:
             parsed = RolloutReceipt.model_validate(receipt)
             _receipt_staging_keys(receipt)
             if parsed.capture_key != owner or any(
-                record.staging_key != staging_key(owner, record.model_call_id)
+                record.staging_key
+                not in _episode_staging_keys(owner, record.model_call_id)
                 for record in parsed.manifest
             ):
                 raise ValueError("Foreign capture ownership in selected attempt")
@@ -1585,10 +1588,7 @@ class RolloutReassembler:
         No publication or cleanup happens before this method completes.
         """
         # Optional Gym dependency; ordinary/non-Gym import paths remain unchanged.
-        from nemo_gym.token_id_capture.staging.records import (
-            RolloutReceipt,
-            staging_key,
-        )
+        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
         n = len(rollout_ids)
         if not n or len(logical_segments) != n:
@@ -1636,7 +1636,7 @@ class RolloutReassembler:
                 if parsed is not None:
                     if parsed.capture_key != expected_id or any(
                         record.staging_key
-                        != staging_key(expected_id, record.model_call_id)
+                        not in _episode_staging_keys(expected_id, record.model_call_id)
                         for record in parsed.manifest
                     ):
                         raise ValueError("foreign receipt/staging ownership")
