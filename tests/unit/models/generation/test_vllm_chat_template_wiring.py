@@ -186,7 +186,14 @@ def _install_fake_vllm(monkeypatch):
         built.clear()
 
 
-def _build_server(monkeypatch, serving_chat_kwargs, *, capture_requests=(), app=None):
+def _build_server(
+    monkeypatch,
+    serving_chat_kwargs,
+    *,
+    capture_requests=(),
+    app=None,
+    invalidate_rewritten_history: bool = False,
+):
     """Run the real server setup and hand back the three consumer stubs."""
     _install_fake_vllm(monkeypatch)
 
@@ -205,6 +212,7 @@ def _build_server(monkeypatch, serving_chat_kwargs, *, capture_requests=(), app=
         served_model_name="served-model", model="model-path"
     )
     worker._capture_calls = {id(request): None for request in capture_requests}
+    worker._invalidate_rewritten_history = invalidate_rewritten_history
     worker.routed_experts_dtype = torch.int16
 
     worker._setup_vllm_openai_api_server(app if app is not None else _FakeApp())

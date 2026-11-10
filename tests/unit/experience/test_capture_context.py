@@ -326,19 +326,15 @@ async def test_worker_managed_root_clears_untrusted_prefix_and_keeps_media_check
         _OnlineRenderer,
     )
 
-    renderer = _build_server(monkeypatch, {})[0][0]
+    renderer = _build_server(monkeypatch, {}, invalidate_rewritten_history=enabled)[0][
+        0
+    ]
     renderer.renderer = SimpleNamespace()
     monkeypatch.setattr(
         VllmAsyncGenerationWorkerImpl, "token_capture", object(), raising=False
     )
     monkeypatch.setattr(
         VllmAsyncGenerationWorkerImpl, "_capture_media", True, raising=False
-    )
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl,
-        "_invalidate_rewritten_history",
-        enabled,
-        raising=False,
     )
     capture_media = MagicMock(return_value=None)
     begin = MagicMock()
