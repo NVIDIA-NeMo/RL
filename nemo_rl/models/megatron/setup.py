@@ -2616,11 +2616,31 @@ def setup_model_and_optimizer(
         megatron_cfg.checkpoint.pretrained_checkpoint is not None
         and checkpoint_exists(megatron_cfg.checkpoint.pretrained_checkpoint)
     )
+    # Quantized policies load their weights through the normal post-wrap path.
+    #
+    # The draft preload below loads the pretrained checkpoint during the PRE-wrap hook,
+    # which is a lifecycle point no other flow uses. Under the ModelOpt quant worker that
+    # breaks: TE's serialized ``_extra_state`` is quantization-dependent and is resized by
+    # TE during forwards (see MegatronQuantPolicyWorker._hide_extra_state), so a strict
+    # load at pre-wrap time asks the checkpoint for expert ``_extra_state`` shards it does
+    # not carry, e.g.
+    #     Missing key in checkpoint state_dict:
+    #         language_model.decoder.layers.1.mlp.experts.experts.linear_fc1._extra_state/shard_192_512
+    # The failure names a decoder layer and never mentions the drafter, so it does not read
+    # as drafter-related at all.
+    #
+    # Skipping the preload here is safe rather than merely convenient: disabling it makes
+    # ``should_load_checkpoint`` true below, so the policy weights are still loaded -- just
+    # through the same path a non-draft quantized run uses. The preload exists so the
+    # drafter sees real policy weights when ``build_model`` runs; LiLiCorr builds from its
+    # own released checkpoint and does not read policy weights at build time.
+    quantization_enabled = policy_cfg.get("quant_cfg") is not None
     preload_policy_from_pretrained_for_draft = (
         draft_enabled
         and not use_peft  # The PEFT pre-wrap hook loads the pretrained base policy before adapters are attached.
         and not resume_checkpoint_exists  # Resume checkpoints already carry the attached draft module state.
         and pretrained_checkpoint_exists
+        and not quantization_enabled
     )
 
     mixed_precision_wrapper = Float16Module
