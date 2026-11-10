@@ -123,7 +123,11 @@ class TestPreshardedWrappers:
 def _make_tq_policy() -> tuple[TQPolicy, MagicMock]:
     """Bare TQPolicy with the attributes the split fan-out touches."""
     p = object.__new__(TQPolicy)
-    p.cfg = {"train_global_batch_size": 8, "train_micro_batch_size": 2}
+    p.cfg = {
+        "train_global_batch_size": 8,
+        "train_micro_batch_size": 2,
+        "make_sequence_length_divisible_by": 1,
+    }
     p._router_replay_enabled = False
     # opd_full off, as __init__ leaves it when the config block is absent.
     p._opd_full_field = None

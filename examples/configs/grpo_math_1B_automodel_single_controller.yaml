@@ -1,0 +1,70 @@
+# AutoModel SingleController exemplar. Run with:
+# uv run examples/run_grpo_single_controller.py --config examples/configs/grpo_math_1B_automodel_single_controller.yaml
+#
+# Supported scope: text GRPO, full-parameter FSDP2 with TP=CP=1,
+# fixed microbatches, and one full-batch SC dispatch per optimizer update.
+# Expert parallelism uses AutoModel's existing MoE mesh and dispatcher.
+# Model-specific recipes inherit this file and override workload/resource sizes.
+defaults: grpo_math_1B.yaml
+
+grpo:
+  # SC uses async_rl instead of the legacy async_grpo configuration.
+  async_grpo: null
+  # Evaluation is not supported by the SC training loop yet.
+  val_period: 0
+
+policy:
+  # One rollout batch must correspond to one optimizer update.
+  train_global_batch_size: ${mul:${grpo.num_prompts_per_step},${grpo.num_generations_per_prompt}}
+  automodel_cfg:
+    enabled: true
+  megatron_cfg:
+    enabled: false
+  dynamic_batching:
+    enabled: false
+  sequence_packing:
+    enabled: false
+  generation:
+    vllm_cfg:
+      async_engine: true
+    colocated:
+      enabled: false
+      resources:
+        # Default: one rollout GPU, with the other GPU used for training.
+        # Override this allocation together with cluster for larger recipes.
+        num_nodes: 1
+        gpus_per_node: 1
+
+# TransferQueue is required for metadata-backed SC dispatch.
+data_plane:
+  enabled: true
+
+async_rl:
+  sampler:
+    name: in_order
+    max_lookahead_versions: 0
+  recompute_kv_cache_after_weight_updates: true
+  # Wait for the entire prompt batch; partial/streaming dispatch is unsupported.
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: ${grpo.num_prompts_per_step}
+
+checkpointing:
+  enabled: false
+  checkpoint_dir: results/grpo-automodel-single-controller
+  # No validation metric is available in the SC loop.
+  metric_name: null
+  # When checkpointing is enabled, retain optimizer and native TQ replay state.
+  save_optimizer: true
+  save_data_plane: true
+
+logger:
+  log_dir: logs/grpo-automodel-single-controller
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl-automodel-sc
+    name: grpo-automodel-single-controller
+
+cluster:
+  num_nodes: 1
+  gpus_per_node: 2
