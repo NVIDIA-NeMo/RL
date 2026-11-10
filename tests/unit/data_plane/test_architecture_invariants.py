@@ -23,8 +23,8 @@
 
 from __future__ import annotations
 
-import importlib
 import ast
+import importlib
 import pathlib
 from argparse import Namespace
 from contextlib import nullcontext
