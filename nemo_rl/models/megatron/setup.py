@@ -2341,43 +2341,58 @@ def _create_megatron_config(
 
 @contextmanager
 def _hide_draft_from_checkpoint_load(model, active):
-    """Drop ``draft_model.*`` from the model's sharded state dict during a load.
+    """Make attached draft modules contribute nothing to a checkpoint load.
 
-    When the draft preload is skipped (quantized runs), the authoritative load runs with
-    the draft module already attached, so the loader would demand draft weights from a
-    base policy checkpoint that cannot contain them:
+    When the preload is skipped (quantized runs), the authoritative load runs with the
+    draft module already attached, so the loader demands draft weights from a base policy
+    checkpoint that cannot contain them:
 
         KeyError: draft_model.body.fc.weight from model not in state dict
 
-    The drafter's weights come from its own released checkpoint (loaded in build_model),
-    never from the policy checkpoint, so excluding them here loses nothing. Keys are
-    matched by containment: sharded entries carry suffixes like ``/shard_0_1``.
+    Patch the DRAFT MODULE itself rather than the chunks in ``model``: the loader unwraps
+    Float16Module/DDP before building the sharded state dict, so patching the wrapper is
+    not observed. Walking ``.module`` chains finds the attached drafter either way.
+
+    The drafter loads its own released weights in build_model, so contributing nothing
+    here loses nothing.
     """
     if not active:
         yield
         return
-    chunks = model if isinstance(model, list) else [model]
+
+    def _iter_draft_modules(chunks):
+        for chunk in chunks if isinstance(chunks, list) else [chunks]:
+            seen = set()
+            node = chunk
+            while node is not None and id(node) not in seen:
+                seen.add(id(node))
+                drafter = getattr(node, "draft_model", None)
+                if drafter is not None:
+                    yield drafter
+                node = getattr(node, "module", None)
+
     patched = []
+    for drafter in _iter_draft_modules(model):
+        for attr in ("sharded_state_dict", "state_dict"):
+            original = getattr(drafter, attr, None)
+            if original is None:
+                continue
 
-    def _filter(d):
-        return {k: v for k, v in d.items() if "draft_model." not in k}
+            def empty(*args, **kwargs):
+                return {}
 
+            patched.append((drafter, attr, original))
+            setattr(drafter, attr, empty)
+    print(
+        f"[draft] hid {len(patched)} state-dict accessor(s) on "
+        f"{len({id(d) for d, _, _ in patched})} draft module(s) for the checkpoint load",
+        flush=True,
+    )
     try:
-        for chunk in chunks:
-            for attr in ("sharded_state_dict", "state_dict"):
-                original = getattr(chunk, attr, None)
-                if original is None:
-                    continue
-
-                def wrapper(*args, _orig=original, **kwargs):
-                    return _filter(_orig(*args, **kwargs))
-
-                patched.append((chunk, attr, original))
-                setattr(chunk, attr, wrapper)
         yield
     finally:
-        for chunk, attr, original in patched:
-            setattr(chunk, attr, original)
+        for drafter, attr, original in patched:
+            setattr(drafter, attr, original)
 
 
 def _create_draft_pre_wrap_hook(
