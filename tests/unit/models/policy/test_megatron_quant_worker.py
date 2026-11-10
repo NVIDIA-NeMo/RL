@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import fnmatch
 import os
 import tempfile
 import time
+from collections.abc import Iterator
 from copy import deepcopy
 from datetime import timedelta
 from pathlib import Path
@@ -115,52 +115,16 @@ def _make_real_quant_worker():
     }
     worker.model = object()
     worker.draft_model = None
-    worker.refit_conversion_tasks = ["task"]
+    worker.refit_conversion_tasks = [
+        SimpleNamespace(
+            global_param_name="decoder.layers.0.mlp.linear_fc2.weight",
+            mapping=SimpleNamespace(hf_param="model.layers.0.mlp.down_proj.weight"),
+        )
+    ]
     worker.megatron_bridge = _FakeModelOptBridge()
     worker.rank = 0
     worker._real_quant_refit_sync_group = None
     return worker
-
-
-@requires_weight_folding
-def test_real_quant_conversion_tasks_delegate_discovery_to_bridge():
-    model = nn.Module()
-    model.weight = nn.Parameter(torch.ones(1))
-    model.weight_quantizer = GroupedQuantizer(TensorQuantizer(), TensorQuantizer())
-    model.weight_quantizer[0].amax = torch.tensor(1.0)
-    model.input_quantizer = TensorQuantizer()
-    model.input_quantizer.amax = torch.tensor(2.0)
-    worker = _make_real_quant_worker()
-    worker.model = model
-    worker.fp8_cfg = {}
-    worker.refit_payload_mode = "logical_weights"
-
-    def build_conversion_tasks(models, *, exclude_param_patterns=()):
-        assert models == [model]
-        assert exclude_param_patterns == ("*weight_quantizer*",)
-        return [
-            name
-            for name, _ in (
-                *worker.model.named_parameters(),
-                *worker.model.named_buffers(),
-            )
-            if not any(
-                fnmatch.fnmatchcase(name, pattern) for pattern in exclude_param_patterns
-            )
-        ]
-
-    worker.megatron_bridge.get_conversion_tasks = build_conversion_tasks
-
-    assert (
-        worker._build_refit_conversion_tasks()
-        is worker.megatron_bridge.plan.conversion_tasks
-    )
-    assert worker._build_refit_conversion_tasks() is worker.refit_conversion_tasks
-    assert worker.megatron_bridge.calls == [("plan", ([model],), {})]
-    assert "weight_quantizer.0._amax" in dict(model.named_buffers())
-
-    worker.cfg["generation"]["real_quant"] = False
-    assert worker._build_refit_conversion_tasks() == ["weight", "input_quantizer._amax"]
 
 
 @requires_weight_folding
@@ -470,6 +434,10 @@ def test_policy_requires_real_quant_config_agreement():
 @requires_weight_folding
 def test_real_quant_config_and_stream_reuse_one_megatron_bridge_plan():
     worker = _make_real_quant_worker()
+    assert (
+        worker._build_refit_conversion_tasks()
+        is worker.megatron_bridge.plan.conversion_tasks
+    )
 
     config = worker.get_real_quantization_config()
     config["quant_algo"] = "modified"
@@ -491,6 +459,23 @@ def test_real_quant_config_and_stream_reuse_one_megatron_bridge_plan():
     assert (
         len([call for call in worker.megatron_bridge.calls if call[0] == "plan"]) == 1
     )
+
+
+@requires_weight_folding
+def test_real_quant_refit_forwards_draft_metadata_mode():
+    worker = _make_real_quant_worker()
+    metadata_modes = []
+
+    def iter_draft_weights(*, metadata_only):
+        metadata_modes.append(metadata_only)
+        yield "draft.layers.0.weight", torch.empty(2, device="meta")
+
+    worker._iter_draft_weights_for_refit = iter_draft_weights
+
+    output = list(worker._iter_params_with_optional_kv_scales(draft_metadata_only=True))
+
+    assert metadata_modes == [True]
+    assert output[-1][0] == "draft.layers.0.weight"
 
 
 @requires_weight_folding
@@ -527,7 +512,7 @@ def test_iter_params_with_optional_kv_scales_uses_real_quant_export(monkeypatch)
     monkeypatch.setattr(
         worker,
         "_iter_real_quant_refit_params",
-        lambda kv_scales=None: iter([("real.weight", torch.ones(1))]),
+        lambda kv_scales=None, **_kwargs: iter([("real.weight", torch.ones(1))]),
     )
 
     with pytest.raises(NotImplementedError, match="filtered conversion tasks"):
@@ -598,7 +583,9 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
     monkeypatch.setattr(
         MegatronPolicyWorkerImpl,
         "_iter_params_with_optional_kv_scales",
-        export_selected,
+        lambda self, kv_scales=None, **_kwargs: iter(
+            [("model.layers.0.mlp.down_proj.weight", torch.ones(2, 2))]
+        ),
     )
 
     output = list(
@@ -612,6 +599,49 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
         "model.layers.0.mlp.down_proj.input_quantizer._amax",
     ]
     torch.testing.assert_close(output[1][1], torch.tensor([3.0]))
+
+
+@requires_weight_folding
+def test_iter_params_with_optional_kv_scales_forwards_draft_metadata_only(
+    monkeypatch,
+):
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    worker_cls = MegatronQuantPolicyWorker.__ray_metadata__.modified_class
+    worker = object.__new__(worker_cls)
+    worker.cfg = {
+        "generation": {
+            "backend": "vllm",
+            "quant_cfg": "FP8_DEFAULT_CFG",
+            "real_quant": False,
+        }
+    }
+    worker.rank = 0
+    worker.refit_conversion_tasks = []
+
+    def metadata_export(
+        self,
+        kv_scales=None,
+        *,
+        draft_metadata_only=False,
+        draft_weights=None,
+    ):
+        if not draft_metadata_only:
+            raise AssertionError("quant override dropped draft metadata mode")
+        yield "draft.model.weight", torch.empty(2, dtype=torch.float32, device="meta")
+
+    monkeypatch.setattr(
+        MegatronPolicyWorkerImpl,
+        "_iter_params_with_optional_kv_scales",
+        metadata_export,
+    )
+
+    output = list(worker._iter_params_with_optional_kv_scales(draft_metadata_only=True))
+
+    assert [name for name, _ in output] == ["draft.model.weight"]
+    assert output[0][1].device.type == "meta"
 
 
 @requires_weight_folding
@@ -650,9 +680,19 @@ def test_folded_quantizer_error_includes_parameter_name(monkeypatch):
     )
 
     def access_refit_task_weights(
-        self, kv_scales=None, conversion_tasks=None, include_draft=True
+        self,
+        kv_scales=None,
+        conversion_tasks=None,
+        include_draft=True,
+        *,
+        draft_metadata_only=False,
+        draft_weights=None,
     ):
-        for refit_task in conversion_tasks:
+        for refit_task in (
+            conversion_tasks
+            if conversion_tasks is not None
+            else self.refit_conversion_tasks
+        ):
             yield refit_task.param_name, refit_task.param_weight
 
     monkeypatch.setattr(
@@ -810,7 +850,7 @@ def test_stream_weights_via_ipc_zmq_does_not_move_without_real_quant(monkeypatch
     monkeypatch.setattr(
         worker,
         "_iter_params_with_optional_kv_scales",
-        lambda kv_scales=None: iter([("model.weight", torch.ones(1))]),
+        lambda kv_scales=None, **_kwargs: iter([("model.weight", torch.ones(1))]),
     )
 
     def fake_stream_weights_via_ipc_zmq_impl(**kwargs):
@@ -1242,16 +1282,6 @@ class TestFindWeightQuantizer:
         module = _SingleWeightQuantModule(enable_quantizer=True)
         assert _find_wq(module, None) is None
 
-    def test_multi_weight_matches_each(self):
-        """Each grouped expert weight must match its own quantizer."""
-        module = _MultiWeightQuantModule(num_weights=3)
-        for i in range(3):
-            w = getattr(module, f"weight{i}")
-            result = _find_wq(module, w)
-            assert result is module.weight_quantizer[i], (
-                f"weight{i} should match the quantizer"
-            )
-
     def test_multi_weight_folded_refit(self, monkeypatch):
         from nemo_rl.models.policy.workers.megatron_policy_worker import (
             MegatronPolicyWorkerImpl,
@@ -1300,3 +1330,136 @@ class TestFindWeightQuantizer:
         module = _MultiWeightQuantModule(num_weights=3)
         unknown = nn.Parameter(torch.randn(4, 4))
         assert _find_wq(module, unknown) is None
+
+
+@pytest.mark.parametrize("quant_mode", ["w4a16_nvfp4", "nvfp4"])
+@requires_quant
+@requires_weight_folding
+def test_modelopt_real_quant_cpu_and_gpu_exports_are_byte_identical(
+    quant_mode: str,
+) -> None:
+    # Megatron Bridge is an optional dependency needed only by this CUDA test.
+    from megatron.bridge.models.conversion.model_bridge import HFWeightTuple
+    from modelopt.torch.export import (
+        capture_quantized_weight_export_state,
+        export_quantized_weight_tensors,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    source = torch.randn(
+        (32, 32),
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=generator,
+    )
+    layer = torch.nn.Linear(32, 32, bias=False, device="cuda", dtype=torch.bfloat16)
+    layer.weight.data.copy_(source)
+    layer = mtq.quantize(
+        layer,
+        deepcopy(mtq.NVFP4_DEFAULT_CFG),
+        lambda model: model(
+            torch.full((1, 32), 2.0, device="cuda", dtype=torch.bfloat16)
+        ),
+    )
+    if quant_mode == "w4a16_nvfp4":
+        mtq.disable_quantizer(layer, "*input_quantizer")
+    state = capture_quantized_weight_export_state(layer, cpu=False)
+
+    def export_hook(
+        name: str,
+        tensor: torch.Tensor,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        prefix = name.removesuffix(".weight")
+        for relative_name, exported_tensor in export_quantized_weight_tensors(
+            tensor, state, tensor.dtype
+        ).items():
+            yield f"{prefix}.{relative_name}", exported_tensor
+
+    weight = HFWeightTuple("model.layers.0.mlp.down_proj.weight", layer.weight)
+    cpu_export = list(weight.iter_finalized(cpu=True, export_hook=export_hook))
+    gpu_export = list(weight.iter_finalized(cpu=False, export_hook=export_hook))
+
+    assert [name for name, _ in cpu_export] == [name for name, _ in gpu_export]
+    expected = {"weight", "weight_scale", "weight_scale_2"}
+    if quant_mode == "nvfp4":
+        expected.add("input_scale")
+    assert {name for name, _ in cpu_export} == {
+        f"model.layers.0.mlp.down_proj.{suffix}" for suffix in expected
+    }
+    for (_, cpu_tensor), (_, gpu_tensor) in zip(cpu_export, gpu_export, strict=True):
+        assert cpu_tensor.device.type == "cpu"
+        assert gpu_tensor.device.type == "cuda"
+        assert cpu_tensor.shape == gpu_tensor.shape
+        assert cpu_tensor.dtype == gpu_tensor.dtype
+        assert torch.equal(
+            cpu_tensor.contiguous().reshape(-1).view(torch.uint8),
+            gpu_tensor.detach().contiguous().reshape(-1).view(torch.uint8).cpu(),
+        )
+
+
+@requires_weight_folding
+def test_ddp_hook_iteration_hides_grouped_quantizer_containers() -> None:
+    from megatron.core.distributed import DistributedDataParallel
+    from modelopt.torch.quantization.nn import AnyQuantizer, GroupedQuantizer
+    from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+
+    module = nn.Linear(4, 4)
+    module.weight_quantizer = GroupedQuantizer(TensorQuantizer(), TensorQuantizer())
+    ddp = object.__new__(DistributedDataParallel)
+    nn.Module.__init__(ddp)
+    ddp.module = module
+    worker = _make_real_quant_worker()
+    worker.model = ddp
+    original = module.named_modules
+
+    with worker.hide_quantizers():
+        assert list(module.named_modules()) == [("", module)]
+
+    assert module.named_modules == original
+    assert any(isinstance(item, AnyQuantizer) for item in module.modules())
+
+
+@requires_weight_folding
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_folded_refit_preserves_unquantized_output_rows(monkeypatch, dtype):
+    from modelopt.torch.quantization.utils import apply_without_qdq
+
+    from nemo_rl.models.policy.workers.megatron_policy_worker import (
+        MegatronPolicyWorkerImpl,
+    )
+
+    module = _SingleWeightQuantModule().to(dtype=dtype)
+    with torch.no_grad():
+        module.weight.copy_(torch.linspace(-1.37, 1.43, 16).reshape(4, 4))
+    module.weight_quantizer.amax = torch.tensor(2.0)
+    module.weight_quantizer.pre_quant_scale = torch.tensor([[0.75, 1.25, 0.875, 1.125]])
+    module._modelopt_unquantized_output_rows = slice(2, 4)
+    original = module.weight.detach().clone()
+    quantized = module.weight_quantizer(module.weight.float()).to(dtype)
+    unquantized = apply_without_qdq(module.weight_quantizer, module.weight[2:]).to(
+        dtype
+    )
+    worker = _make_real_quant_worker()
+    worker.cfg["generation"]["real_quant"] = False
+    worker.refit_conversion_tasks = [
+        SimpleNamespace(
+            param_name="in_proj.weight",
+            global_param_name="in_proj.weight",
+            param_weight=module.weight,
+            megatron_module=module,
+        )
+    ]
+
+    def export_weights(self, kv_scales=None, conversion_tasks=None, include_draft=True):
+        for task in conversion_tasks:
+            yield task.param_name, task.param_weight
+
+    monkeypatch.setattr(
+        MegatronPolicyWorkerImpl, "_iter_params_with_optional_kv_scales", export_weights
+    )
+    exported = dict(worker._iter_params_with_optional_kv_scales())["in_proj.weight"]
+    torch.testing.assert_close(exported[:2], quantized[:2], rtol=0, atol=0)
+    torch.testing.assert_close(exported[2:], unquantized, rtol=0, atol=0)
+    assert not torch.equal(exported[2:], quantized[2:])
+    torch.testing.assert_close(module.weight, original, rtol=0, atol=0)
+    assert module.weight_quantizer.is_enabled

@@ -57,9 +57,13 @@ The main pipeline (`cicd-main.yml`) runs through these stages:
 
 1. **Pre-flight**: determines test level from PR labels, changed files, and event type
 2. **Container build**: Docker image built on GPU runners (skipped for `Lfast` or when a pre-built `image_tag` is provided via `workflow_dispatch`)
-3. **Tests**: run in containers on GPU runners using the custom `test-template` action
+3. **Tests**: unit and functional tests run in containers on GPU runners using the custom `test-template` action. Doc tests also run in the GPU container, in parallel with the unit tests; no job waits for them. The CPU config checks (`test_recipes_and_test_suites.py`, `test_config_validation.py`) run on a GitHub-hosted CPU runner in parallel with the container build; no GPU job waits for them, and on a PR run a failure cancels the rest of the run.
 4. **Coverage**: aggregated from doc-tests, unit-tests, and e2e; uploaded to Codecov
 5. **QA Gate**: aggregates all job results into a single pass/fail status
+
+## Re-running a Failed Run
+
+To retry the same commit, re-run only the failed jobs (**Re-run jobs → Re-run failed jobs**, or `gh run rerun <run-id> --failed`). **Re-run all jobs** repeats every GPU job that already passed. See [CONTRIBUTING.md](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md).
 
 ## Code Review
 

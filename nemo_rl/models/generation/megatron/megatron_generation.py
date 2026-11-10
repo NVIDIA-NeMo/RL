@@ -648,12 +648,17 @@ class MegatronGeneration(GenerationInterface):
         staging_partition: str,
         *,
         capture_media: bool = False,
+        top_logprobs: int = 0,
     ) -> "Optional[MediaColumnSpec]":
         """Install MInf's canonical prompt and completion capture hooks.
 
         Returns the media column spec the coordinators pinned (``None`` for
         text-only capture).
         """
+        if top_logprobs != 0:
+            raise NotImplementedError(
+                "Megatron generation does not capture sampler top-k"
+            )
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
             raise ValueError(
                 "Megatron token capture requires mcore_generation_config."

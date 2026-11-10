@@ -55,12 +55,12 @@ from nemo_rl.algorithms.x_token.utils import (
     pad_distillation_val_batch,
 )
 from nemo_rl.data import DataConfig
-from nemo_rl.data.datasets import AllTaskProcessedDataset
-from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
-from nemo_rl.data.xtoken.cross_tokenizer_collate import (
+from nemo_rl.data.cross_tokenizer.cross_tokenizer_collate import (
     CrossTokenizerCollator,
     CrossTokenizerCollatorConfig,
 )
+from nemo_rl.data.datasets import AllTaskProcessedDataset
+from nemo_rl.data.utils import load_dataloader_state, save_dataloader_state
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import ClusterConfig, RayVirtualCluster
 from nemo_rl.models.policy import PolicyConfig
@@ -290,6 +290,32 @@ def setup(
                 f"({student_vocab}). A same-vocab teacher must share the "
                 "student tokenizer; set aligner.projection_matrix_path to run "
                 "it as a cross-tokenizer teacher."
+            )
+
+    # With context parallelism every forwarded sequence width must split
+    # evenly across the CP ranks, and batch widths follow the data.
+    student_div = policy_config["make_sequence_length_divisible_by"]
+    student_cp = policy_config["automodel_cfg"]["context_parallel_size"]
+    assert student_div % student_cp == 0, (
+        f"policy.make_sequence_length_divisible_by ({student_div}) must be a "
+        f"multiple of policy.automodel_cfg.context_parallel_size ({student_cp})."
+    )
+    for i, (teacher, tc) in enumerate(zip(teachers, teacher_configs)):
+        teacher_cp = tc["automodel_cfg"]["context_parallel_size"]
+        if teacher.aligner.projection_matrix_path is None:
+            # A same-vocab teacher forwards the student batch.
+            assert student_div % teacher_cp == 0, (
+                f"teachers.{i} is a same-vocab teacher, which forwards the "
+                f"student batch: policy.make_sequence_length_divisible_by "
+                f"({student_div}) must be a multiple of its "
+                f"automodel_cfg.context_parallel_size ({teacher_cp})."
+            )
+        else:
+            teacher_div = tc["make_sequence_length_divisible_by"]
+            assert teacher_div % teacher_cp == 0, (
+                f"teachers.{i}.make_sequence_length_divisible_by ({teacher_div}) "
+                f"must be a multiple of its automodel_cfg.context_parallel_size "
+                f"({teacher_cp})."
             )
 
     set_seed(distillation_config["seed"])

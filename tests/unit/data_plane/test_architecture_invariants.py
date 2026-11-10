@@ -22,7 +22,11 @@
 
 from __future__ import annotations
 
+import importlib
 import pathlib
+from argparse import Namespace
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 
@@ -96,6 +100,63 @@ def test_launchers_dispatch_through_the_shared_helpers(launcher: str):
         "nemo_rl.data_plane.factory.make_policy_factory, so it can run the "
         "sync trainer against a plain Policy."
     )
+
+
+@pytest.mark.parametrize("use_nemo_gym", [True, False], ids=["gym", "native"])
+@pytest.mark.parametrize("launcher", ["run_grpo", "run_vlm_grpo"])
+def test_generic_launchers_reject_nemo_gym_configs(
+    monkeypatch: pytest.MonkeyPatch, launcher: str, use_nemo_gym: bool
+) -> None:
+    """Reject Gym configs before Ray while allowing native configs through."""
+    module = importlib.import_module(f"examples.{launcher}")
+    calls: list[str] = []
+
+    class ReachedRay(Exception):
+        pass
+
+    def reach_ray() -> None:
+        calls.append("init_ray")
+        raise ReachedRay
+
+    config = SimpleNamespace(
+        policy={"generation": {}},
+        data={},
+        env={"should_use_nemo_gym": use_nemo_gym},
+        data_plane=None,
+        logger=SimpleNamespace(log_dir="logs"),
+        checkpointing={"enabled": False},
+    )
+    common_fakes = {
+        "register_omegaconf_resolvers": lambda: None,
+        "parse_args": lambda: (Namespace(config="config.yaml"), []),
+        "load_config": lambda _: {},
+        "check_outdated_config": lambda _: None,
+        "MasterConfig": lambda **_: config,
+        "log_container_init_timing": lambda: None,
+        "get_next_experiment_dir": lambda log_dir: log_dir,
+        "maybe_configure_data_plane_env": lambda _: calls.append("data_plane_env"),
+        "init_ray": reach_ray,
+    }
+    launcher_fakes = {
+        "run_grpo": {
+            "init_telemetry_driver": lambda *_, **__: None,
+            "shutdown_telemetry": lambda: None,
+            "startup_span": nullcontext,
+        },
+        "run_vlm_grpo": {"materialize_vllm_video_config": lambda *_: None},
+    }
+    for name, fake in {**common_fakes, **launcher_fakes[launcher]}.items():
+        monkeypatch.setattr(module, name, fake)
+    monkeypatch.setattr(module.OmegaConf, "to_container", lambda *_, **__: {})
+
+    if use_nemo_gym:
+        with pytest.raises(ValueError, match="examples/nemo_gym/run_grpo_nemo_gym.py"):
+            module.main()
+        assert calls == []
+    else:
+        with pytest.raises(ReachedRay):
+            module.main()
+        assert calls == ["data_plane_env", "init_ray"]
 
 
 def test_sync_trainer_is_call_compatible_with_legacy_trainer():

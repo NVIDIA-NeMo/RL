@@ -1,0 +1,41 @@
+# MOPD pipeclean for LiLiCorr co-training, on a Megatron-supported target.
+#
+# Why not Super 3.5 here: every 3.5-Super recipe in this repo is automodel, and the
+# Megatron backend does not model its architecture (512 routed experts with a latent MoE
+# and an MTP layer). Pointing the Megatron path at it fails in checkpoint load, on expert
+# _extra_state shards, long before anything about the drafter is exercised.
+#
+# This recipe keeps the thing under test -- the LiLiCorr co-training loop inside MOPD --
+# and swaps the target for one Megatron does support. It is derived from
+# grpo-qwen3-8b-1n8g-megatron-dflash.yaml, which is the working block-drafter recipe, so
+# the only meaningful delta is dflash -> lilicorr.
+#
+# The drafter is randomly initialised (examples/make_lilicorr_checkpoint.py): there is no
+# released LiLiCorr for any Megatron-supported target. That is fine for a pipeclean,
+# which asks whether the loop runs, not whether acceptance improves.
+defaults: grpo-qwen3-8b-1n8g-megatron-dflash.yaml
+
+# MOPD is GRPO with the on-policy-distillation advantage estimator.
+loss_fn:
+  adv_estimator: opd
+
+policy:
+  draft:
+    speculator_type: lilicorr
+    enabled: true
+    # Written by make_lilicorr_checkpoint.py; override with a real drafter when one
+    # exists for this target.
+    model_name: /lustre/fsw/portfolios/cosmos/users/yeyu/lilicorr_qwen3_8b_synth
+    model_revision: null
+    loss_weight: 1.0
+    anchors_per_sample: 2
+    seed: 13
+    vocab_tile_size: 256
+    position_decay: 1.0
+    # gamma, mask_token_id and target_hidden_state_layer_ids are read from the drafter
+    # checkpoint, so they are deliberately absent here -- a value that drifts from the
+    # weights is a silent accuracy loss, not an error.
+  megatron_cfg:
+    # The fused path returns per-token logprobs and never materialises the full
+    # next-token logits the draft's teacher distribution needs.
+    use_fused_linear_logprobs: false

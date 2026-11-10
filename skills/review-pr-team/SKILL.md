@@ -23,16 +23,9 @@ Review a pull request using a coordinated team of specialized agents.
 
 **Repo**: `NVIDIA-NeMo/RL`
 
-**Requires**: `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` must be set — agent
-teams (teammate spawning, shared task list, `SendMessage`) are an experimental
-Claude Code feature.
+**Requires**: `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` must be set — agent teams (teammate spawning, shared task list, `SendMessage`) are an experimental Claude Code feature.
 
-**Sandbox**: Always pass `dangerouslyDisableSandbox: true` on every Bash
-tool call in this skill. The sandbox's bubblewrap (bwrap) container fails to
-initialize in worktree/container environments with
-`bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`, breaking ALL
-commands — not just network-dependent ones like `gh`. Do NOT attempt any Bash
-call in sandbox mode first; it will fail and waste a round-trip.
+**Sandbox**: Always pass `dangerouslyDisableSandbox: true` on every Bash tool call in this skill. The sandbox's bubblewrap (bwrap) container fails to initialize in worktree/container environments with `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`, breaking ALL commands — not just network-dependent ones like `gh`. Do NOT attempt any Bash call in sandbox mode first; it will fail and waste a round-trip.
 
 ---
 
@@ -76,9 +69,7 @@ gh api repos/NVIDIA-NeMo/RL/pulls/$PRNUM/comments
 
 Record: `$TITLE`, `$AUTHOR`, `$BASE_BRANCH`, `$HEAD_SHA`, changed files list, existing comments, existing reviews.
 
-**Merge conflict check**: If `mergeable` is `"CONFLICTING"` or `mergeStateStatus` is `"DIRTY"`,
-include a prominent note in the review asking the author to rebase their PR on `$BASE_BRANCH`
-and resolve conflicts before further review. Add this as the first item in the review body.
+**Merge conflict check**: If `mergeable` is `"CONFLICTING"` or `mergeStateStatus` is `"DIRTY"`, include a prominent note in the review asking the author to rebase their PR on `$BASE_BRANCH` and resolve conflicts before further review. Add this as the first item in the review body.
 
 **Read the PR description (`body`) carefully.** It contains the author's intent, motivation, and test plan. Also parse it for linked issues (patterns like `Fixes #123`, `Closes #456`, `Related: #789`). For each linked issue, fetch it:
 
@@ -90,20 +81,13 @@ The PR description + linked issues + diff together form the full context. All ag
 
 ### 1.2a Performance & convergence evidence check
 
-If the PR touches code that could affect **performance or convergence** (e.g. new training
-features, optimizer changes, CUDA graph support, kernel changes, parallelism config), check
-the PR description and comments for quantitative evidence:
+If the PR touches code that could affect **performance or convergence** (e.g. new training features, optimizer changes, CUDA graph support, kernel changes, parallelism config), check the PR description and comments for quantitative evidence:
 
-- **New feature**: Author should provide baseline numbers (throughput, tokens/sec, memory,
-  convergence curves) demonstrating the benefit of the feature.
-- **Existing feature modification**: Author should show before/after comparison or prove no
-  regression (e.g. convergence curves from an A/B run).
-- If evidence is missing, flag it as a `[PERF-EVIDENCE]` finding in the review. This is
-  especially important for features that users will enable in production — they need to know
-  the expected benefit and any trade-offs.
+- **New feature**: Author should provide baseline numbers (throughput, tokens/sec, memory, convergence curves) demonstrating the benefit of the feature.
+- **Existing feature modification**: Author should show before/after comparison or prove no regression (e.g. convergence curves from an A/B run).
+- If evidence is missing, flag it as a `[PERF-EVIDENCE]` finding in the review. This is especially important for features that users will enable in production — they need to know the expected benefit and any trade-offs.
 
-Record whether evidence was found: `$PERF_EVIDENCE_FOUND` (yes/no/not-applicable). Pass
-this to the `rl-expert` agent in its prompt.
+Record whether evidence was found: `$PERF_EVIDENCE_FOUND` (yes/no/not-applicable). Pass this to the `rl-expert` agent in its prompt.
 
 ### 1.3 Determine touched submodules
 
@@ -119,38 +103,24 @@ Map paths to submodule names:
 
 ### 1.3a Upstream reference lookup
 
-When the PR adds or modifies config that wraps Megatron-LM `TransformerConfig` fields, agents
-MUST check how **Megatron-Bridge** sets those same fields. Megatron-Bridge is the canonical
-integration layer and often shows the correct, non-deprecated API:
+When the PR adds or modifies config that wraps Megatron-LM `TransformerConfig` fields, agents MUST check how **Megatron-Bridge** sets those same fields. Megatron-Bridge is the canonical integration layer and often shows the correct, non-deprecated API:
 
-1. Get submodule SHAs for permalinks: `git ls-tree HEAD 3rdparty/Megatron-LM-workspace/Megatron-LM`
-   and `git ls-tree HEAD 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge`
-2. Search Megatron-Bridge for the config field name:
-   `grep -rn <field_name> 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/`
-3. Read the Megatron-Bridge code to understand the pattern (what field it sets on
-   `recipe.model`, how it handles RNG, scope validation, etc.)
-4. Read the Megatron-LM `TransformerConfig` field definition and docstring for the
-   canonical documentation of valid values, defaults, and deprecation status
+1. Get submodule SHAs for permalinks: `git ls-tree HEAD 3rdparty/Megatron-LM-workspace/Megatron-LM` and `git ls-tree HEAD 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge`
+2. Search Megatron-Bridge for the config field name: `grep -rn <field_name> 3rdparty/Megatron-Bridge-workspace/Megatron-Bridge/`
+3. Read the Megatron-Bridge code to understand the pattern (what field it sets on `recipe.model`, how it handles RNG, scope validation, etc.)
+4. Read the Megatron-LM `TransformerConfig` field definition and docstring for the canonical documentation of valid values, defaults, and deprecation status
 5. Pass the submodule SHAs and relevant Bridge/LM permalinks to all agents in their prompts
 
-This ensures review comments can point authors to the established pattern rather than
-just saying "this is wrong."
+This ensures review comments can point authors to the established pattern rather than just saying "this is wrong."
 
 ### 1.4 Read root context
 
 - Read `CLAUDE.md` from repo root
 - Read all `.claude/skills/*/SKILL.md` files (except `review-pr` and `review-pr-team`)
-- Read every `references/*.md` file in this skill's own directory. These are the shared review
-  lessons for this repo, grouped by theme. A rule marked ★ has come up three or more times; list those
-  first when you pass the lessons on. A rule that ends with `Details: [name](details/name.md)` has a
-  full lesson behind it, with the steps, commands and repo maps the one-line rule leaves out. Keep those
-  links when you pass the lessons on, and tell every agent to read the detail file whenever its rule
-  applies to what it is checking.
-- Then glob `~/.claude/review-memory/RL/*.md` and read EVERY match. This is the optional, machine-local
-  store of lessons that are not in `references/` yet. It may be empty or absent; an empty glob is fine.
-  New lessons are written here in Phase 6. A memory's `count` is how many times its pattern has shown
-  up in reviewed PRs; list the ones with count 2 or more first.
-- Treat both as binding guidance and pass their content to every spawned agent in its prompt.
+- Read every `references/*.md` file in this skill's own directory. These are the shared review lessons for this repo, grouped by theme. A rule marked ★ has come up three or more times; list those first when you pass the lessons on. A rule that ends with `Details: [name](details/name.md)` has a full lesson behind it, with the steps, commands and repo maps the one-line rule leaves out. Keep those links when you pass the lessons on, and tell every agent to read the detail file whenever its rule applies to what it is checking.
+- Read every `skills/contributing/references/*.md` and treat each rule as a finding checklist, the same as this skill's own references. A rule that ends with `Review Details: [name](...)` has a review lesson behind it, and one that ends with `Contributing Details:` has an author how-to under `skills/contributing/references/details/`; tell every agent to read the linked file whenever the rule applies.
+- Then glob `~/.claude/review-memory/RL/*.md` and read EVERY match. This is the optional, machine-local store of lessons that are not in `references/` yet. It may be empty or absent; an empty glob is fine. New lessons are written here in Phase 6. A memory's `count` is how many times its pattern has shown up in reviewed PRs; list the ones with count 2 or more first.
+- Treat all of them as binding guidance and pass their content to every spawned agent in its prompt.
 
 ### 1.5 Detect GPU availability & set up local testing
 
@@ -158,13 +128,9 @@ just saying "this is wrong."
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null | head -1
 ```
 
-If GPUs are available, set `$GPU_TESTING_AVAILABLE = true`. All agents run tests locally
-via `uv run` — no Docker container needed. On first run, `uv sync` resolves all deps
-(torch, vLLM, CUDA) directly on the host (~5 min first time, instant after).
+If GPUs are available, set `$GPU_TESTING_AVAILABLE = true`. All agents run tests locally via `uv run` — no Docker container needed. On first run, `uv sync` resolves all deps (torch, vLLM, CUDA) directly on the host (~5 min first time, instant after).
 
-If no GPUs: set `$GPU_TESTING_AVAILABLE = false`. Agents should note "not verified — no
-GPU environment" in their findings. Test-agent can still do CPU-only work (grep, read,
-collect-only).
+If no GPUs: set `$GPU_TESTING_AVAILABLE = false`. Agents should note "not verified — no GPU environment" in their findings. Test-agent can still do CPU-only work (grep, read, collect-only).
 
 ### 1.5b Kick off the repo linters (background)
 
@@ -174,80 +140,43 @@ Start the repo's own lint/format/type suite in the background early, so results 
 uv run --group dev pre-commit run --all-files
 ```
 
-Do NOT run `ruff`/`pyrefly` directly — `pre-commit` runs the repo's pinned hook versions and config, and
-calling the tools directly can use the wrong versions/args and produce misleading results. Fallback only
-when `pre-commit` cannot run at all: run the pinned version with `uvx ruff@<version from
-.pre-commit-config.yaml>` and run every ruff hook the config lists (plain `ruff check` misses `I001`). When collating,
-attribute findings ONLY to files in the PR diff (`gh pr view $PRNUM --json files`); `--all-files` also surfaces
-pre-existing issues unrelated to this PR — don't report those. Also flag any NEW source file in the diff that
-isn't added to `pyrefly.toml` `project-includes` (untracked files silently escape type-checking).
+Do NOT run `ruff`/`pyrefly` directly — `pre-commit` runs the repo's pinned hook versions and config, and calling the tools directly can use the wrong versions/args and produce misleading results. Fallback only when `pre-commit` cannot run at all: run the pinned version with `uvx ruff@<version from .pre-commit-config.yaml>` and run every ruff hook the config lists (plain `ruff check` misses `I001`). When collating, attribute findings ONLY to files in the PR diff (`gh pr view $PRNUM --json files`); `--all-files` also surfaces pre-existing issues unrelated to this PR — don't report those. Also flag any NEW source file in the diff that isn't added to `pyrefly.toml` `project-includes` (untracked files silently escape type-checking).
 
 ### 1.6 Teams are MANDATORY — never substitute plain subagents
 
-With `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` set, agent teams form automatically:
-the current session is the team lead, and the team is created the moment you spawn the
-first teammate via the `Agent` tool. There is **no `TeamCreate` step** (that tool was
-removed; a session has exactly one implicit team). You do not name the team — refer to
-the review as "the PR #$PRNUM review" in prompts for human readability only.
+With `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` set, agent teams form automatically: the current session is the team lead, and the team is created the moment you spawn the first teammate via the `Agent` tool. There is **no `TeamCreate` step** (that tool was removed; a session has exactly one implicit team). You do not name the team — refer to the review as "the PR #$PRNUM review" in prompts for human readability only.
 
-**Every agent in this skill MUST be spawned as a named teammate** — `Agent` with a `name`,
-so it appears as its own tmux pane and can `SendMessage` its peers. This is not a
-preference to trade off against reliability:
+**Every agent in this skill MUST be spawned as a named teammate** — `Agent` with a `name`, so it appears as its own tmux pane and can `SendMessage` its peers. This is not a preference to trade off against reliability:
 
-- **Do NOT spawn unnamed/plain background `Agent` calls as a substitute**, even when the
-  teammate channel is being slow or silent. The user watches the panes; a review that
-  "worked" with no panes reads as the team having run when it did not.
-- **Do NOT fall back to solo review.** It throws away substantive reports — six of them on
-  PR #3292, which arrived in full after one correctly-phrased nudge.
-- If a lane is genuinely stuck, escalate *within* teams: re-send the verbatim tool-call
-  nudge below, then re-spawn that lane as a NEW named teammate. Only if a lane still
-  cannot be recovered may you use an unnamed `Agent` for that one lane — and then you
-  MUST say so explicitly in the Phase 4 preview.
+- **Do NOT spawn unnamed/plain background `Agent` calls as a substitute**, even when the teammate channel is being slow or silent. The user watches the panes; a review that "worked" with no panes reads as the team having run when it did not.
+- **Do NOT fall back to solo review.** It throws away substantive reports — six of them on PR #3292, which arrived in full after one correctly-phrased nudge.
+- If a lane is genuinely stuck, escalate *within* teams: re-send the verbatim tool-call nudge below, then re-spawn that lane as a NEW named teammate. Only if a lane still cannot be recovered may you use an unnamed `Agent` for that one lane — and then you MUST say so explicitly in the Phase 4 preview.
 
-The cost of substituting plain subagents is not hypothetical: they cannot message each
-other, so every cross-lane disagreement becomes a serial leader round-trip. On PR #3591
-two lanes contradicted each other on backend reachability and two adversarial passes
-disagreed about CI lane coverage — with a team those are one peer `SendMessage`.
+The cost of substituting plain subagents is not hypothetical: they cannot message each other, so every cross-lane disagreement becomes a serial leader round-trip. On PR #3591 two lanes contradicted each other on backend reachability and two adversarial passes disagreed about CI lane coverage — with a team those are one peer `SendMessage`.
 
 #### Making teammate reports actually land
 
 The delivery failure is real, mechanical, and fixable. Do not let it push you off teams.
 
 - An agent spawned by `Agent` returns its final text to the leader automatically.
-- An agent **resumed via `SendMessage`** has NO such channel. Its final assistant text
-  goes nowhere. It must explicitly call the `SendMessage` tool.
+- An agent **resumed via `SendMessage`** has NO such channel. Its final assistant text goes nowhere. It must explicitly call the `SendMessage` tool.
 
-So a nudge saying "report back" produces an idle notification with no content — the agent
-answered into the void. Phrase it as a tool instruction, verbatim:
+So a nudge saying "report back" produces an idle notification with no content — the agent answered into the void. Phrase it as a tool instruction, verbatim:
 
 > Your report never reached me. When you are resumed by a message, your final assistant
 > text is NOT delivered — you must explicitly call the SendMessage tool. Do this now:
 > `SendMessage(to="team-lead", summary="...", message="<your full findings>")`. Do NOT
 > just write the text as your answer — call the tool.
 
-On PR #3292 all six teammates were silent through two rounds of ordinary nudging; after
-one message phrased that way, all six delivered within minutes.
+On PR #3292 all six teammates were silent through two rounds of ordinary nudging; after one message phrased that way, all six delivered within minutes.
 
-Two force multipliers when nudging: state what you have ALREADY verified (so they spend
-remaining effort on gaps, not redoing your work), and list 2-4 numbered open questions.
+Two force multipliers when nudging: state what you have ALREADY verified (so they spend remaining effort on gaps, not redoing your work), and list 2-4 numbered open questions.
 
-**Delivery can be very late and arrive in ONE batch — never declare the channel dead.**
-On PR #2902 five teammates showed `completed` and stayed silent through eight nudges over
-~2 hours, then every report landed at once and refuted a finding that was already staged.
-Confirmed again on #3422 at ~14 hours, producing that review's top finding. So: keep
-working while you wait; prefer long sleeps over tight `TaskList` polling; say "reports
-have not arrived yet", never "the team did not deliver"; and if reports land after you
-have staged, re-open the staged set against them. A teammate can also outlive your own
-shutdown request — until the review is POSTed, a late report is still actionable.
+**Delivery can be very late and arrive in ONE batch — never declare the channel dead.** On PR #2902 five teammates showed `completed` and stayed silent through eight nudges over ~2 hours, then every report landed at once and refuted a finding that was already staged. Confirmed again on #3422 at ~14 hours, producing that review's top finding. So: keep working while you wait; prefer long sleeps over tight `TaskList` polling; say "reports have not arrived yet", never "the team did not deliver"; and if reports land after you have staged, re-open the staged set against them. A teammate can also outlive your own shutdown request — until the review is POSTed, a late report is still actionable.
 
-**Teammates mutate the shared worktree.** Two agents once applied prototype patches to
-source files mid-run. Before staging, re-verify: `git status --porcelain` plus per-file
-`md5` against `git show HEAD:<path>`. Never stage a review built against a tree an agent
-may have edited.
+**Teammates mutate the shared worktree.** Two agents once applied prototype patches to source files mid-run. Before staging, re-verify: `git status --porcelain` plus per-file `md5` against `git show HEAD:<path>`. Never stage a review built against a tree an agent may have edited.
 
-**Adjudicate, don't aggregate.** Agents contradict each other and the leader, and the
-leader is not automatically right. Verify every load-bearing claim yourself, in both
-directions — including an agent overstating "no CI job covers X" when one does.
+**Adjudicate, don't aggregate.** Agents contradict each other and the leader, and the leader is not automatically right. Verify every load-bearing claim yourself, in both directions — including an agent overstating "no CI job covers X" when one does.
 
 ---
 
@@ -293,16 +222,9 @@ Set dependencies:
 
 ### 2.2 Spawn agents (parallel)
 
-Spawn all agents in a single message with multiple `Agent` tool calls. Give each agent a
-unique `name` (so teammates can address each other via `SendMessage`). Do **not** pass
-`team_name` — that input is ignored; spawning a teammate joins the session's single implicit
-team automatically. You may set `subagent_type` to reuse a defined role; its `tools`/`model`
-are honored and its body is appended to the teammate's prompt (`SendMessage` and the task
-tools are always available regardless of any `tools` allowlist).
+Spawn all agents in a single message with multiple `Agent` tool calls. Give each agent a unique `name` (so teammates can address each other via `SendMessage`). Do **not** pass `team_name` — that input is ignored; spawning a teammate joins the session's single implicit team automatically. You may set `subagent_type` to reuse a defined role; its `tools`/`model` are honored and its body is appended to the teammate's prompt (`SendMessage` and the task tools are always available regardless of any `tools` allowlist).
 
-Spawn Wave 1 and `devil-advocate` here. Do **not** spawn `comment-editor` yet — it is Wave 3 and
-only ever sees findings that survived the adversarial pass. Spawning it early wastes it on findings
-that are about to be disputed, and invites it to start editing before the set is final.
+Spawn Wave 1 and `devil-advocate` here. Do **not** spawn `comment-editor` yet — it is Wave 3 and only ever sees findings that survived the adversarial pass. Spawning it early wastes it on findings that are about to be disputed, and invites it to start editing before the set is final.
 
 ---
 
@@ -369,15 +291,6 @@ Instructions:
   source code (via WebFetch on the raw GitHub URL or `curl`) and provide a permalink to
   the exact line that proves the claim. Use a pinned commit SHA, not `main`. Never claim
   "verl does X" or "TRL does Y" based on memory alone — verify and link.
-- **Compare new components to their nearest existing analog.** When the PR adds a component that
-  parallels an existing one (a new worker group ↔ `lm_policy.py`, a new advantage estimator ↔ the
-  existing estimators, a new config block ↔ `MasterConfig`), diff the new one against the established
-  pattern and flag missing affordances: backend dispatch, override hooks (e.g. `resolve_policy_worker_cls`),
-  guards/validation, type annotations, and return-shape consistency. "It works for the shipped recipe" is
-  not enough if the new component silently diverges from its sibling's contract.
-- **Fail-loud check.** For each new config option / branch, ask: what does the worst plausible misconfiguration
-  do? If it silently produces wrong results (zeroed logprobs, an unrouted alias, an ignored backend, a config
-  combination no warning covers), flag it and suggest a setup-time assert/raise.
 - **Copied-constant check.** Any value the PR copies from code it doesn't own (a string key, a field
   name, a protocol name, a look-alike type) — usually flagged by a comment like "must match X" or
   "mirrors Y" — has to be justified, in this order: (1) import it where it is read, even with a
@@ -469,8 +382,7 @@ Instructions:
   **The comment skeleton:**
 
   ```
-  **C<n> · N action items.**
-  **TL;DR — <the issue in one line>**
+  **C<n> · N action items.** **TL;DR — <the issue in one line>**
   <short explanation of how the problem shows up>
   ### AI-1
   <the fix: a ```suggestion block, or the concrete change + one clause why it can't be one>
@@ -864,9 +776,7 @@ Report ALL verdicts — every challenged finding gets one of:
 
 ### `comment-editor`
 
-Spawned in Wave 3, AFTER devil-advocate reports. It only ever sees findings that survived the
-adversarial pass, so nothing is polished that is about to be killed. It is NOT a reviewer — it
-does not add, drop, or re-judge findings.
+Spawned in Wave 3, AFTER devil-advocate reports. It only ever sees findings that survived the adversarial pass, so nothing is polished that is about to be killed. It is NOT a reviewer — it does not add, drop, or re-judge findings.
 
 ```
 You are the comment editor. You own the final wording of everything this review posts:
@@ -1128,9 +1038,6 @@ Judge on three axes, each tied to an OBSERVABLE (no abstract hand-waving):
      for one logical change.
 
 Rules:
-- Compare the new component to its nearest existing analog (a new worker group ↔ lm_policy,
-  a new estimator ↔ the existing estimators): does it match that pattern's extension points
-  (backend dispatch, override hooks, guards), or diverge without reason?
 - Bias to code the PR INTRODUCES — reshaping a seam while it is being written costs nothing.
   For pre-existing shape the PR merely touches, suggest a tracking issue; do NOT block.
 - Low-severity SUGGESTIONS by default (these are not blockers) unless the shape will actively
@@ -1150,105 +1057,54 @@ Delegate domain questions to rl-expert / submodule experts via SendMessage. Repo
 
 ### Wave 1 → Wave 2 handoff (leader responsibility)
 
-After each Wave 1 agent reports completion (you will receive an idle notification with their
-findings attached), check `TaskList` to see which Wave 1 tasks are still in flight. When ALL
-Wave 1 tasks (`analyze-rl-code`, any `analyze-{submodule}`, `review-existing-comments`,
-`review-and-suggest-tests`, `scan-for-bugs`, `review-design`) are completed, IMMEDIATELY send a single
-consolidated message to `devil-advocate` via `SendMessage` containing the full set of Wave 1
-findings (grouped by source agent). This is a push notification — it unblocks
-`devil-advocate`, which is otherwise idle waiting for your message. Do NOT expect
-`devil-advocate` to poll for completion; it will not wake itself.
+After each Wave 1 agent reports completion (you will receive an idle notification with their findings attached), check `TaskList` to see which Wave 1 tasks are still in flight. When ALL Wave 1 tasks (`analyze-rl-code`, any `analyze-{submodule}`, `review-existing-comments`, `review-and-suggest-tests`, `scan-for-bugs`, `review-design`) are completed, IMMEDIATELY send a single consolidated message to `devil-advocate` via `SendMessage` containing the full set of Wave 1 findings (grouped by source agent). This is a push notification — it unblocks `devil-advocate`, which is otherwise idle waiting for your message. Do NOT expect `devil-advocate` to poll for completion; it will not wake itself.
 
 ### Leader brokering for devil-advocate challenges
 
-When devil-advocate sends challenges to other agents, those agents may go idle without
-checking their inbox. **The leader must broker**: when you see a devil-advocate idle
-notification with a peer DM summary (e.g. "[to test-agent] Challenge X"), send a nudge
-to the target agent via SendMessage telling them to check their inbox and respond. This
-prevents deadlocks where DA is waiting for a response and the target agent is idle.
+When devil-advocate sends challenges to other agents, those agents may go idle without checking their inbox. **The leader must broker**: when you see a devil-advocate idle notification with a peer DM summary (e.g. "[to test-agent] Challenge X"), send a nudge to the target agent via SendMessage telling them to check their inbox and respond. This prevents deadlocks where DA is waiting for a response and the target agent is idle.
 
 ### Tone guidelines
 
-Review comments represent our team — keep them constructive and helpful, especially for
-community contributors who are volunteering their time:
+Review comments represent our team — keep them constructive and helpful, especially for community contributors who are volunteering their time:
 
-- **Ask, don't accuse**: "It would be helpful to include benchmark numbers" not "The PR
-  contains no quantitative evidence."
+- **Ask, don't accuse**: "It would be helpful to include benchmark numbers" not "The PR contains no quantitative evidence."
 - **Suggest, don't demand**: "Consider adding..." or "This could be improved by..."
-- **Don't single out the author**: Never quote an author's words back to highlight what's
-  missing or wrong. If referencing something they said, frame it positively ("Building on
-  your note about...").
-- **Be specific about asks**: "Could you share tokens/sec with and without CUDA graphs on
-  a 1B model?" is better than "Please add performance numbers."
-- **Acknowledgement goes in the review BODY, not in inline comments.** If the feature is
-  valuable, or the author fixed something from a previous round, say so once in the body.
-  Do NOT open an inline comment with credit or a softening preamble — an inline comment
-  carries the TL;DR, how the problem shows up, and the fix. Nothing else. Said once in the
-  body, acknowledgement reads as an assessment of the work; repeated per-comment it reads
-  as padding in front of every ask.
+- **Don't single out the author**: Never quote an author's words back to highlight what's missing or wrong. If referencing something they said, frame it positively ("Building on your note about...").
+- **Be specific about asks**: "Could you share tokens/sec with and without CUDA graphs on a 1B model?" is better than "Please add performance numbers."
+- **Acknowledgement goes in the review BODY, not in inline comments.** If the feature is valuable, or the author fixed something from a previous round, say so once in the body. Do NOT open an inline comment with credit or a softening preamble — an inline comment carries the TL;DR, how the problem shows up, and the fix. Nothing else. Said once in the body, acknowledgement reads as an assessment of the work; repeated per-comment it reads as padding in front of every ask.
 
 ### 🚦 HARD GATE — do NOT stage anything until devil-advocate has reported
 
-**Blocking rule: you may not call `AskUserQuestion` to offer staging, and you may not POST a
-review, until `devil-advocate` has delivered its verdicts via SendMessage.** The
-`collate-review` blockedBy `challenge-findings` dependency exists for this; honour it in
-behaviour, not just in the task graph.
+**Blocking rule: you may not call `AskUserQuestion` to offer staging, and you may not POST a review, until `devil-advocate` has delivered its verdicts via SendMessage.** The `collate-review` blockedBy `challenge-findings` dependency exists for this; honour it in behaviour, not just in the task graph.
 
-**The gate covers EVERY adversarial pass you started, not just the first one to answer.** If you
-respawned devil-advocate on a second channel because the first went silent (see the respawn escape
-hatch below), and then the *original* delivers, you are NOT unblocked — the respawn is a genuine
-second opinion on exactly the findings that have already proven fragile, and it may overturn the
-first. Wait for both and reconcile them, or explicitly kill the extra pass with `TaskStop` and say
-in the preview that you did. Do not silently treat the redundant pass as noise because a report
-already arrived.
+**The gate covers EVERY adversarial pass you started, not just the first one to answer.** If you respawned devil-advocate on a second channel because the first went silent (see the respawn escape hatch below), and then the *original* delivers, you are NOT unblocked — the respawn is a genuine second opinion on exactly the findings that have already proven fragile, and it may overturn the first. Wait for both and reconcile them, or explicitly kill the extra pass with `TaskStop` and say in the preview that you did. Do not silently treat the redundant pass as noise because a report already arrived.
 
-Before calling `AskUserQuestion`, enumerate every agent you spawned and confirm each has either
-reported or been deliberately stopped. "I forgot it was still running" is the failure mode here;
-a spawned-agent checklist is the fix. Observed on PR #3490: the leader presented findings and
-offered staging while a second, deliberately-commissioned adversarial pass was still in flight —
-caught by the user, not by the leader.
+Before calling `AskUserQuestion`, enumerate every agent you spawned and confirm each has either reported or been deliberately stopped. "I forgot it was still running" is the failure mode here; a spawned-agent checklist is the fix. Observed on PR #3490: the leader presented findings and offered staging while a second, deliberately-commissioned adversarial pass was still in flight — caught by the user, not by the leader.
 
 **Two more gates sit in front of the POST, and neither has a bypass:**
-- `comment-editor` must have returned the wire-ready text (Wave 3). The leader does not author the
-  final comments.
+- `comment-editor` must have returned the wire-ready text (Wave 3). The leader does not author the final comments.
 - The pre-POST audit table (Step 0a) must be printed in your reply and every row must be OK.
 
-Both are blocking. If either cannot be satisfied, the review does not post — say so plainly rather
-than routing around it.
+Both are blocking. If either cannot be satisfied, the review does not post — say so plainly rather than routing around it.
 
-This is the single most common way this skill produces churn. The failure mode is seductive:
-the leader has personally verified most findings, devil-advocate is slow, and proceeding
-"feels safe because I checked everything myself." It is not safe — the leader is one of the
-reviewers, and the leader's findings need the adversarial pass **more** than anyone's, because
-nobody else is auditing them.
+This is the single most common way this skill produces churn. The failure mode is seductive: the leader has personally verified most findings, devil-advocate is slow, and proceeding "feels safe because I checked everything myself." It is not safe — the leader is one of the reviewers, and the leader's findings need the adversarial pass **more** than anyone's, because nobody else is auditing them.
 
-If devil-advocate has gone idle without reporting, do NOT interpret that as "no objections."
-Send the explicit-tool-call nudge — a resumed agent's final assistant text is not delivered to
-the leader, so a silent agent is usually one that never called the tool, not one with nothing to say:
+If devil-advocate has gone idle without reporting, do NOT interpret that as "no objections." Send the explicit-tool-call nudge — a resumed agent's final assistant text is not delivered to the leader, so a silent agent is usually one that never called the tool, not one with nothing to say:
 
 > Your verdicts never reached me. When you are resumed by a message, your final assistant text
 > is NOT delivered — you must explicitly call the SendMessage tool. Do this now:
 > `SendMessage(to="team-lead", summary="devil-advocate verdicts", message="<full verdict list>")`.
 
-Only after that nudge has ALSO failed may you proceed, and then you MUST say so in the preview
-("devil-advocate did not report; findings below carry only the leader's verification").
+Only after that nudge has ALSO failed may you proceed, and then you MUST say so in the preview ("devil-advocate did not report; findings below carry only the leader's verification").
 
-**Cost of getting this wrong, observed on PR #3262:** the leader staged 8 comments before
-devil-advocate returned. DA then killed 3 of them — one where the leader's own supporting audit
-used the wrong peer group (comparing PPO recipes against tuned large-model async GRPO recipes to
-claim a config value was anomalous, when it was that family's house value), one where the "no
-test covers this" premise was refuted by an existing deterministic unit test, and one where the
-proposed fix would have defeated a deliberate CI ratchet. The staged review had to be deleted and
-re-POSTed. Had the user hit publish in that window, the author would have received three findings
-that do not survive scrutiny.
+**Cost of getting this wrong, observed on PR #3262:** the leader staged 8 comments before devil-advocate returned. DA then killed 3 of them — one where the leader's own supporting audit used the wrong peer group (comparing PPO recipes against tuned large-model async GRPO recipes to claim a config value was anomalous, when it was that family's house value), one where the "no test covers this" premise was refuted by an existing deterministic unit test, and one where the proposed fix would have defeated a deliberate CI ratchet. The staged review had to be deleted and re-POSTed. Had the user hit publish in that window, the author would have received three findings that do not survive scrutiny.
 
 **If you catch yourself thinking any of these, stop and wait:**
 - "I've verified these myself, DA is a formality."
 - "DA already weighed in on some items, that's close enough."
 - "I'll stage now and amend if DA objects." ← re-POSTing is what creates duplicate comments.
 
-Note also that DA overturning **itself** is a signal the pass is working, not a reason to
-discount it: on #3262 it reinstated a finding it had previously agreed to kill.
+Note also that DA overturning **itself** is a signal the pass is working, not a reason to discount it: on #3262 it reinstated a finding it had previously agreed to kill.
 
 After all Wave 2 agents complete:
 
@@ -1257,62 +1113,24 @@ After all Wave 2 agents complete:
 3. Deduplicate: same file + same line range + same core issue = one finding
 4. Confidence threshold: discard anything scoring below 80
 5. **Show ALL surviving findings** — no caps, no "top N", no summarization
-5a. **Hand the surviving set to `comment-editor` (Wave 3) and wait.** Send each finding together with
-   the lane that produced it, so the editor knows who to ask when it needs context. The editor returns
-   the wire-ready text for every comment and for the review body; that text is what you put in the
-   payload. **You may not skip this and write the comments yourself.** You carry the same rules below so
-   your drafts comply, but your draft is the editor's INPUT, never a substitute for its pass — the editor
-   exists to catch what the leader gets wrong, so a leader bypass reinstates the exact failure. If the
-   editor goes silent, recover the way you would any silent lane (explicit SendMessage tool-call nudge,
-   then re-spawn as a new named teammate). A blocked review is the correct outcome; it is visible and
-   recoverable. A skipped editor is neither.
+5a. **Hand the surviving set to `comment-editor` (Wave 3) and wait.** Send each finding together with the lane that produced it, so the editor knows who to ask when it needs context. The editor returns the wire-ready text for every comment and for the review body; that text is what you put in the payload. **You may not skip this and write the comments yourself.** You carry the same rules below so your drafts comply, but your draft is the editor's INPUT, never a substitute for its pass — the editor exists to catch what the leader gets wrong, so a leader bypass reinstates the exact failure. If the editor goes silent, recover the way you would any silent lane (explicit SendMessage tool-call nudge, then re-spawn as a new named teammate). A blocked review is the correct outcome; it is visible and recoverable. A skipped editor is neither.
 6. The rules the editor applies — and that your own drafts must already meet:
-   - Concise, straight to the point (2-3 sentences max) — the ONLY things that earn extra length are the
-     breaking-case walkthrough and the mechanism context-reload below, each within its own budget. After
-     drafting, re-read and delete every sentence whose removal wouldn't change what the author does.
-   - **Understandable**: if the finding hinges on a mechanism (handshake, protocol, cache, lifecycle,
-     cross-process contract), open with the 4-step context-reload from the preamble — background → what problem
-     the mechanism solves → numbered how-it-works → what breaks — in 4-8 lines. The reader is an expert but has
-     not paged this mechanism in; one who has to reconstruct it from the diff before judging the finding won't.
-   - **In the reader's words, not yours**: strip every noun you only know because you spent an hour in the
-     code (*the ring*, *the frontier*, *the stamp*, *the handshake*). Replace it with what the thing plainly
-     is, or name it once where you explain it. Real code names stay — in backticks, with a permalink, with the
-     plain meaning beside them. Apply this to the TL;DR and the **Action:** line first; those are read alone.
-   - **Actionable**: lead with the issue, then a bolded **Action:** line naming the exact file/function to
-     change. Give the concrete fix (snippet / schema / signature) when known, and note placement + DRY
-     concerns (e.g. "factor this predicate into one helper so the guard can't drift from the loop"). Cut
-     reassurance/editorializing — if the answer to "what should the author DO?" is "nothing," drop the comment
-     or move it to the review body.
-   - **Tangible**: if the finding has a concrete failing case, SHOW it (per the preamble rule) — the triggering
-     config/input, 3-5 permalinked steps from input to symptom, and the real symptom string; or a one-line
-     repro ("run `<recipe>` with `<delta>` → `<symptom>`"). This is the single highest-leverage thing that
-     makes a reviewer's ask land: an author can argue with "this isn't validated", but not with a YAML block
-     and a trace ending in the exact error they'd see. Budget it: config block + a few one-line bullets. A
-     finding with no demonstrable failing case is a weaker finding — reflect that in its score rather than
-     dressing it up in prose.
+   - Concise, straight to the point (2-3 sentences max) — the ONLY things that earn extra length are the breaking-case walkthrough and the mechanism context-reload below, each within its own budget. After drafting, re-read and delete every sentence whose removal wouldn't change what the author does.
+   - **Understandable**: if the finding hinges on a mechanism (handshake, protocol, cache, lifecycle, cross-process contract), open with the 4-step context-reload from the preamble — background → what problem the mechanism solves → numbered how-it-works → what breaks — in 4-8 lines. The reader is an expert but has not paged this mechanism in; one who has to reconstruct it from the diff before judging the finding won't.
+   - **In the reader's words, not yours**: strip every noun you only know because you spent an hour in the code (*the ring*, *the frontier*, *the stamp*, *the handshake*). Replace it with what the thing plainly is, or name it once where you explain it. Real code names stay — in backticks, with a permalink, with the plain meaning beside them. Apply this to the TL;DR and the **Action:** line first; those are read alone.
+   - **Actionable**: lead with the issue, then a bolded **Action:** line naming the exact file/function to change. Give the concrete fix (snippet / schema / signature) when known, and note placement + DRY concerns (e.g. "factor this predicate into one helper so the guard can't drift from the loop"). Cut reassurance/editorializing — if the answer to "what should the author DO?" is "nothing," drop the comment or move it to the review body.
+   - **Tangible**: if the finding has a concrete failing case, SHOW it (per the preamble rule) — the triggering config/input, 3-5 permalinked steps from input to symptom, and the real symptom string; or a one-line repro ("run `<recipe>` with `<delta>` → `<symptom>`"). This is the single highest-leverage thing that makes a reviewer's ask land: an author can argue with "this isn't validated", but not with a YAML block and a trace ending in the exact error they'd see. Budget it: config block + a few one-line bullets. A finding with no demonstrable failing case is a weaker finding — reflect that in its score rather than dressing it up in prose.
    - Label each finding **PR-introduced** vs **pre-existing/adjacent** in one clause near the top
    - Start with a permalink to the code being commented on
-   - **Evidence permalinks**: When a finding references behavior in upstream code (Megatron-LM,
-     Megatron-Bridge, etc.), include permalinks to the specific lines that prove the claim.
-     Use the submodule's own GitHub repo + pinned SHA (from `git ls-tree HEAD 3rdparty/...`).
-     Example: linking to the deprecation notice, the assertion that would crash, the enum
-     definition that shows a missing member, or the `__post_init__` normalization logic.
-     Every claim about external code must have a clickable link — don't just cite file:line.
+   - **Evidence permalinks**: When a finding references behavior in upstream code (Megatron-LM, Megatron-Bridge, etc.), include permalinks to the specific lines that prove the claim. Use the submodule's own GitHub repo + pinned SHA (from `git ls-tree HEAD 3rdparty/...`). Example: linking to the deprecation notice, the assertion that would crash, the enum definition that shows a missing member, or the `__post_init__` normalization logic. Every claim about external code must have a clickable link — don't just cite file:line.
    - For call-stack reasoning (e.g. "A calls B which asserts C"), link each step in the chain
-   - **Include a `suggestion` block whenever the fix is a concrete edit to line(s) in the diff** — not just for
-     docstrings/tests. It is directly committable from the UI, so it is the most actionable form a finding can
-     take; default to it for any clear code/docs fix. The block must contain the exact replacement for the
-     commented line(s) (they are replaced verbatim), so anchor the comment on the line the edit changes. Skip it
-     only when the change isn't a single-region edit (multi-file, a line not in the diff, or an operational/config
-     ask) — then give the concrete change in prose. When multiple valid fixes exist, show one but label it **one
-     way to do it** so it reads as illustrative:
+   - **Include a `suggestion` block whenever the fix is a concrete edit to line(s) in the diff** — not just for docstrings/tests. It is directly committable from the UI, so it is the most actionable form a finding can take; default to it for any clear code/docs fix. The block must contain the exact replacement for the commented line(s) (they are replaced verbatim), so anchor the comment on the line the edit changes. Skip it only when the change isn't a single-region edit (multi-file, a line not in the diff, or an operational/config ask) — then give the concrete change in prose. When multiple valid fixes exist, show one but label it **one way to do it** so it reads as illustrative:
      ````
      ```suggestion
      corrected code here
      ```
      ````
-7. Incorporate linter results from the background `pre-commit` run (§1.5b) — attribute findings ONLY to files
-   in the PR diff (`gh pr view $PRNUM --json files`), and flag any new source file missing from `pyrefly.toml`
+7. Incorporate linter results from the background `pre-commit` run (§1.5b) — attribute findings ONLY to files in the PR diff (`gh pr view $PRNUM --json files`), and flag any new source file missing from `pyrefly.toml`
 8. Incorporate comment-reviewer's thread response drafts
 9. Incorporate test-agent's verified test suggestions
 
@@ -1327,28 +1145,15 @@ After all Wave 2 agents complete:
 
 #### Comment IDs: C1, C2, C3 … — never reused
 
-Give every comment a short ID — `C1`, `C2`, `C3`, … — so the user can say "drop C4" or "reword
-C7" when talking to an agent. Thread replies get IDs from the same counter.
+Give every comment a short ID — `C1`, `C2`, `C3`, … — so the user can say "drop C4" or "reword C7" when talking to an agent. Thread replies get IDs from the same counter.
 
-- **Number once, in preview order.** Assign IDs when you first show the findings here, top to
-  bottom. Put the ID at the start of every card (`**C1 · BUG**`), in the pre-POST audit table,
-  and in every later message that mentions the comment.
-- **An ID is permanent.** It stays with that comment through edits, re-anchoring, staging and
-  publishing. Never renumber to close gaps.
-- **Never reuse an ID.** A deleted comment's number is retired. A new or replacement comment
-  takes the next number above the highest one ever used. Example: C1–C5 exist, the user
-  deletes C2 and C3 and asks for one comment to replace them → it is `C6`, not `C2`. The next
-  new comment after that is `C7`.
-- **Keep the counter across sessions.** Record the ID → GitHub comment ID map, the retired IDs,
-  and the next free number in the PR's memory file (Phase 6). On a re-review or follow-up of the
-  same PR, continue from that number instead of starting over at C1.
-- **The ID goes in the posted text too.** Every inline comment and thread reply starts with it
-  (`**C<n> · 1 action item.**`), and each review-body list item that summarizes a comment names
-  it (`1. (C13) …`). Use the same number as in previews, explainer pages and memory files. Why:
-  the user reads the staged review on GitHub and refers to comments by ID when asking for changes.
+- **Number once, in preview order.** Assign IDs when you first show the findings here, top to bottom. Put the ID at the start of every card (`**C1 · BUG**`), in the pre-POST audit table, and in every later message that mentions the comment.
+- **An ID is permanent.** It stays with that comment through edits, re-anchoring, staging and publishing. Never renumber to close gaps.
+- **Never reuse an ID.** A deleted comment's number is retired. A new or replacement comment takes the next number above the highest one ever used. Example: C1–C5 exist, the user deletes C2 and C3 and asks for one comment to replace them → it is `C6`, not `C2`. The next new comment after that is `C7`.
+- **Keep the counter across sessions.** Record the ID → GitHub comment ID map, the retired IDs, and the next free number in the PR's memory file (Phase 6). On a re-review or follow-up of the same PR, continue from that number instead of starting over at C1.
+- **The ID goes in the posted text too.** Every inline comment and thread reply starts with it (`**C<n> · 1 action item.**`), and each review-body list item that summarizes a comment names it (`1. (C13) …`). Use the same number as in previews, explainer pages and memory files. Why: the user reads the staged review on GitHub and refers to comments by ID when asking for changes.
 
-Display ALL findings to the user using the card layout. Group by severity (Critical, then
-Suggestions, then Informational), with each finding as a blockquote card:
+Display ALL findings to the user using the card layout. Group by severity (Critical, then Suggestions, then Informational), with each finding as a blockquote card:
 
 ```markdown
 ## Review: PR #$PRNUM — $TITLE
@@ -1450,40 +1255,28 @@ If user picks "Discuss individually": iterate through items. For each, ask if th
 
 ## Phase 5: Post Review
 
-**IMPORTANT**: Post everything as a single review. Never post separate standalone comments
-via the issues API.
+**IMPORTANT**: Post everything as a single review. Never post separate standalone comments via the issues API.
 
 ### Known GitHub limitation: PENDING review bodies get wiped on UI submit
 
-When a PENDING review is created via the API with a `body`, the GitHub UI's "Submit review"
-dialog has its own text area that **defaults to empty**. Clicking "Submit" in the UI
-**overwrites** the API-set body with the (empty) text area contents. Only inline `comments`
-survive because they are separate objects.
+When a PENDING review is created via the API with a `body`, the GitHub UI's "Submit review" dialog has its own text area that **defaults to empty**. Clicking "Submit" in the UI **overwrites** the API-set body with the (empty) text area contents. Only inline `comments` survive because they are separate objects.
 
 **Fix**: Do NOT ask the user to submit from the UI. Instead:
 1. Create the PENDING review (body + inline comments) — this stages everything
-2. **Show the user a link to the PENDING review on GitHub** so they can preview the
-   actual rendered comments in context
+2. **Show the user a link to the PENDING review on GitHub** so they can preview the actual rendered comments in context
 3. Ask for FINAL confirmation to publish — use `AskUserQuestion` with options:
    - **Publish** — submit the review via API
-   - **Edit** — user wants to iterate on specific comments (edit IN PLACE via the GraphQL
-     `updatePullRequestReviewComment` mutation — see Step "Edit comments" below — then re-ask)
+   - **Edit** — user wants to iterate on specific comments (edit IN PLACE via the GraphQL `updatePullRequestReviewComment` mutation — see Step "Edit comments" below — then re-ask)
    - **Cancel** — delete the comments this session added and stop (never the review itself; see below)
 4. Only after explicit "Publish" confirmation, submit via the events endpoint
 
-**CRITICAL**: Do NOT submit the review immediately after creating it. The user MUST have
-a chance to preview the staged comments on GitHub and request edits before publishing.
-The Phase 4 selection ("Stage all") only stages — it does NOT authorize publishing.
+**CRITICAL**: Do NOT submit the review immediately after creating it. The user MUST have a chance to preview the staged comments on GitHub and request edits before publishing. The Phase 4 selection ("Stage all") only stages — it does NOT authorize publishing.
 
 ### Step 0a: Pre-POST audit — MANDATORY, and you must show the table
 
-Prose checklists do not get followed. This one is gated on visible output: **build the payload in a
-script, run these checks in the same script, print the per-comment OK/FAIL table into your reply, and
-do not call `gh api … /reviews` until every row is OK.** If the table is not in your reply, you did not
-run it — the user reads its absence as a skipped audit, because that is exactly what it means.
+Prose checklists do not get followed. This one is gated on visible output: **build the payload in a script, run these checks in the same script, print the per-comment OK/FAIL table into your reply, and do not call `gh api … /reviews` until every row is OK.** If the table is not in your reply, you did not run it — the user reads its absence as a skipped audit, because that is exactly what it means.
 
-Do NOT keep a checked-in audit script. Write it fresh each run from this spec, so the checks track the
-spec rather than rotting beside it. Every check below is mechanical; there is no judgement to defer.
+Do NOT keep a checked-in audit script. Write it fresh each run from this spec, so the checks track the spec rather than rotting beside it. Every check below is mechanical; there is no judgement to defer.
 
 Per inline comment:
 
@@ -1501,8 +1294,7 @@ Per inline comment:
 | `oneAI` | WARN, not FAIL: >1 `### AI-n` heading in a single comment. Check whether it is two findings wanting two anchors (that is how a suggestion block goes missing). Several AIs on the same anchored lines are fine. |
 | `anchor` | `git show <current-head>:<path>` at the anchored line does not contain the expected subject token |
 
-On the review body: no monologue, no banned words, and every inline comment it references (by `(C<n>)`)
-must exist in the final payload (a body pointing at a comment the user deleted is a dangling reference).
+On the review body: no monologue, no banned words, and every inline comment it references (by `(C<n>)`) must exist in the final payload (a body pointing at a comment the user deleted is a dangling reference).
 
 Editor drift check — run over comment-editor's output against the findings it was given:
 
@@ -1528,38 +1320,11 @@ REFUSING TO POST (1 failure)
 
 ### Step 0b: Pre-stage checklist — run for EVERY comment, at the initial POST and again for every later `addPullRequestReviewThread`/edit
 
-1. **Anchor at the CURRENT head.** `addPullRequestReviewThread` interprets `line` against the PR's *current*
-   head, NOT the review's `commit_id`. After any author push, recompute every anchor via
-   `git show <current-head>:<path>` and assert the line contains the comment's subject token before posting.
-   (Comments in the original POST are auto-remapped by GitHub when the head moves; GraphQL-added ones are not —
-   a stale line number lands the comment on unrelated code.) When the head has moved mid-review, audit ALL
-   staged comments: GraphQL `comments.nodes{path line originalLine}`; a post-push comment with
-   `line == originalLine` in a file that shifted is the tell that it anchored against the wrong baseline.
-2. **Every named code reference is a clickable permalink** at a pinned SHA — including upstream repos (Gym,
-   aiohttp, ray at the versions in `uv.lock`) and upstack stack PRs (their head SHAs) — and every permalink is
-   verified programmatically (the `L()` helper with `expect` tokens; refuse to emit the payload on mismatch).
-   Claims about external behavior ("aiohttp returns 504", "Gym retries this status") get a permalink to the
-   exact upstream line that proves them, not just an assertion.
-   **Run this as a mechanical pass, per comment, not as a vibe check.** For each staged body, list every
-   `code span`, every filename, and every `file:line` string; drop the ones that sit on the comment's own
-   anchored line; every survivor must be inside a `[...](...)`. Anything left bare is a defect — the author
-   cannot click it and will not go looking. Grep the assembled payload for the tell-tales before POSTing:
-   a `.py`/`.txt`/`.yaml` outside a link, or a `:\d+` outside a link. A single permalink in the opening
-   sentence does NOT discharge this for the rest of the comment; that is exactly how it gets missed.
-   Deleted code is linked at the BASE SHA (see the preamble rule) — verify those targets against
-   `git show <base>:<path>`, not against head, or the check passes while the link still points at the wrong
-   code. Observed on PR #3921: the user had to point out a comment whose entire body — five file references
-   and a cross-reference to a sibling comment — carried one link, to a line where the code no longer existed.
-3. **Suggestion-or-say-why** (see the preamble rule): every AI whose fix is a concrete single-region edit
-   carries a ```suggestion block sized to the region — multi-line regions need the comment created with
-   `startLine`/`line`. Anything else states in one clause why it isn't a suggestion.
-4. **Each AI sits on its target line** or opens with a permalink to it; an AI about a different file/line than
-   its comment's anchor is a split candidate.
-5. **Read it as the author, who has not read your investigation.** Is there a single noun in the comment that
-   you only know because you spent an hour in the code — a name you coined for a mechanism, a state, a buffer?
-   If yes, replace it with what the thing plainly is, or explain it where it first appears. Bare code
-   identifiers are fine (they are greppable and permalinked); invented English is not. Check the first line and
-   the **Action:** line hardest — they are read alone.
+1. **Anchor at the CURRENT head.** `addPullRequestReviewThread` interprets `line` against the PR's *current* head, NOT the review's `commit_id`. After any author push, recompute every anchor via `git show <current-head>:<path>` and assert the line contains the comment's subject token before posting. (Comments in the original POST are auto-remapped by GitHub when the head moves; GraphQL-added ones are not — a stale line number lands the comment on unrelated code.) When the head has moved mid-review, audit ALL staged comments: GraphQL `comments.nodes{path line originalLine}`; a post-push comment with `line == originalLine` in a file that shifted is the tell that it anchored against the wrong baseline.
+2. **Every named code reference is a clickable permalink** at a pinned SHA — including upstream repos (Gym, aiohttp, ray at the versions in `uv.lock`) and upstack stack PRs (their head SHAs) — and every permalink is verified programmatically (the `L()` helper with `expect` tokens; refuse to emit the payload on mismatch). Claims about external behavior ("aiohttp returns 504", "Gym retries this status") get a permalink to the exact upstream line that proves them, not just an assertion. **Run this as a mechanical pass, per comment, not as a vibe check.** For each staged body, list every `code span`, every filename, and every `file:line` string; drop the ones that sit on the comment's own anchored line; every survivor must be inside a `[...](...)`. Anything left bare is a defect — the author cannot click it and will not go looking. Grep the assembled payload for the tell-tales before POSTing: a `.py`/`.txt`/`.yaml` outside a link, or a `:\d+` outside a link. A single permalink in the opening sentence does NOT discharge this for the rest of the comment; that is exactly how it gets missed. Deleted code is linked at the BASE SHA (see the preamble rule) — verify those targets against `git show <base>:<path>`, not against head, or the check passes while the link still points at the wrong code. Observed on PR #3921: the user had to point out a comment whose entire body — five file references and a cross-reference to a sibling comment — carried one link, to a line where the code no longer existed.
+3. **Suggestion-or-say-why** (see the preamble rule): every AI whose fix is a concrete single-region edit carries a ```suggestion block sized to the region — multi-line regions need the comment created with `startLine`/`line`. Anything else states in one clause why it isn't a suggestion.
+4. **Each AI sits on its target line** or opens with a permalink to it; an AI about a different file/line than its comment's anchor is a split candidate.
+5. **Read it as the author, who has not read your investigation.** Is there a single noun in the comment that you only know because you spent an hour in the code — a name you coined for a mechanism, a state, a buffer? If yes, replace it with what the thing plainly is, or explain it where it first appears. Bare code identifiers are fine (they are greppable and permalinked); invented English is not. Check the first line and the **Action:** line hardest — they are read alone.
 
 ### Step 1: Create PENDING review with body + inline comments
 
@@ -1567,35 +1332,20 @@ Do NOT include `event` — omitting it creates a PENDING review.
 
 Add `_Generated by Claude Code_` at the end of the review body.
 
-**CRITICAL — All actionable findings MUST be inline comments, not body text.** The review
-body is the right place for general context: PR summary, merge conflict notes, overall
-impressions, agent count, and non-actionable observations. But every **actionable finding**
-(bugs, guideline violations, test gaps, doc issues) — even those about files not in the
-diff — MUST be posted as an inline comment tied to the most relevant file:line. Actionable
-items buried in the review body are easy to miss and hard to track as resolved.
+**CRITICAL — All actionable findings MUST be inline comments, not body text.** The review body is the right place for general context: PR summary, merge conflict notes, overall impressions, agent count, and non-actionable observations. But every **actionable finding** (bugs, guideline violations, test gaps, doc issues) — even those about files not in the diff — MUST be posted as an inline comment tied to the most relevant file:line. Actionable items buried in the review body are easy to miss and hard to track as resolved.
 
 **How to tie "general" findings to inline comments:**
-- Bug in a file NOT in the diff (e.g. a test file missing a new required field): place the
-  comment on the diff line that INTRODUCES the requirement (e.g. the new field declaration
-  or the code that reads it), and reference the affected external file(s) in the comment body.
-- PR description issue (e.g. wrong field name in docs): place the comment on the diff line
-  where the field is defined, noting the description mismatch.
-- Test coverage gaps: place the comment on the most relevant test file that IS in the diff,
-  listing the untested functions with permalinks.
+- Bug in a file NOT in the diff (e.g. a test file missing a new required field): place the comment on the diff line that INTRODUCES the requirement (e.g. the new field declaration or the code that reads it), and reference the affected external file(s) in the comment body.
+- PR description issue (e.g. wrong field name in docs): place the comment on the diff line where the field is defined, noting the description mismatch.
+- Test coverage gaps: place the comment on the most relevant test file that IS in the diff, listing the untested functions with permalinks.
 - General observations (unseeded RNG, etc.): place on the most relevant source line in the diff.
 
 **IMPORTANT — Evidence permalinks in every inline comment**: Each comment body MUST include:
 1. A permalink to the code being commented on (the line in the PR diff)
-2. **Evidence permalinks** to any upstream/external code that proves the claim — e.g. the
-   Megatron-LM line showing a deprecation notice, the assertion that would crash, the enum
-   definition showing a missing member. For submodule code, use the submodule's own GitHub
-   repo URL + pinned SHA (from `git ls-tree HEAD 3rdparty/<submodule>`). Quote the relevant
-   code snippet inline so the reader doesn't have to click through for the gist.
+2. **Evidence permalinks** to any upstream/external code that proves the claim — e.g. the Megatron-LM line showing a deprecation notice, the assertion that would crash, the enum definition showing a missing member. For submodule code, use the submodule's own GitHub repo URL + pinned SHA (from `git ls-tree HEAD 3rdparty/<submodule>`). Quote the relevant code snippet inline so the reader doesn't have to click through for the gist.
 3. For call-stack reasoning, link each step: "A [calls B](<link>) which [asserts C](<link>)"
 
-Use Python `json.dump` to generate the review JSON — this avoids shell escaping issues with
-backticks, quotes, and markdown in comment bodies. Use the GraphQL `addPullRequestReviewThread`
-mutation (see Step 1a) to add comments that can't be placed on diff lines in the initial POST.
+Use Python `json.dump` to generate the review JSON — this avoids shell escaping issues with backticks, quotes, and markdown in comment bodies. Use the GraphQL `addPullRequestReviewThread` mutation (see Step 1a) to add comments that can't be placed on diff lines in the initial POST.
 
 ```bash
 cat <<'REVIEW_JSON' > "$TMPDIR/review.json"
@@ -1613,17 +1363,13 @@ gh api repos/NVIDIA-NeMo/RL/pulls/$PRNUM/reviews \
   --method POST --input "$TMPDIR/review.json"
 ```
 
-Save the returned review `id` as `$REVIEW_ID`. Always print the pending review
-URL so the user can click through to preview it:
+Save the returned review `id` as `$REVIEW_ID`. Always print the pending review URL so the user can click through to preview it:
 
 ```
 https://github.com/NVIDIA-NeMo/RL/pull/$PRNUM#pullrequestreview-$REVIEW_ID
 ```
 
-**Verify the staged comment count with GraphQL, not REST — REST under-reports on a PENDING review.**
-`GET /pulls/<n>/reviews/<id>/comments` can return fewer comments than were actually attached (observed:
-30 returned for a 32-comment pending review). Trusting it leads to "re-adding" comments that are already
-there and silently creating duplicates. Always confirm with GraphQL, which reports the true `totalCount`:
+**Verify the staged comment count with GraphQL, not REST — REST under-reports on a PENDING review.** `GET /pulls/<n>/reviews/<id>/comments` can return fewer comments than were actually attached (observed: 30 returned for a 32-comment pending review). Trusting it leads to "re-adding" comments that are already there and silently creating duplicates. Always confirm with GraphQL, which reports the true `totalCount`:
 
 ```bash
 cat > /tmp/q.json <<'JSON'
@@ -1634,51 +1380,28 @@ gh api graphql --input /tmp/q.json \
 ```
 
 Rules that follow from this:
-- After creating the review, assert `totalCount == len(comments)` in your payload before telling the user
-  it is staged. If it is short, the POST silently dropped some — recreate the review rather than patching.
-- If comments really are missing, prefer **deleting the review and re-POSTing the canonical JSON** over
-  adding the stragglers with `addPullRequestReviewThread`. Re-adding is what creates duplicates, and a
-  pending review has no cheap dedupe.
-- To find duplicates after the fact, list `(path, body[:60])` from the GraphQL `nodes` and look for repeats;
-  each duplicate's `databaseId` is what you would need to delete.
-- The same caution applies when answering "did the author address my comments?" — enumerate threads via
-  GraphQL so you do not miss ones REST omits.
+- After creating the review, assert `totalCount == len(comments)` in your payload before telling the user it is staged. If it is short, the POST silently dropped some — recreate the review rather than patching.
+- If comments really are missing, prefer **deleting the review and re-POSTing the canonical JSON** over adding the stragglers with `addPullRequestReviewThread`. Re-adding is what creates duplicates, and a pending review has no cheap dedupe.
+- To find duplicates after the fact, list `(path, body[:60])` from the GraphQL `nodes` and look for repeats; each duplicate's `databaseId` is what you would need to delete.
+- The same caution applies when answering "did the author address my comments?" — enumerate threads via GraphQL so you do not miss ones REST omits.
 
 ### 🚫 The staged review is the USER'S, not yours — never add or remove a comment unilaterally
 
-Once the review is staged, the user edits it out of band: adding comments of their own in the GitHub UI,
-deleting ones they disagree with, rewording others. **Those edits are decisions, and they are invisible to
-you unless you re-read the live review.** Treat the server as the source of truth and your own record as
-stale the moment you finish a POST.
+Once the review is staged, the user edits it out of band: adding comments of their own in the GitHub UI, deleting ones they disagree with, rewording others. **Those edits are decisions, and they are invisible to you unless you re-read the live review.** Treat the server as the source of truth and your own record as stale the moment you finish a POST.
 
 Three rules, and the count rule is the one that bites:
 
-- **A comment that is missing was deleted on purpose. Do NOT recreate it.** If the live `totalCount` is
-  lower than your record, the difference is the user pruning, not a POST that dropped comments. Re-adding
-  it costs them the work of deleting it twice and silently overrides a call they already made. This is the
-  one case where the "assert `totalCount == len(comments)`" rule above does NOT apply — that check is only
-  valid in the moments immediately after your own POST, before the user has touched anything.
-- **A comment you do not recognise is theirs. Do NOT delete it.** Before deleting anything, fetch the live
-  comment and confirm it is one you wrote in this session. Never delete by position, by count, or by
-  "everything except the list I have".
-- **Delete only what the user names.** They will point at a specific comment — by URL, by `#rNNN...` id, or
-  by describing it. Resolve that to one `databaseId`, delete exactly that one, and report the new live
-  count. Never infer a deletion from a general remark about the review being too long.
+- **A comment that is missing was deleted on purpose. Do NOT recreate it.** If the live `totalCount` is lower than your record, the difference is the user pruning, not a POST that dropped comments. Re-adding it costs them the work of deleting it twice and silently overrides a call they already made. This is the one case where the "assert `totalCount == len(comments)`" rule above does NOT apply — that check is only valid in the moments immediately after your own POST, before the user has touched anything.
+- **A comment you do not recognise is theirs. Do NOT delete it.** Before deleting anything, fetch the live comment and confirm it is one you wrote in this session. Never delete by position, by count, or by "everything except the list I have".
+- **Delete only what the user names.** They will point at a specific comment — by URL, by `#rNNN...` id, or by describing it. Resolve that to one `databaseId`, delete exactly that one, and report the new live count. Never infer a deletion from a general remark about the review being too long.
 
-Before any mutation of a staged review — add, edit, or delete — **re-read it live** and diff against your
-record. If something moved that you did not move, stop and ask rather than reconciling it yourself. And
-never delete the pending review to "clean up": it is one pending review per user per PR, so their
-hand-written drafts live inside it and go with it.
+Before any mutation of a staged review — add, edit, or delete — **re-read it live** and diff against your record. If something moved that you did not move, stop and ask rather than reconciling it yourself. And never delete the pending review to "clean up": it is one pending review per user per PR, so their hand-written drafts live inside it and go with it.
 
-**If the `gh api` POST is blocked by permissions**: Print the exact command for the
-user to run manually (prefixed with `!`). After they run it, parse the returned JSON
-for the `id` field and print the pending review URL.
+**If the `gh api` POST is blocked by permissions**: Print the exact command for the user to run manually (prefixed with `!`). After they run it, parse the returned JSON for the `id` field and print the pending review URL.
 
 ### Step 1a: Add additional comments to a PENDING review
 
-If the user asks to add more inline comments after the review is created, use the
-**GraphQL** `addPullRequestReviewThread` mutation. The REST API cannot add comments
-to an existing pending review.
+If the user asks to add more inline comments after the review is created, use the **GraphQL** `addPullRequestReviewThread` mutation. The REST API cannot add comments to an existing pending review.
 
 Use Python to generate the JSON, then call `gh api graphql --input <file>`:
 
@@ -1711,8 +1434,7 @@ gh api graphql --input "$TMPDIR/add_comment.json"
 
 **Key details:**
 - Use `node_id` from the review creation response (e.g. `"PRR_kwDO..."`) — NOT the integer `id`
-- The mutation is `addPullRequestReviewThread` — NOT `addPullRequestReviewComment`
-  (`addPullRequestReviewComment` does not accept `line`)
+- The mutation is `addPullRequestReviewThread` — NOT `addPullRequestReviewComment` (`addPullRequestReviewComment` does not accept `line`)
 - REST endpoints that do NOT work for this:
   - `POST /pulls/$PRNUM/reviews/$REVIEW_ID/comments` → 404 (doesn't exist)
   - `POST /pulls/$PRNUM/comments` with `pull_request_review_id` → 422 (not a permitted key)
@@ -1730,14 +1452,11 @@ gh api repos/NVIDIA-NeMo/RL/pulls/$PRNUM/reviews/$REVIEW_ID/events --method POST
 
 Use `AskUserQuestion` with options: **Publish**, **Edit comments**, **Cancel**.
 
-If user picks "Edit comments": ask which comment to change, then edit it IN PLACE with the GraphQL
-`updatePullRequestReviewComment` mutation (by the comment's `node_id`), then re-ask.
+If user picks "Edit comments": ask which comment to change, then edit it IN PLACE with the GraphQL `updatePullRequestReviewComment` mutation (by the comment's `node_id`), then re-ask.
 
-**Do NOT use REST `PATCH /pulls/comments/$COMMENT_ID` while the review is still PENDING — it returns 404**
-(that endpoint only works once the review is submitted). While pending, use GraphQL:
+**Do NOT use REST `PATCH /pulls/comments/$COMMENT_ID` while the review is still PENDING — it returns 404** (that endpoint only works once the review is submitted). While pending, use GraphQL:
 - ADD a new inline comment → `addPullRequestReviewThread` (Step 1a)
-- REPLY to an existing thread → `addPullRequestReviewComment` with `inReplyTo` (Step 3). Replies
-  can be pending; only the REST `/replies` endpoint cannot.
+- REPLY to an existing thread → `addPullRequestReviewComment` with `inReplyTo` (Step 3). Replies can be pending; only the REST `/replies` endpoint cannot.
 - EDIT an existing one → `updatePullRequestReviewComment`
 
 Get a pending comment's `node_id` from the review's comment list:
@@ -1756,10 +1475,7 @@ open("/tmp/edit.json","w").write(json.dumps(gql))
 subprocess.run(["gh","api","graphql","--input","/tmp/edit.json"])
 ```
 
-If user picks "Cancel": re-read the live review, then delete only the comments this session added, one
-`databaseId` at a time (`gh api repos/NVIDIA-NeMo/RL/pulls/comments/$COMMENT_ID --method DELETE`). Never delete
-the pending review itself: it may hold the user's own drafts (see "The staged review is the USER'S" above).
-If the user explicitly asks to delete the whole review, confirm it holds nothing they wrote first.
+If user picks "Cancel": re-read the live review, then delete only the comments this session added, one `databaseId` at a time (`gh api repos/NVIDIA-NeMo/RL/pulls/comments/$COMMENT_ID --method DELETE`). Never delete the pending review itself: it may hold the user's own drafts (see "The staged review is the USER'S" above). If the user explicitly asks to delete the whole review, confirm it holds nothing they wrote first.
 
 ### Step 2: Submit the review via API after user confirms "Publish"
 
@@ -1770,19 +1486,13 @@ gh api repos/NVIDIA-NeMo/RL/pulls/$PRNUM/reviews/$REVIEW_ID/events \
   --method POST -f event=COMMENT
 ```
 
-This publishes the review atomically (body + all inline comments) without going through
-the UI's text area, so the body is preserved.
+This publishes the review atomically (body + all inline comments) without going through the UI's text area, so the body is preserved.
 
 ### Step 3: Thread replies — stage them PENDING, in the same review
 
-**A reply to an existing thread CAN be part of a pending review.** Stage it like every other
-comment, so the user previews the whole review — replies included — before anything publishes.
-Do NOT defer replies until after submitting, and do NOT tell the user replies must wait.
+**A reply to an existing thread CAN be part of a pending review.** Stage it like every other comment, so the user previews the whole review — replies included — before anything publishes. Do NOT defer replies until after submitting, and do NOT tell the user replies must wait.
 
-What misleads here is the REST endpoint. `POST /pulls/$PRNUM/comments/$COMMENT_ID/replies`
-publishes immediately and returns `422: user_id can only have one pending review per pull
-request` while a pending review exists — which reads as "replies cannot be pending". It only
-means *that endpoint* cannot. Use GraphQL instead:
+What misleads here is the REST endpoint. `POST /pulls/$PRNUM/comments/$COMMENT_ID/replies` publishes immediately and returns `422: user_id can only have one pending review per pull request` while a pending review exists — which reads as "replies cannot be pending". It only means *that endpoint* cannot. Use GraphQL instead:
 
 ```python
 import json, subprocess
@@ -1805,19 +1515,12 @@ subprocess.run(["gh", "api", "graphql", "--input", "/tmp/reply.json"])
 ```
 
 Key details, each of which costs a round-trip if you get it wrong:
-- `inReplyTo` is the **node_id of the thread's ROOT comment**, not the comment you are answering.
-  A thread's root is the one whose `in_reply_to_id` is null. Get both from
-  `gh api repos/NVIDIA-NeMo/RL/pulls/$PRNUM/comments --jq '.[] | "\(.id) \(.node_id) \(.path):\(.line) \(.in_reply_to_id // "-")"'`.
-- `addPullRequestReviewComment` is the right mutation here precisely *because* it takes
-  `inReplyTo` and does NOT take `line` — a reply inherits the thread's anchor. Use
-  `addPullRequestReviewThread` (Step 1a) only for a NEW thread on a line.
-- Order matters: create the pending review FIRST (Step 1), then attach replies to it with the
-  returned `node_id`. There is no pending review to attach to before that.
-- Verify with the GraphQL count from Step 1 — replies are counted in the review's
-  `comments.totalCount`, so a 6-comment review plus 1 reply must report 7.
+- `inReplyTo` is the **node_id of the thread's ROOT comment**, not the comment you are answering. A thread's root is the one whose `in_reply_to_id` is null. Get both from `gh api repos/NVIDIA-NeMo/RL/pulls/$PRNUM/comments --jq '.[] | "\(.id) \(.node_id) \(.path):\(.line) \(.in_reply_to_id // "-")"'`.
+- `addPullRequestReviewComment` is the right mutation here precisely *because* it takes `inReplyTo` and does NOT take `line` — a reply inherits the thread's anchor. Use `addPullRequestReviewThread` (Step 1a) only for a NEW thread on a line.
+- Order matters: create the pending review FIRST (Step 1), then attach replies to it with the returned `node_id`. There is no pending review to attach to before that.
+- Verify with the GraphQL count from Step 1 — replies are counted in the review's `comments.totalCount`, so a 6-comment review plus 1 reply must report 7.
 
-Post a reply through the REST `/replies` endpoint only when you deliberately want it published
-on its own, outside any review.
+Post a reply through the REST `/replies` endpoint only when you deliberately want it published on its own, outside any review.
 
 After the review is published, tell the user:
 > Review published on GitHub with <N> inline comments and review summary.
@@ -1826,37 +1529,18 @@ After the review is published, tell the user:
 
 **Full workflow: run `/review-pr-team-verify-followup <pr>`.** It validates each thread, replies `fixed in <sha>` and resolves the fixed ones, and turns partial fixes into a pending follow-up review, which replaces the "partially fixed" reply below.
 
-**Trigger**: the user asks to update the review comments after new commits land, OR asks a
-question like "did the author address my review?" / "did they fix my comments?" (often in a
-follow-up session). That question is the request to run this workflow — don't just summarize;
-after reporting, post the fixed-in replies below (confirm with the user first if they only asked
-the question).
+**Trigger**: the user asks to update the review comments after new commits land, OR asks a question like "did the author address my review?" / "did they fix my comments?" (often in a follow-up session). That question is the request to run this workflow — don't just summarize; after reporting, post the fixed-in replies below (confirm with the user first if they only asked the question).
 
-Method: list the author's **new commits since the reviewed head SHA**
-(`gh pr view $PRNUM --json commits` or `git log <reviewed-sha>..<new-head>`), fetch each commit's
-diff (`gh api repos/NVIDIA-NeMo/RL/commits/$SHA`), and **verify each open review thread against
-those diffs** (re-run the linter/test, inspect the code at that SHA). Then handle each thread by
-how much of the finding was addressed:
+Method: list the author's **new commits since the reviewed head SHA** (`gh pr view $PRNUM --json commits` or `git log <reviewed-sha>..<new-head>`), fetch each commit's diff (`gh api repos/NVIDIA-NeMo/RL/commits/$SHA`), and **verify each open review thread against those diffs** (re-run the linter/test, inspect the code at that SHA). Then handle each thread by how much of the finding was addressed:
 
-- **Completely fixed, and it's VERY OBVIOUS** (the commit's diff directly implements the asked-for
-  change) → reply with exactly `fixed in <full-commit-sha>` (nothing else needed). If it is not
-  obvious — the diff only partially overlaps the ask, or you'd have to infer intent — do NOT post
-  a "fixed" reply; treat it as partial or unaddressed instead.
-- **Not fixed at all** → **do not reply**. Leave the thread as-is; a "still not fixed" note adds
-  noise. (Only surface unaddressed findings to the user in your summary, not on the PR thread.)
-- **Partially fixed** → reply noting it's partially resolved in `<full-commit-sha>` **and spell out
-  how**: what the commit did address and what still remains (the specific sub-item / file:line not
-  yet handled), so the author knows the thread isn't done. Do not mark it simply "fixed."
+- **Completely fixed, and it's VERY OBVIOUS** (the commit's diff directly implements the asked-for change) → reply with exactly `fixed in <full-commit-sha>` (nothing else needed). If it is not obvious — the diff only partially overlaps the ask, or you'd have to infer intent — do NOT post a "fixed" reply; treat it as partial or unaddressed instead.
+- **Not fixed at all** → **do not reply**. Leave the thread as-is; a "still not fixed" note adds noise. (Only surface unaddressed findings to the user in your summary, not on the PR thread.)
+- **Partially fixed** → reply noting it's partially resolved in `<full-commit-sha>` **and spell out how**: what the commit did address and what still remains (the specific sub-item / file:line not yet handled), so the author knows the thread isn't done. Do not mark it simply "fixed."
 
 Rules:
-- Use the **full 40-char commit SHA**, as **plain text with NO backticks / code span**. GitHub's UI
-  only auto-links a bare SHA into a clickable commit permalink; wrapping it in backticks (or any
-  code formatting) suppresses the auto-link. This is the opposite of the usual "wrap code refs in
-  backticks" rule — for a fixed-in commit reference, backticks are wrong.
-- Base the fixed/partial/not-fixed verdict on evidence you confirmed (code present at that SHA +
-  linter/test result), never on the author's claim alone.
-- Post as a **reply to the existing review-comment thread** (the `/comments/$COMMENT_ID/replies`
-  endpoint above), not as a new top-level comment.
+- Use the **full 40-char commit SHA**, as **plain text with NO backticks / code span**. GitHub's UI only auto-links a bare SHA into a clickable commit permalink; wrapping it in backticks (or any code formatting) suppresses the auto-link. This is the opposite of the usual "wrap code refs in backticks" rule — for a fixed-in commit reference, backticks are wrong.
+- Base the fixed/partial/not-fixed verdict on evidence you confirmed (code present at that SHA + linter/test result), never on the author's claim alone.
+- Post as a **reply to the existing review-comment thread** (the `/comments/$COMMENT_ID/replies` endpoint above), not as a new top-level comment.
 
 ```bash
 # Completely fixed:
@@ -1874,14 +1558,9 @@ gh api repos/NVIDIA-NeMo/RL/pulls/$PRNUM/comments/$COMMENT_ID/replies \
 
 ## Phase 6: Capture review lessons (memory write-back)
 
-Shared lessons live in `references/` next to this file and change only through a PR. New lessons go to the
-machine-local store (`~/.claude/review-memory/RL/`), which only grows if you write to it. After the review is
-posted — and **especially whenever the USER corrects, adds, reframes, or pushes back on a finding** during the
-session — distill the durable lesson into a new (or updated) memory file there.
+Shared lessons live in `references/` next to this file and change only through a PR. New lessons go to the machine-local store (`~/.claude/review-memory/RL/`), which only grows if you write to it. After the review is posted — and **especially whenever the USER corrects, adds, reframes, or pushes back on a finding** during the session — distill the durable lesson into a new (or updated) memory file there.
 
-Write a lesson only when it is **general and reusable**: a review-process rule, a repo convention, a recurring
-class of bug/smell, or an operational gotcha. Do NOT write one-off facts about this single PR. Match the
-existing schema:
+Write a lesson only when it is **general and reusable**: a review-process rule, a repo convention, a recurring class of bug/smell, or an operational gotcha. Do NOT write one-off facts about this single PR. Match the existing schema:
 
 ```markdown
 ---
@@ -1902,34 +1581,17 @@ metadata:
 **Seen:** #<PR> <item> (<team|user>)
 ```
 
-**The count.** `count` is how many separate times the pattern has shown up in a reviewed PR. A new
-memory starts at the number of occurrences in this PR. That is usually 1, but if the author made
-the same mistake twice in one PR (two copied key lists, two name-keyed capability lists), it starts
-at 2 with both listed in **Seen**. In each Seen entry, write who caught it: `team` if the review
-raised it on its own, `user` if the user had to ask for it.
+**The count.** `count` is how many separate times the pattern has shown up in a reviewed PR. A new memory starts at the number of occurrences in this PR. That is usually 1, but if the author made the same mistake twice in one PR (two copied key lists, two name-keyed capability lists), it starts at 2 with both listed in **Seen**. In each Seen entry, write who caught it: `team` if the review raised it on its own, `user` if the user had to ask for it.
 
-**Fit before you create.** If an existing memory would have caught the case, do not write a new
-file. Bump its `count` (once per occurrence), set `last_seen`, add the Seen entry, and widen its
-wording by a sentence only if it would not quite have caught this case. If a memory has no `count`
-yet, first set it to the number of incidents its body already describes. Never count the same
-occurrence twice. When a memory reaches count 3, suggest promoting it to a TEST in this skill.
-If the rule that would have caught the case lives in `references/`, do not edit that file here: write
-(or bump) a local memory whose body names the reference file and rule, so the next upstreaming PR can
-bump the ★ or widen the rule.
+**Fit before you create.** If an existing memory would have caught the case, do not write a new file. Bump its `count` (once per occurrence), set `last_seen`, add the Seen entry, and widen its wording by a sentence only if it would not quite have caught this case. If a memory has no `count` yet, first set it to the number of incidents its body already describes. Never count the same occurrence twice. When a memory reaches count 3, suggest promoting it to a TEST in this skill. If the rule that would have caught the case lives in `references/` or `skills/contributing/references/`, do not edit that file here: write (or bump) a local memory whose body names the reference file and rule, so the next upstreaming PR can bump the ★ or widen the rule.
 
-**Upstreaming.** When the user asks, move stable local lessons into the right `references/*.md` file
-(one rule per bullet: the rule in bold, then one short example), open a PR, and archive the moved local
-files so they are not read twice. If the lesson has steps, commands or repo maps the one-line rule cannot
-carry, copy it into `references/details/` and end the rule with `Details: [name](details/name.md)`.
+**Upstreaming.** When the user asks, move stable local lessons into the right `references/*.md` file (one rule per bullet: the rule in bold, then one short example), open a PR, and archive the moved local files so they are not read twice. If the lesson has steps, commands or repo maps the one-line rule cannot carry, copy it into `references/details/` and end the rule with `Details: [name](details/name.md)`.
 
 Set `scope:` deliberately — it routes the lesson when it is upstreamed:
 - `general` → a review-process rule: a `references/` file, or this skill's text once it is stable.
-- `repo-specific` → a NeMo-RL convention: `references/repo-conventions-*.md`, or later the repo's
-  contributor skills (`config-conventions`, `testing`, `cicd`, …).
+- `repo-specific` → a NeMo-RL convention. If an author can follow it while writing code, add it as a one-line rule to the matching `skills/contributing/references/<theme>.md`, and put any review-only steps in `references/details/` behind a `Review Details:` link. Only conventions that a reviewer alone acts on go to `references/repo-conventions-*.md`.
 
-Before writing, glob the folder and **UPDATE** an existing file if one already covers the topic rather than
-duplicating; delete a lesson that turns out wrong. (Materialize is human-triggered: the user asks you to
-review the folder and promote stable lessons into the appropriate skill, then prune what's been absorbed.)
+Before writing, glob the folder and **UPDATE** an existing file if one already covers the topic rather than duplicating; delete a lesson that turns out wrong. (Materialize is human-triggered: the user asks you to review the folder and promote stable lessons into the appropriate skill, then prune what's been absorbed.)
 
 ---
 
@@ -1940,8 +1602,4 @@ Send shutdown to each agent individually (broadcast doesn't support structured m
 SendMessage(to="<agent-name>", message={"type": "shutdown_request"})
 ```
 
-After all agents confirm shutdown, you're done. There is **no `TeamDelete` step** (that tool
-was removed). The team config directory is cleaned up automatically when the session ends; the
-task-list directory persists locally so a resumed session keeps its tasks (governed by
-`cleanupPeriodDays`). Sending each teammate a `shutdown_request` is still the graceful way to
-free their contexts before you finish.
+After all agents confirm shutdown, you're done. There is **no `TeamDelete` step** (that tool was removed). The team config directory is cleaned up automatically when the session ends; the task-list directory persists locally so a resumed session keeps its tasks (governed by `cleanupPeriodDays`). Sending each teammate a `shutdown_request` is still the graceful way to free their contexts before you finish.

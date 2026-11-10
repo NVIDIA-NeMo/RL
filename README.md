@@ -11,6 +11,8 @@
 
 ## 📣 News
 
+* [11/02/2026] Muse Spark text GRPO training is supported on the [Muse Spark support branch](https://github.com/NVIDIA-NeMo/RL/tree/larkz/muse-spark-support) with the AutoModel backend and BF16 vLLM generation! See the [model guide](https://github.com/NVIDIA-NeMo/RL/blob/larkz/muse-spark-support/docs/guides/models/muse/muse-spark.md) for setup, the validated recipe, and known limitations.
+* [11/02/2026] Flint early-access GRPO training is supported on the [flint-support branch](https://github.com/NVIDIA-NeMo/RL/tree/flint-support) with the AutoModel backend and SGLang generation! See the [model guide](https://github.com/NVIDIA-NeMo/RL/blob/flint-support/docs/guides/models/flint/flint.md) for access requirements, setup, and training results.
 * [10/22/2026] MiniMax-M3.1-Flash BF16 GRPO training is supported on the [minimax-m3-1-flash branch](https://github.com/NVIDIA-NeMo/RL/tree/minimax-m3-1-flash) with the AutoModel backend and vLLM generation! See the [model guide](https://github.com/NVIDIA-NeMo/RL/blob/minimax-m3-1-flash/docs/guides/models/minimax/minimax-m3-1-flash.md) for setup, the validated recipe, and known limitations.
 * [10/22/2026] Nemotron 3.5 Super VL (120B-A12B) is now supported in NeMo RL with text DAPO, image GRPO, and NeMo Gym agentic training on the Automodel backend with vLLM generation! See the [model guide](docs/guides/models/nemotron/nemotron-3.5-super-vl.md) for recipes and training results.
 * [10/16/2026] Beam 1.0 Day 0 support by NeMo RL with SFT and RL recipes! See the [beam-support branch](https://github.com/NVIDIA-NeMo/RL/tree/beam-support) and [doc](https://github.com/NVIDIA-NeMo/RL/blob/beam-support/docs/guides/models/reflection/beam.md).
@@ -110,7 +112,7 @@ For detailed information on backend selection, configuration, and examples, see 
 
 ## Features
 
-✅ _Available now_ | 🔜 _Coming in v0.7_
+✅ _Available now_ | 🔜 _Coming in a future release_
 
 - 🔜 **Improved Native Performance** - Improve training time for native PyTorch models.
 - 🔜 **Improved Large MoE Performance** - Improve Megatron Core training performance and generation performance.
@@ -316,7 +318,7 @@ Use `uv run` to launch all commands. It handles pip installing implicitly and en
 >   This ensures consistent environment usage across different shells and sessions. Example: `uv run python examples/run_grpo.py`
 > - Ensure your system has the appropriate CUDA drivers installed, and that your PyTorch version is compatible with both your CUDA setup and hardware.
 > - If you update your environment in `pyproject.toml`, it is necessary to force a rebuild of the virtual environments by setting `NRL_FORCE_REBUILD_VENVS=true` next time you launch a run.
-> - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `huggingface-cli login` as well for Llama models.
+> - **Reminder**: Don't forget to set your `HF_HOME`, `WANDB_API_KEY`, and `HF_DATASETS_CACHE` (if needed). You'll need to do a `hf auth login` as well for Llama models.
 
 
 ## GRPO
@@ -398,7 +400,7 @@ This section outlines how to run GRPO for Qwen2.5-32B with a 16k sequence length
 NUM_ACTOR_NODES=32
 
 # Download Qwen before the job starts to avoid spending time downloading during the training loop
-HF_HOME=/path/to/hf_home huggingface-cli download Qwen/Qwen2.5-32B
+HF_HOME=/path/to/hf_home hf download Qwen/Qwen2.5-32B
 
 # Ensure HF_HOME is included in your MOUNTS
 HF_HOME=/path/to/hf_home \

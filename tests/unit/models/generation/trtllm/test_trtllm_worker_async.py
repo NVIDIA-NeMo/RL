@@ -46,6 +46,7 @@ def _config():
             "tensor_parallel_size": 1,
             "max_model_len": 128,
             "precision": "bfloat16",
+            "load_format": "dummy",
             "max_batch_size": 8,
             "max_num_tokens": 256,
             "async_engine": True,

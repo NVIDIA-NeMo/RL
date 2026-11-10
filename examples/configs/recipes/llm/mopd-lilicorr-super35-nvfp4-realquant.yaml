@@ -1,0 +1,114 @@
+# QA-MOPD with a co-trained LiLiCorr drafter on Nemotron 3.5 Super, NVFP4 real quant.
+#
+# Pipeclean target: the rollout speedup a co-trained LiLiCorr buys inside MOPD. Measured
+# standalone first, outside any training loop, the released drafter gives 2.76x on
+# generation at concurrency 1 and 2.36x at 64 against the BF16 text tower -- acceptance
+# length ~5.0 and flat across batch. Rollout is ~40% of a real-quant step, so that is
+# ~1.85-1.90x end to end, not 2x: 2x would need 3.77x on rollout.
+#
+# MOPD is not a separate algorithm -- it is the GRPO trainer with adv_estimator: opd --
+# so this inherits GRPO's drafter support rather than needing its own.
+defaults: grpo-nemotron3-super-120BA12B-16n4g-megatron-qa-nvfp4-w4a16-real-300step.yaml
+
+# Load the PRE-CONVERTED Megatron checkpoint rather than converting from HF in-flight.
+#
+# The on-the-fly HF path fails during checkpoint load on expert _extra_state shards:
+# this target has 512 routed experts with a latent MoE and an MTP layer, and the
+# converted state dict carries per-expert weights while the built model wants grouped
+# experts with sharded extra state. Megatron-Bridge has a nemotron_h bridge that handles
+# the MTP flattening and expert indices, so converting ahead of time with
+# examples/convert_super35_to_megatron.sbatch produces a checkpoint this path can load.
+#
+# Commented until the conversion lands; the run falls back to HF conversion without it.
+# checkpointing:
+#   pretrained_checkpoint:
+#     path: /lustre/fsw/portfolios/cosmos/users/yeyu/super35_texttower_megatron
+#     format: megatron_bridge
+
+policy:
+  # The inherited chain resolves model_name to NVIDIA-Nemotron-3-Super-120B-A12B-BF16 --
+  # Nemotron 3 Super, NOT 3.5. The LiLiCorr drafter below was trained against Super 3.5,
+  # so leaving the inherited value would co-train a 3.5 drafter against a 3 target: the
+  # shapes line up (hidden 4096, vocab 131072 on both), so nothing would raise -- the
+  # drafter would just learn against hidden states from the wrong model and report a
+  # plausible-looking acceptance rate. Pin the target explicitly.
+  #
+  # TextTower is the text path of Super 3.5 in BF16, which is what QA real-quant wants as
+  # its starting point (it quantizes during training; it does not load a pre-quantized
+  # checkpoint). Kinjal's NVFP4 Super-VL drop is the SERVING artifact and the reference
+  # for the measured 2.57x/1.70x -- it is not the input to this run.
+  model_name: /lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_modelopt/hf-local/nvidia/NVIDIA-Nemotron-3.5-Super-120B-A12B-TextTower
+  draft:
+    enabled: true
+    speculator_type: lilicorr
+    # A dequantized copy. The released drafter is NVFP4-packed (two 4-bit values per
+    # byte), and co-training needs gradients; the loader refuses a packed tensor rather
+    # than reshaping it into garbage.
+    model_name: "/lustre/fsw/portfolios/cosmos/users/yeyu/lilicorr_super35_bf16"
+    # Scales the whole draft contribution, lattice term included.
+    loss_weight: 0.1
+    # Draft-side transient memory scales with anchors_per_sample * gamma * vocab, and
+    # co-training shares the GPU with full policy training on a 120B.
+    anchors_per_sample: 32
+    learning_rate: 1.0e-4
+  megatron_cfg:
+    # The fused path returns per-token logprobs and never materializes the full
+    # next-token logits the draft's teacher distribution needs.
+    use_fused_linear_logprobs: false
+
+    # Build the policy WITHOUT MTP.
+    #
+    # Super 3.5 ships num_nextn_predict_layers: 1, so the HF config carries an MTP layer
+    # and the converted checkpoint carries mtp.* weights. Two reasons to drop it here:
+    #
+    # 1. It is redundant with the drafter. MTP and LiLiCorr are both speculation
+    #    mechanisms; this recipe is measuring what the co-trained drafter buys, and
+    #    carrying MTP alongside muddies that and costs memory.
+    # 2. It is part of the checkpoint/model disagreement this recipe keeps hitting --
+    #    the load failure is on expert state, but the mtp.* branch is more surface for
+    #    the same class of mismatch.
+    #
+    # mcore treats mtp_num_layers: 0 as "disable", clearing mtp_hybrid_override_pattern
+    # with it, rather than building zero layers of something.
+    mtp_num_layers: 0
+
+    # Build SEQUENTIAL experts, matching the checkpoint.
+    #
+    # The load fails on decoder.layers.N.mlp.experts.experts.linear_fc1._extra_state/
+    # shard_K_512 -- the grouped form, one module with 512 shards -- while the
+    # HF-converted checkpoint holds experts.experts.97.linear_fc1.weight, i.e. per-expert
+    # submodules. Those are TEGroupedMLP vs SequentialMLP, and moe_grouped_gemm is the
+    # switch between them.
+    #
+    # Set in the recipe rather than as a Hydra +override: the override was accepted
+    # (it appears in the parsed Overrides list) and the model still built grouped
+    # experts, so the value needs to be present before the provider is constructed.
+    moe_grouped_gemm: false
+    # CP=1, required by the TRAINER, not by the body.
+    #
+    # The body-level problem is fixed: DFlashBody gets its own ModelParallelConfig at
+    # CP=1 and the target's CP-sharded states are gathered before reaching it, so the
+    # body no longer constrains the policy. But grpo.py::_validate_draft_trainer_entrypoint
+    # refuses draft + context_parallel_size > 1 unless the synchronous TransferQueue
+    # trainer is used:
+    #
+    #   "policy.draft with policy.megatron_cfg.context_parallel_size > 1 requires the
+    #    synchronous TransferQueue trainer. Set data_plane.enabled=true and
+    #    grpo.async_grpo.enabled=false, or set context_parallel_size=1."
+    #
+    # The data_plane route is the other option it offers, but that path sets
+    # defer_draft_normalization=True, which DraftLossWrapper rejects in packed mode --
+    # and this recipe packs sequences. So CP=1 is the one that holds.
+    #
+    # Real cost, not a formality: this roughly doubles per-rank activation memory for a
+    # 120B policy. If it does not fit, raise TP/PP rather than re-enabling CP.
+    context_parallel_size: 1
+
+loss_fn:
+  # MOPD: replace GRPO's reward-based advantage with the token-level distillation one.
+  adv_estimator: opd
+
+logger:
+  log_dir: logs/mopd-lilicorr-super35-nvfp4
+  wandb:
+    name: mopd-lilicorr-super35-nvfp4

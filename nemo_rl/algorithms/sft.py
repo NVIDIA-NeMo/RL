@@ -114,6 +114,14 @@ class SFTConfig(BaseModel, extra="allow"):
     val_at_end: bool = False
     seed: int = 42
     only_unmask_final: bool = False
+    # SFT v2 with policy.megatron_cfg.checkpoint.async_save only. Instead of blocking
+    # the next step until an async checkpoint's disk write lands, finalize it at a
+    # later step boundary once every rank's write is done, so the write overlaps
+    # training. tmp_step_N is renamed to step_N after that finalize; the next save and
+    # training exit still finalize blocking. Cost: until the finalize, only tmp_step_N
+    # exists and resume ignores it, so a crash in that window (typically one step)
+    # resumes from the previous checkpoint. Teardown after a failure still publishes it.
+    defer_async_checkpoint_finalize: bool = False
 
 
 class MasterConfig(BaseModel, extra="allow"):
@@ -276,6 +284,11 @@ def setup(
         Tuple of policy, cluster, dataloader, tokenizer, loss_fn, math_env, master_config, logger
     """
     set_seed(master_config.sft.seed)
+    if master_config.sft.defer_async_checkpoint_finalize:
+        raise ValueError(
+            "sft.defer_async_checkpoint_finalize is only supported by SFT v2. "
+            "Set it to false, or run SFT v2 (examples/run_sft_v2.py)."
+        )
 
     # Extract individual configs for easier access
     policy_config = master_config.policy

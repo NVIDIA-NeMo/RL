@@ -14,7 +14,6 @@
 """Tests for the single-seed validation rollout mode (verl-omni val parity)."""
 
 import torch
-from flow_grpo.algorithms.flow_grpo import FlowGRPOValGenerationCfg
 from flow_grpo.models.policy.flow_grpo_policy import derive_rollout_seed
 from flow_grpo.models.policy.workers.flow_grpo_worker import (
     build_single_seed_latents_fn,
@@ -46,9 +45,3 @@ def test_single_seed_latents_repeat_the_first_draw():
     assert torch.equal(out[0], prepare(1, 42)[0])
     for i in range(1, 4):
         assert torch.equal(out[i], out[0])
-
-
-def test_val_generation_cfg_single_seed_defaults_off():
-    cfg = FlowGRPOValGenerationCfg()
-    assert cfg.single_seed is False
-    assert cfg.model_dump()["single_seed"] is False

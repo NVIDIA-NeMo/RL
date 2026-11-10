@@ -6,14 +6,29 @@ set -eou pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 PROJECT_ROOT=$(realpath "$SCRIPT_DIR/../..")
 BASE_TEST=$SCRIPT_DIR/grpo_dp_single_controller.sh
-# simple / mooncake_cpu, or a storage-unit variant of either:
+# simple / mooncake_cpu / nixl, or a variant of one:
 #   simple_placed   simple with SimpleStorageUnits pinned (storage_unit_placement=all)
 #   mooncake_units  mooncake_cpu with CPU storage units as the only memory owners
+#   nixl_ssd        nixl with its units' SSD tier on
+# mooncake_cpu and nixl_ssd save and restore with values on SSD (a run holds
+# up to ~400 KB, so each sets a limit below that) and fail unless SSD was used.
 VARIANT=${1:-simple}
 VARIANT_OVERRIDES=()
+# check_metrics.py expressions run on both phases' metrics.
+VARIANT_CHECKS=()
 case "$VARIANT" in
     simple) BACKEND=simple; TEST_NAME=grpo_dp_single_controller_tq_recovery ;;
-    mooncake_cpu) BACKEND=mooncake_cpu; TEST_NAME=grpo_dp_mooncake_tq_recovery ;;
+    mooncake_cpu)
+        BACKEND=mooncake_cpu
+        TEST_NAME=grpo_dp_mooncake_tq_recovery
+        SSD_DIR=$SCRIPT_DIR/$TEST_NAME/ssd
+        # Offload past 1e-6 of the clients' 4 GiB segments: a few KB each.
+        VARIANT_OVERRIDES=(
+            data_plane.mooncake_cpu.ssd_offload.enabled=true
+            data_plane.mooncake_cpu.ssd_offload.path="$SSD_DIR"
+            data_plane.mooncake_cpu.ssd_offload.offload_threshold=0.000001
+        )
+        ;;
     simple_placed)
         BACKEND=simple
         TEST_NAME=grpo_dp_simple_placed_tq_recovery
@@ -23,6 +38,30 @@ case "$VARIANT" in
         BACKEND=mooncake_cpu
         TEST_NAME=grpo_dp_mooncake_units_tq_recovery
         VARIANT_OVERRIDES=(data_plane.mooncake_cpu.storage_unit_segment_size=4294967296)
+        ;;
+    nixl)
+        BACKEND=nixl
+        TEST_NAME=grpo_dp_nixl_tq_recovery
+        # Per-step unit metrics the driver logs (tq_nixl.unit_metrics).
+        VARIANT_CHECKS=('max(data["data_plane/nixl/retired_mb_sum"]) == 0')
+        ;;
+    nixl_ssd)
+        BACKEND=nixl
+        TEST_NAME=grpo_dp_nixl_ssd_tq_recovery
+        SSD_DIR=$SCRIPT_DIR/$TEST_NAME/ssd
+        # 256 KiB slab per unit: a 128 KiB put area and a 128 KiB SSD IO area.
+        VARIANT_OVERRIDES=(
+            data_plane.nixl.unit_slab_bytes=262144
+            data_plane.nixl.ssd.enabled=true
+            data_plane.nixl.ssd.path="$SSD_DIR"
+            data_plane.nixl.ssd.staging_bytes=131072
+        )
+        # nixl unlinks its SSD files once open, so count spills instead: the
+        # units spill in both phases (training, and the restore into them).
+        VARIANT_CHECKS=(
+            'max(data["data_plane/nixl/retired_mb_sum"]) == 0'
+            'max(data["data_plane/nixl/ssd_spills_sum"]) > 0'
+        )
         ;;
     *) echo "Unsupported recovery variant: $VARIANT" >&2; exit 1 ;;
 esac
@@ -48,6 +87,9 @@ COMMON_OVERRIDES=(
     async_rl.max_buffered_rollouts=8
     # Bridge rewrites the scheduler position on resume only when this is on.
     '+policy.megatron_cfg.scheduler.override_opt_param_scheduler=true'
+    # Every get re-checks each row's put-time hash (restored rows too); a
+    # mismatch is logged, and checked for after each phase.
+    data_plane.observability.verify_tensor_hash=true
     "${VARIANT_OVERRIDES[@]}"
 )
 if [[ "$BACKEND" == "mooncake_cpu" ]]; then
@@ -57,11 +99,30 @@ if [[ "$BACKEND" == "mooncake_cpu" ]]; then
     )
 fi
 
+if [[ "$VARIANT" == "mooncake_cpu" ]]; then
+    # Offload files are deleted once their keys are cleared, so record the
+    # peak count while both phases run (not Mooncake's .lock).
+    SSD_PEAK=$TEST_DIR/ssd_peak
+    echo 0 > "$SSD_PEAK"
+    (
+        # Not errexit/pipefail: find fails until Mooncake creates the dir.
+        set +eo pipefail
+        peak=0
+        while sleep 1; do
+            n=$(find "$SSD_DIR" -type f ! -name '.lock*' 2>/dev/null | wc -l)
+            if (( n > peak )); then peak=$n; echo "$peak" > "$SSD_PEAK"; fi
+        done
+    ) &
+    SSD_WATCHER=$!
+    trap 'kill "$SSD_WATCHER" 2>/dev/null || true' EXIT
+fi
+
 echo "=== Phase 1: save an authoritative native TQ checkpoint ==="
 # Keep the two-step training horizon identical across both processes so the
 # Megatron optimizer scheduler can be restored. The timeout makes phase 1 save
 # after its first completed step and exit early, simulating an interrupted job.
-EXP_NAME="$TEST_NAME/run" RUN_CONVERGENCE_CHECKS=0 bash "$BASE_TEST" \
+# Each phase also runs the base test's convergence checks on its own steps.
+EXP_NAME="$TEST_NAME/run" bash "$BASE_TEST" \
     "${COMMON_OVERRIDES[@]}" \
     grpo.max_num_steps=2 \
     checkpointing.checkpoint_must_save_by=0:0:0:1
@@ -80,7 +141,7 @@ REPLAY_GROUP_COUNT=$(uv run --directory "$PROJECT_ROOT" --no-sync python -c \
     "$CHECKPOINT_DIR/step_1/data_plane/metadata.json")
 
 echo "=== Phase 2: start a fresh process, restore TQ, and train one more step ==="
-EXP_NAME="$TEST_NAME/run" RUN_CONVERGENCE_CHECKS=0 bash "$BASE_TEST" \
+EXP_NAME="$TEST_NAME/run" bash "$BASE_TEST" \
     "${COMMON_OVERRIDES[@]}" grpo.max_num_steps=2
 cp "$BASE_RUN_LOG" "$PHASE2_LOG"
 
@@ -109,6 +170,28 @@ test -f "$CHECKPOINT_DIR/step_2/replay_buffer_metadata.pt"
 if [[ "$BACKEND" == "mooncake_cpu" ]]; then
     test -s "$CHECKPOINT_DIR/step_2/data_plane/mooncake_storage/manifest.json"
 fi
+
+if [[ "$VARIANT" == "mooncake_cpu" ]]; then
+    PEAK=$(cat "$SSD_PEAK")
+    if (( PEAK == 0 )); then
+        echo "FAIL: Mooncake SSD offload never wrote a file under $SSD_DIR" >&2
+        exit 1
+    fi
+    echo "✓ Mooncake SSD offload held up to $PEAK file(s) across save and restore"
+fi
+
+# Hash guard: rows were checked, and no process logged a mismatch or a guard
+# failure (workers' lines reach the run log through Ray).
+for PHASE in phase1 phase2; do
+    if grep -E "data-plane hash (mismatch|guard failed)" "$TEST_DIR/$PHASE.log"; then
+        echo "FAIL: data-plane hash check failed in $PHASE" >&2
+        exit 1
+    fi
+    uv run --directory "$PROJECT_ROOT" tests/check_metrics.py \
+        "$TEST_DIR/${PHASE}_metrics.json" \
+        'max(data["data_plane/driver/step/hash/rows_checked"]) > 0' \
+        "${VARIANT_CHECKS[@]}"
+done
 
 if [[ "$BACKEND" == "simple" ]]; then
     echo "=== Verify the standalone Simple TQ checkpoint CLI round trip ==="

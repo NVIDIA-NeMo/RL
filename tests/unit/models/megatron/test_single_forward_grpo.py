@@ -145,7 +145,10 @@ def test_survivor_normalization_reduces_dp_counts_on_every_pipeline_stage(
         synchronize.assert_not_called()
     else:
         synchronize.assert_called_once()
-        model.scale_gradients.assert_called_once_with(1.5)
+        model.scale_gradients.assert_called_once()
+        factor = model.scale_gradients.call_args.args[0]
+        assert isinstance(factor, torch.Tensor)
+        torch.testing.assert_close(factor, torch.full_like(tokens, 1.5))
 
 
 @pytest.mark.mcore
@@ -319,6 +322,7 @@ def test_train_normalizes_survivors_before_optimizer_step(
     worker = MagicMock()
     worker.dp_size = 1
     worker.mtp_enabled = False
+    worker.draft_provider = None
     worker.model.modules.return_value = []
     worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
     worker.model.scale_gradients.side_effect = scale_gradients

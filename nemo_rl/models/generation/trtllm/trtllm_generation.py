@@ -644,6 +644,7 @@ class TrtllmGeneration(GenerationInterface):
                 "default_chat_template_kwargs": self.cfg["trtllm_cfg"].get(
                     "default_chat_template_kwargs"
                 ),
+                "chat_template": self.cfg["trtllm_cfg"].get("chat_template"),
             }
             for fe_idx in range(n_fe):
                 # Its own CPU-only actor rather than an engine worker's

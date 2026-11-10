@@ -159,6 +159,23 @@ different packed-weight refit protocol. GB200 tests check quantized-value
 parity with the installed vLLM quantizer. Functional GRPO tests also check
 refit in separate policy and rollout worker environments.
 
+### Native MXFP8 linear backends for vLLM refit
+
+MXFP8 rollout uses the FlashInfer CUTLASS linear kernel by default. To use
+FlashInfer CuTeDSL or TRTLLM instead, set `linear_backend` explicitly:
+
+```yaml
+policy:
+  generation:
+    vllm_kwargs:
+      linear_backend: flashinfer_trtllm # or flashinfer_cutedsl
+```
+
+These native kernels use vLLM's layerwise reload during weight refit. Use
+`refit_transport: null` with collective or IPC refit. NCCL Reshard and other
+explicit refit transports are not supported. Native layerwise refit also does
+not support an FP8 KV cache or a co-trained MTP drafter.
+
 To train with FP8, you need to set the Megatron path and configure it using the following settings:
 
 ```yaml

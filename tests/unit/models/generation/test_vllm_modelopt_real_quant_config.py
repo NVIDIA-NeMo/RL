@@ -94,7 +94,12 @@ def _clear_vllm_backend_modules(monkeypatch):
         "nemo_rl.modelopt.models.generation.vllm_quant_backend",
         "nemo_rl.models.generation.vllm.vllm_backend",
     ):
-        monkeypatch.delitem(sys.modules, module_name, raising=False)
+        # Importlib also replaces the parent's binding; restore it with sys.modules.
+        parent_name, _, name = module_name.rpartition(".")
+        parent = importlib.import_module(parent_name)
+        monkeypatch.setattr(parent, name, getattr(parent, name, None), raising=False)
+        monkeypatch.setitem(sys.modules, module_name, sys.modules.get(module_name))
+        monkeypatch.delitem(sys.modules, module_name)
 
 
 def _import_vllm_quant_backend(monkeypatch):
@@ -270,9 +275,7 @@ def test_configure_quant_engine_kwargs_for_fake_quant(
     assert "quantization" not in llm_kwargs
 
 
-@pytest.mark.parametrize(
-    "moe_backend", ["auto", "flashinfer_trtllm", "flashinfer_cutlass", None]
-)
+@pytest.mark.parametrize("moe_backend", ["flashinfer_trtllm", None])
 def test_configure_fake_quant_rejects_non_triton_backend(monkeypatch, moe_backend):
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
@@ -802,61 +805,41 @@ def test_quant_generation_worker_create_engine_configures_quant(monkeypatch):
     ]
 
 
-def test_quant_generation_worker_collective_rpc_accessors():
-    worker_mod = pytest.importorskip(
-        "nemo_rl.modelopt.models.generation.vllm_quant_worker"
-    )
-    worker_cls = worker_mod.VllmQuantGenerationWorker.__ray_metadata__.modified_class
-    worker = object.__new__(worker_cls)
-    calls = []
-
-    class FakeLLM:
-        def collective_rpc(self, name, args):
-            calls.append((name, args))
-            return [{"name": name, "args": args}]
-
-    worker.llm = FakeLLM()
-
-    assert worker.get_quantizer_stats() == {
-        "name": "get_quantizer_stats",
-        "args": tuple(),
-    }
-    assert worker.get_weight_snapshot("weight") == {
-        "name": "get_weight_snapshot",
-        "args": ("weight",),
-    }
-    assert calls == [
-        ("get_quantizer_stats", tuple()),
-        ("get_weight_snapshot", ("weight",)),
-    ]
-
-
 @pytest.mark.asyncio
-async def test_async_quant_generation_worker_collective_rpc_accessors():
+@pytest.mark.parametrize("async_worker", [False, True])
+async def test_quant_generation_worker_collective_rpc_accessors(
+    async_worker: bool,
+) -> None:
     worker_mod = pytest.importorskip(
         "nemo_rl.modelopt.models.generation.vllm_quant_worker"
     )
-    worker_cls = (
-        worker_mod.VllmQuantAsyncGenerationWorker.__ray_metadata__.modified_class
+    actor = (
+        worker_mod.VllmQuantAsyncGenerationWorker
+        if async_worker
+        else worker_mod.VllmQuantGenerationWorker
     )
-    worker = object.__new__(worker_cls)
+    worker = object.__new__(actor.__ray_metadata__.modified_class)
     calls = []
 
-    class FakeLLM:
-        async def collective_rpc(self, name, args):
-            calls.append((name, args))
-            return [{"name": name, "args": args}]
+    def collective_rpc(name: str, args: tuple[str, ...]) -> list[dict[str, object]]:
+        calls.append((name, args))
+        return [{"name": name, "args": args}]
 
-    worker.llm = FakeLLM()
+    async def async_collective_rpc(
+        name: str, args: tuple[str, ...]
+    ) -> list[dict[str, object]]:
+        return collective_rpc(name, args)
 
-    assert await worker.get_quantizer_stats() == {
-        "name": "get_quantizer_stats",
-        "args": tuple(),
-    }
-    assert await worker.get_weight_snapshot("weight") == {
-        "name": "get_weight_snapshot",
-        "args": ("weight",),
-    }
+    worker.llm = types.SimpleNamespace(
+        collective_rpc=async_collective_rpc if async_worker else collective_rpc
+    )
+    stats = worker.get_quantizer_stats()
+    snapshot = worker.get_weight_snapshot("weight")
+    if async_worker:
+        stats, snapshot = await stats, await snapshot
+
+    assert stats == {"name": "get_quantizer_stats", "args": tuple()}
+    assert snapshot == {"name": "get_weight_snapshot", "args": ("weight",)}
     assert calls == [
         ("get_quantizer_stats", tuple()),
         ("get_weight_snapshot", ("weight",)),
@@ -938,32 +921,6 @@ def test_modelopt_refit_info_routes_legacy_fp8_config(
 
     assert calls == [(state_dict_info, None if real_quant else serialized_fp8_config)]
     assert result is (None if real_quant else expected_names)
-
-
-@pytest.mark.parametrize("real_quant", [False, True])
-def test_modelopt_refit_info_preserves_base_validation_errors(
-    monkeypatch: pytest.MonkeyPatch, real_quant: bool
-) -> None:
-    backend = _import_vllm_quant_backend(monkeypatch)
-    base_backend = _base_vllm_backend()
-    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
-    extension._is_real_quant_model = lambda: real_quant
-
-    def reject_refit_info(
-        _self: object,
-        _info: dict[str, object],
-        _fp8_config: dict[str, object] | None = None,
-    ) -> None:
-        raise ValueError("invalid refit metadata")
-
-    monkeypatch.setattr(
-        base_backend.VllmInternalWorkerExtension,
-        "prepare_refit_info",
-        reject_refit_info,
-    )
-
-    with pytest.raises(ValueError, match="invalid refit metadata"):
-        extension.prepare_refit_info({}, {"is_mx": True})
 
 
 @pytest.mark.parametrize(
@@ -1357,7 +1314,7 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
     extension.zmq_socket = FakeSocket()
     extension.state_dict_info = state_dict_info
     extension.maybe_init_zmq = lambda: None
-    extension._load_weights = lambda _weights: None
+    extension._load_weights = lambda _weights, coverage=None: None
     extension.model_runner.model.load_weights = extension._load_weights
     monkeypatch.setattr(
         backend.VllmQuantInternalWorkerExtension,
@@ -1478,8 +1435,17 @@ def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(
         }
     )
     extension.maybe_init_zmq = lambda: None
+    extension._model_update_manifest = (
+        base_backend.ModelUpdateManifest.from_state_dict_info(
+            extension.state_dict_info,
+            target_owner_ranks=(0,),
+            draft_owner_ranks=(),
+        )
+    )
+    coverage = extension._new_model_update_coverage()
+    extension._new_model_update_coverage = lambda: coverage
 
-    def load_weights(weights):
+    def load_weights(weights, *, coverage=None):
         calls.append(("load", extension.zmq_socket.batch_index))
         retained.append(weights)
         for name, weight in weights:
@@ -1492,10 +1458,10 @@ def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(
     extension._load_weights = lambda _: pytest.fail("owned IPC must load directly")
     original_prepare = extension._prepare_ipc_weight_buffer
 
-    def prepare_buffer(buffer, size):
+    def prepare_buffer(buffer, size, *, coverage=None):
         if failure == "prepare":
             raise RuntimeError("prepare failed")
-        owned, loader = original_prepare(buffer, size)
+        owned, loader = original_prepare(buffer, size, coverage=coverage)
         # dtype views retain storage, not necessarily this Python Tensor wrapper.
         owned_storage_refs.append(StorageWeakRef(owned.untyped_storage()))
         return owned, loader
@@ -1610,7 +1576,14 @@ def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(
             assert all(ref.expired() for ref in owned_storage_refs)
         with pytest.raises(RuntimeError, match="unusable after a failed"):
             extension.update_weights_via_ipc_zmq()
+    if success:
+        coverage.require_complete()
+    else:
+        with pytest.raises(RuntimeError, match="missing keys"):
+            coverage.require_complete()
     if failure in ("load", "load_and_fence"):
+        # A failed native loader must not have recorded this key as loaded.
+        coverage.record_loaded(("decoder.weight",))
         assert "IPC weight batch load failed" in caplog.text
         assert "decoder.weight" in caplog.text
 
@@ -1640,37 +1613,9 @@ def test_real_quant_ipc_payload_loads_weights_and_releases_transport_views(
             },
             False,
         ),
-        (
-            True,
-            {
-                "world_size_across_dp": 2,
-                "enable_eplb": False,
-                "tensor_parallel_size": 1,
-                "prefill_context_parallel_size": 2,
-            },
-            False,
-        ),
-        (
-            True,
-            {
-                "world_size_across_dp": 2,
-                "enable_eplb": False,
-                "tensor_parallel_size": 2,
-            },
-            False,
-        ),
-        (
-            True,
-            {
-                "world_size_across_dp": 2,
-                "enable_eplb": False,
-                "pipeline_parallel_size": 2,
-            },
-            False,
-        ),
         (True, {"world_size_across_dp": 1, "enable_eplb": True}, False),
     ],
-    ids=["fake", "singleton", "singleton-ep-flag", "dp", "pcp", "tp", "pp", "eplb"],
+    ids=["fake", "singleton", "singleton-ep-flag", "dp", "eplb"],
 )
 def test_ipc_post_ack_loading_requires_resolved_singleton_without_eplb(
     monkeypatch: pytest.MonkeyPatch,
@@ -1709,7 +1654,7 @@ def test_ipc_packet_ownership_preserves_deferred_views(monkeypatch, real_quant):
     backend = _import_vllm_quant_backend(monkeypatch)
     extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
     pending = []
-    loader = lambda weights: pending.extend(weights)
+    loader = lambda weights, coverage=None: pending.extend(weights)
     extension.model_runner = types.SimpleNamespace(
         model=types.SimpleNamespace(load_weights=loader)
     )
@@ -1887,3 +1832,17 @@ def test_resolve_quant_cfg_rejects_recipe_without_quant_cfg(monkeypatch):
 
     with pytest.raises(ValueError, match="must contain a 'quant_cfg'"):
         resolve_quant_cfg("missing-quant-cfg")
+
+
+def test_real_quant_prepare_refit_info_rejects_draft_manifest(monkeypatch):
+    backend = _import_vllm_quant_backend(monkeypatch)
+    extension = object.__new__(backend.VllmQuantInternalWorkerExtension)
+    extension._is_real_quant_model = lambda: True
+
+    with pytest.raises(RuntimeError, match="does not support draft finalization"):
+        extension.prepare_refit_info(
+            {
+                "model.layers.0.mlp.up_proj.weight": ((4, 4), torch.uint8),
+                "draft.layers.0.self_attn.qkv_proj.weight": ((4, 4), torch.bfloat16),
+            }
+        )

@@ -160,13 +160,26 @@ fi
 
 # Setting ulimit is recommended by ray best practices page
 # @ https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html
-# It's session based and won't affect the system outside the script
-# Ensure that the soft limit isn't above the hard limit
-if [[ $(ulimit -Hn) == "unlimited" ]] || [[ 65535 -lt $(ulimit -Hn) ]]; then
-  ulimit -Sn 65535
-elif [[ $(ulimit -Hn) != "unlimited" ]] && [[ $(ulimit -Hn) -lt 65535 ]]; then
+# It's session based and won't affect the system outside the script.
+#
+# 65535 is Ray's recommended FLOOR, not a target, and a connection pool sized
+# above it makes the descriptor ceiling the real limit, surfacing as
+# OSError: [Errno 24] mid-request instead of as backpressure. Raise the soft
+# limit to NRL_TARGET_NOFILE, or to the hard limit when that is lower.
+NRL_TARGET_NOFILE="${NRL_TARGET_NOFILE:-131072}"
+_hard_nofile="$(ulimit -Hn)"
+_soft_nofile="$(ulimit -Sn)"
+if [[ ${_soft_nofile} == "unlimited" ]] || [[ ${_soft_nofile} -ge ${NRL_TARGET_NOFILE} ]]; then
+  : # Already clears the target; raising a limit must never lower one.
+elif [[ ${_hard_nofile} == "unlimited" ]] || [[ ${_hard_nofile} -ge ${NRL_TARGET_NOFILE} ]]; then
+  ulimit -Sn "${NRL_TARGET_NOFILE}"
+elif [[ ${_hard_nofile} -ge 65535 ]]; then
+  # Below the target but at or above Ray's floor: take everything available.
+  ulimit -Sn "${_hard_nofile}"
+else
   echo "[WARNING]: Cannot increase ulimit on file descriptors to 65535 according ray recommendation: https://docs.ray.io/en/latest/cluster/vms/user-guides/large-cluster-best-practices.html. Speak to cluster admins to increase, otherwise ray may crash unexpectedly."
 fi
+echo "[INFO] file descriptor limit: soft=$(ulimit -Sn) hard=${_hard_nofile}"
 
 # Worker port range must NOT overlap with the OS ephemeral range to prevent
 # TOCTOU collisions.  Ray's Raylet uses a probe-and-release pattern

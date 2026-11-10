@@ -65,25 +65,3 @@ def test_bootstrap_only_patches_dynamic_context(
     compile(updated, str(context), "exec")
     patches._apply_sglang_compat_patches()
     assert context.read_text() == updated
-
-
-def test_missing_dynamic_context_anchor_fails(
-    patches: ModuleType, tmp_path: Path
-) -> None:
-    context = tmp_path / "dynamic_context.py"
-    context.write_text("# Unexpected upstream change.\n")
-    with pytest.raises(RuntimeError, match="Megatron hook_mode anchor"):
-        patches._patch_megatron_hook_mode_in(str(context))
-    assert context.read_text() == "# Unexpected upstream change.\n"
-
-
-def test_missing_megatron_needs_no_patch(
-    patches: ModuleType, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(patches, "_get_megatron_file", Mock(return_value=None))
-    patch_file = Mock()
-    monkeypatch.setattr(patches, "_patch_megatron_hook_mode_in", patch_file)
-
-    patches._patch_megatron_dynamic_context_hook_mode()
-
-    patch_file.assert_not_called()

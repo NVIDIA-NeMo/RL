@@ -1,0 +1,84 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# OpenMathReasoning training and AIME24 validation through single_agent_turn.
+# Reuses Nemotron Nano 9B v2, Megatron TP=2, vLLM, and one node with eight GPUs.
+# Uses Nano v2's default thinking mode with a 16384-token sequence limit.
+#
+# Prepare taskset rows (run from 3rdparty/Gym-workspace/Gym):
+#   uv run gym dataset collate --resources-server math_with_judge \
+#     --mode train_preparation --download \
+#     --output-dir data/openmathreasoning_single_agent_turn \
+#     "++math_with_judge_simple_agent.responses_api_agents.simple_agent.datasets=[\
+#       {name:train,type:train,taskset:openmathreasoning,\
+#        jsonl_fpath:resources_servers/math_with_judge/data/OpenMathReasoning_train.jsonl,\
+#        huggingface_identifier:{repo_id:nvidia/Nemotron-RL-math-OpenMathReasoning,artifact_fpath:train.jsonl},license:'Creative Commons Attribution 4.0 International'},\
+#       {name:validation,type:validation,taskset:openmathreasoning,\
+#        jsonl_fpath:resources_servers/math_with_judge/data/OpenMathReasoning_aime24_validation.jsonl,\
+#        huggingface_identifier:{repo_id:nvidia/Nemotron-RL-math-OpenMathReasoning,artifact_fpath:validation.jsonl},license:'Apache 2.0'}]" \
+#     ++environment_server_routes.openmathreasoning=math_with_judge_environment_server
+#
+# Train (run from the NeMo-RL root):
+#   uv run python examples/nemo_gym/run_grpo_nemo_gym.py \
+#     --config examples/nemo_gym/grpo_openmathreasoning_nemotron_nano_v2_9b_single_agent_turn.yaml
+defaults: grpo_workplace_assistant_nemotron_nano_v2_9b.yaml
+
+policy:
+  max_total_sequence_length: 16384
+  megatron_cfg:
+    moe_per_layer_logging: false
+  generation:
+    vllm_cfg:
+      http_server_serving_chat_kwargs:
+        enable_auto_tools: false
+        tool_parser: null
+
+data:
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/data/openmathreasoning_single_agent_turn/train.jsonl
+  validation:
+    data_path: 3rdparty/Gym-workspace/Gym/data/openmathreasoning_single_agent_turn/validation.jsonl
+
+env:
+  nemo_gym:
+    config_paths:
+      - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+      - resources_servers/math_with_judge/configs/math_with_judge.yaml
+    # Changing config_paths does not clear overrides inherited from the Workplace
+    # Assistant recipe. Disable its wrapper and code-generation server override.
+    workplace_assistant_environment_server: null
+    code_gen: null
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          # Nano v2 uses /think and /no_think in the prompt, defaulting to thinking.
+          # Remove the inherited flag its template ignores. Keep reasoning as text.
+          extra_body:
+            _delete_key: chat_template_kwargs
+    environment_server_routes:
+      openmathreasoning: math_with_judge_environment_server
+    math_with_judge_environment_server:
+      environment_servers:
+        _delete_key: legacy_agent
+        single_agent_turn:
+          entrypoint: app.py
+          cleanup_timeout_seconds: 180
+          resources_server:
+            type: resources_servers
+            name: math_with_judge
+          agent_server:
+            type: responses_api_agents
+            name: math_with_judge_simple_agent
+    # Grade locally with math-verify; no judge-model calls.
+    math_with_judge:
+      resources_servers:
+        math_with_judge:
+          should_use_judge: false
+
+checkpointing:
+  checkpoint_dir: results/grpo-openmathreasoning-nemotron-nano-v2-9b-single-agent-turn
+logger:
+  log_dir: logs/grpo-openmathreasoning-nemotron-nano-v2-9b-single-agent-turn
+  wandb:
+    project: grpo-openmathreasoning
+    name: nemotron-nano-v2-9b-openmathreasoning-single-agent-turn

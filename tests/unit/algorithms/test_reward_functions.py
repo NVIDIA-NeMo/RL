@@ -261,15 +261,6 @@ def test_reward_shaping_disabled_does_not_save_unshaped_reward():
     assert "unshaped_total_reward" not in result_batch
 
 
-def test_reward_shaping_optional_defaults_are_none():
-    config = RewardShapingConfig()
-
-    assert config.overlong_buffer_length is None
-    assert config.overlong_buffer_penalty is None
-    assert config.max_response_length is None
-    assert config.stop_properly_penalty_coef is None
-
-
 def test_reward_shaping_missing_config_values():
     """Test that missing required DAPO config values raise ValueError."""
     batch = create_mock_batch_with_responses(

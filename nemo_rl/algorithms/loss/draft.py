@@ -802,28 +802,27 @@ def projected_streaming_vocab_parallel_soft_ce(
             vocab_parallel_hidden.reshape(-1, student_hidden.shape[-1])
             @ output_weight.detach().T
         )
-        return streaming_vocab_parallel_soft_ce(
-            student_logits=student_logits.reshape(
-                *student_hidden.shape[:-1],
-                output_weight.shape[0],
-            ),
-            teacher_logits=selected_teacher_logits.detach(),
-            mask=mask,
-            bin_ids=bin_ids,
-            weights=weights,
-            token_chunk_size=token_chunk_size,
-            tp_group=tp_group,
+        # Bins are already resolved above; the public entry point would
+        # re-validate them with another host sync.
+        numerators = _CachedVocabParallelSoftCE.apply(
+            student_logits.reshape(*student_hidden.shape[:-1], output_weight.shape[0]),
+            selected_teacher_logits.detach(),
+            mask,
+            bin_ids,
+            num_bins,
+            tp_group,
         )
-    numerators = _StreamingProjectedVocabParallelSoftCE.apply(
-        student_hidden,
-        output_weight,
-        selected_teacher_logits.detach(),
-        mask,
-        bin_ids,
-        num_bins,
-        token_chunk_size,
-        tp_group,
-    )
+    else:
+        numerators = _StreamingProjectedVocabParallelSoftCE.apply(
+            student_hidden,
+            output_weight,
+            selected_teacher_logits.detach(),
+            mask,
+            bin_ids,
+            num_bins,
+            token_chunk_size,
+            tp_group,
+        )
     counts = torch.zeros(num_bins, dtype=torch.float32, device=mask.device)
     counts.scatter_add_(0, bin_ids.reshape(-1), mask.reshape(-1).float())
     return DraftLossStats(
@@ -846,8 +845,6 @@ def dflash_projected_vocab_parallel_soft_ce(
     tp_group: torch.distributed.ProcessGroup | None,
 ) -> DraftLossStats:
     """Map DFlash block slots to the live target head and indexed teacher rows.
-
-    Called from the DFlash training path added in PR #3757.
 
     Slot 0 is the verified anchor token and is always excluded from the loss: this
     function overrides ``loss_mask[:, 0]`` to False regardless of what the caller
@@ -949,6 +946,22 @@ def dflash_projected_vocab_parallel_soft_ce(
         torch.tensor(position_decay, dtype=torch.float32, device=draft_hidden.device),
         torch.arange(gamma, dtype=torch.float32, device=draft_hidden.device),
     )
+    if num_blocks == 0:
+        if output_weight.ndim != 2 or output_weight.shape[1] != draft_hidden.shape[-1]:
+            raise ValueError(
+                "output_weight must be a vocabulary-by-hidden matrix matching "
+                f"draft_hidden, got {output_weight.shape} and {draft_hidden.shape}."
+            )
+        if output_weight.device != draft_hidden.device:
+            raise ValueError("output_weight and draft_hidden must share a device.")
+        if output_weight.dtype != draft_hidden.dtype:
+            raise ValueError("output_weight and draft_hidden must share a dtype.")
+        zero = draft_hidden.sum(dtype=torch.float32)
+        return DraftLossStats(
+            numerators=zero.expand(gamma),
+            counts=torch.zeros(gamma, dtype=torch.float32, device=draft_hidden.device),
+            weights=weights,
+        )
     selected_teacher_logits = (
         teacher_logits.detach()
         .reshape(-1, teacher_logits.shape[-1])

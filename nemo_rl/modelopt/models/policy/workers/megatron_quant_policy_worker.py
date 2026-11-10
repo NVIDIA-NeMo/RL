@@ -34,6 +34,7 @@ from megatron.core.utils import unwrap_model
 from modelopt.torch.quantization.nn import AnyQuantizer
 from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
+from modelopt.torch.quantization.utils import apply_without_qdq
 
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
 from nemo_rl.modelopt.models.policy.workers.utils import (
@@ -320,8 +321,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             load_modelopt_state(unwrapped_model, model_path)
 
     @contextmanager
-    def hide_tensor_quantizers(self):
-        """Temporarily hide ModelOpt quantizers from recursive module iteration."""
+    def hide_quantizers(self):
+        """Temporarily hide ModelOpt quantizers from DDP module iteration."""
         from megatron.core.distributed import DistributedDataParallel
 
         if not isinstance(self.model, DistributedDataParallel):
@@ -343,13 +344,13 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             inner_module.named_modules = original_named_modules
 
     def enable_forward_pre_hook(self):
-        """Enable forward pre-hook while hiding ModelOpt quantizers."""
-        with self.hide_tensor_quantizers():
+        """Enable forward pre-hook, hiding ModelOpt quantizers."""
+        with self.hide_quantizers():
             super().enable_forward_pre_hook()
 
     def disable_forward_pre_hook(self, param_sync=True):
-        """Disable forward pre-hook while hiding ModelOpt quantizers."""
-        with self.hide_tensor_quantizers():
+        """Disable forward pre-hook, hiding ModelOpt quantizers."""
+        with self.hide_quantizers():
             super().disable_forward_pre_hook(param_sync=param_sync)
 
     @contextmanager
@@ -551,6 +552,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     def _iter_real_quant_refit_params(
         self,
         kv_scales: dict[str, float] | None = None,
+        *,
+        draft_metadata_only: bool = False,
+        draft_weights: tuple[tuple[str, torch.Tensor], ...] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Export canonical ModelOpt deployment tensors for non-IPC transports."""
         groups = iter(self._iter_real_quant_refit_groups(kv_scales))
@@ -581,6 +585,37 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             worker_name=str(self),
             drain_between_groups=True,
         )
+
+        if draft_weights is None:
+            yield from self._iter_draft_weights_for_refit(
+                metadata_only=draft_metadata_only
+            )
+        else:
+            yield from draft_weights
+
+        if not vllm_cfg["kv_cache_dtype"].startswith("fp8"):
+            return
+
+        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+            get_vllm_qkv_scale_names,
+        )
+
+        keys: list[str] = []
+        for layer_idx in range(self.megatron_bridge.transformer_config.num_layers):
+            keys.extend(get_vllm_qkv_scale_names(layer_idx).values())
+
+        for param_name in keys:
+            scale_value = (
+                kv_scales[param_name] if kv_scales and param_name in kv_scales else 1.0
+            )
+            yield (
+                param_name,
+                torch.tensor(
+                    scale_value,
+                    dtype=torch.float32,
+                    device="cuda",
+                ).reshape(1),
+            )
 
     @staticmethod
     def _find_weight_quantizer(
@@ -659,6 +694,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         kv_scales: dict[str, float] | None = None,
         conversion_tasks=None,
         include_draft: bool = True,
+        *,
+        draft_metadata_only: bool = False,
+        draft_weights: tuple[tuple[str, torch.Tensor], ...] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Pre-fold weights on-the-fly via lazy proxy tasks.
 
@@ -666,6 +704,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         weight_quantizer(weight) instead of the raw weight. The folded tensor
         is computed lazily when export_hf_weights accesses it, so only one
         extra weight-sized tensor exists at a time — O(1) extra memory.
+
+        ``draft_metadata_only`` is forwarded to the base refit iterator after
+        quant folding so draft metadata keeps the base worker's PP-lane behavior.
 
         Raises:
             RuntimeError: If weight folding fails for a specific parameter,
@@ -676,7 +717,11 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 raise NotImplementedError(
                     "ModelOpt real-quant refit does not support filtered conversion tasks"
                 )
-            yield from self._iter_real_quant_refit_params(kv_scales)
+            yield from self._iter_real_quant_refit_params(
+                kv_scales,
+                draft_metadata_only=draft_metadata_only,
+                draft_weights=draft_weights,
+            )
             return
 
         class _FoldedTask:
@@ -692,7 +737,15 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 if w is None:
                     return None
                 try:
-                    return self._wq(w.float()).to(w.dtype)
+                    rows = getattr(
+                        self._task.megatron_module,
+                        "_modelopt_unquantized_output_rows",
+                        None,
+                    )
+                    folded = self._wq(w.float()).to(w.dtype, copy=rows is not None)
+                    if rows is not None:
+                        folded[rows] = apply_without_qdq(self._wq, w[rows]).to(w.dtype)
+                    return folded
                 except Exception as e:
                     raise RuntimeError(
                         f"Failed to apply weight quantizer for param "
@@ -734,6 +787,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 kv_scales,
                 conversion_tasks=folded_tasks,
                 include_draft=include_draft,
+                draft_metadata_only=draft_metadata_only,
+                draft_weights=draft_weights,
             ):
                 if "weight_quantizer" in name:
                     continue
