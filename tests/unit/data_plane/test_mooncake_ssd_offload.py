@@ -42,7 +42,7 @@ def _cfg(**mooncake_cpu) -> MooncakeCpuConfig:
 
 
 def test_master_args_are_empty_when_offload_is_off() -> None:
-    assert offload.master_args(_cfg()) == ()
+    assert offload.master_args(_cfg(ssd_offload={"enabled": False})) == ()
 
 
 def test_master_args_turn_eviction_into_offload() -> None:
@@ -116,7 +116,7 @@ def fake_store(monkeypatch, tmp_path):
 @pytest.mark.parametrize(
     ("mooncake_cpu", "segment_size"),
     [
-        ({}, None),  # offload off
+        ({"ssd_offload": {"enabled": False}}, None),  # offload off
         ({"ssd_offload": _SSD, "storage_unit_segment_size": UNIT}, None),  # client
         ({"ssd_offload": _SSD}, 0),  # generation worker
     ],
@@ -129,7 +129,7 @@ def test_install_is_a_noop_unless_this_process_owns_memory(
     assert fake_store.exit_hooks == []
     # Every client writes, so every client waits for memory when offload is on.
     waits = getattr(fake_store.client_cls, "_nrl_waits_for_memory", False)
-    assert waits == ("ssd_offload" in mooncake_cpu)
+    assert waits == mooncake_cpu["ssd_offload"]["enabled"]
 
 
 def test_install_gives_each_owner_its_own_dir(fake_store, tmp_path) -> None:
@@ -555,11 +555,12 @@ def test_sweep_deletes_only_the_files_of_cleared_keys(tmp_path) -> None:
     (tmp_path / "foreign").write_bytes(b"not mooncake's")
     answers = {"1@x": 1, "2@x": 0, "3@x": -1}  # exists, absent, RPC error
 
-    removed = offload.sweep_cleared_files(
+    sweep = offload.sweep_cleared_files(
         str(tmp_path), lambda keys: [answers[k] for k in keys]
     )
 
-    assert removed == 1
+    assert sweep.removed == 1
+    assert sweep.files == 3  # the three key files; .lock and "foreign" are not
     assert not cleared.exists()
     assert live.exists() and unknown.exists()
     assert (tmp_path / ".lock").exists() and (tmp_path / "foreign").exists()
@@ -577,13 +578,13 @@ def test_sweep_keeps_a_file_rewritten_after_it_was_listed(tmp_path) -> None:
         os.replace(tmp, replaced)  # replaced by rename (new inode)
         return [0] * len(keys)
 
-    assert offload.sweep_cleared_files(str(tmp_path), exists) == 0
+    assert offload.sweep_cleared_files(str(tmp_path), exists).removed == 0
     assert rewritten.exists() and replaced.exists()
 
 
 def test_sweep_keeps_everything_on_a_short_result_list(tmp_path) -> None:
     kept = _kv_file(tmp_path / "2@x", "2@x")
-    assert offload.sweep_cleared_files(str(tmp_path), lambda keys: []) == 0
+    assert offload.sweep_cleared_files(str(tmp_path), lambda keys: []).removed == 0
     assert kept.exists()
 
 

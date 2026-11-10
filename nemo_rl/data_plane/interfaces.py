@@ -110,10 +110,15 @@ class MooncakeSsdOffloadConfig(BaseModel, extra="allow"):
     offloaded at once): owners delete the files of cleared keys every 30 s.
     Operation, cleanup and the full-disk data-loss risk are described under
     "Mooncake SSD offload" in nemo_rl/data_plane/README.md.
+
+    On by default: data stays in memory while there is room and spills only
+    past ``offload_threshold``. The first spill logs a warning, since reads of
+    spilled objects go through the SSD. ``path`` defaults to a directory under
+    ``/tmp``, which must be a node-local disk, not a RAM-backed tmpfs.
     """
 
-    enabled: bool = False
-    path: str | None = None  # absolute; required when enabled
+    enabled: bool = True
+    path: str | None = "/tmp/nrl_mooncake_ssd_offload"  # absolute; required when enabled
     offload_threshold: Annotated[float, Field(gt=0, le=1)] = 0.5
 
     @model_validator(mode="after")
@@ -214,10 +219,15 @@ class NixlSsdConfig(BaseModel, extra="forbid"):
     spilled blobs back; one thread moves about 2.5 GB/s on NVMe, and a spilled
     put is acknowledged only once its file is written, so a workload that
     spills a large share of every step needs several.
+
+    On by default: a put spills only when the unit's put area is full, and the
+    driver logs a warning at the first spill of a run (reads of spilled blobs
+    wait for the SSD). ``path`` defaults to a directory under ``/tmp``, which
+    must be a node-local disk, not a RAM-backed tmpfs.
     """
 
-    enabled: bool = False
-    path: str | None = None  # absolute; required when enabled
+    enabled: bool = True
+    path: str | None = "/tmp/nrl_nixl_ssd"  # absolute; required when enabled
     staging_bytes: PositiveInt | None = None  # None: unit_slab_bytes // 4
     pickup_s: float = 10.0
     io_threads: PositiveInt = 4

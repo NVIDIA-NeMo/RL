@@ -33,9 +33,10 @@ import threading
 import time
 import urllib.request
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 from nemo_rl.data_plane.interfaces import MooncakeCpuConfig
+from nemo_rl.data_plane.local_disk import require_disk_backed
 
 LOGGER = logging.getLogger(__name__)
 
@@ -160,6 +161,9 @@ def install(cfg: MooncakeCpuConfig, segment_size: int | None) -> None:
                 f"Mooncake SSD offload needs {name}={value}, but the environment "
                 f"sets {os.environ[name]!r}; unset it or turn ssd_offload off"
             )
+    require_disk_backed(
+        str(cfg.ssd_offload.path), setting="data_plane.mooncake_cpu.ssd_offload.path"
+    )
     parent = os.path.join(str(cfg.ssd_offload.path), "nemo_rl_mooncake_offload")
     os.makedirs(parent, exist_ok=True)
     _remove_stale_dirs(parent)  # free disk left by earlier runs on this node
@@ -366,13 +370,23 @@ def _file_key(path: str) -> str | None:
     return scoped[len(_TENANT_PREFIX) :] or None
 
 
-def sweep_cleared_files(root: str, exists: Callable[[list[str]], list[int]]) -> int:
+class Sweep(NamedTuple):
+    """One pass of :func:`sweep_cleared_files`."""
+
+    removed: int  # files deleted (their key is gone from the master)
+    files: int  # offload files seen before deleting
+    bytes: int  # their total size
+
+
+def sweep_cleared_files(
+    root: str, exists: Callable[[list[str]], list[int]]
+) -> Sweep:
     """Delete offload files under ``root`` whose key the master no longer has.
 
     ``exists`` is ``batch_is_exist``: 1 present, 0 absent, negative on error.
     A file is deleted only on an explicit 0 and only if it is unchanged since
     it was listed (before the check): a key re-put and offloaded again after
-    the check rewrites its file, which is then kept. Returns the count deleted.
+    the check rewrites its file, which is then kept.
     """
     files = []
     for dirpath, _, names in os.walk(root):
@@ -395,7 +409,7 @@ def sweep_cleared_files(root: str, exists: Callable[[list[str]], list[int]]) -> 
                 removed += 1
             except FileNotFoundError:
                 pass
-    return removed
+    return Sweep(removed, len(files), sum(stamp[2] for _, _, stamp in files))
 
 
 def _stamp(path: str) -> tuple[int, int, int] | None:
@@ -409,16 +423,33 @@ def _stamp(path: str) -> tuple[int, int, int] | None:
 def _start_sweep(store: Any, root: str) -> None:
     global _sweep_stop
     stop = threading.Event()
+    warned = False  # one warning per owner, at its first offloaded file
 
     def _sweep() -> None:
+        nonlocal warned
         while not stop.wait(SWEEP_INTERVAL_S):
             try:
-                removed = sweep_cleared_files(root, store.batch_is_exist)
+                sweep = sweep_cleared_files(root, store.batch_is_exist)
             except Exception:
                 LOGGER.warning("Mooncake SSD offload sweep failed", exc_info=True)
                 continue
-            if removed:
-                LOGGER.debug("Deleted %d SSD files of cleared keys", removed)
+            if sweep.files and not warned:
+                # Offload means memory passed offload_threshold: the workload is
+                # under memory pressure and reads of spilled objects go through
+                # the SSD. The user may prefer more segment memory instead.
+                warned = True
+                LOGGER.warning(
+                    "Mooncake offloaded %d object(s), %.1f MiB, to SSD under %s: the "
+                    "data plane's memory passed "
+                    "data_plane.mooncake_cpu.ssd_offload.offload_threshold. Reads of "
+                    "spilled objects are slower. Raise storage_unit_segment_size (or "
+                    "global_segment_size) or offload_threshold to keep the data in memory.",
+                    sweep.files,
+                    sweep.bytes / 2**20,
+                    root,
+                )
+            if sweep.removed:
+                LOGGER.debug("Deleted %d SSD files of cleared keys", sweep.removed)
 
     threading.Thread(target=_sweep, name="mooncake-ssd-sweep", daemon=True).start()
     _sweep_stop = stop

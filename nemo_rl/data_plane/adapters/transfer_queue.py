@@ -1298,8 +1298,9 @@ class TQDataPlaneClient(DataPlaneClient):
             _connect_existing_with_segment_size(segment_size)
         if self._gdr_requested and torch.cuda.is_initialized():
             _bind_mooncake_cuda_device()
-        # TQ has built this process's store by now; a no-op unless it owns memory.
-        mooncake_ssd_offload.require_offloading_store()
+        if cfg["backend"] == "mooncake_cpu":
+            # TQ has built this process's store by now; a no-op unless it owns memory.
+            mooncake_ssd_offload.require_offloading_store()
         self._poll_interval_s = cfg["claim_meta_poll_interval_s"]
         self._closed = False
         # TQ restore is non-transactional and requires a globally clean system.

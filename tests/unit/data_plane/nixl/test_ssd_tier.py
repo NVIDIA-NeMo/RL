@@ -613,7 +613,8 @@ def test_deadline_during_commit_aborts_the_blob():
 
 # ------------------------------------------------------------------ config
 def test_ssd_config_validation():
-    assert tq_nixl.ssd_config({}) is None
+    assert tq_nixl.ssd_config({"ssd": {"enabled": False}}) is None
+    assert tq_nixl.ssd_config({})["ssd_dir"] == "/tmp/nrl_nixl_ssd"  # on by default
     ssd = {"enabled": True, "path": "/x"}
     on = {"unit_slab_bytes": 1 << 30, "ssd": ssd}
     assert tq_nixl.ssd_config(on) == {
@@ -632,7 +633,7 @@ def test_ssd_config_validation():
 @pytest.mark.parametrize(
     "ssd, match",
     [
-        ({"enabled": True}, "absolute"),  # no default dir on a small root disk
+        ({"enabled": True, "path": None}, "absolute"),  # a path must be given
         ({"enabled": True, "path": "ssd"}, "absolute"),
         ({"enabled": True, "path": "/x", "dri": "/y"}, "dri"),  # a typo
     ],

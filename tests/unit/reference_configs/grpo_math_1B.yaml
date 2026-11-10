@@ -665,9 +665,9 @@ data_plane:
     storage_unit_placement: all      # all, or cluster names: [inference], [train, teacher:<name>]
     # Spill Mooncake memory to node-local SSD.
     # Each segment owner (storage unit, or client) writes under its own subdir of path.
-    ssd_offload:
-      enabled: false
-      path: null                     # node-local SSD dir; required when enabled
+    ssd_offload:                   # on: spills only above offload_threshold; the
+      enabled: true                # first spill logs a warning (reads of spilled
+      path: /tmp/nrl_mooncake_ssd_offload  # objects are slower). Node-local disk, not tmpfs.
       offload_threshold: 0.5         # offload above this share of segment memory
     use_gdr: false                   # GPU-memory RDMA staging in CUDA clients
     gdr_staging_buffer_mb: 1024      # HBM reserved per active GDR client;
@@ -705,9 +705,9 @@ data_plane:
     op_timeout_s: null               # deadline of one put / get (all its waits); null: 2 x transfer_timeout_s
     graveyard_max_bytes: 4294967296  # memory unfinished transfers may retain before fatal
     debug_check_finite: false        # debug: report non-finite floats / all-False masks on put and get
-    ssd:                             # SSD tier: puts the put area cannot take go to disk
-      enabled: false
-      path: null                     # absolute node-local dir; required when enabled
+    ssd:                             # SSD tier, on: a put the put area cannot take goes to disk;
+      enabled: true                  # the first spill logs a warning (reads of spilled blobs wait
+      path: /tmp/nrl_nixl_ssd        # for the SSD). Node-local disk, not tmpfs.
       staging_bytes: null            # IO area carved from the slab; null: unit_slab_bytes / 4
       pickup_s: 10.0
       io_threads: 4                  # file-I/O threads per unit (spill writes + cold reads); ~2.5 GB/s each

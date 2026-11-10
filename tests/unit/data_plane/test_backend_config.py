@@ -124,7 +124,12 @@ def test_mooncake_checkpoint_mode_is_internal(
     )
 
     cfg = _cfg("mooncake_cpu")
-    cfg["mooncake_cpu"] = {"use_gdr": use_gdr, "gdr_staging_buffer_mb": 384}
+    # TQ is stubbed: the default-on SSD offload would have no store to swap.
+    cfg["mooncake_cpu"] = {
+        "use_gdr": use_gdr,
+        "gdr_staging_buffer_mb": 384,
+        "ssd_offload": {"enabled": False},
+    }
     adapter._init_tq(cfg, checkpointing=checkpointing)
 
     conf = OmegaConf.to_container(captured["conf"], resolve=True)
@@ -148,6 +153,15 @@ def _mooncake_overlay(
 
     # A stub by default: no real thread polling a master that does not exist.
     monkeypatch.setattr(mooncake_ssd_offload, "watch_master_disk_evictions", watch)
+    # install() keeps per-process state; an overlay with offload on must not
+    # leave it behind for a later real client in this test process.
+    for name, value in (
+        ("_dir", None),
+        ("_lock_fd", None),
+        ("_offloading_store_set_up", False),
+        ("_sweep_stop", None),
+    ):
+        monkeypatch.setattr(mooncake_ssd_offload, name, value)
     captured = {}
     monkeypatch.setattr(adapter, "_get_local_node_ip", lambda: "10.0.0.7")
     monkeypatch.setattr(adapter, "_mooncake_transport_config", lambda: {})
@@ -155,6 +169,9 @@ def _mooncake_overlay(
     monkeypatch.setattr(
         adapter.tq, "init", lambda *, conf: captured.setdefault("conf", conf)
     )
+    # TQ is stubbed here, so the (default-on) SSD offload has no store to swap;
+    # tests that want it on say so explicitly.
+    mooncake_cpu = {"ssd_offload": {"enabled": False}, **mooncake_cpu}
     cfg = _cfg("mooncake_cpu", mooncake_cpu=mooncake_cpu)
     # Storage units are only started under a plan; the overlay ignores the IDs.
     plan = ["a" * 56] if mooncake_cpu.get("storage_unit_segment_size") else None
@@ -193,7 +210,7 @@ def test_mooncake_ssd_offload_watches_the_master_for_disk_evictions(
     watched = []
     _mooncake_overlay(
         monkeypatch,
-        {"ssd_offload": _MC_SSD} if ssd_offload else {},
+        {"ssd_offload": _MC_SSD if ssd_offload else {"enabled": False}},
         watch=lambda url, path: watched.append((url, path)),
     )
 
@@ -208,7 +225,7 @@ def test_mooncake_ssd_offload_watches_the_master_for_disk_evictions(
 def test_mooncake_without_ssd_offload_keeps_tq_master_flags(monkeypatch) -> None:
     from transfer_queue.storage.bootstrap import mooncake_bootstrap
 
-    storage = _mooncake_overlay(monkeypatch, {})
+    storage = _mooncake_overlay(monkeypatch, {"ssd_offload": {"enabled": False}})
     assert storage["hard_pin"] is None
     assert mooncake_bootstrap.subprocess.extra_args == ()
 
@@ -228,7 +245,7 @@ def test_mooncake_checkpointing_pins_replicas_unless_offloading(
 ) -> None:
     storage = _mooncake_overlay(
         monkeypatch,
-        {"ssd_offload": _MC_SSD} if ssd_offload else {},
+        {"ssd_offload": _MC_SSD if ssd_offload else {"enabled": False}},
         checkpointing=True,
     )
     # Offload must evict; without it, saves borrow hard-pinned memory directly.
@@ -239,7 +256,10 @@ def test_mooncake_checkpointing_pins_replicas_unless_offloading(
 @pytest.mark.parametrize(
     ("mooncake_cpu", "match"),
     [
-        ({"storage_unit_segment_size": 1, "ssd_offload": {"enabled": True}}, "path"),
+        (
+            {"storage_unit_segment_size": 1, "ssd_offload": {"enabled": True, "path": None}},
+            "path",
+        ),
         (
             {
                 "storage_unit_segment_size": 1,
@@ -302,6 +322,20 @@ def test_simple_storage_units_skip_nodes_without_cpu(monkeypatch) -> None:
         3, required_node_resource=storage["required_node_resource"]
     )
     assert [s.node_id for s in strategies] == [worker["NodeID"]] * 3
+
+
+def test_mooncake_and_nixl_ssd_offload_are_on_by_default() -> None:
+    """Spill-on-pressure tiers cost nothing while memory suffices, so they are on.
+
+    simple's offload is by value size (every value >= threshold_bytes goes to
+    SSD), which is a real cost, so it stays off.
+    """
+    from nemo_rl.data_plane.interfaces import MooncakeCpuConfig, NixlStoreConfig
+
+    mc = MooncakeCpuConfig().ssd_offload
+    assert mc.enabled is True and mc.path == "/tmp/nrl_mooncake_ssd_offload"
+    nx = NixlStoreConfig().ssd
+    assert nx.enabled is True and nx.path == "/tmp/nrl_nixl_ssd"
 
 
 def test_simple_ssd_offload_is_off_by_default(monkeypatch) -> None:
