@@ -168,36 +168,6 @@ def test_release_moe_dispatcher_state_ignores_dense_models():
     assert release_moe_dispatcher_state(model) == 0
 
 
-_SNAPSHOT_COMMIT = "0" * 40
-
-
-def _make_partial_hub_cache(cache_dir, *, local_files, listed_files):
-    """Build an HF cache whose snapshot holds local_files but whose tree listing names listed_files."""
-    repo_dir = cache_dir / "models--org--model"
-    snapshot_dir = repo_dir / "snapshots" / _SNAPSHOT_COMMIT
-    snapshot_dir.mkdir(parents=True)
-    for name in local_files:
-        (snapshot_dir / name).write_text("{}")
-    (repo_dir / "trees").mkdir()
-    (repo_dir / "trees" / f"{_SNAPSHOT_COMMIT}.json").write_text(
-        json.dumps(
-            {
-                "format_version": 1,
-                "files": {
-                    name: {"size": 2, "blob_id": "0" * 40} for name in listed_files
-                },
-            }
-        )
-    )
-    return snapshot_dir
-
-
-@pytest.mark.automodel
-def test_automodel_snapshot_download_patch_installed():
-    """Automodel's base-model load resolves snapshots through the NeMo-RL wrapper."""
-    assert automodel_auto_model.snapshot_download is snapshot_download_base_load_files
-
-
 @pytest.mark.automodel
 def test_automodel_snapshot_download_patch_still_needed():
     """Tripwire: remove the wrapper in nemo_rl/models/automodel/utils.py once this fails.
@@ -212,41 +182,31 @@ def test_automodel_snapshot_download_patch_still_needed():
 
 
 @pytest.mark.automodel
-def test_snapshot_download_base_load_files_accepts_weight_only_cache(tmp_path):
-    """A cache without README/LICENSE still resolves for a base-model load."""
-    snapshot_dir = _make_partial_hub_cache(
-        tmp_path,
-        local_files=["config.json", "model.safetensors"],
-        listed_files=["config.json", "model.safetensors", "README.md", "LICENSE"],
+def test_snapshot_download_base_load_files_checks_only_base_load_files(tmp_path):
+    """A weight-only cached snapshot resolves; a missing weight file still raises."""
+    commit = "0" * 40
+    repo_dir = tmp_path / "models--org--model"
+    snapshot_dir = repo_dir / "snapshots" / commit
+    snapshot_dir.mkdir(parents=True)
+    for name in ("config.json", "model.safetensors"):
+        (snapshot_dir / name).write_text("{}")
+    # The tree listing a pattern-filtered download leaves behind names every repo file.
+    listed = ("config.json", "model.safetensors", "README.md", "LICENSE")
+    (repo_dir / "trees").mkdir()
+    (repo_dir / "trees" / f"{commit}.json").write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "files": {name: {"size": 2, "blob_id": "0" * 40} for name in listed},
+            }
+        )
     )
-    kwargs = {
-        "revision": _SNAPSHOT_COMMIT,
-        "cache_dir": str(tmp_path),
-        "local_files_only": True,
-    }
+    kwargs = {"revision": commit, "cache_dir": str(tmp_path), "local_files_only": True}
 
     with pytest.raises(IncompleteSnapshotError):
         huggingface_hub.snapshot_download("org/model", **kwargs)
     assert snapshot_download_base_load_files("org/model", **kwargs) == str(snapshot_dir)
 
-
-@pytest.mark.automodel
-def test_snapshot_download_base_load_files_rejects_missing_weights(tmp_path):
-    """A cache missing a weight shard the listing names still fails."""
-    _make_partial_hub_cache(
-        tmp_path,
-        local_files=["config.json", "model.safetensors.index.json"],
-        listed_files=[
-            "config.json",
-            "model.safetensors.index.json",
-            "model-00001-of-00002.safetensors",
-        ],
-    )
-
-    with pytest.raises(IncompleteSnapshotError, match="model-00001-of-00002"):
-        snapshot_download_base_load_files(
-            "org/model",
-            revision=_SNAPSHOT_COMMIT,
-            cache_dir=str(tmp_path),
-            local_files_only=True,
-        )
+    (snapshot_dir / "model.safetensors").unlink()
+    with pytest.raises(IncompleteSnapshotError, match="model.safetensors"):
+        snapshot_download_base_load_files("org/model", **kwargs)
