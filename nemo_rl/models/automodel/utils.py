@@ -59,6 +59,35 @@ def move_model_buffers_to_device(
     return model
 
 
+def warmup_compiled_rms_norm(model: nn.Module) -> int:
+    """Initialize native compiled norms without changing model state or RNG."""
+    from nemo_automodel.components.models.common.utils import Float32RMSNorm
+
+    variants = list(
+        dict.fromkeys(
+            (module.weight.shape[0], module.eps, module.weight.dtype)
+            for module in model.modules()
+            if isinstance(module, Float32RMSNorm)
+        )
+    )
+    if not variants:
+        return 0
+    device_index = torch.cuda.current_device()
+    device = torch.device("cuda", device_index)
+    # Lazy compiler initialization allocates CUDA constants and can synchronize
+    # against outstanding FSDP collectives when ranks reach their first norm apart.
+    with torch.random.fork_rng(devices=[device_index]):
+        for width, eps, dtype in variants:
+            norm = Float32RMSNorm(width, eps=eps, device=device, dtype=dtype)
+            inputs = torch.zeros((1, 2, width), device=device, dtype=dtype)
+            with torch.no_grad():
+                norm(inputs)
+            with torch.enable_grad():
+                norm(inputs.requires_grad_()).sum().backward()
+            torch.cuda.synchronize(device)
+    return len(variants)
+
+
 def resolve_model_class(model_name: str) -> Any:
     """Resolve the model class for a model type.
 

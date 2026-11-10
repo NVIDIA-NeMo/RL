@@ -37,7 +37,48 @@ from nemo_rl.models.automodel.utils import (
     move_model_buffers_to_device,
     release_moe_dispatcher_state,
     resolve_model_class,
+    warmup_compiled_rms_norm,
 )
+
+
+@pytest.mark.automodel
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_compiled_norm_warmup_preserves_model_and_rng(dtype: torch.dtype) -> None:
+    from nemo_automodel.components.models.common.utils import Float32RMSNorm
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    with torch.random.fork_rng(devices=[device.index]):
+        model = nn.Sequential(Float32RMSNorm(128, device=device, dtype=dtype))
+        model.eval()
+        state = {
+            key: value.detach().clone() for key, value in model.state_dict().items()
+        }
+        cpu_rng = torch.get_rng_state().clone()
+        cuda_rng = torch.cuda.get_rng_state().clone()
+        warmup_compiled_rms_norm(model)
+        assert torch.equal(torch.get_rng_state(), cpu_rng)
+        assert torch.equal(torch.cuda.get_rng_state(), cuda_rng)
+        assert not model.training and all(p.grad is None for p in model.parameters())
+        assert all(
+            torch.equal(model.state_dict()[key], value) for key, value in state.items()
+        )
+        inputs = torch.randn(
+            (1, 3, 128), device=device, dtype=dtype, requires_grad=True
+        )
+        output = model(inputs)
+        expected = (
+            inputs.float()
+            * torch.rsqrt(inputs.float().square().mean(-1, keepdim=True) + model[0].eps)
+        ).to(dtype)
+        torch.testing.assert_close(output, expected)
+        output.sum().backward()
+        assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
+        assert (
+            model[0].weight.grad is not None
+            and torch.isfinite(model[0].weight.grad).all()
+        )
 
 
 @pytest.mark.automodel

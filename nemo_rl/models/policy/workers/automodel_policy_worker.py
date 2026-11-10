@@ -70,6 +70,7 @@ from nemo_rl.models.automodel.train import (
 from nemo_rl.models.automodel.utils import (
     move_model_buffers_to_device,
     release_moe_dispatcher_state,
+    warmup_compiled_rms_norm,
 )
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
@@ -597,6 +598,11 @@ class AutomodelPolicyWorkerImpl(
         # field name (not positional unpacking) so optional fields appended to
         # ModelAndOptimizerState stay backward compatible across workers.
         self.model = model_and_optimizer_state.model
+        warmed_norms = warmup_compiled_rms_norm(self.model)
+        if warmed_norms:
+            print(
+                f"Initialized {warmed_norms} compiled RMSNorm variants before distributed forwards"
+            )
         self.optimizer = model_and_optimizer_state.optimizer
         self.scheduler = model_and_optimizer_state.scheduler
         self.is_hf_model = model_and_optimizer_state.is_hf_model
