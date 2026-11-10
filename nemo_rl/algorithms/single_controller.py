@@ -131,6 +131,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
     is_ppo_run,
+    rollout_snapshots_enabled,
     validate_forest_objective,
 )
 from nemo_rl.algorithms.single_controller_utils.debug_writer import (
@@ -865,8 +866,7 @@ class SingleControllerActor:
             await self._log_rollout_throughput_metrics(emit=False)
         rollout_checkpoint_task = (
             asyncio.create_task(self._rollout_snapshots.run())
-            if self._master_config.rollout_checkpointing.snapshot_attempt_interval_s
-            is not None
+            if rollout_snapshots_enabled(self._master_config)
             else None
         )
         if rollout_checkpoint_task is not None:
@@ -3235,6 +3235,7 @@ class SingleControllerActor:
                             step_metrics,
                             is_policy_training_step=is_policy_training_step,
                             is_final_checkpoint=is_last_step,
+                            publish_now=should_save_by_timeout,
                         )
                     if defer_refit_for_save:
                         # The save is done; wake the engine unless the loop is about to exit.
@@ -3315,6 +3316,12 @@ class SingleControllerActor:
             )
 
             if should_save_by_timeout:
+                if self._master_config.checkpointing["enabled"]:
+                    # The trainer checkpoint holds no environment state, and no
+                    # later step will wake the pump to snapshot it. step_N is
+                    # already being published in the background, so the snapshot
+                    # runs while its policy write lands and moves in after.
+                    await self._rollout_snapshots.save_at_deadline()
                 print("Timeout has been reached, stopping training early", flush=True)
                 break
         await self._finish_pending_save(blocking=True)
@@ -4148,8 +4155,13 @@ class SingleControllerActor:
         *,
         is_policy_training_step: bool,
         is_final_checkpoint: bool,
+        publish_now: bool = False,
     ) -> None:
-        """Serialize full and rollout-only checkpoint publication."""
+        """Serialize full and rollout-only checkpoint publication.
+
+        ``publish_now`` starts publishing step_N in the background even with
+        ``defer_async_checkpoint_finalize``, as the checkpoint deadline needs.
+        """
         # The workers would wait for a still-pending save anyway; publish it first.
         await self._finish_pending_save(blocking=True)
         async with self._rollout_snapshots.trainer_checkpoint():
@@ -4157,6 +4169,7 @@ class SingleControllerActor:
                 step_metrics,
                 is_policy_training_step=is_policy_training_step,
                 is_final_checkpoint=is_final_checkpoint,
+                publish_now=publish_now,
             )
 
     async def _save_checkpoint_impl(
@@ -4165,6 +4178,7 @@ class SingleControllerActor:
         *,
         is_policy_training_step: bool,
         is_final_checkpoint: bool,
+        publish_now: bool = False,
     ) -> None:
         """Write a full checkpoint for the just-finished train step.
 
@@ -4280,15 +4294,19 @@ class SingleControllerActor:
         # Keep this last: the rename it leads to waits only for the policy's async
         # weight write, so anything written into checkpoint_path after it races
         # the rename.
-        await self._publish_when_policy_write_done(checkpoint_path)
+        await self._publish_when_policy_write_done(
+            checkpoint_path, publish_now=publish_now
+        )
 
-    async def _publish_when_policy_write_done(self, checkpoint_path: PathLike) -> None:
+    async def _publish_when_policy_write_done(
+        self, checkpoint_path: PathLike, *, publish_now: bool = False
+    ) -> None:
         """Arrange for tmp_step_N to become step_N once the policy write lands.
 
         The only way a full checkpoint gets published. Call it only after every
         other part of the checkpoint is on disk.
         """
-        if self._defer_checkpoint_finalize:
+        if self._defer_checkpoint_finalize and not publish_now:
             # Published by _finish_pending_save at a later step boundary.
             self._pending_checkpoint = (checkpoint_path, self._train_steps)
             return

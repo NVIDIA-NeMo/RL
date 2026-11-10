@@ -44,6 +44,8 @@ ROLLOUT_SNAPSHOT_MANIFEST_FILENAME = "manifest.json"
 
 _SNAPSHOT_RE = re.compile(r"snapshot_(\d+)")
 _TMP_SNAPSHOT_RE = re.compile(r"tmp_snapshot_(\d+)")
+# Staged beside the checkpoint directory's step_N folders, not under one.
+_STAGED_SNAPSHOT_PREFIX = "tmp_rollout_snapshot_step_"
 _TRASH_SNAPSHOT_RE = re.compile(r"trash_snapshot_(\d+)")
 
 # A bootstrap fingerprint is fail-closed: every config value participates unless
@@ -567,6 +569,34 @@ def prepare_snapshot_paths(anchor: Path) -> tuple[Path, Path, int]:
     if tmp_path.exists():
         shutil.rmtree(tmp_path)
     tmp_path.mkdir(parents=True)
+    return tmp_path, final_path, sequence
+
+
+def prepare_staged_snapshot_path(checkpoint_dir: Path, step: int) -> Path:
+    """Allocate a snapshot directory beside the checkpoints, before step_N exists.
+
+    The deadline snapshot is written while step_N's policy weights are still
+    being written, so it cannot live under step_N yet. The directory is on the
+    same filesystem, so moving it under step_N later is a rename. Any staged
+    snapshot a killed run left behind is removed first.
+    """
+    for leftover in checkpoint_dir.glob(f"{_STAGED_SNAPSHOT_PREFIX}*"):
+        shutil.rmtree(leftover)
+    staged = checkpoint_dir / f"{_STAGED_SNAPSHOT_PREFIX}{step}"
+    staged.mkdir(parents=True)
+    return staged
+
+
+def adopt_staged_snapshot(staged: Path, anchor: Path) -> tuple[Path, Path, int]:
+    """Move a staged snapshot into the anchor's next temporary snapshot slot.
+
+    Returns:
+        The temporary and final snapshot paths and the sequence number, as
+        ``prepare_snapshot_paths`` does; the caller then publishes as usual.
+    """
+    tmp_path, final_path, sequence = prepare_snapshot_paths(anchor)
+    tmp_path.rmdir()
+    os.rename(staged, tmp_path)
     return tmp_path, final_path, sequence
 
 
