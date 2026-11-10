@@ -1314,11 +1314,11 @@ def real_image_processor():
             get_multimodal_config=lambda: mm_config,
         )
         info = NanoNemotronVLProcessingInfo(InputProcessingContext(config, tokenizer))
-        return NanoNemotronVLMultiModalProcessor(
-            info,
-            NanoNemotronVLDummyInputsBuilder(info),
-            cache=MultiModalProcessorOnlyCache(config) if cached else None,
+        # vLLM takes the processor cache per call, not at construction.
+        processor = NanoNemotronVLMultiModalProcessor(
+            info, NanoNemotronVLDummyInputsBuilder(info)
         )
+        return processor, MultiModalProcessorOnlyCache(config) if cached else None
 
     return make
 
@@ -1338,14 +1338,18 @@ def test_real_vllm_retained_image_budget_and_cache(
     b = Image.fromarray(np.full((128, 128, 3), 47, dtype=np.uint8))
     max_len = 256 if budget == "ample" else 80
     cached = cache_state != "disabled"
-    processor = real_image_processor(max_len, cached)
-    first = processor("<image>", processor.info.parse_mm_data({"image": [a]}))
+    processor, cache = real_image_processor(max_len, cached)
+    first = processor(
+        "<image>", processor.info.parse_mm_data({"image": [a]}), cache=cache
+    )
     retained = capture_processed_media(first, prev_len=0, patch_size=8)
     if cache_state == "restart":
-        processor = real_image_processor(max_len, cached)
+        processor, cache = real_image_processor(max_len, cached)
     images = [a, b] if continuation == "image" else [a]
     text = "<image>" * len(images) + " t" * 32
-    second = processor(text, processor.info.parse_mm_data({"image": images}))
+    second = processor(
+        text, processor.info.parse_mm_data({"image": images}), cache=cache
+    )
     first_pixels = first["mm_kwargs"]["image"][0].get_data()["pixel_values_flat"]
     second_pixels = second["mm_kwargs"]["image"][0].get_data()["pixel_values_flat"]
 
