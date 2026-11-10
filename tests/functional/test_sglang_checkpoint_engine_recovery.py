@@ -52,7 +52,6 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
 from nemo_rl.weight_sync.checkpoint_engine_weight_synchronizer import (
     CheckpointEngineWeightSynchronizer,
 )
-
 from tests.unit.models.generation.sglang.helpers import MODEL_PATH
 
 pytestmark = pytest.mark.sglang

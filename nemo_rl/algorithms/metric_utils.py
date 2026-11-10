@@ -97,6 +97,8 @@ class SetupTimingMetrics:
     generation_init_reserve_time_s: Optional[float] = None
     generation_init_load_time_s: Optional[float] = None
 
+    # sft_v2 only: elsewhere the placement wait falls inside policy_init.
+    cluster_init_time_s: Optional[float] = None
     policy_init_time_s: Optional[float] = None
     # PPO only: the critic shares the training GPUs, so it is built after the policy.
     value_init_time_s: Optional[float] = None

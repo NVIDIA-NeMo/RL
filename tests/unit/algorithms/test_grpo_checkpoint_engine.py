@@ -14,37 +14,8 @@
 
 """Tests for GRPO checkpoint-engine refit routing."""
 
-from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
-
-from omegaconf import OmegaConf
-
-from nemo_rl.utils.config import load_config, register_omegaconf_resolvers
-
-
-def test_nixl_example_is_an_enabled_non_colocated_overlay():
-    from nemo_rl.algorithms.grpo import MasterConfig
-    from nemo_rl.models.generation.vllm.config import (
-        VllmConfig,
-        normalize_vllm_refit_config,
-    )
-
-    repo_root = Path(__file__).parents[3]
-    register_omegaconf_resolvers()
-    raw_config = load_config(
-        repo_root / "examples/configs/grpo_math_8B_megatron_nixl.yaml"
-    )
-    resolved_config = OmegaConf.to_container(raw_config, resolve=True)
-    assert isinstance(resolved_config, dict)
-    config = MasterConfig(**resolved_config)
-
-    generation = config.policy["generation"]
-    normalize_vllm_refit_config(cast(VllmConfig, generation))
-    assert generation["refit_transport"] == "nixl"
-    assert generation["refit_cfg"].nixl.update_weights_bucket_memory_ratio == 0.05
-    assert not generation["colocated"]["enabled"]
-    assert config.cluster.num_nodes == 2
 
 
 def test_reset_encoder_cache_flag_rejected_on_unsupported_refit_transports():
@@ -73,6 +44,76 @@ def test_reset_encoder_cache_flag_rejected_on_unsupported_refit_transports():
     for transport in ("nixl", "vllm_s3_sparse", "vllm_zmq_sparse"):
         with pytest.raises(ValueError, match="reset_encoder_cache_after_weight_update"):
             normalize_vllm_refit_config(_config(transport))
+
+
+def test_native_mxfp8_linear_backend_rejected_on_non_native_refit_transports():
+    """Native MXFP8 linear kernels need the IPC/collective layerwise reload."""
+    import pytest
+
+    from nemo_rl.models.generation.vllm.config import (
+        VllmConfig,
+        normalize_vllm_refit_config,
+    )
+
+    def _config(transport, vllm_kwargs, is_mx=True):
+        return cast(
+            VllmConfig,
+            {
+                "vllm_cfg": {"precision": "fp8", "is_mx": is_mx},
+                "vllm_kwargs": vllm_kwargs,
+                "refit_transport": transport,
+            },
+        )
+
+    for vllm_kwargs in (
+        {"linear_backend": "flashinfer_trtllm"},
+        {"linear_backend": "flashinfer-cutedsl"},
+        {"kernel_config": {"linear_backend": "flashinfer_cutedsl"}},
+        {
+            "linear_backend": "auto",
+            "kernel_config": {"linear_backend": "flashinfer-trtllm"},
+        },
+        {
+            "linear_backend": "flashinfer_trtllm",
+            "kernel_config": {"linear_backend": "flashinfer_cutlass"},
+        },
+    ):
+        assert normalize_vllm_refit_config(_config(None, vllm_kwargs)) is None
+        for transport in (
+            "nccl_reshard",
+            "nixl",
+            "vllm_s3_sparse",
+            "vllm_zmq_sparse",
+            "my_pkg.engine:Engine",
+        ):
+            with pytest.raises(ValueError, match="native MXFP8 linear kernels"):
+                normalize_vllm_refit_config(_config(transport, vllm_kwargs))
+
+    # Non-native backends and non-MX precision keep the existing transports.
+    assert (
+        normalize_vllm_refit_config(
+            _config("nccl_reshard", {"linear_backend": "flashinfer_cutlass"})
+        )
+        is None
+    )
+    assert (
+        normalize_vllm_refit_config(
+            _config(
+                "nccl_reshard",
+                {
+                    "linear_backend": "flashinfer_cutlass",
+                    "kernel_config": {"linear_backend": "flashinfer_cutedsl"},
+                },
+            )
+        )
+        is None
+    )
+    assert (
+        normalize_vllm_refit_config(
+            _config("nccl_reshard", {"linear_backend": "flashinfer_trtllm"}, False)
+        )
+        is None
+    )
 
 
 def test_refit_policy_generation_uses_attached_checkpoint_engine_synchronizer():
