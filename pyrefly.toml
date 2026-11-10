@@ -173,6 +173,7 @@ project-includes = [
   "nemo_rl/data_plane/adapters/tq_nixl.py",
   "nemo_rl/data_plane/adapters/tq_nixl_checkpoint.py",
   "nemo_rl/data_plane/adapters/tq_simple_checkpoint.py",
+  "nemo_rl/data_plane/adapters/tq_controller_checkpoint.py",
   "nemo_rl/data_plane/adapters/transfer_queue.py",
   "nemo_rl/data_plane/adapters/transfer_queue_env.py",
   "nemo_rl/data_plane/async_utils.py",

@@ -1229,6 +1229,22 @@ temporarily increase host-memory use until persistence finishes. This contract
 is audited against the pinned TQ 0.1.11 implementation; a dependency update needs
 the same audit. Only one snapshot may be retained at a time.
 
+Controller capture serializes the native checkpoint layout into immutable bytes
+under a lock shared with the ZMQ request dispatcher. It avoids recursively
+copying the metadata before serialization. Unknown partition subclasses retain
+their native snapshot behavior. Controller and shard persistence run in parallel
+after the caller resumes traffic; neither serializes live controller state or
+returns checkpoint payloads through Ray. The controller bytes remain resident
+until the capture handle is released. File creation is exclusive, and the
+completion marker is written only after all persistence RPCs succeed.
+
+CPU-only real Ray/ZMQ validation, including concurrent PUT/CLEAR requests,
+failure cleanup and restore into fresh actors:
+
+```bash
+RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 uv run tests/functional/data_plane_simple_checkpoint_cpu.py --output /tmp/tq-capture-result.json
+```
+
 ## Async path (proposed)
 
 The data-plane interface covers both sync and async, but the **sync
