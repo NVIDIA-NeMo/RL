@@ -31,6 +31,7 @@ from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.utils import (
     R3_MISSING_ROUTE_SENTINEL,
+    _as_routed_experts_tensor,
     aggregate_spec_decode_counters,
     attach_routed_experts_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
@@ -734,6 +735,47 @@ def test_attach_sampler_topk_logprobs_to_chat_response_choices():
     empty = response_dict["choices"][1]["message"]
     assert tuple(empty["sampler_topk_token_ids"].shape) == (0, 2)
     assert tuple(empty["sampler_topk_logprobs"].shape) == (0, 2)
+
+
+def test_attach_sampler_topk_logprobs_to_chat_response_choices_reads_flat_logprobs():
+    final_res = SimpleNamespace(
+        outputs=[
+            SimpleNamespace(
+                index=0,
+                token_ids=[9],
+                logprobs=SimpleNamespace(
+                    start_indices=[0],
+                    end_indices=[3],
+                    token_ids=[9, 1, 2],
+                    logprobs=[-3.0, -0.3, -1.8],
+                ),
+            ),
+            SimpleNamespace(
+                index=1,
+                token_ids=[],
+                logprobs=SimpleNamespace(
+                    start_indices=[], end_indices=[], token_ids=[], logprobs=[]
+                ),
+            ),
+        ]
+    )
+    response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(index=0, message=SimpleNamespace()),
+            SimpleNamespace(index=1, message=SimpleNamespace()),
+        ]
+    )
+
+    attach_sampler_topk_logprobs_to_chat_response_choices(response, final_res, top_k=2)
+
+    message = response.choices[0].message
+    assert message.sampler_topk_token_ids.tolist() == [[1, 2]]
+    torch.testing.assert_close(
+        message.sampler_topk_logprobs, torch.tensor([[-0.3, -1.8]])
+    )
+    empty = response.choices[1].message
+    assert tuple(empty.sampler_topk_token_ids.shape) == (0, 2)
+    assert tuple(empty.sampler_topk_logprobs.shape) == (0, 2)
 
 
 def test_attach_sampler_topk_logprobs_to_chat_response_choices_requires_k_entries():
@@ -1578,3 +1620,52 @@ def test_check_sampling_param(temperature, top_p, top_k, error) -> None:
             top_k=top_k,
             generation_config=generation_config,
         )
+
+
+class TestRoutedExpertsTensorDtype:
+    """The narrow-unsigned crash the carry-dtype conversion has to survive.
+
+    vLLM can hand back expert ids as ``uint16``. ``Tensor.max()`` is not implemented
+    for that dtype, so the range check widens before reducing. The dtype in these
+    tests is load-bearing: ``uint8`` and every signed type implement ``max()``, so a
+    test written with one of those passes against the unwidened code and pins nothing.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _rearm_range_check(self):
+        """The range check runs once per process; re-arm it around every test."""
+        previous = vllm_utils.G_ROUTED_EXPERTS_RANGE_CHECKED
+        vllm_utils.G_ROUTED_EXPERTS_RANGE_CHECKED = False
+        yield
+        vllm_utils.G_ROUTED_EXPERTS_RANGE_CHECKED = previous
+
+    def test_uint16_ids_convert_without_a_narrow_dtype_reduction(self):
+        """The regression: max() on uint16 raises NotImplementedError("max_all")."""
+        value = torch.tensor([1, 2, 3], dtype=torch.uint16)
+
+        out = _as_routed_experts_tensor(
+            value, device=torch.device("cpu"), dtype=torch.int32
+        )
+
+        assert out.dtype == torch.int32
+        assert out.tolist() == [1, 2, 3]
+
+    def test_the_dtype_this_guards_really_cannot_be_reduced_directly(self):
+        """Pins the premise, so the test above cannot quietly stop testing anything.
+
+        If a future torch implements max_all for uint16 this fails, which is the
+        signal to drop the widening rather than keep carrying it untested.
+        """
+        with pytest.raises(NotImplementedError, match="max_all"):
+            torch.tensor([1], dtype=torch.uint16).max()
+
+    def test_an_out_of_range_uint16_id_is_rejected_rather_than_wrapped(self):
+        """The widening must not cost the overflow check it exists to serve."""
+        # Above int8's max of 127, so the guard fires. 200 also wraps to -56 in
+        # int8, which is the silent corruption the check exists to prevent.
+        value = torch.tensor([200], dtype=torch.uint16)
+
+        with pytest.raises(ValueError, match="exceeds the resolved carry dtype"):
+            _as_routed_experts_tensor(
+                value, device=torch.device("cpu"), dtype=torch.int8
+            )

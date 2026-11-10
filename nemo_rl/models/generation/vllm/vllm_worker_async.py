@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import contextvars
 import copy
 import gc
 import logging
@@ -95,6 +96,14 @@ from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
 
 LOGGER = logging.getLogger(__name__)
 
+# The captured model call the current HTTP request serves. Set when capture
+# begins the call, in the request's task, and read by the engine client when the
+# same task submits the call to the engine, which links the engine request ID to
+# the captured call.
+_CAPTURED_MODEL_CALL: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "nemo_rl_captured_model_call", default=None
+)
+
 if TYPE_CHECKING:
     from nemo_gym.token_id_capture.staging.capture import ActiveCall
 
@@ -166,6 +175,8 @@ class _AsyncLLMHTTPClient:
         self._engine_client = engine_client
         self._engine_loop = engine_loop
         self._flat_logprobs = flat_logprobs
+        # Engine request ID -> captured model call ID, while the request runs.
+        self._captured_requests: dict[str, str] = {}
         self.model_config = engine_client.model_config
         self.renderer = engine_client.renderer
         self.input_processor = engine_client.input_processor
@@ -208,6 +219,9 @@ class _AsyncLLMHTTPClient:
     ) -> AsyncGenerator[Any, None]:
         iterator = None
         completed = False
+        model_call_id = _CAPTURED_MODEL_CALL.get()
+        if model_call_id is not None:
+            self._captured_requests[request_id] = model_call_id
 
         async def next_output() -> Any:
             nonlocal iterator
@@ -225,6 +239,7 @@ class _AsyncLLMHTTPClient:
                     completed = True
                     return
         finally:
+            self._captured_requests.pop(request_id, None)
             if not completed:
                 try:
                     await self._run_on_engine_loop(
@@ -257,6 +272,32 @@ class _AsyncLLMHTTPClient:
 
     async def is_tracing_enabled(self) -> bool:
         return await self._engine_client.is_tracing_enabled()
+
+    async def captured_call_progress(self) -> list[list[Any]]:
+        """Return ``[model_call_id, generated_tokens]`` for each running captured call.
+
+        Reads vLLM's output-processor request state, which has no public API, on
+        the engine loop. Returns nothing if this vLLM keeps that state elsewhere.
+        """
+
+        async def read() -> list[list[Any]]:
+            states = getattr(
+                getattr(self._engine_client, "output_processor", None),
+                "request_states",
+                None,
+            )
+            if states is None:
+                return []
+            progress = []
+            for state in list(states.values()):
+                model_call_id = self._captured_requests.get(state.external_req_id)
+                if model_call_id is not None and state.detokenizer is not None:
+                    progress.append(
+                        [model_call_id, state.detokenizer.num_output_tokens()]
+                    )
+            return progress
+
+        return await self._run_on_engine_loop(read)
 
 
 class VllmAsyncGenerationWorkerImpl(
@@ -817,6 +858,20 @@ class VllmAsyncGenerationWorkerImpl(
         """Rotate the weight version stamped on subsequent captured calls."""
         self._rollout_weight_version = int(version)
 
+    async def captured_call_progress(self) -> Optional[dict[str, Any]]:
+        """Report how far each running captured call got on the current weights.
+
+        Called while generation is paused for a refit, so the counts are where
+        each call switches to the new weights. ``None`` on ranks that serve no
+        captured calls.
+        """
+        if self._http_engine_client is None or self.token_capture is None:
+            return None
+        return {
+            "weight_version": self._rollout_weight_version,
+            "calls": await self._http_engine_client.captured_call_progress(),
+        }
+
     def _capture_admission(self, request: Any) -> Any | None:
         """Parse the ledger's ``ng_capture`` context into a ``CaptureAdmission``.
 
@@ -869,6 +924,7 @@ class VllmAsyncGenerationWorkerImpl(
             prefix_token_ids=prefix_token_ids,
             stream=bool(getattr(request, "stream", False)),
         )
+        _CAPTURED_MODEL_CALL.set(call.model_call_id)
         self._capture_calls[id(request)] = CapturedRequest(
             call, list(prompt_token_ids), media
         )
