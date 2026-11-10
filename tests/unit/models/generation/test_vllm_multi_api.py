@@ -48,6 +48,10 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                     self.http_server = None
                     self.setup_token_capture = AsyncMock()
                     self.set_rollout_weight_version = AsyncMock()
+                    self.captured_call_progress = AsyncMock(
+                        return_value={"weight_version": 10, "calls": [["child", 20]]}
+                    )
+                    self.get_data_plane_snapshot = Mock(return_value={"calls": 3})
                     hosts.append(self)
 
             engine = Mock()
@@ -64,6 +68,8 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             connection.recv.side_effect = [
                 ("capture", ({"impl": "transfer_queue"}, "stage", True, 4)),
                 ("version", (10,)),
+                ("progress", ()),
+                ("snapshot", ()),
                 ("stop", ()),
             ]
             listener = Mock()
@@ -128,6 +134,19 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                 top_logprobs=4,
             )
             hosts[0].set_rollout_weight_version.assert_awaited_once_with(10)
+            hosts[0].captured_call_progress.assert_awaited_once_with()
+            hosts[0].get_data_plane_snapshot.assert_called_once_with()
+            self.assertEqual(
+                [call.args[0] for call in connection.send.call_args_list],
+                [
+                    ("ok", None),
+                    ("ok", None),
+                    ("ok", None),
+                    ("ok", {"weight_version": 10, "calls": [["child", 20]]}),
+                    ("ok", {"calls": 3}),
+                    ("ok", None),
+                ],
+            )
             engine.shutdown.assert_called_once()
             listener.close.assert_called_once()
 
@@ -163,6 +182,33 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(peer.recv(), (name, args))
                     peer.send(("ok", None))
                 await task
+        finally:
+            for connection in pool.connections + peers:
+                connection.close()
+
+    async def test_queries_preserve_child_reply_order(self):
+        pool = module.MultiAPIServerPool(SimpleNamespace(), 3)
+        peers = []
+        for _ in range(2):
+            parent, child = multiprocessing.Pipe()
+            pool.connections.append(parent)
+            pool.children.append(Mock(is_alive=Mock(return_value=True)))
+            peers.append(child)
+        try:
+            for name, replies in [
+                (
+                    "progress",
+                    [None, {"weight_version": 4, "calls": [["child", 30]]}],
+                ),
+                ("snapshot", [{"calls": 2}, {"calls": 3}]),
+            ]:
+                task = asyncio.create_task(pool.command(name))
+                await asyncio.sleep(0.01)
+                for peer in peers:
+                    self.assertEqual(peer.recv(), (name, ()))
+                for peer, reply in reversed(list(zip(peers, replies))):
+                    peer.send(("ok", reply))
+                self.assertEqual(await task, replies)
         finally:
             for connection in pool.connections + peers:
                 connection.close()

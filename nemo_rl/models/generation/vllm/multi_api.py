@@ -26,6 +26,8 @@ from multiprocessing.connection import Connection
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from vllm.v1.metrics.reader import Counter, Gauge
+
     from nemo_rl.models.generation.vllm.config import VllmConfig
 
 
@@ -185,12 +187,15 @@ class MultiAPIServerPool:
             if parent_thread is not None:
                 parent_thread.join(timeout=1)
 
-    async def command(self, name: str, *args: Any) -> None:
+    async def command(self, name: str, *args: Any) -> list[Any]:
         """Serialize a control operation and wait for every child acknowledgement.
 
         Args:
-            name: Operation to broadcast: start, capture, version, or stop.
+            name: Control operation or query to broadcast to child frontends.
             *args: Operation-specific positional values sent to each child.
+
+        Returns:
+            Reply payloads in child frontend order.
         """
         async with self._command_lock:
             try:
@@ -200,7 +205,7 @@ class MultiAPIServerPool:
                     if not process.is_alive():
                         raise RuntimeError(f"HTTP API process {process.name} exited")
                     connection.send((name, args))
-                await asyncio.gather(
+                return await asyncio.gather(
                     *(
                         asyncio.to_thread(receive_reply, connection)
                         for connection in self.connections
@@ -210,6 +215,40 @@ class MultiAPIServerPool:
                 self.stop_children()
                 self.close_engines()
                 raise
+
+    def get_metrics_snapshot(self) -> list[Counter | Gauge]:
+        """Read cumulative token counts and shared-engine gauges across frontends.
+
+        Returns:
+            Logger samples from the multiprocess Prometheus registry.
+        """
+        # vLLM metrics are optional outside generation workers.
+        from vllm.v1.metrics.prometheus import get_prometheus_registry
+        from vllm.v1.metrics.reader import Counter, Gauge
+
+        metrics: list[Counter | Gauge] = []
+        gauge_names = {
+            "vllm:num_requests_running",
+            "vllm:num_requests_waiting",
+            "vllm:kv_cache_usage_perc",
+        }
+        for metric in get_prometheus_registry().collect():
+            if metric.type == "gauge" and metric.name in gauge_names:
+                # The registry applies vLLM's mostrecent mode to shared gauges.
+                metrics.extend(
+                    Gauge(name=metric.name, labels=sample.labels, value=sample.value)
+                    for sample in metric.samples
+                    if sample.name == metric.name
+                )
+            elif metric.type == "counter" and metric.name == "vllm:generation_tokens":
+                metrics.extend(
+                    Counter(
+                        name=metric.name, labels=sample.labels, value=int(sample.value)
+                    )
+                    for sample in metric.samples
+                    if sample.name == metric.name + "_total"
+                )
+        return metrics
 
     def stop_children(self) -> None:
         """Terminate and join child frontends, then close their control pipes."""
@@ -330,6 +369,7 @@ def run_api_process(
             )
             while True:
                 name, args = await asyncio.to_thread(connection.recv)
+                result = None
                 if name == "start":
                     host.server_thread, host.base_url, host.http_server = (
                         host._setup_vllm_server()
@@ -352,6 +392,10 @@ def run_api_process(
                     )
                 elif name == "version":
                     await host.set_rollout_weight_version(args[0])
+                elif name == "progress":
+                    result = await host.captured_call_progress()
+                elif name == "snapshot":
+                    result = host.get_data_plane_snapshot()
                 elif name == "stop":
                     if host.http_server is not None:
                         host.http_server.should_exit = True
@@ -361,7 +405,7 @@ def run_api_process(
                     return
                 else:
                     raise ValueError(f"Unknown HTTP API command: {name}")
-                connection.send(("ok", None))
+                connection.send(("ok", result))
 
         asyncio.run(serve())
     except BaseException as error:

@@ -656,7 +656,12 @@ class VllmAsyncGenerationWorkerImpl(
             time.sleep(min(2.0, interval_s))
             while True:
                 try:
-                    for m in get_metrics_snapshot():
+                    snapshot = (
+                        self._api_server_pool.get_metrics_snapshot()
+                        if self._api_server_pool is not None
+                        else get_metrics_snapshot()
+                    )
+                    for m in snapshot:
                         with self._vllm_metrics_lock:
                             if isinstance(m, Gauge):
                                 # Log the vllm inflight batch sizes
@@ -986,6 +991,24 @@ class VllmAsyncGenerationWorkerImpl(
         if self._api_server_pool is not None:
             await self._api_server_pool.command("version", int(version))
 
+    async def get_data_plane_snapshots(self) -> list[dict[str, Any]]:
+        """Collect each frontend's capture counters and reset its step window.
+
+        Returns:
+            One snapshot per frontend with data-plane observability enabled.
+        """
+        snapshots = []
+        local_snapshot = self.get_data_plane_snapshot()
+        if local_snapshot is not None:
+            snapshots.append(local_snapshot)
+        if self._api_server_pool is not None:
+            snapshots.extend(
+                snapshot
+                for snapshot in await self._api_server_pool.command("snapshot")
+                if snapshot is not None
+            )
+        return snapshots
+
     async def captured_call_progress(self) -> Optional[dict[str, Any]]:
         """Report how far each running captured call got on the current weights.
 
@@ -993,11 +1016,25 @@ class VllmAsyncGenerationWorkerImpl(
         each call switches to the new weights. ``None`` on ranks that serve no
         captured calls.
         """
-        if self._http_engine_client is None or self.token_capture is None:
+        calls = []
+        capture_enabled = False
+        if self._http_engine_client is not None and self.token_capture is not None:
+            capture_enabled = True
+            calls.extend(await self._http_engine_client.captured_call_progress())
+        if self._api_server_pool is not None:
+            for progress in await self._api_server_pool.command("progress"):
+                if progress is not None:
+                    if progress["weight_version"] != self._rollout_weight_version:
+                        raise RuntimeError(
+                            "HTTP frontends have different weight versions"
+                        )
+                    capture_enabled = True
+                    calls.extend(progress["calls"])
+        if not capture_enabled:
             return None
         return {
             "weight_version": self._rollout_weight_version,
-            "calls": await self._http_engine_client.captured_call_progress(),
+            "calls": calls,
         }
 
     def _capture_admission(self, request: Any) -> Any | None:
