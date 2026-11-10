@@ -348,6 +348,7 @@ guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
 guides/refit.md
 guides/checkpoint-engine-refit.md
+guides/persistent-jit-caches.md
 guides/dynamo-generation.md
 guides/router-replay.md
 guides/sampler-replay.md
