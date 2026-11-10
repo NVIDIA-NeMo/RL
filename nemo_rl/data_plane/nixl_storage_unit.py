@@ -523,7 +523,6 @@ class NixlStorageUnit:  # pragma: no cover
             log.error("unit %d: staging %s failed: %s", self.unit_id, b, e)
         now = time.monotonic()
         with self._mu:
-            self._io_jobs -= 1
             rec.staging = False
             gone = self.blobs.get(b) is not rec
             if gone or not ok:
@@ -545,6 +544,8 @@ class NixlStorageUnit:  # pragma: no cover
                 st["stage_wait_ms_max"] = max(st["stage_wait_ms_max"], wait_ms)
         if gone:
             _close(fd)
+        with self._mu:
+            self._io_jobs -= 1  # last: the job owned the file until here
 
     # ------------------------------------------------------------------ identity
     @_locked
