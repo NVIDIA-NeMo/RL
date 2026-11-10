@@ -260,6 +260,16 @@ def test_async_actor_settings_reject_ignored_options(
         validate_vllm_async_actor_settings(cast(VllmConfig, {"vllm_cfg": vllm_cfg}))
 
 
+@pytest.mark.parametrize("count", [0, -1])
+def test_async_actor_settings_reject_invalid_api_server_count(count: int) -> None:
+    with pytest.raises(
+        ValueError, match="http_api_server_count must be a positive integer"
+    ):
+        validate_vllm_async_actor_settings(
+            cast(VllmConfig, {"vllm_cfg": {"http_api_server_count": count}})
+        )
+
+
 @pytest.mark.parametrize(
     "settings",
     [

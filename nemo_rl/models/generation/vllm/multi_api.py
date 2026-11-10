@@ -193,13 +193,13 @@ class MultiAPIServerPool:
             *args: Operation-specific positional values sent to each child.
         """
         async with self._command_lock:
-            for process, connection in zip(
-                self.children, self.connections, strict=True
-            ):
-                if not process.is_alive():
-                    raise RuntimeError(f"HTTP API process {process.name} exited")
-                connection.send((name, args))
             try:
+                for process, connection in zip(
+                    self.children, self.connections, strict=True
+                ):
+                    if not process.is_alive():
+                        raise RuntimeError(f"HTTP API process {process.name} exited")
+                    connection.send((name, args))
                 await asyncio.gather(
                     *(
                         asyncio.to_thread(receive_reply, connection)
@@ -319,7 +319,7 @@ def run_api_process(
 
             install_output_loop_yield(engine, reader_budget_s=budget_ms / 1000)
         host.llm = engine
-        connection.send(("ok", os.getpid()))
+        connection.send(("ok", None))
 
         async def serve() -> None:
             host._engine_loop = asyncio.get_running_loop()
