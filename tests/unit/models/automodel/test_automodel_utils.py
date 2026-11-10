@@ -13,11 +13,16 @@
 # limitations under the License.
 import gc
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Replicate, distribute_tensor
 
 try:
     import nemo_automodel  # noqa: F401
@@ -193,4 +198,50 @@ def test_move_buffers_preserves_aliases_and_readable_state_dict(
     assert model.child.alias is model.persistent
     torch.testing.assert_close(
         model.state_dict()["persistent"].cpu(), torch.arange(6).float()
+    )
+
+
+def _distributed_buffer_roundtrip(rank: int, rendezvous: str) -> None:
+    dist.init_process_group(
+        backend="cpu:gloo,cuda:nccl",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=1,
+    )
+    try:
+        mesh = init_device_mesh("cuda", (1,))
+        model = nn.Module()
+        model.child = nn.Module()
+        values = torch.arange(6, dtype=torch.float32, device="cuda")
+        buffer = distribute_tensor(values, mesh, [Replicate()])
+        model.register_buffer("bias", buffer)
+        model.child.register_buffer("alias", buffer)
+        original_identity = id(buffer)
+
+        move_model_buffers_to_device(model, "cpu")
+        assert model.bias.device.type == "cpu"
+        assert id(model.bias) == original_identity
+        assert model.child.alias is model.bias
+        torch.testing.assert_close(
+            model.state_dict()["bias"].to_local(), torch.arange(6).float()
+        )
+        move_model_buffers_to_device(model, "cuda")
+        assert model.bias.device.type == "cuda"
+        assert model.child.alias is model.bias
+        torch.testing.assert_close(
+            model.state_dict()["bias"].to_local().cpu(), torch.arange(6).float()
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.automodel
+def test_move_distributed_buffers_preserves_state_dict(tmp_path: Path) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for a DTensor buffer device round trip")
+    mp.spawn(
+        _distributed_buffer_roundtrip,
+        args=(str(tmp_path / "buffer-rendezvous"),),
+        nprocs=1,
+        join=True,
     )
