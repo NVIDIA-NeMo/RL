@@ -159,6 +159,7 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.telemetry.instrumentation import accepts_trace_context
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
@@ -678,6 +679,36 @@ def _meta_tensor_alloc_context():
         torch.distributed.broadcast = real_broadcast
         torch.empty_like = real_empty_like
         torch.zeros_like = real_zeros_like
+
+
+def _uses_in_loss_seq_filter(loss_fn: Any) -> bool:
+    """Whether the loss drops rows itself and needs survivor normalization."""
+    return (
+        isinstance(loss_fn, ClippedPGLossFn) and loss_fn.requires_survivor_normalization
+    )
+
+
+def _local_survivor_counts(
+    metrics: list[dict[str, Any]], device: torch.device
+) -> torch.Tensor:
+    """Local ``[kept_seqs, kept_toks]`` summed over this rank's microbatches."""
+    return torch.tensor(
+        [
+            sum(m["seq_logprob_error_valid_seqs"] for m in metrics),
+            sum(m["seq_logprob_error_valid_tokens"] for m in metrics),
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+
+
+def _raise_if_no_survivors(kept_toks: torch.Tensor) -> None:
+    if kept_toks.item() == 0:
+        raise RuntimeError(
+            "No valid response tokens remain after in-loss sequence-logprob "
+            "filtering; refusing an empty optimizer update. Check "
+            "grpo.seq_logprob_error_threshold."
+        )
 
 
 def _reserved_http_server_port_for_rank(
@@ -1322,14 +1353,7 @@ class MegatronPolicyWorkerImpl(
         CP/TP replicas must not be counted as additional samples.
         """
         metrics = losses_reduced
-        counts = torch.tensor(
-            [
-                sum(m["seq_logprob_error_valid_seqs"] for m in metrics),
-                sum(m["seq_logprob_error_valid_tokens"] for m in metrics),
-            ],
-            dtype=torch.float64,
-            device=global_valid_toks.device,
-        )
+        counts = _local_survivor_counts(metrics, global_valid_toks.device)
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             torch.distributed.all_reduce(
                 counts, group=parallel_state.get_data_parallel_group()
@@ -1343,12 +1367,8 @@ class MegatronPolicyWorkerImpl(
 
         # counts is a tensor with 2 elements: [kept_seqs, kept_toks]
         kept_seqs, kept_toks = counts
-        if kept_toks.item() == 0 and not eval_mode:
-            raise RuntimeError(
-                "No valid response tokens remain after in-loss sequence-logprob "
-                "filtering; refusing an empty optimizer update. Check "
-                "grpo.seq_logprob_error_threshold."
-            )
+        if not eval_mode:
+            _raise_if_no_survivors(kept_toks)
         # Counts are weighted by sample_mask and may be positive fractions.
         # Only replace zero denominators (possible during evaluation).
         token_denominator = torch.where(kept_toks > 0, kept_toks, 1.0)
@@ -1576,10 +1596,7 @@ class MegatronPolicyWorkerImpl(
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     torch.cuda.empty_cache()
 
-                if (
-                    isinstance(loss_fn, ClippedPGLossFn)
-                    and loss_fn.requires_survivor_normalization
-                ):
+                if _uses_in_loss_seq_filter(loss_fn):
                     (
                         losses_reduced,
                         global_valid_seqs,
@@ -2326,9 +2343,18 @@ class MegatronPolicyWorkerImpl(
         # from the same policy config on every DP rank, and Megatron runs
         # the same microbatch count on all of them.
         draft_step_state: DraftStepState = state["draft_step_state"]
-        policy_counts = torch.stack(
-            [state["local_valid_seqs"], state["local_valid_toks"]]
-        ).to(torch.float64)
+        loss_fn = state["loss_fn"]
+        in_loss_filter = _uses_in_loss_seq_filter(loss_fn)
+        if in_loss_filter:
+            # Chunks backpropagated unnormalized survivor sums, so divide by the
+            # survivor counts. Metrics are already on every PP stage; reduce DP only.
+            policy_counts = _local_survivor_counts(
+                state["all_mb_metrics"], state["local_valid_toks"].device
+            )
+        else:
+            policy_counts = torch.stack(
+                [state["local_valid_seqs"], state["local_valid_toks"]]
+            ).to(torch.float64)
         to_reduce = torch.cat(
             [
                 policy_counts,
@@ -2341,6 +2367,8 @@ class MegatronPolicyWorkerImpl(
         global_valid_seqs = to_reduce[0]
         global_valid_toks = to_reduce[1]
         draft_step_state.set_global_counts(to_reduce[2:])
+        if in_loss_filter:
+            _raise_if_no_survivors(global_valid_toks)
 
         if state["loss_type"] == LossType.TOKEN_LEVEL:
             n_true = global_valid_toks
@@ -4707,6 +4735,7 @@ class MegatronPolicyWorkerImpl(
         # The plan is consumed (provider mutated to the inference layout); release it.
         self._colocated_reshard_plan = None
 
+    @accepts_trace_context
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/pause_train_step_with_offloading")
     def pause_train_step_with_offloading(self) -> None:
@@ -5099,6 +5128,11 @@ class MegatronPolicyWorkerImpl(
                 self.mcore_state.train_state.consumed_train_samples = (
                     self.scheduler.num_steps
                 )
+
+            # Free cached CUDA blocks to avoid OOM at checkpoint save.
+            gc.collect()
+            torch.cuda.empty_cache()
+
             save_checkpoint(
                 state=self.mcore_state,
                 model=[self.model],

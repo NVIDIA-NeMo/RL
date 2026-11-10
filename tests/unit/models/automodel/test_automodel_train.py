@@ -53,7 +53,6 @@ def _prepare_cp1(
     model: Any,
     processed_inputs: ProcessedInputs,
     *,
-    is_reward_model: bool = False,
     allow_flash_attn_args: bool = True,
 ) -> PreparedModelForward:
     return prepare_model_forward(
@@ -62,7 +61,6 @@ def _prepare_cp1(
         device_mesh=None,
         cp_size=1,
         padding_token_id=0,
-        is_reward_model=is_reward_model,
         allow_flash_attn_args=allow_flash_attn_args,
     )
 
@@ -424,19 +422,6 @@ class TestModelForward:
             assert "media_token_validity_mask" not in model.forward_kwargs
         assert "media_token_validity_mask" in processed_inputs_multimodal.vlm_kwargs
 
-    def test_forward_reward_model_removes_flash_attn(
-        self, mock_model, processed_inputs_with_flash
-    ):
-        prepared = _prepare_cp1(
-            mock_model, processed_inputs_with_flash, is_reward_model=True
-        )
-        model_forward(mock_model, prepared.model_batch)
-
-        mock_model.assert_called_once()
-        call_kwargs = mock_model.call_args[1]
-        # Flash attention should be removed for reward models
-        assert "flash_attn_kwargs" not in call_kwargs
-
     def test_forward_disallow_flash_attn_args(
         self, mock_model, processed_inputs_with_flash
     ):
@@ -697,6 +682,45 @@ class TestScorePostProcessor:
 
         assert result.shape == (4, 64)
         assert result.dtype == torch.float32
+
+    def test_scoring_with_sequence_packing(self, base_cfg):
+        processor = ScorePostProcessor(cfg=base_cfg, enable_seq_packing=True)
+        logits = torch.arange(10, dtype=torch.float32).reshape(1, 10, 1)
+        input_lengths = torch.tensor([3, 5, 2])
+        data_dict = BatchedDataDict({"input_lengths": input_lengths})
+
+        @dataclass
+        class MockFlashAttnKwargs:
+            cu_seqlens_q: torch.Tensor
+
+        processed_inputs = ProcessedInputs(
+            input_ids=torch.zeros(1, 10, dtype=torch.long),
+            seq_len=10,
+            attention_mask=None,
+            position_ids=torch.arange(10).unsqueeze(0),
+            flash_attn_kwargs=MockFlashAttnKwargs(
+                cu_seqlens_q=torch.tensor([0, 3, 8, 10])
+            ),
+            vlm_kwargs={},
+        )
+
+        result = processor(
+            logits=logits,
+            data_dict=data_dict,
+            processed_inputs=processed_inputs,
+            original_batch_size=3,
+            original_seq_len=5,
+        )
+
+        expected = torch.tensor(
+            [
+                [0, 1, 2, 0, 0],
+                [3, 4, 5, 6, 7],
+                [8, 9, 0, 0, 0],
+            ],
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(result, expected)
 
 
 # =====================
@@ -1115,7 +1139,7 @@ class TestForwardWithPostProcessingFn:
         # Call forward_with_post_processing_fn
         result, metrics, _ = forward_with_post_processing_fn(
             model=mock_model,
-            prepared=_prepare_cp1(mock_model, processed_inputs, is_reward_model=True),
+            prepared=_prepare_cp1(mock_model, processed_inputs),
             post_processing_fn=score_post_processor,
             processed_mb=processed_mb,
         )
@@ -1129,13 +1153,13 @@ class TestForwardWithPostProcessingFn:
         # Verify result shape
         assert result.shape == (batch_size,)
 
-    def test_forward_with_score_post_processor_rejects_cp(
+    def test_forward_with_score_post_processor_gathers_cp(
         self,
         mock_model,
         base_cfg,
     ):
-        batch_size = 4
-        seq_len = 64
+        batch_size = 1
+        seq_len = 4
         input_ids = torch.randint(0, 32000, (batch_size, seq_len))
         processed_inputs = ProcessedInputs(
             input_ids=input_ids,
@@ -1157,25 +1181,33 @@ class TestForwardWithPostProcessingFn:
             original_batch_size=batch_size,
             original_seq_len=seq_len,
         )
+        local_logits = torch.tensor([[[10.0], [40.0]]])
+        full_logits = torch.tensor([[[10.0], [20.0], [30.0], [40.0]]])
+        mock_model.return_value = MagicMock(logits=local_logits)
+        cp_sharder = MagicMock()
+        cp_sharder.gather_token_tensor.return_value = full_logits
         prepared = PreparedModelForward(
             model_batch={"input_ids": input_ids},
             cp_size=2,
-            cp_sharder=MagicMock(),
+            cp_sharder=cp_sharder,
             model_context_factory=nullcontext,
         )
 
-        with pytest.raises(
-            NotImplementedError,
-            match="ScorePostProcessor does not support context_parallel_size > 1",
-        ):
-            forward_with_post_processing_fn(
-                model=mock_model,
-                prepared=prepared,
-                post_processing_fn=ScorePostProcessor(cfg=base_cfg),
-                processed_mb=processed_mb,
-            )
+        result, metrics, _ = forward_with_post_processing_fn(
+            model=mock_model,
+            prepared=prepared,
+            post_processing_fn=ScorePostProcessor(cfg=base_cfg),
+            processed_mb=processed_mb,
+        )
 
-        mock_model.assert_not_called()
+        torch.testing.assert_close(result, full_logits.squeeze(-1))
+        torch.testing.assert_close(metrics["scores"], result)
+        cp_sharder.gather_token_tensor.assert_called_once_with(
+            local_logits,
+            seq_dim=1,
+            trim=True,
+            fill=0.0,
+        )
 
 
 # =====================

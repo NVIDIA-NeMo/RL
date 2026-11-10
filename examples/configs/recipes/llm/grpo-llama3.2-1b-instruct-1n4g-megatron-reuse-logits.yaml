@@ -1,0 +1,14 @@
+defaults: ./grpo-llama3.2-1b-instruct-1n4g-megatron.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-llama3.2-1b-instruct-1n4g-megatron-reuse-logits
+policy:
+  megatron_cfg:
+    defer_fp32_logits: true
+    reuse_logits_storage: true
+  logprob_chunk_size: 128
+  sequence_packing:
+    fuse_loss: true
+logger:
+  log_dir: logs/grpo-llama3.2-1b-instruct-1n4g-megatron-reuse-logits
+  wandb:
+    name: grpo-llama3.2-1b-instruct-1n4g-megatron-reuse-logits
