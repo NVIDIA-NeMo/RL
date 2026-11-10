@@ -44,16 +44,20 @@ _DIVERGED_ROW_EXACT_FIELDS = ("reward", "sample_loss_mask")
 # aggregate (see _assert_generation_logprob_agreement), not elementwise.
 
 
+# ``<group>_g<i>``, or ``<group>_g<i>_s<k>`` for a forest-training segment.
+_SAMPLE_ID = re.compile(r"^(?P<group>.+)_g(?P<generation>\d+)(?:_s(?P<segment>\d+))?$")
+
+
 def _generation_identity(sample_id: str) -> tuple[str, int]:
-    try:
-        group_id, generation_index = sample_id.rsplit("_g", 1)
-    except ValueError as error:
-        raise ValueError(
-            f"sample ID has no generation suffix: {sample_id!r}"
-        ) from error
-    if not group_id or not generation_index.isdigit():
+    match = _SAMPLE_ID.fullmatch(sample_id)
+    if match is None:
         raise ValueError(f"invalid generated sample ID: {sample_id!r}")
-    return group_id, int(generation_index)
+    if match["segment"] not in (None, "0"):
+        raise AssertionError(
+            f"{sample_id!r} is a later forest segment; parity compares one "
+            "trained row per rollout"
+        )
+    return match["group"], int(match["generation"])
 
 
 # Per-token columns the trainer's dump writes for each row.

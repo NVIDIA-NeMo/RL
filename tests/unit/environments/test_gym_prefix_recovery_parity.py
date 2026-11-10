@@ -145,6 +145,24 @@ def test_training_records_require_one_experiment_directory(tmp_path: Path) -> No
         _HELPER.load_training_records(tmp_path)
 
 
+@pytest.mark.parametrize(
+    "sample_id", ["group-1_g1", "group-1_g1_s0"], ids=["ordinary", "forest"]
+)
+def test_generation_identity_reads_ordinary_and_forest_rows(sample_id: str) -> None:
+    assert _HELPER._generation_identity(sample_id) == ("group-1", 1)
+
+
+def test_generation_identity_refuses_a_second_forest_segment() -> None:
+    with pytest.raises(AssertionError, match="later forest segment"):
+        _HELPER._generation_identity("group-1_g1_s1")
+
+
+@pytest.mark.parametrize("sample_id", ["group-1", "group-1_pad0", "group-1_gx"])
+def test_generation_identity_refuses_other_rows(sample_id: str) -> None:
+    with pytest.raises(ValueError, match="invalid generated sample ID"):
+        _HELPER._generation_identity(sample_id)
+
+
 def test_compare_training_rows_is_order_independent_and_tolerates_floats() -> None:
     baseline_rows = [
         _row(),
