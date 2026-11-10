@@ -24,6 +24,7 @@ from collections import Counter, OrderedDict
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Mapping, Optional
 
+import ray
 import requests
 import torch
 from megatron.core.inference.config import (
@@ -88,6 +89,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.megatron.config import (
     MultimodalPromptConfigOverrides,
+    resolve_mamba_memory_ratio,
     resolve_refit_execution_batch_bytes,
 )
 from nemo_rl.models.generation.megatron.utils import (
@@ -98,6 +100,7 @@ from nemo_rl.models.generation.megatron.utils import (
     resolve_torch_dtype,
     sample_vision_tensors,
 )
+from nemo_rl.models.megatron import sm_partition
 from nemo_rl.models.megatron.memory_saver import (
     HAVE_TORCH_MEMORY_SAVER,
     pause_inference_weights,
@@ -299,6 +302,27 @@ def _apply_inference_cuda_graph_scope(
 
 if TYPE_CHECKING:
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
+
+
+#: Ray concurrency group of the streaming ``generate_async`` calls. Every in-flight request is one such call on worker
+#: 0, so in the actor's default group they would compete with every other call under Ray's async default of 1000: the
+#: engine would run at most 1000 rows, and the refit / pause / stand-down calls would queue behind generation calls.
+#: In their own group they run beside the default group. Ray sizes groups when the class is defined, so this is a
+#: fixed bound; ``check_generation_calls`` rejects a config that could put more calls in flight. The other methods
+#: stay in the default group, on the thread where the worker set its CUDA device.
+GENERATION_CONCURRENCY_GROUP = "generation"
+MAX_GENERATION_CALLS = 1 << 16
+WORKER_CONCURRENCY_GROUPS = {GENERATION_CONCURRENCY_GROUP: MAX_GENERATION_CALLS}
+
+
+def check_generation_calls(max_inflight_prompts: int, generations_per_prompt: int) -> None:
+    """Reject a config whose in-flight generation calls (one per row) could exceed MAX_GENERATION_CALLS."""
+    calls = max_inflight_prompts * generations_per_prompt
+    if calls > MAX_GENERATION_CALLS:
+        raise ValueError(
+            f"async_rl.max_inflight_prompts x num_generations_per_prompt = {calls} generation calls in flight, above "
+            f"the Megatron generation worker's {MAX_GENERATION_CALLS} (megatron_worker.MAX_GENERATION_CALLS)"
+        )
 
 
 class MegatronGenerationMixin:
@@ -695,9 +719,10 @@ class MegatronGenerationMixin:
             ),
             "pg_collection": pg_collection,
             "mamba_inference_state_config": mamba_inference_state_config,
-            # Reserve more KV-cache space when speculative decoding is enabled.
-            "mamba_memory_ratio": (
-                0.1 + 0.1 * num_speculative_tokens if is_hybrid_model else None
+            "mamba_memory_ratio": resolve_mamba_memory_ratio(
+                is_hybrid_model=is_hybrid_model,
+                max_requests=max_requests,
+                num_speculative_tokens=num_speculative_tokens,
             ),
             "num_speculative_tokens": num_speculative_tokens,
             "logprobs_mode": mcore_generation_config["logprobs_mode"],
@@ -777,6 +802,36 @@ class MegatronGenerationMixin:
                 await result
 
         self._inference_engine_asleep = False
+
+    # ---- co-resident engine (nemo_rl/models/megatron/sm_partition.py): refit without stand-down ----
+
+    def coresident_pause(self) -> None:
+        """Stop the engine at a step boundary on every rank: no suspend, KV / state / graphs stay. No-op before the
+        engine exists (the first refit initializes it in ``coresident_resume``)."""
+        if not self._inference_engine_initialized:
+            return
+        asyncio.run_coroutine_threadsafe(self._coresident_pause(), self._inference_loop).result()
+
+    async def _coresident_pause(self) -> None:
+        if torch.distributed.get_rank() == 0:
+            self.inference_client.pause_engines()
+        await self.dynamic_inference_engine.wait_until(EngineState.PAUSED)
+        # PAUSED is a host state: work already enqueued (an async-scheduled forward, its copies) may still read the
+        # weights; with shared weights the learner writes them next.
+        torch.cuda.synchronize()
+
+    def coresident_resume(self) -> None:
+        """Unpause after every rank's ``coresident_refit_copy`` (the driver serializes the phases, so every rank has
+        bumped its weight epoch before any engine runs again). The first call starts the engine instead."""
+        if not self._inference_engine_initialized:
+            self.prepare_for_generation()
+            return
+        asyncio.run_coroutine_threadsafe(self._coresident_unpause(), self._inference_loop).result()
+
+    async def _coresident_unpause(self) -> None:
+        if torch.distributed.get_rank() == 0:
+            self.inference_client.unpause_engines()
+        await self.dynamic_inference_engine.wait_until(EngineState.RUNNING)
 
     def _sleep(self) -> None:
         """Pause + suspend the engine. No-op if already asleep."""
@@ -1428,6 +1483,7 @@ class MegatronGenerationMixin:
 
         return self._parse_result_to_batched_data_dict(data, result)
 
+    @ray.method(concurrency_group=GENERATION_CONCURRENCY_GROUP)
     async def generate_async(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool = False
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
@@ -2417,6 +2473,68 @@ class MegatronGenerationRefitMixin:
         )
         # TODO: Optimize away the full synchronization.
         torch.cuda.synchronize()
+
+    def open_coresident_refit_handles(self, handles_by_device: dict[str, dict], share: bool = False) -> dict:
+        """Co-resident engine, once: map the learner's refit tensors on this GPU (CUDA IPC); with ``share``, bind the
+        matching ones as this engine's own (before its first forward). Returns what was bound."""
+        from megatron.core.resharding.utils import named_refit_tensors
+
+        handles, learner_coords = handles_by_device[self.report_device_id()]
+        core = sm_partition.refit_core(self._gen_model())
+        self._coresident_src = sm_partition.map_sources(
+            sm_partition.open_refit_handles(handles),
+            learner_coords,
+            sm_partition.refit_names(core),
+            sm_partition.rank_coordinates(),
+        )
+        if not share:
+            return {"tensors_bound": 0, "tensors": len(self._coresident_src)}
+        if self._inference_engine_initialized:
+            raise RuntimeError("shared engine weights must be bound before the engine's first forward")
+        leaf_ids = {id(p) for p in core.parameters()}
+        stats = sm_partition.bind_shared(self._coresident_src, named_refit_tensors(core), leaf_ids)
+        expert_stats = sm_partition.bind_shared_expert_stacks(core, self._coresident_src)
+        print(f"[sm_partition] expert storage: {expert_stats}", flush=True)
+        return {**stats, **expert_stats}
+
+    def coresident_refit_copy(self) -> dict[str, float]:
+        """Co-resident engine, per step (paused on every rank): copy the learner's local tensors into this engine's by
+        name, then everything derived from the weights. Runs on the engine loop thread."""
+        if not self._inference_engine_initialized:
+            return self._coresident_copy_weights()
+        return asyncio.run_coroutine_threadsafe(
+            self._coresident_refit_on_loop(), self._inference_loop
+        ).result()
+
+    async def _coresident_refit_on_loop(self) -> dict[str, float]:
+        # PAUSED is a host state: work the engine already enqueued (a forward scheduled ahead by async scheduling,
+        # its copy streams) may still read the weights. As stock's persist-mode suspend, that forward completes under
+        # the old weights; the copy starts after it.
+        torch.cuda.synchronize()
+        stats = self._coresident_copy_weights()
+        # New weight epoch while still paused on every rank (the prefix-cache salt, as MCore's resume() after a
+        # suspend). Upstream ask: a public DynamicInferenceEngine hook for "weights updated in place".
+        engine = self.dynamic_inference_engine
+        engine._weight_epoch += 1
+        engine._resalt_unprefilled_requests()
+        return stats
+
+    def _coresident_copy_weights(self) -> dict[str, float]:
+        # Load reshard cache hooks only for the IPC refit path.
+        from megatron.core.resharding.execution import refresh_module_caches
+        from megatron.core.resharding.utils import named_refit_tensors
+
+        t0 = time.perf_counter()
+        core = sm_partition.refit_core(self._gen_model())
+        stats = sm_partition.copy_refit(
+            self._coresident_src, named_refit_tensors(core)
+        )
+        with torch.inference_mode():
+            refresh_module_caches(core)
+        # Derived weight storage, as every other refit path (FlashInfer MXFP8 experts; no-op otherwise).
+        self._refresh_flashinfer_mxfp8_weights()
+        torch.cuda.synchronize()
+        return {**stats, "seconds": time.perf_counter() - t0}
 
     def suspend_for_refit(self) -> None:
         """Pause+suspend the inference engine before a weight refit."""

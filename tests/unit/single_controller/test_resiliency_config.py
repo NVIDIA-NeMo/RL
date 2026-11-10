@@ -20,7 +20,9 @@ combinations that would silently do nothing are rejected at load time rather tha
 hour three of a run.
 """
 
+import sys
 import warnings
+from types import SimpleNamespace
 from typing import get_args
 
 import pytest
@@ -42,6 +44,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     validate_single_controller_config,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import _build_retry_policy
+from nemo_rl.distributed.virtual_cluster import ClusterConfig
 
 
 def _all_sampler_names() -> list[str]:
@@ -121,6 +124,31 @@ def test_single_forward_threshold_requires_a_threshold() -> None:
     cfg = _single_forward_config()
     cfg.grpo.seq_logprob_error_threshold = None
     with pytest.raises(ValueError, match="requires seq_logprob_error_threshold"):
+        validate_single_controller_config(cfg)
+
+
+@pytest.mark.parametrize("engine_weights", ["shared", "copy"])
+@pytest.mark.parametrize("reference_kl", [0.0, 0.1])
+def test_mps_shared_weights_reject_reference_policy_swaps(
+    monkeypatch: pytest.MonkeyPatch, engine_weights: str, reference_kl: float
+) -> None:
+    cfg = _master_config()
+    cfg.cluster = ClusterConfig(gpus_per_node=4, num_nodes=1)
+    cfg.loss_fn.reference_policy_kl_penalty = reference_kl
+    cfg.policy["megatron_cfg"] = {"enabled": True, "expert_model_parallel_size": 4}
+    cfg.policy["generation"] = {
+        "backend": "megatron", "refit_transport": "ipc",
+        "colocated": {"enabled": False, "engine_sm_fraction": 0.42, "engine_weights": engine_weights},
+        "mcore_generation_config": {"expert_model_parallel_size": 4},
+    }
+    monkeypatch.setenv("CUDA_MPS_PIPE_DIRECTORY", "/tmp/test-mps")
+    # GPU worker imports are optional for driver-side config validation.
+    monkeypatch.setitem(sys.modules, "nemo_rl.models.generation.megatron.megatron_worker",
+                        SimpleNamespace(check_generation_calls=lambda *args: None))
+    if engine_weights == "shared" and reference_kl > 0:
+        with pytest.raises(ValueError, match="reference-policy weight swapping with shared engine weights"):
+            validate_single_controller_config(cfg)
+    else:
         validate_single_controller_config(cfg)
 
 

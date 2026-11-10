@@ -3603,6 +3603,7 @@ class TestDistributedTimeoutMinutes:
             patch("nemo_rl.models.megatron.setup.configure_dynamo_cache"),
             patch("nemo_rl.models.megatron.setup.destroy_parallel_state"),
             patch("torch.distributed.init_process_group") as mock_init,
+            patch("torch.cuda.current_device", return_value=3),
         ):
             setup_distributed({"megatron_cfg": megatron_cfg, "generation": None})
 
@@ -3616,7 +3617,10 @@ class TestDistributedTimeoutMinutes:
         )
 
         assert call_args.args == ("nccl",)
-        assert call_args.kwargs == {"timeout": datetime.timedelta(minutes=minutes)}
+        assert call_args.kwargs == {
+            "timeout": datetime.timedelta(minutes=minutes),
+            "device_id": torch.device("cuda", 3),
+        }
 
     @pytest.mark.parametrize(
         "megatron_cfg", [{}, {"distributed_timeout_minutes": None}]
@@ -3625,7 +3629,8 @@ class TestDistributedTimeoutMinutes:
         call_args = self._init_process_group_call(megatron_cfg)
 
         assert call_args.args == ("nccl",)
-        assert call_args.kwargs == {}
+        # The group is bound to the worker's current GPU (ranks need not sit on GPUs in rank order).
+        assert call_args.kwargs == {"device_id": torch.device("cuda", 3)}
 
     @pytest.mark.parametrize("minutes", [0, -5])
     def test_non_positive_timeout_is_rejected(self, minutes):

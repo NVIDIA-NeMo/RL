@@ -33,6 +33,15 @@ def resolve_refit_execution_batch_bytes(configured_bytes: int | None) -> int:
     return configured_bytes
 
 
+def resolve_mamba_memory_ratio(
+    *, is_hybrid_model: bool, max_requests: int | None, num_speculative_tokens: int
+) -> float | None:
+    """Let native inference budget exact state sizes for an explicit request limit."""
+    if not is_hybrid_model or max_requests is not None:
+        return None
+    return 0.1 + 0.1 * num_speculative_tokens
+
+
 class MediaPromptSpecOverrides(BaseModel):
     """Partial MCore `MediaPromptSpec`. Omitted fields keep the wrapper's defaults."""
 
@@ -194,7 +203,7 @@ class MCoreGenerationConfig(GenerationConfig):
 
     # None uses NeMo-RL's packed collective, mcore uses Megatron Core's native
     # refit, and nccl_reshard selects the non-colocated NCCL M-to-N transport.
-    refit_transport: NotRequired[Literal["mcore", "nccl_reshard"] | None]
+    refit_transport: NotRequired[Literal["mcore", "nccl_reshard", "ipc"] | None]
     mcore_generation_config: MCoreGenerationSpecificArgs
 
 

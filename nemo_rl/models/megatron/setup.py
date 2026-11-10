@@ -544,11 +544,17 @@ def setup_distributed(config) -> None:
     # already exists, so the collective timeout of the default group (used by
     # dist-checkpoint save finalize / load) has to be set here.
     timeout_minutes = _distributed_timeout_minutes(config)
+    # Bind the group to this worker's GPU. Unbound, NCCL guesses a barrier's device as rank % GPUs per node, which is
+    # wrong when ranks are not placed on GPUs in rank order (co-resident engines, sm_partition.engine_rank_gpus) and
+    # leaves ranks on different communicators.
+    device = torch.device("cuda", torch.cuda.current_device())
     if timeout_minutes is None:
-        torch.distributed.init_process_group("nccl")
+        torch.distributed.init_process_group("nccl", device_id=device)
     else:
         torch.distributed.init_process_group(
-            "nccl", timeout=datetime.timedelta(minutes=timeout_minutes)
+            "nccl",
+            timeout=datetime.timedelta(minutes=timeout_minutes),
+            device_id=device,
         )
 
 

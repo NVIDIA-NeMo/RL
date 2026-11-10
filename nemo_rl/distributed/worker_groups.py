@@ -256,7 +256,12 @@ class RayWorkerBuilder:
             module = importlib.import_module(module_name)
             worker_class = getattr(module, class_name)
             worker_kwargs = dict(self.init_kwargs)
-            default_options = getattr(worker_class, "_default_options", {})
+            # Ray applies a class's concurrency_groups from @ray.remote and rejects them in .options().
+            default_options = {
+                k: v
+                for k, v in getattr(worker_class, "_default_options", {}).items()
+                if k != "concurrency_groups"
+            }
             options = recursive_merge_options(default_options, extra_options)
 
             # Use the worker's configuration interface if available

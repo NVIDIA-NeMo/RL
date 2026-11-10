@@ -129,6 +129,11 @@ class WeightSynchronizer(ABC):
         """
         pass
 
+    def before_learner_write(self) -> None:
+        """Called by the loop right before the optimizer step writes the policy weights (no-op by default). A
+        generation backend that reads the learner's weight memory directly stops reading here, until the next
+        sync_weights publishes the new version."""
+
     @property
     @abstractmethod
     def is_stale(self) -> bool:

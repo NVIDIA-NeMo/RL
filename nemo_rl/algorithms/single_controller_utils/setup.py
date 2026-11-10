@@ -457,6 +457,26 @@ def _build_clusters(
     # the PPO path.
     train_worker_groups = 2 if is_ppo_run(master_config) else 1
 
+    from nemo_rl.models.megatron import sm_partition
+
+    if sm_partition.engine_sm_fraction(master_config.policy) is not None:
+        # Co-resident generation: the stock non-colocated engine, placed on the training GPUs as its own processes (one
+        # more worker group per bundle), each GPU's SMs shared by MPS limits (sm_partition.py).
+        cluster = RayVirtualCluster(
+            name="sc_coresident_cluster",
+            bundle_ct_per_node_list=[gpus_per_node] * policy_nodes,
+            use_gpus=True,
+            num_gpus_per_node=gpus_per_node,
+            max_colocated_worker_groups=train_worker_groups + 1,
+            port_range_low=port_range_low,
+            port_range_high=port_range_high,
+            segment_size=segment_size,
+        )
+        # Created here, once: the stock non-colocated path builds the engine and the trainer in parallel threads, and
+        # both would otherwise lazily create this cluster's placement groups (a name race on multi-node).
+        MegatronGeneration.init_cluster_placement_groups(cluster, master_config.policy)
+        return cluster, cluster, None
+
     if colocated:
         # Policy (+ critic) + generation share GPUs — one cluster.
         node_constraints, remaining_ids, topology = prepare_segment_topology(

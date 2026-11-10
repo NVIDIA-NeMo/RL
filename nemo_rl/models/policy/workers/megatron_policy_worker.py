@@ -75,6 +75,7 @@ from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.experience.route_assembly import RouteLayout
 from nemo_rl.models.generation.interfaces import GenerationDatumSpec
 from nemo_rl.models.generation.megatron.megatron_worker import (
+    WORKER_CONCURRENCY_GROUPS,
     MegatronGenerationMixin,
     MegatronGenerationRefitMixin,
     _configure_inference_optimized_layer_spec,
@@ -87,6 +88,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     NVFP4_PERTOKEN_ZMQ_TIMEOUT_MS,
     NvFp4PerTokenRolloutConfig,
 )
+from nemo_rl.models.megatron import sm_partition
 from nemo_rl.models.megatron.common import (
     clear_transient_megatron_caches,
     get_aux_loss_track_names,
@@ -916,9 +918,18 @@ class MegatronPolicyWorkerImpl(
         gpu_ids = ray.get_gpu_ids()
         local_rank = int(gpu_ids[0])
         os.environ["LOCAL_RANK"] = str(local_rank)
+        # Co-resident generation with MPS static SM partitions: pick this GPU's partition before CUDA init.
+        sm_partition.select_static_partition(
+            config, "engine" if is_refit_destination else "learner", local_rank
+        )
         # Batch-invariant / zero-KL kernels must be enabled before CUDA init.
         enable_batch_invariant_mode(config)
         torch.cuda.set_device(local_rank)
+        # Co-resident generation (sm_partition.py): this process must run under its SM share.
+        sm_partition.check_worker(
+            config, "engine" if is_refit_destination else "learner", rank=local_rank
+        )
+        self._weight_patches: Optional[sm_partition.WeightPatchStore] = None
 
         # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
         apply_transformer_engine_patch()
@@ -1060,11 +1071,28 @@ class MegatronPolicyWorkerImpl(
             "skip_weight_load is only valid for inference-only policies "
             "(init_optimizer=False, init_reference_model=False)."
         )
+        shared_expert_hooks = None
+        if (
+            init_optimizer
+            and sm_partition.engine_sm_fraction(config) is not None
+            and sm_partition.engine_weights_mode(config) == "shared"
+            and self.megatron_cfg.ddp.use_distributed_optimizer
+            and not (
+                self.megatron_cfg.dist.use_torch_fsdp2
+                or self.megatron_cfg.dist.use_megatron_fsdp
+                or self.megatron_cfg.ddp.use_megatron_fsdp
+                or self.megatron_cfg.ddp.use_custom_fsdp
+                or self.megatron_cfg.optimizer.use_layer_wise_distributed_optimizer
+            )
+        ):
+            sm_partition.configure_shared_expert_checkpoint(self.megatron_cfg.checkpoint)
+            shared_expert_hooks = [sm_partition.prepare_shared_expert_layout]
         model_and_optimizer_state = setup_model_and_optimizer(
             config,
             self.megatron_cfg,
             init_optimizer,
             pre_load_checkpoint_hook=getattr(self, "_pre_load_checkpoint_hook", None),
+            additional_pre_wrap_hooks=shared_expert_hooks,
             load_weights=not skip_weight_load,
         )
 
@@ -2308,8 +2336,19 @@ class MegatronPolicyWorkerImpl(
         state = self._assert_step_open()
         if state.get("offloaded", False):
             raise RuntimeError("prepare_for_training must restore the offloaded step")
+        patches = self._coresident_patch_store()
+        if patches is not None:
+            from megatron.core.resharding.utils import named_refit_tensors
+
+            named = list(named_refit_tensors(sm_partition.refit_core(self.model)))
+            patches.before_write(named)
         try:
             result = self._finish_train_step_body(state)
+            if patches is not None:
+                patches.after_write(named)
+                numel = sum(t.numel() for _, t in named)
+                print(f"[sm_partition] weight patches rank {self.rank}: "
+                      f"{patches.stats(numel, named[0][1].element_size())}", flush=True)
         except Exception:
             # Mid-finish failure: state machine is in a partial state and the
             # mcore hooks may still be nulled (or restored, depending on how far
@@ -4876,6 +4915,41 @@ class MegatronPolicyWorkerImpl(
         # Ensure exporters cannot observe a partially gathered buffer.
         torch.cuda.synchronize()
 
+    def _coresident_patch_store(self) -> Optional[sm_partition.WeightPatchStore]:
+        """policy.generation.colocated.record_weight_patches = K: keep the last K per-step weight patches on the GPU
+        (sm_partition.WeightPatchStore). None when off."""
+        generation = self.cfg.get("generation")  # None for training-only policies
+        keep = generation["colocated"].get("record_weight_patches") if generation else None
+        if not keep:
+            return None
+        if self._weight_patches is None:
+            self._weight_patches = sm_partition.WeightPatchStore(int(keep))
+        return self._weight_patches
+
+    def export_coresident_refit_handles(self) -> tuple[str, dict, str, dict]:
+        """Co-resident learner, once: CUDA IPC handles of this rank's local refit tensors by Megatron's resolved name,
+        keyed by its GPU, the storage fingerprint they were taken at, and its TP / PP coordinates."""
+        from megatron.core.resharding.utils import named_refit_tensors
+
+        core = sm_partition.refit_core(self.model)
+        named = list(named_refit_tensors(core))
+        resolved = sm_partition.refit_names(core)
+        return (
+            self.report_device_id(),
+            sm_partition.export_refit_handles((resolved[n], t) for n, t in named),
+            sm_partition.storage_fingerprint(named),
+            sm_partition.rank_coordinates(),
+        )
+
+    def coresident_refit_source_ready(self) -> str:
+        """Co-resident learner, per step: the optimizer step's writes are complete before the engine copies (with
+        overlap_param_gather the SC's sync_params_before_refit has already gathered them). Returns the storage
+        fingerprint: the engine reads this rank's memory through handles taken once, so it must not have moved."""
+        from megatron.core.resharding.utils import named_refit_tensors
+
+        torch.cuda.synchronize()
+        return sm_partition.storage_fingerprint(named_refit_tensors(sm_partition.refit_core(self.model)))
+
     @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
     def offload_before_refit(self):
         """Offload optimizer state and buffers that are safe to release."""
@@ -5490,7 +5564,8 @@ class MegatronPolicyWorkerImpl(
 
 
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
+    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker"),
+    concurrency_groups=WORKER_CONCURRENCY_GROUPS,
 )  # pragma: no cover
 class MegatronPolicyWorker(MegatronPolicyWorkerImpl):
     pass

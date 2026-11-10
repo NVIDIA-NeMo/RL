@@ -44,6 +44,7 @@ from nemo_rl.modelopt.utils import (
     MODELOPT_REAL_QUANT_ZMQ_TIMEOUT_MS,
     resolve_nvfp4_real_quant_mode,
 )
+from nemo_rl.models.generation.megatron.megatron_worker import WORKER_CONCURRENCY_GROUPS
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
@@ -144,7 +145,8 @@ def _set_quantization_model_specs(model_config, disable_modelopt_layer_spec: boo
 
 
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("megatron_quant_policy_worker")
+    runtime_env=get_runtime_env_for_policy_worker("megatron_quant_policy_worker"),
+    concurrency_groups=WORKER_CONCURRENCY_GROUPS,
 )  # pragma: no cover
 class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     def maybe_init_zmq(self) -> None:

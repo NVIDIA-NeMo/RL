@@ -32,6 +32,7 @@ from nemo_rl.data.energon.sft_dataloader import (
 from nemo_rl.data.energon.sft_types import StepEnvelope
 from nemo_rl.data_plane.adapters.local import local_batch_to_tensordict
 from nemo_rl.data_plane.schema import MICRO_BATCH_INDICES, MICRO_BATCH_LENGTHS
+from nemo_rl.models.generation.megatron.megatron_worker import WORKER_CONCURRENCY_GROUPS
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.megatron_policy_worker import (
     MegatronPolicyWorkerImpl,
@@ -51,7 +52,8 @@ ENERGON_RESTORED_ATTR = "rl.energon.restored"
 
 
 @ray.remote(
-    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
+    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker"),
+    concurrency_groups=WORKER_CONCURRENCY_GROUPS,
 )  # pragma: no cover
 class SFTMegatronPolicyWorker(MegatronPolicyWorkerImpl):
     """Megatron policy worker with an Energon loader on each DP owner."""

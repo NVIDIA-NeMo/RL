@@ -301,7 +301,6 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
         chunk_size = ctx.chunk_size
         tp_group = ctx.tp_group
 
-        partition_vocab_size = int(vocab_parallel_logits.shape[-1])
         seq_size = int(vocab_parallel_logits.shape[1])
         num_chunks = (seq_size + chunk_size - 1) // chunk_size
 
@@ -315,6 +314,7 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             if reuse_logits_storage
             else torch.zeros_like(vocab_parallel_logits)
         )
+        zero = torch.zeros((), dtype=torch.float32, device="cpu")
 
         for chunk_idx in range(num_chunks):
             chunk_start = chunk_idx * chunk_size
@@ -329,22 +329,19 @@ class ChunkedDistributedLogprob(torch.autograd.Function):
             )
             softmax_output = softmax_output.exp()
 
-            # 1 if it's the chosen log prob, 0 otherwise
-            is_chosen = (~(target_mask[:, chunk_start:chunk_end])).unsqueeze(
-                -1
-            ) * torch.nn.functional.one_hot(
-                masked_target[:, chunk_start:chunk_end],
-                num_classes=partition_vocab_size,
-            )
-
-            chunk_grad_fp32 = is_chosen.float().sub_(softmax_output)
-            chunk_grad_fp32.mul_(
+            selected_indices = masked_target[:, chunk_start:chunk_end].unsqueeze(-1)
+            selected_grad = (~target_mask[:, chunk_start:chunk_end]).unsqueeze(-1).float()
+            selected_grad.sub_(softmax_output.gather(-1, selected_indices))
+            # Subtract before scaling to preserve rounding, including zero's sign.
+            torch.sub(zero, softmax_output, out=softmax_output)
+            softmax_output.scatter_(-1, selected_indices, selected_grad)
+            softmax_output.mul_(
                 grad_output[:, chunk_start:chunk_end].unsqueeze(dim=-1)
             )
-            grad_input[:, chunk_start:chunk_end, :].copy_(chunk_grad_fp32)
+            grad_input[:, chunk_start:chunk_end, :].copy_(softmax_output)
 
             # Explicitly free before next iteration allocates
-            del softmax_output, is_chosen, logits, chunk_grad_fp32
+            del softmax_output, logits, selected_grad, selected_indices
 
         # if you add an argument to the forward method, then you must add a corresponding None here
         return grad_input, None, None, None, None, None, None, None

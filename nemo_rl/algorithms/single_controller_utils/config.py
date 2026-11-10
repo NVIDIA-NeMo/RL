@@ -1369,6 +1369,32 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "requires non-colocated vLLM rollout. Disable nvfp4_pertoken_rollout "
             "or use the supported GRPO entry point examples/run_grpo.py."
         )
+    if generation_config["backend"] == "megatron":
+        from nemo_rl.models.generation.megatron.megatron_worker import (
+            check_generation_calls,
+        )
+
+        check_generation_calls(
+            async_config.max_inflight_prompts,
+            algo_config(master_config).num_generations_per_prompt,
+        )
+    from nemo_rl.models.megatron import sm_partition
+
+    if sm_partition.engine_sm_fraction(master_config.policy) is not None:
+        sm_partition.validate(
+            master_config.policy,
+            unsupported={
+                "cluster.segment_size": master_config.cluster.segment_size is not None,
+                "PPO (a critic worker group)": is_ppo_run(master_config),
+                "policy.offload_policy_before_refit (learner storage must not move)": bool(
+                    master_config.policy.get("offload_policy_before_refit", False)
+                ),
+                "reference-policy weight swapping with shared engine weights": (
+                    sm_partition.engine_weights_mode(master_config.policy) == "shared"
+                    and logprob_passes_required(master_config, algo_cfg)[1]
+                ),
+            },
+        )
     if generation_config["colocated"]["enabled"]:
         if generation_config["backend"] != "megatron":
             raise ValueError(

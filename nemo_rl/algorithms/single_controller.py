@@ -2751,9 +2751,7 @@ class SingleControllerActor:
                                         await self._rollout_snapshots.begin_optimizer_commit(
                                             drain_snapshot=True
                                         )
-                                        policy_result = await asyncio.to_thread(
-                                            self._trainer.finish_train_step
-                                        )
+                                        policy_result = await self._optimizer_step()
                                         step_open = False
 
                     if train_meta.sequence_lengths:
@@ -2897,9 +2895,7 @@ class SingleControllerActor:
                                 tracer=self._tracer,
                             ),
                         ):
-                            policy_result = await asyncio.to_thread(
-                                self._trainer.finish_train_step
-                            )
+                            policy_result = await self._optimizer_step()
                         step_open = False
                     if is_policy_training_step and not self._gen.blocks_training():
                         # Publish exactly one policy version before full-batch
@@ -2986,9 +2982,7 @@ class SingleControllerActor:
                             tracer=self._tracer,
                         ),
                     ):
-                        policy_result = await asyncio.to_thread(
-                            self._trainer.finish_train_step
-                        )
+                        policy_result = await self._optimizer_step()
                     await self._rollout_snapshots.begin_optimizer_commit(
                         drain_snapshot=False
                     )
@@ -4347,6 +4341,12 @@ class SingleControllerActor:
         """How long to wait for the refit before giving up, or None to wait forever."""
         deadline = self._async_cfg.generation_fleet_health.refit_timeout_s
         return None if deadline is None else deadline + self._REFIT_UNWIND_GRACE_S
+
+    async def _optimizer_step(self) -> Any:
+        """The policy optimizer step. A generation engine that reads the policy's weight memory directly stops before
+        it (before_learner_write) and resumes in the next _sync_weights, the one place a new version is published."""
+        await asyncio.to_thread(self._weight_synchronizer.before_learner_write)
+        return await asyncio.to_thread(self._trainer.finish_train_step)
 
     async def _sync_weights_within(self, kv_scales, what: str) -> None:
         """Run the refit off-loop, and stop waiting if it outlives the deadline.

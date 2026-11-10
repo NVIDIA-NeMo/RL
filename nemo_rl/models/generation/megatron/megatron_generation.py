@@ -314,10 +314,10 @@ class MegatronGeneration(GenerationInterface):
         self._policy_config = config
         self.cfg: MCoreGenerationConfig = config["generation"]
         refit_transport = self.cfg.get("refit_transport")
-        if refit_transport not in (None, "mcore", "nccl_reshard"):
+        if refit_transport not in (None, "mcore", "nccl_reshard", "ipc"):
             raise ValueError(
-                "policy.generation.refit_transport must be null, 'mcore', or "
-                f"'nccl_reshard' for Megatron generation, got {refit_transport!r}."
+                "policy.generation.refit_transport must be null, 'mcore', 'nccl_reshard' "
+                f"or 'ipc' for Megatron generation, got {refit_transport!r}."
             )
         if self.uses_native_refit:
             refit_backend = self.cfg["mcore_generation_config"].get("refit_backend")
@@ -378,6 +378,7 @@ class MegatronGeneration(GenerationInterface):
             skip_weight_load=skip_weight_load,
             is_refit_destination=True,
             reserved_http_server_ports=reserved_http_server_ports,
+            worker_gpu_order=self._coresident_gpu_order(config, cluster),
         )
 
         # Skip-load models do not have their final refit weight buffers yet.
@@ -385,6 +386,25 @@ class MegatronGeneration(GenerationInterface):
         # The engine + HTTP server then first come up at the initial refit.
         if not skip_weight_load:
             self.prepare_for_generation()
+
+    @staticmethod
+    def _coresident_gpu_order(
+        config: PolicyConfig, cluster: RayVirtualCluster
+    ) -> Optional[list[int]]:
+        """Co-resident engine with an EP that is a multiple of the learner's: the GPU of each engine rank, so that its
+        experts are a block of the co-located learner rank's (sm_partition.engine_rank_gpus); None otherwise."""
+        from nemo_rl.models.megatron import sm_partition
+
+        if sm_partition.engine_sm_fraction(config) is None:
+            return None
+        learner_ep = config["megatron_cfg"].get("expert_model_parallel_size") or 1
+        engine_ep = (
+            config["generation"]["mcore_generation_config"].get("expert_model_parallel_size")
+            or learner_ep
+        )
+        if engine_ep == learner_ep:
+            return None
+        return sm_partition.engine_rank_gpus(cluster.world_size(), learner_ep, engine_ep)
 
     @property
     def uses_native_refit(self) -> bool:
