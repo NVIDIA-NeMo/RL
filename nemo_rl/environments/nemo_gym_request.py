@@ -166,9 +166,14 @@ def _policy_connection(
     do not arrange weight refits or token-capture setup on an external server.
     """
     model_name = os.environ.get("NEMO_GYM_POLICY_MODEL_NAME") or model_name
+    return model_name, _external_policy_base_urls() or base_urls
+
+
+def _external_policy_base_urls() -> list[str]:
+    """Read the external endpoint opt-in; empty overrides keep managed serving."""
     raw_urls = os.environ.get("NEMO_GYM_POLICY_BASE_URL")
     if not raw_urls:
-        return model_name, base_urls
+        return []
     error = "NEMO_GYM_POLICY_BASE_URL must be a JSON list of nonempty URL strings"
     try:
         urls = json.loads(raw_urls)
@@ -178,4 +183,25 @@ def _policy_connection(
         not isinstance(url, str) or not url.strip() for url in urls
     ):
         raise ValueError(error)
-    return model_name, urls or base_urls
+    return urls
+
+
+def _validate_prompt_token_prefix(
+    *, seen_token_ids: list[int], prompt_token_ids: list[int]
+) -> None:
+    """Check append-only history, unless external policy endpoints are selected.
+
+    The external-server compatibility bypass only relaxes this assertion; it
+    does not repair token history or alter token-capture/R3 validation.
+    """
+    if _external_policy_base_urls():
+        return
+    assert seen_token_ids == prompt_token_ids[: len(seen_token_ids)], (
+        "Non-contiguous messages found! This may be a tokenization issue where "
+        "certain tokens are combined when messages are concatenated, or it may "
+        "be due to part of the chat history being truncated (like if super long "
+        "history is truncated or if reasoning is stripped out).\n"
+        f"Seen token IDs: {seen_token_ids}\n"
+        f"Output prompt token IDs: {prompt_token_ids}\n"
+        f"output prompt token ids till seen: {prompt_token_ids[: len(seen_token_ids)]}\n"
+    )

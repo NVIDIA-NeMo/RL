@@ -2,7 +2,10 @@
 
 import pytest
 
-from nemo_rl.environments.nemo_gym_request import _policy_connection
+from nemo_rl.environments.nemo_gym_request import (
+    _policy_connection,
+    _validate_prompt_token_prefix,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -63,3 +66,51 @@ def test_invalid_endpoint_override_fails_with_variable_name(monkeypatch, overrid
         ValueError, match="NEMO_GYM_POLICY_BASE_URL must be a JSON list"
     ):
         _policy_connection(model_name="managed", base_urls=["http://local/v1"])
+
+
+@pytest.mark.parametrize("override", [None, "", "[]"])
+@pytest.mark.parametrize("prompt", [[1, 9, 3], [1], []])
+def test_managed_policy_rejects_changed_or_truncated_history(
+    monkeypatch: pytest.MonkeyPatch, override: str | None, prompt: list[int]
+) -> None:
+    if override is not None:
+        monkeypatch.setenv("NEMO_GYM_POLICY_BASE_URL", override)
+    with pytest.raises(AssertionError, match="Non-contiguous messages found!"):
+        _validate_prompt_token_prefix(seen_token_ids=[1, 2], prompt_token_ids=prompt)
+
+
+@pytest.mark.parametrize(
+    "seen,prompt", [([], [1]), ([1, 2], [1, 2]), ([1, 2], [1, 2, 3])]
+)
+def test_managed_policy_accepts_append_only_history(
+    seen: list[int], prompt: list[int]
+) -> None:
+    _validate_prompt_token_prefix(seen_token_ids=seen, prompt_token_ids=prompt)
+
+
+@pytest.mark.parametrize("prompt", [[1, 9, 3], [1], []])
+def test_external_policy_bypasses_prefix_check_without_rewriting_tokens(
+    monkeypatch: pytest.MonkeyPatch, prompt: list[int]
+) -> None:
+    monkeypatch.setenv("NEMO_GYM_POLICY_BASE_URL", '["http://external/v1"]')
+    seen = [1, 2]
+    original_prompt = prompt.copy()
+    _validate_prompt_token_prefix(seen_token_ids=seen, prompt_token_ids=prompt)
+    assert seen == [1, 2]
+    assert prompt == original_prompt
+
+
+def test_model_name_override_alone_keeps_prefix_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NEMO_GYM_POLICY_MODEL_NAME", "external-alias")
+    with pytest.raises(AssertionError, match="Non-contiguous messages found!"):
+        _validate_prompt_token_prefix(seen_token_ids=[1, 2], prompt_token_ids=[9])
+
+
+def test_invalid_endpoint_override_does_not_bypass_prefix_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NEMO_GYM_POLICY_BASE_URL", "not-json")
+    with pytest.raises(ValueError, match="NEMO_GYM_POLICY_BASE_URL"):
+        _validate_prompt_token_prefix(seen_token_ids=[1, 2], prompt_token_ids=[9])
