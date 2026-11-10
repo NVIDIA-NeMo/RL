@@ -836,15 +836,18 @@ def test_continued_attempt_trains_calls_its_earlier_attempt_staged(
     assert_loss_once(forest, records, records)
 
 
-def test_continued_attempt_refuses_rows_of_another_rollout(
-    forest: ForestCapture,
+@pytest.mark.parametrize("first", ["another_rollout", "unstamped"])
+def test_continued_attempt_refuses_rows_it_cannot_own(
+    forest: ForestCapture, first: str
 ) -> None:
-    before, _ = forest.capture([None], owner="other")
+    owner = "other" if first == "another_rollout" else "attempt"
+    before, _ = forest.capture([None], owner=owner)
     after, _ = forest.capture([None], owner="attempt-a1")
-    carried = [r.model_copy(update={"source_capture_key": "other"}) for r in before]
+    if first == "another_rollout":
+        before = [r.model_copy(update={"source_capture_key": owner}) for r in before]
 
     with pytest.raises(ValueError, match="Foreign capture scope"):
-        _continued_request(carried + after, after[-1]).capture_receipts
+        _continued_request(before + after, after[-1]).capture_receipts
 
 
 def test_shared_action_masks_counts_and_prompt_are_owned_once(

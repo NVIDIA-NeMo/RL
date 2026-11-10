@@ -286,11 +286,13 @@ def test_forest_recovery_rejects_malformed_saved_ownership(damage: str) -> None:
         RolloutRecoveryLedger.from_state_dict(state)
 
 
-def _continued_forest_state(call0_owner: str | None = None) -> dict[str, Any]:
+def _continued_forest_state(
+    call0_owner: str | None = None, *, stamped: bool = True
+) -> dict[str, Any]:
     """A sealed Forest attempt a turn restore continued as ``-a1``.
 
     ``call0`` was captured before the restore, so it stays under attempt 0's
-    key unless ``call0_owner`` names another.
+    key, stamped with it, unless ``call0_owner`` names another.
     """
     state = _forest_sealed_ledger().state_dict()
     attempt = state["groups"][0]["siblings"][0]["attempts"][0]
@@ -302,7 +304,10 @@ def _continued_forest_state(call0_owner: str | None = None) -> dict[str, Any]:
     receipt["capture_key"] = owner
     for entry in receipt["manifest"]:
         entry["staging_key"] = f"{owner}/{entry['model_call_id']}"
-    receipt["manifest"][0]["staging_key"] = f"{call0_owner or first_owner}/call0"
+    carried = receipt["manifest"][0]
+    carried["staging_key"] = f"{call0_owner or first_owner}/call0"
+    if stamped:
+        carried["source_capture_key"] = call0_owner or first_owner
     attempt["staging_keys"] = _receipt_staging_keys(receipt)
     return state
 
@@ -316,15 +321,17 @@ def test_continued_forest_attempt_keeps_calls_captured_before_the_restore() -> N
     assert "-a1/" not in attempt.staging_keys[0]
 
 
-@pytest.mark.parametrize("call0_owner", ["later", "other_rollout"])
+@pytest.mark.parametrize("call0", ["later_attempt", "other_rollout", "unstamped"])
 @pytest.mark.nemo_gym
-def test_continued_forest_attempt_rejects_rows_of_other_episodes(
-    call0_owner: str,
-) -> None:
+def test_continued_forest_attempt_rejects_rows_it_cannot_own(call0: str) -> None:
     first_owner = _forest_sealed_ledger().get_group("g7").gate_rollout_id(0)
-    owner = f"{first_owner}-a2" if call0_owner == "later" else "g8_g0_aother"
+    if call0 == "unstamped":
+        state = _continued_forest_state(stamped=False)
+    else:
+        owner = f"{first_owner}-a2" if call0 == "later_attempt" else "g8_g0_aother"
+        state = _continued_forest_state(owner)
     with pytest.raises(ValueError, match="foreign staging ownership"):
-        RolloutRecoveryLedger.from_state_dict(_continued_forest_state(owner))
+        RolloutRecoveryLedger.from_state_dict(state)
 
 
 @pytest.mark.parametrize("schema", [2, 3, 4])

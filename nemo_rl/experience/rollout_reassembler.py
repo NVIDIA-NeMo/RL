@@ -79,7 +79,7 @@ from nemo_rl.experience.reward_penalties import (
     finalize_capture_reward,
 )
 from nemo_rl.experience.rollout_recovery import (
-    _episode_staging_keys,
+    _owned_staging_key,
     _receipt_staging_keys,
 )
 from nemo_rl.experience.route_assembly import (
@@ -1454,7 +1454,9 @@ class RolloutReassembler:
             _receipt_staging_keys(receipt)
             if parsed.capture_key != owner or any(
                 record.staging_key
-                not in _episode_staging_keys(owner, record.model_call_id)
+                != _owned_staging_key(
+                    owner, record.model_call_id, record.source_capture_key
+                )
                 for record in parsed.manifest
             ):
                 raise ValueError("Foreign capture ownership in selected attempt")
@@ -1636,7 +1638,11 @@ class RolloutReassembler:
                 if parsed is not None:
                     if parsed.capture_key != expected_id or any(
                         record.staging_key
-                        not in _episode_staging_keys(expected_id, record.model_call_id)
+                        != _owned_staging_key(
+                            expected_id,
+                            record.model_call_id,
+                            record.source_capture_key,
+                        )
                         for record in parsed.manifest
                     ):
                         raise ValueError("foreign receipt/staging ownership")

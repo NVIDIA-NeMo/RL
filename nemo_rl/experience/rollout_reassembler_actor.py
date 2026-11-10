@@ -36,7 +36,7 @@ from nemo_rl.experience.rollout_reassembler import (
     RolloutSelection,
 )
 from nemo_rl.experience.rollout_recovery import (
-    _episode_staging_keys,
+    _owned_staging_key,
     _receipt_staging_keys,
 )
 from nemo_rl.utils.rpc_guard import assert_metadata_only
@@ -106,7 +106,9 @@ class ReassemblyRequest:
                 raise ValueError("Trainable capture requires a nonempty selection")
             if parsed.capture_key != owner or any(
                 record.staging_key
-                not in _episode_staging_keys(owner, record.model_call_id)
+                != _owned_staging_key(
+                    owner, record.model_call_id, record.source_capture_key
+                )
                 for record in parsed.manifest
             ):
                 raise ValueError("Foreign capture scope in finalizer request")

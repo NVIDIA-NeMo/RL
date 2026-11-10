@@ -547,23 +547,29 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
     return list(dict.fromkeys(staging_keys))
 
 
-def _episode_staging_keys(owner: str, model_call_id: str) -> frozenset[str]:
-    """Return the staging keys one call of ``owner``'s rollout may be stored under.
+def _owned_staging_key(
+    owner: str, model_call_id: str, source_capture_key: str | None
+) -> str | None:
+    """Return the staging key one manifest call of ``owner``'s receipt must have.
 
-    A restored attempt (``<rollout_id>-a<N>``) continues its episode and keeps
-    the calls earlier attempts captured, which stay under those attempts' keys.
+    A call ``owner`` made is staged under ``owner``. A restore that continued
+    the episode as ``owner`` carries earlier calls over, each stamped with the
+    attempt that staged it in ``source_capture_key``, as Gym's rebuild checks.
+    Returns None when the stamp names another rollout or a later attempt.
     """
     from nemo_gym.episode_types import EpisodeId
     from nemo_gym.token_id_capture.staging.records import staging_key
 
-    episode = EpisodeId.from_capture_key(owner)
-    return frozenset(
-        staging_key(
-            EpisodeId(rollout_id=episode.rollout_id, attempt=attempt).capture_key,
-            model_call_id,
-        )
-        for attempt in range(episode.attempt + 1)
-    )
+    if source_capture_key is None:
+        return staging_key(owner, model_call_id)
+    try:
+        source = EpisodeId.from_capture_key(source_capture_key)
+        current = EpisodeId.from_capture_key(owner)
+    except ValueError:
+        return None
+    if source.rollout_id != current.rollout_id or source.attempt > current.attempt:
+        return None
+    return staging_key(source_capture_key, model_call_id)
 
 
 def _attempt_staging_keys(
@@ -595,7 +601,8 @@ def _attempt_staging_keys(
                 not isinstance(call_id, str)
                 or not call_id
                 or "/" in call_id
-                or entry["staging_key"] not in _episode_staging_keys(gate_id, call_id)
+                or entry["staging_key"]
+                != _owned_staging_key(gate_id, call_id, entry.get("source_capture_key"))
             ):
                 raise ValueError(
                     "Forest recovery has foreign staging ownership: "
