@@ -178,7 +178,10 @@ def test_modelopt_moe_amax_aliases_satisfy_installed_vllm_loader(
             super().__init__()
             self.layer_name = "model.layers.1.mixer.experts"
             self.moe_config = SimpleNamespace(
-                hidden_dim_unpadded=1, num_experts=2, num_logical_experts=2
+                hidden_dim_unpadded=1,
+                num_experts=2,
+                num_logical_experts=2,
+                is_act_and_mul=False,
             )
             self.expert_map_manager = SimpleNamespace(num_fused_shared_experts=0)
             self.ckpt_gate_proj_name = "up_proj"
