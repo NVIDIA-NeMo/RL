@@ -185,7 +185,7 @@ class NixlStorageUnit:  # pragma: no cover
         ssd_dir: str | None = None,
         staging_bytes: int = 0,
         pickup_s: float = 10.0,
-        io_threads: int = 4,
+        io_threads: int = 1,  # tq_nixl.ssd_config passes the configured value
         alloc_lease_s: float | None = None,
     ) -> None:
         self.unit_id = int(unit_id)
@@ -257,17 +257,16 @@ class NixlStorageUnit:  # pragma: no cover
     # "done" once it is on disk. A read of a disk blob gets "pending" while a
     # worker reads the file into the IO area, then reads it pinned. Disk I/O is
     # plain blocking file I/O on `io_threads` workers, outside _mu: a hung disk
-    # stalls spills and cold reads, never the put area. One thread moves about
-    # 2.5 GB/s on NVMe and a spilled put waits for its write, so a step that
-    # spills half its data needs several. An IO job owns its IO-area region
-    # until it ends, so a region is never freed under it, whichever thread runs it.
+    # stalls spills and cold reads, never the put area. An IO job owns its
+    # IO-area region (and its file) until it ends, so neither is freed under
+    # it, whichever thread runs it.
     def _init_ssd(
         self,
         slab_bytes: int,
         ssd_dir: str | None,
         staging_bytes: int,
         pickup_s: float,
-        io_threads: int = 4,
+        io_threads: int,
     ) -> None:
         self.ssd_dir = None
         self.staging_ = None
@@ -301,8 +300,6 @@ class NixlStorageUnit:  # pragma: no cover
             ssd_dir, f"nixl-unit-{self.unit_id}-{uuid.uuid4().hex[:6]}"
         )
         os.makedirs(self.ssd_dir, exist_ok=True)
-        if io_threads < 1:
-            raise ValueError(f"ssd io_threads={io_threads} must be >= 1")
         self._worker = ThreadPoolExecutor(io_threads, thread_name_prefix="nvdp-io")
 
     def _start_ticker(self) -> None:
@@ -424,7 +421,6 @@ class NixlStorageUnit:  # pragma: no cover
             log.warning("unit %d: spilling %s failed: %s", self.unit_id, b, e)
         now = time.monotonic()
         with self._mu:
-            self._io_jobs -= 1
             rec.staging = False
             gone = self.blobs.get(b) is not rec
             self._drop_staged(b, rec, now, now)  # nobody ever read the IO region
@@ -439,6 +435,8 @@ class NixlStorageUnit:  # pragma: no cover
                 self.ssd_stats["spill_failures"] += 1
         if fd is not None and not (ok and not gone):
             _close(fd)
+        with self._mu:
+            self._io_jobs -= 1  # last: the job owned the file until here
 
     def _new_file(self) -> int:
         """Open a fresh file in the SSD dir and unlink it at once; the fd keeps it.
