@@ -164,6 +164,8 @@ def bare_unit(
     u._released_held = {}
     u.checkpointing = False
     u.clears_during_save = 0
+    u._captures = {}
+    u._cut_disturbed = False
     u._mu = threading.RLock()
     u._init_ssd(slab_bytes, ssd_dir, staging_bytes, pickup_s)
     u._start_ticker()

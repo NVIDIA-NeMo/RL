@@ -1211,6 +1211,7 @@ fixture for the ABC contract tests.
 | Key | Default | Behavior |
 |---|---|---|
 | `data_plane.simple.async_checkpoint` | `false` | Enable the optional stable-view capture API for in-memory SimpleStorage. |
+| `data_plane.nixl.async_checkpoint` | `false` | Enable the same API for the nixl backend. Works with `data_plane.nixl.ssd.enabled`. |
 
 `DataPlaneClient.capture_checkpoint` returns a temporary handle or `None` when
 the adapter requests synchronous fallback. The caller must hold a global mutation
@@ -1219,7 +1220,7 @@ call `persist()`, and then `release()` after all writes settle, including on
 failure or cancellation. Publication remains the caller's responsibility.
 
 This API requires caller integration: setting the flag alone does not change
-the existing synchronous `save_checkpoint` calls. Other backends return `None`.
+the existing synchronous `save_checkpoint` calls. Mooncake returns `None`.
 SimpleStorage capture requires SSD offload disabled and writes the existing
 native TQ checkpoint format, so restore does not need a new format.
 
@@ -1244,6 +1245,16 @@ failure cleanup and restore into fresh actors:
 ```bash
 RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 uv run tests/functional/data_plane_simple_checkpoint_cpu.py --output /tmp/tq-capture-result.json
 ```
+
+Nixl capture reuses the controller capture above, so the controller is not saved
+inside the barrier. It holds each unit's published blobs (the hold `save_shard`
+uses) and writes the existing `nixl_store/` layout. With
+`data_plane.nixl.async_checkpoint` true, the adapter patches the controller
+before `tq.init`, as it does for SimpleStorage. While a capture is retained, the caller
+may put new keys. It must not update or clear a key of the cut until `release()`:
+a unit notes such a call and `persist()` then fails, with no completion marker.
+A hold allocates nothing. Under this rule no blob is freed during a capture, so a
+capture needs no extra slab space. With the SSD tier on, new puts spill to disk.
 
 ## Async path (proposed)
 

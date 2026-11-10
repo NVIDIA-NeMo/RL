@@ -54,6 +54,14 @@ def _batch(seed: int) -> TensorDict:
     )
 
 
+def _patch_controller():
+    from nemo_rl.data_plane.adapters.tq_controller_checkpoint import (
+        configure_controller_checkpoint,
+    )
+
+    configure_controller_checkpoint()  # before tq.init, as the adapter does
+
+
 def _system(num_units: int):
     import transfer_queue as tq
 
@@ -62,6 +70,7 @@ def _system(num_units: int):
     conf = make_tq_conf(
         num_units=num_units, slab_bytes=32 << 20, staging_bytes=16 << 20, namespace=NS
     )
+    _patch_controller()
     tq.init(conf)
     return tq, conf
 
@@ -134,6 +143,53 @@ def test_save_on_3_restore(ray_cluster, tmp_path_factory, restore_units):
     assert sum(s["rows"] for s in st) == len(keys)  # the cleared row stayed gone
     tq.kv_clear(keys, "train")  # awaited: the units are empty when it returns
     assert sum(ray.get(h.stats.remote())["blobs"] for h in units) == 0
+    _teardown(tq, conf)
+
+
+@pytest.mark.nixl
+def test_capture_then_put_new_keys_then_restore_the_cut(ray_cluster):
+    """New keys put after the capture are not in the checkpoint, and a clear of a
+    key of the cut makes persist fail with no completion marker."""
+    import transfer_queue.interface as tq_interface
+
+    from nemo_rl.data_plane.adapters.tq_nixl_checkpoint import capture_nixl_checkpoint
+
+    ckpt = REPO / ".nvdp_store" / f"capture-{uuid.uuid4().hex[:8]}"
+    tq, conf = _system(3)
+    keys = [f"k{i}" for i in range(N_KEYS)]
+    cut = _batch(11)
+    tq.kv_batch_put(keys, "train", fields=cut)
+    client = tq_interface._maybe_create_tq_client()
+
+    cap = capture_nixl_checkpoint(client, ckpt, metadata={"step": 4})
+    try:
+        tq.kv_batch_put(["late"], "train", fields=_batch(13)[:1])  # a new key
+        assert not (ckpt / "metadata.json").exists()  # not complete until persist
+        cap.persist()
+    finally:
+        cap.release()
+    meta = json.loads((ckpt / "metadata.json").read_text())
+    assert meta == {"storage_saved": True, "user_metadata": {"step": 4}}
+    _check(tq, keys, cut)  # the live data plane kept the cut
+
+    bad = REPO / ".nvdp_store" / f"capture-{uuid.uuid4().hex[:8]}"
+    cap = capture_nixl_checkpoint(client, bad, metadata=None)
+    try:
+        tq.kv_clear(keys[:4], "train")  # a clear of a key of the cut
+        with pytest.raises(Exception, match="updated or cleared"):
+            cap.persist()
+    finally:
+        cap.release()
+    assert not (bad / "metadata.json").exists()
+    _teardown(tq, conf)
+
+    tq, conf = _system(3)
+    tq.load_checkpoint(str(ckpt))
+    _check(tq, keys, cut)
+    units = [ray.get_actor(f"NixlStorageUnit#{i}", namespace=NS) for i in range(3)]
+    assert sum(ray.get(h.stats.remote())["rows"] for h in units) == len(
+        keys
+    )  # no "late"
     _teardown(tq, conf)
 
 
@@ -240,6 +296,77 @@ def test_ssd_on_save_on_2_restore_on_1_spills_and_reads_back(
     tq.load_checkpoint(str(ckpt))
     (st,) = stats(units)
     assert st["blobs"] == 14 and st["disk_only_blobs"] >= 8, st
+    for k, v in zip(keys, vals):
+        got = tq.kv_batch_get([k], "train", select_fields=["x"])
+        assert torch.equal(dense(got["x"]), v), k
+    tq.close()
+    tq_nixl.shutdown(conf)
+
+
+@pytest.mark.nixl
+def test_ssd_capture_then_put_new_keys_then_restore_the_cut(
+    ray_cluster, tmp_path_factory
+):
+    """SSD tier on: a capture holds spilled blobs too. New keys put after the cut
+    are not in the checkpoint; a restore onto one unit (which spills again)
+    reads every value back as it was at the cut."""
+    import transfer_queue as tq
+    import transfer_queue.interface as tq_interface
+
+    import nemo_rl.data_plane.adapters.tq_nixl as tq_nixl
+    from nemo_rl.data_plane.adapters.tq_nixl_checkpoint import capture_nixl_checkpoint
+
+    MiB = 1 << 20
+    ckpt = REPO / ".nvdp_store" / f"capture-ssd-{uuid.uuid4().hex[:8]}"
+    ns = "nvdp-ckpt-ssd-capture"
+
+    def system(n):
+        # 8 MiB slab per unit: 4 MiB put area + 4 MiB IO area.
+        conf = make_tq_conf(num_units=n, slab_bytes=8 * MiB, namespace=ns)
+        conf.backend.NixlStore.op_timeout_s = 60.0
+        conf.backend.NixlStore.ssd = {
+            "enabled": True,
+            "path": str(tmp_path_factory.mktemp("ssd")),
+            "staging_bytes": 4 * MiB,
+        }
+        _patch_controller()
+        tq.init(conf)
+        units = [ray.get_actor(f"NixlStorageUnit#{i}", namespace=ns) for i in range(n)]
+        return conf, units
+
+    def stats(units):
+        return [ray.get(h.stats.remote()) for h in units]
+
+    conf, units = system(2)
+    keys = [f"d{i}" for i in range(14)]  # 14 MiB through 8 MiB of put area
+    vals = [torch.randn(1, MiB // 4) for _ in keys]
+    for k, v in zip(keys, vals):
+        tq.kv_batch_put([k], "train", fields=TensorDict({"x": v}, batch_size=[1]))
+    assert (
+        sum(s["disk_only_blobs"] for s in stats(units)) >= 4
+    )  # the cut has disk blobs
+    client = tq_interface._maybe_create_tq_client()
+
+    cap = capture_nixl_checkpoint(client, ckpt, metadata=None)
+    try:
+        # new keys only: the put area is full, so they spill to disk meanwhile
+        for i in range(2):
+            tq.kv_batch_put(
+                [f"late{i}"],
+                "train",
+                fields=TensorDict({"x": torch.randn(1, MiB // 4)}, batch_size=[1]),
+            )
+        cap.persist()
+    finally:
+        cap.release()
+    assert json.loads((ckpt / "metadata.json").read_text())["storage_saved"] is True
+    tq.close()
+    tq_nixl.shutdown(conf)
+
+    conf, units = system(1)
+    tq.load_checkpoint(str(ckpt))
+    (st,) = stats(units)
+    assert st["rows"] == 14 and st["blobs"] == 14, st  # the cut, and no "late"
     for k, v in zip(keys, vals):
         got = tq.kv_batch_get([k], "train", select_fields=["x"])
         assert torch.equal(dense(got["x"]), v), k

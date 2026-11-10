@@ -783,6 +783,7 @@ data_plane:
     op_timeout_s: null               # deadline of one put / get (all its waits); null: 2 x transfer_timeout_s
     graveyard_max_bytes: 4294967296  # memory unfinished transfers may retain before fatal
     debug_check_finite: false        # debug: report non-finite floats / all-False masks on put and get
+    async_checkpoint: false          # enable the optional stable-view capture API
     ssd:                             # SSD tier: puts the put area cannot take go to disk
       enabled: false
       path: null                     # absolute node-local dir; required when enabled

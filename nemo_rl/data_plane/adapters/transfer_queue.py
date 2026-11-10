@@ -1104,6 +1104,13 @@ def _init_tq(
         import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
 
         nixl_cfg = backend_config(cfg)
+        if nixl_cfg.async_checkpoint:
+            # Patch the controller before tq.init, as the SimpleStorage path does.
+            from nemo_rl.data_plane.adapters.tq_controller_checkpoint import (
+                configure_controller_checkpoint,
+            )
+
+            configure_controller_checkpoint()
         block = nixl_cfg.model_dump()
         placement = block.pop("storage_unit_placement")
         if not block.get("node_ids"):
@@ -1661,6 +1668,22 @@ class TQDataPlaneClient(DataPlaneClient):
         *,
         metadata: dict[str, Any] | None = None,
     ) -> CheckpointCapture | None:
+        if self._backend == "nixl":
+            if not backend_config(self._cfg).async_checkpoint:
+                return None
+            import transfer_queue.interface as tq_interface
+
+            from nemo_rl.data_plane.adapters.tq_nixl_checkpoint import (
+                capture_nixl_checkpoint,
+            )
+
+            self._require_checkpointing_support()
+            _connect_existing()
+            return capture_nixl_checkpoint(
+                tq_interface._maybe_create_tq_client(),
+                checkpoint_dir,
+                metadata=metadata,
+            )
         if self._backend != "simple":
             return None
         simple_cfg = backend_config(self._cfg)

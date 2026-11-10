@@ -36,16 +36,20 @@ guard, so no put/get/clear is in flight while a shard is written.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import time
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import msgspec
 import ray
 
+from nemo_rl.data_plane.checkpoint import CheckpointCapture
 from nemo_rl.data_plane.nixl import blob_format
 from nemo_rl.data_plane.nixl.blobstore import UnitSlabStore
 from nemo_rl.data_plane.nixl.directory import ACTIVE
@@ -95,6 +99,10 @@ def _unit_actor(store: UnitSlabStore, unit_id: int):
     return ray.get_actor(f"NixlStorageUnit#{unit_id}", namespace=store.namespace)
 
 
+def _controller_actor():
+    return ray.get_actor("TransferQueueController", namespace="transfer_queue")
+
+
 def _active_units(store: UnitSlabStore) -> list[int]:
     store._refresh_units()
     return sorted(
@@ -104,25 +112,119 @@ def _active_units(store: UnitSlabStore) -> list[int]:
     )
 
 
+def _shard_entry(unit_id: int, result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "unit_id": unit_id,
+        "file": f"unit-{unit_id}.shard",
+        "nbytes": result["nbytes"],
+        "blobs": result["blobs"],
+        "clears_during_save": int(result.get("clears_during_save", 0)),
+    }
+
+
 def _save_units(store: UnitSlabStore, root: Path) -> dict[str, Any]:
     units = _active_units(store)
     futs = {
         u: _unit_actor(store, u).save_shard.remote(str(root / f"unit-{u}.shard"))
         for u in units
     }
-    shards = []
-    for u, f in futs.items():
-        r = ray.get(f)
-        shards.append(
-            {
-                "unit_id": u,
-                "file": f"unit-{u}.shard",
-                "nbytes": r["nbytes"],
-                "blobs": r["blobs"],
-                "clears_during_save": int(r.get("clears_during_save", 0)),
-            }
-        )
+    shards = [_shard_entry(u, ray.get(f)) for u, f in futs.items()]
     return {"version": VERSION, "shards": shards}
+
+
+# ============================================================================ two-phase save
+def _wait_all(refs: list[Any]) -> list[Any]:
+    """Settle every RPC even if one fails, then raise the first error."""
+    results, first_error = [], None
+    for ref in refs:
+        try:
+            results.append(ray.get(ref))
+        except Exception as error:  # noqa: BLE001 - re-raised below
+            first_error = first_error or error
+    if first_error is not None:
+        raise first_error
+    return results
+
+
+@dataclass
+class NixlCheckpointCapture(CheckpointCapture):
+    """One held cut per unit; ``persist`` writes the files of a synchronous save."""
+
+    checkpoint_dir: Path
+    token: str
+    controller: Any  # holds the controller bytes (see tq_controller_checkpoint)
+    unit_ids: list[int]  # the client's routing table, saved in the manifest
+    units: dict[int, Any]  # unit id -> actor
+    metadata: dict[str, Any]
+
+    def persist(self) -> None:
+        root = _root(self.checkpoint_dir)
+        controller_ref = self.controller.nrl_persist_snapshot.remote(
+            self.token, str(self.checkpoint_dir / "controller_state.pkl")
+        )
+        unit_refs = [
+            actor.persist_shard.remote(self.token, str(root / f"unit-{u}.shard"))
+            for u, actor in self.units.items()
+        ]
+        _, *results = _wait_all([controller_ref, *unit_refs])
+        shards = [_shard_entry(u, r) for u, r in zip(self.units, results, strict=True)]
+        _write_json(
+            root / MANIFEST,
+            {"version": VERSION, "shards": shards, "unit_ids": self.unit_ids},
+        )
+        # The completion marker is last, as in TQ's own save.
+        _write_json(
+            self.checkpoint_dir / "metadata.json",
+            {"storage_saved": True, "user_metadata": self.metadata},
+        )
+
+    def release(self) -> None:
+        _wait_all(
+            [self.controller.nrl_release_snapshot.remote(self.token)]
+            + [a.release_shard.remote(self.token) for a in self.units.values()]
+        )
+
+
+def capture_nixl_checkpoint(
+    client: Any,
+    checkpoint_dir: str | os.PathLike,
+    *,
+    metadata: dict[str, Any] | None,
+) -> NixlCheckpointCapture:
+    """Capture the controller and hold every unit's blobs; ``persist`` writes them later.
+
+    The controller side is the SimpleStorage one (``tq_controller_checkpoint``), so
+    ``configure_controller_checkpoint`` must have run before ``tq.init``. The caller
+    must keep puts and clears out until this returns. After that it may put new
+    keys, call ``persist``, and always call ``release``. It must not update or clear
+    a key of the cut before ``release``: ``persist`` would raise.
+    """
+    meta = copy.deepcopy(metadata) if metadata is not None else {}
+    json.dumps(meta)  # fail before touching disk
+    storage = client.storage_manager.storage_client
+    directory = Path(checkpoint_dir).resolve()
+    directory.mkdir(parents=True, exist_ok=False)  # never overwrite a saved cut
+    _root(directory).mkdir()
+    units = {u: _unit_actor(storage.store, u) for u in _active_units(storage.store)}
+    capture = NixlCheckpointCapture(
+        directory,
+        uuid.uuid4().hex,
+        _controller_actor(),
+        list(storage.unit_ids),
+        units,
+        meta,
+    )
+    try:
+        ray.get(capture.controller.nrl_capture_snapshot.remote(capture.token))
+        _wait_all([a.capture_shard.remote(capture.token) for a in units.values()])
+        return capture
+    except BaseException:
+        # Release on every unit: one that did not capture ignores the token.
+        try:
+            capture.release()
+        except Exception:  # noqa: BLE001 - the original error matters more
+            log.exception("Failed to release an incomplete nixl capture")
+        raise
 
 
 # ============================================================================ load
