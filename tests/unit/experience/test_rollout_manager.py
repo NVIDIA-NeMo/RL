@@ -2063,10 +2063,10 @@ def test_async_nemo_gym_rollout_manager(
         assert last_assistant is not None, f"Completion {i}: no assistant message found"
         assert torch.equal(
             last_assistant["token_ids"],
-            torch.tensor([151667, 198, 32313, 11, 1077]),
+            torch.tensor([151667, 198, 32313, 11, 279]),
         ), (
             f"Completion {i}: last assistant token_ids {last_assistant['token_ids'].tolist()} "
-            f"!= [151667, 198, 32313, 11, 1077]"
+            f"!= [151667, 198, 32313, 11, 279]"
         )
 
         # 3. reward
