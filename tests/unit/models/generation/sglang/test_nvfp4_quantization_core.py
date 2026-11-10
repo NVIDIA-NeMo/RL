@@ -14,6 +14,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from nemo_rl.models.generation.sglang import nvfp4_quantization_core as nvfp4
@@ -94,3 +95,104 @@ def test_contiguous_pair_view_rejects_noncanonical_singleton_stride() -> None:
 
     assert first.is_contiguous() and second.is_contiguous()
     assert nvfp4._contiguous_pair_view(first, second) is None
+
+
+@pytest.mark.parametrize("role", ["gate_proj", "up_proj"])
+def test_live_refit_rejects_incomplete_gate_up_pair(role: str) -> None:
+    name = f"model.layers.0.mlp.experts.0.{role}.weight"
+    with pytest.raises(ValueError, match="incomplete pairs"):
+        list(
+            nvfp4.iter_nvfp4_quantized_tensor_groups(
+                [(name, torch.ones((2, 32)))],
+                skip_weight_substrings=(),
+            )
+        )
+
+
+def test_live_refit_rejects_duplicate_pair_member() -> None:
+    name = "model.layers.0.mlp.experts.0.gate_proj.weight"
+    with pytest.raises(ValueError, match="duplicate gate"):
+        list(
+            nvfp4.iter_nvfp4_quantized_tensor_groups(
+                [(name, torch.ones((2, 32))), (name, torch.ones((2, 32)))],
+                skip_weight_substrings=(),
+            )
+        )
+
+
+def test_skipping_one_pair_member_preserves_both_original_tensors() -> None:
+    base = "model.layers.0.mlp.experts.0"
+    weights = [
+        (f"{base}.{role}.weight", torch.ones((2, 32)))
+        for role in ("gate_proj", "up_proj")
+    ]
+    groups = list(
+        nvfp4.iter_nvfp4_quantized_tensor_groups(
+            weights,
+            skip_weight_substrings=(f"{base}.gate_proj",),
+        )
+    )
+    assert [name for group in groups for name, _ in group] == [
+        name for name, _ in weights
+    ]
+    assert all(group[0][1] is weight for group, (_, weight) in zip(groups, weights))
+
+
+@pytest.mark.parametrize("amax", [0.0, 1e-40, 1.0, 100.0])
+@pytest.mark.parametrize("bound", [256, 448])
+def test_global_scale_remains_finite_and_invertible(amax: float, bound: int) -> None:
+    value = torch.tensor(amax)
+    encoded = nvfp4.nvfp4_global_encode_scale_te(value, nvfp4_e4m3_max=bound)
+    decoded = nvfp4.nvfp4_global_decode_scale_te(value, nvfp4_e4m3_max=bound)
+    assert torch.isfinite(encoded) and encoded > 0
+    assert torch.isfinite(decoded) and decoded > 0
+    torch.testing.assert_close(encoded * decoded, torch.ones(()))
+    if amax >= 1:
+        torch.testing.assert_close(decoded, value / (6 * bound))
+
+
+@pytest.mark.parametrize(
+    ("four_over_six", "e4m3_use", "expected"),
+    [
+        ("", "all", 448),
+        ("weights", "all", 256),
+        ("ALL", "weights", 256),
+        ("activations", "all", 448),
+        ("all", "activations", 448),
+    ],
+)
+def test_weight_scale_bound_respects_te_environment(
+    monkeypatch, four_over_six, e4m3_use, expected
+):
+    monkeypatch.setenv("NVTE_NVFP4_4OVER6", four_over_six)
+    monkeypatch.setenv("NVTE_NVFP4_4OVER6_E4M3_USE_256", e4m3_use)
+    assert nvfp4.nvfp4_weight_e4m3_max() == expected
+
+
+@pytest.mark.parametrize("weight", [torch.ones(32), torch.ones((2, 17))])
+def test_invalid_weight_layout_fails_before_loading_quantizer(weight):
+    with pytest.raises(ValueError):
+        nvfp4.nvfp4_quantize_2d(weight)
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        (torch.ones(32), torch.ones((2, 32))),
+        (torch.ones((2, 32)), torch.ones((2, 48))),
+        (torch.ones((2, 32)), torch.ones((2, 32), dtype=torch.bfloat16)),
+    ],
+)
+def test_invalid_pair_fails_before_loading_quantizer(first, second):
+    with pytest.raises(ValueError):
+        nvfp4.nvfp4_quantize_2d_pair(first, second)
+
+
+def test_pair_view_combines_only_adjacent_rows_of_the_same_storage():
+    combined = torch.arange(6 * 32).reshape(6, 32)
+    first, second = combined[:2], combined[2:]
+    actual = nvfp4._contiguous_pair_view(first, second)
+    assert actual is not None
+    assert actual.untyped_storage().data_ptr() == combined.untyped_storage().data_ptr()
+    assert torch.equal(actual, combined)
+    assert nvfp4._contiguous_pair_view(first.clone(), second.clone()) is None

@@ -45,6 +45,11 @@ on:
         description: Branch for version bump
         required: true
         type: string
+      gh-release-from-tag:
+        description: Tag of previous release for changelog builder
+        required: false
+        type: string
+        default: ""
 
 defaults:
   run:
@@ -79,6 +84,8 @@ jobs:
       docs-target-path: nemo/rl
       publish-as-latest: true
       run-on-version-tag-only: ${{ github.ref_name != 'main' }}
+      gh-release-use-changelog-builder: true
+      gh-release-from-tag: ${{ inputs.gh-release-from-tag || '' }}
       restrict-to-admins: true
     secrets: inherit  # pragma: allowlist secret
 
