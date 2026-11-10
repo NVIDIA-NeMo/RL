@@ -246,6 +246,10 @@ class MegatronGeneration(GenerationInterface):
                 "async_rl.generation_fleet_health.enabled=true is not supported "
                 f"for the {cls.__name__} generation backend"
             )
+        if master_config.token_capture.invalidate_rewritten_history:
+            raise NotImplementedError(
+                "token_capture.invalidate_rewritten_history requires vLLM generation"
+            )
 
     @classmethod
     def verify_served_addresses(
@@ -649,6 +653,7 @@ class MegatronGeneration(GenerationInterface):
         *,
         capture_media: bool = False,
         top_logprobs: int = 0,
+        invalidate_rewritten_history: bool = False,
     ) -> "Optional[MediaColumnSpec]":
         """Install MInf's canonical prompt and completion capture hooks.
 

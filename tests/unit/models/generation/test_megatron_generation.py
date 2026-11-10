@@ -62,6 +62,7 @@ def _master_config_for_megatron_validation(
             recompute_kv_cache_after_weight_updates=False,
             generation_fleet_health=SimpleNamespace(enabled=False),
         ),
+        token_capture=SimpleNamespace(invalidate_rewritten_history=False),
     )
 
 

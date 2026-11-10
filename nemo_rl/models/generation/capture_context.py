@@ -22,6 +22,22 @@ class CaptureInputDecision:
     verify_retained_media: bool
 
 
+def rewrites_history(admission: "CaptureAdmission | None") -> bool:
+    """Whether Gym rooted a later call whose history holds assistant output.
+
+    Such history matches no captured call, so earlier generations would train
+    as prompt. A rollout's first call and a subagent's first call carry no
+    assistant history.
+    """
+    return (
+        admission is not None
+        and admission.mode == "text"
+        and admission.root_reason not in (None, "first_call")
+        and admission.request_replay is not None
+        and any(item.role == "assistant" for item in admission.request_replay.items)
+    )
+
+
 def decide_capture_input(
     admission: "CaptureAdmission",
     *,

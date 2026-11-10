@@ -724,6 +724,12 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # all_segments: every segment; a hit in any of them zeroes the owner's reward.
     # Text penalties run once per rollout, on the scored response.
     forest_penalty_scope: Literal["scored_segment", "all_segments"] = "scored_segment"
+    # Forest only, vLLM generation. Mask the whole rollout when a later call
+    # carries assistant history that matches no captured call (rewritten
+    # history), instead of rooting it as a new segment, so earlier generations
+    # never train as prompt. A subagent's first call carries no assistant
+    # history and is kept.
+    invalidate_rewritten_history: bool = False
 
     @model_validator(mode="after")
     def validate_selection_policy(self) -> "TokenCaptureConfig":
@@ -735,6 +741,7 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
         forest_only = {
             "forest_penalty_scope": self.forest_penalty_scope != "scored_segment",
             "exclude_padding_from_router_stats": self.exclude_padding_from_router_stats,
+            "invalidate_rewritten_history": self.invalidate_rewritten_history,
             "forest_padding_scope": self.forest_padding_scope != "group",
         }
         if not self.forest_training and any(forest_only.values()):

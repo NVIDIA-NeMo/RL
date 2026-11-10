@@ -93,6 +93,29 @@ def test_generation_setup_token_capture_returns_the_coordinators_media_spec(
     )
 
 
+@pytest.mark.parametrize("invalidate", [False, True])
+def test_validate_settings_rejects_rewritten_history_invalidation(invalidate):
+    master_config = SimpleNamespace(
+        policy={
+            "megatron_cfg": {"enabled": True},
+            "generation": {
+                "mcore_generation_config": {"kv_cache_management_mode": "persist"}
+            },
+        },
+        async_rl=SimpleNamespace(
+            recompute_kv_cache_after_weight_updates=False,
+            generation_fleet_health=SimpleNamespace(enabled=False),
+        ),
+        token_capture=SimpleNamespace(invalidate_rewritten_history=invalidate),
+    )
+    if not invalidate:
+        MegatronGeneration.validate_settings(master_config)
+        return
+    # Rejected before any build, not in setup_token_capture.
+    with pytest.raises(NotImplementedError, match="requires vLLM"):
+        MegatronGeneration.validate_settings(master_config)
+
+
 def test_generation_setup_token_capture_requires_exposed_http_server() -> None:
     generation = object.__new__(MegatronGeneration)
     generation.cfg = {"mcore_generation_config": {"expose_http_server": False}}

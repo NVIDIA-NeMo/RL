@@ -140,6 +140,7 @@ def test_forest_selection_config(policy):
     [
         {"forest_penalty_scope": "all_segments"},
         {"exclude_padding_from_router_stats": True},
+        {"invalidate_rewritten_history": True},
         {"forest_padding_scope": "step"},
     ],
 )

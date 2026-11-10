@@ -2290,6 +2290,7 @@ def setup_single_controller(
             token_capture_cfg.staging_partition,
             capture_media=capture_media,
             top_logprobs=master_config.policy["generation"]["top_logprobs"],
+            invalidate_rewritten_history=token_capture_cfg.invalidate_rewritten_history,
         )
         if capture_media and media_columns is None:
             raise RuntimeError(
