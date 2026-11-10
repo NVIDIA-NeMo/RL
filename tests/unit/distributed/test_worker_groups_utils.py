@@ -15,7 +15,12 @@
 
 from copy import deepcopy
 
-from nemo_rl.distributed.worker_group_utils import recursive_merge_options
+import pytest
+
+from nemo_rl.distributed.worker_group_utils import (
+    recursive_merge_options,
+    samples_own_gpu_metrics,
+)
 
 
 class TestRecursiveMergeOptions:
@@ -316,3 +321,39 @@ class TestRecursiveMergeOptions:
         assert result == expected
         # Ensure _nsight is removed
         assert "_nsight" not in result["runtime_env"]
+
+
+class _TrainingWorker:
+    pass
+
+
+class _GenerationWorker:
+    _nsys_gpu_metrics_on_shared_gpu = False
+
+
+@pytest.mark.parametrize(
+    "worker_class,num_gpus,expected",
+    [
+        (_TrainingWorker, 1, True),
+        (_GenerationWorker, 1, True),  # whole GPU
+        (_TrainingWorker, 0.5, True),  # colocated: training workers sample
+        (_GenerationWorker, 0.5, False),  # colocated: generation leaves it to them
+        (_GenerationWorker, 0, False),  # no GPU, e.g. outer vLLM actor at TP>1
+        (_TrainingWorker, 0, False),
+    ],
+)
+def test_samples_own_gpu_metrics(worker_class, num_gpus, expected):
+    """One sampler per GPU: no GPU -> none; a shared GPU goes to the training workers."""
+    assert samples_own_gpu_metrics(worker_class, num_gpus) is expected
+
+
+def test_vllm_workers_leave_shared_gpus_to_training_workers():
+    """The Ray-decorated vLLM actor classes (what create_worker sees) opt out on shared GPUs."""
+    from nemo_rl.models.generation.vllm.vllm_worker import VllmGenerationWorker
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorker,
+    )
+
+    for worker_cls in (VllmGenerationWorker, VllmAsyncGenerationWorker):
+        assert samples_own_gpu_metrics(worker_cls, 0.5) is False
+        assert samples_own_gpu_metrics(worker_cls, 1) is True
