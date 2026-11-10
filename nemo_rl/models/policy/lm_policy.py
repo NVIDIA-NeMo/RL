@@ -349,15 +349,13 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
             cp_size = config["automodel_cfg"]["context_parallel_size"]
             pp_size = automodel_pipeline_parallel_size(config["automodel_cfg"])
             if pp_size != 1:
-                if hf_config is None:
-                    hf_config = get_hf_config(
-                        config["model_name"],
-                        **hf_config_overrides,
-                    )
                 validate_automodel_pipeline_config(
                     config,
                     is_vlm=processor is not None,
-                    model_config=hf_config,
+                    model_config=get_hf_config(
+                        config["model_name"],
+                        **(config.get("hf_config_overrides") or {}),
+                    ),
                 )
 
             env_vars = config["automodel_cfg"].get("env_vars", {})
