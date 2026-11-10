@@ -326,6 +326,7 @@ class DraftLossWrapper:
         # Function-local import: step_state lives under models.megatron.draft,
         # whose package import pulls the modelopt chain non-megatron users avoid.
         from nemo_rl.models.megatron.draft.step_state import (
+            DRAFT_AUX_LOSS_KEY,
             DRAFT_STEP_PAYLOAD_KEY,
             DraftStepState,
         )
