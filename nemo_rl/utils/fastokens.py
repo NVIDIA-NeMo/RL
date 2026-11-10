@@ -31,6 +31,7 @@ See: https://github.com/Atero-ai/fast-tokens
 
 import logging
 import os
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,20 @@ def normalize_fastokens_env() -> None:
         return
 
     os.environ[_VLLM_ENV_VAR] = "1" if nrl_value == "1" else "0"
+
+
+def check_fastokens_applied(tokenizer: Any) -> str:
+    """Return the tokenizer backend; raise if NRL_USE_FASTOKENS=1 but fastokens did not patch it."""
+    backend = getattr(tokenizer, "_tokenizer", None)
+    impl_type = type(backend if backend is not None else tokenizer)
+    name = f"{impl_type.__module__}.{impl_type.__name__}"
+    # Match any fastokens.* class; the private shim name changes across releases.
+    if os.environ.get(_NRL_ENV_VAR) == "1" and not name.startswith("fastokens."):
+        raise RuntimeError(
+            f"{_NRL_ENV_VAR}=1, but the tokenizer backend is {name!r}; "
+            "fastokens.patch_transformers() did not take effect"
+        )
+    return name
 
 
 def maybe_patch_fastokens(enabled: bool) -> None:

@@ -27,6 +27,7 @@ from PIL import Image
 from transformers import AutoTokenizer
 
 import nemo_rl.experience.rollouts as rollouts_mod
+from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.data.collate_fn import rl_collate_fn
 from nemo_rl.data.datasets.response_datasets import NemoGymDataset
 from nemo_rl.data.interfaces import DatumSpec
@@ -46,8 +47,10 @@ from nemo_rl.environments.games.sliding_puzzle import (
     SlidingPuzzleGameLogic,
     SlidingPuzzleMetadata,
 )
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.experience.dynamic_sampling import mask_sample_flagged
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -115,8 +118,16 @@ def _initial_gym_image_batch() -> BatchedDataDict:
     )
 
 
-def test_attach_initial_nemo_gym_image_payloads_attaches_once(monkeypatch):
+@pytest.mark.parametrize("materialized", [False, True], ids=["flat", "materialized"])
+def test_attach_initial_nemo_gym_image_payloads_attaches_once(
+    monkeypatch, materialized
+):
     batch = _initial_gym_image_batch()
+    if materialized:
+        batch["extra_env_info"][0] = {
+            "task_id": {"taskset": "vision:train", "task_id": "image-1"},
+            "task_input": batch["extra_env_info"][0],
+        }
     attached = PackedTensor(torch.ones(1, 3, 2, 3), dim_to_pack=0)
 
     class _Processor:
@@ -2153,11 +2164,20 @@ def test_run_async_nemo_gym_rollout_streams_complete_prompt_groups(monkeypatch):
     assert rollout_results[-1].rollout_metrics["timing/rollout/total"] == 4.0
 
 
-def test_nemo_gym_stream_accumulator_validates_rows_and_completion():
+@pytest.mark.parametrize("materialized", [False, True])
+def test_nemo_gym_stream_accumulator_validates_rows_and_completion(materialized):
     rows = [
         {"task_source": "workplace_assistant"},
         {"task_source": "workplace_assistant"},
     ]
+    if materialized:
+        rows = [
+            {
+                "task_id": {"taskset": "workplace:train", "task_id": "first"},
+                "task_input": {},
+            }
+            for _ in rows
+        ]
     accumulator = rollouts_mod._NemoGymStreamAccumulator(
         rows=rows,
         num_generations=2,
@@ -2168,6 +2188,8 @@ def test_nemo_gym_stream_accumulator_validates_rows_and_completion():
         "type": "responses_api_agents",
         "name": "workplace_assistant_simple_agent",
     }
+    if materialized:
+        resolved_agent_ref = None
     assert accumulator.add(0, {"row": 0}, resolved_agent_ref=resolved_agent_ref) is None
     with pytest.raises(ValueError, match="duplicate row index 0"):
         accumulator.add(0, {"row": 0}, resolved_agent_ref=resolved_agent_ref)
@@ -2189,21 +2211,25 @@ def test_nemo_gym_stream_accumulator_validates_rows_and_completion():
         ).add(2, {"row": 2}, resolved_agent_ref=resolved_agent_ref)
 
 
-def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group():
+@pytest.mark.parametrize("materialized", [False, True])
+def test_nemo_gym_stream_accumulator_rejects_mixed_agent_group(materialized):
+    rows = [{"task_source": "task"}, {"task_source": "task"}]
+    references = [{"name": "agent-a"}, {"name": "agent-b"}]
+    if materialized:
+        rows = [
+            {"task_id": {"taskset": name, "task_id": "first"}, "task_input": {}}
+            for name in ("taskset-a", "taskset-b")
+        ]
+        references = [None, None]
     accumulator = rollouts_mod._NemoGymStreamAccumulator(
-        rows=[
-            {"task_source": "task"},
-            {"task_source": "task"},
-        ],
+        rows=rows,
         num_generations=2,
         allow_mixed_agents=False,
     )
 
-    assert (
-        accumulator.add(0, {"row": 0}, resolved_agent_ref={"name": "agent-a"}) is None
-    )
-    with pytest.raises(ValueError, match="one NeMo-Gym agent"):
-        accumulator.add(1, {"row": 1}, resolved_agent_ref={"name": "agent-b"})
+    assert accumulator.add(0, {"row": 0}, resolved_agent_ref=references[0]) is None
+    with pytest.raises(ValueError, match="one NeMo-Gym attribution key"):
+        accumulator.add(1, {"row": 1}, resolved_agent_ref=references[1])
 
 
 def test_group_reward_diagnostics_reports_ties_and_skips_incomplete_scores():
@@ -2375,6 +2401,104 @@ def test_postprocess_nemo_gym_group_returns_task_index(
         "agent/full_result" in rollout_result.rollout_metrics
     ) is log_full_result_tables
     assert rollout_result.rollout_metrics["agent/truncation_rate"] == 0.0
+
+
+@pytest.mark.parametrize("log_full_result_tables", [False, True])
+@pytest.mark.parametrize(
+    "row_format", ["flat", "materialized_flat_metadata", "materialized_task_data"]
+)
+def test_postprocess_nemo_gym_group_reads_profile_metadata_from_task_rows(
+    log_full_result_tables: bool, row_format: str
+) -> None:
+    rows = []
+    for _ in range(2):
+        task_input = {
+            "responses_create_params": {
+                "input": [{"role": "user", "content": "prompt"}]
+            }
+        }
+        profile_metadata = {
+            "profiled_rewards": [1.0, 1.0],
+            "profiled_output_lengths": [2, 2],
+            "profile_band": {"total": {"a": 2, "b": 6, "f": 0.5}},
+        }
+        if row_format == "materialized_task_data":
+            task_input["task_data"] = profile_metadata
+        else:
+            task_input.update(profile_metadata)
+        row = {"agent_ref": {"name": "agent"}, "_ng_task_index": 42}
+        if row_format == "flat":
+            row.update(task_input)
+        else:
+            del row["agent_ref"]
+            row["task_id"] = {"taskset": "math:train", "task_id": "first"}
+            row["task_input"] = task_input
+        rows.append(row)
+    results = []
+    for reward in (1.0, 0.0):
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([1]),
+        }
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([2]),
+                        "generation_logprobs": torch.tensor([-0.1]),
+                    },
+                ],
+                "full_result": {
+                    "reward": reward,
+                    "response": {
+                        "output": [{"type": "message", "content": [{"text": "answer"}]}]
+                    },
+                },
+            }
+        )
+
+    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=log_full_result_tables,
+        length_penalty_config={
+            "default": {
+                "length_type": "chars",
+                "profiled_length_penalty": 0.2,
+                "profile_band_total": True,
+            }
+        },
+    )
+
+    assert rollout_result.task_index == 42
+    # The profiled budget subtracts 0.2, then the band halves the remaining reward.
+    assert rollout_result.final_batch["total_reward"].tolist() == pytest.approx(
+        [0.4, 0.0]
+    )
+    assert rollout_result.final_batch["env_reward"].tolist() == [1.0, 0.0]
+    attribution_key = "agent" if row_format == "flat" else "math:train"
+    expected_agent_ref = {"name": "agent"} if row_format == "flat" else None
+    assert rollout_result.final_batch["agent_ref"] == [expected_agent_ref] * 2
+    assert rollout_result.final_batch["attribution_key"] == [attribution_key] * 2
+    assert (
+        f"{attribution_key}/full_result" in rollout_result.rollout_metrics
+    ) is log_full_result_tables
+    assert rollout_result.rollout_metrics[f"{attribution_key}/truncation_rate"] == 0.0
+    assert rollout_result.rollout_metrics[f"{attribution_key}/reward/mean"] == 0.2
 
 
 def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
@@ -2745,6 +2869,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
             return _Stream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._dispatch_admission_gate = DataPlaneCheckpointBarrier()
     manager._num_generations_per_prompt = 2
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
     manager._timeouts = RolloutTimeouts()
@@ -2802,6 +2927,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
 def test_nemo_gym_rollout_record_persists_runtime_resolved_agent_ref():
     manager = object.__new__(AsyncNemoGymRolloutImpl)
     manager.set_next_nemo_gym_task_index(0)
+    manager._dispatch_admission_gate = None
     manager._num_generations_per_prompt = 2
     manager._generation_config = {
         "temperature": 1.0,
@@ -2821,8 +2947,11 @@ def test_nemo_gym_rollout_record_persists_runtime_resolved_agent_ref():
         *,
         on_completion=None,
         recovery_granularity=RecoveryGranularity.SIBLING,
+        gym_instance_id=None,
+        dispatch_recorder=None,
     ):
-        del timer, timer_prefix, on_completion, recovery_granularity
+        del timer, timer_prefix, on_completion, recovery_granularity, gym_instance_id
+        del dispatch_recorder
         for row in inputs:
             row["agent_ref"] = resolved_agent_ref
         receipt_completion = SimpleNamespace(env_extras={"ng_receipt": {}})
@@ -2884,6 +3013,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
             return _DuplicateStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._dispatch_admission_gate = None
     manager._num_generations_per_prompt = 2
     # These tests cover stream ordering/dedup, not deadlines or re-dispatch.
     manager._timeouts = RolloutTimeouts()
@@ -2926,10 +3056,50 @@ def test_prepare_nemo_gym_rows_stamps_distinct_legacy_prompt_groups():
     assert [row["_rowidx"] for row in rows] == [0, 1, 2, 3]
 
 
+def test_prepare_nemo_gym_rows_updates_mixed_materialized_and_flat_inputs():
+    materialized_row = {
+        "task_id": {"taskset": "workplace:train", "task_id": "17"},
+        "task_input": {
+            "responses_create_params": {
+                "input": [{"role": "user", "content": "Check my meetings."}],
+                "max_output_tokens": 128,
+                "metadata": {"extra_body": '{"seed": 8}'},
+            },
+            "task_data": {"state": ["meeting-1"]},
+        },
+    }
+    rows = [
+        {"agent_ref": {"name": "flat_row_agent"}, "responses_create_params": {}},
+        materialized_row,
+    ]
+    rollouts_mod._prepare_nemo_gym_rows(
+        rows,
+        generation_config={"max_new_tokens": 64},
+        sampling_params=SimpleNamespace(temperature=0.7, top_p=0.9),
+        num_generations=1,
+    )
+
+    assert materialized_row["task_id"] == {
+        "taskset": "workplace:train",
+        "task_id": "17",
+    }
+    assert materialized_row["task_input"]["task_data"] == {"state": ["meeting-1"]}
+    assert "responses_create_params" not in materialized_row
+    materialized_params = materialized_row["task_input"]["responses_create_params"]
+    assert materialized_params["metadata"] == {"extra_body": '{"seed": 8}'}
+    for params in (rows[0]["responses_create_params"], materialized_params):
+        assert params["temperature"] == 0.7
+        assert params["top_p"] == 0.9
+        assert params["max_output_tokens"] == 64
+    assert [row["_rowidx"] for row in rows] == [0, 1]
+    assert rows[0][NEMO_GYM_GROUP_ID_KEY] != rows[1][NEMO_GYM_GROUP_ID_KEY]
+
+
 def test_rollout_manager_rotates_replicas_and_reports_group_share():
     first, second = object(), object()
     selected = []
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._dispatch_admission_gate = None
     manager._timeouts = RolloutTimeouts()
     manager._max_gym_row_attempts = 1
     manager._deadline_registry = None
@@ -2953,8 +3123,18 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
         timer_prefix,
         *,
         on_completion,
+        dispatch_recorder=None,
+        admission_closed_rows=None,
+        recovery_granularity=None,
     ):
-        del total_rows, timer_prefix, on_completion
+        del (
+            total_rows,
+            timer_prefix,
+            on_completion,
+            dispatch_recorder,
+            admission_closed_rows,
+            recovery_granularity,
+        )
         selected.append(environment)
         for row in pending:
             rowidx = row["_rowidx"]
@@ -3023,6 +3203,7 @@ def test_rollout_manager_attributes_awaited_stream_failure_to_instance():
             return _FailedStream()
 
     manager = object.__new__(AsyncNemoGymRolloutImpl)
+    manager._dispatch_admission_gate = None
     manager._timeouts = RolloutTimeouts()
     manager._max_gym_row_attempts = 1
     manager._deadline_registry = None
@@ -3105,6 +3286,10 @@ def test_run_async_nemo_gym_rollout(
                     "name": "example_multi_step_simple_agent",
                     "type": "responses_api_agents",
                 },
+            ],
+            "attribution_key": [
+                "example_multi_step_simple_agent",
+                "example_multi_step_simple_agent",
             ],
             "length": torch.tensor([3080, 3048]),
             "loss_multiplier": torch.tensor([1.0, 1.0]),
@@ -3290,22 +3475,63 @@ def test_reattach_preserves_marker_across_aliased_message_log_views():
 
 
 def test_mask_sample_flags_read_either_form_of_the_flag():
-    """Either the verify response's first-class ``mask_sample`` field or the
-    ``instance_config.mask_sample`` extras mapping flags a sample. Gym defaults
-    the first-class field to False on every response, so a nested-only
-    environment carries a false first-class field beside the true nested one
-    and the two reads must be OR-ed, not ordered; unflagged and empty rows stay
-    unmasked."""
-    flags = rollouts_mod._mask_sample_flags(
-        [
-            {"mask_sample": True},
-            {"instance_config": {"mask_sample": True}},
-            # An older-form environment on a Gym that defaults the first-class
-            # field to False: either form flags the sample.
-            {"mask_sample": False, "instance_config": {"mask_sample": True}},
-            {"mask_sample": False, "instance_config": {}},
-            {},
-            None,
-        ]
-    )
-    assert flags.tolist() == [True, True, True, False, False, False]
+    extras = [
+        {"mask_sample": True},
+        {"instance_config": {"mask_sample": True}},
+        {"mask_sample": False, "instance_config": {"mask_sample": True}},
+        {"mask_sample": False, "instance_config": {}},
+        {},
+        None,
+    ]
+    expected = [True, True, True, False, False, False]
+    assert rollouts_mod._mask_sample_flags(extras).tolist() == expected
+    assert [mask_sample_flagged(extra) for extra in extras] == expected
+
+
+@pytest.mark.nemo_gym
+def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
+    """A restored turn continues only on the replica that holds its Gym state."""
+    first, second = object(), object()
+    selected = []
+    impl = object.__new__(AsyncNemoGymRolloutImpl)
+    impl._dispatch_admission_gate = None
+    impl._timeouts = RolloutTimeouts()
+    impl._max_gym_row_attempts = 1
+    impl._deadline_registry = None
+    impl._num_generations_per_prompt = 1
+    impl._task_to_env = {
+        "nemo_gym": NemoGymShardSet(
+            handles={"tools": [first, second]}, route_to_shard={"agent": "tools"}
+        )
+    }
+    impl._tokenizer = None
+    impl._effort_config = None
+
+    async def fake_stream_rows(environment, pending, results, shaping, *_a, **_k):
+        selected.append(environment)
+        for row in pending:
+            results[row["_rowidx"]] = {
+                "input_message_log": [{"token_ids": [1]}],
+                "full_result": {"reward": 0.0},
+            }
+            shaping[row["_rowidx"]] = SimpleNamespace(
+                length_rewards_low=[], rewards_low=[], low_lengths=[], high_lengths=[]
+            )
+
+    impl._stream_rows = fake_stream_rows
+    impl._results_to_completions = lambda _results: ([object()], {})
+    impl._compute_rollout_metrics = lambda *_args, **_kwargs: {}
+    impl._compute_reward_penalty_metrics = lambda *_args: {}
+    owner = GymCheckpointInstance("tools", 1).instance_id
+
+    for _ in range(3):
+        asyncio.run(
+            impl._run_rollouts(
+                inputs=[{"_rowidx": 0, "agent_ref": {"name": "agent"}}],
+                timer=rollouts_mod.Timer(),
+                timer_prefix="timing/test",
+                gym_instance_id=owner,
+            )
+        )
+
+    assert selected == [second, second, second]
