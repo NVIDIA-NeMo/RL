@@ -3350,7 +3350,11 @@ def test_postprocess_nemo_gym_rows_checks_task_indices_per_prompt_group(
     ]
 
 
-@pytest.mark.parametrize("task_indices", [[7, 3, 3, 3], [7, 7, 3, None]])
+@pytest.mark.parametrize(
+    "task_indices",
+    [[7, 3, 3, 3], [7, 7, 3, None], [None, None, 7, 3]],
+    ids=["mixed_group", "partial_group", "mixed_group_after_task_rows"],
+)
 def test_postprocess_nemo_gym_rows_refuses_mixed_task_indices_in_a_prompt_group(
     task_indices,
 ):
