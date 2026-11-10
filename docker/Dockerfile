@@ -159,7 +159,7 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
 # Install uv and python outside /root so an unprivileged runtime UID (for example
 # 65532) can execute them: /root is not traversable by other users, and the project
 # venv's python is a symlink into uv's managed-Python directory.
-ARG UV_VERSION=0.11.28
+ARG UV_VERSION=0.13.6
 ARG PYTHON_VERSION=3.13.14
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 # One uv cache for the build and for every runtime identity. It holds every wheel the venvs are
@@ -168,7 +168,8 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 ENV UV_CACHE_DIR=/opt/nemo_rl_cache/uv
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
         | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && \
-    uv python install ${PYTHON_VERSION}
+    uv python install ${PYTHON_VERSION} && \
+    find /opt/uv/python -path "*/pip/_vendor/distlib/*.exe" -delete
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
 # Users are encouraged to enable if the wish.
@@ -271,6 +272,8 @@ COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl nemo_rl/distributed/actor_environments.py ./nemo_rl/distributed/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
+# Part of this recipe, not of the selected source: an older NRL_GIT_REF has no such script.
+COPY docker/prune_uv_cache.py /usr/local/bin/prune_uv_cache.py
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link \
     --exclude=TensorRT-LLM-workspace \
@@ -290,7 +293,7 @@ RUN --mount=type=ssh \
 # downloads persist for the next build. This is the first uv-writing RUN in
 # the stage, so it force-copies the whole store in and prunes on sync-back
 # (see docker/uv_cache_mount.sh). Every later RUN in this stage that also
-# invokes uv (TRT-LLM build, Dynamo install, worker-venv prefetch phase 2,
+# invokes uv (TRT-LLM build, worker-venv prefetch phase 2,
 # Gym prefetch) sources the same helper but only tops up what it adds,
 # instead of re-shipping the whole store again in its own layer.
 # Whether the materialized copy also ships in the final image (for the
@@ -301,6 +304,17 @@ uv_cache_restore force
 trap 'uv_cache_persist prune' EXIT
 
 uv venv --seed
+# Drop what the restored cache carried in that uv.lock no longer pins -- versions from
+# older locks, which neither the seed export's `uv cache prune --ci` (it keeps every
+# source-built version) nor the durable cache mount ever evict (see
+# docker/prune_uv_cache.py). It runs before any sync, so it only ever judges restored
+# content: build-isolation deps the syncs below resolve outside uv.lock (setuptools, a
+# build-time torch, ...) are kept. It runs in this RUN because deleting files in a later
+# layer only hides them, and the image would still ship every byte; and the
+# `uv_cache_persist prune` trap above mirrors the result back into the cache mount.
+du -sh "${UV_CACHE_DIR}"
+"${UV_PROJECT_ENVIRONMENT}/bin/python" /usr/local/bin/prune_uv_cache.py --lock uv.lock --cache-dir "${UV_CACHE_DIR}"
+du -sh "${UV_CACHE_DIR}"
 # The custom build scripts will alter the pyproject.toml and uv.lock
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
     UV_LINK_MODE=hardlink bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL:-} ${BUILD_CUSTOM_VLLM_REF:-} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION:-}
@@ -321,7 +335,6 @@ apt-get update
 # DeepEP's multinode link needs the exact filename libnvidia-ml.so.1; the CUDA base
 # only ships stubs/libnvidia-ml.so. Purged again after the syncs below.
 apt-get install -y --no-install-recommends libnvidia-ml-dev
-uv cache clean deep-ep
 # Everything is hardlinked against the uv cache; this layer holds exactly one real copy of every wheel.
 UV_LINK_MODE=hardlink uv sync --frozen --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
@@ -680,21 +693,17 @@ COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 
 # Keep Dynamo's Python 3.12 dependency graph isolated from NeMo-RL's normal
 # Ray/vLLM environments. Default image builds do not create this environment.
-RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
-    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu -o pipefail
+RUN <<"EOF" bash -exu -o pipefail
 if [[ "${BUILD_DYNAMO:-0}" != "1" ]]; then
     echo "BUILD_DYNAMO is not 1; skipping the managed Dynamo runtime"
     exit 0
 fi
-# Same materialize/sync-back/strip dance as the other uv-writing RUNs --
-# docker/dynamo/install.sh calls uv sync with no explicit UV_CACHE_DIR override, so
-# it uses the image-wide UV_CACHE_DIR (set in base), which must be a plain
-# same-filesystem directory for hardlink installs. Already exists from the
-# hermetic stage unless STRIP_UV_CACHE removed it there.
-source /tmp/uv-cache-helper/uv_cache_mount.sh
-uv_cache_restore
-trap 'uv_cache_persist' EXIT
-bash docker/dynamo/install.sh
+# Dynamo syncs its own lock (Python 3.12) into a --link-mode copy venv that nothing re-syncs at
+# runtime, so its wheels are never needed from the shared cache. A throwaway cache keeps them
+# out of this layer instead of shipping them twice, and out of the durable cache mount, so this
+# RUN needs neither the mount nor the uv_cache_mount.sh restore/persist.
+UV_CACHE_DIR=/tmp/dynamo-uv-cache bash docker/dynamo/install.sh
+rm -rf /tmp/dynamo-uv-cache
 EOF
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
@@ -862,7 +871,7 @@ echo "Exporting uv cache for build ${UV_CACHE_EXPORT_NONCE:-local}"
 # RUN command, leaving this builder-local mount empty. Restore the seed only in
 # that case; unconditionally merging it would resurrect wheels uv evicted.
 if [[ -z "$(find /root/.uv-cache-store -mindepth 1 -print -quit)" ]]; then
-    rsync -a /tmp/uv-cache-seed/ /root/.uv-cache-store/
+    rsync -aH /tmp/uv-cache-seed/ /root/.uv-cache-store/
 fi
 mkdir -p /tmp/uv-cache-export
 cp -a /root/.uv-cache-store/. /tmp/uv-cache-export/
