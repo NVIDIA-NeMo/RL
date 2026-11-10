@@ -121,8 +121,23 @@ def _gate_pwrite(monkeypatch):
     return go, entered
 
 
-def _open_fds():
-    return len(os.listdir("/proc/self/fd"))
+def _open_fds(under):
+    """Open fds of files under ``under`` (a unit's SSD dir), unlinked ones included.
+
+    Counted by target, not process-wide: other units' IO workers (earlier tests
+    in this process) close their files on their own schedule, so a process-wide
+    count moves under this test's feet.
+    """
+    root = str(under)
+    n = 0
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:
+            continue
+        if target.startswith(root):
+            n += 1
+    return n
 
 
 # ------------------------------------------------------------------ spill
@@ -190,13 +205,13 @@ def test_a_failed_write_fails_the_put_and_frees_the_io_area(
 ):
     u = _unit(tmp_path)
     _fill(u)
-    fds = _open_fds()
+    fds = _open_fds(tmp_path)
     monkeypatch.setattr(nixl_storage_unit.os, "pwrite", fail)
     _write(u, "s", u.alloc("s", BLOB, 1), 5)
     assert _commit(u, "s") == "lost"  # never acknowledged, so nothing is lost
     assert "s" not in u.blobs and u._io_jobs == 0
     assert u.staging_.used_bytes == 0 and u.stats()["spill_failures"] == 1
-    assert _open_fds() == fds  # the partial file's fd is closed
+    assert _open_fds(tmp_path) == fds  # the partial file's fd is closed
 
 
 def test_a_put_that_fits_nowhere_is_unitfull_and_a_full_io_area_is_busy(tmp_path):
@@ -285,7 +300,7 @@ def test_abort_with_a_write_in_flight_retires_the_io_region(tmp_path):
 def test_abort_during_the_write_leaves_the_cleanup_to_the_job(tmp_path, monkeypatch):
     u = _unit(tmp_path)
     _fill(u)
-    fds = _open_fds()
+    fds = _open_fds(tmp_path)
     go, entered = _gate_pwrite(monkeypatch)
     _write(u, "s", u.alloc("s", BLOB, 1), 5)
     u.commit("s")
@@ -296,7 +311,7 @@ def test_abort_during_the_write_leaves_the_cleanup_to_the_job(tmp_path, monkeypa
     go.set()
     _wait(lambda: u._io_jobs == 0)
     assert u.staging_.used_bytes == 0 and "s" not in u.blobs
-    assert u.stats()["spills"] == 0 and _open_fds() == fds
+    assert u.stats()["spills"] == 0 and _open_fds(tmp_path) == fds
 
 
 def test_released_disk_blob_closes_its_file(tmp_path):
@@ -402,9 +417,9 @@ def _fill_of(b):
 def test_checkpoint_saves_put_area_and_disk_blobs(tmp_path):
     u = _unit(tmp_path / "u")
     _spilled(u)
-    fds = _open_fds()
+    fds = _open_fds(tmp_path)
     res = u.save_shard(str(tmp_path / "s"))
-    assert _open_fds() == fds  # each dup'd fd is closed after its copy
+    assert _open_fds(tmp_path) == fds  # each dup'd fd is closed after its copy
     assert sorted(res["blobs"]) == [f"b{i}" for i in range(8)]
     raw = (tmp_path / "s").read_bytes()
     assert res["nbytes"] == len(raw) == 8 * BLOB
