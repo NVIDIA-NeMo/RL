@@ -162,7 +162,7 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # L = L_PPO + μ·L_NLL(correct)   (arXiv:2504.05118, Eq. 10)
     # Set to 0 to disable.
     positive_example_nll_weight: float = 0.0
-    ce_penalty: float | None
+    ce_penalty: Optional[float] = None
 
 
 class ClippedPGLossDataDict(TypedDict):

@@ -408,7 +408,7 @@ def setup_vlm_tokenizer(config, runner_file: str):
 
     `runner_file` is the runner's `__file__`: the fixed Qwen3 chat template is read from the runner's directory, and the
     assertion message names the runner."""
-    tokenizer = get_tokenizer(config.policy["tokenizer"], get_processor=config.policy.get("use_hf_processor", False))
+    tokenizer = get_tokenizer(config.policy["tokenizer"], get_processor=True)
     if "Qwen3" in config.policy["tokenizer"]["name"]:
         print("****** Qwen3 tokenizer detected! Swapping in fixed jinja template! ******", flush=True)
         #import requests
