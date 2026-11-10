@@ -34,7 +34,35 @@ from megatron.core.utils import unwrap_model
 from modelopt.torch.quantization.nn import AnyQuantizer
 from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
-from modelopt.torch.quantization.utils import apply_without_qdq
+try:
+    from modelopt.torch.quantization.utils import apply_without_qdq
+except ImportError:  # ModelOpt predating #3124, which is where this landed upstream.
+    # Faithful port of modelopt.torch.quantization.utils.core_utils.apply_without_qdq.
+    # Pinning ModelOpt forward to get it is not an option here: the study's pin carries
+    # KV-scale export fixes that are on a branch main does not contain, so moving the pin
+    # would trade one correctness fix for another.
+    def apply_without_qdq(quantizer, inputs):
+        """Apply the quantizer's pre-quant scale/rotation without quantizing.
+
+        Rows a quantized module computes in high precision still need the transforms
+        (an AWQ / SmoothQuant scale the stored weight compensates for), otherwise they
+        are inconsistent with the quantized rows beside them.
+        """
+        from modelopt.torch.quantization.nn import SequentialQuantizer
+
+        members = (
+            list(quantizer)
+            if isinstance(quantizer, SequentialQuantizer)
+            else [quantizer]
+        )
+        for member in members:
+            disabled = member._disabled
+            member._disabled = True
+            try:
+                inputs = member(inputs)
+            finally:
+                member._disabled = disabled
+        return inputs
 
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
 from nemo_rl.modelopt.models.policy.workers.utils import (
