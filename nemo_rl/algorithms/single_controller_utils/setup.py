@@ -2044,18 +2044,21 @@ def setup_single_controller(
 
     # The communicator needs only the trainer and generation: start it when both return, beside Gym's last stretch.
     start_communicator_early = _start_communicator_early(
-        generation_config["backend"], colocated=colocated, has_teachers=bool(teacher_clusters)
+        generation_config["backend"],
+        colocated=colocated,
+        has_teachers=bool(teacher_clusters),
     )
     tail_lane_secs: dict[str, float] = {}
     communicator_executor = ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="refit-communicator"
     )
-    communicator_future: Optional[Future] = None
+    communicator_future: Optional[Future[WeightSynchronizer]] = None
 
-    def _init_communicator() -> Optional[WeightSynchronizer]:
+    def _init_communicator() -> WeightSynchronizer:
         """Refit communicator rendezvous; needs only the trainer and generation."""
-        if weight_synchronizer is not None:
-            return weight_synchronizer
+        existing_synchronizer = weight_synchronizer
+        if existing_synchronizer is not None:
+            return existing_synchronizer
         t0 = time.perf_counter()
         new_synchronizer = create_weight_synchronizer(
             policy=trainer,

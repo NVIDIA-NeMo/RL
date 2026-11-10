@@ -2866,7 +2866,9 @@ class TestSetup:
         weight_sync = patched_factories["create_weight_synchronizer"].return_value
         weight_sync.init_communicator.side_effect = lambda: _meet("communicator")
 
-        with self._setup_tail_patches(_create_finalizers, _create_advantage, start_early):
+        with self._setup_tail_patches(
+            _create_finalizers, _create_advantage, start_early
+        ):
             try:
                 actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=9))
             except threading.BrokenBarrierError:
@@ -2895,7 +2897,9 @@ class TestSetup:
         weight_sync = patched_factories["create_weight_synchronizer"].return_value
         weight_sync.init_communicator.side_effect = RuntimeError("rendezvous boom")
 
-        with self._setup_tail_patches(_create_finalizers, _create_advantage, start_early):
+        with self._setup_tail_patches(
+            _create_finalizers, _create_advantage, start_early
+        ):
             with pytest.raises(RuntimeError, match="rendezvous boom"):
                 setup_single_controller(mc, MagicMock(pad_token_id=9))
 
