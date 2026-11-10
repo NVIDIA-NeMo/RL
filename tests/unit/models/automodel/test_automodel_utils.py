@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import gc
+import inspect
+import json
 import weakref
 from types import SimpleNamespace
 
+import huggingface_hub
 import pytest
 import torch
 from torch import nn
@@ -24,6 +27,8 @@ try:
 except ImportError:
     pytest.skip("nemo_automodel not available", allow_module_level=True)
 
+from huggingface_hub.errors import IncompleteSnapshotError
+from nemo_automodel._transformers import auto_model as automodel_auto_model
 from nemo_automodel.components.moe.megatron.token_dispatcher import (
     MoEFlexTokenDispatcher,
 )
@@ -31,6 +36,7 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 from nemo_rl.models.automodel.utils import (
     release_moe_dispatcher_state,
     resolve_model_class,
+    snapshot_download_base_load_files,
 )
 
 
@@ -160,3 +166,87 @@ def test_release_moe_dispatcher_state_ignores_dense_models():
     model = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
     model[0].token_dispatcher = None
     assert release_moe_dispatcher_state(model) == 0
+
+
+_SNAPSHOT_COMMIT = "0" * 40
+
+
+def _make_partial_hub_cache(cache_dir, *, local_files, listed_files):
+    """Build an HF cache whose snapshot holds local_files but whose tree listing names listed_files."""
+    repo_dir = cache_dir / "models--org--model"
+    snapshot_dir = repo_dir / "snapshots" / _SNAPSHOT_COMMIT
+    snapshot_dir.mkdir(parents=True)
+    for name in local_files:
+        (snapshot_dir / name).write_text("{}")
+    (repo_dir / "trees").mkdir()
+    (repo_dir / "trees" / f"{_SNAPSHOT_COMMIT}.json").write_text(
+        json.dumps(
+            {
+                "format_version": 1,
+                "files": {
+                    name: {"size": 2, "blob_id": "0" * 40} for name in listed_files
+                },
+            }
+        )
+    )
+    return snapshot_dir
+
+
+@pytest.mark.automodel
+def test_automodel_snapshot_download_patch_installed():
+    """Automodel's base-model load resolves snapshots through the NeMo-RL wrapper."""
+    assert automodel_auto_model.snapshot_download is snapshot_download_base_load_files
+
+
+@pytest.mark.automodel
+def test_automodel_snapshot_download_patch_still_needed():
+    """Tripwire: remove the wrapper in nemo_rl/models/automodel/utils.py once this fails.
+
+    It fails when Automodel's auto_model.py filters the files its snapshot check requires.
+    """
+    assert "allow_patterns" not in inspect.getsource(automodel_auto_model), (
+        "Automodel's auto_model.py now filters snapshot_download; drop "
+        "snapshot_download_base_load_files from nemo_rl/models/automodel/utils.py and "
+        "these tests."
+    )
+
+
+@pytest.mark.automodel
+def test_snapshot_download_base_load_files_accepts_weight_only_cache(tmp_path):
+    """A cache without README/LICENSE still resolves for a base-model load."""
+    snapshot_dir = _make_partial_hub_cache(
+        tmp_path,
+        local_files=["config.json", "model.safetensors"],
+        listed_files=["config.json", "model.safetensors", "README.md", "LICENSE"],
+    )
+    kwargs = {
+        "revision": _SNAPSHOT_COMMIT,
+        "cache_dir": str(tmp_path),
+        "local_files_only": True,
+    }
+
+    with pytest.raises(IncompleteSnapshotError):
+        huggingface_hub.snapshot_download("org/model", **kwargs)
+    assert snapshot_download_base_load_files("org/model", **kwargs) == str(snapshot_dir)
+
+
+@pytest.mark.automodel
+def test_snapshot_download_base_load_files_rejects_missing_weights(tmp_path):
+    """A cache missing a weight shard the listing names still fails."""
+    _make_partial_hub_cache(
+        tmp_path,
+        local_files=["config.json", "model.safetensors.index.json"],
+        listed_files=[
+            "config.json",
+            "model.safetensors.index.json",
+            "model-00001-of-00002.safetensors",
+        ],
+    )
+
+    with pytest.raises(IncompleteSnapshotError, match="model-00001-of-00002"):
+        snapshot_download_base_load_files(
+            "org/model",
+            revision=_SNAPSHOT_COMMIT,
+            cache_dir=str(tmp_path),
+            local_files_only=True,
+        )

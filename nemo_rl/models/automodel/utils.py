@@ -13,10 +13,13 @@
 # limitations under the License.
 from typing import Any, Dict
 
+import huggingface_hub
+
 # Side-effect import: installs the resolver hook that routes FP8-native Mistral 3.5
 # configs to Mistral3FP8VLM. Without it, HF's stock FP8Linear path runs and produces
 # 0-d weight_scale_inv params that FSDP2 rejects.
 import nemo_automodel.components.models.mistral3_vlm  # noqa: F401
+from nemo_automodel._transformers import auto_model as automodel_auto_model
 from nemo_automodel._transformers.auto_model import (
     NeMoAutoModelForCausalLM,
     NeMoAutoModelForImageTextToText,
@@ -26,6 +29,32 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
     MoEFlexTokenDispatcher,
 )
 from torch import nn
+
+# Files Automodel's base-model load reads from a resolved Hub snapshot.
+BASE_LOAD_SNAPSHOT_FILES = (
+    "config.json",
+    "model.safetensors",
+    "model-*.safetensors",
+    "model.safetensors.index.json",
+)
+
+
+def snapshot_download_base_load_files(*args: Any, **kwargs: Any) -> str:
+    """Resolve a cached Hub snapshot, requiring only the files a base-model load reads.
+
+    Automodel's ``_build_model`` resolves the pinned snapshot with
+    ``snapshot_download(..., local_files_only=True)`` and no file filter, so
+    huggingface_hub rejects a snapshot that lacks any file in its cached tree listing,
+    including files such as README.md or LICENSE that weight-only downloads (vLLM's,
+    for one) never fetch. Missing config or weight files still raise.
+    """
+    kwargs.setdefault("allow_patterns", list(BASE_LOAD_SNAPSHOT_FILES))
+    return huggingface_hub.snapshot_download(*args, **kwargs)
+
+
+# TODO: remove once Automodel's auto_model.py passes allow_patterns to snapshot_download;
+# test_automodel_snapshot_download_patch_still_needed fails when it does.
+automodel_auto_model.snapshot_download = snapshot_download_base_load_files
 
 # Add an entry whenever a model's architecture isn't loadable via
 # NeMoAutoModelForCausalLM (e.g. VLMs using ForConditionalGeneration /
