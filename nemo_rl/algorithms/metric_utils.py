@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Literal, Optional, get_args
 
 from nemo_rl.telemetry.vocabulary import (
+    VALIDATION_PREFIX,
     TeedMetric,
     as_scalar,
     register_teed_metrics,
@@ -85,6 +86,42 @@ TRAINING_TEED_METRICS = (
 )
 
 register_teed_metrics(TRAINING_TEED_METRICS)
+
+
+# Keys the validation dicts carry, which GRPO, distillation and the single
+# controller all build the same way. `accuracy` and `avg_length` are always
+# present; `pass_k` only under grouped validation.
+VAL_ACCURACY_KEY = "accuracy"
+VAL_AVG_LENGTH_KEY = "avg_length"
+VAL_PASS_K_KEY = "pass_k"
+
+#: Teed rows for the validation dicts, which reach the Logger under
+#: ``validation`` rather than ``train``. Declared with that prefix because
+#: ``accuracy`` is not a reserved word: a training dict carrying its own
+#: ``accuracy`` must not land on the validation series.
+VALIDATION_TEED_METRICS = (
+    TeedMetric(
+        VAL_ACCURACY_KEY,
+        "rl.validation.accuracy",
+        description="Validation accuracy (mean env reward over the val set).",
+        prefixes=(VALIDATION_PREFIX,),
+    ),
+    TeedMetric(
+        VAL_AVG_LENGTH_KEY,
+        "rl.validation.response.length.mean",
+        unit="{token}",
+        description="Mean validation response length.",
+        prefixes=(VALIDATION_PREFIX,),
+    ),
+    TeedMetric(
+        VAL_PASS_K_KEY,
+        "rl.validation.pass_k",
+        description="Validation pass@k; absent unless validation is grouped.",
+        prefixes=(VALIDATION_PREFIX,),
+    ),
+)
+
+register_teed_metrics(VALIDATION_TEED_METRICS)
 
 
 @dataclass

@@ -1,6 +1,6 @@
 # Metrics
 
-NeMo-RL emits eight namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), per-host memory (`rl.host.memory.*`), rollout checkpoint metrics (`rl.checkpoint.*`), and vision workload (`rl.vision.*`).
+NeMo-RL emits nine namespaces of metrics: async efficiency metrics (`rl.efficiency.*`), startup phase durations (`rl.setup.duration`), training scalars (`rl.reward.*`, `rl.policy.*`, …), validation quality (`rl.validation.*`), vLLM engine metrics (`rl.vllm.*`), driver-side vLLM generation metrics (`gen_ai.*`, following the OTel GenAI semantic conventions), per-host memory (`rl.host.memory.*`), rollout checkpoint metrics (`rl.checkpoint.*`), and vision workload (`rl.vision.*`).
 
 Metrics are emitted **only when telemetry is exporting**. Most pass through the metrics logger of the process that logs them, via its process-local telemetry handle: the driver in the v1 loops, and the Single-Controller actor in v2, which owns the Logger there and so emits the training scalars, `rl.setup.duration` and `rl.checkpoint.*`. `rl.host.memory.*` is scraped from every node by a driver-side monitor on its own timer. Resource attributes identify the producing process.
 
@@ -8,7 +8,9 @@ Every `rl.*` series is **declared by NeMo-RL**, not by lens. lens provides a con
 
 ## The tee
 
-The tee lives outside the algorithm code: `nemo_rl/telemetry/metrics.py` hooks `nemo_rl.utils.logger.Logger.log_metrics`, so after `log_metrics` fans a step out to the file / W&B / MLflow backends it calls `tee_rl_metrics_to_otel(metrics, prefix)`. It is best-effort — the prefixes read include the per-step `train` dicts (`prefix in ("train", "")`) and the one-off `timing/setup` dict at step 0, plus completed `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries and the per-attempt `rollout/checkpoint_outcome` dictionary. Other prefixes are skipped, non-scalar values are ignored, and the whole path is a no-op unless telemetry is actively exporting. The numbers you already see in W&B are therefore the same series you get in your OTLP backend, with no double bookkeeping.
+The tee lives outside the algorithm code: `nemo_rl/telemetry/metrics.py` hooks `nemo_rl.utils.logger.Logger.log_metrics`, so after `log_metrics` fans a step out to the file / W&B / MLflow backends it calls `tee_rl_metrics_to_otel(metrics, prefix)`. It is best-effort — the prefixes read include the per-step `train` dicts (`prefix in ("train", "")`), the `validation` dicts, and the one-off `timing/setup` dict at step 0, plus completed `timing/rollout_checkpoint` and `timing/rollout_recovery` dictionaries and the per-attempt `rollout/checkpoint_outcome` dictionary. Other prefixes are skipped, non-scalar values are ignored, and the whole path is a no-op unless telemetry is actively exporting.
+
+Each `TeedMetric` row names the prefixes it may be read from, because `logger_key` is matched bare. `accuracy` under `validation` and an `accuracy` a training loop logs are different populations, and without the per-row prefix the first row declared for that key would claim both — producing a number that is real, plausible, and wrong. The numbers you already see in W&B are therefore the same series you get in your OTLP backend, with no double bookkeeping.
 
 Each family has its own exception handler, so a bad value in one cannot silence the others.
 
@@ -24,6 +26,22 @@ Mirrored as gauges from the keys the algorithms already log. Each series is a `T
 `kl_penalty` is named for the penalty but holds the divergence — the coefficient is divided back out in `loss_functions.py` — which is why the metric is named `rl.kl.divergence`.
 
 Each row uses the same key constant as its logging site, so a rename cannot leave a gauge silently reporting nothing.
+
+## Validation quality (`rl.validation.*`)
+
+The headline numbers a run is judged on, teed from the `validation` dicts that `validate()` returns. Declared as `VALIDATION_TEED_METRICS` in `nemo_rl/algorithms/metric_utils.py`:
+
+| Metric | Unit | Logger key | Meaning |
+| --- | --- | --- | --- |
+| `rl.validation.accuracy` | | `accuracy` | mean env reward over the validation set |
+| `rl.validation.response.length.mean` | `{token}` | `avg_length` | mean validation response length |
+| `rl.validation.pass_k` | | `pass_k` | pass@k; **absent unless validation is grouped** (`val_num_generations_per_prompt > 1`) |
+
+`rl.validation.accuracy` is the series `checkpointing.metric_name` selects on and the one `stop_at_validation_metric` early-stops against, so it is worth alerting on directly rather than reading off a dashboard.
+
+These are emitted only on validation steps, which is `val_period` steps apart rather than every step. Treat a gap as "no validation ran", not as a regression — a dashboard that interpolates between points will imply quality it did not measure.
+
+The `validation` dict also carries whatever an environment adds through `additional_metrics_to_report`. Those are **not** teed: the key set is env-specific and unknown at declaration time, so there is no row to declare. They remain available in W&B.
 
 ## Startup phases
 

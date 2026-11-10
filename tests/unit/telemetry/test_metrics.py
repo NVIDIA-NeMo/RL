@@ -793,6 +793,44 @@ def test_map_teed_scalars_skips_bool_and_non_numeric():
     assert map_teed_scalars({"reward": True, "loss": "nan", "lr": None}) == {}
 
 
+def test_map_teed_scalars_reads_the_validation_keys():
+    """These reached W&B but not lens at all: the tee dropped the prefix."""
+    _import_teed_metric_owners()
+
+    from nemo_rl.telemetry.metrics import map_teed_scalars
+    from nemo_rl.telemetry.vocabulary import VALIDATION_PREFIX
+
+    values = map_teed_scalars(
+        {"accuracy": 0.42, "avg_length": 256.0, "pass_k": 0.61},
+        VALIDATION_PREFIX,
+    )
+
+    assert values == {
+        "validation_accuracy": 0.42,
+        "validation_response_length_mean": 256.0,
+        "validation_pass_k": 0.61,
+    }
+
+
+def test_a_prefix_only_reads_the_rows_declared_for_it():
+    """``accuracy`` is not reserved -- a train dict may carry its own.
+
+    Without the per-row prefix the bare-key match would file it under
+    ``rl.validation.accuracy``, which is worse than not having the series:
+    the number is real, plausible, and from the wrong population.
+    """
+    _import_teed_metric_owners()
+
+    from nemo_rl.telemetry.metrics import map_teed_scalars
+    from nemo_rl.telemetry.vocabulary import VALIDATION_PREFIX
+
+    train_side = map_teed_scalars({"accuracy": 0.9, "loss": 1.5}, "train")
+    assert train_side == {"policy_loss": 1.5}
+
+    val_side = map_teed_scalars({"accuracy": 0.9, "loss": 1.5}, VALIDATION_PREFIX)
+    assert val_side == {"validation_accuracy": 0.9}
+
+
 def test_every_declared_scalar_has_a_unique_key_and_name():
     """A duplicate key would make one declaration silently shadow another."""
     _import_teed_metric_owners()
