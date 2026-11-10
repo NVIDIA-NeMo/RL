@@ -26,9 +26,7 @@ LOGGER = logging.getLogger(__name__)
 
 # Official Qwen/Qwen3-0.6B tokenizer_config.json chat_template. An exact
 # template contract prevents custom templates from silently changing the suffix.
-QWEN3_TEMPLATE_SHA256 = (
-    "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"
-)
+QWEN3_TEMPLATE_SHA256 = "a55ee1b1660128b7098723e0abcd92caa0788061051c62d51cbe87d9cf1974d8"  # pragma: allowlist secret
 
 
 class TitoNotApplicable(ValueError):

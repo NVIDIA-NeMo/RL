@@ -24,8 +24,8 @@ from transformers import AutoTokenizer
 
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
 from nemo_rl.models.generation.vllm.tito import (
-    CapturedQwen3Renderer,
     QWEN3_TEMPLATE_SHA256,
+    CapturedQwen3Renderer,
     TitoNotApplicable,
     qwen3_suffix_text,
 )
@@ -255,6 +255,7 @@ def test_qwen3_template_contract(tokenizer):
 
 def test_incremental_swe_tokens_round_trip_through_gym_capture(tokenizer):
     from nemo_gym.token_id_capture.staging.capture import RolloutTokenCapture
+    from nemo_gym.token_id_capture.staging.rebuild import verify_and_linearize
     from nemo_gym.token_id_capture.staging.records import (
         CallRecord,
         CaptureAdmission,
@@ -262,7 +263,6 @@ def test_incremental_swe_tokens_round_trip_through_gym_capture(tokenizer):
         StagedCallBaseSnapshot,
         StageResult,
     )
-    from nemo_gym.token_id_capture.staging.rebuild import verify_and_linearize
 
     class Sink:
         def __init__(self):

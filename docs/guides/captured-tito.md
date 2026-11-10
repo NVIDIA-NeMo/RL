@@ -44,14 +44,18 @@ Use `examples/nemo_gym/grpo_qwen3_0_6b_swe_tito.yaml`: Qwen/Qwen3-0.6B, one lear
 4. From NeMo RL, run in the normal two-GPU environment:
 
    ```bash
-   uv run examples/run_grpo_single_controller.py \
+   NRL_LOG_LEVEL=DEBUG uv run examples/run_grpo_single_controller.py \
      --config examples/nemo_gym/grpo_qwen3_0_6b_swe_tito.yaml \
      data.train.data_path=/path/to/swe_tito_smoke.jsonl \
      data.validation.data_path=/path/to/swe_tito_smoke.jsonl
    ```
 
-Inspect accepted multi-turn calls, actual prompt IDs, reconstructed masks/logprobs and the resulting training batch. If the model produces no tool calls, the run has not exercised incremental TITO. Compare against the same recipe with `policy.generation.vllm_cfg.tito_model=null`. Ensure at least one matched continuation before drawing any compatibility or performance conclusion.
+Confirm that the worker logs `Captured Qwen3 TITO reused ... prefix tokens`; a successful rollout alone may have used the native fallback. Inspect accepted multi-turn calls, actual prompt IDs, reconstructed masks/logprobs and the resulting training batch. If the model produces no tool calls, the run has not exercised incremental TITO. Compare against the same recipe with `policy.generation.vllm_cfg.tito_model=null`. Ensure at least one matched continuation before drawing any compatibility or performance conclusion.
 
 ## Validation scope
 
-The focused CPU tests use the real Qwen tokenizer, compare incremental prompts against the existing splice path, verify only suffix text is encoded, and round-trip two synthetic SWE-style calls through Gym's production capture and receipt reconstruction. The optional vLLM parser boundary is substituted in the adapter unit tests. Those tests do not establish real vLLM serving or sandbox/optimizer correctness; the SWE smoke above and the supported-environment CI remain required before marking the PR ready.
+The focused CPU tests use the real Qwen tokenizer, compare incremental prompts against the existing splice path, verify only suffix text is encoded, and round-trip two synthetic SWE-style calls through Gym's production capture and receipt reconstruction. The optional vLLM parser boundary is substituted in the adapter unit tests.
+
+A separate real run used Qwen3-0.6B, vLLM 0.29.0, two H100 GPUs and two SWE-bench Verified astropy tasks through sandboxed OpenCode. Both the enabled recipe and the `tito_model=null` control completed two training steps. The enabled run recorded five incremental renderer hits, reusing 8,216–8,358 prefix tokens across real tool continuations. The control retained existing capture-selected `token_in` behavior without incremental renderer hits. These short sampled runs establish path compatibility, not output equivalence, speedup or issue-resolution quality.
+
+That validation used Apptainer with an independent Gym compatibility patch to propagate serialized sandbox descriptors from the SWE resource server to OpenCode. The pinned Gym submodule is unchanged; this is not evidence that an unpatched Apptainer deployment works. The default recipe still requires configured OpenSandbox infrastructure. Full supported-environment CI remains required before marking the PR ready.

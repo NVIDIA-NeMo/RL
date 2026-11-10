@@ -37,14 +37,11 @@ policy:
       precision: bfloat16
       enforce_eager: true
       http_server_serving_chat_kwargs:
-        _override_: true
         enable_auto_tools: true
         tool_parser: hermes
         reasoning_parser: qwen3
         default_chat_template_kwargs:
           enable_thinking: false
-    vllm_kwargs:
-      _override_: true
 
 async_rl:
   rollout_failure:
@@ -82,11 +79,22 @@ env:
       responses_api_agents:
         opencode_sandboxed_agent:
           opencode_max_context_window: 16384
+          opencode_config:
+            provider:
+              nemo_gym:
+                models:
+                  dummy_model:
+                    limit:
+                      output: ${policy.generation.max_new_tokens}
           num_workers: 1
     policy_model:
       responses_api_models:
         vllm_model:
           uses_reasoning_parser: true
+          sampling_overrides:
+            temperature: ${policy.generation.temperature}
+            top_p: ${policy.generation.top_p}
+            max_tokens: ${policy.generation.max_new_tokens}
           extra_body:
             chat_template_kwargs:
               enable_thinking: false
