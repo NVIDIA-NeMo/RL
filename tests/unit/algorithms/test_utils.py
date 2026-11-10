@@ -1120,6 +1120,107 @@ def test_calculate_baseline_and_std_per_prompt_numerical_precision():
     assert not torch.isnan(std).any()
 
 
+def _reference_baseline_and_std_per_prompt(
+    prompts: torch.Tensor,
+    rewards: torch.Tensor,
+    valid_mask: torch.Tensor,
+    leave_one_out_baseline: bool,
+    std_rewards: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Original per-prompt loop, with one peer matrix per prompt group."""
+    baseline = torch.zeros_like(rewards)
+    std = torch.zeros_like(rewards)
+    is_trivial = torch.ones_like(rewards, dtype=torch.bool)
+    for prompt in torch.unique(prompts, dim=0):
+        idx = torch.nonzero((prompts == prompt).all(1)).flatten()
+        valid = valid_mask[idx]
+        if valid.sum() <= 1:
+            baseline[idx] = rewards[idx]
+            continue
+        peers = torch.ones(len(idx), len(idx))
+        if leave_one_out_baseline:
+            peers -= torch.eye(len(idx))
+        num_valid = valid.sum() - int(leave_one_out_baseline)
+        mean = peers @ (rewards[idx] * valid) / num_valid
+        std_mean = peers @ (std_rewards[idx] * valid) / num_valid
+        square_mean = peers @ (std_rewards[idx].pow(2) * valid) / num_valid
+        variance = (square_mean - std_mean.square()) * (num_valid / (num_valid - 1))
+        compared = peers.bool() & valid.bool()
+        peer_rewards = std_rewards[idx].expand(len(idx), -1)
+        lowest = peer_rewards.masked_fill(~compared, torch.inf).amin(dim=1)
+        highest = peer_rewards.masked_fill(~compared, -torch.inf).amax(dim=1)
+        baseline[idx] = mean
+        std[idx] = variance.sqrt().nan_to_num(0)
+        is_trivial[idx] = lowest == highest
+    return baseline, std, is_trivial
+
+
+@pytest.mark.parametrize("leave_one_out_baseline", [True, False])
+@pytest.mark.parametrize("reward_kind", ["integer", "real"])
+@pytest.mark.parametrize("key_columns", [1, 3])
+def test_calculate_baseline_and_std_per_prompt_matches_per_prompt_loop(
+    leave_one_out_baseline: bool, reward_kind: str, key_columns: int
+):
+    """Shuffled, uneven and partly masked groups give the per-group loop's results."""
+    generator = torch.Generator().manual_seed(0)
+    group_sizes = torch.tensor([1, 2, 3, 4, 5, 8, 16, 16])
+    group_ids = torch.arange(len(group_sizes)).repeat_interleave(group_sizes)
+    group_ids = group_ids[torch.randperm(len(group_ids), generator=generator)]
+    keys = torch.randint(0, 4, (len(group_sizes), key_columns), generator=generator)
+    keys[:, 0] = torch.arange(len(group_sizes))
+    prompts = keys[group_ids]
+
+    for valid_fraction in (1.0, 0.7, 0.3):
+        for separate_std_rewards in (False, True):
+            if reward_kind == "integer":
+                rewards = torch.randint(
+                    -2, 3, group_ids.shape, generator=generator
+                ).float()
+            else:
+                rewards = torch.randn(group_ids.shape, generator=generator)
+            std_rewards = (
+                torch.randint(0, 2, group_ids.shape, generator=generator).float()
+                if separate_std_rewards
+                else rewards
+            )
+            valid_mask = (
+                torch.rand(group_ids.shape, generator=generator) < valid_fraction
+            ).float()
+
+            actual = calculate_baseline_and_std_per_prompt(
+                prompts,
+                rewards,
+                valid_mask,
+                leave_one_out_baseline=leave_one_out_baseline,
+                std_rewards=std_rewards if separate_std_rewards else None,
+            )
+            expected = _reference_baseline_and_std_per_prompt(
+                prompts, rewards, valid_mask, leave_one_out_baseline, std_rewards
+            )
+
+            # Integer rewards sum exactly in float32, so the results must match bitwise.
+            tolerance = 0.0 if reward_kind == "integer" else 1e-5
+            for actual_tensor, expected_tensor in zip(actual[:2], expected[:2]):
+                torch.testing.assert_close(
+                    actual_tensor, expected_tensor, rtol=tolerance, atol=tolerance
+                )
+            assert torch.equal(actual[2], expected[2])
+
+
+def test_calculate_trivial_reward_distributions_shuffled_masked_groups():
+    """Every row gets its own group's verdict when groups interleave and rows are masked."""
+    prompts = torch.tensor([[2], [0], [1], [2], [0], [1], [2], [3], [0], [4], [4]])
+    rewards = torch.tensor([1.0, 0.5, 0.0, 1.0, 0.5, 1.0, 0.0, 0.3, 0.25, 0.0, 1.0])
+    valid_mask = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0])
+
+    is_trivial = calculate_trivial_reward_distributions(prompts, rewards, valid_mask)
+
+    # Voters: group 0 [0.5, 0.5, 0.25], 1 [0.0], 2 [1.0, 1.0], 3 [0.3], 4 [0.0, 1.0].
+    trivial_by_group = {0: False, 1: True, 2: True, 3: True, 4: False}
+    expected = [trivial_by_group[group] for group in prompts.flatten().tolist()]
+    assert is_trivial.tolist() == expected
+
+
 class TestPrintEfficiencySummary:
     def test_basic_efficiency_calculation(self, capsys):
         """Test that efficiency is computed correctly from metrics."""
