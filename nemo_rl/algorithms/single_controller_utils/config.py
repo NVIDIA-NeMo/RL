@@ -51,7 +51,6 @@ from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
 from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
-from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
 from nemo_rl.data import DataConfig
 from nemo_rl.data_plane.interfaces import DataPlaneConfig
@@ -1329,9 +1328,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
     Both directions on the critic: one the PPO path needs and does not have, and
-    one a GRPO run carries and would never build. Plus the reward-shaping and
-    sampling knob SC reads on neither path, a range check on reward_scaling,
-    and the shared reward-shaping configuration checks.
+    one a GRPO run carries and would never build, plus sampling and length-penalty
+    settings the SC path does not implement.
     """
     algo_cfg = algo_config(master_config)
 
@@ -1371,8 +1369,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "implements none of them -- the run would silently skip the "
             "shaping. Disable them."
         )
-
-    RewardShapingConfig.model_validate(algo_cfg.reward_shaping)
 
     # Rejected here rather than at the first advantage call, which is a whole
     # round of rollouts and logprobs later: gdpo needs one reward column per

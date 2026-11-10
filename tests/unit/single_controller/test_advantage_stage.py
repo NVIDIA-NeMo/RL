@@ -1020,9 +1020,7 @@ class TestRewardShaping:
         assert metrics[REWARD_KEY] == pytest.approx(off_metrics[REWARD_KEY])
 
     def test_the_penalty_is_the_dapo_formula_on_the_token_mask_length(self) -> None:
-        # The logged reward is the shaped one, so its mean must move by exactly
-        # the mean penalty -- which pins both the formula and the per-row
-        # length it was computed from.
+        # The mean reward must move by the mean per-row penalty.
         _, _, unshaped = _run_with_shaping(None, 0, self.LENGTHS)
         _, _, shaped = _run_with_shaping(self.DAPO, 0, self.LENGTHS)
         assert shaped[REWARD_KEY] == pytest.approx(
@@ -1030,10 +1028,7 @@ class TestRewardShaping:
         )
 
     def test_shaping_runs_before_the_baseline(self) -> None:
-        # Feeding the already-penalised reward through a run with shaping OFF
-        # must reproduce what the stage computes with shaping ON. That holds
-        # only if the penalty lands ahead of the baseline and the std -- and it
-        # asserts it without reimplementing the estimator here.
+        # Pre-shaped rewards must reproduce shaping before baseline/std computation.
         _, by_stage, _ = _run_with_shaping(self.DAPO, 0, self.LENGTHS)
 
         store = _RowStore(_rows_with_response_lengths(self.LENGTHS))
@@ -1108,11 +1103,7 @@ class TestRewardShaping:
         )
 
     def test_scaling_is_applied_before_shaping(self) -> None:
-        # The penalty is subtracted, so it only means anything against the
-        # scaled range. Shaping first would hand reward + penalty to the
-        # scale, which clamps to the source interval before it maps: every
-        # negative shaped reward comes back as the target floor, dropping the
-        # penalty. Both means are below, so swapping the calls fails here.
+        # Reversing the scale/shape order changes this mean.
         scaling = RewardScalingConfig(
             enabled=True,
             source_min=0.0,
@@ -1175,7 +1166,7 @@ def _run_with_scaling(
 
 
 class TestRewardScaling:
-    """The one reward transform the stage applies, and where it applies it.
+    """Reward scaling on the stage path, and where it is applied.
 
     ``_rows`` rewards are 0/1 and GRPO normalizes by the group std, so an
     affine remap leaves the advantages untouched and a test written on, say,

@@ -402,9 +402,7 @@ class AdvantageComputer:
             tensor_field(data, adv_cfg.truncated_field)
         ).bool()
 
-        # After scale_rewards, as v1 orders them. token_mask.sum(-1) is the
-        # generated-token count on both producers; pinned for payload.py by
-        # test_token_mask_sum_is_the_response_token_length.
+        # Shape after scaling; token_mask counts generated tokens on both producers.
         rewards = apply_reward_shaping(
             BatchedDataDict(
                 {

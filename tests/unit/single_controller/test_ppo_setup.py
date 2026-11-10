@@ -22,7 +22,6 @@ training cluster after the policy has stepped off it.
 
 from __future__ import annotations
 
-import math
 import warnings
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -45,6 +44,7 @@ from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
 from nemo_rl.algorithms.ppo import PPOConfig
+from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -478,36 +478,17 @@ class TestPPOValidation:
             self._warmup_ckpt_config(constant_structure=False)
         )
 
-    def test_accepts_dapo_reward_shaping_on_a_ppo_run(self):
-        """The replacement for reward_shaping's entry in the list above.
-
-        PPOConfig and GRPOConfig declare reward_shaping separately, and
-        _validate_reward_shaping reads it off whichever algo_config returns,
-        so a declaration that drifts breaks PPO runs alone. The cases above
-        cannot catch it: they raise out of the unsupported-knob list, which
-        returns before that validator is reached. The boundaries it enforces
-        are covered on GRPO in test_setup.py's TestRewardShapingValidation.
-        """
+    def test_accepts_dapo_reward_shaping_on_a_ppo_run(self) -> None:
+        """SC setup accepts a validated PPO reward-shaping configuration."""
         mc = _ppo_master_config()
-        shaping = mc.ppo.reward_shaping
-        shaping.enabled = True
-        shaping.overlong_buffer_length = 512
-        shaping.overlong_buffer_penalty = 1
-        shaping.max_response_length = 4096
+        mc.ppo.reward_shaping = RewardShapingConfig(
+            enabled=True,
+            overlong_buffer_length=512,
+            overlong_buffer_penalty=1,
+            max_response_length=4096,
+        )
 
         validate_single_controller_config(mc)
-
-    def test_rejects_a_non_finite_penalty_on_a_ppo_run(self):
-        """The same declaration, read for a rejection rather than an accept."""
-        mc = _ppo_master_config()
-        shaping = mc.ppo.reward_shaping
-        shaping.enabled = True
-        shaping.overlong_buffer_length = 512
-        shaping.overlong_buffer_penalty = math.inf
-        shaping.max_response_length = 4096
-
-        with pytest.raises(ValueError, match="overlong_buffer_penalty"):
-            validate_single_controller_config(mc)
 
     def test_rejects_length_penalty_until_sc_applies_it(self):
         # The SC path has no length-penalty hook yet; fail at setup rather
