@@ -119,8 +119,19 @@ Effect on NCCL collective speed (no SHARP plugin) was not measured.
 - **Checkpointing.** `save_data_plane` writes one shard per unit, its live
   rows, and a manifest. With the same units, each shard restores in place;
   with a different count, the live rows are put again through a client.
-  It works with the SSD tier on: spilled blobs are saved from their files,
-  and a restore that RAM cannot hold spills the rest to disk. `simple` and
+  It works with the SSD tier on: spilled blobs are saved from their files
+  (or from their IO-area copy while the file is still being written), and a
+  restore that RAM cannot hold spills the rest to disk.
+- **A spilled put is acknowledged as soon as its bytes are in the unit.** The
+  WRITE lands in the IO area and `commit` publishes the blob at once, the
+  same guarantee a put-area blob has (both live in the unit's memory and die
+  with it); the file write runs behind the ack on the unit's IO threads.
+  Readers meanwhile read the IO-area copy, which stays after the write as a
+  staged copy until the area needs the room. A failed write keeps that copy
+  (then the only one) and the ticker retries it. Before this, a spilled put
+  waited for its file write: on GB300 with half of each step spilled, put ran
+  at 28 GB/s against 52 GB/s with nothing spilled; with the ack moved, 54-62
+  GB/s on the same workload, hash-verified. `simple` and
   `mooncake_cpu` also checkpoint with their `ssd_offload` on. For
   `mooncake_cpu` that is NeMo-RL's own SSD offload, not upstream TQ's:
   each process that owns Mooncake memory spills to its own node's SSD
