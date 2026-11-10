@@ -43,6 +43,7 @@ from nemo_rl.environments.nemo_gym import (
     setup_nemo_gym_config,
     spinup_nemo_gym_actor,
 )
+from nemo_rl.environments.nemo_gym_harness_mix import parse_harness_mix
 
 
 @pytest.mark.parametrize("backend", ["vllm", "dynamo", "megatron", "trtllm"])
@@ -993,6 +994,7 @@ class _FakeGymCluster:
         *,
         entries_by_index=None,
         environment_routes_by_index=None,
+        server_configs_by_index=None,
         spinup_failures=None,
         spinup_timeouts=None,
         wedged_spinups=None,
@@ -1002,6 +1004,7 @@ class _FakeGymCluster:
     ):
         self.entries_by_index = entries_by_index or {}
         self.environment_routes_by_index = environment_routes_by_index or {}
+        self.server_configs_by_index = server_configs_by_index or {}
         self.spinup_failures = spinup_failures or {}
         self.spinup_timeouts = set(spinup_timeouts or ())
         self.wedged_spinups = set(wedged_spinups or ())
@@ -1051,6 +1054,9 @@ class _FakeGymCluster:
                     "environment_routes",
                     index,
                 )
+                actor.get_environment_server_configs.remote.side_effect = (
+                    lambda names, index=index: ("server_configs", index, tuple(names))
+                )
                 self.actors.append(actor)
                 self.actor_options.append(option_kwargs)
                 self.actor_configs.append(config)
@@ -1070,6 +1076,10 @@ class _FakeGymCluster:
             if self.pg_ready_error is not None:
                 raise self.pg_ready_error
             return None
+        if reference[0] == "server_configs":
+            _, index, names = reference
+            configs = self.server_configs_by_index.get(index, {})
+            return {name: configs[name] for name in names if name in configs}
         kind, index = reference
         if kind == "spinup":
             if index in self.wedged_spinups and timeout is not None:
@@ -2239,3 +2249,249 @@ def test_shard_set_shutdown_releases_the_placement_group_once():
     assert kill.call_count == 4
     # Releasing a group twice raises; the second shutdown must not try.
     remove.assert_called_once_with(pg)
+
+
+_HARNESS_MIX = {
+    "weights": {"opencode": 1, "pi": 1},
+    "environment_servers": {"swe": {"opencode": "swe_opencode", "pi": "swe_pi"}},
+}
+
+
+def _mixed_rows(group_id, generations=4):
+    return [
+        {
+            "task_id": {"taskset": "swe", "task_id": "1"},
+            "task_input": {},
+            "_ng_group_id": group_id,
+            "_ng_rollout_index": index,
+        }
+        for index in range(generations)
+    ]
+
+
+def _swe_server(resources_server="swe_rebench"):
+    return {
+        "environment_servers": {
+            "single_agent_turn": {
+                "entrypoint": "app.py",
+                "agent_server": {"type": "responses_api_agents", "name": "agent"},
+                "resources_server": {
+                    "type": "resources_servers",
+                    "name": resources_server,
+                },
+            }
+        }
+    }
+
+
+def test_build_nemo_gym_config_moves_harness_mix_to_actor_field(detected_uv_dirs):
+    cfg = build_nemo_gym_config(
+        _env_configs(harness_mix=_HARNESS_MIX),
+        base_urls=[],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=False,
+    )
+
+    assert cfg["harness_mix"] == parse_harness_mix(_HARNESS_MIX)
+    # Gym would read an unknown mapping as a server instance config.
+    assert "harness_mix" not in cfg["initial_global_config_dict"]
+
+
+def test_route_name_gives_every_generation_of_a_group_one_harness_server():
+    mix = parse_harness_mix(_HARNESS_MIX)
+    gym_routes = {"swe": "unused_environment", "math": "math_environment"}
+
+    chosen = set()
+    for i in range(50):
+        servers = {
+            nemo_gym_mod.get_nemo_gym_route_name(row, gym_routes, mix)
+            for row in _mixed_rows(f"group-{i}")
+        }
+        assert len(servers) == 1
+        chosen |= servers
+    # The mix replaces the taskset's Gym route, and both harnesses get groups.
+    assert chosen == {"swe_opencode", "swe_pi"}
+    math_row = {"task_id": {"taskset": "math", "task_id": "1"}, "task_input": {}}
+    assert (
+        nemo_gym_mod.get_nemo_gym_route_name(math_row, gym_routes, mix)
+        == "math_environment"
+    )
+    with pytest.raises(ValueError, match="prompt-group ID"):
+        nemo_gym_mod.get_nemo_gym_route_name(
+            {"task_id": {"taskset": "swe", "task_id": "1"}, "task_input": {}},
+            gym_routes,
+            mix,
+        )
+
+
+def test_pick_handle_for_group_sends_a_group_to_its_harness_shard():
+    mix = parse_harness_mix(_HARNESS_MIX)
+    shard_set = _sharded_set({"swe_opencode": "left", "swe_pi": "right"})
+    shard_set.harness_mix = mix
+
+    picked_shards = set()
+    for i in range(20):
+        group_id = f"group-{i}"
+        handle = shard_set.pick_handle_for_group(_mixed_rows(group_id))
+        expected = shard_set.route_to_shard[
+            mix.select("swe", group_id).environment_server
+        ]
+        assert handle is shard_set.handles[expected][0]
+        picked_shards.add(expected)
+    assert picked_shards == {"left", "right"}
+
+
+def test_mixed_taskset_coverage_requires_every_enabled_harness_server():
+    rows = [{"extra_env_info": json.dumps(_mixed_rows("group-0", 1)[0])}]
+    shard_set = _sharded_set({"swe_opencode": "left"})
+    shard_set.harness_mix = parse_harness_mix(_HARNESS_MIX)
+
+    with pytest.raises(nemo_gym_mod.ShardSetupError, match="swe_pi"):
+        nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": rows})
+
+    # A disabled harness's server needs no host.
+    shard_set.harness_mix = parse_harness_mix(
+        {**_HARNESS_MIX, "weights": {"opencode": 1, "pi": 0}}
+    )
+    nemo_gym_mod.validate_dataset_agent_coverage(shard_set, {"train": rows})
+
+
+@pytest.mark.parametrize("sharded", [False, True])
+def test_actor_factory_checks_and_installs_the_harness_mix(detected_uv_dirs, sharded):
+    if sharded:
+        entries = {
+            0: {"swe_opencode": ["environment_servers"]},
+            1: {"swe_pi": ["environment_servers"]},
+        }
+        server_configs = {
+            0: {"swe_opencode": _swe_server()},
+            1: {"swe_pi": _swe_server()},
+        }
+        config = _shard_env_configs(harness_mix=_HARNESS_MIX)
+    else:
+        entries = {
+            0: {
+                "swe_opencode": ["environment_servers"],
+                "swe_pi": ["environment_servers"],
+            }
+        }
+        server_configs = {0: {"swe_opencode": _swe_server(), "swe_pi": _swe_server()}}
+        config = _env_configs(harness_mix=_HARNESS_MIX)
+    cluster = _FakeGymCluster(
+        entries_by_index=entries, server_configs_by_index=server_configs
+    )
+    with _patched_cluster(cluster):
+        shard_set = nemo_gym_mod.build_nemo_gym_actors(
+            config,
+            base_urls=["http://vllm-0"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+        )
+        nemo_gym_mod.validate_dataset_agent_coverage(
+            shard_set,
+            {"train": [{"extra_env_info": json.dumps(_mixed_rows("group-0", 1)[0])}]},
+        )
+
+    mix = parse_harness_mix(_HARNESS_MIX)
+    assert shard_set.harness_mix == mix
+    assert all(
+        actor_config["harness_mix"] == mix for actor_config in cluster.actor_configs
+    )
+    if sharded:
+        assert shard_set.route_to_shard == {"swe_opencode": "judged", "swe_pi": "tools"}
+
+
+@pytest.mark.parametrize(
+    ("entries", "server_configs", "error", "message"),
+    [
+        (
+            {"swe_opencode": ["environment_servers"]},
+            {"swe_opencode": _swe_server()},
+            nemo_gym_mod.ShardSetupError,
+            r"no Gym actor runs: \['swe_pi'\]",
+        ),
+        (
+            {
+                "swe_opencode": ["environment_servers"],
+                "swe_pi": ["environment_servers"],
+            },
+            {"swe_opencode": _swe_server(), "swe_pi": _swe_server("scale_swe")},
+            ValueError,
+            "different resources servers",
+        ),
+    ],
+)
+def test_actor_factory_cleans_up_when_the_harness_mix_is_inconsistent(
+    detected_uv_dirs, entries, server_configs, error, message
+):
+    cluster = _FakeGymCluster(
+        entries_by_index={0: entries}, server_configs_by_index={0: server_configs}
+    )
+    with _patched_cluster(cluster):
+        with pytest.raises(error, match=message):
+            nemo_gym_mod.build_nemo_gym_actors(
+                _env_configs(harness_mix=_HARNESS_MIX),
+                base_urls=["http://vllm-0"],
+                model_name="test-model",
+                tokenizer=_TOKENIZER,
+                enable_router_replay=False,
+                use_fastokens=False,
+                turn_checkpointing_enabled=False,
+            )
+
+    cluster.ray.kill.assert_called_once_with(cluster.actors[0])
+
+
+def test_sharded_factory_rejects_a_shard_that_overrides_the_harness_mix(
+    detected_uv_dirs,
+):
+    config = _shard_env_configs(
+        harness_mix=_HARNESS_MIX,
+        shards=[
+            {"name": "judged", "config_paths": ["judge.yaml"]},
+            {
+                "name": "tools",
+                "config_paths": ["tools.yaml"],
+                "overrides": {"harness_mix": {"weights": {"opencode": 1, "pi": 3}}},
+            },
+        ],
+    )
+    cluster = _FakeGymCluster()
+    with _patched_cluster(cluster):
+        with pytest.raises(nemo_gym_mod.ShardConfigError, match="'tools' overrides"):
+            nemo_gym_mod.build_nemo_gym_actors(
+                config,
+                base_urls=["http://vllm-0"],
+                model_name="test-model",
+                tokenizer=_TOKENIZER,
+                enable_router_replay=False,
+                use_fastokens=False,
+                turn_checkpointing_enabled=False,
+            )
+    assert cluster.actors == []
+
+
+def test_actor_reports_server_configs_and_the_harness_each_row_runs_on():
+    resolved = DictConfig({"swe_opencode": _swe_server(), "not_a_server": 3})
+    mix = parse_harness_mix(_HARNESS_MIX)
+    cls = nemo_gym_mod.NemoGym.__ray_metadata__.modified_class
+    actor = cls.__new__(cls)
+    actor.__init__({"harness_mix": mix})
+    actor.rh = MagicMock()
+
+    with _stub_gym_resolved_config(resolved):
+        configs = actor.get_environment_server_configs(
+            ["swe_opencode", "swe_pi", "not_a_server"]
+        )
+
+    assert configs == {"swe_opencode": _swe_server()}
+    row = _mixed_rows("group-7", 1)[0]
+    assert actor._selected_harness(row) == mix.select("swe", "group-7").harness
+    math_row = {"task_id": {"taskset": "math", "task_id": "1"}, "task_input": {}}
+    assert actor._selected_harness(math_row) is None
+    assert actor._selected_harness({"agent_ref": {"name": "agent"}}) is None

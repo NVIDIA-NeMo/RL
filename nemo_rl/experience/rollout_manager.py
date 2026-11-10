@@ -44,6 +44,7 @@ from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
+from nemo_rl.environments.nemo_gym_harness_mix import harness_metric_namespace
 from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
     get_nemo_gym_task_input,
@@ -1522,7 +1523,10 @@ class AsyncNemoGymRolloutImpl:
                         self._effort_config,
                     )
                     result["reward_log_context"] = RewardLogContext(
-                        agent_name=_nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),
+                        agent_name=harness_metric_namespace(
+                            _nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),
+                            result["full_result"],
+                        ),
                         full_result_json=json.dumps(
                             {
                                 key: value
@@ -1807,7 +1811,13 @@ class AsyncNemoGymRolloutImpl:
         with timer.time(f"{timer_prefix}/compute_metrics"):
             rollout_metrics = self._compute_rollout_metrics(
                 completions,
-                _nemo_gym_metric_namespace(inputs[0]),
+                # One group runs on one harness, so its first result names it.
+                harness_metric_namespace(
+                    _nemo_gym_metric_namespace(inputs[0]),
+                    completed_results[0].get("full_result")
+                    if completed_results
+                    else None,
+                ),
                 full_results=[
                     result.get("full_result") or {} for result in completed_results
                 ],

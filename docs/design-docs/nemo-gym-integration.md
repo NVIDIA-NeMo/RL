@@ -104,6 +104,38 @@ Set these keys in a YAML file, where a key such as `weather:train` needs no quot
 
 An Environment Server can report a failed episode as terminal, meaning a retry cannot succeed. The single controller does not retry such a prompt, and under the default `async_rl.rollout_failure.max_skipped_prompts: 0` the run stops. Non-terminal failures, such as an unavailable model server, are retried as infrastructure failures.
 
+#### Mix harnesses across prompt groups
+
+To train a taskset on several agent harnesses, configure one Environment Server per harness and add `env.nemo_gym.harness_mix`. It holds one set of harness weights for the run and, for each taskset, the server that runs it with each harness:
+
+```yaml
+env:
+  nemo_gym:
+    harness_mix:
+      weights:
+        opencode: 2
+        pi: 1
+      environment_servers:
+        swe_rebench:
+          opencode: swe_rebench_opencode
+          pi: swe_rebench_pi
+        scale_swe:
+          opencode: scale_swe_opencode
+          pi: scale_swe_pi
+```
+
+Each prompt group runs on one harness, chosen at random in proportion to the weights. GRPO compares a group's generations with the group's mean reward, so a group that mixed harnesses would train on the differences between harnesses. With the weights above, about two thirds of the groups run on OpenCode.
+
+- `weights` is optional; every harness defaults to 1. A weight of 0 disables a harness.
+- A taskset that lacks a harness leaves it out of its table. Its groups split over its remaining harnesses in proportion to their weights.
+- For the tasksets it lists, the mix replaces `environment_server_routes`.
+
+The choice is a hash of the group's ID, so retried generations, retried groups, and groups restored from a rollout checkpoint keep their harness. The mix is part of the configuration a rollout checkpoint records, so a run resumes only with the same mix.
+
+Setup requires each listed server to run in exactly one Gym actor. The servers of one taskset must be Environment Servers of one type that score it the same way: the same resources server for `single_agent_turn`, and a `harbor` server must list the taskset in its `tasksets`. Gym still checks at dispatch that each harness is one the taskset's verifier allows.
+
+Rollout metrics for a mixed taskset are named after the taskset and the harness, for example `swe_rebench/opencode/reward`. Settings keyed by taskset, such as teacher selection and length or recovery overrides, still use the taskset name.
+
 ### Shard NeMo Gym across nodes
 
 NeMo RL normally starts one NeMo Gym actor for a job. That actor runs every configured Gym server on one node. Use `env.nemo_gym.shards` when the combined environments need more capacity than one node can provide.
@@ -234,7 +266,7 @@ flowchart LR
 The flow is:
 1. The GRPO or distillation rollout layer starts a streaming `run_rollouts` call on the NemoGym Actor
 2. The actor calls Gym's `RolloutCollectionHelper.run_examples()` in its own process
-3. The collector sends `POST /run` to each row's Environment Server, which executes or delegates the episode. For materialized tasks, NeMo RL selects the server using `environment_server_routes` before calling the collector; for flat rows, the collector resolves the server associated with the Agent
+3. The collector sends `POST /run` to each row's Environment Server, which executes or delegates the episode. For materialized tasks, NeMo RL selects the server using `environment_server_routes`, or `harness_mix` for a mixed taskset, before calling the collector; for flat rows, the collector resolves the server associated with the Agent
 4. Completed examples return through the collector to the actor
 5. Actor post-processes and streams each completed example back with its original row index
 6. The rollout layer emits a prompt group after all generations for that prompt are complete; synchronous callers drain the stream and retain full-batch behavior
@@ -416,7 +448,7 @@ flowchart LR
 - **Responses API** (NeMo Gym): OpenAI Responses API format with `input`, `tools`, and multi-turn conversation
 - **Chat Completions** (vLLM): OpenAI Chat Completions format for the actual inference call
 
-**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and updates `responses_create_params` with generation parameters (`temperature`, `top_p`) at the row's top level or inside `task_input`. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`; the collector wraps each task in an episode request containing `episode_id` and `task`. Materialized tasks carry no Agent reference, so NeMo RL attributes their metrics, teacher selection, and per-key overrides to `task_id.taskset`.
+**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and updates `responses_create_params` with generation parameters (`temperature`, `top_p`) at the row's top level or inside `task_input`. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`, or through `harness_mix` by prompt group; the collector wraps each task in an episode request containing `episode_id` and `task`. Materialized tasks carry no Agent reference, so NeMo RL attributes their metrics, teacher selection, and per-key overrides to `task_id.taskset`.
 
 The Agent sends Responses API requests to the Model Server, which translates Responses API ↔ Chat Completions (converting message formats, extracting reasoning content, attaching token IDs). NeMo RL validates materialized-task episode replies and extracts successful results before the usual result processing. Token IDs, logprobs, and rewards then populate the final Result.
 

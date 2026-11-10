@@ -22,6 +22,7 @@ from nemo_rl.environments.nemo_gym import (
     _normalize_nemo_gym_episode_result,
     _prepare_materialized_nemo_gym_rows,
 )
+from nemo_rl.environments.nemo_gym_harness_mix import parse_harness_mix
 from nemo_rl.experience.failures import (
     FailureClass,
     GymTerminalEpisodeFailure,
@@ -119,6 +120,101 @@ def test_compatibility_judge_failure_stays_a_masked_result() -> None:
         "_ng_failure_class": "judge_failed",
     }
     assert _normalize_nemo_gym_episode_result(row, reply) is reply
+
+
+_WEATHER_MIX = parse_harness_mix(
+    {
+        "environment_servers": {
+            "weather:train": {"fast": "weather_fast", "careful": "weather_careful"}
+        }
+    }
+)
+
+
+def _group_rows(groups, generations):
+    rows = []
+    for group in groups:
+        for index in range(generations):
+            row = _row()
+            row["_rowidx"] = len(rows)
+            row["_ng_group_id"] = group
+            row["_ng_rollout_index"] = index
+            row["_ng_rollout_id"] = f"rollout-{len(rows)}"
+            rows.append(row)
+    return rows
+
+
+def test_harness_mix_stamps_one_server_per_group():
+    rows = _group_rows([f"group-{i}" for i in range(8)], generations=3)
+
+    _prepare_materialized_nemo_gym_rows(
+        rows, {"weather:train": "weather_environment"}, _WEATHER_MIX
+    )
+
+    for row in rows:
+        assert (
+            row["_ng_environment_server"]
+            == _WEATHER_MIX.select(
+                "weather:train", row["_ng_group_id"]
+            ).environment_server
+        )
+    assert {row["_ng_environment_server"] for row in rows} == {
+        "weather_fast",
+        "weather_careful",
+    }
+
+
+def test_stream_runs_each_group_on_its_harness_and_reports_it():
+    rows = _group_rows(["group-1", "group-2", "group-3", "group-4"], generations=2)
+    sent = []
+
+    class _Collector:
+        def run_examples(self, examples, head_server_config, route_failures_to_sidecar):
+            del head_server_config, route_failures_to_sidecar
+            sent.extend(deepcopy(examples))
+
+            async def _done(row):
+                reply = _reply(row)
+                reply["episode_id"]["rollout_id"] = row["_ng_rollout_id"]
+                return row, reply
+
+            return [_done(row) for row in examples]
+
+    cls = NemoGym.__ray_metadata__.modified_class
+    env = cls.__new__(cls)
+    env.__init__({"harness_mix": _WEATHER_MIX})
+    env.rh = object()
+    env.rch = _Collector()
+    env.head_server_config = object()
+    env._tokenizer = object()
+    env._environment_server_routes = {}
+    env._postprocess_nemo_gym_to_nemo_rl_result = (
+        lambda row, result, tokenizer, include_initial_multimodal_data: {
+            "message_log": [],
+            "full_result": result,
+        }
+    )
+
+    async def _collect():
+        return [item async for item in env._stream_rollouts(deepcopy(rows), "test")]
+
+    streamed = asyncio.run(_collect())
+
+    assert len(streamed) == len(rows)
+    for rowidx, agent_ref, result, _ in streamed:
+        choice = _WEATHER_MIX.select("weather:train", rows[rowidx]["_ng_group_id"])
+        assert agent_ref is None
+        assert result["attribution_key"] == "weather:train"
+        assert (
+            result["full_result"]["_ng_environment_server"] == choice.environment_server
+        )
+        assert result["full_result"]["_ng_harness"] == choice.harness
+    # Gym receives the chosen server, not RL's harness label.
+    assert all("_ng_harness" not in row for row in sent)
+    assert {row["_ng_environment_server"] for row in sent} == {
+        "weather_fast",
+        "weather_careful",
+    }
 
 
 def test_materialized_task_preparation_rejects_missing_destination():

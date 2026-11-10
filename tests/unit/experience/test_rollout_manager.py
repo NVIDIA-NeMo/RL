@@ -1279,6 +1279,52 @@ def test_streamed_receipt_callback_uses_current_completion_conversion(
         assert "reward" not in json.loads(context.full_result_json)
 
 
+def test_streamed_receipt_names_a_mixed_taskset_reward_by_harness():
+    class _RunRolloutsRemote:
+        def options(self, *, num_returns):
+            assert num_returns == "streaming"
+            return self
+
+        def remote(self, pending, timer_prefix, per_prompt=False):
+            del pending, timer_prefix, per_prompt
+
+            async def result_ref():
+                result = _mask_gate_receipt_result()
+                result["full_result"]["_ng_harness"] = "pi"
+                return (0, None, {**result, "attribution_key": "swe"}, None)
+
+            async def stream():
+                yield result_ref()
+
+            return stream()
+
+    impl = _nemo_gym_impl(False)
+    env = type("_Environment", (), {"run_rollouts": _RunRolloutsRemote()})()
+    streamed = []
+    pending_row = {"_rowidx": 0, "task_id": {"taskset": "swe"}, "task_input": {}}
+
+    async def on_completion(generation_index, completion):
+        streamed.append(completion)
+
+    _run(
+        impl._stream_rows(
+            env,
+            [pending_row],
+            [None],
+            [None],
+            1,
+            "timing/test",
+            on_completion=on_completion,
+        )
+    )
+
+    (completion,) = streamed
+    # The finalizer names reward metrics after this context, per harness;
+    # attribution stays the taskset.
+    assert completion.env_extras["ng_reward_log_context"].agent_name == "swe/pi"
+    assert completion.env_extras["attribution_key"] == "swe"
+
+
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
 def test_nemo_gym_full_result_tables_are_opt_in(log_full_result_tables):
     impl = _nemo_gym_impl(True, log_full_result_tables=log_full_result_tables)

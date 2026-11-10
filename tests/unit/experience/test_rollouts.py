@@ -2501,6 +2501,61 @@ def test_postprocess_nemo_gym_group_reads_profile_metadata_from_task_rows(
     assert rollout_result.rollout_metrics[f"{attribution_key}/reward/mean"] == 0.2
 
 
+def test_postprocess_nemo_gym_group_names_mixed_taskset_metrics_by_harness():
+    rows = [
+        {
+            "task_id": {"taskset": "swe", "task_id": "1"},
+            "task_input": {"responses_create_params": {"input": []}},
+        }
+        for _ in range(4)
+    ]
+    results = []
+    for index, harness in enumerate(["opencode", "opencode", "pi", "pi"]):
+        input_message = {
+            "role": "user",
+            "content": "prompt",
+            "token_ids": torch.tensor([1]),
+        }
+        results.append(
+            {
+                "input_message_log": [input_message],
+                "message_log": [
+                    input_message,
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "token_ids": torch.tensor([2]),
+                        "generation_logprobs": torch.tensor([-0.1]),
+                    },
+                ],
+                "full_result": {"reward": float(index), "_ng_harness": harness},
+            }
+        )
+
+    rollout_result = rollouts_mod._postprocess_single_nemo_gym_group(
+        nemo_gym_rows=rows,
+        results=results,
+        timer=rollouts_mod.Timer(),
+        timer_prefix="timing/rollout",
+        policy_generation=type(
+            "_PolicyGeneration",
+            (),
+            {"cfg": {"vllm_cfg": {"max_model_len": 128}}},
+        )(),
+        input_batch=BatchedDataDict({"loss_multiplier": torch.ones(4)}),
+        tokenizer=type("_Tokenizer", (), {"pad_token_id": 0})(),
+        log_full_result_tables=False,
+        group_size=2,
+    )
+
+    metrics = rollout_result.rollout_metrics
+    assert metrics["swe/opencode/reward/mean"] == pytest.approx(0.5)
+    assert metrics["swe/pi/reward/mean"] == pytest.approx(2.5)
+    assert "swe/reward/mean" not in metrics
+    # Taskset-keyed settings and attribution keep the taskset name.
+    assert rollout_result.final_batch["attribution_key"] == ["swe"] * 4
+
+
 def test_postprocess_nemo_gym_group_reports_per_agent_live_metrics():
     agent_names = ["agent-a", "agent-a", "agent-b", "agent-b"]
     is_truncated = [True, False, True, True]
