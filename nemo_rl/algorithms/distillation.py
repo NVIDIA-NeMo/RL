@@ -33,6 +33,8 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.metric_utils import (
     TRAIN_FP_UTILIZATION_KEY,
+    VAL_ACCURACY_KEY,
+    VAL_AVG_LENGTH_KEY,
     VALID_TOKENS_PER_SEC_PER_GPU_KEY,
 )
 from nemo_rl.algorithms.utils import set_seed
@@ -1092,7 +1094,9 @@ def _distillation_train_impl(
                     distillation_save_state.total_steps = total_steps + 1
                     distillation_save_state.total_valid_tokens = total_valid_tokens
                     if val_metrics is not None:
-                        distillation_save_state.val_reward = val_metrics["accuracy"]
+                        distillation_save_state.val_reward = val_metrics[
+                            VAL_ACCURACY_KEY
+                        ]
                     elif hasattr(distillation_save_state, "val_reward"):
                         delattr(distillation_save_state, "val_reward")
                     distillation_save_state.consumed_samples = consumed_samples
@@ -1408,8 +1412,8 @@ def validate(
         )
 
         val_metrics = {
-            "accuracy": accuracy,
-            "avg_length": avg_length,
+            VAL_ACCURACY_KEY: accuracy,
+            VAL_AVG_LENGTH_KEY: avg_length,
             **aggregate_rollout_metrics(validation_rollout_metrics),
         }
 

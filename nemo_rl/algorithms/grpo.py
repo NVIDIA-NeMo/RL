@@ -53,6 +53,9 @@ from nemo_rl.algorithms.metric_utils import (
     MEAN_GEN_TOKENS_PER_SAMPLE_KEY,
     REWARD_KEY,
     SETUP_TIMING_PREFIX,
+    VAL_ACCURACY_KEY,
+    VAL_AVG_LENGTH_KEY,
+    VAL_PASS_K_KEY,
     VALID_TOKENS_PER_SEC_PER_GPU_KEY,
     SetupTimingMetrics,
     print_setup_timing_summary,
@@ -823,7 +826,7 @@ def setup(
     # pass_k is only reported when k > 1; catch the mismatch here instead of
     # at the first validation step.
     assert not (
-        grpo_config.stop_at_validation_metric == "pass_k"
+        grpo_config.stop_at_validation_metric == VAL_PASS_K_KEY
         and grpo_config.val_num_generations_per_prompt <= 1
     ), (
         "grpo.stop_at_validation_metric='pass_k' requires "
@@ -4589,7 +4592,7 @@ def _grpo_train_impl(
                     grpo_save_state.current_epoch = current_epoch
                     grpo_save_state.total_valid_tokens = total_valid_tokens
                     if val_metrics is not None:
-                        grpo_save_state.val_reward = val_metrics["accuracy"]
+                        grpo_save_state.val_reward = val_metrics[VAL_ACCURACY_KEY]
                     elif hasattr(grpo_save_state, "val_reward"):
                         delattr(grpo_save_state, "val_reward")
                     grpo_save_state.consumed_samples = consumed_samples
@@ -5086,12 +5089,12 @@ def validate(
         avg_length = total_length_tokens / num_samples if num_samples > 0 else 0.0
 
         val_metrics = {
-            "accuracy": accuracy,
-            "avg_length": avg_length,
+            VAL_ACCURACY_KEY: accuracy,
+            VAL_AVG_LENGTH_KEY: avg_length,
             **additional_metrics_to_report,
         }
         if pass_k is not None:
-            val_metrics["pass_k"] = pass_k
+            val_metrics[VAL_PASS_K_KEY] = pass_k
 
         # Print sample conversations only once at the end of validation
         try:
@@ -6530,7 +6533,7 @@ def async_grpo_train(
                     grpo_save_state.total_steps = step + 1
                     grpo_save_state.total_valid_tokens = total_valid_tokens
                     if val_metrics is not None:
-                        grpo_save_state.val_reward = val_metrics["accuracy"]
+                        grpo_save_state.val_reward = val_metrics[VAL_ACCURACY_KEY]
                     elif hasattr(grpo_save_state, "val_reward"):
                         delattr(grpo_save_state, "val_reward")
                     grpo_save_state.consumed_samples = consumed_samples

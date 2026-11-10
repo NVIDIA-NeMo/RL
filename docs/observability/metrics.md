@@ -55,7 +55,7 @@ What a span cannot tell you: a span times a phase, but not what fraction of the 
 | `rl.performance.token_imbalance` | | `average_token_imbalance` | `performance` |
 | `rl.performance.valid_tokens_per_second_per_gpu` | `{token}/s` | `valid_tokens_per_sec_per_gpu` | `timing/train` |
 
-`rl.performance.fp_utilization` is MFU as a 0–1 ratio, not a percentage. It is emitted only when the run reports `theoretical_tflops`; `rl.performance.tflops_per_gpu` does not depend on that and is always present.
+`rl.performance.fp_utilization` is MFU as a 0–1 ratio, not a percentage, and it needs the model to report `theoretical_tflops`. Neither FLOP row is unconditional. `rl.performance.tflops_per_gpu` comes only from `print_performance_metrics`, so it is GRPO/PPO-only, and that function computes it only when the training step returns `total_flops` *and* sequence packing is off — a packed run has no FLOP rows at all. SFT v1, DPO and distillation compute MFU themselves under the `train` prefix (with no packing condition) but never set `train_flops_per_gpu`, so on those algorithms MFU appears without the TFLOP/s row beside it.
 
 MFU is read from two prefixes because the algorithms disagree on where to put it: GRPO and PPO route it through `print_performance_metrics` into the `performance` dict, while SFT v1, DPO and distillation set it on the step `metrics` dict logged under `train`. Same key, same quantity. The other four rows are GRPO/PPO-only, since only `print_performance_metrics` computes them.
 
@@ -104,6 +104,8 @@ Counters rather than gauges because these are recorded once per microbatch: a pu
 | `train_batch` | a policy worker rank on the whole-batch path (GRPO, PPO, SFT v1, and everything on Automodel, which has no split path), measured per `train()` call |
 
 `train_microbatch` and `train_batch` are two spellings of the same work by different algorithms, never both for one batch — so filter to one before summing, or the same segments are counted twice.
+
+**The stages are not counted over the same set of ranks, so a raw loader-versus-train ratio is wrong.** An Energon loader runs on one rank per data-parallel shard (`run_rank_0_only_axes=REPLICATED_AXES`), while the train stages are recorded on every rank that runs the step — the same batch is counted once per tensor-, pipeline- and context-parallel replica. At TP=4 the train total is 4× the loader total for identical work. Divide the train side by the replication factor before comparing, or compare each stage against itself over time, which is what the series is most useful for anyway.
 
 One instrument per quantity with the stage as an attribute, rather than a series per producer, because the useful question is how the stages compare — whether the loader fed fewer segments or the step consumed them more slowly — and that is a filter on one series rather than a join of two.
 

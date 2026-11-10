@@ -81,6 +81,8 @@ from nemo_rl.algorithms.metric_utils import (
     GRAD_NORM_KEY,
     LOSS_KEY,
     REWARD_KEY,
+    VAL_ACCURACY_KEY,
+    VAL_AVG_LENGTH_KEY,
     VALID_TOKENS_PER_SEC_PER_GPU_KEY,
 )
 from nemo_rl.algorithms.reward_functions import apply_reward_shaping
@@ -352,8 +354,8 @@ def validate_sync(
         )
         avg_length = total_length_tokens / len(total_rewards) if total_rewards else 0.0
         val_metrics = {
-            "accuracy": accuracy,
-            "avg_length": avg_length,
+            VAL_ACCURACY_KEY: accuracy,
+            VAL_AVG_LENGTH_KEY: avg_length,
             **additional_metrics,
         }
         try:
@@ -1355,7 +1357,7 @@ def grpo_train_sync(
                     grpo_save_state.current_epoch = current_epoch
                     grpo_save_state.total_valid_tokens = total_valid_tokens
                     if val_metrics is not None:
-                        grpo_save_state.val_reward = val_metrics["accuracy"]
+                        grpo_save_state.val_reward = val_metrics[VAL_ACCURACY_KEY]
                     elif hasattr(grpo_save_state, "val_reward"):
                         delattr(grpo_save_state, "val_reward")
                     grpo_save_state.consumed_samples = consumed_samples

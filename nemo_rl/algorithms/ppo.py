@@ -52,6 +52,8 @@ from nemo_rl.algorithms.loss.interfaces import LossFunction
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
 from nemo_rl.algorithms.metric_utils import (
     SETUP_TIMING_PREFIX,
+    VAL_ACCURACY_KEY,
+    VAL_AVG_LENGTH_KEY,
     VALID_TOKENS_PER_SEC_PER_GPU_KEY,
 )
 from nemo_rl.algorithms.reward_functions import (
@@ -2047,7 +2049,7 @@ def ppo_train(
                     ppo_save_state["current_epoch"] = current_epoch
                     ppo_save_state["total_valid_tokens"] = total_valid_tokens
                     if val_metrics is not None:
-                        ppo_save_state["val_reward"] = val_metrics["accuracy"]
+                        ppo_save_state["val_reward"] = val_metrics[VAL_ACCURACY_KEY]
                     elif "val_reward" in ppo_save_state:
                         del ppo_save_state["val_reward"]
                     ppo_save_state["consumed_samples"] = consumed_samples
@@ -3031,7 +3033,7 @@ def async_ppo_train(
                     ppo_save_state["total_steps"] = step + 1
                     ppo_save_state["total_valid_tokens"] = total_valid_tokens
                     if val_metrics is not None:
-                        ppo_save_state["val_reward"] = val_metrics["accuracy"]
+                        ppo_save_state["val_reward"] = val_metrics[VAL_ACCURACY_KEY]
                     elif "val_reward" in ppo_save_state:
                         del ppo_save_state["val_reward"]
                     ppo_save_state["consumed_samples"] = consumed_samples
@@ -3335,8 +3337,8 @@ def validate(
         )
 
         val_metrics = {
-            "accuracy": accuracy,
-            "avg_length": avg_length,
+            VAL_ACCURACY_KEY: accuracy,
+            VAL_AVG_LENGTH_KEY: avg_length,
             **additional_metrics_to_report,
         }
 
