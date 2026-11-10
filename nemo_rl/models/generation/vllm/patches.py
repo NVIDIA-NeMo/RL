@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
+import logging
 import os
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from importlib.util import find_spec
@@ -1376,6 +1379,55 @@ def modelopt_moe_amax_aliases(model: "torch.nn.Module") -> Iterator[None]:
             delattr(module, alias)
 
 
+def _patch_vllm_prefill_conv_fp32_products(logger: logging.Logger) -> None:
+    """Keep causal-convolution prefill products in FP32 before accumulation.
+
+    vLLM 0.29 loads BF16 operands but accumulates into FP32. Cast before the
+    multiplication to avoid rounding each product to BF16 first. Restrict the
+    replacement to the prefill kernel; the decode kernel has a separate path.
+    Apply before importing the Triton kernel so its JIT source sees the fix.
+    """
+    file_to_patch = _get_vllm_file("model_executor/layers/mamba/ops/causal_conv1d.py")
+    old_product = "acc += matrix_x * matrix_w"
+    new_product = "acc += matrix_x.to(tl.float32) * matrix_w.to(tl.float32)"
+    loaded = sys.modules.get("vllm.model_executor.layers.mamba.ops.causal_conv1d")
+    if loaded is not None:
+        loaded_kernel = getattr(loaded, "_causal_conv1d_fwd_kernel", None)
+        if new_product not in getattr(loaded_kernel, "src", ""):
+            raise RuntimeError(
+                "The unpatched vLLM prefill convolution is already imported; "
+                "apply the FP32-product patch before loading the kernel."
+            )
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        kernels = [
+            node
+            for node in ast.parse(content).body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_causal_conv1d_fwd_kernel"
+        ]
+        if len(kernels) != 1:
+            raise RuntimeError(
+                "Cannot locate vLLM's causal-convolution prefill kernel; "
+                "update the FP32-product patch for this vLLM version."
+            )
+        kernel = kernels[0]
+        lines = content.splitlines(keepends=True)
+        block = "".join(lines[kernel.lineno - 1 : kernel.end_lineno])
+        if block.count(new_product) == 1 and old_product not in block:
+            logger.info("vLLM prefill-convolution FP32 products already enabled.")
+            return
+        if block.count(old_product) != 1 or new_product in block:
+            raise RuntimeError(
+                "Unexpected vLLM causal-convolution prefill product; "
+                "update the FP32-product patch for this vLLM version."
+            )
+        lines[kernel.lineno - 1 : kernel.end_lineno] = [
+            block.replace(old_product, new_product, 1)
+        ]
+        write_back("".join(lines))
+    logger.info("Enabled FP32 products in vLLM's prefill convolution.")
+
+
 def ensure_vllm_source_compat() -> None:
     """Apply interpreter-independent vLLM source-compat patches.
 
@@ -1461,6 +1513,7 @@ def _apply_vllm_patches(
     _patch_vllm_radio_native_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
+    _patch_vllm_prefill_conv_fp32_products(patch_logger)
     if nemotron_h_fp32_lm_head_enabled and not _patch_vllm_nemotron_h_fp32_lm_head(
         patch_logger
     ):

@@ -847,6 +847,7 @@ def _stub_non_fp32_vllm_patches(monkeypatch, captured_extra_env_vars):
         "_patch_vllm_radio_native_loader",
         "_patch_vllm_radio_final_layernorm",
         "_patch_vllm_glm_decoder_sequence_parallel_moe",
+        "_patch_vllm_prefill_conv_fp32_products",
     ):
         monkeypatch.setattr(patches, patch_name, lambda _logger: None)
     monkeypatch.setattr(
