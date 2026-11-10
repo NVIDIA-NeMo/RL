@@ -59,6 +59,21 @@ def move_model_buffers_to_device(
     return model
 
 
+def initialize_mamba_extensions(model: nn.Module) -> bool:
+    """Register native Mamba CUDA extensions before asynchronous FSDP forwards."""
+    # Keep Mamba's optional CUDA dependencies out of unrelated model paths.
+    from nemo_automodel.components.models.nemotron_v3.layers import (
+        NemotronV3Mamba2Mixer,
+    )
+
+    if not any(isinstance(module, NemotronV3Mamba2Mixer) for module in model.modules()):
+        return False
+    # CUDA registration can wait for work that another rank has not enqueued yet.
+    import mamba_ssm.ops.triton.ssd_combined  # noqa: F401
+
+    return True
+
+
 def warmup_compiled_rms_norm(model: nn.Module) -> int:
     """Initialize native compiled norms without changing model state or RNG."""
     from nemo_automodel.components.models.common.utils import Float32RMSNorm

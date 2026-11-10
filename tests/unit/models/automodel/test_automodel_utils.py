@@ -34,11 +34,69 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 )
 
 from nemo_rl.models.automodel.utils import (
+    initialize_mamba_extensions,
     move_model_buffers_to_device,
     release_moe_dispatcher_state,
     resolve_model_class,
     warmup_compiled_rms_norm,
 )
+
+
+@pytest.mark.automodel
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mamba_registration_preserves_state_and_runs_native_forward() -> None:
+    from nemo_automodel.components.models.nemotron_v3.layers import (
+        NemotronV3Mamba2Mixer,
+    )
+
+    config = SimpleNamespace(
+        hidden_size=128,
+        mamba_num_heads=4,
+        mamba_head_dim=64,
+        ssm_state_size=16,
+        n_groups=1,
+        chunk_size=128,
+        conv_kernel=4,
+        use_conv_bias=True,
+        mamba_hidden_act="silu",
+        time_step_limit=(0.0, float("inf")),
+        time_step_min=0.001,
+        time_step_max=0.1,
+        time_step_floor=1e-4,
+        use_bias=False,
+        layer_norm_epsilon=1e-5,
+    )
+    device = torch.device("cuda", torch.cuda.current_device())
+    with torch.random.fork_rng(devices=[device.index]):
+        mixer = NemotronV3Mamba2Mixer(config, layer_idx=0).to(
+            device=device, dtype=torch.bfloat16
+        )
+        mixer._fp32_params.float()
+        state = {
+            name: value.detach().clone() for name, value in mixer.state_dict().items()
+        }
+        cpu_rng = torch.get_rng_state().clone()
+        cuda_rng = torch.cuda.get_rng_state().clone()
+        assert initialize_mamba_extensions(mixer)
+        assert torch.equal(torch.get_rng_state(), cpu_rng)
+        assert torch.equal(torch.cuda.get_rng_state(), cuda_rng)
+        assert all(parameter.grad is None for parameter in mixer.parameters())
+        assert all(
+            torch.equal(mixer.state_dict()[name], value)
+            for name, value in state.items()
+        )
+        inputs = torch.randn(
+            1, 128, 128, device=device, dtype=torch.bfloat16, requires_grad=True
+        )
+        output = mixer(inputs)
+        assert output.shape == inputs.shape and torch.isfinite(output).all()
+        output.float().square().mean().backward()
+        assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
+        assert all(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter in mixer.parameters()
+        )
 
 
 @pytest.mark.automodel
