@@ -24,18 +24,20 @@ Key differences from megatron approach:
 """
 
 from collections import defaultdict
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Iterator, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from nemo_automodel.components.distributed.context_parallel import (
     ContextParallelSharder,
 )
 from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtensor
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForCausalLM,
@@ -93,6 +95,66 @@ class PreparedModelForward:
     cp_size: int
     cp_sharder: Optional[ContextParallelSharder]
     model_context_factory: Callable[[], AbstractContextManager[Any]]
+
+
+@contextmanager
+def _captured_omni_projector_context(
+    model: nn.Module,
+    model_batch: dict[str, Any],
+    device_mesh: Optional[DeviceMesh],
+) -> Iterator[None]:
+    """Align sharded projector calls across image and text-only microbatches."""
+    architectures = getattr(getattr(model, "config", None), "architectures", ())
+    projector = getattr(model, "vision_projector", None)
+    if (
+        device_mesh is None
+        or not set(architectures or ()).intersection(
+            {"NemotronH_Nano_Omni_Reasoning_V3", "NemotronH_Omni_Reasoning_V3"}
+        )
+        or not isinstance(projector, nn.Module)
+        or not isinstance(projector, FSDPModule)
+    ):
+        yield
+        return
+
+    pixels = model_batch.get("pixel_values")
+    has_images = pixels is not None and pixels.shape[0] > 0
+    image_ranks = torch.tensor(
+        int(has_images), device=model_batch["input_ids"].device, dtype=torch.int32
+    )
+    dist.all_reduce(
+        image_ranks, op=dist.ReduceOp.MAX, group=device_mesh["dp"].get_group()
+    )
+    if has_images or not bool(image_ranks.item()):
+        yield
+        return
+
+    calls = 0
+
+    def empty_projection(
+        module: nn.Module, args: tuple[Any, ...], output: torch.Tensor
+    ) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return output
+        width = projector.norm.weight.shape[0]
+        empty = output.new_empty((1, 0, width))
+        # The zero edge keeps mixed-batch gradient collectives aligned without
+        # creating projector gradients (and Adam decay) for an all-text step.
+        projected = projector(empty)
+        return output + projected.sum().to(output.dtype) * 0
+
+    embedding = model.language_model.get_input_embeddings()
+    handle = embedding.register_forward_hook(empty_projection)
+    try:
+        yield
+        if calls != 1:
+            raise RuntimeError(
+                "Native Omni must embed inputs once before vision projection"
+            )
+    finally:
+        handle.remove()
 
 
 def _build_model_batch(
@@ -173,11 +235,16 @@ def prepare_model_forward(
     )
 
     if cp_size <= 1:
+        context_factory: Callable[[], AbstractContextManager[Any]] = nullcontext
+        if "num_frames" in processed_inputs.vlm_kwargs:
+            context_factory = partial(
+                _captured_omni_projector_context, model, model_batch, device_mesh
+            )
         return PreparedModelForward(
             model_batch=model_batch,
             cp_size=cp_size,
             cp_sharder=None,
-            model_context_factory=nullcontext,
+            model_context_factory=context_factory,
         )
 
     # Automodel's generic CP prep reads ``batch["labels"]`` unconditionally and
