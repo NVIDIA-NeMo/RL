@@ -2339,6 +2339,47 @@ def _create_megatron_config(
     )
 
 
+@contextmanager
+def _hide_draft_from_checkpoint_load(model, active):
+    """Drop ``draft_model.*`` from the model's sharded state dict during a load.
+
+    When the draft preload is skipped (quantized runs), the authoritative load runs with
+    the draft module already attached, so the loader would demand draft weights from a
+    base policy checkpoint that cannot contain them:
+
+        KeyError: draft_model.body.fc.weight from model not in state dict
+
+    The drafter's weights come from its own released checkpoint (loaded in build_model),
+    never from the policy checkpoint, so excluding them here loses nothing. Keys are
+    matched by containment: sharded entries carry suffixes like ``/shard_0_1``.
+    """
+    if not active:
+        yield
+        return
+    chunks = model if isinstance(model, list) else [model]
+    patched = []
+
+    def _filter(d):
+        return {k: v for k, v in d.items() if "draft_model." not in k}
+
+    try:
+        for chunk in chunks:
+            for attr in ("sharded_state_dict", "state_dict"):
+                original = getattr(chunk, attr, None)
+                if original is None:
+                    continue
+
+                def wrapper(*args, _orig=original, **kwargs):
+                    return _filter(_orig(*args, **kwargs))
+
+                patched.append((chunk, attr, original))
+                setattr(chunk, attr, wrapper)
+        yield
+    finally:
+        for chunk, attr, original in patched:
+            setattr(chunk, attr, original)
+
+
 def _create_draft_pre_wrap_hook(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -2365,25 +2406,6 @@ def _create_draft_pre_wrap_hook(
                     f"Invalid pretrained checkpoint directory found: {pretrained_checkpoint}"
                 )
             megatron_cfg.checkpoint.finetune = True
-            # Best-effort warm start, so load NON-STRICTLY.
-            #
-            # This runs at a lifecycle point no other load uses: before the draft module is
-            # attached, and under the ModelOpt quant worker before quantization. The model
-            # there carries TE ``_extra_state`` entries the converted checkpoint does not --
-            # ModelOpt appends calibration data to TE's extra state and TE resizes it during
-            # forwards -- so a strict load fails on keys that are metadata, not weights:
-            #   Missing key in checkpoint state_dict:
-            #     ...layers.1.mlp.experts.experts.linear_fc1._extra_state/shard_192_512
-            #
-            # Filtering those keys out by hand does NOT work: TEGrouped expert weight
-            # resolution reads them, and removing them makes the weights themselves fail to
-            # resolve. strict=False is both simpler and the honest description of this load.
-            # CAVEAT, and it matters: when the preload runs, should_load_checkpoint
-            # below is False, so THIS IS THE ONLY LOAD of policy weights. Non-strict
-            # therefore tolerates ANY mismatch, not just _extra_state -- a genuinely
-            # missing expert weight would be left at init and trained from, silently.
-            # Acceptable for a wiring smoke; verify the weights actually landed before
-            # any real run.
             _load_checkpoint_from_path(
                 load_dir=pretrained_checkpoint,
                 state=state,
@@ -2393,7 +2415,6 @@ def _create_draft_pre_wrap_hook(
                 checkpointing_context={},
                 skip_load_to_model_and_opt=False,
                 ignore_ckpt_step=True,
-                strict=False,
             )
 
         draft_owner = find_draft_owner_chunk(model)
@@ -2636,11 +2657,24 @@ def setup_model_and_optimizer(
         megatron_cfg.checkpoint.pretrained_checkpoint is not None
         and checkpoint_exists(megatron_cfg.checkpoint.pretrained_checkpoint)
     )
+    # Under the ModelOpt quant worker the pretrained path is REDIRECTED to the quantized
+    # checkpoint cache (validate_model_paths appends _quant_checkpoint_cache_suffix and
+    # requires has_modelopt_state). The non-draft flow is consistent because its load runs
+    # after _restore_modelopt_state_pre_load has quantized the model. The draft preload
+    # runs at PRE-WRAP, before quantization, so it would load a quantized checkpoint into
+    # an unquantized model and fail on TE _extra_state:
+    #     Missing key in checkpoint state_dict:
+    #       ...layers.1.mlp.experts.experts.linear_fc1._extra_state/shard_192_512
+    # No strictness setting fixes that -- the two sides genuinely disagree. (strict= on
+    # _load_checkpoint_from_path only reaches torch.nn.Module.load_state_dict, not the
+    # dist-checkpoint load plan where this raises.)
+    quantization_enabled = policy_cfg.get("quant_cfg") is not None
     preload_policy_from_pretrained_for_draft = (
         draft_enabled
         and not use_peft  # The PEFT pre-wrap hook loads the pretrained base policy before adapters are attached.
         and not resume_checkpoint_exists  # Resume checkpoints already carry the attached draft module state.
         and pretrained_checkpoint_exists
+        and not quantization_enabled
     )
 
     mixed_precision_wrapper = Float16Module
@@ -2862,7 +2896,12 @@ def setup_model_and_optimizer(
     if should_load_checkpoint:
         if pre_load_checkpoint_hook is not None:
             pre_load_checkpoint_hook(state, model)
-        with _sync_consumed_samples_on_scheduler_load(state, scheduler):
+        with (
+            _hide_draft_from_checkpoint_load(
+                model, draft_enabled and not preload_policy_from_pretrained_for_draft
+            ),
+            _sync_consumed_samples_on_scheduler_load(state, scheduler),
+        ):
             load_checkpoint(
                 state,
                 model,
