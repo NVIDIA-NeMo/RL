@@ -243,7 +243,7 @@ ENV HYBRID_EP_MULTINODE=${HYBRID_EP_MULTINODE}
 ENV CUDA_HOME=/usr/local/cuda
 
 ## CUDA 13 moved standard library headers under include/cccl; expose that path so
-## builds that include <cuda/std/...> (e.g., deep_gemm) can find them.
+## builds that include <cuda/std/...> (e.g., deep_ep) can find them.
 ENV CPLUS_INCLUDE_PATH=/usr/local/cuda/include/cccl
 
 # Point TE at the pip-installed cuDNN instead of the system one.

@@ -26,7 +26,7 @@ dependencies = [
   "pip",        # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",      # for flash-attn parallel build
   # Deliberately a range, not an exact pin: each backend extra pins the torch its
-  # wheels were built against (vllm/mcore/automodel: 2.14.0; trtllm: 2.13.0;
+  # wheels were built against (vllm: 2.14.0; mcore/automodel/trtllm: 2.13.0;
   # sglang: 2.11.0) and resolves in its own uv conflict fork, so the base spec must
   # admit all of them. The ceiling keeps the driver venv from drifting to a newer
   # torch on a relock; it resolves to the highest allowed (2.14.0), matching vLLM.
@@ -139,9 +139,12 @@ dependencies = [
 
 [project.optional-dependencies]
 automodel = [
-  # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
-  "torch==2.14.0",
-  "torchvision==0.29.0",
+  # Colocated with vLLM engines (CUDA-IPC refit), so vLLM must be able to open the
+  # CUDA IPC handles this torch writes. torch 2.13 and 2.14 (vLLM) write the same
+  # handle version. Not moved to 2.14: its headers need C++20, which DeepEP,
+  # flash-attn, mamba-ssm and causal-conv1d (built from source here) do not use.
+  "torch==2.13.0",
+  "torchvision==0.28.0",
   "nemo-automodel[moe]",
   # Automodel's FLA kernels require this TileLang version on Hopper.
   # Keep this scoped to the automodel fork; sglang intentionally pins TileLang 0.1.8.
@@ -166,11 +169,12 @@ vllm = [
   "transformers==5.16.1",
   "tilelang==0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "cuda-python",
-  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
-  # deep_ep also needs libibverbs-dev
-  # sudo apt-get update
-  # sudo apt-get install libibverbs-dev
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
+  # No standalone deep_gemm: the vLLM wheel ships its own prebuilt DeepGEMM
+  # (vllm.third_party.deep_gemm) and only falls back to it when `import deep_gemm`
+  # fails, so a separately pinned build would shadow the one vLLM was tested with.
+  # No deep_ep either: the pinned DeepEP compiles as C++17, which torch 2.14's
+  # headers reject, and NeMo-RL's vLLM engines use vLLM's default
+  # allgather_reducescatter all2all backend, which does not need it.
   # PyPI publishes the default cu130 wheels for both supported architectures.
   # https://github.com/vllm-project/vllm/releases/tag/v0.33.0
   "vllm==0.33.0",
@@ -229,9 +233,12 @@ mcore = [
   # dependency megatron-core[dev,mlm] and its [tool.uv.sources] path mapping, so Megatron-LM
   # pyproject changes propagate on bump without any mirror here.
   "megatron-bridge[te,ssm]",
-  # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
-  "torch==2.14.0",
-  "torchvision==0.29.0",
+  # Colocated with vLLM engines (CUDA-IPC refit), so vLLM must be able to open the
+  # CUDA IPC handles this torch writes. torch 2.13 and 2.14 (vLLM) write the same
+  # handle version. Not moved to 2.14: its headers need C++20, which DeepEP,
+  # flash-attn, mamba-ssm and causal-conv1d (built from source here) do not use.
+  "torch==2.13.0",
+  "torchvision==0.28.0",
   # Within Megatron-Bridge's supported range (>=5.15,<5.20); Megatron-Bridge itself locks 5.19.0.
   "transformers==5.16.1",
   "tilelang==0.1.9; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
@@ -446,7 +453,6 @@ no-build-isolation-package = [
   "mamba-ssm",
   "causal-conv1d",
   "fast-hadamard-transform",
-  "deep_gemm",
   "deep_ep",
   "flash_mla",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
@@ -620,7 +626,6 @@ conflicts = [
 flash-attn = [{ requirement = "torch", match-runtime = true }]
 # Git-sourced packages CAN use match-runtime = true if we provide dependency-metadata
 deep_ep = [{ requirement = "torch", match-runtime = true }]
-deep_gemm = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
@@ -671,12 +676,6 @@ requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
 version = "1.2.1+17cfb81"
-requires-dist = ["torch", "packaging", "ninja"]
-
-[[tool.uv.dependency-metadata]]
-name = "deep_gemm"
-# This version has to match the version in the commit/rev/tag used
-version = "2.5.0"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
