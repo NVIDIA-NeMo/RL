@@ -43,7 +43,7 @@ import uuid
 from typing import Any, AsyncGenerator, Optional, TypedDict
 
 from dynamo.llm import PythonAsyncEngine
-from dynamo.llm.exceptions import HttpError
+from dynamo.llm.exceptions import HttpError, InvalidArgument
 
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     CAPTURE_FILE_ENV,
@@ -392,10 +392,11 @@ class NemoRLChatEngine:
                 data = item.data()
                 if data and data.get("engine_data"):
                     engine_data = data["engine_data"]
-        except ValueError as error:
-            # Dynamo raises an engine's error as a ValueError, which it would
-            # answer with 400. The engine sends every status it means as a
-            # refusal, so anything raised is an engine failure: 500, as natively.
+        except (ValueError, InvalidArgument) as error:
+            # Dynamo raises an engine's error as a ValueError, or from 1.7 the
+            # engine adapter's InvalidArgument as itself (not a ValueError), and
+            # would answer either with 400. The engine sends every status it means
+            # as a refusal, so anything raised is an engine failure: 500, as natively.
             raise HttpError(500, str(error)) from error
         if engine_data is None:
             raise HttpError(500, "the engine returned no result for this call")
