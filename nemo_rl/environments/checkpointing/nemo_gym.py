@@ -261,14 +261,16 @@ class GymEnvironmentSnapshot:
         return expected_staging_keys
 
     def metrics(self, paused_seconds: float) -> dict[str, float]:
-        metrics = {
+        # A dict literal: the telemetry drift test reads these keys from source.
+        return {
             "gym_parked_seconds": paused_seconds,
             # Episodes Gym could not capture; they start over after a crash.
             "gym_restarted_episodes": float(self.restarted_rollouts),
+            **{
+                f"generation_{name}_calls": float(count)
+                for name, count in self.generation_cut.counts.items()
+            },
         }
-        for name, count in self.generation_cut.counts.items():
-            metrics[f"generation_{name}_calls"] = float(count)
-        return metrics
 
 
 class GymEnvironmentCheckpoint:
