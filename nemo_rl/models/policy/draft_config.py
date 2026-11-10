@@ -337,7 +337,13 @@ class LiLiCorrDraftConfig(_MegatronBlockDraftConfigBase):
     speculator_type: Literal["lilicorr"] = "lilicorr"
     enabled: bool = False
     model_name: str | None = None
+    model_revision: str | None = None
     aux_layer_indices: None = Field(default=None, exclude=True, repr=False)
+    # Recipes derive from the DFlash one, which sets num_layers as the drafter's own
+    # depth. LiLiCorr reads depth from the checkpoint, so this is accepted only to be
+    # cross-checked against it below: silently ignoring a value that disagrees with the
+    # weights is the same silent-accuracy-loss failure the rest of this class avoids.
+    num_layers: Annotated[int, Field(gt=0)] | None = None
     loss_weight: Annotated[float, Field(gt=0)] = 0.1
     learning_rate: Annotated[float, Field(gt=0)] = 1.0e-4
     optimizer: DraftOptimizerConfig | None = None
@@ -389,6 +395,17 @@ class LiLiCorrDraftConfig(_MegatronBlockDraftConfigBase):
                 "target_hidden_state_layer_ids",
                 [int(i) for i in dflash["target_layer_ids"]],
             )
+
+        # Cross-check an inherited num_layers against the weights rather than ignoring it.
+        if self.num_layers is not None:
+            ckpt_layers = checkpoint.get("num_hidden_layers")
+            if ckpt_layers is not None and self.num_layers != ckpt_layers:
+                raise ValueError(
+                    f"policy.draft.num_layers={self.num_layers} disagrees with the "
+                    f"drafter checkpoint's num_hidden_layers={ckpt_layers} "
+                    f"({self.model_name}). Remove the override; LiLiCorr takes its "
+                    f"depth from the checkpoint."
+                )
         return self
     # Optional override of the taps read from the checkpoint. Left None, the checkpoint's
     # target_layer_ids win -- which is what a released drafter was trained against.
