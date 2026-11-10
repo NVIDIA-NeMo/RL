@@ -17,7 +17,9 @@ import base64
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
+import subprocess
 
 import pytest
 from omegaconf.errors import InterpolationResolutionError
@@ -34,6 +36,53 @@ spec = importlib.util.spec_from_file_location(
 assert spec is not None and spec.loader is not None
 adapter = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(adapter)
+
+
+@pytest.mark.parametrize("checkpoint_kind", ["empty", "populated", "dangling_link"])
+def test_training_acceptance_refuses_existing_checkpoint_root(
+    tmp_path: Path, checkpoint_kind: str
+) -> None:
+    checkpoint_root = tmp_path / "checkpoints"
+    if checkpoint_kind == "dangling_link":
+        checkpoint_root.symlink_to(tmp_path / "missing")
+    else:
+        checkpoint_root.mkdir()
+        if checkpoint_kind == "populated":
+            (checkpoint_root / "training_info.json").write_text("original checkpoint")
+    marker = tmp_path / "runner-called"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    runner = bin_dir / "uv"
+    runner.write_text(f'#!/usr/bin/env bash\ntouch "{marker}"\nexit 91\n')
+    runner.chmod(0o755)
+    result = subprocess.run(
+        [
+            "bash",
+            str(ROOT / "tests/functional/mm_coding_super35_train_resume.sh"),
+            "single",
+        ],
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "MM_CODING_TRAIN_DATA": str(tmp_path / "train.jsonl"),
+            "MM_CODING_VALIDATION_DATA": str(tmp_path / "validation.jsonl"),
+            "MM_CODING_REFERENCE_ROOT": str(tmp_path),
+            "MM_CODING_ACCEPTANCE_ROOT": str(tmp_path / "acceptance"),
+            "MM_CODING_CHECKPOINT_ROOT": str(checkpoint_root),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 2
+    assert "Refusing to reuse an earlier checkpoint directory" in result.stderr
+    assert not marker.exists()
+    if checkpoint_kind == "populated":
+        assert (
+            checkpoint_root / "training_info.json"
+        ).read_text() == "original checkpoint"
+    if checkpoint_kind == "dangling_link":
+        assert checkpoint_root.is_symlink()
 
 
 def test_data_paths_are_explicit_not_example_or_benchmark_fallback(

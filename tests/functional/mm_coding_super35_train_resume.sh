@@ -43,6 +43,12 @@ if [[ "${1:-}" == -- ]]; then shift; fi
 output="${MM_CODING_ACCEPTANCE_ROOT}/${mode}"
 mkdir -p "${output}"
 checkpoint_dir=${MM_CODING_CHECKPOINT_ROOT:-${output}/checkpoints}
+if [[ -e "${checkpoint_dir}" || -L "${checkpoint_dir}" ]]; then
+    echo "Refusing to reuse an earlier checkpoint directory: ${checkpoint_dir}" >&2
+    exit 2
+fi
+mkdir -p -- "$(dirname -- "${checkpoint_dir}")"
+mkdir -- "${checkpoint_dir}"
 uv run --no-sync python examples/nemo_gym/nemotron-3.5-super-vl/check_mm_coding_runtime.py \
     --mode "${mode}" > "${output}/runtime-check.json"
 common=(

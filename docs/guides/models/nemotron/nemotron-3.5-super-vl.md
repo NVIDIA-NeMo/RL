@@ -155,7 +155,9 @@ The helper runs three updates, exits, and starts a separate process targeting
 step four with the same optimizer, checkpoint root and data. Override
 `MM_CODING_SAVE_STEPS` for a different test duration. It does not submit jobs.
 Set `MM_CODING_CHECKPOINT_ROOT` to use separate checkpoint storage; logs remain
-under `MM_CODING_ACCEPTANCE_ROOT`.
+under `MM_CODING_ACCEPTANCE_ROOT`. Both paths must be new: the helper rejects
+existing checkpoint directories, including empty directories and dangling links,
+so the first phase cannot resume an earlier test.
 Pass resource overrides explicitly: the inherited production recipe requests
 16 nodes, including eight generation nodes. Successful process exits and
 checkpoint directories are preliminary; inspect the retained native restore,
