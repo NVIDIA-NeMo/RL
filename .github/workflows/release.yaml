@@ -65,8 +65,24 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
+  previous-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.find.outputs.tag }}
+    steps:
+      - name: Find previous release tag
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG=$(gh api --paginate "repos/${{ github.repository }}/tags" --jq '.[].name' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+          echo "Previous release tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
   release:
-    if: ${{ !cancelled() }}
+    needs: [previous-tag]
+    if: ${{ !cancelled() && needs.previous-tag.result == 'success' }}
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@d98ebd557712eeff155f3ab8e411abab629f4b0c # v1.6.0
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
@@ -85,7 +101,7 @@ jobs:
       publish-as-latest: true
       run-on-version-tag-only: ${{ github.ref_name != 'main' }}
       gh-release-use-changelog-builder: true
-      gh-release-from-tag: ${{ inputs.gh-release-from-tag || '' }}
+      gh-release-from-tag: ${{ inputs.gh-release-from-tag || needs.previous-tag.outputs.tag }}
       restrict-to-admins: true
     secrets: inherit  # pragma: allowlist secret
 
