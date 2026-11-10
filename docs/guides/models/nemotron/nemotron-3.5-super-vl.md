@@ -137,8 +137,27 @@ that a rollout's tokens, images and logprobs were captured correctly.
 Set `MM_CODING_TRAIN_DATA` and `MM_CODING_VALIDATION_DATA` to the adapted files,
 and `MM_CODING_REFERENCE_ROOT` to their shared reference root. Both data paths
 are required; the recipe never falls back to the synthetic examples or an
-evaluation test set. Then launch through `examples/nemo_gym/run_grpo_nemo_gym.py`
+evaluation test set. Then launch through `examples/run_grpo_single_controller.py`
 with `--config examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_single.yaml`.
+
+These coding recipes enable the existing SingleController token-capture path
+and native data-plane checkpointing. Typed multi-turn environment results do
+not contain a legacy terminal response; they require captured model-call tokens
+and images. The legacy `run_grpo_nemo_gym.py` entrypoint does not support that
+capture path. Recovery uses the existing `sibling` boundary; this does not claim
+in-flight typed-episode turn recovery.
+
+After provisioning the role environments, run
+`bash tests/functional/mm_coding_super35_train_resume.sh mixed -- <Hydra overrides>`
+inside an approved GPU allocation. Set `MM_CODING_ACCEPTANCE_ROOT` to a new
+output directory and supply the **matching mode's** train/validation files.
+The helper runs three updates, exits, and starts a separate process targeting
+step four with the same optimizer, checkpoint root and data. Override
+`MM_CODING_SAVE_STEPS` for a different test duration. It does not submit jobs.
+Pass resource overrides explicitly: the inherited production recipe requests
+16 nodes, including eight generation nodes. Successful process exits and
+checkpoint directories are preliminary; inspect the retained native restore,
+optimizer, token/image/logprob and data-cursor evidence before accepting recovery.
 
 The recipe uses learner TP1/CP1 without packing or sequence parallelism, keeps
 the model's image processor and raw vLLM logprobs, and masks invalid Gym

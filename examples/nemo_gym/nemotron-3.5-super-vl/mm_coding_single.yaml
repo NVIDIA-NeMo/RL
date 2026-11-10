@@ -1,5 +1,8 @@
-defaults: workplace_assistant_automodel.yaml
+defaults:
+- ../../configs/grpo_math_1B_megatron_single_controller.yaml
+- workplace_assistant_automodel.yaml
 grpo:
+  async_grpo: null
   num_prompts_per_step: 4
   max_num_steps: 3
   val_at_start: false
@@ -7,6 +10,9 @@ grpo:
 checkpointing:
   checkpoint_dir: results/grpo-super35-mm-coding-single
   save_period: 1
+  save_data_plane: true
+token_capture:
+  enabled: true
 policy:
   train_global_batch_size: 64
   automodel_cfg:
