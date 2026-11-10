@@ -355,9 +355,8 @@ def test_standard_microbatch_dispatch_runs_gspo_loss_and_audio_gradient(
         torch.isfinite(torch.as_tensor(value)).all() for value in metrics.values()
     )
     reference_logprobs = _dense_response_logprobs(model, sampling.temperature)
-    sequence_logratios = (
-        (reference_logprobs - expected) * RESPONSE_MASK
-    ).sum(1) / RESPONSE_MASK.sum(1)
+    masked_logratios = (reference_logprobs - expected) * RESPONSE_MASK
+    sequence_logratios = masked_logratios.sum(1) / RESPONSE_MASK.sum(1)
     reference_loss = -(sequence_logratios.exp() * torch.tensor([1.0, -0.5])).mean()
     parameters = [
         parameter for parameter in model.parameters() if parameter.requires_grad
