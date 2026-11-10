@@ -1937,6 +1937,46 @@ class TestFinalizerStateRelease:
 
 
 class TestPeriodicRolloutCheckpoint:
+    def test_release_timeout_retains_unpublished_files_and_stops_checkpointing(
+        self, tmp_path: Path
+    ) -> None:
+        actor = self._actor(tmp_path)
+        events = []
+
+        @contextlib.asynccontextmanager
+        async def snapshot(_path):
+            yield _FakeEnvironmentSnapshot()
+
+        class Capture(CheckpointCapture):
+            def persist(self) -> None:
+                events.append("persist")
+                raise TimeoutError("persistence is still running")
+
+            def release(self) -> None:
+                events.append("release")
+                raise TimeoutError("persistence is still running")
+
+        def capture_checkpoint(checkpoint_dir, *, metadata):
+            checkpoint_dir = Path(checkpoint_dir)
+            checkpoint_dir.mkdir(parents=True)
+            (checkpoint_dir / "pending-write").write_bytes(b"in progress")
+            return Capture()
+
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        actor._dp_client.capture_checkpoint = capture_checkpoint
+        attach_rollout_checkpointing(actor)
+        try:
+            with pytest.raises(RuntimeError, match="stopping checkpointing") as error:
+                asyncio.run(actor._rollout_snapshots.save_snapshot(force=True))
+        finally:
+            actor._checkpointer.shutdown()
+        assert isinstance(error.value.__cause__, TimeoutError)
+        assert events == ["persist", "release"]
+        snapshots = tmp_path / "checkpoints" / BOOTSTRAP_DIRNAME / "rollout_snapshots"
+        assert len(list(snapshots.glob("tmp_snapshot_*"))) == 1
+        assert len(list(snapshots.rglob("pending-write"))) == 1
+        assert not list(snapshots.glob("snapshot_*"))
+
     @pytest.mark.parametrize("failure", [None, "persist", "resume", "publish"])
     def test_deferred_tq_persists_after_resume_and_releases_on_failure(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str | None

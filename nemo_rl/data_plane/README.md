@@ -1289,7 +1289,11 @@ cleaned during restore; environment recovery still requires a rollout snapshot.
 
 Temporary capture ownership lives in `SnapshotCapture`, separate from the
 serializable `CapturedRolloutState`. Failures release the retained views after
-outstanding writes settle and do not publish a partial snapshot.
+outstanding writes settle and do not publish a partial snapshot. If release
+cannot be confirmed within its RPC budget, checkpointing stops with an invariant
+error and retains the unpublished directory: a remote write may still be using
+it. The save lock is acquired before the next mutation barrier, so a new capture
+cannot race the previous snapshot's persistence/release.
 
 The snapshot-save lock remains held until publication, so optimizer commits may
 still wait. This setting makes persistence asynchronous relative to rollout

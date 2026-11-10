@@ -765,10 +765,12 @@ class RolloutSnapshotter(_UsesRolloutParts):
                     try:
                         await checkpoint_io(captured.data_plane.release)
                     except Exception as error:
-                        warnings.warn(
-                            f"Failed to release captured TQ snapshot: {error}",
-                            stacklevel=2,
-                        )
+                        # A timed-out RPC can still be writing these files. Stop
+                        # instead of deleting them or admitting another capture.
+                        raise RuntimeError(
+                            "Cannot confirm captured TQ snapshot release; "
+                            f"retaining {tmp_path} and stopping checkpointing"
+                        ) from error
                 if tmp_path.exists():
                     await asyncio.to_thread(partial(shutil.rmtree, tmp_path))
                 raise
