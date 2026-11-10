@@ -728,9 +728,6 @@ policy:
     checkpoint:
       async_save: true
       ckpt_assume_constant_structure: true
-      ckpt_fully_parallel_load_exchange_algo: broadcast
-      ckpt_fully_parallel_load_process_group: ep_dp
-      ckpt_fully_parallel_save_process_group: ep_dp
     context_parallel_size: 2
     cp_normalize: true
     defer_fp32_logits: true

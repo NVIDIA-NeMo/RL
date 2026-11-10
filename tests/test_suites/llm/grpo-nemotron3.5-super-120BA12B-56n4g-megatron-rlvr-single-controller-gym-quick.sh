@@ -70,9 +70,12 @@ uv run examples/run_grpo_single_controller.py \
 uv run tests/json_dump_tb_logs.py $LOG_DIR --output_path $JSON_METRICS
 
 # The bounds are loose on purpose: they catch a broken train/generation match, not small drift.
-# The GenRM check fails if the external GenRM pool never scores a rollout.
+# One check per judge pool, because a failed judge call scores 0: GenRM, lc_judge (NL2Bash pool) and
+# the jailbreak agent (safety pool, in step 1 only).
 uv run tests/check_metrics.py $JSON_METRICS \
     'data["train/token_mult_prob_error"]["3"] < 1.1' \
     'max(data["train/gen_kl_error"]) < 0.005' \
     'max(data["train/reward"]) > 0.0' \
-    'max(data["train/genrm_simple_agent/reward/mean"]) > 0.0'
+    'max(data["train/genrm_simple_agent/reward/mean"]) > 0.0' \
+    'max(data["train/lc_judge_simple_agent/reward/mean"]) > 0.0' \
+    'max(data["train/jailbreak_refusal_with_explanation/reward/mean"]) > 0.0'
