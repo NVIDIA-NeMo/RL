@@ -515,12 +515,51 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
         return self._get_modelopt_export_plan().conversion_tasks
 
+    @staticmethod
+    @contextmanager
+    def _detach_draft_modules(model):
+        """Temporarily unregister attached draft modules from the module tree.
+
+        Megatron-Bridge builds the export plan by walking named_parameters() and
+        requires an HF mapping for every one. A co-trained drafter has none -- it is
+        not part of the policy's HF architecture and is refit separately, outside the
+        export plan -- so leaving it attached fails validation with
+
+            ValueError: No mapping found for the following Megatron parameter(s):
+              draft_model.body.fc.weight
+              draft_model.lilicorr.anchor_out_head.weight
+              ...
+
+        Unregister via ``_modules`` rather than setattr(None): nn.Module keeps
+        submodules there, and assigning None would leave a dangling entry instead of
+        removing it from the traversal.
+        """
+        chunks = model if isinstance(model, list) else [model]
+        detached = []
+        try:
+            for chunk in chunks:
+                node = chunk
+                seen = set()
+                while node is not None and id(node) not in seen:
+                    seen.add(id(node))
+                    mods = getattr(node, "_modules", None)
+                    if mods is not None and "draft_model" in mods:
+                        detached.append((node, mods.pop("draft_model")))
+                    node = getattr(node, "module", None)
+            yield
+        finally:
+            for node, drafter in detached:
+                node._modules["draft_model"] = drafter
+
     def _get_modelopt_export_plan(self):
         plan = getattr(self, "_modelopt_export_plan", None)
         if plan is not None:
             return plan
 
-        plan = self.megatron_bridge.build_hf_modelopt_export_plan([self.model])
+        # The drafter is excluded from the policy's export plan: it has no HF mapping
+        # and its weights are streamed separately (see _iter_draft_weights_for_refit).
+        with self._detach_draft_modules(self.model):
+            plan = self.megatron_bridge.build_hf_modelopt_export_plan([self.model])
         self.refit_conversion_tasks = plan.conversion_tasks
         self._modelopt_export_plan = plan
         return plan
