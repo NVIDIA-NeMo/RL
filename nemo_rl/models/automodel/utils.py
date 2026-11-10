@@ -11,6 +11,11 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import json
+import logging
+import os
+from collections.abc import Callable
+from glob import glob
 from typing import Any, Dict
 
 import huggingface_hub
@@ -25,10 +30,21 @@ from nemo_automodel._transformers.auto_model import (
     NeMoAutoModelForImageTextToText,
     NeMoAutoModelForTextToWaveform,
 )
+from nemo_automodel.components.checkpoint._backports.hf_storage import (
+    _get_key_renaming_mapping,
+)
+from nemo_automodel.components.checkpoint.checkpointing import (
+    Checkpointer,
+    _unwrap_ddp_model,
+)
 from nemo_automodel.components.moe.megatron.token_dispatcher import (
     MoEFlexTokenDispatcher,
 )
+from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
+from safetensors import safe_open
 from torch import nn
+
+logger = logging.getLogger(__name__)
 
 # Files Automodel's base-model load reads from a resolved Hub snapshot.
 BASE_LOAD_SNAPSHOT_FILES = (
@@ -55,6 +71,111 @@ def snapshot_download_base_load_files(*args: Any, **kwargs: Any) -> str:
 # TODO: remove once Automodel's auto_model.py passes allow_patterns to snapshot_download;
 # test_automodel_snapshot_download_patch_still_needed fails when it does.
 automodel_auto_model.snapshot_download = snapshot_download_base_load_files
+
+
+def _checkpoint_tensor_names(model_path: str) -> set[str] | None:
+    """Return the tensor names of the HF safetensors checkpoint in a local directory, or None."""
+    index_path = os.path.join(model_path, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path) as f:
+            return set(json.load(f)["weight_map"])
+    weight_files = glob(os.path.join(model_path, "*.safetensors"))
+    if not weight_files:
+        return None
+    names: set[str] = set()
+    for weight_file in weight_files:
+        with safe_open(weight_file, framework="pt") as f:
+            names.update(f.keys())
+    return names
+
+
+def new_task_head_keys(
+    model: nn.Module,
+    model_path: str,
+    key_mapping: dict[str, str] | Callable[[str], str] | None,
+) -> list[str]:
+    """Return keys of heads the model adds to its checkpoint's architecture that the checkpoint lacks.
+
+    Mirrors NVIDIA-NeMo/Automodel#4710, e.g. ``score.*`` of a ``*ForTokenClassification``
+    value model built on a ``*ForCausalLM`` checkpoint.
+    """
+    unwrapped = _unwrap_ddp_model(model)
+    prefix = getattr(unwrapped, "base_model_prefix", "")
+    backbone = getattr(unwrapped, prefix, None) if prefix else None
+    # A model that is its own backbone (e.g. T5ForConditionalGeneration) has no task heads.
+    if not isinstance(backbone, nn.Module) or backbone is unwrapped:
+        return []
+    architectures = getattr(getattr(unwrapped, "config", None), "architectures", None)
+    # FSDP2 swaps in a generated subclass, so match any class in the MRO.
+    if not architectures or any(
+        cls.__name__ in architectures for cls in type(unwrapped).__mro__
+    ):
+        return []
+    head_keys = [
+        key
+        for key in map(canonical_parameter_fqn, unwrapped.state_dict())
+        if not key.startswith(f"{prefix}.") and not key.endswith("_extra_state")
+    ]
+    checkpoint_names = _checkpoint_tensor_names(model_path) if head_keys else None
+    if checkpoint_names is None:
+        return []
+    if key_mapping:
+        checkpoint_names = {
+            _get_key_renaming_mapping(name, key_mapping) for name in checkpoint_names
+        }
+    return [key for key in head_keys if key not in checkpoint_names]
+
+
+_automodel_checkpointer_load_model = Checkpointer.load_model
+
+
+def load_model_keeping_new_task_heads(
+    self: Checkpointer,
+    model: nn.Module,
+    model_path: str,
+    is_init_step: bool = False,
+    use_checkpoint_id: bool = True,
+    key_mapping: dict[str, str] | Callable[[str], str] | None = None,
+    allow_checkpoint_key_subset: bool = False,
+) -> None:
+    """Checkpointer.load_model that keeps new task heads absent from a base checkpoint at their init."""
+    head_keys = (
+        new_task_head_keys(model, model_path, key_mapping)
+        if is_init_step
+        and not allow_checkpoint_key_subset
+        and isinstance(model, nn.Module)
+        and not hasattr(_unwrap_ddp_model(model), "state_dict_adapter")
+        and os.path.isdir(model_path)
+        else []
+    )
+    skip_prefixes = self.config.skip_task_head_prefixes_for_base_model
+    if head_keys:
+        logger.warning(
+            "Checkpoint %s has no weights for task-head keys %s; keeping their initialization.",
+            model_path,
+            head_keys[:10],
+        )
+        self.config.skip_task_head_prefixes_for_base_model = [
+            *(skip_prefixes or []),
+            *head_keys,
+        ]
+    try:
+        _automodel_checkpointer_load_model(
+            self,
+            model,
+            model_path,
+            is_init_step=is_init_step,
+            use_checkpoint_id=use_checkpoint_id,
+            key_mapping=key_mapping,
+            allow_checkpoint_key_subset=allow_checkpoint_key_subset,
+        )
+    finally:
+        self.config.skip_task_head_prefixes_for_base_model = skip_prefixes
+
+
+# TODO: remove once NVIDIA-NeMo/Automodel#4710 lands in the pinned Automodel;
+# test_automodel_new_task_head_patch_still_needed fails when it does.
+Checkpointer.load_model = load_model_keeping_new_task_heads
 
 # Add an entry whenever a model's architecture isn't loadable via
 # NeMoAutoModelForCausalLM (e.g. VLMs using ForConditionalGeneration /

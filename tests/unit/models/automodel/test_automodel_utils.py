@@ -29,10 +29,15 @@ except ImportError:
 
 from huggingface_hub.errors import IncompleteSnapshotError
 from nemo_automodel._transformers import auto_model as automodel_auto_model
+from nemo_automodel.components.checkpoint.checkpointing import Checkpointer
+from nemo_automodel.components.checkpoint.config import CheckpointingConfig
 from nemo_automodel.components.moe.megatron.token_dispatcher import (
     MoEFlexTokenDispatcher,
 )
+from torch.distributed.checkpoint.api import CheckpointException
+from transformers import Qwen2Config, Qwen2ForCausalLM, Qwen2ForTokenClassification
 
+from nemo_rl.models.automodel import utils as automodel_utils
 from nemo_rl.models.automodel.utils import (
     release_moe_dispatcher_state,
     resolve_model_class,
@@ -210,3 +215,81 @@ def test_snapshot_download_base_load_files_checks_only_base_load_files(tmp_path)
     (snapshot_dir / "model.safetensors").unlink()
     with pytest.raises(IncompleteSnapshotError, match="model.safetensors"):
         snapshot_download_base_load_files("org/model", **kwargs)
+
+
+def _tiny_qwen2_config() -> Qwen2Config:
+    """Return a one-layer Qwen2 config with an untied LM head and one label."""
+    return Qwen2Config(
+        vocab_size=32,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=32,
+        tie_word_embeddings=False,
+        num_labels=1,
+        use_cache=False,
+    )
+
+
+def _base_load_checkpointer(tmp_path) -> Checkpointer:
+    """Return a load-only Checkpointer like the one Automodel's from_pretrained builds."""
+    return Checkpointer(
+        CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=str(tmp_path / "checkpoints"),
+            model_save_format="safetensors",
+            save_consolidated=False,
+        ),
+        dp_rank=0,
+        tp_rank=0,
+        pp_rank=0,
+        moe_mesh=None,
+    )
+
+
+@pytest.mark.automodel
+def test_automodel_new_task_head_patch_still_needed(tmp_path):
+    """Tripwire: remove load_model_keeping_new_task_heads once this fails (Automodel#4710)."""
+    Qwen2ForCausalLM(_tiny_qwen2_config()).save_pretrained(tmp_path / "base")
+    model = Qwen2ForTokenClassification(Qwen2Config.from_pretrained(tmp_path / "base"))
+
+    with pytest.raises(CheckpointException, match="Missing key in checkpoint"):
+        automodel_utils._automodel_checkpointer_load_model(
+            _base_load_checkpointer(tmp_path),
+            model,
+            str(tmp_path / "base"),
+            is_init_step=True,
+        )
+
+
+@pytest.mark.automodel
+def test_load_model_keeps_new_task_head_and_loads_saved_head(tmp_path):
+    """A base-LM checkpoint leaves the new score head at init; a saved score head loads."""
+    torch.manual_seed(0)
+    base = Qwen2ForCausalLM(_tiny_qwen2_config())
+    base.save_pretrained(tmp_path / "base")
+    trained = Qwen2ForTokenClassification(_tiny_qwen2_config())
+    trained.save_pretrained(tmp_path / "trained")
+    checkpointer = _base_load_checkpointer(tmp_path)
+
+    torch.manual_seed(1)
+    value_model = Qwen2ForTokenClassification(
+        Qwen2Config.from_pretrained(tmp_path / "base")
+    )
+    score_init = {k: v.clone() for k, v in value_model.score.state_dict().items()}
+    checkpointer.load_model(value_model, str(tmp_path / "base"), is_init_step=True)
+    torch.testing.assert_close(
+        value_model.model.embed_tokens.weight, base.model.embed_tokens.weight
+    )
+    torch.testing.assert_close(value_model.score.state_dict(), score_init)
+    assert checkpointer.config.skip_task_head_prefixes_for_base_model is None
+
+    reward_model = Qwen2ForTokenClassification(
+        Qwen2Config.from_pretrained(tmp_path / "trained")
+    )
+    checkpointer.load_model(reward_model, str(tmp_path / "trained"), is_init_step=True)
+    torch.testing.assert_close(
+        reward_model.score.state_dict(), trained.score.state_dict()
+    )
