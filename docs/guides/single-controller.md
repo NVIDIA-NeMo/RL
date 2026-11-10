@@ -84,11 +84,11 @@ BF16 full-batch and streaming updates are not expected to be bitwise identical.
 Cancellation drains issued worker RPCs before aborting an uncommitted step.
 An uncertain commit or RPC that cannot drain requires checkpoint recovery.
 Checkpoints contain committed model/optimizer state and rollout recovery
-metadata, not half-step gradients. See the
-[streaming design and validation limits](../design-docs/automodel-single-controller-streaming.md).
-Qwen3.5 EP16 has not passed the declared BF16 gradient limit; its qualification
-and long-run validation remain incomplete. See the
-[validation record](../../validation/pr3/RESULTS.md) for passed and failed configurations.
+metadata, not half-step gradients.
+
+Streaming is experimental. BF16 gradient differences require fixed-input
+qualification for each model and recipe. Qwen3.5 EP16 has not met the declared
+1% gradient-difference limit; long-run reward curves do not replace that check.
 
 ### Mandatory settings
 

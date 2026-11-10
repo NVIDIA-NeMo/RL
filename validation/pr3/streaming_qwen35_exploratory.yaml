@@ -1,9 +1,0 @@
-defaults: streaming_qwen35.yaml
-checkpointing:
-  checkpoint_dir: validation/pr3/results/yuekaiz-qwen35-streaming-la0-300-exploratory/checkpoints
-logger:
-  log_dir: validation/pr3/results/yuekaiz-qwen35-streaming-la0-300-exploratory/logs
-  wandb:
-    group: yuekaiz-pr5090-streaming-la0-exploratory
-    id: yuekaiz5090explorela0s42
-    name: yuekaiz-qwen35-ep16-streaming-la0-300-s42-exploratory

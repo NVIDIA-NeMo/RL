@@ -1,6 +1,0 @@
-defaults: streaming_qwen35_exploratory.yaml
-grpo:
-  max_num_steps: 600
-logger:
-  wandb:
-    name: yuekaiz-qwen35-ep16-streaming-la0-600-s42-exploratory

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Fixed-data parity through AutoModel's full-batch SC metadata lifecycle.
+"""Fixed-data parity through AutoModel's full-batch and streaming SC lifecycle.
 
 Run inside the AutoModel environment with torchrun and enough GPUs for the model.
 The L0 wrapper uses a tiny Llama on two GPUs; larger models use this same harness.
@@ -365,248 +365,6 @@ def make_batch(gbs: int, seq_len: int) -> BatchedDataDict[Any]:
     )
 
 
-def normalizer_placement_control(
-    worker: AutomodelPolicyWorkerImpl,
-    args: argparse.Namespace,
-    dispatch_sizes: list[int],
-    output: Path,
-) -> None:
-    """Diagnose rounding with an independent full-input numerator backward.
-
-    Compare three paths from identical state: ordinary V1, ordinary V1 with
-    only normalization moved to clip entry, and SC streaming. The last two
-    must match exactly. A passing diagnostic does not pass or relax the
-    original BF16 full-batch gradient gate and cannot release a long run.
-    """
-    rank, world = dist.get_rank(), dist.get_world_size()
-    records = []
-    original_process = worker_module.process_global_batch
-    original_clip = worker_module.scale_grads_and_clip_grad_norm
-    client = worker._require_dp_client()
-    for token_level in (True, False):
-        loss_fn = ClippedPGLossFn(
-            ClippedPGLossConfig(
-                token_level_loss=token_level,
-                reference_policy_kl_penalty=0.01,
-                force_on_policy_ratio=True,
-                use_importance_sampling_correction=True,
-            )
-        )
-        for step in range(args.steps):
-            batch = make_batch(world * args.local_batch_size, args.seq_len)
-            shard = batch.get_batch(rank, args.local_batch_size)
-            worker.prepare_for_lp_inference()
-            lp = worker.get_logprobs(shard)["logprobs"].cpu()
-            gathered = [torch.empty_like(lp, device="cuda") for _ in range(world)]
-            dist.all_gather(gathered, lp.cuda())
-            full_lp = torch.cat(gathered).cpu()
-            batch["prev_logprobs"] = full_lp
-            batch["generation_logprobs"] = full_lp - 0.02
-            batch["reference_policy_logprobs"] = full_lp + 0.01
-            shard = batch.get_batch(rank, args.local_batch_size)
-            worker.prepare_for_training()
-            before = snapshot_model(worker)
-            optim_before = snapshot_optimizer(worker)
-            raw_before = snapshot_raw_optimizer(worker)
-            sched_before = copy.deepcopy(worker.scheduler.state_dict())
-            cpu_rng, gpu_rng = torch.get_rng_state(), torch.cuda.get_rng_state()
-
-            def reset() -> None:
-                restore_model(worker, before)
-                restore_optimizer(worker, optim_before, raw_before)
-                worker.scheduler.load_state_dict(sched_before)
-                torch.set_rng_state(cpu_rng)
-                torch.cuda.set_rng_state(gpu_rng)
-
-            def full_input(numerator: bool) -> dict[str, torch.Tensor]:
-                gradients = {}
-                denominator = 1.0
-
-                def process(*values: Any, **kwargs: Any) -> dict[str, Any]:
-                    nonlocal denominator
-                    result = original_process(*values, **kwargs)
-                    key = "global_valid_toks" if token_level else "global_valid_seqs"
-                    denominator = result[key].item()
-                    if numerator:
-                        result["global_valid_toks"] = torch.ones_like(
-                            result["global_valid_toks"]
-                        )
-                        result["global_valid_seqs"] = torch.ones_like(
-                            result["global_valid_seqs"]
-                        )
-                    return result
-
-                def capture(*values: Any, **kwargs: Any) -> Any:
-                    for name, parameter in worker.model.named_parameters():
-                        if parameter.grad is not None:
-                            if numerator:
-                                parameter.grad.mul_(1.0 / denominator)
-                            gradients[name] = (
-                                local(parameter.grad).detach().cpu().clone()
-                            )
-                    return original_clip(*values, **kwargs)
-
-                with (
-                    patch.object(
-                        worker_module, "process_global_batch", side_effect=process
-                    ),
-                    patch.object(
-                        worker_module,
-                        "scale_grads_and_clip_grad_norm",
-                        side_effect=capture,
-                    ),
-                ):
-                    worker.train(shard, loss_fn)
-                return gradients
-
-            ordinary_gradients = full_input(False)
-            reset()
-            numerator_gradients = full_input(True)
-            original_report = bf16_gradient_report(
-                numerator_gradients, ordinary_gradients
-            )
-            sufficient = torch.tensor(
-                list(original_report["sufficient_statistics"].values()),
-                dtype=torch.float64,
-                device="cuda",
-            )
-            dist.all_reduce(sufficient)
-            difference_sq, actual_sq, expected_sq, dot = sufficient.tolist()
-            global_report = {
-                "relative_l2": (difference_sq / expected_sq) ** 0.5
-                if expected_sq
-                else difference_sq**0.5,
-                "cosine": dot / (actual_sq * expected_sq) ** 0.5
-                if actual_sq and expected_sq
-                else float(actual_sq == expected_sq),
-                "norm_relative_error": abs(actual_sq**0.5 - expected_sq**0.5)
-                / expected_sq**0.5
-                if expected_sq
-                else actual_sq**0.5,
-            }
-            reference_model = snapshot_model(worker)
-            reference_optimizer = snapshot_optimizer(worker)
-            reference_raw = snapshot_raw_optimizer(worker)
-            reference_scheduler = copy.deepcopy(worker.scheduler.state_dict())
-            reset()
-            partition = f"normalizer-{token_level}-{step}"
-            client.register_partition(
-                partition_id=partition,
-                fields=list(batch),
-                num_samples=batch.size,
-                consumer_tasks=["train"],
-            )
-            meta = client.put_samples(
-                sample_ids=[str(index) for index in range(batch.size)],
-                partition_id=partition,
-                fields=local_batch_to_tensordict(dict(batch), batch_size=batch.size),
-            )
-            meta = replace(
-                meta,
-                task_name="train",
-                extra_info={
-                    **meta.extra_info,
-                    GLOBAL_FORWARD_PAD_SEQLEN: args.seq_len,
-                },
-            )
-            metas, _ = shard_meta_for_dp(meta, dp_world=world)
-            worker.begin_train_step_presharded(loss_fn)
-            offset = 0
-            for size in dispatch_sizes:
-                worker.train_microbatch_presharded(
-                    metas[rank].slice(offset, offset + size)
-                )
-                offset += size
-                lp_cpu, lp_gpu = torch.get_rng_state(), torch.cuda.get_rng_state()
-                worker.prepare_for_lp_inference(keep_train_buffers=True)
-                worker.get_logprobs(shard)
-                worker.prepare_for_training()
-                torch.set_rng_state(lp_cpu)
-                torch.cuda.set_rng_state(lp_gpu)
-
-            def check_gradient(*values: Any, **kwargs: Any) -> Any:
-                gradients = {
-                    name: local(parameter.grad).detach().cpu()
-                    for name, parameter in worker.model.named_parameters()
-                    if parameter.grad is not None
-                }
-                compare_tree(gradients, numerator_gradients, rtol=0, atol=0)
-                return original_clip(*values, **kwargs)
-
-            with patch.object(
-                worker_module,
-                "scale_grads_and_clip_grad_norm",
-                side_effect=check_gradient,
-            ):
-                worker.finish_train_step_presharded()
-            compare_tree(snapshot_model(worker), reference_model, rtol=0, atol=0)
-            compare_tree(
-                snapshot_optimizer(worker), reference_optimizer, rtol=0, atol=0
-            )
-            compare_tree(snapshot_raw_optimizer(worker), reference_raw, rtol=0, atol=0)
-            compare_tree(
-                worker.scheduler.state_dict(), reference_scheduler, rtol=0, atol=0
-            )
-            record = {
-                "token_level": token_level,
-                "step": step,
-                "numerator_reference_exact": True,
-                "original_bf16_gradient_gate_passed": (
-                    original_report["relative_l2"] <= 0.01
-                    and original_report["cosine"] >= 0.9999
-                    and original_report["norm_relative_error"] <= 0.01
-                ),
-                "normalizer_only_difference": original_report,
-                "global_sharded_vector_difference": global_report,
-            }
-            records.append(record)
-            (output / f"normalizer-control-rank{rank}.json").write_text(
-                json.dumps(records, indent=2) + "\n"
-            )
-            print(
-                f"NORMALIZER_CONTROL rank={rank} token={token_level} step={step} exact=True original_l2={original_report['relative_l2']}",
-                flush=True,
-            )
-    original_gates = torch.tensor(
-        [record["original_bf16_gradient_gate_passed"] for record in records],
-        dtype=torch.int64,
-        device="cuda",
-    )
-    dist.all_reduce(original_gates, op=dist.ReduceOp.MIN)
-    dist.barrier()
-    if rank == 0:
-        (output / "normalizer-control.json").write_text(
-            json.dumps(
-                {
-                    "passed": True,
-                    "contract": "normalizer_placement_diagnostic_only",
-                    "releases_training": False,
-                    "source_sha": args.source_sha,
-                    "source_file_sha256": {
-                        str(
-                            path.relative_to(Path(__file__).resolve().parents[2])
-                        ): hashlib.sha256(path.read_bytes()).hexdigest()
-                        for path in (
-                            Path(__file__).resolve(),
-                            Path(worker_module.__file__).resolve(),
-                        )
-                    },
-                    "original_bf16_gradient_gate_passed": bool(
-                        original_gates.all().item()
-                    ),
-                    "global_sharded_vector_differences": [
-                        record["global_sharded_vector_difference"] for record in records
-                    ],
-                    "rank_reports": [
-                        f"normalizer-control-rank{index}.json" for index in range(world)
-                    ],
-                },
-                indent=2,
-            )
-            + "\n"
-        )
-
-
 def run(args: argparse.Namespace) -> None:
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
@@ -682,12 +440,6 @@ def run(args: argparse.Namespace) -> None:
     client = worker._require_dp_client()
     output = Path(args.output)
     output.mkdir(parents=True, exist_ok=True)
-    if args.normalizer_control:
-        try:
-            normalizer_placement_control(worker, args, dispatch_sizes, output)
-        finally:
-            dist.destroy_process_group()
-        return
     run_log = None
     if rank == 0 and args.wandb_project:
         import wandb
@@ -884,46 +636,6 @@ def run(args: argparse.Namespace) -> None:
                 if args.optimizer_oracle:
                     actual_model = snapshot_model(worker)
                     actual_optim = snapshot_optimizer(worker)
-                    worst_name = next(iter(captured))
-                    worst_difference = -1.0
-                    for parameter_name in captured:
-                        difference = float(
-                            (actual_model[parameter_name] - expected[parameter_name])
-                            .abs()
-                            .max()
-                        )
-                        if difference > worst_difference:
-                            worst_name = parameter_name
-                            worst_difference = difference
-                    worst_index = int(
-                        (actual_model[worst_name] - expected[worst_name])
-                        .abs()
-                        .reshape(-1)
-                        .argmax()
-                    )
-                    print(
-                        "UPDATE_DIAGNOSTIC "
-                        + json.dumps(
-                            {
-                                "parameter": worst_name,
-                                "flat_index": worst_index,
-                                "full_batch_gradient": float(
-                                    captured[worst_name].reshape(-1)[worst_index]
-                                ),
-                                "streaming_gradient": float(
-                                    split_grad[worst_name].reshape(-1)[worst_index]
-                                ),
-                                "full_batch_parameter": float(
-                                    expected[worst_name].reshape(-1)[worst_index]
-                                ),
-                                "streaming_parameter": float(
-                                    actual_model[worst_name].reshape(-1)[worst_index]
-                                ),
-                                "lr": worker.optimizer.param_groups[0]["lr"],
-                            }
-                        ),
-                        flush=True,
-                    )
                     errors["parameter_max_abs"] = measure_tree(actual_model, expected)
                     errors["optimizer_max_abs"] = measure_tree(
                         actual_optim, expected_optim
@@ -1121,7 +833,6 @@ if __name__ == "__main__":
     parser.add_argument("--optimizer-oracle", action="store_true")
     parser.add_argument("--recipe-optimizer", action="store_true")
     parser.add_argument("--mask-rank", type=int)
-    parser.add_argument("--normalizer-control", action="store_true")
     parser.add_argument("--seq-len", type=int, default=64)
     parser.add_argument("--rtol", type=float, default=1e-5)
     parser.add_argument("--atol", type=float, default=1e-6)
