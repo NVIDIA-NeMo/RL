@@ -1,5 +1,34 @@
 # Streaming LA0 curve comparison
 
+Expanded comparisons with the local runs are available separately, preserving
+this original three-series snapshot:
+
+- [Qwen expanded PNG](results/curve-comparison-expanded/comparison.png),
+  [CSV](results/curve-comparison-expanded/comparison.csv), and
+  [source/coverage JSON](results/curve-comparison-expanded/comparison-summary.json).
+- [Gemma expanded PNG](gemma_e2b/results/curve-comparison-expanded/comparison.png).
+
+Both expanded plots mark Shuangy sources in the legends. Qwen additionally shows
+fresh LA1 with A_log FP32 refit plus prefill-conv FP32-product fixes from the
+start, and legacy non-fresh LA1 with known backend/refit issues. The latter
+resumed checkpoint 600 with only the A_log fix from update 601; the red dotted
+600 boundary marks that change. It was user-cancelled, so no cancelled work is
+restarted. Fresh LA1 is sampled only through the last committed update when the
+plot job snapshots its logs. Later resume segments replace replayed earlier
+records at the same optimizer step. No series is extrapolated. Policy KL uses a logarithmic axis; gradient norm
+uses a log axis or a nonnegative symlog axis when zero-gradient updates exist.
+Qwen step time uses a log axis to retain resume/cold-update spikes while showing
+ordinary update times clearly. No raw observations are clipped.
+
+Reproduce both expanded figures with `sbatch validation/pr3/plot_expanded_comparison.sh`
+using a small CPU-only allocation in the original image. Source CSV/JSONL/log
+hashes, native segment lineage, accepted step counts and all eight finite-metric
+checks are recorded in the expanded JSON files. These historical comparisons do
+not change the failed Qwen BF16 gate, unassessed Gemma fixed-input parity, or
+lack of controlled speedup evidence.
+
+The original comparison is described below.
+
 The eight panels compare reward, generated length, gen_kl_error,
 policy_kl_error, policy loss, approximate entropy, preclip gradient norm and
 step time. Faint lines are raw values; solid lines are trailing 10-step means.

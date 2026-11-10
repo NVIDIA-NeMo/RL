@@ -10,6 +10,15 @@ parity is **NOT ASSESSED**, and the earlier Qwen BF16 original 1% gate remains
 [900-step report](RESULTS900.md) | [Eight-panel PNG](results/curve-comparison/comparison.png) |
 [CSV](results/curve-comparison/comparison.csv) | [Computed summary](results/curve-comparison/comparison-summary.json)
 
+An expanded five-series figure adds the completed local full-batch LA0 and LA1
+runs: [expanded PNG](results/curve-comparison-expanded/comparison.png),
+[CSV](results/curve-comparison-expanded/comparison.csv), and
+[provenance](results/curve-comparison-expanded/comparison-summary.json).
+Legends name Shuangy explicitly: `v1 sync (shuangy)` and
+`full-batch LA0 (shuangy)`. Local full-batch LA0/LA1 and streaming LA0 cover 900
+steps each; historical Shuangy runs retain their observed shorter coverage.
+The original three-series snapshot and its qualification evidence remain intact.
+
 `gen_kl_error` showed no sustained runaway through step 900. Its first 50-step
 mean was 0.000390821, last 50-step mean 0.000554309, and maximum 0.000959170 at
 step 392. Policy KL still spiked (maximum 2.414998 at step 93), and preclip
