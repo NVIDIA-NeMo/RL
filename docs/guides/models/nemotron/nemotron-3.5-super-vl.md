@@ -64,8 +64,9 @@ The internal Gym `mm_coding_training` component supports Chart2Code, MMSVG
 Img2SVG/Text2SVG, Image2Struct LaTeX and Design2Code. The recipe
 [`mm_coding_single.yaml`](../../../../examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_single.yaml)
 inherits the Super Automodel/vLLM setup and replaces the task, data and Gym
-bindings. It is a **two-step acceptance recipe**, not a production training
-budget or a claim of improved benchmark performance. It uses 8 training and
+bindings. Its default limit is **three optimizer updates**. The recovery helper
+then targets a fourth update in a fresh process. This acceptance test is not a
+production training budget or a claim of improved benchmark performance. It uses 8 training and
 8 generation nodes, 4 GPUs per node, as inherited from the agentic recipe.
 No jobs are started by preparing or resolving it.
 
