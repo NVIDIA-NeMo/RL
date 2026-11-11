@@ -764,8 +764,9 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     # every in-flight rollout over after a crash. False fails setup and names such
     # servers; true accepts them with a warning.
     allow_restart_only_gym_servers: bool = False
-    # Per-generation-owner bounds for each cut-time prefix TQ put. Rows are
-    # never split; one row larger than the token limit is written alone.
+    # Per-generation-owner bounds for prefix TQ I/O: rows per cut-time put and
+    # keys per restore-time get, and token rows per cut-time put. Rows are
+    # never split; one row larger than the token limit is processed alone.
     generation_prefix_batch_size: Annotated[int, Field(gt=0)] = 256
     generation_prefix_batch_max_tokens: Annotated[int, Field(gt=0)] = 4_194_304
 
