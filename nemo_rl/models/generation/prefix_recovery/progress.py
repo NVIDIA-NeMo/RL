@@ -33,6 +33,9 @@ class GenerationProgress:
     logprobs: Any
     finish_reason: str | None
     stop_reason: str | int | None
+    # Router replay: the request's route pieces at the same boundary, when the
+    # read was asked for them.
+    route_pieces: list[Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -52,9 +55,16 @@ class ProgressReader(Protocol):
     """Reads every named call's new tokens at one engine output boundary."""
 
     def read(
-        self, calls: Sequence[tuple[str, int]], *, timeout_s: float | None
+        self,
+        calls: Sequence[tuple[str, int]],
+        *,
+        timeout_s: float | None,
+        route_calls: frozenset[str] = frozenset(),
     ) -> ProgressRead:
-        """Read ``(model_call_id, start)`` calls; raise TimeoutError past ``timeout_s``."""
+        """Read ``(model_call_id, start)`` calls; raise TimeoutError past ``timeout_s``.
+
+        Calls named in ``route_calls`` also get their route pieces copied.
+        """
         ...
 
     def logprobs(

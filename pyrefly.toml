@@ -289,6 +289,7 @@ project-includes = [
   "nemo_rl/models/generation/prefix_recovery/progress.py",
   "nemo_rl/models/generation/prefix_recovery/recovery.py",
   "nemo_rl/models/generation/prefix_recovery/restore.py",
+  "nemo_rl/models/generation/prefix_recovery/routes.py",
   "nemo_rl/models/generation/prefix_recovery/state.py",
   "nemo_rl/models/generation/capture_context.py",
   "nemo_rl/models/generation/sglang/config.py",

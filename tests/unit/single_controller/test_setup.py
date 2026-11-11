@@ -1326,7 +1326,6 @@ class TestSetup:
     @pytest.mark.parametrize(
         ("feature", "match"),
         [
-            ("router_replay", "does not yet support router replay"),
             (
                 "megatron",
                 "target_level='prefix' currently supports only the vllm generation",
@@ -1347,8 +1346,6 @@ class TestSetup:
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
-        if feature == "router_replay":
-            mc.policy["router_replay"] = {"enabled": True}
 
         with pytest.raises(NotImplementedError, match=match):
             setup_single_controller(mc, MagicMock(pad_token_id=0))
@@ -1539,12 +1536,15 @@ class TestSetup:
 
         assert gym_log_dirs_at_build == [str(tmp_path / "exp_001" / "nemo_gym")]
 
+    @pytest.mark.parametrize("router_replay", [False, True])
     def test_prefix_recovery_accepts_multimodal_capture(
         self,
         tmp_path: Path,
         patched_factories,
+        router_replay: bool,
     ):
         mc = _make_master_config(colocated=False, backend="vllm", megatron_enabled=True)
+        mc.policy["router_replay"] = {"enabled": router_replay}
         mc.checkpointing.update(
             {
                 "checkpoint_dir": str(tmp_path / "checkpoints"),
@@ -1577,7 +1577,9 @@ class TestSetup:
             patch.object(
                 sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
             ) as mock_spinup,
-            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch.object(
+                sc_setup_mod, "router_replay_enabled", return_value=router_replay
+            ),
             patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
             patch(
                 "nemo_rl.experience.rollout_reassembler_actor."

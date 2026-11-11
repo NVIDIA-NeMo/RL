@@ -52,6 +52,9 @@ class PrefixRecoveryParts:
     # Bound on one cut, measured from its arrival; None waits indefinitely.
     control_timeout_s: float | None
     progress_reader: ProgressReader
+    # Whether calls carry router-replay routes; a restore then requires every
+    # chunk's routes.
+    router_replay: bool
     # Extras for a call's first prefix row, from the media its capture state
     # holds; None for a call without media.
     prefix_row_extras: Callable[[_RequestCaptureState], dict[str, Any] | None]
