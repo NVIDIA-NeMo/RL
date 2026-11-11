@@ -1108,7 +1108,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
     # The server resolves the chat template through vLLM's own loader, so the
     # stub tree needs this leaf even though the test does not assert on it.
     make_module(
-        "vllm.entrypoints.chat_utils",
+        "vllm.renderers.chat_utils.chat_template",
         load_chat_template=MagicMock(return_value=None),
     )
     make_module(
