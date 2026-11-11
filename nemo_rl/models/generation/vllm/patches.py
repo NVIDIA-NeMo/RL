@@ -130,8 +130,6 @@ def _patch_vllm_init_workers_ray(
         that moves upstream the py_executable injection silently stops
         happening, so the caller must not report success unconditionally.
     """
-    file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
-
     old_line = "self._init_workers_ray(placement_group)"
     new_line = (
         "self._init_workers_ray(placement_group, "
@@ -139,12 +137,18 @@ def _patch_vllm_init_workers_ray(
     )
 
     applied = False
-    with _locked_file_patch(file_to_patch) as (content, write_back):
-        if new_line in content:
-            applied = True  # already patched by another worker on this node
-        elif old_line in content:
-            write_back(content.replace(old_line, new_line))
-            applied = True
+    try:
+        file_to_patch = _get_vllm_file("v1/executor/ray_executor.py")
+    except RuntimeError:
+        # vLLM #62228 deleted the v1 Ray executor; RayExecutorV2 needs no file patch.
+        file_to_patch = None
+    if file_to_patch is not None:
+        with _locked_file_patch(file_to_patch) as (content, write_back):
+            if new_line in content:
+                applied = True  # already patched by another worker on this node
+            elif old_line in content:
+                write_back(content.replace(old_line, new_line))
+                applied = True
 
     env_vars_to_copy = ["RAY_ENABLE_UV_RUN_RUNTIME_ENV", *(extra_env_vars or [])]
     existing = os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", "")

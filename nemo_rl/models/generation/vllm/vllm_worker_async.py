@@ -1341,7 +1341,11 @@ class VllmAsyncGenerationWorkerImpl(
         from fastapi import Header, HTTPException, Request
         from fastapi.responses import JSONResponse, StreamingResponse
         from pydantic import PrivateAttr
-        from vllm.entrypoints.chat_utils import load_chat_template
+        try:
+            # vLLM #60522/#60972 moved chat_utils under vllm.renderers.
+            from vllm.renderers.chat_utils.chat_template import load_chat_template
+        except ImportError:
+            from vllm.entrypoints.chat_utils import load_chat_template
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
             ChatCompletionResponse,

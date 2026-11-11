@@ -997,9 +997,20 @@ class BaseVllmGenerationWorker:
         try:
             from vllm.v1.executor.ray_executor import RayDistributedExecutor
         except ImportError:
-            from vllm.executor.ray_distributed_executor import (
-                RayDistributedExecutor,
-            )
+            try:
+                from vllm.executor.ray_distributed_executor import (
+                    RayDistributedExecutor,
+                )
+            except ImportError:
+                # vLLM #62228 removed the v1 Ray executor. RayExecutorV2 builds its
+                # nsight runtime_env inline, so there is no hook to override here.
+                print(
+                    "WARNING: this vLLM has only RayExecutorV2; NeMo-RL's deferred "
+                    "nsight capture is not applied to internal TP workers, which "
+                    "use vLLM's default always-on nsight config.",
+                    flush=True,
+                )
+                return
 
         def _patched_configure(self, ray_remote_kwargs):
             runtime_env = ray_remote_kwargs.setdefault("runtime_env", {})
