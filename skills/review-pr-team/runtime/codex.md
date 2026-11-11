@@ -2,7 +2,7 @@
 
 Read this file when running the shared review workflow in Codex. Claude Code follows [SKILL.md](../SKILL.md) as written. The Claude teams flag, tmux panes, native shared task tools, and Claude shutdown messages are not Codex prerequisites.
 
-For Codex, this adapter overrides conflicting runtime mechanics in the shared phases and role templates. Keep the review criteria shared; apply the tool mapping and role adaptations below when preparing each agent's prompt.
+For Codex, this adapter overrides conflicting instructions in the shared phases, role templates and posting audits. Apply the tool mapping, role adaptations and review checks below when preparing agent prompts; retain the remaining shared review criteria and approval gates.
 
 ## Tool mapping
 
@@ -31,11 +31,28 @@ Agents can message peers or the leader with `send_message` using the canonical a
 
 ## Preparing role prompts
 
-Before dispatch, translate the common preamble and assigned role template using this adapter. Include the applicable adaptations in the dispatched prompt so agents receive consistent executable instructions:
+Before dispatch, translate the common preamble and assigned role template using this adapter. Include the applicable adaptations and Codex review checks below in the dispatched prompt so agents receive consistent executable instructions:
 
 - **All roles:** work on the role/task supplied by the leader and report its ID and outcome. Replace native shared-task instructions with the leader-owned ledger/reporting process and map tool names using the table above. Apply the Codex context and permissions above instead of Claude-specific paths and settings.
-- **`devil-advocate`:** the leader starts this task only after every Wave 1 report has arrived, with the complete findings attached to the dispatch. Begin reviewing that handoff immediately; do not wait for a separate wake-up message. If the handoff is missing, request it from the leader.
+- **`devil-advocate`:** the leader starts this task only after every Wave 1 report has arrived, with the complete findings, applicable contract checks and concrete exclusion reasons attached to the dispatch. Begin reviewing that handoff immediately; do not wait for a separate wake-up message. If the handoff is missing, request it from the leader.
 - **`test-agent` and any role doing runtime validation:** user and host restrictions override the shared local test-execution instructions, including GPU work and collect-only. When execution is prohibited or unavailable, report evidence-backed coverage gaps and a proposed test plan, explicitly marked as not run. Do not present unexecuted test code as a verified suggestion or claim it passes.
+
+## Codex review checks
+
+Apply these checks to changed behavior and its related declarations, explanations and tests, including unchanged files. Keep the scope tied to the PR.
+
+- **`rl-expert`:** trace changed options/backends through their owning schema (including inherited fields), validation and consumers; compare sibling declarations and adjacent error remedies with the newly accepted/rejected combinations. Check added, modified and related existing docstrings, comments, design flows and extension examples. Follow user-guide links to verify that target tables/examples include the promised backend or combination. For resource explanations, identify the executing process and allocator/stream/communicator owner and compare them with the text's subject. Missing new docstrings do not replace these checks.
+- **`test-agent`:** for each changed branch or cross-backend call contract, identify the setup that reaches it and the assertion that would detect wrong or skipped behavior. Check mocks against the signature, attributes and return shape production actually inspects; verify library behavior from source/docs before flagging it. Distinguish matching implementations today from tests guarding their shared contract; an accepted parameter name alone does not validate payload contents. Search existing coverage before proposing another guard.
+- **Coverage decisions:** distinguish unit, real-model, distributed, manual-run and recurring CI/nightly evidence where relevant. A broader test can reduce impact without making an ineffective local mock correct; a successful manual run does not establish recurring coverage. Keep discretionary test-matrix expansion a recommendation, separate from an unmet author request.
+- **`comment-reviewer` and discovering agents:** match historical requests by concrete claim, target and requested edit. Preserve user-removed drafts; their disappearance is neither a code fix nor permission to restore them, and it does not exempt other locations or distinct issues. Record concrete excluded candidates with their specific evidence and reason. An existing-test exclusion needs its setup and detecting assertion; a duplicate exclusion needs the matching request's scope.
+- **`devil-advocate`:** override the shared file-list disqualifier: an unchanged schema, diagnostic, test or document can require an update because of this PR. Require links to both the PR change creating that obligation and the missed update, and compare base/head to distinguish unrelated pre-existing defects. File-list absence alone does not establish a stale diff.
+- **Leader and `devil-advocate`:** require compact records of applicable checks: changed behavior/check, source evidence, result (finding, checked with no issue, excluded with reason, or not applicable with reason), and actual execution status. File/member inventories do not establish these results. Return unexamined applicable checks to their owner before Wave 2. DA independently verifies the cited source and exclusions, including no-findings reports; omitted candidates receive peer verification and adversarial verdicts before editing. Keep these records internal. Separate factual confidence from impact: schema, documentation and test-quality findings need evidence of the omission/mismatch, not an invented runtime crash.
+
+## Test proposals and posting audits
+
+The host/user execution limits above apply to every role, including bug-finder, and to collection, imports, stubs, dependency setup and lint. GPU detection is capability, not authorization. Where execution is permitted and available, run proposed tests before claiming they pass; otherwise report the statically established gap and a plan or example labelled not run.
+
+For unexecuted proposed tests, override the shared verified-only test requirement and suggestion-block rules: use a language-tagged, non-committable example labelled not run. Comment-editor must preserve that form and execution status; the pre-POST `sugg` audit and pre-stage checklist accept “proposed test not run” as the reason. This exception does not change suggestion requirements for ordinary code fixes or weaken factual-premise checks.
 
 ## Task ledger and scheduling
 
@@ -46,7 +63,7 @@ Read the session's actual concurrency limit. With four slots including the leade
 Preserve these dependencies regardless of capacity:
 
 1. Run every applicable Wave 1 role, collecting each report. Queue roles that do not fit, rather than omitting them or starting waiting agents in scarce slots.
-2. Assign the complete Wave 1 set (including leader candidates) to an independent `devil-advocate` agent that did not produce those findings. Reserve an agent for this pass if the runtime limits total agents as well as active agents.
+2. Check the Codex review records and concrete exclusion reasons before marking Wave 1 reported; return unexamined applicable checks to their owner. Assign the complete Wave 1 set (including leader candidates and those records) to an independent `devil-advocate` agent that did not produce those findings. Reserve an agent for this pass if the runtime limits total agents as well as active agents.
 3. Reconcile every commissioned adversarial report. For a challenge to a completed specialist, use `followup_task` with the challenge and evidence; forward its answer to DA. The leader brokers messages if peers cannot communicate directly.
 4. Only then dispatch `edit-comments` with the final survivors and body draft. A completed DA agent may take the editor role in a separate turn if capacity requires reuse. The leader may not replace the editor pass with its own prose.
 5. Offer staging only after the ledger shows every required report received and all outstanding passes reported or deliberately stopped. An interrupted DA or editor task is incomplete; complete that role before opening its gate.
