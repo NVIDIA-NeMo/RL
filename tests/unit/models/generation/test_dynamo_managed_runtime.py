@@ -293,6 +293,7 @@ def test_frontend_launches_nemo_rls_chat_engine_from_the_given_interpreter(
 ) -> None:
     runtime = _runtime(render_workers=3)
     runtime._frontend_port = 3000
+    runtime._generation_cut_port = 2400
     runtime._namespace = "nemo-rl-test"
     launched = []
     monkeypatch.setattr(
@@ -303,7 +304,11 @@ def test_frontend_launches_nemo_rls_chat_engine_from_the_given_interpreter(
 
     runtime._start_frontend()
     runtime.publish_chat_capture(
-        dp_cfg={"backend": "simple"}, staging_partition="staging", capture_media=False
+        dp_cfg={"backend": "simple"},
+        staging_partition="staging",
+        capture_media=False,
+        generation_cut_control_token="secret",
+        generation_cut_control_timeout_s=60.0,
     )
 
     ((command, env),) = launched
@@ -315,6 +320,8 @@ def test_frontend_launches_nemo_rls_chat_engine_from_the_given_interpreter(
     ]
     assert env[managed_runtime.RENDER_WORKERS_ENV] == "3"
     assert env[managed_runtime.RAY_ADDRESS_ENV] == "10.0.0.1:6379"
+    # NeMo-Gym's checkpoint generation cuts go to a port of the frontend's own.
+    assert env[managed_runtime.GENERATION_CUT_PORT_ENV] == "2400"
     # Capture is set up after the engines register; the chat engine reads it
     # from the file the frontend was told about.
     with open(env[managed_runtime.CAPTURE_FILE_ENV], "rb") as capture_file:
@@ -322,6 +329,8 @@ def test_frontend_launches_nemo_rls_chat_engine_from_the_given_interpreter(
             "data_plane": {"backend": "simple"},
             "staging_partition": "staging",
             "capture_media": False,
+            "generation_cut_control_token": "secret",
+            "generation_cut_control_timeout_s": 60.0,
         }
     runtime.shutdown()
 

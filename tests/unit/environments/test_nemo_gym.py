@@ -2602,6 +2602,7 @@ def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkey
             checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
             turn_checkpointing_enabled=False,
             generation_prefix_cuts_enabled=False,
+            generation_cut_control_urls=None,
         )
         NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
         return started[-1]
@@ -2662,6 +2663,7 @@ def test_spinup_forwards_job_identity_to_gym_servers(monkeypatch):
             checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
             turn_checkpointing_enabled=False,
             generation_prefix_cuts_enabled=False,
+            generation_cut_control_urls=None,
         )
         NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
         return parse_otel_resource_attributes(os.environ["OTEL_RESOURCE_ATTRIBUTES"])

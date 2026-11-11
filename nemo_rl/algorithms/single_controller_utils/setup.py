@@ -800,6 +800,7 @@ def _spinup_gym(
     base_urls: list[str],
     tokenizer: PreTrainedTokenizerBase,
     policy_api_key: Optional[str],
+    generation_cut_control_urls: Optional[list[str]],
 ) -> tuple[NemoGymShardSet, float]:
     """Spin up the NeMo-Gym shard set against the reserved vLLM URLs.
 
@@ -810,6 +811,9 @@ def _spinup_gym(
             call. See NemoGym.set_tokenizer.
         policy_api_key: The bearer token the vLLM server requires on its OpenAI
             routes (VllmGeneration.http_server_api_key), or None when it checks none.
+        generation_cut_control_urls: Where Gym sends checkpoint generation cuts,
+            one per base URL (VllmGeneration.generation_cut_control_urls), or
+            None when each base URL takes its own.
 
     Returns:
         A tuple of (NeMo-Gym shard set, wall time spent in this call).
@@ -832,6 +836,7 @@ def _spinup_gym(
         generation_prefix_cuts_enabled=(
             master_config.rollout_recovery.generation_prefix_cuts_enabled
         ),
+        generation_cut_control_urls=generation_cut_control_urls,
         # Capture transport config includes the generation request's candidate count.
         token_capture=(
             {
@@ -1987,6 +1992,11 @@ def setup_single_controller(
             # key; a Megatron generation server is built later and checks none.
             policy_api_key=(
                 generation.http_server_api_key if generation is not None else None
+            ),
+            generation_cut_control_urls=(
+                generation.generation_cut_control_urls
+                if generation is not None
+                else None
             ),
         )
 

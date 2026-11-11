@@ -2964,6 +2964,7 @@ def build_nemo_gym_config(
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
     generation_prefix_cuts_enabled: bool = False,
+    generation_cut_control_urls: Optional[list[str]] = None,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
@@ -2988,6 +2989,10 @@ def build_nemo_gym_config(
         generation_prefix_cuts_enabled: Let Gym cut active model calls at a
             checkpoint so a restore resumes them from their decoded prefix.
             Requires ``turn_checkpointing_enabled``.
+        generation_cut_control_urls: Where Gym sends those cuts, one per entry
+            of ``base_urls``; None when each base URL takes its own, as a
+            vLLM server does. A Dynamo frontend takes them on another port
+            (VllmGeneration.generation_cut_control_urls).
         policy_api_key: The bearer token the generation server requires on its
             OpenAI routes (VllmGeneration.http_server_api_key), or None when it
             checks none.
@@ -3023,6 +3028,7 @@ def build_nemo_gym_config(
         ),
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+        generation_cut_control_urls=generation_cut_control_urls,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     )
@@ -3085,6 +3091,7 @@ def _build_gym_actor_config(
     checkpoint_instance: GymCheckpointInstance,
     turn_checkpointing_enabled: bool,
     generation_prefix_cuts_enabled: bool,
+    generation_cut_control_urls: Optional[list[str]],
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
 ) -> NemoGymConfig:
@@ -3180,6 +3187,11 @@ def _build_gym_actor_config(
         policy_overrides["checkpoint"] = {"policy": True}
         if generation_prefix_cuts_enabled:
             policy_overrides["checkpoint"]["generation_cuts"] = True
+            if generation_cut_control_urls is not None:
+                # The base URLs do not take cuts themselves (a Dynamo frontend).
+                policy_overrides["generation_cut_control_url"] = list(
+                    generation_cut_control_urls
+                )
 
     return NemoGymConfig(
         model_name=model_name,
@@ -3484,6 +3496,7 @@ def build_nemo_gym_actors(
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
     generation_prefix_cuts_enabled: bool = False,
+    generation_cut_control_urls: Optional[list[str]] = None,
     token_capture: Optional[dict[str, Any]] = None,
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float = DEFAULT_SHARD_PG_READY_TIMEOUT_SECONDS,
@@ -3505,6 +3518,10 @@ def build_nemo_gym_actors(
         generation_prefix_cuts_enabled: Let Gym cut active model calls at a
             checkpoint so a restore resumes them from their decoded prefix.
             Requires ``turn_checkpointing_enabled``.
+        generation_cut_control_urls: Where Gym sends those cuts, one per entry
+            of ``base_urls``; None when each base URL takes its own, as a
+            vLLM server does. A Dynamo frontend takes them on another port
+            (VllmGeneration.generation_cut_control_urls).
 
     Returns:
         A :class:`NemoGymShardSet` whose actors are all running and validated.
@@ -3527,6 +3544,7 @@ def build_nemo_gym_actors(
             use_fastokens=use_fastokens,
             turn_checkpointing_enabled=turn_checkpointing_enabled,
             generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+            generation_cut_control_urls=generation_cut_control_urls,
             token_capture=token_capture,
             policy_api_key=policy_api_key,
         )
@@ -3541,6 +3559,7 @@ def build_nemo_gym_actors(
         use_fastokens=use_fastokens,
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+        generation_cut_control_urls=generation_cut_control_urls,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
         pg_ready_timeout=pg_ready_timeout,
@@ -3558,6 +3577,7 @@ def _build_single_gym_actor(
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
     generation_prefix_cuts_enabled: bool,
+    generation_cut_control_urls: Optional[list[str]],
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
 ) -> NemoGymShardSet:
@@ -3574,6 +3594,7 @@ def _build_single_gym_actor(
         ),
         turn_checkpointing_enabled=turn_checkpointing_enabled,
         generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+        generation_cut_control_urls=generation_cut_control_urls,
         token_capture=token_capture,
         policy_api_key=policy_api_key,
     )
@@ -3624,6 +3645,7 @@ def _build_sharded_gym_actors(
     use_fastokens: bool,
     turn_checkpointing_enabled: bool,
     generation_prefix_cuts_enabled: bool,
+    generation_cut_control_urls: Optional[list[str]],
     token_capture: Optional[dict[str, Any]],
     policy_api_key: Optional[str] = None,
     pg_ready_timeout: float,
@@ -3714,6 +3736,7 @@ def _build_sharded_gym_actors(
                     ),
                     turn_checkpointing_enabled=turn_checkpointing_enabled,
                     generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
+                    generation_cut_control_urls=generation_cut_control_urls,
                     token_capture=token_capture,
                     policy_api_key=policy_api_key,
                 )

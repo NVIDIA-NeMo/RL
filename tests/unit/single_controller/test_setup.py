@@ -1208,6 +1208,7 @@ class TestSetup:
                 ["http://generation"],
                 MagicMock(name="tokenizer"),
                 policy_api_key=None,
+                generation_cut_control_urls=None,
             )
 
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is False
@@ -1234,11 +1235,13 @@ class TestSetup:
                 ["http://generation"],
                 MagicMock(name="tokenizer"),
                 policy_api_key=None,
+                generation_cut_control_urls=["http://generation-cuts"],
             )
 
         kwargs = mock_spinup.call_args.kwargs
         assert kwargs["turn_checkpointing_enabled"] is True
         assert kwargs["generation_prefix_cuts_enabled"] is generation_prefix_cuts
+        assert kwargs["generation_cut_control_urls"] == ["http://generation-cuts"]
         # The flag is a typed keyword, not an undeclared key in the capture config.
         assert "generation_prefix_cuts_enabled" not in kwargs["token_capture"]
 
@@ -2613,6 +2616,10 @@ class TestSetup:
             use_fastokens=False,
             turn_checkpointing_enabled=False,
             generation_prefix_cuts_enabled=False,
+            # Where the generation backend takes Gym's checkpoint cuts.
+            generation_cut_control_urls=patched_factories[
+                "fake_gen"
+            ].generation_cut_control_urls,
             # The vLLM server's bearer token, handed to the Gym model server.
             policy_api_key=patched_factories["fake_gen"].http_server_api_key,
             token_capture=None,

@@ -121,10 +121,21 @@ def _managed_namespace() -> str:
 
 # The frontend process's environment for NeMo RL's chat engine
 # (dynamo/vllm/chat_engine.py): its render workers, where setup_token_capture
-# writes the capture config, and the Ray cluster its TQ reads go through.
+# writes the capture config, the Ray cluster its TQ reads go through, and the
+# port it takes NeMo-Gym's generation cuts on (dynamo/vllm/generation_cut.py).
 RENDER_WORKERS_ENV = "NEMO_RL_DYNAMO_RENDER_WORKERS"
 CAPTURE_FILE_ENV = "NEMO_RL_DYNAMO_CAPTURE_FILE"
 RAY_ADDRESS_ENV = "NEMO_RL_DYNAMO_RAY_ADDRESS"
+GENERATION_CUT_PORT_ENV = "NEMO_RL_DYNAMO_GENERATION_CUT_PORT"
+
+
+def read_chat_capture() -> dict[str, Any] | None:
+    """What ``publish_chat_capture`` wrote for this frontend; None before it has."""
+    path = os.environ[CAPTURE_FILE_ENV]
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as capture_file:
+        return pickle.load(capture_file)
 
 
 class ManagedDynamoRuntime:
@@ -159,6 +170,7 @@ class ManagedDynamoRuntime:
         self._etcd_peer_port = 0
         self._nats_port = 0
         self._frontend_port = 0
+        self._generation_cut_port = 0
         self._manager_env: dict[str, str] = {}
         self._started = False
         self._etcd_process: subprocess.Popen | None = None
@@ -177,6 +189,14 @@ class ManagedDynamoRuntime:
             raise RuntimeError("Managed Dynamo runtime has not been started")
         host = f"[{self._host}]" if ":" in self._host else self._host
         return f"http://{host}:{self._frontend_port}/v1"
+
+    @property
+    def generation_cut_control_url(self) -> str:
+        """Where the frontend process takes NeMo-Gym's checkpoint generation cuts."""
+        if not self._started:
+            raise RuntimeError("Managed Dynamo runtime has not been started")
+        host = f"[{self._host}]" if ":" in self._host else self._host
+        return f"http://{host}:{self._generation_cut_port}"
 
     @property
     def engine_env(self) -> dict[str, str]:
@@ -202,15 +222,19 @@ class ManagedDynamoRuntime:
         )
         http = (DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW, DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH)
         ports: list[int] = []
-        for low, high in (control, control, control, http):
+        for low, high in (control, control, control, http, control):
             ports.append(
                 _get_free_port_local(
                     low, high, max_retries=None, excluded_ports=set(ports)
                 )
             )
-        self._etcd_port, self._etcd_peer_port, self._nats_port, self._frontend_port = (
-            ports
-        )
+        (
+            self._etcd_port,
+            self._etcd_peer_port,
+            self._nats_port,
+            self._frontend_port,
+            self._generation_cut_port,
+        ) = ports
         self._manager_env = {
             "ETCD_ENDPOINTS": f"http://{self._host}:{self._etcd_port}",
             "NATS_SERVER": f"nats://{self._host}:{self._nats_port}",
@@ -367,6 +391,7 @@ class ManagedDynamoRuntime:
         )
         frontend_env[CAPTURE_FILE_ENV] = os.path.join(self._chat_dir, "capture.pkl")
         frontend_env[RAY_ADDRESS_ENV] = self._ray_address
+        frontend_env[GENERATION_CUT_PORT_ENV] = str(self._generation_cut_port)
         dynamo_venv = os.path.dirname(os.path.dirname(self._frontend_python))
         frontend_env["VIRTUAL_ENV"] = dynamo_venv
         frontend_env["UV_PROJECT_ENVIRONMENT"] = dynamo_venv
@@ -380,11 +405,15 @@ class ManagedDynamoRuntime:
         dp_cfg: dict[str, Any],
         staging_partition: str,
         capture_media: bool,
+        generation_cut_control_token: str | None,
+        generation_cut_control_timeout_s: float | None,
     ) -> None:
-        """Tell the frontend's chat engine where token-capture prefixes are read.
+        """Tell the frontend where token-capture prefixes are read, and who may cut.
 
         Capture is set up after the engines register, so the chat engine reads
-        this on its first captured call.
+        this on its first captured call. ``generation_cut_control_token`` is the
+        bearer token a generation cut must carry, None to refuse every cut;
+        ``generation_cut_control_timeout_s`` bounds one cut across the engines.
         """
         if self._chat_dir is None:
             raise RuntimeError("Managed Dynamo runtime has not been started")
@@ -398,6 +427,10 @@ class ManagedDynamoRuntime:
                     "data_plane": dp_cfg,
                     "staging_partition": staging_partition,
                     "capture_media": capture_media,
+                    "generation_cut_control_token": generation_cut_control_token,
+                    "generation_cut_control_timeout_s": (
+                        generation_cut_control_timeout_s
+                    ),
                 },
                 capture_file,
             )

@@ -269,6 +269,7 @@ project-includes = [
   "nemo_rl/models/generation/dynamo/vllm/adapter.py",
   "nemo_rl/models/generation/dynamo/vllm/chat_engine.py",
   "nemo_rl/models/generation/dynamo/vllm/frontend.py",
+  "nemo_rl/models/generation/dynamo/vllm/generation_cut.py",
   "nemo_rl/models/generation/dynamo/vllm/render_pool.py",
   "nemo_rl/models/generation/gym_call.py",
   "nemo_rl/models/generation/dynamo/rollout_client.py",

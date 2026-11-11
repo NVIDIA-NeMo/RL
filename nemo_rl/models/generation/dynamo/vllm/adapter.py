@@ -75,6 +75,11 @@ from nemo_rl.models.generation.dynamo.vllm.chat_engine import (
     GymCallPlan,
     GymEngineReply,
 )
+from nemo_rl.models.generation.dynamo.vllm.generation_cut import (
+    CUT_PREFIXES_KEY,
+    GENERATION_CUT_ANNOTATION,
+    INVENTORY_KEY,
+)
 from nemo_rl.models.generation.gym_call import GymCallResult
 from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 from nemo_rl.models.generation.score_centering import (
@@ -205,7 +210,41 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         self._max_model_len = self._llm.vllm_config.model_config.max_model_len
 
     def _handlers(self) -> dict[str, RequestHandler]:
-        return {**super()._handlers(), GYM_CALL_ANNOTATION: self._generate_gym}
+        return {
+            **super()._handlers(),
+            GYM_CALL_ANNOTATION: self._generate_gym,
+            GENERATION_CUT_ANNOTATION: self._generate_cut,
+        }
+
+    async def _generate_cut(
+        self, request: GenerateRequest, annotation: str, context: Context
+    ) -> AsyncGenerator[GenerateChunk, None]:
+        """Cut the calls of a checkpoint's inventory that this engine holds.
+
+        The frontend sends every engine the whole inventory
+        (:mod:`~nemo_rl.models.generation.dynamo.vllm.generation_cut`), so the
+        answer names only the calls cut here.
+        """
+        del annotation, context
+        # Deferred: Gym is optional outside framework-owned capture.
+        from nemo_gym._checkpoint.generation_cut import GenerationCutInventory
+
+        inventory = GenerationCutInventory.model_validate(
+            (request.get("extra_args") or {})[INVENTORY_KEY]
+        )
+        receipt = await self._host._prefix_recovery.run_cut(inventory)
+        yield {
+            "token_ids": [],
+            "index": 0,
+            "finish_reason": "stop",
+            "engine_data": {
+                CUT_PREFIXES_KEY: [
+                    ack.model_dump(mode="json")
+                    for ack in receipt.prefixes
+                    if ack.disposition == "durable_prefix"
+                ]
+            },
+        }
 
     async def serve_rollout(
         self,

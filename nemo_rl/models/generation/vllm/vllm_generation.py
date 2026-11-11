@@ -216,6 +216,7 @@ class VllmGeneration(GenerationInterface):
     # defaults, so shutdown() also works when __init__ failed before starting them.
     _dynamo_runtime: Optional["ManagedDynamoRuntime"] = None
     dynamo_frontend_url: Optional[str] = None
+    dynamo_generation_cut_url: Optional[str] = None
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
@@ -784,6 +785,17 @@ class VllmGeneration(GenerationInterface):
             return [self.dynamo_frontend_url]
         return self.dp_openai_server_base_urls
 
+    @property
+    def generation_cut_control_urls(self) -> Optional[list[str]]:
+        """Where NeMo-Gym sends checkpoint generation cuts, one per ``client_base_urls`` entry.
+
+        None when each base URL takes its own cuts, as every shard's server
+        does. The Dynamo frontend takes them on a port of its own.
+        """
+        if self.dynamo_generation_cut_url is not None:
+            return [self.dynamo_generation_cut_url]
+        return None
+
     def _start_dynamo_services(self) -> None:
         """Start the etcd, NATS and frontend this fleet's engines register with."""
         from nemo_rl.models.generation.dynamo.managed_runtime import (
@@ -801,6 +813,7 @@ class VllmGeneration(GenerationInterface):
         runtime.start()
         self._dynamo_runtime = runtime
         self.dynamo_frontend_url = runtime.frontend_url
+        self.dynamo_generation_cut_url = runtime.generation_cut_control_url
 
     def _register_dynamo_engines(self) -> None:
         """Serve every shard's engine through Dynamo; wait until it routes to all."""
@@ -900,11 +913,18 @@ class VllmGeneration(GenerationInterface):
         self._token_capture_media = agreed_media_columns(ray.get(futures))
         self._token_capture_setup = setup
         if self._dynamo_runtime is not None:
-            # NeMo-Gym's calls through Dynamo read their prefix in the frontend.
+            # NeMo-Gym's calls through Dynamo read their prefix in the frontend,
+            # which also takes Gym's generation cuts for the engines.
             self._dynamo_runtime.publish_chat_capture(
                 dp_cfg=dp_cfg,
                 staging_partition=staging_partition,
                 capture_media=capture_media,
+                generation_cut_control_token=(
+                    generation_cut_control_token
+                    if generation_prefix_cuts_enabled
+                    else None
+                ),
+                generation_cut_control_timeout_s=generation_cut_control_timeout_s,
             )
         return self._token_capture_media
 
