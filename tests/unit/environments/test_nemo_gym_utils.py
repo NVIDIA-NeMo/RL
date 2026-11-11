@@ -440,6 +440,7 @@ def test_spinup_passes_parent_resolution_to_gym(forest_training, tmp_path, monke
                 "enabled": True,
                 "forest_training": forest_training,
                 "selection_policy": "returned_history",
+                "max_rows_per_rollout": None,
                 "generation_backend": "vllm",
                 "capture_dir": str(tmp_path),
                 "control_auth_token": "test-control",

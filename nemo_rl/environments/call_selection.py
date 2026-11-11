@@ -23,9 +23,11 @@ membership; shared capture validation and reconstruction remain authoritative.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
+import random
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
@@ -320,6 +322,161 @@ def select_all_captured(
         ):
             selected.append(record)
     return selected, terminal_response_id
+
+
+def read_selection_priorities(
+    result: dict[str, Any], records: list[CallRecord]
+) -> dict[str, int]:
+    """Read the harness's optional ``selection_priorities`` result field.
+
+    The field maps served response IDs of this attempt to priority classes;
+    0 is the highest priority. An absent field leaves every leaf in one class.
+    """
+    priorities = result.get("selection_priorities")
+    if priorities is None:
+        return {}
+    if not isinstance(priorities, dict) or any(
+        not isinstance(key, str)
+        or isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < 0
+        for key, value in priorities.items()
+    ):
+        raise ValueError(
+            "selection_priorities must map response IDs to nonnegative integers"
+        )
+    unknown = set(priorities) - {record.response_id for record in records}
+    if unknown:
+        raise ValueError(
+            f"selection_priorities names responses outside this capture: {sorted(unknown)}"
+        )
+    return priorities
+
+
+def cap_selected_rows(
+    selected: list[CallRecord],
+    terminal_response_id: str,
+    *,
+    max_rows: int,
+    priorities: Mapping[str, int],
+) -> list[CallRecord]:
+    """Keep at most ``max_rows`` root-to-leaf paths of a selection.
+
+    Each selected leaf becomes one training row. The scored terminal's path is
+    always kept. Each further draw takes the highest-priority class that still
+    has a candidate leaf, a selected leaf outside the kept calls. A leaf's class
+    is its ``priorities`` value; unlisted leaves rank after every listed class.
+    Within the class, a leaf is drawn with probability proportional to the
+    ``delta_len`` its path adds outside the kept calls, then its whole path is
+    kept. Draws stop at ``max_rows`` kept leaves or when no candidate remains.
+
+    ``delta_len`` counts every token a call appends, so a call's carried input
+    (a root's prompt, a child's tool results) weighs like its generation. The
+    token-free manifest has no exact generated count: the split between carried
+    and generated tokens exists only in the staged token masks, which selection
+    does not read, and a harness reports usage only for the responses it
+    returns, not for every captured call.
+
+    The draw is seeded by the selection's call IDs, so one attempt always keeps
+    the same rows. The selection must be closed (every parent selected); callers
+    cap only selections that passed the completion and failure checks, so the
+    cap never makes a masked rollout trainable. Kept calls retain the input
+    order, with each call moved after its kept parent.
+    """
+    by_call = {record.model_call_id: record for record in selected}
+    parents = _parent_ids(selected)
+    # Draws walk leaves by call ID, so the result ignores the selection's order.
+    leaves = sorted(
+        (record for record in selected if record.model_call_id not in parents),
+        key=lambda record: record.model_call_id,
+    )
+    if len(leaves) <= max_rows:
+        return selected
+
+    def path(record: CallRecord) -> list[CallRecord]:
+        chain = [record]
+        while chain[-1].parent_call_id is not None:
+            chain.append(by_call[chain[-1].parent_call_id])
+        return chain
+
+    def rank(leaf: CallRecord) -> tuple[int, int]:
+        if leaf.response_id in priorities:
+            return (0, priorities[leaf.response_id])
+        return (1, 0)
+
+    terminal = next(r for r in selected if r.response_id == terminal_response_id)
+    kept = {record.model_call_id for record in path(terminal)}
+    seed = hashlib.sha256("\0".join(sorted(by_call)).encode()).digest()
+    rng = random.Random(int.from_bytes(seed[:8], "big"))
+    while True:
+        kept_parents = {by_call[call].parent_call_id for call in kept}
+        if sum(call not in kept_parents for call in kept) >= max_rows:
+            break
+        candidates = [leaf for leaf in leaves if leaf.model_call_id not in kept]
+        if not candidates:
+            break
+        best = min(map(rank, candidates))
+        weighted = [
+            (
+                leaf,
+                sum(r.delta_len for r in path(leaf) if r.model_call_id not in kept),
+            )
+            for leaf in candidates
+            if rank(leaf) == best
+        ]
+        draw = rng.randrange(sum(weight for _, weight in weighted))
+        for leaf, weight in weighted:
+            if draw < weight:
+                kept.update(record.model_call_id for record in path(leaf))
+                break
+            draw -= weight
+    ordered: list[CallRecord] = []
+    emitted: set[str] = set()
+    for record in selected:
+        if record.model_call_id in kept and record.model_call_id not in emitted:
+            for ancestor in reversed(path(record)):
+                if ancestor.model_call_id not in emitted:
+                    emitted.add(ancestor.model_call_id)
+                    ordered.append(ancestor)
+    return ordered
+
+
+def _parent_ids(selected: list[CallRecord]) -> set[str | None]:
+    return {record.parent_call_id for record in selected}
+
+
+def count_selected_rows(selected: list[CallRecord]) -> int:
+    """Count a closed selection's leaves, one training row each."""
+    parents = _parent_ids(selected)
+    return sum(record.model_call_id not in parents for record in selected)
+
+
+def cap_priority_sampled(
+    selected: list[CallRecord],
+    terminal_response_id: str,
+    max_rows: int,
+    *,
+    records: list[CallRecord],
+    result: dict[str, Any],
+) -> list[CallRecord]:
+    """``priority_sampled``: ``cap_selected_rows`` by the harness's priorities."""
+    return cap_selected_rows(
+        selected,
+        terminal_response_id,
+        max_rows=max_rows,
+        priorities=read_selection_priorities(result, records),
+    )
+
+
+# A row cap rule ``(selected, terminal_response_id, max_rows, *, records, result)``
+# returns a closed subset of a trainable selection that keeps the scored call's
+# path. ``records`` is every captured call of the attempt; ``result`` is the
+# harness result. ``token_capture.row_cap_rule`` names the rule.
+type RowCapRule = Callable[..., list[CallRecord]]
+
+ROW_CAP_RULES: dict[str, RowCapRule] = {
+    "priority_sampled": cap_priority_sampled,
+}
 
 
 SELECTION_POLICIES: dict[str, SelectionPolicy] = {

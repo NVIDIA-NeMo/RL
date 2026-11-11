@@ -76,6 +76,45 @@ def test_selection_restore_preserves_new_defaulted_fields(
     assert _selection_from_state(dataclasses.asdict(selection)) == selection
 
 
+def test_selection_restore_defaults_row_cap_fields_from_older_state() -> None:
+    flags = (ActionOutputFlags(False, False),)
+    capped = RolloutSelection(
+        ("response0",),
+        flags,
+        prompt_response_id="response1",
+        row_cap_dropped_rows=2,
+        row_cap_dropped_calls=3,
+    )
+    assert _selection_from_state(dataclasses.asdict(capped)) == capped
+    older = {
+        "response_ids": ("response0",),
+        "action_flags": ({"invalid_tool_call": False, "malformed_thinking": False},),
+        "truncated": False,
+    }
+    assert _selection_from_state(older) == RolloutSelection(("response0",), flags)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        {"prompt_response_id": "response0"},
+        {"prompt_response_id": ""},
+        {"prompt_response_id": 7},
+        {"row_cap_dropped_rows": -1},
+        {"row_cap_dropped_calls": True},
+        {"row_cap_dropped_rows": 1.0},
+    ],
+)
+def test_selection_restore_rejects_malformed_row_cap_fields(
+    damage: dict[str, Any],
+) -> None:
+    state = dataclasses.asdict(
+        RolloutSelection(("response0",), (ActionOutputFlags(False, False),))
+    )
+    with pytest.raises(ValueError, match="row-cap fields"):
+        _selection_from_state(state | damage)
+
+
 def _forest_sealed_ledger() -> RolloutRecoveryLedger:
     from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 

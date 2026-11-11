@@ -316,6 +316,7 @@ def test_real_collector_streams_episode_and_flat_http_results(
                         "enabled": token_capture,
                         "forest_training": forest_training,
                         "selection_policy": "returned_history",
+                        "max_rows_per_rollout": None,
                     }
                 }
             )

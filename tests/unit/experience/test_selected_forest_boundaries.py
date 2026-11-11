@@ -284,6 +284,7 @@ def test_forest_restart_retains_selection_terminal_and_once_only_loss(
     assert not any(partition == "staged" for partition, _ in forest.plane.rows)
 
 
+@pytest.mark.parametrize("max_rows", [None, 1])
 @pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
 @pytest.mark.parametrize("reverse_manifest", [False, True])
 @pytest.mark.parametrize(
@@ -315,6 +316,7 @@ def test_subagent_failures_reach_final_training_rows(
     policy: str,
     reverse_manifest: bool,
     failure: str,
+    max_rows: int | None,
 ) -> None:
     from nemo_gym.token_id_capture import UNCOMMITTED_CALL_REASON
 
@@ -402,6 +404,8 @@ def test_subagent_failures_reach_final_training_rows(
         monkeypatch.setattr("nemo_rl.environments.nemo_gym._CAPTURE_DRAIN_TIMEOUT_S", 0)
     env = _env(forest.harness)
     env._selection_policy = policy
+    env._max_rows_per_rollout = max_rows
+    env._row_cap_rule = None if max_rows is None else "priority_sampled"
     control = env._control
 
     async def capture_control(method: str, path: str) -> dict:
@@ -438,10 +442,12 @@ def test_subagent_failures_reach_final_training_rows(
         or (failure == "cancel_after_commit" and policy == "all_captured")
     )
     assert processed["receipt"]["capture_poisoned"] is masked
-    truncated = policy == "all_captured" and failure in (
-        "length_leaf",
-        "max_tokens_leaf",
-        "max_output_tokens_leaf",
+    # A capped rollout trains only the scored path, so a dropped leaf's length
+    # stop does not truncate it; the cap never unmasks a masked rollout.
+    truncated = (
+        max_rows is None
+        and policy == "all_captured"
+        and failure in ("length_leaf", "max_tokens_leaf", "max_output_tokens_leaf")
     )
     assert processed["truncated"] is truncated
     result = forest.finalizer.finalize_group(
@@ -462,8 +468,15 @@ def test_subagent_failures_reach_final_training_rows(
         and failure not in ("failed_leaf", "unknown_leaf", "filtered_leaf")
         else [records[i] for i in accepted_indices]
     )
+    rows = uncapped_rows = 5 if len(selected) == 8 else 4
+    if max_rows is not None and not masked:
+        selected, rows = [records[5], records[6]], 1
     assert_loss_once(forest, [] if masked else selected, records)
-    assert result.valid_row_count == (0 if masked else (5 if len(selected) == 8 else 4))
+    assert result.valid_row_count == (0 if masked else rows)
+    # A masked rollout is never capped.
+    assert result.metrics["finalize/row_cap_dropped_rows"] == float(
+        0 if masked else uncapped_rows - rows
+    )
     # Termination rates count the rollout once, not once per segment row.
     assert result.metrics["finalize/truncated_count"] == float(truncated and not masked)
     if result.meta is not None:
@@ -475,6 +488,80 @@ def test_subagent_failures_reach_final_training_rows(
     assert {key for partition, key in forest.plane.rows if partition == "staged"} == (
         {"attempt/lost"} if pending else set()
     )
+
+
+def test_row_cap_trains_harness_priorities_after_the_scored_path(
+    forest: ForestCapture,
+) -> None:
+    # Main A -> B / retry C; worker D -> E / H; main compacts into F -> scored G.
+    records, replies = forest.capture([None, 0, 0, None, 3, None, 5, 3])
+    env = _env(forest.harness)
+    env._selection_policy = "all_captured"
+    env._max_rows_per_rollout = 2
+    env._row_cap_rule = "priority_sampled"
+    result = {
+        "terminal_response_id": replies[6]["id"],
+        "reward": 1.0,
+        "selection_priorities": {replies[4]["id"]: 0, replies[7]["id"]: 1},
+    }
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+    )
+    kept = [records[i] for i in (3, 4, 5, 6)]
+    capped = processed["logical_selection"]
+    assert capped.response_ids == tuple(r.response_id for r in kept)
+    # Leaves B, C and H and calls A, B, C and H stay untrained; A still
+    # supplies the grouping prompt, not the worker's root D.
+    assert capped.prompt_response_id == records[0].response_id
+    assert (capped.row_cap_dropped_rows, capped.row_cap_dropped_calls) == (3, 4)
+    published = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [processed["receipt"]],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[processed["logical_selection"]],
+    )
+    assert published.valid_row_count == 2
+    assert_loss_once(forest, kept, records)
+    assert {
+        name: published.metrics[f"finalize/row_cap_{name}"]
+        for name in ("capped_rollouts", "dropped_rows", "dropped_calls")
+    } == {"capped_rollouts": 1.0, "dropped_rows": 3.0, "dropped_calls": 4.0}
+    # Root A's prompt tokens, where uncapped selection puts them.
+    assert [
+        fields["prompt_ids_for_adv"].tolist()
+        for (partition, _), fields in forest.plane.rows.items()
+        if partition == "canonical"
+    ] == [[[10, 11]]] * 2
+
+    result["selection_priorities"] = {"unserved": 0}
+    with pytest.raises(ValueError, match="'attempt'.*outside this capture"):
+        asyncio.run(
+            env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+        )
+
+
+@pytest.mark.parametrize("prompt", ["selected", "child", "unknown"])
+def test_grouping_prompt_must_name_an_unselected_root(
+    forest: ForestCapture, prompt: str
+) -> None:
+    records, _ = forest.capture([None, 0, None, 2])
+    value = replace(
+        selection(records[2:]),
+        prompt_response_id={
+            "selected": records[2].response_id,
+            "child": records[1].response_id,
+            "unknown": "unserved",
+        }[prompt],
+    )
+    with pytest.raises(ValueError, match="unselected captured root"):
+        forest.finalizer._plan_selected_calls(
+            ["attempt"], [receipt(records, terminal=records[3])], [value]
+        )
 
 
 def test_all_captured_does_not_require_returned_execution_history(forest):

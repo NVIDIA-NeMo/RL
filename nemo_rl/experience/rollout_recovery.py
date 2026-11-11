@@ -601,7 +601,15 @@ def _selection_from_state(raw: Any) -> RolloutSelection | None:
     )
 
     expected_fields = {field.name for field in dataclasses.fields(RolloutSelection)}
-    if not isinstance(raw, dict) or set(raw) != expected_fields:
+    # Row-cap fields postdate schema 7 and default to an uncapped selection.
+    optional_fields = {
+        "prompt_response_id",
+        "row_cap_dropped_rows",
+        "row_cap_dropped_calls",
+    }
+    if not isinstance(raw, dict) or not (
+        expected_fields - optional_fields <= set(raw) <= expected_fields
+    ):
         raise ValueError(
             "Forest recovery selection must contain every descriptor field: "
             f"expected={sorted(expected_fields)}, "
@@ -615,6 +623,20 @@ def _selection_from_state(raw: Any) -> RolloutSelection | None:
         or not isinstance(flags, tuple)
         or len(flags) != len(responses)
         or not isinstance(raw["truncated"], bool)
+        or (
+            raw.get("prompt_response_id") is not None
+            and (
+                not isinstance(raw["prompt_response_id"], str)
+                or not raw["prompt_response_id"]
+                or raw["prompt_response_id"] in responses
+            )
+        )
+        or any(
+            isinstance(raw.get(name, 0), bool)
+            or not isinstance(raw.get(name, 0), int)
+            or raw.get(name, 0) < 0
+            for name in ("row_cap_dropped_rows", "row_cap_dropped_calls")
+        )
         or any(
             not isinstance(flag, dict)
             or set(flag)
@@ -624,7 +646,8 @@ def _selection_from_state(raw: Any) -> RolloutSelection | None:
         )
     ):
         raise ValueError(
-            "Forest recovery selection has invalid response IDs or action flags"
+            "Forest recovery selection has invalid response IDs, action flags, "
+            "or row-cap fields"
         )
     selection_state: dict[str, Any] = {
         **raw,

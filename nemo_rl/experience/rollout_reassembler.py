@@ -156,6 +156,13 @@ class RolloutSelection:
     response_ids: tuple[str, ...]
     action_flags: tuple[ActionOutputFlags, ...]
     truncated: bool = False
+    # A parentless captured response outside the selection whose prompt groups
+    # the owner instead of the first selected root's: the first root the
+    # selection had before token_capture.max_rows_per_rollout dropped its rows.
+    prompt_response_id: str | None = None
+    # Rows (selected leaves) and calls the row cap removed, for metrics only.
+    row_cap_dropped_rows: int = 0
+    row_cap_dropped_calls: int = 0
 
 
 @dataclass(frozen=True)
@@ -169,6 +176,8 @@ class SegmentReceipt:
     truncated: bool = False
     # Image columns occupy the selected terminal's existing staging key.
     action_flags: tuple[ActionOutputFlags, ...] | None = None
+    # First Forest segment only: RolloutSelection.prompt_response_id.
+    prompt_response_id: str | None = None
 
 
 @dataclass
@@ -955,6 +964,22 @@ class RolloutReassembler:
             metrics["finalize/valid_logical_owner_count"] = float(
                 logical.valid_owner_count
             )
+        if logical_selections is not None:
+            # token_capture.max_rows_per_rollout: owners it trimmed, and what it
+            # left untrained. Zero when the cap is off or never binds.
+            metrics["finalize/row_cap_capped_rollouts"] = float(
+                sum(
+                    1
+                    for selection in logical_selections
+                    if selection.row_cap_dropped_rows
+                )
+            )
+            metrics["finalize/row_cap_dropped_rows"] = float(
+                sum(selection.row_cap_dropped_rows for selection in logical_selections)
+            )
+            metrics["finalize/row_cap_dropped_calls"] = float(
+                sum(selection.row_cap_dropped_calls for selection in logical_selections)
+            )
         # Per-row counts are pooled by the consuming controller once per
         # committed group, alongside the retained reward observations;
         # rejected placeholders never enter this population.
@@ -1481,6 +1506,15 @@ class RolloutReassembler:
                 raise ValueError(
                     "Selected response is missing or ambiguous in the capture manifest"
                 )
+            prompt_response_id = selection.prompt_response_id
+            if prompt_response_id is not None and (
+                prompt_response_id in selected
+                or prompt_response_id not in by_response
+                or by_response[prompt_response_id].parent_call_id is not None
+            ):
+                raise ValueError(
+                    "Grouping prompt must name an unselected captured root"
+                )
             # Selection supplies membership and semantic root order. Completion
             # order in the manifest says nothing about independent branches.
             positions = {
@@ -1561,6 +1595,7 @@ class RolloutReassembler:
                             flags_by_call[record.model_call_id] for record in chain
                         ),
                         truncated=selection.truncated,
+                        prompt_response_id=(None if owner_plan else prompt_response_id),
                     )
                 )
             plans.append(owner_plan)
@@ -1614,9 +1649,8 @@ class RolloutReassembler:
             if not segments:
                 raise ValueError(f"{owner_id}: missing initial prompt evidence")
             rebuilt = []
-            scored_call = RolloutReceipt.model_validate(
-                receipts[slot]
-            ).terminal_model_call_id
+            owner_receipt = RolloutReceipt.model_validate(receipts[slot])
+            scored_call = owner_receipt.terminal_model_call_id
             reward_row: FinalizedRollout | None = None
             parsed_receipts = []
             owner_valid = True
@@ -1709,12 +1743,19 @@ class RolloutReassembler:
             first = rebuilt[0]
             parsed = parsed_receipts[0]
             selected = segments[0].selected_response_ids
+            # A row cap can leave the owner's first root unselected; the
+            # selection then names it, and the prompt comes from the full receipt.
+            prompt_response = segments[0].prompt_response_id
             roots = (
                 [
                     record
-                    for record in parsed.manifest
+                    for record in (
+                        parsed.manifest
+                        if prompt_response is None
+                        else owner_receipt.manifest
+                    )
                     if selected
-                    and record.response_id == selected[0]
+                    and record.response_id == (prompt_response or selected[0])
                     and record.parent_call_id is None
                 ]
                 if parsed
@@ -1728,7 +1769,7 @@ class RolloutReassembler:
             if failed_capture:
                 # Grouping uses dispatch identity, not these non-training tokens.
                 original_prompt = [self._pad_token_id]
-            elif first.valid:
+            elif first.valid and prompt_response is None:
                 if first.model_call_ids[0] != roots[0].model_call_id:
                     raise ValueError(
                         f"{owner_id}: selected initial root disagrees with receipt"
@@ -1736,7 +1777,8 @@ class RolloutReassembler:
                 original_prompt = first.token_ids[: first.prompt_len]
             else:
                 # Only recover grouping identity, never training validity, from
-                # a sound selected root when a later call poisoned segment zero.
+                # a sound root when a later call poisoned segment zero or the
+                # row cap left that root unselected.
                 root_receipt = RolloutReceipt(
                     capture_key=segments[0].capture_rollout_id,
                     manifest=roots,
