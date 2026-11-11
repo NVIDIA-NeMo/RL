@@ -921,6 +921,8 @@ class TestSetup:
         mc.policy.update(
             {
                 "precision": "bfloat16",
+                "sequence_packing": {"enabled": False},
+                "dynamic_batching": {"enabled": False},
                 "automodel_cfg": {
                     "enabled": True,
                     "tensor_parallel_size": 1,
