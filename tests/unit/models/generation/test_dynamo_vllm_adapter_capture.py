@@ -22,6 +22,7 @@ faked.
 import base64
 import pickle
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -34,11 +35,18 @@ pytest.importorskip("vllm")
 pytest.importorskip("nemo_gym.token_id_capture.staging")
 
 from dynamo.llm.exceptions import InvalidArgument  # noqa: E402
+from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
+    GenerationCutInventory,
+    GenerationCutPrefix,
+)
 from nemo_gym.token_id_capture import NG_COMMIT_COORDS_FIELD  # noqa: E402
 from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter  # noqa: E402
 from nemo_gym.token_id_capture.replay import (  # noqa: E402
     replay_context,
     summarize_replay,
+)
+from nemo_gym.token_id_capture.staging.capture import (  # noqa: E402
+    RolloutTokenCapture,
 )
 from nemo_gym.token_id_capture.staging.records import CaptureAdmission  # noqa: E402
 from vllm.multimodal.inputs import PlaceholderRange  # noqa: E402
@@ -48,6 +56,12 @@ from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache  # noqa: E402
 from nemo_rl.models.generation.dynamo.vllm import (  # noqa: E402
     adapter as vllm_adapter,
 )
+from nemo_rl.models.generation.dynamo.vllm.generation_cut import (  # noqa: E402
+    CUT_PREFIXES_KEY,
+    GENERATION_CUT_ANNOTATION,
+    INVENTORY_KEY,
+)
+from nemo_rl.models.generation.prefix_recovery import NoPrefixRecovery  # noqa: E402
 from nemo_rl.models.generation.vllm.utils import R3_MISSING_ROUTE_SENTINEL  # noqa: E402
 from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
     routed_experts_tensor_metadata,
@@ -65,6 +79,11 @@ from tests.unit.models.generation.test_dynamo_vllm_adapter import (  # noqa: E40
     _host,
     _logprob,
     _output,
+)
+from tests.unit.models.generation.test_vllm_token_capture_hosting import (  # noqa: E402
+    _active_call_inventory,
+    _cuts,
+    _MemorySink,
 )
 
 COORDS = {"staging_key": "rollout-1/c2"}
@@ -98,9 +117,23 @@ class _Capture:
         self.attachments: list[dict | None] = []
         self.failed: list[str] = []
 
-    def begin_call(self, admission, *, prefix_token_ids, stream):
+    def begin_call(
+        self,
+        admission,
+        *,
+        prefix_token_ids,
+        generation_cut,
+        generation_cut_staging_keys,
+        stream,
+    ):
+        del generation_cut_staging_keys
         self.begun.append((admission, prefix_token_ids, stream))
-        return SimpleNamespace(admission=admission)
+        return SimpleNamespace(
+            admission=admission,
+            model_call_id=admission.model_call_id,
+            capture_key=admission.capture_key,
+            generation_cut=generation_cut,
+        )
 
     def complete_call_from_response(self, call, payload, attachments=None):
         self.staged.append(payload)
@@ -179,7 +212,7 @@ def test_a_captured_token_in_call_is_staged_from_the_engine() -> None:
     # Only the commit coordinates go back through the frontend, beside the text.
     assert chunk["engine_data"]["result"] == {NG_COMMIT_COORDS_FIELD: COORDS}
     assert "logprobs" not in chunk["engine_data"]["output"]
-    assert host._capture_calls == {}
+    assert len(host._capture_registry) == 0
 
 
 def test_a_captured_call_stages_the_samplers_top_k_for_score_centering() -> None:
@@ -276,7 +309,7 @@ def test_a_call_that_does_not_finish_cleanly_fails_its_capture(
 
     assert host.token_capture.staged == []
     assert host.token_capture.failed == [reason]
-    assert host._capture_calls == {}
+    assert len(host._capture_registry) == 0
 
 
 def _multimodal(placeholders: list[PlaceholderRange]) -> str:
@@ -366,3 +399,67 @@ def test_a_captured_media_call_stages_the_media_the_engine_ran_on() -> None:
     (payload,) = host.token_capture.staged
     assert payload["prompt_token_ids"] == processed
     assert chunk["engine_data"]["result"] == {NG_COMMIT_COORDS_FIELD: COORDS}
+
+
+def test_an_engine_answers_a_cut_with_the_calls_it_cut() -> None:
+    sink = _MemorySink()
+    host = _host(_FakeLLM())
+    host._capture_sink = sink
+    host.token_capture = RolloutTokenCapture(
+        sink=sink, weight_version_fn=lambda: 0, adapter=VLLMCaptureAdapter()
+    )
+    _cuts(host)
+    inventory, _ = _active_call_inventory(host, ("held", [12, 13]))
+    # The frontend sends every engine the whole inventory: one call here,
+    # one that another engine holds.
+    inventory = GenerationCutInventory.build(
+        checkpoint_id=inventory.checkpoint_id,
+        server_name=inventory.server_name,
+        active_prefixes=[
+            *inventory.active_prefixes,
+            GenerationCutPrefix(
+                ticket_id="ticket-elsewhere",
+                rollout_id="r9",
+                attempt=0,
+                model_call_id="elsewhere",
+                admitted_at=1.0,
+            ),
+        ],
+    )
+
+    (chunk,) = _collect(
+        vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0),
+        {
+            "token_ids": [],
+            "annotations": [GENERATION_CUT_ANNOTATION],
+            "extra_args": {INVENTORY_KEY: inventory.model_dump(mode="json")},
+        },
+    )
+
+    (ack,) = chunk["engine_data"][CUT_PREFIXES_KEY]
+    assert (ack["model_call_id"], ack["disposition"]) == ("held", "durable_prefix")
+    assert ack["prefix_token_count"] == 2
+    # The cut's rows are in TQ before the engine answers.
+    assert ack["staging_keys"] == sink.generation_prefix_keys
+
+
+def test_a_captured_call_records_what_a_cut_needs() -> None:
+    """A checkpoint cuts only a call whose output budget and progress it knows."""
+    final = _output([1, 3, 4], _completion([10, 11], "stop"))
+    llm = _FakeLLM([final])
+    host = _capturing_host(llm)
+    host._prefix_recovery = MagicMock(wraps=NoPrefixRecovery())
+
+    _collect(
+        vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0),
+        _captured_call([1, 3, 4], TEXT),
+    )
+
+    ((_, params, _, _),) = llm.calls
+    ((chat, recorded_params),) = [
+        call.args for call in host._prefix_recovery.on_sampling_params.call_args_list
+    ]
+    assert recorded_params is params
+    assert [call.args for call in host._prefix_recovery.observe.call_args_list] == [
+        (chat, final)
+    ]

@@ -123,6 +123,38 @@ the fields both paths exchange with Gym. `tests/unit/models/generation/test_gym_
 sends the same calls through the native routes and through this path and
 checks they match step for step.
 
+### Prefix recovery
+
+With `rollout_recovery.target_level: prefix`, a checkpoint cuts each running
+call (its decoded tokens are staged in TQ), and a restore resumes it from
+those tokens. The engines hold the calls and the worker-side state
+(`models/generation/prefix_recovery`), so both halves run there, with the
+native server's code:
+
+- **The cut.** NeMo-Gym posts it beside the URL its calls go to, the
+  frontend. A Dynamo frontend route can only be a synchronous GET, so
+  `dynamo/vllm/frontend.py` also wraps `DistributedRuntime` and serves the
+  native route (`vllm/generation_cut_route.py`) on a second port, in the
+  frontend process (`dynamo/vllm/generation_cut.py`). It sends the cut to
+  every engine with `Client.direct`; the adapter's `nemo_rl:generation_cut`
+  handler runs the worker's own cut and answers with the calls it cut; and
+  the answers are merged into the one receipt Gym expects. A call no engine
+  cut gets Gym's failure ack and regenerates after a restore.
+- **The resume.** The frontend renders and routes a re-sent call like any
+  other. The adapter then runs the steps the native server runs
+  (`resolve_restored_call` and its helpers in `vllm/chat_server.py`): it
+  reads and checks the saved rows, replaces the prompt with them, lowers the
+  output budget, and begins capture with the cut. A cut it cannot use (rows
+  gone, or newer than its weights) is dropped, and the frontend's prompt
+  runs. The engine's reply names what it resumed from, and the render pool
+  puts the saved text back before vLLM's parsers run and counts the saved
+  tokens as output (`prefix_recovery/restore.py`).
+
+The resolve is in the engine, not the frontend, because the check needs the
+engine's weight version and its capture state, and a cut the engine drops then
+needs no second pass through the frontend. The cost is that the KV router
+scores a resumed call on the prompt without its saved tokens.
+
 ## Driver
 
 `VllmGeneration` starts `ManagedDynamoRuntime`, which runs etcd, NATS and

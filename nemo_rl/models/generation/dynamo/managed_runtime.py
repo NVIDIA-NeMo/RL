@@ -35,7 +35,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, NamedTuple, Sequence
 
 import ray
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -219,10 +219,28 @@ class _ServiceProcess:
 
 # The frontend process's environment for NeMo RL's chat engine
 # (dynamo/vllm/chat_engine.py): its render workers, where setup_token_capture
-# writes the capture config, and the Ray cluster its TQ reads go through.
+# writes the capture config, the Ray cluster its TQ reads go through, and the
+# port it takes NeMo-Gym's generation cuts on (dynamo/vllm/generation_cut.py).
 RENDER_WORKERS_ENV = "NEMO_RL_DYNAMO_RENDER_WORKERS"
 CAPTURE_FILE_ENV = "NEMO_RL_DYNAMO_CAPTURE_FILE"
 RAY_ADDRESS_ENV = "NEMO_RL_DYNAMO_RAY_ADDRESS"
+GENERATION_CUT_PORT_ENV = "NEMO_RL_DYNAMO_GENERATION_CUT_PORT"
+
+
+def read_chat_capture() -> dict[str, Any] | None:
+    """What ``publish_chat_capture`` wrote for this frontend; None before it has."""
+    path = os.environ[CAPTURE_FILE_ENV]
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as capture_file:
+        return pickle.load(capture_file)
+
+
+class FrontendUrls(NamedTuple):
+    """Where one frontend serves OpenAI calls and takes NeMo-Gym's generation cuts."""
+
+    base_url: str
+    generation_cut_control_url: str
 
 
 class FrontendHost:
@@ -244,11 +262,16 @@ class FrontendHost:
         namespace: str,
         dynamo_cfg: DynamoCfg,
         env: dict[str, str],
-    ) -> str:
-        """Launch the frontend on a free port of this node; return its OpenAI base URL."""
+    ) -> FrontendUrls:
+        """Launch the frontend on free ports of this node; return where it serves."""
         port = _get_free_port_local(
             DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
             DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
+            max_retries=None,
+        )
+        generation_cut_port = _get_free_port_local(
+            DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW,
+            DEFAULT_DYNAMO_CONTROL_PORT_RANGE_HIGH,
             max_retries=None,
         )
         argv = frontend_argv(
@@ -264,10 +287,14 @@ class FrontendHost:
         self._chat_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_chat_")
         frontend_env = _service_env(env)
         frontend_env[CAPTURE_FILE_ENV] = os.path.join(self._chat_dir, "capture.pkl")
+        frontend_env[GENERATION_CUT_PORT_ENV] = str(generation_cut_port)
         self._process = _ServiceProcess(command, env=frontend_env, label="frontend")
         host = _get_node_ip_local()
         host = f"[{host}]" if ":" in host else host
-        return f"http://{host}:{port}/v1"
+        return FrontendUrls(
+            base_url=f"http://{host}:{port}/v1",
+            generation_cut_control_url=f"http://{host}:{generation_cut_port}",
+        )
 
     def publish_chat_capture(self, capture: dict[str, Any]) -> None:
         """Write the token-capture config this frontend's chat engine reads."""
@@ -347,6 +374,7 @@ class ManagedDynamoRuntime:
         self._nats_process: _ServiceProcess | None = None
         self._frontend_hosts: list[ray.actor.ActorHandle] = []
         self._frontend_urls: list[str] = []
+        self._generation_cut_urls: list[str] = []
         self._etcd_data_dir: str | None = None
         self._nats_data_dir: str | None = None
 
@@ -360,6 +388,16 @@ class ManagedDynamoRuntime:
         if not self._started:
             raise RuntimeError("Managed Dynamo runtime has not been started")
         return list(self._frontend_urls)
+
+    @property
+    def generation_cut_control_urls(self) -> list[str]:
+        """Where each frontend takes NeMo-Gym's checkpoint generation cuts.
+
+        One per ``frontend_urls`` entry, in the same order.
+        """
+        if not self._started:
+            raise RuntimeError("Managed Dynamo runtime has not been started")
+        return list(self._generation_cut_urls)
 
     @property
     def engine_env(self) -> dict[str, str]:
@@ -525,7 +563,7 @@ class ManagedDynamoRuntime:
                     )
                 ).remote()
             )
-        self._frontend_urls = ray.get(
+        started: list[FrontendUrls] = ray.get(
             [
                 host.start.remote(
                     frontend_python=self._frontend_python,
@@ -536,6 +574,10 @@ class ManagedDynamoRuntime:
                 for host in self._frontend_hosts
             ]
         )
+        self._frontend_urls = [urls.base_url for urls in started]
+        self._generation_cut_urls = [
+            urls.generation_cut_control_url for urls in started
+        ]
 
     def publish_chat_capture(
         self,
@@ -543,11 +585,15 @@ class ManagedDynamoRuntime:
         dp_cfg: dict[str, Any],
         staging_partition: str,
         capture_media: bool,
+        generation_cut_control_token: str | None,
+        generation_cut_control_timeout_s: float | None,
     ) -> None:
         """Tell every frontend's chat engine where token-capture prefixes are read.
 
         Capture is set up after the engines register, so each chat engine reads
-        this on its first captured call.
+        this on its first captured call. ``generation_cut_control_token`` is the
+        bearer token a generation cut must carry, None to refuse every cut;
+        ``generation_cut_control_timeout_s`` bounds one cut across the engines.
         """
         if not self._started:
             raise RuntimeError("Managed Dynamo runtime has not been started")
@@ -555,6 +601,8 @@ class ManagedDynamoRuntime:
             "data_plane": dp_cfg,
             "staging_partition": staging_partition,
             "capture_media": capture_media,
+            "generation_cut_control_token": generation_cut_control_token,
+            "generation_cut_control_timeout_s": generation_cut_control_timeout_s,
         }
         ray.get(
             [host.publish_chat_capture.remote(capture) for host in self._frontend_hosts]
@@ -685,6 +733,7 @@ class ManagedDynamoRuntime:
                 LOGGER.exception("Failed to stop a managed Dynamo frontend")
         self._frontend_hosts = []
         self._frontend_urls = []
+        self._generation_cut_urls = []
         try:
             if self._nats_process is not None:
                 self._nats_process.stop()

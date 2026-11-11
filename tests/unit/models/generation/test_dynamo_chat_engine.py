@@ -103,7 +103,7 @@ class _Pool:
             raise self.error
         return self.rendered
 
-    async def respond(self, request, prompt_token_ids, output) -> dict:
+    async def respond(self, request, prompt_token_ids, output, restored=None) -> dict:
         self.responded.append((request, prompt_token_ids, output))
         return self.reply
 
@@ -452,6 +452,9 @@ def test_dynamos_frontend_still_builds_its_entrypoint_by_the_name_nemo_rl_wraps(
     # chat_engine_factory; if Dynamo stops reading it there, Dynamo's own
     # preprocessor serves chat and every NeMo-Gym call is refused.
     assert "EntrypointArgs" in frontend_main.async_main.__code__.co_names
+    # It swaps this one to serve NeMo-Gym's generation cuts from the frontend's
+    # runtime; if Dynamo stops reading it there, every cut gets a 404.
+    assert "DistributedRuntime" in frontend_main.async_main.__code__.co_names
 
 
 def test_only_nemo_rls_engines_are_served() -> None:

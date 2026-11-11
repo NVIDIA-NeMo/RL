@@ -45,6 +45,10 @@ pytest.importorskip("nemo_gym.token_id_capture.staging")
 import httpx  # noqa: E402
 from dynamo.llm.exceptions import HttpError  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
+from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
+    GenerationCutInventory,
+    GenerationCutPrefix,
+)
 from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter  # noqa: E402
 from nemo_gym.token_id_capture.replay import (  # noqa: E402
     replay_context,
@@ -79,9 +83,18 @@ from nemo_rl.models.generation.dynamo.vllm.render_pool import RenderPool  # noqa
 from nemo_rl.models.generation.gym_call import (  # noqa: E402
     GYM_EXTRAS_ANNOTATION_PREFIX,
 )
+from nemo_rl.models.generation.prefix_recovery.restore import (  # noqa: E402
+    _build_restored_prefix_terminal_output,
+    restored_terminal,
+)
 from nemo_rl.models.generation.vllm import chat_server  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
+)
+from tests.unit.models.generation.test_vllm_token_capture_hosting import (  # noqa: E402
+    _cuts,
+    _MemoryPrefixSource,
+    _MemorySink,
 )
 
 MAX_MODEL_LEN = 512
@@ -226,11 +239,20 @@ class _Engine:
         self.errored = False
         self._kit = kit
         self.runs: list[tuple[list[int], Any, Any]] = []
+        # How many of REPLY's tokens the prompt already ends with: a call
+        # resumed from a checkpoint cut generates only the rest.
+        self.resumed = 0
 
     async def generate(self, prompt, sampling_params, request_id, **kwargs):
         prompt_token_ids = list(prompt["prompt_token_ids"])
         self.runs.append((prompt_token_ids, sampling_params, _media(prompt)))
-        reply_ids = self._kit.ids(REPLY)
+        terminal = restored_terminal()
+        if terminal is not None:
+            # As the worker's engine client answers a call whose saved prefix
+            # had already finished it: without decoding.
+            yield _build_restored_prefix_terminal_output(request_id, terminal)
+            return
+        reply_ids = self._kit.ids(REPLY)[self.resumed :]
         logprobs = None
         if sampling_params.logprobs is not None:
             decode = self._kit.tokenizer.decode
@@ -250,7 +272,9 @@ class _Engine:
             outputs=[
                 CompletionOutput(
                     index=0,
-                    text=REPLY,
+                    text=self._kit.tokenizer.decode(reply_ids)
+                    if self.resumed
+                    else REPLY,
                     token_ids=reply_ids,
                     cumulative_logprob=None,
                     logprobs=logprobs,
@@ -335,13 +359,13 @@ class _Outcome:
 
 def _host(kit: _Kit, deltas: dict[str, list[int]], top_logprobs: int):
     host = object.__new__(VllmAsyncGenerationWorkerImpl)
+    host._init_token_capture_state()
     host.cfg = kit.generation
     host.llm = host._http_engine_client = _Engine(kit)
     host.llm_async_engine_args = kit.engine_args
     host.model_name = "model"
     host.routed_experts_dtype = torch.int16
     host._capture_media = kit.capture_media
-    host._capture_calls = {}
     host._capture_top_logprobs = top_logprobs
     host._staging_source = None
     host._rollout_weight_version = 0
@@ -873,3 +897,183 @@ def test_a_measure_call_counts_the_prompt_the_call_would_run(kits, observation) 
         dynamo.reply["nvext"]["nemo_rl"]["prompt_token_count"] == native.reply["count"]
     )
     assert dynamo.runs == []
+
+
+def _cut_call(
+    kit: _Kit, prompt_token_ids: list[int], saved: int, *, output_limit: int
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Cut a call that has generated ``saved`` of REPLY's tokens, as a checkpoint does.
+
+    Returns the cut's staged rows by key, and the continuation Gym puts in the
+    admission of the call it re-sends after a restore.
+    """
+    host, _, _ = _host(kit, {}, 0)
+    sink = _MemorySink()
+    host._capture_sink = sink
+    request = SimpleNamespace(ng_capture=_admission(mode="text"), stream=False)
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        host, request, prompt_token_ids
+    )
+    state = host._capture_registry.get(request)
+    state.set_effective_output_limit(output_limit)
+    reply_ids = kit.ids(REPLY)
+    state.record(
+        reply_ids[:saved],
+        [-0.5] * saved,
+        finish_reason="stop" if saved == len(reply_ids) else None,
+    )
+    (ack,) = (
+        _cuts(host, tokenizer=kit.tokenizer)
+        .checkpoint_cut(
+            GenerationCutInventory.build(
+                checkpoint_id="checkpoint-1",
+                server_name="policy_model",
+                active_prefixes=[
+                    GenerationCutPrefix(
+                        ticket_id="ticket-1",
+                        rollout_id="rollout-1",
+                        attempt=0,
+                        model_call_id="c2",
+                        admitted_at=1.0,
+                    )
+                ],
+            )
+        )
+        .prefixes
+    )
+    assert ack.disposition == "durable_prefix"
+    (cut_key,) = ack.staging_keys
+    cut_record = sink.generation_prefix_records[-1][1]
+    return {cut_key: cut_record}, {
+        "source_capture_key": "rollout-1",
+        "source_model_call_id": "c2",
+        "staging_keys": [cut_key],
+        "prefix_token_count": ack.prefix_token_count,
+        "prefix_digest": cut_record.digest,
+        "effective_output_limit": ack.effective_output_limit,
+        "terminal_finish_reason": ack.terminal_finish_reason,
+        "terminal_stop_reason": ack.terminal_stop_reason,
+    }
+
+
+def _restored_host(kit: _Kit, records: dict[str, Any], resumed: int):
+    """A host after a restore: fresh, with the cut's rows in TQ."""
+    host, sink, failed = _host(kit, {}, 0)
+    host._capture_sink = _MemorySink()
+    _cuts(
+        host,
+        staging_source=_MemoryPrefixSource({}, records=records),
+        tokenizer=kit.tokenizer,
+    )
+    host.llm.resumed = resumed
+    return host, sink, failed
+
+
+def _reply_text(saved: int, kit: _Kit) -> str:
+    return kit.tokenizer.decode(kit.ids(REPLY)[:saved])
+
+
+@pytest.mark.parametrize(
+    ("cut_after", "rows_kept"),
+    [
+        # The cut lands inside the reasoning, ...
+        ("<think>\nchecking", True),
+        # ... after it ended, so the reasoning parser must see the saved part, ...
+        ("</think>\n\n<tool_call>", True),
+        # ... inside the tool call's JSON, ...
+        ('{"name": "get_weather"', True),
+        # ... or after the call had finished: nothing is left to decode.
+        (REPLY, True),
+        # A cut whose rows are gone is dropped, and the call regenerates.
+        ("</think>\n\n<tool_call>", False),
+    ],
+    ids=["in_reasoning", "after_reasoning", "in_tool_call", "finished", "rows_gone"],
+)
+def test_a_call_cut_at_a_checkpoint_resumes_to_the_uninterrupted_reply(
+    kits, cut_after: str, rows_kept: bool
+) -> None:
+    kit = kits("qwen3")
+    reply_ids = kit.ids(REPLY)
+    # The cut saved the tokens up to the end of ``cut_after``.
+    saved = next(
+        count
+        for count in range(1, len(reply_ids) + 1)
+        if cut_after in _reply_text(count, kit)
+    )
+    body = {
+        "model": kit.path,
+        "messages": [*HISTORY, OBSERVATION],
+        "tools": TOOLS,
+        "temperature": 0.7,
+        "top_p": 0.9,
+        "max_tokens": 64,
+        "logprobs": True,
+        "top_logprobs": 0,
+        "ng_capture": _admission(mode="text"),
+    }
+    # Each path in a task of its own, as each request has on a server: a
+    # finished prefix is marked in a context variable.
+    whole = asyncio.run(_native(kit, *_host(kit, {}, 0), body, measure=False))
+    ((prompt, params, _),) = whole.runs
+    ((whole_record, _),) = whole.staged
+    records, continuation = _cut_call(
+        kit, prompt, saved, output_limit=params.max_tokens
+    )
+    resumed = saved if rows_kept else 0
+    extras = {
+        "ng_capture": CaptureAdmission(
+            capture_key="rollout-1-a1",
+            model_call_id="c3",
+            mode="text",
+            generation_cut=continuation,
+        ).model_dump(mode="json")
+    }
+    rows = records if rows_kept else {}
+    native = asyncio.run(
+        _native(
+            kit, *_restored_host(kit, rows, resumed), {**body, **extras}, measure=False
+        )
+    )
+    dynamo = asyncio.run(
+        _dynamo(kit, *_restored_host(kit, rows, resumed), {**body, **extras}, extras)
+    )
+
+    assert (native.status, dynamo.status) == (200, 200), (native.reply, dynamo.reply)
+    # The engine ran the saved rows as its prompt, with the budget that is left.
+    ((native_prompt, native_params, _),) = native.runs
+    ((dynamo_prompt, dynamo_params, _),) = dynamo.runs
+    assert native_prompt == dynamo_prompt == prompt + reply_ids[:resumed]
+    assert dynamo_params == native_params
+    if resumed < len(reply_ids):
+        assert native_params.max_tokens == params.max_tokens - resumed
+    # Capture staged one row for the call: the saved tokens, then the rest.
+    for outcome in (native, dynamo):
+        ((record, _),) = outcome.staged
+        assert record.token_ids_delta == whole_record.token_ids_delta
+        assert record.token_mask_delta == whole_record.token_mask_delta
+        assert (
+            record.generation_log_probs_delta == whole_record.generation_log_probs_delta
+        )
+        assert outcome.failed == []
+    # Gym reads the reply the uninterrupted call gave.
+    whole_choice = whole.reply["choices"][0]
+    native_choice = native.reply["choices"][0]
+    (dynamo_choice,) = dynamo.reply["choices"]
+    for choice, message in (
+        (native_choice, native_choice["message"]),
+        (dynamo_choice, dynamo_choice["delta"]),
+    ):
+        assert choice["finish_reason"] == whole_choice["finish_reason"]
+        assert message["content"] == whole_choice["message"]["content"]
+        assert (
+            message.get("reasoning", message.get("reasoning_content"))
+            == whole_choice["message"]["reasoning"]
+        )
+        assert [call["function"] for call in message["tool_calls"]] == [
+            call["function"] for call in whole_choice["message"]["tool_calls"]
+        ]
+    counts = ("prompt_tokens", "completion_tokens", "total_tokens")
+    for usage in (native.reply["usage"], dynamo.reply["usage"]):
+        assert [usage[count] for count in counts] == [
+            whole.reply["usage"][count] for count in counts
+        ]

@@ -122,6 +122,27 @@ Where the behavior differs from the native endpoint:
   dialect moves it back to the header, so the harness sees the native error.
 - A call's processed media travels to the engine inside the request.
 
+### Rollout recovery
+
+`rollout_recovery.target_level: turn` and `prefix` work through Dynamo with no
+extra setting. With `prefix`, NeMo-Gym asks the generation backend to cut its
+running calls at each checkpoint, and re-sends each cut call after a restore.
+Two things differ from the native endpoint:
+
+- **Where the cut goes.** Gym sends the cut beside the URL its calls go to,
+  which is a frontend, but the calls run in the engines. Each frontend process
+  takes the cut on a port of its own, from the same range as etcd and NATS, and
+  sends it to every engine over Dynamo's request plane; each engine cuts the
+  calls it holds. Setup tells Gym each frontend's port
+  (`generation_cut_control_url` in Gym's `vllm_model` config, one per
+  `base_url`). The port is needed until a Dynamo frontend route can take a POST
+  ([ai-dynamo/dynamo#18486](https://github.com/ai-dynamo/dynamo/issues/18486)).
+- **What the router sees for a resumed call.** The engine replaces the prompt
+  the frontend sent with the call's saved tokens and generates the rest, and
+  the frontend puts the saved text back in front of the reply. So the KV router
+  scores that one call on a prompt without the saved tokens. A cut the engine
+  cannot use is dropped and the call regenerates, as natively.
+
 ## Not supported
 
 Startup rejects these with `dynamo: true`:

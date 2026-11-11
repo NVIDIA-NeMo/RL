@@ -39,12 +39,28 @@ import uuid
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, TypedDict
 
 LOGGER = logging.getLogger(__name__)
 
 # Set in each worker process by _init_worker.
 _WORKER: Optional["_Worker"] = None
+
+
+class RestoredReply(TypedDict):
+    """What the engine resumed a call from, after a checkpoint cut it.
+
+    The engine swaps the frontend's prompt for the saved rows and generates
+    only the rest, so the reply needs these to read as the whole call's.
+    """
+
+    # The prompt the engine ran: the capture prefix, then the saved rows.
+    prompt_token_ids: list[int]
+    # The saved rows' generated tokens, which the reply's text and usage count.
+    token_ids: list[int]
+    # The saved prefix's finish, when it had already ended the call:
+    # ``_RestoredPrefixTerminal``'s fields without the prompt.
+    terminal: Optional[dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -266,6 +282,7 @@ class _Worker:
         request: dict[str, Any],
         prompt_token_ids: list[int],
         output: dict[str, Any],
+        restored: Optional[RestoredReply] = None,
     ) -> dict[str, Any]:
         from vllm.entrypoints.generate.base.protocol import RequestResponseMetadata
         from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -274,11 +291,31 @@ class _Worker:
         from vllm.logprobs import Logprob
         from vllm.outputs import CompletionOutput, RequestOutput
 
+        from nemo_rl.models.generation.prefix_recovery.restore import (
+            _RestoredPrefixTerminal,
+            restore_reply_text,
+            restore_reply_usage,
+            wrap_parser_for_restore,
+        )
         from nemo_rl.models.generation.vllm.chat_server import (
             chat_request_from_render,
         )
 
         chat = chat_request_from_render(request)
+        resumed_token_ids: list[int] = []
+        terminal = None
+        if restored is not None:
+            # The engine resumed this call from the tokens a checkpoint cut
+            # saved: it ran this prompt and generated only the rest.
+            prompt_token_ids = restored["prompt_token_ids"]
+            resumed_token_ids = restored["token_ids"]
+            # The engine lowered its own copy's min_tokens, never this one.
+            chat._original_min_tokens = chat.min_tokens
+            if restored["terminal"] is not None:
+                terminal = _RestoredPrefixTerminal(
+                    prompt_token_ids=tuple(prompt_token_ids), **restored["terminal"]
+                )
+                chat._restored_prefix_terminal = terminal
         logprobs = None
         if output.get("logprobs") is not None:
             logprobs = [
@@ -309,6 +346,17 @@ class _Worker:
             finished=True,
         )
 
+        if restored is not None:
+            # Before vLLM parses the reply, so tool calls and reasoning are
+            # parsed from the whole call's text.
+            restore_reply_text(
+                chat,
+                request_output,
+                prefix_token_ids=resumed_token_ids,
+                engine_prompt_token_ids=prompt_token_ids,
+                tokenizer=self.tokenizer,
+            )
+
         async def results():
             yield request_output
 
@@ -321,11 +369,14 @@ class _Worker:
                 [],
                 self.tokenizer,
                 RequestResponseMetadata(request_id=request_output.request_id),
-                parser=self._parser(chat),
+                parser=wrap_parser_for_restore(self._parser(chat), resumed_token_ids),
             )
         )
         if not isinstance(response, ChatCompletionResponse):
             raise ValueError(f"vLLM could not build the reply: {response}")
+        restore_reply_usage(
+            response, restored_token_count=len(resumed_token_ids), terminal=terminal
+        )
         return response.model_dump(mode="json", exclude_none=True)
 
 
@@ -344,10 +395,13 @@ def _render(body: dict[str, Any], measure: bool) -> RenderedCall:
 
 
 def _respond(
-    request: dict[str, Any], prompt_token_ids: list[int], output: dict[str, Any]
+    request: dict[str, Any],
+    prompt_token_ids: list[int],
+    output: dict[str, Any],
+    restored: Optional[RestoredReply],
 ) -> dict[str, Any]:
     assert _WORKER is not None
-    return _WORKER.respond(request, prompt_token_ids, output)
+    return _WORKER.respond(request, prompt_token_ids, output, restored)
 
 
 def _info() -> dict[str, Any]:
@@ -419,8 +473,10 @@ class RenderPool:
         request: dict[str, Any],
         prompt_token_ids: list[int],
         output: dict[str, Any],
+        restored: Optional[RestoredReply] = None,
     ) -> dict[str, Any]:
-        return await self._submit(_respond, request, prompt_token_ids, output)
+        """Build the reply; ``restored`` is the engine's ``RestoredReply``, if any."""
+        return await self._submit(_respond, request, prompt_token_ids, output, restored)
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)

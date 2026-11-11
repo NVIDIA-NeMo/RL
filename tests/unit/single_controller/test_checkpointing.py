@@ -124,6 +124,7 @@ from nemo_rl.environments.gym_checkpoint_coordinator import (
 from nemo_rl.experience.rollout_recovery import (
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
     ROLLOUT_RECOVERY_STATE_FILENAME,
+    RecoveryTargetLevel,
     RolloutRecoveryLedger,
 )
 from nemo_rl.experience.route_plan import (
@@ -134,6 +135,7 @@ from nemo_rl.experience.route_plan import (
 from nemo_rl.telemetry.vocabulary import TELEMETRY_WALL_TIME_METRIC
 from nemo_rl.utils.checkpoint import CheckpointManager
 from nemo_rl.utils.logger import LoggerConfig
+from nemo_rl.utils.timer import TimeoutChecker
 
 # Reuse the factory patches from the setup tests (same cross-module fixture
 # import pattern as test_rollout_pump.py).
@@ -168,8 +170,9 @@ class _FakeEnvironmentSnapshot:
     def __init__(self) -> None:
         self.checked_cuts: list[Any] = []
 
-    async def check_against_cut(self, cut: Any) -> None:
+    async def check_against_cut(self, cut: Any) -> frozenset[str]:
         self.checked_cuts.append(cut)
+        return frozenset()
 
     def metrics(self, paused_seconds: float) -> dict[str, float]:
         return {"environment_paused_seconds": paused_seconds}
@@ -598,7 +601,7 @@ class _FakeGeneration:
     def snapshot_step_metrics(self) -> None:
         pass
 
-    def get_step_metrics(self) -> dict[str, float]:
+    def get_step_metrics(self, *, keep_snapshot: bool = False) -> dict[str, float]:
         return {}
 
     def pause_generation_for_refit(
@@ -694,6 +697,12 @@ class _FakeRolloutManager:
 
     def set_weight_version(self, version: int) -> None:
         self.weight_versions.append(version)
+
+    filter_zero_variance_groups = False
+
+    def drain_step_reward_metrics(self, step: int) -> dict[str, float]:
+        del step
+        return {}
 
     def reserve_prompt_group(
         self,
@@ -1668,22 +1677,34 @@ class TestSaveTrigger:
         assert trainer.save_calls == []
         assert _step_dir_names(tmp_path / "checkpoints") == set()
 
-    def test_timeout_saves_and_stops_training_early(self, tmp_path):
-        # 0-second budget: the first check_save() fires; the pump must save
-        # at step 1 (off the period boundary) and break out of the loop.
+    @pytest.mark.parametrize("defer_finalize", [False, True])
+    def test_timeout_saves_and_stops_training_early(self, tmp_path, defer_finalize):
+        # 0-second budget: the first check_save() fires; the pump must save at
+        # step 1 (off the period boundary), snapshot rollouts, then stop.
         mc = _actor_master_config(
             tmp_path,
             max_num_steps=4,
             save_period=100,
             checkpoint_must_save_by="00:00:00:00",
+            defer_finalize=defer_finalize,
         )
         trainer = _FakeTrainer()
+        published_at_snapshot: list[set[str]] = []
 
-        actor = _run_train_pump(mc, _make_actor_args(trainer=trainer))
+        def _seed(actor) -> None:
+            async def _save_at_deadline() -> None:
+                await asyncio.to_thread(actor._checkpointer.finalize_pending)
+                published_at_snapshot.append(_step_dir_names(tmp_path / "checkpoints"))
+
+            actor._rollout_snapshots.save_at_deadline = _save_at_deadline
+
+        actor = _run_train_pump(mc, _make_actor_args(trainer=trainer), seed=_seed)
 
         assert actor._train_steps == 1
         assert len(trainer.save_calls) == 1
         assert trainer.save_calls[0]["is_final_checkpoint"] is False
+        # The deadline snapshot runs once, after step_1 is published.
+        assert published_at_snapshot == [{"step_1"}]
         assert _step_dir_names(tmp_path / "checkpoints") == {"step_1"}
 
     def test_rollout_exhaustion_saves_final_checkpoint(self, tmp_path):
@@ -1850,9 +1871,9 @@ class TestSaveTrigger:
         def _seed(actor):
             publish = actor._publish_when_policy_write_done
 
-            async def _record(checkpoint_path):
+            async def _record(checkpoint_path, **kwargs):
                 at_publish.append(_files(checkpoint_path))
-                await publish(checkpoint_path)
+                await publish(checkpoint_path, **kwargs)
 
             actor._publish_when_policy_write_done = _record
 
@@ -1904,6 +1925,25 @@ class TestSaveTrigger:
         }
 
         with pytest.raises(ValueError, match="rollout_checkpointing"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("on_trainer_checkpoint", [True, False])
+    def test_deferred_finalize_allows_only_deadline_turn_snapshots(
+        self, tmp_path, on_trainer_checkpoint
+    ):
+        """Only a snapshot after each trainer checkpoint needs step_N published early."""
+        mc = _actor_master_config(tmp_path, defer_finalize=True)
+        mc.policy["megatron_cfg"] = {
+            "enabled": True,
+            "checkpoint": {"async_save": True},
+        }
+        mc.rollout_recovery.target_level = RecoveryTargetLevel.TURN
+        mc.rollout_checkpointing.snapshot_on_trainer_checkpoint = on_trainer_checkpoint
+
+        if on_trainer_checkpoint:
+            with pytest.raises(ValueError, match="snapshot_on_trainer_checkpoint"):
+                validate_single_controller_config(mc)
+        else:
             validate_single_controller_config(mc)
 
 
@@ -1992,7 +2032,11 @@ class TestPeriodicRolloutCheckpoint:
             (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).read_text()
         )
         assert manifest["rolled_back_train_group_count"] == int(claimed)
-        assert torch.load(snapshot / "replacement_reserve.pt", weights_only=True) == []
+        # Two pools since dynamic sampling got its own; both empty here.
+        assert torch.load(snapshot / "replacement_reserve.pt", weights_only=True) == {
+            "replacement": [],
+            "filtered": [],
+        }
         restored_state = torch.load(
             snapshot / REPLAY_BUFFER_METADATA_FILENAME, weights_only=False
         )
@@ -2057,6 +2101,27 @@ class TestPeriodicRolloutCheckpoint:
             ),
             SetupTimingMetrics(),
         )
+
+    def _interval_free_actor(self, tmp_path: Path, timeout=None):
+        """An actor snapshotting only on wakeups or the deadline; records ``force``."""
+        actor = self._actor(tmp_path)
+        actor._master_config.rollout_checkpointing.snapshot_attempt_interval_s = None
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint()
+        if timeout is not None:
+            actor._timeout = timeout
+        attach_rollout_checkpointing(actor)
+        forced: list[bool] = []
+        attempted = asyncio.Event()
+
+        async def _save(
+            *, force: bool = False, staged: bool = False
+        ) -> RolloutCheckpointSaveResult:
+            forced.append(force)
+            attempted.set()
+            return RolloutCheckpointSaveResult(saved=True, reason="completed")
+
+        actor._rollout_snapshots.save_snapshot = _save
+        return actor, forced, attempted
 
     @pytest.mark.parametrize(
         "changed_setting", [None, "penalty", "effort", "extras", "inactive"]
@@ -2342,7 +2407,9 @@ class TestPeriodicRolloutCheckpoint:
             done = asyncio.Event()
             calls = 0
 
-            async def _save(*, force: bool = False) -> RolloutCheckpointSaveResult:
+            async def _save(
+                *, force: bool = False, staged: bool = False
+            ) -> RolloutCheckpointSaveResult:
                 nonlocal calls
                 del force
                 reason = reasons[min(calls, len(reasons) - 1)]
@@ -2624,7 +2691,7 @@ class TestPeriodicRolloutCheckpoint:
             )
 
     @pytest.mark.parametrize("checkpoint_kind", ["snapshot", "full"])
-    def test_snapshot_persists_and_restores_pending_finalizer_metrics(
+    def test_snapshot_persists_and_restores_pending_step_state(
         self, tmp_path: Path, checkpoint_kind: str
     ):
         """Only canonical groups' pending statistics are saved; restore keeps them."""
@@ -2635,6 +2702,8 @@ class TestPeriodicRolloutCheckpoint:
         from nemo_rl.experience.rollout_recovery import parse_rollout_recovery_state
 
         actor = self._actor(tmp_path)
+        actor._rollout_runtime.steps_allowed_short = {0}
+        actor._rollout_runtime.batch_shortfall = {0: 1}
         claimed_meta = KVBatchMeta(
             partition_id=_PARTITION_ID,
             task_name=None,
@@ -2687,11 +2756,15 @@ class TestPeriodicRolloutCheckpoint:
         state = torch.load(
             snapshot / ROLLOUT_RECOVERY_STATE_FILENAME, weights_only=True
         )
+        assert state["steps_allowed_short"] == [0]
+        assert state["batch_shortfall"] == {0: 1}
         assert state["finalizer_metrics_by_group"] == {"claimed-group": pending}
         assert parse_rollout_recovery_state(state).finalizer_rewards_by_group == {
             "claimed-group": observations
         }
 
+        actor._rollout_runtime.steps_allowed_short = set()
+        actor._rollout_runtime.batch_shortfall = {}
         actor._rollout_runtime.finalizer_metrics_by_group = {}
         actor._rollout_runtime.finalizer_rewards_by_group = {}
         actor._buffer.training_claims = []
@@ -2710,6 +2783,8 @@ class TestPeriodicRolloutCheckpoint:
         assert actor._rollout_runtime.finalizer_rewards_by_group == {
             "claimed-group": observations
         }
+        assert actor._rollout_runtime.steps_allowed_short == {0}
+        assert actor._rollout_runtime.batch_shortfall == {0: 1}
 
     def test_snapshot_reindexes_rows_owned_by_active_streamed_step(
         self, tmp_path: Path
@@ -2798,7 +2873,7 @@ class TestPeriodicRolloutCheckpoint:
         async def _main() -> None:
             attempted = asyncio.Event()
 
-            async def _save(*, force: bool = False) -> Any:
+            async def _save(*, force: bool = False, staged: bool = False) -> Any:
                 del force
                 attempted.set()
                 return SimpleNamespace(saved=False, reason="no_data_plane_mutations")
@@ -2820,6 +2895,275 @@ class TestPeriodicRolloutCheckpoint:
         finally:
             actor._checkpointer.shutdown()
 
+    @pytest.mark.parametrize("on_trainer_checkpoint", [True, False])
+    def test_pump_without_an_interval_waits_for_a_trainer_checkpoint(
+        self, tmp_path: Path, on_trainer_checkpoint: bool
+    ):
+        actor, forced, attempted = self._interval_free_actor(tmp_path)
+        actor._master_config.rollout_checkpointing.snapshot_on_trainer_checkpoint = (
+            on_trainer_checkpoint
+        )
+        actor._train_steps = 1
+
+        async def _main() -> None:
+            pump = asyncio.create_task(actor._rollout_snapshots.run())
+            try:
+                await asyncio.sleep(0.05)
+                assert forced == []
+                actor._rollout_snapshots.trainer_checkpoint_published(1)
+                if on_trainer_checkpoint:
+                    await asyncio.wait_for(attempted.wait(), timeout=1.0)
+                else:
+                    await asyncio.sleep(0.05)
+            finally:
+                pump.cancel()
+                await asyncio.gather(pump, return_exceptions=True)
+
+        try:
+            asyncio.run(_main())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert forced == ([False] if on_trainer_checkpoint else [])
+
+    def test_pump_without_an_interval_snapshots_at_a_pre_step_deadline(
+        self, tmp_path: Path
+    ):
+        actor, forced, _ = self._interval_free_actor(
+            tmp_path, timeout=TimeoutChecker(timeout="00:00:00:00")
+        )
+        try:
+            asyncio.run(asyncio.wait_for(actor._rollout_snapshots.run(), timeout=5.0))
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert forced == [True]
+        assert actor._rollout_snapshots.stop_requested
+
+    def test_pump_without_an_interval_ignores_a_deadline_wait_after_step_one(
+        self, tmp_path: Path
+    ):
+        """Past step 0 the train pump owns the deadline, so a stale wait saves nothing."""
+        actor, forced, _ = self._interval_free_actor(tmp_path)
+
+        async def _main() -> None:
+            # Timed for a deadline 1s away, then step 1 finishes first.
+            with patch.object(
+                actor._rollout_snapshots,
+                "_seconds_until_next_attempt",
+                return_value=0.01,
+            ):
+                actor._train_steps = 1
+                pump = asyncio.create_task(actor._rollout_snapshots.run())
+                await asyncio.sleep(0.1)
+                pump.cancel()
+                await asyncio.gather(pump, return_exceptions=True)
+
+        try:
+            asyncio.run(_main())
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert forced == []
+
+    @pytest.mark.parametrize(
+        ("holds_rollout_state", "outcome", "expected"),
+        [
+            (False, "completed", "no attempt"),
+            (True, "completed", "saved"),
+            (True, "skipped", "warns"),
+            (True, OSError("storage unavailable"), "warns"),
+            (True, RuntimeError("broken checkpoint invariant"), "raises"),
+        ],
+        ids=["no-environment-state", "saved", "skipped", "io-error", "invariant"],
+    )
+    def test_deadline_snapshot(
+        self, tmp_path: Path, holds_rollout_state, outcome, expected
+    ):
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+        actor._environment_checkpoint = (
+            _FakeEnvironmentCheckpoint()
+            if holds_rollout_state
+            else NoEnvironmentCheckpoint()
+        )
+        attach_rollout_checkpointing(actor)
+        actor._train_steps = 1
+        actor._rollout_snapshots._wakeup.set()
+        forced: list[bool] = []
+
+        async def _save(
+            *, force: bool = False, staged: bool = False
+        ) -> RolloutCheckpointSaveResult:
+            forced.append(force)
+            if isinstance(outcome, Exception):
+                raise outcome
+            if outcome == "skipped":
+                return RolloutCheckpointSaveResult(
+                    saved=False, reason="optimizer_commit_in_progress"
+                )
+            return RolloutCheckpointSaveResult(saved=True, reason="completed")
+
+        actor._rollout_snapshots.save_snapshot = _save
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                if expected == "raises":
+                    with pytest.raises(RuntimeError, match="broken checkpoint"):
+                        asyncio.run(actor._rollout_snapshots.save_at_deadline())
+                else:
+                    asyncio.run(actor._rollout_snapshots.save_at_deadline())
+        finally:
+            actor._checkpointer.shutdown()
+
+        deadline_warnings = [
+            w for w in caught if "checkpoint deadline" in str(w.message)
+        ]
+        if expected == "no attempt":
+            assert forced == []
+            return
+        assert forced == [True]
+        assert not actor._rollout_snapshots._wakeup.is_set()
+        assert bool(deadline_warnings) is (expected == "warns")
+
+    def _staged_actor(self, tmp_path: Path, on_environment_save=lambda: None):
+        """An actor at step 1 whose environment save runs ``on_environment_save``."""
+        actor = self._actor(tmp_path)
+        actor._logger = MagicMock()
+
+        @contextlib.asynccontextmanager
+        async def snapshot(_path):
+            on_environment_save()
+            yield _FakeEnvironmentSnapshot()
+
+        actor._environment_checkpoint = _FakeEnvironmentCheckpoint(snapshot)
+        attach_rollout_checkpointing(actor)
+        actor._train_steps = actor._trainer_version = 1
+        return actor
+
+    def test_a_staged_snapshot_overlaps_the_policy_write_then_moves_into_step_n(
+        self, tmp_path: Path
+    ):
+        checkpoints = tmp_path / "checkpoints"
+        write_landed = threading.Event()
+        published_at_environment_save: list[bool] = []
+
+        def environment_save() -> None:
+            published_at_environment_save.append((checkpoints / "step_1").exists())
+            write_landed.set()
+
+        actor = self._staged_actor(tmp_path, environment_save)
+        # A staged snapshot a killed run left behind.
+        (checkpoints / "tmp_rollout_snapshot_step_0").mkdir(parents=True)
+        (checkpoints / "tmp_step_1").mkdir()
+        # step_1's policy write lands only once the environment has been saved.
+        actor._checkpointer.begin_finalization(
+            checkpoints / "tmp_step_1", wait_fn=lambda: write_landed.wait(5.0)
+        )
+        try:
+            result = asyncio.run(
+                actor._rollout_snapshots.save_snapshot(force=True, staged=True)
+            )
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert result.saved
+        assert published_at_environment_save == [False]
+        snapshot = checkpoints / "step_1" / "rollout_snapshots" / "snapshot_000001"
+        assert (snapshot / ROLLOUT_SNAPSHOT_MANIFEST_FILENAME).is_file()
+        assert list(checkpoints.glob("tmp_rollout_snapshot_step_*")) == []
+        logged = actor._logger.log_metrics.call_args.args[0]
+        assert logged["trainer_publish_wait_seconds"] >= 0.0
+
+    def test_a_staged_snapshot_without_a_published_step_n_is_dropped(
+        self, tmp_path: Path
+    ):
+        """A failed or missing policy write publishes no step_N; nothing is left."""
+        actor = self._staged_actor(tmp_path)
+        try:
+            result = asyncio.run(
+                actor._rollout_snapshots.save_snapshot(force=True, staged=True)
+            )
+        finally:
+            actor._checkpointer.shutdown()
+
+        assert not result.saved
+        assert result.reason == "missing_trainer_anchor"
+        checkpoints = tmp_path / "checkpoints"
+        assert not (checkpoints / "step_1").exists()
+        assert list(checkpoints.glob("tmp_rollout_snapshot_step_*")) == []
+
+    @pytest.mark.parametrize(
+        ("prefix_cuts_enabled", "restore_level", "expect_save"),
+        [
+            (True, RecoveryTargetLevel.PREFIX, True),
+            (False, RecoveryTargetLevel.PREFIX, False),
+            (True, RecoveryTargetLevel.TURN, False),
+        ],
+    )
+    def test_unchanged_data_plane_still_cuts_a_decoding_prefix(
+        self,
+        tmp_path: Path,
+        prefix_cuts_enabled: bool,
+        restore_level: RecoveryTargetLevel,
+        expect_save: bool,
+    ) -> None:
+        """Decoding grows a recoverable prefix without mutating the data plane."""
+
+        class _SaveStarted(Exception):
+            pass
+
+        actor = self._actor(tmp_path)
+        snapshots = actor._rollout_snapshots
+        # Only the cadence check reads the target; the rest of this actor is
+        # built for sibling recovery.
+        actor._master_config.rollout_recovery.target_level = (
+            RecoveryTargetLevel.PREFIX
+            if prefix_cuts_enabled
+            else RecoveryTargetLevel.SIBLING
+        )
+        ledger = actor._rollout_recovery_ledger
+
+        async def dispatch() -> None:
+            async with actor._data_plane_checkpoint_barrier.mutation() as cut:
+                ledger.reserve_group(
+                    cut,
+                    group_id="g7",
+                    admission_id="batch-7",
+                    prompt_id="7",
+                    prompt_payload={"idx": 7, "message_log": []},
+                    expected_generations=2,
+                    target_step=0,
+                    start_weight_version=0,
+                    restore_level=restore_level,
+                    admitted=True,
+                )
+                ledger.mark_group_dispatched(
+                    cut, "g7", environment_instance_id="tools/replica-0"
+                )
+
+        asyncio.run(dispatch())
+        snapshots._last_snapshot_mutation_version = (
+            actor._data_plane_checkpoint_barrier.mutation_version
+        )
+        result = None
+        try:
+            with patch.object(
+                actor._checkpointer, "finalize_pending", side_effect=_SaveStarted
+            ):
+                try:
+                    result = asyncio.run(snapshots.save_snapshot())
+                except _SaveStarted:
+                    pass
+        finally:
+            actor._checkpointer.shutdown()
+
+        if expect_save:
+            assert result is None
+        else:
+            assert result is not None
+            assert result.reason == "no_data_plane_mutations"
+
     def test_periodic_pump_reports_each_consecutive_failure(
         self,
         tmp_path: Path,
@@ -2833,7 +3177,9 @@ class TestPeriodicRolloutCheckpoint:
             two_failures = asyncio.Event()
             calls = 0
 
-            async def _failing_save(*, force: bool = False) -> bool:
+            async def _failing_save(
+                *, force: bool = False, staged: bool = False
+            ) -> bool:
                 nonlocal calls
                 del force
                 calls += 1
@@ -2868,7 +3214,9 @@ class TestPeriodicRolloutCheckpoint:
         actor._train_steps = 1
 
         async def _main() -> None:
-            async def _failing_save(*, force: bool = False) -> bool:
+            async def _failing_save(
+                *, force: bool = False, staged: bool = False
+            ) -> bool:
                 del force
                 raise OSError("storage unavailable")
 
@@ -2919,7 +3267,9 @@ class TestPeriodicRolloutCheckpoint:
             two_failures = asyncio.Event()
             calls = 0
 
-            async def _failing_save(*, force: bool = False) -> bool:
+            async def _failing_save(
+                *, force: bool = False, staged: bool = False
+            ) -> bool:
                 nonlocal calls
                 del force
                 calls += 1
@@ -2956,7 +3306,9 @@ class TestPeriodicRolloutCheckpoint:
         calls = 0
 
         async def _main() -> None:
-            async def _failing_save(*, force: bool = False) -> bool:
+            async def _failing_save(
+                *, force: bool = False, staged: bool = False
+            ) -> bool:
                 nonlocal calls
                 del force
                 calls += 1
@@ -2988,7 +3340,9 @@ class TestPeriodicRolloutCheckpoint:
         calls = 0
 
         async def _main() -> None:
-            async def _failing_save(*, force: bool = False) -> bool:
+            async def _failing_save(
+                *, force: bool = False, staged: bool = False
+            ) -> bool:
                 nonlocal calls
                 del force
                 calls += 1
@@ -3038,6 +3392,7 @@ class TestDataPlaneCheckpoint:
         state = build_rollout_recovery_state(
             ledger,
             batch_shortfall={},
+            steps_allowed_short=set(),
             sampler_stamps_target_steps=True,
             reward_settings=CaptureRewardSettings.from_configs(
                 config.reward_penalties, None, None
@@ -3597,6 +3952,9 @@ def _ppo_save_actor(tmp_path: Path, calls: list[str]):
     actor._consumed_samples = 0
     actor._total_valid_tokens = 0
     actor._rollout_runtime.replacement_reserve = []
+    actor._rollout_runtime.filtered_reserve = []
+    actor._rollout_runtime.finalizer_metrics_by_group = {}
+    actor._rollout_runtime.finalizer_rewards_by_group = {}
     actor._async_cfg = SimpleNamespace(
         sampler=SimpleNamespace(name="in_order"),
         max_buffered_rollouts=4,
@@ -3639,9 +3997,9 @@ class TestPPOSaveOrder:
         actor = _ppo_save_actor(tmp_path, calls)
         publish = actor._publish_when_policy_write_done
 
-        async def _record_publish(checkpoint_path):
+        async def _record_publish(checkpoint_path, **kwargs):
             calls.append("publish")
-            await publish(checkpoint_path)
+            await publish(checkpoint_path, **kwargs)
 
         actor._publish_when_policy_write_done = _record_publish
 
@@ -3692,6 +4050,28 @@ class TestPPOWarmupCheckpoint:
         assert written is is_policy_training_step
         # The critic trains from step 0, so its optimizer is always written.
         assert actor._value.save_kwargs["optimizer_path"] is not None
+
+    @pytest.mark.parametrize("consumed_samples", [0, 16])
+    def test_grpo_skipped_step_checkpoint_preserves_only_initialized_optimizer(
+        self, actor, consumed_samples
+    ):
+        actor._is_ppo = False
+        actor._consumed_samples = consumed_samples
+        actor._train_steps = 2
+
+        asyncio.run(
+            actor._save_checkpoint(
+                {"skipped_step": 1},
+                is_policy_training_step=True,
+                is_final_checkpoint=True,
+            )
+        )
+
+        assert actor._trainer.save_kwargs["weights_path"] is not None
+        assert (actor._trainer.save_kwargs["optimizer_path"] is not None) == (
+            consumed_samples > 0
+        )
+        assert actor._save_state.consumed_samples == consumed_samples
 
     def test_warmup_step_skips_the_top_k_metric(self, actor):
         """No policy metrics exist yet, so the checkpoint just is not a candidate."""
@@ -4773,7 +5153,10 @@ class TestReplacementReservePersistence:
 
         reserve_path = tmp_path / "checkpoints" / "step_2" / "replacement_reserve.pt"
         assert reserve_path.exists()
-        assert torch.load(reserve_path, weights_only=False) == ["spare0", "spare1"]
+        assert torch.load(reserve_path, weights_only=False) == {
+            "replacement": ["spare0", "spare1"],
+            "filtered": [],
+        }
         # Saved, not consumed: the pool the run continues with is untouched.
         assert list(actor._rollout_runtime.replacement_reserve) == ["spare0", "spare1"]
 
@@ -4785,7 +5168,10 @@ class TestReplacementReservePersistence:
 
         step_dir = tmp_path / "checkpoints" / "step_2"
         assert step_dir.exists()
-        assert torch.load(step_dir / "replacement_reserve.pt", weights_only=False) == []
+        assert torch.load(step_dir / "replacement_reserve.pt", weights_only=False) == {
+            "replacement": [],
+            "filtered": [],
+        }
 
     def test_run_restores_the_pooled_spares(self, tmp_path):
         ckpt_dir = tmp_path / "resume_ckpt"
