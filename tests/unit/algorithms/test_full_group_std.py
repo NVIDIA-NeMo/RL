@@ -86,6 +86,12 @@ def test_full_group_std_rejects_non_grpo_estimators(name):
     AdvEstimatorConfig(name=name)
 
 
+def test_full_group_std_requires_normalize_rewards():
+    with pytest.raises(ValueError, match="requires normalize_rewards=true"):
+        AdvEstimatorConfig(full_group_std=True, normalize_rewards=False)
+    AdvEstimatorConfig(normalize_rewards=False)
+
+
 @pytest.mark.parametrize("valid", [[1] * 64, [0] * 64, [1] + [0] * 63])
 def test_full_group_constant_or_undersized_advantages_are_exactly_zero(valid):
     estimator = GRPOAdvantageEstimator(

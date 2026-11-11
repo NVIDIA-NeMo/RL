@@ -845,8 +845,8 @@ advantage, and a group whose valid rewards are all equal gets $\sigma = 0$ and z
 advantages. For the example above, $\sigma \approx 0.336$, so rollout 1 gets
 $A_1 \approx -2.83$ instead of $-0.95$ and every other rollout gets $A_i \approx 0.40$.
 
-The option is rejected for other estimators. The default `false` keeps the per-rollout
-$\sigma_i$.
+The option is rejected for other estimators and with `normalize_rewards: false`. The
+default `false` keeps the per-rollout $\sigma_i$.
 
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
