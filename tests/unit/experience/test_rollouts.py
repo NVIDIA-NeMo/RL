@@ -918,6 +918,7 @@ def test_async_vlm_multiturn_drops_stale_vllm_content(
         *,
         sample_multimodal_data=None,
         deduplicate_multimodal_data=False,
+        sample_extra_env_info=None,
     ):
         calls.append(
             {
@@ -996,6 +997,52 @@ def test_async_vlm_multiturn_drops_stale_vllm_content(
     ]
     # Without this the two parametrized legs assert exactly the same thing.
     assert [call["dedup"] for call in calls] == [deduplicate_multimodal_data] * 2
+
+
+def _run_capped_async_rollout(monkeypatch, generation):
+    monkeypatch.setattr(
+        "nemo_rl.experience.rollouts.calculate_rewards",
+        lambda batch, task_to_env: EnvironmentReturn(
+            observations=[{"role": "user", "content": "done"}],
+            metadata=[{"max_output_tokens": 4}],
+            next_stop_strings=[None],
+            rewards=torch.tensor([0.0]),
+            terminateds=torch.tensor([True]),
+            answers=[None],
+        ),
+    )
+    run_async_multi_turn_rollout(
+        policy_generation=generation,
+        input_batch=BatchedDataDict(
+            {
+                "message_log": [
+                    [{"role": "user", "content": "", "token_ids": torch.tensor([1])}]
+                ],
+                "extra_env_info": [{"max_output_tokens": 4}],
+                "task_name": ["capped"],
+                "stop_strings": [None],
+                "idx": [0],
+            }
+        ),
+        tokenizer=_DummyTokenizer(),
+        task_to_env={},
+        max_seq_len=32,
+        max_rollout_turns=1,
+    )
+
+
+def test_async_rollout_forwards_output_caps_to_vllm(monkeypatch):
+    generation = _CapturingAsyncVllmGeneration()
+    _run_capped_async_rollout(monkeypatch, generation)
+    assert generation.generation_input["max_output_tokens"] == [4]
+
+
+def test_async_rollout_rejects_output_caps_on_non_vllm_backends(monkeypatch):
+    generation = _CapturingAsyncVllmGeneration()
+    generation.cfg = {"backend": "megatron"}
+    with pytest.raises(ValueError, match="only supported by the vLLM"):
+        _run_capped_async_rollout(monkeypatch, generation)
+    assert generation.generation_input is None
 
 
 class _DummyDynamoGeneration(_DummySGLangGeneration):

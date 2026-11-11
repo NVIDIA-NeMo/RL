@@ -404,28 +404,36 @@ def _add_r3_fallback_metrics(
     )
 
 
-def _attach_output_caps(
-    generation_input_data: BatchedDataDict[GenerationDatumSpec],
-    batch: BatchedDataDict[DatumSpec],
-    policy_generation: GenerationInterface,
-) -> None:
-    """Forward per-sample ``extra_env_info["max_output_tokens"]`` caps to generation."""
-    metadata = batch.get("extra_env_info")
-    if metadata is None:
-        return
+def _output_caps(
+    extra_env_info: list[Any] | None, policy_generation: GenerationInterface
+) -> list[int | None] | None:
+    """Return per-sample ``max_output_tokens`` caps, or None when no row sets one."""
+    if extra_env_info is None:
+        return None
     caps = [
         info.get("max_output_tokens") if isinstance(info, dict) else None
-        for info in metadata
+        for info in extra_env_info
     ]
     if all(cap is None for cap in caps):
-        return
+        return None
     generation_config = getattr(policy_generation, "cfg", None) or {}
     if generation_config.get("backend") != "vllm":
         raise ValueError(
             "Per-sample max_output_tokens caps are only supported by the vLLM "
             "generation backend."
         )
-    generation_input_data["max_output_tokens"] = caps
+    return caps
+
+
+def _attach_output_caps(
+    generation_input_data: BatchedDataDict[GenerationDatumSpec],
+    batch: BatchedDataDict[DatumSpec],
+    policy_generation: GenerationInterface,
+) -> None:
+    """Forward per-sample ``extra_env_info["max_output_tokens"]`` caps to generation."""
+    caps = _output_caps(batch.get("extra_env_info"), policy_generation)
+    if caps is not None:
+        generation_input_data["max_output_tokens"] = caps
 
 
 def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
@@ -1310,6 +1318,7 @@ async def async_generate_response_for_sample_turn(
     *,
     sample_multimodal_data: dict[str, Any] | None = None,
     deduplicate_multimodal_data: bool = False,
+    sample_extra_env_info: dict[str, Any] | None = None,
 ) -> tuple[list[dict], torch.Tensor, torch.Tensor, dict[str, float]]:
     """Generate a response for a single sample's turn using async generation.
 
@@ -1323,6 +1332,8 @@ async def async_generate_response_for_sample_turn(
         sample_multimodal_data: vLLM-ready media fields for this sample.
         deduplicate_multimodal_data: Avoid sending both vLLM-ready and policy-ready
             media through the async generation boundary.
+        sample_extra_env_info: Environment metadata for this sample; carries the
+            optional ``max_output_tokens`` cap.
 
     Returns:
         Tuple of (updated_message_log, generated_tokens, input_lengths, generation_metrics)
@@ -1352,6 +1363,7 @@ async def async_generate_response_for_sample_turn(
         {
             "message_log": batch_message_logs,
             "stop_strings": [sample_stop_strings],
+            "extra_env_info": [sample_extra_env_info],
         }
     )
     for key, value in (sample_multimodal_data or {}).items():
@@ -1470,6 +1482,7 @@ async def run_sample_multi_turn_rollout(
                 greedy=greedy,
                 sample_multimodal_data=turn_multimodal_data,
                 deduplicate_multimodal_data=deduplicate_multimodal_data,
+                sample_extra_env_info=current_extra_env_info,
             )
             current_message_log = updated_message_log
 
@@ -1710,6 +1723,8 @@ async def _run_multi_turn_rollout_async(
 ) -> tuple[BatchedDataDict[DatumSpec], list[dict[str, Any]]]:
     """Run one native rollout batch and retain metrics at sample granularity."""
     batch_size = len(input_batch["message_log"])
+    # Validate before the sample tasks: a turn that raises only ends its sample.
+    _output_caps(input_batch["extra_env_info"], policy_generation)
 
     sample_initial_states = []
     for i in range(batch_size):
