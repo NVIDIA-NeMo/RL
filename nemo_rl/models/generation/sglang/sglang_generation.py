@@ -62,6 +62,10 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
+# Bound on the best-effort graceful shutdown during cohort rollback when no
+# health monitor exists to supply its configured per-RPC timeout.
+_ROLLBACK_GRACEFUL_SHUTDOWN_TIMEOUT_S = 30.0
+
 
 class SGLangGeneration(GenerationInterface):
     """The class to run rollout and convert rollout data to training data.
@@ -192,6 +196,39 @@ class SGLangGeneration(GenerationInterface):
             self.gpu_offset + j * self.num_gpus_per_engine
             for j in range(len(self.engines))
         ]
+
+    def run_checkpoint_engine_method(
+        self, checkpoint_method: str, method_args: tuple[Any, ...] = ()
+    ) -> list[ray.ObjectRef]:
+        """Run a checkpoint-engine method on every logical SGLang engine."""
+        if self.nodes_per_engine != 1:
+            raise NotImplementedError(
+                "SGLang checkpoint-engine refit currently requires each logical "
+                "engine to fit on one node."
+            )
+
+        refs = []
+        for engine, rollout_rank_start in zip(
+            self.engines, self.engine_gpu_offsets, strict=True
+        ):
+            args = method_args
+            if checkpoint_method == "init_checkpoint_engine":
+                args = (*method_args, rollout_rank_start)
+            refs.append(getattr(engine, checkpoint_method).remote(*args))
+        return refs
+
+    def init_checkpoint_engine_process_groups(
+        self,
+        *,
+        train_world_size: int,
+        rollout_world_size: int,
+        metadata: list[Any],
+    ) -> list[ray.ObjectRef]:
+        """Connect every rank-local receiver to its policy peer."""
+        args = (train_world_size, rollout_world_size, metadata)
+        return self.run_checkpoint_engine_method(
+            "init_checkpoint_engine_process_group", args
+        )
 
     def _start_engines(
         self, port_cursors: dict[int, int] | None = None
@@ -364,35 +401,91 @@ class SGLangGeneration(GenerationInterface):
             self._health_monitor.record_restart_attempts(dead_indices)
 
         port_cursors: dict[int, int] = {}
-        handles, _ = self._start_engines(port_cursors)
-        if handles:
-            ray.get(handles)
+        pre_attempt_count = self.num_new_engines
+        try:
+            # ``_start_engines`` publishes the replacement actors into
+            # ``all_engines`` and rewrites ``num_new_engines`` before their init
+            # is awaited, so a partially initialized cohort is already visible.
+            # Everything up to and including the offload transition is one
+            # attempt: a failure anywhere must restore the ``None`` slots —
+            # they, not a count for actors that never finished recovering,
+            # drive the next attempt.
+            handles, _ = self._start_engines(port_cursors)
+            if handles:
+                ray.get(handles)
 
-        assert self.num_new_engines == len(dead_indices), (
-            "num_new_engines does not match dead_indices length"
+            assert self.num_new_engines == len(dead_indices), (
+                "num_new_engines does not match dead_indices length"
+            )
+
+            # Replacement engines are freshly booted and still loading weights,
+            # so give them the configured grace period before the monitor
+            # probes them.
+            if self._health_monitor is not None:
+                self._health_monitor.arm_first_wait()
+
+            if self.needs_offload:
+                new_engines = [self.all_engines[i] for i in dead_indices]
+                ray.get(
+                    [
+                        engine.release_memory_occupation.remote(tags=["weights"])
+                        for engine in new_engines
+                    ]
+                )
+                ray.get(
+                    [
+                        engine.release_memory_occupation.remote(tags=["kv_cache"])
+                        for engine in new_engines
+                    ]
+                )
+                # The synchronizer onloads weights after recovery for all engines.
+                # Resuming here too would onload a replacement twice.
+        except BaseException as recover_exc:
+            # BaseException: a KeyboardInterrupt during the init wait must
+            # still roll the published cohort back before propagating.
+            try:
+                self._rollback_replacement_cohort(dead_indices, pre_attempt_count)
+            except BaseException as rollback_exc:
+                from nemo_rl.models.generation.sglang.fault_tolerance import (
+                    RecoveryRollbackError,
+                )
+
+                raise RecoveryRollbackError(
+                    "Engine recovery failed and the replacement-cohort rollback "
+                    f"also failed ({rollback_exc!r}); engine state is "
+                    "inconsistent and refit must not proceed."
+                ) from recover_exc
+            raise
+
+    def _rollback_replacement_cohort(
+        self, dead_indices: list[int], pre_attempt_count: int
+    ) -> None:
+        """Kill a (possibly partially initialized) replacement cohort.
+
+        Deregister each logical engine using cached URLs, then attempt bounded
+        graceful shutdown before ``ray.kill``. A failed actor cannot deregister
+        itself. Replacements whose init never reached ``self.process`` fail
+        the graceful step; that is expected and tolerated. Actor kill failure
+        propagates because the cohort cannot then be considered rolled back.
+        """
+        graceful_timeout = (
+            self._health_monitor.check_timeout
+            if self._health_monitor is not None
+            else _ROLLBACK_GRACEFUL_SHUTDOWN_TIMEOUT_S
         )
-
-        # Replacement engines are freshly booted and still loading weights, so
-        # give them the configured grace period before the monitor probes them.
         if self._health_monitor is not None:
-            self._health_monitor.arm_first_wait()
-
-        if self.needs_offload and dead_indices:
-            new_engines = [self.all_engines[i] for i in dead_indices]
-            ray.get(
-                [
-                    engine.release_memory_occupation.remote(tags=["weights"])
-                    for engine in new_engines
-                ]
-            )
-            ray.get(
-                [
-                    engine.release_memory_occupation.remote(tags=["kv_cache"])
-                    for engine in new_engines
-                ]
-            )
-            # The synchronizer onloads weights after recovery for all engines.
-            # Resuming here too would onload a replacement twice.
+            for engine_id in sorted({i // self.nodes_per_engine for i in dead_indices}):
+                self._health_monitor._remove_router_worker(engine_id)
+        for i in dead_indices:
+            engine = self.all_engines[i]
+            if engine is not None:
+                try:
+                    ray.get(engine.shutdown.remote(), timeout=graceful_timeout)
+                except Exception:
+                    pass
+                ray.kill(engine)
+            self.all_engines[i] = None
+        self.num_new_engines = pre_attempt_count
 
     def get_updatable_engines(self) -> tuple[list, int, list[int], list[int]]:
         """Return engines eligible for weight updates."""
