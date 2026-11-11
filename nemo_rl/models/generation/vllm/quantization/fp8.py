@@ -1873,8 +1873,10 @@ def process_weights_after_loading_kv(self, layer) -> None:
     deletion.
     """
     from vllm.platforms import current_platform
-    from vllm.utils.torch_utils import is_quantized_kv_cache
-    from vllm.v1.kv_cache_interface import kv_cache_uses_per_token_head_scales
+    from vllm.v1.kv_cache_interface import (
+        is_quantized_kv_cache,
+        kv_cache_uses_per_token_head_scales,
+    )
 
     # Per-token-head quantized KV cache: scales are computed dynamically per
     # (token, head) in the kernel at cache-write time. Nothing to refit here.
