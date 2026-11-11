@@ -276,8 +276,9 @@ def test_adapter_cli_writes_multi_dataset(tmp_path, monkeypatch, capsys):
     adapter.main()
     row = json.loads(output.read_text())
     assert row["task_id"]["taskset"] == "mm-coding:opencode"
-    assert "Only the final answer file is transferred to a fresh grading sandbox" in (
-        row["task_input"]["responses_create_params"]["input"][0]["content"]
+    assert (
+        "Only the final answer file is transferred to a fresh grading sandbox"
+        in (row["task_input"]["responses_create_params"]["input"][0]["content"])
     )
     assert json.loads(capsys.readouterr().out)["rows"] == 1
 
