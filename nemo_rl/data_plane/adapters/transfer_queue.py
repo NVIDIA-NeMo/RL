@@ -1046,11 +1046,11 @@ def _init_tq(
         _patch_mooncake_master_metrics_port(
             metrics_port, mooncake_ssd_offload.master_args(mooncake_cfg)
         )
+        metrics_url = f"http://{local_ip}:{metrics_port}/metrics"
         if mooncake_cfg.ssd_offload.enabled:
             # Stop the run if Mooncake ever deletes an SSD copy for space.
             mooncake_ssd_offload.watch_master_disk_evictions(
-                f"http://{local_ip}:{metrics_port}/metrics",
-                mooncake_cfg.ssd_offload.dir(),
+                metrics_url, mooncake_cfg.ssd_offload.dir()
             )
         overlay = {
             **controller_overlay,
@@ -1066,6 +1066,10 @@ def _init_tq(
                     # mooncake_master + the metadata server bind to.
                     "metadata_server": f"{local_ip}:{metadata_port}",
                     "master_server_address": f"{local_ip}:{master_port}",
+                    # Read by the single controller every step
+                    # (mooncake_ssd_offload.step_metrics) from whichever process
+                    # it runs in; every client gets this block from the controller.
+                    "metrics_url": metrics_url,
                     # Runtime mode derived from the existing trainer settings,
                     # not a second user-facing checkpoint switch.
                     "checkpoint": {"enabled": checkpointing},

@@ -653,14 +653,20 @@ While memory suffices nothing is written, so the default costs nothing. With
 `path: null` each owner writes under its node's NVMe: `/raid` (where DGX nodes
 mount the NVMe RAID) when the node has it, else `/tmp`. The directory must be
 on a disk: an owner refuses to start when it is on a RAM-backed filesystem
-(tmpfs), since spilling there would consume the memory it is meant to relieve. The first time an owner's 30 s sweep finds offloaded files
-in its directory it logs one warning with the count and size: the workload's data-plane footprint passed the
-threshold, and reads of spilled objects now wait for the SSD. Raise
-`storage_unit_segment_size` (or `global_segment_size`), or `offload_threshold`,
-if that trade-off is not wanted. The nixl backend's SSD tier (`nixl.ssd`, also
-on by default) spills only when a unit's put area is full and logs the same
-kind of warning from the driver when `data_plane/nixl/ssd_spills_sum` first
-rises above 0.
+(tmpfs), since spilling there would consume the memory it is meant to relieve.
+
+The single controller reads the master's `/metrics` every step and logs, under
+`data_plane/mooncake/`: `mem_used_mb`, `mem_capacity_mb`, `mem_used_ratio`
+(compare with `offload_threshold`), `keys`, `offloaded_keys_total`,
+`offloaded_mb_total` (objects the master moved from memory to the owners' SSD)
+and `disk_evictions_total` (always 0 in a healthy run, see below). The first
+step with `offloaded_keys_total > 0` logs one warning: the workload's
+data-plane footprint passed the threshold, and reads of offloaded objects now
+go through the SSD. Raise `storage_unit_segment_size` (or
+`global_segment_size`), or `offload_threshold`, if that trade-off is not
+wanted. The nixl backend's SSD tier (`nixl.ssd`, also on by default) spills
+only when a unit's put area is full and logs the same kind of warning when
+`data_plane/nixl/ssd_spills_sum` first rises above 0.
 
 ```
 memory > offload_threshold ──> SSD copy written ──> memory copy dropped

@@ -308,6 +308,43 @@ def test_disk_evictions_reads_the_master_counter(text, count) -> None:
     assert offload.disk_evictions(text) == count
 
 
+_MASTER = """\
+master_allocated_bytes 1073741824
+master_total_capacity_bytes 4294967296
+master_key_count 10
+master_evicted_key_count_mem {keys}
+master_evicted_size_bytes_mem 2097152
+master_evict_disk_replica_requests_total 0
+"""
+
+
+def test_master_metrics_are_in_mib_with_a_memory_ratio() -> None:
+    assert offload.master_metrics(_MASTER.format(keys=5)) == {
+        "mem_used_mb": 1024.0,
+        "mem_capacity_mb": 4096.0,
+        "keys": 10.0,
+        "offloaded_keys_total": 5.0,
+        "offloaded_mb_total": 2.0,
+        "disk_evictions_total": 0.0,
+        "mem_used_ratio": 0.25,
+    }
+    assert offload.master_metrics("")["mem_used_ratio"] == 0.0  # no capacity yet
+
+
+def test_the_first_offload_warns_once(monkeypatch, caplog) -> None:
+    monkeypatch.setattr(offload, "_warned_offload", False)
+    with caplog.at_level("WARNING", logger=offload.LOGGER.name):
+        for keys in (0, 5, 9):
+            offload._warn_on_first_offload(offload.master_metrics(_MASTER.format(keys=keys)))
+    (msg,) = [r.getMessage() for r in caplog.records]
+    assert "5 object(s), 2.0 MiB" in msg and "25% of 4.0 GiB" in msg
+    assert "offload_threshold" in msg
+
+
+def test_step_metrics_without_a_mooncake_client_is_empty() -> None:
+    assert offload.step_metrics() == {}  # this process has no TQ client
+
+
 def _watch(reads, **kwargs):
     """Run the watcher over scripted counter reads until it stops."""
     script = iter(reads)
@@ -415,6 +452,21 @@ def test_watch_master_disk_evictions_reads_the_real_endpoint(
     assert not fired.wait(0.2)  # counter at 0: keep watching
     metrics_server.body = "master_evict_disk_replica_requests_total 1\n"
     assert fired.wait(5)
+
+
+def test_step_metrics_read_the_real_endpoint_and_warn_once(
+    monkeypatch, caplog, metrics_server
+) -> None:
+    url = f"http://127.0.0.1:{metrics_server.server_port}/metrics"
+    monkeypatch.setattr(offload, "_master_metrics_url", lambda: url)
+    monkeypatch.setattr(offload, "_warned_offload", False)
+    metrics_server.body = _MASTER.format(keys=0)
+    with caplog.at_level("WARNING", logger=offload.LOGGER.name):
+        assert offload.step_metrics()["offloaded_keys_total"] == 0
+        metrics_server.body = _MASTER.format(keys=7)
+        assert offload.step_metrics()["offloaded_keys_total"] == 7
+        assert offload.step_metrics()["mem_used_ratio"] == 0.25
+    assert len(caplog.records) == 1
 
 
 def test_a_reinit_replaces_the_old_watcher(monkeypatch) -> None:
@@ -559,8 +611,7 @@ def test_sweep_deletes_only_the_files_of_cleared_keys(tmp_path) -> None:
         str(tmp_path), lambda keys: [answers[k] for k in keys]
     )
 
-    assert sweep.removed == 1
-    assert sweep.files == 3  # the three key files; .lock and "foreign" are not
+    assert sweep == 1
     assert not cleared.exists()
     assert live.exists() and unknown.exists()
     assert (tmp_path / ".lock").exists() and (tmp_path / "foreign").exists()
@@ -578,13 +629,13 @@ def test_sweep_keeps_a_file_rewritten_after_it_was_listed(tmp_path) -> None:
         os.replace(tmp, replaced)  # replaced by rename (new inode)
         return [0] * len(keys)
 
-    assert offload.sweep_cleared_files(str(tmp_path), exists).removed == 0
+    assert offload.sweep_cleared_files(str(tmp_path), exists) == 0
     assert rewritten.exists() and replaced.exists()
 
 
 def test_sweep_keeps_everything_on_a_short_result_list(tmp_path) -> None:
     kept = _kv_file(tmp_path / "2@x", "2@x")
-    assert offload.sweep_cleared_files(str(tmp_path), lambda keys: []).removed == 0
+    assert offload.sweep_cleared_files(str(tmp_path), lambda keys: []) == 0
     assert kept.exists()
 
 

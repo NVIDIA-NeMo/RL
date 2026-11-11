@@ -33,7 +33,7 @@ import threading
 import time
 import urllib.request
 from collections.abc import Callable
-from typing import Any, NamedTuple
+from typing import Any
 
 from nemo_rl.data_plane.interfaces import MooncakeCpuConfig
 from nemo_rl.data_plane.local_disk import require_disk_backed
@@ -78,11 +78,23 @@ PUT_BACKOFF_MAX_S = 1.0
 # (FileStorage::NotifyEvictedDiskReplicas -> BatchEvictDiskReplica). NeMo-RL
 # and TQ never delete SSD copies themselves, so any count means data loss.
 EVICTION_COUNTER = "master_evict_disk_replica_requests_total"
-_COUNTER_LINE = re.compile(
-    rf"^{re.escape(EVICTION_COUNTER)}(?:{{[^}}]*}})?\s+(\S+)", re.M
-)
 # The running watcher in this process, if any.
 _watch_stop: threading.Event | None = None
+
+# Master gauges and counters the driver logs every step (step_metrics), by
+# their name in Mooncake 0.3.x's /metrics -> (logged name, divisor). The
+# "evicted ... mem" counters are the objects the master moved out of memory;
+# with master_args (offload on eviction, no forced eviction) every one of them
+# went to its owner's SSD, so they are the offload volume.
+MASTER_METRICS = {
+    "master_allocated_bytes": ("mem_used_mb", 2**20),
+    "master_total_capacity_bytes": ("mem_capacity_mb", 2**20),
+    "master_key_count": ("keys", 1),
+    "master_evicted_key_count_mem": ("offloaded_keys_total", 1),
+    "master_evicted_size_bytes_mem": ("offloaded_mb_total", 2**20),
+    EVICTION_COUNTER: ("disk_evictions_total", 1),
+}
+_warned_offload = False  # one warning per driver process, at the first offload
 
 # Mooncake's remove drops only the master's record: the owner keeps the file of
 # a cleared key until the key is offloaded again or the owner exits. Each owner
@@ -369,23 +381,13 @@ def _file_key(path: str) -> str | None:
     return scoped[len(_TENANT_PREFIX) :] or None
 
 
-class Sweep(NamedTuple):
-    """One pass of :func:`sweep_cleared_files`."""
-
-    removed: int  # files deleted (their key is gone from the master)
-    files: int  # offload files seen before deleting
-    bytes: int  # their total size
-
-
-def sweep_cleared_files(
-    root: str, exists: Callable[[list[str]], list[int]]
-) -> Sweep:
+def sweep_cleared_files(root: str, exists: Callable[[list[str]], list[int]]) -> int:
     """Delete offload files under ``root`` whose key the master no longer has.
 
     ``exists`` is ``batch_is_exist``: 1 present, 0 absent, negative on error.
     A file is deleted only on an explicit 0 and only if it is unchanged since
     it was listed (before the check): a key re-put and offloaded again after
-    the check rewrites its file, which is then kept.
+    the check rewrites its file, which is then kept. Returns the number deleted.
     """
     files = []
     for dirpath, _, names in os.walk(root):
@@ -408,7 +410,7 @@ def sweep_cleared_files(
                 removed += 1
             except FileNotFoundError:
                 pass
-    return Sweep(removed, len(files), sum(stamp[2] for _, _, stamp in files))
+    return removed
 
 
 def _stamp(path: str) -> tuple[int, int, int] | None:
@@ -422,41 +424,87 @@ def _stamp(path: str) -> tuple[int, int, int] | None:
 def _start_sweep(store: Any, root: str) -> None:
     global _sweep_stop
     stop = threading.Event()
-    warned = False  # one warning per owner, at its first offloaded file
 
     def _sweep() -> None:
-        nonlocal warned
         while not stop.wait(SWEEP_INTERVAL_S):
             try:
-                sweep = sweep_cleared_files(root, store.batch_is_exist)
+                removed = sweep_cleared_files(root, store.batch_is_exist)
             except Exception:
                 LOGGER.warning("Mooncake SSD offload sweep failed", exc_info=True)
                 continue
-            if sweep.files and not warned:
-                # Offload means memory passed offload_threshold: the workload is
-                # under memory pressure and reads of spilled objects go through
-                # the SSD. The user may prefer more segment memory instead.
-                warned = True
-                LOGGER.warning(
-                    "Mooncake offloaded %d object(s), %.1f MiB, to SSD under %s: the "
-                    "data plane's memory passed "
-                    "data_plane.mooncake_cpu.ssd_offload.offload_threshold. Reads of "
-                    "spilled objects are slower. Raise storage_unit_segment_size (or "
-                    "global_segment_size) or offload_threshold to keep the data in memory.",
-                    sweep.files,
-                    sweep.bytes / 2**20,
-                    root,
-                )
-            if sweep.removed:
-                LOGGER.debug("Deleted %d SSD files of cleared keys", sweep.removed)
+            if removed:
+                LOGGER.debug("Deleted %d SSD files of cleared keys", removed)
 
     threading.Thread(target=_sweep, name="mooncake-ssd-sweep", daemon=True).start()
     _sweep_stop = stop
 
 
+def _counter(metrics_text: str, name: str) -> float:
+    """``name`` summed over its label sets in Prometheus ``/metrics`` text; 0 if absent."""
+    line = re.compile(rf"^{re.escape(name)}(?:{{[^}}]*}})?\s+(\S+)", re.M)
+    return sum(float(value) for value in line.findall(metrics_text))
+
+
 def disk_evictions(metrics_text: str) -> int:
     """The master's SSD-eviction count from its Prometheus ``/metrics`` text."""
-    return int(sum(float(value) for value in _COUNTER_LINE.findall(metrics_text)))
+    return int(_counter(metrics_text, EVICTION_COUNTER))
+
+
+def master_metrics(metrics_text: str) -> dict[str, float]:
+    """``MASTER_METRICS`` read from the master's ``/metrics`` text, plus ``mem_used_ratio``."""
+    out = {
+        name: _counter(metrics_text, metric) / divisor
+        for metric, (name, divisor) in MASTER_METRICS.items()
+    }
+    capacity = out["mem_capacity_mb"]
+    out["mem_used_ratio"] = out["mem_used_mb"] / capacity if capacity else 0.0
+    return out
+
+
+def step_metrics() -> dict[str, float]:
+    """The master's counters for the driver to log every step.
+
+    ``{}`` when this process has no Mooncake TQ client. Read from the master's
+    ``/metrics`` (its URL travels in the TQ config, see ``_init_tq``); the first
+    offloaded object logs one warning.
+    """
+    url = _master_metrics_url()
+    if url is None:
+        return {}
+    with urllib.request.urlopen(url, timeout=5) as response:
+        out = master_metrics(response.read().decode())
+    _warn_on_first_offload(out)
+    return out
+
+
+def _master_metrics_url() -> str | None:
+    try:
+        import transfer_queue as tq
+
+        client = tq.get_client().storage_manager.storage_client
+        return client.config.get("metrics_url")
+    except Exception:  # noqa: BLE001 - no TQ client here, or not Mooncake's
+        return None
+
+
+def _warn_on_first_offload(metrics: dict[str, float]) -> None:
+    """The first offload means memory passed the threshold: say so once, with the remedy."""
+    global _warned_offload
+    if _warned_offload or metrics["offloaded_keys_total"] == 0:
+        return
+    _warned_offload = True
+    LOGGER.warning(
+        "Mooncake offloaded %d object(s), %.1f MiB, to SSD: the data plane's "
+        "memory (now %.0f%% of %.1f GiB used) passed "
+        "data_plane.mooncake_cpu.ssd_offload.offload_threshold, so the workload is "
+        "under memory pressure. Reads of offloaded objects go through the owners' "
+        "SSD. Raise storage_unit_segment_size (or global_segment_size) or "
+        "offload_threshold to keep the data in memory.",
+        int(metrics["offloaded_keys_total"]),
+        metrics["offloaded_mb_total"],
+        100 * metrics["mem_used_ratio"],
+        metrics["mem_capacity_mb"] / 1024,
+    )
 
 
 def watch_disk_evictions(
