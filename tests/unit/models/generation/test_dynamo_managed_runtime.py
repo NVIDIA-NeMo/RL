@@ -27,6 +27,7 @@ from nemo_rl.models.generation.dynamo import managed_runtime
 from nemo_rl.models.generation.dynamo.config import DynamoCfg, DynamoFrontendArgs
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     FrontendHost,
+    FrontendUrls,
     ManagedDynamoRuntime,
     _managed_namespace,
     _service_executable,
@@ -401,7 +402,11 @@ class _FakeFrontendHostActor:
                 @staticmethod
                 def remote(**kwargs):
                     actor.envs.append(kwargs["env"])
-                    return f"http://frontend-{len(actor.envs)}/v1"
+                    host = f"frontend-{len(actor.envs)}"
+                    return FrontendUrls(
+                        base_url=f"http://{host}:3000/v1",
+                        generation_cut_control_url=f"http://{host}:2400",
+                    )
 
             class publish_chat_capture:
                 @staticmethod
@@ -425,23 +430,34 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
     runtime._start_frontends([node_a, node_b])
     runtime._started = True
     runtime.publish_chat_capture(
-        dp_cfg={"backend": "simple"}, staging_partition="staging", capture_media=False
+        dp_cfg={"backend": "simple"},
+        staging_partition="staging",
+        capture_media=False,
+        generation_cut_control_token="secret",
+        generation_cut_control_timeout_s=60.0,
     )
 
     assert hosts.node_ids == [node_a, node_b, node_a]
-    assert runtime._frontend_urls == [f"http://frontend-{i}/v1" for i in (1, 2, 3)]
+    assert runtime.frontend_urls == [f"http://frontend-{i}:3000/v1" for i in (1, 2, 3)]
+    # Gym pairs each base URL with the cut port of the frontend behind it.
+    assert runtime.generation_cut_control_urls == [
+        f"http://frontend-{i}:2400" for i in (1, 2, 3)
+    ]
     for env in hosts.envs:
         assert env["DYN_TCP_LISTEN_BACKLOG"] == "8192"
         assert env["DYN_NAMESPACE"] == "nemo-rl-test"
         assert env["VIRTUAL_ENV"] == "/venvs/vllm"
         assert env[managed_runtime.RENDER_WORKERS_ENV] == "3"
         assert env[managed_runtime.RAY_ADDRESS_ENV] == "10.0.0.1:6379"
-    # Every frontend's chat engine reads token-capture prefixes the same way.
+    # Every frontend's chat engine reads token-capture prefixes, and checks a
+    # cut's bearer token, the same way.
     assert hosts.captures == 3 * [
         {
             "data_plane": {"backend": "simple"},
             "staging_partition": "staging",
             "capture_media": False,
+            "generation_cut_control_token": "secret",
+            "generation_cut_control_timeout_s": 60.0,
         }
     ]
 
@@ -461,15 +477,19 @@ def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
         lambda command, *, env, label: launched.append((command, env))
         or _FakeProcess(),
     )
+    ports = {
+        managed_runtime.DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW: 3000,
+        managed_runtime.DEFAULT_DYNAMO_CONTROL_PORT_RANGE_LOW: 2400,
+    }
     monkeypatch.setattr(
-        managed_runtime, "_get_free_port_local", lambda *args, **kwargs: 3000
+        managed_runtime, "_get_free_port_local", lambda low, high, **kwargs: ports[low]
     )
     monkeypatch.setattr(managed_runtime, "_get_node_ip_local", lambda: "10.0.0.2")
     monkeypatch.setattr(managed_runtime.tempfile, "tempdir", str(tmp_path))
     monkeypatch.setenv("DYN_STALE_SETTING", "remove-me")
     host = FrontendHost()
 
-    url = host.start(
+    urls = host.start(
         frontend_python="/venvs/vllm/bin/python",
         namespace="nemo-rl-test",
         dynamo_cfg=DynamoCfg(),
@@ -477,7 +497,10 @@ def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
     )
     host.publish_chat_capture({"staging_partition": "staging"})
 
-    assert url == "http://10.0.0.2:3000/v1"
+    assert urls == FrontendUrls(
+        base_url="http://10.0.0.2:3000/v1",
+        generation_cut_control_url="http://10.0.0.2:2400",
+    )
     ((command, env),) = launched
     # Dynamo's frontend, with NeMo RL's chat engine serving chat calls.
     assert command[:3] == [
@@ -488,6 +511,8 @@ def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
     assert command[command.index("--http-port") + 1] == "3000"
     assert env["DYN_NAMESPACE"] == "nemo-rl-test"
     assert "DYN_STALE_SETTING" not in env
+    # NeMo-Gym's checkpoint generation cuts go to a port of the frontend's own.
+    assert env[managed_runtime.GENERATION_CUT_PORT_ENV] == "2400"
     assert host.returncode() is None
     # Capture is set up after the engines register; the chat engine reads it
     # from the file on its own node that the frontend was told about.

@@ -1399,6 +1399,66 @@ def test_turn_recovery_rejects_typed_environment_servers(as_omegaconf):
         nemo_gym_mod._reject_typed_environment_servers(as_config(typed))
 
 
+@pytest.mark.parametrize("control_urls", [None, ["http://frontend:2400"]])
+def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
+    detected_uv_dirs, control_urls
+):
+    config = build_nemo_gym_config(
+        _env_configs(),
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=True,
+        generation_prefix_cuts_enabled=True,
+        generation_cut_control_urls=control_urls,
+        token_capture={
+            "enabled": True,
+            "capture_dir": "/capture",
+            "control_auth_token": "secret",
+        },
+    )
+
+    model = config["initial_global_config_dict"]["policy_model"][
+        "responses_api_models"
+    ]["vllm_model"]
+    assert model["checkpoint"] == {"policy": True, "generation_cuts": True}
+    # Only a backend that takes cuts elsewhere (a Dynamo frontend) names where.
+    assert model.get("generation_cut_control_url") == control_urls
+
+
+@pytest.mark.nemo_gym
+def test_prefix_checkpointing_policy_overrides_are_gym_fields(detected_uv_dirs):
+    """Gym accepts unknown config keys, so a renamed field would silently turn cuts off."""
+    # Deferred: Gym's model servers ship with the optional nemo_gym extra.
+    from responses_api_models.vllm_model.app import VLLMModelConfig
+
+    config = build_nemo_gym_config(
+        _env_configs(),
+        base_urls=["http://vllm-0"],
+        model_name="test-model",
+        enable_router_replay=False,
+        use_fastokens=False,
+        turn_checkpointing_enabled=True,
+        generation_prefix_cuts_enabled=True,
+        generation_cut_control_urls=["http://frontend:2400"],
+        token_capture={
+            "enabled": True,
+            "capture_dir": "/capture",
+            "control_auth_token": "secret",
+        },
+    )
+
+    model = config["initial_global_config_dict"]["policy_model"][
+        "responses_api_models"
+    ]["vllm_model"]
+    assert "generation_cut_control_url" in model
+    assert set(model) - set(VLLMModelConfig.model_fields) == set()
+    checkpoint_config = VLLMModelConfig.model_fields["checkpoint"].annotation
+    assert set(model["checkpoint"]) == {"policy", "generation_cuts"}
+    assert set(model["checkpoint"]) <= set(checkpoint_config.model_fields)
+
+
 def test_checkpointing_requires_token_capture(detected_uv_dirs):
     with pytest.raises(ValueError, match="requires token capture"):
         build_nemo_gym_config(

@@ -31,7 +31,22 @@ pytest.importorskip("vllm")
 
 from transformers import AutoTokenizer  # noqa: E402
 
-from nemo_rl.models.generation.dynamo.vllm.render_pool import RenderPool  # noqa: E402
+from nemo_rl.models.generation.dynamo.vllm.render_pool import (  # noqa: E402
+    RenderPool,
+    _Worker,
+)
+from nemo_rl.models.generation.prefix_recovery.restore import (  # noqa: E402
+    _classify_restored_prefix_terminal,
+)
+from tests.unit.models.generation.prefix_restore_cases import (  # noqa: E402
+    RESTORE_CASES,
+    RestoreCase,
+)
+from tests.unit.models.generation.test_prefix_restore_cases import (  # noqa: E402
+    _engine_text,
+    _ids,
+    _tokenizer,
+)
 
 MAX_MODEL_LEN = 512
 SPEC = {
@@ -225,3 +240,100 @@ def test_workers_decode_videos_with_nemo_rls_loader(tiny_qwen3_model_path) -> No
             pool.shutdown()
 
     assert asyncio.run(serve()) == "TorchCodecNemotronVLVideoBackend"
+
+
+class _RecordingParser:
+    """vLLM's response parser: the content is the text, and the IDs are kept."""
+
+    def __init__(self) -> None:
+        self.token_ids: list[int] | None = None
+
+    def parse(
+        self, model_output, request, *, enable_auto_tools, model_output_token_ids
+    ):
+        self.token_ids = list(model_output_token_ids)
+        return None, model_output, []
+
+    def count_reasoning_tokens(self, token_ids) -> int:
+        return 0
+
+
+@pytest.fixture(scope="module")
+def reply_worker(tiny_qwen3_model_path) -> _Worker:
+    """One render worker, in this process, to build replies with."""
+    return _Worker(SPEC, tiny_qwen3_model_path)
+
+
+@pytest.mark.parametrize("style", ["metaspace", "byte_level"])
+@pytest.mark.parametrize("case", RESTORE_CASES, ids=lambda case: case.name)
+def test_a_resumed_calls_reply_matches_the_uninterrupted_reply(
+    reply_worker, monkeypatch, case: RestoreCase, style: str
+) -> None:
+    """The cases the native server passes in test_prefix_restore_cases.py."""
+    tokenizer = _tokenizer(style)
+    parser = _RecordingParser()
+    monkeypatch.setattr(reply_worker, "tokenizer", tokenizer)
+    monkeypatch.setattr(reply_worker, "_parser", lambda chat: parser)
+    prompt = _ids(tokenizer, case.prompt)
+    output = _ids(tokenizer, case.output)
+    saved, tail = output[: case.saved], output[case.saved :]
+    # The engine ran the saved rows as its prompt and decoded only the tail.
+    terminal = _classify_restored_prefix_terminal(
+        prompt_token_ids=prompt + saved,
+        prefix_token_count=len(saved),
+        requested_output_tokens=len(output) + 8,
+        model_max_tokens=4096,
+        terminal_finish_reason=case.finish_reason if not tail else None,
+        terminal_stop_reason=case.stop_reason if not tail else None,
+    )
+    tail_text = ""
+    if tail:
+        tail_text = _engine_text(
+            tokenizer,
+            prompt + saved,
+            tail,
+            case,
+            min_tokens=max(0, case.min_tokens - len(saved)),
+        )
+
+    reply = reply_worker.respond(
+        {
+            "model": "model",
+            "min_tokens": case.min_tokens,
+            "stop": list(case.stop) or None,
+            "include_stop_str_in_output": case.include_stop_str_in_output,
+        },
+        # The prompt the frontend sent, which the engine swapped.
+        prompt,
+        {
+            "text": tail_text,
+            "token_ids": tail,
+            "finish_reason": case.finish_reason,
+            "stop_reason": case.stop_reason,
+        },
+        {
+            "prompt_token_ids": prompt + saved,
+            "token_ids": saved,
+            "terminal": None
+            if terminal is None
+            else {
+                "prefix_token_count": terminal.prefix_token_count,
+                "reason": terminal.reason,
+                "finish_reason": terminal.finish_reason,
+                "stop_reason": terminal.stop_reason,
+            },
+        },
+    )
+
+    (choice,) = reply["choices"]
+    assert choice["message"]["content"] == _engine_text(
+        tokenizer, prompt, output, case, min_tokens=case.min_tokens
+    )
+    assert choice["finish_reason"] == case.finish_reason
+    # Tool-call and reasoning parsers see the whole output, saved tokens first.
+    assert parser.token_ids == output
+    usage = reply["usage"]
+    assert (usage["prompt_tokens"], usage["completion_tokens"]) == (
+        len(prompt),
+        len(output),
+    )

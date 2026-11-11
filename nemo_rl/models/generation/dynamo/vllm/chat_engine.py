@@ -36,7 +36,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
-import pickle
 import threading
 import time
 import uuid
@@ -46,13 +45,14 @@ from dynamo.llm import PythonAsyncEngine
 from dynamo.llm.exceptions import HttpError, InvalidArgument
 
 from nemo_rl.models.generation.dynamo.managed_runtime import (
-    CAPTURE_FILE_ENV,
     RAY_ADDRESS_ENV,
     RENDER_WORKERS_ENV,
+    read_chat_capture,
 )
 from nemo_rl.models.generation.dynamo.vllm.render_pool import (
     RenderedCall,
     RenderPool,
+    RestoredReply,
 )
 from nemo_rl.models.generation.gym_call import (
     GYM_RESULT_NVEXT_KEY,
@@ -106,6 +106,8 @@ class GymEngineReply(TypedDict, total=False):
     # GymCallResult as JSON.
     output: dict[str, Any]
     result: dict[str, Any]
+    # Only for a call resumed from a checkpoint cut.
+    restored: RestoredReply
     refusal: GymCallRefusal
 
 
@@ -188,14 +190,12 @@ class _CaptureSource:
         from nemo_rl.data_plane import build_data_plane_client
         from nemo_rl.data_plane.tq_token_sink import ChainPrefixCache, TQTokenSource
 
-        path = os.environ[CAPTURE_FILE_ENV]
-        if not os.path.exists(path):
+        capture = read_chat_capture()
+        if capture is None:
             raise RuntimeError(
                 "a token-capture call reached the Dynamo frontend before token "
                 "capture was set up for it"
             )
-        with open(path, "rb") as capture_file:
-            capture = pickle.load(capture_file)
         if not ray.is_initialized():
             ray.init(address=os.environ[RAY_ADDRESS_ENV], log_to_driver=False)
         client = build_data_plane_client(
@@ -346,7 +346,10 @@ class NemoRLChatEngine:
             # reply carries none.
             reply_request = {**engine_request, "logprobs": False, "top_logprobs": None}
         response = await self._pool.respond(
-            reply_request, prompt_token_ids, engine_data["output"]
+            reply_request,
+            prompt_token_ids,
+            engine_data["output"],
+            engine_data.get("restored"),
         )
         (choice,) = response["choices"]
         return self._chunk(

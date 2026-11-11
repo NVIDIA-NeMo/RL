@@ -21,7 +21,9 @@ The arguments are ``dynamo.frontend``'s own. Its ``main`` builds one
 ``chat_engine_factory``, so every chat call reaches
 :mod:`~nemo_rl.models.generation.dynamo.vllm.chat_engine` and never Dynamo's
 Rust preprocessor. ``/v1/completions`` (NeMo RL's own rollouts, token ids in)
-is unchanged.
+is unchanged. It wraps ``DistributedRuntime`` the same way, to serve NeMo-Gym's
+checkpoint generation cuts through the frontend's own runtime
+(:mod:`~nemo_rl.models.generation.dynamo.vllm.generation_cut`).
 """
 
 import sys
@@ -31,6 +33,9 @@ def main() -> None:
     import dynamo.frontend.main as frontend_main
 
     from nemo_rl.models.generation.dynamo.vllm.chat_engine import ChatEngineFactory
+    from nemo_rl.models.generation.dynamo.vllm.generation_cut import (
+        start_generation_cut_server,
+    )
 
     factory = ChatEngineFactory()
     entrypoint_args = frontend_main.EntrypointArgs
@@ -45,7 +50,15 @@ def main() -> None:
             engine_type, chat_engine_factory=factory.chat_engine_factory, **kwargs
         )
 
+    distributed_runtime = frontend_main.DistributedRuntime
+
+    def with_generation_cuts(loop, *args, **kwargs):
+        runtime = distributed_runtime(loop, *args, **kwargs)
+        start_generation_cut_server(runtime, loop)
+        return runtime
+
     frontend_main.EntrypointArgs = with_chat_engine
+    frontend_main.DistributedRuntime = with_generation_cuts
     sys.argv[0] = "dynamo.frontend"
     frontend_main.main()
 
