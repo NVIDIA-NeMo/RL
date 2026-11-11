@@ -1253,13 +1253,28 @@ class LiLiCorrSpeculator(DFlashSpeculator):
             raise RuntimeError("LiLiCorr loss_stats ran without a DFlash output")
 
         plan = dflash_output.plan
+        # Gold tokens come from the per-sample input_ids. With sequence packing the
+        # plan's label_positions index the packed CP-local sequence, so -- like
+        # DFlash's _loss_mask -- use the per-sample positions instead; indexing
+        # per-sample data with packed positions runs off the end (device assert).
+        sample_positions = (
+            plan.label_positions
+            if dflash_output.sequence_layout is None
+            else plan.packed_rope_positions
+        )
+        input_ids = data["input_ids"]
+        target_ids = input_ids[
+            plan.sample_rows[:, None],
+            sample_positions.clamp(0, input_ids.shape[-1] - 1),
+        ]
+        # Slots outside the draft loss (padding, past a sample's end, non-response)
+        # get an id no candidate can match, so their gold index is -100.
+        in_loss = self._loss_mask(plan, data, dflash_output.sequence_layout)
+        target_ids = torch.where(in_loss, target_ids, torch.full_like(target_ids, -1))
         # Drop the anchor column, matching score_candidates: the lattice scores the
         # mask slots only, so the gold path must index the same ones. DFlash's own
         # objective does the same thing with loss_mask[:, 1:].
-        target_ids = data["input_ids"][
-            plan.sample_rows[:, None],
-            plan.label_positions,
-        ][:, 1:]
+        target_ids = target_ids[:, 1:]
         if target_ids.shape[-1] != output.candidate_ids.shape[-2]:
             raise RuntimeError(
                 f"LiLiCorr gold targets have {target_ids.shape[-1]} slots but the "
