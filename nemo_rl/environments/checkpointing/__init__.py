@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Optional
 
 from nemo_rl.environments.checkpointing.interfaces import (
     EnvironmentCheckpoint,
@@ -25,7 +25,9 @@ from nemo_rl.environments.checkpointing.interfaces import (
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data_plane.interfaces import DataPlaneClient
     from nemo_rl.experience.rollout_manager import RolloutManager
+    from nemo_rl.models.generation.interfaces import GenerationInterface
 
 
 def build_environment_checkpoint(
@@ -33,13 +35,16 @@ def build_environment_checkpoint(
     *,
     env_handles: dict[str, Any],
     rollout_manager: RolloutManager,
-    dp_client: Any,
+    dp_client: DataPlaneClient,
+    generation: Optional[GenerationInterface] = None,
 ) -> EnvironmentCheckpoint:
     """Return the environment checkpoint this run's config asks for.
 
-    Only turn-level recovery keeps environment state, and setup already
-    requires NeMo Gym for it. A new backend that keeps rollout state adds its
-    branch here.
+    Only turn- and prefix-level recovery keep environment state, and setup
+    already requires NeMo Gym for them. ``generation`` is the policy's
+    generation handle; prefix recovery deletes its workers' obsolete generation
+    chunk rows before each snapshot.
+    A new backend that keeps rollout state adds its branch here.
     """
     if not master_config.rollout_recovery.turn_checkpointing_enabled:
         return NoEnvironmentCheckpoint()
@@ -52,4 +57,5 @@ def build_environment_checkpoint(
         env_handles=env_handles,
         rollout_manager=rollout_manager,
         dp_client=dp_client,
+        generation=generation,
     )

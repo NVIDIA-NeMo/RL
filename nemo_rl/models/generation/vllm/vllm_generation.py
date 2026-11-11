@@ -199,6 +199,9 @@ class _TokenCaptureSetup:
     staging_partition: str
     capture_media: bool
     top_logprobs: int
+    generation_prefix_cuts_enabled: bool
+    generation_cut_control_token: str | None
+    generation_cut_control_timeout_s: float | None
 
 
 class VllmGeneration(GenerationInterface):
@@ -739,6 +742,9 @@ class VllmGeneration(GenerationInterface):
         *,
         capture_media: bool = False,
         top_logprobs: int = 0,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
+        generation_cut_control_timeout_s: float | None = None,
     ) -> "Optional[MediaColumnSpec]":
         """Install ledger-authoritative token capture in every DP-leader worker.
 
@@ -754,7 +760,13 @@ class VllmGeneration(GenerationInterface):
             "is the worker's in-process HTTP server)"
         )
         setup = _TokenCaptureSetup(
-            dp_cfg, staging_partition, capture_media, top_logprobs
+            dp_cfg,
+            staging_partition,
+            capture_media,
+            top_logprobs,
+            generation_prefix_cuts_enabled,
+            generation_cut_control_token,
+            generation_cut_control_timeout_s,
         )
         futures = self.worker_group.run_all_workers_single_data(
             "setup_token_capture",
@@ -1970,6 +1982,41 @@ class VllmGeneration(GenerationInterface):
         if self.fleet_monitor is not None:
             self.fleet_monitor.raise_if_exhausted()
         return True
+
+    def flush_obsolete_generation_cut_rows(
+        self, epoch: int, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Delete chunk rows of calls that ended before snapshot ``epoch``."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "flush_obsolete_generation_cut_rows requires async_engine=True"
+            )
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "flush_obsolete_generation_cut_rows_async",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            epoch=epoch,
+        )
+        if not all(ray.get(futures, timeout=timeout_s)):
+            raise RuntimeError(
+                "flush_obsolete_generation_cut_rows failed on an async vLLM engine"
+            )
+        return True
+
+    def get_generation_prefix_counts(self) -> dict[str, int]:
+        """Sum over workers of generation-prefix restore and cut counts."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_generation_prefix_counts",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        totals: dict[str, int] = {}
+        for counts in ray.get(futures):
+            for name, value in counts.items():
+                totals[name] = totals.get(name, 0) + value
+        return totals
 
     @property
     def requires_kv_scale_sync(self) -> bool:
