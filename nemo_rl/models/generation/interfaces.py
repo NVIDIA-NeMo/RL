@@ -68,7 +68,12 @@ def get_num_routed_experts(hf_config: Any) -> Optional[int]:
     for owner in (hf_config, getattr(hf_config, "text_config", None)):
         if owner is None:
             continue
-        for attr in ("num_experts", "n_routed_experts", "num_local_experts"):
+        for attr in (
+            "num_experts",
+            "n_routed_experts",
+            "num_local_experts",
+            "moe_num_experts",  # Step3.5 / Step5 configs
+        ):
             value = getattr(owner, attr, None)
             if isinstance(value, int) and value > 0:
                 return value

@@ -22,7 +22,6 @@ from typing import Any, Optional, cast
 
 import ray
 import torch
-from transformers import AutoConfig
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
@@ -66,6 +65,7 @@ from nemo_rl.models.generation.vllm.video_utils import (
 )
 from nemo_rl.models.generation.vllm.worker_utils import (
     find_tokenizer_required_architectures,
+    load_hf_config_for_vllm,
     resolve_distributed_executor_backend,
     resolve_vllm_dp_settings,
     resolve_vllm_dp_size,
@@ -725,7 +725,7 @@ class BaseVllmGenerationWorker:
 
         # Override HF config for gpt-oss models to ensure compatibility with megatron
         # The megatron --> hf export is done in bf16, so we disable quantization
-        hf_config = AutoConfig.from_pretrained(self.model_name, trust_remote_code=True)
+        hf_config = load_hf_config_for_vllm(self.model_name, trust_remote_code=True)
         self.routed_experts_dtype = resolve_routed_experts_dtype(
             get_num_routed_experts(hf_config)
         )

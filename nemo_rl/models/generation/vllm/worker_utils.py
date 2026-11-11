@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from collections.abc import Iterable
+from typing import Any
 
 TOKENIZER_REQUIRED_ARCHITECTURES = frozenset(
     {
@@ -56,6 +57,38 @@ def resolve_vllm_dp_size(tensor_parallel_size: int, expert_parallel_size: int) -
     if expert_parallel_size <= tensor_parallel_size:
         return 1
     return expert_parallel_size // tensor_parallel_size
+
+
+def load_hf_config_for_vllm(model_name: str, **kwargs: Any) -> Any:
+    """Load a model config on the vLLM side, falling back to vLLM's config registry.
+
+    Some new checkpoints declare a ``model_type`` that vLLM registers but Transformers
+    does not (vLLM ships its own config classes under ``vllm.transformers_utils.configs``),
+    so ``AutoConfig.from_pretrained`` raises. vLLM itself loads such checkpoints through
+    ``vllm.transformers_utils.config.get_config``; use the same resolver here so the worker
+    sees the config vLLM will serve. Only an unrecognized ``model_type`` falls back; every
+    other error is re-raised.
+    """
+    from transformers import AutoConfig
+
+    try:
+        return AutoConfig.from_pretrained(model_name, **kwargs)
+    except (KeyError, ValueError) as e:
+        if "does not recognize this architecture" not in str(e) and not isinstance(
+            e, KeyError
+        ):
+            raise
+        from vllm.transformers_utils.config import get_config
+
+        config = get_config(
+            model_name, trust_remote_code=kwargs.get("trust_remote_code", False)
+        )
+        print(
+            f"Transformers does not register model_type of {model_name}; "
+            f"using vLLM's config ({type(config).__name__}).",
+            flush=True,
+        )
+        return config
 
 
 def resolve_vllm_rank_prefixes(
