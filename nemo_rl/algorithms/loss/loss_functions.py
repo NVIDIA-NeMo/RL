@@ -44,6 +44,7 @@ from nemo_rl.algorithms.loss.interfaces import (
     MetricNormalizer,
 )
 from nemo_rl.algorithms.loss.score_centering import compute_score_centering_term
+from nemo_rl.algorithms.loss.topk_overlap import compute_topk_overlap_diagnostics
 from nemo_rl.algorithms.utils import (
     calculate_kl,
     compute_seq_logprob_errors,
@@ -2059,11 +2060,33 @@ class DistillationLossFn(LossFunction):
         student_topk_logprobs: torch.Tensor,
         teacher_topk_logprobs: torch.Tensor,
         H_all: torch.Tensor | None,
+        student_own_topk_logprobs: torch.Tensor,
+        student_own_topk_ids: torch.Tensor,
         data: DistillationLossDataDict,
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Compute distillation loss between teacher and student logits."""
+        """Compute distillation loss between teacher and student logits.
+
+        Args:
+            student_topk_logprobs: Student log-probs at the teacher's top-k ids
+                ``[B, S-1, k]``.
+            teacher_topk_logprobs: Teacher log-probs renormalized over its top-k
+                ``[B, S-1, k]``.
+            H_all: Student ``sum_v p log p`` ``[B, S-1]``, or None when the loss
+                does not need it.
+            student_own_topk_logprobs: Student full-vocabulary log-probs at its
+                own top-k ids ``[B, S-1, k]``, for the overlap diagnostics.
+            student_own_topk_ids: The student's own top-k ids ``[B, S-1, k]``.
+            data: Microbatch with the masks and the teacher top-k ids.
+            global_valid_seqs: Global valid-sequence count.
+            global_valid_toks: Global valid-token count.
+
+        Returns:
+            Tuple of the scalar loss and its metric dict, which also carries
+            the top-k overlap diagnostics of ``compute_topk_overlap_diagnostics``
+            averaged over valid tokens.
+        """
         student_probs = student_topk_logprobs.exp()  # [B, S-1, k]
         teacher_probs = teacher_topk_logprobs.exp()  # [B, S-1, k]
 
@@ -2097,6 +2120,13 @@ class DistillationLossFn(LossFunction):
 
         per_token_kl = per_token_kl.sum(dim=-1) + loss_correction_term  # [B, S-1]
 
+        overlap = compute_topk_overlap_diagnostics(
+            student_own_topk_logprobs,
+            student_own_topk_ids,
+            teacher_topk_logprobs=teacher_topk_logprobs,
+            teacher_topk_ids=data["teacher_topk_indices"][:, : per_token_kl.shape[1]],
+        )
+
         # Masking and reduction
         if "token_mask" in data and "sample_mask" in data:
             token_mask = data["token_mask"][:, 1:]
@@ -2105,17 +2135,24 @@ class DistillationLossFn(LossFunction):
             max_len = per_token_kl.shape[1]
             token_mask = token_mask[:, :max_len]
             mask = token_mask * sample_mask.unsqueeze(-1)  # [B, S-1]
-            # align mask shape to per_token_kl
-            kl_loss = masked_mean(
-                per_token_kl,
-                mask,
-                global_normalization_factor=global_valid_toks,
-            )
-        else:
-            kl_loss = per_token_kl.mean()
 
-        metrics = {
-            "loss": float(kl_loss.item()) if kl_loss.ndim == 0 else kl_loss,
+            def reduce(per_token: torch.Tensor) -> torch.Tensor:
+                return masked_mean(
+                    per_token, mask, global_normalization_factor=global_valid_toks
+                )
+
+        else:
+
+            def reduce(per_token: torch.Tensor) -> torch.Tensor:
+                return per_token.mean()
+
+        kl_loss = reduce(per_token_kl)
+
+        scalar_metrics = {"loss": kl_loss}
+        for name, per_token in overlap._asdict().items():
+            scalar_metrics[f"topk_{name}"] = reduce(per_token)
+        metrics: dict[str, Any] = {
+            **materialize_scalar_metrics(scalar_metrics, kl_loss.dtype),
             "num_valid_samples": data["input_ids"].shape[0],
         }
 
