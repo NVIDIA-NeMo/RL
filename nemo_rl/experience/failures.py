@@ -179,6 +179,15 @@ class RolloutRedispatchExhausted(RuntimeError):
     """
 
 
+class RestoredHarnessChanged(RuntimeError):
+    """A restored prompt group would finish on another harness than it started on.
+
+    Raised when ``env.nemo_gym.multi_harness``, or the Gym servers it lists,
+    changed across a resume. Like :class:`RolloutRedispatchExhausted`, it is
+    terminal for the run, so the per-attempt retry loop re-raises it.
+    """
+
+
 class RolloutStall(RuntimeError):
     """Rollouts are in flight but none has committed within the watchdog deadline."""
 

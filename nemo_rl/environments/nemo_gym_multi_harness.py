@@ -28,50 +28,84 @@ At startup the driver reads which agent each listed server runs from Gym's
 config, resolves the routes, and sends them to every Gym actor. A group's
 server is a hash of its durable group ID mapped onto the weights. The driver
 and the actors therefore pick the same server, groups spread over the
-harnesses in proportion to the weights, and a retried or restored group keeps
-its server without any stored state.
+harnesses in proportion to the weights, and a retried group keeps its server
+without any stored state. A group restored after a resume keeps its server
+unless the configuration changed; the rollout manager then stops the run
+instead of finishing the group on another harness.
 
 This module is imported on the driver, where Gym is not installed.
 """
 
 import hashlib
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Self
+
+from omegaconf import OmegaConf
+from pydantic import BaseModel, model_validator
 
 MULTI_HARNESS_CONFIG_KEY = "multi_harness"
 HARNESS_RESULT_KEY = "_ng_harness"
 
-# Versions the hash so a future selection rule cannot silently reassign
-# groups restored from an older run.
+# Part of every hash, so a new selection rule needs a new tag. A restored group
+# that the new rule moves to another harness stops the run, as any change of
+# harness across a resume does.
 _SELECTION_DOMAIN = b"nemo-rl-multi-harness-v1\0"
 _HASH_SPAN = float(2**64)
-_CONFIG_KEYS = frozenset({"routes", "weights"})
+# Gym's single_agent_turn servers fall back to their agent's resources server.
+_SINGLE_AGENT_TURN_TYPES = frozenset({"single_agent_turn", "single_agent_turn_legacy"})
 
 
-@dataclass(frozen=True)
-class MultiHarnessConfig:
-    """``env.nemo_gym.multi_harness`` as written, before servers are matched to agents.
+class MultiHarnessConfig(BaseModel, extra="forbid"):
+    """``env.nemo_gym.multi_harness``, before servers are matched to agents.
 
     Attributes:
-        routes: ``(taskset, (environment_server, ...))`` pairs, sorted.
-        weights: ``(agent type, weight)`` pairs, sorted, or None to weight
-            every agent 1.
+        routes: Each multi-harness taskset's Environment Servers, one per harness.
+        weights: The weight of each agent type for the whole run, or None to
+            weight every agent 1.
     """
 
-    routes: tuple[tuple[str, tuple[str, ...]], ...]
-    weights: tuple[tuple[str, float], ...] | None
+    routes: dict[str, list[str]]
+    weights: dict[str, float] | None = None
+
+    @model_validator(mode="after")
+    def _check_values(self) -> Self:
+        if not self.routes:
+            raise ValueError("routes must list at least one taskset")
+        for taskset, servers in self.routes.items():
+            if (
+                not taskset
+                or not servers
+                or not all(servers)
+                or len(set(servers)) != len(servers)
+            ):
+                raise ValueError(
+                    f"routes.{taskset} must be a nonempty list of distinct "
+                    "Environment Server names"
+                )
+        if self.weights is not None:
+            if not self.weights:
+                raise ValueError("weights must map agent types to weights")
+            for agent, weight in self.weights.items():
+                if not agent or not math.isfinite(weight) or weight < 0:
+                    raise ValueError(
+                        "weights must map agent types to finite numbers >= 0; "
+                        f"got {agent!r}: {weight!r}"
+                    )
+        return self
 
     @property
     def tasksets(self) -> frozenset[str]:
         """Return the tasksets these routes cover."""
-        return frozenset(taskset for taskset, _ in self.routes)
+        return frozenset(self.routes)
 
     @property
     def servers(self) -> frozenset[str]:
         """Return every server the routes list."""
-        return frozenset(server for _, servers in self.routes for server in servers)
+        return frozenset(
+            server for servers in self.routes.values() for server in servers
+        )
 
 
 @dataclass(frozen=True)
@@ -166,69 +200,16 @@ class MultiHarnessRoutes:
 
 
 def parse_multi_harness(value: object) -> MultiHarnessConfig | None:
-    """Validate the shape of ``env.nemo_gym.multi_harness``.
+    """Validate ``env.nemo_gym.multi_harness``, or return None when it is unset.
 
-    ``routes`` maps each taskset to a list of distinct Environment Server
-    names. ``weights`` is optional and maps agent types to finite numbers of
-    at least 0. Which agent each server runs is only known once Gym has
-    started; :func:`resolve_multi_harness` checks the rest then.
+    Which agent each server runs is only known once Gym has started;
+    :func:`resolve_multi_harness` checks the rest then.
     """
     if value is None:
         return None
-    if not isinstance(value, Mapping):
-        raise ValueError(
-            "env.nemo_gym.multi_harness must be a mapping with routes and "
-            "optional weights"
-        )
-    unknown = sorted(str(key) for key in value if key not in _CONFIG_KEYS)
-    if unknown:
-        raise ValueError(f"env.nemo_gym.multi_harness has unknown keys {unknown}")
-
-    raw_routes = value.get("routes")
-    if not isinstance(raw_routes, Mapping) or not raw_routes:
-        raise ValueError(
-            "env.nemo_gym.multi_harness.routes must map each taskset to a list "
-            "of Environment Servers"
-        )
-    routes: list[tuple[str, tuple[str, ...]]] = []
-    for taskset, servers in raw_routes.items():
-        if (
-            not _is_name(taskset)
-            or isinstance(servers, (str, Mapping))
-            or not isinstance(servers, Sequence)
-            or not servers
-            or not all(_is_name(server) for server in servers)
-            or len(set(servers)) != len(servers)
-        ):
-            raise ValueError(
-                f"env.nemo_gym.multi_harness.routes.{taskset} must be a nonempty "
-                "list of distinct Environment Server names"
-            )
-        routes.append((taskset, tuple(sorted(servers))))
-
-    raw_weights = value.get("weights")
-    weights: tuple[tuple[str, float], ...] | None = None
-    if raw_weights is not None:
-        if not isinstance(raw_weights, Mapping) or not raw_weights:
-            raise ValueError(
-                "env.nemo_gym.multi_harness.weights must map agent types to weights"
-            )
-        parsed: dict[str, float] = {}
-        for agent, weight in raw_weights.items():
-            if (
-                not _is_name(agent)
-                or isinstance(weight, bool)
-                or not isinstance(weight, (int, float))
-                or not math.isfinite(weight)
-                or weight < 0
-            ):
-                raise ValueError(
-                    "env.nemo_gym.multi_harness.weights must map agent types to "
-                    f"finite numbers >= 0; got {agent!r}: {weight!r}"
-                )
-            parsed[agent] = float(weight)
-        weights = tuple(sorted(parsed.items()))
-    return MultiHarnessConfig(routes=tuple(sorted(routes)), weights=weights)
+    if OmegaConf.is_config(value):
+        value = OmegaConf.to_container(value, resolve=True)
+    return MultiHarnessConfig.model_validate(value)
 
 
 def describe_environment_server(
@@ -263,7 +244,19 @@ def describe_environment_server(
         if isinstance(agent_entry, Mapping)
         else None
     )
+    agent_config = (
+        next(iter(agent_types.values()))
+        if isinstance(agent_types, Mapping) and len(agent_types) == 1
+        else None
+    )
     resources_ref = server_config.get("resources_server")
+    if (
+        resources_ref is None
+        and server_type in _SINGLE_AGENT_TURN_TYPES
+        and isinstance(agent_config, Mapping)
+    ):
+        # Gym uses the agent's resources server when the server names none.
+        resources_ref = agent_config.get("resources_server")
     resources_name = (
         resources_ref.get("name") if isinstance(resources_ref, Mapping) else None
     )
@@ -305,11 +298,11 @@ def resolve_multi_harness(
             differently from the taskset's other servers.
     """
     agents_by_taskset: dict[str, list[tuple[str, str]]] = {}
-    for taskset, names in config.routes:
+    for taskset, names in sorted(config.routes.items()):
         agents: list[tuple[str, str]] = []
         types: set[str] = set()
         verifiers: set[str | None] = set()
-        for server in names:
+        for server in sorted(names):
             info = servers.get(server)
             if info is None or info.agent is None:
                 raise ValueError(

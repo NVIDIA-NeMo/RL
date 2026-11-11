@@ -44,10 +44,14 @@ from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
-from nemo_rl.environments.nemo_gym_multi_harness import harness_metric_namespace
+from nemo_rl.environments.nemo_gym_multi_harness import (
+    HARNESS_RESULT_KEY,
+    harness_metric_namespace,
+)
 from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
     get_nemo_gym_task_input,
+    is_nemo_gym_task,
 )
 from nemo_rl.experience.dynamic_sampling import (
     StepRewardStats,
@@ -63,6 +67,7 @@ from nemo_rl.experience.failures import (
     GymAdmissionClosed,
     GymRowFailure,
     GymTransportError,
+    RestoredHarnessChanged,
     RolloutDataFailure,
     RolloutFailure,
     RolloutRedispatchExhausted,
@@ -82,6 +87,7 @@ from nemo_rl.experience.metric_utils import calculate_single_metric, pct
 from nemo_rl.experience.reward_penalties import RewardLogContext, compute_reward_checks
 from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
+    PromptGroupRecoveryRecord,
     PromptGroupStatus,
     RecoveryGranularity,
     RecoveryTargetLevel,
@@ -1843,6 +1849,20 @@ class AsyncNemoGymRolloutImpl:
 
         return completions, prompt_message_log, rollout_metrics
 
+    def metric_namespace_for_group(self, row: Mapping[str, Any], group_id: str) -> str:
+        """Name the metric namespace a group gets under the current routes.
+
+        This is the taskset, plus the agent the group runs for a multi-harness
+        taskset, as each finished row records it in its reward log context.
+        """
+        namespace = _nemo_gym_metric_namespace(row)
+        routes = as_nemo_gym_shard_set(self._task_to_env["nemo_gym"]).multi_harness
+        taskset = get_nemo_gym_attribution_key(row)
+        if routes is None or taskset is None or not routes.covers(taskset):
+            return namespace
+        harness = routes.select(taskset, group_id).harness
+        return harness_metric_namespace(namespace, {HARNESS_RESULT_KEY: harness})
+
     def select_checkpoint_instance(self, input_sample: DatumSpec) -> str:
         """Choose and return the durable Gym actor identity for one prompt group."""
         extra_env_info = input_sample.get("extra_env_info")
@@ -2924,7 +2944,9 @@ class RolloutManager:
                     inflight_registry=inflight_registry,
                 )
             except Exception as error:
-                if isinstance(error, UnresolvedCaptureAcknowledgement):
+                if isinstance(
+                    error, (UnresolvedCaptureAcknowledgement, RestoredHarnessChanged)
+                ):
                     raise
                 reason = type(error).__name__
                 if classify_rollout_failure(error) is FailureClass.INFRA:
@@ -2979,6 +3001,45 @@ class RolloutManager:
         self._stats.skipped += 1
         return None
 
+    def _require_unchanged_harness(
+        self, input_sample: DatumSpec, recovery_group: PromptGroupRecoveryRecord
+    ) -> None:
+        """Refuse to finish a restored group on another harness than its sealed rows.
+
+        A group's harness is recomputed from its ID, so it changes only when
+        ``env.nemo_gym.multi_harness`` or the Gym servers it lists changed
+        across a resume. Each sealed row recorded its harness in its reward
+        log context; finishing the group under a different one would train one
+        GRPO group on two harnesses.
+        """
+        row = input_sample.get("extra_env_info")
+        if not isinstance(self._impl, AsyncNemoGymRolloutImpl) or not (
+            isinstance(row, Mapping) and is_nemo_gym_task(row)
+        ):
+            return
+        sealed = [
+            sibling.current_attempt
+            for sibling in recovery_group.siblings
+            if sibling.current_attempt.status == RolloutAttemptStatus.SEALED
+        ]
+        if not sealed:
+            return
+        expected = self._impl.metric_namespace_for_group(row, recovery_group.group_id)
+        for attempt in sealed:
+            context = attempt.reward_log_context
+            if context is None and expected == _nemo_gym_metric_namespace(row):
+                # A ledger without contexts; nothing to compare off multi-harness.
+                continue
+            recorded = context.agent_name if context is not None else None
+            if recorded != expected:
+                raise RestoredHarnessChanged(
+                    f"Restored prompt group {recovery_group.group_id!r} has finished "
+                    f"generations recorded as {recorded!r}, but the current "
+                    f"configuration runs the rest as {expected!r}. Changing "
+                    "env.nemo_gym.multi_harness, or the Gym servers it lists, "
+                    "across a resume is not supported."
+                )
+
     async def _generate_for_finalization_attempt(
         self,
         input_sample: DatumSpec,
@@ -2990,6 +3051,9 @@ class RolloutManager:
         from nemo_rl.experience.rollout_reassembler_actor import ReassemblyRequest
 
         assert self._tq_buffer is not None
+        self._require_unchanged_harness(
+            input_sample, self._recovery_ledger.get_group(recovery_group_id)
+        )
         async with self._recovery_mutation() as cut:
             recovery_group = self._recovery_ledger.get_group(recovery_group_id)
             if recovery_group.status == PromptGroupStatus.GENERATING:

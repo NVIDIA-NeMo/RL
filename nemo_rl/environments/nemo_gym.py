@@ -3918,8 +3918,9 @@ def _install_multi_harness_routes(
 
     A taskset is routed by ``environment_server_routes`` or by
     ``multi_harness.routes``, never both. Each listed server must run in
-    exactly one Gym actor. That actor describes the server from its own Gym
-    config, so the match sees the servers of every shard.
+    exactly one shard; its replicas are fine. The shard's first actor
+    describes the server from its own Gym config, so the match sees the
+    servers of every shard.
 
     Raises:
         ShardConfigError: A taskset is in both route settings.
@@ -3943,8 +3944,8 @@ def _install_multi_harness_routes(
     missing = sorted(server for server, shards in owners.items() if not shards)
     if missing:
         raise ShardSetupError(
-            "env.nemo_gym.multi_harness.routes lists Environment Servers that no "
-            f"Gym actor runs: {missing}."
+            "env.nemo_gym.multi_harness.routes lists names that are not "
+            f"Environment Servers any Gym actor runs: {missing}."
         )
     duplicated = {
         server: shards for server, shards in owners.items() if len(shards) > 1

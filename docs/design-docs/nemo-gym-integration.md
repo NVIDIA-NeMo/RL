@@ -75,7 +75,7 @@ NeMo RL supports two Gym dataset formats. Both enter Gym through an Environment 
 - **Flat rows** identify the Agent through `agent_ref.name` or `task_source`. Gym resolves the Environment Server associated with that Agent, including through `legacy_agent`.
 - **Materialized task rows** contain `task_id` and `task_input`. Set `env.nemo_gym.environment_server_routes` to map each row's `task_id.taskset` to a configured Environment Server entry name.
 
-The taskset mapping can also be supplied in a Gym YAML loaded through `config_paths`; RL reads it from Gym's merged configuration. RL sends each prompt group to an actor hosting the selected server. With the current Gym pin, materialized task rows can target `single_agent_turn` or `single_agent_turn_legacy`.
+The taskset mapping can also be supplied in a Gym YAML loaded through `config_paths`; RL reads it from Gym's merged configuration. RL sends each prompt group to an actor hosting the selected server. With the current Gym pin, materialized task rows can target `single_agent_turn`, `single_agent_turn_legacy`, or `harbor`.
 
 See [Data Format Translation](#data-format-translation) for the field layout of each format.
 
@@ -119,21 +119,21 @@ env:
       routes:
         swe_rebench: [swe_rebench_opencode, swe_rebench_pi]
         scale_swe: [scale_swe_opencode, scale_swe_pi]
-      weights:  # optional; every agent defaults to 1
+      weights:  # optional; omit for equal weights, otherwise list every agent
         opencode_agent: 2
         pi_agent: 1
 ```
 
 - A taskset goes in `environment_server_routes` or in `multi_harness.routes`, never both. Setup stops if a taskset is in both.
-- Each server in `multi_harness.routes` is an Environment Server defined in the Gym configuration, usually one per harness loaded through `config_paths`. NeMo RL reads which agent each server runs from that configuration.
-- Each prompt group of a multi-harness taskset runs on one of its servers, chosen at random in proportion to the weight of the agent that the server runs. With the weights above, about two thirds of the groups run on OpenCode.
-- Weights are keyed by agent type, the key under `responses_api_agents` in the agent's Gym configuration, such as `opencode_agent`. They apply to the whole run. A weight of 0 disables an agent. If `weights` is set, every agent that a listed server runs needs a weight, and every weight must name such an agent; setup stops otherwise. A taskset whose agents all have weight 0 also stops setup.
+- Each listed server is an Environment Server from the Gym configuration, usually one per harness. NeMo RL reads the type of agent each server runs, its key under `responses_api_agents` such as `opencode_agent`. The servers of one taskset must run different agent types.
+- Each prompt group runs on one of its taskset's servers, chosen at random in proportion to the weight of the server's agent. With the weights above, about two thirds of the groups run on OpenCode.
+- Weights apply to the whole run. A set `weights` must list exactly the agents the servers run. A weight of 0 disables an agent, but its servers must still be listed and running; to drop a harness, remove its servers and its weight.
 
-GRPO compares a group's generations with the group's mean reward, so a group that mixed harnesses would train on the differences between harnesses. Every generation of a group therefore runs on the same server, including retried generations, retried groups, and groups restored from a rollout checkpoint: the choice is a hash of the group's ID. A rollout checkpoint records the `multi_harness` block, so a run resumes only with the same routes and weights.
+GRPO compares a group's generations with the group's mean reward, so a group that mixed harnesses would train on the differences between harnesses. The choice is a hash of the group's ID, so every generation of a group, including retries, runs on the same server. Changing `multi_harness`, or the Gym servers it lists, across a resume is not supported: with token capture, a restored group that would finish on another harness stops the run.
 
-Setup checks each multi-harness taskset's servers. Each must run in exactly one Gym actor and run a different agent, and all must score the taskset the same way: one Environment Server type, the same resources server for `single_agent_turn`, and the taskset listed in each server's `tasksets` for `harbor`. Gym still checks at dispatch that each agent is one the taskset's verifier allows. With `env.nemo_gym.shards`, every shard uses the shared `multi_harness` block; setup stops if a shard's `overrides` change it.
+Setup also checks that each listed server runs in exactly one shard (its replicas are fine) and that a taskset's servers share one Environment Server type and verifier: the same resources server for `single_agent_turn`, and the taskset in each server's `tasksets` for `harbor`. With `env.nemo_gym.shards`, every shard must use the shared `multi_harness` block.
 
-Rollout metrics for a multi-harness taskset are named after the taskset and the agent, for example `swe_rebench/opencode_agent/reward`. There is no combined line for a multi-harness taskset; run-wide totals such as `total_reward` remain. Settings keyed by taskset, such as teacher selection and length or recovery overrides, still use the taskset name.
+Metrics for a multi-harness taskset are named after the taskset and the agent, such as `swe_rebench/opencode_agent/reward/mean`. There are no `swe_rebench/...` keys, so select checkpoints on a run-wide key such as `total_reward`. Validation draws a fresh harness for each prompt on every pass, so per-harness validation numbers cover different prompts each time. Settings keyed by taskset, such as teacher selection and length or recovery overrides, still use the taskset name.
 
 ### Shard NeMo Gym across nodes
 
@@ -447,7 +447,7 @@ flowchart LR
 - **Responses API** (NeMo Gym): OpenAI Responses API format with `input`, `tools`, and multi-turn conversation
 - **Chat Completions** (vLLM): OpenAI Chat Completions format for the actual inference call
 
-**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and updates `responses_create_params` with generation parameters (`temperature`, `top_p`) at the row's top level or inside `task_input`. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`, or through `multi_harness.routes` by prompt group; the collector wraps each task in an episode request containing `episode_id` and `task`. Materialized tasks carry no Agent reference, so NeMo RL attributes their metrics, teacher selection, and per-key overrides to `task_id.taskset`.
+**Data flow**: NeMo RL reads the Gym row from `extra_env_info` and updates `responses_create_params` with generation parameters (`temperature`, `top_p`) at the row's top level or inside `task_input`. Flat rows resolve to the Environment Server associated with their Agent. Materialized tasks route by `task_id.taskset` through `environment_server_routes`, or through `multi_harness.routes` by prompt group; the collector wraps each task in an episode request containing `episode_id` and `task`. Materialized tasks carry no Agent reference, so NeMo RL attributes their metrics, teacher selection, and per-key overrides to `task_id.taskset`; a multi-harness taskset's metrics are further split by agent.
 
 The Agent sends Responses API requests to the Model Server, which translates Responses API ↔ Chat Completions (converting message formats, extracting reasoning content, attaching token IDs). NeMo RL validates materialized-task episode replies and extracts successful results before the usual result processing. Token IDs, logprobs, and rewards then populate the final Result.
 
