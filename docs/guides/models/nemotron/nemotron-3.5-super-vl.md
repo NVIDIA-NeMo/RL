@@ -186,6 +186,11 @@ Use `--mode multi` for stock OpenCode sessions per task, or
 and `--epoch` freeze routing when preparing the file, before GRPO siblings are
 expanded. The model-visible task prompt is preserved; multi adds workspace and
 preview instructions. Private grading metadata stays outside model input.
+Before reusing previously prepared multi/mixed rows, verify that their typed
+tasksets select only `mm-coding:opencode` and their system prompts explain that
+only the self-contained final answer file reaches a fresh grading sandbox.
+Regenerate rows that fail either check with the current adapter; an explicit
+`--harnesses opencode` argument alone does not update an existing prompt.
 Use the matching [`mm_coding_multi.yaml`](../../../../examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_multi.yaml)
 or [`mm_coding_mixed.yaml`](../../../../examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_mixed.yaml)
 recipe. All three recipes share the learner, optimizer and reward settings. Multi and
