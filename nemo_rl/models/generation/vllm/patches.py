@@ -774,14 +774,17 @@ def _patch_vllm_radio_native_loader(logger) -> None:
 
 
 def _patch_vllm_radio_final_layernorm(logger) -> None:
-    """Port checkpoint-backed Super Omni final vision LayerNorm to vLLM 0.29.
+    """Make vLLM's Super Omni final vision LayerNorm match the Megatron scoring path.
 
-    The layer runs in FP32 before pixel shuffle/projection. Both affine
-    parameters must load before activation, including dummy startup + refit.
-    Supports stock vLLM 0.29 source or this patch's complete output. Custom
-    forks, including the already-fixed serving fork below, are not recognized;
-    unexpected source layouts fail before writing rather than being skipped.
-    References: RL #4036 and TomerBN-Nvidia/vllm commit 10908b9f.
+    vLLM 0.33 builds the layer itself, but runs it in the LLM dtype after the
+    BF16 cast, applies it even when no checkpoint weights were loaded, and only
+    reads the ``vision_projector.`` weight names. This patch runs it in FP32
+    before the cast, turns it on only once both affine parameters have loaded
+    (so dummy startup + refit stays a no-op until then), and also reads the bare
+    ``vision_final_layernorm.`` names.
+    Supports stock vLLM 0.33 source or this patch's complete output; unexpected
+    source layouts fail before writing rather than being skipped.
+    References: RL #4036.
     """
     try:
         file_to_patch = _get_vllm_file("model_executor/models/nano_nemotron_vl.py")
@@ -791,11 +794,17 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
 
     replacements = (
         (
-            """            self.mlp1 = mlp1.to(llm_dtype)
-            self.sound_encoder: ProjectedParakeet | None = None
+            """            # Match the HF vision projector for checkpoints trained with MTP.
+            self.vision_final_layernorm = (
+                nn.LayerNorm(
+                    vit_hidden_size,
+                    eps=getattr(vision_config, "layer_norm_eps", 1e-6),
+                ).to(llm_dtype)
+                if (getattr(config.text_config, "num_nextn_predict_layers", 0) or 0) > 0
+                else None
+            )
 """,
-            """            self.mlp1 = mlp1.to(llm_dtype)
-            self.vision_final_layernorm: nn.LayerNorm | None = None
+            """            self.vision_final_layernorm: nn.LayerNorm | None = None
             if (
                 getattr(config.text_config, "num_nextn_predict_layers", 0) or 0
             ) > 0:
@@ -807,7 +816,6 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
                 ).float()
             self._loaded_vision_final_layernorm_params: set[str] = set()
             self._vision_final_layernorm_enabled = False
-            self.sound_encoder: ProjectedParakeet | None = None
 """,
         ),
         (
@@ -832,6 +840,8 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
         (
             """        _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
         vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+        if self.vision_final_layernorm is not None:
+            vit_embeds = self.vision_final_layernorm(vit_embeds)
 """,
             """        _, vit_embeds = self.vision_model(pixel_values, imgs_sizes=imgs_sizes)
         vit_embeds = self._apply_vision_final_layernorm(vit_embeds)
@@ -842,6 +852,8 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
             """            else:
                 _, vit_embeds = self.vision_model(chunk)
             vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+            if self.vision_final_layernorm is not None:
+                vit_embeds = self.vision_final_layernorm(vit_embeds)
 """,
             """            else:
                 _, vit_embeds = self.vision_model(chunk)
@@ -850,28 +862,10 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
 """,
         ),
         (
-            """            connector=["mlp1", "sound_encoder.projection"],
-""",
-            """            connector=[
-                "mlp1",
-                "vision_final_layernorm",
-                "sound_encoder.projection",
-            ],
-""",
-        ),
-        (
-            """        adapter_dict = dict(self.mlp1.named_parameters())
-""",
-            """        adapter_dict = dict(self.mlp1.named_parameters())
-        final_layernorm_dict = (
-            dict(self.vision_final_layernorm.named_parameters())
-            if load_multimodal_weights and self.vision_final_layernorm is not None
-            else {}
-        )
-""",
-        ),
-        (
-            """        def is_vision_weights(name: str) -> bool:
+            """        vision_norm_prefix = "vision_projector.vision_final_layernorm."
+
+        def is_vision_norm_weights(name: str) -> bool:
+            return name.startswith(vision_norm_prefix)
 """,
             """        def get_final_layernorm_name(name: str) -> str | None:
             for prefix in (
@@ -881,25 +875,20 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
                 if name.startswith(prefix):
                     return name.removeprefix(prefix)
             return None
-
-        def is_vision_weights(name: str) -> bool:
 """,
         ),
         (
-            """        adapter_weights: list[tuple[str, torch.Tensor]] = []
-        vision_weights: list[tuple[str, torch.Tensor]] = []
+            """                elif is_vision_norm_weights(name):
+                    if not load_multimodal_weights:
+                        continue
+                    param_name = name.removeprefix(vision_norm_prefix)
+                    assert param_name in vision_norm_params, (
+                        f"Unexpected vision LayerNorm weight: {name}"
+                    )
+                    with torch.no_grad():
+                        default_weight_loader(vision_norm_params[param_name], w)
 """,
-            """        adapter_weights: list[tuple[str, torch.Tensor]] = []
-        final_layernorm_weights: list[tuple[str, torch.Tensor]] = []
-        vision_weights: list[tuple[str, torch.Tensor]] = []
-""",
-        ),
-        (
-            """                elif is_vision_weights(name):
-""",
-            """                elif (
-                    final_layernorm_name := get_final_layernorm_name(name)
-                ) is not None:
+            """                elif (param_name := get_final_layernorm_name(name)) is not None:
                     if not load_multimodal_weights:
                         continue
                     if self.vision_final_layernorm is None:
@@ -907,31 +896,14 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
                             "Checkpoint has final vision LayerNorm weights but "
                             "the model configuration did not construct the layer"
                         )
-                    final_layernorm_weights.append(
-                        (final_layernorm_name, w.detach().clone())
-                    )
-                elif is_vision_weights(name):
-""",
-        ),
-        (
-            """            self.vision_model.load_weights(vision_weights)
-            if self.sound_encoder is not None and len(sound_weights) > 0:
-""",
-            """            for trimmed_name, w in final_layernorm_weights:
-                param = final_layernorm_dict[trimmed_name]
-                with torch.no_grad():
-                    default_weight_loader(param, w)
-                self._loaded_vision_final_layernorm_params.add(trimmed_name)
-            if final_layernorm_weights and (
-                self._loaded_vision_final_layernorm_params >= final_layernorm_dict.keys()
-            ):
-                self._vision_final_layernorm_enabled = True
-                logger.info_once(
-                    "Loaded RADIO final LayerNorm affine parameters",
-                    scope="global",
-                )
-            self.vision_model.load_weights(vision_weights)
-            if self.sound_encoder is not None and len(sound_weights) > 0:
+                    with torch.no_grad():
+                        default_weight_loader(vision_norm_params[param_name], w)
+                    self._loaded_vision_final_layernorm_params.add(param_name)
+                    if (
+                        self._loaded_vision_final_layernorm_params
+                        >= vision_norm_params.keys()
+                    ):
+                        self._vision_final_layernorm_enabled = True
 """,
         ),
     )
@@ -940,7 +912,7 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
             return
         if any(content.count(old) != 1 for old, _ in replacements):
             raise RuntimeError(
-                "Final vision LayerNorm patch requires the vLLM 0.29 model source "
+                "Final vision LayerNorm patch requires the vLLM 0.33 model source "
                 f"or its fully patched equivalent: {file_to_patch}"
             )
         for old, new in replacements:
