@@ -19,6 +19,7 @@ import fcntl
 import hashlib
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -48,8 +49,16 @@ class PatchBundle:
 @dataclass(frozen=True)
 class OriginalFile:
     path: Path
-    content: bytes | None
     mode: int
+    uid: int
+    gid: int
+
+
+@dataclass(frozen=True)
+class PreparedFile:
+    original: OriginalFile
+    replacement: Path
+    backup: Path | None
 
 
 def digest(content: bytes) -> str:
@@ -147,42 +156,71 @@ def staged_contents(root: Path, bundle: PatchBundle) -> dict[Path, bytes]:
         return result
 
 
-def replace_bytes(path: Path, content: bytes, *, mode: int) -> None:
-    """Replace a file atomically without modifying hard-linked uv cache files."""
-    descriptor, name = tempfile.mkstemp(prefix=".nrl-lease-", dir=path.parent)
-    temporary = Path(name)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-            os.fchmod(stream.fileno(), mode)
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+def prepare_replacement(path: Path, content: bytes, original: OriginalFile) -> None:
+    """Write and sync a replacement with the original access metadata."""
+    with path.open("xb") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fchown(stream.fileno(), original.uid, original.gid)
+        os.fchmod(stream.fileno(), original.mode)
+        os.fsync(stream.fileno())
 
 
 def install_contents(roots: Sequence[Path], contents: dict[Path, bytes]) -> None:
-    """Publish verified files, restoring original contents if a write fails."""
-    written: list[OriginalFile] = []
+    """Prepare every replacement and rollback inode before publishing sources."""
+    directories: list[Path] = []
+    prepared: list[PreparedFile] = []
+    published: list[PreparedFile] = []
+    retain_backups = False
     try:
         for root in roots:
             for relative, content in contents.items():
                 target = root / relative
+                existing = target.stat() if target.exists() else None
+                owner = existing if existing is not None else target.parent.stat()
                 original = OriginalFile(
                     target,
-                    target.read_bytes() if target.exists() else None,
-                    stat.S_IMODE(target.stat().st_mode) if target.exists() else 0o644,
+                    stat.S_IMODE(existing.st_mode) if existing is not None else 0o644,
+                    owner.st_uid,
+                    owner.st_gid,
                 )
-                replace_bytes(target, content, mode=original.mode)
-                written.append(original)
-    except OSError:
-        for original in reversed(written):
-            if original.content is None:
-                original.path.unlink(missing_ok=True)
-            else:
-                replace_bytes(original.path, original.content, mode=original.mode)
-        raise
+                directory = Path(
+                    tempfile.mkdtemp(prefix=".nrl-lease-", dir=target.parent)
+                )
+                directories.append(directory)
+                backup = directory / "original" if existing is not None else None
+                if backup is not None:
+                    os.link(target, backup)
+                replacement = directory / "replacement"
+                prepare_replacement(replacement, content, original)
+                prepared.append(PreparedFile(original, replacement, backup))
+        try:
+            for item in prepared:
+                os.replace(item.replacement, item.original.path)
+                published.append(item)
+        except OSError as error:
+            failures: list[OSError] = []
+            for item in reversed(published):
+                try:
+                    if item.backup is None:
+                        item.original.path.unlink()
+                    else:
+                        os.replace(item.backup, item.original.path)
+                except OSError as failure:
+                    failures.append(failure)
+            if failures:
+                retain_backups = True
+                locations = ", ".join(map(str, directories))
+                raise OSError(
+                    f"Rollback failed; restore backups or rebuild packages. Staging retained: {locations}"
+                ) from ExceptionGroup(
+                    "Installation and rollback failures", [error, *failures]
+                )
+            raise
+    finally:
+        if not retain_backups:
+            for directory in reversed(directories):
+                shutil.rmtree(directory)
 
 
 def apply_bundle(

@@ -203,12 +203,21 @@ python tools/apply_vllm_nixl_lease_patch.py --apply \
 The check reports `original` or `applied`; rerun it after applying and require
 `applied` for every root. Applying twice is safe. Unsupported or partially
 patched packages fail before source writes; rebuild a partially patched image.
-The installer stages and hashes all resulting files before replacing them,
-preserves file modes, and replaces files atomically to avoid modifying uv cache
-hardlinks. Run it offline: individual replacements are atomic, but the complete
-multi-file installation is not atomic against running readers or process kills.
-Ordinary write failures trigger rollback; a killed installer requires rebuilding
-or rechecking the image. All P/D processes must restart with the same patched
+The installer stages and hashes all resulting files, then prepares every
+replacement and same-filesystem rollback hardlink before replacing any source.
+It preserves existing UID, GID, and permission bits; new modules inherit their
+parent directory's UID/GID and are readable with mode `0644`. Failure to preserve
+ownership aborts before publication. Package filesystems must support hardlinks
+and atomic renames. The installer never rewrites the contents of linked uv cache files.
+
+Run it offline: individual replacements are atomic, but the complete multi-file
+installation is not atomic against running readers or process kills. Ordinary
+write failures restore original inodes by renaming backups and remove newly
+added modules; restoration does not allocate another copy of their contents.
+If restoration itself fails, the tool attempts all remaining restores, reports
+the failure, and retains staging directories for recovery. Rebuild the image
+or restore those backups before starting workers. A killed installer also
+requires rebuilding or rechecking the image. All P/D processes must restart with the same patched
 package; mixed wire versions are unsupported. Rebuilding frozen environments
 can discard the fix and requires applying and checking it again.
 
@@ -218,11 +227,18 @@ safely under the default failure policy. To recover by locally recomputing the
 prompt KV on decode, set the decode engine's
 `kv_transfer_config.kv_load_failure_policy` to `"recompute"`. The policy alone
 does not add lease verification to an unpatched package. Increasing the lease
-can reduce expiry frequency but does not replace validity checking.
+can reduce expiry frequency but does not replace validity checking. If NIXL
+cannot release a lease-check transfer handle, its landing cells remain
+quarantined. Requests wait while active reads or prepared batches can return
+capacity; when none can, an unsatisfiable queued request fails through the
+existing fail/recompute policy instead of waiting indefinitely.
 
 Controlled two-node, TP=2 GPU qualification covered a normal handoff, expiry
 without cache pressure, expiry with block reuse, a longer-lease control, and
 expiry followed by decode recomputation. The patched path rejected stale leases
 before model execution; the recompute case produced finite output. This does
 not establish full SWE training correctness, scaling performance, or correctness
-for every NIXL transfer topology.
+for every NIXL transfer topology. The linked PR's W&B runs cover the pre-review
+backport. Subsequent installer transaction/ownership hardening and the permanent
+landing-cell exhaustion path have CPU regression coverage; those changes have
+not been rerun on GPUs.

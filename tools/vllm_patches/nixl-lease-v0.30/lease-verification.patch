@@ -229,7 +229,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/lease_slots.py b/
 new file mode 100644
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/lease_slots.py
-@@ -0,0 +1,377 @@
+@@ -0,0 +1,383 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Pull-mode KV lease slots for the NIXL connector.
@@ -500,7 +500,13 @@ new file mode 100644
 +        batches: dict[tuple[EngineId, int], list[_SlotRead]] = defaultdict(list)
 +        for req_id, checks in list(self._queued.items()):
 +            if len(checks) > len(self._free_cells):
-+                break
++                if self._reads or batches:
++                    break
++                del self._queued[req_id]
++                self._failures[req_id] = (
++                    "not enough reusable lease-check landing cells"
++                )
++                continue
 +            del self._queued[req_id]
 +            for check in checks:
 +                cell = self._free_cells.pop()
