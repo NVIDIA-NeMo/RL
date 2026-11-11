@@ -62,7 +62,7 @@ Authors are encouraged to write tests for their research projects. This template
 
 Unit and functional tests are discovered under `research/*/tests/unit/` and
 `research/*/tests/functional/*.sh`. Before running them, CI changes into the
-project directory and runs `uv sync --locked --inexact --group test`. Declare
+project directory and runs `uv sync --locked --group test`. Declare
 runtime dependencies and a `test` dependency group in the project's
 `pyproject.toml`, add the project to the root uv workspace, and update `uv.lock`.
 
