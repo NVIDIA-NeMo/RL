@@ -69,12 +69,13 @@ colocated generation.
 
 ### Draft Weights with Context Parallel Training
 
-With `refit_transport: nccl_reshard`, a Megatron trainer can send draft weights
-from its TP, PP, and CP lanes to vLLM. The vLLM generation layout must use CP1.
-Setup rejects a `decode_context_parallel_size` or `prefill_context_parallel_size`
-value other than 1 in `vllm_kwargs` or `vllm_cfg`.
-This transport support does not, by itself, enable a draft-training layout;
-configure a supported training path separately. The vLLM reload API does not
+The `nccl_reshard` transport can carry Megatron draft weights from the trainer's
+TP, PP, and CP lanes to vLLM. Setup does not enable this layout yet. Setup
+rejects `policy.draft.enabled=true` with `refit_transport: nccl_reshard`. Setup
+also rejects it when `policy.megatron_cfg.context_parallel_size` is greater
+than 1. With `nccl_reshard`, the vLLM generation layout must use CP1. Setup
+rejects a `decode_context_parallel_size` or `prefill_context_parallel_size`
+value other than 1 in `vllm_kwargs` or `vllm_cfg`. The vLLM reload API does not
 support trainer-owned draft weights.
 
 ## Refit Performance Options

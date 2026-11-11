@@ -230,7 +230,10 @@ role.
 1. **`init_collective()`** — creates the `model_update_group`, a NCCL group spanning all
    training and generation ranks. The bulk path does not use it; it carries the misc
    packed-broadcast, including FP8 KV-cache scales for backend combinations that support
-   them, identical to the conventional collective transport.
+   them, identical to the conventional collective transport. It also carries the
+   readiness token, the first collective of every refit. Each rank sends or reads the
+   token **before** the bulk reshard. All ranks must use the two kinds of communicators
+   in the same order, or NCCL can deadlock.
 2. **`init_nccl_reshard_comm_group()`** — creates the bulk-path communicator(s): **one
    NCCL group per training PP stage**, each spanning that stage's training ranks plus
    *all* generation ranks (non-PP is simply `pp_size == 1`, a single group over
@@ -318,7 +321,9 @@ Every training step (with in-flight weight updates, concurrently with generation
 
 ### The Misc Path
 
-After the bulk reshard completes, the misc parameters are transferred.
+After the bulk reshard completes, the misc parameters are transferred. The misc
+broadcast does not read the readiness token again, because every rank already read it
+before the bulk reshard.
 This part is reusing the same code implementation as the conventional packed_tensor refit.
 Its representation is unchanged. Only source scale entries belonging to quantized bulk
 weights are removed; the receiver must retain its newly generated scales for those

@@ -107,7 +107,10 @@ from nemo_rl.models.megatron.zero_train_gen_mismatch import (
     allow_installed_flash_attn_4,
 )
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
-from nemo_rl.utils.packed_tensor import packed_broadcast_consumer
+from nemo_rl.utils.packed_tensor import (
+    packed_broadcast_consumer,
+    packed_broadcast_preflight_consumer,
+)
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     _INDIVIDUAL_EXPERT_RE,
     _STR_TO_DTYPE,
@@ -2158,6 +2161,10 @@ class MegatronGenerationRefitMixin:
         )
         streams = [torch.cuda.Stream() for _ in range(num_streams)]
         events: dict[int, torch.cuda.Event] = {}
+        # The trainer posts the readiness token before the bulk reshard. Read it
+        # here too: collectives on model_update_group and the per-stage groups
+        # must run in the same order on every rank, or NCCL can deadlock.
+        packed_broadcast_preflight_consumer(self.model_update_group, 0)
         try:
             for index, (stage, params) in enumerate(stage_params.items()):
                 previous_index = index - num_streams
@@ -2189,6 +2196,7 @@ class MegatronGenerationRefitMixin:
             result = self._update_destination_weights_from_collective(
                 refit_timeout_s=refit_timeout_s,
                 refresh_mxfp8=False,
+                preflight_checked=True,
             )
             self._refresh_flashinfer_mxfp8_weights()
             return result
@@ -2293,6 +2301,7 @@ class MegatronGenerationRefitMixin:
         refit_timeout_s: Optional[float] = None,
         *,
         refresh_mxfp8: bool = True,
+        preflight_checked: bool = False,
     ) -> bool:
         """Receive packed HF tensors and import them into the Megatron model."""
         from nemo_rl.distributed.refit_watchdog import sync_stream_within
@@ -2314,6 +2323,7 @@ class MegatronGenerationRefitMixin:
                 group=self.model_update_group,
                 src=0,
                 post_unpack_func=self._load_generation_refit_batch,
+                preflight_checked=preflight_checked,
             )
             if self._generation_refit_task_index != len(self._generation_refit_tasks):
                 task = self._generation_refit_tasks[self._generation_refit_task_index]
