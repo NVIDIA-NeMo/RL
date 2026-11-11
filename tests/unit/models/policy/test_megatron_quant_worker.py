@@ -308,7 +308,7 @@ def test_iter_real_quant_refit_params_can_keep_export_on_gpu() -> None:
     worker = _make_real_quant_worker()
     worker.cfg["generation"]["real_quant_export_cpu_offload"] = False
 
-    list(worker._iter_real_quant_refit_params())
+    list(worker._iter_real_quant_refit_params(draft_weights=()))
 
     _, kwargs = worker.megatron_bridge.calls[0]
     assert kwargs["cpu"] is False
@@ -372,7 +372,7 @@ def test_iter_real_quant_refit_params_exports_w4a4_mode():
     worker.cfg["quant_cfg"] = quant_cfg
     worker.cfg["generation"]["quant_cfg"] = quant_cfg
 
-    list(worker._iter_real_quant_refit_params())
+    list(worker._iter_real_quant_refit_params(draft_weights=()))
 
     _, kwargs = worker.megatron_bridge.calls[0]
     assert kwargs["quant_mode"] == "nvfp4"

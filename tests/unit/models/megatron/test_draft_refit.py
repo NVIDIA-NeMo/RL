@@ -477,6 +477,7 @@ def _draft_refit_worker(*, draft_model: object | None) -> Any:
     worker.model = object()
     worker.megatron_bridge = _EmptyBridge()
     worker.refit_conversion_tasks = []
+    worker._refit_prequant_names = set()
     worker.draft_model = draft_model
     return worker
 
