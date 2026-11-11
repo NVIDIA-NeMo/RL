@@ -2600,9 +2600,11 @@ def test_process_fp8_moe_preserves_storage_and_loaders(
 
     fp8_module.process_weights_after_loading_moe(method, layer)
     if change_layout != "none":
+        # On a layout change vLLM keeps the parameter object and gives it new
+        # storage; later refits must then reuse that storage.
         for name, param in params.items():
-            assert getattr(layer, name) is not param
-        params = {name: getattr(layer, name) for name in shapes}
+            assert getattr(layer, name) is param
+            assert param.data_ptr() != pointers[name]
         pointers = {name: param.data_ptr() for name, param in params.items()}
     for _ in range(2):
         fp8_module.process_weights_after_loading_moe(method, layer)

@@ -1062,13 +1062,8 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
             bmm_batch_size=bmm_batch_size,
         )
         if is_bmm:
-            replace_parameter(layer, "weight", dg_weight, prefer_copy=True)
-            replace_parameter(
-                layer,
-                "weight_scale_inv",
-                dg_weight_scale,
-                prefer_copy=True,
-            )
+            replace_parameter(layer, "weight", dg_weight)
+            replace_parameter(layer, "weight_scale_inv", dg_weight_scale)
         else:
             for name, processed_weight in (
                 ("weight", dg_weight),
@@ -1457,7 +1452,7 @@ def process_weights_after_loading_moe(self, layer) -> None:
                 )
     for name, converted_weight in converted_weights:
         if global_fp8_config.is_deepseek_v4:
-            replace_parameter(layer, name, converted_weight, prefer_copy=True)
+            replace_parameter(layer, name, converted_weight)
         else:
             getattr(layer, name).copy_(converted_weight)
 
