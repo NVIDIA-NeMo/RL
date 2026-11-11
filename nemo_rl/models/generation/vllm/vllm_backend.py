@@ -1520,6 +1520,15 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         silently left on its startup weights.
         """
         # Co-trained draft weights are exported with the `draft.` prefix.
+        if draft_weights and os.environ.get("NRL_DEBUG_DRAFT_CKPT") and not getattr(
+            self, "_nrl_dbg_names_logged", False
+        ):
+            self._nrl_dbg_names_logged = True  # pyrefly: ignore[implicitly-defined-attribute]
+            logger.warning(
+                "[draft-debug] first draft bucket: %d tensors, e.g. %s",
+                len(draft_weights),
+                [(n, tuple(t.shape), str(t.dtype)) for n, t in draft_weights[:6]],
+            )
         if self._draft_runtime_adapter is None:
             draft_loaded = self._load_draft_weights(draft_weights)
         else:
@@ -2007,6 +2016,13 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         manifest = self._model_update_manifest
         adapter = self._draft_runtime_adapter
         if manifest is None or manifest.draft is None or adapter is None:
+            if os.environ.get("NRL_DEBUG_DRAFT_CKPT"):
+                logger.warning(
+                    "[draft-debug] no drafter post-processing: manifest=%s draft=%s adapter=%s",
+                    manifest is not None,
+                    None if manifest is None else manifest.draft is not None,
+                    adapter is not None,
+                )
             return
         if not adapter.is_owner:
             return
@@ -2014,6 +2030,77 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
             self.model_runner.vllm_config.speculative_config.draft_model_config
         )
         process_weights_after_loading(adapter.model, draft_model_config, self.device)
+        debug_ckpt = os.environ.get("NRL_DEBUG_DRAFT_CKPT")
+        if debug_ckpt:
+            self._debug_compare_drafter(adapter.model, debug_ckpt)
+
+    @torch.no_grad()
+    def _debug_compare_drafter(self, draft_model: Any, ckpt_dir: str) -> None:
+        """Compare the live vLLM drafter with its checkpoint (env-gated debugging).
+
+        Right after the first refit the trainer's drafter equals the checkpoint, so
+        every comparable tensor should match to bf16 rounding.
+        """
+        count = getattr(self, "_nrl_dbg_compares", 0)
+        if count >= 2:
+            return
+        self._nrl_dbg_compares = count + 1  # pyrefly: ignore[implicitly-defined-attribute]
+        import glob
+
+        from safetensors import safe_open
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        rank = get_tensor_model_parallel_rank()
+        params = dict(draft_model.named_parameters())
+        status: dict[str, int] = {}
+        worst: list[tuple[float, str, float, float]] = []
+        missing: list[str] = []
+        for path in sorted(glob.glob(os.path.join(ckpt_dir, "*.safetensors"))):
+            with safe_open(path, "pt", device="cpu") as handle:
+                for name in handle.keys():
+                    param = next(
+                        (params[c] for c in (name, "model." + name) if c in params), None
+                    )
+                    if param is None:
+                        status["not_a_vllm_param"] = status.get("not_a_vllm_param", 0) + 1
+                        missing.append(name)
+                        continue
+                    ref = handle.get_tensor(name).float()
+                    live = param.detach().float().cpu()
+                    if live.shape != ref.shape and live.dim() == ref.dim() and (
+                        live.shape[1:] == ref.shape[1:]
+                    ):
+                        rows = live.shape[0]
+                        ref = ref[rank * rows : (rank + 1) * rows]
+                    if live.shape != ref.shape:
+                        status["shape_mismatch"] = status.get("shape_mismatch", 0) + 1
+                        continue
+                    diff = (live - ref).abs().max().item()
+                    key = "match" if diff <= 2e-2 * max(ref.abs().max().item(), 1e-6) else "DIFFERS"
+                    status[key] = status.get(key, 0) + 1
+                    worst.append((diff, name, live.norm().item(), ref.norm().item()))
+        worst.sort(reverse=True)
+        target = self.model_runner.model
+        target_ptrs = {
+            n: p.data_ptr()
+            for n, p in target.named_parameters()
+            if n.endswith(("lm_head.weight", "embed_tokens.weight"))
+        }
+        aliases = {
+            n: [t for t, ptr in target_ptrs.items() if ptr == p.data_ptr()]
+            for n, p in params.items()
+            if n.endswith(("lm_head.weight", "embed_tokens.weight"))
+        }
+        logger.warning(
+            "[draft-debug] rank=%d compare#%d status=%s aliases=%s not_vllm=%s "
+            "worst(diff,name,live_norm,ckpt_norm)=%s",
+            rank,
+            count + 1,
+            status,
+            aliases,
+            missing[:8],
+            [(round(d, 4), n, round(a, 2), round(b, 2)) for d, n, a, b in worst[:8]],
+        )
 
     def _mark_refit_unusable(self, error: BaseException) -> None:
         reason = f"{type(error).__name__}: {error}"
