@@ -37,7 +37,6 @@ from typing import Any, Literal
 from nemo_rl.models.generation.prefix_recovery.parts import PrefixRecoveryParts
 from nemo_rl.models.generation.prefix_recovery.restore import (
     _generation_cut_blockers,
-    restore_reply_text,
 )
 from nemo_rl.models.generation.prefix_recovery.state import (
     _CompletedCaptureState,
@@ -199,21 +198,6 @@ class PrefixRecovery:
             start=observed,
             finish_reason=finish_reason,
             stop_reason=stop_reason,
-        )
-
-    def restore_reply_text(
-        self, request: Any, request_output: Any, *, tokenizer: Any
-    ) -> None:
-        """Prepend a resumed call's restored text to its final output."""
-        state = self._registry.get(request)
-        if state is None or not state.resumed_generation_token_ids:
-            return
-        restore_reply_text(
-            request,
-            request_output,
-            prefix_token_ids=state.resumed_generation_token_ids,
-            engine_prompt_token_ids=state.prompt_token_ids,
-            tokenizer=tokenizer,
         )
 
     def retire(self, staging_keys: Sequence[str]) -> None:
@@ -867,11 +851,6 @@ class NoPrefixRecovery:
         pass
 
     def observe(self, request: Any, request_output: Any) -> None:
-        pass
-
-    def restore_reply_text(
-        self, request: Any, request_output: Any, *, tokenizer: Any
-    ) -> None:
         pass
 
     def remember_completed(

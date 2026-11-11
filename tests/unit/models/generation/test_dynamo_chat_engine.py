@@ -59,6 +59,11 @@ SPLICED = [*PREFIX, 3, 4]
 TOKEN_IN = {"mode": "token_in", "capture_key": "rollout-1", "model_call_id": "c2"}
 
 
+def _admission(fields: dict) -> SimpleNamespace:
+    """A parsed capture admission, as the render pool returns it."""
+    return SimpleNamespace(**fields, model_dump=lambda mode="python": dict(fields))
+
+
 def _rendered(**fields) -> RenderedCall:
     """What a render-pool worker returns for a call."""
     return RenderedCall(
@@ -147,8 +152,8 @@ class _Capture:
     def __init__(self) -> None:
         self.resolved: list[dict] = []
 
-    def resolve_prefix(self, serving_admission: dict) -> list[int]:
-        self.resolved.append(serving_admission)
+    def resolve_prefix(self, serving_admission) -> list[int]:
+        self.resolved.append(serving_admission.model_dump(mode="json"))
         return PREFIX
 
 
@@ -257,19 +262,22 @@ def test_a_gym_call_is_rendered_spliced_and_routed_with_its_capture_plan() -> No
     assert routed["token_ids"] == SPLICED
     assert routed["stop_conditions"] == {"max_tokens": MAX_MODEL_LEN - len(SPLICED)}
     assert routed["annotations"] == [chat_engine.GYM_CALL_ANNOTATION]
-    plan = routed["extra_args"][chat_engine.PLAN_KEY]
-    assert plan["request"] == {
+    wire = routed["extra_args"][chat_engine.PLAN_KEY]
+    plan = wire["prepared_prompt"]
+    # The request as rendered; the engine sets the plan's clamped budget.
+    assert wire["request"] == {
         "model": "model",
-        "max_tokens": MAX_MODEL_LEN - len(SPLICED),
+        "max_tokens": 20,
         "max_completion_tokens": None,
     }
+    assert plan["max_tokens"] == MAX_MODEL_LEN - len(SPLICED)
     assert (plan["template_token_ids"], plan["splice"], plan["prefix_len"]) == (
         TEMPLATE,
         # Each side is cut at its turn end: PREFIX[:3] + TEMPLATE[2:].
         [3, 2],
         len(PREFIX),
     )
-    assert (plan["admission"], plan["multimodal"], plan["reasoning_ended"]) == (
+    assert (plan["admission"], wire["multimodal"], wire["reasoning_ended"]) == (
         None,
         None,
         False,
@@ -290,8 +298,8 @@ def test_a_token_in_call_splices_the_prefix_staged_in_tq() -> None:
         _rendered(
             template_token_ids=TEMPLATE,
             history_token_ids=HISTORY,
-            admission=TOKEN_IN,
-            serving_admission=TOKEN_IN,
+            admission=_admission(TOKEN_IN),
+            serving_admission=_admission(TOKEN_IN),
         )
     )
     router = _Router()
@@ -303,7 +311,7 @@ def test_a_token_in_call_splices_the_prefix_staged_in_tq() -> None:
     assert capture.resolved == [TOKEN_IN]
     (routed,) = router.requests
     assert routed["token_ids"] == SPLICED
-    plan = routed["extra_args"][chat_engine.PLAN_KEY]
+    plan = routed["extra_args"][chat_engine.PLAN_KEY]["prepared_prompt"]
     assert (plan["admission"], plan["serving_admission"], plan["prefix_len"]) == (
         TOKEN_IN,
         TOKEN_IN,

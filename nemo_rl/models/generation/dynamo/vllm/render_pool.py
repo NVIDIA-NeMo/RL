@@ -65,16 +65,19 @@ class RestoredReply(TypedDict):
 
 @dataclass(frozen=True)
 class RenderedCall:
-    """What the frontend needs from a render to splice, route and serve a call."""
+    """What the frontend needs from a render to plan, route and serve a call.
+
+    A :class:`~nemo_rl.models.generation.vllm.prompt_and_capture.RenderedPrompt`.
+    """
 
     template_token_ids: list[int]
     # The render up to the last assistant turn, when a prefix will be spliced.
     history_token_ids: Optional[list[int]]
     # The request's own prefix (Gym's echo) after the capture decision.
     required_prefix_token_ids: Optional[list[int]]
-    # Capture admissions as JSON: what is stored, and how the prompt is served.
-    admission: Optional[dict[str, Any]]
-    serving_admission: Optional[dict[str, Any]]
+    # Capture admissions: what is stored, and how the prompt is served.
+    admission: Any
+    serving_admission: Any
     verify_retained_media: bool
     # The rendered engine input's multimodal part (pickled), or None for text.
     multimodal: Optional[bytes]
@@ -107,9 +110,6 @@ class _Worker:
 
         from vllm.config import CacheConfig, LoadConfig, VllmConfig
         from vllm.engine.arg_utils import AsyncEngineArgs
-        from vllm.entrypoints.openai.chat_completion.serving import (
-            OpenAIServingChat,
-        )
         from vllm.entrypoints.openai.models.protocol import BaseModelPath
         from vllm.entrypoints.openai.models.serving import OpenAIServingModels
         from vllm.renderers.registry import renderer_from_config
@@ -179,7 +179,7 @@ class _Worker:
             ],
             lora_modules=None,
         )
-        self.serving_chat = OpenAIServingChat(
+        self.serving_chat = chat_server.FrontendServingChat(
             **{
                 **serving_chat_kwargs,
                 "engine_client": engine_client,
@@ -210,21 +210,16 @@ class _Worker:
         )
 
     def render(self, body: dict[str, Any], *, measure: bool = False) -> RenderedCall:
+        from nemo_rl.models.generation.vllm.prompt_and_capture import set_max_tokens
         from nemo_rl.models.generation.vllm.chat_server import (
             NeMoRLChatCompletionRequest,
             NeMoRLMeasureChatRequest,
-            set_max_tokens,
         )
 
         request_cls = (
             NeMoRLMeasureChatRequest if measure else NeMoRLChatCompletionRequest
         )
         chat = request_cls.model_validate(body)
-        request_max_tokens = (
-            chat.max_completion_tokens
-            if chat.max_completion_tokens is not None
-            else chat.max_tokens
-        )
         admission = None
         if chat.ng_capture is not None:
             # Deferred: only captured calls need it, and capture already imports nemo_gym.
@@ -236,8 +231,8 @@ class _Worker:
         )
         # The serving reads these back from the request; restore the budget
         # the render lowered for vLLM's pre-tokenization length check.
-        if request_max_tokens is not None:
-            set_max_tokens(chat, request_max_tokens)
+        if rendered.request_max_tokens is not None:
+            set_max_tokens(chat, rendered.request_max_tokens)
         parser = self._parser(chat)
         reasoning_ended = None
         reasoning_parser_kwargs = None
@@ -266,13 +261,13 @@ class _Worker:
         return RenderedCall(
             template_token_ids=list(rendered.engine_prompt["prompt_token_ids"]),
             history_token_ids=rendered.history_token_ids,
-            required_prefix_token_ids=chat.required_prefix_token_ids,
-            admission=_admission_json(rendered.admission),
-            serving_admission=_admission_json(rendered.serving_admission),
+            required_prefix_token_ids=rendered.required_prefix_token_ids,
+            admission=rendered.admission,
+            serving_admission=rendered.serving_admission,
             verify_retained_media=rendered.verify_retained_media,
             multimodal=multimodal,
             request=chat.model_dump(mode="json", exclude={"messages"}),
-            request_max_tokens=request_max_tokens,
+            request_max_tokens=rendered.request_max_tokens,
             reasoning_ended=reasoning_ended,
             reasoning_parser_kwargs=reasoning_parser_kwargs,
         )
@@ -293,29 +288,25 @@ class _Worker:
 
         from nemo_rl.models.generation.prefix_recovery.restore import (
             _RestoredPrefixTerminal,
-            restore_reply_text,
-            restore_reply_usage,
-            wrap_parser_for_restore,
         )
         from nemo_rl.models.generation.vllm.chat_server import (
             chat_request_from_render,
         )
 
         chat = chat_request_from_render(request)
-        resumed_token_ids: list[int] = []
-        terminal = None
         if restored is not None:
             # The engine resumed this call from the tokens a checkpoint cut
-            # saved: it ran this prompt and generated only the rest.
+            # saved: it ran this prompt and generated only the rest. The
+            # serving chat's reply fixes read these fields, as natively.
             prompt_token_ids = restored["prompt_token_ids"]
-            resumed_token_ids = restored["token_ids"]
+            chat._restored_prompt_token_ids = tuple(prompt_token_ids)
+            chat._restored_generation_token_ids = tuple(restored["token_ids"])
             # The engine lowered its own copy's min_tokens, never this one.
             chat._original_min_tokens = chat.min_tokens
             if restored["terminal"] is not None:
-                terminal = _RestoredPrefixTerminal(
+                chat._restored_prefix_terminal = _RestoredPrefixTerminal(
                     prompt_token_ids=tuple(prompt_token_ids), **restored["terminal"]
                 )
-                chat._restored_prefix_terminal = terminal
         logprobs = None
         if output.get("logprobs") is not None:
             logprobs = [
@@ -346,17 +337,6 @@ class _Worker:
             finished=True,
         )
 
-        if restored is not None:
-            # Before vLLM parses the reply, so tool calls and reasoning are
-            # parsed from the whole call's text.
-            restore_reply_text(
-                chat,
-                request_output,
-                prefix_token_ids=resumed_token_ids,
-                engine_prompt_token_ids=prompt_token_ids,
-                tokenizer=self.tokenizer,
-            )
-
         async def results():
             yield request_output
 
@@ -369,19 +349,12 @@ class _Worker:
                 [],
                 self.tokenizer,
                 RequestResponseMetadata(request_id=request_output.request_id),
-                parser=wrap_parser_for_restore(self._parser(chat), resumed_token_ids),
+                parser=self._parser(chat),
             )
         )
         if not isinstance(response, ChatCompletionResponse):
             raise ValueError(f"vLLM could not build the reply: {response}")
-        restore_reply_usage(
-            response, restored_token_count=len(resumed_token_ids), terminal=terminal
-        )
         return response.model_dump(mode="json", exclude_none=True)
-
-
-def _admission_json(admission: Any) -> Optional[dict[str, Any]]:
-    return None if admission is None else admission.model_dump(mode="json")
 
 
 def _init_worker(spec: dict[str, Any], model_dir: str) -> None:

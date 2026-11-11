@@ -964,8 +964,8 @@ class VllmAsyncGenerationWorkerImpl(
     ) -> None:
         """Admit one ledger-forwarded call into the capture layer.
 
-        Called from preprocess_chat once the exact engine prompt is known
-        (post-splice in token-in mode, full render in text mode). No-op
+        Called from ``prompt_and_capture.start_capture`` once the exact engine prompt
+        is known (post-splice in token-in mode, full render in text mode). No-op
         unless capture is installed and the request carries the ledger's
         ``ng_capture`` context.
 
@@ -1144,18 +1144,6 @@ class VllmAsyncGenerationWorkerImpl(
         from nemo_rl.data_plane.tq_token_sink import resolve_admission_prefix
 
         return resolve_admission_prefix(admission, self._chain_prefix)
-
-    def _enter_request_prefix(self, request: Any, prefix_token_ids: list[int]) -> None:
-        """Attach the resolved prefix to the request through the capture adapter.
-
-        ``VLLMCaptureAdapter.enter_prefix`` writes the engine-native field
-        (``required_prefix_token_ids``) into a payload; the same fields are
-        applied to the pydantic request so the existing prefix-splice branch
-        of preprocess_chat handles staged and inline prefixes alike.
-        """
-        adapter = self.token_capture.adapter
-        for field_name, value in adapter.enter_prefix({}, prefix_token_ids).items():
-            setattr(request, field_name, value)
 
     @staticmethod
     def _delta_align_routed_experts(

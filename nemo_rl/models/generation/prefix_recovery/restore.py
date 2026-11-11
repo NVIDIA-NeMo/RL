@@ -344,7 +344,7 @@ def _full_generator_signature(method: Callable[..., Any]) -> inspect.Signature:
         raise RuntimeError(
             "vLLM's OpenAIServingChat.chat_completion_full_generator has no "
             f"{missing} parameter, which restored generation prefixes rewrite; "
-            "update NeMoRLOpenAIServingChatMixin.chat_completion_full_generator"
+            "update ResumedCallReplyMixin.chat_completion_full_generator"
         )
     return signature
 

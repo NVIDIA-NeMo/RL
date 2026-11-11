@@ -20,11 +20,11 @@ vLLM backend of ``engine_adapter.DynamoEngineAdapter``, over the AsyncLLM that
 speculative decoding are that worker's own.
 
 It serves two request kinds, both token ids in: NeMo RL's own rollouts, and
-NeMo-Gym's chat calls, which NeMo RL's chat engine in the frontend rendered,
-spliced and routed (``chat_engine``). For those the adapter runs the native
-server's steps after the render: the media snapshot, ``begin_call``, the
-generation with the SamplingParams the native server would build, and the one
-TQ write.
+NeMo-Gym's chat calls, whose prompt NeMo RL's chat engine in the frontend
+rendered, prepared and routed (``chat_engine``). For those the adapter runs the
+native server's steps after that (``prompt_and_capture``): ``start_capture``, the
+generation with the SamplingParams the native server would build, and
+``save_capture``'s one TQ write.
 """
 
 from __future__ import annotations
@@ -38,7 +38,6 @@ import math
 import os
 import pickle
 from collections.abc import AsyncGenerator
-from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -52,16 +51,11 @@ from dynamo.common.backend import (
 from dynamo.common.backend.publisher import ComponentSnapshot, KvEventSource, ZmqSource
 from dynamo.llm.exceptions import InvalidArgument
 from pydantic_core import to_jsonable_python
-from vllm.entrypoints.serve.exception_handling.error_response import (
-    create_error_response,
-)
 from vllm.entrypoints.serve.utils.api_utils import get_max_tokens
-from vllm.exceptions import GracefulHTTPError, VLLMClientError, VLLMValidationError
 from vllm.inputs import TokensPrompt
 from vllm.v1.kv_cache_interface import KVCacheSpecKind
 from vllm.v1.metrics.loggers import StatLoggerBase
 
-from nemo_rl.data.captured_media import MediaCaptureRejected
 from nemo_rl.models.generation.dynamo.config import DynamoCfg
 from nemo_rl.models.generation.dynamo.engine_adapter import (
     DynamoEngineAdapter,
@@ -72,7 +66,7 @@ from nemo_rl.models.generation.dynamo.vllm.chat_engine import (
     GYM_CALL_ANNOTATION,
     PLAN_KEY,
     RUNTIME_DATA_KEY,
-    GymCallPlan,
+    ForwardedCall,
     GymEngineReply,
 )
 from nemo_rl.models.generation.dynamo.vllm.generation_cut import (
@@ -81,14 +75,19 @@ from nemo_rl.models.generation.dynamo.vllm.generation_cut import (
     INVENTORY_KEY,
 )
 from nemo_rl.models.generation.gym_call import GymCallResult
-from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 from nemo_rl.models.generation.score_centering import (
     extract_score_centering_samples,
+)
+from nemo_rl.models.generation.vllm.prompt_and_capture import (
+    PreparedPrompt,
+    abort_request_capture,
+    start_capture,
+    abort_capture,
+    save_capture,
 )
 from nemo_rl.models.generation.vllm.utils import (
     chat_generation_tokens,
     chat_routed_experts,
-    remap_multimodal_placeholders,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -302,222 +301,129 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
     async def _generate_gym(
         self, request: GenerateRequest, annotation: str, context: Context
     ) -> AsyncGenerator[GenerateChunk, None]:
+        # Deferred: chat_server imports vLLM's OpenAI server stack.
+        from nemo_rl.models.generation.vllm.chat_server import (
+            chat_request_from_render,
+        )
+
         del annotation
-        plan = (request.get("extra_args") or {}).get(PLAN_KEY)
-        if plan is None:
+        wire: Optional[ForwardedCall] = (request.get("extra_args") or {}).get(PLAN_KEY)
+        if wire is None:
             raise InvalidArgument(
                 "NeMo-Gym calls reach NeMo RL's engines through NeMo RL's chat "
                 f"engine in the Dynamo frontend (extra_args.{PLAN_KEY})."
             )
+        host = self._host
+        plan = PreparedPrompt.from_json(
+            wire["prepared_prompt"],
+            prompt_token_ids=list(request["token_ids"]),
+            parse_admission=host._parse_capture_admission,
+        )
+        chat = chat_request_from_render(wire["request"])
         try:
-            chunk = await self._serve_gym_call(
-                plan, list(request["token_ids"]), context
-            )
-        except (VLLMClientError, GracefulHTTPError) as error:
-            # The status vLLM's server answers it with; a native 400 for a
-            # validation error also acknowledges a capture call's refusal.
-            response = create_error_response(error).error
-            chunk = _refusal(
-                response.code,
-                response.message,
-                acknowledge=isinstance(error, VLLMValidationError),
-            )
-        except MediaCaptureRejected as error:
-            chunk = _refusal(HTTPStatus.BAD_REQUEST, f"{error} ({error.code})")
+            chunk = await self._serve_gym_call(chat, plan, wire, context)
+        except BaseException as error:
+            failure = await abort_capture(host, chat, error)
+            if failure is None:
+                raise
+            message = failure.message
+            if failure.code != failure.status:
+                # The frontend forwards only a status and a message.
+                message = f"{message} ({failure.code})"
+            chunk = _refusal(failure.status, message, acknowledge=failure.acknowledge)
         if chunk is not None:
             yield chunk
 
     async def _serve_gym_call(
-        self, plan: GymCallPlan, prompt_token_ids: list[int], context: Context
+        self, chat: Any, plan: PreparedPrompt, wire: ForwardedCall, context: Context
     ) -> Optional[GenerateChunk]:
-        """One NeMo-Gym chat call, after the frontend rendered and spliced it.
+        """One NeMo-Gym chat call, after the frontend prepared its prompt.
 
-        The native server's steps after the render, in its order: the media
-        snapshot, ``begin_call`` (which stamps the weight version), the
-        generation, and the one TQ write. Returns one chunk whose
-        ``engine_data`` carries the output the frontend builds the reply from
-        and the call's :class:`GymCallResult`; None for a captured call whose
-        client went away.
+        The native server's steps after the plan, in its order: the queue
+        check vLLM's serving runs first, :func:`start_capture` (a restore
+        from a checkpoint cut, and ``begin_call``, which stamps the weight
+        version), the generation, and :func:`save_capture`'s one TQ write.
+        Returns one chunk whose ``engine_data`` carries the output the
+        frontend builds the reply from and the call's :class:`GymCallResult`;
+        None for a captured call whose client went away.
         """
-        # Deferred: chat_server imports vLLM's OpenAI server stack.
-        from nemo_rl.models.generation.vllm.chat_server import (
-            abort_request_capture,
-            chat_request_from_render,
-            clamp_max_tokens,
-            classify_restored_terminal,
-            resolve_restored_call,
-            serve_restored_terminal,
-            set_max_tokens,
-        )
-
         host = self._host
-        chat = chat_request_from_render(plan["request"])
-        admission = host._parse_capture_admission(plan["admission"])
-        # One object when storage and serving are one admission, as natively.
-        serving_admission = admission
-        if plan["serving_admission"] != plan["admission"]:
-            serving_admission = host._parse_capture_admission(plan["serving_admission"])
-        if admission is not None and admission.mode == "candidate":
-            # The frontend's chat engine decides a candidate; a request
-            # still marked one skipped that decision.
-            raise InvalidArgument(
-                "a candidate admission reached the engine undecided; NeMo RL's "
-                "chat engine must resolve it before capture"
-            )
-        prefix_token_ids = None
-        if admission is not None and admission.mode == "token_in":
-            prefix_token_ids = prompt_token_ids[: plan["prefix_len"]]
-        restored = None
-        if serving_admission is not None:
-            # A call a checkpoint cut resumes from the tokens the cut saved. A
-            # cut this engine cannot use comes back as None: the frontend's
-            # prompt stands, and the call regenerates.
-            resolved_admission, restored = await resolve_restored_call(
-                host,
-                chat,
-                serving_admission,
-                # The model's own prefix is the spliced prompt's first ids.
-                prompt_token_ids[: plan["prefix_len"]]
-                if serving_admission.mode == "token_in"
-                else [],
-            )
-            if serving_admission is admission:
-                admission = resolved_admission
-            serving_admission = resolved_admission
-        splice_cut, multimodal = plan["splice"], plan["multimodal"]
-        terminal = None
-        if restored is not None:
-            # The saved rows are the exact engine prompt at the cut, so the
-            # frontend's splice is dropped; cuts are text-only, so no media.
-            splice_cut = multimodal = None
-            prompt_token_ids = restored.prompt_token_ids
-            terminal = classify_restored_terminal(
-                restored, prompt_token_ids, admission, max_model_len=self._max_model_len
-            )
-            if terminal is None:
-                max_tokens = clamp_max_tokens(
-                    restored.max_tokens
-                    if restored.max_tokens is not None
-                    else chat.max_completion_tokens
-                    if chat.max_completion_tokens is not None
-                    else chat.max_tokens,
-                    len(prompt_token_ids),
-                    self._max_model_len,
-                )
-                if max_tokens is not None:
-                    set_max_tokens(chat, max_tokens)
-        splice = None
-        if splice_cut is not None:
-            splice = PrefixSplice(prompt_token_ids, *splice_cut)
+        # The worker's own engine client, as the native server uses it, with
+        # the queue limits vLLM's serving checks before the render.
+        engine_client = host._http_engine_client or self._llm
+        engine_client.check_admission(1, context.id())
         engine_prompt: dict[str, Any]
-        if multimodal is not None:
+        if wire["multimodal"] is not None:
             # The processed media, in the template's coordinates.
             engine_prompt = {
-                **pickle.loads(base64.b64decode(multimodal)),
-                "prompt_token_ids": list(plan["template_token_ids"]),
+                **pickle.loads(base64.b64decode(wire["multimodal"])),
+                "prompt_token_ids": list(plan.template_token_ids),
             }
         else:
-            engine_prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
-        media = None
-        if admission is not None and restored is None:
-            # Off-loop: a retained-media check reads staged calls.
-            media = await asyncio.to_thread(
-                host._capture_request_media,
-                engine_prompt,
-                admission=serving_admission if splice is not None else admission,
-                splice=splice,
-                verify_retained_media=plan["verify_retained_media"],
-            )
-        if splice is not None and multimodal is not None:
-            # Successful media capture already remapped these ranges.
-            if media is None and (placeholders := engine_prompt.get("mm_placeholders")):
-                engine_prompt["mm_placeholders"] = remap_multimodal_placeholders(
-                    template_token_ids=engine_prompt["prompt_token_ids"],
-                    final_token_ids=prompt_token_ids,
-                    mm_placeholders=placeholders,
-                    splice=splice,
-                )
-            engine_prompt["prompt_token_ids"] = prompt_token_ids
-        host._begin_request_capture(
-            chat,
-            prompt_token_ids,
-            admission=admission,
-            prefix_token_ids=prefix_token_ids,
-            media=media,
-            generation_cut=None if restored is None else restored.saved,
-            resumed_generation_token_ids=(
-                None if restored is None else restored.resumed_generation_token_ids
-            ),
+            engine_prompt = TokensPrompt(prompt_token_ids=plan.prompt_token_ids)
+        await start_capture(
+            host, chat, engine_prompt, plan, max_model_len=self._max_model_len
         )
-        if terminal is not None:
-            # This task also submits the call: the engine client answers it.
-            serve_restored_terminal(
-                chat,
-                engine_prompt,
-                terminal,
-                admission,
-                max_model_len=self._max_model_len,
-            )
         captured = chat in host._capture_registry
-        try:
-            final_output = await self._generate(chat, engine_prompt, plan, context)
-            if admission is not None and context.is_stopped():
-                # Dynamo aborts the vLLM request on a disconnect but never
-                # cancels this generator: fail the capture (below), as the
-                # native endpoint's cancellation does, instead of staging it.
-                return None
-            completion = final_output.outputs[0]
-            if completion.finish_reason == "error":
-                # As vLLM's chat server does (_raise_if_error): never stage a failed call.
-                raise RuntimeError(f"Generation failed for request {context.id()}")
-            output: dict[str, Any] = {
-                "text": completion.text,
-                "token_ids": list(completion.token_ids),
-                "finish_reason": completion.finish_reason,
-                "stop_reason": completion.stop_reason,
+        final_output = await self._generate(
+            chat, engine_prompt, wire, engine_client, context
+        )
+        if plan.admission is not None and context.is_stopped():
+            # Dynamo aborts the vLLM request on a disconnect but never
+            # cancels this generator: fail the capture, as the native
+            # endpoint's cancellation does, instead of staging it.
+            await abort_request_capture(host, chat, "client_disconnect")
+            return None
+        completion = final_output.outputs[0]
+        if completion.finish_reason == "error":
+            # As vLLM's chat server does (_raise_if_error): never stage a failed call.
+            raise RuntimeError(f"Generation failed for request {context.id()}")
+        output: dict[str, Any] = {
+            "text": completion.text,
+            "token_ids": list(completion.token_ids),
+            "finish_reason": completion.finish_reason,
+            "stop_reason": completion.stop_reason,
+        }
+        if captured:
+            result = await self._stage(chat, final_output)
+        else:
+            result = self._call_result(final_output)
+            if chat.logprobs:
+                output["logprobs"] = _wire_logprobs(completion.logprobs)
+        reply: GymEngineReply = {
+            "output": output,
+            "result": result.model_dump(exclude_none=True),
+        }
+        if chat._restored_prompt_token_ids:
+            # The frontend's reply puts the saved text back in front.
+            terminal = chat._restored_prefix_terminal
+            reply["restored"] = {
+                "prompt_token_ids": list(chat._restored_prompt_token_ids),
+                "token_ids": list(chat._restored_generation_token_ids),
+                "terminal": None
+                if terminal is None
+                else {
+                    "prefix_token_count": terminal.prefix_token_count,
+                    "reason": terminal.reason,
+                    "finish_reason": terminal.finish_reason,
+                    "stop_reason": terminal.stop_reason,
+                },
             }
-            if captured:
-                result = await self._stage(chat, final_output)
-            else:
-                result = self._call_result(final_output)
-                if chat.logprobs:
-                    output["logprobs"] = _wire_logprobs(completion.logprobs)
-            reply: GymEngineReply = {
-                "output": output,
-                "result": result.model_dump(exclude_none=True),
-            }
-            if restored is not None:
-                # The frontend's reply puts the saved text back in front.
-                reply["restored"] = {
-                    "prompt_token_ids": prompt_token_ids,
-                    "token_ids": restored.resumed_generation_token_ids,
-                    "terminal": None
-                    if terminal is None
-                    else {
-                        "prefix_token_count": terminal.prefix_token_count,
-                        "reason": terminal.reason,
-                        "finish_reason": terminal.finish_reason,
-                        "stop_reason": terminal.stop_reason,
-                    },
-                }
-            return {
-                "token_ids": output["token_ids"],
-                "index": 0,
-                "finish_reason": completion.finish_reason,
-                "completion_usage": _usage(final_output, len(completion.token_ids)),
-                "engine_data": reply,
-            }
-        finally:
-            # A no-op once the call was staged: staging pops its capture state.
-            if admission is not None:
-                await abort_request_capture(
-                    host,
-                    chat,
-                    "client_disconnect" if context.is_stopped() else "engine_error",
-                )
+        return {
+            "token_ids": output["token_ids"],
+            "index": 0,
+            "finish_reason": completion.finish_reason,
+            "completion_usage": _usage(final_output, len(completion.token_ids)),
+            "engine_data": reply,
+        }
 
     async def _generate(
-        self, chat: Any, engine_prompt: Any, plan: GymCallPlan, context: Context
+        self,
+        chat: Any,
+        engine_prompt: Any,
+        wire: ForwardedCall,
+        engine_client: Any,
+        context: Context,
     ) -> Any:
         """Generate as the native server does, with the SamplingParams it builds."""
         model_config = self._llm.model_config
@@ -543,17 +449,13 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         if chat.ng_capture is not None:
             # As the native request does: a cut needs the call's resolved budget.
             self._host._prefix_recovery.on_sampling_params(chat, params)
-        # The worker's own engine client, as the native server uses it, with
-        # the queue limits it checks before generating.
-        engine_client = self._host._http_engine_client or self._llm
-        engine_client.check_admission(1, context.id())
         final_output = None
         async for output in engine_client.generate(
             engine_prompt,
             params,
             context.id(),
-            reasoning_ended=plan["reasoning_ended"],
-            reasoning_parser_kwargs=plan["reasoning_parser_kwargs"],
+            reasoning_ended=wire["reasoning_ended"],
+            reasoning_parser_kwargs=wire["reasoning_parser_kwargs"],
         ):
             # Recorded before asking for the next output, which releases
             # vLLM's finished state for this request.
@@ -608,6 +510,14 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         # Deferred: only captured calls reach here, and capture already imports nemo_gym.
         from nemo_gym.token_id_capture import NG_COMMIT_COORDS_FIELD
 
+        # Off the loop, as natively: the sampler top-k scales with the
+        # completion's length and K.
+        content = await asyncio.to_thread(self._response_to_stage, final_output)
+        content = await save_capture(self._host, chat, content)
+        return GymCallResult(ng_commit_coords=content[NG_COMMIT_COORDS_FIELD])
+
+    def _response_to_stage(self, final_output: Any) -> dict[str, Any]:
+        """A captured call's response, with the fields the native endpoint stages."""
         completion = final_output.outputs[0]
         message: dict[str, Any] = {"generation_token_ids": list(completion.token_ids)}
         if completion.logprobs is not None:
@@ -623,7 +533,7 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
             ) = extract_score_centering_samples(
                 completion, num_candidates=self._host._capture_top_logprobs
             )
-        content = {
+        return {
             "choices": [
                 {
                     "index": 0,
@@ -632,11 +542,6 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
                 }
             ]
         }
-        # The sink write is a blocking data-plane round trip.
-        content = await asyncio.to_thread(
-            self._host._finish_request_capture, chat, content
-        )
-        return GymCallResult(ng_commit_coords=content[NG_COMMIT_COORDS_FIELD])
 
     async def abort(self, context: Context) -> None:
         await self._llm.abort(context.id())

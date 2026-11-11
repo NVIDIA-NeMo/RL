@@ -65,6 +65,7 @@ from PIL import Image  # noqa: E402
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer  # noqa: E402
 from vllm.config import CacheConfig, LoadConfig, VllmConfig  # noqa: E402
 from vllm.engine.arg_utils import AsyncEngineArgs  # noqa: E402
+from vllm.exceptions import QueueOverflowError, VLLMValidationError  # noqa: E402
 from vllm.logprobs import Logprob  # noqa: E402
 from vllm.outputs import CompletionOutput, RequestOutput  # noqa: E402
 from vllm.renderers.registry import renderer_from_config  # noqa: E402
@@ -228,9 +229,13 @@ class _Kit:
 
 
 class _Engine:
-    """vLLM's engine client: answers every call with REPLY and records its runs."""
+    """vLLM's engine client: answers every call with REPLY and records its runs.
 
-    def __init__(self, kit: _Kit) -> None:
+    ``refuse`` is what the engine refuses every call with, and where: its
+    queue check ("admission") or its input check ("generate").
+    """
+
+    def __init__(self, kit: _Kit, refuse: Optional[tuple[str, Any]] = None) -> None:
         self.model_config = kit.model_config
         self.renderer = kit.renderer
         self.vllm_config = kit.vllm_config
@@ -238,12 +243,15 @@ class _Engine:
         self.io_processor = None
         self.errored = False
         self._kit = kit
+        self._refuse = refuse
         self.runs: list[tuple[list[int], Any, Any]] = []
         # How many of REPLY's tokens the prompt already ends with: a call
         # resumed from a checkpoint cut generates only the rest.
         self.resumed = 0
 
     async def generate(self, prompt, sampling_params, request_id, **kwargs):
+        if self._refuse is not None and self._refuse[0] == "generate":
+            raise self._refuse[1]
         prompt_token_ids = list(prompt["prompt_token_ids"])
         self.runs.append((prompt_token_ids, sampling_params, _media(prompt)))
         terminal = restored_terminal()
@@ -286,7 +294,8 @@ class _Engine:
         )
 
     def check_admission(self, n, request_id=None) -> None:
-        pass
+        if self._refuse is not None and self._refuse[0] == "admission":
+            raise self._refuse[1]
 
     async def is_tracing_enabled(self) -> bool:
         return False
@@ -357,11 +366,16 @@ class _Outcome:
     failed: list[str] = field(default_factory=list)
 
 
-def _host(kit: _Kit, deltas: dict[str, list[int]], top_logprobs: int):
+def _host(
+    kit: _Kit,
+    deltas: dict[str, list[int]],
+    top_logprobs: int,
+    refuse: Optional[tuple[str, Any]] = None,
+):
     host = object.__new__(VllmAsyncGenerationWorkerImpl)
     host._init_token_capture_state()
     host.cfg = kit.generation
-    host.llm = host._http_engine_client = _Engine(kit)
+    host.llm = host._http_engine_client = _Engine(kit, refuse)
     host.llm_async_engine_args = kit.engine_args
     host.model_name = "model"
     host.routed_experts_dtype = torch.int16
@@ -637,11 +651,15 @@ class _Case:
     fields: dict[str, Any] = field(default_factory=dict)
     # The sampler top-k capture stages, for score centering.
     top_logprobs: int = 0
-    # 200, or the 400 both paths refuse the call with before it runs.
+    # 200, or the status both paths refuse the call with before it runs.
     status: int = 200
     # The mode capture stages the call in; None when the call is not captured.
     mode: Optional[str] = None
     kit: str = "qwen3"
+    # What the engine refuses the call with, and where (see _Engine).
+    refuse: Optional[tuple[str, Any]] = None
+    # What a refused call's capture is failed with, on both paths.
+    failed: tuple[str, ...] = ()
 
 
 def _off_policy(name: str, value: Any) -> _Case:
@@ -777,6 +795,28 @@ CASES = [
     _off_policy("presence_penalty", 0.5),
     _off_policy("frequency_penalty", 0.5),
     _off_policy("logit_bias", {"10": 5.0}),
+    # Capture stages one choice, and the trainer replays one.
+    _Case("n_2", fields={"n": 2}, status=400),
+    # Token information without top_logprobs, unset or sent as null.
+    _Case("top_logprobs_unset", fields={"top_logprobs": None}, status=400),
+    # A full queue: vLLM's 503, so Gym retries elsewhere; checked before capture.
+    _Case(
+        "queue_full",
+        extras=lambda kit: {"ng_capture": _admission(mode="text")},
+        status=503,
+        refuse=("admission", QueueOverflowError()),
+    ),
+    # The engine's input check refuses a captured call after it began.
+    _Case(
+        "token_out_of_vocabulary",
+        extras=lambda kit: {"ng_capture": _admission(mode="text")},
+        status=400,
+        refuse=(
+            "generate",
+            VLLMValidationError("Token id 999999 is out of vocabulary"),
+        ),
+        failed=("invalid_request",),
+    ),
 ]
 
 
@@ -801,10 +841,13 @@ def test_a_gym_call_takes_the_same_steps_through_dynamo_as_natively(kits, case) 
 
     async def both():
         native = await _native(
-            kit, *_host(kit, deltas, case.top_logprobs), body, measure=False
+            kit,
+            *_host(kit, deltas, case.top_logprobs, case.refuse),
+            body,
+            measure=False,
         )
         dynamo = await _dynamo(
-            kit, *_host(kit, deltas, case.top_logprobs), body, extras
+            kit, *_host(kit, deltas, case.top_logprobs, case.refuse), body, extras
         )
         return native, dynamo
 
@@ -816,6 +859,9 @@ def test_a_gym_call_takes_the_same_steps_through_dynamo_as_natively(kits, case) 
     )
     if case.status != 200:
         assert native.runs == dynamo.runs == []
+        # Capture is failed alike, and neither path staged the call.
+        assert native.failed == dynamo.failed == list(case.failed)
+        assert native.staged == dynamo.staged == []
         return
     # The engine ran the same prompt, media and SamplingParams.
     ((native_prompt, native_params, native_media),) = native.runs

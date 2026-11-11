@@ -531,18 +531,23 @@ def on_policy_sampling(
     presence_penalty: Optional[float],
     frequency_penalty: Optional[float],
     logit_bias: Optional[Mapping[Any, float]],
+    n: Optional[int],
+    logprobs: Optional[bool],
+    top_logprobs: Optional[int],
     generation_config: Any,
 ) -> dict[str, Any]:
     """The sampling a NeMo-Gym chat call is served with, on every serving path.
 
     The request must match the train or validation profile
-    (:func:`check_sampling_param`) and set no sampling the trainer does not
-    replay. Floats are compared at f32: Dynamo's frontend carries them as f32,
-    so 0.7 arrives as 0.69999998.
+    (:func:`check_sampling_param`), set no sampling the trainer does not
+    replay, sample one choice, and set ``top_logprobs`` when it asks for
+    token information. Floats are compared at f32: Dynamo's frontend carries
+    them as f32, so 0.7 arrives as 0.69999998.
 
     Args:
         temperature, top_p, top_k, min_p, repetition_penalty, presence_penalty,
-            frequency_penalty, logit_bias: The request's values.
+            frequency_penalty, logit_bias, n, logprobs, top_logprobs: The
+            request's values; None (or missing) when it did not set them.
         generation_config: ``policy.generation``.
 
     Returns:
@@ -582,6 +587,16 @@ def on_policy_sampling(
             )
     if logit_bias:
         raise OffPolicySamplingError("request logit_bias is not supported")
+    if (n or 1) != 1:
+        # Capture stages one choice per call, and the trainer replays one.
+        raise OffPolicySamplingError(
+            f"request n={n} is not supported; NeMo-Gym calls take n=1"
+        )
+    if logprobs and top_logprobs is None:
+        raise OffPolicySamplingError(
+            "`top_logprobs` must be set when requesting token information from "
+            "NeMo RL's chat endpoint"
+        )
     is_train = (_f32(temperature), _f32(top_p)) == (
         profile["temperature"],
         profile["top_p"],

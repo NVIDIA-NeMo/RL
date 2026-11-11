@@ -21,10 +21,12 @@ parsed by the same code as NeMo RL's native vLLM server:
 1. the call's :class:`~nemo_rl.models.generation.gym_call.GymCallExtras` and
    on-policy sampling are checked;
 2. a render-pool worker renders it (:mod:`render_pool`);
-3. here, the token-capture prefix is read from TQ and spliced in, and the
-   output budget is clamped to the context;
+3. here, the prompt is prepared as natively
+   (:func:`~nemo_rl.models.generation.vllm.prompt_and_capture.prepare_prompt`: the
+   token-capture prefix read from TQ, the splice and the clamp);
 4. the final token ids go through Dynamo's KV router to one engine, whose
-   adapter runs the capture and generation (``adapter.DynamoVllmAdapter``);
+   adapter runs the capture and generation
+   (``adapter.DynamoVllmAdapter``);
 5. a render-pool worker builds the reply with vLLM's own parsers.
 
 The engine publishes its engine args and chat settings at registration
@@ -50,7 +52,6 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
     read_chat_capture,
 )
 from nemo_rl.models.generation.dynamo.vllm.render_pool import (
-    RenderedCall,
     RenderPool,
     RestoredReply,
 )
@@ -60,30 +61,26 @@ from nemo_rl.models.generation.gym_call import (
     GymCallResult,
     GymRequestFields,
 )
-from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
 
 # The key the engine publishes its chat settings under in runtime_data.
 RUNTIME_DATA_KEY = "nemo_rl_chat"
-# The annotation the adapter serves NeMo-Gym calls by; the capture plan rides
+# The annotation the adapter serves NeMo-Gym calls by; the ForwardedCall rides
 # in extra_args under PLAN_KEY.
 GYM_CALL_ANNOTATION = "nemo_gym:rollout"
 PLAN_KEY = "nemo_rl"
 
 
-class GymCallPlan(TypedDict):
-    """What the chat engine sends the adapter in ``extra_args[PLAN_KEY]``."""
+class ForwardedCall(TypedDict):
+    """What the chat engine sends the adapter in ``extra_args[PLAN_KEY]``.
 
+    The call's ``PreparedPrompt.to_json()`` and what the engine needs that the
+    native worker has in process: the rendered request, its media, and what
+    vLLM's chat serving hands the engine besides the prompt.
+    """
+
+    prepared_prompt: dict[str, Any]
     # The rendered chat request, without messages.
     request: dict[str, Any]
-    # Capture admissions as JSON: what is stored, and how the prompt is served.
-    admission: Optional[dict[str, Any]]
-    serving_admission: Optional[dict[str, Any]]
-    verify_retained_media: bool
-    # The model's own prefix length at the start of the spliced prompt.
-    prefix_len: Optional[int]
-    template_token_ids: list[int]
-    # PrefixSplice's (model_cut_end, template_cut_start), when spliced.
-    splice: Optional[list[int]]
     # The render's multimodal input, pickled then base64-encoded.
     multimodal: Optional[str]
     reasoning_ended: Optional[bool]
@@ -169,19 +166,15 @@ class _CaptureSource:
         # Calls run resolve_prefix on several threads at once; connect once.
         self._connect_lock = threading.Lock()
 
-    def resolve_prefix(self, serving_admission: dict[str, Any]) -> list[int]:
+    def resolve_prefix(self, serving_admission: Any) -> list[int]:
         """The admission's prefix, read from TQ (blocking; run off the loop)."""
-        from nemo_gym.token_id_capture.staging.records import CaptureAdmission
-
         from nemo_rl.data_plane.tq_token_sink import resolve_admission_prefix
 
         if self._prefix_cache is None:
             with self._connect_lock:
                 if self._prefix_cache is None:
                     self._prefix_cache = self._connect()
-        return resolve_admission_prefix(
-            CaptureAdmission.model_validate(serving_admission), self._prefix_cache
-        )
+        return resolve_admission_prefix(serving_admission, self._prefix_cache)
 
     @staticmethod
     def _connect() -> Any:
@@ -231,10 +224,8 @@ class NemoRLChatEngine:
     async def generate(
         self, request: dict[str, Any], context: Any = None
     ) -> AsyncGenerator[dict[str, Any], None]:
-        from vllm.exceptions import VLLMValidationError
-
-        from nemo_rl.data.captured_media import MediaCaptureRejected
-        from nemo_rl.models.generation.vllm.utils import OffPolicySamplingError
+        # Deferred: prompt_and_capture imports vLLM.
+        from nemo_rl.models.generation.vllm.prompt_and_capture import error_reply
 
         extras = GymCallExtras.from_annotations(
             (request.get("nvext") or {}).get("annotations") or ()
@@ -247,18 +238,24 @@ class NemoRLChatEngine:
                 "/v1/completions.",
             )
         try:
-            yield await self._serve(request, extras, context)
-        except (OffPolicySamplingError, MediaCaptureRejected) as error:
-            raise HttpError(400, str(error)) from error
-        except VLLMValidationError as error:
-            # Refused before the engine ran, so nothing was staged: as natively.
-            raise HttpError(400, str(error) + _capture_refusal_ack(extras)) from error
+            chunk = await self._serve(request, extras, context)
+        except HttpError:
+            raise
+        except Exception as error:
+            # The steps before the engine refuse a call with these, as
+            # natively; the frontend holds no capture state to fail.
+            failure = error_reply(error)
+            if failure is None:
+                raise
+            ack = _capture_refusal_ack(extras) if failure.acknowledge else ""
+            raise HttpError(failure.status, failure.message + ack) from error
+        yield chunk
 
     async def _serve(
         self, request: dict[str, Any], extras: GymCallExtras, context: Any
     ) -> dict[str, Any]:
-        # Deferred: chat_server imports vLLM's OpenAI server stack.
-        from nemo_rl.models.generation.vllm.chat_server import clamp_max_tokens
+        # Deferred: prompt_and_capture imports vLLM.
+        from nemo_rl.models.generation.vllm.prompt_and_capture import prepare_prompt
         from nemo_rl.models.generation.vllm.utils import on_policy_sampling
 
         body = _drop_none(
@@ -266,8 +263,6 @@ class NemoRLChatEngine:
         )
         if request.get("chat_template_args"):
             body["chat_template_kwargs"] = request["chat_template_args"]
-        if (body.get("n") or 1) != 1:
-            raise HttpError(400, "NeMo-Gym calls take n=1.")
         body.update(
             on_policy_sampling(
                 temperature=body.get("temperature"),
@@ -278,6 +273,10 @@ class NemoRLChatEngine:
                 presence_penalty=body.get("presence_penalty"),
                 frequency_penalty=body.get("frequency_penalty"),
                 logit_bias=body.get("logit_bias"),
+                n=body.get("n"),
+                logprobs=body.get("logprobs"),
+                # From the raw request: _drop_none drops an explicit null.
+                top_logprobs=request.get("top_logprobs"),
                 generation_config=self._generation,
             )
         )
@@ -285,36 +284,26 @@ class NemoRLChatEngine:
         body.update(extras.model_dump(include=request_fields))
         info = await self._pool.info()
         rendered = await self._pool.render(body, measure=extras.ng_measure)
-        prompt_token_ids, splice, prefix = await self._splice(
-            rendered, info["turn_end_token_ids"]
+        plan = await prepare_prompt(
+            rendered,
+            resolve_prefix=self._capture.resolve_prefix,
+            turn_end_token_ids=info["turn_end_token_ids"],
+            max_model_len=info["max_model_len"],
+            clamp=not extras.ng_measure,
         )
         if extras.ng_measure:
             return self._chunk(
                 request,
                 GymCallResult(
-                    prompt_token_count=len(prompt_token_ids), ng_context_measured=True
+                    prompt_token_count=len(plan.prompt_token_ids),
+                    ng_context_measured=True,
                 ),
                 message={"role": "assistant", "content": ""},
                 finish_reason="stop",
             )
-        max_tokens = clamp_max_tokens(
-            rendered.request_max_tokens, len(prompt_token_ids), info["max_model_len"]
-        )
-        engine_request = dict(rendered.request)
-        if max_tokens is not None:
-            engine_request["max_tokens"] = max_tokens
-            engine_request["max_completion_tokens"] = None
-        plan: GymCallPlan = {
-            "request": engine_request,
-            "admission": rendered.admission,
-            "serving_admission": rendered.serving_admission,
-            "verify_retained_media": rendered.verify_retained_media,
-            # The model's own prefix is the spliced prompt's first ids.
-            "prefix_len": None if prefix is None else len(prefix),
-            "template_token_ids": rendered.template_token_ids,
-            "splice": None
-            if splice is None
-            else [splice.model_cut_end, splice.template_cut_start],
+        wire: ForwardedCall = {
+            "prepared_prompt": plan.to_json(),
+            "request": rendered.request,
             "multimodal": None
             if rendered.multimodal is None
             else base64.b64encode(rendered.multimodal).decode(),
@@ -323,8 +312,8 @@ class NemoRLChatEngine:
         }
         preprocessed = {
             "model": request["model"],
-            "token_ids": prompt_token_ids,
-            "stop_conditions": {"max_tokens": max_tokens},
+            "token_ids": plan.prompt_token_ids,
+            "stop_conditions": {"max_tokens": plan.max_tokens},
             "sampling_options": {
                 "temperature": body["temperature"],
                 "top_p": body["top_p"],
@@ -332,7 +321,7 @@ class NemoRLChatEngine:
             "output_options": {},
             "eos_token_ids": [],
             "annotations": [GYM_CALL_ANNOTATION],
-            "extra_args": {PLAN_KEY: plan},
+            "extra_args": {PLAN_KEY: wire},
         }
         engine_data = await self._call_engine(preprocessed, context)
         if (refusal := engine_data.get("refusal")) is not None:
@@ -340,14 +329,14 @@ class NemoRLChatEngine:
             ack = _capture_refusal_ack(extras) if refusal["acknowledge"] else ""
             raise HttpError(refusal["status"], refusal["message"] + ack)
         result = GymCallResult.model_validate(engine_data["result"])
-        reply_request = engine_request
+        reply_request = rendered.request
         if result.ng_commit_coords is not None:
             # A captured call's logprobs were staged with it; as natively, its
             # reply carries none.
-            reply_request = {**engine_request, "logprobs": False, "top_logprobs": None}
+            reply_request = {**reply_request, "logprobs": False, "top_logprobs": None}
         response = await self._pool.respond(
             reply_request,
-            prompt_token_ids,
+            plan.prompt_token_ids,
             engine_data["output"],
             engine_data.get("restored"),
         )
@@ -360,30 +349,6 @@ class NemoRLChatEngine:
             logprobs=choice.get("logprobs"),
             usage=response.get("usage"),
         )
-
-    async def _splice(
-        self, rendered: RenderedCall, turn_end_token_ids: list[int]
-    ) -> tuple[list[int], Any, Any]:
-        """The prompt the engine runs: the model's own prefix, then the template's."""
-        prefix: Optional[list[int]] = None
-        serving = rendered.serving_admission
-        if serving is not None and serving["mode"] == "token_in":
-            # A blocking data-plane read; keep it off the frontend's loop.
-            prefix = await asyncio.to_thread(self._capture.resolve_prefix, serving)
-        elif rendered.required_prefix_token_ids is not None:
-            prefix = rendered.required_prefix_token_ids
-        if prefix is None:
-            return rendered.template_token_ids, None, None
-        # The render includes the history whenever a prefix will be spliced.
-        assert rendered.history_token_ids is not None
-        splice = splice_prefix_tokens(
-            tokenizer=None,
-            model_prefix_token_ids=prefix,
-            template_prefix_token_ids=rendered.history_token_ids,
-            template_token_ids=rendered.template_token_ids,
-            eos_token_id=turn_end_token_ids,
-        )
-        return splice.token_ids, splice, prefix
 
     async def _call_engine(
         self, preprocessed: dict[str, Any], context: Any

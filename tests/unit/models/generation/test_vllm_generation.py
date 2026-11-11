@@ -988,12 +988,13 @@ def skip_fp8_known_failures() -> None:
 def _install_fake_vllm_openai_modules(monkeypatch):
     # chat_server imports vLLM at module level: drop the cached copy so the
     # server is built against these fakes, and restore it afterwards.
-    chat_server = "nemo_rl.models.generation.vllm.chat_server"
-    monkeypatch.setitem(sys.modules, chat_server, None)
-    del sys.modules[chat_server]
-    monkeypatch.delattr(
-        sys.modules["nemo_rl.models.generation.vllm"], "chat_server", raising=False
-    )
+    for name in ("chat_server", "prompt_and_capture"):
+        module_name = f"nemo_rl.models.generation.vllm.{name}"
+        monkeypatch.setitem(sys.modules, module_name, None)
+        del sys.modules[module_name]
+        monkeypatch.delattr(
+            sys.modules["nemo_rl.models.generation.vllm"], name, raising=False
+        )
     for module_name in (
         "vllm",
         "vllm.entrypoints",
@@ -1003,6 +1004,7 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.entrypoints.openai.models",
         "vllm.entrypoints.serve",
         "vllm.entrypoints.serve.engine",
+        "vllm.entrypoints.serve.exception_handling",
         "vllm.entrypoints.serve.tokenize",
         "vllm.entrypoints.serve.utils",
         "vllm.reasoning",
@@ -1174,7 +1176,16 @@ def _install_fake_vllm_openai_modules(monkeypatch):
         "vllm.entrypoints.serve.tokenize.serving",
         ServingTokenization=ServingTokenization,
     )
-    make_module("vllm.exceptions", VLLMValidationError=VLLMValidationError)
+    make_module(
+        "vllm.exceptions",
+        VLLMValidationError=VLLMValidationError,
+        VLLMClientError=type("VLLMClientError", (Exception,), {}),
+        GracefulHTTPError=type("GracefulHTTPError", (Exception,), {}),
+    )
+    make_module(
+        "vllm.entrypoints.serve.exception_handling.error_response",
+        create_error_response=MagicMock(),
+    )
     make_module("vllm.sampling_params", StructuredOutputsParams=MagicMock())
     make_module(
         "vllm.reasoning.abs_reasoning_parsers",
@@ -1353,14 +1364,18 @@ def _fake_chat_request():
         temperature=1.0,
         max_tokens=1,
         max_completion_tokens=None,
+        n=1,
         # Read by NeMoRLOpenAIServingChatMixin.chat_completion_full_generator.
         stream=False,
         return_tokens_as_token_ids=None,
         logprobs=False,
         top_logprobs=None,
+        # The fields the client set, as pydantic records them.
+        model_fields_set=set(),
         # NeMoRLChatCompletionRequest's private defaults for a call that
         # restores no generation prefix.
         _restored_generation_token_ids=(),
+        _restored_prompt_token_ids=(),
         _restored_prefix_terminal=None,
     )
 
@@ -1478,16 +1493,18 @@ def _route_through_full_generator(serving_chat, result_generator) -> None:
 
 @pytest.mark.asyncio
 async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
-    """Overflow from _clamp_max_tokens must be HTTP 400 that NeMo Gym recognizes."""
+    """Overflow from clamp_max_tokens must be HTTP 400 that NeMo Gym recognizes."""
     _, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
+    prompt_and_capture = sys.modules[
+        "nemo_rl.models.generation.vllm.prompt_and_capture"
+    ]
 
     max_model_len = 128
-    renderer = serving_chat.kwargs["online_renderer"]
-    renderer.model_config = types.SimpleNamespace(max_model_len=max_model_len)
-    overflow_prompt = [0] * max_model_len
 
     async def create_chat_completion(request, _raw_request):
-        renderer._clamp_max_tokens(request, request.max_tokens, overflow_prompt)
+        prompt_and_capture.clamp_max_tokens(
+            request.max_tokens, max_model_len, max_model_len
+        )
 
     serving_chat.create_chat_completion = create_chat_completion
     response = await chat_handler(_fake_chat_request(), MagicMock())
@@ -1520,14 +1537,17 @@ async def test_context_overflow_returns_http_400_for_nemo_gym(monkeypatch):
 def test_clamp_max_tokens_sets_the_limit_the_request_uses(
     monkeypatch, max_tokens, max_completion_tokens, expected
 ):
-    _, serving_chat, _ = _setup_fake_vllm_chat_handler(monkeypatch)
-    renderer = serving_chat.kwargs["online_renderer"]
-    renderer.model_config = types.SimpleNamespace(max_model_len=2048)
+    _setup_fake_vllm_chat_handler(monkeypatch)
+    prompt_and_capture = sys.modules[
+        "nemo_rl.models.generation.vllm.prompt_and_capture"
+    ]
     request = types.SimpleNamespace(
         max_tokens=max_tokens, max_completion_tokens=max_completion_tokens
     )
 
-    renderer._clamp_max_tokens(request, 424, [0] * 1024)
+    prompt_and_capture.set_max_tokens(
+        request, prompt_and_capture.clamp_max_tokens(424, 1024, 2048)
+    )
 
     assert vars(request) == expected
 
@@ -1871,6 +1891,7 @@ async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch, logpr
     request.logprobs = logprobs
     request.return_tokens_as_token_ids = True
     request.top_logprobs = 0
+    request.model_fields_set = {"top_logprobs"}
     token_capture, call = _track_request_capture(worker, request)
     task = asyncio.create_task(chat_handler(request, MagicMock()))
     try:

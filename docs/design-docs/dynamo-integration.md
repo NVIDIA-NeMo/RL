@@ -114,9 +114,12 @@ one event loop, so it runs in the pool, first in first out. Per call:
 2. the chat engine checks on-policy sampling (`on_policy_sampling`, shared
    with the native route), reads a token-in prefix from TQ through a read-only
    client, splices it in with the model's turn-end tokens, and clamps the
-   output budget;
-3. the final token IDs go through the KV router to one engine (see above);
-4. the pool builds the reply with vLLM's own response builder and parsers.
+   output budget (`prepare_prompt` in `vllm/prompt_and_capture.py`, shared
+   with the native server);
+3. the final token IDs go through the KV router to one engine, whose adapter
+   runs the native server's `start_capture` and `save_capture`;
+4. the pool builds the reply with vLLM's own response builder and parsers,
+   through the same reply fixes for restored calls as the native server.
 
 `GymCallExtras` and `GymCallResult` (`models/generation/gym_call.py`) define
 the fields both paths exchange with Gym. `tests/unit/models/generation/test_gym_chat_path.py`
