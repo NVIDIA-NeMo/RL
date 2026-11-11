@@ -80,10 +80,15 @@ class AdvEstimatorConfig(BaseModel, extra="allow"):
 
     @model_validator(mode="after")
     def validate_full_group_std(self) -> "AdvEstimatorConfig":
-        """Reject full_group_std for estimators that would ignore it."""
+        """Reject full_group_std where it would be ignored."""
         if self.full_group_std and self.name != "grpo":
             raise ValueError(
                 f"adv_estimator.full_group_std is only supported for name='grpo', got {self.name!r}."
+            )
+        if self.full_group_std and not self.normalize_rewards:
+            raise ValueError(
+                "adv_estimator.full_group_std requires normalize_rewards=true; "
+                "without normalization the group std is never applied."
             )
         return self
 
