@@ -786,6 +786,13 @@ class BaseVllmGenerationWorker:
         )
         _validate_worker_extension_cls(vllm_kwargs, default_worker_extension_cls)
         _log_effective_quantization_ignore_patterns(self.cfg["vllm_cfg"], vllm_kwargs)
+        if vllm_kwargs.get(
+            "enable_return_routed_experts", False
+        ) and not _resolve_enable_prefix_caching(self.cfg["vllm_cfg"]):
+            raise ValueError(
+                "vLLM returns routed experts (router replay) through its prefix-cache "
+                "blocks; set policy.generation.vllm_cfg.enable_prefix_caching=true."
+            )
         llm_kwargs = dict(
             model=self.model_name,
             served_model_name=self.model_name,
