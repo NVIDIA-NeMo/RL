@@ -90,6 +90,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
 from nemo_rl.data.multimodal_utils import WIRE_MULTIMODAL_FIELDS
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION
 from nemo_rl.data_plane.schema import (
+    GROUP_TOKEN_MEAN_WEIGHT,
     OPD_FULL_TEACHER_INDEX_FIELD,
     SC_ROLLOUT_SCHEMA_FIELDS,
 )
@@ -3747,6 +3748,7 @@ class TestNativeTQRecoverySetup:
             save_state=save_state,
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
         )
 
         assert restored == metadata
@@ -3768,6 +3770,7 @@ class TestNativeTQRecoverySetup:
             save_state=_save_state(trainer_version=7),
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
         )
 
         assert restored == metadata
@@ -3785,6 +3788,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
             )
 
         policy.load_data_plane_checkpoint.assert_not_called()
@@ -3817,6 +3821,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
             )
 
     def test_checkpoint_without_replay_artifacts_does_not_load_tq(
@@ -3832,6 +3837,7 @@ class TestNativeTQRecoverySetup:
             save_state=_save_state(),
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
         )
 
         assert restored is None
@@ -3854,6 +3860,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
             )
 
     def test_rejects_tq_checkpoint_from_different_training_step(self, tmp_path):
@@ -3870,6 +3877,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
             )
 
     @pytest.mark.parametrize(
@@ -3906,6 +3914,7 @@ class TestNativeTQRecoverySetup:
                 save_state=_save_state(),
                 partition_id="rollout_data",
                 sampler_name="in_order",
+                loss_normalization="global_token_mean",
                 opd_full_teacher_checkpoints=current,
             )
 
@@ -3924,7 +3933,71 @@ class TestNativeTQRecoverySetup:
             save_state=_save_state(),
             partition_id="rollout_data",
             sampler_name="in_order",
+            loss_normalization="global_token_mean",
             opd_full_teacher_checkpoints=["ckpt-a", "ckpt-b"],
+        )
+
+        assert restored == metadata
+
+    @pytest.mark.parametrize(
+        ("saved", "current"),
+        [
+            ("global_token_mean", "sequence_mean"),
+            ("sequence_mean", "global_token_mean"),
+            # Written before the field existed, so it can only have been one
+            # of the two original modes.
+            (None, "group_token_mean"),
+        ],
+    )
+    def test_rejects_tq_checkpoint_written_under_another_loss_normalization(
+        self, tmp_path, saved, current
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        metadata = _native_tq_metadata()
+        if saved is not None:
+            metadata["loss_normalization"] = saved
+        policy = MagicMock()
+        policy.load_data_plane_checkpoint.return_value = metadata
+
+        with pytest.raises(ValueError, match="new checkpoint_dir"):
+            sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+                load_checkpoint=policy.load_data_plane_checkpoint,
+                last_checkpoint_path=str(checkpoint_path),
+                save_state=_save_state(),
+                partition_id="rollout_data",
+                sampler_name="in_order",
+                loss_normalization=current,
+            )
+
+    @pytest.mark.parametrize(
+        ("saved", "current"),
+        [
+            ("sequence_mean", "sequence_mean"),
+            (None, "global_token_mean"),
+            (None, "sequence_mean"),
+        ],
+    )
+    def test_accepts_tq_checkpoint_with_a_compatible_loss_normalization(
+        self, tmp_path, saved, current
+    ):
+        checkpoint_path = tmp_path / "step_3"
+        (checkpoint_path / DATA_PLANE_CHECKPOINT_DIR).mkdir(parents=True)
+        (checkpoint_path / REPLAY_BUFFER_METADATA_FILENAME).touch()
+        metadata = _native_tq_metadata()
+        if saved is not None:
+            metadata["loss_normalization"] = saved
+        policy = MagicMock()
+        policy.load_data_plane_checkpoint.return_value = metadata
+
+        restored = sc_setup_mod._maybe_restore_native_data_plane_checkpoint(
+            load_checkpoint=policy.load_data_plane_checkpoint,
+            last_checkpoint_path=str(checkpoint_path),
+            save_state=_save_state(),
+            partition_id="rollout_data",
+            sampler_name="in_order",
+            loss_normalization=current,
         )
 
         assert restored == metadata
@@ -4387,9 +4460,8 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
 ):
     """Capture rows carry their own media, so dedup has nothing to share: a GRPO
     run asking for it is rejected. A PPO run has no ``grpo`` block; the guard
-    must not read it. The guard is the last check in the token-capture block,
-    so reaching the OPD lookup that follows it proves the guard let the PPO
-    config through.
+    must not read it. Reaching seed initialization after the token-capture
+    block proves that the PPO config passed the guard.
     """
 
     class _PassedTokenCaptureBlock(Exception):
@@ -4410,8 +4482,8 @@ def test_token_capture_media_dedup_guard_reads_only_the_grpo_config(
         patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
         patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
         patch.object(
-            sc_setup_mod.opd_module,
-            "get_opd_full_config",
+            sc_setup_mod,
+            "set_seed",
             side_effect=_PassedTokenCaptureBlock,
         ) as mock_gate,
         expectation,
@@ -4654,3 +4726,16 @@ def test_generation_top_logprobs_requires_score_centering_or_replay():
     mc.policy["generation"]["top_logprobs"] = 4
     with pytest.raises(ValueError, match="only read by loss_fn.score_centering"):
         validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize("normalization", ["global_token_mean", "group_token_mean"])
+def test_partition_warmup_registers_reducer_columns(patched_factories, normalization):
+    mc = _make_master_config(
+        megatron_enabled=True,
+        loss_cfg=ClippedPGLossConfig(normalization=normalization),
+    )
+    actor_args, _ = setup_single_controller(mc, MagicMock(pad_token_id=0))
+    warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs["fields"]
+    assert (GROUP_TOKEN_MEAN_WEIGHT in warmup_fields) is (
+        normalization == "group_token_mean"
+    )

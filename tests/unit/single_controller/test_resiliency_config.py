@@ -22,6 +22,7 @@ hour three of a run.
 
 import warnings
 from typing import get_args
+from unittest.mock import MagicMock
 
 import pytest
 from pydantic import ValidationError
@@ -41,7 +42,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     logprob_passes_required,
     validate_single_controller_config,
 )
-from nemo_rl.algorithms.single_controller_utils.setup import _build_retry_policy
+from nemo_rl.algorithms.single_controller_utils.setup import (
+    _build_retry_policy,
+    setup_single_controller,
+)
 
 
 def _all_sampler_names() -> list[str]:
@@ -122,6 +126,19 @@ def test_single_forward_threshold_requires_a_threshold() -> None:
     cfg.grpo.seq_logprob_error_threshold = None
     with pytest.raises(ValueError, match="requires seq_logprob_error_threshold"):
         validate_single_controller_config(cfg)
+
+
+def test_group_token_mean_requires_megatron_before_setup() -> None:
+    cfg = _master_config()
+    cfg.loss_fn.normalization = "group_token_mean"
+    cfg.policy["megatron_cfg"] = {"enabled": True}
+    validate_single_controller_config(cfg)
+    cfg.policy["megatron_cfg"]["enabled"] = False
+    # Missing setup fields must not hide this compatibility error.
+    with pytest.raises(
+        ValueError, match="group_token_mean requires SingleController GRPO"
+    ):
+        setup_single_controller(cfg, MagicMock(pad_token_id=0))
 
 
 class TestRolloutFailureValidation:

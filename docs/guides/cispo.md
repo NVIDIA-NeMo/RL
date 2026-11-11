@@ -41,7 +41,7 @@ CISPO is enabled through the `loss_fn` block:
 ```yaml
 loss_fn:
   use_cispo: true
-  token_level_loss: true
+  normalization: global_token_mean
   sequence_level_importance_ratios: false
   force_on_policy_ratio: false
   ratio_clip_min: 1.0
@@ -53,7 +53,7 @@ loss_fn:
 - **`use_cispo`**: Enables the CISPO objective in the shared `ClippedPGLossFn`.
 - **`ratio_clip_min` / `ratio_clip_max`**: Follow the paper's additive epsilon convention. The effective clamp range is `[1 - ratio_clip_min, 1 + ratio_clip_max]`. For example, `ratio_clip_min: 1.0` and `ratio_clip_max: 5.0` clamp ratios to `[0, 6]`; since policy ratios are non-negative, this is effectively an upper-only clamp at `6`.
 - **`ratio_clip_c`**: Must be `null` for CISPO — dual clipping is incompatible with the CISPO objective.
-- **`token_level_loss`**: CISPO is defined per token, so keep this `true`. Setting it to `false` is rejected at construction time. See [Loss Normalization](grpo.md#loss-normalization-token_level_loss) for what this parameter controls.
+- **`normalization`**: use `global_token_mean`, or `group_token_mean` on the supported SingleController path. `sequence_mean` is rejected at construction time. The deprecated `token_level_loss: true` alias remains supported when `normalization` is unset. See [Loss Normalization](grpo.md#loss-normalization).
 
 > [!NOTE]
 > When `use_importance_sampling_correction: true`, the shared GRPO loss path additionally multiplies the CISPO token loss by the actor-vs-generation correction `exp(prev_logprobs - generation_logprobs)`. This correction is separate from CISPO's clipped `pi_theta / pi_old` weight.
