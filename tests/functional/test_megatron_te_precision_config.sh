@@ -112,7 +112,7 @@ print("TE precision config validation functional test passed")
 PY
 
 cd "$PROJECT_ROOT"
-uv run --extra mcore coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" --source="$PROJECT_ROOT/nemo_rl" \
+uv run --isolated --extra mcore --group test coverage run -a --data-file="$PROJECT_ROOT/tests/.coverage" --source="$PROJECT_ROOT/nemo_rl" \
     "$TEST_PY" \
     "$MATCHING_RECIPE" \
     "$MISMATCH_RECIPE" \
