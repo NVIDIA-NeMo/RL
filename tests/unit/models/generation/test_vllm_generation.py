@@ -5571,3 +5571,36 @@ def test_async_vllm_http_client_forwards_admission_checks() -> None:
         client.check_admission(3, request_id="req-3")
 
     assert calls == [(1, None), (2, "req-2"), (3, "req-3")]
+
+
+def test_sync_worker_finishes_queued_batches_before_resetting_the_prefix_cache():
+    events = []
+
+    class EngineCore:
+        def __init__(self):
+            self.batch_queue = ["batch left by generate()"]
+
+    class EngineClient:
+        def __init__(self):
+            self.engine_core = EngineCore()
+
+        def get_output(self):
+            events.append("step")
+            self.engine_core.batch_queue.pop()
+
+    class Engine:
+        def __init__(self):
+            self.engine_core = EngineClient()
+
+        def reset_prefix_cache(self):
+            events.append(
+                f"reset with {len(self.engine_core.engine_core.batch_queue)} queued"
+            )
+
+    worker = VllmGenerationWorkerImpl.__new__(VllmGenerationWorkerImpl)
+    worker.llm = types.SimpleNamespace(llm_engine=Engine())
+    worker.cfg = {"vllm_cfg": {"async_engine": False}}
+
+    worker.reset_prefix_cache()
+
+    assert events == ["step", "reset with 0 queued"]

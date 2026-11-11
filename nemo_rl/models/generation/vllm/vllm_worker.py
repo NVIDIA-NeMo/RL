@@ -1639,6 +1639,21 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             traceback.print_exc()
             return False
 
+    def _reset_prefix_cache_with_no_batch_in_flight(self) -> None:
+        """Finish the engine's queued batches, then reset the prefix cache.
+
+        ``LLM.generate`` returns once every request has its final output. With
+        async scheduling that can leave one scheduled batch in the in-process
+        engine's queue. vLLM 0.33 asserts that no batch is in flight across a
+        prefix cache reset when routed experts are returned, so the next
+        ``generate`` would fail with "auxiliary output generation changed with
+        output in flight".
+        """
+        engine_client = self.llm.llm_engine.engine_core
+        while engine_client.engine_core.batch_queue:
+            engine_client.get_output()
+        self.llm.llm_engine.reset_prefix_cache()
+
     def reset_prefix_cache(self):
         """Reset the prefix cache of vLLM engine."""
         assert self.llm is not None, (
@@ -1650,7 +1665,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
                 "reset_prefix_cache can only be used with async_engine=False. Use reset_prefix_cache_async instead."
             )
 
-        self.llm.llm_engine.reset_prefix_cache()
+        self._reset_prefix_cache_with_no_batch_in_flight()
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -1666,7 +1681,7 @@ class VllmGenerationWorkerImpl(VllmCheckpointEngineRpcMixin, BaseVllmGenerationW
             )
 
         # Reset the prefix cache to ensure that prefix cache is not reused after weights are updated
-        self.llm.llm_engine.reset_prefix_cache()
+        self._reset_prefix_cache_with_no_batch_in_flight()
         # Clear the renderer's multimodal processor cache (sender side) so it
         # stays in sync with the receiver cache that vLLM clears internally
         # during sleep.  Without this, the sender thinks images are already
