@@ -23,6 +23,12 @@ from nemo_rl.models.generation.interfaces import (
     agreed_media_columns,
 )
 
+# ``setup_token_capture`` takes these from ``rollout_recovery`` with no defaults.
+_PREFIX_BATCH_LIMITS = {
+    "generation_prefix_batch_size": 256,
+    "generation_prefix_batch_max_tokens": 4_194_304,
+}
+
 
 class _MinimalGeneration(GenerationInterface):
     """Satisfies the abstract methods only; inherits every optional hook."""
@@ -46,7 +52,7 @@ class _MinimalGeneration(GenerationInterface):
 def test_setup_token_capture_default_names_the_backend():
     """A backend without token capture rejects setup by name, not AttributeError."""
     with pytest.raises(NotImplementedError, match="_MinimalGeneration"):
-        _MinimalGeneration().setup_token_capture({}, "staging")
+        _MinimalGeneration().setup_token_capture({}, "staging", **_PREFIX_BATCH_LIMITS)
 
 
 def test_set_rollout_weight_version_default_names_the_backend():
