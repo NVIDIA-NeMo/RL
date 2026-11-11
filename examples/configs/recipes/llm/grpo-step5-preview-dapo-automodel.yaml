@@ -46,9 +46,19 @@ policy:
   router_replay:
     enabled: true
   optimizer:
+    # Automodel Step5 SFT optimizer: 10 B/param of training state (BF16 params+grads,
+    # 16-bit param remainders = lossless FP32 master, BF16 Adam moments). Validated on the
+    # 8-layer proxy: gen_kl_error and grad_norm match AdamW; peak GPU memory 72 -> 53 GB.
+    name: transformer_engine.pytorch.optimizers.FusedAdam
     kwargs:
       lr: 1.0e-06
       weight_decay: 0.1
+      betas: [0.9, 0.95]
+      eps: 1.0e-8
+      master_weights: true
+      store_param_remainders: true
+      exp_avg_dtype: torch.bfloat16
+      exp_avg_sq_dtype: torch.bfloat16
   automodel_cfg:
     context_parallel_size: 1
     expert_parallel_size: 64
