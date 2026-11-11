@@ -19,6 +19,10 @@ import torch
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
+# Per-row result of in-loss sequence filtering: a list of 0/1 floats, one per row
+# in the loss's batch order. It is not a metric; workers pop it before reduction.
+SEQ_LOGPROB_KEEP_MASK_KEY = "seq_logprob_error_keep_mask"
+
 
 class LossType(enum.Enum):
     TOKEN_LEVEL = "token_level"

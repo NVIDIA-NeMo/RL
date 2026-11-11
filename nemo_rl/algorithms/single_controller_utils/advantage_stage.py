@@ -228,6 +228,9 @@ class AdvantageRequest:
     # names its file after it and the pool has no view of the controller's
     # counter. Unset when the dump is off, which is the default.
     train_step: Optional[int] = None
+    # Overrides the config's policy_logprobs_required for this call, e.g. a PPO
+    # critic-warmup step that ran the policy-logprob pass under in-loss filtering.
+    policy_logprobs_required: Optional[bool] = None
 
 
 def split_meta_by_prompt_group(
@@ -345,6 +348,10 @@ class AdvantageComputer:
         """Run one call's advantage stage and return its reduced results."""
         meta = request.meta
         cfg = self._config
+        if request.policy_logprobs_required is not None:
+            cfg = replace(
+                cfg, policy_logprobs_required=request.policy_logprobs_required
+            )
         adv_cfg = cfg.advantage
         logical = has_logical_owners(meta)
         if logical and (

@@ -1681,8 +1681,6 @@ def resolve_ppo_chunk_alignment(
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     if master_config.loss_fn.seq_logprob_error_in_loss:
-        if is_ppo_run(master_config):
-            raise ValueError("loss_fn.seq_logprob_error_in_loss requires GRPO")
         _validate_seq_logprob_error_in_loss(master_config)
     _validate_algo_settings(master_config)
 
