@@ -503,6 +503,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         # A bare step number, not a payload: the stage writes the training
         # dump and has no other way to learn which step it is writing.
         "train_step",
+        # A single bool: whether this call ran the policy-logprob pass.
+        "policy_logprobs_required",
     }
     assert {f.name for f in fields(AdvantageOutcome)} == {
         "meta",
@@ -1252,3 +1254,27 @@ def test_failed_actor_rpc_raises_and_retires_the_actor(capsys) -> None:
     assert ctrl._available_advantage_actors.qsize() == 0
     # The mutation cut is released even on failure.
     assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1
+
+
+@pytest.mark.parametrize("override", [None, True])
+def test_request_override_applies_the_threshold_like_the_separate_pass(override):
+    """A PPO critic-warmup step runs the policy-logprob pass under in-loss
+    filtering; the override makes the stage mask rejected rows as with the flag off."""
+    rows = _rows()
+    for row in rows.values():
+        row["generation_logprobs"] = row["prev_logprobs"].clone()
+    rows["s1"]["generation_logprobs"] = rows["s1"]["prev_logprobs"] - 5.0
+    store = _RowStore(rows)
+    ctrl = _controller("grpo", 1, store, seq_logprob_error_threshold=2.0)
+    assert not ctrl._advantage_stage_config.policy_logprobs_required
+
+    asyncio.run(ctrl._advantage_stage(_pool_meta(), policy_logprobs_required=override))
+
+    masks = [
+        store.rows[f"s{i}"]["sample_mask"].item()
+        for i in range(NUM_GROUPS * GROUP_SIZE)
+    ]
+    expected = [1.0] * (NUM_GROUPS * GROUP_SIZE)
+    if override:
+        expected[1] = 0.0
+    assert masks == expected

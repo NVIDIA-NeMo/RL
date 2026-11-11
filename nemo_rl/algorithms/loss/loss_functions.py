@@ -38,6 +38,7 @@ from nemo_rl.algorithms.loss.draft import (
     streaming_vocab_parallel_soft_ce,
 )
 from nemo_rl.algorithms.loss.interfaces import (
+    SEQ_LOGPROB_KEEP_MASK_KEY,
     LossFunction,
     LossInputType,
     LossType,
@@ -803,6 +804,9 @@ class ClippedPGLossFn(LossFunction):
             ).to(sample_mask.dtype)
             seq_error_metrics["num_masked_seqs_by_logprob_error"] = (
                 (sample_mask - filtered_sample_mask).sum().item()
+            )
+            seq_error_metrics[SEQ_LOGPROB_KEEP_MASK_KEY] = (
+                (errors <= self.seq_logprob_error_threshold).float().cpu().tolist()
             )
             sample_mask = filtered_sample_mask
             mask = token_mask * sample_mask.unsqueeze(-1)
