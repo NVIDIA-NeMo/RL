@@ -17,6 +17,12 @@ env:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
     - resources_servers/mm_coding_training/configs/mm_coding_multi.yaml
     - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+    mm_coding_opencode_agent:
+      responses_api_agents:
+        opencode_agent:
+          model: ${policy.model_name}
+          context_window: ${add:${policy.max_total_sequence_length},${mul:-1,${policy.generation.max_new_tokens}}}
+          max_output_tokens: ${policy.generation.max_new_tokens}
 
 logger:
   log_dir: logs/grpo-super35-mm-coding-multi

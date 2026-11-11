@@ -192,6 +192,9 @@ recipe. All three recipes share the learner, optimizer and reward settings. Mult
 mixed permit up to 32 images per request instead of the single-answer cap of
 2, so retained reference/preview observations do not fail after two images. The
 16384-token context and adapter/model-server request limits still apply.
+The OpenCode model name follows `policy.model_name`. Its output limit follows
+`policy.generation.max_new_tokens`, and its context budget is the total sequence
+length minus that output limit. Keep the output limit below the total length.
 The Gym deployment also needs PR #5719 (public lifecycle and `LentSandboxes`)
 and the typed catalog-row validator follow-up, or their merged successors.
 Use the exact reviewed dependency SHAs, not an unpinned moving branch. OpenCode

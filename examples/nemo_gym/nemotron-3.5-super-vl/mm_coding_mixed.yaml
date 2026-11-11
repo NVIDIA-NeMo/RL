@@ -1,5 +1,5 @@
 # Mixed coding harness routes share the single recipe's Super VL learner and reward.
-defaults: mm_coding_single.yaml
+defaults: mm_coding_multi.yaml
 
 checkpointing:
   checkpoint_dir: results/grpo-super35-mm-coding-mixed
