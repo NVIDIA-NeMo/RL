@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Any
 
 _RAM_FILESYSTEMS = frozenset({"tmpfs", "ramfs", "devtmpfs"})
 NVME_MOUNT = "/raid"  # DGX nodes mount the NVMe RAID here
@@ -39,17 +40,51 @@ def default_ssd_dir(name: str, mounts_text: str | None = None) -> str:
     through :func:`require_disk_backed` there. ``mounts_text`` as in
     :func:`filesystem_of`.
     """
+    base = FALLBACK_BASE if nvme_fallback_reason(mounts_text) else NVME_MOUNT
+    return os.path.join(base, name)
+
+
+def nvme_fallback_reason(mounts_text: str | None = None) -> str | None:
+    """Why :func:`default_ssd_dir` cannot use ``/raid`` here; ``None`` when it can."""
     # From /proc/mounts, not os.path.ismount: in a container whose root lives
     # on the same device (enroot keeps container roots under /raid), a bind
     # mount of /raid has the device of /, and ismount says False. Writable:
     # /raid is often root-owned, and a job then has no business there.
     mountpoint, fs = _mount_of(NVME_MOUNT, mounts_text)
-    nvme = (
-        mountpoint == NVME_MOUNT
-        and fs not in _RAM_FILESYSTEMS
-        and os.access(NVME_MOUNT, os.W_OK)
+    if mountpoint != NVME_MOUNT:
+        return f"{NVME_MOUNT} is not mounted"
+    if fs in _RAM_FILESYSTEMS:
+        return f"{NVME_MOUNT} is a {fs} (RAM, not a disk)"
+    if not os.access(NVME_MOUNT, os.W_OK):
+        return f"{NVME_MOUNT} is not writable by this process"
+    return None
+
+
+_noted_fallback = False  # one note per process; the driver's is the run's
+
+
+def note_ssd_dir_fallback_once(log: Any) -> None:
+    """Log once why the SSD tiers default to ``/tmp`` and what ``/tmp`` is, if so."""
+    global _noted_fallback
+    if _noted_fallback:
+        return
+    _noted_fallback = True
+    reason = nvme_fallback_reason()
+    if reason is None:
+        return
+    mountpoint, fs = _mount_of(FALLBACK_BASE)
+    log.warning(
+        "%s on %s, so the data plane's SSD tiers default to %s (%s mounted at %s). "
+        "If that is not the node's NVMe, mount the NVMe at %s (ray.sub does so when "
+        "%s is writable on the node) or set the tier's path.",
+        reason,
+        os.uname().nodename,
+        FALLBACK_BASE,
+        fs or "unknown filesystem",
+        mountpoint or "?",
+        NVME_MOUNT,
+        NVME_MOUNT,
     )
-    return os.path.join(NVME_MOUNT if nvme else FALLBACK_BASE, name)
 
 
 def filesystem_of(path: str, mounts_text: str | None = None) -> str:

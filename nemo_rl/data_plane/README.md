@@ -651,9 +651,16 @@ Registered memory is pinned once per RDMA NIC, so per-process buffers add up qui
 
 While memory suffices nothing is written, so the default costs nothing. With
 `path: null` each owner writes under its node's NVMe: `/raid` (where DGX nodes
-mount the NVMe RAID) when the node has it, else `/tmp`. The directory must be
-on a disk: an owner refuses to start when it is on a RAM-backed filesystem
-(tmpfs), since spilling there would consume the memory it is meant to relieve.
+mount the NVMe RAID) when it is mounted, a disk and writable, else `/tmp`.
+`ray.sub` mounts a per-user NVMe directory at the container's `/raid` by
+itself: `NRL_NVME_DIR` when set (for example `/raid/scratch/$USER` on a
+cluster whose RAID root is root-owned), else `/raid/$USER` (created when the
+user owns `/raid`). Nothing is mounted otherwise, and the driver logs one
+note saying the tiers use `/tmp` and what `/tmp` is (in an enroot container
+`/tmp` is often the node's NVMe already). Other launchers mount the directory
+at `/raid` the same way, or set `path`. The directory must be on a disk: an owner
+refuses to start when it is on a RAM-backed filesystem (tmpfs), since spilling
+there would consume the memory it is meant to relieve.
 
 The single controller reads the master's `/metrics` every step and logs, under
 `data_plane/mooncake/`: `mem_used_mb`, `mem_capacity_mb`, `mem_used_ratio`

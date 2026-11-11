@@ -65,6 +65,7 @@ from nemo_rl.data_plane.interfaces import (
     gdr_enabled,
     storage_unit_placement,
 )
+from nemo_rl.data_plane.local_disk import note_ssd_dir_fallback_once
 from nemo_rl.data_plane.schema import MICROBATCH_PADDED_FIELDS
 from nemo_rl.distributed.virtual_cluster import _reserve_data_plane_ports
 
@@ -1048,6 +1049,8 @@ def _init_tq(
         )
         metrics_url = f"http://{local_ip}:{metrics_port}/metrics"
         if mooncake_cfg.ssd_offload.enabled:
+            if mooncake_cfg.ssd_offload.path is None:
+                note_ssd_dir_fallback_once(LOGGER)
             # Stop the run if Mooncake ever deletes an SSD copy for space.
             mooncake_ssd_offload.watch_master_disk_evictions(
                 metrics_url, mooncake_cfg.ssd_offload.dir()
@@ -1098,6 +1101,8 @@ def _init_tq(
         import nemo_rl.data_plane.adapters.tq_nixl  # noqa: F401
 
         nixl_cfg = backend_config(cfg)
+        if nixl_cfg.ssd.enabled and nixl_cfg.ssd.path is None:
+            note_ssd_dir_fallback_once(LOGGER)
         block = nixl_cfg.model_dump()
         placement = block.pop("storage_unit_placement")
         if not block.get("node_ids"):

@@ -57,3 +57,26 @@ def test_default_ssd_dir_prefers_a_writable_mounted_raid(
     # The same device as / is fine: in an enroot container / itself lives on /raid.
     monkeypatch.setattr(local_disk.os, "access", lambda p, mode: writable)
     assert local_disk.default_ssd_dir("nrl_x", _MOUNTS + raid_line) == expected
+
+
+def test_the_fallback_is_noted_once_with_what_tmp_is(monkeypatch):
+    # /raid absent in this process's mounts: the note names the reason and /tmp's filesystem.
+    monkeypatch.setattr(local_disk, "_noted_fallback", False)
+    monkeypatch.setattr(local_disk, "_mount_of", lambda p, text=None: ("/", "ext4"))
+    notes = []
+    log = type("Log", (), {"warning": lambda self, msg, *a: notes.append(msg % a)})()
+    local_disk.note_ssd_dir_fallback_once(log)
+    local_disk.note_ssd_dir_fallback_once(log)
+    (note,) = notes
+    assert note.startswith("/raid is not mounted on ") and "/tmp (ext4 mounted at /)" in note
+
+
+def test_no_note_when_raid_is_usable(monkeypatch):
+    monkeypatch.setattr(local_disk, "_noted_fallback", False)
+    monkeypatch.setattr(local_disk, "_mount_of", lambda p, text=None: ("/raid", "ext4"))
+    monkeypatch.setattr(local_disk.os, "access", lambda p, mode: True)
+    notes = []
+    local_disk.note_ssd_dir_fallback_once(
+        type("Log", (), {"warning": lambda self, *a: notes.append(a)})()
+    )
+    assert notes == []
