@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+import math
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import Any, Optional
 
@@ -55,6 +57,19 @@ class TQDriverMixin:
             return args, None
         return None, None
 
+    def _forward_pad_multiple(self, metas: Sequence[KVBatchMeta]) -> int:
+        """Combine model, producer and dynamic-batch token alignment requirements."""
+        _, dynamic_args = self._packing_args("train_mb_tokens")
+        multiples = [
+            int(self.cfg["make_sequence_length_divisible_by"]),
+            *[int(meta.extra_info.get("pad_to_multiple", 1)) for meta in metas],
+        ]
+        if dynamic_args is not None:
+            multiples.append(int(dynamic_args["sequence_length_round"]))
+        if any(multiple <= 0 for multiple in multiples):
+            raise ValueError("Forward sequence padding multiples must be positive")
+        return math.lcm(*multiples)
+
     def _stamp_pad_seqlen(self, meta: KVBatchMeta) -> None:
         """Mint ``GLOBAL_FORWARD_PAD_SEQLEN`` onto ``meta.extra_info`` (idempotent).
 
@@ -65,11 +80,8 @@ class TQDriverMixin:
             return
         if GLOBAL_FORWARD_PAD_SEQLEN in meta.extra_info:
             return
-        _, dba = self._packing_args("train_mb_tokens")
-        seq_round = int(dba["sequence_length_round"]) if dba is not None else 1
-        pad_mult = int(meta.extra_info.get("pad_to_multiple", 1))
         meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] = round_up(
-            max(meta.sequence_lengths), max(pad_mult, seq_round)
+            max(meta.sequence_lengths), self._forward_pad_multiple([meta])
         )
 
     def _isolated_meta(
