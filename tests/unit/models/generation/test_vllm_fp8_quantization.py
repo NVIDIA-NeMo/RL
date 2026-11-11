@@ -1469,36 +1469,18 @@ def test_process_mxfp8_moe_padding_rejects_modular_kernel(fp8_module, monkeypatc
 def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(
     fp8_module, requires_padding
 ):
+    import inspect
+
+    from vllm.model_executor.layers.fused_moe.modular_kernel import FusedMoEKernel
+
     fp8 = fp8_module
     calls = []
+    kernel_signature = inspect.signature(FusedMoEKernel.apply_monolithic)
 
     class Kernel:
-        def apply_monolithic(
-            self,
-            x,
-            w13,
-            w2,
-            router_logits,
-            *,
-            activation,
-            global_num_experts,
-            expert_map,
-            apply_router_weight_on_input,
-            num_expert_group,
-            topk_group,
-            e_score_correction_bias,
-            routed_scaling_factor,
-        ):
-            kwargs = {
-                "activation": activation,
-                "global_num_experts": global_num_experts,
-                "expert_map": expert_map,
-                "apply_router_weight_on_input": apply_router_weight_on_input,
-                "num_expert_group": num_expert_group,
-                "topk_group": topk_group,
-                "e_score_correction_bias": e_score_correction_bias,
-                "routed_scaling_factor": routed_scaling_factor,
-            }
+        def apply_monolithic(self, x, w13, w2, router_logits, **kwargs):
+            # Fails when the installed vLLM kernel takes different arguments.
+            kernel_signature.bind(self, x, w13, w2, router_logits, **kwargs)
             calls.append((x, w13, w2, router_logits, kwargs))
             return x + 1
 
@@ -1524,6 +1506,7 @@ def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(
         "topk_group": 2,
         "e_score_correction_bias": "correction-bias",
         "routed_scaling_factor": 1.25,
+        "routing_sink": "routing-sink",
     }
     if requires_padding:
         layer_kwargs.update(
@@ -1559,6 +1542,7 @@ def test_apply_monolithic_mxfp8_moe_uses_padded_apply_weights(
         "topk_group": 2,
         "e_score_correction_bias": "correction-bias",
         "routed_scaling_factor": 1.25,
+        "routing_sink": "routing-sink",
     }
     assert tuple(output.shape) == (2, 2688)
     torch.testing.assert_close(output, x + 1)
