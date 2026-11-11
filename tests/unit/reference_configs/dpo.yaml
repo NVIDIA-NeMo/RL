@@ -56,6 +56,7 @@ policy:
     env_vars:
       PYTORCH_CUDA_ALLOC_CONF: ""  # Refers to https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-alloc-conf
     enabled: true
+    distributed_timeout_minutes: null
     checkpoint:
       model_save_format: "safetensors"
       save_consolidated: "false"

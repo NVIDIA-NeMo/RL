@@ -201,6 +201,9 @@ class AutomodelCheckpointConfig(TypedDict, total=False):
 class AutomodelConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
+    # Collective timeout (minutes) for the default process group and the FSDP2 /
+    # expert-parallel groups derived from it. None = torch default (10 for NCCL).
+    distributed_timeout_minutes: NotRequired[float | None]
     # Distributed parallelism sizes
     # data_parallel_size is derived from world_size / (tp * cp * ep)
     tensor_parallel_size: int
