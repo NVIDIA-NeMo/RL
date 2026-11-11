@@ -124,17 +124,13 @@ Enable `token_capture.enabled: true` and `token_capture.forest_training: true` o
   For `A → B` and `A → C`, both branches train; it does not choose the latest
   sibling. Shared `A` contributes loss once, and both rows share the rollout's
   reward and advantage.
-- `continued_chains` trains every independent session (for example, subagents)
-  as its own row. The scored chain comes first and holds only the scored call's
-  ancestors; each other root, in admission order, descends to a unique leaf,
-  preferring children that were continued. An ambiguous fork drops that root, a
-  leaf whose cumulative hash repeats an earlier chain is dropped as a
-  byte-identical retry, and calls that did not finish trainably end a chain
-  instead of masking the rollout. It names the scored terminal as `all_captured`
-  does.
-
-`token_capture.max_rows_per_rollout` (`continued_chains` only) caps rows per
-rollout: the scored chain plus the first N-1 other chains.
+`token_capture.max_rows_per_rollout` caps physical Forest rows per rollout, before
+execution padding, for any selection policy. `null` (the default) keeps every row.
+When the plan exceeds the limit, retain the first planned row containing the
+scored call, then the first N-1 other rows in the existing planning order. A fork
+under one root can produce multiple rows and each counts toward the limit.
+Capture validation and rollout-level truncation still cover all selected calls;
+the cap does not excuse failed capture or change terminal attribution.
 
 All built-in policies reuse capture validation, completion checks, forest reconstruction,
 and once-only loss ownership for shared ancestors. Pending calls, lost capture

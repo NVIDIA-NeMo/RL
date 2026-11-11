@@ -2116,7 +2116,6 @@ Depending on your data shape, you may want to change these values."""
         from nemo_rl.environments.call_selection import (
             LENGTH_FINISH_REASONS,
             TerminalNotIdentified,
-            cap_selected_roots,
             resolve_scored_terminal,
             resolve_selection_policy,
         )
@@ -2172,10 +2171,6 @@ Depending on your data shape, you may want to change these values."""
                 if any(f.model_call_id in selected_call_ids for f in parsed.failures):
                     capture_failed = True
                     selected = []
-                elif self._max_rows_per_rollout is not None:
-                    selected = cap_selected_roots(
-                        selected, terminal_response_id, self._max_rows_per_rollout
-                    )
             except TerminalNotIdentified as error:
                 # Mask the owner rather than fail the run; reported per step.
                 print(f"⚠️ Rollout {owner!r} masked: {error}", file=sys.stderr)
@@ -2269,6 +2264,7 @@ Depending on your data shape, you may want to change these values."""
                 for r in selected
             ),
             truncated=truncated,
+            max_rows_per_rollout=self._max_rows_per_rollout,
         )
         full_result: dict[str, Any] = {
             key: value

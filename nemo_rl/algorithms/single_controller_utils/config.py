@@ -704,9 +704,6 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     forest_training: bool = False
     # returned_history preserves the harness-selected trajectory (default).
     # all_captured includes every captured call, including abandoned attempts.
-    # continued_chains trains the scored chain plus one continued chain per other
-    # root, dropping ambiguous forks and byte-identical retries (see
-    # call_selection.select_continued_chains).
     # Custom policies use an importable package.module:function path.
     selection_policy: str = "returned_history"
     # Forest only. Keep execution padding and failed owners' borrowed inputs out
@@ -721,8 +718,7 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Step padding only. Which real rows the padding copies: row0 repeats the
     # batch's first row; cyclic takes rows 0, 1, 2, ...
     forest_pad_source: Literal["row0", "cyclic"] = "row0"
-    # continued_chains only. Max rows per rollout: the scored chain plus the
-    # first N-1 other chains, in selection order. None keeps every chain.
+    # Forest only. Cap physical rows, retaining a scored-call row; None keeps all.
     max_rows_per_rollout: Optional[PositiveInt] = None
     # Which Forest segments the token-level reward penalties (unwanted tokens,
     # malformed think tags) check.
@@ -747,14 +743,6 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
         if not self.forest_training and any(forest_only.values()):
             names = ", ".join(name for name, set_ in forest_only.items() if set_)
             raise ValueError(f"token_capture.{names} requires forest_training=true")
-        if (
-            self.max_rows_per_rollout is not None
-            and self.selection_policy != "continued_chains"
-        ):
-            raise ValueError(
-                "token_capture.max_rows_per_rollout requires "
-                "selection_policy=continued_chains"
-            )
         if self.forest_pad_source != "row0" and self.forest_padding_scope != "step":
             raise ValueError(
                 "token_capture.forest_pad_source requires forest_padding_scope=step"
