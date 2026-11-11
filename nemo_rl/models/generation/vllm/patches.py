@@ -1085,20 +1085,16 @@ def _patch_vllm_routed_experts_capture_router_fallback(
 ) -> bool:
     """Let monolithic MoE kernels without in-kernel capture use the router hook.
 
-    vLLM 0.29 moved the routed-experts binding into
-    ``routed_experts_capturer.bind_routed_experts_capturer``. For a monolithic
-    kernel it requires ``fused_experts.supports_routing_replay_capture()`` and
-    binds the capture function to that experts *object* (the kernel then writes
-    ``routing_replay_out`` itself); any other monolithic kernel is rejected with
-    ``ValueError``. Two things make the object binding unusable for NeMo-RL's
-    NVFP4 per-token method: the kernel is rebuilt on every refit, so the bound
-    capture function is dropped after the first weight update and the returned
-    routes go back to all-zero; and the per-token kernel is the one FlashInfer
-    launch that has not been validated with a replay buffer attached. Kernels
-    that report no in-kernel capture (see ``nvfp4_pertoken.host_captured_experts_cls``)
-    therefore fall back to ``router.set_capture_fn`` — the hook that
-    ``_patch_vllm_moe_routed_experts_capture`` fires on the monolithic branch
-    and the path vLLM 0.26 used for every monolithic kernel.
+    ``routed_experts_capturer.bind_routed_experts_capturer`` requires a
+    monolithic kernel to report ``supports_routing_replay_capture()`` and then
+    gives the layer a ``RoutedExpertsSink`` whose buffer the kernel fills with
+    ``routing_replay_out``; any other monolithic kernel is rejected with
+    ``ValueError``. NeMo-RL's NVFP4 per-token kernel is the one FlashInfer
+    launch that has not been validated with a replay buffer attached, so it
+    reports no in-kernel capture (see
+    ``nvfp4_pertoken.host_captured_experts_cls``). Such kernels fall back to
+    ``router.set_capture_fn`` — the hook that
+    ``_patch_vllm_moe_routed_experts_capture`` fires on the monolithic branch.
     """
     try:
         file_to_patch = _get_vllm_file(
@@ -1116,7 +1112,6 @@ def _patch_vllm_routed_experts_capture_router_fallback(
 
     marker = "NeMo-RL patch (router fallback for monolithic routed-experts capture)"
     old_snippet = (
-        "        if quant_method.is_monolithic:\n"
         "            if not (\n"
         "                isinstance(fused_experts, FusedMoEExpertsMonolithic)\n"
         "                and fused_experts.supports_routing_replay_capture()\n"
@@ -1125,11 +1120,12 @@ def _patch_vllm_routed_experts_capture_router_fallback(
         '                    "Routed-experts capture is not supported with monolithic "\n'
         '                    f"MoE kernel {type(fused_experts).__name__}."\n'
         "                )\n"
-        "            fused_experts.set_capture_fn(capture_fn)\n"
+        "            module.routed_experts.routing_sink = RoutedExpertsSink(\n"
+        "                fused_experts.moe_config, capture_fn\n"
+        "            )\n"
         "            num_bound += 1\n"
     )
     new_snippet = (
-        "        if quant_method.is_monolithic:\n"
         "            # NeMo-RL patch (router fallback for monolithic routed-experts capture):\n"
         "            # a monolithic kernel that does not capture routing itself is\n"
         "            # captured through the router; NeMo-RL's moe_runner patch fires\n"
@@ -1138,7 +1134,9 @@ def _patch_vllm_routed_experts_capture_router_fallback(
         "                isinstance(fused_experts, FusedMoEExpertsMonolithic)\n"
         "                and fused_experts.supports_routing_replay_capture()\n"
         "            ):\n"
-        "                fused_experts.set_capture_fn(capture_fn)\n"
+        "                module.routed_experts.routing_sink = RoutedExpertsSink(\n"
+        "                    fused_experts.moe_config, capture_fn\n"
+        "                )\n"
         "                num_bound += 1\n"
         "            elif isinstance(module.router, BaseRouter):\n"
         "                module.router.set_capture_fn(capture_fn)\n"
