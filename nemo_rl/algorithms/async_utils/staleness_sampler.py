@@ -213,6 +213,9 @@ class DropAccountingSampler(Protocol):
     ) -> Optional[int]:
         """Return the step a permanently lost group is charged to.
 
+        This policy may be re-evaluated after an awaited selection completes;
+        compute the destination without mutating sampler state.
+
         Args:
             target_step: The step stamped on the lost group, or ``None`` if the
                 policy does not stamp.

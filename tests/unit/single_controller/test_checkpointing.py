@@ -67,6 +67,8 @@ from nemo_rl.algorithms.async_utils.replay_buffer import (
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
     InOrderSamplerConfig,
+    ReadyFirstSampler,
+    ReadyFirstSamplerConfig,
     WindowedSamplerConfig,
     sampler_supports_buffer_checkpoint,
 )
@@ -100,6 +102,7 @@ from nemo_rl.algorithms.rollout_checkpointing.state import (
 from nemo_rl.algorithms.single_controller import (
     RolloutRuntimeState,
     SingleControllerActor,
+    _StepAssembly,
 )
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
@@ -2852,6 +2855,66 @@ class TestPeriodicRolloutCheckpoint:
             assert not result.saved
             assert result.reason == "optimizer_commit_in_progress"
             assert actor._dp_client.save_calls == []
+        finally:
+            actor._checkpointer.shutdown()
+
+    @pytest.mark.parametrize("when", ["before_attempt", "after_anchor"])
+    def test_snapshot_waits_for_selection_shortfall_reconciliation(
+        self, tmp_path: Path, when: str
+    ) -> None:
+        actor = self._actor(tmp_path)
+        actor._algo_cfg.num_prompts_per_step = 4
+        actor._async_cfg.rollout_failure.min_step_batch_fraction = 0.5
+        actor._master_config.async_rl.sampler = ReadyFirstSamplerConfig(
+            max_staleness_versions=1
+        )
+        actor._sampler = ReadyFirstSampler(actor._buffer, max_staleness_versions=1)
+        actor._step_assembly = _StepAssembly(0, 0, [])
+        attach_rollout_checkpointing(actor)
+
+        def lose() -> None:
+            for _ in range(3):
+                actor._credit_shortfall(None)
+            assert actor._rollout_runtime.batch_shortfall == {0: 3}
+
+        async def exercise() -> None:
+            if when == "before_attempt":
+                lose()
+            else:
+                resolve_anchor = actor._rollout_snapshots._resolve_anchor
+
+                async def lose_after_anchor():
+                    anchor = await resolve_anchor()
+                    lose()
+                    return anchor
+
+                actor._rollout_snapshots._resolve_anchor = lose_after_anchor
+            skipped = await actor._rollout_snapshots.save_snapshot(force=True)
+            assert not skipped.saved
+            assert skipped.reason == "trainer_state_changed"
+            assert actor._dp_client.save_calls == []
+            if when == "after_anchor":
+                actor._rollout_snapshots._resolve_anchor = resolve_anchor
+            async with actor._data_plane_checkpoint_barrier.checkpoint() as cut:
+                with pytest.raises(RuntimeError, match="unreconciled selection"):
+                    await actor._rollout_snapshots.capture(
+                        cut, tmp_path / "unsafe", "rollout_snapshot"
+                    )
+            credits = actor._step_assembly.selection_credits
+            actor._step_assembly.selection_credits = None
+            actor._step_assembly.selected_groups = 3
+            actor._reconcile_selection_credits(0, credits)
+            assert actor._target_groups_for_step(0) == 3
+            assert actor._target_groups_for_step(1) == 2
+            saved = await actor._rollout_snapshots.save_snapshot(force=True)
+            assert saved.saved
+
+        try:
+            asyncio.run(exercise())
+            paths = list(tmp_path.rglob(ROLLOUT_RECOVERY_STATE_FILENAME))
+            assert len(paths) == 1
+            state = torch.load(paths[0], weights_only=True)
+            assert state["batch_shortfall"] == {0: 1, 1: 2}
         finally:
             actor._checkpointer.shutdown()
 

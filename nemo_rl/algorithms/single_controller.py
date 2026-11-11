@@ -52,7 +52,7 @@ import uuid
 import warnings
 from collections import deque
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -324,6 +324,20 @@ def _worker_group_snapshots(worker_group: Any) -> Callable[[], list[dict[str, An
         return [s for s in ray.get(futures) if s]
 
     return fan_out
+
+
+@dataclass(frozen=True)
+class _ShortfallCredit:
+    target_step: Optional[int]
+    charged_step: int
+    allow_short: bool
+
+
+@dataclass
+class _StepAssembly:
+    version: int
+    selected_groups: int
+    selection_credits: Optional[list[_ShortfallCredit]]
 
 
 @ray.remote(num_cpus=1, num_gpus=0)  # pragma: no cover
@@ -808,6 +822,7 @@ class SingleControllerActor:
         # the current step has finished selecting. A lost group with no step of its own
         # is charged here.
         self._assembling_version: int = restored_trainer_version
+        self._step_assembly: Optional[_StepAssembly] = None
         self._train_steps: int = actor_args.save_state.current_step
         self._current_epoch: int = actor_args.save_state.current_epoch
         self._step_log_dict: dict[str, list] = {
@@ -1945,7 +1960,9 @@ class SingleControllerActor:
                                     cut, replacement, target_step=target_step
                                 )
                             else:
-                                self._credit_shortfall(target_step)
+                                self._credit_shortfall(
+                                    target_step, allow_short=filtered
+                                )
                         if replacement is None:
                             # Nothing was committed, so the train pump will never see this
                             # group and never release its permit on our behalf.
@@ -2511,14 +2528,58 @@ class SingleControllerActor:
             )
         return self._accounting_step(target_step)
 
-    def _credit_shortfall(self, target_step: Optional[int]) -> None:
+    def _advance_assembling_version(self) -> None:
+        """Move past steps whose selected groups and losses fill their batch."""
+        assembly = self._step_assembly
+        while True:
+            selected = (
+                assembly.selected_groups
+                if assembly is not None and assembly.version == self._assembling_version
+                else 0
+            )
+            lost = self._rollout_runtime.batch_shortfall.get(
+                self._assembling_version, 0
+            )
+            if selected + lost < self._algo_cfg.num_prompts_per_step:
+                return
+            self._assembling_version += 1
+
+    def _reconcile_selection_credits(
+        self, assembling_version: int, credits: list[_ShortfallCredit]
+    ) -> None:
+        """Reapply only losses that raced an awaited selection, using its result."""
+        for credit in credits:
+            remaining = self._rollout_runtime.batch_shortfall[credit.charged_step] - 1
+            if remaining:
+                self._rollout_runtime.batch_shortfall[credit.charged_step] = remaining
+            else:
+                del self._rollout_runtime.batch_shortfall[credit.charged_step]
+        self._assembling_version = assembling_version
+        self._advance_assembling_version()
+        for credit in credits:
+            self._credit_shortfall(credit.target_step, allow_short=credit.allow_short)
+        self._rollout_runtime.shortfall_reconciliation_pending = False
+
+    def _credit_shortfall(
+        self, target_step: Optional[int], *, allow_short: bool = False
+    ) -> None:
         """Record that a step will never receive a group it is waiting for."""
+        self._advance_assembling_version()
         charged_step = self._charge_step_for_lost_group(target_step)
         if charged_step is None:
             return
         self._rollout_runtime.batch_shortfall[charged_step] = (
             self._rollout_runtime.batch_shortfall.get(charged_step, 0) + 1
         )
+        if allow_short:
+            self._rollout_runtime.steps_allowed_short.add(charged_step)
+        assembly = self._step_assembly
+        if assembly is not None and assembly.selection_credits is not None:
+            assembly.selection_credits.append(
+                _ShortfallCredit(target_step, charged_step, allow_short)
+            )
+            self._rollout_runtime.shortfall_reconciliation_pending = True
+        self._advance_assembling_version()
         print(
             f"  target_step={charged_step} is one group short "
             f"({self._rollout_runtime.batch_shortfall[charged_step]} total); the train pump "
@@ -2639,6 +2700,7 @@ class SingleControllerActor:
             ):
                 maybe_gpu_profile_step(self._gen, self._train_steps + 1)
             version_during_step = self._trainer_version
+            self._step_assembly = _StepAssembly(version_during_step, 0, None)
             groups_dispatched = 0
             evicted_stale_prompt_groups = 0
             min_sample_version = None
@@ -2750,11 +2812,24 @@ class SingleControllerActor:
                         training_claim_ids_before = (
                             self._buffer.training_owned_group_ids()
                         )
-                        train_meta, num_groups = await self._sampler.select(
-                            current_train_weight=self._trainer_version,
-                            min_prompt_groups=min_prompt_groups,
-                            max_prompt_groups=max_prompt_groups,
-                            **selection_kwargs,
+                        assembly = self._step_assembly
+                        assert assembly is not None
+                        cursor_before_selection = self._assembling_version
+                        selection_credits: list[_ShortfallCredit] = []
+                        assembly.selection_credits = selection_credits
+                        try:
+                            train_meta, num_groups = await self._sampler.select(
+                                current_train_weight=self._trainer_version,
+                                min_prompt_groups=min_prompt_groups,
+                                max_prompt_groups=max_prompt_groups,
+                                **selection_kwargs,
+                            )
+                        finally:
+                            assembly.selection_credits = None
+                        assembly.selected_groups = groups_dispatched + num_groups
+                        # Credits remain checkpoint-visible while the claim waits.
+                        self._reconcile_selection_credits(
+                            cursor_before_selection, selection_credits
                         )
                         training_claim_ids_after = (
                             self._buffer.training_owned_group_ids()
@@ -2860,16 +2935,6 @@ class SingleControllerActor:
                             )
                             starvation_span.end()
                             starvation_span = None
-
-                        # No await since the select returned. If this chunk completes the
-                        # step, a group lost while it trains counts toward the next one:
-                        # charged here it would be pruned with this step, and the next
-                        # would wait for a group nobody is generating.
-                        if (
-                            groups_dispatched + num_groups
-                            >= self._target_groups_for_step(version_during_step)
-                        ):
-                            self._assembling_version = version_during_step + 1
 
                         consumed_metas.append(train_meta)
                         consumed_training_claim_ids.extend(selected_training_claim_ids)
@@ -3219,7 +3284,10 @@ class SingleControllerActor:
                 # Selection is over, so a group lost from here on counts toward the next
                 # step. Nothing awaits between the loop's last target read and here, so
                 # no loss can be charged to this step after it stopped reading.
-                self._assembling_version = version_during_step + 1
+                self._assembling_version = max(
+                    self._assembling_version, version_during_step + 1
+                )
+                self._step_assembly = None
 
                 # The loop can leave a wait open on two exits that continue
                 # the run, where an unended span would stay open over the
