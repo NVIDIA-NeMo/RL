@@ -1001,6 +1001,7 @@ class VllmAsyncGenerationWorkerImpl(
             weight_version_fn=lambda: self._rollout_weight_version,
             adapter=VLLMCaptureAdapter(),
         )
+        await self._prefix_recovery.aclose()
         self._prefix_recovery.shutdown()
         self._prefix_recovery = NoPrefixRecovery()
         self._cut_routes_dtype = (
@@ -2311,6 +2312,7 @@ class VllmAsyncGenerationWorkerImpl(
             # Waiting for a wedged TQ write here would make actor shutdown hang.
             prefix_recovery = getattr(self, "_prefix_recovery", None)
             if prefix_recovery is not None:
+                await prefix_recovery.aclose()
                 prefix_recovery.shutdown()
             if self._api_server_pool is not None:
                 await self._api_server_pool.command("stop")
