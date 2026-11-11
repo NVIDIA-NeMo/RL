@@ -146,6 +146,12 @@ and images. The legacy `run_grpo_nemo_gym.py` entrypoint does not support that
 capture path. Recovery uses the existing `sibling` boundary; this does not claim
 in-flight typed-episode turn recovery.
 
+Automodel split training accumulates gradients across chunks and applies the
+complete batch normalization before one optimizer and scheduler update. This
+path supports FP32/BF16, TP=CP=1 and fixed microbatches. Dynamic batching,
+sequence packing/parallelism, draft co-training and in-loss survivor filtering
+are rejected before GPU allocation.
+
 Captured still images use the native Automodel `NemotronOmni` dynamic-resolution
 forward. The learner restores the packed patches to padded pixels without
 resizing or changing pixel values, and keeps each image's native dimensions.

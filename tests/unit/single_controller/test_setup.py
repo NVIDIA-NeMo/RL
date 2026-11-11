@@ -99,6 +99,7 @@ from nemo_rl.experience.rollout_recovery import RecoveryTargetLevel
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.interfaces import SamplerReplayConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
+from nemo_rl.models.policy import Eagle3DraftConfig
 from nemo_rl.utils.config import (
     load_config,
     register_omegaconf_resolvers,
@@ -4787,4 +4788,30 @@ def test_captured_omni_automodel_rejects_unsupported_backend_before_allocation(
         "automodel_kwargs": {"force_hf": invalid == "force_hf"},
     }
     with pytest.raises(ValueError, match="Omni media token capture requires"):
+        validate_single_controller_config(config)
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    ["tp", "cp", "sequence_parallel", "packing", "dynamic", "precision", "draft"],
+)
+def test_automodel_split_rejects_unimplemented_modes_before_allocation(unsupported):
+    config = _make_master_config()
+    config.policy["is_vlm"] = False
+    config.policy["automodel_cfg"] = {
+        "enabled": True,
+        "tensor_parallel_size": 2 if unsupported == "tp" else 1,
+        "context_parallel_size": 2 if unsupported == "cp" else 1,
+        "sequence_parallel": unsupported == "sequence_parallel",
+    }
+    config.policy["sequence_packing"] = {"enabled": unsupported == "packing"}
+    config.policy["dynamic_batching"] = {"enabled": unsupported == "dynamic"}
+    config.policy["precision"] = "float16" if unsupported == "precision" else "bfloat16"
+    if unsupported == "draft":
+        config.policy["draft"] = Eagle3DraftConfig(
+            enabled=True, model_name="test-draft"
+        )
+    with pytest.raises(
+        ValueError, match="SingleController Automodel training requires"
+    ):
         validate_single_controller_config(config)
