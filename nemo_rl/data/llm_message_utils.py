@@ -230,38 +230,6 @@ def validate_precomputed_loss_masks(
                 )
 
 
-def _pad_tensor(
-    tensor: Tensor,
-    max_len: int,
-    pad_side: str,
-    pad_value: int = 0,
-) -> Tensor:
-    """Pad a tensor to the specified length.
-
-    Args:
-        tensor: Tensor to pad
-        max_len: Length to pad to
-        pad_side: Whether to pad on the 'left' or 'right'
-        pad_value: Value to use for padding
-
-    Returns:
-        torch.Tensor: Padded tensor
-    """
-    pad_len = max_len - tensor.size(0)
-    if pad_len <= 0:
-        return tensor
-
-    padding = torch.full(
-        (pad_len, *tensor.shape[1:]),
-        pad_value,
-        dtype=tensor.dtype,
-        device=tensor.device,
-    )
-    return torch.cat(
-        [padding, tensor] if pad_side == "left" else [tensor, padding], dim=0
-    )
-
-
 def _validate_tensor_consistency(tensors: list[Tensor]) -> None:
     """Validate that all tensors have consistent dtypes and devices.
 
@@ -453,10 +421,23 @@ def batched_message_log_to_flat_message(
             for v in tensor_values
         ]
 
-        # Pad and stack tensors (always right padding)
+        # Right-pad every row into one preallocated tensor.
         pad_value = pad_value_dict.get(key, 0) if pad_value_dict else 0
-        padded = [_pad_tensor(t, max_len, "right", pad_value) for t in filled_values]
-        result[key] = torch.stack(padded)
+        row_shape = filled_values[0].shape[1:]
+        padded = torch.full(
+            (len(filled_values), max_len, *row_shape),
+            pad_value,
+            dtype=tensors[0].dtype,
+            device=tensors[0].device,
+        )
+        for i, value in enumerate(filled_values):
+            if value.shape[1:] != row_shape:
+                raise RuntimeError(
+                    f"tensors for {key=} must have the same trailing shape: "
+                    f"{tuple(filled_values[0].shape)} vs {tuple(value.shape)}"
+                )
+            padded[i, : value.size(0)] = value
+        result[key] = padded
 
     return result, input_lengths_tensor
 
