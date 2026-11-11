@@ -312,33 +312,35 @@ _MASTER = """\
 master_allocated_bytes 1073741824
 master_total_capacity_bytes 4294967296
 master_key_count 10
-master_evicted_key_count_mem {keys}
+master_successful_evictions_mem {rounds}
+master_evicted_key_count_mem 5
 master_evicted_size_bytes_mem 2097152
 master_evict_disk_replica_requests_total 0
 """
 
 
 def test_master_metrics_are_in_mib_with_a_memory_ratio() -> None:
-    assert offload.master_metrics(_MASTER.format(keys=5)) == {
+    assert offload.master_metrics(_MASTER.format(rounds=3)) == {
         "mem_used_mb": 1024.0,
         "mem_capacity_mb": 4096.0,
         "keys": 10.0,
-        "offloaded_keys_total": 5.0,
-        "offloaded_mb_total": 2.0,
+        "offload_rounds_total": 3.0,
+        "mem_evicted_keys_total": 5.0,
+        "mem_evicted_mb_total": 2.0,
         "disk_evictions_total": 0.0,
         "mem_used_ratio": 0.25,
     }
     assert offload.master_metrics("")["mem_used_ratio"] == 0.0  # no capacity yet
 
 
-def test_the_first_offload_warns_once(monkeypatch, caplog) -> None:
+def test_the_first_offload_round_warns_once(monkeypatch, caplog) -> None:
     monkeypatch.setattr(offload, "_warned_offload", False)
     with caplog.at_level("WARNING", logger=offload.LOGGER.name):
-        for keys in (0, 5, 9):
-            offload._warn_on_first_offload(offload.master_metrics(_MASTER.format(keys=keys)))
+        for rounds in (0, 3, 9):
+            offload._warn_on_first_offload(offload.master_metrics(_MASTER.format(rounds=rounds)))
     (msg,) = [r.getMessage() for r in caplog.records]
-    assert "5 object(s), 2.0 MiB" in msg and "25% of 4.0 GiB" in msg
-    assert "offload_threshold" in msg
+    assert "3 SSD offload round(s)" in msg and "25% of 4.0 GiB" in msg
+    assert "5 object(s), 2.0 MiB" in msg and "offload_threshold" in msg
 
 
 def test_step_metrics_without_a_mooncake_client_is_empty() -> None:
@@ -460,11 +462,11 @@ def test_step_metrics_read_the_real_endpoint_and_warn_once(
     url = f"http://127.0.0.1:{metrics_server.server_port}/metrics"
     monkeypatch.setattr(offload, "_master_metrics_url", lambda: url)
     monkeypatch.setattr(offload, "_warned_offload", False)
-    metrics_server.body = _MASTER.format(keys=0)
+    metrics_server.body = _MASTER.format(rounds=0)
     with caplog.at_level("WARNING", logger=offload.LOGGER.name):
-        assert offload.step_metrics()["offloaded_keys_total"] == 0
-        metrics_server.body = _MASTER.format(keys=7)
-        assert offload.step_metrics()["offloaded_keys_total"] == 7
+        assert offload.step_metrics()["offload_rounds_total"] == 0
+        metrics_server.body = _MASTER.format(rounds=7)
+        assert offload.step_metrics()["offload_rounds_total"] == 7
         assert offload.step_metrics()["mem_used_ratio"] == 0.25
     assert len(caplog.records) == 1
 
