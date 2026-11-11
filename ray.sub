@@ -1220,6 +1220,19 @@ else
   echo "[INFO] SANDBOX_CONTAINER or SANDBOX_COMMAND not defined, skipping sandbox startup"
 fi
 
+# Host-level image preflight: pyxis sometimes reports "No such file" for an image that exists
+# (seen on single nodes on DFW Lustre), and a worker node that fails to start leaves the job
+# waiting for its Ray actors until the 30 min timeout. Look the image up on every node first,
+# retrying for ~60 s, and fail fast naming the node otherwise. NRL_SKIP_IMAGE_PREFLIGHT=1 skips.
+if [[ -n "${CONTAINER:-}" ]] && [[ -z "${NRL_SKIP_IMAGE_PREFLIGHT:-}" ]]; then
+  log_phase "image preflight on all nodes"
+  if ! srun --overlap --nodes="$SLURM_JOB_NUM_NODES" --ntasks-per-node=1 --cpus-per-task=1 \
+      bash -c 'for i in $(seq 1 20); do [[ -r "$0" ]] && exit 0; sleep 3; done; echo "[ERROR] $(hostname): image not readable: $0" >&2; exit 1' "$CONTAINER"; then
+    echo "[ERROR] Image preflight failed; resubmit excluding the node(s) named above." >&2
+    exit 1
+  fi
+fi
+
 # Start the Ray head.
 log_phase "launching Ray head + worker sruns"
 srun $COMMON_SRUN_ARGS --container-name=ray-head --nodes=1 --ntasks=1 --cpus-per-task=$CPUS_PER_WORKER -w "$head_node" -o $LOG_DIR/ray-head.log bash -x -c "$head_cmd" &
