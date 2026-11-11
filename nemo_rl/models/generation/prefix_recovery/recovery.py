@@ -38,6 +38,7 @@ from typing import Any, Literal
 import torch
 
 from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
+from nemo_rl.models.generation.prefix_read_batcher import PrefixReadBatcher
 from nemo_rl.models.generation.prefix_recovery.parts import PrefixRecoveryParts
 from nemo_rl.models.generation.prefix_recovery.restore import (
     _generation_cut_blockers,
@@ -149,6 +150,10 @@ class PrefixRecovery:
         # Obsolete chunk rows are deleted here, off the serving loop.
         self._cleanup_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="nrl-generation-cut-cleanup"
+        )
+        # Restores arriving together share their chunk reads.
+        self._reader = PrefixReadBatcher(
+            self._fetch_rows, max_rows=parts.generation_prefix_batch_size
         )
 
     @property
@@ -966,7 +971,17 @@ class PrefixRecovery:
     def _fetch_chunks(self, continuation: Any) -> list[Any]:
         """Fetch the staged chunks named by a ``GenerationCutContinuation``, in order."""
         # Gym requires at least one staging key per continuation.
-        staging_keys = list(continuation.staging_keys)
+        chunks = self._fetch_rows(list(continuation.staging_keys))
+        if not chunks:
+            raise RuntimeError("generation-cut continuation has no staged chunks")
+        return chunks
+
+    def _fetch_rows(self, staging_keys: list[str]) -> list[Any]:
+        """Fetch cut rows with their extras and routes, in the requested order.
+
+        Also the fetch callback of the restore reader, which coalesces the
+        keys of concurrent restores into one call.
+        """
         # The finalization read also returns each row's extras, which carry a
         # media call's spans and tensor digests, and its route fragment when
         # router replay is on; plain ``fetch`` returns neither.
@@ -975,9 +990,30 @@ class PrefixRecovery:
         )
         if len(chunks) != len(staging_keys):
             raise RuntimeError("generation-cut fetch did not return every staged chunk")
-        if not chunks:
-            raise RuntimeError("generation-cut continuation has no staged chunks")
         return chunks
+
+    async def read_restore_chunks(self, admission: Any) -> list[Any] | None:
+        """Read a restored call's chunks through the shared restore reader.
+
+        Returns None when the admission restores no cut, or when the shared
+        read failed; ``resolve_restore`` then reads the rows itself.
+        """
+        continuation = admission.generation_cut
+        if continuation is None:
+            return None
+        try:
+            return await self._reader.fetch(list(continuation.staging_keys))
+        except Exception:  # noqa: BLE001 - resolve_restore retries the read
+            LOGGER.debug(
+                "shared prefix read failed for model call %s",
+                admission.model_call_id,
+                exc_info=True,
+            )
+            return None
+
+    async def aclose(self) -> None:
+        """Fail pending restore reads; call before ``shutdown``."""
+        await self._reader.aclose()
 
     def _rebuild_prefix(
         self,
@@ -1101,7 +1137,10 @@ class PrefixRecovery:
         return _ResolvedGenerationCut(snapshot=snapshot, routed_experts=routed_experts)
 
     def resolve_restore(
-        self, admission: Any, prefix_token_ids: list[int]
+        self,
+        admission: Any,
+        prefix_token_ids: list[int],
+        chunks: list[Any] | None = None,
     ) -> tuple[Any, _ResolvedGenerationCut | None]:
         """Resolve an admission's restored prefix, or drop it so the call regenerates.
 
@@ -1110,14 +1149,17 @@ class PrefixRecovery:
         so a prefix that cannot be fetched, whose media cannot be restored,
         or that does not match its admission costs time, not the rollout.
         Returns the admission to serve and the verified prefix with its media
-        and routes, or the admission without its cut and None.
+        and routes, or the admission without its cut and None. ``chunks`` are
+        the cut's rows when ``read_restore_chunks`` already read them;
+        otherwise they are read here.
         """
         continuation = admission.generation_cut
         if continuation is None:
             return admission, None
         try:
             # One fetch serves both the media and the prefix.
-            chunks = self._fetch_chunks(continuation)
+            if chunks is None:
+                chunks = self._fetch_chunks(continuation)
             media = self._parts.restore_media(chunks)
             resolved = self._rebuild_prefix(admission, prefix_token_ids, chunks)
             snapshot = resolved.snapshot
@@ -1190,7 +1232,10 @@ class NoPrefixRecovery:
     control_token: str | None = None
 
     def resolve_restore(
-        self, admission: Any, prefix_token_ids: list[int]
+        self,
+        admission: Any,
+        prefix_token_ids: list[int],
+        chunks: list[Any] | None = None,
     ) -> tuple[Any, _ResolvedGenerationCut | None]:
         if admission.generation_cut is None:
             return admission, None
@@ -1234,6 +1279,12 @@ class NoPrefixRecovery:
         pass
 
     async def flush(self, epoch: int) -> None:
+        pass
+
+    async def read_restore_chunks(self, admission: Any) -> list[Any] | None:
+        return None
+
+    async def aclose(self) -> None:
         pass
 
     def counts(self) -> dict[str, int]:

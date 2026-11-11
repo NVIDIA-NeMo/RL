@@ -4140,3 +4140,38 @@ def test_worker_batch_observation_continues_while_lifecycle_waits():
     progress = state.snapshot()
     assert progress.generated_token_ids[progress.staged_token_count :] == [99]
     assert progress.generated_token_ids[: progress.staged_token_count] == [20, 21]
+
+
+def test_restored_prefix_uses_the_chunks_its_reader_fetched():
+    """The restore reader fetches a restore's chunks; resolving the prefix
+    must use them instead of reading TQ again."""
+    sink = _MemorySink()
+    cut_key, cut_record, request = _restorable_cut(sink)
+    worker = _resumed_worker(sink, records={cut_key: cut_record})
+    admission = worker._capture_admission(request)
+    chunks = _cuts(worker)._fetch_rows([cut_key])
+    recovery = _cuts(worker, staging_source=_MemoryPrefixSource({}, records={}))
+
+    served, resolved = recovery.resolve_restore(admission, [], chunks)
+
+    assert served is admission
+    assert resolved.snapshot.digest == cut_record.digest
+
+
+def test_restore_reader_shares_reads_and_falls_back_on_a_failed_read():
+    sink = _MemorySink()
+    cut_key, cut_record, request = _restorable_cut(sink)
+    worker = _resumed_worker(sink, records={cut_key: cut_record})
+    admission = worker._capture_admission(request)
+
+    async def read(recovery):
+        try:
+            return await recovery.read_restore_chunks(admission)
+        finally:
+            await recovery.aclose()
+
+    chunks = asyncio.run(read(_cuts(worker)))
+    assert [chunk.snapshot.digest for chunk in chunks] == [cut_record.digest]
+    # A failed shared read hands resolve_restore no chunks, so it reads alone.
+    empty = _cuts(worker, staging_source=_MemoryPrefixSource({}, records={}))
+    assert asyncio.run(read(empty)) is None
