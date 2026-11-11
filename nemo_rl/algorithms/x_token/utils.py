@@ -146,7 +146,7 @@ def pad_distillation_val_batch(
 
     padded: BatchedDataDict[Any] = BatchedDataDict()
     for key, value in batch.items():
-        if torch.is_tensor(value):
+        if isinstance(value, torch.Tensor):
             pad_rows = value[-1:].repeat(pad, *([1] * (value.dim() - 1)))
             padded[key] = torch.cat([value, pad_rows], dim=0)
         else:
