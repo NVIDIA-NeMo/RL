@@ -82,16 +82,21 @@ EVICTION_COUNTER = "master_evict_disk_replica_requests_total"
 _watch_stop: threading.Event | None = None
 
 # Master gauges and counters the driver logs every step (step_metrics), by
-# their name in Mooncake 0.3.x's /metrics -> (logged name, divisor). The
-# "evicted ... mem" counters are the objects the master moved out of memory;
-# with master_args (offload on eviction, no forced eviction) every one of them
-# went to its owner's SSD, so they are the offload volume.
+# their name in Mooncake 0.3.x's /metrics -> (logged name, divisor). The master
+# has no per-object offload counter. With master_args (offload on eviction, no
+# forced eviction) each successful eviction round wrote at least one object to
+# an owner's SSD, so "successful evictions mem" counts offload rounds; the
+# "evicted ... mem" counters are the objects whose memory copy was then
+# dropped, whose reads go through the SSD. Measured: a run past the threshold
+# with memory to spare ran 11 rounds (112 files) and dropped 0 memory copies;
+# one under memory pressure dropped 34,693 objects, about its file count.
 MASTER_METRICS = {
     "master_allocated_bytes": ("mem_used_mb", 2**20),
     "master_total_capacity_bytes": ("mem_capacity_mb", 2**20),
     "master_key_count": ("keys", 1),
-    "master_evicted_key_count_mem": ("offloaded_keys_total", 1),
-    "master_evicted_size_bytes_mem": ("offloaded_mb_total", 2**20),
+    "master_successful_evictions_mem": ("offload_rounds_total", 1),
+    "master_evicted_key_count_mem": ("mem_evicted_keys_total", 1),
+    "master_evicted_size_bytes_mem": ("mem_evicted_mb_total", 2**20),
     EVICTION_COUNTER: ("disk_evictions_total", 1),
 }
 _warned_offload = False  # one warning per driver process, at the first offload
@@ -490,20 +495,20 @@ def _master_metrics_url() -> str | None:
 def _warn_on_first_offload(metrics: dict[str, float]) -> None:
     """The first offload means memory passed the threshold: say so once, with the remedy."""
     global _warned_offload
-    if _warned_offload or metrics["offloaded_keys_total"] == 0:
+    if _warned_offload or metrics["offload_rounds_total"] == 0:
         return
     _warned_offload = True
     LOGGER.warning(
-        "Mooncake offloaded %d object(s), %.1f MiB, to SSD: the data plane's "
-        "memory (now %.0f%% of %.1f GiB used) passed "
-        "data_plane.mooncake_cpu.ssd_offload.offload_threshold, so the workload is "
-        "under memory pressure. Reads of offloaded objects go through the owners' "
-        "SSD. Raise storage_unit_segment_size (or global_segment_size) or "
+        "Mooncake ran %d SSD offload round(s): the data plane's memory (now %.0f%% "
+        "of %.1f GiB used) passed data_plane.mooncake_cpu.ssd_offload.offload_threshold. "
+        "%d object(s), %.1f MiB, lost their memory copy and are read from the "
+        "owners' SSD. Raise storage_unit_segment_size (or global_segment_size) or "
         "offload_threshold to keep the data in memory.",
-        int(metrics["offloaded_keys_total"]),
-        metrics["offloaded_mb_total"],
+        int(metrics["offload_rounds_total"]),
         100 * metrics["mem_used_ratio"],
         metrics["mem_capacity_mb"] / 1024,
+        int(metrics["mem_evicted_keys_total"]),
+        metrics["mem_evicted_mb_total"],
     )
 
 

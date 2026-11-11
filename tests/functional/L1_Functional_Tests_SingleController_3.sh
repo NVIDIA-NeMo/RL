@@ -36,15 +36,16 @@ run_test() {
 
 # Native TQ + metadata-only completed replay recovery (#3480).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh
-# Same recovery flow with Mooncake CPU storage and SSD offload on; skips
-# without an RDMA device.
+# Same recovery flow with Mooncake CPU storage, forced onto its SSD offload;
+# skips without an RDMA device.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_mooncake_tq_recovery.sh
 # Same flows with storage units: SimpleStorageUnits pinned by placement, and
-# Mooncake CPU storage units as the only memory owners (skips without RDMA).
+# Mooncake CPU storage units as the only memory owners, with the default SSD
+# offload settings and no spill expected (skips without RDMA).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_single_controller_tq_recovery.sh simple_placed
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_mooncake_tq_recovery.sh mooncake_units
-# Same recovery flow on the nixl data plane, with its SSD tier off and on
-# (skip without an RDMA device).
+# Same recovery flow on the nixl data plane: default SSD tier with no spill,
+# and forced onto the SSD tier (skip without an RDMA device).
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_nixl_tq_recovery.sh
 run_test fast uv run --no-sync bash ./tests/functional/grpo_dp_nixl_tq_recovery.sh nixl_ssd
 # Deterministic process restart with an admitted group held before canonical TQ
