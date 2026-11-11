@@ -55,6 +55,7 @@ from nemo_rl.models.megatron.draft.utils import (
     load_hf_weights_to_dflash,
     load_hf_weights_to_dspark,
     register_draft_grad_norm_group,
+    unwrap_policy_language_model,
 )
 from nemo_rl.models.policy.draft_config import (
     DraftConfig,
@@ -649,7 +650,7 @@ class DFlashSpeculator:
                 0,
                 plan.local_anchor_positions,
             ].unsqueeze(1)
-        policy = unwrap_model(policy_model)
+        policy = unwrap_policy_language_model(policy_model)
         word_embeddings = policy.embedding.word_embeddings
         mask_ids = torch.full(
             (plan.sample_rows.numel(), self.config.gamma),
@@ -1012,7 +1013,7 @@ class DSparkSpeculator:
                 plan.local_anchor_positions,
             ].unsqueeze(1)
             input_rows = torch.zeros_like(plan.sample_rows)
-        policy = unwrap_model(policy_model)
+        policy = unwrap_policy_language_model(policy_model)
         mask_ids = torch.full(
             (plan.sample_rows.numel(), self.config.block_size - 1),
             self.config.mask_token_id,
@@ -1209,7 +1210,7 @@ class LiLiCorrSpeculator(DFlashSpeculator):
             )
             data["dflash_output"] = output
         plan = output.plan
-        policy = unwrap_model(kwargs["policy_model"])
+        policy = unwrap_policy_language_model(kwargs["policy_model"])
         anchor_hidden = output.hidden[:, :1]
         # loss_stats does not receive draft_model, so hand the head over here.
         data["lilicorr_head"] = draft_model.lilicorr

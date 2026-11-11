@@ -196,3 +196,23 @@ def test_capture_ignores_a_forward_without_decoder_input():
     capture._captured = {}
     capture._make_decoder_input_hook()(None, (torch.zeros(1),), {})
     assert "embeds" not in capture._captured
+
+
+def test_policy_head_is_found_inside_a_vl_wrapper():
+    from types import SimpleNamespace
+
+    from nemo_rl.models.megatron.draft.utils import (
+        get_policy_lm_head_weight,
+        unwrap_policy_language_model,
+    )
+
+    weight = torch.zeros(4, 2)
+    language_model = torch.nn.Module()
+    language_model.output_layer = SimpleNamespace(weight=weight)
+    llava = torch.nn.Module()
+    llava.language_model = language_model
+    omni = torch.nn.Module()  # NemotronOmniModel layout: .llava_model.language_model
+    omni.llava_model = llava
+    assert unwrap_policy_language_model(omni) is language_model
+    assert get_policy_lm_head_weight(omni) is weight
+    assert unwrap_policy_language_model(language_model) is language_model

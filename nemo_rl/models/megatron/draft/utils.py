@@ -2092,9 +2092,25 @@ def export_dspark_heads_to_hf(
     return exported
 
 
+def unwrap_policy_language_model(policy_model_chunk: MegatronModule) -> Any:
+    """Return the GPT/Mamba language model inside a policy chunk.
+
+    VL wrappers (NemotronVLModel / NemotronOmniModel) keep it under
+    ``.llava_model.language_model``; plain LLM chunks are the model itself.
+    """
+    model = unwrap_model(policy_model_chunk)
+    llava_model = getattr(model, "llava_model", None)
+    if llava_model is not None:
+        model = llava_model
+    language_model = getattr(model, "language_model", None)
+    if language_model is not None:
+        model = language_model
+    return model
+
+
 def get_policy_lm_head_weight(policy_model_chunk: MegatronModule) -> torch.Tensor:
     """Return the local policy LM-head shard for draft initialization."""
-    unwrapped_policy_model = unwrap_model(policy_model_chunk)
+    unwrapped_policy_model = unwrap_policy_language_model(policy_model_chunk)
     if getattr(unwrapped_policy_model, "share_embeddings_and_output_weights", False):
         return unwrapped_policy_model.shared_embedding_or_output_weight()
     return unwrapped_policy_model.output_layer.weight
