@@ -8,9 +8,13 @@ This is an adapted backport to `0.30.0+g116da885561b.cu132`, rather than an
 unmodified cherry-pick onto NeMo RL's default vLLM version. The patch retains
 that build's inline lease expiry cleanup and worker APIs, adds lease slot
 invalidation before expiry cleanup frees the KV blocks, and integrates consumer
-nonce verification into the existing pull completion path. `lease_slots.py`
-matches the pinned upstream revision. Newer upstream packed/PLE paths and
-unrelated notification metrics are outside this backport.
+nonce verification into the existing pull completion path. `lease_slots.py` is
+based on the pinned upstream revision, with a local correction for permanent
+landing-cell exhaustion after failed transfer-handle release. Quarantined cells
+remain unavailable; queued checks fail when no active read or prepared batch
+can return capacity. Temporary contention still waits for completion. Newer
+upstream packed/PLE paths and unrelated notification metrics are outside this
+backport.
 
 The manifest contains the exact input and output source hashes. Wire version
 `15062065` is reserved here for this adapted backport: deploy the same build on

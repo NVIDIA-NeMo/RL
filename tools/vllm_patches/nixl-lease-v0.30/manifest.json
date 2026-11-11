@@ -2,7 +2,7 @@
   "upstream_pr": "https://github.com/vllm-project/vllm/pull/62065",
   "upstream_head": "03b2648165d24128611cd15818f4ecf51c0a0205",
   "qualified_version": "0.30.0+g116da885561b.cu132",
-  "patch_sha256": "b49a90e569bde8bb2e4cf41b3bf347a99973a68975c19aebe9ab03b9e24ee074",
+  "patch_sha256": "aefb55ac0e46594afd217904b34617d0cf81462d5ea18877a88af747d44a17ef",
   "backport_wire_version": 15062065,
   "files": [
     {
@@ -13,7 +13,7 @@
     {
       "path": "distributed/kv_transfer/kv_connector/v1/nixl/lease_slots.py",
       "original_sha256": null,
-      "patched_sha256": "1cd6e6e93d3f5f03eb94b061de89aa13b8671ea34a554adac4f4dbcfce8f06ce"
+      "patched_sha256": "9ce8c91a2a2bb30acb4ecf673069abaa1dc7948bf7cc03cb6a9e25f415b37672"
     },
     {
       "path": "distributed/kv_transfer/kv_connector/v1/nixl/metadata.py",
