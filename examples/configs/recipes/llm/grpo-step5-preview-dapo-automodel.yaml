@@ -17,8 +17,8 @@ grpo:
     target_min: -1.0
   reward_shaping:
     enabled: true
-    overlong_buffer_length: 1024
-    max_response_length: 7168
+    overlong_buffer_length: 512
+    max_response_length: 2048
 loss_fn:
   token_level_loss: false
   reference_policy_kl_penalty: 0.0
@@ -38,8 +38,9 @@ policy:
     num_nextn_predict_layers: 0
   train_micro_batch_size: 1
   logprob_batch_size: 1
-  # > 4,104 tokens so CSA region selection (512 regions x 8 tokens) actually drops history.
-  max_total_sequence_length: 8192
+  # 1K prompt + 2K response. Note: below 4,104 tokens CSA region selection (512 regions x 8 tokens)
+  # keeps all history; the sparse-drop path is exercised by the proxy smoke at 8K.
+  max_total_sequence_length: 3072
   offload_optimizer_for_logprob: true
   make_sequence_length_divisible_by: 64
   refit_buffer_size_gb: 1
@@ -84,7 +85,7 @@ policy:
   dynamic_batching:
     enabled: true
   generation:
-    max_new_tokens: 7168
+    max_new_tokens: 2048
     vllm_cfg:
       # BF16 weights are 1.2 TB: one engine = TP8 x EP32 (vLLM DP4) = 32 GPUs / 4 nodes, about
       # 40 GB of weights per GPU; 4 engines on 16 nodes.
@@ -92,7 +93,7 @@ policy:
       expert_parallel_size: 32
       gpu_memory_utilization: 0.75
       enable_expert_parallel: true
-      enforce_eager: true
+      enforce_eager: false   # CUDA graphs on; eager only to debug hard failures
       # R3: vLLM >= the AuxOutput connector (in 0e7ce459) returns routed experts per KV block,
       # keyed by block hash, so cached prefixes keep their routes; it requires prefix caching ON
       # ("AuxOutput Connector requires prefix caching"). Older vLLM needed it OFF for R3.
