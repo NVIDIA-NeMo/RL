@@ -679,7 +679,7 @@ The offset $k$ starts at 0. After each training step, the trainer compares the s
 
 #### Single-forward sequence-logprob filtering
 
-For non-streaming Megatron GRPO, enable `loss_fn.seq_logprob_error_in_loss` to apply the absolute sequence-logprob error threshold inside the training loss. This avoids the standalone policy-logprob forward even when `grpo.seq_logprob_error_threshold` is set:
+For Megatron GRPO, enable `loss_fn.seq_logprob_error_in_loss` to apply the absolute sequence-logprob error threshold inside the training loss. This avoids the standalone policy-logprob forward even when `grpo.seq_logprob_error_threshold` is set:
 
 ```yaml
 grpo:
@@ -692,7 +692,7 @@ loss_fn:
   reference_policy_kl_penalty: 0.0
 ```
 
-The default is `false`, retaining the existing pre-training check. This mode requires the `grpo` advantage estimator and one optimizer update per rollout batch (`force_on_policy_ratio`'s existing constraint). It supports synchronous and legacy asynchronous training, including synchronous data-plane training, sequence packing, and gradient accumulation. SingleController is rejected because its advantage baselines depend on the earlier filtering decision. Automodel, KL-in-reward, MTP, draft training, positive-example NLL, and distillation are not supported by this mode. A reference-model forward is still needed if reference KL is enabled; the example disables it. Existing recipes using MTP (such as the NeMo-Gym Nemotron recipes), distillation (`mopd`), or Automodel must first satisfy these constraints; setting the flag alone does not make them compatible.
+The default is `false`, retaining the existing pre-training check. This mode requires the `grpo` advantage estimator and one optimizer update per rollout batch (`force_on_policy_ratio`'s existing constraint). It supports synchronous and legacy asynchronous training, including synchronous data-plane training, sequence packing, and gradient accumulation, and SingleController GRPO without `token_capture.forest_training`. In every trainer, rows the loss rejects still vote in their group's advantage baseline, because the baseline is computed before the training forward. With `grpo.masked_reward_policy: exclude`, the separate-pass filter (used when this flag is off) drops those rows from the baseline instead, in every trainer, so turning this flag on changes which rows vote. Automodel, KL-in-reward, MTP, draft training, positive-example NLL, and distillation are not supported by this mode. A reference-model forward is still needed if reference KL is enabled; the example disables it. Existing recipes using MTP (such as the NeMo-Gym Nemotron recipes), distillation (`mopd`), or Automodel must first satisfy these constraints; setting the flag alone does not make them compatible.
 
 The [Qwen2.5-Math-1.5B single-forward recipe](../../examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-1n8g-megatron-single-forward.yaml) provides a complete configuration for one node with eight GPUs. The comparison below used two GB300 nodes with four GPUs each, with overrides `cluster.num_nodes=2 cluster.gpus_per_node=4 cluster.segment_size=2`. The reported step times therefore do not describe the recipe's default topology and also depend on the benchmark hardware and runtime.
 

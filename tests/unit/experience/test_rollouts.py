@@ -50,6 +50,7 @@ from nemo_rl.environments.games.sliding_puzzle import (
 from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
 from nemo_rl.environments.interfaces import EnvironmentReturn
 from nemo_rl.environments.nemo_gym import NemoGymShardSet
+from nemo_rl.experience.dynamic_sampling import mask_sample_flagged
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
@@ -3474,25 +3475,17 @@ def test_reattach_preserves_marker_across_aliased_message_log_views():
 
 
 def test_mask_sample_flags_read_either_form_of_the_flag():
-    """Either the verify response's first-class ``mask_sample`` field or the
-    ``instance_config.mask_sample`` extras mapping flags a sample. Gym defaults
-    the first-class field to False on every response, so a nested-only
-    environment carries a false first-class field beside the true nested one
-    and the two reads must be OR-ed, not ordered; unflagged and empty rows stay
-    unmasked."""
-    flags = rollouts_mod._mask_sample_flags(
-        [
-            {"mask_sample": True},
-            {"instance_config": {"mask_sample": True}},
-            # An older-form environment on a Gym that defaults the first-class
-            # field to False: either form flags the sample.
-            {"mask_sample": False, "instance_config": {"mask_sample": True}},
-            {"mask_sample": False, "instance_config": {}},
-            {},
-            None,
-        ]
-    )
-    assert flags.tolist() == [True, True, True, False, False, False]
+    extras = [
+        {"mask_sample": True},
+        {"instance_config": {"mask_sample": True}},
+        {"mask_sample": False, "instance_config": {"mask_sample": True}},
+        {"mask_sample": False, "instance_config": {}},
+        {},
+        None,
+    ]
+    expected = [True, True, True, False, False, False]
+    assert rollouts_mod._mask_sample_flags(extras).tolist() == expected
+    assert [mask_sample_flagged(extra) for extra in extras] == expected
 
 
 @pytest.mark.nemo_gym

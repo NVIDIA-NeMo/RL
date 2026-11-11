@@ -33,6 +33,7 @@ from nemo_rl.data.deepseek_v4_tokenizer import (
     should_use_deepseek_v4_chat_template,
 )
 from nemo_rl.data.multimodal_utils import uses_image_placeholder
+from nemo_rl.experience.dynamic_sampling import rewards_carry_no_signal
 from nemo_rl.models.policy import TokenizerConfig
 from nemo_rl.telemetry.vocabulary import (
     EFFICIENCY_PCT_KEY,
@@ -264,9 +265,7 @@ def calculate_trivial_reward_distributions(
     for prompt in torch.unique(prompts, dim=0):
         prompt_mask = (prompts == prompt).all(1)
         valid_rewards = rewards[prompt_mask & valid_mask.bool()]
-        is_trivial = valid_rewards.numel() <= 1 or (
-            valid_rewards.amin() == valid_rewards.amax()
-        )
+        is_trivial = rewards_carry_no_signal(valid_rewards.tolist())
         is_trivial_prompt_distribution[prompt_mask] = is_trivial
 
     return is_trivial_prompt_distribution

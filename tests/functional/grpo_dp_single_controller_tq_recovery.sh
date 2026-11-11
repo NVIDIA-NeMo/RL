@@ -189,7 +189,7 @@ for PHASE in phase1 phase2; do
     fi
     uv run --directory "$PROJECT_ROOT" tests/check_metrics.py \
         "$TEST_DIR/${PHASE}_metrics.json" \
-        'max(data["data_plane/driver/step/hash/rows_checked"]) > 0' \
+        'max({**data.get("data_plane/cluster/step/hash/rows_checked", {}), **data.get("data_plane/driver/step/hash/rows_checked", {})}) > 0' \
         "${VARIANT_CHECKS[@]}"
 done
 

@@ -162,7 +162,7 @@ When a CI run fails and you want to retry the same commit (for example, after a 
 - In the GitHub UI, open the workflow run and choose **Re-run jobs → Re-run failed jobs**.
 - From the command line: `gh run rerun <run-id> --failed --repo NVIDIA-NeMo/RL`.
 
-Do **not** use **Re-run all jobs**. It repeats every GPU job, including the ones that already passed on that commit, and gives you no new information. Re-running only the failed jobs keeps the passing results, and it also re-runs any jobs that were skipped because they depended on the failure.
+Do **not** use **Re-run all jobs**. It repeats every GPU job, including the ones that already passed on that commit, and gives you no new information. Re-running only the failed jobs keeps the passing results, and it also re-runs any jobs that were cancelled or skipped because of the failure.
 
 Before re-running, read the failure log (`gh run view <run-id> --log-failed --repo NVIDIA-NeMo/RL`). If the failure comes from your change, push a fix instead; a new commit needs a new `/ok to test <sha>` comment.
 

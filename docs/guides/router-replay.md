@@ -31,10 +31,10 @@ to return routed expert indices by setting `enable_return_routed_experts=True`
 in the vLLM kwargs. The generation payload is then carried through the normal
 rollout and policy data path as the `routed_experts` field.
 
-We recommend setting `policy.generation.vllm_cfg.enable_prefix_caching=false`
-with Router Replay. With prefix caching and chunked prefill, vLLM has
-occasionally returned incomplete `routed_experts` for a request, which Router
-Replay then rejects. Prefix caching is not required by either policy backend.
+Keep `policy.generation.vllm_cfg.enable_prefix_caching=true` with Router Replay.
+vLLM stores the routed experts next to its prefix-cache blocks and returns them
+for cached prefix tokens too, so it refuses to return routed experts with prefix
+caching off. NeMo RL rejects that combination when the engine is created.
 
 ### Megatron Inference generation
 
@@ -113,7 +113,7 @@ Example: `examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-automodel-ep8-r
 and halves `train/gen_kl_error` (0.00037 vs 0.00086). Without Router Replay
 (`dapo-nanov3.5-30BA3B-4n8g-automodel-ep8.yaml`), 0-2 tokens per step disagreed by 10-31
 nats between vLLM and training, spiking the mean to 1e6-3e9 on about 20% of steps.
-The R3 recipe also turns vLLM prefix caching off, while the base recipe leaves it on.
+Both recipes leave vLLM prefix caching on.
 
 ## Validation
 

@@ -18,7 +18,11 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
-from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
+from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
+from nemo_rl.algorithms.loss.utils import (
+    rescale_loss_metrics,
+    skips_policy_logprob_pass,
+)
 from nemo_rl.algorithms.loss.wrapper import SequencePackingLossWrapper
 from nemo_rl.algorithms.utils import compute_seq_logprob_errors
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -158,6 +162,111 @@ def test_accumulated_loss_and_gradients_match_upstream_mask(
     assert sum(m["loss"] for m in rescaled) == pytest.approx(expected_loss.item())
     # Loss-local filtering must not change rollout/advantage bookkeeping.
     assert data["sample_mask"].tolist() == [1.0, 1.0, 1.0, 0.0]
+
+
+@pytest.mark.parametrize("chunks", [[4], [1, 1, 1, 1], [2, 2], [1, 3]])
+@pytest.mark.parametrize("kl_penalty", [0.0, 0.1])
+@pytest.mark.parametrize("metrics_level", ["full", "minimal"])
+def test_split_api_survivor_division_matches_upstream_mask(
+    chunks, kl_penalty, metrics_level
+):
+    """SingleController's N=1 chunk sums divided by survivors match pre-masking."""
+    data, values = _batch()
+    cfg = ClippedPGLossConfig(
+        force_on_policy_ratio=True,
+        token_level_loss=True,
+        reference_policy_kl_penalty=kl_penalty,
+        use_importance_sampling_correction=True,
+        truncated_importance_sampling_type="seq-mask-tis",
+        truncated_importance_sampling_ratio_min=0.8,
+        truncated_importance_sampling_ratio=1.2,
+        metrics_level=metrics_level,
+    )
+    expected_data = data.select_indices(list(range(4)))
+    expected_data["sample_mask"] = torch.tensor([1.0, 0.0, 1.0, 0.0])
+    expected_lp = values.clone().requires_grad_()
+    expected_loss, expected_metrics = ClippedPGLossFn(cfg)(
+        next_token_logprobs=expected_lp,
+        data=expected_data,
+        global_valid_seqs=torch.tensor(2.0),
+        global_valid_toks=torch.tensor(4.0),
+    )
+    expected_loss.backward()
+
+    loss_fn = ClippedPGLossFn(
+        cfg.model_copy(update={"seq_logprob_error_in_loss": True}),
+        seq_logprob_error_threshold=2.0,
+    )
+    actual_lp = values.clone().requires_grad_()
+    metrics = []
+    start = 0
+    for size in chunks:
+        end = start + size
+        loss, chunk_metrics = loss_fn(
+            next_token_logprobs=actual_lp[start:end],
+            data=data.slice(start, end),
+            global_valid_seqs=torch.tensor(1.0),
+            global_valid_toks=torch.tensor(1.0),
+        )
+        loss.backward()
+        metrics.append(chunk_metrics)
+        start = end
+
+    kept_toks = sum(m["seq_logprob_error_valid_tokens"] for m in metrics)
+    kept_seqs = sum(m["seq_logprob_error_valid_seqs"] for m in metrics)
+    torch.testing.assert_close(actual_lp.grad / kept_toks, expected_lp.grad)
+    rescaled = [
+        rescale_loss_metrics(
+            m,
+            loss_fn.metric_normalizations,
+            token_factor=1 / kept_toks,
+            sequence_factor=1 / kept_seqs,
+        )
+        for m in metrics
+    ]
+    for key in (
+        "loss",
+        "is_oob_ratio",
+        "token_mult_prob_error",
+        "kl_penalty",
+        "num_valid_samples",
+    ):
+        assert sum(m[key] for m in rescaled) == pytest.approx(expected_metrics[key])
+
+
+def test_rescale_loss_metrics_scales_listed_metrics():
+    rescaled = rescale_loss_metrics(
+        {"tok": 2.0, "seq": 2.0, "raw": 2.0},
+        {
+            "tok": MetricNormalizer.TOKENS,
+            "seq": MetricNormalizer.SEQUENCES,
+            "raw": MetricNormalizer.NONE,
+        },
+        token_factor=3.0,
+        sequence_factor=5.0,
+    )
+    assert rescaled == {"tok": 6.0, "seq": 10.0, "raw": 2.0}
+
+
+def test_rescale_loss_metrics_rejects_unlisted_metric():
+    with pytest.raises(ValueError, match="'other' is missing"):
+        rescale_loss_metrics({"other": 2.0}, {}, token_factor=3.0, sequence_factor=5.0)
+
+
+@pytest.mark.parametrize(
+    ("forced", "threshold", "in_loss", "expected"),
+    [
+        (False, None, False, False),
+        (True, None, False, True),
+        (True, 2.0, False, False),
+        (True, 2.0, True, True),
+    ],
+)
+def test_skips_policy_logprob_pass(forced, threshold, in_loss, expected):
+    loss_cfg = ClippedPGLossConfig.model_construct(
+        force_on_policy_ratio=forced, seq_logprob_error_in_loss=in_loss
+    )
+    assert skips_policy_logprob_pass(loss_cfg, threshold) is expected
 
 
 @pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -float("inf")])

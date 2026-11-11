@@ -20,7 +20,7 @@ This module provides a suite of tools to enable FP8 quantization for large langu
 NeMo RL applies monkey patches to several core `vLLM` components to enable FP8 generation for reinforcement learning.  
 When the `init_fp8` function is called, it modifies the following:
 
-### RayDistributedExecutor
+### RayExecutorV2
 - For multi-GPU inference, the executor is patched to ensure that every worker process applies the same FP8 patches **before model initialization**.
 
 ### Quantization Utilities

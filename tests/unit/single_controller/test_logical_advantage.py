@@ -360,6 +360,87 @@ def test_deduplicates_unequal_segments_without_pooling_identical_prompts_across_
     assert data["advantages"].count_nonzero() == 0
 
 
+@pytest.mark.parametrize("reorder", [False, True])
+@pytest.mark.parametrize("mask_owner", [False, True])
+@pytest.mark.parametrize("actor_count", [0, 2])
+def test_forest_reward_scaling_before_owner_baseline(
+    reorder: bool, mask_owner: bool, actor_count: int
+) -> None:
+    meta, data = _batch(
+        [
+            ("a", [(-1.0, 3), (0.5, 1), (4.0, 2)]),
+            ("b", [(-1.0, 1), (0.5, 2), (4.0, 1)]),
+        ],
+        padding=True,
+    )
+    if mask_owner:
+        data["mask_sample"][0] = True
+    order = [0, 1, 2, 3, 4, 5, 10, 6, 7, 8, 9]
+    if reorder:
+        order.reverse()
+    meta, data = meta.subset(order), data[order]
+    raw_rewards = data["total_reward"].clone()
+    ctrl = _controller(
+        meta,
+        data,
+        grpo={
+            "reward_scaling": {
+                "enabled": True,
+                "source_min": 0.0,
+                "source_max": 2.0,
+                "target_min": -1.0,
+                "target_max": 1.0,
+            }
+        },
+    )
+    validate_forest_objective(ctrl._algo_cfg, ctrl._master_config.loss_fn)
+    store = _RowStore(
+        {
+            sid: {name: data[name][i].clone() for name in data.keys()}
+            for i, sid in enumerate(meta.sample_ids)
+        }
+    )
+    computer = AdvantageComputer(
+        store,
+        config=ctrl._advantage_stage_config,
+        advantage_estimator=ctrl._advantage_estimator,
+    )
+    ctrl._advantage_computer = computer
+    ctrl._advantage_actors = [_InlineActor(computer) for _ in range(actor_count)]
+    ctrl._available_advantage_actors = asyncio.Queue()
+    for actor in ctrl._advantage_actors:
+        ctrl._available_advantage_actors.put_nowait(actor)
+    scaled = torch.tensor([-1.0, -0.5, 1.0])
+    for _ in range(2):
+        ctrl._step_log_dict.clear()
+        _, valid = asyncio.run(ctrl._advantage_stage(meta))
+        assert valid
+        output = store.get_samples(
+            sample_ids=meta.sample_ids,
+            select_fields=["advantages", "total_reward", "sample_mask"],
+        )
+        torch.testing.assert_close(output["total_reward"], raw_rewards)
+        for row, tag in enumerate(meta.tags):
+            filtered = mask_owner and tag["dispatch_group_id"] == "a"
+            slot = tag["logical_slot"]
+            keep = slot is not None and not (filtered and slot == 0)
+            baseline = scaled[1:].mean() if filtered else scaled.mean()
+            expected = float(scaled[slot] - baseline) if keep else 0.0
+            torch.testing.assert_close(
+                output["advantages"][row], torch.full((3,), expected)
+            )
+            assert output["sample_mask"][row].item() == float(keep)
+        partials = ctrl._step_log_dict["reward_partials"]
+        assert sum(p.weight for p in partials) == (5 if mask_owner else 6)
+        assert sum(p.weighted_total for p in partials) == pytest.approx(
+            0.0 if mask_owner else -1.0
+        )
+    if actor_count:
+        assert sorted(
+            size for actor in ctrl._advantage_actors for size in actor.calls
+        ) == [4, 4, 7, 7]
+
+
 @pytest.mark.parametrize("padding", [False, True])
 @pytest.mark.parametrize(
     "flagged_rows,expected_count",
@@ -763,7 +844,6 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
     [
         ({"adv_estimator": {"name": "gdpo"}}, {}),
         ({"use_dynamic_sampling": True}, {}),
-        ({"reward_scaling": {"enabled": True}}, {}),
         ({"reward_shaping": {"enabled": True}}, {}),
         ({"calculate_advantages_on_gpu": True}, {}),
         ({"invalid_tool_call_advantage": -5.0}, {}),

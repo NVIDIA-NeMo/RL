@@ -221,6 +221,8 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         "valid_row_count",
         "total_row_count",
         "token_metrics",
+        # One (model call ID, weight version, tokens) tuple per trained call.
+        "call_versions",
     }
 
 

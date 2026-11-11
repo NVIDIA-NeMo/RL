@@ -73,6 +73,7 @@ from nemo_rl.environments.nemo_gym_task import (
 from nemo_rl.environments.nemotron_utils import (
     verify_static_video_media_alignment,
 )
+from nemo_rl.experience.dynamic_sampling import mask_sample_flagged
 from nemo_rl.experience.failures import GymRowFailure
 from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
@@ -413,14 +414,9 @@ def _mask_sample_flags(extras: Iterable[dict[str, Any] | None]) -> torch.Tensor:
     flags only ``instance_config.mask_sample`` carries a false first-class
     field beside the true nested one.
     """
-
-    def flagged(extra: dict[str, Any] | None) -> bool:
-        extra = extra or {}
-        if extra.get(MASK_SAMPLE):
-            return True
-        return bool((extra.get("instance_config") or {}).get(MASK_SAMPLE, False))
-
-    return torch.tensor([flagged(extra) for extra in extras], dtype=torch.bool)
+    return torch.tensor(
+        [mask_sample_flagged(extra) for extra in extras], dtype=torch.bool
+    )
 
 
 def _attach_routed_experts_to_message_log_prefix(

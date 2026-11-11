@@ -131,6 +131,9 @@ class FinalizedRollout:
     output_masks: dict[str, list[bool]] = field(default_factory=dict)
     # One length per owned call, even when adjacent generations have no input gap.
     generation_lengths: tuple[int, ...] = ()
+    # (model call ID, weight version stamped when it began, tokens it generated)
+    # for the same owned calls.
+    call_versions: tuple[tuple[str, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -206,6 +209,9 @@ class FinalizedGroup:
     # Token metrics counted from the verified rows. The controller merges them
     # with the Gym rollout metrics into the group's ROLLOUT_METRICS sidecar.
     token_metrics: dict[str, Any] = field(default_factory=dict)
+    # Each trained call's (model call ID, weight version it began on, tokens it
+    # generated), across the group's verified rollouts; empty when dropped.
+    call_versions: list[tuple[str, int, int]] = field(default_factory=list)
 
 
 def _capture_token_metrics(
@@ -706,6 +712,11 @@ class RolloutReassembler:
             token_mask=token_mask,
             generation_lengths=tuple(
                 length
+                for call_id, _, length in row.link_spans
+                if call_id not in loss_excluded_call_ids
+            ),
+            call_versions=tuple(
+                (call_id, records_by_call[call_id].weight_version, length)
                 for call_id, _, length in row.link_spans
                 if call_id not in loss_excluded_call_ids
             ),
@@ -1404,6 +1415,7 @@ class RolloutReassembler:
             meta=meta,
             group_min_wv=group_min_wv,
             group_max_wv=group_max_wv,
+            call_versions=[call for row in valid_rows for call in row.call_versions],
             staging_keys=(staging_keys if self._defer_routed_experts_to_policy else []),
             canonical_output_tokens=sum(
                 int(mask) for row in valid_rows for mask in row.token_mask

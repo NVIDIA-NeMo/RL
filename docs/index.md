@@ -356,6 +356,7 @@ guides/yarn-long-context.md
 guides/xtoken-off-policy-distillation.md
 guides/refit.md
 guides/checkpoint-engine-refit.md
+guides/persistent-jit-caches.md
 guides/dynamo-generation.md
 guides/router-replay.md
 guides/sampler-replay.md
@@ -420,6 +421,7 @@ design-docs/automodel-context-parallel.md
 design-docs/token-capture-ledger.md
 design-docs/dflash-draft-body.md
 design-docs/dspark-objectives.md
+design-docs/single-controller-rollout-checkpointing.md
 ```
 
 ```{toctree}
