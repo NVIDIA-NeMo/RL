@@ -159,9 +159,9 @@ def test_routes_are_deterministic_and_ignore_order(mode):
     if mode == "single":
         assert set(routes.values()) == {"single"}
     elif mode == "multi":
-        assert set(routes.values()) == set(adapter.HARNESS_NAMES)
+        assert set(routes.values()) == {"opencode"}
     else:
-        assert set(routes.values()) == {"single", *adapter.HARNESS_NAMES}
+        assert set(routes.values()) == {"single", "opencode"}
         assert 0.15 < sum(v != "single" for v in routes.values()) / len(tasks) < 0.35
 
 
@@ -250,7 +250,9 @@ def test_existing_source_jsonl_is_retargeted_without_reusing_old_agent_prompt(
 def test_adapter_cli_writes_multi_dataset(tmp_path, monkeypatch, capsys):
     source, output = tmp_path / "tasks.jsonl", tmp_path / "multi.jsonl"
     source.write_text(
-        json.dumps({"benchmark": "mmsvg_text2svg", "task_id": "one", "prompt": "draw"})
+        json.dumps(
+            {"benchmark": "mmsvg_text2svg", "task_id": "example-1", "prompt": "draw"}
+        )
         + "\n"
     )
     monkeypatch.setattr(
@@ -269,12 +271,14 @@ def test_adapter_cli_writes_multi_dataset(tmp_path, monkeypatch, capsys):
             "task",
             "--mode",
             "multi",
-            "--harnesses",
-            "opencode",
         ],
     )
     adapter.main()
-    assert json.loads(output.read_text())["task_id"]["taskset"] == "mm-coding:opencode"
+    row = json.loads(output.read_text())
+    assert row["task_id"]["taskset"] == "mm-coding:opencode"
+    assert "Only the final answer file is transferred to a fresh grading sandbox" in (
+        row["task_input"]["responses_create_params"]["input"][0]["content"]
+    )
     assert json.loads(capsys.readouterr().out)["rows"] == 1
 
 
