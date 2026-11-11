@@ -701,6 +701,9 @@ class GenerationInterface(ABC):
         *,
         capture_media: bool = False,
         top_logprobs: int = 0,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
+        generation_cut_control_timeout_s: float | None = None,
     ) -> "Optional[MediaColumnSpec]":
         """Install token capture in the serving workers (``token_capture.enabled``).
 
@@ -716,6 +719,12 @@ class GenerationInterface(ABC):
             capture_media: Whether the staging partition carries media columns and
                 the workers must stage the media the engine consumed beside each
                 call's tokens.
+            generation_prefix_cuts_enabled: Allow checkpoint-time cuts of active
+                model calls for prefix recovery.
+            generation_cut_control_token: Bearer token used by Gym's checkpoint
+                coordinator to authorize generation-cut requests.
+            generation_cut_control_timeout_s: Bound on one generation-cut
+                request; calls not cut by then are acknowledged as failures.
 
         Returns:
             With ``capture_media``, the pixel dtype and patch size the workers
@@ -815,6 +824,33 @@ class GenerationInterface(ABC):
         _warn_unsupported_in_flight_refit_pause_once(type(self).__name__)
         return False
 
+    def flush_obsolete_generation_cut_rows(
+        self, epoch: int, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Delete chunk rows of calls that ended before snapshot ``epoch``.
+
+        Returns once every worker's delete is done, so none overlaps the
+        snapshot's TQ save. A worker ignores an epoch no newer than one it
+        already flushed.
+        """
+        raise NotImplementedError(
+            "generation-prefix checkpointing is not supported for "
+            f"{type(self).__name__}"
+        )
+
+    def get_generation_prefix_counts(self) -> dict[str, int]:
+        """Sum over workers of generation-prefix restore and cut counts.
+
+        Returns:
+            Counts since the workers started: ``restored_calls`` and their
+            ``restored_prefix_tokens``, and the progress-read counts named by
+            ``PrefixRecovery.counts``.
+        """
+        raise NotImplementedError(
+            "generation-prefix checkpointing is not supported for "
+            f"{type(self).__name__}"
+        )
+
     def blocks_training(self) -> bool:
         """Whether this engine must stand down before a training step.
 
@@ -860,13 +896,15 @@ class GenerationInterface(ABC):
         Backends without per-step generation metrics may use this default no-op.
         """
 
-    def get_step_metrics(self) -> dict[str, float]:
+    def get_step_metrics(self, *, keep_snapshot: bool = False) -> dict[str, float]:
         """Finish the current metric window and return generation metrics.
 
+        Args:
+            keep_snapshot: Use this window's end as the next window's baseline.
+
         Returns:
-            Metrics accumulated since the matching ``snapshot_step_metrics``
-            call, not running totals. Backends without per-step generation
-            metrics return an empty dictionary.
+            Metrics accumulated since the current baseline. Backends without
+            per-step generation metrics return an empty dictionary.
         """
         return {}
 

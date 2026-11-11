@@ -541,13 +541,14 @@ class SingleControllerActor:
         # it costs five minutes, not quietly at hour three of a run.
         self._env_handles = actor_args.env_handles
         # Rollout state the environment backend holds between turns. Only
-        # turn-level recovery keeps any; otherwise this is a no-op.
+        # turn- and prefix-level recovery keep any; otherwise this is a no-op.
         self._environment_checkpoint: EnvironmentCheckpoint = (
             build_environment_checkpoint(
                 master_config,
                 env_handles=self._env_handles,
                 rollout_manager=self._rollout_manager,
                 dp_client=self._dp_client,
+                generation=self._gen,
             )
         )
         # These two keep the getattr for a genuinely different reason: None is a
@@ -871,6 +872,12 @@ class SingleControllerActor:
 
         if await self._rollout_restorer.restore():
             self._rollout_recovery_enabled = True
+
+        # Capture the baseline before either pump can dispatch generation.
+        try:
+            await asyncio.to_thread(self._gen.snapshot_step_metrics)
+        except RayActorError as error:
+            log.warning("Skipping generation snapshot metrics: %s", error)
 
         # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
@@ -2802,14 +2809,6 @@ class SingleControllerActor:
                             train_meta.extra_info.pop(ROLLOUT_METRICS, [])
                         )
 
-                    if groups_dispatched == 0:
-                        try:
-                            await asyncio.to_thread(self._gen.snapshot_step_metrics)
-                        except RayActorError as error:
-                            log.warning(
-                                "Skipping generation snapshot metrics: %s", error
-                            )
-
                     # Safe mid-loop: colocated steps are assembled whole, so the loop closes after this.
                     # The gate reopens at the post-step _sync_weights wake, or after the save on save-bound steps.
                     if self._gen.blocks_training():
@@ -3354,10 +3353,28 @@ class SingleControllerActor:
                         step_metrics[name] = Table(data=data, columns=["Full result"])
                 try:
                     step_metrics.update(
-                        await asyncio.to_thread(self._gen.get_step_metrics)
+                        await asyncio.to_thread(
+                            self._gen.get_step_metrics, keep_snapshot=True
+                        )
                     )
                 except RayActorError as error:
                     log.warning("Skipping generation step metrics: %s", error)
+                if self._master_config.rollout_recovery.generation_prefix_cuts_enabled:
+                    try:
+                        prefix_counts = await asyncio.to_thread(
+                            self._gen.get_generation_prefix_counts
+                        )
+                    except RayActorError as error:
+                        log.warning("Skipping generation-prefix metrics: %s", error)
+                    else:
+                        # Totals since the generation workers started, so a
+                        # restore or a failed cut shows up as a step in the curve.
+                        step_metrics.update(
+                            {
+                                f"generation_prefix/{name}": float(count)
+                                for name, count in prefix_counts.items()
+                            }
+                        )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 step_metrics.update(
                     _pooled_opd_metrics(
