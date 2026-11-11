@@ -283,3 +283,83 @@ GPUs with TP=8. The histories include checkpoint/resume and contain updates
 Use the Qwen3.5 recipe above with `grpo.max_num_steps=500` for this run length.
 
 ![Qwen3.5-35B-A3B Base at EP=16: V1 versus full-batch SC over 500 updates, showing reward, mean generated tokens per sample, loss, generation KL error, and approximate entropy.](../assets/automodel-sc/qwen3.5-35ba3b-ep16-v1-vs-sc-500steps.png)
+
+## Full-batch LA1 training behavior
+
+Lookahead one (LA1) overlaps collection of the next rollout batch with training
+on the current batch. The controller admits samples up to one policy version
+behind the trainer, in target-step order. Each optimizer update still consumes
+one complete global batch through the same AutoModel lifecycle. The
+[LA1 overrides above](#enabling-lookahead-one) enable importance-sampling
+correction and allocate capacity for the current and lookahead prompt batches.
+
+The following comparisons use full-batch LA0 and LA1 with the same model,
+seed 42, batch configuration, learning rate, and resource layout within each
+model pair. All runs use GRPO on DAPOMath17K, microbatch size 1, a 4,096-token
+total sequence limit, and at most 2,048 generated tokens. Learning rates use
+10 warmup updates followed by a constant schedule. Dynamic sampling, reward
+shaping, and online validation are disabled.
+
+| Model | Plotted updates | Prompts × responses | Training / rollout H100 GPUs | Learning rate |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen3.5-35B-A3B Base | 1–500 | 8 × 4 | 16 / 8 | 1e-6 |
+| Nemotron 3.5 Lightning-30B-A3B | 1–600 | 8 × 4 | 16 / 8 | 1e-6 |
+| Gemma4 E2B IT | 1–900 | 32 × 16 | 4 / 4 | 2e-6 |
+| Qwen3-8B | 1–600 | 8 × 4 | 8 / 8 | 1e-6 |
+
+The two MoE models use EP=16 for training and TP=8 for rollout. Qwen3-8B uses
+the ordinary full-batch LA0 control and disables thinking in both arms.
+The Qwen3.5 LA1 curve comes from the fresh HF-base run with both native-FP32
+`A_log` refit and FP32 prefill-convolution products enabled from the start.
+Its LA0 curve is the existing SC reference, available through update 500, which
+predates those two precision fixes. Both Lightning arms include the fixes.
+The Qwen3.5 comparison therefore includes the precision-fix difference as well
+as lookahead; it does not isolate their individual effects.
+
+### Curve and timing methodology
+
+Each model has the five panels used in the V1/SC comparisons above:
+`train/reward`, `train/mean_gen_tokens_per_sample`, `train/loss`,
+`train/gen_kl_error`, and `train/approx_entropy`. A sixth panel adds the logged
+`timing/train/total_step_time` in seconds, on a logarithmic axis so startup and
+checkpoint outliers remain visible. Faint lines include every raw update;
+solid lines are trailing 10-update means starting at update 10. Gray dotted
+lines mark continuations. Canonical histories select the later committed record
+at resumed overlaps, so each plotted update appears once. No nonfinite points
+or finite outliers are removed, and metrics retain their configured sample
+masking behavior.
+
+Training reward broadly tracks LA0 even when LA1's `gen_kl_error` rises later in
+training. The diagnostic compares generation logprobs with the current policy's
+pre-update logprobs on sampled responses, so it reflects both policy-version
+lag and training/inference numerical differences. The KL gap appears at
+different stages across the models. Response length and entropy can also
+diverge while training reward remains close; similar reward does not imply
+identical policy distributions.
+
+The table reports mean reward and generation KL over the last 100 plotted
+updates. Mean step times use the same set of updates in both arms after
+warmup, excluding checkpoint updates and continuation-boundary updates.
+Observed speedup is LA0 mean step time divided by LA1 mean step time.
+
+| Model | Reward, last 100: LA0 / LA1 | gen_kl_error, last 100: LA0 / LA1 | Mean step time (s): LA0 / LA1 | Observed speedup |
+| --- | ---: | ---: | ---: | ---: |
+| Qwen3.5-35B-A3B Base | 0.6412 / 0.6531 | 0.000915 / 0.001368 | 130.39 / 66.76 | 1.95× |
+| Nemotron 3.5 Lightning-30B-A3B | 0.6703 / 0.6619 | 0.001337 / 0.003708 | 84.11 / 43.58 | 1.93× |
+| Gemma4 E2B IT | 0.4902 / 0.4965 | 0.000527 / 0.000739 | 70.25 / 60.11 | 1.17× |
+| Qwen3-8B | 0.5075 / 0.5428 | 0.000387 / 0.000519 | 40.50 / 21.59 | 1.88× |
+
+LA1 has shorter logged step times in all four comparisons. These timings
+describe independently sampled training workloads with different generated
+lengths and trajectories; a fixed-work benchmark would be needed to isolate
+execution speed. The single-seed training curves provide behavioral evidence,
+with held-out evaluation and identical-input numerical replay remaining
+separate validation.
+
+### Qwen3.5 and Nemotron 3.5 Lightning
+
+![Full-batch LA0 versus LA1 for Qwen3.5-35B-A3B Base over 500 updates and Nemotron 3.5 Lightning-30B-A3B over 600 updates. Each model shows reward, generated length, loss, generation KL error, entropy, and training step time; faint raw curves and trailing 10-update means retain all plotted updates.](../assets/automodel-sc/la0-vs-la1-qwen35-nemotron35.png)
+
+### Gemma4 E2B IT and Qwen3-8B
+
+![Full-batch LA0 versus LA1 for Gemma4 E2B IT at batch 512 over 900 updates and Qwen3-8B at batch 32 over 600 updates. Each model shows reward, generated length, loss, generation KL error, entropy, and training step time; faint raw curves and trailing 10-update means retain all plotted updates.](../assets/automodel-sc/la0-vs-la1-gemma4-qwen3.png)
