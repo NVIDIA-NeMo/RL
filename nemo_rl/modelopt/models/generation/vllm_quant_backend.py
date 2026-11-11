@@ -82,6 +82,20 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     def _supports_unquantized_flashinfer_trtllm_refit(self) -> bool:
         return False
 
+    def _validate_native_layerwise_refit(
+        self, transport: WeightUpdateTransport | None = None
+    ) -> None:
+        # The base guard (extended in #3638 to native MXFP8 linear kernels) rejects an
+        # FP8 KV cache because the *targeted* layerwise reload leaves static KV scales
+        # outside its lifecycle. ModelOpt real-quant does not use the targeted reload:
+        # it reloads the whole model (_get_native_layerwise_reload_targets -> [model])
+        # and refits KV scales itself in _kv_scale_refit. Its MXFP8 linears trip the
+        # native-MXFP8 branch, so without this the recipe's FP8 KV cache fails at the
+        # first refit, which it did not before #3638.
+        if self._is_real_quant_model():
+            return
+        super()._validate_native_layerwise_refit(transport)
+
     def maybe_init_zmq(self) -> None:
         """Use a longer timeout only for ModelOpt real-quant refits."""
         super().maybe_init_zmq()
