@@ -30,7 +30,7 @@ dependencies = [
   # 2.11.0) and resolves in its own uv conflict fork, so the base spec must admit
   # both. The ceiling keeps the driver venv from drifting to a newer torch on a
   # relock; it resolves to the highest allowed (2.13.0), matching vLLM.
-  "torch>=2.11,<2.14",
+  "torch>=2.11,<2.15",  # step5-support: vllm/automodel forks move to 2.14.0 (vLLM 0e7ce459 wheel ABI)
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]>=2.58.0",                                                                                # CVE mitigation
@@ -54,12 +54,12 @@ dependencies = [
   "plotly",
   "sympy>=1.14.0",
   "pillow>=12.3.0",                                                                                      # Address CVE (Pillow 12.3.0)
-  "torchvision>=0.26,<0.29",                                                                             # tracks the torch range above (0.26 <-> 2.11, 0.28 <-> 2.13)
+  "torchvision>=0.26,<0.30",                                                                             # tracks the torch range above (0.26 <-> 2.11, 0.28 <-> 2.13)
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Keep the base range compatible with every backend-specific pin (5.5.4 through
   # 5.16.1). Environments without a backend extra resolve to the upper bound.
-  "transformers>=5.5.0,<=5.16.1",
+  "transformers>=5.5.0,<=5.18.0",  # step5-support: automodel main + vLLM 0e7ce459 use 5.18.0
   "num2words>=0.5.14",                                                                                                       # for SmolVLM
   "timm",
   "open-clip-torch>=3.2.0",
@@ -140,8 +140,9 @@ dependencies = [
 [project.optional-dependencies]
 automodel = [
   # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
-  "torch==2.13.0",
-  "torchvision==0.28.0",
+  # step5-support: 2.14.0 to match the vLLM 0e7ce459 wheel.
+  "torch==2.14.0",
+  "torchvision==0.29.0",
   "nemo-automodel[moe]",
   # Automodel's FLA kernels require this TileLang version on Hopper.
   # Keep this scoped to the automodel fork; sglang intentionally pins TileLang 0.1.8.
@@ -150,8 +151,11 @@ automodel = [
   # https://github.com/NVIDIA/TransformerEngine/blob/v2.3/transformer_engine/pytorch/attention/dot_product_attention/utils.py#L108
   # https://github.com/facebookresearch/xformers/blob/8354497deb2c04c67fbb2e2ad911e86530da0e90/xformers/ops/fmha/flash.py#L76
   "flash-attn==2.8.1",
-  # Mirrors nemo-automodel's own `transformers==5.12.1` pin (Automodel r0.6.0).
-  "transformers==5.12.1",
+  # step5-support: mirrors nemo-automodel's own `transformers==5.18.0` pin (Automodel main 3b355abb).
+  "transformers==5.18.0",
+  # step5-support: Step5 attention (SWA varlen + CSA block-sparse, head_dim 192) runs on FA4 CuTe;
+  # same ref as Automodel docker/Dockerfile FLASH_ATTN_REF (SM90 hd192 GQA backward fix).
+  "flash-attn-4 @ git+https://github.com/Dao-AILab/flash-attention.git@3c2c6b31e730fd13e7d6f0d384af22684b24c532#subdirectory=flash_attn/cute ; sys_platform == 'linux'",
   "mistral-common>=1.11.0",
   "mamba-ssm",
   "causal-conv1d",
@@ -160,10 +164,11 @@ automodel = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
 ]
 vllm = [
-  # ABI of the vLLM 0.29.0 cu130 wheels.
-  "torch==2.13.0",
-  "torchvision==0.28.0",
-  "transformers==5.12.1",
+  # step5-support: ABI of the vLLM 0e7ce459 commit wheels (requirements/cuda.txt: torch 2.14.0).
+  "torch==2.14.0",
+  "torchvision==0.29.0",
+  # vLLM 0e7ce459 requires transformers>=5.16.1,<5.21.0; match the automodel fork.
+  "transformers==5.18.0",
   "tilelang==0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "cuda-python",
   "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
@@ -171,14 +176,26 @@ vllm = [
   # sudo apt-get update
   # sudo apt-get install libibverbs-dev
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  # PyPI publishes the default cu130 wheels for both supported architectures.
-  # https://github.com/vllm-project/vllm/releases/tag/v0.29.0
-  "vllm==0.29.0",
+  # step5-support: commit wheel for vLLM main 0e7ce459 (2026-11-07), the newest commit touching
+  # vllm/models/step5 (#61727 adds Step5; #65153 CSA tail-ring KV block fix; #66000 MTP config fix).
+  # No release carries Step5 with these fixes yet (v0.33.0rc3 lacks #65153).
+  "vllm @ https://wheels.vllm.ai/0e7ce45962af40f96b8e89ab6502d12b1e81b58d/vllm-0.33.0rc1.dev1017%2Bg0e7ce4596-cp38-abi3-manylinux_2_28_x86_64.whl ; platform_machine == 'x86_64'",
+  "vllm @ https://wheels.vllm.ai/0e7ce45962af40f96b8e89ab6502d12b1e81b58d/vllm-0.33.0rc1.dev1017%2Bg0e7ce4596-cp38-abi3-manylinux_2_28_aarch64.whl ; platform_machine == 'aarch64'",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.18",
-  "flashinfer-cubin==0.6.18",
-  "flashinfer-jit-cache==0.6.18",
-  "nvidia-cutlass-dsl[cu13]==4.6.2",
+  # step5-support: versions from vLLM 0e7ce459 requirements/cuda.txt (flashinfer 0.7.3, cutlass-dsl 4.8.0).
+  "flashinfer-python==0.7.3",
+  "flashinfer-cubin==0.7.3",
+  "flashinfer-jit-cache==0.7.3",
+  # Direct so their [tool.uv.sources] index applies (jit-cache 0.7.3 depends on each of them).
+  "flashinfer-jit-cache-sm80==0.7.3",
+  "flashinfer-jit-cache-sm89==0.7.3",
+  "flashinfer-jit-cache-sm90a==0.7.3",
+  "flashinfer-jit-cache-sm100a==0.7.3",
+  "flashinfer-jit-cache-sm103a==0.7.3",
+  "flashinfer-jit-cache-sm110a==0.7.3 ; platform_machine == 'aarch64'",  # aarch64-only wheels
+  "flashinfer-jit-cache-sm120f==0.7.3",
+  "flashinfer-jit-cache-sm121a==0.7.3 ; platform_machine == 'aarch64'",  # aarch64-only wheels
+  "nvidia-cutlass-dsl[cu13]==4.8.0",
 ]
 sglang = [
   # sglang-miles (3003d70f) and sglang-kernel 0.4.5 are built against torch 2.11;
@@ -378,6 +395,16 @@ nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "43
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.7.0" }
 flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
+# step5-support: flashinfer-jit-cache 0.7.3 (vLLM 0e7ce459) splits into per-SM packages that only
+# the cu130 index publishes; uv sources attach to transitive deps only when listed here.
+flashinfer-jit-cache-sm80 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm89 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm90a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm100a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm103a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm110a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm120f = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm121a = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
 members = [
@@ -620,6 +647,23 @@ flash-attn = { MAX_JOBS = "4" }
 [[tool.uv.dependency-metadata]]
 name = "flash-attn"
 requires-dist = ["torch", "einops", "setuptools", "psutil", "ninja"]
+
+# step5-support: flashinfer-jit-cache 0.7.3 is a shim whose per-arch wheels declare different
+# provider sets (the aarch64 wheel adds sm110a/sm121a, which have no x86_64 wheels). uv applies one
+# wheel's metadata to every platform, so restate it with markers.
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache"
+version = "0.7.3+cu130"
+requires-dist = [
+  "flashinfer-jit-cache-sm80==0.7.3+cu130",
+  "flashinfer-jit-cache-sm89==0.7.3+cu130",
+  "flashinfer-jit-cache-sm90a==0.7.3+cu130",
+  "flashinfer-jit-cache-sm100a==0.7.3+cu130",
+  "flashinfer-jit-cache-sm103a==0.7.3+cu130",
+  "flashinfer-jit-cache-sm120f==0.7.3+cu130",
+  "flashinfer-jit-cache-sm110a==0.7.3+cu130 ; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm121a==0.7.3+cu130 ; platform_machine == 'aarch64'",
+]
 
 [[tool.uv.dependency-metadata]]
 name = "flash-mla"
