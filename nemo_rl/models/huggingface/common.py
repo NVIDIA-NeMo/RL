@@ -55,9 +55,25 @@ class ModelFlag(Enum):
                 raise ValueError(f"Unknown ModelFlag: {self}")
 
 
+def _model_type(model_name: str) -> Optional[str]:
+    """Return the checkpoint's ``model_type``, even when Transformers does not register it.
+
+    New checkpoints can declare a ``model_type`` that only vLLM or AutoModel register
+    (for example Step-5's ``step5_vl``); ``AutoConfig`` then raises. The flag checks
+    below only compare the type string, so read it from the raw config instead.
+    """
+    try:
+        hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+        return getattr(hf_config, "model_type", None)
+    except (KeyError, ValueError):
+        from transformers import PretrainedConfig
+
+        config_dict, _ = PretrainedConfig.get_config_dict(model_name)
+        return config_dict.get("model_type")
+
+
 def is_gemma_model(model_name: str) -> bool:
-    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    return hasattr(hf_config, "model_type") and hf_config.model_type in [
+    return _model_type(model_name) in [
         "gemma2",
         "gemma3",
         "gemma3_text",
@@ -71,8 +87,7 @@ def is_nano_nemotron_vl_model(model_name: str) -> bool:
     rollouts, so vLLM must load the vision weights from the checkpoint
     (``load_format=auto``) instead of using dummy initialization.
     """
-    hf_config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    return hasattr(hf_config, "model_type") and hf_config.model_type in [
+    return _model_type(model_name) in [
         "NemotronH_Nano_VL_V2",
         "NemotronH_Nano_Omni_Reasoning_V3",
         # Nemotron 3.5 Super VL (config.model_type is "nemotron_h_omni").
