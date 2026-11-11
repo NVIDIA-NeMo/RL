@@ -718,6 +718,8 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # Step padding only. Which real rows the padding copies: row0 repeats the
     # batch's first row; cyclic takes rows 0, 1, 2, ...
     forest_pad_source: Literal["row0", "cyclic"] = "row0"
+    # Forest only. Cap physical rows, retaining a scored-call row; None keeps all.
+    max_rows_per_rollout: Optional[PositiveInt] = None
     # Which Forest segments the token-level reward penalties (unwanted tokens,
     # malformed think tags) check.
     # scored_segment: only the segment holding the scored call (default).
@@ -733,6 +735,7 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
                 f"selection_policy={self.selection_policy} requires forest_training=true"
             )
         forest_only = {
+            "max_rows_per_rollout": self.max_rows_per_rollout is not None,
             "forest_penalty_scope": self.forest_penalty_scope != "scored_segment",
             "exclude_padding_from_router_stats": self.exclude_padding_from_router_stats,
             "forest_padding_scope": self.forest_padding_scope != "group",

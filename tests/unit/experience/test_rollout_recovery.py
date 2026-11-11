@@ -76,6 +76,43 @@ def test_selection_restore_preserves_new_defaulted_fields(
     assert _selection_from_state(dataclasses.asdict(selection)) == selection
 
 
+@pytest.mark.parametrize("limit", [None, 1, 3])
+def test_selection_restore_preserves_physical_row_cap(limit: int | None) -> None:
+    selection = RolloutSelection(
+        ("response0",), (ActionOutputFlags(False, False),), max_rows_per_rollout=limit
+    )
+    assert _selection_from_state(dataclasses.asdict(selection)) == selection
+
+
+@pytest.mark.parametrize("limit", [0, -1, True, 1.5, "2"])
+def test_selection_restore_rejects_invalid_row_cap(limit: Any) -> None:
+    state = dataclasses.asdict(RolloutSelection((), ()))
+    state["max_rows_per_rollout"] = limit
+    with pytest.raises(ValueError, match="max_rows_per_rollout"):
+        _selection_from_state(state)
+
+
+@pytest.mark.nemo_gym
+def test_forest_recovery_upgrades_uncapped_selection() -> None:
+    state = _forest_sealed_ledger().state_dict()
+    state["schema_version"] = 7
+    descriptor = state["groups"][0]["siblings"][0]["attempts"][0]["logical_selection"]
+    del descriptor["max_rows_per_rollout"]
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    selection = restored.get_group("g7").siblings[0].current_attempt.logical_selection
+    assert selection is not None
+    assert selection.max_rows_per_rollout is None
+
+
+@pytest.mark.nemo_gym
+def test_forest_recovery_requires_saved_row_cap() -> None:
+    state = _forest_sealed_ledger().state_dict()
+    descriptor = state["groups"][0]["siblings"][0]["attempts"][0]["logical_selection"]
+    del descriptor["max_rows_per_rollout"]
+    with pytest.raises(ValueError, match="every descriptor field"):
+        RolloutRecoveryLedger.from_state_dict(state)
+
+
 def _forest_sealed_ledger() -> RolloutRecoveryLedger:
     from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 

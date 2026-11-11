@@ -281,28 +281,70 @@ def select_captured_calls(
     return selected, terminal_response_id
 
 
+class TerminalNotIdentified(ValueError):
+    """No captured call can be named as the scored terminal; the owner is masked."""
+
+
+# Gym resolve_terminal attribution methods (nemo_gym/token_id_capture/terminal.py),
+# mapped to RolloutReceipt.terminal_selection values. Add new Gym methods here.
+_RECEIPT_METHOD = {
+    "explicit": "declared",
+    "declared": "declared",
+    "response_id": "response_id",
+    "content": "content",
+    "item_id": "content",
+    "content_output": "content",
+    "content_cumulative": "content",
+    "content_tool_ids": "content",
+}
+
+
+def resolve_scored_terminal(
+    records: list[CallRecord], result: dict[str, Any]
+) -> tuple[CallRecord, str, str]:
+    """Name the scored call: witness attribution, else the parent-link heuristic.
+
+    Returns ``(record, terminal_selection, attribution_reason)``. A declared
+    terminal that no witness confirms never falls back to the heuristic.
+    Raises ``TerminalNotIdentified`` when neither stage names a call.
+    """
+    # Defer the optional Gym dependency until the policy is executed.
+    from nemo_gym.token_id_capture.staging import resolve_terminal, select_terminal_call
+
+    declared = result.get("terminal_response_id")
+    attribution = resolve_terminal(
+        records, result.get("response"), declared_response_id=declared
+    )
+    by_call = {record.model_call_id: record for record in records}
+    if attribution.attributed:
+        method = _RECEIPT_METHOD.get(attribution.method)
+        if method is None:
+            raise ValueError(
+                f"Unknown Gym attribution method {attribution.method!r}; "
+                "add it to call_selection._RECEIPT_METHOD"
+            )
+        return by_call[attribution.model_call_id], method, attribution.reason
+    if declared:
+        raise TerminalNotIdentified(
+            "declared terminal is not attributable: " + attribution.reason
+        )
+    heuristic = select_terminal_call(records)
+    if heuristic.terminal_model_call_id is None:
+        raise TerminalNotIdentified(
+            f"no scored terminal: {attribution.reason}; heuristic: {heuristic.reason}"
+        )
+    return by_call[heuristic.terminal_model_call_id], "heuristic", attribution.reason
+
+
+LENGTH_FINISH_REASONS = ("length", "max_tokens", "max_output_tokens")
+
+
 def select_all_captured(
     records: list[CallRecord], result: dict[str, Any]
 ) -> tuple[list[CallRecord], str | None]:
     """Include all calls except unusable, unscored leaves, retaining attribution."""
-    # Defer the optional Gym dependency until the policy is executed.
-    from nemo_gym.token_id_capture.staging import resolve_terminal
-
-    attribution = resolve_terminal(
-        records,
-        result.get("response"),
-        declared_response_id=result.get("terminal_response_id"),
-    )
-    if not attribution.attributed:
-        raise ValueError(
-            "all_captured requires an identifiable scored terminal: "
-            + attribution.reason
-        )
-    terminal_response_id = next(
-        record.response_id
-        for record in records
-        if record.model_call_id == attribution.model_call_id
-    )
+    terminal, _, _ = resolve_scored_terminal(records, result)
+    terminal_response_id = terminal.response_id
     # Unusable parents or the scored call still invalidate the owner downstream.
     parents = {record.parent_call_id for record in records}
     selected = []
@@ -310,12 +352,11 @@ def select_all_captured(
         unusable = record.response_status in ("failed", "unknown") or (
             record.response_status == "incomplete"
             and bool(record.finish_reason)
-            and record.finish_reason
-            not in ("length", "max_tokens", "max_output_tokens")
+            and record.finish_reason not in LENGTH_FINISH_REASONS
         )
         if (
             not unusable
-            or record.model_call_id == attribution.model_call_id
+            or record.model_call_id == terminal.model_call_id
             or record.model_call_id in parents
         ):
             selected.append(record)

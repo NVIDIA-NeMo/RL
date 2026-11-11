@@ -155,6 +155,13 @@ class RolloutSelection:
     response_ids: tuple[str, ...]
     action_flags: tuple[ActionOutputFlags, ...]
     truncated: bool = False
+    max_rows_per_rollout: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_rows_per_rollout is not None and (
+            type(self.max_rows_per_rollout) is not int or self.max_rows_per_rollout < 1
+        ):
+            raise ValueError("max_rows_per_rollout must be a positive integer or None")
 
 
 @dataclass(frozen=True)
@@ -1573,6 +1580,19 @@ class RolloutReassembler:
                         truncated=selection.truncated,
                     )
                 )
+            max_rows = selection.max_rows_per_rollout
+            if max_rows is not None and len(owner_plan) > max_rows:
+                scored_response = by_call[parsed.terminal_model_call_id].response_id
+                scored_index = next(
+                    index
+                    for index, segment in enumerate(owner_plan)
+                    if scored_response in segment.selected_response_ids
+                )
+                owner_plan = [owner_plan[scored_index]] + [
+                    segment
+                    for index, segment in enumerate(owner_plan)
+                    if index != scored_index
+                ][: max_rows - 1]
             plans.append(owner_plan)
         return plans
 

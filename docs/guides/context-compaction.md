@@ -116,20 +116,33 @@ Enable `token_capture.enabled: true` and `token_capture.forest_training: true` o
   completion checks can mask the rollout. Missing required completion metadata
   remains an error. Length-limited calls remain eligible, subject to the existing
   logical-rollout `overlong_filtering` policy. This policy does not require the
-  full execution history, but still requires an attributable scored
-  terminal through `terminal_response_id` or the
-  returned response's identity/content. Capture order is not a terminal witness.
+  full execution history. The scored terminal is named by `terminal_response_id`
+  or the returned response's identity/content; without such a witness, the
+  parent-link heuristic names the single continued leaf. A declared terminal that
+  no witness confirms, or a rollout neither stage resolves, is masked. Capture
+  order is not a terminal witness.
   For `A → B` and `A → C`, both branches train; it does not choose the latest
   sibling. Shared `A` contributes loss once, and both rows share the rollout's
   reward and advantage.
 
-Both policies reuse capture validation, completion checks, forest reconstruction,
-and once-only loss ownership for shared ancestors. Pending calls, lost capture
-evidence, and failed selected executions still mask the logical rollout. A failure
+`token_capture.max_rows_per_rollout` caps physical Forest rows per rollout, before
+execution padding, for any selection policy. `null` (the default) keeps every row.
+When the plan exceeds the limit, retain the first planned row containing the
+scored call, then the first N-1 other rows in the existing planning order. A fork
+under one root can produce multiple rows and each counts toward the limit.
+Capture-status, completion-metadata, and parent-link checks, together with
+rollout-level truncation, still cover all selected calls. Staged data is fetched
+and verified (including token/hash checks) only for retained paths; data used
+exclusively by dropped paths is not verified. The cap does not change terminal
+attribution or bypass the checks that run before row limiting.
+
+All built-in policies reuse capture validation, completion checks, forest reconstruction,
+and once-only loss ownership for shared ancestors. Pending calls, reported capture
+failures, and failed selected executions still mask the logical rollout. A failure
 record does not acknowledge a pending worker's writes or transfer them to cleanup.
-Failed parents and failed scored calls remain invalid. Neither policy infers
-agent roles. `all_captured` requires `forest_training: true`; it does not enable
-per-agent rewards or remove the execution restrictions below.
+Failed parents and failed scored calls remain invalid. No built-in policy infers
+agent roles. Non-default policies require `forest_training: true`; they do not
+enable per-agent rewards or remove the execution restrictions below.
 
 A cancellation recorded as `request_finished_without_staged_coordinates` does
 not mask the rollout when the call already has a committed capture, no calls

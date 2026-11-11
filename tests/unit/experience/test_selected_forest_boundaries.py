@@ -9,6 +9,7 @@ import asyncio
 from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -22,7 +23,10 @@ from responses_api_models.vllm_model.tests import test_framework_context as gym
 from nemo_rl.algorithms.grpo import RewardPenaltyConfig
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTER_EXCLUDED_ROWS
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink, TQTokenSource
-from nemo_rl.environments.call_selection import select_captured_calls
+from nemo_rl.environments.call_selection import (
+    resolve_scored_terminal,
+    select_captured_calls,
+)
 from nemo_rl.experience.reward_penalties import (
     RewardChecks,
     RewardLogContext,
@@ -195,8 +199,13 @@ def test_selection_policy_reuses_forest_publication(forest, policy, reverse_mani
 
 @pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
 @pytest.mark.parametrize("interleaved", [False, True])
+@pytest.mark.parametrize("max_rows", [None, 1, 2])
 def test_forest_restart_retains_selection_terminal_and_once_only_loss(
-    forest: ForestCapture, tmp_path: Path, policy: str, interleaved: bool
+    forest: ForestCapture,
+    tmp_path: Path,
+    policy: str,
+    interleaved: bool,
+    max_rows: int | None,
 ) -> None:
     from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
     from tests.unit.experience.test_rollout_recovery import _mutate, _prompt, _reserve
@@ -223,9 +232,12 @@ def test_forest_restart_retains_selection_terminal_and_once_only_loss(
         parents = [None, None, 0, 1, 0, None, 5, 1]
         accepted_indices, scored_index = (0, 1, 3, 4, 5, 6, 7), 6
         expected_rows = 5 if policy == "all_captured" else 4
+    if max_rows is not None:
+        expected_rows = min(expected_rows, max_rows)
     records, replies = forest.capture(parents, owner=owner)
     env = _env(forest.harness)
     env._selection_policy = policy
+    env._max_rows_per_rollout = max_rows
     output = ordinary(
         [replies[i] for i in accepted_indices], terminal=replies[scored_index]["id"]
     )
@@ -258,6 +270,7 @@ def test_forest_restart_retains_selection_terminal_and_once_only_loss(
     _mutate(lambda cut: restored.prepare_for_restart(cut))
     attempt = restored.get_group("group").siblings[0].current_attempt
     assert attempt == ledger.get_group("group").siblings[0].current_attempt
+    assert attempt.logical_selection.max_rows_per_rollout == max_rows
     assert (
         attempt.receipt["terminal_model_call_id"] == records[scored_index].model_call_id
     )
@@ -285,6 +298,12 @@ def test_forest_restart_retains_selection_terminal_and_once_only_loss(
     selected = (
         records if policy == "all_captured" else [records[i] for i in accepted_indices]
     )
+    if max_rows is not None:
+        plans = forest.finalizer._plan_selected_calls(
+            owners, receipts, [attempt.logical_selection]
+        )[0]
+        kept = {response for plan in plans for response in plan.selected_response_ids}
+        selected = [record for record in selected if record.response_id in kept]
     assert_loss_once(forest, selected, records)
     assert not any(partition == "staged" for partition, _ in forest.plane.rows)
 
@@ -717,19 +736,17 @@ def test_all_captured_attributes_exported_content(
         for index, item in enumerate(result["response"]["output"])
     ]
     result["reward"] = 1.0
-    if not cumulative and not unique_output:
-        # This fixture otherwise returns the same "answer" on every call.
-        # Its final text alone cannot identify which call was scored.
-        with pytest.raises(ValueError, match="content_ambiguous"):
-            asyncio.run(
-                env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
-            )
-        assert not any(partition == "canonical" for partition, _ in forest.plane.rows)
-        return
     processed = asyncio.run(
         env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
     )
     assert processed["receipt"]["terminal_model_call_id"] == records[1].model_call_id
+    # The fixture returns the same "answer" on every call, so the final text
+    # alone is ambiguous; the parent-link heuristic then names the continued leaf.
+    ambiguous = not cumulative and not unique_output
+    assert processed["receipt"]["terminal_selection"] == (
+        "heuristic" if ambiguous else "content"
+    )
+    assert not processed["receipt"]["capture_poisoned"]
     assert set(processed["logical_selection"].response_ids) == {
         record.response_id for record in records
     }
@@ -748,18 +765,43 @@ def test_all_captured_attributes_exported_content(
     assert_loss_once(forest, records, records)
 
 
-@pytest.mark.parametrize("contradictory", [False, True])
-def test_all_captured_never_guesses_scored_terminal(forest, contradictory):
-    records, replies = forest.capture([None, None])
+@pytest.mark.parametrize("policy", ["all_captured"])
+@pytest.mark.parametrize(
+    "parents,contradictory,terminal",
+    [
+        # No witness: the heuristic follows the continued root to its leaf.
+        ([None, 0, None], False, 1),
+        # No witness and a fork with two leaves: the heuristic cannot choose.
+        ([None, 0, 0], False, None),
+        # A declared terminal that the scored response contradicts never falls back.
+        ([None, None], True, None),
+    ],
+)
+def test_unattributed_terminal_falls_back_or_masks(
+    forest, policy, parents, contradictory, terminal
+):
+    records, replies = forest.capture(parents)
     env = _env(forest.harness)
-    env._selection_policy = "all_captured"
+    env._selection_policy = policy
     result = {"reward": 1.0}
     if contradictory:
         result.update(response=replies[0], terminal_response_id=replies[1]["id"])
-    with pytest.raises(ValueError, match="identifiable scored terminal"):
-        asyncio.run(
-            env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, result)
+    )
+    receipt = processed["receipt"]
+    if terminal is None:
+        assert receipt["capture_poisoned"]
+        assert receipt["failure_reason"] == "terminal_not_identified"
+        assert receipt["terminal_model_call_id"] is None
+        assert receipt["terminal_selection"] == (
+            "declared" if contradictory else "heuristic"
         )
+        assert processed["logical_selection"].response_ids == ()
+    else:
+        assert not receipt["capture_poisoned"]
+        assert receipt["terminal_selection"] == "heuristic"
+        assert receipt["terminal_model_call_id"] == records[terminal].model_call_id
 
 
 @pytest.mark.parametrize("final_text,empty", [("Done.", False), ("", True)])
@@ -1377,6 +1419,98 @@ def test_forest_penalty_scope_combines_segment_token_checks(
         )
     # Counted once per owner, however many segments hit.
     assert result.metrics["finalize/penalty_count/unwanted_token"] == float(penalized)
+
+
+@pytest.mark.parametrize("policy", ["returned_history", "all_captured"])
+@pytest.mark.parametrize(
+    "limit,scored,expected",
+    [
+        (None, 3, [1, 2, 3, 5]),
+        (4, 3, [1, 2, 3, 5]),
+        (8, 3, [1, 2, 3, 5]),
+        (1, 3, [3]),
+        (2, 3, [3, 1]),
+        (3, 3, [3, 1, 2]),
+        (1, 0, [1]),
+        (2, 0, [1, 2]),
+        (1, 5, [5]),
+    ],
+)
+def test_physical_row_cap_preserves_scored_call_and_plan_order(
+    forest: ForestCapture,
+    policy: str,
+    limit: int | None,
+    scored: int,
+    expected: list[int],
+) -> None:
+    records, replies = forest.capture([None, 0, 0, 0, None, 4])
+    env = _env(forest.harness)
+    env._selection_policy = policy
+    env._max_rows_per_rollout = limit
+    output = ordinary(replies, terminal=replies[scored]["id"])
+    output["reward"] = 1.0
+    processed = asyncio.run(
+        env._postprocess_receipt_mode({"_ng_rollout_id": "attempt"}, output)
+    )
+    descriptor = processed["logical_selection"]
+    assert descriptor.max_rows_per_rollout == limit
+    assert descriptor.response_ids == tuple(record.response_id for record in records)
+    plans = forest.finalizer._plan_selected_calls(
+        ["attempt"], [processed["receipt"]], [descriptor]
+    )[0]
+    assert [plan.selected_response_ids[-1] for plan in plans] == [
+        records[index].response_id for index in expected
+    ]
+    request = ReassemblyRequest(
+        group_id="group",
+        rollout_ids=("attempt",),
+        canonical_sample_ids=("group_g0",),
+        receipts=(processed["receipt"],),
+        rewards=(1.0,),
+        fallback_weight_version=7,
+        prompt_idx=99,
+        mask_sample=(False,),
+        logical_selections=(descriptor,),
+    )
+    cleanup_ids = request.cleanup_sample_ids
+    result = forest.finalizer.finalize_group(
+        "group",
+        ["attempt"],
+        [processed["receipt"]],
+        [1.0],
+        mask_sample=[False],
+        fallback_weight_version=7,
+        prompt_idx=99,
+        canonical_sample_ids=["group_g0"],
+        logical_selections=[descriptor],
+    )
+    assert result.valid_row_count == len(expected)
+    assert tuple(result.meta.sample_ids) == cleanup_ids
+    assert not any(partition == "staged" for partition, _ in forest.plane.rows)
+    kept_responses = {
+        response for plan in plans for response in plan.selected_response_ids
+    }
+    assert records[scored].response_id in kept_responses
+    assert_loss_once(
+        forest,
+        [record for record in records if record.response_id in kept_responses],
+        records,
+    )
+
+
+def test_unknown_gym_attribution_method_fails_loudly(forest, monkeypatch):
+    import nemo_gym.token_id_capture.staging as staging
+
+    records, replies = forest.capture([None])
+    attribution = SimpleNamespace(
+        attributed=True,
+        method="new_method",
+        model_call_id=records[0].model_call_id,
+        reason="",
+    )
+    monkeypatch.setattr(staging, "resolve_terminal", lambda *a, **k: attribution)
+    with pytest.raises(ValueError, match="new_method.*_RECEIPT_METHOD"):
+        resolve_scored_terminal(records, ordinary(replies))
 
 
 def test_publication_identity_drift_preserves_staging(forest, monkeypatch):

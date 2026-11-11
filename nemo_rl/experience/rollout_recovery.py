@@ -44,13 +44,14 @@ if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
     from nemo_rl.experience.rollout_reassembler import RolloutSelection
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 7
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 8
 # Schemas 2 to 5 predate turn-level recovery; they load through
 # _upgrade_pre_turn_recovery_groups.
 _PRE_TURN_RECOVERY_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
 SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {
     *_PRE_TURN_RECOVERY_SCHEMA_VERSIONS,
     6,
+    7,
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
 }
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
@@ -1925,9 +1926,13 @@ class RolloutRecoveryLedger:
                     raise ValueError(
                         f"recovery attempt is missing logical_selection: gate_id={base_gate_id!r}"
                     )
-                selection = _selection_from_state(
-                    attempt_state.get("logical_selection")
-                )
+                selection_state = attempt_state.get("logical_selection")
+                if schema_version < 8 and isinstance(selection_state, dict):
+                    selection_state = {
+                        "max_rows_per_rollout": None,
+                        **selection_state,
+                    }
+                selection = _selection_from_state(selection_state)
                 reward = attempt_state.get("reward")
                 mask_sample = attempt_state.get("mask_sample")
                 raw_checks = attempt_state.get("reward_checks")
