@@ -1705,6 +1705,8 @@ def _generation_cut_route(
                 prefix_row_extras=lambda state: None,
                 router_replay=False,
                 sampler_top_k=0,
+                generation_prefix_batch_size=256,
+                generation_prefix_batch_max_tokens=4_194_304,
             )
         )
         recovery.checkpoint_cut = checkpoint_cut

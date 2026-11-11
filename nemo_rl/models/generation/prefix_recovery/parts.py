@@ -62,3 +62,7 @@ class PrefixRecoveryParts:
     # Extras for a call's first prefix row, from the media its capture state
     # holds; None for a call without media.
     prefix_row_extras: Callable[[_RequestCaptureState], dict[str, Any] | None]
+    # Most rows per cut-time TQ put.
+    generation_prefix_batch_size: int
+    # Most token rows per cut-time TQ put; one larger row is written alone.
+    generation_prefix_batch_max_tokens: int

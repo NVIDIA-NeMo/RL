@@ -97,6 +97,8 @@ class TestRestartShardTokenCapture:
         "generation_prefix_cuts_enabled": False,
         "generation_cut_control_token": None,
         "generation_cut_control_timeout_s": None,
+        "generation_prefix_batch_size": 256,
+        "generation_prefix_batch_max_tokens": 4_194_304,
     }
 
     @staticmethod
