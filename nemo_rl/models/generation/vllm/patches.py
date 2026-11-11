@@ -1101,10 +1101,12 @@ def _patch_vllm_moe_routed_experts_capture(logger, *, required: bool = False) ->
         return False
 
     marker = "NeMo-RL patch (routed-experts capture for router replay)"
+    # Anchor on the branch head only: vLLM 0.29 calls forward_monolithic next, newer vLLM
+    # (#52780) first calls router.prepare_monolithic_logits. The capture call goes before
+    # either, on the raw router logits, exactly as the modular branch's select_experts sees them.
     old_snippet = (
         "        if self.routed_experts.quant_method.is_monolithic:\n"
         "            # Monolithic kernels: pass router_logits to routed_experts\n"
-        "            fused_out = self.routed_experts.forward_monolithic("
     )
     new_snippet = (
         "        if self.routed_experts.quant_method.is_monolithic:\n"
@@ -1121,7 +1123,6 @@ def _patch_vllm_moe_routed_experts_capture(logger, *, required: bool = False) ->
         "                    topk_indices_dtype=self._quant_method.topk_indices_dtype,\n"
         "                    input_ids=input_ids,\n"
         "                )\n"
-        "            fused_out = self.routed_experts.forward_monolithic("
     )
 
     with _locked_file_patch(file_to_patch) as (content, write_back):
@@ -1215,10 +1216,51 @@ def _patch_vllm_routed_experts_capture_router_fallback(
         "                )\n"
     )
 
+    # Newer vLLM binds capture-capable monolithic kernels through a RoutedExpertsSink on
+    # the runner's routed_experts instead of fused_experts.set_capture_fn; same fallback.
+    old_snippet_sink = (
+        "            if not (\n"
+        "                isinstance(fused_experts, FusedMoEExpertsMonolithic)\n"
+        "                and fused_experts.supports_routing_replay_capture()\n"
+        "            ):\n"
+        "                raise ValueError(\n"
+        '                    "Routed-experts capture is not supported with monolithic "\n'
+        '                    f"MoE kernel {type(fused_experts).__name__}."\n'
+        "                )\n"
+        "            module.routed_experts.routing_sink = RoutedExpertsSink(\n"
+        "                fused_experts.moe_config, capture_fn\n"
+        "            )\n"
+        "            num_bound += 1\n"
+    )
+    new_snippet_sink = (
+        "            # NeMo-RL patch (router fallback for monolithic routed-experts capture):\n"
+        "            # a monolithic kernel that does not capture routing itself is\n"
+        "            # captured through the router; NeMo-RL's moe_runner patch fires\n"
+        "            # router.select_experts on the monolithic branch when capture_fn is set.\n"
+        "            if (\n"
+        "                isinstance(fused_experts, FusedMoEExpertsMonolithic)\n"
+        "                and fused_experts.supports_routing_replay_capture()\n"
+        "            ):\n"
+        "                module.routed_experts.routing_sink = RoutedExpertsSink(\n"
+        "                    fused_experts.moe_config, capture_fn\n"
+        "                )\n"
+        "                num_bound += 1\n"
+        "            elif isinstance(module.router, BaseRouter):\n"
+        "                module.router.set_capture_fn(capture_fn)\n"
+        "                num_bound += 1\n"
+        "            else:\n"
+        "                raise ValueError(\n"
+        '                    "Routed-experts capture is not supported with monolithic "\n'
+        '                    f"MoE kernel {type(fused_experts).__name__}."\n'
+        "                )\n"
+    )
+
     with _locked_file_patch(file_to_patch) as (content, write_back):
         if marker in content:
             logger.info("Routed-experts capture router-fallback patch already applied.")
             return True
+        if old_snippet not in content and content.count(old_snippet_sink) == 1:
+            old_snippet, new_snippet = old_snippet_sink, new_snippet_sink
         if old_snippet not in content:
             message = (
                 "Could not apply the routed-experts capture router-fallback patch: "
