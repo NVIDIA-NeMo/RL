@@ -14,6 +14,7 @@
 
 import contextlib
 import math
+import random
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -40,6 +41,7 @@ from nemo_rl.models.generation.vllm.utils import (
     compute_engine_step_metrics,
     compute_spec_decode_metrics,
     encode_counter_key,
+    extract_generation_logprobs,
     format_prompt_for_vllm_generation,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
@@ -881,6 +883,130 @@ def test_attach_token_information_to_chat_response_choices_rejects_invalid_struc
         attach_token_information_to_chat_response_choices(response, final_res)
 
 
+def _position(token_id: int, logprob: float) -> dict:
+    return {token_id: SimpleNamespace(logprob=logprob)}
+
+
+def test_extract_generation_logprobs_reads_only_the_positions_asked_for():
+    # A live container may already hold a later step; it is left unread.
+    logprobs = [_position(12, -0.1), _position(13, -0.2), _position(14, -0.3)]
+
+    assert extract_generation_logprobs([12, 13], logprobs, start=0) == [-0.1, -0.2]
+    assert extract_generation_logprobs([13], logprobs, start=1) == [-0.2]
+    assert extract_generation_logprobs([], None, start=3) == []
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "logprobs", "error_match"),
+    [
+        ([12], None, "did not include logprobs"),
+        ([12, 13], [_position(12, -0.1)], "token_count=2, logprob_count=1"),
+        ([12], [_position(99, -0.1)], "did not include the selected token"),
+    ],
+)
+def test_extract_generation_logprobs_rejects_inconsistent_outputs(
+    token_ids, logprobs, error_match
+):
+    with pytest.raises(RuntimeError, match=error_match):
+        extract_generation_logprobs(token_ids, logprobs, start=0)
+
+
+class _FlatLogprobs:
+    """vLLM ``FlatLogprobs``' arrays; per-position indexing must not be used."""
+
+    def __init__(self, positions: list[list[tuple[int, float]]]) -> None:
+        self.start_indices: list[int] = []
+        self.end_indices: list[int] = []
+        self.token_ids: list[int] = []
+        self.logprobs: list[float] = []
+        for candidates in positions:
+            self.start_indices.append(len(self.token_ids))
+            for token_id, logprob in candidates:
+                self.token_ids.append(token_id)
+                self.logprobs.append(logprob)
+            self.end_indices.append(len(self.token_ids))
+
+    def __len__(self) -> int:
+        return len(self.start_indices)
+
+    def __getitem__(self, position: int):
+        raise AssertionError("flat logprobs must be read through their arrays")
+
+
+def test_extract_generation_logprobs_reads_flat_arrays_without_mappings():
+    # vLLM's layout: the sampled token first, then the top-k, which may
+    # repeat the sampled token with the same log probability.
+    logprobs = _FlatLogprobs(
+        [
+            [(12, -0.1), (7, -2.0)],
+            [(13, -0.2), (5, -1.0), (13, -0.2)],
+            [(14, -1e9)],
+            [(15, -0.4)],
+        ]
+    )
+
+    assert extract_generation_logprobs([12, 13, 14], logprobs, start=0) == [
+        -0.1,
+        -0.2,
+        vllm_utils.VLLM_LOGPROB_FLOOR,
+    ]
+    assert extract_generation_logprobs([15], logprobs, start=3) == [-0.4]
+
+
+@pytest.mark.parametrize(
+    ("token_ids", "error_match"),
+    [
+        ([12, 13], "token_count=2, logprob_count=1"),
+        ([99], "did not include the selected token first"),
+        # Present only among the top-k: not the layout this read relies on.
+        ([7], "did not include the selected token first"),
+    ],
+)
+def test_extract_generation_logprobs_rejects_inconsistent_flat_arrays(
+    token_ids, error_match
+):
+    logprobs = _FlatLogprobs([[(12, -0.1), (7, -2.0)]])
+    # A position whose end index is not yet appended is not published.
+    logprobs.start_indices.append(len(logprobs.token_ids))
+
+    with pytest.raises(RuntimeError, match=error_match):
+        extract_generation_logprobs(token_ids, logprobs, start=0)
+
+
+@pytest.mark.vllm
+def test_flat_logprob_read_matches_vllm_mappings():
+    """Both of vLLM's containers, filled the way its sampler fills them."""
+    from vllm.logprobs import FlatLogprobs, append_logprobs_for_next_position
+
+    generator = random.Random(0)
+    flat, mappings = FlatLogprobs(), []
+    sampled = []
+    for _ in range(64):
+        top_k = generator.sample(range(1000), 4)
+        values = {token_id: -generator.random() * 5 for token_id in top_k}
+        # The sampler writes the sampled token first; it is often also top-k.
+        token_id = generator.choice([*top_k, generator.randrange(1000, 2000)])
+        values.setdefault(token_id, -generator.random() * 5)
+        row = [token_id, *top_k]
+        for container in (flat, mappings):
+            append_logprobs_for_next_position(
+                container,
+                row,
+                [values[candidate] for candidate in row],
+                [None] * len(row),
+                rank=1,
+                num_logprobs=len(top_k),
+            )
+        sampled.append(token_id)
+
+    expected = extract_generation_logprobs(sampled[10:], mappings, start=10)
+    assert extract_generation_logprobs(sampled[10:], flat, start=10) == expected
+    assert expected == [
+        max(mappings[position][token_id].logprob, vllm_utils.VLLM_LOGPROB_FLOOR)
+        for position, token_id in enumerate(sampled[10:], 10)
+    ]
+
+
 @pytest.mark.parametrize("encode_for_wire", [False, True])
 def test_model_dump_chat_response_with_dynamic_message_fields_preserves_all_fields(
     encode_for_wire,
@@ -1317,6 +1443,46 @@ def test_step_metrics_are_returned_when_the_snapshot_reads_cleanly():
 
     assert isinstance(metrics, dict)
     assert stub._step_metrics_snapshot is None
+
+
+def test_step_metrics_reuse_the_end_snapshot_without_gaps():
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    stub = _generation_stub({"vllm:generation_tokens": 10.0})
+    stub._get_raw_spec_counters = MagicMock(
+        side_effect=[
+            {"vllm:generation_tokens": 30.0},
+            {"vllm:generation_tokens": 65.0},
+        ]
+    )
+
+    first = VllmGeneration.get_step_metrics(stub, keep_snapshot=True)
+    second = VllmGeneration.get_step_metrics(stub, keep_snapshot=True)
+
+    assert first["vllm/generation_tokens"] == 20.0
+    assert second["vllm/generation_tokens"] == 35.0
+    assert stub._get_raw_spec_counters.call_count == 2
+    assert stub._step_metrics_snapshot == {"vllm:generation_tokens": 65.0}
+
+
+def test_continuous_step_metrics_recover_after_a_failed_read():
+    from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration
+
+    stub = _generation_stub({"vllm:generation_tokens": 10.0})
+    stub._get_raw_spec_counters = MagicMock(
+        side_effect=[
+            RuntimeError("reader gone"),
+            {"vllm:generation_tokens": 30.0},
+            {"vllm:generation_tokens": 65.0},
+        ]
+    )
+
+    assert VllmGeneration.get_step_metrics(stub, keep_snapshot=True) == {}
+    assert stub._step_metrics_snapshot is None
+    assert VllmGeneration.get_step_metrics(stub, keep_snapshot=True) == {}
+    assert stub._step_metrics_snapshot == {"vllm:generation_tokens": 30.0}
+    metrics = VllmGeneration.get_step_metrics(stub, keep_snapshot=True)
+    assert metrics["vllm/generation_tokens"] == 35.0
 
 
 @dataclass(frozen=True)
