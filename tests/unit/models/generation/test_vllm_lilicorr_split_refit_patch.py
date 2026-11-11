@@ -23,7 +23,13 @@ from nemo_rl.models.generation.vllm import patches
 
 def _source_with(tmp_path: Path, body: str) -> Path:
     path = tmp_path / "lilicorr.py"
-    path.write_text("def load_weights(self):\n" + body)
+    path.write_text(
+        "class LiLiCorrHead:\n    def __init__(self):\n"
+        + patches._LILICORR_INIT_OLD
+        + patches._LILICORR_MATERIALIZE_OLD
+        + "        pass\n\n    def load_weights(self):\n"
+        + body
+    )
     return path
 
 
@@ -35,6 +41,8 @@ def test_patch_gates_coverage_check_and_is_idempotent(tmp_path, monkeypatch):
     once = path.read_text()
     assert patches._LILICORR_COVERAGE_NEW in once
     assert "if missing and _nrl_coverage_check_enabled():" in once
+    assert "_nrl_build_inference_buffers" in once  # in-place refill wrapper
+    assert "self.materialize_inference_buffers(" in once  # built at construction
     patches._patch_vllm_lilicorr_split_refit(logger)
     assert path.read_text() == once
 
@@ -42,7 +50,7 @@ def test_patch_gates_coverage_check_and_is_idempotent(tmp_path, monkeypatch):
 def test_patch_refuses_an_unknown_layout(tmp_path, monkeypatch):
     path = _source_with(tmp_path, "        pass\n")
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _rel: str(path))
-    with pytest.raises(RuntimeError, match="LiLiCorr split-refit patch"):
+    with pytest.raises(RuntimeError, match="LiLiCorr refit patch"):
         patches._patch_vllm_lilicorr_split_refit(logging.getLogger("test"))
 
 
