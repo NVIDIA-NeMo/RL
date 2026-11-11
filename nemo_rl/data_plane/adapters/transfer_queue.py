@@ -1395,14 +1395,25 @@ class TQDataPlaneClient(DataPlaneClient):
         fields = [f for f in fields if f not in already]
         if not fields:
             return
+        self._mark_data_operation_started()
+        # Restored or shared partitions already have typed columns. A float
+        # placeholder would conflict with their live integer or boolean rows.
+        schema_key = (
+            f"__schema__:{partition_id}:{os.getpid()}:{id(self)}:{time.time_ns()}"
+        )
+        # The client rejects an empty key list. A missing unique key yields
+        # no rows while preserving the controller's registered field schema.
+        existing = tq.get_client().kv_retrieve_meta(
+            keys=[schema_key], partition_id=partition_id, create=False
+        )
+        already.update(existing.field_schema)
+        fields = [f for f in fields if f not in already]
+        if not fields:
+            return
         # Use a unique KV key instead of ``client.put``'s default row id
         # (``0@field`` at the Mooncake storage layer). Mooncake does not
         # support upsert, so repeated schema warmups can collide with
         # stale metadata from a previous registration.
-        self._mark_data_operation_started()
-        schema_key = (
-            f"__schema__:{partition_id}:{os.getpid()}:{id(self)}:{time.time_ns()}"
-        )
         dummy_td = TensorDict(
             {f: torch.zeros(1) for f in fields},
             batch_size=[1],
