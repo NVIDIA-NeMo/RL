@@ -2510,7 +2510,9 @@ def test_postprocess_nemo_gym_group_names_mixed_taskset_metrics_by_harness():
         for _ in range(4)
     ]
     results = []
-    for index, harness in enumerate(["opencode", "opencode", "pi", "pi"]):
+    for index, harness in enumerate(
+        ["opencode_agent", "opencode_agent", "pi_agent", "pi_agent"]
+    ):
         input_message = {
             "role": "user",
             "content": "prompt",
@@ -2549,8 +2551,8 @@ def test_postprocess_nemo_gym_group_names_mixed_taskset_metrics_by_harness():
     )
 
     metrics = rollout_result.rollout_metrics
-    assert metrics["swe/opencode/reward/mean"] == pytest.approx(0.5)
-    assert metrics["swe/pi/reward/mean"] == pytest.approx(2.5)
+    assert metrics["swe/opencode_agent/reward/mean"] == pytest.approx(0.5)
+    assert metrics["swe/pi_agent/reward/mean"] == pytest.approx(2.5)
     assert "swe/reward/mean" not in metrics
     # Taskset-keyed settings and attribution keep the taskset name.
     assert rollout_result.final_batch["attribution_key"] == ["swe"] * 4

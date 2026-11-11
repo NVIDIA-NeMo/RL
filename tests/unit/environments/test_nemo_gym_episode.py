@@ -22,7 +22,7 @@ from nemo_rl.environments.nemo_gym import (
     _normalize_nemo_gym_episode_result,
     _prepare_materialized_nemo_gym_rows,
 )
-from nemo_rl.environments.nemo_gym_harness_mix import parse_harness_mix
+from nemo_rl.environments.nemo_gym_multi_harness import MultiHarnessRoutes
 from nemo_rl.experience.failures import (
     FailureClass,
     GymTerminalEpisodeFailure,
@@ -122,12 +122,16 @@ def test_compatibility_judge_failure_stays_a_masked_result() -> None:
     assert _normalize_nemo_gym_episode_result(row, reply) is reply
 
 
-_WEATHER_MIX = parse_harness_mix(
-    {
-        "environment_servers": {
-            "weather:train": {"fast": "weather_fast", "careful": "weather_careful"}
-        }
-    }
+_WEATHER_ROUTES = MultiHarnessRoutes(
+    candidates=(
+        (
+            "weather:train",
+            (
+                ("careful_agent", "weather_careful", 1.0),
+                ("fast_agent", "weather_fast", 1.0),
+            ),
+        ),
+    )
 )
 
 
@@ -144,17 +148,15 @@ def _group_rows(groups, generations):
     return rows
 
 
-def test_harness_mix_stamps_one_server_per_group():
+def test_multi_harness_stamps_one_server_per_group():
     rows = _group_rows([f"group-{i}" for i in range(8)], generations=3)
 
-    _prepare_materialized_nemo_gym_rows(
-        rows, {"weather:train": "weather_environment"}, _WEATHER_MIX
-    )
+    _prepare_materialized_nemo_gym_rows(rows, {}, _WEATHER_ROUTES)
 
     for row in rows:
         assert (
             row["_ng_environment_server"]
-            == _WEATHER_MIX.select(
+            == _WEATHER_ROUTES.select(
                 "weather:train", row["_ng_group_id"]
             ).environment_server
         )
@@ -182,7 +184,8 @@ def test_stream_runs_each_group_on_its_harness_and_reports_it():
 
     cls = NemoGym.__ray_metadata__.modified_class
     env = cls.__new__(cls)
-    env.__init__({"harness_mix": _WEATHER_MIX})
+    env.__init__({})
+    env.set_multi_harness_routes(_WEATHER_ROUTES)
     env.rh = object()
     env.rch = _Collector()
     env.head_server_config = object()
@@ -202,7 +205,7 @@ def test_stream_runs_each_group_on_its_harness_and_reports_it():
 
     assert len(streamed) == len(rows)
     for rowidx, agent_ref, result, _ in streamed:
-        choice = _WEATHER_MIX.select("weather:train", rows[rowidx]["_ng_group_id"])
+        choice = _WEATHER_ROUTES.select("weather:train", rows[rowidx]["_ng_group_id"])
         assert agent_ref is None
         assert result["attribution_key"] == "weather:train"
         assert (
