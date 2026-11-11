@@ -309,8 +309,9 @@ def test_fractional_survivor_gradients_match_prefiltering(
 
 @pytest.mark.mcore
 @pytest.mark.parametrize("in_loss", [False, True])
+@pytest.mark.parametrize("mtp_detach_heads", [None, False, True])
 def test_train_normalizes_survivors_before_optimizer_step(
-    monkeypatch: pytest.MonkeyPatch, in_loss: bool
+    monkeypatch: pytest.MonkeyPatch, in_loss: bool, mtp_detach_heads: bool | None
 ) -> None:
     """In-loss and prefiltered batches reach the optimizer with equal gradients."""
     # Optional Megatron imports are available only in the mcore test environment.
@@ -361,7 +362,16 @@ def test_train_normalizes_survivors_before_optimizer_step(
 
     worker = MagicMock()
     worker.dp_size = 1
-    worker.mtp_enabled = False
+    # None = no MTP layers; False/True = attached/detached heads.
+    worker.mtp_enabled = mtp_detach_heads is not None
+    model_config = worker._get_model_config.return_value
+    model_config.mtp_num_layers = 0 if mtp_detach_heads is None else 2
+    model_config.mtp_detach_heads = bool(mtp_detach_heads)
+    model_config.mtp_loss_scaling_factor = 0.3
+    worker._raise_if_attached_mtp_with_in_loss_filter = partial(
+        worker_module.MegatronPolicyWorkerImpl._raise_if_attached_mtp_with_in_loss_filter,
+        worker,
+    )
     worker.model.modules.return_value = []
     worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
     worker.model.scale_gradients.side_effect = scale_gradients
@@ -405,6 +415,13 @@ def test_train_normalizes_survivors_before_optimizer_step(
         return tensor(*args, **kwargs)
 
     monkeypatch.setattr(torch, "tensor", cpu_tensor)
+    if in_loss and mtp_detach_heads is False:
+        with pytest.raises(ValueError, match="only with detached heads"):
+            worker_module.MegatronPolicyWorkerImpl.train(
+                worker, SimpleNamespace(size=2), loss_fn, gbs=2, mbs=2
+            )
+        assert events == []
+        return
     with pytest.raises(OptimizerReached):
         worker_module.MegatronPolicyWorkerImpl.train(
             worker, SimpleNamespace(size=2), loss_fn, gbs=2, mbs=2
@@ -414,3 +431,8 @@ def test_train_normalizes_survivors_before_optimizer_step(
     )
     if not in_loss:
         worker.model.scale_gradients.assert_not_called()
+    if in_loss and mtp_detach_heads:
+        # scale_gradients gets G/K = 2.0 here, so the MTP rescale is undone by 0.5.
+        worker._scale_mtp_param_grads.assert_called_once_with(0.5)
+    else:
+        worker._scale_mtp_param_grads.assert_not_called()

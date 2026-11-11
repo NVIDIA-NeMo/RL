@@ -1424,6 +1424,7 @@ class MegatronPolicyWorkerImpl(
             "check_dim_skip_keys is only supported by the Automodel worker; "
             "Megatron does not run cross-tokenizer distillation."
         )
+        self._raise_if_attached_mtp_with_in_loss_filter(loss_fn)
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
@@ -1884,6 +1885,27 @@ class MegatronPolicyWorkerImpl(
     #    no FSDP-style ``loss *= dp_size*cp_size`` cancellation is needed
     #    per microbatch.
 
+    def _raise_if_attached_mtp_with_in_loss_filter(self, loss_fn: LossFunction) -> None:
+        """Reject attached MTP heads with in-loss filtering, using the built model.
+
+        The YAML may omit ``mtp_num_layers`` while the checkpoint enables MTP, so the
+        config validator alone cannot catch this. A zero MTP loss weight puts no MTP
+        gradient on shared weights and is allowed.
+        """
+        config = self._get_model_config()
+        if (
+            self.mtp_enabled
+            and _uses_in_loss_seq_filter(loss_fn)
+            and getattr(config, "mtp_loss_scaling_factor", 0.1) != 0
+            and not bool(getattr(config, "mtp_detach_heads", False))
+        ):
+            raise ValueError(
+                "loss_fn.seq_logprob_error_in_loss supports MTP only with detached heads, "
+                f"but the model has mtp_num_layers={config.mtp_num_layers} with "
+                "mtp_detach_heads=False. Set policy.megatron_cfg.mtp_detach_heads=true, "
+                "or mtp_num_layers=0 to turn MTP off."
+            )
+
     def _split_step_state_init(
         self,
         loss_fn: LossFunction,
@@ -1926,6 +1948,8 @@ class MegatronPolicyWorkerImpl(
                 f"Got loss_type={loss_type}, mtp_num_layers={model_config.mtp_num_layers}, "
                 f"mtp_loss_scaling_factor={mtp_loss_scaling_factor}."
             )
+
+        self._raise_if_attached_mtp_with_in_loss_filter(loss_fn)
 
         return {
             "loss_fn": loss_fn,

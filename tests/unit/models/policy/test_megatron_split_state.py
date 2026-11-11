@@ -1328,6 +1328,27 @@ class TestFinishInLossSeqFilter:
         torch.testing.assert_close(mtp_param.main_grad, torch.full((4,), 300 / 2048))
         torch.testing.assert_close(other_param.main_grad, torch.ones(4))
 
+    @pytest.mark.parametrize("mtp_loss_scaling_factor", [0.3, 0.0])
+    def test_attached_mtp_from_the_built_model_is_rejected(
+        self, mock_module_symbols, mtp_loss_scaling_factor
+    ):
+        """The checkpoint can enable MTP even when the YAML has no MTP keys."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        assert "mtp_num_layers" not in w.cfg["megatron_cfg"]
+        w.model.config.mtp_num_layers = 2
+        w.model.config.mtp_detach_heads = False
+        w.model.config.mtp_loss_scaling_factor = mtp_loss_scaling_factor
+        w.mtp_enabled = True
+        if mtp_loss_scaling_factor:
+            with pytest.raises(ValueError, match="only with detached heads"):
+                w.begin_train_step(loss_fn=_in_loss_seq_filter_loss_fn())
+        else:
+            # No MTP gradient reaches shared weights, so attached heads are fine.
+            w.begin_train_step(loss_fn=_in_loss_seq_filter_loss_fn())
+            w.abort_train_step()
+
     def test_empty_survivor_step_raises_before_any_update(self, mock_module_symbols):
         from nemo_rl.algorithms.loss.interfaces import LossType
 
