@@ -493,7 +493,10 @@ def test_ipc_refit_preflights_and_caches_draft_before_zmq(
     calls: list[str] = []
     cached_draft = (("draft.model.weight", torch.ones(1)),)
 
-    def preflight() -> tuple[tuple[tuple[str, torch.Tensor], ...], None]:
+    def preflight(
+        *, metadata_only: bool = False
+    ) -> tuple[tuple[tuple[str, torch.Tensor], ...], None]:
+        assert metadata_only is False
         calls.append("preflight")
         return cached_draft, None
 
@@ -531,7 +534,7 @@ def test_ipc_refit_preflight_failure_stops_before_zmq(
     worker = _draft_refit_worker(draft_model=None)
     calls: list[str] = []
     failure = RuntimeError("draft preflight failed")
-    worker._preflight_draft_weights_for_refit = lambda: ((), failure)
+    worker._preflight_draft_weights_for_refit = lambda **_kwargs: ((), failure)
     worker.maybe_init_zmq = lambda: calls.append("init_zmq")
     monkeypatch.setattr(
         policy_utils,
