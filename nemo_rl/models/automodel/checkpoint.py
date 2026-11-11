@@ -150,6 +150,15 @@ def _patch_qwen_vl_vision_key_mapping() -> None:
     if os.environ.get("NRL_DISABLE_QWENVL_VISION_PATCH") == "1":
         return
 
+    # The removal condition above: transformers >= 5.6 carries #45358, so the mapping is
+    # already right (Automodel main pins 5.18, whose get_combined_key_mapping also takes a
+    # keyword-only ``model=`` argument that this wrapper did not accept).
+    import transformers
+    from packaging.version import Version
+
+    if Version(transformers.__version__) >= Version("5.6.0"):
+        return
+
     import nemo_automodel.components.checkpoint.checkpointing as _am_ckpt
 
     _vision_nested = {"qwen2_5_vl", "qwen2_vl"}
@@ -158,8 +167,8 @@ def _patch_qwen_vl_vision_key_mapping() -> None:
     if getattr(_orig, "_nrl_vision_patch", False):
         return
 
-    def _patched_get_combined_key_mapping(model_type, model_key_mapping=None):
-        result = _orig(model_type, model_key_mapping)
+    def _patched_get_combined_key_mapping(model_type, model_key_mapping=None, **kwargs):
+        result = _orig(model_type, model_key_mapping, **kwargs)
         if model_type in _vision_nested:
             result = dict(result or {})
             if not any(str(t).startswith("model.visual") for t in result.values()):
