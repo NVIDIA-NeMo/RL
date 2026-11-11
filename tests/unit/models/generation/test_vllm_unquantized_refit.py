@@ -45,11 +45,16 @@ def test_unquantized_refit_does_not_import_fp8(
             raise ModuleNotFoundError("Optional FP8 backend is unavailable")
         return original_import(name, globals, locals, fromlist, level)
 
+    ext._uses_native_layerwise_refit = lambda transport: False
+    ext._refit_unusable_reason = None
     monkeypatch.setattr(builtins, "__import__", reject_fp8)
-    if reload_iterator:
-        model.load_weights(weights=ext._prepare_reload_weight_iterator(iter(weights)))
-    else:
-        ext._load_hf_weights(weights)
+    with ext._weight_update_lifecycle("ipc"):
+        if reload_iterator:
+            model.load_weights(
+                weights=ext._prepare_reload_weight_iterator(iter(weights))
+            )
+        else:
+            ext._load_hf_weights(weights)
 
     assert len(received) == 1
     assert received[0][0] == "weight"
