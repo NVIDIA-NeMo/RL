@@ -657,12 +657,16 @@ on a disk: an owner refuses to start when it is on a RAM-backed filesystem
 
 The single controller reads the master's `/metrics` every step and logs, under
 `data_plane/mooncake/`: `mem_used_mb`, `mem_capacity_mb`, `mem_used_ratio`
-(compare with `offload_threshold`), `keys`, `offloaded_keys_total`,
-`offloaded_mb_total` (objects the master moved from memory to the owners' SSD)
-and `disk_evictions_total` (always 0 in a healthy run, see below). The first
-step with `offloaded_keys_total > 0` logs one warning: the workload's
-data-plane footprint passed the threshold, and reads of offloaded objects now
-go through the SSD. Raise `storage_unit_segment_size` (or
+(compare with `offload_threshold`), `keys`, `offload_rounds_total` (eviction
+rounds the master ran; each wrote objects to the owners' SSD),
+`mem_evicted_keys_total`, `mem_evicted_mb_total` (objects whose memory copy was
+dropped, so their reads go through the SSD) and `disk_evictions_total` (always
+0 in a healthy run, see below). Mooncake 0.3.x has no per-object offload
+counter: past the threshold with memory to spare it writes SSD copies and
+keeps the memory copies, so `offload_rounds_total` rises while
+`mem_evicted_*` stay 0; under memory pressure both rise. The first step with
+`offload_rounds_total > 0` logs one warning: the workload's data-plane
+footprint passed the threshold. Raise `storage_unit_segment_size` (or
 `global_segment_size`), or `offload_threshold`, if that trade-off is not
 wanted. The nixl backend's SSD tier (`nixl.ssd`, also on by default) spills
 only when a unit's put area is full and logs the same kind of warning when
