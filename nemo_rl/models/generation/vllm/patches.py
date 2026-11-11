@@ -999,10 +999,17 @@ def _patch_vllm_radio_final_layernorm(logger) -> None:
         if all(new in content for _, new in replacements):
             return
         if any(content.count(old) != 1 for old, _ in replacements):
-            raise RuntimeError(
-                "Final vision LayerNorm patch requires the vLLM 0.29 model source "
-                f"or its fully patched equivalent: {file_to_patch}"
+            # Like the other model-source patches here, an unrecognized layout is
+            # reported and skipped instead of failing every model served by this
+            # vLLM (the file is patched for all models, not only Super Omni).
+            logger.error(
+                "Final vision LayerNorm patch NOT applied: %s is neither the vLLM "
+                "0.29 source nor its fully patched equivalent. Super Omni VL "
+                "rollouts on this vLLM skip the checkpoint final vision LayerNorm; "
+                "other models are unaffected.",
+                file_to_patch,
             )
+            return
         for old, new in replacements:
             content = content.replace(old, new, 1)
         write_back(content)
