@@ -94,6 +94,12 @@ for IS_MODE in ${SC_IS_MODES:-off is tis icepop adaptive-ppo-clip}; do
         'all_finite(data["train/score_centering_head_mass"])' \
         'min(data["train/score_centering_head_mass"]) > 0' \
         'max(data["train/score_centering_head_mass"]) <= 1.0001' \
+        'all_finite(data["train/score_centering_policy_head_mass"])' \
+        'all_finite(data["train/score_centering_tv_distance"])' \
+        'all_finite(data["train/score_centering_head_mass_min"])' \
+        'min(data["train/score_centering_tv_distance"]) >= 0' \
+        'max(data["train/score_centering_tv_distance"]) <= 1.0001' \
+        'min(data["train/score_centering_head_mass_min"]) > 0' \
         'min(data["train/global_valid_toks"]) > 0' \
         'max(data["train/finalize/total_ms"]) > 0' \
         'max(data["train/finalize/invalid_row_rate"]) == 0' \

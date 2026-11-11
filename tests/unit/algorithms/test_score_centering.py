@@ -23,7 +23,10 @@ import torch
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossConfig, ClippedPGLossFn
-from nemo_rl.algorithms.loss.score_centering import compute_score_centering_term
+from nemo_rl.algorithms.loss.score_centering import (
+    compute_score_centering_diagnostics,
+    compute_score_centering_term,
+)
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 _REPLAY = TrainingSamplingParams(top_k=4, top_p=0.9, sampler_replay=True)
@@ -668,3 +671,116 @@ def test_score_centering_masks_nonfinite_positions_and_keeps_filtered_correction
         # head/tail correction still supplies a gradient.
         assert token_lp.grad[0, 0] == 0
         assert head_lp.grad[0, 0].abs().sum() > 0
+
+
+@pytest.mark.parametrize("head_probs", [(0.1, 0.6), (0.3, 0.65), (0.5, 0.2)])
+def test_score_centering_tv_distance_matches_the_full_distribution(head_probs):
+    """With the sampler's tail exactly ``rho * p``, the head estimate is the exact TV.
+
+    It is also half the L1 norm of the IS-off correction's logit gradient,
+    ``q_hat - p``: the drift the correction removes.
+    """
+    logits = torch.tensor(
+        [0.6, -0.2, 0.1, -0.7, 0.3], dtype=torch.float64, requires_grad=True
+    )
+    logp = logits.log_softmax(-1)
+    p = logp.detach().exp()
+    q_head = torch.tensor(head_probs, dtype=torch.float64)
+    q = torch.cat([q_head, (1 - q_head.sum()) * p[2:] / p[2:].sum()])
+    head_lp = logp[:2].reshape(1, 1, 2)
+    sampler_lp = q_head.log().reshape(1, 1, 2)
+
+    diagnostics = compute_score_centering_diagnostics(
+        head_lp,
+        sampler_topk_logprobs=sampler_lp,
+        token_mask=torch.ones(1, 1),
+        sampler_replay=False,
+    )
+    correction, head_mass = compute_score_centering_term(
+        head_lp,
+        sampler_topk_logprobs=sampler_lp,
+        importance_sampling_mode="off",
+        is_bounds=None,
+        token_mask=torch.ones(1, 1),
+        sampler_replay=False,
+    )
+    (grad,) = torch.autograd.grad(correction.sum(), logits)
+
+    exact_tv = 0.5 * (q - p).abs().sum()
+    torch.testing.assert_close(diagnostics.tv_distance, exact_tv.reshape(1, 1))
+    torch.testing.assert_close(grad, q - p)
+    torch.testing.assert_close(
+        diagnostics.tv_distance, 0.5 * grad.abs().sum().reshape(1, 1)
+    )
+    torch.testing.assert_close(diagnostics.policy_head_mass, p[:2].sum().reshape(1, 1))
+    torch.testing.assert_close(head_mass, q_head.sum().reshape(1, 1))
+
+
+@pytest.mark.parametrize("sampler_replay", [False, True])
+def test_score_centering_diagnostics_vanish_when_the_sampler_matches(sampler_replay):
+    torch.manual_seed(29)
+    vocab, k = 9, 4
+    logits = torch.randn(2, 3, vocab, dtype=torch.float64)
+    ids, _ = _captured_head(2, 3, vocab, k)
+    if sampler_replay:
+        # The head is the sampler's whole support; both renormalize over it.
+        head_lp = logits.gather(-1, ids).log_softmax(-1)
+    else:
+        head_lp = logits.log_softmax(-1).gather(-1, ids)
+    token_mask = torch.tensor([[1.0, 1.0, 0.0], [1.0, 0.0, 1.0]])
+
+    diagnostics = compute_score_centering_diagnostics(
+        head_lp,
+        sampler_topk_logprobs=head_lp,
+        token_mask=token_mask,
+        sampler_replay=sampler_replay,
+    )
+    _, head_mass = compute_score_centering_term(
+        head_lp,
+        sampler_topk_logprobs=head_lp,
+        importance_sampling_mode="off",
+        is_bounds=None,
+        token_mask=token_mask,
+        sampler_replay=sampler_replay,
+    )
+
+    torch.testing.assert_close(
+        diagnostics.tv_distance, torch.zeros(2, 3, dtype=torch.float64)
+    )
+    torch.testing.assert_close(diagnostics.policy_head_mass, head_mass)
+    if not sampler_replay:
+        # Both have a tail, so the tail term is exercised and cancels.
+        assert (head_mass[token_mask.bool()] < 0.99).all()
+
+
+def test_score_centering_diagnostics_under_replay_have_no_tail():
+    """Filtered slots and masked positions add nothing, and neither side has a tail.
+
+    The captured sampler mass rounds 5e-5 short of 1; a modeled sampler tail
+    would add half of that to the distance.
+    """
+    logits = torch.tensor([0.6, -0.2, 0.1, -0.7, -1.5], dtype=torch.float64)
+    kept = torch.tensor([True, True, True, False, False])
+    logp = logits.masked_fill(~kept, -float("inf")).log_softmax(-1)
+    q = torch.tensor([0.5, 0.3, 0.19995, 0.0, 0.0], dtype=torch.float64)
+    nan_head = torch.full((5,), float("nan"), dtype=torch.float64)
+    head_lp = torch.stack([logp, nan_head]).unsqueeze(0)
+    sampler_lp = torch.stack([q.log(), nan_head]).unsqueeze(0)
+
+    diagnostics = compute_score_centering_diagnostics(
+        head_lp,
+        sampler_topk_logprobs=sampler_lp,
+        token_mask=torch.tensor([[1.0, 0.0]]),
+        sampler_replay=True,
+    )
+
+    p = logp.exp()
+    expected_tv = 0.5 * (q[kept] - p[kept]).abs().sum()
+    torch.testing.assert_close(
+        diagnostics.tv_distance,
+        torch.stack([expected_tv, torch.zeros((), dtype=torch.float64)]).reshape(1, 2),
+    )
+    torch.testing.assert_close(
+        diagnostics.policy_head_mass,
+        torch.tensor([[1.0, 0.0]], dtype=torch.float64),
+    )

@@ -261,8 +261,13 @@ The checks require three loss/head-mass records, finite loss and gradient
 norms, positive valid-token counts, head mass in `(0, 1.0001]`, finalizer
 activity, and zero invalid-row and poisoned-rollout metrics. The
 `train/score_centering_head_mass` metric proves the score-centering loss path
-executed. The adaptive-ppo-clip run also requires three
-`train/cur_adaptive_ppo_clip_k` records, one per step, from its controller.
+executed. The checks also require finite values for three diagnostics: the
+trainer's head mass `train/score_centering_policy_head_mass`, the estimated
+sampler-trainer total variation distance `train/score_centering_tv_distance`
+in `[0, 1.0001]`, and the step's lowest per-token head mass
+`train/score_centering_head_mass_min` above 0. The adaptive-ppo-clip run also
+requires three `train/cur_adaptive_ppo_clip_k` records, one per step, from its
+controller.
 This smoke does not establish convergence, large-K performance, or
 TP/CP correctness. Separate packed TP/CP unit tests compare values and gradients
 against an unpacked, full-vocabulary reference.

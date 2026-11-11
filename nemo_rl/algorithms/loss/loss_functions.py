@@ -43,7 +43,10 @@ from nemo_rl.algorithms.loss.interfaces import (
     LossType,
     MetricNormalizer,
 )
-from nemo_rl.algorithms.loss.score_centering import compute_score_centering_term
+from nemo_rl.algorithms.loss.score_centering import (
+    compute_score_centering_diagnostics,
+    compute_score_centering_term,
+)
 from nemo_rl.algorithms.utils import (
     calculate_kl,
     compute_seq_logprob_errors,
@@ -611,8 +614,14 @@ class ClippedPGLossFn(LossFunction):
                 else MetricNormalizer.TOKENS
             )
         if self.score_centering:
-            self.metric_normalizations["score_centering_head_mass"] = (
-                MetricNormalizer.TOKENS
+            self.metric_normalizations.update(
+                {
+                    "score_centering_head_mass": MetricNormalizer.TOKENS,
+                    "score_centering_policy_head_mass": MetricNormalizer.TOKENS,
+                    "score_centering_tv_distance": MetricNormalizer.TOKENS,
+                    # Extremum — combined downstream with min, never scaled.
+                    "score_centering_head_mass_min": MetricNormalizer.NONE,
+                }
             )
         if self.opd_full is not None:
             # opd_full returns its own metric set from _opd_full_call; the
@@ -1072,15 +1081,17 @@ class ClippedPGLossFn(LossFunction):
             assert policy_logprobs_at_sampler_topk is not None, (
                 "score_centering requires policy_logprobs_at_sampler_topk from prepare_loss_input"
             )
+            sampler_topk_logprobs = data["sampler_topk_logprobs"][:, 1:]
+            # Score centering under top-k/top-p always replays the sampler's
+            # support; only filtering supplies policy_support_mask.
+            sampler_replay = policy_support_mask is not None
             centering, head_mass = compute_score_centering_term(
                 policy_logprobs_at_sampler_topk,
-                sampler_topk_logprobs=data["sampler_topk_logprobs"][:, 1:],
+                sampler_topk_logprobs=sampler_topk_logprobs,
                 importance_sampling_mode=self._score_centering_is_mode,
                 is_bounds=self._get_score_centering_is_bounds(),
                 token_mask=mask,
-                # Score centering under top-k/top-p always replays the sampler's
-                # support; only filtering supplies policy_support_mask.
-                sampler_replay=policy_support_mask is not None,
+                sampler_replay=sampler_replay,
                 adaptive_ppo_clip_advantages=advantages,
                 adaptive_ppo_clip_outer_bound=self.truncated_importance_sampling_adaptive_outer_bound,
             )
@@ -1095,9 +1106,30 @@ class ClippedPGLossFn(LossFunction):
                     sample_mask,
                     global_normalization_factor=global_valid_seqs,
                 )
-            score_centering_metrics["score_centering_head_mass"] = masked_mean(
-                head_mass, mask, global_normalization_factor=global_valid_toks
+            diagnostics = compute_score_centering_diagnostics(
+                policy_logprobs_at_sampler_topk,
+                sampler_topk_logprobs=sampler_topk_logprobs,
+                token_mask=mask,
+                sampler_replay=sampler_replay,
             )
+            score_centering_metrics = {
+                "score_centering_head_mass": masked_mean(
+                    head_mass, mask, global_normalization_factor=global_valid_toks
+                ),
+                "score_centering_policy_head_mass": masked_mean(
+                    diagnostics.policy_head_mass,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ),
+                "score_centering_tv_distance": masked_mean(
+                    diagnostics.tv_distance,
+                    mask,
+                    global_normalization_factor=global_valid_toks,
+                ),
+                "score_centering_head_mass_min": torch.where(
+                    mask.bool(), head_mass, float("inf")
+                ).min(),
+            }
 
         # Metric: sampling importance ratio (mean over samples)
         # See: docs/guides/grpo.md#sampling-importance-ratio

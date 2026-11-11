@@ -124,6 +124,16 @@ class TestAggregateStepMetrics:
         assert out["lr"] == pytest.approx(0.2)
         assert out["some_sum_metric"] == pytest.approx(6.0)
 
+    def test_score_centering_head_mass_min_keeps_the_smallest(self) -> None:
+        # The inf comes from a microbatch with no active tokens.
+        result = {
+            "all_mb_metrics": {
+                "score_centering_head_mass_min": [0.97, math.inf, 0.91],
+            }
+        }
+        out = aggregate_step_metrics(result)
+        assert out["score_centering_head_mass_min"] == pytest.approx(0.91)
+
     def test_min_max_all_inf_falls_back_to_neg_one(self) -> None:
         result = {
             "all_mb_metrics": {
