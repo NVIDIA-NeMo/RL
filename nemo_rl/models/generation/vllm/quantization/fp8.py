@@ -198,10 +198,16 @@ def apply_fp8_patches(self, fp8_config):
             patcher2 = patch(func2_path, process_weights_after_loading_moe)
             fp8_state.vllm_patches.append(patcher2)
             if global_fp8_config.is_mx:
+                from vllm.model_executor.layers.quantization.modelopt import (
+                    ModelOptLinearMethod,
+                )
+
                 fp8_state.vllm_patches.append(
                     patch(
-                        "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8LinearMethod.process_weights_after_loading",
-                        process_weights_after_loading_mxfp8_linear,
+                        "vllm.model_executor.layers.quantization.modelopt.ModelOptLinearMethod.process_weights_after_loading",
+                        route_mxfp8_linear_post_load(
+                            ModelOptLinearMethod.process_weights_after_loading
+                        ),
                     )
                 )
                 fp8_state.vllm_patches.append(
@@ -1155,6 +1161,28 @@ def process_weights_after_loading(self, layer) -> None:
     # with block quantization. We must do the same to avoid AttributeError.
     if not hasattr(layer, "input_scale"):
         layer.input_scale = None
+
+
+def route_mxfp8_linear_post_load(
+    vllm_process_weights_after_loading: Callable[[Any, Any], None],
+) -> Callable[[Any, Any], None]:
+    """Send MXFP8 linears to NeMo-RL's post-load and other formats to vLLM's.
+
+    vLLM uses one ModelOptLinearMethod for every ModelOpt linear format, so the
+    MXFP8 refit post-load cannot replace the method outright.
+    """
+
+    def process_weights_after_loading(self, layer) -> None:
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kMxfp8Static,
+        )
+
+        if self.spec.weight == kMxfp8Static:
+            process_weights_after_loading_mxfp8_linear(self, layer)
+        else:
+            vllm_process_weights_after_loading(self, layer)
+
+    return process_weights_after_loading
 
 
 def process_weights_after_loading_mxfp8_linear(self, layer) -> None:

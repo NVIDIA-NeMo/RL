@@ -1670,11 +1670,6 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     expected_mxfp8_calls = [
         (
             "vllm.model_executor.layers.quantization.modelopt."
-            "ModelOptMxFp8LinearMethod.process_weights_after_loading",
-            fp8.process_weights_after_loading_mxfp8_linear,
-        ),
-        (
-            "vllm.model_executor.layers.quantization.modelopt."
             "ModelOptMxFp8FusedMoE.create_weights",
             fp8.create_weights_mxfp8_moe,
         ),
@@ -1691,6 +1686,14 @@ def test_apply_fp8_patches_registers_modelopt_patches_only_for_mxfp8(
     ]
     actual_mxfp8_calls = [call for call in patched_calls if "ModelOptMxFp8" in call[0]]
     assert actual_mxfp8_calls == expected_mxfp8_calls
+    # vLLM has one linear method for every ModelOpt format, so the MXFP8 linear
+    # post-load is patched onto it through a router.
+    assert [
+        path for path, _replacement in patched_calls if "ModelOptLinearMethod" in path
+    ] == [
+        "vllm.model_executor.layers.quantization.modelopt."
+        "ModelOptLinearMethod.process_weights_after_loading"
+    ]
     assert all(patcher.started for patcher in fp8.fp8_state.vllm_patches)
 
     fp8.fp8_state = fp8.FP8State()
@@ -3560,7 +3563,7 @@ def test_mxfp8_linear_kernel_names_resolve_on_installed_vllm(fp8_module):
 
     from vllm.model_executor.kernels.linear.mxfp8 import flashinfer
     from vllm.model_executor.layers.quantization.modelopt import (
-        ModelOptMxFp8LinearMethod,
+        ModelOptLinearMethod,
     )
 
     from nemo_rl.models.generation.vllm.config import NATIVE_MXFP8_LINEAR_KERNELS
@@ -3573,7 +3576,7 @@ def test_mxfp8_linear_kernel_names_resolve_on_installed_vllm(fp8_module):
         assert isinstance(kernel_type, type)
         kernel = kernel_type.__new__(kernel_type)
         assert fp8_module._is_flashinfer_mxfp8_linear_kernel(kernel, kernel_name)
-    assert "self.kernel" in inspect.getsource(ModelOptMxFp8LinearMethod)
+    assert "self.kernel" in inspect.getsource(ModelOptLinearMethod)
 
 
 def test_mxfp8_auto_linear_backend_keeps_refit_cutlass_default(fp8_module, monkeypatch):
