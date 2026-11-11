@@ -1721,10 +1721,11 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             or master_config.policy["dynamic_batching"]["enabled"]
             or master_config.policy["precision"] not in ("float32", "bfloat16")
             or (draft is not None and draft.enabled)
+            or master_config.loss_fn.positive_example_nll_weight != 0
         ):
             raise ValueError(
                 "SingleController Automodel training requires TP=CP=1, "
-                "fixed microbatches, FP32/BF16, no sequence packing/parallelism or draft"
+                "fixed microbatches, FP32/BF16, no sequence packing/parallelism, draft or positive-example NLL"
             )
 
     async_config = master_config.async_rl

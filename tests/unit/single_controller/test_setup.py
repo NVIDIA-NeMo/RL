@@ -4793,7 +4793,16 @@ def test_captured_omni_automodel_rejects_unsupported_backend_before_allocation(
 
 @pytest.mark.parametrize(
     "unsupported",
-    ["tp", "cp", "sequence_parallel", "packing", "dynamic", "precision", "draft"],
+    [
+        "tp",
+        "cp",
+        "sequence_parallel",
+        "packing",
+        "dynamic",
+        "precision",
+        "draft",
+        "nll",
+    ],
 )
 def test_automodel_split_rejects_unimplemented_modes_before_allocation(unsupported):
     config = _make_master_config()
@@ -4807,6 +4816,8 @@ def test_automodel_split_rejects_unimplemented_modes_before_allocation(unsupport
     config.policy["sequence_packing"] = {"enabled": unsupported == "packing"}
     config.policy["dynamic_batching"] = {"enabled": unsupported == "dynamic"}
     config.policy["precision"] = "float16" if unsupported == "precision" else "bfloat16"
+    if unsupported == "nll":
+        config.loss_fn.positive_example_nll_weight = 0.1
     if unsupported == "draft":
         config.policy["draft"] = Eagle3DraftConfig(
             enabled=True, model_name="test-draft"

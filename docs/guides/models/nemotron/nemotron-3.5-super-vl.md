@@ -149,8 +149,8 @@ in-flight typed-episode turn recovery.
 Automodel split training accumulates gradients across chunks and applies the
 complete batch normalization before one optimizer and scheduler update. This
 path supports FP32/BF16, TP=CP=1 and fixed microbatches. Dynamic batching,
-sequence packing/parallelism, draft co-training and in-loss survivor filtering
-are rejected before GPU allocation.
+sequence packing/parallelism, draft co-training, positive-example NLL and
+in-loss survivor filtering are rejected before GPU allocation.
 
 Captured still images use the native Automodel `NemotronOmni` dynamic-resolution
 forward. The learner restores the packed patches to padded pixels without

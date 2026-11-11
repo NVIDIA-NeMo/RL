@@ -949,10 +949,11 @@ class AutomodelPolicyWorkerImpl(
             or self.draft_runtime is not None
             or self.dtype not in (torch.float32, torch.bfloat16)
             or getattr(loss_fn, "requires_survivor_normalization", False)
+            or getattr(loss_fn, "positive_example_nll_weight", 0) != 0
         ):
             raise NotImplementedError(
                 "Automodel split training requires TP=CP=1, fixed microbatches, "
-                "FP32/BF16, no sequence packing, draft, or in-loss survivor filtering"
+                "FP32/BF16, no sequence packing, draft, positive-example NLL, or in-loss survivor filtering"
             )
         gbs = self.cfg["train_global_batch_size"] if gbs is None else gbs
         mbs = self.cfg["train_micro_batch_size"] if mbs is None else mbs
