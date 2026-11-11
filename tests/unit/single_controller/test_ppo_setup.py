@@ -44,6 +44,7 @@ from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
 from nemo_rl.algorithms.ppo import PPOConfig
+from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -477,23 +478,17 @@ class TestPPOValidation:
             self._warmup_ckpt_config(constant_structure=False)
         )
 
-    @pytest.mark.parametrize(
-        "enable",
-        [
-            lambda cfg: setattr(cfg.reward_shaping, "enabled", True),
-        ],
-        ids=[
-            "reward_shaping",
-        ],
-    )
-    def test_rejects_shaping_the_sc_path_does_not_implement(self, enable):
+    def test_accepts_dapo_reward_shaping_on_a_ppo_run(self) -> None:
+        """SC setup accepts a validated PPO reward-shaping configuration."""
         mc = _ppo_master_config()
-        enable(mc.ppo)
+        mc.ppo.reward_shaping = RewardShapingConfig(
+            enabled=True,
+            overlong_buffer_length=512,
+            overlong_buffer_penalty=1,
+            max_response_length=4096,
+        )
 
-        with pytest.raises(
-            NotImplementedError, match="not supported on the SingleController"
-        ):
-            validate_single_controller_config(mc)
+        validate_single_controller_config(mc)
 
     def test_rejects_length_penalty_until_sc_applies_it(self):
         # The SC path has no length-penalty hook yet; fail at setup rather

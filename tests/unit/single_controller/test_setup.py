@@ -65,6 +65,7 @@ from nemo_rl.algorithms.opd import (
     opd_full_teacher_index_field,
 )
 from nemo_rl.algorithms.ppo import PPOConfig
+from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     bootstrap_compatibility_identity,
     ensure_bootstrap_anchor,
@@ -4120,6 +4121,44 @@ def test_master_config_reports_the_reward_scaling_field_path(
         MasterConfig(**config)
 
     assert error.value.errors()[0]["loc"] == (algorithm, "reward_scaling")
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "recipe"),
+    [
+        ("grpo", "examples/configs/grpo_math_1B_megatron_single_controller.yaml"),
+        ("ppo", "examples/configs/ppo_math_1B_megatron_single_controller.yaml"),
+    ],
+)
+def test_master_config_reports_the_reward_shaping_field_path(
+    algorithm: str, recipe: str
+) -> None:
+    register_omegaconf_resolvers()
+    repo_root = Path(__file__).resolve().parents[3]
+    config = OmegaConf.to_container(load_config(repo_root / recipe), resolve=True)
+    config[algorithm]["reward_shaping"] = {
+        "enabled": True,
+        "overlong_buffer_length": 512,
+        "overlong_buffer_penalty": float("inf"),
+        "max_response_length": 4096,
+    }
+
+    with pytest.raises(ValidationError) as error:
+        MasterConfig(**config)
+
+    assert error.value.errors()[0]["loc"] == (algorithm, "reward_shaping")
+
+
+def test_accepts_dapo_reward_shaping_on_a_grpo_run() -> None:
+    config = _make_master_config()
+    config.grpo.reward_shaping = RewardShapingConfig(
+        enabled=True,
+        overlong_buffer_length=512,
+        overlong_buffer_penalty=1,
+        max_response_length=4096,
+    )
+
+    validate_single_controller_config(config)
 
 
 class _FakeTeacherGroup:
