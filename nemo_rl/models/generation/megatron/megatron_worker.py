@@ -1105,15 +1105,21 @@ class MegatronGenerationMixin:
         staging_partition: str,
         *,
         capture_media: bool = False,
+        stage_media_spans: bool = False,
     ) -> MediaColumnSpec | None:
         """Install canonical TQ capture on each MInf model-parallel leader.
 
         ``capture_media`` builds the sink/source against the media-enabled
         staging schema so the stager can hand the engine's media tensors to
-        TQ beside each call's tokens. Returns the media column spec the
+        TQ beside each call's tokens. ``stage_media_spans`` (media capture
+        only) also stages each call's image placeholder spans, located by the
+        inference wrapper's pre-expanded image token, for the forest
+        finalizer to verify. Returns the media column spec the
         coordinator pinned the staging column to (``None`` for text-only
         capture and on followers, which host no hooks).
         """
+        if stage_media_spans and not capture_media:
+            raise ValueError("stage_media_spans requires capture_media")
         engine = self.dynamic_inference_engine
         if engine is None:
             raise RuntimeError(
@@ -1169,6 +1175,13 @@ class MegatronGenerationMixin:
             )
 
             expected_route_dims = router_replay_dimensions_for_model(self._gen_model())
+        # The token MInf's expanded prompts carry once per image embedding
+        # (what build_preexpanded_media_token_mask matches).
+        media_token_id = (
+            int(self.inference_wrapped_model.get_preexpanded_media_token_id("image"))
+            if stage_media_spans
+            else None
+        )
         stager = TQMegatronTokenStager(
             TQTokenSink(
                 dp_client,
@@ -1178,6 +1191,7 @@ class MegatronGenerationMixin:
             ),
             require_routed_experts=self._router_replay_enabled,
             expected_route_dims=expected_route_dims,
+            media_token_id=media_token_id,
         )
         engine.payload_stager = stager
         self._request_payload_stager = stager

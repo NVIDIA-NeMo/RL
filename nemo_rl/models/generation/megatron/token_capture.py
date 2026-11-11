@@ -35,8 +35,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from nemo_rl.data.captured_media import CapturedMediaItem, token_digest
 from nemo_rl.data_plane.tq_token_sink import (
     ChainPrefixCache,
+    MediaItemSizes,
     StagedMediaTensors,
     TQTokenSink,
     TQTokenSource,
@@ -368,7 +370,9 @@ def slice_media_tensors(
     return sliced
 
 
-def _new_media_tensors(payload: Any, minf_params: Any) -> dict[str, Any] | None:
+def _new_media_tensors(
+    payload: Any, minf_params: Any
+) -> tuple[dict[str, Any] | None, MediaItemSizes, int]:
     """Return the media of one finished MInf payload that is new to this call.
 
     Checks the first ``minf_params["media_prev_count"]`` items of
@@ -383,7 +387,10 @@ def _new_media_tensors(payload: Any, minf_params: Any) -> dict[str, Any] | None:
             wrote, or ``None`` for requests it did not touch.
 
     Returns:
-        The sliced media tensors, or ``None`` when the call adds no media.
+        ``(tensors, item_sizes, prev_count)``: the sliced media tensors
+        (``None`` when the call adds no media), the ``(height, width)`` rows
+        of every media item the engine saw (retained and new, in prompt
+        order), and how many leading items the parent chain already staged.
 
     Raises:
         TypeError: ``minf_params`` is not a dict, ``media_tensors`` is not
@@ -437,7 +444,83 @@ def _new_media_tensors(payload: Any, minf_params: Any) -> dict[str, Any] | None:
                 f"MInf retained media geometry changed: item {index} was "
                 f"staged at {staged}, the engine saw {seen}"
             )
-    return None if validated is None else slice_media_tensors(validated, prev_count)
+    tensors = None if validated is None else slice_media_tensors(validated, prev_count)
+    return tensors, items, prev_count
+
+
+def _media_spans(
+    prompt_token_ids: list[int],
+    item_sizes: MediaItemSizes,
+    *,
+    media_token_id: int,
+    prev_len: int,
+    prev_count: int,
+) -> list[dict[str, Any]]:
+    """Describe where each image new to this call sits in MInf's expanded prompt.
+
+    MInf's ``prompt_token_ids`` carry one ``media_token_id`` per projected
+    embedding, and each image expands to one contiguous run of it, so the
+    ``i``-th maximal run is the ``i``-th media item. Items before
+    ``prev_count`` were staged by earlier calls and must lie inside the first
+    ``prev_len`` tokens; the rest must lie in this call's new prompt tokens.
+    Returns ``CapturedMediaItem.to_dict()`` for each new image (the
+    ``media_spans`` extras the forest finalizer verifies), ``[]`` when the
+    call adds none.
+
+    Raises:
+        ValueError: the run count differs from the media item count, an item
+            straddles ``prev_len``, or a new item is a video (its frames are
+            separated by other tokens, so one run cannot describe it).
+    """
+    runs: list[tuple[int, int]] = []
+    start = None
+    for index, token in enumerate(prompt_token_ids):
+        if token == media_token_id:
+            if start is None:
+                start = index
+        elif start is not None:
+            runs.append((start, index))
+            start = None
+    if start is not None:
+        runs.append((start, len(prompt_token_ids)))
+    if len(runs) != len(item_sizes):
+        raise ValueError(
+            f"MInf prompt has {len(runs)} media token runs (token id "
+            f"{media_token_id}) for {len(item_sizes)} media items; cannot "
+            "locate media spans"
+        )
+    spans = []
+    for index, ((start, end), sizes) in enumerate(zip(runs, item_sizes)):
+        if index < prev_count:
+            if end > prev_len:
+                raise ValueError(
+                    f"MInf retained media item {index} spans tokens [{start}, "
+                    f"{end}) past the parent chain's {prev_len} tokens"
+                )
+            continue
+        if start < prev_len:
+            raise ValueError(
+                f"MInf new media item {index} spans tokens [{start}, {end}) "
+                f"before this call's new prompt at {prev_len}"
+            )
+        if len(sizes) != 1:
+            raise ValueError(
+                "MInf media spans support still images only; media item "
+                f"{index} has {len(sizes)} frames"
+            )
+        length = end - start
+        spans.append(
+            CapturedMediaItem(
+                modality="image",
+                placeholder_offset=start,
+                placeholder_length=length,
+                placeholder_digest=token_digest(prompt_token_ids[start:end]),
+                token_id=media_token_id,
+                embedding_spans=((start, length),),
+                imgs_sizes=(tuple(sizes[0]),),
+            ).to_dict()
+        )
+    return spans
 
 
 class TQMegatronTokenStager:
@@ -455,6 +538,7 @@ class TQMegatronTokenStager:
         *,
         require_routed_experts: bool = False,
         expected_route_dims: tuple[int, int] | None = None,
+        media_token_id: int | None = None,
     ) -> None:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.megatron import (
@@ -473,6 +557,9 @@ class TQMegatronTokenStager:
         )
         self._require_routed_experts = require_routed_experts
         self._expected_route_dims = expected_route_dims
+        # The engine's pre-expanded image token; set when the finalizer verifies
+        # per-call media spans (forest training), which every call then stages.
+        self._media_token_id = media_token_id
         # MInf hands over float32 pixels; the sink's column is pinned to the
         # vision encoder's weight dtype (the trainer casts pixels to it before
         # encoding anyway), so cast once here and stage half the bytes.
@@ -620,7 +707,28 @@ class TQMegatronTokenStager:
             )
             extras = {"routed_experts": encode_routed_experts(routed_experts)}
         try:
-            media = _new_media_tensors(payload, minf_params)
+            media, item_sizes, prev_count = _new_media_tensors(payload, minf_params)
+            if self._media_token_id is not None:
+                # Deferred: nemo_gym is an optional extra absent in non-gym runs.
+                from nemo_gym.token_id_capture.adapters.vllm import MEDIA_SPANS_FIELD
+
+                if media is not None and "num_frames" in media:
+                    raise ValueError(
+                        "MInf media spans support still images only; this call "
+                        "adds video"
+                    )
+                # Written on every call, empty when it adds no media: the
+                # finalizer requires the field whenever it verifies spans.
+                extras = {
+                    **(extras or {}),
+                    MEDIA_SPANS_FIELD: _media_spans(
+                        prompt_token_ids,
+                        item_sizes,
+                        media_token_id=self._media_token_id,
+                        prev_len=call.admission.prev_len,
+                        prev_count=prev_count,
+                    ),
+                }
         except (TypeError, ValueError, RuntimeError) as error:
             coords = self._capture.fail_call(
                 call, reason=f"{type(error).__name__}: {error}"

@@ -745,6 +745,7 @@ class VllmGeneration(GenerationInterface):
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
+        stage_media_spans: bool = False,
     ) -> "Optional[MediaColumnSpec]":
         """Install ledger-authoritative token capture in every DP-leader worker.
 
@@ -754,7 +755,10 @@ class VllmGeneration(GenerationInterface):
         leaders pinned (``None`` for text-only capture). The arguments are kept
         so ``restart_shard`` can install the same capture in a replacement.
         ``top_logprobs`` > 0 also stages sampler top-k log-probs.
+        vLLM stages media spans on every media call regardless of
+        ``stage_media_spans``.
         """
+        del stage_media_spans  # Always on for vLLM.
         assert self.cfg["vllm_cfg"]["async_engine"], (
             "token capture requires the async vLLM engine (the capture host "
             "is the worker's in-process HTTP server)"

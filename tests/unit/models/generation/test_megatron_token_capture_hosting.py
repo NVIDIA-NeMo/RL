@@ -80,6 +80,7 @@ def test_generation_setup_token_capture_fans_tq_config_to_workers(monkeypatch):
                 "dp_cfg": dp_cfg,
                 "staging_partition": "rollout_staging",
                 "capture_media": False,
+                "stage_media_spans": False,
             },
         )
     ]
@@ -165,10 +166,13 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
             self.source = source
 
     class _Stager:
-        def __init__(self, sink, *, require_routed_experts, expected_route_dims):
+        def __init__(
+            self, sink, *, require_routed_experts, expected_route_dims, media_token_id
+        ):
             self.sink = sink
             self.require_routed_experts = require_routed_experts
             self.expected_route_dims = expected_route_dims
+            self.media_token_id = media_token_id
 
     monkeypatch.setattr(
         "nemo_rl.data_plane.build_data_plane_client", lambda *_a, **_k: "dp"
@@ -232,6 +236,8 @@ def test_worker_installs_prompt_preparer_and_stager_only_on_mp_coordinator(
     assert worker._request_payload_stager.expected_route_dims == (
         (4, 2) if router_replay_enabled else None
     )
+    # Media spans are off unless forest training asks for them.
+    assert worker._request_payload_stager.media_token_id is None
 
     worker.set_rollout_weight_version(7)
     # The client's ZMQ socket is not thread safe and its listener task runs on
@@ -352,6 +358,52 @@ def test_worker_media_capture_requires_image_preprocessing(
         if capture_media
         else None
     )
+
+
+@pytest.mark.parametrize("stage_media_spans", [True, False])
+def test_worker_stages_media_spans_with_the_wrappers_preexpanded_image_token(
+    monkeypatch, stage_media_spans
+) -> None:
+    """Forest training verifies per-call media spans, which the stager locates
+    by the token MInf's expanded prompts carry once per image embedding."""
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.build_data_plane_client", lambda *_a, **_k: "dp"
+    )
+    monkeypatch.setattr(
+        "nemo_rl.data_plane.tq_token_sink.TQTokenSink",
+        lambda *_a, media_pixel_dtype, **_k: SimpleNamespace(
+            media_pixel_dtype=media_pixel_dtype
+        ),
+    )
+    worker = _capture_ready_worker()
+    worker._image_preprocessing_config = SimpleNamespace(patch_dim=16)
+    worker._inference_model_and_media_parts = lambda: (
+        "lm",
+        _omni_model(torch.float16),
+    )
+    modalities = []
+
+    def _token_id(modality):
+        modalities.append(modality)
+        return 131072
+
+    worker.inference_wrapped_model = SimpleNamespace(
+        get_preexpanded_media_token_id=_token_id
+    )
+
+    worker.setup_token_capture(
+        {}, "rollout_staging", capture_media=True, stage_media_spans=stage_media_spans
+    )
+    stager = worker._request_payload_stager
+    assert stager._media_token_id == (131072 if stage_media_spans else None)
+    assert modalities == (["image"] if stage_media_spans else [])
+
+
+def test_worker_media_spans_require_media_capture() -> None:
+    worker = _capture_ready_worker()
+    with pytest.raises(ValueError, match="stage_media_spans requires capture_media"):
+        worker.setup_token_capture({}, "rollout_staging", stage_media_spans=True)
+    assert worker.dynamic_inference_engine.payload_stager is None
 
 
 def test_worker_media_capture_requires_vision_encoder_on_coordinator(

@@ -1420,13 +1420,16 @@ def test_finalize_rollout_media(tq_client, media_partitions, case, pixel_dtype):
     assert row.media["num_frames"].as_tensor().tolist() == [1] * len(bundles)
 
 
+@pytest.mark.parametrize("forest_training", [False, True])
 def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
-    tq_client, media_partitions
+    tq_client, media_partitions, forest_training
 ):
     """Stager -> preparer -> stager -> finalizer with real media: each call
     stages only the images new to it, and the finalized row carries the
     engine's pixels once each, in prompt order. Images differ in size so a
-    fixed per-image cut in the slicer would also fail."""
+    fixed per-image cut in the slicer would also fail. Forest training also
+    verifies each call's media spans, which the stager locates by the
+    pre-expanded image token (99 here)."""
     # Deferred import: megatron-core is a heavy, optional dependency.
     from megatron.core.inference.inference_request import (
         PREFIX_EOS_TOKEN_ID_FIELD,
@@ -1451,7 +1454,7 @@ def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
         capture_media=True,
         media_pixel_dtype=torch.float32,
     )
-    stager = TQMegatronTokenStager(sink)
+    stager = TQMegatronTokenStager(sink, media_token_id=99 if forest_training else None)
     preparer = TQMegatronPromptPreparer(
         TQTokenSource(
             tq_client, staging_partition=MEDIA_STAGING_PARTITION, capture_media=True
@@ -1525,7 +1528,7 @@ def test_megatron_capture_two_turn_media_finalizes_to_the_engine_pixels(
         terminal_selection="declared",
     )
     row = _media_finalizer(tq_client).finalize_rollout(
-        rollout_id, receipt.model_dump(), reward=1.0
+        rollout_id, receipt.model_dump(), reward=1.0, forest_training=forest_training
     )
 
     assert row.valid, row.rejection_reason

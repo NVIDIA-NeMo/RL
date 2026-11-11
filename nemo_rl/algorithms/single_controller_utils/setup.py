@@ -2287,6 +2287,8 @@ def setup_single_controller(
             generation_prefix_cuts_enabled=generation_prefix_cuts_enabled,
             generation_cut_control_token=token_capture_cfg.control_auth_token,
             generation_cut_control_timeout_s=token_capture_cfg.control_timeout_s,
+            # Only the forest finalizer verifies per-call media spans.
+            stage_media_spans=capture_media and token_capture_cfg.forest_training,
         )
         if capture_media and media_columns is None:
             raise RuntimeError(

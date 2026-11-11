@@ -49,7 +49,8 @@ class MediaCaptureRejected(ValueError):
         self.code = code
 
 
-def _token_digest(tokens: list[int]) -> str:
+def token_digest(tokens: list[int]) -> str:
+    """Digest of a placeholder's exact token ids, as ``placeholder_digest`` stores it."""
     return hashlib.sha256(
         json.dumps(tokens, separators=(",", ":")).encode()
     ).hexdigest()
@@ -121,7 +122,7 @@ class CapturedMediaItem:
         if (
             start < 0
             or end > len(tokens)
-            or _token_digest(tokens[start:end]) != self.placeholder_digest
+            or token_digest(tokens[start:end]) != self.placeholder_digest
         ):
             raise MediaCaptureRejected(
                 "Media placeholder does not match the exact carried prompt"
@@ -455,7 +456,7 @@ def capture_processed_media(
             modality,
             offset,
             span.length,
-            _token_digest(local_tokens),
+            token_digest(local_tokens),
             token_id,
             tuple(runs),
             tuple(tuple(size) for size in sizes.tolist()),

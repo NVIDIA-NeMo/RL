@@ -708,6 +708,7 @@ class GenerationInterface(ABC):
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
+        stage_media_spans: bool = False,
     ) -> "Optional[MediaColumnSpec]":
         """Install token capture in the serving workers (``token_capture.enabled``).
 
@@ -729,6 +730,9 @@ class GenerationInterface(ABC):
                 coordinator to authorize generation-cut requests.
             generation_cut_control_timeout_s: Bound on one generation-cut
                 request; calls not cut by then are acknowledged as failures.
+            stage_media_spans: With ``capture_media``, also stage each call's
+                media placeholder spans (``media_spans`` extras), which the
+                forest finalizer verifies on every call.
 
         Returns:
             With ``capture_media``, the pixel dtype and patch size the workers

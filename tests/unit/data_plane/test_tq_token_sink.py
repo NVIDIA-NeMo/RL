@@ -73,6 +73,7 @@ from nemo_rl.models.generation.megatron.token_capture import (  # noqa: E402
     TQMegatronPromptPreparer,
     TQMegatronTokenStager,
     _delta_align_minf_routing_indices,
+    _media_spans,
     _new_media_tensors,
     slice_media_tensors,
 )
@@ -1859,6 +1860,156 @@ def test_megatron_stager_poisons_malformed_payloads_with_capture_failed(
         TQTokenSource(tq_client, staging_partition=staging_partition).fetch(
             ["minf-r0/c1"]
         )
+
+
+def test_media_spans_describe_only_the_images_new_to_the_call():
+    """Media token 9 marks one embedding each; image 0 was staged by the parent
+    (prev_len 6), so only images 1 and 2 are described, at their absolute
+    offsets in the expanded prompt."""
+    from nemo_rl.data.captured_media import CapturedMediaItem, token_digest
+
+    prompt = [1, 9, 9, 9, 2, 3, 4, 9, 9, 5, 9, 6]
+    spans = _media_spans(
+        prompt,
+        (((4, 4),), ((2, 4),), ((2, 2),)),
+        media_token_id=9,
+        prev_len=6,
+        prev_count=1,
+    )
+
+    assert spans == [
+        CapturedMediaItem(
+            modality="image",
+            placeholder_offset=7,
+            placeholder_length=2,
+            placeholder_digest=token_digest([9, 9]),
+            token_id=9,
+            embedding_spans=((7, 2),),
+            imgs_sizes=((2, 4),),
+        ).to_dict(),
+        CapturedMediaItem(
+            modality="image",
+            placeholder_offset=10,
+            placeholder_length=1,
+            placeholder_digest=token_digest([9]),
+            token_id=9,
+            embedding_spans=((10, 1),),
+            imgs_sizes=((2, 2),),
+        ).to_dict(),
+    ]
+    # Round-trips through the finalizer's parser and its token check.
+    for value in spans:
+        CapturedMediaItem.from_dict(value).verify_tokens(prompt[6:], origin=6)
+
+
+@pytest.mark.parametrize(
+    ("prompt", "item_sizes", "prev_len", "prev_count", "expected"),
+    [
+        pytest.param([1, 2, 3], (), 0, 0, [], id="text-only"),
+        pytest.param([1, 9, 9, 2, 3], (((4, 4),),), 4, 1, [], id="all-retained"),
+    ],
+)
+def test_media_spans_are_empty_when_the_call_adds_no_media(
+    prompt, item_sizes, prev_len, prev_count, expected
+):
+    assert (
+        _media_spans(
+            prompt,
+            item_sizes,
+            media_token_id=9,
+            prev_len=prev_len,
+            prev_count=prev_count,
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("prompt", "item_sizes", "prev_len", "prev_count", "match"),
+    [
+        # Two adjacent images merge into one run: the layout is ambiguous.
+        pytest.param(
+            [1, 9, 9, 9, 2],
+            (((4, 4),), ((2, 4),)),
+            0,
+            0,
+            "1 media token runs .* for 2 media items",
+            id="run-count-mismatch",
+        ),
+        pytest.param(
+            [1, 9, 9, 9, 2],
+            (((4, 4),),),
+            2,
+            1,
+            "retained media item 0 spans tokens \\[1, 4\\) past",
+            id="retained-crosses-prev-len",
+        ),
+        pytest.param(
+            [1, 9, 9, 9, 2],
+            (((4, 4),),),
+            2,
+            0,
+            "new media item 0 spans tokens \\[1, 4\\) before",
+            id="new-crosses-prev-len",
+        ),
+        pytest.param(
+            [1, 9, 9, 9, 2],
+            (((4, 4), (4, 4)),),
+            0,
+            0,
+            "still images only; media item 0 has 2 frames",
+            id="video",
+        ),
+    ],
+)
+def test_media_spans_reject_layouts_they_cannot_describe(
+    prompt, item_sizes, prev_len, prev_count, match
+):
+    with pytest.raises(ValueError, match=match):
+        _media_spans(
+            prompt,
+            item_sizes,
+            media_token_id=9,
+            prev_len=prev_len,
+            prev_count=prev_count,
+        )
+
+
+@pytest.mark.parametrize("video", [False, True])
+def test_megatron_stager_stages_media_spans_or_fails_video(
+    tq_client, media_partition, video
+):
+    """With a media token id the stager writes ``media_spans`` extras the
+    forest finalizer verifies; a video (even one frame, which a frame flag
+    marks) cannot be described by one run and fails the call."""
+    media = _minf_media_tensors()
+    if video:
+        media["num_frames"] = torch.tensor([1], dtype=torch.int32)
+    stager = TQMegatronTokenStager(
+        _megatron_sink(tq_client, media_partition, media=True), media_token_id=99
+    )
+    admission = nemo_gym.CaptureAdmission(
+        capture_key="minf-r0", model_call_id="c1", mode="text"
+    )
+    result = stager.stage(
+        "minf-response-1",
+        _minf_payload(multimodal=True, media_tensors=media),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        offload_params={"ng_capture": admission.model_dump(mode="json")},
+    )
+    coords = result.response_metadata["ng_commit_coords"]
+    if video:
+        assert coords["disposition"] == "capture_failed"
+        return
+    assert coords["disposition"] == "staged"
+    (call,) = TQTokenSource(
+        tq_client, staging_partition=media_partition, capture_media=True
+    ).fetch_for_finalization([coords["staging_key"]])
+    from nemo_rl.data.captured_media import verified_media_items
+
+    (item,) = verified_media_items(call)
+    assert (item.placeholder_offset, item.placeholder_length) == (1, 3)
+    assert item.imgs_sizes == ((4, 4),)
 
 
 @pytest.mark.parametrize(

@@ -652,6 +652,7 @@ class MegatronGeneration(GenerationInterface):
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
+        stage_media_spans: bool = False,
     ) -> "Optional[MediaColumnSpec]":
         """Install MInf's canonical prompt and completion capture hooks.
 
@@ -676,6 +677,7 @@ class MegatronGeneration(GenerationInterface):
             dp_cfg=dp_cfg,
             staging_partition=staging_partition,
             capture_media=capture_media,
+            stage_media_spans=stage_media_spans,
         )
         return agreed_media_columns(ray.get(futures))
 
