@@ -333,6 +333,7 @@ Completed groups are restored directly from the TQ snapshot. For unfinished
 token-capture groups, `rollout_recovery.target_level` selects the requested
 restart boundary:
 
+- `prefix` also keeps the tokens each active model call has decoded, and resumes the call from them.
 - `turn` requests coordinated Gym participant recovery from the last saved turn.
 - `sibling` preserves each sealed sibling and redispatches only unfinished ones.
 - `prompt_group` retries every sibling in the group when any sibling is unfinished.
@@ -357,8 +358,8 @@ leaves them out of the commit, does not wait for them, and records them in
 their tasks. If any other candidate is neither exported by Gym nor drained before
 the deadline, the checkpoint aborts and every deployment is resumed.
 
-Because a restart-only server would make turn-level recovery quietly restart its
-rollouts, SC reads every Gym participant's checkpoint `mode` from discovery
+Because a restart-only server would make turn- or prefix-level recovery quietly
+restart its rollouts, SC reads every Gym participant's checkpoint `mode` from discovery
 before the first rollout. If any server's mode is `restart_only` (the default for
 agents and resources servers), setup fails and names it, unless
 `rollout_recovery.allow_restart_only_gym_servers` is true, which accepts it with
@@ -412,8 +413,22 @@ another crash does not lose the saved turn boundary.
 
 If no rollout snapshot follows the newest trainer checkpoint, SC restores that
 checkpoint on its own: completed groups come back from TQ and unfinished
-turn-level rollouts restart from their tasks. A rollout snapshot without its
+turn- and prefix-level rollouts restart from their tasks. A rollout snapshot without its
 `gym_checkpoint.json` is refused.
+
+The `prefix` target needs everything the `turn` target needs (listed below),
+and does not yet support multimodal capture, router replay, or
+`policy.generation.top_logprobs > 0`. Each cut must finish within
+`token_capture.control_timeout_s`; a call that is not cut in time restarts from
+its last saved turn. Some calls are never cut and also restart from their last
+saved turn:
+
+- Calls using stop strings, multi-token `bad_words`, or a per-request `seed`
+  while sampling, because a resumed call could not apply them to the tokens it
+  already decoded.
+- Calls with structured output (a non-text `response_format`, `guided_*` or
+  `structured_outputs`) or a `tool_choice` other than `auto` or `none`, which
+  NeMo Gym leaves uncut.
 
 The `turn` target currently requires vLLM generation, NeMo Gym, token capture,
 periodic rollout snapshots, `restore_mode: latest`, and the same named Gym
@@ -433,7 +448,7 @@ YAML: a command-line override cannot express a key that contains `:`, such as
 `weather:train`. The agent map also keeps datasets collated
 before Gym recorded `task_source` working, although re-collating them is
 recommended. Overrides may only select a coarser level than the global target,
-and are not supported with `turn` yet: a checkpointing Gym deployment exports
+and are not supported with `turn` or `prefix` yet: a checkpointing Gym deployment exports
 every live episode, so a coarser route on it would fall outside the commit
 scope. Until Gym advertises group-scoring capabilities, configure group-scored routes
 such as GenRM explicitly as `prompt_group`. Non-default policies require
@@ -696,7 +711,7 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See
   [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
-- Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). Managed Dynamo (`backend: dynamo`) is supported on the native rollout path; see [Managed Dynamo generation](dynamo-generation.md#run-under-the-singlecontroller). SGLang and TRT-LLM have not been tested on SC.
+- Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). vLLM generation can also serve through Dynamo (`policy.generation.dynamo: true`); see [Dynamo serving](dynamo-generation.md). SGLang and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, but each critic epoch must contain exactly `value.train_global_batch_size` samples in either value-training mode, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
 - Reward shaping and sample filtering — setup rejects what is unimplemented rather than silently skipping it.
@@ -706,7 +721,7 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   - `reward_shaping` — not implemented on either algorithm block; setup rejects it.
   - `use_dynamic_sampling` — supported for GRPO under the constraints in [Dynamic sampling](#dynamic-sampling).
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
-- The drain gate in refit is not yet supported. Managed Dynamo pauses its engines before every refit because its weight update is unsafe while requests run, but that is not the drain gate: running requests finish on the old weights, while queued requests and later turns of a multi-turn rollout run on the new ones.
+- The drain gate in refit is not yet supported.
 
 ### Full training-data dumps
 

@@ -738,7 +738,9 @@ class TaskSourceRecoveryGranularity:
 class RolloutRecoveryConfig(BaseModel, extra="allow"):
     """Retry and restore policy for unfinished token-capture prompt groups.
 
-    ``turn`` requests Gym participant recovery, ``sibling`` preserves completed
+    ``prefix`` restores Gym participant state and decoded tokens from an active
+    model call, ``turn`` requests Gym participant recovery and restarts an active
+    call from its preceding durable turn, ``sibling`` preserves completed
     generations and restarts unfinished siblings, and ``prompt_group`` restarts
     every sibling in an unfinished group. Overrides may only make a particular
     taskset, task source, or agent coarser than the global target.
@@ -757,9 +759,9 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     )
     # Seconds Gym gets to park its in-flight steps; see the exemplar YAML.
     gym_prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
-    # With target_level='turn', a Gym server whose checkpoint mode is
-    # restart_only (the default for agents and resources servers) starts every
-    # in-flight rollout over after a crash. False fails setup and names such
+    # With target_level='turn' or 'prefix', a Gym server whose checkpoint mode
+    # is restart_only (the default for agents and resources servers) starts
+    # every in-flight rollout over after a crash. False fails setup and names such
     # servers; true accepts them with a warning.
     allow_restart_only_gym_servers: bool = False
 
@@ -768,11 +770,11 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         """Reject the restart-only opt-in where Gym does not checkpoint rollouts."""
         if (
             self.allow_restart_only_gym_servers
-            and self.target_level is not RecoveryTargetLevel.TURN
+            and not self.target_level.requires_environment_checkpoint
         ):
             raise ValueError(
                 "rollout_recovery.allow_restart_only_gym_servers applies only to "
-                "target_level='turn'; with "
+                "target_level='turn' or 'prefix'; with "
                 f"target_level={self.target_level.value!r} every unfinished "
                 "rollout already starts over"
             )
@@ -798,19 +800,25 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
                     f"{mapping_name} may only force a coarser recovery level than "
                     f"target_level={self.target_level.value!r}; invalid={finer!r}"
                 )
-            if self.target_level is RecoveryTargetLevel.TURN and overrides:
+            if self.target_level.requires_environment_checkpoint and overrides:
                 # A checkpointing Gym deployment exports every live episode, so
                 # a coarser route on it would fall outside the commit scope.
                 raise ValueError(
-                    f"{mapping_name} is not supported with target_level='turn' "
-                    f"yet; got {sorted(overrides)!r}"
+                    f"{mapping_name} is not supported with "
+                    f"target_level={self.target_level.value!r} yet; "
+                    f"got {sorted(overrides)!r}"
                 )
         return self
 
     @property
     def turn_checkpointing_enabled(self) -> bool:
         """Whether Gym participant state is required for the requested target."""
-        return self.target_level is RecoveryTargetLevel.TURN
+        return self.target_level.requires_environment_checkpoint
+
+    @property
+    def generation_prefix_cuts_enabled(self) -> bool:
+        """Whether active model calls participate in Gym's checkpoint cut."""
+        return self.target_level.preserves_generation_prefix
 
     def resolve_for_prompt(
         self, prompt: Mapping[str, Any]
@@ -1931,6 +1939,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 f"token_capture.control_timeout_s ({gym_park_s}); a turn snapshot "
                 "can hold rollout dispatch that long."
             )
+    if recovery_config.generation_prefix_cuts_enabled and top_logprobs > 0:
+        # Sampler top-k is staged from a call's final response only, so a
+        # restored generation prefix would have no candidates for its tokens.
+        raise ValueError(
+            "rollout_recovery.target_level='prefix' does not support "
+            "policy.generation.top_logprobs > 0 (loss_fn.score_centering) yet"
+        )
     if token_capture_config.defer_routed_experts_to_policy and not (
         token_capture_config.enabled
     ):
