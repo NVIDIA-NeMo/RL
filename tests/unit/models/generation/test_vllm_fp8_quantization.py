@@ -2769,7 +2769,11 @@ def test_deepseek_v4_two_refits_preserve_kernel_fp32_scale_references(
     # config (intermediate_size_per_partition / tp_size / hidden_dim); sizes
     # divisible by the [2, 2] block keep the checkpoint block shape.
     layer.moe_config = types.SimpleNamespace(
-        has_bias=False, intermediate_size_per_partition=4, tp_size=1, hidden_dim=4
+        has_bias=False,
+        intermediate_size_per_partition=4,
+        tp_size=1,
+        hidden_dim=4,
+        moe_backend="auto",
     )
     layer.quant_method = method = vllm_fp8.Fp8MoEMethod(
         vllm_fp8.Fp8Config(is_checkpoint_fp8_serialized=True, weight_block_size=[2, 2]),
