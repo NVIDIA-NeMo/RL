@@ -149,14 +149,6 @@ def test_forest_options_require_forest_training(option):
         TokenCaptureConfig(**option)
 
 
-def test_forest_pad_source_requires_step_padding():
-    assert TokenCaptureConfig(
-        forest_training=True, forest_padding_scope="step", forest_pad_source="cyclic"
-    )
-    with pytest.raises(ValueError, match="forest_padding_scope=step"):
-        TokenCaptureConfig(forest_training=True, forest_pad_source="cyclic")
-
-
 def _controller(
     meta, data, *, grpo=None, loss=None, policy_logprobs_required: bool = False
 ):
@@ -389,6 +381,87 @@ def test_deduplicates_unequal_segments_without_pooling_identical_prompts_across_
     assert reward_partial.weighted_total == 2
     assert reward_partial.weight == 4
     assert data["advantages"].count_nonzero() == 0
+
+
+@pytest.mark.parametrize("reorder", [False, True])
+@pytest.mark.parametrize("mask_owner", [False, True])
+@pytest.mark.parametrize("actor_count", [0, 2])
+def test_forest_reward_scaling_before_owner_baseline(
+    reorder: bool, mask_owner: bool, actor_count: int
+) -> None:
+    meta, data = _batch(
+        [
+            ("a", [(-1.0, 3), (0.5, 1), (4.0, 2)]),
+            ("b", [(-1.0, 1), (0.5, 2), (4.0, 1)]),
+        ],
+        padding=True,
+    )
+    if mask_owner:
+        data["mask_sample"][0] = True
+    order = [0, 1, 2, 3, 4, 5, 10, 6, 7, 8, 9]
+    if reorder:
+        order.reverse()
+    meta, data = meta.subset(order), data[order]
+    raw_rewards = data["total_reward"].clone()
+    ctrl = _controller(
+        meta,
+        data,
+        grpo={
+            "reward_scaling": {
+                "enabled": True,
+                "source_min": 0.0,
+                "source_max": 2.0,
+                "target_min": -1.0,
+                "target_max": 1.0,
+            }
+        },
+    )
+    validate_forest_objective(ctrl._algo_cfg, ctrl._master_config.loss_fn)
+    store = _RowStore(
+        {
+            sid: {name: data[name][i].clone() for name in data.keys()}
+            for i, sid in enumerate(meta.sample_ids)
+        }
+    )
+    computer = AdvantageComputer(
+        store,
+        config=ctrl._advantage_stage_config,
+        advantage_estimator=ctrl._advantage_estimator,
+    )
+    ctrl._advantage_computer = computer
+    ctrl._advantage_actors = [_InlineActor(computer) for _ in range(actor_count)]
+    ctrl._available_advantage_actors = asyncio.Queue()
+    for actor in ctrl._advantage_actors:
+        ctrl._available_advantage_actors.put_nowait(actor)
+    scaled = torch.tensor([-1.0, -0.5, 1.0])
+    for _ in range(2):
+        ctrl._step_log_dict.clear()
+        _, valid = asyncio.run(ctrl._advantage_stage(meta))
+        assert valid
+        output = store.get_samples(
+            sample_ids=meta.sample_ids,
+            select_fields=["advantages", "total_reward", "sample_mask"],
+        )
+        torch.testing.assert_close(output["total_reward"], raw_rewards)
+        for row, tag in enumerate(meta.tags):
+            filtered = mask_owner and tag["dispatch_group_id"] == "a"
+            slot = tag["logical_slot"]
+            keep = slot is not None and not (filtered and slot == 0)
+            baseline = scaled[1:].mean() if filtered else scaled.mean()
+            expected = float(scaled[slot] - baseline) if keep else 0.0
+            torch.testing.assert_close(
+                output["advantages"][row], torch.full((3,), expected)
+            )
+            assert output["sample_mask"][row].item() == float(keep)
+        partials = ctrl._step_log_dict["reward_partials"]
+        assert sum(p.weight for p in partials) == (5 if mask_owner else 6)
+        assert sum(p.weighted_total for p in partials) == pytest.approx(
+            0.0 if mask_owner else -1.0
+        )
+    if actor_count:
+        assert sorted(
+            size for actor in ctrl._advantage_actors for size in actor.calls
+        ) == [4, 4, 7, 7]
 
 
 @pytest.mark.parametrize("padding", [False, True])
@@ -794,7 +867,6 @@ def test_rejects_incomplete_or_inconsistent_inputs_before_writing(bad_case):
     [
         ({"adv_estimator": {"name": "gdpo"}}, {}),
         ({"use_dynamic_sampling": True}, {}),
-        ({"reward_scaling": {"enabled": True}}, {}),
         ({"reward_shaping": {"enabled": True}}, {}),
         ({"calculate_advantages_on_gpu": True}, {}),
         ({"invalid_tool_call_advantage": -5.0}, {}),
@@ -887,32 +959,25 @@ def test_forest_ppo_runs_gae_per_row_and_masks_whole_owner(reorder: bool) -> Non
     assert ctrl._step_log_dict["reward_partials"][0].weight == 2
 
 
-def test_forest_ppo_normalize_over_all_rows_excludes_execution_padding() -> None:
+def test_forest_ppo_whitening_excludes_masked_rows_and_execution_padding() -> None:
     meta, data = _batch([("a", [(0.0, 2), (1.0, 1)])], padding=True)
     data = _with_values(data, seed=1)
-    data["mask_sample"][2] = True  # slot 1 trains nothing but still whitens.
+    data["mask_sample"][2] = True
     # Live padding tokens and a huge reward would dominate any statistic.
     data["token_mask"][-1] = torch.tensor([0.0, 1.0, 1.0])
     inputs = data.clone()
-    results = {}
-    for normalize_over in ("kept_rows", "all_rows"):
-        data = inputs.clone()
-        ctrl = _ppo_controller(meta, data, normalize_over=normalize_over)
-        asyncio.run(ctrl._advantage_stage(meta))
-        results[normalize_over] = data["advantages"].clone()
+    ctrl = _ppo_controller(meta, data)
+    asyncio.run(ctrl._advantage_stage(meta))
     keep = torch.tensor([1.0, 1.0, 0.0, 0.0])
-    real = torch.tensor([1.0, 1.0, 1.0, 0.0]).unsqueeze(-1)
     estimator = ctrl._advantage_estimator
     expected, _ = estimator.compute_advantage(
         prompt_ids=None,
         rewards=inputs["total_reward"].float(),
-        mask=inputs["token_mask"] * real,
+        mask=inputs["token_mask"] * keep.unsqueeze(-1),
         values=inputs["values"],
     )
-    expected = expected * inputs["token_mask"] * keep.unsqueeze(-1)
-    torch.testing.assert_close(results["all_rows"], expected)
-    assert not torch.allclose(results["all_rows"], results["kept_rows"])
-    assert results["all_rows"][2:].count_nonzero() == 0
+    torch.testing.assert_close(data["advantages"], expected)
+    assert data["advantages"][2:].count_nonzero() == 0
 
 
 def test_ppo_keeps_gae_advantages_for_weighted_rows() -> None:
@@ -950,30 +1015,7 @@ def test_ppo_keeps_gae_advantages_for_weighted_rows() -> None:
     torch.testing.assert_close(data["returns"], returns)
 
 
-def test_gae_whitening_padding_requires_all_rows() -> None:
-    assert GAEConfig(normalize_over="all_rows", whiten_execution_padding=True)
-    with pytest.raises(ValueError, match="normalize_over=all_rows"):
-        GAEConfig(whiten_execution_padding=True)
-
-
-def test_gae_all_rows_requires_whitening() -> None:
-    with pytest.raises(ValueError, match="normalize_advantages=true"):
-        GAEConfig(normalize_over="all_rows", normalize_advantages=False)
-
-
-@pytest.mark.parametrize("whiten_padding", [False, True])
-def test_raw_reward_rejects_gae_population_options(whiten_padding) -> None:
-    with pytest.raises(ValueError, match="require name=gae"):
-        GAEConfig(
-            name="raw_reward",
-            normalize_over="all_rows",
-            whiten_execution_padding=whiten_padding,
-        )
-    assert GAEConfig(name="raw_reward")
-    assert GAEConfig(normalize_over="all_rows", whiten_execution_padding=whiten_padding)
-
-
-def _step_padded(source: str, multiple: int = 4):
+def _step_padded(multiple: int = 4):
     """Five real rows in two groups, padded once for the whole batch."""
     meta, data = _batch([("a", [(0.0, 2), (1.0, 1)]), ("b", [(2.0, 1), (3.0, 1)])])
     data = _with_values(data, seed=2)
@@ -994,16 +1036,16 @@ def _step_padded(source: str, multiple: int = 4):
     ctrl._forest_step_row_multiple = multiple
     ctrl._master_config = SimpleNamespace(
         token_capture=TokenCaptureConfig(
-            forest_training=True, forest_padding_scope="step", forest_pad_source=source
+            forest_training=True, forest_padding_scope="step"
         )
     )
     padded, pad_meta = asyncio.run(ctrl._pad_forest_step_rows(meta))
     return meta, padded, pad_meta, store
 
 
-@pytest.mark.parametrize("source,copied", [("row0", [0, 0, 0]), ("cyclic", [0, 1, 2])])
-def test_forest_step_padding_copies_rows_once_per_batch(source, copied) -> None:
-    meta, padded, pad_meta, store = _step_padded(source)
+def test_forest_step_padding_copies_rows_once_per_batch() -> None:
+    meta, padded, pad_meta, store = _step_padded()
+    copied = [0, 0, 0]
     assert padded.size == 8 and pad_meta.size == 3
     assert padded.sample_ids == meta.sample_ids + pad_meta.sample_ids
     for pad_id, row in zip(pad_meta.sample_ids, copied, strict=True):
@@ -1016,31 +1058,22 @@ def test_forest_step_padding_copies_rows_once_per_batch(source, copied) -> None:
         assert tag["dispatch_group_id"] == meta.tags[row]["dispatch_group_id"]
         assert tag["logical_rollout_id"] is None and tag["segment_count"] == 0
     # A batch already at the multiple is left alone.
-    _, unpadded, none, _ = _step_padded(source, multiple=5)
+    _, unpadded, none, _ = _step_padded(multiple=5)
     assert none is None and unpadded.size == 5
 
 
-@pytest.mark.parametrize("whiten_padding", [False, True])
-def test_forest_step_padding_whitening_counts_padding_copies(whiten_padding) -> None:
-    _, padded, _, store = _step_padded("row0")
+def test_forest_step_padding_whitening_excludes_padding_copies() -> None:
+    _, padded, _, store = _step_padded()
     data = store.get_samples(sample_ids=padded.sample_ids, select_fields=padded.fields)
     inputs = data.clone()
-    ctrl = _ppo_controller(
-        padded,
-        data,
-        normalize_over="all_rows",
-        whiten_execution_padding=whiten_padding,
-    )
+    ctrl = _ppo_controller(padded, data)
     _, valid = asyncio.run(ctrl._advantage_stage(padded))
     assert valid
     real = torch.tensor([1.0] * 5 + [0.0] * 3)
-    # With whiten_execution_padding the row-0 copies join whitening; padding
-    # never trains.
     expected, _ = ctrl._advantage_estimator.compute_advantage(
         prompt_ids=None,
         rewards=inputs["total_reward"].float(),
-        mask=inputs["token_mask"]
-        * (torch.ones(8) if whiten_padding else real).unsqueeze(-1),
+        mask=inputs["token_mask"] * real.unsqueeze(-1),
         values=inputs["values"],
     )
     expected = expected * inputs["token_mask"] * real.unsqueeze(-1)

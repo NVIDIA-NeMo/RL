@@ -143,6 +143,20 @@ def test_train_pump_reuses_setup_router_validation(monkeypatch, padding, logprob
     ctrl._trainer.finish_train_step.assert_called_once()
 
 
+def test_data_exhausted_forest_step_below_floor_aborts_optimizer(monkeypatch):
+    ctrl, _ = _setup(monkeypatch, failure="short")
+    ctrl._rollout_runtime.steps_allowed_short.add(0)
+    ctrl._rollout_runtime.batch_shortfall[0] = 1
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=3))
+
+    ctrl._trainer.abort_train_step.assert_called_once()
+    ctrl._trainer.finish_train_step.assert_not_called()
+    ctrl._sync_weights.assert_not_awaited()
+    assert ctrl._consumed_samples == 0
+    assert ctrl._train_steps == 1
+
+
 @pytest.mark.parametrize("flag", [None, 0, "false"])
 @pytest.mark.parametrize("field", ["is_execution_padding", "uses_borrowed_input"])
 def test_malformed_input_layout_flag_fails_before_forward(monkeypatch, flag, field):

@@ -13,14 +13,20 @@
 # limitations under the License.
 """The rollout result pipeline behind generate_async."""
 
+import json
+import math
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 
-from nemo_rl.models.generation.vllm.request_pipeline import (
+from nemo_rl.models.generation.rollout_result import (
     RolloutResult,
+    rollout_result_from_wire,
+    rollout_result_to_wire,
+)
+from nemo_rl.models.generation.vllm.request_pipeline import (
     rollout_output,
     rollout_result,
 )
@@ -90,3 +96,33 @@ def test_router_replay_routes_are_aligned_and_counted() -> None:
 def test_router_replay_requires_routes() -> None:
     with pytest.raises(RuntimeError, match="did not include routed_experts"):
         _result(_final_output([7, 8, 9]), r3=True)
+
+
+def test_wire_round_trip_preserves_the_output() -> None:
+    result = _result(
+        _final_output([7, 8, 9], prompt_routes=3, generated_routes=3), r3=True
+    )
+    # The wire crosses Dynamo's frontend as strict JSON.
+    wire = json.loads(json.dumps(rollout_result_to_wire(result), allow_nan=False))
+    input_ids = torch.tensor([1, 2, 3])
+
+    direct = rollout_output(result, input_ids=input_ids, input_length=3)
+    shipped = rollout_output(
+        rollout_result_from_wire(wire),
+        input_ids=input_ids,
+        input_length=3,
+    )
+
+    assert direct.keys() == shipped.keys()
+    for key in direct:
+        assert torch.equal(direct[key], shipped[key]), key
+
+
+def test_wire_carries_non_finite_logprobs_as_strict_json() -> None:
+    result = RolloutResult(
+        [7, 8, 9], [-0.5, float("-inf"), float("nan")], False, None, None
+    )
+    # Dynamo's transport is strict JSON: non-finite floats would arrive as null.
+    wire = json.loads(json.dumps(rollout_result_to_wire(result), allow_nan=False))
+    logprobs = rollout_result_from_wire(wire).logprobs
+    assert logprobs[:2] == [-0.5, float("-inf")] and math.isnan(logprobs[2])
