@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import itertools
+import math
 import pickle
 
 import pytest
@@ -643,6 +644,45 @@ def test_clipped_pg_loss_sanitizes_masked_operands(
         assert metrics["gen_kl_error"] == pytest.approx(0.0)
     assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
     assert metrics == pytest.approx(expected_metrics)
+
+
+@pytest.mark.parametrize("metrics_level", ["full", "minimal"])
+@pytest.mark.parametrize(
+    "difference", [0.0, -torch.finfo(torch.float32).eps, float("nan")]
+)
+def test_clipped_pg_counts_valid_logprob_mismatches(
+    metrics_level: str, difference: float
+) -> None:
+    data, _, _, _ = _setup_clipped_pg_test_data(batch_size=2, seq_len=5, device="cpu")
+    data["prev_logprobs"].fill_(-1.0)
+    data["generation_logprobs"].fill_(-1.0)
+    data["generation_logprobs"][0, 1] += difference
+    data["generation_logprobs"][0, 3] = float("nan")
+    data["generation_logprobs"][1, :] = float("nan")
+    data["token_mask"][0, 3:] = 0
+    data["sample_mask"][1] = 0
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            reference_policy_kl_penalty=0.0,
+            metrics_level=metrics_level,
+            use_importance_sampling_correction=False,
+        )
+    )
+
+    _, metrics = loss_fn(
+        next_token_logprobs=data["prev_logprobs"][:, 1:],
+        data=data,
+        global_valid_seqs=torch.tensor(1),
+        global_valid_toks=torch.tensor(2),
+    )
+
+    assert metrics["gen_prev_logprob_mismatch_tokens"] == (difference != 0)
+    assert (
+        loss_fn.metric_normalizations["gen_prev_logprob_mismatch_tokens"]
+        is MetricNormalizer.NONE
+    )
+    if difference != 0 and math.isfinite(difference) and metrics_level == "full":
+        assert metrics["gen_kl_error"] == 0
 
 
 @pytest.mark.parametrize("seq_logprob_error_in_loss", [False, True])
@@ -3213,6 +3253,7 @@ class TestMetricNormalizationAdvertisement:
             "policy_support_excluded_tokens": MetricNormalizer.NONE,
             "positive_nll_loss": MetricNormalizer.NONE,
             "token_mult_prob_error": MetricNormalizer.TOKENS,
+            "gen_prev_logprob_mismatch_tokens": MetricNormalizer.NONE,
         }
         if correction is not None:
             expected_normalizations["sampling_importance_ratio"] = (
