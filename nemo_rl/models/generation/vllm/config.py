@@ -485,7 +485,7 @@ def materialize_vllm_video_config(
 # Entry points with end-to-end coverage for the per-token NVFP4 rollout.
 # Every other entry point shares the same Megatron training worker and vLLM
 # refit path, so the mode is expected to work there, but is unvalidated.
-NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS = frozenset({"grpo"})
+NVFP4_PERTOKEN_VALIDATED_ENTRY_POINTS = frozenset({"grpo", "single_controller"})
 
 
 def parse_nvfp4_pertoken_rollout(
@@ -609,10 +609,7 @@ def validate_nvfp4_pertoken_generation(
         raise ValueError(
             "generation.nvfp4_pertoken_rollout requires refit_transport=null"
         )
-    colocated = config.get("colocated") or {}
     vllm_cfg = config["vllm_cfg"]
-    if not colocated.get("enabled"):
-        raise ValueError("generation.nvfp4_pertoken_rollout requires colocated rollout")
     if vllm_cfg["pipeline_parallel_size"] > 1:
         raise ValueError(
             "generation.nvfp4_pertoken_rollout does not support vLLM PP>1 yet: "

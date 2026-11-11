@@ -1,0 +1,52 @@
+# SingleController variant of grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick.yaml:
+# 2 nodes train, the other 2 serve non-colocated per-token NVFP4 vLLM rollouts.
+defaults: ./grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick.yaml
+
+grpo:
+  # SC reads async_rl instead, and the entrypoint raises if this block is set.
+  async_grpo: null
+  # SC does not support validation yet.
+  val_period: 0
+
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick-single-controller
+  metric_name: null
+
+# TransferQueue is mandatory for the SingleController path.
+data_plane:
+  enabled: true
+
+async_rl:
+  # Zero lookahead keeps the run on-policy, like the colocated recipe.
+  sampler:
+    name: in_order
+    max_lookahead_versions: 0
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: ${grpo.num_prompts_per_step}
+  # The test checks one train_data_step*.jsonl per step.
+  log_full_train_data: true
+
+policy:
+  megatron_cfg:
+    # Training has 8 GPUs here instead of the colocated recipe's 16.
+    expert_model_parallel_size: 8
+    env_vars:
+      NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: "8"
+  generation:
+    vllm_cfg:
+      async_engine: true
+    colocated:
+      enabled: false
+      resources:
+        num_nodes: 2
+        gpus_per_node: 4
+
+cluster:
+  # Training and rollout each take one 2-node segment.
+  segment_size: 2
+
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick-single-controller
+  wandb:
+    name: grpo-qwen3-30ba3b-4n4g-megatron-te-nvfp4-pertoken-quick-single-controller

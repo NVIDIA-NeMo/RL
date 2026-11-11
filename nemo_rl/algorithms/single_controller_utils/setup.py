@@ -146,7 +146,10 @@ from nemo_rl.models.generation.megatron.megatron_generation import MegatronGener
 from nemo_rl.models.generation.sglang.config import SGLangConfig
 from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.vllm import VllmGeneration
-from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    normalize_nvfp4_pertoken_policy_config,
+)
 from nemo_rl.models.megatron.router_replay import (
     configure_vllm_for_router_replay,
     router_replay_enabled,
@@ -1158,6 +1161,14 @@ def setup_single_controller(
     # Validate every LoRA rollout representation and materialize native vLLM
     # settings before generation and trainer are constructed concurrently.
     configure_lora_refit(policy_config)
+    # Only GRPO has end-to-end coverage here; the other algorithms warn.
+    if is_ppo_run(master_config):
+        nvfp4_entry_point = "single_controller_ppo"
+    elif master_config.on_policy_distillation is not None:
+        nvfp4_entry_point = "single_controller_distillation"
+    else:
+        nvfp4_entry_point = "single_controller"
+    normalize_nvfp4_pertoken_policy_config(policy_config, entry_point=nvfp4_entry_point)
 
     # Every nccl_reshard precondition, checked once, here, before any GPU work.
     #
