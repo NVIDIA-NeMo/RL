@@ -1,10 +1,11 @@
 # H100 variant of dapo-deepseek-v4.1-12n4g-fsdp2tp1-ep48-colocated-stream-adam.yaml:
-# 8 nodes x 8 H100-80GB, training EP64, colocated vLLM TP8 x EP64 (vLLM DP8 x TP8, one instance), HybridEP
-# dispatcher, plain torch.optim.AdamW on the CPU-offloaded parameters. Validated for 50 steps (8 nodes) and 5 steps
-# (16 nodes) with generation-KL error 0.0005; see docs/guides/models/deepseek/deepseek-v4.1-flash.md, "H100".
-# Why not the 12n4g settings on 80 GB GPUs: TP8 x EP8 needs >= 1 TiB of HBM per vLLM instance and TP is capped at
-# o_groups = 8; `dispatcher: torch` needs memory proportional to the EP size; BF16CPUAdamW parks the FP32 gradient
-# shards on the GPU until the step (34.5 GB per rank at EP64).
+# 8 nodes x 8 H100-80GB, training EP64 with the HybridEP dispatcher, colocated vLLM TP8 x EP64 (vLLM DP8 x TP8, one
+# instance) with CUDA graphs, plain torch.optim.AdamW on the CPU-offloaded parameters. Validated for 50 steps with
+# generation-KL error 0.0005; see docs/guides/models/deepseek/deepseek-v4.1-flash.md, "H100".
+# Why not the 12n4g vLLM / optimizer settings on 80 GB GPUs: TP8 x EP8 needs >= 1 TiB of HBM per vLLM instance and TP is
+# capped at o_groups = 8; BF16CPUAdamW parks the FP32 gradient shards on the GPU until the step (34.5 GB per rank at EP64).
+# To scale to 16 x 8: cluster/colocated num_nodes 16, expert_parallel_size 128 on both sides, train_global_batch_size 256
+# (num_prompts_per_step 32), gpu_memory_utilization 0.65.
 defaults: ../../grpo_math_1B.yaml
 grpo:
   num_prompts_per_step: 24
@@ -48,7 +49,8 @@ checkpointing:
   enabled: true
   keep_top_k: 1
   # A checkpoint with torch.optim.AdamW state is 6.6 TB (FP32 moments); save every 10 steps and keep the newest one
-  # (metric_name: null makes keep_top_k recency-based so a checkpoint written at a non-validation step is also eligible for deletion).
+  # (metric_name: null makes keep_top_k keep the newest periodic checkpoint instead of the best-accuracy one, so a validation dip
+  # does not leave an older 6.6 TB checkpoint on disk as the resume point).
   save_period: 10
   metric_name: null
   checkpoint_must_save_by: 00:03:40:00
@@ -103,10 +105,17 @@ policy:
     context_parallel_size: 1
     expert_parallel_size: 64
     activation_checkpointing: true
+    # Same two HybridEP knobs as the 12n4g recipe: NCCL timeout for the first-use JIT / TileLang compiles, and the HybridEP
+    # buffer allocated once for the micro-batch token budget instead of being reallocated mid-step.
+    distributed_timeout_minutes: 45
+    hybridep_max_tokens_per_rank: 3072
     env_vars:
       NRL_REFIT_SERIAL_COLLECTIVES: '1'
       NRL_REFIT_BUFFER_MEMORY_RATIO: '0.3'
       NRL_REFIT_BUFFER_MAX_GB: '4'
+      # With CUDA-graph generation the colocated policy workers OOMed in the training backward around step 35 on 80 GB
+      # GPUs (~10 GiB of allocator fragmentation next to the sleeping vLLM); capping the split size avoids it.
+      PYTORCH_CUDA_ALLOC_CONF: 'max_split_size_mb:1024'
     moe_parallelizer:
       reshard_after_forward: true
       lm_head_precision: float32
@@ -117,7 +126,7 @@ policy:
         linear: torch
         rms_norm: torch_fp32
         experts: torch_mm
-        dispatcher: hybridep   # torch dispatcher: all-gather/all-reduce buffer grows with EP (12.7 GiB at EP64, 44 GiB at EP128)
+        dispatcher: hybridep
         rope_fusion: false
         gate_precision: float32
         enable_hf_state_dict_adapter: true
@@ -148,7 +157,7 @@ policy:
       tensor_parallel_size: 8     # vLLM's V4.1 o_proj caps TP at o_groups = 8
       expert_parallel_size: 64    # = vLLM DP8 x TP8: one 64-GPU instance; bf16 experts do not fit a TP8 x EP8 instance on 80 GB
       gpu_memory_utilization: 0.7   # the policy side's resident HybridEP/NCCL buffers must fit next to vLLM across sleep/wake
-      enforce_eager: true
+      enforce_eager: false
       max_model_len: ${policy.max_total_sequence_length}
       enable_prefix_caching: false
       use_deep_gemm: true
@@ -169,7 +178,10 @@ policy:
       language_model_only: true
       max_num_batched_tokens: 2048
       enable_chunked_prefill: true
-      max_num_seqs: 24   # every DP engine serves its prompts in one wave (KV budget allows ~590 x 3072-token sequences)
+      max_num_seqs: 24   # every DP engine serves its prompts in one wave (KV budget allows ~500 x 3072-token sequences at 0.7)
+      # Capture CUDA graphs without Inductor compilation (as in the 12n4g recipe).
+      compilation_config:
+        backend: eager
       # With EP > TP the DP engines are coupled by the expert all-to-all; vLLM's default async scheduling then deadlocks
       # the group when the first engine finishes its prompts (https://github.com/vllm-project/vllm/issues/43547).
       async_scheduling: false

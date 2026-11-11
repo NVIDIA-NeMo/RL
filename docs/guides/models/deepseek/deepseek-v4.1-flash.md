@@ -79,7 +79,6 @@ dataset download access. Configure W&B externally, or disable it at launch.
 | --- | --- | --- | --- |
 | DeepSeek V4.1 Flash | DAPO | Colocated AutoModel + vLLM | [Streaming CPU Adam recipe](../../../../examples/configs/recipes/llm/dapo-deepseek-v4.1-12n4g-fsdp2tp1-ep48-colocated-stream-adam.yaml) |
 | DeepSeek V4.1 Flash | DAPO | Colocated AutoModel + vLLM, 8 × 8 H100 | [H100 CPU-AdamW recipe](../../../../examples/configs/recipes/llm/dapo-deepseek-v4.1-8n8g-fsdp2tp1-ep64-colocated-cpu-adamw.yaml) |
-| DeepSeek V4.1 Flash | DAPO | Colocated AutoModel + vLLM, 16 × 8 H100 | [H100 16-node recipe](../../../../examples/configs/recipes/llm/dapo-deepseek-v4.1-16n8g-fsdp2tp1-ep128-colocated-cpu-adamw.yaml) |
 
 Provision resources matching the YAML. Training and generation share devices;
 review both parallel layouts before changing resource counts.
@@ -135,46 +134,52 @@ settings. The launcher does not allocate nodes or start the cluster for you.
 
 The reference recipe is sized for 4-GPU nodes with ≈ 186 GB per GPU (12 × 4, EP48,
 vLLM TP8/EP8, `BF16CPUAdamW`). On 8 × H100-80GB nodes with 2 TB of host memory the
-same algorithm settings run with four layout changes, provided by
-`dapo-deepseek-v4.1-8n8g-fsdp2tp1-ep64-colocated-cpu-adamw.yaml` (and a 16-node
-variant, EP128, `train_global_batch_size: 256`):
+same algorithm settings run with the layout changes below, provided by
+`dapo-deepseek-v4.1-8n8g-fsdp2tp1-ep64-colocated-cpu-adamw.yaml`. HybridEP,
+`hybridep_max_tokens_per_rank`, `distributed_timeout_minutes` and CUDA-graph
+generation are taken over from the reference recipe unchanged. Launch it with the
+direct entry point (`run_deepseek_v41_stream_adam.sh` is wired to the 12 × 4 recipe):
 
-| Setting | 12 × 4 recipe | H100 recipes | Why |
+```bash
+uv run examples/run_grpo.py \
+  --config examples/configs/recipes/llm/dapo-deepseek-v4.1-8n8g-fsdp2tp1-ep64-colocated-cpu-adamw.yaml \
+  logger.wandb_enabled=false
+```
+
+| Setting | 12 × 4 recipe | H100 recipe | Why |
 | --- | --- | --- | --- |
-| vLLM `expert_parallel_size` | 8 (= TP, no data parallel) | 64 / 128 (vLLM DP8 / DP16 × TP8, one instance) | BF16 experts need ≥ 1 TiB of HBM per instance; vLLM's V4.1 `o_proj` caps TP at `o_groups = 8`, so the experts must be spread over data-parallel ranks |
+| vLLM `expert_parallel_size` | 8 (= TP, no data parallel) | 64 (vLLM DP8 × TP8, one instance) | BF16 experts need ≥ 1 TiB of HBM per instance; vLLM's V4.1 `o_proj` caps TP at `o_groups = 8`, so the experts must be spread over data-parallel ranks |
 | vLLM `async_scheduling` | vLLM default (on) | `false` | with EP > TP the engines share the expert all-to-all; async scheduling deadlocks the group when the first engine finishes its prompts (vllm-project/vllm#43547) |
-| `backend.dispatcher` | `torch` | `hybridep` | the `torch` dispatcher's all-gather/all-reduce buffer grows with the EP size (≈ 13 GiB at EP64, 44 GiB at EP128 per micro-batch) |
+| vLLM `max_num_seqs` | 32 | 24 | each DP engine serves its 24 prompts in one wave |
+| vLLM `gpu_memory_utilization` | 0.75 | 0.70 | the policy side's resident HybridEP/NCCL buffers must fit next to vLLM across sleep/wake |
 | `policy.optimizer` | `BF16CPUAdamW` | `torch.optim.AdamW` | the streaming path keeps the reduced FP32 gradient shards on the GPU until the step (34.5 GB per rank at EP64); plain AdamW on the CPU-offloaded parameters reduces to host memory — ≈ 35 GB more host memory per rank, FP32 moments, 6.6 TB checkpoints |
+| `PYTORCH_CUDA_ALLOC_CONF` (policy workers) | unset | `max_split_size_mb:1024` | with CUDA-graph generation the training backward OOMed around step 35 from ≈ 10 GiB of allocator fragmentation next to the sleeping vLLM; capping the split size avoids it |
 
-Also changed: `gpu_memory_utilization` 0.70 (8 nodes) / 0.65 (16 nodes) — the KV
-budget is large (≈ 1.8 M tokens) and the policy side's resident HybridEP/NCCL
-buffers must fit next to vLLM across sleep/wake; `max_num_seqs: 24` so each engine
-serves its prompts in one wave; `save_period: 10` with `metric_name: null`
-(recency-based retention of one 6.6 TB checkpoint).
+Also changed: `save_period: 10` with `metric_name: null` (recency-based retention
+of one 6.6 TB checkpoint).
 
-Measured on 8 × 8 H100 (recipe as above, GBS 192): 491–830 s per step
-(generation 250–350 s, training 120–320 s, log-probs 70–150 s), generation-KL
-error 0.0005, host memory ≈ 1.2 TB per node steady and 1.5 TB peak,
-checkpoint save 121–175 s, validation 444–532 s. Over 50 steps the AIME-2024
-validation accuracy went 0.4375 → 0.4542 → 0.5458 → 0.6000 → 0.6333 (steps 10–50),
-the same trajectory as the 12 × 4 reference curve above. 16 × 8: 646–814 s per step
-at GBS 256.
+Measured on 8 × 8 H100 (GBS 192, 50 steps with a validation and a checkpoint every
+10 steps): 389–660 s per step (generation 109–124 s, training 130–375 s, log-probs
+65–185 s), generation-KL error 0.0005–0.0006, validation 216–218 s, checkpoint save
+130–213 s, host memory ≈ 1.2 TB per node steady. AIME-2024 validation accuracy
+0.4667 → 0.5417 → 0.5417 → 0.5750 → 0.6625 at steps 10–50; the same recipe with
+eager generation gave 0.4375 → 0.4542 → 0.5458 → 0.6000 → 0.6333 at 491–830 s per
+step — both track the 12 × 4 reference curve below within the noise of 240
+validation samples.
+
+Scaling to 16 × 8: set `cluster.num_nodes` and `policy.generation.colocated.resources.num_nodes`
+to 16, `expert_parallel_size: 128` for both the trainer and vLLM (DP16 × TP8),
+`train_global_batch_size: 256` (`num_prompts_per_step: 32`) and
+`gpu_memory_utilization: 0.65`; this layout ran 50 steps at 336–489 s per step
+(0.4542 → 0.6167 at steps 10–50).
 
 Notes for H100 clusters:
 
 - DeepEP (`dispatcher: deepep`) times out in the first multi-node dispatch on the
-  pinned DeepEP commit with NVSHMEM 3.7.2 (#4027); use HybridEP.
-- HybridEP sizes its buffer from the first micro-batch and reallocates for larger
-  ones; multi-node reallocation re-creates the DOCA queue pairs and is slow. Keep the
-  micro-batch token cap (`train_mb_tokens` / `logprob_mb_tokens`) fixed; a
-  configurable pre-size is proposed in NVIDIA-NeMo/Automodel.
-- First-use JIT compilation (HybridEP, TileLang) on cold nodes can hold ranks apart
-  for several minutes; if the default 10-minute NCCL timeout is hit during the first
-  step, raise the process-group timeout.
-- vLLM CUDA graphs without Inductor (`vllm_cfg.enforce_eager: false`,
-  `vllm_kwargs.compilation_config.backend: eager`) cut generation to 112–116 s per
-  step and the step to 419–579 s with unchanged generation-KL error; the recipes keep
-  `enforce_eager: true` for comparability with the reference curve.
+  pinned DeepEP commit with NVSHMEM 3.7.2 (#4027); keep HybridEP.
+- On an InfiniBand cluster HybridEP ran across 8 and 16 nodes over RDMA; the
+  single-NVLink-domain requirement noted in the reference recipe is specific to
+  GB200 NVL72.
 
 ## Reference Training Curves
 
@@ -207,7 +212,6 @@ Validation markers show the recorded evaluation points only.
   throughput claim is made for this configuration.
 - Optimizer restore checks dtype, shape and distributed layout. The optimizer's
   loader does not itself provide resharding across different layouts.
-- The H100 recipes were validated for 50 steps (8 × 8) and 5 steps (16 × 8) on one
-  InfiniBand cluster; they use `torch.optim.AdamW` with FP32 moments, so their
-  optimizer rounding differs from the `BF16CPUAdamW` reference and their checkpoints
-  are 6.6 TB instead of 4.1 TB.
+- The H100 recipe was validated for 50 steps on one InfiniBand cluster; it uses
+  `torch.optim.AdamW` with FP32 moments, so its optimizer rounding differs from the
+  `BF16CPUAdamW` reference and its checkpoints are 6.6 TB instead of 4.1 TB.
