@@ -99,6 +99,33 @@ class IPCWeightManifestError(RuntimeError):
     """An IPC transfer did not match the prepared state-dict manifest."""
 
 
+@contextmanager
+def _vllm_partial_weight_update() -> Iterator[None]:
+    """Tell vLLM that a ``load_weights`` call carries only part of the checkpoint.
+
+    NeMo-RL refits in buckets, one ``load_weights`` call per bucket. vLLM marks such
+    updates with ``model_loader.reload.weight_update_active()`` (set by its own
+    ``start_reload``); model loaders that verify a full checkpoint load (for example
+    Step5's fused qkv+indexer completeness check) skip that check while it is set.
+    NeMo-RL does not go through ``start_reload``, so set the flag around the call.
+    No-op on vLLM without the reload lifecycle module.
+    """
+    try:
+        from vllm.model_executor.model_loader.reload import lifecycle
+    except ImportError:
+        yield
+        return
+    if not hasattr(lifecycle, "_weight_update_active"):
+        yield
+        return
+    previous = lifecycle._weight_update_active
+    lifecycle._weight_update_active = True
+    try:
+        yield
+    finally:
+        lifecycle._weight_update_active = previous
+
+
 def _detach_pending_layerwise_weights(
     model: torch.nn.Module, source_storage_ptrs: set[int]
 ) -> None:
@@ -773,7 +800,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         when the model's ``load_weights`` does not report one.
         """
         if not getattr(self, "_nrl_layerwise_reload_active", False):
-            return self.model_runner.model.load_weights(weights=weights)
+            with _vllm_partial_weight_update():
+                return self.model_runner.model.load_weights(weights=weights)
 
         source_storage_ptrs: set[int] = set()
 
@@ -784,7 +812,10 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
 
         load_error: Exception | None = None
         try:
-            return self.model_runner.model.load_weights(weights=track_source_storage())
+            with _vllm_partial_weight_update():
+                return self.model_runner.model.load_weights(
+                    weights=track_source_storage()
+                )
         except Exception as error:
             load_error = error
             raise
