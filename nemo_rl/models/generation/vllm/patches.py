@@ -1364,7 +1364,62 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_radio_native_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_nano_vl_projector_loader(patch_logger)
+    _patch_vllm_lilicorr_split_refit(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
+
+
+_LILICORR_COVERAGE_OLD = """        missing = expected - seen
+        if missing:
+            raise ValueError(
+                f"LiLiCorr checkpoint coverage mismatch: missing={sorted(missing)}"
+            )
+"""
+_LILICORR_COVERAGE_NEW = """        missing = expected - seen
+        # NeMo RL: an RL refit streams the drafter over several load_weights
+        # calls, so check coverage only for a complete load (vllm#66069).
+        from vllm.model_executor.model_loader.mtp_validation import (
+            is_mtp_completeness_check_enabled as _nrl_coverage_check_enabled,
+        )
+
+        if missing and _nrl_coverage_check_enabled():
+            raise ValueError(
+                f"LiLiCorr checkpoint coverage mismatch: missing={sorted(missing)}"
+            )
+"""
+
+
+def _patch_vllm_lilicorr_split_refit(logger) -> None:
+    """Let a LiLiCorr drafter accept a refit split across load_weights calls.
+
+    vLLM 0.33's ``LiLiCorrForCausalLM.load_weights`` raises unless every head
+    and convolution tensor arrives in the same call. NeMo RL refits stream the
+    drafter in buckets, so the first bucket fails. This gates the check on
+    vLLM's ``is_mtp_completeness_check_enabled`` scope, which
+    ``_load_draft_weights`` disables; startup loads keep the check. NeMo RL's
+    ModelUpdateCoverage still proves every streamed draft tensor was loaded.
+
+    The inference buffers are still rebuilt at the end of every call. They are
+    a pure function of the head weights loaded so far, so the call carrying
+    the last head tensor (or any later one) leaves them correct.
+    Port of vllm-project/vllm#66069 (closed unmerged) to vLLM 0.33.
+    """
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/lilicorr.py")
+    except RuntimeError:
+        # vLLM builds without LiLiCorr (< 0.31) have nothing to patch.
+        logger.info("vLLM has no LiLiCorr drafter; skipping split-refit patch.")
+        return
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if _LILICORR_COVERAGE_NEW in content:
+            return
+        if content.count(_LILICORR_COVERAGE_OLD) != 1:
+            raise RuntimeError(
+                "LiLiCorr split-refit patch requires the vLLM 0.33 lilicorr.py "
+                f"coverage check or its patched form: {file_to_patch}"
+            )
+        write_back(content.replace(_LILICORR_COVERAGE_OLD, _LILICORR_COVERAGE_NEW, 1))
+    logger.info("Patched LiLiCorr to accept a draft refit split across calls.")
 
 
 def _apply_vllm_patches(
@@ -1385,6 +1440,7 @@ def _apply_vllm_patches(
     _patch_vllm_radio_native_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_nano_vl_projector_loader(patch_logger)
+    _patch_vllm_lilicorr_split_refit(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
     _patch_vllm_moe_routed_experts_capture(
         patch_logger, required=require_moe_routed_experts_capture
