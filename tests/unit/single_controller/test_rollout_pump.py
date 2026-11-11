@@ -126,6 +126,7 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     ctrl._batch_promotions = {}
     ctrl._rollout_runtime.sampler_stamps_target_steps = False
     ctrl._assembling_version = 0
+    ctrl._step_assembly = None
     # Empty means the legacy (non-token-capture) dispatch path.
     ctrl._finalizer_actors = []
     ctrl._rollout_runtime.replacement_reserve = deque()
@@ -1152,6 +1153,8 @@ class TestChargeShortfall:
         ctrl = object.__new__(controller_cls)
         ctrl._sampler = sampler
         ctrl._assembling_version = assembling_version
+        ctrl._step_assembly = None
+        ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=4)
         ctrl._rollout_runtime = RolloutRuntimeState()
         return ctrl
 
@@ -1219,6 +1222,7 @@ class TestALostGroupDoesNotStallTheGate:
         ctrl = object.__new__(controller_cls)
         ctrl._sampler = sampler
         ctrl._assembling_version = 0
+        ctrl._step_assembly = None
         ctrl._rollout_runtime = RolloutRuntimeState()
         ctrl._algo_cfg = SimpleNamespace(num_prompts_per_step=2)
         ctrl._async_cfg = SimpleNamespace(

@@ -62,7 +62,7 @@ class RolloutCheckpointSaveResult:
 
 @dataclass
 class RolloutRuntimeState:
-    """Rollout state that the pumps change and every checkpoint saves.
+    """Rollout state shared by the pumps and checkpoint coordination.
 
     The controller owns the one instance; restore fills it before the pumps
     start, and checkpoints read it under the exclusive data-plane cut.
@@ -78,6 +78,8 @@ class RolloutRuntimeState:
     steps_allowed_short: set[int] = field(default_factory=set)
     # Lost groups charged to each step according to DropAccountingSampler.
     batch_shortfall: dict[int, int] = field(default_factory=dict)
+    # Transient: snapshots must wait until an awaited selection's losses are reconciled.
+    shortfall_reconciliation_pending: bool = False
     # Whether any batch was admitted. Retain the serialized field name for compatibility.
     sampler_stamps_target_steps: bool = False
     # Finalizer results kept per group until the group is trained or dropped.
