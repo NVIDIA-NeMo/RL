@@ -640,20 +640,44 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         self,
         kv_scales: dict[str, float] | None = None,
         *,
+        include_draft: bool = True,
         draft_metadata_only: bool = False,
         draft_weights: tuple[tuple[str, torch.Tensor], ...] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Export canonical ModelOpt deployment tensors for non-IPC transports."""
+        """Export canonical ModelOpt deployment tensors for non-IPC transports.
+
+        The co-trained drafter is not in the ModelOpt export plan, so its BF16
+        ``draft.*`` tensors follow the policy groups. The same iterator builds the
+        refit metadata and the broadcast, so both sides agree on the drafter.
+        """
         groups = iter(self._iter_real_quant_refit_groups(kv_scales))
         while True:
             try:
                 group = next(groups)
             except StopIteration:
-                return
+                break
             try:
                 yield from group
             finally:
                 del group
+        if not include_draft:
+            return
+        if draft_weights is None:
+            yield from self._iter_draft_weights_for_refit(
+                metadata_only=draft_metadata_only
+            )
+        else:
+            yield from draft_weights
+
+    def _iter_real_quant_refit_groups_with_draft(
+        self, kv_scales: dict[str, float] | None = None
+    ) -> Generator[tuple[tuple[str, torch.Tensor], ...], None, None]:
+        """ModelOpt deployment groups, then the BF16 drafter as one final group."""
+        yield from self._iter_real_quant_refit_groups(kv_scales)
+        # Every rank runs this: the drafter export broadcasts across PP lanes.
+        draft = tuple(self._iter_draft_weights_for_refit(metadata_only=False))
+        if draft:
+            yield draft
 
     @torch.no_grad()
     def stream_weights_via_ipc_zmq(self, buffer_size_bytes=0, kv_scales=None) -> None:
@@ -665,44 +689,13 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
         stream_weights_via_ipc_zmq_impl(
-            params_generator=self._iter_real_quant_refit_groups(kv_scales),
+            params_generator=self._iter_real_quant_refit_groups_with_draft(kv_scales),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
             drain_between_groups=True,
         )
-
-        if draft_weights is None:
-            yield from self._iter_draft_weights_for_refit(
-                metadata_only=draft_metadata_only
-            )
-        else:
-            yield from draft_weights
-
-        if not vllm_cfg["kv_cache_dtype"].startswith("fp8"):
-            return
-
-        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
-            get_vllm_qkv_scale_names,
-        )
-
-        keys: list[str] = []
-        for layer_idx in range(self.megatron_bridge.transformer_config.num_layers):
-            keys.extend(get_vllm_qkv_scale_names(layer_idx).values())
-
-        for param_name in keys:
-            scale_value = (
-                kv_scales[param_name] if kv_scales and param_name in kv_scales else 1.0
-            )
-            yield (
-                param_name,
-                torch.tensor(
-                    scale_value,
-                    dtype=torch.float32,
-                    device="cuda",
-                ).reshape(1),
-            )
 
     @staticmethod
     def _find_weight_quantizer(
@@ -806,6 +799,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 )
             yield from self._iter_real_quant_refit_params(
                 kv_scales,
+                include_draft=include_draft,
                 draft_metadata_only=draft_metadata_only,
                 draft_weights=draft_weights,
             )
