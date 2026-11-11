@@ -303,10 +303,14 @@ class DraftLossWrapper:
             raise ValueError("global_valid_toks is required for DraftLossWrapper.")
         policy_data = data
         if self.draft_provider is not None:
+            # Per-step drafter outputs (dataclasses, even modules) live in `data`
+            # for loss_stats; the policy loss slices every entry per sequence.
             transient_output_keys = {
                 "dflash_output",
                 "dspark_output",
                 "eagle3_output",
+                "lilicorr_output",
+                "lilicorr_head",
             } & data.keys()
             if transient_output_keys:
                 policy_data = copy(data)
