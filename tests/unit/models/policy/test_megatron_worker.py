@@ -269,7 +269,7 @@ def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
     )
 
     worker.cfg = {"generation": {"backend": "vllm"}}
-    list(worker._iter_params_with_optional_kv_scales())
+    list(worker._iter_params_with_optional_kv_scales(draft_weights=()))
     forwarded = worker.megatron_bridge.export_hf_weights.call_args.kwargs[
         "conversion_tasks"
     ]
@@ -278,7 +278,7 @@ def test_fp8_export_payload_survives_for_non_megatron_backends() -> None:
     assert forwarded[0].param_weight.dtype == torch.float8_e4m3fn
 
     worker.cfg = {"generation": {"backend": "megatron"}}
-    list(worker._iter_params_with_optional_kv_scales())
+    list(worker._iter_params_with_optional_kv_scales(draft_weights=()))
     megatron_forwarded = worker.megatron_bridge.export_hf_weights.call_args.kwargs[
         "conversion_tasks"
     ]
@@ -691,9 +691,7 @@ def test_m2n_destination_refreshes_flashinfer_after_misc_import(
         side_effect=lambda **_: order.append("packed") or True
     )
     preflight = MagicMock(side_effect=lambda *_: order.append("token"))
-    monkeypatch.setattr(
-        worker_module, "packed_broadcast_preflight_consumer", preflight
-    )
+    monkeypatch.setattr(worker_module, "packed_broadcast_preflight_consumer", preflight)
     monkeypatch.setattr(
         "nemo_rl.weight_sync.xferdtensor.xferdtensor",
         lambda *_: order.append("bulk"),
@@ -3183,7 +3181,8 @@ def test_prepare_source_refit_info_resets_previous_prequantization_selection():
     worker._refit_prequant_names = {name}
     worker._calculate_refit_param_info = lambda: {}
 
-    def _iter_params():
+    def _iter_params(*, draft_weights):
+        assert draft_weights == ()
         dtype = (
             torch.float8_e4m3fn
             if name in worker._refit_prequant_names
@@ -3192,6 +3191,7 @@ def test_prepare_source_refit_info_resets_previous_prequantization_selection():
         yield name, torch.ones(2, 64, dtype=dtype)
 
     worker._iter_params_with_optional_kv_scales = _iter_params
+    worker._draft_weights_for_refit = lambda *, metadata_only: ()
 
     info = worker._prepare_source_refit_info()
 

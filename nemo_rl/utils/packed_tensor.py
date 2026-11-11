@@ -90,8 +90,10 @@ def packed_broadcast_producer(
         num_buffers: number of alternating CUDA buffers. Uses the default when unset.
         preflight_error: local producer error synchronized before any payload broadcast.
         preflight_checked: caller already completed the shared readiness collective.
-        use_legacy_packing: pack an oversized tensor with the ones before it, as
-            vLLM's own consumer expects, instead of sending it in its own broadcast.
+        use_legacy_packing: use vLLM's native wire protocol. It packs an oversized
+            tensor with the ones before it and sends no NeMo readiness token,
+            because vLLM's own consumer (Dynamo) does not read one. A local
+            ``preflight_error`` still raises before any payload broadcast.
 
     Returns:
         None
@@ -99,7 +101,7 @@ def packed_broadcast_producer(
     """
     if buffer_size_bytes is not None and buffer_size_bytes <= 0:
         raise ValueError("buffer_size_bytes must be > 0")
-    if not preflight_checked:
+    if not (preflight_checked or use_legacy_packing):
         packed_broadcast_preflight_producer(group, src, preflight_error)
     elif preflight_error is not None:
         raise RuntimeError(str(preflight_error)) from preflight_error

@@ -684,17 +684,13 @@ def _collect_local_refit_hf_names(conversion_tasks: Iterable[Any]) -> set[str]:
 
 
 @contextmanager
-def _meta_tensor_alloc_context(
-    *,
-    control_broadcast_group: Optional[torch.distributed.ProcessGroup] = None,
-):
+def _meta_tensor_alloc_context():
     """Skip real GPU work during metadata enumeration.
 
     Bridge's ``export_hf_weights`` does PP/TP/EP gathers to materialize
     full unsharded tensors, but the refit-info builders only need shape+dtype.
     Patch the allocators to redirect to ``meta`` and turn the collectives into
-    no-ops. Fixed integer/byte protocol broadcasts may be preserved on one
-    explicit group. Subsequent shape-only ops on meta tensors propagate correctly,
+    no-ops. Subsequent shape-only ops on meta tensors propagate correctly,
     while peak memory stays at zero extra GiB.
     """
     real_all_gather = torch.distributed.all_gather
@@ -712,13 +708,6 @@ def _meta_tensor_alloc_context(
         return None
 
     def _noop_broadcast(tensor, src, *a, **k):
-        if (
-            control_broadcast_group is not None
-            and k.get("group") is control_broadcast_group
-            and tensor.device.type != "meta"
-            and tensor.dtype in {torch.int64, torch.uint8}
-        ):
-            return real_broadcast(tensor, src, *a, **k)
         return None
 
     torch.distributed.all_gather = _noop_all_gather
@@ -3336,7 +3325,9 @@ class MegatronPolicyWorkerImpl(
 
         # Collect tensor metadata for refit / hf side info.
         refit_param_info_hf = {}
-        for name, tensor in self._iter_params_with_optional_kv_scales():
+        for name, tensor in self._iter_params_with_optional_kv_scales(
+            draft_weights=self._draft_weights_for_refit(metadata_only=True),
+        ):
             refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
 
         self._refit_param_info_hf = refit_param_info_hf
@@ -3829,6 +3820,19 @@ class MegatronPolicyWorkerImpl(
         except Exception as error:
             return (), error
 
+    def _draft_weights_for_refit(
+        self,
+        *,
+        metadata_only: bool = False,
+    ) -> tuple[tuple[str, torch.Tensor], ...]:
+        """Return the draft export, or raise the rank-agreed preflight failure."""
+        draft_weights, error = self._preflight_draft_weights_for_refit(
+            metadata_only=metadata_only
+        )
+        if error is not None:
+            raise error
+        return draft_weights
+
     @staticmethod
     def _iter_logical_refit_conversion_tasks(
         conversion_tasks: Iterable[Any],
@@ -3869,10 +3873,8 @@ class MegatronPolicyWorkerImpl(
         self,
         kv_scales: Optional[dict[str, float]] = None,
         conversion_tasks=None,
-        include_draft: bool = True,
         *,
-        draft_metadata_only: bool = False,
-        draft_weights: tuple[tuple[str, torch.Tensor], ...] | None = None,
+        draft_weights: tuple[tuple[str, torch.Tensor], ...],
     ) -> Iterator[tuple[str, torch.Tensor]]:
         """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
 
@@ -3883,13 +3885,11 @@ class MegatronPolicyWorkerImpl(
         — used by the nccl_reshard_refit misc-refit path to pass a filtered subset so
         Bridge only does TP/EP all-gather for those tasks instead of the full model.
 
-        ``include_draft`` controls the ``draft.*`` weights. SGLang refit sets it
-        False: the engine keeps draft weights via
-        ``enable_draft_weights_cpu_backup`` rather than receiving them.
-
-        ``draft_metadata_only`` returns meta draft tensors without moving payloads.
-        ``draft_weights`` supplies an already-materialized export, so a caller that
-        ran the draft preflight does not re-enter the PP broadcast a second time.
+        ``draft_weights`` holds the ``draft.*`` export from
+        ``_draft_weights_for_refit``. The iterator never runs the draft PP
+        broadcast itself, so every rank enters that collective exactly once
+        before any payload transfer. SGLang refit passes ``()``: the engine keeps
+        draft weights via ``enable_draft_weights_cpu_backup``.
         """
         from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
             get_vllm_qkv_scale_names,
@@ -3920,13 +3920,7 @@ class MegatronPolicyWorkerImpl(
             yield from self._maybe_prequantize_param(name, tensor)
             del tensor
 
-        if include_draft:
-            if draft_weights is None:
-                yield from self._iter_draft_weights_for_refit(
-                    metadata_only=draft_metadata_only
-                )
-            else:
-                yield from draft_weights
+        yield from draft_weights
 
         # Check whether FP8 KV cache is enabled.
         use_fp8_kv_cache = False
@@ -4030,7 +4024,7 @@ class MegatronPolicyWorkerImpl(
             )
 
         return iter_named_tensor_buckets(
-            self._iter_params_with_optional_kv_scales(include_draft=False),
+            self._iter_params_with_optional_kv_scales(draft_weights=()),
             buffer_size_bytes=buffer_size_bytes,
         )
 
@@ -4161,9 +4155,7 @@ class MegatronPolicyWorkerImpl(
         self, buffer_size_bytes: int = 0, kv_scales: Optional[dict[str, float]] = None
     ) -> None:
         """Stream model weights to peer process via ZMQ IPC socket."""
-        draft_weights, preflight_error = self._preflight_draft_weights_for_refit()
-        if preflight_error is not None:
-            raise preflight_error
+        draft_weights = self._draft_weights_for_refit()
         self.maybe_init_zmq()
 
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
@@ -4239,9 +4231,6 @@ class MegatronPolicyWorkerImpl(
             buffer_size_bytes=buffer_size_bytes,
             num_buffers=num_buffers,
             preflight_error=preflight_error,
-            # vLLM's native consumer (Dynamo) does not read the NeMo readiness
-            # token, so the legacy layout skips it. A local error still raises.
-            preflight_checked=use_legacy_packing,
             use_legacy_packing=use_legacy_packing,
         )
 
@@ -4351,11 +4340,7 @@ class MegatronPolicyWorkerImpl(
         stays agnostic to any gen backend's MoE-fusion layout.
         """
         self.refit_param_info_mcore = self._calculate_refit_param_info()
-        draft_metadata, draft_preflight_error = self._preflight_draft_weights_for_refit(
-            metadata_only=True
-        )
-        if draft_preflight_error is not None:
-            raise draft_preflight_error
+        draft_metadata = self._draft_weights_for_refit(metadata_only=True)
         self._bulk_refit_conversion_tasks = self._build_bulk_refit_conversion_tasks()
 
         # Only the FFN gate/up/down weights take the bulk
@@ -4398,9 +4383,9 @@ class MegatronPolicyWorkerImpl(
                 payload_bytes[1] += num_bytes
             ordered_manifest.append((route, name, shape, dtype))
 
-        with _meta_tensor_alloc_context(
-            control_broadcast_group=parallel_state.get_pipeline_model_parallel_group()
-        ):
+        # Draft metadata comes from the preflight above. No draft PP collective
+        # runs inside this context, so every broadcast here can stay a no-op.
+        with _meta_tensor_alloc_context():
             # Standard Bridge tasks describe logical HF weights, independent of
             # the physical FP8 data/scale tasks used by other transports.
             for name, tensor in self.megatron_bridge.export_hf_weights(
@@ -4430,7 +4415,6 @@ class MegatronPolicyWorkerImpl(
             # BF16, so their training scales must not overwrite destination
             # post-hook scales.
             for name, tensor in self._iter_params_with_optional_kv_scales(
-                draft_metadata_only=True,
                 draft_weights=draft_metadata,
             ):
                 if name in state_dict_metadata or any(

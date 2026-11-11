@@ -271,7 +271,7 @@ def test_real_quant_refit_detection_requires_vllm_quant_cfg_and_flag():
 def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
     worker = _make_real_quant_worker()
 
-    output = list(worker._iter_real_quant_refit_params())
+    output = list(worker._iter_real_quant_refit_params(draft_weights=()))
 
     assert output[0][0] == "model.layers.0.mlp.down_proj.weight"
     args, kwargs = worker.megatron_bridge.calls[0]
@@ -284,20 +284,23 @@ def test_iter_real_quant_refit_params_uses_megatron_bridge_export():
 
 
 @requires_weight_folding
-def test_real_quant_refit_forwards_draft_metadata_mode():
+def test_real_quant_refit_yields_preflighted_draft_weights_without_pp_export():
     worker = _make_real_quant_worker()
-    metadata_modes = []
+    draft_tensor = torch.empty(2, device="meta")
 
-    def iter_draft_weights(*, metadata_only):
-        metadata_modes.append(metadata_only)
-        yield "draft.layers.0.weight", torch.empty(2, device="meta")
+    def fail_draft_export(**_kwargs):
+        raise AssertionError("real-quant refit re-entered the draft PP export")
 
-    worker._iter_draft_weights_for_refit = iter_draft_weights
+    worker._iter_draft_weights_for_refit = fail_draft_export
 
-    output = list(worker._iter_params_with_optional_kv_scales(draft_metadata_only=True))
+    output = list(
+        worker._iter_params_with_optional_kv_scales(
+            draft_weights=(("draft.layers.0.weight", draft_tensor),)
+        )
+    )
 
-    assert metadata_modes == [True]
     assert output[-1][0] == "draft.layers.0.weight"
+    assert output[-1][1] is draft_tensor
 
 
 @requires_weight_folding
@@ -381,7 +384,7 @@ def test_iter_real_quant_refit_params_rejects_policy_generation_mode_mismatch():
     worker.cfg["generation"]["quant_cfg"] = "NVFP4_EXPERTS_ONLY_CFG"
 
     with pytest.raises(ValueError, match="matching policy and generation"):
-        list(worker._iter_real_quant_refit_params())
+        list(worker._iter_real_quant_refit_params(draft_weights=()))
 
 
 @requires_weight_folding
@@ -393,7 +396,9 @@ def test_iter_params_with_optional_kv_scales_uses_real_quant_export(monkeypatch)
         lambda kv_scales=None, **_kwargs: iter([("real.weight", torch.ones(1))]),
     )
 
-    output = list(worker._iter_params_with_optional_kv_scales({"scale": 1.0}))
+    output = list(
+        worker._iter_params_with_optional_kv_scales({"scale": 1.0}, draft_weights=())
+    )
 
     assert output[0][0] == "real.weight"
     torch.testing.assert_close(output[0][1], torch.ones(1))
@@ -444,7 +449,7 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
         ),
     )
 
-    output = list(worker._iter_params_with_optional_kv_scales())
+    output = list(worker._iter_params_with_optional_kv_scales(draft_weights=()))
 
     assert [name for name, _ in output] == [
         "model.layers.0.mlp.down_proj.weight",
@@ -454,7 +459,7 @@ def test_iter_params_with_optional_kv_scales_exports_input_amax(monkeypatch):
 
 
 @requires_weight_folding
-def test_iter_params_with_optional_kv_scales_forwards_draft_metadata_only(
+def test_iter_params_with_optional_kv_scales_forwards_draft_weights(
     monkeypatch,
 ):
     from nemo_rl.models.policy.workers.megatron_policy_worker import (
@@ -473,16 +478,8 @@ def test_iter_params_with_optional_kv_scales_forwards_draft_metadata_only(
     worker.rank = 0
     worker.refit_conversion_tasks = []
 
-    def metadata_export(
-        self,
-        kv_scales=None,
-        *,
-        draft_metadata_only=False,
-        draft_weights=None,
-    ):
-        if not draft_metadata_only:
-            raise AssertionError("quant override dropped draft metadata mode")
-        yield "draft.model.weight", torch.empty(2, dtype=torch.float32, device="meta")
+    def metadata_export(self, kv_scales=None, *, draft_weights):
+        yield from draft_weights
 
     monkeypatch.setattr(
         MegatronPolicyWorkerImpl,
@@ -490,10 +487,15 @@ def test_iter_params_with_optional_kv_scales_forwards_draft_metadata_only(
         metadata_export,
     )
 
-    output = list(worker._iter_params_with_optional_kv_scales(draft_metadata_only=True))
+    draft_tensor = torch.empty(2, dtype=torch.float32, device="meta")
+    output = list(
+        worker._iter_params_with_optional_kv_scales(
+            draft_weights=(("draft.model.weight", draft_tensor),)
+        )
+    )
 
     assert [name for name, _ in output] == ["draft.model.weight"]
-    assert output[0][1].device.type == "meta"
+    assert output[0][1] is draft_tensor
 
 
 @requires_weight_folding
@@ -531,13 +533,7 @@ def test_folded_quantizer_error_includes_parameter_name(monkeypatch):
         lambda *_args: FailingQuantizer(),
     )
 
-    def access_refit_task_weights(
-        self,
-        kv_scales=None,
-        *,
-        draft_metadata_only=False,
-        draft_weights=None,
-    ):
+    def access_refit_task_weights(self, kv_scales=None, *, draft_weights):
         for refit_task in self.refit_conversion_tasks:
             yield refit_task.param_name, refit_task.param_weight
 
@@ -548,7 +544,7 @@ def test_folded_quantizer_error_includes_parameter_name(monkeypatch):
     )
 
     with pytest.raises(RuntimeError) as exc_info:
-        list(worker._iter_params_with_optional_kv_scales())
+        list(worker._iter_params_with_optional_kv_scales(draft_weights=()))
 
     assert (
         "Failed to apply weight quantizer for param "

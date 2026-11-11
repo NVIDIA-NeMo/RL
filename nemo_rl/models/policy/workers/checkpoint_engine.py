@@ -86,7 +86,10 @@ class MegatronCheckpointEngineSendMixin:
     def _checkpoint_engine_weight_iterator(
         self, kv_scales: Optional[dict[str, float]] = None
     ) -> Iterator[tuple[str, torch.Tensor]]:
-        weights = self._iter_params_with_optional_kv_scales(kv_scales=kv_scales)
+        weights = self._iter_params_with_optional_kv_scales(
+            kv_scales=kv_scales,
+            draft_weights=self._draft_weights_for_refit(),
+        )
         target_layout = self.checkpoint_engine.get_target_weight_layout()
         if target_layout is None:
             return weights
