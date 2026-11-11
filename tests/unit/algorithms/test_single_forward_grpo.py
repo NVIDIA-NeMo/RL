@@ -148,6 +148,7 @@ def test_accumulated_loss_and_gradients_match_upstream_mask(
             loss_fn.metric_normalizations,
             token_factor=6 / kept_toks,
             sequence_factor=3 / kept_seqs,
+            loss_divisor_factor=6 / kept_toks,
         )
         for m in metrics
     ]
@@ -221,6 +222,7 @@ def test_split_api_survivor_division_matches_upstream_mask(
             loss_fn.metric_normalizations,
             token_factor=1 / kept_toks,
             sequence_factor=1 / kept_seqs,
+            loss_divisor_factor=1 / kept_toks,
         )
         for m in metrics
     ]
@@ -244,13 +246,20 @@ def test_rescale_loss_metrics_scales_listed_metrics():
         },
         token_factor=3.0,
         sequence_factor=5.0,
+        loss_divisor_factor=7.0,
     )
     assert rescaled == {"tok": 6.0, "seq": 10.0, "raw": 2.0}
 
 
 def test_rescale_loss_metrics_rejects_unlisted_metric():
     with pytest.raises(ValueError, match="'other' is missing"):
-        rescale_loss_metrics({"other": 2.0}, {}, token_factor=3.0, sequence_factor=5.0)
+        rescale_loss_metrics(
+            {"other": 2.0},
+            {},
+            token_factor=3.0,
+            sequence_factor=5.0,
+            loss_divisor_factor=3.0,
+        )
 
 
 @pytest.mark.parametrize(

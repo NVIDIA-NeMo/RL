@@ -1000,7 +1000,12 @@ def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> No
     """Keep the initial Forest objective identical at startup and before fanout."""
     unsupported = {
         "grpo.adv_estimator.name": grpo.adv_estimator.name != "grpo",
-        "loss_fn.token_level_loss": not loss.token_level_loss,
+        # Name whichever selector the user set; the default is global_token_mean.
+        (
+            "loss_fn.token_level_loss"
+            if loss.normalization is None and loss.token_level_loss is not None
+            else "loss_fn.normalization"
+        ): loss.resolved_normalization != "global_token_mean",
         "loss_fn.sequence_level_importance_ratios": loss.sequence_level_importance_ratios,
         "loss_fn.truncated_importance_sampling_type": loss.truncated_importance_sampling_type
         == "seq-mask-tis",

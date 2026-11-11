@@ -46,6 +46,38 @@ _SEQ_METRIC_MAX: frozenset[str] = frozenset(
 )
 
 
+class StreamingObjectiveLoss:
+    """Hand the split worker's placeholder count to the loss as its explicit denominator.
+
+    The forward callbacks pass ``global_valid_toks = global_valid_seqs = 1``;
+    the worker divides the raw sums by the all-reduced objective count at finish.
+    """
+
+    def __init__(self, loss_fn: LossFunction) -> None:
+        self.loss_fn = loss_fn
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "loss_fn":  # deepcopy/unpickle probe before __init__ ran
+            raise AttributeError(name)
+        return getattr(self.loss_fn, name)
+
+    def __call__(
+        self,
+        *args: Any,
+        global_valid_seqs: torch.Tensor,
+        global_valid_toks: torch.Tensor,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        # Keyword-only, so a positional caller fails loudly here.
+        return self.loss_fn(
+            *args,
+            global_valid_seqs=global_valid_seqs,
+            global_valid_toks=global_valid_toks,
+            global_objective_denominator=global_valid_toks,
+            **kwargs,
+        )
+
+
 class SequencePackingLossWrapper:
     def __init__(
         self,

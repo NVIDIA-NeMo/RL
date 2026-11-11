@@ -19,6 +19,19 @@ which is, in general, not equivalent to the full-batch loss. To fix this, we nee
 
 In NeMo RL, this information is passed to the loss function directly. Each loss function is expected to fall into one of two categories, token-level or sequence-level, which is an attribute of the loss function itself (see [loss_functions.py](../../nemo_rl/algorithms/loss/loss_functions.py) for some examples). The policy then uses this information to compute the global normalization factor using the full batch (for token-level losses, this is the total number of tokens in the batch. For sequence-level losses, this is the number of valid sequences in the batch). The normalization factor is then passed to the loss function, which uses it to normalize the microbatch loss. To get the loss for the global batch, the policy simply sums across all microbatch losses.
 
+For policy-gradient losses, `loss_fn.normalization` selects a named internal
+reducer: `GlobalTokenMeanReduction` sums valid token losses, while
+`SequenceMeanReduction` first averages tokens within each response. Each reducer
+owns both that formula (shared by actor loss and KL) and its denominator rule.
+The public loss-call arguments and the `LossType` contract remain available to
+existing trainers and losses.
+
+Streaming Megatron training calls the reducer's `local_counts` before packing or
+context-parallel splitting. It accumulates raw gradients with a denominator of
+one, sums the counts across data-parallel workers at update completion, and then
+normalizes gradients once. Token and sequence counts remain available separately
+for diagnostics and auxiliary objectives.
+
 For our simple example above, this would look like:
 
 ```{testcode}
