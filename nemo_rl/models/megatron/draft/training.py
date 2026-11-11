@@ -81,6 +81,9 @@ class DFlashForwardOutput:
     output_weight: Tensor
     sequence_layout: DraftSequenceLayout | None = None
     selected_teacher_logits: Tensor | None = None
+    # True only for a drafter-owned head (LiLiCorr has_own_lm_head), which trains
+    # through the draft loss; the policy head never does.
+    train_output_weight: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -774,6 +777,7 @@ class DFlashSpeculator:
             position_decay=self.config.position_decay,
             token_chunk_size=self.config.vocab_tile_size,
             tp_group=vocab_parallel_group,
+            train_output_weight=output.train_output_weight,
         )
 
     def export_weights(self, model: MegatronModule) -> list[tuple[str, Tensor]]:
@@ -1200,7 +1204,9 @@ class LiLiCorrSpeculator(DFlashSpeculator):
             # has_own_lm_head drafters are SERVED with their own head, so the draft
             # side (backbone CE and lattice candidates) must use it too. The teacher
             # side keeps the policy head: selected_teacher_logits were already built.
-            output = dataclasses.replace(output, output_weight=own_lm_head)
+            output = dataclasses.replace(
+                output, output_weight=own_lm_head, train_output_weight=True
+            )
             data["dflash_output"] = output
         plan = output.plan
         policy = unwrap_model(kwargs["policy_model"])

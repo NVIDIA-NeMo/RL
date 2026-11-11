@@ -721,8 +721,13 @@ def projected_streaming_vocab_parallel_soft_ce(
     bin_ids: torch.Tensor | None = None,
     weights: torch.Tensor | None = None,
     _skip_tp_metadata_check: bool = False,
+    train_output_weight: bool = False,
 ) -> DraftLossStats:
     """Project hidden states against preselected teacher rows with TP-safe metadata.
+
+    ``output_weight`` is never trained unless ``train_output_weight`` is set: the
+    policy head must not learn from the draft loss even if a caller forgets to
+    detach it. Only a drafter-owned head (LiLiCorr ``has_own_lm_head``) sets it.
 
     TP ranks agree on a fixed structural header and exact mask/bin/weight metadata
     before validation or loss collectives, so malformed rank-local inputs fail together.
@@ -806,6 +811,8 @@ def projected_streaming_vocab_parallel_soft_ce(
         raise ValueError(f"token_chunk_size must be positive, got {token_chunk_size}.")
     bin_ids, weights, num_bins = _resolve_draft_bins(mask, bin_ids, weights)
 
+    if not train_output_weight:
+        output_weight = output_weight.detach()
     num_tokens = student_hidden.numel() // student_hidden.shape[-1]
     if num_tokens <= token_chunk_size:
         vocab_parallel_hidden = _SumTensorParallelHiddenGradient.apply(
@@ -814,8 +821,7 @@ def projected_streaming_vocab_parallel_soft_ce(
         )
         student_logits = (
             vocab_parallel_hidden.reshape(-1, student_hidden.shape[-1])
-            # Not detached: a drafter-owned head trains through here. The policy
-            # head reaches this already detached, so it still gets no gradient.
+            # Detached above unless train_output_weight, so only an owned head trains.
             @ output_weight.T
         )
         # Bins are already resolved above; the public entry point would
@@ -859,6 +865,7 @@ def dflash_projected_vocab_parallel_soft_ce(
     position_decay: float,
     token_chunk_size: int,
     tp_group: torch.distributed.ProcessGroup | None,
+    train_output_weight: bool = False,
 ) -> DraftLossStats:
     """Map DFlash block slots to the live target head and indexed teacher rows.
 
@@ -996,4 +1003,5 @@ def dflash_projected_vocab_parallel_soft_ce(
         weights=weights,
         token_chunk_size=token_chunk_size,
         tp_group=tp_group,
+        train_output_weight=train_output_weight,
     )

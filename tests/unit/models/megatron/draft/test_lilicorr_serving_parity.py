@@ -142,6 +142,7 @@ def test_soft_ce_trains_a_drafter_owned_head(token_chunk_size):
         mask=mask,
         token_chunk_size=token_chunk_size,
         tp_group=None,
+        train_output_weight=True,
     )
     stats.numerators.sum().backward()
 
@@ -152,23 +153,28 @@ def test_soft_ce_trains_a_drafter_owned_head(token_chunk_size):
     (per_token * mask).sum().backward()
 
     assert weight.grad is not None, "drafter-owned head received no gradient"
-    torch.testing.assert_close(weight.grad, ref_weight.grad)
-    torch.testing.assert_close(hidden.grad, ref_hidden.grad)
+    # The kernels accumulate in float32; compare at float32 precision.
+    torch.testing.assert_close(weight.grad, ref_weight.grad, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(hidden.grad, ref_hidden.grad, rtol=1e-5, atol=1e-6)
 
 
-def test_soft_ce_leaves_a_detached_policy_head_alone():
+@pytest.mark.parametrize("token_chunk_size", [1, 1024])
+def test_soft_ce_never_trains_the_head_unless_asked(token_chunk_size):
+    # Even a head that requires grad (a policy head someone forgot to detach) must
+    # not learn from the draft loss by default.
     hidden = torch.randn(1, 2, 8, requires_grad=True)
-    weight = torch.randn(5, 8)
+    weight = torch.randn(5, 8, requires_grad=True)
     stats = projected_streaming_vocab_parallel_soft_ce(
         student_hidden=hidden,
         output_weight=weight,
         selected_teacher_logits=torch.randn(1, 2, 5),
         mask=torch.ones(1, 2, dtype=torch.bool),
-        token_chunk_size=1,
+        token_chunk_size=token_chunk_size,
         tp_group=None,
     )
     stats.numerators.sum().backward()
     assert weight.grad is None
+    assert hidden.grad is not None
 
 
 @pytest.mark.parametrize("positional", [False, True])
