@@ -324,8 +324,9 @@ rollout_recovery:
   # rollouts start over after a crash.
   # Set true to accept that with a warning; only valid with target_level: turn or prefix.
   allow_restart_only_gym_servers: false
-  # Per-generation-owner bounds for each checkpoint-cut TQ put with
-  # target_level: prefix. A row larger than the token limit is written alone.
+  # Per-generation-owner bounds for prefix TQ I/O with target_level: prefix:
+  # rows per checkpoint-cut put and keys per restore get, and token rows per
+  # cut put. A row larger than the token limit is written alone.
   generation_prefix_batch_size: 256
   generation_prefix_batch_max_tokens: 4194304
 

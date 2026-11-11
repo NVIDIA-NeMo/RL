@@ -61,7 +61,7 @@ class PrefixRecoveryParts:
     # A restored call's media, read back from its fetched prefix chunks; None
     # when the worker does not capture media.
     restore_media: Callable[[Sequence[Any]], Any | None]
-    # Most rows per cut-time TQ put.
+    # Most rows per cut-time TQ put, and keys per restore-time TQ get.
     generation_prefix_batch_size: int
     # Most token rows per cut-time TQ put; one larger row is written alone.
     generation_prefix_batch_max_tokens: int

@@ -29,6 +29,7 @@ project-includes = [
   "nemo_rl/experience/dynamic_sampling.py",
   "nemo_rl/environments/call_selection.py",
   "nemo_rl/algorithms/single_controller_utils/logical_advantage.py",
+  "nemo_rl/models/generation/prefix_read_batcher.py",
   "nemo_rl/data/captured_media.py",
   "nemo_rl/experience/reward_penalties.py",
   # TODO: enable these once we have 100 correctness
