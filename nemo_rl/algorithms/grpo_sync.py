@@ -196,7 +196,7 @@ def _apply_dynamic_sampling(
         pending_meta: Survivors accumulated from prior iterations.
         pending_carry: ``driver_carry`` rows aligned to ``pending_meta``.
         pending_unfiltered_rewards: All iterations' rewards pre-filter,
-            for legacy reward metric parity.
+            for the ``unfiltered_reward`` metric.
         train_prompts_size: Target batch size.
         num_gen_batches: Iteration counter (1-based).
         max_gen_batches: Upper bound on iterations before raising.
@@ -206,8 +206,8 @@ def _apply_dynamic_sampling(
         ``(pending_meta, pending_carry, pending_rewards, is_complete,
         ds_metrics, unfiltered_for_log)``.
     """
-    # Cumulative unfiltered total_reward for legacy metrics["reward"]
-    # parity. Reference-only append (no copy) — slice tensors are
+    # Cumulative unfiltered total_reward for metrics["unfiltered_reward"].
+    # Reference-only append (no copy) — slice tensors are
     # produced fresh per iteration, not aliased to TQ-owned bulk.
     pending_unfiltered_rewards.append(driver_carry["total_reward"])
 
@@ -657,8 +657,8 @@ def grpo_train_sync(
         # until we have enough for a full training batch. The TQ
         # payload of pending uids remains alive until either consumed
         # by training (clear_samples at step end) or evicted on overflow.
-        # ``pending_unfiltered_rewards`` is logging-only — preserves
-        # legacy ``metrics["reward"]`` semantics (cumulative unfiltered
+        # ``pending_unfiltered_rewards`` is logging-only — feeds
+        # ``metrics["unfiltered_reward"]`` (cumulative unfiltered
         # total_reward across all contributing iterations).
         pending_meta = None
         pending_carry: Optional[BatchedDataDict] = None
@@ -1287,8 +1287,7 @@ def grpo_train_sync(
                     else rewards
                 )
                 if master_config.grpo.use_dynamic_sampling:
-                    metrics["filtered_reward"] = rewards.numpy()
-                    metrics["reward"] = unfiltered_rewards.numpy()
+                    metrics["unfiltered_reward"] = unfiltered_rewards.numpy()
 
                 metrics.update(train_results["all_mb_metrics"])
                 metrics.update(gen_step_metrics)
@@ -1308,7 +1307,7 @@ def grpo_train_sync(
                         "draft_lr",
                         "wd",
                         "reward",
-                        "filtered_reward",
+                        "unfiltered_reward",
                         "global_valid_seqs",
                         "global_valid_toks",
                         "mean_prompt_length",
@@ -1514,13 +1513,11 @@ def grpo_train_sync(
                     else "not reported"
                 )
             )
+            print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             if master_config.grpo.use_dynamic_sampling:
-                print(f"  • Avg Filtered Reward: {np.mean(rewards.numpy()):.4f}")
                 print(
-                    f"  • Avg Total Reward: {np.mean(unfiltered_rewards.numpy()):.4f}"
+                    f"  • Avg Unfiltered Reward: {np.mean(unfiltered_rewards.numpy()):.4f}"
                 )
-            else:
-                print(f"  • Avg Reward: {np.mean(rewards.numpy()):.4f}")
             print(
                 f"  • Mean Generation Length: {metrics_logging_data['mean_gen_tokens_per_sample']:.4f}",
                 flush=True,

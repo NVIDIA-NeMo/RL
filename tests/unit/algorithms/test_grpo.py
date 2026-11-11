@@ -3439,6 +3439,103 @@ def test_grpo_train_dynamic_sampling_with_loo_keeps_prompt_group_intact(
     torch.testing.assert_close(captured_rewards[0], expected_training_rewards)
 
 
+def test_grpo_train_dynamic_sampling_reports_trained_rows_as_reward(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_grpo_components: dict[str, Any],
+) -> None:
+    """`reward` is the trained-rows mean; `unfiltered_reward` is the pre-filter mean."""
+    uniform_prompt = torch.tensor([1, 2, 3])
+    diverse_prompt = torch.tensor([7, 8, 9])
+    two_prompt_batch = BatchedDataDict[DatumSpec](
+        {
+            "message_log": [
+                [{"role": "user", "content": "uniform", "token_ids": uniform_prompt}],
+                [{"role": "user", "content": "diverse", "token_ids": diverse_prompt}],
+            ],
+            "task_name": ["math", "math"],
+            "extra_env_info": [{}, {}],
+            "loss_multiplier": torch.tensor([1.0, 1.0]),
+            "idx": torch.tensor([0, 1]),
+            "length": torch.tensor([3, 3]),
+        }
+    )
+    train_dataloader = MagicMock(spec=StatefulDataLoader)
+    train_dataloader.__iter__ = lambda _self: iter([two_prompt_batch] * 2)
+    train_dataloader.__len__ = MagicMock(return_value=2)
+    # The uniform prompt's group is dropped and the diverse prompt's group is kept.
+    generated_rewards = torch.tensor([1.0, 1.0, 1.0, 0.0])
+    trained_rewards = generated_rewards[2:]
+    # The loop reports the pre-filter rewards cut to the training batch size.
+    unfiltered_rewards = generated_rewards[: len(trained_rewards)]
+
+    def fake_rollout(*_args: Any, **kwargs: Any) -> tuple[BatchedDataDict, dict]:
+        rollout_batch = kwargs["input_batch"]
+        for message_log in rollout_batch["message_log"]:
+            message_log.append(
+                {
+                    "role": "assistant",
+                    "content": "answer",
+                    "token_ids": torch.tensor([4]),
+                }
+            )
+        rollout_batch["total_reward"] = generated_rewards.clone()
+        return rollout_batch, {"mean_gen_tokens_per_sample": 1.0}
+
+    monkeypatch.setattr(
+        grpo_mod, "should_use_async_rollouts", lambda *_args, **_kwargs: False
+    )
+    monkeypatch.setattr(grpo_mod, "run_multi_turn_rollout", fake_rollout)
+    monkeypatch.setattr(
+        grpo_mod, "refit_policy_generation", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        grpo_mod, "print_performance_metrics", lambda *_args, **_kwargs: {}
+    )
+    monkeypatch.setattr(
+        grpo_mod, "maybe_gpu_profile_step", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(
+        grpo_mod,
+        "compute_and_apply_seq_logprob_error_masking",
+        lambda *_args, **_kwargs: _mock_seq_logprob_error_result(),
+    )
+    monkeypatch.setattr(grpo_mod, "MemoryTracker", MagicMock)
+
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.max_num_steps = 1
+    master_config.grpo.max_num_epochs = 1
+    master_config.grpo.val_period = 0
+    master_config.grpo.num_prompts_per_step = 1
+    master_config.grpo.batch_multiplier = 2
+    master_config.grpo.num_generations_per_prompt = 2
+    master_config.grpo.dynamic_sampling_max_gen_batches = 1
+    master_config.grpo.use_dynamic_sampling = True
+
+    grpo_mod.grpo_train(
+        mock_grpo_components["policy"],
+        _mock_policy_generation(),
+        train_dataloader,
+        mock_grpo_components["val_dataloader"],
+        mock_grpo_components["tokenizer"],
+        mock_grpo_components["loss_fn"],
+        mock_grpo_components["task_to_env"],
+        mock_grpo_components["val_task_to_env"],
+        mock_grpo_components["logger"],
+        mock_grpo_components["checkpointer"],
+        _initial_grpo_save_state(),
+        master_config,
+    )
+
+    train_metrics = _logged_train_metrics_with_key(
+        mock_grpo_components["logger"], "unfiltered_reward"
+    )
+    assert train_metrics["reward"] == pytest.approx(trained_rewards.mean().item())
+    assert train_metrics["unfiltered_reward"] == pytest.approx(
+        unfiltered_rewards.mean().item()
+    )
+    assert "filtered_reward" not in train_metrics
+
+
 @pytest.mark.parametrize("policy", ["exclude", "include"])
 def test_grpo_train_dynamic_sampling_std_excludes_masked_rows(
     monkeypatch: pytest.MonkeyPatch,

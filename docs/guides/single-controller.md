@@ -543,10 +543,6 @@ Expect fewer training steps than `grpo.max_num_steps`. Replacements are ordinary
 
 The reward totals are kept in memory only, so after a checkpoint resume the in-flight step's reward metrics cover just the groups generated after the resume.
 
-```{warning}
-`train/reward` means different things on the two paths, so the curves are not comparable. With dynamic sampling on, v1 reports the **pre-filter** mean as `reward` and the kept rows as `filtered_reward`; SC keeps `reward` as the **trained-rows** mean and reports the pre-filter mean as `unfiltered_reward`. Comparing a v1 run against an SC run means lining up v1's `reward` with SC's `unfiltered_reward`, and v1's `filtered_reward` with SC's `reward`. SC's naming is the one to keep: every other metric on both paths describes the data actually trained on, and only v1's dynamic-sampling branch redefines `reward` to mean something else. Aligning v1 to this naming is tracked in [#5039](https://github.com/NVIDIA-NeMo/RL/issues/5039); it changes a metric existing dashboards already consume, so it lands on its own.
-```
-
 ## Implementation Structure
 
 The SC path splits the async-GRPO loop across a rollout pump and a train pump that share a `TQReplayBuffer` and are orchestrated by the `SingleControllerActor`.

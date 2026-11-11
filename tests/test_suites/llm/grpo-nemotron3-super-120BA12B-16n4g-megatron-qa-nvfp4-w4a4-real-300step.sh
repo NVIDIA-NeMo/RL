@@ -51,7 +51,7 @@ assert_not_grep "Using NvFp4LinearBackend.MARLIN" "$RUN_LOG" \
 
 uv run --no-sync tests/check_metrics.py "$JSON_METRICS" \
     'data["train/num_valid_samples"]["1"] >= 64' \
-    'data["train/reward"]["1"] >= 0.4' \
+    'data["train/unfiltered_reward"]["1"] >= 0.4' \
     'data["train/gen_kl_error"]["1"] < 0.1' \
     'data["train/token_mult_prob_error"]["1"] < 1.15' \
     'data["validation/accuracy"]["1"] >= 0.5'
