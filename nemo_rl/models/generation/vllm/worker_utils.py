@@ -24,6 +24,8 @@ TOKENIZER_REQUIRED_ARCHITECTURES = frozenset(
         "NemotronH_Omni_Reasoning_V3",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
+        # Step-5-Preview: vLLM's Step3VLMultiModalProcessor needs a tokenizer.
+        "Step5ForConditionalGeneration",
     }
 )
 

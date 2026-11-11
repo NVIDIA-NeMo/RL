@@ -1,0 +1,105 @@
+# Step-5-Preview (600B MoE, 27B active) GRPO/DAPO on AutoModel (FSDP2 + EP) with vLLM rollout.
+# DRAFT during bring-up: topology (num_nodes, EP, vLLM TP) is set by the full-model stage and the
+# file will be renamed to the validated <N>n8g form.
+defaults: ../../grpo_math_1B.yaml
+grpo:
+  num_prompts_per_step: 32
+  num_generations_per_prompt: 16
+  max_num_steps: 1000
+  normalize_rewards: false
+  use_leave_one_out_baseline: false
+  adv_estimator:
+    normalize_rewards: false
+    use_leave_one_out_baseline: false
+  use_dynamic_sampling: true
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 1024
+    max_response_length: 7168
+loss_fn:
+  token_level_loss: false
+  reference_policy_kl_penalty: 0.0
+  use_importance_sampling_correction: true
+  truncated_importance_sampling_type: tis
+  truncated_importance_sampling_ratio: 2
+  ratio_clip_max: 0.28
+  ratio_clip_c: 10
+checkpointing:
+  checkpoint_dir: results/grpo-step5-preview-dapo-automodel
+  keep_top_k: 1
+  save_period: 5
+policy:
+  model_name: stepfun-ai/Step-5-Preview-BF16
+  hf_config_overrides:
+    # MTP heads are not trained by RL and speculative decoding is out of scope.
+    num_nextn_predict_layers: 0
+  train_micro_batch_size: 1
+  logprob_batch_size: 1
+  # > 4,104 tokens so CSA region selection (512 regions x 8 tokens) actually drops history.
+  max_total_sequence_length: 8192
+  offload_optimizer_for_logprob: true
+  make_sequence_length_divisible_by: 64
+  refit_buffer_size_gb: 1
+  router_replay:
+    enabled: true
+  optimizer:
+    kwargs:
+      lr: 1.0e-06
+      weight_decay: 0.1
+  automodel_cfg:
+    context_parallel_size: 1
+    expert_parallel_size: 64
+    activation_checkpointing: true
+    moe_parallelizer:
+      ignore_router_for_ac: true
+    automodel_kwargs:
+      backend:
+        # From Automodel examples/llm_finetune/stepfun/step_5_preview_tulu3_sft.yaml
+        _target_: nemo_automodel.components.models.common.BackendConfig
+        attn: fa4
+        linear: te
+        rms_norm: torch_fp32
+        experts: torch_mm
+        dispatcher: hybridep
+        compile_router_weight: true
+        gate_precision: float32
+        enable_hf_state_dict_adapter: true
+        enable_fsdp_optimizations: true
+  sequence_packing:
+    enabled: false
+  dynamic_batching:
+    enabled: true
+  generation:
+    max_new_tokens: 7168
+    vllm_cfg:
+      tensor_parallel_size: 8
+      enable_expert_parallel: true
+      enforce_eager: true
+      # R3: vLLM >= the AuxOutput connector (in 0e7ce459) returns routed experts per KV block,
+      # keyed by block hash, so cached prefixes keep their routes; it requires prefix caching ON
+      # ("AuxOutput Connector requires prefix caching"). Older vLLM needed it OFF for R3.
+      enable_prefix_caching: true
+data:
+  max_input_seq_length: 1024
+  train:
+    dataset_name: DAPOMath17K
+  validation:
+    dataset_name: DAPOMathAIME2024
+  default:
+    prompt_file: null
+env:
+  math:
+    num_workers: 16
+    math_verify_impl: dapo_math_verify
+logger:
+  wandb_enabled: true
+  tensorboard_enabled: true
+  wandb:
+    project: nemo-rl-step5
+    name: grpo-step5-preview-dapo-automodel
+cluster:
+  gpus_per_node: 8
+  num_nodes: 32
