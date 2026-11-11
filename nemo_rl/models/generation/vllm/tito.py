@@ -93,6 +93,9 @@ class CapturedQwen3Renderer:
         from vllm.entrypoints.chat_utils import parse_chat_messages_async
         from vllm.renderers.hf import resolve_chat_template_content_format
 
+        # Checkpoint restore owns interrupted output tokens and remaining budgets.
+        if self.admission.generation_cut is not None:
+            raise TitoNotApplicable("Generation restore requires native preprocessing")
         if len(conversations) != 1:
             raise TitoNotApplicable("Expected one conversation")
         messages = conversations[0]

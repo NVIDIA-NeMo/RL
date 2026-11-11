@@ -8,7 +8,10 @@ import pytest
 pytest.importorskip("nemo_gym", reason="requires the paired Gym checkout")
 
 from nemo_gym.token_id_capture.replay import replay_context, summarize_replay
-from nemo_gym.token_id_capture.staging.records import CaptureAdmission
+from nemo_gym.token_id_capture.staging.records import (
+    CaptureAdmission,
+    GenerationCutContinuation,
+)
 from pydantic import ValidationError
 
 from nemo_rl.models.generation.capture_context import decide_capture_input
@@ -59,6 +62,50 @@ def test_an_unproven_response_boundary_roots_a_new_segment():
     )
     assert decision.storage.mode == "text"
     assert decision.serving is None
+
+
+CUT = GenerationCutContinuation(
+    source_capture_key="attempt-before-restore",
+    source_model_call_id="next-before-restore",
+    staging_keys=("active/checkpoint-1/0",),
+    prefix_token_count=4,
+    prefix_digest="c" * 64,
+    effective_output_limit=128,
+)
+
+
+@pytest.mark.parametrize(
+    ("messages", "mode"),
+    [
+        (HISTORY + [OBSERVATION], "token_in"),
+        # An unproven response boundary roots a new segment.
+        (HISTORY + [OBSERVATION, HISTORY[-1]], "text"),
+    ],
+)
+def test_a_restored_cut_reaches_the_served_admission(messages, mode):
+    decision = decide_capture_input(candidate(generation_cut=CUT), messages=messages)
+
+    assert decision.storage.mode == mode
+    # The worker resumes the call only from the admission it serves.
+    assert decision.serving is decision.storage
+    assert decision.storage.generation_cut == CUT
+
+
+def test_a_restored_cut_on_a_text_root_is_served():
+    # Forest training's first call: a text root that Gym replays from its
+    # source history, where long cuts usually land.
+    admission = CaptureAdmission(
+        capture_key="attempt",
+        model_call_id="first",
+        mode="text",
+        request_replay=replay_context(HISTORY, render_digest="b" * 64),
+        generation_cut=CUT,
+    )
+    decision = decide_capture_input(admission, messages=HISTORY)
+
+    assert decision.storage.mode == "text"
+    assert decision.serving is decision.storage
+    assert decision.storage.generation_cut == CUT
 
 
 def test_ordinary_admission_is_unchanged():

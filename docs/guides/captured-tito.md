@@ -12,7 +12,7 @@ Captured TITO reuses Gym's source-history matching and NeMo RL's exact token cap
 
 The generation backend must be native async vLLM with its HTTP server exposed. The opt-in path requires a candidate from Gym's source-history matcher; it does not trust assistant token metadata as a substitute for that proof. Uncaptured requests and ordinary fingerprint capture retain the existing renderer.
 
-The template is qualified by its SHA-256, not by a model name substring. Custom templates, non-text requests, unfinished assistant generations, tokenization-only requests, prompt truncation, and unsupported request options use the existing full-history path. Invalid capture evidence and storage failures remain errors. The module checks the vLLM version because it delegates to the versioned OnlineRenderer interface.
+The template is qualified by its SHA-256, not by a model name substring. Custom templates, non-text requests, unfinished assistant generations, tokenization-only requests, prompt truncation, checkpointed generation restores, and unsupported request options use the existing full-history path. Invalid capture evidence and storage failures remain errors. The module checks the vLLM version because it delegates to the versioned OnlineRenderer interface.
 
 ## Gym and training compatibility
 

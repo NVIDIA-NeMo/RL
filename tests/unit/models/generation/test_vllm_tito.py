@@ -20,6 +20,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from nemo_gym.token_id_capture.staging.records import GenerationCutContinuation
 from transformers import AutoTokenizer
 
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
@@ -201,7 +202,7 @@ def test_capture_adapter_encodes_only_suffix(tokenizer, parser_stub, monkeypatch
     assert adapter.prefix_token_ids == prefix
 
 
-@pytest.mark.parametrize("case", ["template", "unfinished", "media"])
+@pytest.mark.parametrize("case", ["template", "unfinished", "media", "generation_cut"])
 def test_capture_adapter_falls_back_without_staging(tokenizer, parser_stub, case):
     prefix = [42, tokenizer.eos_token_id] if case != "unfinished" else [42]
     adapter, params, messages = make_adapter(
@@ -209,6 +210,15 @@ def test_capture_adapter_falls_back_without_staging(tokenizer, parser_stub, case
         prefix=prefix,
         template="custom template" if case == "template" else None,
     )
+    if case == "generation_cut":
+        adapter.admission.generation_cut = GenerationCutContinuation(
+            source_capture_key="saved-rollout",
+            source_model_call_id="saved-call",
+            staging_keys=("saved-cut",),
+            prefix_token_count=1,
+            prefix_digest="c" * 64,
+            effective_output_limit=64,
+        )
     if case == "media":
         messages[-1]["content"] = [{"type": "image_url", "image_url": {"url": "x"}}]
     with pytest.raises(TitoNotApplicable):
