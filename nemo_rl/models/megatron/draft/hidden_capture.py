@@ -84,7 +84,12 @@ class HiddenStateCapture:
         model: nn.Module,
         aux_layer_indices: Optional[Tuple[int, ...]] = None,
     ):
-        self.model = unwrap_model(model)
+        from nemo_rl.models.megatron.draft.utils import unwrap_policy_language_model
+
+        # Hook the GPT/Mamba language model, not a VL wrapper around it: the
+        # wrapper has no .embedding / .output_layer and its forward never sees
+        # decoder_input, so embeddings and output hidden states went uncaptured.
+        self.model = unwrap_policy_language_model(model)
         self.num_layers = self.model.config.num_layers
 
         self.aux_layer_indices = (
