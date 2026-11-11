@@ -51,6 +51,19 @@ policy:
     # co-training shares the GPU with full policy training on a 120B.
     anchors_per_sample: 32
     learning_rate: 1.0e-4
+  generation:
+    vllm_kwargs:
+      # Rollout speculates with the co-trained drafter -- the point of this recipe.
+      # vLLM (>= 0.31) serves LiLiCorr through its DFlash method: the checkpoint's
+      # LiLiCorrDraftModel architecture selects it, and Model Runner V2 is chosen
+      # automatically. num_speculative_tokens must be the checkpoint's
+      # block_size - 1 (= policy.draft.gamma). The drafter's weights arrive by
+      # refit every step (body, convolutions, reranker and its own lm_head).
+      speculative_config:
+        method: dflash
+        model: ${policy.draft.model_name}
+        num_speculative_tokens: 7
+        draft_sample_method: probabilistic
   megatron_cfg:
     # The fused path returns per-token logprobs and never materializes the full
     # next-token logits the draft's teacher distribution needs.
