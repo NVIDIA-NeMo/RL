@@ -25,6 +25,12 @@ from nemo_rl.models.generation.megatron.megatron_worker import (  # noqa: E402
 
 pytestmark = pytest.mark.nemo_gym
 
+# ``setup_token_capture`` takes these from ``rollout_recovery`` with no defaults.
+_PREFIX_BATCH_LIMITS = {
+    "generation_prefix_batch_size": 256,
+    "generation_prefix_batch_max_tokens": 4_194_304,
+}
+
 
 @pytest.fixture
 def inference_loop():
@@ -57,6 +63,7 @@ def test_generation_refuses_generation_prefix_cuts():
             {"backend": "simple"},
             "rollout_staging",
             generation_prefix_cuts_enabled=True,
+            **_PREFIX_BATCH_LIMITS,
         )
 
 
@@ -71,7 +78,12 @@ def test_generation_setup_token_capture_fans_tq_config_to_workers(monkeypatch):
     )
 
     dp_cfg = {"backend": "simple"}
-    assert generation.setup_token_capture(dp_cfg, "rollout_staging") is None
+    assert (
+        generation.setup_token_capture(
+            dp_cfg, "rollout_staging", **_PREFIX_BATCH_LIMITS
+        )
+        is None
+    )
 
     assert worker_group.calls == [
         (
@@ -99,7 +111,10 @@ def test_generation_setup_token_capture_returns_the_coordinators_media_spec(
     )
     assert (
         generation.setup_token_capture(
-            {"backend": "simple"}, "rollout_staging", capture_media=True
+            {"backend": "simple"},
+            "rollout_staging",
+            capture_media=True,
+            **_PREFIX_BATCH_LIMITS,
         )
         is spec
     )
@@ -112,7 +127,9 @@ def test_generation_setup_token_capture_requires_exposed_http_server() -> None:
     generation._policy = SimpleNamespace(worker_group=worker_group)
 
     with pytest.raises(ValueError, match="expose_http_server=true"):
-        generation.setup_token_capture({"backend": "simple"}, "rollout_staging")
+        generation.setup_token_capture(
+            {"backend": "simple"}, "rollout_staging", **_PREFIX_BATCH_LIMITS
+        )
 
     # The driver-side guard fires before any worker is asked to install hooks.
     assert worker_group.calls == []

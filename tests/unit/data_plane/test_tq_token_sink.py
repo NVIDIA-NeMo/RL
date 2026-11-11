@@ -638,11 +638,8 @@ def test_generation_prefix_round_trips_under_checkpoint_scoped_keys(
     records, _, _ = build_fixture_artifacts("single_call")
     record = records[0]
 
-    first = sink.stage_generation_prefix(
-        record, checkpoint_id="checkpoint-1", chunk_sequence=0
-    )
-    second = sink.stage_generation_prefix(
-        record, checkpoint_id="checkpoint-1", chunk_sequence=1
+    written = sink.stage_generation_prefix_batch(
+        [record, record], checkpoint_id="checkpoint-1", chunk_sequences=[0, 1]
     )
     keys = [
         generation_cut_staging_key(
@@ -654,8 +651,7 @@ def test_generation_prefix_round_trips_under_checkpoint_scoped_keys(
         for sequence in (0, 1)
     ]
 
-    assert first.ok and second.ok
-    assert [first.staging_key, second.staging_key] == keys
+    assert written == keys
     assert [snapshot.model_dump() for snapshot in source.fetch(keys)] == [
         record.model_dump(exclude={"extras"}),
         record.model_dump(exclude={"extras"}),
@@ -2156,3 +2152,172 @@ def test_slice_media_tensors_rejects_inconsistent_geometry(
     slicer only adds the item-count bound."""
     with pytest.raises(ValueError, match=error):
         slice_media_tensors(validate_media_tensors(media_tensors), prev_count)
+
+
+def test_generation_prefix_batch_round_trips_ragged_rows(tq_client, staging_partition):
+    class RecordingClient:
+        def __init__(self):
+            self.calls = []
+
+        def put_samples(self, **kwargs):
+            self.calls.append(kwargs)
+            return tq_client.put_samples(**kwargs)
+
+    client = RecordingClient()
+    sink = TQTokenSink(client, staging_partition=staging_partition)
+    records, _, _ = build_fixture_artifacts("worked_example")
+    more_records, _, _ = build_fixture_artifacts(
+        "single_call", rollout_id="a-different-length-rollout-id"
+    )
+    records.extend(more_records)
+    keys = sink.stage_generation_prefix_batch(
+        records,
+        checkpoint_id="batch-checkpoint",
+        chunk_sequences=list(range(len(records))),
+    )
+
+    assert len(client.calls) == 1
+    assert client.calls[0]["sample_ids"] == keys
+    assert [tag["digest"] for tag in client.calls[0]["tags"]] == [
+        record.digest for record in records
+    ]
+    restored = TQTokenSource(tq_client, staging_partition=staging_partition).fetch(keys)
+    assert [row.model_dump() for row in restored] == [
+        record.model_dump(exclude={"extras"}) for record in records
+    ]
+
+
+def test_generation_prefix_batch_matches_single_rows_with_media_and_routes(
+    tq_client, media_partition
+):
+    from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+
+    client = _RecordingClient(tq_client)
+    sink = TQTokenSink(
+        client,
+        staging_partition=media_partition,
+        capture_media=True,
+        media_pixel_dtype=torch.bfloat16,
+    )
+    source = TQTokenSource(
+        client, staging_partition=media_partition, capture_media=True
+    )
+    chain, _, _ = build_fixture_artifacts("worked_example")
+    single, _, _ = build_fixture_artifacts("single_call")
+    records = [
+        record.model_copy(
+            update={
+                "extras": {
+                    "routed_experts": encode_routed_experts(
+                        torch.arange(
+                            len(record.token_ids_delta) * 4, dtype=torch.int16
+                        ).reshape(-1, 2, 2)
+                        + offset
+                    )
+                }
+            }
+        )
+        for offset, record in enumerate([*chain[:2], single[0]])
+    ]
+    # A still image, a one-frame video, and a text call in one batch.
+    bundles = [_still(), _video(frames=(1,), dtype=torch.bfloat16), None]
+
+    single_keys = []
+    for sequence, (record, bundle) in enumerate(zip(records, bundles, strict=True)):
+        single_keys += sink.stage_generation_prefix_batch(
+            [record],
+            checkpoint_id="single-cut",
+            chunk_sequences=[sequence],
+            attachments=[bundle],
+        )
+    puts_before = len(client.puts)
+    batched_keys = sink.stage_generation_prefix_batch(
+        records,
+        checkpoint_id="batched-cut",
+        chunk_sequences=list(range(len(records))),
+        attachments=bundles,
+    )
+    assert len(client.puts) - puts_before < len(records)
+
+    single = source.fetch_for_finalization(single_keys, include_route_fragments=True)
+    batched = source.fetch_for_finalization(batched_keys, include_route_fragments=True)
+    for expected, actual, bundle in zip(single, batched, bundles, strict=True):
+        assert actual.snapshot == expected.snapshot
+        assert actual.extras == expected.extras
+        assert actual.routed_len == expected.routed_len
+        assert actual.fragment.encoding == expected.fragment.encoding
+        _assert_same_tensor(actual.fragment.routes, expected.fragment.routes)
+        assert actual.media_present is (bundle is not None)
+        assert actual.media_has_frames == expected.media_has_frames
+        if bundle is not None:
+            [media] = source.fetch_media([actual])
+            _assert_same_tensor(media.imgs, bundle["imgs"])
+            _assert_same_tensor(media.imgs_sizes, bundle["imgs_sizes"])
+
+
+def test_generation_prefix_batch_rejects_bad_inventory_before_writing():
+    class UnexpectedClient:
+        def put_samples(self, **kwargs):
+            pytest.fail("invalid inventory must not reach TQ")
+
+    sink = TQTokenSink(UnexpectedClient(), staging_partition="test")
+    records, _, _ = build_fixture_artifacts("single_call")
+    assert (
+        sink.stage_generation_prefix_batch(
+            [], checkpoint_id="checkpoint", chunk_sequences=[]
+        )
+        == []
+    )
+    with pytest.raises(ValueError, match="equal lengths"):
+        sink.stage_generation_prefix_batch(
+            records, checkpoint_id="checkpoint", chunk_sequences=[]
+        )
+    with pytest.raises(ValueError, match="duplicate"):
+        sink.stage_generation_prefix_batch(
+            records * 2, checkpoint_id="checkpoint", chunk_sequences=[0, 0]
+        )
+
+
+@pytest.mark.parametrize("failing_put", [1, 2])
+def test_generation_prefix_batch_failure_discards_every_key_and_raises(failing_put):
+    """A routed row and plain rows go in two puts; whichever put fails, rows the
+    other put already wrote are discarded too, and nothing is returned."""
+    from nemo_rl.utils.routed_experts_codec import encode_routed_experts
+
+    class FailingClient:
+        def __init__(self):
+            self.calls = 0
+            self.cleared = []
+
+        def put_samples(self, **kwargs):
+            self.calls += 1
+            if self.calls == failing_put:
+                raise RuntimeError("injected partial batch write")
+
+        def clear_samples(self, **kwargs):
+            self.cleared.extend(kwargs["sample_ids"])
+
+    client = FailingClient()
+    sink = TQTokenSink(client, staging_partition="test")
+    records, _, _ = build_fixture_artifacts("worked_example")
+    routes = torch.zeros(len(records[0].token_ids_delta), 2, 2, dtype=torch.int16)
+    records[0] = records[0].model_copy(
+        update={"extras": {"routed_experts": encode_routed_experts(routes)}}
+    )
+    with pytest.raises(RuntimeError, match="injected partial batch write"):
+        sink.stage_generation_prefix_batch(
+            records,
+            checkpoint_id="checkpoint",
+            chunk_sequences=list(range(len(records))),
+        )
+
+    assert client.calls == failing_put
+    assert client.cleared == [
+        generation_cut_staging_key(
+            "checkpoint",
+            record.rollout_id,
+            record.model_call_id,
+            chunk_sequence=sequence,
+        )
+        for sequence, record in enumerate(records)
+    ]

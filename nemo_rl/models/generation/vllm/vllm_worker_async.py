@@ -814,6 +814,8 @@ class VllmAsyncGenerationWorkerImpl(
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
+        generation_prefix_batch_size: int,
+        generation_prefix_batch_max_tokens: int,
     ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
@@ -927,6 +929,10 @@ class VllmAsyncGenerationWorkerImpl(
                     router_replay=self._cut_routes_dtype is not None,
                     prefix_row_extras=self._generation_cut_record_payload,
                     restore_media=self._restore_generation_cut_media,
+                    generation_prefix_batch_size=generation_prefix_batch_size,
+                    generation_prefix_batch_max_tokens=(
+                        generation_prefix_batch_max_tokens
+                    ),
                 )
             )
         if not capture_media:
