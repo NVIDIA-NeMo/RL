@@ -70,6 +70,7 @@ from nemo_rl.models.generation.megatron.token_capture import (  # noqa: E402
     MEDIA_PREV_COUNT_KEY,
     MEDIA_PREV_SIZES_KEY,
     MINF_CAPTURE_PARAMS_FIELD,
+    MINF_CONVERTED_MESSAGE_ROLES_FIELD,
     TQMegatronPromptPreparer,
     TQMegatronTokenStager,
     _delta_align_minf_routing_indices,
@@ -79,6 +80,11 @@ from nemo_rl.models.generation.megatron.token_capture import (  # noqa: E402
 from tests.unit.data_plane.token_capture_test_fixtures import (  # noqa: E402
     build_fixture_artifacts,
     fixture_names,
+)
+from tests.unit.experience.test_capture_context import (  # noqa: E402
+    HISTORY,
+    OBSERVATION,
+    candidate,
 )
 
 STAGING_PARTITION = "rollout_staging_test"
@@ -1712,6 +1718,163 @@ def test_megatron_prompt_preparer_text_mode_drops_endpoint_media_count(
     expected_params.pop(PREFIX_MEDIA_COUNT_FIELD, None)
     assert result.offload_params == expected_params
     assert offload_params == original_offload_params
+
+
+# A tool observation after the candidate's history: the only new item.
+TOOL_OBSERVATION = {"role": "tool", "tool_call_id": "call-1", "content": "out"}
+
+
+def _staged_candidate(root_coords, items):
+    """A Gym forest candidate whose parent is the staged root call."""
+    return candidate(
+        items,
+        capture_key="minf-r0",
+        model_call_id="c2",
+        parent_call_id="c1",
+        prev_len=3,
+        staging_chain=[root_coords["staging_key"]],
+        parent_chain_hash=root_coords["chain_hash"],
+    )
+
+
+def test_megatron_preparer_resolves_a_preserved_candidate_to_token_in(
+    tq_client, staging_partition
+):
+    """A candidate whose converted boundary survives is served and stored token-in.
+
+    The endpoint re-rendered the prior turn differently (12 for 11); the
+    preparer splices the captured prefix over it, and the stager hands Gym a
+    resolved token-in admission, never the candidate.
+    """
+    stager, root_coords = _stage_root(
+        tq_client,
+        staging_partition,
+        SimpleNamespace(
+            prompt_token_ids=[10, 11],
+            generated_token_ids=[2],
+            generated_log_probs=[-0.1],
+        ),
+    )
+    admission = _staged_candidate(root_coords, HISTORY + [TOOL_OBSERVATION])
+    preparer = TQMegatronPromptPreparer(
+        TQTokenSource(tq_client, staging_partition=STAGING_PARTITION)
+    )
+
+    result = preparer.prepare_prompt(
+        [10, 12, 2, 20],
+        offload_params={
+            "ng_capture": admission.model_dump(mode="json"),
+            PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [10, 12, 2],
+            PREFIX_EOS_TOKEN_ID_FIELD: 2,
+            # The endpoint's converted messages carry a system prompt Gym's
+            # replay does not; only the cut before the suffix must be proven.
+            MINF_CONVERTED_MESSAGE_ROLES_FIELD: [
+                "system",
+                "user",
+                "assistant",
+                "tool",
+            ],
+        },
+    )
+
+    assert result.prompt == [10, 11, 2, 20]
+    prepared = result.offload_params["ng_capture"]
+    assert prepared["mode"] == "token_in"
+    assert prepared["parent_call_id"] == "c1"
+    assert prepared["required_prefix_token_ids"] == [10, 11, 2]
+
+    begin_call = MagicMock(wraps=stager._capture.begin_call)
+    stager._capture.begin_call = begin_call
+    staged = stager.stage(
+        "minf-response-2",
+        SimpleNamespace(
+            prompt_token_ids=result.prompt,
+            generated_token_ids=[30],
+            generated_log_probs=[-0.2],
+        ),
+        finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+        offload_params=result.offload_params,
+    )
+
+    [(begun,), _] = begin_call.call_args
+    assert begun.mode == "token_in"
+    coords = staged.response_metadata["ng_commit_coords"]
+    assert coords["disposition"] == "staged"
+    assert (coords["prev_len"], coords["delta_len"]) == (3, 2)
+
+
+@pytest.mark.parametrize("endpoint_reports_count", [True, False])
+def test_megatron_preparer_roots_a_candidate_whose_boundary_was_not_preserved(
+    endpoint_reports_count,
+):
+    """Without an assistant turn before the suffix the candidate roots as text."""
+    admission = candidate(HISTORY + [OBSERVATION])
+    prompt = [10, 11, 2, 20]
+    offload_params = {
+        "ng_capture": admission.model_dump(mode="json"),
+        PREFIX_TEMPLATE_TOKEN_IDS_FIELD: [10, 11, 2],
+        PREFIX_EOS_TOKEN_ID_FIELD: 2,
+        # Conversion merged the assistant turn away from the cut.
+        MINF_CONVERTED_MESSAGE_ROLES_FIELD: ["user", "user", "user"],
+    }
+    if endpoint_reports_count:
+        offload_params[PREFIX_MEDIA_COUNT_FIELD] = 1
+    original_offload_params = dict(offload_params)
+    preparer = TQMegatronPromptPreparer(MagicMock(spec=TQTokenSource))
+
+    result = preparer.prepare_prompt(prompt, offload_params=offload_params)
+
+    assert result.prompt == prompt
+    prepared = result.offload_params["ng_capture"]
+    assert prepared["mode"] == "text"
+    assert prepared["capture_key"] == admission.capture_key
+    assert prepared["model_call_id"] == admission.model_call_id
+    assert PREFIX_MEDIA_COUNT_FIELD not in result.offload_params
+    assert PREFIX_EXPANDED_TOKEN_COUNT_FIELD not in result.offload_params
+    assert MINF_CAPTURE_PARAMS_FIELD not in result.offload_params
+    assert offload_params == original_offload_params
+
+
+@pytest.mark.parametrize("roles", [None, "user", ["user", None]])
+def test_megatron_preparer_rejects_a_candidate_without_converted_roles(roles):
+    """The boundary cannot be proven without the endpoint's converted roles."""
+    offload_params = {"ng_capture": candidate().model_dump(mode="json")}
+    if roles is not None:
+        offload_params[MINF_CONVERTED_MESSAGE_ROLES_FIELD] = roles
+    preparer = TQMegatronPromptPreparer(MagicMock(spec=TQTokenSource))
+
+    with pytest.raises(ValueError, match="converted message roles"):
+        preparer.prepare_prompt([10, 11, 2, 20], offload_params=offload_params)
+
+
+def test_megatron_stager_refuses_an_unresolved_candidate(
+    tq_client, staging_partition, caplog
+):
+    """A candidate that skipped the preparer is declined before Gym sees it."""
+    stager = TQMegatronTokenStager(_megatron_sink(tq_client, staging_partition))
+    begin_call = MagicMock(wraps=stager._capture.begin_call)
+    stager._capture.begin_call = begin_call
+
+    with caplog.at_level(
+        "ERROR", logger="nemo_rl.models.generation.megatron.token_capture"
+    ):
+        result = stager.stage(
+            "minf-response-2",
+            SimpleNamespace(
+                prompt_token_ids=[10, 11, 2, 20],
+                generated_token_ids=[30],
+                generated_log_probs=[-0.2],
+            ),
+            finished_metadata=SimpleNamespace(policy_epoch=[(0, 7)]),
+            offload_params={"ng_capture": candidate().model_dump(mode="json")},
+        )
+
+    assert result is None
+    begin_call.assert_not_called()
+    assert any(
+        r.exc_info and "unresolved candidate" in str(r.exc_info[1])
+        for r in caplog.records
+    )
 
 
 def test_megatron_stager_stamps_admission_epoch_when_request_spans_refit(

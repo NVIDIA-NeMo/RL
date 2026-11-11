@@ -47,6 +47,7 @@ from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     boundary_route_rows,
 )
+from nemo_rl.models.generation.capture_context import decide_capture_input
 from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
 from nemo_rl.utils.routed_experts_codec import encode_routed_experts
 
@@ -62,6 +63,10 @@ MEDIA_PREV_COUNT_KEY = "media_prev_count"
 # ``(height, width)`` rows per staged item (``StagedPrefix.media_sizes`` as
 # nested lists): the stager checks the engine's retained media against them.
 MEDIA_PREV_SIZES_KEY = "media_prev_sizes"
+# Roles of the converted chat messages, in order. The Megatron chat endpoint
+# writes this reserved key (clients cannot send ``_``-prefixed params) so the
+# preparer can check a Gym candidate's response boundary as vLLM does.
+MINF_CONVERTED_MESSAGE_ROLES_FIELD = "_converted_message_roles"
 
 
 def _delta_align_minf_routing_indices(
@@ -144,6 +149,14 @@ class TQMegatronPromptPreparer:
     ) -> RequestPromptPreparationResult:
         """Resolve the admission's staged prefix and splice it into the prompt.
 
+        A Gym ``candidate`` admission (or one carrying ``request_replay``) is
+        first resolved with ``decide_capture_input``, as the vLLM worker does,
+        against the converted message roles the endpoint placed in
+        ``offload_params``: ``ng_capture`` is replaced by the storage
+        admission (``token_in`` when the response boundary survived
+        conversion, else a ``text`` root), so the stager never hands Gym an
+        unresolved candidate, and the serving admission picks the branch below.
+
         Returns the prompt unchanged when ``offload_params`` carries no
         ``ng_capture`` admission or the admission is text mode; a text-mode
         return also drops the endpoint's ``_prefix_media_count`` (if any), since
@@ -182,11 +195,12 @@ class TQMegatronPromptPreparer:
             The (possibly spliced) prompt and the updated ``offload_params``.
 
         Raises:
-            ValueError: The resolved prefix length differs from the admission's
-                ``prev_len``, the splice metadata is malformed or missing for a
-                chained admission, the splice did not yield the authorized
-                prefix, or the endpoint's prefix media count disagrees with the
-                chain's.
+            ValueError: A candidate admission arrives without the endpoint's
+                converted message roles, the resolved prefix length differs
+                from the admission's ``prev_len``, the splice metadata is
+                malformed or missing for a chained admission, the splice did
+                not yield the authorized prefix, or the endpoint's prefix media
+                count disagrees with the chain's.
             TypeError: The prompt is not a token-id list.
         """
         # Deferred import: megatron-core is a heavy, optional dependency.
@@ -211,6 +225,24 @@ class TQMegatronPromptPreparer:
             )
 
         admission = CaptureAdmission.model_validate(capture_payload)
+        if admission.mode == "candidate" or admission.request_replay is not None:
+            roles = offload_params.get(MINF_CONVERTED_MESSAGE_ROLES_FIELD)
+            if not isinstance(roles, list) or any(type(r) is not str for r in roles):
+                raise ValueError(
+                    "MInf candidate capture requires the chat endpoint's converted "
+                    "message roles"
+                )
+            # Renderer equivalence for empty tool content is unproven on MInf
+            # (allow_empty_tool_content stays False): such calls root as text.
+            decision = decide_capture_input(
+                admission, messages=[{"role": role} for role in roles]
+            )
+            offload_params = dict(offload_params)
+            # The stager hands this field to Gym's begin_call; it must never
+            # still hold the unresolved candidate. A token-in decision rewrites
+            # it below with the same admission plus its resolved prefix.
+            offload_params[NG_CAPTURE_FIELD] = decision.storage.model_dump(mode="json")
+            admission = decision.serving or decision.storage
         if admission.mode == "text":
             if PREFIX_MEDIA_COUNT_FIELD in offload_params:
                 offload_params = dict(offload_params)
@@ -547,6 +579,11 @@ class TQMegatronTokenStager:
             from nemo_gym.token_id_capture.staging.records import CaptureAdmission
 
             admission = CaptureAdmission.model_validate(capture_payload)
+            if admission.mode == "candidate":
+                raise ValueError(
+                    "MInf capture admission is still an unresolved candidate; "
+                    "the prompt preparer did not run for this request"
+                )
             call = self._capture.begin_call(
                 admission,
                 weight_version=self._weight_version(finished_metadata),
