@@ -970,13 +970,15 @@ class BaseVllmGenerationWorker:
     def _patch_vllm_nsight_config() -> None:
         """Override vLLM's nsight config for internal TP workers to use deferred capture.
 
-        vLLM's default _configure_ray_workers_use_nsight applies an always-on nsight
-        config (no capture-range, cuda-graph-trace=node) which causes significant
+        vLLM's RayExecutorV2._build_runtime_env applies an always-on nsight config
+        (no capture-range, cuda-graph-trace=node) which causes significant
         overhead and hangs Ray's compiled DAG. This patch replaces it with NeMo RL's
         lighter config that uses capture-range=cudaProfilerApi, deferring actual
         tracing until start_gpu_profiling() triggers cudaProfilerStart() on each
         internal worker via collective_rpc.
         """
+        from vllm.v1.executor.ray_executor_v2 import RayExecutorV2
+
         from nemo_rl.utils.nsys import NRL_NSYS_PROFILE_STEP_RANGE
 
         nsight_config = {
@@ -988,20 +990,15 @@ class BaseVllmGenerationWorker:
             "capture-range-end": "repeat",
             "cuda-graph-trace": "node",
         }
+        original_build_runtime_env = RayExecutorV2._build_runtime_env
 
-        try:
-            from vllm.v1.executor.ray_executor import RayDistributedExecutor
-        except ImportError:
-            from vllm.executor.ray_distributed_executor import (
-                RayDistributedExecutor,
-            )
+        def _patched_build_runtime_env(self) -> dict:
+            runtime_env = original_build_runtime_env(self)
+            if self.parallel_config.ray_workers_use_nsight:
+                runtime_env["nsight"] = nsight_config
+            return runtime_env
 
-        def _patched_configure(self, ray_remote_kwargs):
-            runtime_env = ray_remote_kwargs.setdefault("runtime_env", {})
-            runtime_env.update({"nsight": nsight_config})
-            return ray_remote_kwargs
-
-        RayDistributedExecutor._configure_ray_workers_use_nsight = _patched_configure
+        RayExecutorV2._build_runtime_env = _patched_build_runtime_env
 
     def _get_raw_spec_counters(self) -> dict[str, float | list[float]]:
         """Get the vLLM engine's Prometheus counters.
