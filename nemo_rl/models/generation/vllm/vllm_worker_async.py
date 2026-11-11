@@ -1581,6 +1581,16 @@ class VllmAsyncGenerationWorkerImpl(
                     if actual_request_max_tokens is not None:
                         self._set_max_tokens(request, 1)
 
+                # vLLM 0.33 turns parallel_tool_calls=False into a grammar that
+                # masks sampling after the first tool call, so the logprobs it
+                # returns no longer match the trainer's unmasked forward pass.
+                # Hide the flag from the parser only: vLLM still trims the
+                # response to the first tool call, as it did before 0.33.
+                single_tool_call = (
+                    getattr(request, "parallel_tool_calls", None) is False
+                )
+                if single_tool_call:
+                    request.parallel_tool_calls = None
                 try:
                     res = await super().preprocess_chat(
                         request=request,
@@ -1600,6 +1610,9 @@ class VllmAsyncGenerationWorkerImpl(
                             "Prompt exceeds max_model_len: %s", e
                         )
                     raise
+                finally:
+                    if single_tool_call:
+                        request.parallel_tool_calls = False
 
                 # Token capture: build the admission once, before branching,
                 # and resolve its prefix from it (staging_chain -> cached TQ

@@ -1515,6 +1515,33 @@ def test_clamp_max_tokens_sets_the_limit_the_request_uses(
     assert vars(request) == expected
 
 
+@pytest.mark.asyncio
+async def test_vllm_parser_does_not_see_parallel_tool_calls_false(monkeypatch):
+    """vLLM 0.33 turns the flag into a grammar that masks sampling."""
+    worker, serving_chat, _ = _setup_fake_vllm_chat_handler(monkeypatch)
+    worker._capture_media = False
+    worker._capture_request_media = MagicMock(return_value=None)
+    worker._begin_request_capture = MagicMock()
+    renderer = serving_chat.kwargs["online_renderer"]
+    seen_by_vllm = []
+
+    async def preprocess_chat(self, request, **kwargs):
+        seen_by_vllm.append(request.parallel_tool_calls)
+        return [], [{"prompt_token_ids": [1, 2]}]
+
+    vllm_online_renderer = sys.modules["vllm.renderers.online_renderer"].OnlineRenderer
+    monkeypatch.setattr(
+        vllm_online_renderer, "preprocess_chat", preprocess_chat, raising=False
+    )
+    request = types.SimpleNamespace(parallel_tool_calls=False)
+
+    await renderer.preprocess_chat(request, [], None, "auto", None)
+
+    assert seen_by_vllm == [None]
+    # vLLM reads the flag again to trim the response to the first tool call.
+    assert request.parallel_tool_calls is False
+
+
 @pytest.mark.parametrize(
     ("stream", "expected_kind"), [(False, "final_only"), (True, "delta")]
 )
