@@ -362,6 +362,8 @@ class RolloutSnapshotter(_UsesRolloutParts):
         only; the live trainer keeps accumulating gradients without modification.
         """
         cut.require_live()
+        if self._rollout_runtime.shortfall_reconciliation_pending:
+            raise RuntimeError("cannot checkpoint unreconciled selection shortfalls")
         snapshot = kind == "rollout_snapshot"
         dataloader_state = self._dataloader.state_dict()
         next_nemo_gym_task_index = self._rollout_manager.get_next_nemo_gym_task_index()
@@ -624,6 +626,10 @@ class RolloutSnapshotter(_UsesRolloutParts):
                 step_N never appears.
         """
         async with self._save_lock:
+            if self._rollout_runtime.shortfall_reconciliation_pending:
+                return RolloutCheckpointSaveResult(
+                    saved=False, reason="trainer_state_changed"
+                )
             if self._optimizer_commit_in_progress:
                 return RolloutCheckpointSaveResult(
                     saved=False,
@@ -701,6 +707,7 @@ class RolloutSnapshotter(_UsesRolloutParts):
                         cut_wall_time = time.time()
                         if (
                             self._optimizer_commit_in_progress
+                            or self._rollout_runtime.shortfall_reconciliation_pending
                             or self._read_progress().train_steps != expected_train_step
                             or self._read_progress().trainer_version
                             != expected_trainer_version
