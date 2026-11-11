@@ -247,26 +247,6 @@ def validate_batch_invariant_mode(config: PolicyConfig) -> ZeroTrainGenValidatio
     return out
 
 
-def allow_installed_flash_attn_4() -> None:
-    """Enable MCore's FA4 path for the pinned ``flash-attn-4`` b19.
-
-    MCore gates ``HAVE_FA4`` on ``>=4.0.0b20``, which needs a newer
-    ``apache-tvm-ffi`` than we pin. The call signature is identical.
-    """
-    # Deferred: Megatron-Core exists only in worker venvs.
-    import megatron.core.transformer.attention as mcore_attention
-
-    if getattr(mcore_attention, "HAVE_FA4", False):
-        return
-    if _first_package_version(("flash-attn-4", "flash_attn_4")) is None:
-        return
-    # Deferred: optional dependency, checked above.
-    from flash_attn.cute import flash_attn_varlen_func
-
-    mcore_attention.flash_attn4_varlen_func = flash_attn_varlen_func
-    mcore_attention.HAVE_FA4 = True
-
-
 class _GenAlignedLogprob(torch.autograd.Function):
     """Megatron Inference's log-probs forward; the replaced function's backward.
 
@@ -462,7 +442,6 @@ def _enable_mcore_deterministic_tuning() -> None:
 def enable_batch_invariant_kernels(config: PolicyConfig) -> None:
     """Pin TE FA support and call MCore ``enable_batch_invariant_mode``."""
     megatron_cfg = config["megatron_cfg"]
-    allow_installed_flash_attn_4()
     collective = megatron_cfg["batch_invariant_collective"]
 
     # Deferred: Megatron-Core exists only in worker venvs.
@@ -536,12 +515,6 @@ def _validate_backend(config: PolicyConfig, out: ZeroTrainGenValidation) -> None
             f"(got {generation.get('backend') if generation else None!r})."
         )
         return
-
-    if generation["colocated"]["enabled"]:
-        out.violations.append(
-            "zero_train_gen_mismatch does not support colocated generation; set "
-            "policy.generation.colocated.enabled=false."
-        )
 
     inference_cfg = merged_inference_megatron_cfg(config)
     impl = inference_cfg.get("transformer_impl")
