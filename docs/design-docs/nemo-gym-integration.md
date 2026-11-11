@@ -127,13 +127,13 @@ env:
 - A taskset goes in `environment_server_routes` or in `multi_harness.routes`, never both. Setup stops if a taskset is in both.
 - Each server in `multi_harness.routes` is an Environment Server defined in the Gym configuration, usually one per harness loaded through `config_paths`. NeMo RL reads which agent each server runs from that configuration.
 - Each prompt group of a multi-harness taskset runs on one of its servers, chosen at random in proportion to the weight of the agent that the server runs. With the weights above, about two thirds of the groups run on OpenCode.
-- Weights are keyed by agent type, the key under `responses_api_agents` in the agent's Gym configuration, such as `opencode_agent`. They apply to the whole run. A weight of 0 disables an agent.
+- Weights are keyed by agent type, the key under `responses_api_agents` in the agent's Gym configuration, such as `opencode_agent`. They apply to the whole run. A weight of 0 disables an agent. If `weights` is set, every agent that a listed server runs needs a weight, and every weight must name such an agent; setup stops otherwise. A taskset whose agents all have weight 0 also stops setup.
 
 GRPO compares a group's generations with the group's mean reward, so a group that mixed harnesses would train on the differences between harnesses. Every generation of a group therefore runs on the same server, including retried generations, retried groups, and groups restored from a rollout checkpoint: the choice is a hash of the group's ID. A rollout checkpoint records the `multi_harness` block, so a run resumes only with the same routes and weights.
 
-Setup checks each multi-harness taskset's servers. Each must run in exactly one Gym actor and run a different agent, and all must score the taskset the same way: one Environment Server type, the same resources server for `single_agent_turn`, and the taskset listed in each server's `tasksets` for `harbor`. Gym still checks at dispatch that each agent is one the taskset's verifier allows.
+Setup checks each multi-harness taskset's servers. Each must run in exactly one Gym actor and run a different agent, and all must score the taskset the same way: one Environment Server type, the same resources server for `single_agent_turn`, and the taskset listed in each server's `tasksets` for `harbor`. Gym still checks at dispatch that each agent is one the taskset's verifier allows. With `env.nemo_gym.shards`, every shard uses the shared `multi_harness` block; setup stops if a shard's `overrides` change it.
 
-Rollout metrics for a multi-harness taskset are named after the taskset and the agent, for example `swe_rebench/opencode_agent/reward`. Settings keyed by taskset, such as teacher selection and length or recovery overrides, still use the taskset name.
+Rollout metrics for a multi-harness taskset are named after the taskset and the agent, for example `swe_rebench/opencode_agent/reward`. There is no combined line for a multi-harness taskset; run-wide totals such as `total_reward` remain. Settings keyed by taskset, such as teacher selection and length or recovery overrides, still use the taskset name.
 
 ### Shard NeMo Gym across nodes
 

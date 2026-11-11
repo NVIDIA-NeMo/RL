@@ -1951,7 +1951,7 @@ Depending on your data shape, you may want to change these values."""
                     )
                 except (GymTransportError, RolloutDataFailure) as error:
                     return nemo_gym_row, error
-                # Only materialized tasks can run on a mixed harness. Metrics read
+                # Only materialized tasks can be multi-harness. Metrics read
                 # the harness from the result; the row sent to Gym carries only
                 # the server it ran on.
                 if is_nemo_gym_task(nemo_gym_row):
