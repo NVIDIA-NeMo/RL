@@ -1037,11 +1037,13 @@ def _patch_vllm_moe_routed_experts_capture(logger, *, required: bool = False) ->
     old_snippet = (
         "        if self.routed_experts.quant_method.is_monolithic:\n"
         "            # Monolithic kernels: pass router_logits to routed_experts\n"
+        "            router_logits = self.router.prepare_monolithic_logits(router_logits)\n"
         "            fused_out = self.routed_experts.forward_monolithic("
     )
     new_snippet = (
         "        if self.routed_experts.quant_method.is_monolithic:\n"
         "            # Monolithic kernels: pass router_logits to routed_experts\n"
+        "            router_logits = self.router.prepare_monolithic_logits(router_logits)\n"
         "            # NeMo-RL patch (routed-experts capture for router replay): "
         "monolithic MoE kernels compute top-k routing\n"
         "            # inside the fused kernel and never call router.select_experts,\n"
