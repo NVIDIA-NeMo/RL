@@ -23,7 +23,12 @@ import ray
 from nemo_rl.data.captured_media import MediaColumnSpec
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import forest_row_ids
+from nemo_rl.distributed.actor_environments import (
+    NEMO_GYM_ACTOR_FQN,
+    ROLLOUT_REASSEMBLER_ACTOR_FQN,
+)
 from nemo_rl.experience.reward_penalties import RewardChecks, RewardLogContext
 from nemo_rl.experience.rollout_reassembler import (
     FinalizedGroup,
@@ -37,6 +42,7 @@ from nemo_rl.utils.venvs import make_actor_runtime_env
 if TYPE_CHECKING:
     from nemo_rl.algorithms.grpo import RewardPenaltyConfig
     from nemo_rl.experience.rollouts import EffortLevelsConfig
+    from nemo_rl.models.policy import TokenizerConfig
 
 
 @dataclass(frozen=True)
@@ -62,8 +68,10 @@ class ReassemblyRequest:
     execution_row_multiple: int = 1
     reward_checks: tuple[RewardChecks | None, ...] | None = None
     reward_log_contexts: tuple[RewardLogContext | None, ...] | None = None
-    # Resolved by Gym and persisted with the sealed receipts for teacher routing.
+    # Real agent identity for flat rows, retained for existing checkpoint readers.
     resolved_agent_name: Optional[str] = None
+    # Taskset or flat-agent attribution, persisted with sealed receipts.
+    attribution_key: Optional[str] = None
 
     @property
     def capture_receipts(self) -> tuple[Optional[dict[str, Any]], ...]:
@@ -139,6 +147,10 @@ class RolloutReassemblerActorConfig:
     top_logprobs: int
     reward_penalty_config: RewardPenaltyConfig | None = None
     effort_config: EffortLevelsConfig | None = None
+    # Policy tokenizer and resolved think tags, set only when
+    # penalize_malformed_think_tag needs to decode generations.
+    tokenizer_config: TokenizerConfig | None = None
+    thinking_tags: tuple[str, ...] | None = None
 
 
 @ray.remote(
@@ -155,9 +167,16 @@ class RolloutReassemblerActor:  # pragma: no cover
         dp_config: DataPlaneConfig,
         config: RolloutReassemblerActorConfig,
     ) -> None:
-        dp_client = build_data_plane_client(dp_config, bootstrap=False)
+        self._dp_client = build_data_plane_client(dp_config, bootstrap=False)
+        tokenizer = None
+        if config.tokenizer_config is not None:
+            # Deferred: loading a tokenizer pulls in transformers, which only
+            # the malformed-think-tag penalty needs here.
+            from nemo_rl.algorithms.utils import get_tokenizer
+
+            tokenizer = get_tokenizer(config.tokenizer_config)
         self._finalizer = RolloutReassembler(
-            dp_client,
+            self._dp_client,
             partition_id=config.partition_id,
             staging_partition=config.staging_partition,
             pad_token_id=config.pad_token_id,
@@ -168,12 +187,19 @@ class RolloutReassemblerActor:  # pragma: no cover
             media_columns=config.media_columns,
             reward_penalty_config=config.reward_penalty_config,
             effort_config=config.effort_config,
+            tokenizer=tokenizer,
+            thinking_tags=config.thinking_tags,
             top_logprobs=config.top_logprobs,
         )
 
     def mooncake_checkpoint(self, body: dict[str, Any]) -> dict[str, Any] | None:
         """Run an owner-local checkpoint command; return metadata, never payloads."""
         return run_checkpoint_command(body)
+
+    def get_data_plane_snapshot(self) -> dict[str, Any] | None:
+        if not is_metrics_client(self._dp_client):
+            return None
+        return self._dp_client.snapshot(reset_step_window=True)
 
     def check_dependencies(self) -> None:
         """Import the finalization API before the controller starts rollouts."""
@@ -237,8 +263,14 @@ def create_rollout_reassembler_actors(
     """Construct and validate the pool after TQ partitions are registered."""
     if num_workers <= 0:
         raise ValueError(f"num_reassembler_workers must be positive, got {num_workers}")
+    # Deferred: the registry loads driver-only virtual-cluster dependencies.
+    from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
+
+    same_env = get_actor_python_env(
+        ROLLOUT_REASSEMBLER_ACTOR_FQN
+    ) == get_actor_python_env(NEMO_GYM_ACTOR_FQN)
     runtime_env = make_actor_runtime_env(
-        "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor"
+        NEMO_GYM_ACTOR_FQN if same_env else ROLLOUT_REASSEMBLER_ACTOR_FQN
     )
     actors = [
         RolloutReassemblerActor.options(runtime_env=runtime_env).remote(

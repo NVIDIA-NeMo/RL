@@ -48,6 +48,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
 )
 from nemo_rl.algorithms.grpo import (
     GRPOConfig,
+    RewardScalingConfig,
     _create_advantage_estimator,
     _initial_grpo_save_state,
 )
@@ -55,6 +56,7 @@ from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller import (
+    RolloutRuntimeState,
     SingleControllerActor,
     _pooled_opd_metrics,
 )
@@ -67,6 +69,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
     TokenCaptureConfig,
+    logprob_passes_required,
     resolve_ppo_chunk_alignment,
     validate_single_controller_config,
 )
@@ -98,18 +101,21 @@ from nemo_rl.weight_sync.sglang_weight_synchronizer import (
     SGLangColocatedWeightSynchronizer,
     SGLangDisaggregatedWeightSynchronizer,
 )
+from tests.unit.single_controller._rollout_checkpoints import (
+    attach_rollout_checkpointing,
+)
 
 
 def test_train_fields_add_the_sampler_topk_for_score_centering():
     without = single_controller._train_fields_for_step(
         policy_logprobs_required=True,
         reference_logprobs_required=False,
-        score_centering=False,
+        sampler_head_required=False,
     )
     with_topk = single_controller._train_fields_for_step(
         policy_logprobs_required=True,
         reference_logprobs_required=False,
-        score_centering=True,
+        sampler_head_required=True,
     )
     assert "reference_policy_logprobs" not in without
     assert with_topk == without + SAMPLER_TOPK_FIELDS
@@ -209,7 +215,11 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         gen_handle=SimpleNamespace(
             worker_group=SimpleNamespace(workers=[], dp_leader_worker_indices=[])
         ),
-        trainer_handle=SimpleNamespace(worker_group=SimpleNamespace(workers=[])),
+        trainer_handle=SimpleNamespace(
+            worker_group=SimpleNamespace(workers=[]),
+            add_data_plane_snapshot_source=lambda actor: None,
+            add_data_plane_snapshot_fn=lambda fn: None,
+        ),
         value_handle=None,
         teacher_worker_groups=None,
         dataloader=None,
@@ -419,8 +429,8 @@ def test_resumed_mooncake_init_restores_without_partition_registration(
     dp_client.load_checkpoint.assert_called_once_with(data_plane_path)
     single_controller.configure_checkpoint_workers.assert_called_once_with([])
     dp_client.register_partition.assert_not_called()
-    assert controller._data_plane_checkpoint_metadata == metadata
-    assert controller._rollout_checkpoint_load_metrics == {
+    assert controller._rollout_restorer._resume.data_plane_metadata == metadata
+    assert controller._rollout_restorer._resume.rollout_checkpoint_load_metrics == {
         "snapshot_resolution_seconds": 1.0,
         "tq_load_seconds": 5.0,
     }
@@ -453,7 +463,7 @@ def test_fresh_mooncake_init_registers_partition(
         configure.assert_not_called()
     dp_client.load_checkpoint.assert_not_called()
     dp_client.register_partition.assert_called_once()
-    assert controller._data_plane_checkpoint_metadata is None
+    assert controller._rollout_restorer._resume.data_plane_metadata is None
 
 
 @pytest.mark.parametrize("multimodal", [False, True])
@@ -1071,6 +1081,7 @@ def test_sync_weights_sglang_flushes_only_while_paused(
     ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
+    ctrl._trainer_version = 1
     ctrl._master_config = SimpleNamespace(
         env={}, token_capture=SimpleNamespace(enabled=False)
     )
@@ -1134,6 +1145,7 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._timer = Timer()
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
+    ctrl._trainer_version = 1
     # env={} -> should_use_nemo_gym is False, so _sync_weights takes the native
     # abort path (empty registry -> no-op) instead of the gym gate.
     ctrl._master_config = SimpleNamespace(
@@ -1175,7 +1187,9 @@ def test_sync_weights_keeps_dispatch_paused_when_generation_resume_fails() -> No
     )
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
 
     with pytest.raises(RuntimeError, match="successful refit pause"):
         asyncio.run(ctrl._sync_weights())
@@ -1232,7 +1246,9 @@ def test_sync_weights_does_not_resume_generation_after_failed_refit() -> None:
     )
     ctrl._inflight_by_group_id = {}
     ctrl._rollout_recovery_enabled = False
-    ctrl._master_config = SimpleNamespace(env={})
+    ctrl._master_config = SimpleNamespace(
+        env={}, token_capture=SimpleNamespace(enabled=False)
+    )
 
     with pytest.raises(RuntimeError, match="refit failed"):
         asyncio.run(ctrl._sync_weights())
@@ -2355,7 +2371,8 @@ class _StepMetricRecordingGeneration:
     def snapshot_step_metrics(self) -> None:
         self._record("snapshot_step_metrics")
 
-    def get_step_metrics(self) -> dict[str, float]:
+    def get_step_metrics(self, *, keep_snapshot: bool = False) -> dict[str, float]:
+        assert keep_snapshot
         self._record("get_step_metrics")
         return {"vllm/spec_acceptance_rate": 0.8}
 
@@ -2368,6 +2385,7 @@ class _NoOpDataPlane:
 def _train_pump_controller(*, sampler) -> object:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._master_config = SimpleNamespace(
         token_capture=TokenCaptureConfig(),
         grpo=GRPOConfig.model_construct(
@@ -2377,6 +2395,7 @@ def _train_pump_controller(*, sampler) -> object:
         # The pump's step epilogue reads the save triggers even when saving
         # is disabled.
         checkpointing={"enabled": False, "save_period": 10},
+        rollout_recovery=SimpleNamespace(generation_prefix_cuts_enabled=False),
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -2400,7 +2419,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._train_fields = single_controller._train_fields_for_step(
         policy_logprobs_required=False,
         reference_logprobs_required=False,
-        score_centering=False,
+        sampler_head_required=False,
     )
     ctrl._advantage_estimator = None
     ctrl._partition_id = "rollout_data"
@@ -2408,8 +2427,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._buffer = _EmptyBuffer()
     ctrl._buffer_capacity = asyncio.Semaphore(2)
     ctrl._rollout_exhausted = asyncio.Event()
-    ctrl._optimizer_commit_in_progress = False
-    ctrl._optimizer_commit_started = asyncio.Event()
+    attach_rollout_checkpointing(ctrl)
     ctrl._rollout_exhausted.set()
     ctrl._trainer = _NoOpTrainer()
     ctrl._is_ppo = False
@@ -2423,26 +2441,28 @@ def _train_pump_controller(*, sampler) -> object:
         requires_kv_scale_sync=False,
         blocks_training=lambda: False,
         snapshot_step_metrics=lambda: None,
-        get_step_metrics=lambda: {},
+        get_step_metrics=lambda *, keep_snapshot=False: {},
     )
     ctrl._rollout_manager = SimpleNamespace(
         set_weight_version=MagicMock(),
         suspend_request_deadlines=MagicMock(),
         resume_request_deadlines=MagicMock(),
+        drain_step_reward_metrics=MagicMock(return_value={}),
+        filter_zero_variance_groups=False,
     )
     ctrl._loss_fn = None
     ctrl._dp_client = _NoOpDataPlane()
     ctrl._timer = Timer()
     ctrl._trainer_version = 0
     ctrl._train_steps = 0
-    ctrl._checkpoint_save_lock = asyncio.Lock()
-    ctrl._optimizer_commit_in_progress = False
+    attach_rollout_checkpointing(ctrl)
     ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
-    ctrl._batch_shortfall = {}
     ctrl._batch_replacements = {}
     ctrl._batch_promotions = {}
-    ctrl._finalizer_metrics_by_group = {}
-    ctrl._finalizer_rewards_by_group = {}
+    ctrl._dynamic_sampling_enabled = False
+    ctrl._rollout_runtime.steps_allowed_short = set()
+    ctrl._rollout_runtime.finalizer_metrics_by_group = {}
+    ctrl._rollout_runtime.finalizer_rewards_by_group = {}
     ctrl._log_full_result_tables = False
     ctrl._step_log_dict = {
         "reward_partials": [],
@@ -2506,7 +2526,7 @@ class _DroppingSampler(_OneThenEmptySampler):
         self.ctrl = None
 
     def _credit(self) -> None:
-        self.ctrl._batch_shortfall[self.ctrl._trainer_version] = 1
+        self.ctrl._rollout_runtime.batch_shortfall[self.ctrl._trainer_version] = 1
 
     async def evict(self, *, current_train_weight: int) -> int:
         del current_train_weight
@@ -2578,9 +2598,95 @@ def test_train_pump_closes_a_step_short_when_a_stamped_prompt_is_dropped(
     # which would report 0 for every step forever.
     assert ctrl._trainer_version == 1
     # This step's counts are pruned; a later step's survive to be reported by it.
-    assert ctrl._batch_shortfall == {}
+    assert ctrl._rollout_runtime.batch_shortfall == {}
     assert ctrl._batch_replacements == {}
     assert ctrl._batch_promotions == {3: 1}
+
+
+@pytest.mark.parametrize("credit_in_evict", [False, True])
+@pytest.mark.parametrize("fraction, skipped", [(0.5, False), (0.51, True)])
+def test_data_exhausted_step_respects_batch_floor(
+    monkeypatch, credit_in_evict: bool, fraction: float, skipped: bool
+) -> None:
+    ctrl = _dropping_controller(credit_in_evict=credit_in_evict)
+    ctrl._rollout_runtime.steps_allowed_short.add(0)
+    ctrl._async_cfg.rollout_failure.min_step_batch_fraction = fraction
+    ctrl._trainer.abort_train_step = MagicMock()
+    ctrl._trainer.finish_train_step = MagicMock(return_value={})
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert ctrl._trainer.abort_train_step.call_count == int(skipped)
+    assert ctrl._trainer.finish_train_step.call_count == int(not skipped)
+    assert ctrl._consumed_samples == int(not skipped)
+    assert ctrl._train_steps == ctrl._trainer_version == 1
+    metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert metrics["skipped_step"] == int(skipped)
+    assert ctrl._buffer_capacity._value == 3
+    assert ctrl._sync_weights.await_count == int(not skipped)
+
+
+def test_skipped_exhausted_step_allows_later_admitted_step_to_train(
+    monkeypatch,
+) -> None:
+    metas = [
+        KVBatchMeta(
+            partition_id="rollout_data",
+            task_name="train",
+            sample_ids=[f"sample-{index}"],
+            fields=[],
+            sequence_lengths=[1],
+            tags=_one_group_tags(1),
+        )
+        for index in range(3)
+    ]
+    ctrl = _train_pump_controller(sampler=_SequenceSampler(metas))
+    ctrl._algo_cfg.max_num_steps = 2
+    ctrl._rollout_runtime.steps_allowed_short.add(0)
+    ctrl._rollout_runtime.batch_shortfall[0] = 1
+    ctrl._trainer.abort_train_step = MagicMock()
+    ctrl._trainer.finish_train_step = MagicMock(return_value={})
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    ctrl._trainer.abort_train_step.assert_called_once()
+    ctrl._trainer.finish_train_step.assert_called_once()
+    assert ctrl._consumed_samples == 2
+    assert ctrl._train_steps == ctrl._trainer_version == 2
+    metrics = [
+        call.args[0]
+        for call in ctrl._logger.log_metrics.call_args_list
+        if call.kwargs.get("prefix") == "train"
+    ]
+    assert [item["skipped_step"] for item in metrics] == [1, 0]
+    assert ctrl._buffer_capacity._value == 5
+
+
+def test_data_exhausted_step_with_no_groups_skips_without_opening_optimizer(
+    monkeypatch,
+) -> None:
+    ctrl = _train_pump_controller(sampler=_EmptySampler())
+    ctrl._rollout_runtime.steps_allowed_short.add(0)
+    ctrl._rollout_runtime.batch_shortfall[0] = 2
+    ctrl._trainer.begin_train_step = MagicMock()
+    ctrl._trainer.abort_train_step = MagicMock()
+    ctrl._trainer.finish_train_step = MagicMock()
+    ctrl._logger = MagicMock()
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    ctrl._trainer.begin_train_step.assert_not_called()
+    ctrl._trainer.abort_train_step.assert_not_called()
+    ctrl._trainer.finish_train_step.assert_not_called()
+    assert ctrl._consumed_samples == 0
+    assert ctrl._train_steps == ctrl._trainer_version == 1
+    assert ctrl._logger.log_metrics.call_args_list[0].args[0]["skipped_step"] == 1
 
 
 def test_train_pump_prunes_stamps_older_than_the_step_that_just_closed(
@@ -2604,12 +2710,12 @@ def test_train_pump_prunes_stamps_older_than_the_step_that_just_closed(
     ctrl._trainer_version = 3
     ctrl._sync_weights = AsyncMock(return_value=0)
     ctrl._logger = MagicMock()
-    ctrl._batch_shortfall = {2: 1, 3: 1, 5: 1}
+    ctrl._rollout_runtime.batch_shortfall = {2: 1, 3: 1, 5: 1}
     monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    assert ctrl._batch_shortfall == {5: 1}
+    assert ctrl._rollout_runtime.batch_shortfall == {5: 1}
 
 
 @pytest.mark.parametrize(
@@ -2670,7 +2776,7 @@ def test_train_pump_requests_and_fetches_only_required_logprobs(
     ctrl._train_fields = single_controller._train_fields_for_step(
         policy_logprobs_required=policy_logprobs_required,
         reference_logprobs_required=reference_logprobs_required,
-        score_centering=False,
+        sampler_head_required=False,
     )
     trainer = _LogprobRecordingTrainer()
     ctrl._trainer = trainer
@@ -2839,7 +2945,39 @@ def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
     assert "histogram/gen_tokens_length" not in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("dies_in", [None, "snapshot_step_metrics", "get_step_metrics"])
+@pytest.mark.parametrize("snapshot_fails", [False, True])
+def test_run_pumps_snapshots_generation_before_dispatch(
+    monkeypatch, snapshot_fails: bool
+) -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = controller_cls.__new__(controller_cls)
+    ctrl._environment_checkpoint = SimpleNamespace(check_startup=AsyncMock())
+    ctrl._weight_synchronizer = SimpleNamespace(is_stale=False)
+    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._trainer_version = 0
+    ctrl._rollout_restorer = SimpleNamespace(restore=AsyncMock(return_value=False))
+    events = []
+
+    def snapshot() -> None:
+        events.append("snapshot")
+        if snapshot_fails:
+            raise ActorDiedError()
+
+    def stop_before_dispatch(coroutine: Any) -> None:
+        coroutine.close()
+        events.append("dispatch")
+        raise RuntimeError("stop before dispatch")
+
+    ctrl._gen = SimpleNamespace(snapshot_step_metrics=snapshot)
+    monkeypatch.setattr(asyncio, "create_task", stop_before_dispatch)
+
+    with pytest.raises(RuntimeError, match="stop before dispatch"):
+        asyncio.run(ctrl._run_pumps())
+
+    assert events == ["snapshot", "dispatch"]
+
+
+@pytest.mark.parametrize("dies_in", [None, "get_step_metrics"])
 def test_train_pump_collects_generation_metrics_at_step_boundaries(
     monkeypatch, dies_in
 ) -> None:
@@ -2864,7 +3002,6 @@ def test_train_pump_collects_generation_metrics_at_step_boundaries(
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert events == [
-        "snapshot_step_metrics",
         "begin_train_step",
         "train_microbatches",
         "train_microbatches",
@@ -2876,6 +3013,39 @@ def test_train_pump_collects_generation_metrics_at_step_boundaries(
         assert "vllm/spec_acceptance_rate" not in train_metrics
     else:
         assert train_metrics["vllm/spec_acceptance_rate"] == pytest.approx(0.8)
+
+
+def test_train_pump_logs_generation_prefix_restores_with_prefix_cuts(
+    monkeypatch,
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=_one_group_tags(1),
+    )
+    events: list[str] = []
+    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
+    ctrl._trainer = _StepMetricRecordingTrainer(events)
+    ctrl._gen = _StepMetricRecordingGeneration(events, dies_in=None)
+    ctrl._gen.get_generation_prefix_counts = lambda: {
+        "restored_calls": 3,
+        "restored_prefix_tokens": 120,
+        "progress_read_hold_us": 2,
+    }
+    ctrl._master_config.rollout_recovery.generation_prefix_cuts_enabled = True
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert train_metrics["generation_prefix/restored_calls"] == 3.0
+    assert train_metrics["generation_prefix/restored_prefix_tokens"] == 120.0
+    assert train_metrics["generation_prefix/progress_read_hold_us"] == 2.0
 
 
 @pytest.mark.parametrize(
@@ -2931,7 +3101,7 @@ def test_train_pump_chunked_step_by_engine_regime(
         blocks_training=lambda: engine_blocks_training,
         finish_generation=_finish_generation,
         snapshot_step_metrics=lambda: None,
-        get_step_metrics=lambda: {},
+        get_step_metrics=lambda *, keep_snapshot=False: {},
     )
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
@@ -3281,7 +3451,7 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
                 ctrl._rollout_permitted.is_set()
             ),
             snapshot_step_metrics=lambda: None,
-            get_step_metrics=lambda: {},
+            get_step_metrics=lambda *, keep_snapshot=False: {},
         )
         ctrl._rollout_permitted = asyncio.Event()
         ctrl._rollout_permitted.set()
@@ -3560,7 +3730,7 @@ def _streaming_ppo_controller(
     async def sync_weights(*, calibration_data) -> int:
         assert calibration_data is None
         assert ctrl._trainer_version == 1
-        assert ctrl._optimizer_commit_in_progress
+        assert ctrl._rollout_snapshots._optimizer_commit_in_progress
         calls.append("refit")
         return 0
 
@@ -3628,7 +3798,7 @@ def test_streaming_ppo_prepares_critic_before_waiting_for_next_chunk(
             assert ctrl._value.inference_prepared
             assert ctrl._trainer.gradients_offloaded == ctrl._trainer.step_open
             assert ctrl._train_steps == ctrl._trainer_version == 0
-            assert not ctrl._optimizer_commit_in_progress
+            assert not ctrl._rollout_snapshots._optimizer_commit_in_progress
             assert "clear_samples" not in calls
             if attempts <= 4:
                 assert calls.count("critic.prepare_for_inference") == 2
@@ -3892,7 +4062,7 @@ def test_streaming_ppo_selection_failure_does_not_commit_pending_step(
     assert "critic.train_from_meta" not in calls
     assert "refit" not in calls
     assert "clear_samples" not in calls
-    assert not ctrl._optimizer_commit_in_progress
+    assert not ctrl._rollout_snapshots._optimizer_commit_in_progress
 
 
 @pytest.mark.parametrize("streaming", [False, True])
@@ -3905,8 +4075,8 @@ def test_ppo_blocks_rollout_snapshots_until_full_batch_critic_finishes(
     train_epochs = ctrl._value_train_epochs
 
     async def check_snapshot_then_train(meta: KVBatchMeta, *, num_epochs: int) -> dict:
-        assert ctrl._optimizer_commit_in_progress
-        snapshot = await ctrl._save_rollout_checkpoint(force=True)
+        assert ctrl._rollout_snapshots._optimizer_commit_in_progress
+        snapshot = await ctrl._rollout_snapshots.save_snapshot(force=True)
         assert not snapshot.saved
         assert snapshot.reason == "optimizer_commit_in_progress"
         assert ctrl._trainer_version == (0 if warmup else 1)
@@ -3916,7 +4086,7 @@ def test_ppo_blocks_rollout_snapshots_until_full_batch_critic_finishes(
 
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
-    assert not ctrl._optimizer_commit_in_progress
+    assert not ctrl._rollout_snapshots._optimizer_commit_in_progress
     assert ctrl._trainer_version == ctrl._train_steps == 1
     assert calls.count("refit") == (0 if warmup else 1)
 
@@ -3977,11 +4147,12 @@ def test_ppo_checkpoint_saves_both_updates_without_repeating_early_refit(
         assert kwargs == {
             "is_policy_training_step": True,
             "is_final_checkpoint": True,
+            "publish_now": False,
         }
         assert "critic.finish_training" in calls
         assert len(ctrl._dp_client.cleared_ids) == len(metas)
         assert ctrl._trainer_version == ctrl._train_steps == 1
-        assert not ctrl._optimizer_commit_in_progress
+        assert not ctrl._rollout_snapshots._optimizer_commit_in_progress
         assert "critic/loss" in metrics
         calls.append("checkpoint")
 
@@ -4045,7 +4216,7 @@ def test_streaming_ppo_accumulates_policy_then_trains_full_batch_critic(
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
     ctrl._rollout_manager.set_weight_version.assert_called_once_with(1)
     assert ctrl._train_steps == ctrl._trainer_version == 1
-    assert not ctrl._optimizer_commit_in_progress
+    assert not ctrl._rollout_snapshots._optimizer_commit_in_progress
 
 
 @pytest.mark.parametrize(
@@ -4183,7 +4354,7 @@ def test_ppo_waits_for_inflight_snapshot_before_optimizer_and_early_refit(
 
     async def run_with_inflight_snapshot() -> None:
         waiting_for_snapshot = asyncio.Event()
-        acquire = ctrl._checkpoint_save_lock.acquire
+        acquire = ctrl._rollout_snapshots._save_lock.acquire
 
         async def observe_acquire() -> bool:
             waiting_for_snapshot.set()
@@ -4191,8 +4362,12 @@ def test_ppo_waits_for_inflight_snapshot_before_optimizer_and_early_refit(
 
         # A snapshot has captured the old train step and is still writing it.
         # Signal the exact lock acquisition instead of relying on a timed sleep.
-        async with ctrl._checkpoint_save_lock:
-            monkeypatch.setattr(ctrl._checkpoint_save_lock, "acquire", observe_acquire)
+        async with ctrl._rollout_snapshots._save_lock:
+            monkeypatch.setattr(
+                ctrl._rollout_snapshots._save_lock,
+                "acquire",
+                observe_acquire,
+            )
             pump = asyncio.create_task(ctrl._train_pump())
             await asyncio.wait_for(waiting_for_snapshot.wait(), timeout=1.0)
             assert len(ctrl._trainer.trained_metas) == (len(metas) if streaming else 1)
@@ -4200,7 +4375,7 @@ def test_ppo_waits_for_inflight_snapshot_before_optimizer_and_early_refit(
             assert "critic.train_from_meta" not in calls
             assert "refit" not in calls
             assert ctrl._train_steps == ctrl._trainer_version == 0
-            assert not ctrl._optimizer_commit_in_progress
+            assert not ctrl._rollout_snapshots._optimizer_commit_in_progress
 
         await asyncio.wait_for(pump, timeout=1.0)
 
@@ -4212,7 +4387,7 @@ def test_ppo_waits_for_inflight_snapshot_before_optimizer_and_early_refit(
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
     ctrl._rollout_manager.set_weight_version.assert_called_once_with(1)
     assert ctrl._train_steps == ctrl._trainer_version == 1
-    assert not ctrl._optimizer_commit_in_progress
+    assert not ctrl._rollout_snapshots._optimizer_commit_in_progress
 
 
 @pytest.mark.parametrize("warmup", [False, True])
@@ -4396,15 +4571,8 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
     ctrl._is_ppo = True
-    ctrl._master_config = SimpleNamespace(
-        ppo=SimpleNamespace(
-            seq_logprob_error_threshold=None,
-            overlong_filtering=False,
-            # The shard-decline log names the estimator, so an unshardable
-            # stub has to carry one even though the assertions below ignore it.
-            adv_estimator=SimpleNamespace(name="gae"),
-        )
-    )
+    # Populate stage-read defaults without validating this partial PPO stub.
+    ctrl._master_config = SimpleNamespace(ppo=PPOConfig.model_construct())
     ctrl._algo_cfg = ctrl._master_config.ppo
     ctrl._message_level_advantage_penalties_enabled = False
     # gae normalizes over the whole batch, so it is not shard-invariant.
@@ -4437,6 +4605,75 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     )
     assert "returns" in (result_meta.fields or [])
     assert "advantages" in (result_meta.fields or [])
+
+
+def test_advantage_stage_scales_rewards_off_the_ppo_block_before_gae() -> None:
+    """Scaled PPO rewards must reach the real GAE critic targets."""
+    batch_size, sequence_length = 2, 4
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(
+                batch_size, sequence_length, dtype=torch.long
+            ),
+            "total_reward": torch.tensor([1.0, 0.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.ones(batch_size),
+            "values": torch.zeros(batch_size, sequence_length),
+            "mask_sample": torch.zeros(batch_size, dtype=torch.bool),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    ppo = PPOConfig.model_construct(
+        reward_scaling=RewardScalingConfig(
+            enabled=True,
+            source_min=0.0,
+            source_max=1.0,
+            target_min=-1.0,
+            target_max=1.0,
+        ),
+        adv_estimator=GAEConfig(normalize_advantages=False, gae_gamma=1.0),
+    )
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = GeneralizedAdvantageEstimator(
+        ppo.adv_estimator, ClippedPGLossConfig()
+    )
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._policy_logprobs_required = False
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._train_data_dump = None
+    ctrl._is_ppo = True
+    ctrl._master_config = SimpleNamespace(ppo=ppo)
+    ctrl._algo_cfg = ppo
+    ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl, shardable=False)
+    ctrl._step_log_dict = {
+        "reward_partials": [],
+        "advantage_partials": [],
+        "sequence_lengths": [],
+        "num_mask_sample_filtered": [],
+        "seq_logprob_error_metrics": [],
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
+    )
+
+    asyncio.run(ctrl._advantage_stage(meta))
+
+    returns = data_plane.written_fields["returns"]
+    torch.testing.assert_close(returns[:, -1], torch.tensor([1.0, -1.0]))
+    partial = ctrl._step_log_dict["reward_partials"][0]
+    assert partial.weighted_total / partial.weight == pytest.approx(0.0)
+    torch.testing.assert_close(data["total_reward"], torch.tensor([1.0, 0.0]))
 
 
 @pytest.mark.parametrize("dump_enabled", [False, True])
@@ -4528,12 +4765,16 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
     pending = {
         "group-0": {
             "finalize/penalty_count/empty_final_answer": 1.0,
+            "finalize/truncated_count": 1.0,
+            "finalize/truncated_count/agent": 1.0,
             "finalize/effort/low/100": 1.0,
             "finalize/effort/length_reward_sum": 0.9,
             "finalize/effort/reward_sum": 1.9,
         },
         "group-1": {
             "finalize/penalty_count/empty_final_answer": 0.0,
+            "finalize/truncated_count": 0.0,
+            "finalize/truncated_count/agent": 0.0,
             "finalize/effort/low/900": 1.0,
             "finalize/effort/low/1000": 1.0,
             "finalize/effort/low/1200": 1.0,
@@ -4544,6 +4785,7 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
     state = build_rollout_recovery_state(
         RolloutRecoveryLedger(),
         batch_shortfall={},
+        steps_allowed_short=set(),
         sampler_stamps_target_steps=True,
         finalizer_metrics_by_group=pending,
         finalizer_rewards_by_group={
@@ -4566,10 +4808,10 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
             ],
         },
     )
-    ctrl._finalizer_metrics_by_group = parse_rollout_recovery_state(
+    ctrl._rollout_runtime.finalizer_metrics_by_group = parse_rollout_recovery_state(
         state
     ).finalizer_metrics_by_group
-    ctrl._finalizer_rewards_by_group = parse_rollout_recovery_state(
+    ctrl._rollout_runtime.finalizer_rewards_by_group = parse_rollout_recovery_state(
         state
     ).finalizer_rewards_by_group
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
@@ -4581,6 +4823,11 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
     assert metrics["total_reward/median"] == 2.0
     assert metrics["total_reward/histogram"] == [0.0, 2.0, 2.0, 2.0]
     assert metrics["agent/reward/histogram"] == [0.0, 2.0, 2.0, 2.0]
+    # Termination rates pool truncated valid rows, not per-group rates.
+    assert metrics["truncation_rate"] == 0.25
+    assert metrics["natural_termination_rate"] == 0.75
+    assert metrics["agent/truncation_rate"] == 0.25
+    assert not any(name.startswith("finalize/truncated_count") for name in metrics)
     assert ("agent/full_result" in metrics) is log_full_result_tables
     if log_full_result_tables:
         assert '"reward":0.0' in metrics["agent/full_result"].data[0][0]
@@ -4589,8 +4836,8 @@ def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
     assert metrics["median_length_low"] == 950
     assert metrics["mean_length_reward_low"] == pytest.approx(0.2)
     assert not any(name.startswith("finalize/effort/") for name in metrics)
-    assert ctrl._finalizer_metrics_by_group == {}
-    assert ctrl._finalizer_rewards_by_group == {}
+    assert ctrl._rollout_runtime.finalizer_metrics_by_group == {}
+    assert ctrl._rollout_runtime.finalizer_rewards_by_group == {}
 
 
 @pytest.mark.parametrize("policy", ["exclude", "include"])
@@ -4661,6 +4908,85 @@ def test_advantage_stage_statistics_participation_is_binary(policy: str) -> None
     )
     assert data_plane.written_fields is not None
     assert "sample_mask" not in data_plane.written_fields.keys()
+
+
+@pytest.mark.parametrize(
+    "policy, expected_participation",
+    [("exclude", [1.0, 0.0, 0.0, 1.0]), ("include", [1.0, 1.0, 0.0, 1.0])],
+)
+def test_advantage_stage_in_loss_seq_filter_keeps_legacy_participation(
+    policy: str, expected_participation: list[float]
+) -> None:
+    """In-loss filtering adds no pre-training mask and skips the logprob columns.
+
+    Row 1 carries mask_sample and row 2 is a token-capture placeholder; both
+    trainers keep the placeholder out of the baseline under either policy.
+    """
+    batch_size, sequence_length = 4, 4
+    data = TensorDict(
+        {
+            "prompt_ids_for_adv": torch.zeros(batch_size, 1, dtype=torch.long),
+            "total_reward": torch.tensor([1.0, 3.0, 5.0, 0.0]),
+            "token_mask": torch.ones(batch_size, sequence_length),
+            "sample_mask": torch.tensor([1.0, 1.0, 0.0, 1.0]),
+            "mask_sample": torch.tensor([False, True, False, False]),
+            "truncated": torch.zeros(batch_size, dtype=torch.bool),
+        },
+        batch_size=[batch_size],
+    )
+    data_plane = _AdvantageDataPlane(data)
+    estimator = _MaskRecordingAdvantageEstimator()
+    ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+    ctrl._dp_client = data_plane
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = estimator
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._master_config = SimpleNamespace(
+        grpo=GRPOConfig(seq_logprob_error_threshold=2.0, masked_reward_policy=policy),
+        loss_fn=ClippedPGLossConfig(
+            seq_logprob_error_in_loss=True,
+            force_on_policy_ratio=True,
+            reference_policy_kl_penalty=0,
+        ),
+    )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._policy_logprobs_required, ctrl._reference_logprobs_required = (
+        logprob_passes_required(ctrl._master_config, ctrl._algo_cfg)
+    )
+    ctrl._teacher_logprobs_required = False
+    ctrl._train_data_dump = None
+    ctrl._is_ppo = False
+    ctrl._message_level_advantage_penalties_enabled = False
+    _stamp_advantage_stage_config(ctrl)
+    ctrl._step_log_dict = {
+        key: []
+        for key in (
+            "reward_partials",
+            "advantage_partials",
+            "sequence_lengths",
+            "num_mask_sample_filtered",
+            "seq_logprob_error_metrics",
+        )
+    }
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[f"sample-{i}" for i in range(batch_size)],
+        fields=list(data.keys()),
+        tags=_one_group_tags(batch_size),
+    )
+
+    _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
+
+    assert not ctrl._policy_logprobs_required
+    assert has_valid_training_tokens
+    assert torch.equal(estimator.valid_mask, torch.tensor(expected_participation))
+    torch.testing.assert_close(
+        estimator.mask,
+        data["token_mask"] * torch.tensor([1.0, 0.0, 0.0, 1.0]).unsqueeze(-1),
+    )
+    # The loss reports logprob-error counts; no controller record is made.
+    assert ctrl._step_log_dict["seq_logprob_error_metrics"] == []
 
 
 @pytest.mark.parametrize("policy", ["exclude", "include"])
@@ -4852,3 +5178,20 @@ def test_advantage_stage_placeholders_never_vote(
         return torch.stack(written.unbind()[:2])
 
     torch.testing.assert_close(compute(placeholders=True), compute(placeholders=False))
+
+
+def test_worker_group_snapshots_fan_out_and_drop_silent_ranks(monkeypatch) -> None:
+    """The critic and teacher groups join the cluster view through one fan-out each."""
+    calls: list[str] = []
+    group = SimpleNamespace(
+        run_all_workers_single_data=lambda name: calls.append(name) or ["r0", "r1"]
+    )
+    answers = {"r0": {"total_wall_ms": 1.0}, "r1": None}
+    monkeypatch.setattr(
+        single_controller.ray, "get", lambda refs: [answers[r] for r in refs]
+    )
+
+    snapshots = single_controller._worker_group_snapshots(group)()
+
+    assert calls == ["get_data_plane_snapshot"]
+    assert snapshots == [{"total_wall_ms": 1.0}]

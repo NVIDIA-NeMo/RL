@@ -21,9 +21,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from nemo_rl.environments.checkpointing.interfaces import EnvironmentEpisode
+
 if TYPE_CHECKING:
     from nemo_gym._checkpoint.coordination import Participants, PrepareResult
     from nemo_gym.server_utils import ServerClient
+
+
+# Gym's episode identity is the backend-neutral one the recovery ledger uses.
+# ``capture_key`` mirrors Gym's ``EpisodeId.capture_key``.
+GymCheckpointEpisode = EnvironmentEpisode
 
 
 @dataclass(frozen=True)
@@ -89,35 +96,8 @@ class GymCheckpointCommitSummary:
     unowned_live_episodes: tuple[GymCheckpointEpisode, ...] = ()
 
 
-@dataclass(frozen=True, order=True)
-class GymCheckpointEpisode:
-    """Serializable identity of one physical Gym episode attempt."""
-
-    rollout_id: str
-    attempt: int
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.rollout_id, str) or not self.rollout_id:
-            raise ValueError("Gym checkpoint rollout_id must not be empty")
-        if (
-            not isinstance(self.attempt, int)
-            or isinstance(self.attempt, bool)
-            or self.attempt < 0
-        ):
-            raise ValueError("Gym checkpoint attempt must be non-negative")
-
-    @property
-    def capture_key(self) -> str:
-        """Gym's attempt-qualified key: ``EpisodeId.capture_key``, mirrored."""
-        return (
-            self.rollout_id
-            if self.attempt == 0
-            else f"{self.rollout_id}-a{self.attempt}"
-        )
-
-    def next_attempt(self) -> GymCheckpointEpisode:
-        """Return the physical episode Gym creates when this one is restored."""
-        return GymCheckpointEpisode(self.rollout_id, self.attempt + 1)
+# Gym's model participants report these in each prepare reply's ``counts``.
+GENERATION_CUT_COUNT_NAMES = ("cut", "cut_failed", "cut_skipped")
 
 
 @dataclass(frozen=True)
@@ -131,9 +111,18 @@ class GymCheckpointPrepareSummary:
     prepared: bool
     blockers: dict[str, tuple[str, ...]]
     restarts: tuple[GymCheckpointEpisode, ...]
+    # Gym's per-checkpoint generation-cut outcome, summed over participants:
+    # calls cut, calls the worker could not cut, and calls never cut (their
+    # decoding is constrained). The last two regenerate after a restore.
+    generation_cut_counts: dict[str, int] = field(default_factory=dict)
 
     @classmethod
     def from_result(cls, result: PrepareResult) -> GymCheckpointPrepareSummary:
+        counts = {name: 0 for name in GENERATION_CUT_COUNT_NAMES}
+        for reply in result.replies.values():
+            reported = (reply.get("report") or {}).get("counts") or {}
+            for name in GENERATION_CUT_COUNT_NAMES:
+                counts[name] += int(reported.get(name, 0))
         return cls(
             prepared=result.prepared,
             blockers={
@@ -146,6 +135,7 @@ class GymCheckpointPrepareSummary:
                     for episode in result.restarts()
                 )
             ),
+            generation_cut_counts=counts,
         )
 
 

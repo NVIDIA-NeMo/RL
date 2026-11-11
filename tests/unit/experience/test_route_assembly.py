@@ -30,7 +30,7 @@ from nemo_gym.token_id_capture.staging.digest import (  # noqa: E402
     compute_extras_digest,
 )
 
-from nemo_rl.data_plane.schema import ROUTE_ENCODING_ENVELOPE  # noqa: E402
+from nemo_rl.data_plane.schema import ROUTE_ENCODING_TENSOR  # noqa: E402
 from nemo_rl.experience.route_assembly import (  # noqa: E402
     RouteFragment,
     RouteLayout,
@@ -44,10 +44,6 @@ from nemo_rl.experience.route_plan import (  # noqa: E402
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
-)
-from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
-    decode_routed_experts,
-    encode_routed_experts,
 )
 
 pytestmark = pytest.mark.nemo_gym
@@ -67,20 +63,15 @@ def _assemble(calls: list[tuple[torch.Tensor, int, int]]) -> torch.Tensor:
     """
     spans, fragments = [], {}
     for index, (vllm_routes, prev_len, prompt_len) in enumerate(calls):
-        payload = {
-            "choices": [
-                {"message": {"routed_experts": encode_routed_experts(vllm_routes)}}
-            ]
-        }
-        VllmAsyncGenerationWorkerImpl._delta_align_routed_experts(
+        payload = {"choices": [{"message": {"routed_experts": vllm_routes}}]}
+        staged = VllmAsyncGenerationWorkerImpl._delta_align_routed_experts(
             payload,
             prev_len=prev_len,
             prompt_len=prompt_len,
             generated_len=len(vllm_routes) - prompt_len,
         )
-        staged = decode_routed_experts(
-            payload["choices"][0]["message"]["routed_experts"], torch.int16
-        )
+        assert staged is not None
+        route_metadata = payload["choices"][0]["message"]["routed_experts"]
         key = f"rollout/call{index}"
         spans.append(
             RouteSpan(
@@ -89,13 +80,11 @@ def _assemble(calls: list[tuple[torch.Tensor, int, int]]) -> torch.Tensor:
                 generation_len=len(vllm_routes) - prompt_len,
                 staged_route_len=len(staged),
                 extras_digest_version=EXTRAS_DIGEST_VERSION,
-                extras_digest=compute_extras_digest(
-                    {"routed_experts": encode_routed_experts(staged)}
-                ),
+                extras_digest=compute_extras_digest({"routed_experts": route_metadata}),
                 boundary_rows=boundary_route_rows(prev_len),
             )
         )
-        fragments[key] = RouteFragment(staged, ROUTE_ENCODING_ENVELOPE, b"null")
+        fragments[key] = RouteFragment(staged, ROUTE_ENCODING_TENSOR, b"null")
 
     total_len = len(calls[-1][0])
     plan = RouteAssemblyPlan(
@@ -121,7 +110,20 @@ def test_single_call_keeps_vllm_routes() -> None:
     assert torch.equal(_assemble([(call, 0, 2)]), call)
 
 
-def test_turn_boundary_gets_the_next_calls_route() -> None:
+def test_turn_boundary_gets_the_next_calls_route(monkeypatch) -> None:
+    def reject_codec(*args, **kwargs):
+        pytest.fail("native route capture must not encode or decode route tensors")
+
+    monkeypatch.setattr(
+        "nemo_rl.utils.routed_experts_codec.encode_routed_experts", reject_codec
+    )
+    monkeypatch.setattr(
+        "nemo_rl.utils.routed_experts_codec.decode_routed_experts", reject_codec
+    )
+    monkeypatch.setattr(
+        "nemo_rl.experience.route_assembly.encode_routed_experts", reject_codec
+    )
+
     # Call 1: prompt 2 tokens, generates 2 (positions 2-3).
     call1 = _routes([10, 11], [12, 13], [14, 15], NO_ROUTE)
     # Call 2: prompt = call 1's 4 tokens + 1 tool token, generates 1.
