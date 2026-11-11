@@ -28,6 +28,18 @@ if TYPE_CHECKING:
 # calls _apply_vllm_patches in serving containers that do not install NeMo RL.
 
 
+def vllm_uses_ray_executor_v2() -> bool:
+    """Whether Ray-backed vLLM engines run on ``RayExecutorV2``.
+
+    vLLM 0.25 defaulted ``VLLM_USE_RAY_V2_EXECUTOR_BACKEND`` to on, and vLLM #62228
+    (2026-10-19) removed the variable together with the v1 Ray executor, leaving
+    ``RayExecutorV2`` as the only one. A missing attribute therefore means V2.
+    """
+    import vllm.envs as envs
+
+    return bool(getattr(envs, "VLLM_USE_RAY_V2_EXECUTOR_BACKEND", True))
+
+
 def _get_vllm_file(relative_path: str) -> str:
     """Return absolute path to a vLLM file or raise if it cannot be found.
 
@@ -1357,7 +1369,6 @@ def _apply_vllm_patches(
     require_moe_routed_experts_capture: bool = False,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
-    import vllm.envs as envs
     from vllm.logger import init_logger
 
     patch_logger = init_logger("vllm_patch")
@@ -1367,7 +1378,7 @@ def _apply_vllm_patches(
     # _init_workers_ray; the patch is only load-bearing when it is set to "0".
     # Reporting the same way in both cases either cries wolf or hides a real
     # break, so branch on it.
-    uses_v1_executor = not envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND
+    uses_v1_executor = not vllm_uses_ray_executor_v2()
     applied = _patch_vllm_init_workers_ray(py_executable, extra_env_vars)
 
     if applied and uses_v1_executor:

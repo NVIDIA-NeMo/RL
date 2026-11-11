@@ -1961,8 +1961,17 @@ def test_multi_gpu_fp8_patches_before_model_load(fp8_module, monkeypatch, use_ra
     """Both Ray executors must receive the FP8 patches before worker/model init."""
     from vllm import envs
     from vllm.v1.executor.abstract import Executor
-    from vllm.v1.executor.ray_executor import RayDistributedExecutor
     from vllm.v1.executor.ray_executor_v2 import RayExecutorV2, RayWorkerProc
+
+    # vLLM #62228 removed the v1 Ray executor and VLLM_USE_RAY_V2_EXECUTOR_BACKEND;
+    # RayExecutorV2 is then the only Ray executor and the v1 case does not exist.
+    has_v1_switch = "VLLM_USE_RAY_V2_EXECUTOR_BACKEND" in dir(envs)
+    if not has_v1_switch:
+        if use_ray_v2 == "0":
+            pytest.skip("this vLLM has no v1 Ray executor (vLLM #62228)")
+        RayDistributedExecutor = types.SimpleNamespace(collective_rpc=None)
+    else:
+        from vllm.v1.executor.ray_executor import RayDistributedExecutor
 
     fp8 = fp8_module
     events = []
@@ -1971,12 +1980,13 @@ def test_multi_gpu_fp8_patches_before_model_load(fp8_module, monkeypatch, use_ra
         parallel_config=types.SimpleNamespace(distributed_executor_backend="ray")
     )
 
-    # vLLM memoizes env lookups once an engine has been built in-process, which
-    # would make setenv below a silent no-op and quietly test one branch twice.
-    envs.disable_envs_cache()
-    monkeypatch.setenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", use_ray_v2)
     uses_v2 = use_ray_v2 == "1"
-    assert envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND is uses_v2
+    if has_v1_switch:
+        # vLLM memoizes env lookups once an engine has been built in-process, which
+        # would make setenv below a silent no-op and quietly test one branch twice.
+        envs.disable_envs_cache()
+        monkeypatch.setenv("VLLM_USE_RAY_V2_EXECUTOR_BACKEND", use_ray_v2)
+        assert envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND is uses_v2
     assert Executor.get_class(vllm_config) is (
         RayExecutorV2 if uses_v2 else RayDistributedExecutor
     )

@@ -24,7 +24,6 @@ import ray
 import torch
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModel, DeepseekV3Config, PretrainedConfig
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
@@ -146,7 +145,9 @@ def set_refit_manifest_names(names: set[str] | None) -> None:
 
 def monkey_patch_vllm_ray_executor(fp8_config):
     if fp8_config.model_parallel_size > 1:
-        if envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
+        from nemo_rl.models.generation.vllm.patches import vllm_uses_ray_executor_v2
+
+        if vllm_uses_ray_executor_v2():
             from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
 
             original_initialize_worker = RayWorkerProc.initialize_worker
