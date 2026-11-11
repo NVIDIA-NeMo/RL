@@ -50,6 +50,17 @@ from nemo_rl.algorithms.single_controller_utils.debug_writer import (
     DebugWriterConfig,
     JsonDebugWriter,
 )
+from nemo_rl.algorithms.single_controller_utils.masking_stats import (
+    new_masking_stats_accumulator,
+    reduce_masking_stats,
+)
+from nemo_rl.algorithms.single_controller_utils.rollout_stats import (
+    accumulate_rollout_stats,
+    merge_stats_accumulator,
+    new_rollout_stats_accumulator,
+    reduce_rollout_stats,
+    stats_accumulator_to_rpc,
+)
 from nemo_rl.algorithms.single_controller_utils.utils import (
     AdvantagePartial,
     RewardPartial,
@@ -57,7 +68,7 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.algorithms.utils import calculate_baseline_and_std_per_prompt
 from nemo_rl.data_plane import KVBatchMeta
-from nemo_rl.data_plane.schema import GROUP_ID_TAG
+from nemo_rl.data_plane.schema import GROUP_ID_TAG, INPUT_LENGTHS
 from nemo_rl.utils.logger import LoggerConfig
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 from nemo_rl.utils.timer import Timer
@@ -113,6 +124,7 @@ class TestInputFields:
             adv.sample_mask_field,
             adv.mask_sample_field,
             adv.truncated_field,
+            INPUT_LENGTHS,
         ]
 
     def test_policy_logprobs_pull_both_logprob_columns(self) -> None:
@@ -167,6 +179,32 @@ class TestRpcBoundaryStaysMetadataOnly:
             opd_stat_sum=2.0,
             opd_stat_sumsq=2.5,
             opd_stat_count=2,
+        )
+        assert_metadata_only(outcome)
+
+    def test_outcome_with_row_stats_carries_no_payload(self) -> None:
+        stats = new_rollout_stats_accumulator()
+        accumulate_rollout_stats(
+            stats,
+            prompt_ids=torch.tensor([0, 0, 1, 1]),
+            rewards=torch.tensor([1.0, 0.0, 1.0, 1.0]),
+            sample_mask=torch.ones(4),
+            token_mask=torch.tensor([[0, 1, 1], [0, 1, 0], [1, 1, 1], [0, 0, 1]]),
+            truncated=torch.zeros(4, dtype=torch.bool),
+            seq_lens=torch.tensor([3, 3, 3, 3]),
+        )
+        outcome = AdvantageOutcome(
+            meta=KVBatchMeta(
+                partition_id="rollout_data",
+                task_name="train",
+                sample_ids=["sample-0"],
+                fields=["advantages"],
+            ),
+            has_valid_training_tokens=True,
+            num_mask_sample_filtered=0,
+            reward_partial=RewardPartial.from_rows(torch.tensor([1.0])),
+            advantage_partial=AdvantagePartial.from_values(torch.tensor([0.5])),
+            rollout_stats=stats_accumulator_to_rpc(stats),
         )
         assert_metadata_only(outcome)
 
@@ -515,6 +553,11 @@ def test_rpc_dataclass_fields_are_classified() -> None:
         # disk shard-side.
         "train_data_dump_s",
         "train_data_dump_receipt",
+        # One scalar per row as plain lists (rewards, mask flags, generated
+        # tokens, turns, sequence length, group index), never per-token data:
+        # the step's percentiles and per-group stats need the rows.
+        "masking_stats",
+        "rollout_stats",
     }
 
 
@@ -690,6 +733,8 @@ def _controller(
     ctrl._opd_stat_sum = ctrl._opd_stat_sumsq = 0.0
     ctrl._opd_stat_count = 0
     ctrl._opd_gap_sum = 0.0
+    ctrl._masking_stats_acc = new_masking_stats_accumulator()
+    ctrl._rollout_stats_acc = new_rollout_stats_accumulator()
     ctrl._step_log_dict = {
         "reward_partials": [],
         "advantage_partials": [],
@@ -717,7 +762,11 @@ def _run(estimator_name: str, num_actors: int):
         seq_logprob_error_metrics=ctrl._step_log_dict["seq_logprob_error_metrics"],
     )
     opd = (ctrl._opd_stat_sum, ctrl._opd_stat_sumsq, ctrl._opd_stat_count)
-    return ctrl, advantages, metrics, has_valid, opd
+    stats = (
+        reduce_masking_stats(ctrl._masking_stats_acc),
+        reduce_rollout_stats(ctrl._rollout_stats_acc),
+    )
+    return ctrl, advantages, metrics, has_valid, opd, stats
 
 
 @pytest.mark.parametrize("estimator_name", sorted(SHARD_INVARIANT_ESTIMATORS))
@@ -729,14 +778,23 @@ def test_sharded_pool_matches_in_process(estimator_name: str) -> None:
     that share prompt text too, now that the baseline keys on GROUP_ID_TAG
     rather than on the prompt tokens.
     """
-    _, adv_local, metrics_local, valid_local, opd_local = _run(estimator_name, 0)
-    ctrl, adv_pool, metrics_pool, valid_pool, opd_pool = _run(estimator_name, 3)
+    _, adv_local, metrics_local, valid_local, opd_local, stats_local = _run(
+        estimator_name, 0
+    )
+    ctrl, adv_pool, metrics_pool, valid_pool, opd_pool, stats_pool = _run(
+        estimator_name, 3
+    )
     # 6 groups over 3 actors: every actor got exactly 2 whole groups.
     assert [actor.calls for actor in ctrl._advantage_actors] == [[8], [8], [8]]
     torch.testing.assert_close(adv_pool, adv_local)
     assert metrics_pool == pytest.approx(metrics_local)
     assert valid_pool == valid_local
     assert opd_pool == pytest.approx(opd_local)
+    # Each shard numbers its groups from 0; the controller must re-base them.
+    assert stats_pool[1]["groups/count"] == NUM_GROUPS
+    assert stats_pool[0]["masking/groups"] == NUM_GROUPS
+    assert stats_pool[0] == pytest.approx(stats_local[0])
+    assert stats_pool[1] == pytest.approx(stats_local[1])
 
 
 @pytest.mark.parametrize("full_vocab", [False, True])
@@ -941,3 +999,81 @@ def test_failed_actor_rpc_raises_and_retires_the_actor(capsys) -> None:
     assert ctrl._available_advantage_actors.qsize() == 0
     # The mutation cut is released even on failure.
     assert ctrl._data_plane_checkpoint_barrier.mutation_version == 1
+
+
+# ── grpo.masked_reward_policy ──────────────────────────────────────────────
+
+
+class _RecordingEstimator:
+    """Records what the stage hands the estimator; returns zero advantages."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict[str, torch.Tensor]] = []
+
+    def compute_advantage(self, prompt_ids, rewards, mask, valid_mask=None, **_):
+        self.calls.append({"mask": mask.clone(), "valid_mask": valid_mask.clone()})
+        return torch.zeros_like(mask)
+
+
+@pytest.mark.parametrize("policy", ["exclude", "include"])
+def test_masked_rows_enter_the_baseline_only_under_include(policy) -> None:
+    """An env-flagged row never trains; masked_reward_policy decides its baseline weight."""
+    keep_in_baseline = policy == "include"
+    meta = _meta_for_group_sizes([4])
+    rewards = [1.0, 1.0, 1.0, 0.0]
+    rows = {
+        sid: {
+            "total_reward": torch.tensor(rewards[i]),
+            "token_mask": torch.ones(SEQ),
+            "sample_mask": torch.tensor(1.0),
+            # The failing row is the one the env (or a mask_sample rule) flagged.
+            "mask_sample": torch.tensor(i == 3),
+            "truncated": torch.tensor(False),
+            "input_lengths": torch.tensor(SEQ),
+        }
+        for i, sid in enumerate(meta.sample_ids)
+    }
+    estimator = _RecordingEstimator()
+    computer = AdvantageComputer(
+        _RowStore(rows),
+        config=_config(
+            algo=GRPOConfig(
+                num_generations_per_prompt=4,
+                seq_logprob_error_threshold=None,
+                masked_reward_policy=policy,
+            )
+        ),
+        advantage_estimator=estimator,
+    )
+    outcome = asyncio.run(computer.run(AdvantageRequest(meta=meta)))
+
+    (call,) = estimator.calls
+    # The flagged row never contributes a gradient either way.
+    assert call["mask"][3].sum() == 0
+    assert call["mask"][:3].bool().all()
+    # Only the policy decides whether its reward counts in the group baseline.
+    expected = [1.0, 1.0, 1.0, 1.0 if keep_in_baseline else 0.0]
+    assert call["valid_mask"].tolist() == expected
+
+    masking = new_masking_stats_accumulator()
+    assert outcome.masking_stats is not None
+    merge_stats_accumulator(masking, outcome.masking_stats)
+    metrics = reduce_masking_stats(masking)
+    assert metrics["masking/env_flag_rows"] == 1.0
+    assert metrics["masking/trained_rows"] == 3.0
+    assert metrics["masking/baseline_rows"] == (4.0 if keep_in_baseline else 3.0)
+
+    # Group spread follows the baseline rows; per-sample stats stay on trained rows.
+    rollout = new_rollout_stats_accumulator()
+    assert outcome.rollout_stats is not None
+    merge_stats_accumulator(rollout, outcome.rollout_stats)
+    stats = reduce_rollout_stats(rollout)
+    assert stats["reward/pass_frac"] == 1.0
+    if keep_in_baseline:
+        assert stats["groups/mixed_count"] == 1.0
+        assert stats["groups/all_pass_frac"] == 0.0
+        assert stats["groups/zero_advantage_sample_frac"] == 0.0
+    else:
+        assert stats["groups/mixed_count"] == 0.0
+        assert stats["groups/all_pass_frac"] == 1.0
+        assert stats["groups/zero_advantage_sample_frac"] == 1.0
