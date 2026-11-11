@@ -33,7 +33,7 @@ import threading
 import time
 import urllib.request
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 from nemo_rl.data_plane.interfaces import MooncakeCpuConfig
 from nemo_rl.data_plane.local_disk import require_disk_backed
