@@ -1519,6 +1519,7 @@ class AsyncNemoGymRolloutImpl:
                         result["full_result"],
                         inputs_by_rowidx[rowidx],
                         self._effort_config,
+                        text_checks=result["scored_text_checks"],
                     )
                     result["reward_log_context"] = RewardLogContext(
                         agent_name=_nemo_gym_metric_namespace(inputs_by_rowidx[rowidx]),

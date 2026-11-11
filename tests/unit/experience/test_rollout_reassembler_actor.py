@@ -160,11 +160,13 @@ def test_actor_forwards_capture_media_to_the_reassembler(
             if capture_media
             else None
         ),
+        forest_penalty_scope="all_segments",
     )
     actor = object.__new__(actor_cls)
     actor.__init__({"enabled": True, "impl": "transfer_queue"}, config)
     finalizer = actor._finalizer
     assert finalizer._capture_media is capture_media
+    assert finalizer._forest_penalty_scope == "all_segments"
     assert finalizer._media_columns is config.media_columns
     assert finalizer._source._capture_media is capture_media
     assert finalizer._staging._capture_media is capture_media
@@ -300,6 +302,7 @@ def test_factory_selects_compatible_environment_and_waits_for_dependencies(
         capture_media=False,
         media_columns=None,
         top_logprobs=0,
+        forest_penalty_scope="scored_segment",
     )
     dp_config = {"enabled": True, "impl": "transfer_queue", "backend": "simple"}
     actors = [MagicMock(), MagicMock()]

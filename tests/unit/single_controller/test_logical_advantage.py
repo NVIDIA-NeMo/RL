@@ -138,6 +138,7 @@ def test_forest_selection_config(policy):
 @pytest.mark.parametrize(
     "option",
     [
+        {"forest_penalty_scope": "all_segments"},
         {"exclude_padding_from_router_stats": True},
         {"forest_padding_scope": "step"},
     ],

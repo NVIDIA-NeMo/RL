@@ -4381,7 +4381,6 @@ def forest_config():
         ("grpo.invalid_tool_call_advantage", 0.0, "message-level advantage"),
         ("grpo.malformed_thinking_advantage", 0.0, "message-level advantage"),
         ("token_capture.defer_routed_experts_to_policy", True, "direct routed-expert"),
-        ("reward_penalties.penalize_malformed_think_tag", True, "reward penalties"),
         ("policy.megatron_cfg.enabled", False, "non-interleaved Megatron"),
         ("policy.dynamic_batching.enabled", True, "non-interleaved Megatron"),
         (
@@ -4455,6 +4454,20 @@ def test_setup_and_advantage_share_logprob_requirements(
 @pytest.mark.parametrize("fraction", [0.5, 0.9, 1.0])
 def test_forest_startup_accepts_partial_step_policy(forest_config, fraction):
     forest_config.async_rl.rollout_failure.min_step_batch_fraction = fraction
+    validate_single_controller_config(forest_config)
+
+
+@pytest.mark.parametrize("scope", ["scored_segment", "all_segments"])
+@pytest.mark.parametrize(
+    "penalties",
+    [
+        {"penalize_unwanted_tokens": True, "token_ids": {"unwanted": [7]}},
+        {"penalize_malformed_think_tag": True},
+    ],
+)
+def test_forest_startup_accepts_reward_penalties(forest_config, scope, penalties):
+    forest_config.reward_penalties = RewardPenaltyConfig(**penalties)
+    forest_config.token_capture.forest_penalty_scope = scope
     validate_single_controller_config(forest_config)
 
 

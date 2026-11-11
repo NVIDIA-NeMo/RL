@@ -40,7 +40,7 @@ from collections import Counter
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, replace
 from graphlib import CycleError, TopologicalSorter
-from typing import TYPE_CHECKING, Any, Optional, cast
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 
 import torch
 
@@ -77,6 +77,7 @@ from nemo_rl.experience.reward_penalties import (
     FinalizedReward,
     RewardChecks,
     RewardLogContext,
+    capture_token_penalty_counts,
     finalize_capture_reward,
 )
 from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
@@ -391,8 +392,12 @@ class RolloutReassembler:
         tokenizer: Any = None,
         thinking_tags: Sequence[str] | None = None,
         top_logprobs: int = 0,
+        forest_penalty_scope: Literal["scored_segment", "all_segments"] = (
+            "scored_segment"
+        ),
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
+        self._forest_penalty_scope = forest_penalty_scope
         # Decodes generations for the malformed-think-tag string check.
         self._tokenizer = tokenizer
         self._thinking_tags = thinking_tags
@@ -562,6 +567,18 @@ class RolloutReassembler:
                 )
             except ValueError as error:
                 return rejected(f"reward_processing:{error}", staging_keys)
+        elif (
+            self._forest_penalty_scope == "all_segments"
+            and self._reward_penalty_config is not None
+        ):
+            # Token checks on every other segment; the owner combines them.
+            penalty_counts = capture_token_penalty_counts(
+                self._reward_penalty_config,
+                token_ids=row.token_ids,
+                link_spans=row.link_spans,
+                decode=self._decode if self._tokenizer is not None else None,
+                thinking_tags=self._thinking_tags,
+            )
         weight_versions = [record.weight_version for record in parsed.manifest]
         min_wv, max_wv = min(weight_versions), max(weight_versions)
 
@@ -1764,7 +1781,28 @@ class RolloutReassembler:
             if owner_valid:
                 if reward_row is None:
                     raise ValueError(f"{owner_id}: missing scored-call reward evidence")
-                rebuilt = [replace(row, reward=reward_row.reward) for row in rebuilt]
+                owner_reward, owner_counts = (
+                    reward_row.reward,
+                    reward_row.penalty_counts,
+                )
+                if self._forest_penalty_scope == "all_segments":
+                    owner_counts = {
+                        name: max(row.penalty_counts.get(name, 0) for row in rebuilt)
+                        for name in {
+                            name for row in rebuilt for name in row.penalty_counts
+                        }
+                    }
+                    if any(owner_counts.values()):
+                        owner_reward = 0.0
+                # Counts ride the scored row so metrics count each owner once.
+                rebuilt = [
+                    replace(
+                        row,
+                        reward=owner_reward,
+                        penalty_counts=owner_counts if row is reward_row else {},
+                    )
+                    for row in rebuilt
+                ]
                 prepared.valid_owner_count += 1
             else:
                 rebuilt = [

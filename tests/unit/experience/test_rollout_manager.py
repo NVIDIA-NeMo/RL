@@ -1149,6 +1149,7 @@ def _mask_gate_receipt_result():
     return {
         "message_log": [],
         "receipt": {"capture_key": "r0", "manifest": []},
+        "scored_text_checks": (False, True),
         "rollout_id": "r0",
         "full_result": {
             "reward": 1.0,
