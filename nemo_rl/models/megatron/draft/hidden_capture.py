@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, ContextManager, Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
-from megatron.core.utils import unwrap_model
 from torch import Tensor, nn
 
 if TYPE_CHECKING:
