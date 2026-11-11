@@ -22,6 +22,10 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
+import torch
+
+from nemo_rl.models.generation.prefix_recovery.routes import _EngineRouteCache
+
 
 @dataclass(frozen=True)
 class _CallProgress:
@@ -41,6 +45,8 @@ class _CallProgress:
     # Set when the request's sampling settings would not carry across a cut,
     # so the call regenerates after a restore instead of resuming its prefix.
     uncuttable_reason: str | None
+    # Router replay: the full-sequence routes of the call's final output.
+    terminal_routed_experts: torch.Tensor | None
 
 
 @dataclass(frozen=True)
@@ -67,8 +73,8 @@ class _RequestCaptureState:
     or rolling back a cut, starting the terminal write) exist only on the
     ``_CallLifecycle`` that ``lifecycle()`` yields while it holds
     ``_lifecycle_lock``, which a cut keeps across its TQ write. ``call``,
-    ``prompt_token_ids``, ``media`` and ``resumed_generation_token_ids`` never
-    change after ``begin_call``.
+    ``prompt_token_ids``, ``media``, ``resumed_generation_token_ids`` and the
+    router-replay settings never change after ``begin_call``.
 
     Each successful cut stages only the tokens past the last sealed one. The
     ordered TQ keys remain in Gym lineage; the full list is kept locally to
@@ -80,6 +86,10 @@ class _RequestCaptureState:
         "_prompt_token_ids",
         "_media",
         "_resumed_generation_token_ids",
+        "_routed_experts_dtype",
+        "_restored_routed_experts",
+        "_terminal_routed_experts",
+        "_engine_routes",
         "_lock",
         "_lifecycle_lock",
         "_generated_token_ids",
@@ -105,6 +115,8 @@ class _RequestCaptureState:
         resumed_generation_token_ids: Sequence[int] = (),
         effective_output_limit: int | None = None,
         staging_keys: Sequence[str] = (),
+        routed_experts_dtype: torch.dtype | None = None,
+        restored_routed_experts: torch.Tensor | None = None,
     ) -> None:
         self._call = call
         self._prompt_token_ids = list(prompt_token_ids)
@@ -113,6 +125,17 @@ class _RequestCaptureState:
         # generation-prefix row carries its tensor digests across recovery.
         self._media = media
         self._resumed_generation_token_ids = list(resumed_generation_token_ids)
+        # Router replay: the dtype a cut stages the routes of the tokens it
+        # freezes in; None when the call's cuts stage no routes.
+        self._routed_experts_dtype = routed_experts_dtype
+        # A resumed call's routes for its restored prefix, delta-aligned.
+        self._restored_routed_experts = restored_routed_experts
+        self._terminal_routed_experts: torch.Tensor | None = None
+        self._engine_routes = (
+            None
+            if routed_experts_dtype is None
+            else _EngineRouteCache(routed_experts_dtype)
+        )
         self._lock = threading.Lock()
         # Serializes lifecycle-changing TQ operations for this call. Token
         # recording uses ``_lock`` instead, so a finished output can be
@@ -148,6 +171,14 @@ class _RequestCaptureState:
     @property
     def resumed_generation_token_ids(self) -> list[int]:
         return self._resumed_generation_token_ids
+
+    @property
+    def routed_experts_dtype(self) -> torch.dtype | None:
+        return self._routed_experts_dtype
+
+    @property
+    def restored_routed_experts(self) -> torch.Tensor | None:
+        return self._restored_routed_experts
 
     @property
     def recorded_token_count(self) -> int:
@@ -196,6 +227,11 @@ class _RequestCaptureState:
             else:
                 self._terminal_finish_reason = finish_reason
                 self._terminal_stop_reason = stop_reason
+
+    def record_terminal_routes(self, routed_experts: torch.Tensor) -> None:
+        """Keep the full-sequence routes of the call's final output."""
+        with self._lock:
+            self._terminal_routed_experts = routed_experts
 
     def record_error(self, error: str) -> None:
         """Keep the call out of cuts: its recorded tokens disagree with vLLM's."""
@@ -257,6 +293,7 @@ class _RequestCaptureState:
             terminal_stop_reason=self._terminal_stop_reason,
             observation_error=self._observation_error,
             uncuttable_reason=self._uncuttable_reason,
+            terminal_routed_experts=self._terminal_routed_experts,
         )
 
 
@@ -347,6 +384,13 @@ class _CallLifecycle:
             state._frozen_cut = None
             if staged_key is not None:
                 state._staging_keys.append(staged_key)
+
+    def absorb_engine_route_pieces(self, pieces: Sequence[Any]) -> torch.Tensor:
+        """Join the engine's new route pieces; return the request's routes so far."""
+        engine_routes = self._require_live()._engine_routes
+        if engine_routes is None:
+            raise RuntimeError("this call's cuts stage no router-replay routes")
+        return engine_routes.absorb(pieces)
 
     def rollback(self, checkpoint_id: str) -> None:
         """Abandon a cut; its tokens stay unstaged for the next one."""

@@ -25,9 +25,13 @@ from __future__ import annotations
 import contextvars
 import inspect
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Literal, Optional
+
+import torch
+
+from nemo_rl.experience.route_assembly import ROUTE_MISSING_SENTINEL
 
 
 def _remaining_generation_limits_after_prefix(
@@ -106,6 +110,8 @@ class _RestoredPrefixTerminal:
     reason: str
     finish_reason: Literal["stop", "length"]
     stop_reason: str | int | None = None
+    # Full-sequence routes for router replay; see _restored_prefix_terminal_routes.
+    routed_experts: torch.Tensor | None = field(default=None, compare=False)
 
     @property
     def original_prompt_token_count(self) -> int:
@@ -209,6 +215,26 @@ def _classify_restored_prefix_terminal(
     )
 
 
+def _restored_prefix_terminal_routes(
+    restored: torch.Tensor, *, prev_len: int
+) -> torch.Tensor:
+    """Full-sequence routes for a restored prefix that needs no more decoding.
+
+    ``restored`` is the cut's delta-aligned routes, ending with its final
+    placeholder row. The engine never runs, so no prefill routes the
+    positions before the delta, including the parent's last token, and
+    nothing routes the final token: those rows are ``ROUTE_MISSING_SENTINEL``,
+    as an uninterrupted call's final row is.
+    """
+
+    def missing(rows: int) -> torch.Tensor:
+        return torch.full(
+            (rows, *restored.shape[1:]), ROUTE_MISSING_SENTINEL, dtype=restored.dtype
+        )
+
+    return torch.cat((missing(prev_len), restored[:-1], missing(1)), dim=0)
+
+
 def _build_restored_prefix_terminal_output(
     request_id: str, terminal: _RestoredPrefixTerminal
 ) -> Any:
@@ -229,6 +255,11 @@ def _build_restored_prefix_terminal_output(
                 logprobs=[],
                 finish_reason=terminal.finish_reason,
                 stop_reason=terminal.stop_reason,
+                routed_experts=(
+                    None
+                    if terminal.routed_experts is None
+                    else terminal.routed_experts.numpy()
+                ),
             )
         ],
         finished=True,

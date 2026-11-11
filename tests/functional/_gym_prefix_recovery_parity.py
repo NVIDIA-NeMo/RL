@@ -281,14 +281,18 @@ _COMPLETED_PREFIX_LINE = re.compile(
     r"source_model_call_id=(?P<source_model_call_id>\S+) "
     r"prefix_tokens=(?P<prefix_tokens>\d+) tail_tokens=(?P<tail_tokens>\d+) "
     r"total_generation_tokens=(?P<total_tokens>\d+)"
+    # Router replay: the restored prefix's routes, as staged for training.
+    r"(?: prefix_routes_sha256=(?P<routes_sha256>[0-9a-f]{64}|none))?"
 )
 
 
-def _restored_prefix_hashes(recovery_log: str) -> dict[tuple[str, int], list[str]]:
-    restored: dict[tuple[str, int], list[str]] = {}
+def _restored_prefix_lines(
+    recovery_log: str,
+) -> dict[tuple[str, int], list[dict[str, Any]]]:
+    restored: dict[tuple[str, int], list[dict[str, Any]]] = {}
     for line in restored_prefixes(recovery_log):
         key = (line["source_model_call_id"], line["prefix_tokens"])
-        restored.setdefault(key, []).append(line["prefix_ids_sha256"])
+        restored.setdefault(key, []).append(line)
     return restored
 
 
@@ -305,6 +309,8 @@ def _assert_prefix_boundary(
     selection: Mapping[str, Any],
     recovery_log: str,
     recovery: RowIndex,
+    *,
+    require_routes: bool = False,
 ) -> dict[tuple[str, int], int]:
     """Require each restored call to complete once and train on its restored prefix.
 
@@ -314,7 +320,8 @@ def _assert_prefix_boundary(
     ``-inf`` logprobs drop out of ``token_mask``), which a search for the last
     unmasked segment would mistake for the call's start. A dropped or
     duplicated token moves that start, so the restored prefix no longer sits
-    there.
+    there. With ``require_routes`` (router replay), the routes hashed when the
+    prefix was rebuilt from TQ must be the ones its completion staged.
 
     Returns:
         Each cut's ``(group_id, generation_index)`` mapped to the index in its
@@ -325,7 +332,7 @@ def _assert_prefix_boundary(
         line = match.groupdict()
         key = (line["source_model_call_id"], int(line["prefix_tokens"]))
         completed.setdefault(key, []).append(line)
-    restored = _restored_prefix_hashes(recovery_log)
+    restored = _restored_prefix_lines(recovery_log)
     by_call = _calls_by_generation(recovery)
 
     starts: dict[tuple[str, int], int] = {}
@@ -347,11 +354,17 @@ def _assert_prefix_boundary(
                 "restored generation token accounting has a gap or overlap: "
                 f"prefix={prefix_tokens}, tail={tail_tokens}, total={total_tokens}"
             )
-        hashes = restored.get((source, prefix_tokens), [])
-        if len(hashes) != 1:
+        restores = restored.get((source, prefix_tokens), [])
+        if len(restores) != 1:
             raise AssertionError(
-                f"restored prefix {source!r} was logged {len(hashes)} times, "
+                f"restored prefix {source!r} was logged {len(restores)} times, "
                 "expected once"
+            )
+        routes = (restores[0]["routes_sha256"], matches[0]["routes_sha256"])
+        if require_routes and (routes[0] != routes[1] or routes[0] in (None, "none")):
+            raise AssertionError(
+                f"row staged for {source!r} does not carry its restored prefix "
+                f"routes: restored={routes[0]}, staged={routes[1]}"
             )
         key = (cut["group_id"], int(cut["generation_index"]))
         if key not in by_call:
@@ -365,7 +378,10 @@ def _assert_prefix_boundary(
                 f"trained row for {source!r} does not end with its "
                 f"{total_tokens} generated tokens: row has {len(row['token_ids'])}"
             )
-        if _closing_prefix_sha256(row, start, prefix_tokens) != hashes[0]:
+        if (
+            _closing_prefix_sha256(row, start, prefix_tokens)
+            != restores[0]["prefix_ids_sha256"]
+        ):
             raise AssertionError(
                 f"row for {source!r} does not start its closing call with its "
                 f"{prefix_tokens} restored prefix tokens"
@@ -401,7 +417,7 @@ def _check_cuts(
         identities of the restored rows set aside.
     """
     starts = _assert_prefix_boundary(selection, recovery_log, recovery)
-    restored = _restored_prefix_hashes(recovery_log)
+    restored = _restored_prefix_lines(recovery_log)
     by_call = _calls_by_generation(recovery)
 
     diverged: set[tuple[int, int, int]] = set()
@@ -411,7 +427,8 @@ def _check_cuts(
         start = starts[key]
         identity = by_call[key]
         right = recovery[identity]
-        (restored_hash,) = restored[(cut["model_call_id"], prefix_tokens)]
+        (restored_line,) = restored[(cut["model_call_id"], prefix_tokens)]
+        restored_hash = restored_line["prefix_ids_sha256"]
         left = baseline.get(identity)
         if (
             left is None

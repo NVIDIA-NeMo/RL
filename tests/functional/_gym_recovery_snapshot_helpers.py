@@ -57,6 +57,8 @@ _RESTORED_PREFIX_LINE = re.compile(
     r"prefix_digest=(?P<prefix_digest>[0-9a-f]{64}) "
     r"weight_version_span=\[\d+,\d+\] "
     r"prefix_ids_sha256=(?P<prefix_ids_sha256>[0-9a-f]{64})"
+    # Router replay: the restored prefix's routes, as rebuilt from TQ.
+    r"(?: prefix_routes_sha256=(?P<routes_sha256>[0-9a-f]{64}|none))?"
 )
 
 
