@@ -579,25 +579,8 @@ class AdvantageComputer:
                 data,
                 adv_cfg.teacher_logprobs_field,
             )
-        # Tokens GAE runs and whitens over; advantages are zeroed outside mask.
-        gae_mask = mask
         if cfg.is_ppo:
             kwargs["values"] = tensor_field(data, adv_cfg.values_field)
-            estimator_cfg = cfg.algo.adv_estimator
-            if (
-                estimator_cfg.name == "gae"
-                and estimator_cfg.normalize_over == "all_rows"
-            ):
-                # Every real row's response tokens, including rows the loss
-                # masks; execution padding counts only with
-                # whiten_execution_padding.
-                real_rows = (
-                    (owner_batch.row_owner >= 0).to(token_mask.dtype)
-                    if owner_batch is not None
-                    and not estimator_cfg.whiten_execution_padding
-                    else torch.ones_like(final_sample_mask)
-                )
-                gae_mask = token_mask * real_rows.unsqueeze(-1)
 
         # Training predicts token t from position t - 1, so token_mask[:, 1:]
         # is the exact mask used when global_valid_toks and the loss are built.
@@ -642,7 +625,7 @@ class AdvantageComputer:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
-                mask=gae_mask,
+                mask=mask,
                 repeated_batch=repeated_batch,
                 valid_mask=advantage_valid_mask,
                 normalization_mask=token_mask * advantage_valid_mask.unsqueeze(-1),

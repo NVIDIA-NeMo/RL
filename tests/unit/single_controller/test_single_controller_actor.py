@@ -4439,7 +4439,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
             overlong_filtering=False,
             # The shard-decline log names the estimator, so an unshardable
             # stub has to carry one even though the assertions below ignore it.
-            adv_estimator=SimpleNamespace(name="gae", normalize_over="kept_rows"),
+            adv_estimator=SimpleNamespace(name="gae"),
         )
     )
     ctrl._algo_cfg = ctrl._master_config.ppo

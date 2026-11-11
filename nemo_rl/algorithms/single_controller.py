@@ -4622,18 +4622,15 @@ class SingleControllerActor:
         """Pad a Forest training batch once to the policy and critic row multiple.
 
         Used with ``token_capture.forest_padding_scope: step``. Pad rows copy
-        real rows under new sample IDs with ``sample_mask`` zeroed;
-        ``forest_pad_source`` picks the copies. Returns the padded meta and the
+        the first row under new sample IDs with ``sample_mask`` zeroed.
+        Returns the padded meta and the
         pad rows' meta for post-step cleanup, or ``(meta, None)``.
         """
         num_pad = -meta.size % self._forest_step_row_multiple
         if num_pad == 0:
             return meta, None
         assert meta.tags is not None
-        if self._master_config.token_capture.forest_pad_source == "row0":
-            sources = [0] * num_pad
-        else:
-            sources = [index % meta.size for index in range(num_pad)]
+        sources = [0] * num_pad
         pad_ids = [
             f"{meta.sample_ids[source]}_pad{index}"
             for index, source in enumerate(sources)

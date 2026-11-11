@@ -294,8 +294,6 @@ token_capture:
   exclude_padding_from_router_stats: false
   # Forest only. Pad each published group (group) or each training batch once (step).
   forest_padding_scope: group
-  # Step padding only. Rows the padding copies: row0 or cyclic.
-  forest_pad_source: row0
   staging_partition: rollout_staging
 
 # Target recovery boundary for unfinished token-capture groups. "turn" enables

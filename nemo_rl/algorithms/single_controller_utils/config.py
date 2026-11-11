@@ -715,9 +715,6 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # row multiple. group: each published group (default). step: once per
     # training batch, which pads far fewer rows when groups hold few rollouts.
     forest_padding_scope: Literal["group", "step"] = "group"
-    # Step padding only. Which real rows the padding copies: row0 repeats the
-    # batch's first row; cyclic takes rows 0, 1, 2, ...
-    forest_pad_source: Literal["row0", "cyclic"] = "row0"
 
     @model_validator(mode="after")
     def validate_selection_policy(self) -> "TokenCaptureConfig":
@@ -733,10 +730,6 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
         if not self.forest_training and any(forest_only.values()):
             names = ", ".join(name for name, set_ in forest_only.items() if set_)
             raise ValueError(f"token_capture.{names} requires forest_training=true")
-        if self.forest_pad_source != "row0" and self.forest_padding_scope != "step":
-            raise ValueError(
-                "token_capture.forest_pad_source requires forest_padding_scope=step"
-            )
         return self
 
 
@@ -1849,20 +1842,6 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "non-default rollout_recovery policies require "
             "token_capture.enabled=true; without token capture, unfinished Gym "
             "siblings have no durable receipts to recover"
-        )
-    if (
-        is_ppo_run(master_config)
-        and master_config.ppo.adv_estimator.name == "gae"  # type: ignore
-        and master_config.ppo.adv_estimator.whiten_execution_padding  # type: ignore
-        and not (
-            token_capture_config.forest_training
-            and token_capture_config.forest_padding_scope == "step"
-        )
-    ):
-        # Only step padding copies carry token_mask; group padding has none.
-        raise ValueError(
-            "ppo.adv_estimator.whiten_execution_padding requires "
-            "token_capture.forest_training=true and forest_padding_scope=step"
         )
     if token_capture_config.forest_training:
         forest_algo_cfg = algo_config(master_config)

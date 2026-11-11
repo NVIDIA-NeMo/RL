@@ -226,10 +226,8 @@ replacement budget. The default, `None`, disables this group-level filter.
 
 With PPO, the critic scores every physical row and GAE runs per row with that
 row's own values; every row of a logical rollout carries the rollout's reward.
-The logical rollout still decides validity as above. `ppo.adv_estimator.normalize_over`
-selects the whitening population: `kept_rows` (default) or `all_rows`, which also
-includes rows masked from the loss. Execution padding counts only with
-`whiten_execution_padding: true` (which requires `all_rows`); it never trains.
+The logical rollout still decides validity as above. GAE and advantage whitening
+exclude rows masked from the loss, including execution padding.
 The critic trains on all of a step's rows as one optimizer step, and execution
 padding is sized for both the policy's and the critic's data-parallel and
 microbatch shapes. Forest PPO requires `ppo.value_training_mode: whole_batch`.
@@ -242,14 +240,11 @@ Batch cardinality counts logical rollouts; GRPO advantages are per logical rollo
 `token_capture.forest_padding_scope: step` (Forest only; default `group`) pads
 each training batch once to the row multiple, instead of padding every
 published group. With few rollouts per group, per-group padding can multiply
-the rows each step trains on. `forest_pad_source` picks the copied rows: `row0`
-(default) repeats the batch's first row; `cyclic` takes rows 0, 1, 2, and so on.
+the rows each step trains on. Padding repeats the batch's first row with its
+loss masked out.
 A rollout snapshot taken during a step keeps that step's padding copies; resume
 deletes them before checking the replay inventory. Streaming PPO trains each chunk
 separately, so this scope pads every chunk.
-
-With `ppo.adv_estimator.whiten_execution_padding: true`, these copies also join
-the advantage whitening; they still carry no loss.
 
 Captured-rollout length metrics are emitted after tensor verification, with one
 observation per logical rollout. `gen_tokens_per_sample` sums uniquely owned

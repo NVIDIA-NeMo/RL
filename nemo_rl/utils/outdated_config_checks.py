@@ -251,6 +251,32 @@ def reject_outdated_rollout_recovery_granularity(config: dict[str, Any]) -> None
     raise ValueError(message)
 
 
+def reject_outdated_forest_population_options(config: dict[str, Any]) -> None:
+    """Reject deferred Forest whitening and padding-source options.
+
+    Args:
+        config: The resolved user configuration before schema validation.
+    """
+    ppo = config.get("ppo")
+    estimator = ppo.get("adv_estimator") if isinstance(ppo, dict) else None
+    if isinstance(estimator, dict):
+        removed = {"normalize_over", "whiten_execution_padding"} & estimator.keys()
+        if removed:
+            raise ValueError(
+                f"ppo.adv_estimator no longer accepts {sorted(removed)!r}. "
+                "Remove these keys; GAE whitening uses only loss-participating "
+                "rows and excludes execution padding. All-row and padding "
+                "whitening are not supported."
+            )
+    token_capture = config.get("token_capture")
+    if isinstance(token_capture, dict) and "forest_pad_source" in token_capture:
+        raise ValueError(
+            "token_capture.forest_pad_source is no longer supported. Remove the "
+            "key; Forest step padding always copies the first row. Cyclic "
+            "padding is not supported."
+        )
+
+
 def check_outdated_config(config: dict[str, Any]) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
@@ -270,3 +296,4 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     reject_outdated_dynamo_router_reset_states(config)
     reject_outdated_context_compaction(config)
     reject_outdated_rollout_recovery_granularity(config)
+    reject_outdated_forest_population_options(config)
