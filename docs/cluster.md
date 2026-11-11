@@ -197,6 +197,9 @@ sbatch ray.sub \
     subcommands invoke (`unsquashfs` for `enroot create`, `squashfuse` and
     `fuse-overlayfs` for starting a `.sqsh` image directly). With
     `tools/launch`, pass the variable through `EXTRA_ENV`.
+* - `NRL_COMPILE_CACHE_SHARED_DIR`, `NRL_COMPILE_CACHE_LOCAL_DIR`
+  - Keep vLLM's and Megatron's JIT compile caches between jobs. Unset by default.
+    See [Persistent JIT Compile Caches](guides/persistent-jit-caches.md).
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
   - Base directory for storing Ray logs. Defaults to the Slurm submission directory ([SLURM_SUBMIT_DIR](https://slurm.schedmd.com/sbatch.html#OPT_SLURM_SUBMIT_DIR)).
 * - `LOKI_PUSH_URL`

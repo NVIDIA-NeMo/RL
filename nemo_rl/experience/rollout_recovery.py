@@ -44,13 +44,14 @@ if TYPE_CHECKING:
     from nemo_rl.data.interfaces import DatumSpec
     from nemo_rl.experience.rollout_reassembler import RolloutSelection
 
-ROLLOUT_RECOVERY_SCHEMA_VERSION = 7
+ROLLOUT_RECOVERY_SCHEMA_VERSION = 8
 # Schemas 2 to 5 predate turn-level recovery; they load through
 # _upgrade_pre_turn_recovery_groups.
 _PRE_TURN_RECOVERY_SCHEMA_VERSIONS = frozenset({2, 3, 4, 5})
 SUPPORTED_ROLLOUT_RECOVERY_SCHEMA_VERSIONS = {
     *_PRE_TURN_RECOVERY_SCHEMA_VERSIONS,
     6,
+    7,
     ROLLOUT_RECOVERY_SCHEMA_VERSION,
 }
 ROLLOUT_RECOVERY_STATE_FILENAME = "rollout_recovery.pt"
@@ -61,6 +62,7 @@ _SIDECAR_STATE_FIELDS = frozenset(
     {
         *_LEDGER_STATE_FIELDS,
         "batch_shortfall",
+        "steps_allowed_short",
         "finalizer_metrics_by_group",
         "finalizer_rewards_by_group",
         "reward_settings",
@@ -202,6 +204,7 @@ class RecoveryGranularity(StrEnum):
 class RecoveryTargetLevel(StrEnum):
     """Finest requested restart boundary for an unfinished rollout."""
 
+    PREFIX = "prefix"
     TURN = "turn"
     SIBLING = "sibling"
     PROMPT_GROUP = "prompt_group"
@@ -217,8 +220,18 @@ class RecoveryTargetLevel(StrEnum):
 
     @property
     def rank(self) -> int:
-        """0 for ``turn``; a larger rank restarts more work. Follows declaration order."""
+        """0 for ``prefix``; a larger rank restarts more work. Follows declaration order."""
         return list(RecoveryTargetLevel.__members__.values()).index(self)
+
+    @property
+    def requires_environment_checkpoint(self) -> bool:
+        """Whether recovery needs environment checkpoint state for the active episode."""
+        return self in {RecoveryTargetLevel.PREFIX, RecoveryTargetLevel.TURN}
+
+    @property
+    def preserves_generation_prefix(self) -> bool:
+        """Whether recovery continues an active model call from decoded tokens."""
+        return self is RecoveryTargetLevel.PREFIX
 
 
 class RolloutAttemptStatus(StrEnum):
@@ -427,6 +440,7 @@ class ParsedRolloutRecoveryState:
 
     ledger_state: RolloutRecoveryState
     batch_shortfall: dict[int, int]
+    steps_allowed_short: set[int]
     sampler_stamps_target_steps: Optional[bool]
     finalizer_metrics_by_group: dict[str, dict[str, float]]
     finalizer_rewards_by_group: dict[str, list[FinalizedReward]]
@@ -457,10 +471,10 @@ class UnresolvedCaptureAcknowledgement(ValueError):
 def _holds_environment_episode(
     record: PromptGroupRecoveryRecord, sibling: RolloutSiblingRecord
 ) -> bool:
-    """Whether this sibling's current attempt is live environment state."""
+    """Whether this sibling's current attempt is live turn/prefix environment state."""
     return (
         record.status is PromptGroupStatus.GENERATING
-        and record.restore_level is RecoveryTargetLevel.TURN
+        and record.restore_level.requires_environment_checkpoint
         and sibling.current_attempt.holds_environment_state
     )
 
@@ -825,7 +839,7 @@ class RolloutRecoveryLedger:
                             episode.attempt,
                         )
                         if (
-                            record.restore_level is RecoveryTargetLevel.TURN
+                            record.restore_level.requires_environment_checkpoint
                             and attempt.status
                             in {
                                 RolloutAttemptStatus.DISPATCHED,
@@ -858,7 +872,7 @@ class RolloutRecoveryLedger:
         unused_restores = restored - consumed_restores
         if unused_restores:
             raise ValueError(
-                "environment restored episodes are not owned by dispatched turn-level "
+                "environment restored episodes are not owned by dispatched environment-state "
                 f"rollouts: {sorted(unused_restores)!r}"
             )
 
@@ -938,7 +952,7 @@ class RolloutRecoveryLedger:
         self,
         instance_ids: set[str] | frozenset[str],
     ) -> dict[str, tuple[EnvironmentEpisode, ...]]:
-        """Return active turn-level environment episodes grouped by owning actor."""
+        """Return active turn/prefix environment episodes grouped by owning actor."""
         inventory: dict[str, list[EnvironmentEpisode]] = {
             instance_id: [] for instance_id in instance_ids
         }
@@ -950,13 +964,13 @@ class RolloutRecoveryLedger:
                 instance_id = attempt.environment_instance_id
                 if instance_id is None:
                     raise RuntimeError(
-                        "cannot checkpoint a dispatched turn-level rollout without "
+                        "cannot checkpoint a dispatched environment-state rollout without "
                         f"environment ownership: group={record.group_id!r}, "
                         f"generation_index={sibling.generation_index}"
                     )
                 if instance_id not in inventory:
                     raise RuntimeError(
-                        f"turn-level rollout references unavailable environment instance "
+                        f"environment-state rollout references unavailable environment instance "
                         f"{instance_id!r}"
                     )
                 inventory[instance_id].append(
@@ -995,6 +1009,20 @@ class RolloutRecoveryLedger:
                 ):
                     held[instance_id].add(episode)
         return held
+
+    def has_dispatched_generation_prefix(self) -> bool:
+        """Whether a dispatched attempt may be growing a recoverable prefix.
+
+        Decoding advances such an attempt without mutating the data plane, so a
+        snapshot cadence keyed only on data-plane mutations would never cut it.
+        """
+        return any(
+            record.status is PromptGroupStatus.GENERATING
+            and record.restore_level.preserves_generation_prefix
+            and sibling.current_attempt.status is RolloutAttemptStatus.DISPATCHED
+            for record in self._groups.values()
+            for sibling in record.siblings
+        )
 
     def _record_environment_retirements(
         self, record: PromptGroupRecoveryRecord
@@ -1190,12 +1218,12 @@ class RolloutRecoveryLedger:
             raise ValueError("only reserved rollout attempts may be dispatched")
         for attempt in attempts:
             if (
-                record.restore_level is RecoveryTargetLevel.TURN
+                record.restore_level.requires_environment_checkpoint
                 and attempt.environment_instance_id is None
                 and environment_instance_id is None
             ):
                 raise ValueError(
-                    "turn-level rollout dispatch requires an environment checkpoint owner"
+                    "turn/prefix rollout dispatch requires an environment checkpoint owner"
                 )
             if attempt.environment_instance_id is not None:
                 if environment_instance_id != attempt.environment_instance_id:
@@ -2179,10 +2207,29 @@ def _validate_finalizer_rewards(value: object) -> dict[str, list[FinalizedReward
     return result
 
 
+def _validate_steps_allowed_short(value: object) -> set[int]:
+    """Validate the exhausted steps whose short batch must reach the train pump."""
+    if not isinstance(value, list):
+        raise TypeError("rollout recovery steps_allowed_short must be a list")
+    if any(
+        isinstance(step, bool) or not isinstance(step, int) or step < 0
+        for step in value
+    ):
+        raise ValueError(
+            "rollout recovery steps_allowed_short must contain non-negative integers"
+        )
+    if len(value) != len(set(value)):
+        raise ValueError(
+            "rollout recovery steps_allowed_short contains duplicate steps"
+        )
+    return set(value)
+
+
 def build_rollout_recovery_state(
     ledger: RolloutRecoveryLedger,
     *,
     batch_shortfall: dict[int, int],
+    steps_allowed_short: set[int],
     sampler_stamps_target_steps: bool,
     finalizer_metrics_by_group: dict[str, dict[str, float]] | None = None,
     finalizer_rewards_by_group: dict[str, list[FinalizedReward]] | None = None,
@@ -2196,6 +2243,9 @@ def build_rollout_recovery_state(
         )
     state = ledger.state_dict()
     state["batch_shortfall"] = _validate_batch_shortfall(batch_shortfall)
+    state["steps_allowed_short"] = sorted(
+        _validate_steps_allowed_short(list(steps_allowed_short))
+    )
     state["sampler_stamps_target_steps"] = sampler_stamps_target_steps
     state["finalizer_metrics_by_group"] = _validate_finalizer_metrics(
         finalizer_metrics_by_group or {}
@@ -2289,9 +2339,14 @@ def parse_rollout_recovery_state(state: object) -> ParsedRolloutRecoveryState:
     )
     if set(finalizer_rewards) - set(finalizer_metrics):
         raise ValueError("finalized reward observations require matching group metrics")
+    if schema_version >= 8 and "steps_allowed_short" not in state:
+        raise ValueError("rollout recovery sidecar is missing 'steps_allowed_short'")
     return ParsedRolloutRecoveryState(
         ledger_state=ledger_state,
         batch_shortfall=_validate_batch_shortfall(state.get("batch_shortfall", {})),
+        steps_allowed_short=_validate_steps_allowed_short(
+            state.get("steps_allowed_short", [])
+        ),
         sampler_stamps_target_steps=raw_sampler_stamps,
         finalizer_metrics_by_group=finalizer_metrics,
         finalizer_rewards_by_group=finalizer_rewards,

@@ -335,13 +335,13 @@ class _Outcome:
 
 def _host(kit: _Kit, deltas: dict[str, list[int]], top_logprobs: int):
     host = object.__new__(VllmAsyncGenerationWorkerImpl)
+    host._init_token_capture_state()
     host.cfg = kit.generation
     host.llm = host._http_engine_client = _Engine(kit)
     host.llm_async_engine_args = kit.engine_args
     host.model_name = "model"
     host.routed_experts_dtype = torch.int16
     host._capture_media = kit.capture_media
-    host._capture_calls = {}
     host._capture_top_logprobs = top_logprobs
     host._staging_source = None
     host._rollout_weight_version = 0

@@ -98,9 +98,23 @@ class _Capture:
         self.attachments: list[dict | None] = []
         self.failed: list[str] = []
 
-    def begin_call(self, admission, *, prefix_token_ids, stream):
+    def begin_call(
+        self,
+        admission,
+        *,
+        prefix_token_ids,
+        generation_cut,
+        generation_cut_staging_keys,
+        stream,
+    ):
+        del generation_cut_staging_keys
         self.begun.append((admission, prefix_token_ids, stream))
-        return SimpleNamespace(admission=admission)
+        return SimpleNamespace(
+            admission=admission,
+            model_call_id=admission.model_call_id,
+            capture_key=admission.capture_key,
+            generation_cut=generation_cut,
+        )
 
     def complete_call_from_response(self, call, payload, attachments=None):
         self.staged.append(payload)
@@ -179,7 +193,7 @@ def test_a_captured_token_in_call_is_staged_from_the_engine() -> None:
     # Only the commit coordinates go back through the frontend, beside the text.
     assert chunk["engine_data"]["result"] == {NG_COMMIT_COORDS_FIELD: COORDS}
     assert "logprobs" not in chunk["engine_data"]["output"]
-    assert host._capture_calls == {}
+    assert len(host._capture_registry) == 0
 
 
 def test_a_captured_call_stages_the_samplers_top_k_for_score_centering() -> None:
@@ -276,7 +290,7 @@ def test_a_call_that_does_not_finish_cleanly_fails_its_capture(
 
     assert host.token_capture.staged == []
     assert host.token_capture.failed == [reason]
-    assert host._capture_calls == {}
+    assert len(host._capture_registry) == 0
 
 
 def _multimodal(placeholders: list[PlaceholderRange]) -> str:

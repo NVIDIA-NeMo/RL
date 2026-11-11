@@ -205,6 +205,9 @@ class _TokenCaptureSetup:
     staging_partition: str
     capture_media: bool
     top_logprobs: int
+    generation_prefix_cuts_enabled: bool
+    generation_cut_control_token: str | None
+    generation_cut_control_timeout_s: float | None
 
 
 class VllmGeneration(GenerationInterface):
@@ -863,6 +866,9 @@ class VllmGeneration(GenerationInterface):
         *,
         capture_media: bool = False,
         top_logprobs: int = 0,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
+        generation_cut_control_timeout_s: float | None = None,
     ) -> "Optional[MediaColumnSpec]":
         """Install ledger-authoritative token capture in every DP-leader worker.
 
@@ -878,7 +884,13 @@ class VllmGeneration(GenerationInterface):
             "is the worker's in-process HTTP server)"
         )
         setup = _TokenCaptureSetup(
-            dp_cfg, staging_partition, capture_media, top_logprobs
+            dp_cfg,
+            staging_partition,
+            capture_media,
+            top_logprobs,
+            generation_prefix_cuts_enabled,
+            generation_cut_control_token,
+            generation_cut_control_timeout_s,
         )
         futures = self.worker_group.run_all_workers_single_data(
             "setup_token_capture",
@@ -978,21 +990,25 @@ class VllmGeneration(GenerationInterface):
             )
             self._step_metrics_snapshot = None
 
-    def get_step_metrics(self) -> dict[str, float]:
-        """Get the vLLM engine metrics delta since snapshot_step_metrics().
+    def get_step_metrics(self, *, keep_snapshot: bool = False) -> dict[str, float]:
+        """Get vLLM engine metric deltas for the current window.
 
         Covers the speculative-decoding family plus the engine's token,
         sequence-length and request-outcome series, all derived from the same
         pair of snapshots so the wider coverage costs no extra RPC.
 
+        Args:
+            keep_snapshot: Retain the end counters for the next window. A missing
+                baseline is initialized without emitting deltas.
+
         Returns:
             Dictionary of delta metrics with 'vllm/' prefix.
-            Returns empty dict if snapshot_step_metrics() was not called.
+            Returns empty dict when no baseline is available.
 
         Raises:
-            RuntimeWarning: If called without snapshot_step_metrics() first.
+            RuntimeWarning: If no baseline is available and keep_snapshot is false.
         """
-        if self._step_metrics_snapshot is None:
+        if self._step_metrics_snapshot is None and not keep_snapshot:
             warnings.warn(
                 "get_step_metrics() called without snapshot_step_metrics(). "
                 "Call snapshot_step_metrics() before generation to track metrics.",
@@ -1009,10 +1025,15 @@ class VllmGeneration(GenerationInterface):
         # vLLM rename must cost observability rather than the run.
         try:
             counters_end = self._get_raw_spec_counters()
+            if counters_start is None:
+                self._step_metrics_snapshot = counters_end
+                return {}
             step_metrics = compute_spec_decode_metrics(counters_start, counters_end)
             step_metrics.update(
                 compute_engine_step_metrics(counters_start, counters_end)
             )
+            if keep_snapshot:
+                self._step_metrics_snapshot = counters_end
         except ray.exceptions.RayActorError:
             # See snapshot_step_metrics: the caller handles a dead actor.
             raise
@@ -2115,6 +2136,22 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError("Failed to pause every async vLLM engine")
         return True
 
+    def captured_call_progress(
+        self, *, timeout_s: Optional[float] = None
+    ) -> list[dict[str, Any]]:
+        """Collect each paused engine's running captured calls and their lengths."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            return []
+        futures = [
+            worker.captured_call_progress.remote()
+            for worker in self._refit_leader_workers()
+        ]
+        return [
+            progress
+            for progress in ray.get(futures, timeout=timeout_s)
+            if progress is not None
+        ]
+
     def resume_generation_after_refit(
         self, *, timeout_s: Optional[float] = None
     ) -> bool:
@@ -2148,6 +2185,41 @@ class VllmGeneration(GenerationInterface):
         if self.fleet_monitor is not None:
             self.fleet_monitor.raise_if_exhausted()
         return True
+
+    def flush_obsolete_generation_cut_rows(
+        self, epoch: int, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Delete chunk rows of calls that ended before snapshot ``epoch``."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "flush_obsolete_generation_cut_rows requires async_engine=True"
+            )
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "flush_obsolete_generation_cut_rows_async",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            epoch=epoch,
+        )
+        if not all(ray.get(futures, timeout=timeout_s)):
+            raise RuntimeError(
+                "flush_obsolete_generation_cut_rows failed on an async vLLM engine"
+            )
+        return True
+
+    def get_generation_prefix_counts(self) -> dict[str, int]:
+        """Sum over workers of generation-prefix restore and cut counts."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_generation_prefix_counts",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        totals: dict[str, int] = {}
+        for counts in ray.get(futures):
+            for name, value in counts.items():
+                totals[name] = totals.get(name, 0) + value
+        return totals
 
     @property
     def requires_kv_scale_sync(self) -> bool:

@@ -358,7 +358,7 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
             prefix_token_ids=prefix_token_ids,
             media=media,
         )
-        captured = id(chat) in host._capture_calls
+        captured = chat in host._capture_registry
         try:
             final_output = await self._generate(chat, engine_prompt, plan, context)
             if admission is not None and context.is_stopped():

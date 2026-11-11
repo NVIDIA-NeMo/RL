@@ -143,6 +143,7 @@ class _FakeLLM:
 
 def _host(llm: _FakeLLM, **cfg) -> VllmAsyncGenerationWorkerImpl:
     host = object.__new__(VllmAsyncGenerationWorkerImpl)
+    host._init_token_capture_state()
     host.cfg = {
         "max_new_tokens": 8,
         "temperature": 0.7,
@@ -162,7 +163,6 @@ def _host(llm: _FakeLLM, **cfg) -> VllmAsyncGenerationWorkerImpl:
     host.llm = llm
     host._http_engine_client = None
     host._capture_media = False
-    host._capture_calls = {}
     host._capture_top_logprobs = 0
     host.token_capture = None
     return host
