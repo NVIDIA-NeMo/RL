@@ -20,11 +20,9 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, get_args
 from unittest.mock import patch
 
-import ray
 import torch
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModel, DeepseekV3Config, PretrainedConfig
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
@@ -146,46 +144,24 @@ def set_refit_manifest_names(names: set[str] | None) -> None:
 
 def monkey_patch_vllm_ray_executor(fp8_config):
     if fp8_config.model_parallel_size > 1:
-        if envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
-            from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
+        from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
 
-            original_initialize_worker = RayWorkerProc.initialize_worker
+        original_initialize_worker = RayWorkerProc.initialize_worker
 
-            def patched_initialize_worker(self, *args, **kwargs):
-                # Resolve state in the worker's module because cloudpickle snapshots
-                # globals referenced by nested functions.
-                from nemo_rl.models.generation.vllm.quantization import fp8
+        def patched_initialize_worker(self, *args, **kwargs):
+            # Resolve state in the worker's module because cloudpickle snapshots
+            # globals referenced by nested functions.
+            from nemo_rl.models.generation.vllm.quantization import fp8
 
-                if not fp8.fp8_patches_applied:
-                    fp8.apply_fp8_patches(None, fp8_config)
+            if not fp8.fp8_patches_applied:
+                fp8.apply_fp8_patches(None, fp8_config)
 
-                return original_initialize_worker(self, *args, **kwargs)
+            return original_initialize_worker(self, *args, **kwargs)
 
-            # RayExecutorV2 creates ray.remote(RayWorkerProc) after this hook. Ray
-            # copies inherited methods onto its generated actor subclass and
-            # serializes it by value, so actors receive this driver-side replacement.
-            RayWorkerProc.initialize_worker = patched_initialize_worker
-            return
-
-        # we patch vllm's collective_rpc so that before vllm initalizes the model on each rank, we execute
-        # a ray remote that patches each worker with the required fp8 vllm patches
-        from vllm.v1.executor.ray_executor import RayDistributedExecutor
-
-        original_run_workers = RayDistributedExecutor.collective_rpc
-
-        def patched_run_workers(self, *args, **kwargs):
-            global fp8_patches_applied
-            if not fp8_patches_applied:
-                futures = [
-                    worker.execute_method.remote(apply_fp8_patches, fp8_config)
-                    for worker in self.workers
-                ]
-                [ray.get(future) for future in futures]
-                fp8_patches_applied = True
-
-            return original_run_workers(self, *args, **kwargs)
-
-        RayDistributedExecutor.collective_rpc = patched_run_workers
+        # RayExecutorV2 creates ray.remote(RayWorkerProc) after this hook. Ray
+        # copies inherited methods onto its generated actor subclass and
+        # serializes it by value, so actors receive this driver-side replacement.
+        RayWorkerProc.initialize_worker = patched_initialize_worker
     else:
         # for single gpu there is no ray, so just call the patches
         apply_fp8_patches(None, fp8_config)
