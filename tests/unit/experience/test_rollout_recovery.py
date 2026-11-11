@@ -562,6 +562,7 @@ def test_receipt_free_recovery_still_loads(schema: int, sealed: bool) -> None:
     assert current.receipt is None
     assert current.reward == (1.0 if sealed else None)
     assert parsed.batch_shortfall == {7: 1}
+    assert parsed.steps_allowed_short == set()
     _bind(restored, "g7", _prompt())
     assert restored.state_dict()["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
 
@@ -682,6 +683,7 @@ def test_checkpoint_state_round_trip_preserves_controller_and_ledger_state() -> 
     state = build_rollout_recovery_state(
         ledger,
         batch_shortfall={7: 1},
+        steps_allowed_short={7},
         sampler_stamps_target_steps=True,
     )
     parsed = parse_rollout_recovery_state(state)
@@ -690,6 +692,7 @@ def test_checkpoint_state_round_trip_preserves_controller_and_ledger_state() -> 
 
     assert [group.group_id for group in restored.groups()] == ["g7"]
     assert parsed.batch_shortfall == {7: 1}
+    assert parsed.steps_allowed_short == {7}
     assert parsed.sampler_stamps_target_steps is True
 
 
@@ -697,6 +700,7 @@ def test_checkpoint_parser_rejects_unknown_sidecar_fields() -> None:
     state = build_rollout_recovery_state(
         RolloutRecoveryLedger(),
         batch_shortfall={},
+        steps_allowed_short=set(),
         sampler_stamps_target_steps=True,
     )
     state["unexpected"] = True
@@ -711,6 +715,7 @@ def _sidecar_state(ledger: RolloutRecoveryLedger) -> dict[str, object]:
     """Ledger state plus the controller-owned keys every sidecar must carry."""
     return {
         **ledger.state_dict(),
+        "steps_allowed_short": [],
         "reward_settings": None,
         "finalizer_metrics_by_group": {},
         "finalizer_rewards_by_group": {},
@@ -955,22 +960,30 @@ def test_recovery_config_rejects_malformed_prompt_identity(
 
 
 @pytest.mark.parametrize(
+    "target_level", [RecoveryTargetLevel.TURN, RecoveryTargetLevel.PREFIX]
+)
+@pytest.mark.parametrize(
     "overrides",
     [
         {"task_source_target_level_overrides": {"genrm_compare": "prompt_group"}},
         {"agent_target_level_overrides": {"genrm_agent": "prompt_group"}},
+        {"task_source_target_level_overrides": {"restart-call": "turn"}},
     ],
 )
-def test_turn_recovery_rejects_target_overrides(overrides: dict[str, Any]) -> None:
+def test_gym_state_recovery_rejects_target_overrides(
+    target_level: RecoveryTargetLevel, overrides: dict[str, Any]
+) -> None:
     """A coarser route on a checkpointing Gym would fall outside the commit scope."""
-    with pytest.raises(ValueError, match="not supported with target_level='turn'"):
-        RolloutRecoveryConfig(target_level=RecoveryTargetLevel.TURN, **overrides)
+    with pytest.raises(
+        ValueError, match=f"not supported with target_level='{target_level.value}'"
+    ):
+        RolloutRecoveryConfig(target_level=target_level, **overrides)
 
 
 @pytest.mark.parametrize(
     "target_level", [RecoveryTargetLevel.SIBLING, RecoveryTargetLevel.PROMPT_GROUP]
 )
-def test_restart_only_gym_servers_opt_in_requires_turn_recovery(
+def test_restart_only_gym_servers_opt_in_requires_gym_checkpoints(
     target_level: RecoveryTargetLevel,
 ) -> None:
     """Below turn level every unfinished rollout starts over anyway."""
@@ -978,9 +991,20 @@ def test_restart_only_gym_servers_opt_in_requires_turn_recovery(
         RolloutRecoveryConfig(
             target_level=target_level, allow_restart_only_gym_servers=True
         )
-    RolloutRecoveryConfig(
-        target_level=RecoveryTargetLevel.TURN, allow_restart_only_gym_servers=True
+
+
+@pytest.mark.parametrize(
+    "target_level", [RecoveryTargetLevel.TURN, RecoveryTargetLevel.PREFIX]
+)
+def test_restart_only_gym_servers_opt_in_accepts_gym_checkpoint_levels(
+    target_level: RecoveryTargetLevel,
+) -> None:
+    """Prefix checks Gym servers at startup too, so it must accept the opt-in."""
+    config = RolloutRecoveryConfig(
+        target_level=target_level, allow_restart_only_gym_servers=True
     )
+
+    assert config.allow_restart_only_gym_servers
 
 
 @pytest.mark.parametrize("timeout_s", [0.0, -1.0])
@@ -1239,7 +1263,12 @@ def test_restart_preserves_sealed_sibling_and_retries_only_interrupted_one() -> 
     assert retry.siblings[1].current_attempt.status is RolloutAttemptStatus.RESERVED
 
 
-def test_turn_restart_preserves_sealed_sibling_and_restores_other_from_gym() -> None:
+@pytest.mark.parametrize(
+    "restore_level", [RecoveryTargetLevel.PREFIX, RecoveryTargetLevel.TURN]
+)
+def test_gym_state_restart_preserves_sealed_sibling_and_restores_other_from_gym(
+    restore_level: RecoveryTargetLevel,
+) -> None:
     ledger = RolloutRecoveryLedger()
     group = _reserve(
         ledger,
@@ -1250,7 +1279,7 @@ def test_turn_restart_preserves_sealed_sibling_and_restores_other_from_gym() -> 
         expected_generations=2,
         target_step=7,
         start_weight_version=6,
-        restore_level=RecoveryTargetLevel.TURN,
+        restore_level=restore_level,
         admitted=True,
     )
     _mutate(
@@ -1961,6 +1990,7 @@ def test_restore_accepts_empty_compatible_sidecar(version: int) -> None:
         "schema_version": version,
         "groups": [],
         "batch_shortfall": {},
+        "steps_allowed_short": [],
         "sampler_stamps_target_steps": False,
     }
     if version >= 3:
@@ -2241,6 +2271,7 @@ def test_checkpoint_preserves_pending_finalizer_metrics_independently_of_sealed_
     state = build_rollout_recovery_state(
         RolloutRecoveryLedger(),
         batch_shortfall={},
+        steps_allowed_short=set(),
         sampler_stamps_target_steps=True,
         finalizer_metrics_by_group=metrics,
     )
@@ -2318,6 +2349,7 @@ def test_checkpoint_validates_reward_settings_and_observations():
     state = build_rollout_recovery_state(
         RolloutRecoveryLedger(),
         batch_shortfall={},
+        steps_allowed_short=set(),
         sampler_stamps_target_steps=True,
         reward_settings=settings,
         finalizer_rewards_by_group={"kept": [observation], "stale": [observation]},
@@ -2350,7 +2382,10 @@ def test_checkpoint_validates_reward_settings_and_observations():
 )
 def test_sidecar_requires_every_current_schema_key(key):
     state = build_rollout_recovery_state(
-        RolloutRecoveryLedger(), batch_shortfall={}, sampler_stamps_target_steps=True
+        RolloutRecoveryLedger(),
+        batch_shortfall={},
+        steps_allowed_short=set(),
+        sampler_stamps_target_steps=True,
     )
     assert state["schema_version"] == ROLLOUT_RECOVERY_SCHEMA_VERSION
     assert parse_rollout_recovery_state(state).reward_settings is None
@@ -2380,6 +2415,40 @@ def _dispatched_turn_group(
         )
     )
     return group
+
+
+@pytest.mark.parametrize(
+    ("restore_level", "expected"),
+    [(RecoveryTargetLevel.PREFIX, True), (RecoveryTargetLevel.TURN, False)],
+)
+def test_only_a_dispatched_prefix_attempt_grows_a_recoverable_prefix(
+    restore_level: RecoveryTargetLevel, expected: bool
+) -> None:
+    """Decoding advances only dispatched prefix-level attempts between mutations."""
+    ledger = RolloutRecoveryLedger()
+    _reserve(
+        ledger,
+        group_id="g7",
+        admission_id="batch-7",
+        prompt_id="7",
+        prompt_payload=_prompt(),
+        expected_generations=2,
+        target_step=7,
+        start_weight_version=6,
+        restore_level=restore_level,
+        admitted=True,
+    )
+    assert not ledger.has_dispatched_generation_prefix()
+
+    _mutate(
+        lambda cut: ledger.mark_group_dispatched(
+            cut, "g7", environment_instance_id="tools/replica-0"
+        )
+    )
+    assert ledger.has_dispatched_generation_prefix() is expected
+
+    _mutate(lambda cut: ledger.abandon_unsealed(cut, "g7"))
+    assert not ledger.has_dispatched_generation_prefix()
 
 
 def test_refused_fresh_dispatch_keeps_identity_and_leaves_gym_inventory() -> None:
@@ -2686,3 +2755,20 @@ def test_an_abandoned_episode_is_not_held_by_its_redispatched_replacement() -> N
     held = ledger.environment_episodes_still_held({"tools/replica-0": [old, new]})
 
     assert held == {"tools/replica-0": {new}}
+
+
+@pytest.mark.parametrize("value", [None, {}, [True], [-1], [1.0], [1, 1]])
+def test_checkpoint_rejects_invalid_short_step_permissions(value) -> None:
+    state = _sidecar_state(RolloutRecoveryLedger())
+    state["steps_allowed_short"] = value
+    with pytest.raises((TypeError, ValueError), match="steps_allowed_short"):
+        parse_rollout_recovery_state(state)
+
+
+def test_checkpoint_requires_short_step_permissions_for_new_schema() -> None:
+    state = _sidecar_state(RolloutRecoveryLedger())
+    del state["steps_allowed_short"]
+    with pytest.raises(ValueError, match="steps_allowed_short"):
+        parse_rollout_recovery_state(state)
+    state["schema_version"] = 7
+    assert parse_rollout_recovery_state(state).steps_allowed_short == set()

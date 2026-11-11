@@ -48,6 +48,14 @@ from nemo_rl.environments.nemo_gym_task import (
     get_nemo_gym_attribution_key,
     get_nemo_gym_task_input,
 )
+from nemo_rl.experience.dynamic_sampling import (
+    StepRewardStats,
+    drain_step_reward_metrics,
+    mask_sample_flagged,
+    participating_rewards,
+    record_group_rewards,
+    rewards_carry_no_signal,
+)
 from nemo_rl.experience.failures import (
     FailureClass,
     GenerationUnavailable,
@@ -75,7 +83,6 @@ from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     PromptGroupStatus,
     RecoveryGranularity,
-    RecoveryTargetLevel,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
     SiblingSealResult,
@@ -205,6 +212,12 @@ class RolloutOutcome(str, enum.Enum):
     # releasing its backpressure permit and atomically replacing the ledger owner or
     # crediting the step's shortfall.
     SKIPPED = "skipped"
+    # Dynamic sampling dropped the group before commit: every generation scored the
+    # same, so it carries no advantage signal. The rollout itself was healthy, which is
+    # why this is not SKIPPED -- the caller must replace it out of the dynamic-sampling
+    # budget rather than the rollout fault-tolerance budget, and credits the step short
+    # only when the spare pool is dry.
+    FILTERED = "filtered"
 
 
 @dataclass(frozen=True)
@@ -283,6 +296,10 @@ class RolloutStats:
 
     committed: int = 0
     skipped: int = 0
+    # Groups dropped by dynamic sampling because all generations got the same reward.
+    # Kept apart from the failure counts: the rollout was healthy, so counting it as a
+    # failure would make the fleet look sick.
+    zero_variance_groups: int = 0
     # Infra re-dispatches: the fleet is degrading. Kept apart from data retries because
     # conflating them defeats the whole point of the two-budget split -- an operator
     # watching redispatch_total climb needs to know whether the cluster is sick or the
@@ -345,6 +362,7 @@ class RolloutStats:
         metrics: dict[str, float] = {
             "rollout/committed_total": float(self.committed),
             "rollout/skipped_total": float(self.skipped),
+            "rollout/zero_variance_groups_total": float(self.zero_variance_groups),
             "rollout/redispatch_total": float(
                 sum(self.redispatches_by_reason.values())
             ),
@@ -2195,10 +2213,20 @@ class RolloutManager:
         log_full_result_tables: bool = False,
         forest_training: bool = False,
         execution_row_multiple: int = 1,
+        filter_zero_variance_groups: bool = False,
+        # Which rows vote in a group's reward statistics. Read only when the filter
+        # above is on or a step's rewards are tallied; setup always passes the run's
+        # own grpo values, so these are not a second home for those defaults.
+        masked_reward_policy: Optional[str] = None,
+        overlong_filtering: bool = False,
     ) -> None:
         assert num_generations_per_prompt >= 1, (
             "num_generations_per_prompt must be >= 1"
         )
+        # DAPO: drop a group whose voting generations all scored the same.
+        self._filter_zero_variance_groups = filter_zero_variance_groups
+        self._masked_reward_policy = masked_reward_policy
+        self._overlong_filtering = overlong_filtering
         # Resolved before the impl is built: the NeMo-Gym impl reads its row-retry
         # budget out of it at construction time, and shares the counters so its
         # row-level re-dispatches land in the same place as everything else.
@@ -2208,6 +2236,9 @@ class RolloutManager:
             else RolloutRetryPolicy.single_attempt()
         )
         self._stats = RolloutStats()
+        # Keyed by the step a group was generated for; the controller pops a step's
+        # entry when that step closes.
+        self._step_rewards: dict[int, StepRewardStats] = {}
         # Shared with the impl's request deadlines so the controller can pause their clocks
         # while a colocated engine is in training mode.
         self._request_deadlines = RequestDeadlineRegistry()
@@ -2469,6 +2500,39 @@ class RolloutManager:
             dispatch_recorder=dispatch_recorder,
         )
 
+    def _participating_rewards(self, record: PromptGroupRecord) -> list[float]:
+        """This group's voting rewards under the run's masking policy."""
+        return participating_rewards(
+            record,
+            masked_reward_policy=self._masked_reward_policy,
+            overlong_filtering=self._overlong_filtering,
+        )
+
+    def _is_zero_variance_group(self, record: PromptGroupRecord) -> bool:
+        """Whether this group's voters leave every row zero advantage."""
+        return rewards_carry_no_signal(self._participating_rewards(record))
+
+    def record_group_rewards(
+        self,
+        target_step: Optional[int],
+        rewards: Sequence[float],
+        *,
+        replacement_index: int,
+        zero_variance: bool,
+    ) -> None:
+        """Record a finished group's rewards for its original target step."""
+        record_group_rewards(
+            self._step_rewards,
+            target_step,
+            rewards,
+            replacement_index=replacement_index,
+            zero_variance=zero_variance,
+        )
+
+    def drain_step_reward_metrics(self, step: int) -> dict[str, float]:
+        """Report this step's rewards and retire this and older step tallies."""
+        return drain_step_reward_metrics(self._step_rewards, step)
+
     async def generate_and_push(
         self,
         input_sample: DatumSpec,
@@ -2476,6 +2540,7 @@ class RolloutManager:
         target_step: Optional[int] = None,
         inflight_registry: Optional[dict[str, tuple[asyncio.Task[None], int]]] = None,
         lineage_group_id: Optional[str] = None,
+        replacement_index: int = 0,
     ) -> RolloutOutcome:
         """Roll out one prompt and commit it, re-dispatching on infrastructure failure.
 
@@ -2499,6 +2564,9 @@ class RolloutManager:
             lineage_group_id: Stable group minted by the rollout ledger before
                 dataloader dispatch. TQ records this same ID rather than minting one.
                 ``None`` preserves the ordinary non-checkpointed fresh-ID retry path.
+            replacement_index: 0 for the originally scheduled prompt, N for its N-th
+                replacement after a group was dropped. Only used to separate first
+                attempts in the per-step reward metrics.
 
         Returns:
             ``COMMITTED`` when the group reached the buffer, or ``SKIPPED`` when the
@@ -2508,6 +2576,13 @@ class RolloutManager:
             so the caller owns both its backpressure permit and the checkpoint-atomic
             transition from its retained ledger record to either a replacement prompt
             or the shortfall for the training step it was stamped for.
+
+            ``FILTERED`` when dynamic sampling dropped the group before commit because
+            every generation scored the same reward. It carries the same two caller
+            obligations as ``SKIPPED`` -- the backpressure permit and the ledger
+            transition -- but the rollout itself succeeded, so its replacement is paid
+            for out of ``grpo.dynamic_sampling_max_gen_batches`` rather than
+            the rollout fault-tolerance budget.
 
         Raises:
             RolloutRedispatchExhausted: The infra budget ran out and the fleet has not
@@ -2592,12 +2667,46 @@ class RolloutManager:
                 finally:
                     if inflight_registry is not None:
                         inflight_registry.pop(tq_group_id, None)
+                if self._filter_zero_variance_groups and self._is_zero_variance_group(
+                    record
+                ):
+                    # Filtering happens before commit, so removing the reservation writes no rows.
+                    await self._tq_buffer.remove_group(tq_group_id)
+                    # A filtered group is a healthy rollout and breaks a consecutive infrastructure-failure run.
+                    self._consecutive_infra_drops = 0
+                    self._stats.zero_variance_groups += 1
+                    rewards = [c.reward for c in record.completions]
+                    voting = self._participating_rewards(record)
+                    self.record_group_rewards(
+                        target_step,
+                        rewards,
+                        replacement_index=replacement_index,
+                        zero_variance=True,
+                    )
+                    # Report the voting rows; under exclude they differ from the group size.
+                    scored = voting[0] if voting else float("nan")
+                    print(
+                        f"  dynamic sampling: dropped group {tq_group_id} "
+                        f"(target_step={target_step}), {len(voting)} of "
+                        f"{len(rewards)} generation(s) vote in the baseline and all "
+                        f"scored {scored}; "
+                        f"{self._stats.zero_variance_groups} dropped so far",
+                        flush=True,
+                    )
+                    return RolloutOutcome.FILTERED
                 end_version = self._weight_version
                 await self._tq_buffer.commit(
                     tq_group_id,
                     record,
                     start_weight_version=start_version,
                     end_weight_version=end_version,
+                )
+                # After the commit, so a re-run on commit failure cannot count twice.
+                self.record_group_rewards(
+                    target_step,
+                    [c.reward for c in record.completions],
+                    replacement_index=replacement_index,
+                    zero_variance=self._is_zero_variance_group(record),
                 )
             except Exception as error:
                 # A failed rollout must not leave an unready slot that can block an
@@ -2907,11 +3016,12 @@ class RolloutManager:
         if pending_owners:
             environment_instance_id = next(iter(pending_owners))
         elif (
-            pending_indices and recovery_group.restore_level is RecoveryTargetLevel.TURN
+            pending_indices
+            and recovery_group.restore_level.requires_environment_checkpoint
         ):
             if not isinstance(self._impl, AsyncNemoGymRolloutImpl):
                 raise RuntimeError(
-                    "turn-level recovery requires the NeMo-Gym rollout path"
+                    "turn/prefix recovery requires the NeMo-Gym rollout path"
                 )
             environment_instance_id = self._impl.select_checkpoint_instance(
                 attempt_input_sample
@@ -2981,12 +3091,7 @@ class RolloutManager:
                     f"receipt={receipt.get('capture_key')!r}, "
                     f"expected={gate_rollout_id!r}"
                 )
-            mask_sample = bool(
-                (completion.env_extras or {}).get(MASK_SAMPLE)
-                or ((completion.env_extras or {}).get("instance_config") or {}).get(
-                    MASK_SAMPLE, False
-                )
-            )
+            mask_sample = mask_sample_flagged(completion.env_extras)
 
             if recovery_group.recovery_granularity is RecoveryGranularity.PROMPT_GROUP:
                 result = SiblingSealResult(
