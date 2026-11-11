@@ -923,6 +923,9 @@ class TestSetup:
                 "precision": "bfloat16",
                 "automodel_cfg": {
                     "enabled": True,
+                    "tensor_parallel_size": 1,
+                    "context_parallel_size": 1,
+                    "sequence_parallel": False,
                     "lora_cfg": {"enabled": True, "dim": 16, "alpha": 64},
                 },
             }
