@@ -341,13 +341,22 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         """
         # Deferred: chat_server imports vLLM's OpenAI server stack.
         from nemo_rl.models.generation.vllm.chat_server import (
+            abort_request_capture,
             chat_request_from_render,
+            clamp_max_tokens,
+            classify_restored_terminal,
+            resolve_restored_call,
+            serve_restored_terminal,
+            set_max_tokens,
         )
 
         host = self._host
         chat = chat_request_from_render(plan["request"])
         admission = host._parse_capture_admission(plan["admission"])
-        serving_admission = host._parse_capture_admission(plan["serving_admission"])
+        # One object when storage and serving are one admission, as natively.
+        serving_admission = admission
+        if plan["serving_admission"] != plan["admission"]:
+            serving_admission = host._parse_capture_admission(plan["serving_admission"])
         if admission is not None and admission.mode == "candidate":
             # The frontend's chat engine decides a candidate; a request
             # still marked one skipped that decision.
@@ -355,20 +364,62 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
                 "a candidate admission reached the engine undecided; NeMo RL's "
                 "chat engine must resolve it before capture"
             )
+        prefix_token_ids = None
+        if admission is not None and admission.mode == "token_in":
+            prefix_token_ids = prompt_token_ids[: plan["prefix_len"]]
+        restored = None
+        if serving_admission is not None:
+            # A call a checkpoint cut resumes from the tokens the cut saved. A
+            # cut this engine cannot use comes back as None: the frontend's
+            # prompt stands, and the call regenerates.
+            resolved_admission, restored = await resolve_restored_call(
+                host,
+                chat,
+                serving_admission,
+                # The model's own prefix is the spliced prompt's first ids.
+                prompt_token_ids[: plan["prefix_len"]]
+                if serving_admission.mode == "token_in"
+                else [],
+            )
+            if serving_admission is admission:
+                admission = resolved_admission
+            serving_admission = resolved_admission
+        splice_cut, multimodal = plan["splice"], plan["multimodal"]
+        terminal = None
+        if restored is not None:
+            # The saved rows are the exact engine prompt at the cut, so the
+            # frontend's splice is dropped; cuts are text-only, so no media.
+            splice_cut = multimodal = None
+            prompt_token_ids = restored.prompt_token_ids
+            terminal = classify_restored_terminal(
+                restored, prompt_token_ids, admission, max_model_len=self._max_model_len
+            )
+            if terminal is None:
+                max_tokens = clamp_max_tokens(
+                    restored.max_tokens
+                    if restored.max_tokens is not None
+                    else chat.max_completion_tokens
+                    if chat.max_completion_tokens is not None
+                    else chat.max_tokens,
+                    len(prompt_token_ids),
+                    self._max_model_len,
+                )
+                if max_tokens is not None:
+                    set_max_tokens(chat, max_tokens)
         splice = None
-        if plan["splice"] is not None:
-            splice = PrefixSplice(prompt_token_ids, *plan["splice"])
+        if splice_cut is not None:
+            splice = PrefixSplice(prompt_token_ids, *splice_cut)
         engine_prompt: dict[str, Any]
-        if plan["multimodal"] is not None:
+        if multimodal is not None:
             # The processed media, in the template's coordinates.
             engine_prompt = {
-                **pickle.loads(base64.b64decode(plan["multimodal"])),
+                **pickle.loads(base64.b64decode(multimodal)),
                 "prompt_token_ids": list(plan["template_token_ids"]),
             }
         else:
             engine_prompt = TokensPrompt(prompt_token_ids=prompt_token_ids)
         media = None
-        if admission is not None:
+        if admission is not None and restored is None:
             # Off-loop: a retained-media check reads staged calls.
             media = await asyncio.to_thread(
                 host._capture_request_media,
@@ -377,7 +428,7 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
                 splice=splice,
                 verify_retained_media=plan["verify_retained_media"],
             )
-        if splice is not None and plan["multimodal"] is not None:
+        if splice is not None and multimodal is not None:
             # Successful media capture already remapped these ranges.
             if media is None and (placeholders := engine_prompt.get("mm_placeholders")):
                 engine_prompt["mm_placeholders"] = remap_multimodal_placeholders(
@@ -387,16 +438,26 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
                     splice=splice,
                 )
             engine_prompt["prompt_token_ids"] = prompt_token_ids
-        prefix_token_ids = None
-        if admission is not None and admission.mode == "token_in":
-            prefix_token_ids = prompt_token_ids[: plan["prefix_len"]]
         host._begin_request_capture(
             chat,
             prompt_token_ids,
             admission=admission,
             prefix_token_ids=prefix_token_ids,
             media=media,
+            generation_cut=None if restored is None else restored.saved,
+            resumed_generation_token_ids=(
+                None if restored is None else restored.resumed_generation_token_ids
+            ),
         )
+        if terminal is not None:
+            # This task also submits the call: the engine client answers it.
+            serve_restored_terminal(
+                chat,
+                engine_prompt,
+                terminal,
+                admission,
+                max_model_len=self._max_model_len,
+            )
         captured = chat in host._capture_registry
         try:
             final_output = await self._generate(chat, engine_prompt, plan, context)
@@ -425,6 +486,20 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
                 "output": output,
                 "result": result.model_dump(exclude_none=True),
             }
+            if restored is not None:
+                # The frontend's reply puts the saved text back in front.
+                reply["restored"] = {
+                    "prompt_token_ids": prompt_token_ids,
+                    "token_ids": restored.resumed_generation_token_ids,
+                    "terminal": None
+                    if terminal is None
+                    else {
+                        "prefix_token_count": terminal.prefix_token_count,
+                        "reason": terminal.reason,
+                        "finish_reason": terminal.finish_reason,
+                        "stop_reason": terminal.stop_reason,
+                    },
+                }
             return {
                 "token_ids": output["token_ids"],
                 "index": 0,
@@ -435,11 +510,10 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         finally:
             # A no-op once the call was staged: staging pops its capture state.
             if admission is not None:
-                host._abort_request_capture(
+                await abort_request_capture(
+                    host,
                     chat,
-                    reason=(
-                        "client_disconnect" if context.is_stopped() else "engine_error"
-                    ),
+                    "client_disconnect" if context.is_stopped() else "engine_error",
                 )
 
     async def _generate(
@@ -466,6 +540,9 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
             truncate_prompt_tokens=chat.truncate_prompt_tokens,
         )
         params = chat.to_sampling_params(max_tokens, default_sampling_params)
+        if chat.ng_capture is not None:
+            # As the native request does: a cut needs the call's resolved budget.
+            self._host._prefix_recovery.on_sampling_params(chat, params)
         # The worker's own engine client, as the native server uses it, with
         # the queue limits it checks before generating.
         engine_client = self._host._http_engine_client or self._llm
@@ -478,6 +555,9 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
             reasoning_ended=plan["reasoning_ended"],
             reasoning_parser_kwargs=plan["reasoning_parser_kwargs"],
         ):
+            # Recorded before asking for the next output, which releases
+            # vLLM's finished state for this request.
+            self._host._prefix_recovery.observe(chat, output)
             final_output = output
         if final_output is None:
             raise RuntimeError(f"No output received for request {context.id()}")

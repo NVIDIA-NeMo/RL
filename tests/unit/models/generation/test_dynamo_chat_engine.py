@@ -103,7 +103,7 @@ class _Pool:
             raise self.error
         return self.rendered
 
-    async def respond(self, request, prompt_token_ids, output) -> dict:
+    async def respond(self, request, prompt_token_ids, output, restored=None) -> dict:
         self.responded.append((request, prompt_token_ids, output))
         return self.reply
 

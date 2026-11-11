@@ -22,6 +22,7 @@ faked.
 import base64
 import pickle
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -60,6 +61,7 @@ from nemo_rl.models.generation.dynamo.vllm.generation_cut import (  # noqa: E402
     GENERATION_CUT_ANNOTATION,
     INVENTORY_KEY,
 )
+from nemo_rl.models.generation.prefix_recovery import NoPrefixRecovery  # noqa: E402
 from nemo_rl.models.generation.vllm.utils import R3_MISSING_ROUTE_SENTINEL  # noqa: E402
 from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
     routed_experts_tensor_metadata,
@@ -439,3 +441,25 @@ def test_an_engine_answers_a_cut_with_the_calls_it_cut() -> None:
     assert ack["prefix_token_count"] == 2
     # The cut's rows are in TQ before the engine answers.
     assert ack["staging_keys"] == sink.generation_prefix_keys
+
+
+def test_a_captured_call_records_what_a_cut_needs() -> None:
+    """A checkpoint cuts only a call whose output budget and progress it knows."""
+    final = _output([1, 3, 4], _completion([10, 11], "stop"))
+    llm = _FakeLLM([final])
+    host = _capturing_host(llm)
+    host._prefix_recovery = MagicMock(wraps=NoPrefixRecovery())
+
+    _collect(
+        vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0),
+        _captured_call([1, 3, 4], TEXT),
+    )
+
+    ((_, params, _, _),) = llm.calls
+    ((chat, recorded_params),) = [
+        call.args for call in host._prefix_recovery.on_sampling_params.call_args_list
+    ]
+    assert recorded_params is params
+    assert [call.args for call in host._prefix_recovery.observe.call_args_list] == [
+        (chat, final)
+    ]
