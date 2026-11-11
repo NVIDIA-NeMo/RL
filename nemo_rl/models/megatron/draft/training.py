@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import warnings
 from collections.abc import Mapping
+import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Protocol, cast
 
@@ -1194,6 +1195,13 @@ class LiLiCorrSpeculator(DFlashSpeculator):
                 "build_model must return a LiLiCorrDraftModel."
             )
 
+        own_lm_head = getattr(draft_model, "lm_head_weight", None)
+        if own_lm_head is not None:
+            # has_own_lm_head drafters are SERVED with their own head, so the draft
+            # side (backbone CE and lattice candidates) must use it too. The teacher
+            # side keeps the policy head: selected_teacher_logits were already built.
+            output = dataclasses.replace(output, output_weight=own_lm_head)
+            data["dflash_output"] = output
         plan = output.plan
         policy = unwrap_model(kwargs["policy_model"])
         anchor_hidden = output.hidden[:, :1]

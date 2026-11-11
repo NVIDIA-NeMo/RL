@@ -1902,6 +1902,16 @@ def _dflash_weight_layout(
         "mlp.up_proj.weight": ((intermediate_size, hidden_size), 0),
         "mlp.down_proj.weight": ((hidden_size, intermediate_size), 1),
     }
+    taps = int(getattr(config, "conv_kernel_size", 0))
+    if taps > 0:
+        # Grouped convolutions act on the full hidden size and are replicated.
+        num_groups = hidden_size // int(config.conv_group_size)
+        for conv in ("attention_conv", "mlp_conv"):
+            layouts[f"{conv}.base_kernel"] = ((2, taps, hidden_size), None)
+            layouts[f"{conv}.kernel_projection.weight"] = (
+                (2 * taps * num_groups, hidden_size),
+                None,
+            )
     try:
         return layouts[suffix]
     except KeyError as exc:

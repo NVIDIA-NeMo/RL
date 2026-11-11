@@ -165,6 +165,120 @@ def load_lilicorr_weights(head: Any, model_name: str) -> None:
     print(f"  LiLiCorr head: loaded {len(found)} tensors from {root}")
 
 
+# Checkpoint tensors that are not part of the DFlash body: the reranker head (loaded
+# by load_lilicorr_weights) and the drafter-owned LM head (load_lilicorr_lm_head).
+_NON_BODY_PREFIXES = ("lilicorr.", "lm_head.")
+
+
+def load_lilicorr_body_weights(body: DFlashBody, model_name: str) -> None:
+    """Load the DFlash backbone, convolutions included, STRICTLY from the checkpoint.
+
+    Without this the body trains from random init while the head is pretrained: every
+    loss stays finite and nothing errors, but the served drafter is untrained.
+    """
+    from nemo_rl.models.megatron.draft.utils import (
+        _load_checkpoint_state,
+        _load_normalized_hf_weights_to_dflash,
+        _normalize_draft_state_dict,
+    )
+
+    state = _normalize_draft_state_dict(_load_checkpoint_state(model_name))
+    body_state = {
+        name: tensor
+        for name, tensor in state.items()
+        if not name.startswith(_NON_BODY_PREFIXES)
+    }
+    missing, unexpected = _load_normalized_hf_weights_to_dflash(body, body_state)
+    if missing or unexpected:
+        raise ValueError(
+            f"LiLiCorr body did not load cleanly from {model_name}: "
+            f"missing={sorted(missing)[:6]}, unexpected={sorted(unexpected)[:6]}"
+        )
+    print(f"  LiLiCorr body: loaded {len(body_state)} tensors from {model_name}")
+
+
+def load_lilicorr_lm_head_shard(
+    model_name: str, *, policy_lm_head_shard: Tensor, tp_rank: int
+) -> Tensor:
+    """Load the drafter-owned LM head as the same vocab shard the policy head holds.
+
+    Checkpoints with ``has_own_lm_head`` are served with THEIR head (vLLM LiLiCorr), so
+    training must project draft hidden states through it too. Sharding it exactly like
+    the policy head lets the existing vocab-parallel losses use it unchanged.
+    """
+    from nemo_rl.models.megatron.draft.utils import (
+        _load_checkpoint_state,
+        _normalize_draft_state_dict,
+    )
+
+    state = _normalize_draft_state_dict(_load_checkpoint_state(model_name))
+    if "lm_head.weight" not in state:
+        raise ValueError(
+            f"{model_name} sets has_own_lm_head but carries no lm_head.weight"
+        )
+    full = state["lm_head.weight"]
+    rows, hidden = policy_lm_head_shard.shape
+    if full.shape[1] != hidden:
+        raise ValueError(
+            f"drafter lm_head hidden {full.shape[1]} != policy hidden {hidden}"
+        )
+    shard = torch.zeros(
+        rows, hidden, dtype=policy_lm_head_shard.dtype, device=policy_lm_head_shard.device
+    )
+    start = tp_rank * rows
+    # Megatron pads the vocab; padded rows stay zero, like the policy's.
+    valid = max(0, min(rows, full.shape[0] - start))
+    if valid:
+        shard[:valid] = full[start : start + valid].to(shard)
+    return shard
+
+
+def vocab_parallel_topk_logprobs(
+    local_logits: Tensor,
+    k: int,
+    *,
+    vocab_start: int,
+    vocab_size: int,
+    tp_group: Any,
+) -> tuple[Tensor, Tensor]:
+    """Global top-k token ids and log-probs from vocab-parallel logits.
+
+    Each tensor-parallel rank holds logits for one contiguous vocab range. A local
+    log_softmax/top-k would normalise over a fraction of the vocab and return LOCAL
+    indices, so every rank would score different, wrongly-identified candidates.
+    """
+    local_logits = local_logits.float()
+    local_size = local_logits.shape[-1]
+    # Megatron pads the vocab; padded columns are never real tokens.
+    real = vocab_size - vocab_start
+    if real < local_size:
+        local_logits = local_logits.clone()
+        local_logits[..., max(real, 0) :] = float("-inf")
+    world = 1 if tp_group is None else torch.distributed.get_world_size(tp_group)
+    max_logit = local_logits.amax(dim=-1, keepdim=True)
+    if world > 1:
+        torch.distributed.all_reduce(
+            max_logit, op=torch.distributed.ReduceOp.MAX, group=tp_group
+        )
+    sum_exp = (local_logits - max_logit).exp().sum(dim=-1, keepdim=True)
+    if world > 1:
+        torch.distributed.all_reduce(sum_exp, group=tp_group)
+    log_normalizer = max_logit + sum_exp.log()
+
+    values, ids = local_logits.topk(k, dim=-1)
+    ids = ids + vocab_start
+    if world > 1:
+        gathered_values = [torch.empty_like(values) for _ in range(world)]
+        gathered_ids = [torch.empty_like(ids) for _ in range(world)]
+        torch.distributed.all_gather(gathered_values, values, group=tp_group)
+        torch.distributed.all_gather(gathered_ids, ids, group=tp_group)
+        values = torch.cat(gathered_values, dim=-1)
+        ids = torch.cat(gathered_ids, dim=-1)
+        values, order = values.topk(k, dim=-1)
+        ids = ids.gather(-1, order)
+    return values - log_normalizer, ids
+
+
 class LiLiCorrDraftModel(MegatronModule):
     """DFlash backbone with a LiLiCorr reranker on top."""
 
@@ -200,6 +314,74 @@ class LiLiCorrDraftModel(MegatronModule):
         self.body = body
         self.lilicorr = head
         self.draft_config = config
+        # Drafter-owned LM head as a TRAINABLE vocab-parallel shard (laid out like the
+        # policy head), or None to use the policy's head.
+        self.register_parameter("lm_head_weight", None)
+        # Real (unpadded) vocab and this rank's vocab offset for global top-k ids.
+        self.vocab_size: int | None = None
+        self.vocab_start: int = 0
+        self.vocab_tp_group: Any = None
+
+    def set_vocab_parallel(
+        self,
+        *,
+        vocab_size: int,
+        vocab_start: int,
+        tp_group: Any,
+        own_lm_head: Tensor | None = None,
+    ) -> None:
+        if own_lm_head is not None:
+            from megatron.core.tensor_parallel.layers import (
+                set_tensor_model_parallel_attributes,
+            )
+
+            weight = torch.nn.Parameter(own_lm_head, requires_grad=True)
+            # Mark it vocab-sharded so grad norm, the distributed optimizer and
+            # checkpoints treat each rank's rows as distinct, not as replicas.
+            set_tensor_model_parallel_attributes(weight, is_parallel=True, dim=0, stride=1)
+            self.lm_head_weight = weight
+        self.vocab_size = int(vocab_size)
+        self.vocab_start = int(vocab_start)
+        self.vocab_tp_group = tp_group
+
+    def sharded_state_dict(
+        self,
+        prefix: str = "",
+        sharded_offsets: tuple = (),
+        metadata: dict | None = None,
+    ) -> Any:
+        """Checkpoint the owned LM head as a vocab (dim 0) TP shard, not a replica."""
+        from megatron.core.transformer.utils import (
+            ensure_metadata_has_dp_cp_group,
+            make_sharded_tensors_for_checkpoint,
+            sharded_state_dict_default,
+        )
+
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        sharded = {}
+        tp_group = getattr(self.body, "tp_group", None)
+        for name, module in self.named_children():
+            sharded.update(
+                sharded_state_dict_default(
+                    module,
+                    f"{prefix}{name}.",
+                    sharded_offsets,
+                    metadata,
+                    tp_group=tp_group,
+                )
+            )
+        if self.lm_head_weight is not None:
+            sharded.update(
+                make_sharded_tensors_for_checkpoint(
+                    {"lm_head_weight": self.lm_head_weight},
+                    prefix,
+                    {"lm_head_weight": 0},
+                    sharded_offsets,
+                    tp_group=self.vocab_tp_group,
+                    dp_cp_group=metadata.get("dp_cp_group"),
+                )
+            )
+        return sharded
 
     def forward(
         self,
@@ -250,9 +432,18 @@ class LiLiCorrDraftModel(MegatronModule):
         mask_hidden = block_hidden[:, 1:]
         mask_logits = student_logits[:, 1:]
         topk = self.lilicorr.candidate_topk
-        cand_logprobs, cand_ids = torch.log_softmax(
-            mask_logits.detach().float(), dim=-1
-        ).topk(topk, dim=-1)
+        # output_weight is a vocab-parallel shard: take the GLOBAL top-k.
+        cand_logprobs, cand_ids = vocab_parallel_topk_logprobs(
+            mask_logits.detach(),
+            topk,
+            vocab_start=self.vocab_start,
+            vocab_size=(
+                self.vocab_size
+                if self.vocab_size is not None
+                else self.vocab_start + mask_logits.shape[-1]
+            ),
+            tp_group=self.vocab_tp_group,
+        )
 
         # The head takes [batch, blocks, slots, k]; Megatron hands us rows that already
         # flatten batch x anchors into one dimension. Add a singleton batch rather than
@@ -352,23 +543,54 @@ def build_lilicorr_draft_model(
         or body_defaults.num_target_taps,
         rope_theta=float(ckpt_cfg.get("rope_theta", body_defaults.rope_theta)),
         rms_norm_eps=float(ckpt_cfg.get("rms_norm_eps", body_defaults.rms_norm_eps)),
+        # Grouped-convolution checkpoints are served with the convolutions (vLLM
+        # LiLiCorr builds DFlash2 layers), so the trained body must run them too.
+        conv_kernel_size=int(dflash_cfg.get("conv_kernel_size", 0) or 0),
+        conv_group_size=int(dflash_cfg.get("conv_group_size", 0) or 0),
     )
+    tp_group = getattr(pg_collection, "tp", None)
     body = DFlashBody(
         config=body_config,
         parallel_config=parallel_config,
-        tp_group=getattr(pg_collection, "tp", None),
+        tp_group=tp_group,
     )
 
     head = build_lilicorr_head(head_cfg)
 
-    # Load the released reranker weights STRICTLY. A silent partial load is the failure
-    # this project keeps meeting: the module initialises, training runs, and acceptance is
-    # quietly near zero because the head is still at its init values.
+    # Load the released weights STRICTLY -- body and reranker. A silent partial load is
+    # the failure this project keeps meeting: the module initialises, training runs, and
+    # acceptance is quietly near zero because part of the drafter is at init values.
+    load_lilicorr_body_weights(body, draft_config.model_name)
     load_lilicorr_weights(head, draft_config.model_name)
 
     model = LiLiCorrDraftModel(body=body, head=head, config=draft_config)
+
+    from nemo_rl.models.megatron.draft.utils import (
+        DRAFT_GRAD_NORM_GROUP,
+        get_policy_lm_head_weight,
+        register_draft_grad_norm_group,
+    )
+
+    policy_head = get_policy_lm_head_weight(policy_model_chunk)
+    tp_rank = 0 if tp_group is None else torch.distributed.get_rank(tp_group)
+    own_lm_head = None
+    if ckpt_cfg.get("has_own_lm_head"):
+        own_lm_head = load_lilicorr_lm_head_shard(
+            draft_config.model_name, policy_lm_head_shard=policy_head, tp_rank=tp_rank
+        )
+    model.set_vocab_parallel(
+        vocab_size=int(ckpt_cfg.get("draft_vocab_size", ckpt_cfg["vocab_size"])),
+        vocab_start=tp_rank * policy_head.shape[0],
+        tp_group=tp_group,
+        own_lm_head=own_lm_head,
+    )
     if model_provider.params_dtype is not None:
         model = model.to(model_provider.params_dtype)
+    # Report the drafter's gradient norm separately from the policy's, as the DFlash
+    # provider does for its body.
+    register_draft_grad_norm_group()
+    for parameter in model.parameters():
+        parameter.grad_norm_group = DRAFT_GRAD_NORM_GROUP
     return model
 
 
@@ -400,5 +622,17 @@ def export_lilicorr_weights_to_hf(model: Any) -> list[tuple[Tensor, Tensor]]:
         (f"lilicorr.{_from_positional_name(name)}", tensor.detach())
         for name, tensor in head.state_dict().items()
     )
+    own_lm_head = getattr(module, "lm_head_weight", None)
+    if own_lm_head is not None:
+        # vLLM starts the drafter from dummy weights and fills it by refit, so the
+        # drafter-owned head must be streamed even though it is frozen here.
+        shard = own_lm_head.detach()
+        group = module.vocab_tp_group
+        world = 1 if group is None else torch.distributed.get_world_size(group)
+        if world > 1:
+            parts = [torch.empty_like(shard) for _ in range(world)]
+            torch.distributed.all_gather(parts, shard, group=group)
+            shard = torch.cat(parts, dim=0)
+        exported.append(("lm_head.weight", shard[: module.vocab_size]))
     return exported
 
