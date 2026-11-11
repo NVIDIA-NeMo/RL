@@ -708,7 +708,7 @@ def _raise_if_no_survivors(kept_toks: torch.Tensor) -> None:
         raise RuntimeError(
             "No valid response tokens remain after in-loss sequence-logprob "
             "filtering; refusing an empty optimizer update. Check "
-            "grpo.seq_logprob_error_threshold."
+            "seq_logprob_error_threshold in the grpo or ppo block."
         )
 
 
