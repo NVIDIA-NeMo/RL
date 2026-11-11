@@ -1347,6 +1347,7 @@ class MegatronPolicyWorkerImpl(
         global_valid_seqs: torch.Tensor,
         global_valid_toks: torch.Tensor,
         eval_mode: bool,
+        mtp_detached: bool,
     ) -> tuple[list[dict[str, Any]], torch.Tensor, torch.Tensor]:
         """Normalize one complete optimizer batch after in-loss filtering.
 
@@ -1357,6 +1358,9 @@ class MegatronPolicyWorkerImpl(
         All microbatches have now finished, so sum survivor counts over DP, broadcast them to
         every PP stage, and correct gradients before the optimizer clips them.
         CP/TP replicas must not be counted as additional samples.
+
+        With ``mtp_detached``, detached MTP heads keep their pre-filter token
+        denominator: their loss mask is built before filtering.
         """
         metrics = losses_reduced
         counts = _local_survivor_counts(metrics, global_valid_toks.device)
@@ -1392,6 +1396,8 @@ class MegatronPolicyWorkerImpl(
             # gradient buffers (including distributed-optimizer gradient shards).
             torch.cuda.synchronize()
             self.model.scale_gradients(token_factor)
+            if mtp_detached:
+                self._scale_mtp_param_grads(1.0 / token_factor)
         metrics = [
             rescale_loss_metrics(
                 m,
@@ -1424,6 +1430,7 @@ class MegatronPolicyWorkerImpl(
             "check_dim_skip_keys is only supported by the Automodel worker; "
             "Megatron does not run cross-tokenizer distillation."
         )
+        self._raise_if_attached_mtp_with_in_loss_filter(loss_fn)
         self.timer.start("train")
         # Note: zero_grad_buffer is called at the start of each global batch iteration
         # in the loop below, so we don't need to call it here.
@@ -1613,6 +1620,10 @@ class MegatronPolicyWorkerImpl(
                         global_valid_seqs=global_valid_seqs,
                         global_valid_toks=global_valid_toks,
                         eval_mode=eval_mode,
+                        mtp_detached=self.mtp_enabled
+                        and bool(
+                            getattr(self._get_model_config(), "mtp_detach_heads", False)
+                        ),
                     )
 
                 # Update parameters.
@@ -1880,6 +1891,27 @@ class MegatronPolicyWorkerImpl(
     #    no FSDP-style ``loss *= dp_size*cp_size`` cancellation is needed
     #    per microbatch.
 
+    def _raise_if_attached_mtp_with_in_loss_filter(self, loss_fn: LossFunction) -> None:
+        """Reject attached MTP heads with in-loss filtering, using the built model.
+
+        The YAML may omit ``mtp_num_layers`` while the checkpoint enables MTP, so the
+        config validator alone cannot catch this. A zero MTP loss weight puts no MTP
+        gradient on shared weights and is allowed.
+        """
+        config = self._get_model_config()
+        if (
+            self.mtp_enabled
+            and _uses_in_loss_seq_filter(loss_fn)
+            and getattr(config, "mtp_loss_scaling_factor", 0.1) != 0
+            and not bool(getattr(config, "mtp_detach_heads", False))
+        ):
+            raise ValueError(
+                "loss_fn.seq_logprob_error_in_loss supports MTP only with detached heads, "
+                f"but the model has mtp_num_layers={config.mtp_num_layers} with "
+                "mtp_detach_heads=False. Set policy.megatron_cfg.mtp_detach_heads=true, "
+                "or mtp_num_layers=0 to turn MTP off."
+            )
+
     def _split_step_state_init(
         self,
         loss_fn: LossFunction,
@@ -1922,6 +1954,8 @@ class MegatronPolicyWorkerImpl(
                 f"Got loss_type={loss_type}, mtp_num_layers={model_config.mtp_num_layers}, "
                 f"mtp_loss_scaling_factor={mtp_loss_scaling_factor}."
             )
+
+        self._raise_if_attached_mtp_with_in_loss_filter(loss_fn)
 
         return {
             "loss_fn": loss_fn,
@@ -2354,8 +2388,15 @@ class MegatronPolicyWorkerImpl(
         if in_loss_filter:
             # Chunks backpropagated unnormalized survivor sums, so divide by the
             # survivor counts. Metrics are already on every PP stage; reduce DP only.
-            policy_counts = _local_survivor_counts(
-                state["all_mb_metrics"], state["local_valid_toks"].device
+            # MTP's loss mask is built before filtering, so it keeps the
+            # pre-filter token count as its denominator.
+            policy_counts = torch.cat(
+                [
+                    _local_survivor_counts(
+                        state["all_mb_metrics"], state["local_valid_toks"].device
+                    ),
+                    state["local_valid_toks"].to(torch.float64).reshape(1),
+                ]
             )
         else:
             policy_counts = torch.stack(
@@ -2372,7 +2413,8 @@ class MegatronPolicyWorkerImpl(
         )
         global_valid_seqs = to_reduce[0]
         global_valid_toks = to_reduce[1]
-        draft_step_state.set_global_counts(to_reduce[2:])
+        mtp_valid_toks = to_reduce[2] if in_loss_filter else global_valid_toks
+        draft_step_state.set_global_counts(to_reduce[policy_counts.numel() :])
         if in_loss_filter:
             _raise_if_no_survivors(global_valid_toks)
 
@@ -2395,11 +2437,12 @@ class MegatronPolicyWorkerImpl(
             )
         # The uniform rescale gives MTP the main loss's denominator. Correct
         # detached, MTP-tagged parameters back to the valid-token denominator
-        # used by the synchronous path. For token-level loss the factor is 1.
+        # used by the synchronous path. For token-level loss without in-loss
+        # filtering the factor is 1.
         # This runs before gradient reduction; scaling and reduction are linear.
         if state["mtp_enabled"] and state["mtp_detach_heads"]:
             self._scale_mtp_param_grads(
-                float((n_safe / global_valid_toks.clamp(min=1)).item())
+                float((n_safe / mtp_valid_toks.clamp(min=1)).item())
             )
         # No more forward/backward calls remain in this step. Clear the
         # callable before optimizer/scheduler/checkpoint state can serialize it.

@@ -128,6 +128,7 @@ def test_survivor_normalization_reduces_dp_counts_on_every_pipeline_stage(
             global_valid_seqs=torch.tensor(4.0 * sample_weight),
             global_valid_toks=torch.tensor(9.0 * sample_weight),
             eval_mode=eval_mode,
+            mtp_detached=False,
         )
     )
     assert sequences.item() == 3 * sample_weight
@@ -146,6 +147,46 @@ def test_survivor_normalization_reduces_dp_counts_on_every_pipeline_stage(
     else:
         synchronize.assert_called_once()
         model.scale_gradients.assert_called_once_with(1.5)
+
+
+@pytest.mark.mcore
+def test_survivor_normalization_restores_detached_mtp_denominator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Detached MTP heads undo the survivor rescale and keep 1/G."""
+    # Optional Megatron imports are available only in the mcore test environment.
+    from nemo_rl.models.policy.workers import megatron_policy_worker as worker_module
+
+    monkeypatch.setattr(
+        worker_module.parallel_state, "get_data_parallel_group", lambda: None
+    )
+    monkeypatch.setattr(
+        worker_module.parallel_state, "is_pipeline_last_stage", lambda **_: True
+    )
+    monkeypatch.setattr(
+        worker_module.parallel_state,
+        "get_pipeline_model_parallel_world_size",
+        lambda: 1,
+    )
+    monkeypatch.setattr(torch.distributed, "all_reduce", Mock())
+    monkeypatch.setattr(torch.cuda, "synchronize", Mock())
+    worker = SimpleNamespace(model=Mock(), _scale_mtp_param_grads=Mock())
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(seq_logprob_error_in_loss=True, force_on_policy_ratio=True),
+        seq_logprob_error_threshold=2.0,
+    )
+    worker_module.MegatronPolicyWorkerImpl._normalize_in_loss_seq_filter(
+        worker,
+        loss_fn,
+        [{"seq_logprob_error_valid_seqs": 2.0, "seq_logprob_error_valid_tokens": 4.0}],
+        global_valid_seqs=torch.tensor(3.0),
+        global_valid_toks=torch.tensor(8.0),
+        eval_mode=False,
+        mtp_detached=True,
+    )
+
+    worker.model.scale_gradients.assert_called_once_with(2.0)
+    worker._scale_mtp_param_grads.assert_called_once_with(0.5)
 
 
 @pytest.mark.mcore
@@ -184,6 +225,7 @@ def test_empty_survivor_batch_never_scales_gradients(
         global_valid_seqs=torch.tensor(2.0),
         global_valid_toks=torch.tensor(8.0),
         eval_mode=eval_mode,
+        mtp_detached=False,
     )
     normalize = worker_module.MegatronPolicyWorkerImpl._normalize_in_loss_seq_filter
     if eval_mode:
@@ -257,6 +299,7 @@ def test_fractional_survivor_gradients_match_prefiltering(
             global_valid_seqs=original_weight,
             global_valid_toks=original_weight,
             eval_mode=False,
+            mtp_detached=False,
         )
     )
     assert sequences.item() == tokens.item() == sample_weight
@@ -266,8 +309,9 @@ def test_fractional_survivor_gradients_match_prefiltering(
 
 @pytest.mark.mcore
 @pytest.mark.parametrize("in_loss", [False, True])
+@pytest.mark.parametrize("mtp_detach_heads", [None, False, True])
 def test_train_normalizes_survivors_before_optimizer_step(
-    monkeypatch: pytest.MonkeyPatch, in_loss: bool
+    monkeypatch: pytest.MonkeyPatch, in_loss: bool, mtp_detach_heads: bool | None
 ) -> None:
     """In-loss and prefiltered batches reach the optimizer with equal gradients."""
     # Optional Megatron imports are available only in the mcore test environment.
@@ -318,7 +362,16 @@ def test_train_normalizes_survivors_before_optimizer_step(
 
     worker = MagicMock()
     worker.dp_size = 1
-    worker.mtp_enabled = False
+    # None = no MTP layers; False/True = attached/detached heads.
+    worker.mtp_enabled = mtp_detach_heads is not None
+    model_config = worker._get_model_config.return_value
+    model_config.mtp_num_layers = 0 if mtp_detach_heads is None else 2
+    model_config.mtp_detach_heads = bool(mtp_detach_heads)
+    model_config.mtp_loss_scaling_factor = 0.3
+    worker._raise_if_attached_mtp_with_in_loss_filter = partial(
+        worker_module.MegatronPolicyWorkerImpl._raise_if_attached_mtp_with_in_loss_filter,
+        worker,
+    )
     worker.model.modules.return_value = []
     worker.cfg = {"megatron_cfg": {"empty_unused_memory_level": 0}}
     worker.model.scale_gradients.side_effect = scale_gradients
@@ -362,6 +415,13 @@ def test_train_normalizes_survivors_before_optimizer_step(
         return tensor(*args, **kwargs)
 
     monkeypatch.setattr(torch, "tensor", cpu_tensor)
+    if in_loss and mtp_detach_heads is False:
+        with pytest.raises(ValueError, match="only with detached heads"):
+            worker_module.MegatronPolicyWorkerImpl.train(
+                worker, SimpleNamespace(size=2), loss_fn, gbs=2, mbs=2
+            )
+        assert events == []
+        return
     with pytest.raises(OptimizerReached):
         worker_module.MegatronPolicyWorkerImpl.train(
             worker, SimpleNamespace(size=2), loss_fn, gbs=2, mbs=2
@@ -371,3 +431,8 @@ def test_train_normalizes_survivors_before_optimizer_step(
     )
     if not in_loss:
         worker.model.scale_gradients.assert_not_called()
+    if in_loss and mtp_detach_heads:
+        # scale_gradients gets G/K = 2.0 here, so the MTP rescale is undone by 0.5.
+        worker._scale_mtp_param_grads.assert_called_once_with(0.5)
+    else:
+        worker._scale_mtp_param_grads.assert_not_called()
