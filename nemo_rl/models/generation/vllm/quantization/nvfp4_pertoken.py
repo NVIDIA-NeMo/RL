@@ -41,6 +41,9 @@ from vllm.model_executor.layers.quantization.modelopt import (
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
 )
+from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    trtllm_nvfp4_hidden_alignment,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.utils import replace_parameter
 
@@ -589,6 +592,8 @@ class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
         # so routed-experts capture goes through the router, not the kernel.
         assert self.experts_cls is not None
         self.experts_cls = host_captured_experts_cls(self.experts_cls)
+        # The base class reads this when it creates weights and applies the kernel.
+        self.per_token_activation = True
 
     def process_weights_after_loading(self, layer) -> None:
         """Finalize reload-format weights for dynamic per-token activation FP4.
@@ -639,6 +644,10 @@ class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
             w2_scale_2=layer.w2_weight_scale_2,
             a2_scale=layer.w2_input_scale,
             is_act_and_mul=self.moe.is_act_and_mul,
+            trtllm_hidden_alignment=trtllm_nvfp4_hidden_alignment(
+                per_token_activation=True,
+                is_act_and_mul=self.moe.is_act_and_mul,
+            ),
         )
 
         # Stride-0 expanded scale views break layerwise-reload finalize
