@@ -32,6 +32,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -49,6 +50,11 @@ GENERATION_CUT_ANNOTATION = "nemo_rl:generation_cut"
 INVENTORY_KEY = "nemo_rl_generation_cut"
 # The calls an engine cut, in its answer's engine_data.
 CUT_PREFIXES_KEY = "prefixes"
+# The frontend's deadline for the cut, in extra_args: wall-clock seconds, since
+# an engine on another host does not share the frontend's monotonic clock.
+DEADLINE_KEY = "nemo_rl_generation_cut_deadline"
+# What an engine leaves of that deadline for its answer to reach the frontend.
+CUT_REPLY_MARGIN_S = 1.0
 
 
 def merge_cut_receipts(inventory: Any, engine_prefixes: Iterable[Sequence[Any]]) -> Any:
@@ -103,22 +109,28 @@ class EngineCutFanOut:
 
     async def run_cut(self, inventory: Any) -> Any:
         """Cut ``inventory``'s calls. Safe to await from the control server's loop."""
+        # One deadline, from the cut's arrival, for this wait and every engine:
+        # an engine that started its own later would answer after this gave up.
+        timeout_s = (read_chat_capture() or {}).get("generation_cut_control_timeout_s")
+        deadline = None if timeout_s is None else time.time() + timeout_s
         return await asyncio.wrap_future(
             asyncio.run_coroutine_threadsafe(
-                self._cut_on_every_engine(inventory), self._loop
+                self._cut_on_every_engine(inventory, deadline), self._loop
             )
         )
 
-    async def _cut_on_every_engine(self, inventory: Any) -> Any:
+    async def _cut_on_every_engine(self, inventory: Any, deadline: float | None) -> Any:
         client = await self._client
         request = {
             # Dynamo's request type requires the field: without it the request
             # never reaches the engine and the caller is left waiting.
             "token_ids": [],
             "annotations": [GENERATION_CUT_ANNOTATION],
-            "extra_args": {INVENTORY_KEY: inventory.model_dump(mode="json")},
+            "extra_args": {
+                INVENTORY_KEY: inventory.model_dump(mode="json"),
+                DEADLINE_KEY: deadline,
+            },
         }
-        capture = read_chat_capture() or {}
         cuts = {
             asyncio.ensure_future(
                 self._cut_on_engine(client, request, instance_id)
@@ -128,7 +140,8 @@ class EngineCutFanOut:
         engine_prefixes = []
         if cuts:
             done, late = await asyncio.wait(
-                cuts, timeout=capture.get("generation_cut_control_timeout_s")
+                cuts,
+                timeout=None if deadline is None else max(0.0, deadline - time.time()),
             )
             for cut in late:
                 cut.cancel()

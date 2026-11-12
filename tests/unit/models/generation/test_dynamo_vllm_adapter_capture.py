@@ -21,6 +21,7 @@ faked.
 
 import base64
 import pickle
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -58,6 +59,8 @@ from nemo_rl.models.generation.dynamo.vllm import (  # noqa: E402
 )
 from nemo_rl.models.generation.dynamo.vllm.generation_cut import (  # noqa: E402
     CUT_PREFIXES_KEY,
+    CUT_REPLY_MARGIN_S,
+    DEADLINE_KEY,
     GENERATION_CUT_ANNOTATION,
     INVENTORY_KEY,
 )
@@ -186,7 +189,6 @@ def test_a_captured_token_in_call_is_staged_from_the_engine() -> None:
             SPLICED,
             TOKEN_IN,
             prefix_len=len(PREFIX),
-            template_token_ids=TEMPLATE,
             splice=SPLICE,
         ),
     )
@@ -427,15 +429,30 @@ def test_an_engine_answers_a_cut_with_the_calls_it_cut() -> None:
         ],
     )
 
+    run_cut = host._prefix_recovery.run_cut
+    deadlines = []
+
+    async def record_deadline(inventory, *, deadline):
+        deadlines.append(deadline - time.monotonic())
+        return await run_cut(inventory, deadline=deadline)
+
+    host._prefix_recovery.run_cut = record_deadline
+
     (chunk,) = _collect(
         vllm_adapter.DynamoVllmAdapter(host, leader_worker_idx=0),
         {
             "token_ids": [],
             "annotations": [GENERATION_CUT_ANNOTATION],
-            "extra_args": {INVENTORY_KEY: inventory.model_dump(mode="json")},
+            "extra_args": {
+                INVENTORY_KEY: inventory.model_dump(mode="json"),
+                DEADLINE_KEY: time.time() + 30,
+            },
         },
     )
 
+    # The cut ran to the frontend's deadline, less the margin for the answer.
+    (remaining,) = deadlines
+    assert 30 - CUT_REPLY_MARGIN_S - 5 < remaining <= 30 - CUT_REPLY_MARGIN_S
     (ack,) = chunk["engine_data"][CUT_PREFIXES_KEY]
     assert (ack["model_call_id"], ack["disposition"]) == ("held", "durable_prefix")
     assert ack["prefix_token_count"] == 2

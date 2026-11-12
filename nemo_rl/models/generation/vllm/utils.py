@@ -521,6 +521,27 @@ def _f32(value: Optional[float]) -> Optional[float]:
     return None if value is None else float(np.float32(value))
 
 
+# SamplingParams.extra_args key: a native chat call's reasoning_ended, as
+# NeMo RL read it from the call's template render.
+REASONING_ENDED_ARG = "nemo_rl_reasoning_ended"
+
+
+def take_reasoning_ended(sampling_params: Any, engine_kwargs: dict[str, Any]) -> None:
+    """Hand the engine the ``reasoning_ended`` a call's SamplingParams carry.
+
+    vLLM's chat serving reads its own value from the spliced prompt, whose
+    earlier turns still hold their own end-of-reasoning tokens; this replaces
+    it and takes the argument back out of ``extra_args``. A call that carries
+    none is left as it is.
+    """
+    extra_args = sampling_params.extra_args
+    if not extra_args or REASONING_ENDED_ARG not in extra_args:
+        return
+    engine_kwargs["reasoning_ended"] = extra_args.pop(REASONING_ENDED_ARG)
+    if not extra_args:
+        sampling_params.extra_args = None
+
+
 def on_policy_sampling(
     *,
     temperature: Optional[float],
@@ -531,18 +552,24 @@ def on_policy_sampling(
     presence_penalty: Optional[float],
     frequency_penalty: Optional[float],
     logit_bias: Optional[Mapping[Any, float]],
+    n: Optional[int],
+    logprobs: Optional[bool],
+    top_logprobs: Optional[int],
+    stream: Optional[bool],
     generation_config: Any,
 ) -> dict[str, Any]:
     """The sampling a NeMo-Gym chat call is served with, on every serving path.
 
     The request must match the train or validation profile
-    (:func:`check_sampling_param`) and set no sampling the trainer does not
-    replay. Floats are compared at f32: Dynamo's frontend carries them as f32,
-    so 0.7 arrives as 0.69999998.
+    (:func:`check_sampling_param`), set no sampling the trainer does not
+    replay, sample one choice, set ``top_logprobs`` when it asks for token
+    information, and not stream. Floats are compared at f32: Dynamo's frontend
+    carries them as f32, so 0.7 arrives as 0.69999998.
 
     Args:
         temperature, top_p, top_k, min_p, repetition_penalty, presence_penalty,
-            frequency_penalty, logit_bias: The request's values.
+            frequency_penalty, logit_bias, n, logprobs, top_logprobs, stream:
+            The request's values; None (or missing) when it did not set them.
         generation_config: ``policy.generation``.
 
     Returns:
@@ -582,6 +609,22 @@ def on_policy_sampling(
             )
     if logit_bias:
         raise OffPolicySamplingError("request logit_bias is not supported")
+    if (n or 1) != 1:
+        # Capture stages one choice per call, and the trainer replays one.
+        raise OffPolicySamplingError(
+            f"request n={n} is not supported; NeMo-Gym calls take n=1"
+        )
+    if logprobs and top_logprobs is None:
+        raise OffPolicySamplingError(
+            "`top_logprobs` must be set when requesting token information from "
+            "NeMo RL's chat endpoint"
+        )
+    if stream:
+        # Capture refuses a streamed call, and vLLM's delta outputs would leave
+        # the Dynamo path only the last piece of an uncaptured one.
+        raise OffPolicySamplingError(
+            "request stream=true is not supported; NeMo-Gym calls do not stream"
+        )
     is_train = (_f32(temperature), _f32(top_p)) == (
         profile["temperature"],
         profile["top_p"],

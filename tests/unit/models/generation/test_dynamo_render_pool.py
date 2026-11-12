@@ -273,6 +273,8 @@ def test_a_resumed_calls_reply_matches_the_uninterrupted_reply(
     tokenizer = _tokenizer(style)
     parser = _RecordingParser()
     monkeypatch.setattr(reply_worker, "tokenizer", tokenizer)
+    # The serving chat's reply step decodes the saved tokens with its renderer's.
+    monkeypatch.setattr(reply_worker.serving_chat.renderer, "tokenizer", tokenizer)
     monkeypatch.setattr(reply_worker, "_parser", lambda chat: parser)
     prompt = _ids(tokenizer, case.prompt)
     output = _ids(tokenizer, case.output)
