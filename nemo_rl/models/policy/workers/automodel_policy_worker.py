@@ -468,6 +468,37 @@ def _maybe_adapt_tensor_to_hf(
     return [(fqn, tensor)]
 
 
+@contextmanager
+def _optimizer_state_dict_in_stored_dtypes(optimizer: Optional[torch.optim.Optimizer]):
+    """Make TE FusedAdam ``state_dict()`` return BF16 states as stored, not FP32 copies.
+
+    FusedAdam's ``state_dict()`` converts every BF16 state (``exp_avg``,
+    ``exp_avg_sq``) to a new FP32 tensor and re-wraps it with
+    ``DTensor.from_local`` on the mesh's device type, so all copies sit on GPU at
+    once (+8 B/param; Step-5 600B on 128 H100s: save OOM at long-run steps 15
+    and 25 even with the state staged on CPU). ``get_unscaled_state(...,
+    skip_unscale=True)`` returns the stored BF16 tensor itself: the checkpoint
+    holds exactly the optimizer's state (lossless), with no extra GPU memory.
+    ``FusedAdam.load_state_dict`` applies ``.float()`` to each loaded state, so
+    these checkpoints load as before. FP16/FP8 states still go through unscaling.
+    """
+    dtype_map = getattr(optimizer, "name_to_dtype_map", None)
+    original = getattr(optimizer, "get_unscaled_state", None)
+    if optimizer is None or dtype_map is None or original is None:
+        yield
+        return
+
+    def get_state_as_stored(param, state_name, skip_unscale=False):
+        keep = dtype_map.get(state_name) == torch.bfloat16
+        return original(param, state_name, skip_unscale=skip_unscale or keep)
+
+    optimizer.get_unscaled_state = get_state_as_stored
+    try:
+        yield
+    finally:
+        del optimizer.get_unscaled_state
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class AutomodelPolicyWorkerImpl(
@@ -1749,25 +1780,27 @@ class AutomodelPolicyWorkerImpl(
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
         if self.optimizer is not None and optimizer_path is not None:
-            # Optimizers with low-precision state (TE FusedAdam with BF16 moments) build
-            # FP32 copies of every state in ``state_dict()``. Stage the state on host
-            # memory first; ``prepare_for_training`` moves it back before the next step.
-            # FusedAdam re-wraps each copy with ``DTensor.from_local`` on the mesh's
-            # device type, so the copies still land on GPU (~47 GiB/GPU for Step-5 600B
-            # on 128 H100s). Also drop the MoE dispatch state that pins the last
-            # recompute graph per layer (as offload_before_refit does); with it the
-            # save OOMed at long-run step 15.
-            mem_before = torch.cuda.memory_allocated() / 2**30
-            self.move_optimizer_to_device("cpu")
+            # Release the MoE dispatch state that pins each layer's last recompute
+            # graph (as offload_before_refit does) before the save allocates.
             release_moe_dispatcher_state(self.model)
             gc.collect()
             torch.cuda.empty_cache()
-            if self.rank == 0:
-                print(
-                    f"save_checkpoint: GPU allocated {mem_before:.2f} GiB -> "
-                    f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB after optimizer "
-                    "offload and MoE dispatch-state release"
-                )
+        with _optimizer_state_dict_in_stored_dtypes(self.optimizer):
+            self._save_checkpoint_impl(
+                weights_path,
+                optimizer_path,
+                tokenizer_path,
+                is_final_checkpoint=is_final_checkpoint,
+            )
+
+    def _save_checkpoint_impl(
+        self,
+        weights_path: str,
+        optimizer_path: Optional[str],
+        tokenizer_path: Optional[str],
+        *,
+        is_final_checkpoint: bool,
+    ) -> None:
         if self.draft_model is not None:
             from nemo_rl.models.automodel.draft.checkpoint import (
                 save_checkpoint_with_draft,
