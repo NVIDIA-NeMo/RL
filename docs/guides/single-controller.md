@@ -487,7 +487,7 @@ Pick one of five modes with `sampler.name`. Each mode takes its own knobs, liste
 | `custom`       | Determined by the imported class.                                                                                       | Determined by the imported class.                                                                                 | `target: "module:ClassName"` — bring your own `PromptGroupSampler`.                                          |
 
 
-PPO supports `in_order` and `ready_first`, with full-step batches or streaming chunks. Streaming requires `ppo.ppo_epochs: 1`; the policy accumulates gradients across chunks, then updates and refits before critic training. By default each critic epoch uses the assembled full batch; `ppo.value_training_mode: split` instead replays the same chunks into one critic update per epoch. For `ready_first`, set `loss_fn.use_importance_sampling_correction: true`; its `max_staleness_versions` controls admission lookahead, while already-admitted rollouts remain selectable. With any sampler, `loss_fn.force_on_policy_ratio: true` requires `ppo.ppo_epochs: 1`: the forced ratio equals the true one only for the first optimizer step on a batch.
+PPO supports `in_order` and `ready_first`, with full-step batches or streaming chunks. Streaming requires `ppo.ppo_epochs: 1`; the policy accumulates gradients across chunks, then updates and refits before critic training. By default each critic epoch uses the assembled full batch; `ppo.value_training_mode: split` instead replays the same chunks into one critic update per epoch. For `ready_first`, set `loss_fn.use_importance_sampling_correction: true`; its `max_staleness_versions` controls admission lookahead, while already-admitted rollouts remain selectable. With any sampler, `loss_fn.force_on_policy_ratio: true` requires `ppo.ppo_epochs: 1`: the forced ratio equals the true one only for the first optimizer step on a batch. In-loss sequence-logprob filtering (`loss_fn.seq_logprob_error_in_loss`) is supported with `ppo.ppo_epochs: 1`; see [Single-forward sequence-logprob filtering](grpo.md#single-forward-sequence-logprob-filtering).
 
 ### Config → behavior map
 
@@ -711,17 +711,17 @@ The SC path is still under active development. Feature gaps are tracked in [issu
   Gym rollouts; multimodal/VLM MOPD is not yet supported. See
   [Multi-Teacher On-Policy Distillation](../about/algorithms/mopd.md#running-mopd).
 - Train backend: only Megatron is supported and validated; the AutoModel training path has not been tested on SC.
-- Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). Managed Dynamo (`backend: dynamo`) is supported on the native rollout path; see [Managed Dynamo generation](dynamo-generation.md#run-under-the-singlecontroller). SGLang and TRT-LLM have not been tested on SC.
+- Generation backend: vLLM and Megatron generation are supported (Megatron in both non-colocated and colocated modes). vLLM generation can also serve through Dynamo (`policy.generation.dynamo: true`); see [Dynamo serving](dynamo-generation.md). SGLang and TRT-LLM have not been tested on SC.
 - Validation is not yet supported (setup raises on `val_period > 0`, `val_at_start`, or `val_at_end`); checkpointing is.
 - (PPO) Rollout drop budgets — `async_rl.rollout_failure.max_skipped_prompts` and `max_consecutive_dropped_prompts` must both be `0`. A drop shortens the step, but each critic epoch must contain exactly `value.train_global_batch_size` samples in either value-training mode, so setup rejects a non-zero budget. The resiliency layer stays available on GRPO.
 - Reward shaping and sample filtering — setup rejects what is unimplemented rather than silently skipping it.
   - `reward_scaling` — supported. The advantage stage applies it ahead of the baseline and the logged `reward`, as v1 does. Configuration rejects non-finite bounds and requires `source_min < source_max`.
+  - `reward_shaping` — supported, both the DAPO overlong penalty and the `stop_properly_penalty_coef` truncation penalty. Applied after `reward_scaling`, as v1 orders them: the overlong penalty is subtracted from the reward, so its magnitude is only meaningful against the scaled range. Response length comes from `token_mask`, which the stage already fetches, so nothing is added to the rollout schema. Setup rejects an enabled DAPO block missing any of `overlong_buffer_length` / `overlong_buffer_penalty` / `max_response_length`, one whose `overlong_buffer_length` is not positive, or one whose `overlong_buffer_penalty` is negative or non-finite; `stop_properly_penalty_coef` needs none of them and must be in `[0, 1]`. Setup warns when `max_response_length <= overlong_buffer_length`. Not supported under `token_capture.forest_training`, which rejects it at setup.
   - `overlong_filtering` — supported. Truncated completions are excluded from the loss through `sample_mask`.
   - Environment-flagged sample masking — supported. A step in which every completion is filtered is rejected rather than skipped.
-  - `reward_shaping` — not implemented on either algorithm block; setup rejects it.
   - `use_dynamic_sampling` — supported for GRPO under the constraints in [Dynamic sampling](#dynamic-sampling).
 - The `windowed` sampler has no `over_sampling_ratio` cap — over-produced groups aged past the window are evicted, wasting rollout compute.
-- The drain gate in refit is not yet supported. Managed Dynamo pauses its engines before every refit because its weight update is unsafe while requests run, but that is not the drain gate: running requests finish on the old weights, while queued requests and later turns of a multi-turn rollout run on the new ones.
+- The drain gate in refit is not yet supported.
 
 ### Full training-data dumps
 

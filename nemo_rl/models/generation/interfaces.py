@@ -315,9 +315,6 @@ def should_use_async_rollouts(
         return False
     backend = generation_config.get("backend", "")
 
-    if backend == "dynamo":
-        return True
-
     if backend == "sglang":
         return bool(generation_config.get("use_async_rollouts", False))
 
@@ -600,8 +597,7 @@ class GenerationInterface(ABC):
         Which Ray worker leads shard N depends on how shards are laid out across workers,
         which is the backend's business. Asking for it by shard index keeps that here
         rather than in the control loop, where the same arithmetic had a second copy that
-        also assumed every backend has a ``worker_group`` -- an assumption that has already
-        broken a lane once (``'DynamoGeneration' object has no attribute 'worker_group'``).
+        also assumed every backend has a ``worker_group``.
         """
         raise NotImplementedError
 

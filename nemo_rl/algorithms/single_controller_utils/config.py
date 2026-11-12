@@ -1328,9 +1328,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
     Both directions on the critic: one the PPO path needs and does not have, and
-    one a GRPO run carries and would never build. Plus the reward-shaping and
-    sampling knobs SC reads on neither path, and a range check on the one it
-    does read.
+    one a GRPO run carries and would never build, plus sampling and length-penalty
+    settings the SC path does not implement.
     """
     algo_cfg = algo_config(master_config)
 
@@ -1358,7 +1357,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     unsupported = [
         name
         for name, enabled in (
-            ("reward_shaping", algo_cfg.reward_shaping.enabled),
             # getattr: PPO's config has no length_penalty field.
             ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
         )
@@ -1683,8 +1681,6 @@ def resolve_ppo_chunk_alignment(
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     if master_config.loss_fn.seq_logprob_error_in_loss:
-        if is_ppo_run(master_config):
-            raise ValueError("loss_fn.seq_logprob_error_in_loss requires GRPO")
         _validate_seq_logprob_error_in_loss(master_config)
     _validate_algo_settings(master_config)
 

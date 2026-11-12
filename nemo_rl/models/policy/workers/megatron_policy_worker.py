@@ -61,7 +61,7 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
 )
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import SEQ_LOGPROB_KEEP_MASK_KEY, LossFunction
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
 from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
@@ -747,12 +747,22 @@ def _local_survivor_counts(
     )
 
 
+def _pop_keep_masks(metrics: list[dict[str, Any]]) -> Optional[list[float]]:
+    """Remove the per-row in-loss keep masks and join them in row order, if any."""
+    masks = [
+        m.pop(SEQ_LOGPROB_KEEP_MASK_KEY)
+        for m in metrics
+        if SEQ_LOGPROB_KEEP_MASK_KEY in m
+    ]
+    return [keep for mask in masks for keep in mask] if masks else None
+
+
 def _raise_if_no_survivors(kept_toks: torch.Tensor) -> None:
     if kept_toks.item() == 0:
         raise RuntimeError(
             "No valid response tokens remain after in-loss sequence-logprob "
             "filtering; refusing an empty optimizer update. Check "
-            "grpo.seq_logprob_error_threshold."
+            "seq_logprob_error_threshold in the grpo or ppo block."
         )
 
 
@@ -1403,6 +1413,8 @@ class MegatronPolicyWorkerImpl(
         CP/TP replicas must not be counted as additional samples.
         """
         metrics = losses_reduced
+        # This path has no critic to hand the per-row keep mask to.
+        _pop_keep_masks(metrics)
         counts = _local_survivor_counts(metrics, global_valid_toks.device)
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             torch.distributed.all_reduce(
@@ -2140,15 +2152,17 @@ class MegatronPolicyWorkerImpl(
     def train_microbatch(
         self,
         data: BatchedDataDict[Any],
-    ) -> None:
+    ) -> Optional[list[float]]:
         """One DP slice of data → one ``forward_backward_func`` invocation.
 
         Wrapped in ``self.model.no_sync()`` so the mcore DDP hooks
         accumulate ``param.main_grad`` locally on each rank without
         dispatching a per-call DP reduce. The single true reduce is done
-        explicitly in ``finish_train_step``. Returns nothing: gradients
-        land in ``param.main_grad`` and per-microbatch metrics accumulate
-        in the open-step state until ``finish_train_step`` surfaces them.
+        explicitly in ``finish_train_step``. Gradients land in
+        ``param.main_grad`` and per-microbatch metrics accumulate in the
+        open-step state until ``finish_train_step`` surfaces them. Returns the
+        in-loss filter's per-row keep mask in ``data`` row order, or None when
+        the loss does not filter rows.
 
         Multimodal validity-mask and model-owned packing/CP behavior match the
         regular ``train`` path.
@@ -2157,7 +2171,7 @@ class MegatronPolicyWorkerImpl(
         if state.get("offloaded", False):
             raise RuntimeError("prepare_for_training must restore the offloaded step")
         try:
-            self._train_microbatch_body(state, data)
+            return self._train_microbatch_body(state, data)
         except Exception:
             # The body left all three mcore hooks nulled when begin_train_step
             # opened the step. If we propagate without restoring, future steps
@@ -2183,7 +2197,7 @@ class MegatronPolicyWorkerImpl(
         self,
         state: dict[str, Any],
         data: BatchedDataDict[Any],
-    ) -> None:
+    ) -> Optional[list[float]]:
         if should_reduce_loss_across_context_parallel(data):
             raise NotImplementedError(
                 "Direct packed SFT rows are not supported by the split training API"
@@ -2337,6 +2351,7 @@ class MegatronPolicyWorkerImpl(
         mb_metrics_collected = broadcast_loss_metrics_from_last_stage(
             mb_metrics_collected
         )
+        keep_mask = _pop_keep_masks(mb_metrics_collected)
 
         for m in mb_metrics_collected:
             draft_payload = m.get(DRAFT_STEP_PAYLOAD_KEY)
@@ -2352,6 +2367,7 @@ class MegatronPolicyWorkerImpl(
             # the global_loss aggregation at finish.
             if "loss" in m:
                 state["mb_losses"].append(m["loss"])
+        return keep_mask
 
     @wrap_with_nvtx_name("megatron_policy_worker/finish_train_step")
     def finish_train_step(self) -> dict[str, Any]:
