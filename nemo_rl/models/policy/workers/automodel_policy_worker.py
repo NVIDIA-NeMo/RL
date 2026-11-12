@@ -1750,13 +1750,24 @@ class AutomodelPolicyWorkerImpl(
         """
         if self.optimizer is not None and optimizer_path is not None:
             # Optimizers with low-precision state (TE FusedAdam with BF16 moments) build
-            # FP32 copies of every state in ``state_dict()``, on the state's device; on
-            # GPU that is +8 bytes/param at once (Step-5 600B on 128 H100s: ~37 GiB,
-            # save OOM after the last step). Stage the state on host memory first;
-            # ``prepare_for_training`` moves it back before the next step.
+            # FP32 copies of every state in ``state_dict()``. Stage the state on host
+            # memory first; ``prepare_for_training`` moves it back before the next step.
+            # FusedAdam re-wraps each copy with ``DTensor.from_local`` on the mesh's
+            # device type, so the copies still land on GPU (~47 GiB/GPU for Step-5 600B
+            # on 128 H100s). Also drop the MoE dispatch state that pins the last
+            # recompute graph per layer (as offload_before_refit does); with it the
+            # save OOMed at long-run step 15.
+            mem_before = torch.cuda.memory_allocated() / 2**30
             self.move_optimizer_to_device("cpu")
+            release_moe_dispatcher_state(self.model)
             gc.collect()
             torch.cuda.empty_cache()
+            if self.rank == 0:
+                print(
+                    f"save_checkpoint: GPU allocated {mem_before:.2f} GiB -> "
+                    f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB after optimizer "
+                    "offload and MoE dispatch-state release"
+                )
         if self.draft_model is not None:
             from nemo_rl.models.automodel.draft.checkpoint import (
                 save_checkpoint_with_draft,
