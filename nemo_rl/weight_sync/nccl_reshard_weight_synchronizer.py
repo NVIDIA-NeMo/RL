@@ -14,19 +14,18 @@
 
 """NCCL-xfer (shard-to-shard) weight synchronizer for non-colocated deployments.
 
-Handles disaggregated Megatron-train -> vLLM/Megatron-gen weight refit via the
-``xferdtensor`` reshard: bulk FFN/expert params are resharded shard-to-shard
-between the train and gen parallelism layouts over a dedicated per-PP-stage NCCL
-communicator, while the remaining "misc" params ride a packed broadcast over the
-shared ``model_update_group``. Unlike the plain collective synchronizer (which
-broadcasts every full tensor), this path redistributes each param directly
+Handles disaggregated Megatron-train -> vLLM/Megatron/TRT-LLM-gen weight refit
+via xferdtensor: bulk FFN/expert params are resharded shard-to-shard between the
+train and gen parallelism layouts over dedicated per-(generation layout, PP stage)
+NCCL communicators, while the remaining misc params ride a packed broadcast over
+the shared model_update_group. This path redistributes each bulk param directly
 between layouts, avoiding a full gather + broadcast.
 
 Lifecycle:
   init_communicator():
     1. policy/generation.init_collective()           -- model_update_group (misc)
     2. policy.init_nccl_reshard_comm_group() and
-       generation.rebuild_nccl_reshard_comm_group()     -- per-PP-stage bulk groups
+       generation.rebuild_nccl_reshard_comm_group()     -- per-layout, per-PP-stage bulk groups
     3. policy.prepare_nccl_reshard_refit_info()
        -> generation.prepare_nccl_reshard_refit_info()   -- backend-agnostic metadata
   sync_weights():
@@ -332,12 +331,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         futures_inference = self._generation.rebuild_collective(membership, ip, port)
         ray.get(futures_train + futures_inference)
 
-        # 2. Bulk-path comm group(s): one per (generation layout, PP stage),
-        #    each spanning that stage's train ranks + the layout's gen ranks
-        #    (non-PP, one layout == a single group over all train + gen ranks).
-        #    Separate NCCL communicators from model_update_group; the workers
-        #    run the misc broadcast strictly after the bulk reshard (concurrent
-        #    communicators can deadlock).
+        # Build per-layout/stage bulk groups; finish bulk before misc to avoid communicator deadlocks.
         pp_size = train_parallelism["pp_size"]
         train_gpus_per_node = self._train_cluster.num_gpus_per_node
         train_ranks_per_stage = train_world_size // pp_size
@@ -396,15 +390,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                 layout_index=layout_index,
             )
             ray.get(futures_train + futures_inference)
-        # 3. Refit metadata.  Train builds backend-agnostic per-layer metadata
-        #    (HF naming convention) per layout; gen maps it into its own fused
-        #    layout (e.g. vLLM's w13/w2, TRT-LLM's EP slots).
-        #
-        #    Regenerated, not reused, on a rebuild. Each parameter's destination
-        #    placements are derived from the layout's world size, so a plan built
-        #    for the old fleet would have survivors writing the slices the dead
-        #    shard used to own and leaving their own unwritten -- with no error,
-        #    because a stale mesh is still a valid mesh.
+        # Rebuild per-layout plans after fleet changes to avoid stale destination slices.
         wire_refit_infos = []
         for layout_index, (layout, layout_world) in enumerate(
             zip(layouts, layout_worlds)
@@ -422,11 +408,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
             )
             if self._policy.cfg["generation"]["backend"] == "trtllm":
                 check_trtllm_nccl_reshard_bulk_params(nccl_reshard_refit_info)
-            # nccl_reshard_refit_info holds MeshInfo rank tensors created under
-            # Megatron, whose pickles resolve a Megatron-patched storage loader and
-            # therefore need `import megatron` on unpickle. Convert them to plain
-            # lists here; the gen worker rebuilds them in
-            # `restore_refit_info_placements()`.
+            # Wire rank lists avoid Megatron's tensor-unpickle hooks on gen workers.
             wire_refit_infos.append(
                 make_nccl_reshard_refit_info_wire_safe(nccl_reshard_refit_info)
             )

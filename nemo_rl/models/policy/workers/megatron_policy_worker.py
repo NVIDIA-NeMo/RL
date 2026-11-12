@@ -745,9 +745,6 @@ class MegatronPolicyWorkerImpl(
     # Tests and extension classes that bypass __init__ retain the historical
     # training/source behavior unless they explicitly select destination.
     is_refit_destination: bool = False
-    # nccl_reshard source plans keyed by generation layout (one for vLLM and
-    # Megatron generation, one per engine role for disaggregated TRT-LLM).
-    nccl_reshard_refit_infos: Optional[dict[int, dict[str, Any]]] = None
     # Holds the split-API train-step state between begin/finish or
     # begin/abort; None when no step is open. Declared at class level so
     # ``self._train_step_state = None`` after finish/abort type-checks.
@@ -1218,6 +1215,8 @@ class MegatronPolicyWorkerImpl(
         self.refit_conversion_tasks = None
         self.refit_conversion_tasks_current_index = None
         self.refit_param_info_mcore = None
+        self.pp_comm_group: dict[int, Any] = {}
+        self.nccl_reshard_refit_infos: dict[int, dict[str, Any]] = {}
 
         ## used for streaming update inference engine weights
         self._held_gather_buffer = None
@@ -4289,7 +4288,7 @@ class MegatronPolicyWorkerImpl(
             )
 
         # The key metadata, which should shared with generation workers
-        self.nccl_reshard_refit_info = build_nccl_reshard_refit_info(
+        refit_info = build_nccl_reshard_refit_info(
             state_dict_metadata,
             train_parallelism,
             gen_parallelism,
@@ -4298,13 +4297,11 @@ class MegatronPolicyWorkerImpl(
             layer_to_pp_stage=layer_to_pp_stage,
         )
         # Build HFToLocalParamMap (see nccl_reshard_utils)
-        self.hf_to_local_param_map = self.build_hf_to_local_param_map(
-            self.nccl_reshard_refit_info
-        )
+        self.hf_to_local_param_map = self.build_hf_to_local_param_map(refit_info)
 
         # Keep the misc_meta in the nccl_reshard_refit_info
         # misc_meta[hf_name] -> [shape, dtype]
-        self.nccl_reshard_refit_info["misc_meta"] = misc_meta
+        refit_info["misc_meta"] = misc_meta
         # Filter conversion_tasks to the misc subset.
         _misc_names = set(misc_meta.keys())
 
@@ -4323,7 +4320,7 @@ class MegatronPolicyWorkerImpl(
             if task is not None and _task_is_misc(task)
         ]
 
-        return self.nccl_reshard_refit_info
+        return refit_info
 
     def prepare_nccl_reshard_refit_info(
         self,
@@ -4377,7 +4374,7 @@ class MegatronPolicyWorkerImpl(
             train_world_size,
             gen_world_size,
         )
-        plans = dict(self.nccl_reshard_refit_infos or {})
+        plans = dict(self.nccl_reshard_refit_infos)
         plans[layout_index] = refit_info
         self.nccl_reshard_refit_infos = plans
         return refit_info
@@ -4554,11 +4551,7 @@ class MegatronPolicyWorkerImpl(
             )
             groups = [*generation_groups.values(), self.model_update_group]
         else:
-            layout_groups = self.pp_comm_groups_by_layout or {}
-            groups = [
-                *(layout_groups.values() or [self.pp_comm_group]),
-                self.model_update_group,
-            ]
+            groups = [*self.pp_comm_group.values(), self.model_update_group]
 
         with RefitAbortWatchdog(groups, refit_timeout_s) as guard:
             if self.is_refit_destination:
@@ -4615,10 +4608,7 @@ class MegatronPolicyWorkerImpl(
 
     def _nccl_reshard_layout_indices(self) -> list[int]:
         """Generation layouts this worker sends bulk params to, in order."""
-        plans = self.nccl_reshard_refit_infos or {}
-        if not plans:
-            return [0]
-        return sorted(plans)
+        return sorted(self.nccl_reshard_refit_infos)
 
     def _send_bulk_params(
         self,
@@ -4636,12 +4626,12 @@ class MegatronPolicyWorkerImpl(
         """
         from nemo_rl.weight_sync.xferdtensor import DTensorRef, xferdtensor
 
-        plans = self.nccl_reshard_refit_infos or {}
-        groups = self.pp_comm_groups_by_layout or {}
+        plans = self.nccl_reshard_refit_infos
+        groups = self.pp_comm_group
         layouts = []
         for layout_index in layout_indices:
-            refit_info = plans.get(layout_index, self.nccl_reshard_refit_info)
-            group = groups.get(layout_index, self.pp_comm_group)
+            refit_info = plans[layout_index]
+            group = groups[layout_index]
             if group is None:
                 raise RuntimeError(
                     f"no reshard bulk communicator for generation layout {layout_index}"
@@ -4659,64 +4649,60 @@ class MegatronPolicyWorkerImpl(
         cache_layer = len(layouts) > 1
         for layer_name in layer_names:
             layer_ctxs: dict[int, tuple[LocalParamSpec, RefitCtx]] = {}
-            try:
-                for layout_index, refit_info, group, stream in layouts:
-                    for param_info in refit_info["per_layer_params"][layer_name]:
-                        # Each train worker handles only its own PP stage's params
-                        # (non-PP = every param is in pp_stage 0).
-                        if param_info.get("pp_stage", 0) != self.my_pp_stage:
-                            continue
+            for layout_index, refit_info, group, stream in layouts:
+                for param_info in refit_info["per_layer_params"][layer_name]:
+                    # Each train worker handles only its own PP stage's params
+                    # (non-PP = every param is in pp_stage 0).
+                    if param_info.get("pp_stage", 0) != self.my_pp_stage:
+                        continue
 
-                        spec = self.hf_to_local_param_map.get(param_info["name"])
-                        assert spec is not None, (
-                            f"no spec for {param_info['name']!r} in hf_to_local_param_map"
+                    spec = self.hf_to_local_param_map.get(param_info["name"])
+                    assert spec is not None, (
+                        f"no spec for {param_info['name']!r} in hf_to_local_param_map"
+                    )
+                    cached = layer_ctxs.get(id(spec))
+                    if cached is None:
+                        ctx = spec.materialize()
+                        assert ctx.buf is not None, (
+                            f"no local tensor for {param_info['name']!r}"
                         )
-                        cached = layer_ctxs.get(id(spec))
-                        if cached is None:
-                            ctx = spec.materialize()
-                            assert ctx.buf is not None, (
-                                f"no local tensor for {param_info['name']!r}"
-                            )
-                            if cache_layer:
-                                layer_ctxs[id(spec)] = (spec, ctx)
-                        else:
-                            ctx = cached[1]
-                        if stream is not materialize_stream:
-                            # Wait for materialization before sending this buffer.
-                            stream.wait_stream(materialize_stream)
-                        src_tensor = DTensorRef(
-                            local_tensor=ctx.buf,
-                            global_shape=param_info["global_shape"],
-                        )
-                        xferdtensor(
-                            src_tensor,
-                            param_info["src_mesh_info"],
-                            param_info["src_placements"],
-                            None,
-                            param_info["dst_mesh_info"],
-                            param_info["dst_placements"],
-                            group,
-                            stream,
-                        )
-                        if stream is not materialize_stream:
-                            # Keep source storage alive until this stream finishes sending it.
-                            ctx.buf.record_stream(stream)
-                        del src_tensor
-                        if not cache_layer:
-                            if spec.post is not None:
-                                spec.post(ctx)
-                            del ctx
-                for spec, ctx in layer_ctxs.values():
-                    if spec.post is not None:
-                        spec.post(ctx)
-            finally:
-                # Never retain stale BF16 materializations across layers or
-                # optimizer steps.
-                layer_ctxs.clear()
+                        if cache_layer:
+                            layer_ctxs[id(spec)] = (spec, ctx)
+                    else:
+                        ctx = cached[1]
+                    if stream is not materialize_stream:
+                        # Wait for materialization before sending this buffer.
+                        stream.wait_stream(materialize_stream)
+                    src_tensor = DTensorRef(
+                        local_tensor=ctx.buf,
+                        global_shape=param_info["global_shape"],
+                    )
+                    xferdtensor(
+                        src_tensor,
+                        param_info["src_mesh_info"],
+                        param_info["src_placements"],
+                        None,
+                        param_info["dst_mesh_info"],
+                        param_info["dst_placements"],
+                        group,
+                        stream,
+                    )
+                    if stream is not materialize_stream:
+                        # Keep source storage alive until this stream finishes sending it.
+                        ctx.buf.record_stream(stream)
+                    del src_tensor
+                    if not cache_layer:
+                        if spec.post is not None:
+                            spec.post(ctx)
+                        del ctx
+            for spec, ctx in layer_ctxs.values():
+                if spec.post is not None:
+                    spec.post(ctx)
+            layer_ctxs.clear()
 
     def _broadcast_misc_params_packed(self, kv_scales=None) -> None:
         """Broadcast misc params via the existing packed_broadcast machinery."""
-        misc_meta = self.nccl_reshard_refit_info.get("misc_meta", {})
+        misc_meta = self.nccl_reshard_refit_infos[0]["misc_meta"]
         if not misc_meta:
             return
 

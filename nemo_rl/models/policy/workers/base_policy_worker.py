@@ -29,11 +29,8 @@ class AbstractPolicyWorker:
     # None until init_collective builds it. Declared so a rebuild can release the
     # previous group without probing for the attribute's existence.
     model_update_group: Optional[Any] = None
-    # Same, for the per-PP-stage group the nccl_reshard transport builds.
-    pp_comm_group: Optional[Any] = None
-    # The same group keyed by generation layout, for backends whose engines come
-    # in several layouts (disaggregated TRT-LLM); layout 0 is ``pp_comm_group``.
-    pp_comm_groups_by_layout: Optional[dict[int, Any]] = None
+    # Bulk communicator for each generation layout in this worker's PP stage.
+    pp_comm_group: dict[int, Any]
 
     def sync_params_before_refit(self) -> None:
         """Materialize optimizer updates before refit when the backend requires it."""
@@ -125,17 +122,10 @@ class AbstractPolicyWorker:
         from nemo_rl.distributed.refit_watchdog import RELEASE_GRACE_S, release_within
         from nemo_rl.distributed.stateless_process_group import StatelessProcessGroup
 
-        # Released for the same reason init_collective releases model_update_group:
-        # _build re-runs both communicator families on every reconcile, so without this
-        # each recovery strands a NCCL communicator and a bound TCPStore per PP stage for
-        # the life of the worker. Deferred past the rendezvous and bounded, same as there.
-        # Replace only this layout's group; layout 0 also backs pp_comm_group.
-        groups_by_layout = dict(self.pp_comm_groups_by_layout or {})
+        # Replace only this layout's group; bound cleanup after rendezvous to avoid leaks.
+        groups_by_layout = dict(self.pp_comm_group)
         stale_group = groups_by_layout.pop(layout_index, None)
-        if layout_index == 0:
-            stale_group = stale_group or self.pp_comm_group
-            self.pp_comm_group = None
-        self.pp_comm_groups_by_layout = groups_by_layout
+        self.pp_comm_group = groups_by_layout
 
         # Printed on both sides of this rendezvous, because a mismatch here is invisible
         # otherwise: the party that got it wrong just waits, and the other reports a 300s
@@ -159,9 +149,7 @@ class AbstractPolicyWorker:
         # Free cached blocks so NCCL P2P buffers have headroom (see init_collective).
         torch.cuda.empty_cache()
         group.init_nccl_communicator(device=device)
-        self.pp_comm_groups_by_layout[layout_index] = group
-        if layout_index == 0:
-            self.pp_comm_group = group
+        self.pp_comm_group[layout_index] = group
         self.my_pp_stage = my_pp_stage
 
         if stale_group is not None:

@@ -99,6 +99,10 @@ shard-layout requirements in this document.
 | TE blockwise FP8 (`fp8_param=true`) | ❌ | ✅ | ❌ | ✅ | ✅ | ✅ |
 | TE MXFP8 (`fp8_param=true`) | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
+* **TensorRT-LLM:** BF16 training can refit BF16, blockwise FP8 and MXFP8 engines.
+  Routed MoE experts use shard-to-shard transfer; other parameters use the misc
+  broadcast. Every engine role requires pure expert parallelism and generation PP 1,
+  with no expert load balancer.
 * `*` vLLM's MXFP8 quantizer accepts BF16/FP16 input. Unquantized FP32 sources
   retain FP32 on the wire, so `check_nccl_reshard_refit_support` rejects
   `policy.precision='float32'` with `vllm_cfg.is_mx=true`.
@@ -310,13 +314,12 @@ Every training step (with in-flight weight updates, concurrently with generation
 * `post(ctx)` commits received values to local storage, including quantization and
   scale updates. It runs after the transfer on the corresponding CUDA stream.
 
-* The **training side** walks `per_layer_params`, skipping parameters owned by other PP
-  stages. For each parameter it resolves the `LocalParamSpec`, calls `materialize()`
-  (which runs `pre` for dequantization or grouped preparation), wraps the local shard in a
-  `DTensorRef` (which reports the *global* shape while holding only the local tensor),
-  and calls
-  `xferdtensor(src, src_mesh, src_placements, None, dst_mesh, dst_placements, group,
-  stream)`.
+* The **training side** walks each layer once, materializes its local sources, and
+  sends them to every generation layout on that layout's stream. Bulk communicators
+  are separate for each generation layout and training PP stage; each contains that
+  stage's training ranks and only that layout's generation ranks. vLLM, Megatron and
+  aggregated TensorRT-LLM use one layout; disaggregated TensorRT-LLM uses separate
+  prefill and decode layouts. The misc packed broadcast remains shared.
 * The **generation side** walks the same metadata in the same order — every rank in a
   comm group must issue the same sequence of transfers. Per-PP-stage parameter groups
   are distributed across `NRL_REFIT_NUM_STREAMS` CUDA streams so different stages'
@@ -420,11 +423,12 @@ its own weights. A new *generation* backend simply consumes the shipped metadata
 **Copy-paste boilerplate** (identical in shape to the existing backend; only
 names/attributes change):
 
-1. `prepare_nccl_reshard_refit_info` — restore the shipped metadata and call
-   `build_hf_to_local_param_map` once.
-2. The communicator bootstrap (`init_collective`, `init_nccl_reshard_comm_group`) — the
-   same `StatelessProcessGroup` setup; the only requirement is the rank convention:
-   training ranks first (per-stage-local for the bulk groups), generation ranks after.
+1. Generation-side `prepare_nccl_reshard_refit_info(refit_infos)` receives a list of
+   plans, one per generation layout, and dispatches each plan to its matching engines.
+   Single-layout backends require exactly one plan.
+2. `rebuild_nccl_reshard_comm_group(..., layout_index=0)` rebuilds the selected
+   layout's bulk groups, one per training PP stage, with training ranks first and
+   that layout's generation ranks after. The misc communicator remains shared.
 3. The `nccl_reshard_refit()` loop — walk `per_layer_params` in metadata order (grouped
    by `pp_stage` across `NRL_REFIT_NUM_STREAMS` streams), resolve each `LocalParamSpec`,
    call `materialize()`, call `xferdtensor`, run `post`. It only touches the generic spec/metadata
