@@ -144,6 +144,37 @@ def _patch_vllm_init_workers_ray(
     return applied
 
 
+def _patch_vllm_compile_cache_relative_artifacts(logger) -> None:
+    """Backport vllm#52142: load compiled artifacts relative to the cache folder.
+
+    vLLM before 0.31.1 stores the absolute path of each compiled artifact in its
+    cache index and loads from that path, so a cache written under one folder
+    fails to load from another ("No such file or directory"). With persistent
+    compile caches each engine gets its own folder, filled from a copy another
+    engine wrote, so they need this; nemo_rl/utils/compile_cache.py applies it on
+    every node of the engine. Remove once vLLM >= 0.31.1.
+    """
+    file_to_patch = _get_vllm_file("compilation/compiler_interface.py")
+    marker = "NeMo-RL: vllm#52142"
+    old_snippet = "        path = handle[1]\n"
+    # A plain string, not an f-string: the anchor test reads it out of this source.
+    new_snippet = (
+        "        path = os.path.join(self.cache_dir, handle[0])"
+        "  # NeMo-RL: vllm#52142\n"
+    )
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            return
+        if content.count(old_snippet) != 1:
+            raise RuntimeError(
+                "Persistent compile caches are on but the vllm#52142 backport does "
+                f"not match {file_to_patch}; the vLLM version changed. Update or "
+                "remove _patch_vllm_compile_cache_relative_artifacts."
+            )
+        write_back(content.replace(old_snippet, new_snippet, 1))
+    logger.info("Patched vLLM to load compiled artifacts relative to the cache folder.")
+
+
 def _patch_vllm_llama_eagle3_own_lm_head(logger) -> None:
     """Patch LlamaEagle3 to keep truncated draft lm_head ownership."""
     try:

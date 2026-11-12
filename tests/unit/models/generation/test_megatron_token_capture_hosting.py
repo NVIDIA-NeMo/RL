@@ -48,6 +48,18 @@ class _WorkerGroup:
         return self.replies
 
 
+def test_generation_refuses_generation_prefix_cuts():
+    """Setup refuses `prefix` with Megatron first; this backs it up per backend."""
+    generation = object.__new__(MegatronGeneration)
+
+    with pytest.raises(NotImplementedError, match="not implemented for Megatron"):
+        generation.setup_token_capture(
+            {"backend": "simple"},
+            "rollout_staging",
+            generation_prefix_cuts_enabled=True,
+        )
+
+
 def test_generation_setup_token_capture_fans_tq_config_to_workers(monkeypatch):
     generation = object.__new__(MegatronGeneration)
     generation.cfg = {"mcore_generation_config": {"expose_http_server": True}}
