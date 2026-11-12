@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     )
 
 from nemo_rl.data_plane.codec import stack_or_nest
+from nemo_rl.data_plane.direct_prefix_batch import encode_prefix_groups
 from nemo_rl.data_plane.schema import (
     PER_TOKEN_STAGING_FIELDS,
     ROUTE_ENCODING_ENVELOPE,
@@ -505,11 +506,33 @@ class TQTokenSink:
         media_pixel_dtype: torch.dtype | None = None,
     ) -> None:
         self._store = TQStagingStore(dp_client, staging_partition=staging_partition)
+        self._prefix_store: TQStagingStore | None = None
+        self._direct_prefix_columns = False
         self._capture_media = capture_media
         # Pixel dtype every media row of this partition must carry (the engine
         # model dtype). Fixes the ``media_imgs`` column dtype so text-call
         # sentinels and real rows agree; see ``_media_sentinels``.
         self._media_pixel_dtype = media_pixel_dtype
+
+    def set_prefix_writer(self, dp_client: Any) -> None:
+        """Route prefix PUTs and failed-prefix cleanup through a separate client.
+
+        Install once, before accepting cuts. Terminal writes, restore reads,
+        and ordinary cleanup retain their original client.
+        """
+        if self._prefix_store is not None:
+            raise RuntimeError("A prefix writer is already installed")
+        self._prefix_store = TQStagingStore(
+            dp_client, staging_partition=self._store._staging_partition
+        )
+
+    def enable_direct_prefix_columns(self) -> None:
+        """Build text/router cut batches directly in owned column buffers."""
+        if self._capture_media:
+            raise ValueError(
+                "Direct prefix columns require a text-only staging partition"
+            )
+        self._direct_prefix_columns = True
 
     @property
     def media_pixel_dtype(self) -> torch.dtype | None:
@@ -803,38 +826,55 @@ class TQTokenSink:
         ]
         if len(set(keys)) != len(keys):
             raise ValueError("generation-prefix batch contains duplicate staging keys")
-        groups: dict[
-            tuple[Any, ...],
-            list[tuple[int, dict[str, torch.Tensor], dict[str, Any]]],
-        ] = {}
-        for index, (record, row_attachments) in enumerate(
-            zip(records, attachments, strict=True)
+        store = self._store if self._prefix_store is None else self._prefix_store
+        if self._direct_prefix_columns and all(
+            (
+                (record.extras or {}).get(ROUTED_EXPERTS_FIELD) is None
+                or isinstance(record.extras[ROUTED_EXPERTS_FIELD], dict)
+            )
+            and not (attached and set(attached) - {ROUTED_EXPERTS_FIELD})
+            for record, attached in zip(records, attachments, strict=True)
         ):
-            fields, tags = self._encode_record(
-                record, attachments=row_attachments, generation_cut_chunk=True
+            if not records:
+                return []
+            encoded = encode_prefix_groups(
+                records, attachments, mode_codes=_MODE_TO_CODE
             )
-            signature = tuple(
-                (name, fields[name].dtype, tuple(fields[name].shape[2:]))
-                for name in sorted(fields)
-            )
-            groups.setdefault(signature, []).append((index, fields, tags))
-
+        else:
+            groups: dict[
+                tuple[Any, ...],
+                list[tuple[int, dict[str, torch.Tensor], dict[str, Any]]],
+            ] = {}
+            for index, (record, row_attachments) in enumerate(
+                zip(records, attachments, strict=True)
+            ):
+                fields, tags = self._encode_record(
+                    record, attachments=row_attachments, generation_cut_chunk=True
+                )
+                signature = tuple(
+                    (name, fields[name].dtype, tuple(fields[name].shape[2:]))
+                    for name in sorted(fields)
+                )
+                groups.setdefault(signature, []).append((index, fields, tags))
+            encoded = [
+                (
+                    [item[0] for item in group],
+                    TensorDict(
+                        {
+                            name: stack_or_nest([item[1][name][0] for item in group])
+                            for name in group[0][1]
+                        },
+                        batch_size=[len(group)],
+                    ),
+                    [item[2] for item in group],
+                )
+                for group in groups.values()
+            ]
         try:
-            for group in groups.values():
-                fields = TensorDict(
-                    {
-                        name: stack_or_nest([item[1][name][0] for item in group])
-                        for name in group[0][1]
-                    },
-                    batch_size=[len(group)],
-                )
-                self._store.put_many(
-                    [keys[item[0]] for item in group],
-                    fields,
-                    tags=[item[2] for item in group],
-                )
+            for indices, fields, tags in encoded:
+                store.put_many([keys[index] for index in indices], fields, tags=tags)
         except Exception:
-            self._discard_failed_writes(keys)
+            self._discard_failed_writes(keys, store=store)
             raise
         return keys
 
@@ -851,10 +891,12 @@ class TQTokenSink:
         """
         self._discard_failed_writes([key])
 
-    def _discard_failed_writes(self, keys: Sequence[str]) -> None:
+    def _discard_failed_writes(
+        self, keys: Sequence[str], *, store: TQStagingStore | None = None
+    ) -> None:
         """Best-effort cleanup for one uncertain single-row or batch write."""
         try:
-            self._store.clear(list(keys))
+            (self._store if store is None else store).clear(list(keys))
         except Exception as error:  # noqa: BLE001 — cleanup must not mask the stage failure
             logging.getLogger(__name__).error(
                 "TQTokenSink could not discard %d failed writes: %s: %s; "

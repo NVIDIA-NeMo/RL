@@ -52,6 +52,13 @@ from nemo_rl.data.captured_media import (
     verify_restored_media,
 )
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.interfaces import DataPlaneConfig
+from nemo_rl.data_plane.prefix_pipeline import PrefixWritePipelineConfig
+from nemo_rl.data_plane.prefix_writer_actor import (
+    RayPrefixWriterClient,
+    create_prefix_writer,
+    validate_prefix_writer_setup,
+)
 from nemo_rl.data_plane.tq_token_sink import MediaMetadataIntegrityError
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
@@ -412,6 +419,8 @@ class VllmAsyncGenerationWorkerImpl(
     VllmAsyncCheckpointEngineRpcMixin,
     BaseVllmGenerationWorker,
 ):
+    _prefix_writer: RayPrefixWriterClient | None
+
     def __init__(
         self,
         config,
@@ -506,6 +515,7 @@ class VllmAsyncGenerationWorkerImpl(
         # the shared ChainPrefixCache below.
         self._staging_source: Any | None = None
         self._capture_dp_client: Any | None = None
+        self._prefix_writer: RayPrefixWriterClient | None = None
         # Resolved staging-chain prefixes, shared implementation with the Megatron
         # preparer. Installed by setup_token_capture; fetch runs on executor threads.
         # Deferred import: tq_token_sink pulls in the data-plane stack.
@@ -806,7 +816,7 @@ class VllmAsyncGenerationWorkerImpl(
 
     async def setup_token_capture(
         self,
-        dp_cfg: dict[str, Any],
+        dp_cfg: DataPlaneConfig,
         staging_partition: str,
         *,
         capture_media: bool = False,
@@ -829,6 +839,39 @@ class VllmAsyncGenerationWorkerImpl(
         """
         if not self.is_model_owner:
             return None
+        writer_enabled = self.cfg["vllm_cfg"].get("prefix_writer_actor")
+        pipeline_raw = self.cfg["vllm_cfg"].get("prefix_write_pipeline")
+        pipeline_config = (
+            PrefixWritePipelineConfig()
+            if pipeline_raw is None
+            else PrefixWritePipelineConfig.model_validate(pipeline_raw)
+        )
+        if pipeline_config.enabled and not pipeline_config.direct_column_encoding:
+            raise ValueError("Prefix write pipeline requires direct column encoding")
+        if (pipeline_config.enabled or pipeline_config.direct_column_encoding) and (
+            not generation_prefix_cuts_enabled or capture_media
+        ):
+            raise ValueError(
+                "Prefix write pipeline/encoder requires text-only prefix capture"
+            )
+        if (
+            pipeline_config.enabled
+            and pipeline_config.max_buffered_payload_bytes
+            < 2 * pipeline_config.max_batch_payload_bytes
+        ):
+            raise ValueError(
+                "Prefix pipeline buffer must hold a write and one preparation reservation"
+            )
+        if self._prefix_writer is not None:
+            raise RuntimeError(
+                "Token capture with a prefix writer is already installed"
+            )
+        if writer_enabled:
+            validate_prefix_writer_setup(
+                dp_cfg,
+                prefix_cuts=generation_prefix_cuts_enabled,
+                capture_media=capture_media,
+            )
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
         from nemo_gym.token_id_capture.staging import install_capture
@@ -850,6 +893,8 @@ class VllmAsyncGenerationWorkerImpl(
             capture_media=capture_media,
             media_pixel_dtype=pixel_dtype,
         )
+        if pipeline_config.direct_column_encoding:
+            sink.enable_direct_prefix_columns()
         self._capture_top_logprobs = int(top_logprobs)
         if generation_prefix_cuts_enabled and not generation_cut_control_token:
             raise ValueError(
@@ -934,8 +979,23 @@ class VllmAsyncGenerationWorkerImpl(
                     generation_prefix_batch_max_tokens=(
                         generation_prefix_batch_max_tokens
                     ),
-                )
+                ),
+                pipeline_config=pipeline_config,
             )
+        if writer_enabled:
+            try:
+                writer = await create_prefix_writer(
+                    dp_cfg, partition_id=staging_partition
+                )
+            except BaseException:
+                self._prefix_recovery.shutdown()
+                raise
+            try:
+                sink.set_prefix_writer(writer)
+            except BaseException:
+                writer.close()
+                raise
+            self._prefix_writer = writer
         if not capture_media:
             return None
         return MediaColumnSpec(
@@ -3228,6 +3288,10 @@ class VllmAsyncGenerationWorkerImpl(
     async def shutdown(self) -> bool:
         """Clean up vLLM resources."""
         try:
+            # Teardown must unblock an in-flight remote PUT, not await it forever.
+            if self._prefix_writer is not None:
+                self._prefix_writer.close()
+                self._prefix_writer = None
             # Waiting for a wedged TQ write here would make actor shutdown hang.
             prefix_recovery = getattr(self, "_prefix_recovery", None)
             if prefix_recovery is not None:

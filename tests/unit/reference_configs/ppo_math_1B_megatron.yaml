@@ -304,6 +304,10 @@ policy:
       http_server_num_replicas: 8
     vllm_cfg:
       async_engine: false
+      prefix_writer_actor: false # Prefix-only SimpleStorage writes in a colocated CPU actor; requires async HTTP capture and prefix cuts.
+      prefix_write_pipeline: # Text/router prefix encoder and bounded prepare/write overlap.
+        enabled: false
+        direct_column_encoding: false
       precision: ${policy.precision}
       kv_cache_dtype: "auto"
       logprobs_mode: processed_logprobs

@@ -18,6 +18,7 @@ from typing import cast
 
 import pytest
 
+
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm.config import (
@@ -26,6 +27,76 @@ from nemo_rl.models.generation.vllm.config import (
     validate_vllm_async_actor_settings,
     validate_vllm_quantization_config,
 )
+
+
+@pytest.mark.parametrize(
+    "writer,direct,async_engine,buffer_size",
+    [
+        (True, False, True, 536870912),
+        (True, True, False, 536870912),
+        (True, True, True, 134217728),
+    ],
+)
+def test_prefix_pipeline_rejects_unsupported_setup(
+    writer: bool,
+    direct: bool,
+    async_engine: bool,
+    buffer_size: int,
+) -> None:
+    with pytest.raises(ValueError):
+        validate_vllm_async_actor_settings(
+            {
+                "vllm_cfg": {
+                    "async_engine": async_engine,
+                    "expose_http_server": True,
+                    "prefix_writer_actor": writer,
+                    "prefix_write_pipeline": {
+                        "enabled": True,
+                        "direct_column_encoding": direct,
+                        "max_buffered_payload_bytes": buffer_size,
+                    },
+                },
+            }
+        )
+
+
+@pytest.mark.parametrize("writer", [False, True])
+def test_prefix_pipeline_supports_local_or_actor_writes(writer: bool) -> None:
+    validate_vllm_async_actor_settings(
+        {
+            "vllm_cfg": {
+                "async_engine": True,
+                "expose_http_server": True,
+                "prefix_writer_actor": writer,
+                "prefix_write_pipeline": {
+                    "enabled": True,
+                    "direct_column_encoding": True,
+                },
+            },
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    "async_engine,http", [(False, False), (False, True), (True, False)]
+)
+def test_prefix_writer_requires_async_http(async_engine: bool, http: bool) -> None:
+    with pytest.raises(ValueError, match="prefix_writer_actor requires"):
+        validate_vllm_async_actor_settings(
+            {
+                "vllm_cfg": {
+                    "prefix_writer_actor": True,
+                    "async_engine": async_engine,
+                    "expose_http_server": http,
+                }
+            }
+        )
+
+
+@pytest.mark.parametrize("value", ["false", "true", 1, 0])
+def test_prefix_writer_rejects_non_boolean(value: object) -> None:
+    with pytest.raises(ValueError, match="must be boolean"):
+        validate_vllm_async_actor_settings({"vllm_cfg": {"prefix_writer_actor": value}})
 
 
 @pytest.mark.parametrize(
