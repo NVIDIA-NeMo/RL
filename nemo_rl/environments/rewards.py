@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import math
 import re
 from typing import Callable, Optional
 
@@ -94,6 +95,10 @@ def bbox_giou_reward(
     """Given [x1, y1, x2, y2] normalized bounding box coordinates within the <{answer_tag}> tags, compute the GIoU between the ground truth and the response.
 
     The `answer_tag` is customizable and must be specified as part of the user COT prompt text file.
+
+    A response box must have finite coordinates with x1 < x2 and y1 < y2; otherwise the reward is 0.
+    Without this check, a box with reversed corners has a positive "area" and an empty intersection,
+    which makes the GIoU exceed 1, and NaN, inf or overflowing coordinates give NaN or inf rewards.
     """
     match = re.search(rf"<{answer_tag}>([\s\S]*)</{answer_tag}>", response)
     if match:
@@ -109,6 +114,14 @@ def bbox_giou_reward(
             float(x) for x in answer.replace("[", "").replace("]", "").split(",")
         ]
     except ValueError:
+        return 0.0, False
+
+    # GIoU is only bounded in [-1, 1] for well-formed boxes, so reject reversed, empty or non-finite ones.
+    if (
+        not all(math.isfinite(v) for v in (x1r, y1r, x2r, y2r))
+        or x2r <= x1r
+        or y2r <= y1r
+    ):
         return 0.0, False
 
     # compute iou function
@@ -139,6 +152,9 @@ def bbox_giou_reward(
         giou = iou - (area_c - area_u) / area_c
     else:
         giou = iou
+    # Coordinates large enough to overflow the areas give NaN or inf.
+    if not math.isfinite(giou):
+        return 0.0, False
     return giou, giou > 0.5
 
 
