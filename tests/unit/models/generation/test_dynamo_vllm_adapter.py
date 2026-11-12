@@ -50,8 +50,8 @@ from nemo_rl.models.generation.dynamo.vllm import (  # noqa: E402
     adapter as vllm_adapter,
 )
 from nemo_rl.models.generation.dynamo.vllm.chat_engine import (  # noqa: E402
+    CALL_KEY,
     GYM_CALL_ANNOTATION,
-    PLAN_KEY,
     RUNTIME_DATA_KEY,
     ForwardedCall,
 )
@@ -471,10 +471,8 @@ def _gym_call(token_ids: list[int], **fields) -> dict:
     ``fields`` set the prepared prompt's fields and the call's others by name.
     """
     plan = {
-        "template_token_ids": token_ids,
         "splice": None,
         "prefix_len": None,
-        "measure_only": False,
         "request_max_tokens": None,
         "max_tokens": None,
         "admission": None,
@@ -488,6 +486,13 @@ def _gym_call(token_ids: list[int], **fields) -> dict:
         "reasoning_ended": None,
         "reasoning_parser_kwargs": None,
     }
+    # A media call's template ids are its own prompt's unless it was spliced.
+    template_token_ids = fields.pop("template_token_ids", token_ids)
+    if (inputs := fields.pop("multimodal", None)) is not None:
+        wire["multimodal"] = {
+            "inputs": inputs,
+            "template_token_ids": template_token_ids,
+        }
     for name, value in fields.items():
         if name in plan:
             plan[name] = value
@@ -497,7 +502,7 @@ def _gym_call(token_ids: list[int], **fields) -> dict:
     return {
         "token_ids": token_ids,
         "annotations": [GYM_CALL_ANNOTATION],
-        "extra_args": {PLAN_KEY: wire},
+        "extra_args": {CALL_KEY: wire},
     }
 
 

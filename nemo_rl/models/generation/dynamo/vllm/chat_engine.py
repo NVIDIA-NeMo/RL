@@ -65,13 +65,22 @@ from nemo_rl.models.generation.gym_call import (
 # The key the engine publishes its chat settings under in runtime_data.
 RUNTIME_DATA_KEY = "nemo_rl_chat"
 # The annotation the adapter serves NeMo-Gym calls by; the ForwardedCall rides
-# in extra_args under PLAN_KEY.
+# in extra_args under CALL_KEY.
 GYM_CALL_ANNOTATION = "nemo_gym:rollout"
-PLAN_KEY = "nemo_rl"
+CALL_KEY = "nemo_rl"
+
+
+class ForwardedMedia(TypedDict):
+    """A media call's render, in the template's coordinates."""
+
+    # The render's multimodal input, pickled then base64-encoded.
+    inputs: str
+    # The template's token ids, which the input's placeholders index.
+    template_token_ids: list[int]
 
 
 class ForwardedCall(TypedDict):
-    """What the chat engine sends the adapter in ``extra_args[PLAN_KEY]``.
+    """What the chat engine sends the adapter in ``extra_args[CALL_KEY]``.
 
     The call's ``PreparedPrompt.to_json()`` and what the engine needs that the
     native worker has in process: the rendered request, its media, and what
@@ -81,8 +90,8 @@ class ForwardedCall(TypedDict):
     prepared_prompt: dict[str, Any]
     # The rendered chat request, without messages.
     request: dict[str, Any]
-    # The render's multimodal input, pickled then base64-encoded.
-    multimodal: Optional[str]
+    # None for a text call, which sends its prompt once: as the final token ids.
+    multimodal: Optional[ForwardedMedia]
     reasoning_ended: Optional[bool]
     reasoning_parser_kwargs: Optional[dict[str, Any]]
 
@@ -289,7 +298,7 @@ class NemoRLChatEngine:
             resolve_prefix=self._capture.resolve_prefix,
             turn_end_token_ids=info["turn_end_token_ids"],
             max_model_len=info["max_model_len"],
-            clamp=not extras.ng_measure,
+            measure_only=extras.ng_measure,
         )
         if extras.ng_measure:
             return self._chunk(
@@ -301,12 +310,16 @@ class NemoRLChatEngine:
                 message={"role": "assistant", "content": ""},
                 finish_reason="stop",
             )
+        media: Optional[ForwardedMedia] = None
+        if rendered.multimodal is not None:
+            media = ForwardedMedia(
+                inputs=base64.b64encode(rendered.multimodal).decode(),
+                template_token_ids=rendered.template_token_ids,
+            )
         wire: ForwardedCall = {
             "prepared_prompt": plan.to_json(),
             "request": rendered.request,
-            "multimodal": None
-            if rendered.multimodal is None
-            else base64.b64encode(rendered.multimodal).decode(),
+            "multimodal": media,
             "reasoning_ended": rendered.reasoning_ended,
             "reasoning_parser_kwargs": rendered.reasoning_parser_kwargs,
         }
@@ -321,7 +334,7 @@ class NemoRLChatEngine:
             "output_options": {},
             "eos_token_ids": [],
             "annotations": [GYM_CALL_ANNOTATION],
-            "extra_args": {PLAN_KEY: wire},
+            "extra_args": {CALL_KEY: wire},
         }
         engine_data = await self._call_engine(preprocessed, context)
         if (refusal := engine_data.get("refusal")) is not None:

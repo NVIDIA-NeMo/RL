@@ -316,7 +316,7 @@ class NeMoRLOpenAIServingMixin:
             ),
             max_model_len=self.model_config.max_model_len,
             # /tokenize counts a prompt of any length, so only chat calls clamp.
-            clamp=isinstance(request, NeMoRLChatCompletionRequest),
+            measure_only=not isinstance(request, NeMoRLChatCompletionRequest),
             tokenizer=self.renderer.tokenizer,
         )
         await start_capture(

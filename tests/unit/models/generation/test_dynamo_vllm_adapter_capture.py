@@ -186,7 +186,6 @@ def test_a_captured_token_in_call_is_staged_from_the_engine() -> None:
             SPLICED,
             TOKEN_IN,
             prefix_len=len(PREFIX),
-            template_token_ids=TEMPLATE,
             splice=SPLICE,
         ),
     )

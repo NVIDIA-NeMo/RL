@@ -63,8 +63,8 @@ from nemo_rl.models.generation.dynamo.engine_adapter import (
     ServedRollout,
 )
 from nemo_rl.models.generation.dynamo.vllm.chat_engine import (
+    CALL_KEY,
     GYM_CALL_ANNOTATION,
-    PLAN_KEY,
     RUNTIME_DATA_KEY,
     ForwardedCall,
     GymEngineReply,
@@ -307,11 +307,11 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         )
 
         del annotation
-        wire: Optional[ForwardedCall] = (request.get("extra_args") or {}).get(PLAN_KEY)
+        wire: Optional[ForwardedCall] = (request.get("extra_args") or {}).get(CALL_KEY)
         if wire is None:
             raise InvalidArgument(
                 "NeMo-Gym calls reach NeMo RL's engines through NeMo RL's chat "
-                f"engine in the Dynamo frontend (extra_args.{PLAN_KEY})."
+                f"engine in the Dynamo frontend (extra_args.{CALL_KEY})."
             )
         host = self._host
         plan = PreparedPrompt.from_json(
@@ -353,11 +353,12 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         engine_client = host._http_engine_client or self._llm
         engine_client.check_admission(1, context.id())
         engine_prompt: dict[str, Any]
-        if wire["multimodal"] is not None:
+        media = wire["multimodal"]
+        if media is not None:
             # The processed media, in the template's coordinates.
             engine_prompt = {
-                **pickle.loads(base64.b64decode(wire["multimodal"])),
-                "prompt_token_ids": list(plan.template_token_ids),
+                **pickle.loads(base64.b64decode(media["inputs"])),
+                "prompt_token_ids": list(media["template_token_ids"]),
             }
         else:
             engine_prompt = TokensPrompt(prompt_token_ids=plan.prompt_token_ids)
@@ -509,9 +510,12 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         # Deferred: only captured calls reach here, and capture already imports nemo_gym.
         from nemo_gym.token_id_capture import NG_COMMIT_COORDS_FIELD
 
-        # Off the loop, as natively: the sampler top-k scales with the
-        # completion's length and K.
-        content = await asyncio.to_thread(self._response_to_stage, final_output)
+        if self._host._capture_top_logprobs:
+            # Off the loop, as natively: the sampler top-k scales with the
+            # completion's length and K.
+            content = await asyncio.to_thread(self._response_to_stage, final_output)
+        else:
+            content = self._response_to_stage(final_output)
         content = await save_capture(self._host, chat, content)
         return GymCallResult(ng_commit_coords=content[NG_COMMIT_COORDS_FIELD])
 

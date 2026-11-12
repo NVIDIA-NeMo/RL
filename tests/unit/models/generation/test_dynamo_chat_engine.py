@@ -262,7 +262,7 @@ def test_a_gym_call_is_rendered_spliced_and_routed_with_its_capture_plan() -> No
     assert routed["token_ids"] == SPLICED
     assert routed["stop_conditions"] == {"max_tokens": MAX_MODEL_LEN - len(SPLICED)}
     assert routed["annotations"] == [chat_engine.GYM_CALL_ANNOTATION]
-    wire = routed["extra_args"][chat_engine.PLAN_KEY]
+    wire = routed["extra_args"][chat_engine.CALL_KEY]
     plan = wire["prepared_prompt"]
     # The request as rendered; the engine sets the plan's clamped budget.
     assert wire["request"] == {
@@ -271,12 +271,13 @@ def test_a_gym_call_is_rendered_spliced_and_routed_with_its_capture_plan() -> No
         "max_completion_tokens": None,
     }
     assert plan["max_tokens"] == MAX_MODEL_LEN - len(SPLICED)
-    assert (plan["template_token_ids"], plan["splice"], plan["prefix_len"]) == (
-        TEMPLATE,
+    assert (plan["splice"], plan["prefix_len"]) == (
         # Each side is cut at its turn end: PREFIX[:3] + TEMPLATE[2:].
         [3, 2],
         len(PREFIX),
     )
+    # A text call sends its prompt once: the template's ids ride only with media.
+    assert "template_token_ids" not in plan
     assert (plan["admission"], wire["multimodal"], wire["reasoning_ended"]) == (
         None,
         None,
@@ -311,7 +312,7 @@ def test_a_token_in_call_splices_the_prefix_staged_in_tq() -> None:
     assert capture.resolved == [TOKEN_IN]
     (routed,) = router.requests
     assert routed["token_ids"] == SPLICED
-    plan = routed["extra_args"][chat_engine.PLAN_KEY]["prepared_prompt"]
+    plan = routed["extra_args"][chat_engine.CALL_KEY]["prepared_prompt"]
     assert (plan["admission"], plan["serving_admission"], plan["prefix_len"]) == (
         TOKEN_IN,
         TOKEN_IN,

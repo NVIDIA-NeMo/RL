@@ -126,6 +126,8 @@ async def resolve_restored_call(
     regenerates. For a restore, the request gets its restore fields (which the
     reply reads) and its remaining ``min_tokens``.
     """
+    if serving_admission.generation_cut is None:
+        return serving_admission, None
     # Off-loop: the saved rows are a blocking TQ read.
     resolved_admission, saved = await asyncio.to_thread(
         host._prefix_recovery.resolve_restore, serving_admission, prefix_token_ids
@@ -267,7 +269,6 @@ class PreparedPrompt:
     """A call's prompt as the engine runs it, its output budget, and how capture admits it."""
 
     prompt_token_ids: list[int]
-    template_token_ids: list[int]
     # How the model's own prefix replaced the template's history; None if not.
     splice: Optional[PrefixSplice]
     # The model's own prefix is the prompt's first ``prefix_len`` ids.
@@ -292,12 +293,10 @@ class PreparedPrompt:
     def to_json(self) -> dict[str, Any]:
         """As JSON, without the prompt (it rides as the call's token ids)."""
         return {
-            "template_token_ids": self.template_token_ids,
             "splice": None
             if self.splice is None
             else [self.splice.model_cut_end, self.splice.template_cut_start],
             "prefix_len": self.prefix_len,
-            "measure_only": self.measure_only,
             "request_max_tokens": self.request_max_tokens,
             "max_tokens": self.max_tokens,
             "admission": _admission_json(self.admission),
@@ -324,10 +323,10 @@ class PreparedPrompt:
             serving_admission = parse_admission(wire["serving_admission"])
         return cls(
             prompt_token_ids=prompt_token_ids,
-            template_token_ids=list(wire["template_token_ids"]),
             splice=splice,
             prefix_len=wire["prefix_len"],
-            measure_only=wire["measure_only"],
+            # A measure call is answered where it is prepared.
+            measure_only=False,
             request_max_tokens=wire["request_max_tokens"],
             max_tokens=wire["max_tokens"],
             admission=admission,
@@ -346,7 +345,7 @@ async def prepare_prompt(
     resolve_prefix: Callable[[Any], list[int]],
     turn_end_token_ids: Collection[int],
     max_model_len: int,
-    clamp: bool,
+    measure_only: bool,
     tokenizer: Any = None,
 ) -> PreparedPrompt:
     """Prepare a rendered call's prompt: the ids the engine runs, and its output budget.
@@ -357,8 +356,9 @@ async def prepare_prompt(
             so it runs off the event loop.
         turn_end_token_ids: Every id a turn can end on; the splice cuts by them.
         max_model_len: The engine's context length.
-        clamp: Whether the call generates, so its budget is clamped to the
-            context; a measure call counts its prompt at any length.
+        measure_only: Whether Gym only measures the prompt. Such a call counts
+            a prompt of any length; a generating call's budget is clamped to
+            the context.
         tokenizer: Only for the splice's error message; may be None.
 
     Raises:
@@ -384,16 +384,15 @@ async def prepare_prompt(
         )
         prompt_token_ids = splice.token_ids
     max_tokens = None
-    if clamp:
+    if not measure_only:
         max_tokens = clamp_max_tokens(
             rendered.request_max_tokens, len(prompt_token_ids), max_model_len
         )
     return PreparedPrompt(
         prompt_token_ids=prompt_token_ids,
-        template_token_ids=rendered.template_token_ids,
         splice=splice,
         prefix_len=None if prefix is None else len(prefix),
-        measure_only=not clamp,
+        measure_only=measure_only,
         request_max_tokens=rendered.request_max_tokens,
         max_tokens=max_tokens,
         admission=rendered.admission,
