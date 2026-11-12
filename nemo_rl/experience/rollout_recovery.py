@@ -111,6 +111,75 @@ _ATTEMPT_STATE_FIELDS = frozenset(
     }
 )
 
+_IMMUTABLE_RECEIPT_TYPES = frozenset(
+    {str, bytes, int, float, bool, complex, type(None)}
+)
+
+
+def _copy_checkpoint_value(value: Any, memo: dict[int, Any] | None = None) -> Any:
+    """Detach receipt containers while sharing immutable scalar leaves.
+
+    Preserve shared containers and cycles within a receipt. Other types,
+    including container subclasses, retain their custom deepcopy behavior.
+    """
+    value_type = type(value)
+    if value_type in _IMMUTABLE_RECEIPT_TYPES:
+        return value
+    if memo is None:
+        memo = {}
+    identity = id(value)
+    if identity in memo:
+        return memo[identity]
+    if value_type is dict:
+        copied_dict: dict[Any, Any] = {}
+        memo[identity] = copied_dict
+        for key, item in value.items():
+            copied_dict[_copy_checkpoint_value(key, memo)] = _copy_checkpoint_value(
+                item, memo
+            )
+        return copied_dict
+    if value_type is list:
+        copied_list: list[Any] = []
+        memo[identity] = copied_list
+        copied_list.extend(_copy_checkpoint_value(item, memo) for item in value)
+        return copied_list
+    return copy.deepcopy(value, memo)
+
+
+def _reward_checks_state(checks: RewardChecks) -> dict[str, Any]:
+    """Project reward checks into an owned checkpoint dictionary."""
+    if type(checks) is not RewardChecks:
+        return dataclasses.asdict(checks)
+    return {
+        "duplicated_reasoning": _copy_checkpoint_value(checks.duplicated_reasoning),
+        "empty_final_answer": _copy_checkpoint_value(checks.empty_final_answer),
+        "low_effort": _copy_checkpoint_value(checks.low_effort),
+    }
+
+
+def _reward_log_context_state(context: RewardLogContext) -> dict[str, Any]:
+    """Copy the reward-log envelope while sharing immutable strings."""
+    if type(context) is not RewardLogContext:
+        return dataclasses.asdict(context)
+    return {
+        "agent_name": _copy_checkpoint_value(context.agent_name),
+        "full_result_json": _copy_checkpoint_value(context.full_result_json),
+    }
+
+
+def _finalized_reward_state(reward: FinalizedReward) -> dict[str, Any]:
+    """Project finalized rewards into the checkpoint schema."""
+    if type(reward) is not FinalizedReward:
+        return dataclasses.asdict(reward)
+    return {
+        "sample_id": _copy_checkpoint_value(reward.sample_id),
+        "rollout_id": _copy_checkpoint_value(reward.rollout_id),
+        "reward": _copy_checkpoint_value(reward.reward),
+        "log_context": _reward_log_context_state(reward.log_context)
+        if reward.log_context is not None
+        else None,
+    }
+
 
 def _reject_unknown_fields(
     mapping: Mapping[Any, Any],
@@ -1677,8 +1746,14 @@ class RolloutRecoveryLedger:
     def __contains__(self, group_id: object) -> bool:
         return isinstance(group_id, str) and group_id in self._groups
 
-    def state_dict(self) -> dict[str, Any]:
-        """Return the versioned metadata persisted in ``rollout_recovery.pt``."""
+    def state_dict(
+        self, *, exclude_group_ids: set[str] | None = None
+    ) -> dict[str, Any]:
+        """Detach versioned metadata, omitting canonically owned groups.
+
+        Excluded groups still undergo checkpoint-safety and prompt-identity
+        checks, but their nested attempt metadata is not copied.
+        """
         self.assert_checkpoint_safe()
         groups = []
         for record in self._groups.values():
@@ -1693,6 +1768,8 @@ class RolloutRecoveryLedger:
                 prompt_payload,
                 group_id=record.group_id,
             )
+            if exclude_group_ids is not None and record.group_id in exclude_group_ids:
+                continue
             groups.append(
                 {
                     "group_id": record.group_id,
@@ -1718,7 +1795,7 @@ class RolloutRecoveryLedger:
                                 {
                                     "attempt_uuid": attempt.attempt_uuid.bytes,
                                     "status": attempt.status.value,
-                                    "receipt": copy.deepcopy(attempt.receipt),
+                                    "receipt": _copy_checkpoint_value(attempt.receipt),
                                     "logical_selection": (
                                         dataclasses.asdict(attempt.logical_selection)
                                         if attempt.logical_selection is not None
@@ -1726,12 +1803,12 @@ class RolloutRecoveryLedger:
                                     ),
                                     "reward": attempt.reward,
                                     "mask_sample": attempt.mask_sample,
-                                    "reward_checks": dataclasses.asdict(
+                                    "reward_checks": _reward_checks_state(
                                         attempt.reward_checks
                                     )
                                     if attempt.reward_checks is not None
                                     else None,
-                                    "reward_log_context": dataclasses.asdict(
+                                    "reward_log_context": _reward_log_context_state(
                                         attempt.reward_log_context
                                     )
                                     if attempt.reward_log_context is not None
@@ -2241,7 +2318,7 @@ def build_rollout_recovery_state(
         raise TypeError(
             "rollout recovery sampler_stamps_target_steps must be a boolean"
         )
-    state = ledger.state_dict()
+    state = ledger.state_dict(exclude_group_ids=canonical_group_ids)
     state["batch_shortfall"] = _validate_batch_shortfall(batch_shortfall)
     state["steps_allowed_short"] = sorted(
         _validate_steps_allowed_short(list(steps_allowed_short))
@@ -2254,15 +2331,11 @@ def build_rollout_recovery_state(
         reward_settings.to_state() if reward_settings is not None else None
     )
     state["finalizer_rewards_by_group"] = {
-        group_id: [dataclasses.asdict(row) for row in rows]
+        group_id: [_finalized_reward_state(row) for row in rows]
         for group_id, rows in (finalizer_rewards_by_group or {}).items()
+        if canonical_group_ids is None or group_id in canonical_group_ids
     }
     if canonical_group_ids is not None:
-        state["groups"] = [
-            group
-            for group in state["groups"]
-            if group["group_id"] not in canonical_group_ids
-        ]
         for key in ("finalizer_metrics_by_group", "finalizer_rewards_by_group"):
             state[key] = {
                 group_id: value
