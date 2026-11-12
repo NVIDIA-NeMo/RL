@@ -60,6 +60,20 @@ policy:
       store_param_remainders: true
       exp_avg_dtype: torch.bfloat16
       exp_avg_sq_dtype: torch.bfloat16
+  # 10-step linear warmup to lr, then constant: same as the other AutoModel DAPO recipes
+  # (grpo_math_1B.yaml default is 50 steps from 0.1x, which left lr at 4.4e-7 at step 20).
+  scheduler:
+  - name: torch.optim.lr_scheduler.LinearLR
+    kwargs:
+      start_factor: 1.0e-08
+      end_factor: 1.0
+      total_iters: 10
+  - name: torch.optim.lr_scheduler.ConstantLR
+    kwargs:
+      factor: 1.0
+      total_iters: 10000000000
+  - milestones:
+    - 10
   automodel_cfg:
     context_parallel_size: 1
     # 352 experts: EP must divide 352 and the world size; on 128 GPUs only EP32 works (11 experts/rank).
