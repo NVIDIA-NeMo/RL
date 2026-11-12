@@ -28,7 +28,7 @@ from nemo_automodel.components.distributed.tensor_utils import (
 from nemo_automodel.components.training.utils import scale_grads_and_clip_grad_norm
 from nemo_automodel.shared.parameter_names import canonical_parameter_fqn
 from torch import nn
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -217,6 +217,25 @@ def automodel_lora_params_generator(
         )
 
 
+def _full_tensor_low_peak(tensor: DTensor) -> torch.Tensor:
+    """``DTensor.full_tensor()`` that gathers non-zero tensor dims first.
+
+    An all-gather along tensor dim ``d != 0`` gathers into a dim-0 stacked
+    buffer and then ``torch.cat``s it, so the result is allocated twice. Expert
+    weights are sharded ``Shard(0)`` over EP and ``Shard(1)`` over FSDP; when
+    the dim-1 gather runs last, it doubles the *full* tensor (Step-5: two
+    8.25 GiB copies per layer, refit OOM at 16 H100 nodes). Gathering the
+    dim != 0 mesh dims first keeps that copy at local-shard size; the final
+    dim-0 gathers return the all-gather output without a copy.
+    """
+    placements = list(tensor.placements)
+    for mesh_dim, placement in enumerate(placements):
+        if placement.is_shard() and placement.dim != 0:
+            placements[mesh_dim] = Replicate()
+            tensor = tensor.redistribute(tensor.device_mesh, placements)
+    return tensor.full_tensor()
+
+
 def _module_params_generator(
     model: nn.Module, target_dtype: torch.dtype
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
@@ -247,7 +266,9 @@ def _module_params_generator(
     for name, tensor in state_dict.items():
         if _is_lora_adapter_tensor(name):
             continue
-        full_tensor = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+        full_tensor = (
+            _full_tensor_low_peak(tensor) if isinstance(tensor, DTensor) else tensor
+        )
         merged_tensor = _maybe_merge_lora_weight(module_map, name, full_tensor)
 
         adapted_fqn_tensors = _maybe_adapt_tensor_to_hf(model, name, merged_tensor)
