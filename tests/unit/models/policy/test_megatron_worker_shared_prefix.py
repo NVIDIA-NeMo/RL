@@ -301,6 +301,31 @@ def test_shared_prefix_training_rejects_score_centering(
     worker._validate_shared_prefix_loss(loss_fn)
 
 
+@pytest.mark.parametrize(
+    ("mode", "rejected"), [("train", True), ("logprobs", False), ("dense", False)]
+)
+def test_shared_prefix_training_rejects_in_loss_seq_filter(
+    mode: str, rejected: bool
+) -> None:
+    # Shared training units regroup the fetched rows, so the filter's per-row keep
+    # flags cannot be written back. mode=logprobs trains densely.
+    worker = _bare_worker(mode=mode)
+    loss_fn = MagicMock(
+        spec=worker_module.ClippedPGLossFn,
+        input_type=LossInputType.LOGPROB,
+        score_centering=False,
+        requires_survivor_normalization=True,
+    )
+
+    if not rejected:
+        worker._validate_shared_prefix_loss(loss_fn)
+        return
+    with pytest.raises(NotImplementedError, match="seq_logprob_error_in_loss"):
+        worker._validate_shared_prefix_loss(loss_fn)
+    loss_fn.requires_survivor_normalization = False
+    worker._validate_shared_prefix_loss(loss_fn)
+
+
 def test_dense_control_checks_evaluation_mtp_bypass_at_setup() -> None:
     worker = _bare_worker(mode="dense", bypass_evaluation_mtp=True)
     worker.model = torch.nn.Linear(1, 1)

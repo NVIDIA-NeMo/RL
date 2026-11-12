@@ -1572,6 +1572,14 @@ class MegatronPolicyWorkerImpl(
                 "loss_fn.score_centering=true: shared-prefix training units do "
                 "not expose vocabulary logits to the loss"
             )
+        # The in-loss filter reports keep flags in microbatch row order, which
+        # shared-prefix units do not keep, so the write-back would hit other rows.
+        if _uses_in_loss_seq_filter(loss_fn):
+            raise NotImplementedError(
+                "shared-prefix train mode does not support "
+                "loss_fn.seq_logprob_error_in_loss=true: shared-prefix training "
+                "units do not keep the fetched row order"
+            )
 
     def _shared_prefix_bin_capacity(
         self,

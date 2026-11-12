@@ -113,6 +113,7 @@ The `logprobs` and `train` modes also require the following. Policy and single-c
 - `token_capture.enabled: true`.
 - `token_capture.forest_training: false`. Forest training publishes segment rows and execution-padding rows, which are not shared-prefix completions.
 - `loss_fn.score_centering: false` in `train` mode. Shared training units pass already-extracted logprobs to the loss, so it cannot gather the policy logprobs at the sampler's top-k ids. `logprobs` mode trains densely, so this check does not apply there.
+- `loss_fn.seq_logprob_error_in_loss: false` in `train` mode. The in-loss filter writes its per-row keep flags back in microbatch row order, which shared training units do not keep.
 - `async_rl.rollout_failure.max_skipped_prompts: 0` and `max_consecutive_dropped_prompts: 0`, and `token_capture.min_valid_fraction_per_group` unset. A dropped prompt can leave a step that no longer splits into complete data-parallel groups. A drop that no setting controls (a structural finalizer drop, or a shortfall restored from a checkpoint) and that leaves a step target that is not a multiple of the data-parallel size stops the run at the next chunk selection, before another chunk trains. A shortfall that keeps the target aligned closes the step short, as in dense mode.
 - `grpo.num_prompts_per_step` a multiple of the policy data-parallel size, because complete groups are assigned to data-parallel ranks. The controller checks this before the first training chunk.
 - A `TQPolicy`. Other policies raise `NotImplementedError` at construction.

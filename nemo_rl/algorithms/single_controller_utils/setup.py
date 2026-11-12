@@ -1444,6 +1444,20 @@ def setup_single_controller(
                 "do not expose vocabulary logits to the loss. Use mode=logprobs "
                 "or disable score centering"
             )
+        # The in-loss filter writes its keep flags back in microbatch row order,
+        # which shared-prefix training units do not keep.
+        if (
+            master_config.loss_fn.seq_logprob_error_in_loss
+            and get_shared_prefix_training_config(policy_config).enabled_for(
+                stage="train"
+            )
+        ):
+            raise ValueError(
+                "policy.shared_prefix_training.mode=train does not support "
+                "loss_fn.seq_logprob_error_in_loss=true: shared-prefix training "
+                "units do not keep the fetched row order. Use mode=logprobs or "
+                "disable the in-loss filter"
+            )
         # A dropped prompt shrinks its step target (InOrderSampler) to a count
         # that need not split into complete DP groups, and "replace" falls back
         # to shrinking once its spares run out.

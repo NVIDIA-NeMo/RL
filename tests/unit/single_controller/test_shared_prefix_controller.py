@@ -360,6 +360,33 @@ def test_shared_prefix_train_rejects_score_centering_before_allocating_workers(
     patched_factories["_build_clusters"].assert_not_called()
 
 
+def test_shared_prefix_train_rejects_in_loss_seq_filter_before_allocating_workers(
+    patched_factories,  # noqa: F811
+    monkeypatch,
+):
+    # Skip the in-loss filter's own checks, which this partial config does not
+    # populate, so the shared-prefix gate itself is exercised.
+    import nemo_rl.algorithms.single_controller_utils.setup as sc_setup_mod
+    from nemo_rl.algorithms.loss import ClippedPGLossConfig
+
+    monkeypatch.setattr(
+        sc_setup_mod, "validate_single_controller_config", lambda master_config: None
+    )
+    mc = _make_master_config(
+        sampler_cfg=InOrderSamplerConfig(),
+        loss_cfg=ClippedPGLossConfig(seq_logprob_error_in_loss=True),
+    )
+    mc.policy["shared_prefix_training"] = {"mode": "train"}
+    mc.token_capture.enabled = True
+
+    with pytest.raises(
+        ValueError, match="does not support loss_fn.seq_logprob_error_in_loss"
+    ):
+        setup_single_controller(mc, MagicMock(pad_token_id=0))
+
+    patched_factories["_build_clusters"].assert_not_called()
+
+
 def test_shared_prefix_rejects_forest_training_before_allocating_workers(
     patched_factories,  # noqa: F811
     monkeypatch,

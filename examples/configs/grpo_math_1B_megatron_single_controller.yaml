@@ -215,7 +215,8 @@ policy:
   # router_replay disabled, no HybridEP input prepadding, zero
   # async_rl.rollout_failure drop budgets, and num_prompts_per_step a multiple
   # of the policy data-parallel size. Train mode also requires
-  # loss_fn.score_centering=false. At data-parallel size > 1 they require
+  # loss_fn.score_centering=false and loss_fn.seq_logprob_error_in_loss=false.
+  # At data-parallel size > 1 they require
   # pack_groups and align_data_parallel. Unknown keys are rejected.
   # shared_prefix_training:
   #   # disabled | dense (conventional packing, comparison control) |
