@@ -11,7 +11,11 @@ tests/test_suites/llm/grpo-gemma3-1b-it-1n4g-automodel.sh
 tests/test_suites/llm/grpo-qwen2.5-7b-instruct-4n4g-automodel-tp2.v3.sh
 
 # Megatron
+tests/test_suites/llm/grpo-qwen2.5-0.5b-1n4g-megatron-tp2-fp8-per-token-head-quick.sh
 tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n4g-megatron.sh
+# Fused sequence-packing loss with a chunked logprob that writes its grad into
+# the packed logits' storage (policy.megatron_cfg.reuse_logits_storage=true)
+tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n4g-megatron-reuse-logits.sh
 tests/test_suites/llm/grpo-qwen3-1.7b-1n4g-megatron-eagle3.sh
 tests/test_suites/llm/grpo-llama3.2-1b-instruct-1n4g-megatron_generation.sh
 tests/test_suites/llm/grpo-nanov3-30BA3B-4n4g-megatron_generation-noncolocated-async-gym.sh
@@ -32,12 +36,12 @@ tests/test_suites/llm/grpo-qwen3.5-35ba3b-6n4g-async-1off-bf16-trtllm.sh
 # TRT-LLM generation backend
 tests/test_suites/llm/grpo-qwen3-1.7b-2n4g-automodel-trtllm.sh
 tests/test_suites/llm/grpo-qwen2.5-0.5b-1n4g-megatron-trtllm-noncolocated-async.sh
-# The only job that runs TRT-LLM behind NeMo-Gym, and the only one that
-# exercises prefill/decode disaggregation. Uses the SWE pivot single-step
+# The only job that exercises prefill/decode disaggregation. Uses the SWE pivot single-step
 # environment, so it needs no Apptainer or per-instance SIFs.
 tests/test_suites/llm/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1.sh
 
 tests/test_suites/llm/grpo-qwen3.5-35ba3b-4n4g-megatron-trtllm-mxfp8-noncolocated.sh
+tests/test_suites/llm/grpo-qwen3-30ba3b-thinking-swe1-4n4g-megatron-trtllm-noncolocated-gym.sh
 
 # Functional moonlight run
 tests/test_suites/llm/grpo-moonlight-16ba3b-4n4g-megatron.sh

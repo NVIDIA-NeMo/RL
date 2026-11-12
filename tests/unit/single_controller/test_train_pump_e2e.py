@@ -196,7 +196,7 @@ class _FakeGeneration:
     def snapshot_step_metrics(self) -> None:
         pass
 
-    def get_step_metrics(self) -> dict[str, float]:
+    def get_step_metrics(self, *, keep_snapshot: bool = False) -> dict[str, float]:
         return {}
 
     def pause_generation_for_refit(
@@ -347,6 +347,8 @@ def test_train_pump_drives_mcore_training_step(
             ),
             suspend_request_deadlines=lambda: None,
             resume_request_deadlines=lambda: None,
+            drain_step_reward_metrics=lambda _step: {},
+            filter_zero_variance_groups=False,
         )
 
         master_config = MasterConfig.model_construct(

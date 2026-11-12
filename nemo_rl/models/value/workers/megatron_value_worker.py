@@ -60,6 +60,7 @@ from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.models.megatron.common import (
     broadcast_tensor,
+    clear_transient_megatron_caches,
     get_aux_loss_track_names,
     get_moe_metrics,
 )
@@ -92,6 +93,10 @@ from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorke
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
+from nemo_rl.models.value.utils import (
+    gather_and_right_shift_values,
+    right_shift_values,
+)
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
@@ -234,14 +239,7 @@ def _value_loss_prepare_fn(
     # Drop the value head's trailing singleton ([..., 1]).
     if values.ndim > 2 and values.shape[-1] == 1:
         values = values.squeeze(-1)
-    cp_size = (
-        1
-        if context_parallel_group is None
-        else torch.distributed.get_world_size(context_parallel_group)
-    )
-    if cp_size > 1:
-        values = allgather_cp_sharded_tensor(values, context_parallel_group, seq_dim=1)
-    values = torch.cat([torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1)
+    values = gather_and_right_shift_values(values, context_parallel_group)
     values = values[:, : data["returns"].shape[1]]
     return {"logits": values}, data
 
@@ -1080,10 +1078,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                     )
                 else:
                     # [B, S]: shift right by 1 so values[t] = V(state before token t).
-                    values = output_tensor.squeeze(-1)
-                    values = torch.cat(
-                        [torch.zeros_like(values[:, :1]), values[:, :-1]], dim=1
-                    )
+                    values = right_shift_values(output_tensor.squeeze(-1))
                 return torch.tensor(0.0, device=values.device), {"values": values}
 
             return output_tensor, collection_fn
@@ -1335,6 +1330,11 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
             and not self.optimizer_cpu_offload
         ):
             self.move_optimizer("cpu")
+
+        # Same transient caches the policy clears before refit; see
+        # clear_transient_megatron_caches.
+        if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit"):
+            clear_transient_megatron_caches(self.model)
 
         gc.collect()
         torch.cuda.empty_cache()

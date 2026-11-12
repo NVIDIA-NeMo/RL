@@ -45,6 +45,11 @@ on:
         description: Branch for version bump
         required: true
         type: string
+      gh-release-from-tag:
+        description: Tag of previous release for changelog builder
+        required: false
+        type: string
+        default: ""
 
 defaults:
   run:
@@ -60,8 +65,47 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'push' }}
 
 jobs:
+  previous-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.find.outputs.tag }}
+    steps:
+      - name: Checkout release ref
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ inputs.release-ref }}
+          sparse-checkout: nemo_rl/package_info.py
+          persist-credentials: false
+
+      - name: Find previous release tag
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          TAGS=$(gh api --paginate "repos/${{ github.repository }}/tags" --jq '.[].name' \
+            | { grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true; } | sort -V)
+
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            PKG=nemo_rl/package_info.py
+            MAJOR=$(awk -F'= ' '/^MAJOR = /{print $2}' "$PKG")
+            MINOR=$(awk -F'= ' '/^MINOR = /{print $2}' "$PKG")
+            PATCH=$(awk -F'= ' '/^PATCH = /{print $2}' "$PKG")
+            TARGET="v${MAJOR}.${MINOR}.${PATCH}"
+            TAG=$(printf '%s\n%s\n' "$TAGS" "$TARGET" | sed '/^$/d' | sort -V -u \
+              | awk -v t="$TARGET" '$0 == t {print p; exit} {p = $0}')
+            echo "Release target: $TARGET"
+          else
+            TAG=$(printf '%s\n' "$TAGS" | tail -n1)
+          fi
+
+          echo "Previous release tag: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
   release:
-    if: ${{ !cancelled() }}
+    needs: [previous-tag]
+    if: ${{ !cancelled() && needs.previous-tag.result == 'success' }}
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_release_library.yml@d98ebd557712eeff155f3ab8e411abab629f4b0c # v1.6.0
     with:
       release-ref: ${{ inputs.release-ref || github.sha }}
@@ -79,6 +123,8 @@ jobs:
       docs-target-path: nemo/rl
       publish-as-latest: true
       run-on-version-tag-only: ${{ github.ref_name != 'main' }}
+      gh-release-use-changelog-builder: true
+      gh-release-from-tag: ${{ inputs.gh-release-from-tag || needs.previous-tag.outputs.tag }}
       restrict-to-admins: true
     secrets: inherit  # pragma: allowlist secret
 

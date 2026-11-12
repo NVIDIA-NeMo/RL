@@ -19,6 +19,7 @@ import secrets
 import time
 import warnings
 from collections import defaultdict
+from dataclasses import asdict, dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -32,12 +33,14 @@ import numpy as np
 import ray
 from ray.util.placement_group import PlacementGroup
 
+from nemo_rl.data.multimodal_utils import VLLM_PROMPT_KEYS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
 from nemo_rl.distributed.named_sharding import NamedSharding
 from nemo_rl.distributed.ray_actor_environment_registry import get_actor_python_env
 from nemo_rl.distributed.refit_watchdog import RefitAborted
 from nemo_rl.distributed.virtual_cluster import NVLINK_DOMAIN_UNKNOWN, RayVirtualCluster
 from nemo_rl.distributed.worker_groups import RayWorkerBuilder, RayWorkerGroup
+from nemo_rl.models.generation.dynamo.config import dynamo_cfg, dynamo_enabled
 from nemo_rl.models.generation.fleet_health import (
     GenerationFleetHealth,
     HealthyShardSelector,
@@ -47,7 +50,9 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     GenerationOutputSpec,
     agreed_media_columns,
+    verify_right_padding,
 )
+from nemo_rl.models.generation.rollout_result import rollout_result_from_wire
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
@@ -59,6 +64,7 @@ from nemo_rl.models.generation.vllm.draft_utils import (
     draft_module_sharing_disable_required,
 )
 from nemo_rl.models.generation.vllm.metric_names import BATCH_DURATION_KEY
+from nemo_rl.models.generation.vllm.request_pipeline import rollout_output
 from nemo_rl.models.generation.vllm.utils import (
     aggregate_spec_decode_counters,
     assert_reload_refit_config_supported,
@@ -87,6 +93,7 @@ if TYPE_CHECKING:
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
     from nemo_rl.data.captured_media import MediaColumnSpec
     from nemo_rl.data_plane.interfaces import DataPlaneConfig
+    from nemo_rl.models.generation.dynamo.managed_runtime import ManagedDynamoRuntime
 
 logger = logging.getLogger(__name__)
 
@@ -190,12 +197,41 @@ def _record_vllm_generation_metrics(
         warn_once("vllm_inference_metrics", "nemo-lens: failed to record vLLM metrics")
 
 
+@dataclass(frozen=True)
+class _TokenCaptureSetup:
+    """The arguments setup_token_capture fanned out, kept for restart_shard."""
+
+    dp_cfg: "DataPlaneConfig"
+    staging_partition: str
+    capture_media: bool
+    top_logprobs: int
+    generation_prefix_cuts_enabled: bool
+    generation_cut_control_token: str | None
+    generation_cut_control_timeout_s: float | None
+
+
 class VllmGeneration(GenerationInterface):
+    # Dynamo serving (policy.generation.dynamo): __init__ starts etcd, NATS and
+    # the frontend; each engine registers itself once its AsyncLLM runs. Class
+    # defaults, so shutdown() also works when __init__ failed before starting them.
+    _dynamo_runtime: Optional["ManagedDynamoRuntime"] = None
+    dynamo_frontend_url: Optional[str] = None
+
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
         """Reject pure-config vLLM settings the SC entrypoint cannot honor."""
         generation_config = cast(VllmConfig, master_config.policy["generation"])
         assert_reload_refit_config_supported(generation_config)
+        if (
+            dynamo_enabled(generation_config)
+            and master_config.async_rl.generation_fleet_health.enabled
+        ):
+            raise ValueError(
+                "async_rl.generation_fleet_health.enabled=true is not supported "
+                "with policy.generation.dynamo=true yet: the Dynamo frontend "
+                "picks engines itself, and a restarted shard does not register "
+                "with it. Disable fleet health."
+            )
 
     @staticmethod
     def init_cluster_placement_groups(
@@ -281,6 +317,12 @@ class VllmGeneration(GenerationInterface):
         assert self.dp_size % self.vllm_dp_size == 0, (
             f"Data parallel size ({self.dp_size}) must be a multiple of vLLM data parallel size ({self.vllm_dp_size})."
         )
+
+        if dynamo_enabled(self.cfg) and not self.cfg["vllm_cfg"]["async_engine"]:
+            raise ValueError(
+                "policy.generation.dynamo=true serves the async vLLM engine; set "
+                "vllm_cfg.async_engine=true (configure_generation_config does)."
+            )
 
         # Validate sampling parameters early to avoid resource allocation with unsupported configs.
         top_k: int | None = self.cfg["top_k"]
@@ -401,6 +443,10 @@ class VllmGeneration(GenerationInterface):
         # RayWorkerGroup(env_vars=...) below) is inherited by them.
         if draft_module_sharing_disable_required(self.cfg):
             env_vars[DRAFT_DISABLE_MODULE_SHARING_ENV] = "1"
+        if dynamo_enabled(self.cfg):
+            # dynamo._core fixes its log format when the engine first imports it,
+            # before engine_env is applied, so it must be in the actor's env.
+            env_vars["DYN_SDK_DISABLE_ANSI_LOGGING"] = "1"
 
         # Check if we need parallelism-aware worker group creation
         if self.model_parallel_size > 1:
@@ -444,6 +490,15 @@ class VllmGeneration(GenerationInterface):
         # any run that never loses one -- so absence is a real value, not a missing one,
         # and it should not be discovered with getattr at the read site.
         self._refit_membership: Optional["RefitMembership"] = None
+        # What setup_token_capture installed and the weight version last stamped, kept so
+        # restart_shard can give a replacement leader the same capture as the fleet. None
+        # means token capture was never set up.
+        self._token_capture_setup: Optional[_TokenCaptureSetup] = None
+        self._token_capture_media: Optional["MediaColumnSpec"] = None
+        self._rollout_weight_version: Optional[int] = None
+
+        if dynamo_enabled(self.cfg):
+            self._start_dynamo_services()
 
         if defer_model_load:
             # Workers only reserved ports — collect URLs immediately and defer
@@ -459,6 +514,7 @@ class VllmGeneration(GenerationInterface):
             # when the http server is active.
             self.dp_openai_server_base_urls = self._report_dp_openai_server_base_urls()
             self.device_uuids = self._report_device_id()
+            self._register_dynamo_engines()
 
         self._step_metrics_snapshot: dict[str | tuple[str, int], float] | None = None
 
@@ -701,6 +757,68 @@ class VllmGeneration(GenerationInterface):
 
         # Save device UUIDs
         self.device_uuids = self._report_device_id()
+        self._register_dynamo_engines()
+
+    def _start_dynamo_services(self) -> None:
+        """Start the etcd, NATS and frontend this fleet's engines register with."""
+        from nemo_rl.models.generation.dynamo.managed_runtime import (
+            ManagedDynamoRuntime,
+        )
+
+        runtime = ManagedDynamoRuntime(
+            dynamo_cfg=dynamo_cfg(self.cfg),
+            model_name=self.cfg["model_name"],
+            # The workers' venv carries ai-dynamo, so the frontend runs the same
+            # release as every engine.
+            frontend_python=self.worker_group.py_executable,
+        )
+        runtime.start()
+        self._dynamo_runtime = runtime
+        self.dynamo_frontend_url = runtime.frontend_url
+
+    def _register_dynamo_engines(self) -> None:
+        """Serve every shard's engine through Dynamo; wait until it routes to all."""
+        runtime = self._dynamo_runtime
+        if runtime is None:
+            return
+        leader_indices = [
+            self.worker_group.get_dp_leader_worker_idx(shard)
+            for shard in range(self.dp_size)
+        ]
+        ray.get(
+            [
+                self.worker_group.workers[idx].start_dynamo_endpoint_async.remote(
+                    namespace=runtime.namespace,
+                    engine_env=runtime.engine_env,
+                    leader_worker_idx=idx,
+                )
+                for idx in leader_indices
+            ]
+        )
+        runtime.wait_for_engines(
+            self.dp_size, check_engines=self._check_dynamo_endpoints
+        )
+
+    def _check_dynamo_endpoints(self) -> None:
+        """Raise if a DP leader exited or its Dynamo endpoint stopped serving."""
+        leaders = [
+            self.worker_group.workers[self.worker_group.get_dp_leader_worker_idx(shard)]
+            for shard in range(self.dp_size)
+        ]
+        try:
+            errors = ray.get(
+                [leader.dynamo_endpoint_error.remote() for leader in leaders]
+            )
+        except ray.exceptions.RayActorError as error:
+            raise RuntimeError(
+                "A vLLM engine exited while waiting for Dynamo registration."
+            ) from error
+        for shard, error in enumerate(errors):
+            if error is not None:
+                raise RuntimeError(
+                    f"The Dynamo endpoint of generation shard {shard} stopped "
+                    f"serving: {error}"
+                )
 
     def _post_init(self):
         # Choose the appropriate method based on async_engine setting
@@ -722,37 +840,81 @@ class VllmGeneration(GenerationInterface):
         *,
         capture_media: bool = False,
         top_logprobs: int = 0,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
+        generation_cut_control_timeout_s: float | None = None,
     ) -> "Optional[MediaColumnSpec]":
         """Install ledger-authoritative token capture in every DP-leader worker.
 
         Called once at setup when ``token_capture.enabled``; each async worker
         builds its in-worker data-plane client + TQTokenSink and makes the
         single Gym ``install_capture`` call. Returns the media column spec the
-        leaders pinned (``None`` for text-only capture).
+        leaders pinned (``None`` for text-only capture). The arguments are kept
+        so ``restart_shard`` can install the same capture in a replacement.
         ``top_logprobs`` > 0 also stages sampler top-k log-probs.
         """
         assert self.cfg["vllm_cfg"]["async_engine"], (
             "token capture requires the async vLLM engine (the capture host "
             "is the worker's in-process HTTP server)"
         )
+        setup = _TokenCaptureSetup(
+            dp_cfg,
+            staging_partition,
+            capture_media,
+            top_logprobs,
+            generation_prefix_cuts_enabled,
+            generation_cut_control_token,
+            generation_cut_control_timeout_s,
+        )
         futures = self.worker_group.run_all_workers_single_data(
             "setup_token_capture",
-            dp_cfg=dp_cfg,
-            staging_partition=staging_partition,
-            capture_media=capture_media,
-            top_logprobs=top_logprobs,
+            **asdict(setup),
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
-        return agreed_media_columns(ray.get(futures))
+        self._token_capture_media = agreed_media_columns(ray.get(futures))
+        self._token_capture_setup = setup
+        return self._token_capture_media
+
+    def get_data_plane_snapshots(self) -> list[dict[str, Any]]:
+        """Capture-client counters from every DP-leader worker that has one."""
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_data_plane_snapshot",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        return [s for s in ray.get(futures) if s]
 
     def set_rollout_weight_version(self, version: int) -> None:
-        """Rotate the weight version workers stamp on captured model calls."""
-        futures = self.worker_group.run_all_workers_single_data(
-            "set_rollout_weight_version",
-            version=version,
-            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
-        )
-        ray.get(futures)
+        """Rotate the weight version refit members stamp on captured model calls.
+
+        Addresses the refit members, not the whole worker group. A dead shard's actor
+        cannot answer, and a replacement that is still restarting is not built yet;
+        walking every worker would raise on the first and wait on the second. A
+        replacement gets the current version from restart_shard and every later one
+        here, once it rejoins the refit.
+        """
+        self._rollout_weight_version = version
+        leaders = self._refit_leaders_by_shard()
+        if self.fleet_monitor is not None:
+            # The membership is the last reconcile's, but the handles are live: a shard
+            # condemned since then may already hold a replacement that is still loading.
+            # A shard is absent before its handle is swapped and until restart_shard
+            # returns, and restart_shard stamps the replacement itself, so reading the
+            # absent set after the snapshot never addresses a replacement mid-build.
+            absent = set(self.fleet_monitor.absent_shards())
+            leaders = [leader for leader in leaders if leader[0] not in absent]
+        futures = [
+            worker.set_rollout_weight_version.remote(version=version)
+            for _, _, worker in leaders
+        ]
+        for (shard_idx, leader_idx, worker), future in zip(leaders, futures):
+            try:
+                ray.get(future)
+            except ray.exceptions.ActorDiedError as exc:
+                if self.fleet_monitor is None:
+                    raise
+                # A late error from an old actor must not condemn its replacement.
+                if self.worker_group.workers[leader_idx] is worker:
+                    self.fleet_monitor.record_actor_death(shard_idx, error=str(exc))
 
     def _get_raw_spec_counters(self) -> dict[str | tuple[str, int], float]:
         """Collect raw spec decode counters from workers."""
@@ -795,21 +957,25 @@ class VllmGeneration(GenerationInterface):
             )
             self._step_metrics_snapshot = None
 
-    def get_step_metrics(self) -> dict[str, float]:
-        """Get the vLLM engine metrics delta since snapshot_step_metrics().
+    def get_step_metrics(self, *, keep_snapshot: bool = False) -> dict[str, float]:
+        """Get vLLM engine metric deltas for the current window.
 
         Covers the speculative-decoding family plus the engine's token,
         sequence-length and request-outcome series, all derived from the same
         pair of snapshots so the wider coverage costs no extra RPC.
 
+        Args:
+            keep_snapshot: Retain the end counters for the next window. A missing
+                baseline is initialized without emitting deltas.
+
         Returns:
             Dictionary of delta metrics with 'vllm/' prefix.
-            Returns empty dict if snapshot_step_metrics() was not called.
+            Returns empty dict when no baseline is available.
 
         Raises:
-            RuntimeWarning: If called without snapshot_step_metrics() first.
+            RuntimeWarning: If no baseline is available and keep_snapshot is false.
         """
-        if self._step_metrics_snapshot is None:
+        if self._step_metrics_snapshot is None and not keep_snapshot:
             warnings.warn(
                 "get_step_metrics() called without snapshot_step_metrics(). "
                 "Call snapshot_step_metrics() before generation to track metrics.",
@@ -826,10 +992,15 @@ class VllmGeneration(GenerationInterface):
         # vLLM rename must cost observability rather than the run.
         try:
             counters_end = self._get_raw_spec_counters()
+            if counters_start is None:
+                self._step_metrics_snapshot = counters_end
+                return {}
             step_metrics = compute_spec_decode_metrics(counters_start, counters_end)
             step_metrics.update(
                 compute_engine_step_metrics(counters_start, counters_end)
             )
+            if keep_snapshot:
+                self._step_metrics_snapshot = counters_end
         except ray.exceptions.RayActorError:
             # See snapshot_step_metrics: the caller handles a dead actor.
             raise
@@ -906,7 +1077,10 @@ class VllmGeneration(GenerationInterface):
 
         Mirrors the startup sequence (`create workers -> load_model -> post_init ->
         report URL`) rather than inventing a shorter one, because anything the deferred-
-        load path does at startup is equally required for a replacement.
+        load path does at startup is equally required for a replacement. It also
+        installs the token capture that setup adds after startup (setup_token_capture
+        and the current weight version), before the URL is returned, so a replacement
+        is never published without it.
 
         Returns:
             The replacement's OpenAI base URL, or None for a sync engine that exposes no
@@ -951,6 +1125,31 @@ class VllmGeneration(GenerationInterface):
             "post_init_async" if self.cfg["vllm_cfg"]["async_engine"] else "post_init"
         )
         ray.get(getattr(leader, method_name).remote())
+
+        # setup_token_capture runs once, at setup, so a recreated leader starts with
+        # capture dormant: it would serve calls without staging them. Install the same
+        # capture the fleet has, and its current weight version, before the URL is
+        # published.
+        if self._token_capture_setup is not None:
+            media = ray.get(
+                leader.setup_token_capture.remote(**asdict(self._token_capture_setup))
+            )
+            if media != self._token_capture_media:
+                raise RuntimeError(
+                    f"restarted shard {shard_idx} pinned media column spec {media}, "
+                    f"but the fleet pinned {self._token_capture_media}"
+                )
+            if self._rollout_weight_version is not None:
+                ray.get(
+                    leader.set_rollout_weight_version.remote(
+                        version=self._rollout_weight_version
+                    )
+                )
+            print(
+                f"  restart_shard: shard {shard_idx} token capture reinstalled "
+                f"(weight version {self._rollout_weight_version})",
+                flush=True,
+            )
 
         if not self.cfg["vllm_cfg"]["async_engine"]:
             return None
@@ -1401,10 +1600,67 @@ class VllmGeneration(GenerationInterface):
                 return False  # Return False for empty case to trigger early return
             return True
 
+        if self._dynamo_serves(data):
+            if validate_generate_data(data):
+                yield await self._generate_through_dynamo(data, greedy)
+            return
         async for result in self._async_generate_base(
             data, "generate_async", validate_generate_data, greedy
         ):
             yield result
+
+    def _dynamo_serves(self, data: BatchedDataDict[GenerationDatumSpec]) -> bool:
+        """Whether a rollout goes through the Dynamo frontend's KV-aware router.
+
+        Media-backed prompts keep this class's own dispatch: the engine does not
+        yet take them through the frontend.
+        """
+        return self.dynamo_frontend_url is not None and not (
+            VLLM_PROMPT_KEYS & data.keys()
+        )
+
+    async def _generate_through_dynamo(
+        self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool
+    ) -> tuple[int, BatchedDataDict[GenerationOutputSpec]]:
+        """One rollout through the frontend, sampled by the engine as natively."""
+        # Local import: nemo_rl.experience pulls the rollout stack, which must not
+        # become a load-time dependency of the generation backend.
+        from nemo_rl.experience.failures import GenerationUnavailable
+        from nemo_rl.models.generation.dynamo.rollout_client import (
+            post_rollout,
+            rollout_payload,
+        )
+
+        assert data.size == 1, (
+            "generate_async is restricted to handle only single samples, "
+            f"but received batch_size={data.size}. Please handle batching "
+            "outside this method."
+        )
+        verify_right_padding(data, pad_value=self.cfg["_pad_token_id"])
+        input_length = int(data["input_lengths"][0].item())
+        input_ids = data["input_ids"][0]
+        stop_strings = data.get("stop_strings", [None])[0]
+        payload = rollout_payload(
+            model_name=self.cfg["model_name"],
+            prompt_token_ids=input_ids[:input_length].tolist(),
+            max_model_len=int(self.cfg["vllm_cfg"]["max_model_len"]),
+            greedy=greedy,
+            stop_strings=stop_strings,
+        )
+        url = f"{self.dynamo_frontend_url}/completions"
+        try:
+            engine_data = await post_rollout(
+                url, payload, dynamo_cfg(self.cfg).request_timeout_s
+            )
+        except RuntimeError as error:
+            raise GenerationUnavailable(str(error)) from error
+        output = rollout_output(
+            rollout_result_from_wire(engine_data["rollout"]),
+            input_ids=input_ids,
+            input_length=input_length,
+        )
+        output["gen_leader_worker_idx"] = [int(engine_data["gen_leader_worker_idx"])]
+        return 0, output
 
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Wake workers up for colocated inference."""
@@ -1470,6 +1726,21 @@ class VllmGeneration(GenerationInterface):
         except Exception as e:
             print(f"Error during policy shutdown: {e}")
             return False
+        finally:
+            # After the engines: they leave discovery as their processes exit.
+            if self._dynamo_runtime is not None:
+                self._dynamo_runtime.shutdown()
+                self._dynamo_runtime = None
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Leave the driver-owned Dynamo services behind when shipped to an actor.
+
+        Rollout actors receive this object; a copy keeps the frontend URL and the
+        worker handles, but the service processes stay with the driver.
+        """
+        state = self.__dict__.copy()
+        state["_dynamo_runtime"] = None
+        return state
 
     def prepare_refit_info(
         self, state_dict_info: Optional[dict[str, Any]]
@@ -1832,6 +2103,22 @@ class VllmGeneration(GenerationInterface):
             raise RuntimeError("Failed to pause every async vLLM engine")
         return True
 
+    def captured_call_progress(
+        self, *, timeout_s: Optional[float] = None
+    ) -> list[dict[str, Any]]:
+        """Collect each paused engine's running captured calls and their lengths."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            return []
+        futures = [
+            worker.captured_call_progress.remote()
+            for worker in self._refit_leader_workers()
+        ]
+        return [
+            progress
+            for progress in ray.get(futures, timeout=timeout_s)
+            if progress is not None
+        ]
+
     def resume_generation_after_refit(
         self, *, timeout_s: Optional[float] = None
     ) -> bool:
@@ -1865,6 +2152,41 @@ class VllmGeneration(GenerationInterface):
         if self.fleet_monitor is not None:
             self.fleet_monitor.raise_if_exhausted()
         return True
+
+    def flush_obsolete_generation_cut_rows(
+        self, epoch: int, *, timeout_s: Optional[float] = None
+    ) -> bool:
+        """Delete chunk rows of calls that ended before snapshot ``epoch``."""
+        if not self.cfg["vllm_cfg"]["async_engine"]:
+            raise RuntimeError(
+                "flush_obsolete_generation_cut_rows requires async_engine=True"
+            )
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "flush_obsolete_generation_cut_rows_async",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+            epoch=epoch,
+        )
+        if not all(ray.get(futures, timeout=timeout_s)):
+            raise RuntimeError(
+                "flush_obsolete_generation_cut_rows failed on an async vLLM engine"
+            )
+        return True
+
+    def get_generation_prefix_counts(self) -> dict[str, int]:
+        """Sum over workers of generation-prefix restore and cut counts."""
+        if not self.worker_group or not self.worker_group.workers:
+            raise RuntimeError("Worker group is not initialized")
+        futures = self.worker_group.run_all_workers_single_data(
+            "get_generation_prefix_counts",
+            run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+        )
+        totals: dict[str, int] = {}
+        for counts in ray.get(futures):
+            for name, value in counts.items():
+                totals[name] = totals.get(name, 0) + value
+        return totals
 
     @property
     def requires_kv_scale_sync(self) -> bool:

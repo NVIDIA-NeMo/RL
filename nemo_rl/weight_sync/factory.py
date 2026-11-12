@@ -27,7 +27,6 @@ topology (colocated vs. non-colocated) and the generation backend:
 from typing import Any, Optional
 
 from nemo_rl.models.generation.constants import (
-    DYNAMO_BACKEND,
     MEGATRON_BACKEND,
     SGLANG_BACKEND,
     TRTLLM_BACKEND,
@@ -92,7 +91,7 @@ def create_weight_synchronizer(
         policy: Policy object (ColocatablePolicyInterface).
         generation: Generation object (GenerationInterface).
         generation_backend: Name of the generation backend ("vllm", "sglang",
-            "megatron", or "dynamo").
+            "megatron", or "trtllm").
         colocated: Whether policy and generation share the same GPUs.
         train_cluster: RayVirtualCluster for training workers. Required for
             non-colocated deployments except SGLang, which owns its own group.
@@ -114,7 +113,6 @@ def create_weight_synchronizer(
         VLLM_BACKEND,
         SGLANG_BACKEND,
         MEGATRON_BACKEND,
-        DYNAMO_BACKEND,
         TRTLLM_BACKEND,
     }
     if generation_backend not in _SUPPORTED_BACKENDS:
