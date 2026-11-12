@@ -303,12 +303,11 @@ def test_dockerfile_prunes_the_seed_before_any_sync() -> None:
     assert run_start < restore < venv < prune < first_sync < run_end
     assert persist < run_end
 
-    # Dynamo installs with a throwaway cache, so its RUN needs no shared cache mount.
+    # Dynamo's install only downloads etcd and nats-server, so its RUN needs no
+    # shared cache mount.
     dynamo = next(i for i, l in code if "docker/dynamo/install.sh" in l and "bash" in l)
     dynamo_run = max(i for i, l in code if i < dynamo and l.startswith("RUN"))
     assert "uv-cache" not in "\n".join(lines[dynamo_run:dynamo])
-    assert lines[dynamo].startswith("UV_CACHE_DIR=/tmp/")
-    assert lines[dynamo + 1].startswith("rm -rf /tmp/")
 
 
 @pytest.mark.parametrize("suffix", [".http", ".msgpack", ".lock", ".rev"])
