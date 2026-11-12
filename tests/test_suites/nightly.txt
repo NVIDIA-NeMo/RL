@@ -238,6 +238,7 @@ tests/test_suites/llm/dapo-llama3.1-8b-instruct-2n8g-ready-first-single-controll
 # (Qwen2.5-1.5B, OpenMathReasoning through NeMo-Gym); gate on finalizer health.
 tests/test_suites/llm/dapo-qwen2.5-1.5b-instruct-1n8g-windowed-single-controller-token_capture.sh
 tests/test_suites/llm/dapo-qwen2.5-1.5b-instruct-1n8g-ready-first-single-controller-token_capture.sh
+tests/test_suites/llm/ppo-qwen2.5-1.5b-math-3n8g-megatron-dedicated-value.sh
 
 #############
 # Diffusion #

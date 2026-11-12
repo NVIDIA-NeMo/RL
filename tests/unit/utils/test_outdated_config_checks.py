@@ -20,6 +20,20 @@ import pytest
 from nemo_rl.utils.outdated_config_checks import check_outdated_config
 
 
+@pytest.mark.parametrize("dedicated", [True, False])
+def test_outdated_value_resources_dedicated_is_rejected(dedicated):
+    with pytest.raises(ValueError, match="move it to value.dedicated"):
+        check_outdated_config({"value": {"resources": {"dedicated": dedicated}}})
+
+
+@pytest.mark.parametrize(
+    "config",
+    [{}, {"value": {}}, {"value": {"dedicated": True, "resources": {"num_nodes": 1}}}],
+)
+def test_value_dedicated_new_location_is_accepted(config):
+    check_outdated_config(config)
+
+
 @pytest.mark.parametrize("value", [True, False, None])
 @pytest.mark.parametrize("new_key", [{}, {"forest_training": True}])
 def test_context_compaction_key_requires_explicit_migration(value, new_key):

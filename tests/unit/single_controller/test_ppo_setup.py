@@ -255,6 +255,7 @@ class TestPPOValidation:
             ("policy_backend", "policy.megatron_cfg.enabled=true"),
             ("colocated", "colocated.enabled=false"),
             ("missing_value_nodes", "value.resources.num_nodes >= 1"),
+            ("missing_resources", "value.resources.num_nodes >= 1"),
             ("partial_generation_node", "generation to use full nodes"),
             ("no_policy_node", "at least one full policy node"),
         ],
@@ -269,7 +270,8 @@ class TestPPOValidation:
             "gpus_per_node": 8,
             "num_nodes": 1,
         }
-        mc.value["resources"] = ValueResourcesConfig(dedicated=True, num_nodes=1)
+        mc.value["dedicated"] = True
+        mc.value["resources"] = ValueResourcesConfig(num_nodes=1)
 
         if invalid_setting == "policy_backend":
             mc.policy["megatron_cfg"]["enabled"] = False
@@ -277,6 +279,8 @@ class TestPPOValidation:
             mc.policy["generation"]["colocated"]["enabled"] = True
         elif invalid_setting == "missing_value_nodes":
             mc.value["resources"].num_nodes = None
+        elif invalid_setting == "missing_resources":
+            del mc.value["resources"]
         elif invalid_setting == "partial_generation_node":
             mc.policy["generation"]["colocated"]["resources"]["gpus_per_node"] = 4
         else:
@@ -1206,7 +1210,8 @@ class TestSetupBuildsTheCritic:
             "gpus_per_node": 8,
             "num_nodes": 1,
         }
-        mc.value["resources"] = ValueResourcesConfig(dedicated=True, num_nodes=1)
+        mc.value["dedicated"] = True
+        mc.value["resources"] = ValueResourcesConfig(num_nodes=1)
         train_cluster = MagicMock(name="train_cluster")
         inference_cluster = MagicMock(name="inference_cluster")
         value_cluster = MagicMock(name="value_cluster")
@@ -1422,9 +1427,8 @@ class TestTrainClusterSizesForTheCritic:
             "gpus_per_node": 8,
             "num_nodes": 1,
         }
-        master_config.value["resources"] = ValueResourcesConfig(
-            dedicated=True, num_nodes=2
-        )
+        master_config.value["dedicated"] = True
+        master_config.value["resources"] = ValueResourcesConfig(num_nodes=2)
 
         train, inference, value, _ = sc_setup_mod._build_clusters(master_config)
 
