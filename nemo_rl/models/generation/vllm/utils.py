@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import is_dataclass, replace
 from typing import Any, Optional, cast
 
@@ -32,6 +32,7 @@ from nemo_rl.models.generation.interfaces import (
 from nemo_rl.models.generation.openai_server_utils import PrefixSplice
 from nemo_rl.models.generation.score_centering import (
     VLLM_LOGPROB_FLOOR,
+    extract_flat_score_centering_samples,
     extract_score_centering_samples,
 )
 from nemo_rl.models.generation.vllm.config import VllmConfig
@@ -65,6 +66,105 @@ R3_MISSING_ROUTE_SENTINEL = ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL
 # The expert-id range vs carry dtype is model-constant, so it is verified on the
 # first non-empty routed-experts tensor per process and skipped afterwards.
 G_ROUTED_EXPERTS_RANGE_CHECKED = False
+
+
+def extract_generation_logprobs(
+    token_ids: Sequence[int], logprobs: Any, *, start: int, where: str = ""
+) -> list[float]:
+    """Read the sampled log probabilities of the generated tokens from ``start`` on.
+
+    ``logprobs`` may be vLLM's live, append-only container. Only the positions
+    of ``token_ids`` are read, which the caller must have seen published (under
+    vLLM's output lock, or in a finished output). ``FlatLogprobs`` (vLLM's
+    ``flat_logprobs``) is read through its arrays, without building a mapping
+    per position.
+
+    Args:
+        token_ids: The generated token IDs at positions ``start`` onward.
+        logprobs: vLLM's per-position logprobs for the whole generation, or
+            None if vLLM sent none.
+        start: Generated position of ``token_ids[0]``.
+        where: Context prepended to the token in a missing-token error.
+
+    Returns:
+        The sampled token's log probability at each of those positions.
+    """
+    if not token_ids:
+        return []
+    if logprobs is None:
+        raise RuntimeError(
+            "vLLM generation output with token IDs did not include logprobs"
+        )
+    end = start + len(token_ids)
+    flat = _flat_logprob_arrays(logprobs)
+    published = len(logprobs) if flat is None else min(len(flat[0]), len(flat[1]))
+    if published < end:
+        raise RuntimeError(
+            "vLLM returned mismatched generation token IDs and log probabilities: "
+            f"token_count={end}, logprob_count={published}"
+        )
+    if flat is not None:
+        return _select_flat_logprobs(token_ids, flat, start=start, where=where)
+    selected_logprobs: list[float] = []
+    for position, token_id in enumerate(token_ids, start):
+        selected = logprobs[position].get(token_id)
+        if selected is None:
+            raise RuntimeError(
+                "vLLM generation log probabilities did not include the selected "
+                f"token: {where}token_id={token_id}"
+            )
+        selected_logprobs.append(max(float(selected.logprob), VLLM_LOGPROB_FLOOR))
+    return selected_logprobs
+
+
+def _flat_logprob_arrays(
+    logprobs: Any,
+) -> tuple[list[int], list[int], list[int], list[float]] | None:
+    """Return vLLM ``FlatLogprobs``' arrays, or ``None`` for per-position mappings.
+
+    Indexing a ``FlatLogprobs`` position builds a dict of ``Logprob`` objects,
+    one per stored candidate; reading the arrays builds none.
+    """
+    starts = getattr(logprobs, "start_indices", None)
+    ends = getattr(logprobs, "end_indices", None)
+    candidate_ids = getattr(logprobs, "token_ids", None)
+    values = getattr(logprobs, "logprobs", None)
+    if (
+        isinstance(starts, list)
+        and isinstance(ends, list)
+        and isinstance(candidate_ids, list)
+        and isinstance(values, list)
+    ):
+        return starts, ends, candidate_ids, values
+    return None
+
+
+def _select_flat_logprobs(
+    token_ids: Sequence[int],
+    flat: tuple[list[int], list[int], list[int], list[float]],
+    *,
+    start: int,
+    where: str = "",
+) -> list[float]:
+    """Read each sampled token's log probability straight from flat arrays.
+
+    vLLM's sampler writes the sampled token first at each position, then its
+    top-k (the layout ``extract_flat_score_centering_samples`` also checks), so
+    the sampled log probability is the slot at ``start_indices[p]``.
+    """
+    starts, _, candidate_ids, values = flat
+    selected_logprobs: list[float] = []
+    for position, token_id in enumerate(token_ids, start):
+        index = starts[position]
+        if candidate_ids[index] != token_id:
+            raise RuntimeError(
+                "vLLM generation log probabilities did not include the selected "
+                f"token first: {where}token_id={token_id}"
+            )
+        selected_logprobs.append(max(float(values[index]), VLLM_LOGPROB_FLOOR))
+    return selected_logprobs
+
+
 _GROUPED_MOE_EXPERT_WEIGHT_SUFFIXES = (
     "mlp.experts.gate_up_proj",
     "mlp.experts.down_proj",
@@ -308,7 +408,8 @@ def _as_routed_experts_tensor(
     global G_ROUTED_EXPERTS_RANGE_CHECKED
     tensor = torch.as_tensor(value, device=device)
     if not G_ROUTED_EXPERTS_RANGE_CHECKED and tensor.numel() > 0:
-        max_id = int(tensor.max())
+        # Widen uint16 expert IDs because torch.max does not support narrow unsigned dtypes.
+        max_id = int(tensor.to(torch.int64).max())
         limit = torch.iinfo(dtype).max
         if max_id > limit:
             raise ValueError(
@@ -327,7 +428,7 @@ def check_sampling_param(
     top_p: Optional[float],
     top_k: Optional[int],
     generation_config: Any,
-) -> None:
+) -> int:
     """Reject an HTTP rollout request that would sample off-policy.
 
     Request sampling must match NeMo RL's exactly, or inference runs off-policy and
@@ -339,23 +440,20 @@ def check_sampling_param(
     Args:
         temperature: The request's temperature.
         top_p: The request's top_p. It must be explicit: vLLM resolves an unset top_p
-            from the model's generation_config.json (``ModelConfig.generation_config``
-            defaults to ``"auto"``), not necessarily 1.0.
-        top_k: The request's top_k, which must be unset or -1 (disabled), matching
-            ``BaseVllmGenerationWorker._build_sampling_params``. vLLM resolves an
-            unset top_k from generation_config.json too, so None means on-policy only
-            once the caller sends the request with top_k=-1.
+            from the model's generation_config.json, not necessarily 1.0.
+        top_k: The request's top_k, which must be unset or equal the matched
+            profile's top_k (``top_k`` or ``val_top_k``; -1 when that is None).
         generation_config: ``policy.generation``, with the train and validation
             sampling parameters.
 
+    Returns:
+        The top_k to serve the request with: the matched profile's, as
+        ``BaseVllmGenerationWorker._build_sampling_params`` sets it (-1 disables).
+
     Raises:
-        ValueError: The request's top_k is set, its top_p is unset, or its
-            temperature and top_p match neither sampling profile.
+        ValueError: The request's top_p is unset, its temperature and top_p match
+            neither sampling profile, or its top_k differs from the profile's.
     """
-    if top_k not in (None, -1):
-        raise ValueError(
-            f"Top k sampling parameter must be unset, empty, or -1. Got `{top_k}`"
-        )
     if top_p is None:
         raise ValueError(
             "top_p must be set explicitly on NeMo-RL requests; an unset top_p is "
@@ -370,15 +468,25 @@ def check_sampling_param(
         temperature == generation_config["val_temperature"]
         and top_p == generation_config["val_top_p"]
     )
-    if is_train_sampling or is_val_sampling:
-        return
-    raise ValueError(
-        f"request sampling (temperature={temperature}, top_p={top_p}) matches neither "
-        f"the train sampling params (temperature={generation_config['temperature']}, "
-        f"top_p={generation_config['top_p']}) nor the validation sampling params "
-        f"(val_temperature={generation_config['val_temperature']}, "
-        f"val_top_p={generation_config['val_top_p']})"
-    )
+    if not (is_train_sampling or is_val_sampling):
+        raise ValueError(
+            f"request sampling (temperature={temperature}, top_p={top_p}) matches "
+            "neither the train sampling params "
+            f"(temperature={generation_config['temperature']}, "
+            f"top_p={generation_config['top_p']}) nor the validation sampling params "
+            f"(val_temperature={generation_config['val_temperature']}, "
+            f"val_top_p={generation_config['val_top_p']})"
+        )
+    # Train wins a tie: grpo.setup() rejects a val_top_k that differs from top_k
+    # when the two profiles share temperature and top_p.
+    profile_top_k = generation_config["top_k" if is_train_sampling else "val_top_k"]
+    profile_top_k = -1 if profile_top_k is None else profile_top_k
+    if top_k not in (None, profile_top_k):
+        raise ValueError(
+            f"request top_k={top_k} must be unset or match the configured top_k "
+            f"({profile_top_k})"
+        )
+    return profile_top_k
 
 
 def validate_rollout_prompt(expected: list[int], actual: list[int] | None) -> None:
@@ -752,22 +860,12 @@ def chat_generation_tokens(generation_details: Any) -> tuple[list[int], list[flo
             f"token_count={len(generation_token_ids)}, "
             f"logprob_count={len(generation_logprob_details)}."
         )
-    generation_log_probs = []
-    for token_id, position_logprobs in zip(
-        generation_token_ids, generation_logprob_details
-    ):
-        selected_token_logprob = position_logprobs.get(token_id)
-        if selected_token_logprob is None:
-            raise RuntimeError(
-                "vLLM generation log probabilities did not include the "
-                "selected token while attaching token information to "
-                "the OpenAI-compatible chat response: "
-                f"choice_idx={choice_index}, token_id={token_id}."
-            )
-        generation_log_probs.append(
-            max(float(selected_token_logprob.logprob), VLLM_LOGPROB_FLOOR)
-        )
-    return generation_token_ids, generation_log_probs
+    return generation_token_ids, extract_generation_logprobs(
+        generation_token_ids,
+        generation_logprob_details,
+        start=0,
+        where=f"choice_idx={choice_index}, ",
+    )
 
 
 def attach_sampler_topk_logprobs_to_chat_response_choices(
@@ -789,12 +887,18 @@ def attach_sampler_topk_logprobs_to_chat_response_choices(
         output.index: output for output in getattr(final_request_output, "outputs", [])
     }
     for choice in getattr(response, "choices", []):
+        output = outputs_by_index[choice.index]
+        # vLLM stores sample logprobs as a list of per-position dicts, or as
+        # FlatLogprobs when the request set flat_logprobs.
+        extract = (
+            extract_score_centering_samples
+            if output.logprobs is None or isinstance(output.logprobs, list)
+            else extract_flat_score_centering_samples
+        )
         (
             choice.message.sampler_topk_token_ids,
             choice.message.sampler_topk_logprobs,
-        ) = extract_score_centering_samples(
-            outputs_by_index[choice.index], num_candidates=top_k
-        )
+        ) = extract(output, num_candidates=top_k)
 
     return response
 

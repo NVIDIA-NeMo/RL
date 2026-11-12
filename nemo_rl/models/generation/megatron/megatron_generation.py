@@ -563,8 +563,10 @@ class MegatronGeneration(GenerationInterface):
         pp_size: int,
         train_ranks_per_stage: int,
         sub_world_size: int,
+        layout_index: int = 0,
     ) -> list[ray.ObjectRef]:
         """Build bulk communicators over the selected Megatron ranks."""
+        assert layout_index == 0, "Megatron generation has a single reshard layout"
         return [
             worker.init_nccl_reshard_comm_groups_generation.remote(
                 pp_ips=pp_ips,
@@ -577,8 +579,12 @@ class MegatronGeneration(GenerationInterface):
             for worker, rank, _original_rank in self._refit_ranked_workers(membership)
         ]
 
-    def prepare_nccl_reshard_refit_info(self, refit_info: dict[str, Any]) -> None:
+    def prepare_nccl_reshard_refit_info(
+        self, refit_infos: list[dict[str, Any]]
+    ) -> None:
         """Build each inference worker's HF-to-Megatron M-to-N receive map."""
+        assert len(refit_infos) == 1, "Megatron generation has a single reshard layout"
+        refit_info = refit_infos[0]
         futures = [
             worker.prepare_nccl_reshard_refit_info.remote(refit_info=refit_info)
             for worker, _rank, _original_rank in self._refit_ranked_workers()
@@ -680,6 +686,9 @@ class MegatronGeneration(GenerationInterface):
         *,
         capture_media: bool = False,
         top_logprobs: int = 0,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
+        generation_cut_control_timeout_s: float | None = None,
     ) -> "Optional[MediaColumnSpec]":
         """Install MInf's canonical prompt and completion capture hooks.
 
@@ -689,6 +698,10 @@ class MegatronGeneration(GenerationInterface):
         if top_logprobs != 0:
             raise NotImplementedError(
                 "Megatron generation does not capture sampler top-k"
+            )
+        if generation_prefix_cuts_enabled:
+            raise NotImplementedError(
+                "generation-prefix recovery is not implemented for Megatron inference"
             )
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
             raise ValueError(
