@@ -106,6 +106,10 @@ native server's steps, with the native server's code:
 both paths and checks they run the same prompt and `SamplingParams`, stage the
 same record and return the same reply.
 
+Both paths refuse, with HTTP 400 and before anything runs, a call that streams
+(`stream: true`), asks for more than one choice (`n`), or sets `logprobs`
+without `top_logprobs`. NeMo-Gym sends none of these.
+
 Where the behavior differs from the native endpoint:
 
 - The frontend refuses more than 32 `stop` strings, and vLLM request fields its
@@ -129,8 +133,9 @@ Two things differ from the native endpoint:
   which is the frontend, but the calls run in the engines. The frontend process
   takes the cut on a port of its own, from the same range as etcd and NATS, and
   sends it to every engine over Dynamo's request plane; each engine cuts the
-  calls it holds. Setup tells Gym the port (`generation_cut_control_url` in
-  Gym's `vllm_model` config). The port is needed until a Dynamo frontend route
+  calls it holds, up to the frontend's deadline
+  (`token_capture.control_timeout_s` from the cut's arrival there). Setup tells
+  Gym the port (`generation_cut_control_url` in Gym's `vllm_model` config). The port is needed until a Dynamo frontend route
   can take a POST
   ([ai-dynamo/dynamo#18486](https://github.com/ai-dynamo/dynamo/issues/18486)).
 - **What the router sees for a resumed call.** The engine replaces the prompt

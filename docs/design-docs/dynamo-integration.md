@@ -109,8 +109,9 @@ one event loop, so it runs in the pool, first in first out. Per call:
 
 1. the pool renders it with the native server's render step
    (`_render_chat_call`, shared with `vllm/chat_server.py`), including the
-   token-capture decision for a Gym candidate and the history render the
-   splice cuts against;
+   token-capture decision for a Gym candidate, the history render the
+   splice cuts against, and `reasoning_ended`, read from the template's
+   render and never from a spliced prompt;
 2. the chat engine checks on-policy sampling (`on_policy_sampling`, shared
    with the native route), reads a token-in prefix from TQ through a read-only
    client, splices it in with the model's turn-end tokens, and clamps the
@@ -120,6 +121,11 @@ one event loop, so it runs in the pool, first in first out. Per call:
    runs the native server's `start_capture` and `save_capture`;
 4. the pool builds the reply with vLLM's own response builder and parsers,
    through the same reply fixes for restored calls as the native server.
+
+A call that is refused or fails is answered through one map on both paths
+(`error_reply` in `vllm/prompt_and_capture.py`): the status, the error body,
+the reason its capture is failed with, and whether Gym is told the capture
+call was refused before it was staged.
 
 `GymCallExtras` and `GymCallResult` (`models/generation/gym_call.py`) define
 the fields both paths exchange with Gym. `tests/unit/models/generation/test_gym_chat_path.py`
@@ -142,10 +148,13 @@ native server's code:
   every engine with `Client.direct`; the adapter's `nemo_rl:generation_cut`
   handler runs the worker's own cut and answers with the calls it cut; and
   the answers are merged into the one receipt Gym expects. A call no engine
-  cut gets Gym's failure ack and regenerates after a restore.
+  cut gets Gym's failure ack and regenerates after a restore. The frontend
+  takes one deadline when the cut arrives and sends it along, so an engine
+  stops cutting in time for its answer to reach the frontend; an engine
+  that timed the cut itself would start later and answer too late.
 - **The resume.** The frontend renders and routes a re-sent call like any
   other. The adapter then runs the steps the native server runs
-  (`resolve_restored_call` and its helpers in `vllm/chat_server.py`): it
+  (`start_capture` in `vllm/prompt_and_capture.py`): it
   reads and checks the saved rows, replaces the prompt with them, lowers the
   output budget, and begins capture with the cut. A cut it cannot use (rows
   gone, or newer than its weights) is dropped, and the frontend's prompt
