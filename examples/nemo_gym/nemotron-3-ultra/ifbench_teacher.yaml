@@ -391,6 +391,7 @@ env:
   nemo_gym:
     abstention_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -412,6 +413,7 @@ env:
             name: genrm_simple_agent_reasoning_off
     instruction_following_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -419,6 +421,7 @@ env:
             name: instruction_following_simple_agent
     inverse_if_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -426,6 +429,7 @@ env:
             name: inverse_if_simple_agent
     multichallenge_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
