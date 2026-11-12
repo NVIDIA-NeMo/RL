@@ -17,8 +17,12 @@ import math
 import pytest
 import torch
 
+from nemo_rl.algorithms.grpo import compute_and_apply_seq_logprob_error_masking
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
-from nemo_rl.algorithms.loss.interfaces import MetricNormalizer
+from nemo_rl.algorithms.loss.interfaces import (
+    SEQ_LOGPROB_KEEP_MASK_KEY,
+    MetricNormalizer,
+)
 from nemo_rl.algorithms.loss.utils import (
     rescale_loss_metrics,
     skips_policy_logprob_pass,
@@ -122,6 +126,7 @@ def test_accumulated_loss_and_gradients_match_upstream_mask(
     )
     actual_lp = values.clone().requires_grad_()
     metrics = []
+    keep_mask = []
     start = 0
     for size in chunks:
         end = start + size
@@ -132,9 +137,13 @@ def test_accumulated_loss_and_gradients_match_upstream_mask(
             global_valid_toks=torch.tensor(6.0),
         )
         loss.backward()
+        # The per-row keep mask is not a metric; workers pop it before reduction.
+        keep_mask.extend(chunk_metrics.pop(SEQ_LOGPROB_KEEP_MASK_KEY))
         assert chunk_metrics.keys() == loss_fn.metric_normalizations.keys()
         metrics.append(chunk_metrics)
         start = end
+    # Only row 1 exceeds the threshold; row 3's own sample_mask is applied later.
+    assert keep_mask == [1.0, 0.0, 1.0, 1.0]
 
     kept_toks = sum(m["seq_logprob_error_valid_tokens"] for m in metrics)
     kept_seqs = sum(m["seq_logprob_error_valid_seqs"] for m in metrics)
@@ -209,6 +218,7 @@ def test_split_api_survivor_division_matches_upstream_mask(
             global_valid_toks=torch.tensor(1.0),
         )
         loss.backward()
+        chunk_metrics.pop(SEQ_LOGPROB_KEEP_MASK_KEY)
         metrics.append(chunk_metrics)
         start = end
 
@@ -467,5 +477,39 @@ def test_packed_loss_preserves_sequence_decisions_and_survivor_counts():
         "seq_logprob_error_valid_tokens",
         "seq_logprob_error_valid_seqs",
         "num_masked_seqs_by_logprob_error",
+        # Per-sequence keep masks are joined in row order, not summed.
+        SEQ_LOGPROB_KEEP_MASK_KEY,
     ):
         assert metrics[key] == expected_metrics[key]
+
+
+def test_in_loss_keep_mask_reproduces_the_separate_pass_sample_mask():
+    """Applied to sample_mask, the loss's keep mask equals the separate pass's mask.
+
+    That is the mask PPO's critic trains on, so the flag must not change it.
+    """
+    data, current = _batch()
+    separate = data.select_indices(list(range(4)))
+    separate["prev_logprobs"] = torch.cat(
+        [torch.zeros(4, 1, dtype=current.dtype), current], dim=1
+    )
+    compute_and_apply_seq_logprob_error_masking(
+        separate, rewards=torch.zeros(4), seq_logprob_error_threshold=2.0
+    )
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            seq_logprob_error_in_loss=True,
+            force_on_policy_ratio=True,
+            reference_policy_kl_penalty=0,
+        ),
+        seq_logprob_error_threshold=2.0,
+    )
+    _, metrics = loss_fn(
+        next_token_logprobs=current,
+        data=data,
+        global_valid_seqs=torch.tensor(3.0),
+        global_valid_toks=torch.tensor(6.0),
+    )
+    keep = torch.tensor(metrics[SEQ_LOGPROB_KEEP_MASK_KEY], dtype=torch.float64)
+    torch.testing.assert_close(data["sample_mask"] * keep, separate["sample_mask"])
+    assert separate["sample_mask"].tolist() == [1.0, 0.0, 1.0, 0.0]

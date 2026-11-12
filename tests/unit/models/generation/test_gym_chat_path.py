@@ -34,6 +34,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
+import numpy as np
 import pytest
 import torch
 
@@ -50,6 +51,10 @@ from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
     GenerationCutPrefix,
 )
 from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter  # noqa: E402
+from nemo_gym.token_id_capture.external_capture import (  # noqa: E402
+    split_dynamo_capture_refusal,
+)
+from nemo_gym.token_id_capture.protocols import CAPTURE_REFUSAL_HEADER  # noqa: E402
 from nemo_gym.token_id_capture.replay import (  # noqa: E402
     replay_context,
     summarize_replay,
@@ -65,6 +70,7 @@ from PIL import Image  # noqa: E402
 from transformers import AutoConfig, AutoProcessor, AutoTokenizer  # noqa: E402
 from vllm.config import CacheConfig, LoadConfig, VllmConfig  # noqa: E402
 from vllm.engine.arg_utils import AsyncEngineArgs  # noqa: E402
+from vllm.exceptions import QueueOverflowError, VLLMValidationError  # noqa: E402
 from vllm.logprobs import Logprob  # noqa: E402
 from vllm.outputs import CompletionOutput, RequestOutput  # noqa: E402
 from vllm.renderers.registry import renderer_from_config  # noqa: E402
@@ -88,6 +94,7 @@ from nemo_rl.models.generation.prefix_recovery.restore import (  # noqa: E402
     restored_terminal,
 )
 from nemo_rl.models.generation.vllm import chat_server  # noqa: E402
+from nemo_rl.models.generation.vllm.utils import take_reasoning_ended  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
 )
@@ -164,6 +171,8 @@ REPLY = (
     '{"name": "get_weather", "arguments": {"city": "Lyon"}}\n</tool_call>'
 )
 TURN_1_REPLY = "<think>\neasy\n</think>\n\nIt is sunny."
+# Reasoning the template drops from history, longer than the context.
+LONG_TURN_1_REPLY = "<think>\n" + "hmm " * MAX_MODEL_LEN + "\n</think>\n\nIt is sunny."
 # Turn 1 as a tool call, which Gym's source history recorded with empty
 # content and the harness now sends with none.
 TOOL_TURN = {
@@ -219,18 +228,23 @@ class _Kit:
     def ids(self, text: str) -> list[int]:
         return self.tokenizer.encode(text, add_special_tokens=False)
 
-    def turn_1_tokens(self) -> list[int]:
+    def turn_1_tokens(self, reply: str = TURN_1_REPLY) -> list[int]:
         """Turn 1's prompt and the model's own reply, as capture staged them."""
         prompt = self.tokenizer.apply_chat_template(
             HISTORY[:1], tools=TOOLS, add_generation_prompt=True, tokenize=False
         )
-        return self.ids(prompt + TURN_1_REPLY + "<|im_end|>")
+        return self.ids(prompt + reply + "<|im_end|>")
 
 
 class _Engine:
-    """vLLM's engine client: answers every call with REPLY and records its runs."""
+    """vLLM's engine client: answers every call with REPLY and records its runs.
 
-    def __init__(self, kit: _Kit) -> None:
+    ``refuse`` is what the engine refuses every call with, and where: its
+    queue check ("admission"), its input check ("generate"), or mid-generation
+    ("running"), where a cancelled native handler gets its CancelledError.
+    """
+
+    def __init__(self, kit: _Kit, refuse: Optional[tuple[str, Any]] = None) -> None:
         self.model_config = kit.model_config
         self.renderer = kit.renderer
         self.vllm_config = kit.vllm_config
@@ -238,14 +252,24 @@ class _Engine:
         self.io_processor = None
         self.errored = False
         self._kit = kit
+        self._refuse = refuse
         self.runs: list[tuple[list[int], Any, Any]] = []
+        # The reasoning_ended each run was handed.
+        self.reasoning_ended: list[Optional[bool]] = []
         # How many of REPLY's tokens the prompt already ends with: a call
         # resumed from a checkpoint cut generates only the rest.
         self.resumed = 0
 
     async def generate(self, prompt, sampling_params, request_id, **kwargs):
+        if self._refuse is not None and self._refuse[0] == "generate":
+            raise self._refuse[1]
+        # As the worker's engine client does before it submits the call.
+        take_reasoning_ended(sampling_params, kwargs)
         prompt_token_ids = list(prompt["prompt_token_ids"])
         self.runs.append((prompt_token_ids, sampling_params, _media(prompt)))
+        self.reasoning_ended.append(kwargs.get("reasoning_ended"))
+        if self._refuse is not None and self._refuse[0] == "running":
+            raise self._refuse[1]
         terminal = restored_terminal()
         if terminal is not None:
             # As the worker's engine client answers a call whose saved prefix
@@ -264,7 +288,14 @@ class _Engine:
                 }
                 for token_id in reply_ids
             ]
-        yield RequestOutput(
+        routes = None
+        if self._kit.generation.get("vllm_kwargs", {}).get(
+            "enable_return_routed_experts"
+        ):
+            # vLLM routes every token but the last sampled one: [tokens, layers, k].
+            tokens = len(prompt_token_ids) + len(reply_ids) - 1
+            routes = np.arange(tokens * 4, dtype=np.int16).reshape(tokens, 2, 2)
+        output = RequestOutput(
             request_id=request_id,
             prompt=None,
             prompt_token_ids=prompt_token_ids,
@@ -279,14 +310,21 @@ class _Engine:
                     cumulative_logprob=None,
                     logprobs=logprobs,
                     finish_reason="stop",
+                    routed_experts=None
+                    if routes is None
+                    else routes[len(prompt_token_ids) :],
                 )
             ],
             finished=True,
             num_cached_tokens=0,
         )
+        if routes is not None:
+            output.prompt_routed_experts = routes[: len(prompt_token_ids)]
+        yield output
 
     def check_admission(self, n, request_id=None) -> None:
-        pass
+        if self._refuse is not None and self._refuse[0] == "admission":
+            raise self._refuse[1]
 
     async def is_tracing_enabled(self) -> bool:
         return False
@@ -350,18 +388,28 @@ class _Staged:
 class _Outcome:
     """What one path did with a call."""
 
-    status: int
+    # None when the client went away: nobody is answered.
+    status: Optional[int]
     reply: dict[str, Any]
     runs: list[tuple[list[int], Any, Any]]
     staged: list[tuple[Any, Any]]
     failed: list[str] = field(default_factory=list)
+    # The capture call Gym is told was refused before it was staged, if any.
+    acknowledged: Optional[str] = None
+    # What the engine was told of each run's reasoning.
+    reasoning_ended: list[Optional[bool]] = field(default_factory=list)
 
 
-def _host(kit: _Kit, deltas: dict[str, list[int]], top_logprobs: int):
+def _host(
+    kit: _Kit,
+    deltas: dict[str, list[int]],
+    top_logprobs: int,
+    refuse: Optional[tuple[str, Any]] = None,
+):
     host = object.__new__(VllmAsyncGenerationWorkerImpl)
     host._init_token_capture_state()
     host.cfg = kit.generation
-    host.llm = host._http_engine_client = _Engine(kit)
+    host.llm = host._http_engine_client = _Engine(kit, refuse)
     host.llm_async_engine_args = kit.engine_args
     host.model_name = "model"
     host.routed_experts_dtype = torch.int16
@@ -399,39 +447,60 @@ async def _native(kit, host, sink, failed, body, *, measure: bool) -> _Outcome:
         app, server, host=host, generation_config=kit.generation
     )
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://native"
+        # A server error is answered with a 500, as uvicorn does.
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+        base_url="http://native",
     ) as client:
-        response = await client.post(
-            "/tokenize" if measure else "/v1/chat/completions", json=body
-        )
+        try:
+            response = await client.post(
+                "/tokenize" if measure else "/v1/chat/completions", json=body
+            )
+        except asyncio.CancelledError:
+            # The handler was cancelled, as on a client disconnect.
+            return _Outcome(None, {}, host.llm.runs, sink.staged, failed)
+    is_json = response.headers["content-type"] == "application/json"
     return _Outcome(
-        response.status_code, response.json(), host.llm.runs, sink.staged, failed
+        response.status_code,
+        response.json() if is_json else {"error": response.text},
+        host.llm.runs,
+        sink.staged,
+        failed,
+        response.headers.get(CAPTURE_REFUSAL_HEADER),
+        host.llm.reasoning_ended,
     )
 
 
 class _Router:
     """Dynamo's router to one engine: the request crosses the wire as JSON."""
 
-    def __init__(self, adapter: DynamoVllmAdapter) -> None:
+    def __init__(self, adapter: DynamoVllmAdapter, *, stopped: bool) -> None:
         self._adapter = adapter
+        self._stopped = stopped
 
     async def generate(self, request, context=None):
         wire = json.loads(json.dumps(request))
-        chunks = [chunk async for chunk in self._adapter.generate(wire, _Context())]
+        context = _Context(self._stopped)
 
         async def stream():
-            for chunk in chunks:
-                yield SimpleItem(chunk)
+            try:
+                async for chunk in self._adapter.generate(wire, context):
+                    yield SimpleItem(chunk)
+            except Exception as error:
+                # Dynamo raises an engine's error from the stream, as a ValueError.
+                raise ValueError(str(error)) from error
 
         return stream()
 
 
 class _Context:
+    def __init__(self, stopped: bool) -> None:
+        self._stopped = stopped
+
     def id(self) -> str:
         return "chatcmpl-0"
 
     def is_stopped(self) -> bool:
-        return False
+        return self._stopped
 
 
 class SimpleItem:
@@ -442,7 +511,9 @@ class SimpleItem:
         return self._data
 
 
-async def _dynamo(kit, host, sink, failed, body, extras) -> _Outcome:
+async def _dynamo(
+    kit, host, sink, failed, body, extras, *, stopped: bool = False
+) -> _Outcome:
     request = {k: v for k, v in body.items() if k not in extras}
     # Dynamo's request names the template kwargs chat_template_args.
     if "chat_template_kwargs" in request:
@@ -454,7 +525,9 @@ async def _dynamo(kit, host, sink, failed, body, extras) -> _Outcome:
     capture._prefix_cache = host._chain_prefix
     engine = chat_engine.NemoRLChatEngine(
         pool=kit.pool,
-        routed_engine=_Router(DynamoVllmAdapter(host, leader_worker_idx=0)),
+        routed_engine=_Router(
+            DynamoVllmAdapter(host, leader_worker_idx=0), stopped=stopped
+        ),
         spec=json.loads(json.dumps(chat_runtime_data(host)))[
             chat_engine.RUNTIME_DATA_KEY
         ],
@@ -463,10 +536,24 @@ async def _dynamo(kit, host, sink, failed, body, extras) -> _Outcome:
     try:
         (chunk,) = [chunk async for chunk in engine.generate(request, None)]
     except HttpError as error:
+        message, acknowledged = split_dynamo_capture_refusal(error.message)
         return _Outcome(
-            error.code, {"error": error.message}, host.llm.runs, sink.staged, failed
+            # The frontend's answer to a client that went away reaches nobody.
+            None if stopped else error.code,
+            {"error": message},
+            host.llm.runs,
+            sink.staged,
+            failed,
+            acknowledged,
         )
-    return _Outcome(200, chunk, host.llm.runs, sink.staged, failed)
+    return _Outcome(
+        200,
+        chunk,
+        host.llm.runs,
+        sink.staged,
+        failed,
+        reasoning_ended=host.llm.reasoning_ended,
+    )
 
 
 def _generation(*, vllm_cfg=None, **chat_settings) -> dict[str, Any]:
@@ -536,6 +623,12 @@ KITS = {
     "vlm": _KitSpec(_generation(reasoning_parser=""), _vlm),
     # A tool parser with no structural tag: a forced tool sets structured outputs.
     "pythonic": _KitSpec(_generation(tool_parser="pythonic")),
+    # A reasoning parser that reads the prompt back to its last think token.
+    "deepseek_r1": _KitSpec(_generation(reasoning_parser="deepseek_r1")),
+    # Router replay: the engine returns each token's routed experts.
+    "router_replay": _KitSpec(
+        {**GENERATION, "vllm_kwargs": {"enable_return_routed_experts": True}}
+    ),
 }
 
 
@@ -597,11 +690,11 @@ def _admission(**fields) -> dict[str, Any]:
     ).model_dump(mode="json")
 
 
-def _staged_turn_1(kit: _Kit, **fields) -> dict[str, Any]:
+def _staged_turn_1(kit: _Kit, reply: str = TURN_1_REPLY, **fields) -> dict[str, Any]:
     """Turn 2's admission, chained to turn 1 staged under rollout-1/c1."""
     return _admission(
         parent_call_id="c1",
-        prev_len=len(kit.turn_1_tokens()),
+        prev_len=len(kit.turn_1_tokens(reply)),
         parent_chain_hash="1" * 64,
         staging_chain=["rollout-1/c1"],
         **fields,
@@ -637,11 +730,25 @@ class _Case:
     fields: dict[str, Any] = field(default_factory=dict)
     # The sampler top-k capture stages, for score centering.
     top_logprobs: int = 0
-    # 200, or the 400 both paths refuse the call with before it runs.
+    # Request fields the call leaves out.
+    omit: tuple[str, ...] = ()
+    # 200, or the status both paths answer a call that did not finish with.
     status: int = 200
     # The mode capture stages the call in; None when the call is not captured.
     mode: Optional[str] = None
     kit: str = "qwen3"
+    # What the engine refuses the call with, and where (see _Engine).
+    refuse: Optional[tuple[str, Any]] = None
+    # The client goes away while the engine generates: nobody is answered.
+    disconnect: bool = False
+    # What an unfinished call's capture is failed with, on both paths.
+    failed: tuple[str, ...] = ()
+    # Whether Gym is told the capture call was refused before it was staged.
+    acknowledged: bool = False
+    # Turn 1's reply as the model wrote it and capture staged it.
+    turn_1_reply: str = TURN_1_REPLY
+    # What the engine is told of the call's reasoning; unchecked when None.
+    reasoning_ended: Optional[bool] = None
 
 
 def _off_policy(name: str, value: Any) -> _Case:
@@ -777,6 +884,85 @@ CASES = [
     _off_policy("presence_penalty", 0.5),
     _off_policy("frequency_penalty", 0.5),
     _off_policy("logit_bias", {"10": 5.0}),
+    # Capture stages one choice, and the trainer replays one.
+    _Case("n_2", fields={"n": 2}, status=400),
+    # Token information without top_logprobs, unset or sent as null.
+    _Case("top_logprobs_unset", omit=("top_logprobs",), status=400),
+    _Case("top_logprobs_null", fields={"top_logprobs": None}, status=400),
+    # Neither path stages a streamed call, and Gym never sends one.
+    _Case("stream", fields={"stream": True}, status=400),
+    # A field vLLM refuses while the request is parsed, before any step runs.
+    _Case(
+        "field_error",
+        extras=lambda kit: {"ng_capture": _admission(mode="text")},
+        fields={"logprobs": False, "top_logprobs": 5},
+        status=400,
+        acknowledged=True,
+    ),
+    # The model's own turn 1 is longer than the template's render of it, so the
+    # spliced prompt fills the context though the render fits.
+    _Case(
+        "spliced_prompt_overflow",
+        extras=lambda kit: {
+            "ng_capture": _staged_turn_1(kit, LONG_TURN_1_REPLY, mode="token_in")
+        },
+        status=400,
+        acknowledged=True,
+        turn_1_reply=LONG_TURN_1_REPLY,
+    ),
+    # A full queue: vLLM's 503, so Gym retries elsewhere; checked before capture.
+    _Case(
+        "queue_full",
+        extras=lambda kit: {"ng_capture": _admission(mode="text")},
+        status=503,
+        refuse=("admission", QueueOverflowError()),
+    ),
+    # The engine's input check refuses a captured call after it began.
+    _Case(
+        "token_out_of_vocabulary",
+        extras=lambda kit: {"ng_capture": _admission(mode="text")},
+        status=400,
+        refuse=(
+            "generate",
+            VLLMValidationError("Token id 999999 is out of vocabulary"),
+        ),
+        failed=("invalid_request",),
+        acknowledged=True,
+    ),
+    # The engine fails a captured call: a server error, and nothing staged.
+    _Case(
+        "engine_error",
+        extras=lambda kit: {"ng_capture": _admission(mode="text")},
+        status=500,
+        refuse=("generate", RuntimeError("engine failed")),
+        failed=("engine_error",),
+    ),
+    # The client goes away mid-generation: the call ran, and is not staged.
+    _Case(
+        "client_disconnect",
+        extras=lambda kit: {"ng_capture": _admission(mode="text")},
+        disconnect=True,
+        failed=("client_disconnect",),
+    ),
+    # Structured output after the model's own turn 1, whose reasoning the
+    # template drops: that turn's </think> does not end this turn's reasoning.
+    _Case(
+        "reasoning_not_ended_by_an_earlier_turn",
+        extras=lambda kit: {"required_prefix_token_ids": kit.turn_1_tokens()},
+        fields={
+            "chat_template_kwargs": {"enable_thinking": True},
+            "response_format": {"type": "json_object"},
+        },
+        kit="deepseek_r1",
+        reasoning_ended=False,
+    ),
+    # Router replay stages each token's routed experts with the call.
+    _Case(
+        "router_replay",
+        extras=lambda kit: {"ng_capture": _admission(mode="text")},
+        mode="text",
+        kit="router_replay",
+    ),
 ]
 
 
@@ -797,25 +983,46 @@ def test_a_gym_call_takes_the_same_steps_through_dynamo_as_natively(kits, case) 
         **case.fields,
         **extras,
     }
-    deltas = {"rollout-1/c1": kit.turn_1_tokens()}
+    for name in case.omit:
+        del body[name]
+    deltas = {"rollout-1/c1": kit.turn_1_tokens(case.turn_1_reply)}
+    # A disconnect cancels the native handler while the engine generates;
+    # Dynamo only marks the call's context stopped.
+    cancelled = ("running", asyncio.CancelledError()) if case.disconnect else None
 
     async def both():
         native = await _native(
-            kit, *_host(kit, deltas, case.top_logprobs), body, measure=False
+            kit,
+            *_host(kit, deltas, case.top_logprobs, cancelled or case.refuse),
+            body,
+            measure=False,
         )
         dynamo = await _dynamo(
-            kit, *_host(kit, deltas, case.top_logprobs), body, extras
+            kit,
+            *_host(kit, deltas, case.top_logprobs, case.refuse),
+            body,
+            extras,
+            stopped=case.disconnect,
         )
         return native, dynamo
 
     native, dynamo = asyncio.run(both())
 
-    assert (native.status, dynamo.status) == (case.status, case.status), (
+    status = None if case.disconnect else case.status
+    assert (native.status, dynamo.status) == (status, status), (
         native.reply,
         dynamo.reply,
     )
-    if case.status != 200:
-        assert native.runs == dynamo.runs == []
+    if status != 200:
+        # Only a call the client left reached the engine, with the same prompt.
+        assert [run[0] for run in native.runs] == [run[0] for run in dynamo.runs]
+        assert len(native.runs) == (1 if case.disconnect else 0)
+        # Capture is failed alike, and neither path staged the call.
+        assert native.failed == dynamo.failed == list(case.failed)
+        assert native.staged == dynamo.staged == []
+        # Gym is told alike that its capture call was refused before staging.
+        acknowledged = "c2" if case.acknowledged else None
+        assert native.acknowledged == dynamo.acknowledged == acknowledged
         return
     # The engine ran the same prompt, media and SamplingParams.
     ((native_prompt, native_params, native_media),) = native.runs
@@ -824,6 +1031,10 @@ def test_a_gym_call_takes_the_same_steps_through_dynamo_as_natively(kits, case) 
     _assert_same_media(dynamo_media, native_media)
     assert (native_media is not None) == (case.kit == "vlm")
     assert dynamo_params == native_params
+    # ...and was told the same of the call's reasoning, read from its template.
+    assert dynamo.reasoning_ended == native.reasoning_ended
+    if case.reasoning_ended is not None:
+        assert native.reasoning_ended == [case.reasoning_ended]
     # Capture staged the same record and tensors, in the expected mode.
     assert [record.mode for record, _ in native.staged] == (
         [case.mode] if case.mode else []
@@ -836,6 +1047,9 @@ def test_a_gym_call_takes_the_same_steps_through_dynamo_as_natively(kits, case) 
         assert (dynamo_tensors or {}).keys() == (native_tensors or {}).keys()
         for name, tensor in (native_tensors or {}).items():
             assert torch.equal(dynamo_tensors[name], tensor), name
+        assert ("routed_experts" in (native_tensors or {})) == (
+            case.kit == "router_replay"
+        )
     assert dynamo.failed == native.failed == []
     # Gym reads the same reply and token fields.
     message = native.reply["choices"][0]["message"]

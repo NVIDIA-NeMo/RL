@@ -15,6 +15,7 @@
 """NeMo-Gym's checkpoint generation cut through the Dynamo frontend."""
 
 import asyncio
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -35,6 +36,7 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (  # noqa: E402
 )
 from nemo_rl.models.generation.dynamo.vllm.generation_cut import (  # noqa: E402
     CUT_PREFIXES_KEY,
+    DEADLINE_KEY,
     GENERATION_CUT_ANNOTATION,
     INVENTORY_KEY,
     EngineCutFanOut,
@@ -49,6 +51,10 @@ class _Item:
 
     def data(self):
         return self._data
+
+
+class _Late(list):
+    """An engine's answer that reaches the frontend after its deadline."""
 
 
 class _Client:
@@ -68,8 +74,10 @@ class _Client:
             raise answer
 
         async def stream():
-            if answer is None:
-                await asyncio.Event().wait()
+            if isinstance(answer, _Late):
+                await asyncio.sleep(
+                    request["extra_args"][DEADLINE_KEY] - time.time() + 5
+                )
             yield _Item({"token_ids": [], "engine_data": {CUT_PREFIXES_KEY: answer}})
 
         return stream()
@@ -104,28 +112,33 @@ def _call(name: str) -> GenerationCutPrefix:
 def test_a_cut_reaches_every_engine_and_each_call_gets_its_engines_answer(
     monkeypatch, tmp_path
 ) -> None:
-    held, lost = _call("held"), _call("lost")
+    held, lost, late = _call("held"), _call("lost"), _call("late")
     inventory = GenerationCutInventory.build(
         checkpoint_id="checkpoint-1",
         server_name="policy_model",
-        active_prefixes=[held, lost],
+        active_prefixes=[held, lost, late],
     )
-    cut = GenerationCutPrefixAck(
-        **held.model_dump(),
-        disposition="durable_prefix",
-        cut_kind="active_prefix",
-        frozen_buffer_id="active/checkpoint-1/0",
-        staging_keys=("__generation_cut__/checkpoint-1/r0/held/0",),
-        prefix_token_count=3,
-        prefix_digest="0" * 64,
-        effective_output_limit=8,
-    )
+
+    def cut(call: GenerationCutPrefix) -> dict:
+        return GenerationCutPrefixAck(
+            **call.model_dump(),
+            disposition="durable_prefix",
+            cut_kind="active_prefix",
+            frozen_buffer_id="active/checkpoint-1/0",
+            staging_keys=(
+                f"__generation_cut__/checkpoint-1/r0/{call.model_call_id}/0",
+            ),
+            prefix_token_count=3,
+            prefix_digest="0" * 64,
+            effective_output_limit=8,
+        ).model_dump(mode="json")
+
     client = _Client(
         {
-            1: [],  # holds neither call
-            2: [cut.model_dump(mode="json")],
+            1: [],  # holds none of the calls
+            2: [cut(held)],
             3: RuntimeError("engine gone"),
-            4: None,  # never answers
+            4: _Late([cut(late)]),
         }
     )
     runtime = _Runtime(client)
@@ -160,21 +173,30 @@ def test_a_cut_reaches_every_engine_and_each_call_gets_its_engines_answer(
             generation_cut_control_timeout_s=0.5,
         )
         assert fan_out.control_token == "secret"
-        return await fan_out.run_cut(inventory)
+        arrived = time.time()
+        return arrived, await fan_out.run_cut(inventory)
 
-    receipt = asyncio.run(run())
+    arrived, receipt = asyncio.run(run())
 
     # Gym accepts it as the answer to its inventory: every call acked once.
     receipt.validate_for(inventory)
     assert {ack.model_call_id: ack.disposition for ack in receipt.prefixes} == {
         "held": "durable_prefix",
         "lost": "durable_failure",
+        # Its engine cut it, but answered after the frontend stopped waiting.
+        "late": "durable_failure",
     }
     assert runtime.paths == ["nemo-rl-test.backend.generate"]
-    # Every engine gets the whole inventory; token_ids is always present.
+    # Every engine gets the whole inventory and the frontend's one deadline,
+    # counted from the cut's arrival; token_ids is always present.
+    deadline = client.requests[1]["extra_args"][DEADLINE_KEY]
+    assert arrived + 0.5 <= deadline <= time.time()
     request = {
         "token_ids": [],
         "annotations": [GENERATION_CUT_ANNOTATION],
-        "extra_args": {INVENTORY_KEY: inventory.model_dump(mode="json")},
+        "extra_args": {
+            INVENTORY_KEY: inventory.model_dump(mode="json"),
+            DEADLINE_KEY: deadline,
+        },
     }
     assert client.requests == {1: request, 2: request, 3: request, 4: request}

@@ -37,7 +37,6 @@ from typing import Any, Literal
 from nemo_rl.models.generation.prefix_recovery.parts import PrefixRecoveryParts
 from nemo_rl.models.generation.prefix_recovery.restore import (
     _generation_cut_blockers,
-    restore_reply_text,
 )
 from nemo_rl.models.generation.prefix_recovery.state import (
     _CompletedCaptureState,
@@ -201,21 +200,6 @@ class PrefixRecovery:
             stop_reason=stop_reason,
         )
 
-    def restore_reply_text(
-        self, request: Any, request_output: Any, *, tokenizer: Any
-    ) -> None:
-        """Prepend a resumed call's restored text to its final output."""
-        state = self._registry.get(request)
-        if state is None or not state.resumed_generation_token_ids:
-            return
-        restore_reply_text(
-            request,
-            request_output,
-            prefix_token_ids=state.resumed_generation_token_ids,
-            engine_prompt_token_ids=state.prompt_token_ids,
-            tokenizer=tokenizer,
-        )
-
     def retire(self, staging_keys: Sequence[str]) -> None:
         """Queue an ended call's chunk rows for the next snapshot to delete.
 
@@ -282,11 +266,17 @@ class PrefixRecovery:
 
     # ---- A checkpoint cut -----------------------------------------------
 
-    async def run_cut(self, inventory: Any) -> Any:
-        """Cut every call Gym's inventory names, off the serving loop."""
-        # Measured from arrival so time queued behind a stale cut counts.
-        timeout_s = self._parts.control_timeout_s
-        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    async def run_cut(self, inventory: Any, *, deadline: float | None = None) -> Any:
+        """Cut every call Gym's inventory names, off the serving loop.
+
+        ``deadline`` is a ``time.monotonic()`` bound from a caller that waits
+        on one of its own (the Dynamo frontend). Without it the cut gets
+        ``control_timeout_s`` from its arrival here.
+        """
+        if deadline is None:
+            # Measured from arrival so time queued behind a stale cut counts.
+            timeout_s = self._parts.control_timeout_s
+            deadline = None if timeout_s is None else time.monotonic() + timeout_s
         return await asyncio.get_running_loop().run_in_executor(
             self._control_executor,
             functools.partial(self.checkpoint_cut, inventory, deadline=deadline),
@@ -869,11 +859,6 @@ class NoPrefixRecovery:
     def observe(self, request: Any, request_output: Any) -> None:
         pass
 
-    def restore_reply_text(
-        self, request: Any, request_output: Any, *, tokenizer: Any
-    ) -> None:
-        pass
-
     def remember_completed(
         self,
         model_call_id: str,
@@ -899,5 +884,5 @@ class NoPrefixRecovery:
     def shutdown(self) -> None:
         pass
 
-    async def run_cut(self, inventory: Any) -> Any:
+    async def run_cut(self, inventory: Any, *, deadline: float | None = None) -> Any:
         raise RuntimeError("generation-prefix cuts are disabled on this worker")

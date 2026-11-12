@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from nemo_rl.models.generation.vllm.utils import REASONING_ENDED_ARG
 from nemo_rl.models.generation.vllm.vllm_worker_async import _AsyncLLMHTTPClient
 
 pytestmark = pytest.mark.vllm
@@ -48,9 +49,26 @@ def test_generate_sets_flat_logprobs(
     flat_logprobs, logprobs, prompt_logprobs, expected
 ):
     sampling_params = SimpleNamespace(
-        logprobs=logprobs, prompt_logprobs=prompt_logprobs, flat_logprobs=False
+        logprobs=logprobs,
+        prompt_logprobs=prompt_logprobs,
+        flat_logprobs=False,
+        extra_args=None,
     )
 
     _client(flat_logprobs=flat_logprobs).generate("prompt", sampling_params, "req-0")
 
     assert sampling_params.flat_logprobs is expected
+
+
+def test_generate_hands_the_engine_the_template_reasoning_ended():
+    """vLLM's serving passes its own value, read from the spliced prompt."""
+    client = _client(flat_logprobs=False)
+    client._generate = lambda prompt, sampling_params, request_id, kwargs: kwargs
+    sampling_params = SimpleNamespace(
+        logprobs=None, extra_args={REASONING_ENDED_ARG: False, "other": 1}
+    )
+
+    kwargs = client.generate("prompt", sampling_params, "req-0", reasoning_ended=True)
+
+    assert kwargs == {"reasoning_ended": False}
+    assert sampling_params.extra_args == {"other": 1}

@@ -50,10 +50,10 @@ from nemo_rl.models.generation.dynamo.vllm import (  # noqa: E402
     adapter as vllm_adapter,
 )
 from nemo_rl.models.generation.dynamo.vllm.chat_engine import (  # noqa: E402
+    CALL_KEY,
     GYM_CALL_ANNOTATION,
-    PLAN_KEY,
     RUNTIME_DATA_KEY,
-    GymCallPlan,
+    ForwardedCall,
 )
 from nemo_rl.models.generation.interfaces import SamplerReplayConfig  # noqa: E402
 from nemo_rl.models.generation.rollout_result import (  # noqa: E402
@@ -465,25 +465,44 @@ def _chat(**fields) -> dict:
     ).model_dump(mode="json", exclude={"messages"})
 
 
-def _gym_call(token_ids: list[int], **plan) -> dict:
-    """A Gym call as the chat engine routes it: final token ids and the plan."""
-    full_plan: GymCallPlan = {
-        "request": _chat(),
+def _gym_call(token_ids: list[int], **fields) -> dict:
+    """A Gym call as the chat engine routes it: final token ids and the plan.
+
+    ``fields`` set the prepared prompt's fields and the call's others by name.
+    """
+    plan = {
+        "splice": None,
+        "prefix_len": None,
+        "request_max_tokens": None,
+        "max_tokens": None,
         "admission": None,
         "serving_admission": None,
         "verify_retained_media": False,
-        "prefix_len": None,
-        "template_token_ids": token_ids,
-        "splice": None,
+    }
+    wire: ForwardedCall = {
+        "prepared_prompt": plan,
+        "request": _chat(),
         "multimodal": None,
         "reasoning_ended": None,
         "reasoning_parser_kwargs": None,
-        **plan,
     }
+    # A media call's template ids are its own prompt's unless it was spliced.
+    template_token_ids = fields.pop("template_token_ids", token_ids)
+    if (inputs := fields.pop("multimodal", None)) is not None:
+        wire["multimodal"] = {
+            "inputs": inputs,
+            "template_token_ids": template_token_ids,
+        }
+    for name, value in fields.items():
+        if name in plan:
+            plan[name] = value
+        else:
+            assert name in wire, name
+            wire[name] = value
     return {
         "token_ids": token_ids,
         "annotations": [GYM_CALL_ANNOTATION],
-        "extra_args": {PLAN_KEY: full_plan},
+        "extra_args": {CALL_KEY: wire},
     }
 
 
