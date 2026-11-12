@@ -378,7 +378,9 @@ UV_LINK_MODE=hardlink uv sync --frozen $GROUP_FLAGS --no-install-project
 
 # Worker-venv prefetch, phase 1: third-party packages only.
 #
-# Each Ray actor runs in its own venv under NEMO_RL_VENV_DIR. Build them HERE, in the same
+# Each Ray actor runs in a venv under NEMO_RL_VENV_DIR. Actors that need the same set of
+# extras share one venv: it is built once as extras-<names>, and each actor's own path
+# NEMO_RL_VENV_DIR/<actor FQN> is a symlink to it. Build them HERE, in the same
 # layer as the uv cache above, because a hardlink into an already-finished layer makes
 # overlayfs copy the file up -- so building them later would trade ~1.5M symlinks for
 # gigabytes of duplicated wheels. Built here, the N venvs cost directory entries and share
@@ -404,7 +406,10 @@ UV_LINK_MODE=hardlink uv sync --frozen $GROUP_FLAGS --no-install-project
 "${UV_PROJECT_ENVIRONMENT}/bin/python" nemo_rl/distributed/actor_environments.py all $SKIP_EXTRAS \
     > /opt/actor_venvs.tsv
 test -s /opt/actor_venvs.tsv
-while IFS=$'\t' read -r venv_name stage extras; do
+while IFS=$'\t' read -r venv_name stage extras actors; do
+    # A source from before the shared venvs lists one venv per actor, named after the
+    # actor, with no fourth column.
+    actors="${actors:-$venv_name}"
     if [[ "$stage" == "trtllm" ]]; then
         # tensorrt_llm does not exist yet; warm the base and finish in the TRT-LLM layer.
         extras=""
@@ -412,6 +417,11 @@ while IFS=$'\t' read -r venv_name stage extras; do
     venv_path="${NEMO_RL_VENV_DIR}/${venv_name}"
     uv venv --allow-existing "$venv_path"
     UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --frozen $extras --no-install-project
+    for actor in $actors; do
+        if [[ "$actor" != "$venv_name" ]]; then
+            ln -s "$venv_name" "${NEMO_RL_VENV_DIR}/${actor}"
+        fi
+    done
 done < /opt/actor_venvs.tsv
 
 apt-get purge -y libnvidia-ml-dev
@@ -621,7 +631,7 @@ du -sh "${UV_CACHE_DIR}" /root/.cache/trtllm-wheels
 # dependency layer's cache (e.g. tilelang) get copied up here, a small accepted cost.
 # The dependency layer already wrote the actor list to /opt/actor_venvs.tsv, so this layer
 # reuses it rather than re-deriving it -- one reader, one place it can go wrong.
-while IFS=$'\t' read -r venv_name stage extras; do
+while IFS=$'\t' read -r venv_name stage extras actors; do
     if [[ "$stage" != "trtllm" ]]; then
         continue
     fi
@@ -750,13 +760,15 @@ export TRTLLM_REQUIRE_CACHED_WHEEL=1
 #
 # This is why the venvs cannot simply be built here in one pass: hardlinking against the
 # dependency layer's cache from this layer would make overlayfs copy every wheel up.
-# Build exactly the venvs phase 1 built, by name. Re-deriving the list here would
-# mean filtering on the actor name again, which cannot tell that e.g.
+# Finish exactly the actors phase 1 built venvs for, by name. Re-deriving the list here
+# would mean filtering on the actor name again, which cannot tell that e.g.
 # AsyncTrajectoryCollector needs the vLLM extra -- so without vllm the two
 # passes would disagree and this layer would build three venvs the dependency layer
 # deliberately skipped. prefetch_venvs.py matches these positionally as substrings,
-# and a full FQN matches only itself.
-UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py $(cut -f1 /opt/actor_venvs.tsv)
+# and a full FQN matches only itself. Each actor path is a symlink to its shared venv,
+# so actors that share one finish the same venv; the repeats change nothing.
+UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py \
+    $(awk -F'\t' '{ print ($4 == "" ? $1 : $4) }' /opt/actor_venvs.tsv)
 # The editable installs, wrapper metadata, and build-backend wheels added above are new in
 # this layer; hand only those to the runtime UID so it can re-sync the venvs offline. Stays
 # unconditional even when STRIP_UV_CACHE is set -- see the dependency layer's chown above
