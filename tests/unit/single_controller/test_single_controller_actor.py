@@ -2413,6 +2413,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._timeout.start_iterations()
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._policy_logprobs_required = False
+    ctrl._warmup_policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
@@ -3508,6 +3509,38 @@ def test_train_pump_trains_the_policy_once_warmup_is_over(monkeypatch, capsys) -
     assert capsys.readouterr().out.count("Critic warmup complete") == 1
 
 
+@pytest.mark.parametrize("warmup", [True, False])
+def test_in_loss_ppo_runs_the_policy_logprob_pass_only_during_critic_warmup(
+    monkeypatch, warmup
+) -> None:
+    """With in-loss filtering the policy loss decides rejections, but it does not
+    run during critic warmup, so those steps take the separate pass instead."""
+    meta = _single_group_meta()
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta),
+        policy_training_start_step=1,
+    )
+    ctrl._warmup_policy_logprobs_required = True
+    if not warmup:
+        ctrl._train_steps = 1
+        ctrl._trainer_version = 1
+        ctrl._algo_cfg.max_num_steps = 2
+    trainer = MagicMock(spec=_NoOpTrainer)
+    trainer.get_logprobs_from_meta = MagicMock()
+    trainer.finish_train_step.return_value = {}
+    ctrl._trainer = trainer
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert trainer.get_logprobs_from_meta.call_count == (1 if warmup else 0)
+    # The advantage stage then applies the threshold exactly as with the flag off.
+    assert ctrl._advantage_stage.await_args.kwargs == {
+        "policy_logprobs_required": warmup
+    }
+
+
 def test_train_pump_groups_ppo_epochs_by_model(monkeypatch) -> None:
     """Each model stays resident for all of its PPO epochs.
 
@@ -3722,8 +3755,11 @@ def _streaming_ppo_controller(
     ctrl._policy_logprobs_required = True
     validity = iter(valid_chunks)
 
-    async def advantage_stage(meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
+    async def advantage_stage(
+        meta: KVBatchMeta, *, policy_logprobs_required: bool | None = None
+    ) -> tuple[KVBatchMeta, bool]:
         assert "values" in meta.fields
+        assert policy_logprobs_required is True
         calls.append("gae")
         return meta.with_fields(["advantages", "returns"]), next(validity)
 

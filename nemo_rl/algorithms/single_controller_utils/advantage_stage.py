@@ -51,6 +51,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
 )
+from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     logprob_passes_required,
@@ -227,6 +228,9 @@ class AdvantageRequest:
     # names its file after it and the pool has no view of the controller's
     # counter. Unset when the dump is off, which is the default.
     train_step: Optional[int] = None
+    # Overrides the config's policy_logprobs_required for this call, e.g. a PPO
+    # critic-warmup step that ran the policy-logprob pass under in-loss filtering.
+    policy_logprobs_required: Optional[bool] = None
 
 
 def split_meta_by_prompt_group(
@@ -344,6 +348,10 @@ class AdvantageComputer:
         """Run one call's advantage stage and return its reduced results."""
         meta = request.meta
         cfg = self._config
+        if request.policy_logprobs_required is not None:
+            cfg = replace(
+                cfg, policy_logprobs_required=request.policy_logprobs_required
+            )
         adv_cfg = cfg.advantage
         logical = has_logical_owners(meta)
         if logical and (
@@ -400,6 +408,18 @@ class AdvantageComputer:
         truncated = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.truncated_field)
         ).bool()
+
+        # Shape after scaling; token_mask counts generated tokens on both producers.
+        rewards = apply_reward_shaping(
+            BatchedDataDict(
+                {
+                    "total_reward": rewards,
+                    "response_token_lengths": token_mask.sum(dim=-1).long(),
+                    "truncated": truncated,
+                }
+            ),
+            cfg.algo.reward_shaping,
+        )["total_reward"]
 
         has_response_tokens = token_mask[:, 1:].bool().any(dim=-1)
         # A context-only segment has no physical loss row, but its empty mask
