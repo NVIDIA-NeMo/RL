@@ -592,8 +592,6 @@ class ModelOptNvFp4PerTokenFusedMoE(ModelOptNvFp4FusedMoE):
         # so routed-experts capture goes through the router, not the kernel.
         assert self.experts_cls is not None
         self.experts_cls = host_captured_experts_cls(self.experts_cls)
-        # The base class reads this when it creates weights and applies the kernel.
-        self.per_token_activation = True
 
     def process_weights_after_loading(self, layer) -> None:
         """Finalize reload-format weights for dynamic per-token activation FP4.
