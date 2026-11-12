@@ -176,6 +176,9 @@ Gym venvs for the `workplace_assistant` resource server are built on first launc
 or prebaked into the container as in the
 [Nemotron 3.5 Lightning guide](nemotron-3.5-lightning.md#container) with
 `--build-arg NEMO_GYM_PREFETCH_CONFIGS="examples/nemo_gym/nemotron-3.5-super-vl/workplace_assistant_automodel.yaml"`.
+To reuse them without rebuilding the image, see
+[Python Environments on Shared Filesystems](../../../cluster.md#python-environments-on-shared-filesystems);
+do not move them to a shared filesystem.
 
 ```bash
 # Text DAPO (DAPO-Math-17K / AIME-2024)
