@@ -1402,7 +1402,7 @@ class DWRLLossFn(LossFunction):
             terminal_logprobs = torch.cat([final_logprobs, final_logprobs_no], dim=-1)
             ce_loss = -masked_mean(
                 terminal_logprobs,
-                torch.ones_like(terminal_logprobs) * 0.5,
+                torch.cat([sample_mask, sample_mask], dim=-1) * 0.5,
                 global_normalization_factor=global_valid_seqs,
             )
         else:
@@ -2051,7 +2051,7 @@ class DWRLPairwiseLossFn(LossFunction):
             terminal_logprobs = torch.cat([final_logprobs, final_logprobs_no], dim=-1)
             ce_loss = -masked_mean(
                 terminal_logprobs,
-                torch.ones_like(terminal_logprobs) * 0.5,
+                torch.cat([sample_mask, sample_mask], dim=-1) * 0.5,
                 global_normalization_factor=global_valid_seqs,
             )
         else:
