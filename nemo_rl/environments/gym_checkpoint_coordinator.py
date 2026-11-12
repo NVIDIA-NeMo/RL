@@ -250,6 +250,16 @@ def _episodes_by_instance(
 
 
 @dataclass(frozen=True)
+class GymCheckpointPrepared:
+    """What every prepared Gym deployment reported for one checkpoint."""
+
+    # Each instance's episodes a commit must leave out.
+    restarts: dict[str, frozenset[GymCheckpointEpisode]]
+    # Gym's generation-cut outcome, summed over instances.
+    generation_cut_counts: dict[str, int]
+
+
+@dataclass(frozen=True)
 class GymCheckpointCommitResult:
     """Outer manifest plus each Gym actor's validated commit summary."""
 
@@ -454,15 +464,8 @@ class GymCheckpointCoordinator:
         """
         inventory = self._validate_inventory(episodes_by_instance)
         restarted = self._validate_inventory(restarts)
-        overlap = {
-            instance_id: sorted(set(inventory[instance_id]) & set(episodes))
-            for instance_id, episodes in restarted.items()
-            if set(inventory[instance_id]) & set(episodes)
-        }
-        if overlap:
-            raise ValueError(f"Gym checkpoint commit scope names restarts: {overlap!r}")
         deadline_ts = self._deadline()
-        raw_summaries = await self._collect(
+        summaries: dict[str, GymCheckpointCommitSummary] = await self._collect(
             "commit",
             {
                 instance_id: self._handles[instance_id].checkpoint_commit.remote(
@@ -475,24 +478,8 @@ class GymCheckpointCoordinator:
             },
             deadline_ts=deadline_ts,
         )
-        summaries: dict[str, GymCheckpointCommitSummary] = {}
-        for instance_id, summary in raw_summaries.items():
-            if not isinstance(summary, GymCheckpointCommitSummary):
-                raise TypeError(
-                    "Gym checkpoint actor returned an invalid commit summary: "
-                    f"instance={instance_id!r}, type={type(summary).__name__}"
-                )
-            summaries[instance_id] = summary
-            expected = set(inventory[instance_id])
-            actual = set(summary.exported_episodes)
-            unexpected = actual - expected
-            if unexpected:
-                raise RuntimeError(
-                    "Gym checkpoint actor exported an episode outside the "
-                    "candidate set: "
-                    f"instance={instance_id!r}, "
-                    f"unexpected={sorted(unexpected, key=repr)!r}"
-                )
+        # The adapter already checked every participant's export against the
+        # episodes requested here.
         manifest = GymCheckpointManifest(
             schema_version=GYM_CHECKPOINT_SCHEMA_VERSION,
             checkpoint_id=checkpoint_id,
@@ -619,38 +606,30 @@ class GymCheckpointCoordinator:
             # or actor-local validation error is an uncertain outcome, so the
             # remote restore may have succeeded before the failure reached this
             # coordinator.
-            cleanup_errors: list[BaseException] = []
-            try:
-                cleanup_deadline_ts = self._deadline()
-                await self._collect(
-                    "restore_retire",
-                    {
-                        instance_id: self._handles[
-                            instance_id
-                        ].checkpoint_retire.remote(
-                            restore_id,
-                            tuple(
-                                episode.next_attempt()
-                                for episode in inventory[instance_id]
-                            ),
-                            deadline_ts=cleanup_deadline_ts,
-                        )
-                        for instance_id in inventory
-                    },
-                    deadline_ts=cleanup_deadline_ts,
-                )
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-            try:
-                await self.resume(restore_id)
-            except BaseException as cleanup_error:
-                cleanup_errors.append(cleanup_error)
-            for cleanup_error in cleanup_errors:
-                error.add_note(
-                    "Gym cross-instance restore cleanup also failed: "
-                    f"{type(cleanup_error).__name__}: {cleanup_error}"
-                )
+            await self._discard_restore(restore_id, manifest, error)
             raise
+
+    async def _discard_restore(
+        self,
+        restore_id: str,
+        manifest: GymCheckpointManifest,
+        error: BaseException,
+    ) -> None:
+        """Retire the restored attempts, then reopen Gym, noting failures on ``error``."""
+        try:
+            await self.retire_restored(restore_id, manifest)
+        except Exception as cleanup_error:
+            error.add_note(
+                "Gym retire of restored attempts also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
+        try:
+            await self.resume(restore_id)
+        except Exception as cleanup_error:
+            error.add_note(
+                "Gym restore cleanup also failed: "
+                f"{type(cleanup_error).__name__}: {cleanup_error}"
+            )
 
     @asynccontextmanager
     async def restored(
@@ -669,20 +648,7 @@ class GymCheckpointCoordinator:
         try:
             yield
         except BaseException as error:
-            try:
-                await self.retire_restored(restore_id, manifest)
-            except Exception as retire_error:
-                error.add_note(
-                    "Gym retire of restored attempts also failed: "
-                    f"{type(retire_error).__name__}: {retire_error}"
-                )
-            try:
-                await self.resume(restore_id)
-            except Exception as resume_error:
-                error.add_note(
-                    "Gym restore cleanup also failed: "
-                    f"{type(resume_error).__name__}: {resume_error}"
-                )
+            await self._discard_restore(restore_id, manifest, error)
             raise
         else:
             await self.resume(restore_id)
@@ -735,10 +701,11 @@ class GymCheckpointCoordinator:
     @asynccontextmanager
     async def prepared(
         self, checkpoint_id: str
-    ) -> AsyncIterator[dict[str, frozenset[GymCheckpointEpisode]]]:
+    ) -> AsyncIterator[GymCheckpointPrepared]:
         """Prepare every deployment, renew its lease, and always release it.
 
-        Yields each instance's restarts: the episodes a commit must leave out.
+        Yields each instance's restarts, the episodes a commit must leave out,
+        and Gym's generation-cut counts.
         Gym resumes when the body exits, before the caller publishes, so new
         rollouts wait only for Gym's own commit. Once the body succeeded every
         commit is written and resume only reopens admission: a resume that
@@ -756,10 +723,19 @@ class GymCheckpointCoordinator:
             )
             body_error: BaseException | None = None
             try:
-                yield {
-                    instance_id: frozenset(summary.restarts)
-                    for instance_id, summary in summaries.items()
-                }
+                generation_cut_counts: dict[str, int] = {}
+                for summary in summaries.values():
+                    for name, count in summary.generation_cut_counts.items():
+                        generation_cut_counts[name] = (
+                            generation_cut_counts.get(name, 0) + count
+                        )
+                yield GymCheckpointPrepared(
+                    restarts={
+                        instance_id: frozenset(summary.restarts)
+                        for instance_id, summary in summaries.items()
+                    },
+                    generation_cut_counts=generation_cut_counts,
+                )
             except BaseException as error:
                 body_error = error
                 raise

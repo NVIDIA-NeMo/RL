@@ -11,16 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-"""Driver-owned etcd, NATS and frontend that NeMo RL's own engines register with."""
-
 import json
 import signal
 import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 from nemo_rl.models.generation.dynamo import managed_runtime as runtime_module
+from nemo_rl.models.generation.dynamo.config import DynamoCfg, DynamoFrontendArgs
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     ManagedDynamoRuntime,
     _managed_namespace,
@@ -31,6 +31,24 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
 from nemo_rl.models.generation.megatron.dynamo_config import MegatronDynamoCfg
 
 _MODULE = "nemo_rl.models.generation.dynamo.managed_runtime"
+
+
+def _runtime(**frontend_args) -> ManagedDynamoRuntime:
+    return ManagedDynamoRuntime(
+        dynamo_cfg=DynamoCfg(
+            startup_timeout_s=5, frontend_args=DynamoFrontendArgs(**frontend_args)
+        ),
+        model_name="model",
+        frontend_python="/venvs/vllm/bin/python",
+    )
+
+
+class _FakeProcess:
+    returncode = None
+
+    @staticmethod
+    def poll():
+        return None
 
 
 class _FakeHttpResponse:
@@ -49,18 +67,280 @@ class _FakeHttpResponse:
         return json.dumps(self._payload).encode()
 
 
-def _instance(component: str, instance_id: str, namespace: str = "ns") -> dict:
-    return {
-        "namespace": namespace,
-        "component": component,
-        "endpoint": "generate",
-        "instance_id": instance_id,
+def _started(runtime: ManagedDynamoRuntime) -> ManagedDynamoRuntime:
+    runtime._started = True
+    runtime._host = "10.0.0.1"
+    runtime._frontend_port = 3000
+    runtime._namespace = "nemo-rl-test"
+    runtime._etcd_process = _FakeProcess()
+    runtime._nats_process = _FakeProcess()
+    runtime._frontend_process = _FakeProcess()
+    return runtime
+
+
+def test_dynamo_package_directory_does_not_shadow_stdlib_http() -> None:
+    package_dir = (
+        Path(__file__).resolve().parents[4]
+        / "nemo_rl"
+        / "models"
+        / "generation"
+        / "dynamo"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", "import http.client"],
+        cwd=package_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_runtime_construction_is_inert_and_namespace_is_driver_owned(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("SLURM_JOB_ID", "Job/123.4")
+    assert _managed_namespace() == "nemo-rl-job-123-4"
+    runtime = _runtime()
+    assert runtime._started is False
+    assert runtime._etcd_process is None
+    with pytest.raises(RuntimeError, match="not been started"):
+        _ = runtime.frontend_url
+    with pytest.raises(RuntimeError, match="not been started"):
+        _ = runtime.engine_env
+
+
+def test_managed_service_and_frontend_environments_are_runtime_owned(
+    monkeypatch,
+) -> None:
+    runtime = _runtime()
+    runtime._manager_env = {
+        "DYN_NAMESPACE": "managed",
+        "DYN_DISCOVERY_BACKEND": "etcd",
+        "ETCD_ENDPOINTS": "http://managed-etcd:2379",
+        "NATS_SERVER": "nats://managed-nats:4222",
     }
+    monkeypatch.setenv("DYN_NAMESPACE", "stale")
+    monkeypatch.setenv("DYN_STALE_SETTING", "remove-me")
+    monkeypatch.setenv("ETCD_STALE_SETTING", "remove-me")
+    monkeypatch.setenv("NATS_STALE_SETTING", "remove-me")
+    monkeypatch.setenv("NCCL_DEBUG", "INFO")
+
+    service_env = runtime._service_env()
+    assert service_env["DYN_NAMESPACE"] == "managed"
+    assert service_env["ETCD_ENDPOINTS"] == "http://managed-etcd:2379"
+    assert service_env["NATS_SERVER"] == "nats://managed-nats:4222"
+    assert "DYN_STALE_SETTING" not in service_env
+    assert "ETCD_STALE_SETTING" not in service_env
+    assert "NATS_STALE_SETTING" not in service_env
+    assert service_env["NCCL_DEBUG"] == "INFO"
+
+    runtime._started = True
+    engine_env = runtime.engine_env
+    assert engine_env["DYN_NAMESPACE"] == "managed"
+    # Each engine serves its own model card, so a frontend on another node can
+    # read model files that exist only on the engine's node.
+    assert engine_env["DYN_SYSTEM_PORT"] == "0"
+    assert "DYN_SYSTEM_PORT" not in service_env
 
 
-def _runtime(**overrides) -> ManagedDynamoRuntime:
-    # Megatron's dynamo_cfg stands in for any backend's: the runtime reads only
-    # startup_timeout_s and frontend_args.
+def test_dynamo_services_resolve_from_bin_dir_then_path(monkeypatch, tmp_path) -> None:
+    etcd = tmp_path / "etcd"
+    etcd.write_text("#!/bin/sh\n")
+    etcd.chmod(0o755)
+    monkeypatch.setenv("NEMO_RL_DYNAMO_BIN_DIR", str(tmp_path))
+    assert _service_executable("etcd") == str(etcd)
+    with pytest.raises(FileNotFoundError, match="NEMO_RL_DYNAMO_BIN_DIR"):
+        _service_executable("nats-server")
+
+    monkeypatch.delenv("NEMO_RL_DYNAMO_BIN_DIR")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert _service_executable("etcd") == str(etcd)
+    with pytest.raises(FileNotFoundError, match="on PATH"):
+        _service_executable("nats-server")
+
+
+def test_stop_process_escalates_its_process_group(monkeypatch) -> None:
+    class EscalatingProcess:
+        pid = 1234
+
+        def __init__(self):
+            self.wait_count = 0
+
+        @staticmethod
+        def poll():
+            return None
+
+        def wait(self, timeout):
+            self.wait_count += 1
+            if self.wait_count == 1:
+                raise subprocess.TimeoutExpired("dynamo", timeout)
+            return 0
+
+    signals = []
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.os.killpg",
+        lambda pid, sig: signals.append((pid, sig)),
+    )
+    process = EscalatingProcess()
+    ManagedDynamoRuntime._stop_process(process, "frontend", timeout_s=0.01)
+    assert signals == [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)]
+
+
+def test_shutdown_guards_each_owned_resource_independently(monkeypatch) -> None:
+    runtime = _runtime()
+    runtime._frontend_process = object()
+    runtime._nats_process = object()
+    runtime._etcd_process = object()
+    calls = []
+
+    def stop_process(process, label, timeout_s=15):
+        if process is None:
+            return
+        calls.append(label)
+        if label == "frontend":
+            raise RuntimeError("frontend failure")
+
+    monkeypatch.setattr(runtime, "_stop_process", stop_process)
+    runtime.shutdown()
+    runtime.shutdown()
+
+    assert calls == ["frontend", "NATS", "etcd"]
+    assert runtime._frontend_process is None
+    assert runtime._nats_process is None
+    assert runtime._etcd_process is None
+
+
+def test_engines_are_ready_once_registered_and_the_model_is_served(
+    monkeypatch,
+) -> None:
+    runtime = _started(_runtime())
+    health = {
+        "instances": [
+            {
+                "namespace": "nemo-rl-test",
+                "component": "backend",
+                "endpoint": "generate",
+                "instance_id": f"engine-{idx}",
+            }
+            for idx in range(2)
+        ]
+        # Another namespace's engine does not count toward this fleet.
+        + [
+            {
+                "namespace": "other",
+                "component": "backend",
+                "endpoint": "generate",
+                "instance_id": "foreign",
+            }
+        ]
+    }
+    responses = iter(
+        [
+            health,
+            {"data": []},
+            health,
+            {"data": [{"id": "model"}]},
+        ]
+    )
+    urls: list[str] = []
+
+    def fake_urlopen(url, timeout):
+        urls.append(url)
+        return _FakeHttpResponse(next(responses))
+
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.urllib.request.urlopen",
+        fake_urlopen,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.time.sleep", lambda _: None
+    )
+    runtime.wait_for_engines(2, check_engines=lambda: None)
+    assert (
+        urls
+        == [
+            "http://127.0.0.1:3000/health",
+            "http://127.0.0.1:3000/v1/models",
+        ]
+        * 2
+    )
+
+
+@pytest.mark.parametrize(
+    ("stopped", "error"),
+    [
+        ("engine", "shard 0 stopped serving"),
+        # A bad frontend_args.extra_cli_args flag makes the frontend exit at once.
+        ("frontend", r"frontend is not alive \(code=2\)"),
+    ],
+)
+def test_engine_wait_fails_immediately_when_an_engine_or_service_stops(
+    stopped, error
+) -> None:
+    runtime = _started(_runtime())
+    if stopped == "frontend":
+        runtime._frontend_process.poll = lambda: 2
+        runtime._frontend_process.returncode = 2
+
+    def check_engines() -> None:
+        if stopped == "engine":
+            raise RuntimeError("endpoint of generation shard 0 stopped serving")
+
+    with pytest.raises(RuntimeError, match=error):
+        runtime.wait_for_engines(1, check_engines=check_engines)
+
+
+def test_frontend_launches_from_the_given_interpreter(monkeypatch) -> None:
+    runtime = _runtime()
+    runtime._frontend_port = 3000
+    runtime._namespace = "nemo-rl-test"
+    launched = []
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.dynamo.managed_runtime.subprocess.Popen",
+        lambda command, **kwargs: launched.append(command) or _FakeProcess(),
+    )
+
+    runtime._start_frontend()
+
+    assert launched[0][:3] == ["/venvs/vllm/bin/python", "-m", "dynamo.frontend"]
+
+
+def test_shutdown_logs_the_kv_events_the_router_applied(monkeypatch, capsys) -> None:
+    runtime = _started(_runtime())
+    metrics = (
+        "# HELP dynamo_component_kv_cache_events_applied KV events applied\n"
+        'dynamo_component_kv_cache_events_applied{event_type="stored",status="ok",worker_id="1"} 40\n'
+        'dynamo_component_kv_cache_events_applied{event_type="stored",status="ok",worker_id="2"} 2\n'
+        'dynamo_component_kv_cache_events_applied{event_type="stored",status="parent_block_not_found"} 3\n'
+        # Every prefix-cache reset applies one; it says nothing about block events.
+        'dynamo_component_kv_cache_events_applied{event_type="cleared",status="ok",worker_id="1"} 5\n'
+        'dynamo_component_requests_total{status="ok"} 9\n'
+    )
+
+    class _Metrics(_FakeHttpResponse):
+        def read(self):
+            return metrics.encode()
+
+    urls = []
+    monkeypatch.setattr(
+        "urllib.request.urlopen",
+        lambda url, timeout: urls.append(url) or _Metrics(None),
+    )
+    monkeypatch.setattr(runtime, "_stop_process", lambda *args, **kwargs: None)
+
+    runtime.shutdown()
+
+    assert urls == ["http://127.0.0.1:3000/metrics"]
+    assert (
+        '[Dynamo] router applied KV events: {"ok": 42.0, "parent_block_not_found": 3.0}'
+        in capsys.readouterr().out
+    )
+
+
+# The runtime reads only startup_timeout_s and frontend_args, so the Megatron
+# engines' dynamo_cfg serves it as well as the vLLM one above.
+def _megatron_runtime(**overrides) -> ManagedDynamoRuntime:
     return ManagedDynamoRuntime(
         dynamo_cfg=MegatronDynamoCfg(**overrides),
         model_name="model",
@@ -68,44 +348,13 @@ def _runtime(**overrides) -> ManagedDynamoRuntime:
     )
 
 
-def test_construction_is_inert_and_namespace_is_driver_owned(monkeypatch) -> None:
-    monkeypatch.setenv("SLURM_JOB_ID", "Job/123.4")
-    assert _managed_namespace() == "nemo-rl-job-123-4"
-    runtime = _runtime()
-    assert runtime._started is False and runtime._etcd_process is None
-    assert runtime.namespace == "nemo-rl-job-123-4"
-    for attribute in ("frontend_url", "engine_env"):
-        with pytest.raises(RuntimeError, match="not been started"):
-            getattr(runtime, attribute)
-
-
-def test_start_launches_every_service_and_hands_engines_their_env(monkeypatch):
-    runtime = _runtime()
-    launched: list[str] = []
-    for service in ("etcd", "nats", "frontend"):
-        monkeypatch.setattr(
-            runtime,
-            f"_start_{service}",
-            lambda service=service: launched.append(service),
-        )
-    monkeypatch.setattr(f"{_MODULE}._get_node_ip_local", lambda: "10.0.0.1")
-    ports = iter([2379, 2380, 4222, 3000])
-    monkeypatch.setattr(
-        f"{_MODULE}._get_free_port_local", lambda *args, **kwargs: next(ports)
-    )
-    monkeypatch.setattr(f"{_MODULE}.atexit.register", lambda fn: None)
-
-    runtime.start()
-
-    assert launched == ["etcd", "nats", "frontend"]
-    assert runtime.frontend_url == "http://10.0.0.1:3000/v1"
-    env = runtime.engine_env
-    assert env["ETCD_ENDPOINTS"] == "http://10.0.0.1:2379"
-    assert env["NATS_SERVER"] == "nats://10.0.0.1:4222"
-    assert env["DYN_NAMESPACE"] == runtime.namespace
-    assert env["DYN_SYSTEM_PORT"] == "0"
-    with pytest.raises(RuntimeError, match="already started"):
-        runtime.start()
+def _instance(component: str, instance_id: str, namespace: str = "ns") -> dict:
+    return {
+        "namespace": namespace,
+        "component": component,
+        "endpoint": "generate",
+        "instance_id": instance_id,
+    }
 
 
 def test_frontend_argv_rejects_repeated_options() -> None:
@@ -129,62 +378,6 @@ def test_frontend_argv_rejects_repeated_options() -> None:
     )
     with pytest.raises(ValueError, match="--kv-overlap-score-weight is repeated"):
         frontend_argv(host="0.0.0.0", port=3000, namespace="ns", dynamo_cfg=cfg)
-
-
-def test_service_env_is_runtime_owned(monkeypatch) -> None:
-    runtime = _runtime()
-    runtime._manager_env = {
-        "DYN_NAMESPACE": "managed",
-        "ETCD_ENDPOINTS": "http://managed-etcd:2379",
-    }
-    monkeypatch.setenv("DYN_NAMESPACE", "stale")
-    monkeypatch.setenv("DYN_STALE_SETTING", "remove-me")
-    monkeypatch.setenv("ETCD_ENDPOINTS", "http://stale-etcd:2379")
-    monkeypatch.setenv("NATS_STALE_SETTING", "remove-me")
-    monkeypatch.setenv("NCCL_DEBUG", "INFO")
-
-    env = runtime._service_env()
-
-    assert env["DYN_NAMESPACE"] == "managed"
-    assert env["ETCD_ENDPOINTS"] == "http://managed-etcd:2379"
-    assert "DYN_STALE_SETTING" not in env and "NATS_STALE_SETTING" not in env
-    assert env["NCCL_DEBUG"] == "INFO"
-
-
-def test_service_executable_lookup_order(monkeypatch, tmp_path) -> None:
-    binary = tmp_path / "etcd"
-    binary.write_text("#!/bin/sh\n")
-    binary.chmod(0o755)
-    monkeypatch.setenv("NEMO_RL_DYNAMO_BIN_DIR", str(tmp_path))
-    assert _service_executable("etcd") == str(binary)
-    with pytest.raises(FileNotFoundError, match="NEMO_RL_DYNAMO_BIN_DIR"):
-        _service_executable("nats-server")
-
-
-def test_stop_process_escalates_its_process_group(monkeypatch) -> None:
-    class EscalatingProcess:
-        pid = 1234
-
-        def __init__(self):
-            self.wait_count = 0
-
-        @staticmethod
-        def poll():
-            return None
-
-        def wait(self, timeout):
-            self.wait_count += 1
-            if self.wait_count == 1:
-                raise subprocess.TimeoutExpired("dynamo", timeout)
-            return 0
-
-    signals = []
-    monkeypatch.setattr(
-        f"{_MODULE}.os.killpg", lambda pid, sig: signals.append((pid, sig))
-    )
-    process = EscalatingProcess()
-    ManagedDynamoRuntime._stop_process(process, "frontend", timeout_s=0.01)
-    assert signals == [(process.pid, signal.SIGTERM), (process.pid, signal.SIGKILL)]
 
 
 def test_wait_counts_every_component_then_the_model(monkeypatch) -> None:
@@ -288,7 +481,7 @@ def test_wait_times_out_naming_what_is_missing(monkeypatch) -> None:
 def test_runtime_wait_takes_a_count_or_one_per_component(
     monkeypatch, expected_engines, components
 ) -> None:
-    runtime = _runtime(startup_timeout_s=7.0)
+    runtime = _megatron_runtime(startup_timeout_s=7.0)
     runtime._frontend_port = 3000
     runtime._namespace = "ns"
     monkeypatch.setattr(runtime, "_assert_services_alive", lambda: None)
@@ -315,7 +508,7 @@ def test_runtime_wait_takes_a_count_or_one_per_component(
 
 
 def test_runtime_wait_checks_its_own_processes(monkeypatch) -> None:
-    runtime = _runtime()
+    runtime = _megatron_runtime()
     runtime._frontend_port = 3000
     runtime._namespace = "ns"
     # No service process was started: the probe says so before any HTTP call.
@@ -325,32 +518,3 @@ def test_runtime_wait_checks_its_own_processes(monkeypatch) -> None:
     )
     with pytest.raises(RuntimeError, match="etcd is not alive"):
         runtime.wait_for_engines({"prefill": 1}, check_engines=lambda: None)
-
-
-def test_shutdown_guards_each_owned_resource(monkeypatch, tmp_path) -> None:
-    runtime = _runtime()
-    stopped: list[str] = []
-
-    def fake_stop(process, label, timeout_s=15):
-        stopped.append(label)
-        if label == "NATS":
-            raise RuntimeError("boom")
-
-    monkeypatch.setattr(
-        runtime_module.ManagedDynamoRuntime, "_stop_process", staticmethod(fake_stop)
-    )
-    runtime._frontend_process = object()
-    runtime._nats_process = object()
-    runtime._etcd_process = object()
-    etcd_dir = tmp_path / "etcd"
-    etcd_dir.mkdir()
-    runtime._etcd_data_dir = str(etcd_dir)
-    runtime._started = True
-
-    runtime.shutdown()
-
-    assert stopped == ["frontend", "NATS", "etcd"]
-    assert not etcd_dir.exists()
-    assert runtime._started is False and runtime._frontend_process is None
-    runtime.shutdown()
-    assert stopped == ["frontend", "NATS", "etcd"] * 2
