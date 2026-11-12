@@ -211,6 +211,7 @@ def _stage_optimizer_state_on_cpu(optimizer: torch.optim.Optimizer) -> None:
     from torch.distributed.checkpoint.state_dict import _init_optim_state
 
     _init_optim_state(optimizer)
+    optimizer.zero_grad(set_to_none=True)
     for state in optimizer.state.values():
         for k, v in state.items():
             if isinstance(v, torch.Tensor) and v.device.type != "cpu":
@@ -487,12 +488,24 @@ class AutomodelCheckpointManager:
         if optimizer_path and optimizer is not None:
             _stage_optimizer_state_on_cpu(optimizer)
             self.check_master_weight_dtypes(model, optimizer, optimizer_path)
-            self.checkpointer.load_optimizer(
-                optimizer=optimizer,
-                model=model,
-                weights_path=optimizer_path,
-                scheduler=scheduler,
-            )
+            # torch's Optimizer.load_state_dict casts every loaded state tensor to its
+            # parameter's device at once; with CUDA params that put the whole state on
+            # GPU next to the model (Step-5 600B / 128 H100: resume OOM). Keep the params
+            # on CPU for the optimizer load; prepare_for_training moves state to CUDA.
+            optimizer.zero_grad(set_to_none=True)
+            device = next(model.parameters()).device
+            model.to("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
+            try:
+                self.checkpointer.load_optimizer(
+                    optimizer=optimizer,
+                    model=model,
+                    weights_path=optimizer_path,
+                    scheduler=scheduler,
+                )
+            finally:
+                model.to(device)
 
     def check_master_weight_dtypes(
         self,
