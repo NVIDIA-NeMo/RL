@@ -342,7 +342,9 @@ srun --nodes=1 --no-container-mount-home \
 The script clears `/opt/gym_venvs`, so the archive holds only the environments the recipe
 config uses, built from your Gym. It builds them with the same CUDA torch backend and vLLM
 wheel override as the image's own prefetch step, so a build on a node without GPUs does not
-pick CPU torch. It stops on the first error, and only a finished build replaces the archive.
+pick CPU torch. If the image was built with non-default `NEMO_GYM_CUDA` or
+`NEMO_GYM_VLLM_VERSION` build arguments, set the same values for the build. It stops on the first
+error, and only a finished build replaces the archive.
 Next to the archive it writes `<archive>.servers`, which lists the environments, and
 `<archive>.size`.
 
