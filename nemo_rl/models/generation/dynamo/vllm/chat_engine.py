@@ -37,6 +37,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib
+import logging
 import os
 import threading
 import time
@@ -61,6 +63,8 @@ from nemo_rl.models.generation.gym_call import (
     GymCallResult,
     GymRequestFields,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 # The key the engine publishes its chat settings under in runtime_data.
 RUNTIME_DATA_KEY = "nemo_rl_chat"
@@ -177,12 +181,18 @@ class _CaptureSource:
 
     def resolve_prefix(self, serving_admission: Any) -> list[int]:
         """The admission's prefix, read from TQ (blocking; run off the loop)."""
+        started = time.monotonic()
         from nemo_rl.data_plane.tq_token_sink import resolve_admission_prefix
 
         if self._prefix_cache is None:
             with self._connect_lock:
                 if self._prefix_cache is None:
                     self._prefix_cache = self._connect()
+                    LOGGER.info(
+                        "The first token-capture prefix read imported and "
+                        "connected to TQ in %.1fs",
+                        time.monotonic() - started,
+                    )
         return resolve_admission_prefix(serving_admission, self._prefix_cache)
 
     @staticmethod
@@ -214,6 +224,15 @@ class _CaptureSource:
         return cache
 
 
+def _log_failed_start(task: asyncio.Task[None]) -> None:
+    """Log why the chat engine's start failed; the first call fails the same way."""
+    if not task.cancelled() and task.exception() is not None:
+        LOGGER.error(
+            "NeMo RL's chat engine could not start its render workers",
+            exc_info=task.exception(),
+        )
+
+
 class NemoRLChatEngine:
     """Serves NeMo-Gym's chat calls for one model's engines."""
 
@@ -229,6 +248,27 @@ class NemoRLChatEngine:
         self._routed_engine = routed_engine
         self._generation = spec["generation"]
         self._capture = capture
+        # Held here: the event loop keeps only a weak reference to its tasks.
+        self._start_task: Optional[asyncio.Task[None]] = None
+
+    def start(self) -> None:
+        """Do in the background what the first chat call would wait for.
+
+        The render workers start, and the steps a call runs are imported (they
+        import vLLM) in a thread, so the frontend's event loop keeps serving.
+        A call that arrives first waits for the workers, as without this.
+        """
+        self._start_task = asyncio.get_running_loop().create_task(self._start())
+        self._start_task.add_done_callback(_log_failed_start)
+
+    async def _start(self) -> None:
+        await asyncio.gather(
+            self._pool.start(),
+            asyncio.to_thread(
+                importlib.import_module,
+                "nemo_rl.models.generation.vllm.prompt_and_capture",
+            ),
+        )
 
     async def generate(
         self, request: dict[str, Any], context: Any = None
@@ -452,4 +492,8 @@ class ChatEngineFactory:
         engine = NemoRLChatEngine(
             pool=pool, routed_engine=routed_engine, spec=spec, capture=self._capture
         )
+        if spec["generation"]["vllm_cfg"].get("expose_http_server"):
+            # NeMo-Gym's calls need this flag, and the native worker starts its
+            # chat server on it. Without it no chat call comes, so nothing starts.
+            engine.start()
         return PythonAsyncEngine(engine.generate, asyncio.get_running_loop())

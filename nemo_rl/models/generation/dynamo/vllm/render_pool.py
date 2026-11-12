@@ -35,6 +35,7 @@ import logging
 import multiprocessing
 import os
 import pickle
+import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -161,6 +162,9 @@ class _Worker:
             reasoning_parser=serving_chat_kwargs.get("reasoning_parser"),
             default_chat_template_kwargs=default_chat_template_kwargs,
         )
+        # As vLLM's API server does at startup: compiles the chat template and
+        # warms the multimodal processor, so the first render does neither.
+        self.online_renderer.warmup()
         # vLLM's chat serving builds replies only here; it never generates.
         engine_client = SimpleNamespace(
             model_config=self.model_config,
@@ -379,7 +383,11 @@ def _info() -> dict[str, Any]:
 
 
 class RenderPool:
-    """``workers`` processes that render and answer chat calls, FIFO."""
+    """``workers`` processes that render and answer chat calls, FIFO.
+
+    :meth:`start` starts them all. Without it the executor starts one for each
+    job submitted while none is idle, so the first calls wait for them.
+    """
 
     def __init__(self, spec: dict[str, Any], model_dir: str, *, workers: int):
         self._spec = spec
@@ -418,12 +426,21 @@ class RenderPool:
                 self._executor = self._start()
             raise
 
-    async def info(self) -> dict[str, Any]:
-        """The model's turn-end ids and context length, from a started worker.
+    async def start(self) -> None:
+        """Start every worker now: one job each, submitted while none is idle."""
+        started = time.monotonic()
+        infos = await asyncio.gather(
+            *(self._submit(_info) for _ in range(self._workers))
+        )
+        self._info = infos[0]
+        LOGGER.info(
+            "The render pool's first of %d workers is ready after %.1fs",
+            self._workers,
+            time.monotonic() - started,
+        )
 
-        Workers start on first use, so a run that sends no chat call never
-        builds them.
-        """
+    async def info(self) -> dict[str, Any]:
+        """The model's turn-end ids and context length, from a started worker."""
         if self._info is None:
             self._info = await self._submit(_info)
         return self._info

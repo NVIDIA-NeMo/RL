@@ -480,3 +480,37 @@ def test_only_nemo_rls_engines_are_served() -> None:
 
     with pytest.raises(RuntimeError, match="without NeMo RL's chat settings"):
         asyncio.run(build())
+
+
+@pytest.mark.parametrize("exposes_chat", [True, False])
+def test_render_workers_start_at_registration_only_where_chat_is_served(
+    monkeypatch, exposes_chat: bool
+) -> None:
+    started: list[int] = []
+
+    class _StartedPool:
+        def __init__(self, spec: dict, model_dir: str, *, workers: int) -> None:
+            self._workers = workers
+
+        async def start(self) -> None:
+            started.append(self._workers)
+
+    monkeypatch.setattr(chat_engine, "RenderPool", _StartedPool)
+    monkeypatch.setenv(chat_engine.RENDER_WORKERS_ENV, "3")
+    # NeMo-Gym needs the flag, and the native worker starts its server on it.
+    generation = {**GENERATION, "vllm_cfg": {"expose_http_server": exposes_chat}}
+    spec = {"engine_args": {}, "generation": generation}
+    model = SimpleNamespace(
+        runtime_config=lambda: {"runtime_data": {chat_engine.RUNTIME_DATA_KEY: spec}},
+        name=lambda: "model",
+        local_dir=lambda: "/snapshots/model",
+    )
+
+    async def register() -> None:
+        await chat_engine.ChatEngineFactory().chat_engine_factory(0, model, _Router())
+        # The start runs in the background; registration never waits for it.
+        await asyncio.gather(*(asyncio.all_tasks() - {asyncio.current_task()}))
+
+    asyncio.run(register())
+
+    assert started == ([3] if exposes_chat else [])
