@@ -243,7 +243,13 @@ ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
 # Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
-ENV TORCH_CUDA_ARCH_LIST="9.0 10.0"
+ARG TORCH_CUDA_ARCH_LIST="9.0 10.0"
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
+# Build-only knobs read by the flash-attn and FlashMLA source builds. Unset keeps
+# each package's own default.
+ARG FLASH_ATTN_CUDA_ARCHS
+ARG FLASH_MLA_DISABLE_SM90
+ARG NVCC_THREADS
 
 # Build HybridEP with inter-node transport support. Derived from the ARG (not
 # hardcoded) so a non-default --build-arg HYBRID_EP_MULTINODE=0 is reflected
