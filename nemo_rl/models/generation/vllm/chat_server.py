@@ -52,7 +52,7 @@ from vllm.entrypoints.serve.tokenize.protocol import (
 )
 from vllm.entrypoints.serve.tokenize.serving import ServingTokenization
 from vllm.entrypoints.serve.utils.api_utils import with_cancellation
-from vllm.exceptions import VLLMValidationError
+from vllm.exceptions import VLLMClientError, VLLMValidationError
 from vllm.reasoning.abs_reasoning_parsers import ReasoningParserManager
 from vllm.renderers.hf import HfRenderer
 from vllm.renderers.online_renderer import OnlineRenderer
@@ -77,8 +77,10 @@ from nemo_rl.models.generation.vllm.generation_cut_route import (
     register_generation_cut_route,
 )
 from nemo_rl.models.generation.vllm.prompt_and_capture import (
+    ErrorReply,
     abort_capture,
     abort_request_capture,
+    error_reply,
     prepare_prompt,
     save_capture,
     set_max_tokens,
@@ -762,12 +764,48 @@ def build_chat_server(
     return ChatServer(online_renderer, openai_serving_chat, openai_serving_tokenization)
 
 
+def _error_response(
+    failure: ErrorReply, headers: Optional[dict[str, str]]
+) -> JSONResponse:
+    """The OpenAI error body of a call refused before its reply."""
+    return JSONResponse(
+        content={
+            "error": {
+                "message": failure.message,
+                "type": failure.error_type,
+                "param": failure.param,
+                "code": failure.code,
+            }
+        },
+        status_code=failure.status,
+        headers=headers or None,
+    )
+
+
+CHAT_COMPLETIONS_PATH = "/v1/chat/completions"
+
+
 def register_routes(
     app: FastAPI, server: ChatServer, *, host: Any, generation_config: dict[str, Any]
 ) -> None:
     """Add /v1/chat/completions and /tokenize to ``app``."""
     openai_serving_chat = server.serving_chat
     openai_serving_tokenization = server.serving_tokenization
+
+    @app.exception_handler(VLLMClientError)
+    async def refuse_unparsed_request(raw_request: Request, error: VLLMClientError):
+        # vLLM raises some request errors from the body's validators, before any
+        # route runs; unhandled, FastAPI answers them with a 500.
+        failure = error_reply(error)
+        if failure is None:
+            raise error
+        headers = None
+        if failure.acknowledge and raw_request.url.path == CHAT_COMPLETIONS_PATH:
+            # No capture began: the refused call is named by the raw body.
+            headers = host._context_refusal_headers(
+                GymRequestFields.model_validate_json(await raw_request.body())
+            )
+        return _error_response(failure, headers)
 
     class HostedChatCompletionRequest(NeMoRLChatCompletionRequest):
         def to_sampling_params(self, *args, **kwargs):
@@ -779,7 +817,7 @@ def register_routes(
     register_generation_cut_route(app, lambda: host._prefix_recovery)
 
     # The create_chat_completion and tokenize methods are taken from vllm/entrypoints/openai/api_server.py
-    @app.post("/v1/chat/completions")
+    @app.post(CHAT_COMPLETIONS_PATH)
     # Like vLLM's own routes: cancel the handler (and with it the engine
     # request) when the client disconnects, instead of generating for nobody.
     @with_cancellation
@@ -824,22 +862,10 @@ def register_routes(
             failure = await abort_capture(host, request, error)
             if failure is None:
                 raise
-            return JSONResponse(
-                content={
-                    "error": {
-                        "message": failure.message,
-                        "type": failure.error_type,
-                        "param": failure.param,
-                        "code": failure.code,
-                    }
-                },
-                status_code=failure.status,
-                # Sent after abort_capture drained the capture state.
-                headers=(
-                    host._context_refusal_headers(request)
-                    if failure.acknowledge
-                    else None
-                ),
+            # The acknowledgement goes out after abort_capture drained capture state.
+            return _error_response(
+                failure,
+                host._context_refusal_headers(request) if failure.acknowledge else None,
             )
 
         if isinstance(generator, ErrorResponse):
