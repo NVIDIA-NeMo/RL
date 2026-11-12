@@ -337,11 +337,28 @@ class AsyncTrajectoryCollector:
 
         return [generation_weight_version + i for i in range(1, generation_lead + 1)]
 
+    def _candidate_target_weights(self, generation_weight_version: int) -> list[int]:
+        """Targets this generation version may fill, short current target first.
+
+        ``_calculate_target_weights`` only looks ahead, so a target that is
+        still short when the weights advance to it can never be completed: the
+        trainer waits for it and the collector only generates for later steps.
+        That happens when a target is gap-filled from a partial batch (e.g. a
+        frontier-aligned resume that regenerates abandoned ordinals) and the
+        refit lands before the rest of the target was reserved. Trajectories
+        generated at version T are valid for target T (age 0), so offer T
+        itself first; it is skipped whenever T is already full or consumed.
+        """
+        targets = self._calculate_target_weights(generation_weight_version)
+        if generation_weight_version not in targets:
+            targets = [generation_weight_version, *targets]
+        return targets
+
     def _get_next_target_for_generation(
         self, generation_weight_version: int
     ) -> Optional[int]:
         """Get the next target weight that needs generation (if any)."""
-        target_weights = self._calculate_target_weights(generation_weight_version)
+        target_weights = self._candidate_target_weights(generation_weight_version)
         num_prompts = self._num_prompts_per_step
         max_age_steps = self._max_trajectory_age_steps
         last_consumed_target = ray.get(
@@ -416,7 +433,7 @@ class AsyncTrajectoryCollector:
     def _should_pause_for_generation_limits(self) -> bool:
         """Check if collection should be paused due to generation limits."""
         try:
-            target_weights = self._calculate_target_weights(self.current_weight_version)
+            target_weights = self._candidate_target_weights(self.current_weight_version)
             num_prompts = self._num_prompts_per_step
             max_age_steps = self._max_trajectory_age_steps
             last_consumed_target = ray.get(
