@@ -22,7 +22,8 @@
 #       Run inside the training image, from the NeMo RL checkout.
 #       Builds the Gym server venvs that the configs use into /opt/gym_venvs (NEMO_GYM_VENV_DIR),
 #       then writes <archive.tar>, <archive.tar>.servers and <archive.tar>.size.
-#       Uses the same CUDA torch backend and vLLM wheel override as the image's own Gym prefetch step.
+#       Uses the same CUDA torch backend and vLLM wheel override as the image's own Gym prefetch step
+#       (gym_vllm_override.sh); set NEMO_GYM_CUDA or NEMO_GYM_VLLM_VERSION if the image was built with others.
 #   gym_venv_archive.sh unpack <archive.tar> [<file to touch on failure>]
 #       Run as ray.sub's SETUP_COMMAND on every node, before Ray starts.
 #       Replaces /opt/gym_venvs with the archive's venvs, or does nothing if it already holds them.
@@ -47,19 +48,14 @@ build() {
     rm -rf "${VENV_DIR:?}"
     mkdir -p "${VENV_DIR}"
 
-    # Same environment as docker/Dockerfile's Gym prefetch step: CUDA torch and vLLM's prebuilt CUDA wheel, so a
-    # build on a node without GPUs does not pick CPU torch for vLLM-based Gym servers.
-    local cuda="${NEMO_GYM_CUDA-cu130}"
-    local vllm_version="${NEMO_GYM_VLLM_VERSION-0.29.0}"
+    # Same environment as docker/Dockerfile's Gym prefetch step, from the same helper: CUDA torch and vLLM's
+    # prebuilt CUDA wheel, so a build on a node without GPUs does not pick CPU torch for vLLM-based Gym servers.
+    # shellcheck source=examples/nemo_gym/gym_vllm_override.sh
+    source "$(dirname "${BASH_SOURCE[0]}")/gym_vllm_override.sh"
     local override_file
     override_file="$(mktemp)"
-    if [[ -n "${vllm_version}" ]]; then
-        local wheel_arch
-        case "$(uname -m)" in aarch64) wheel_arch=aarch64 ;; *) wheel_arch=x86_64 ;; esac
-        printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s-cp38-abi3-manylinux_2_28_%s.whl\n' \
-            "${vllm_version}" "${vllm_version}" "${wheel_arch}" > "${override_file}"
-    fi
-    UV_TORCH_BACKEND="${cuda}" UV_OVERRIDE="${override_file}" \
+    gym_write_vllm_override "${override_file}"
+    UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" UV_OVERRIDE="${override_file}" \
         uv run --no-sync python examples/nemo_gym/prefetch_venvs.py "$@"
     rm -f "${override_file}"
 
@@ -88,7 +84,7 @@ unpack() {
     if staging="$(mktemp -d "$(dirname "${VENV_DIR}")/.gym_venvs.XXXXXX")" &&
         [[ "$(stat -c %s "${archive}" 2>/dev/null)" == "$(cat "${archive}.size" 2>/dev/null)" ]] &&
         tar -C "${staging}" -xf "${archive}" &&
-        [[ -s "${archive}.servers" ]] &&
+        [[ -f "${archive}.servers" && -r "${archive}.servers" && -s "${archive}.servers" ]] &&
         ! while read -r server; do
             [[ -x "${staging}/$(basename "${VENV_DIR}")/${server}/.venv/bin/python" ]] || echo "missing: ${server}"
         done < "${archive}.servers" | grep . >&2 &&
