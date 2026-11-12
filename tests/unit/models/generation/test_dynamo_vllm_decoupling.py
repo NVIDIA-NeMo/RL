@@ -38,6 +38,9 @@ DYNAMO_SDK_MODULES = {
     "dynamo.common.backend",
     "dynamo.common.backend.logprobs",
     "dynamo.common.backend.publisher",
+    # Megatron engines resolve their model files through it; it reaches only
+    # dynamo._core, dynamo.llm and dynamo.common.snapshot, never dynamo.vllm.
+    "dynamo.common.model_fetch",
     "dynamo.llm.exceptions",
 }
 

@@ -19,12 +19,18 @@ from pathlib import Path
 
 import pytest
 
+from nemo_rl.models.generation.dynamo import managed_runtime as runtime_module
 from nemo_rl.models.generation.dynamo.config import DynamoCfg, DynamoFrontendArgs
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     ManagedDynamoRuntime,
     _managed_namespace,
     _service_executable,
+    frontend_argv,
+    wait_for_engine_registrations,
 )
+from nemo_rl.models.generation.megatron.dynamo_config import MegatronDynamoCfg
+
+_MODULE = "nemo_rl.models.generation.dynamo.managed_runtime"
 
 
 def _runtime(**frontend_args) -> ManagedDynamoRuntime:
@@ -330,3 +336,185 @@ def test_shutdown_logs_the_kv_events_the_router_applied(monkeypatch, capsys) -> 
         '[Dynamo] router applied KV events: {"ok": 42.0, "parent_block_not_found": 3.0}'
         in capsys.readouterr().out
     )
+
+
+# The runtime reads only startup_timeout_s and frontend_args, so the Megatron
+# engines' dynamo_cfg serves it as well as the vLLM one above.
+def _megatron_runtime(**overrides) -> ManagedDynamoRuntime:
+    return ManagedDynamoRuntime(
+        dynamo_cfg=MegatronDynamoCfg(**overrides),
+        model_name="model",
+        frontend_python="/venvs/engine/bin/python",
+    )
+
+
+def _instance(component: str, instance_id: str, namespace: str = "ns") -> dict:
+    return {
+        "namespace": namespace,
+        "component": component,
+        "endpoint": "generate",
+        "instance_id": instance_id,
+    }
+
+
+def test_frontend_argv_rejects_repeated_options() -> None:
+    cfg = MegatronDynamoCfg(
+        frontend_args={"extra_cli_args": ["--kv-overlap-score-weight=2"]}
+    )
+    argv = frontend_argv(host="0.0.0.0", port=3000, namespace="ns", dynamo_cfg=cfg)
+    assert argv[:4] == ["--http-host", "0.0.0.0", "--http-port", "3000"]
+    assert "--router-mode" in argv and argv[-1] == "--kv-overlap-score-weight=2"
+    cfg = MegatronDynamoCfg(frontend_args={"extra_cli_args": ["--router_mode=kv"]})
+    with pytest.raises(ValueError, match="--router-mode is set by both"):
+        frontend_argv(host="0.0.0.0", port=3000, namespace="ns", dynamo_cfg=cfg)
+    # Spellings that differ only in "_" vs "-" are the same option.
+    cfg = MegatronDynamoCfg(
+        frontend_args={
+            "extra_cli_args": [
+                "--kv-overlap-score-weight=1",
+                "--kv_overlap_score_weight=2",
+            ]
+        }
+    )
+    with pytest.raises(ValueError, match="--kv-overlap-score-weight is repeated"):
+        frontend_argv(host="0.0.0.0", port=3000, namespace="ns", dynamo_cfg=cfg)
+
+
+def test_wait_counts_every_component_then_the_model(monkeypatch) -> None:
+    """Both roles must register and the model must be routable before success."""
+    prefill_only = {"instances": [_instance("prefill", "p0")]}
+    both = {
+        "instances": [
+            _instance("prefill", "p0"),
+            _instance("backend", "d0"),
+            _instance("backend", "d1"),
+            # Another namespace's engine does not count.
+            _instance("backend", "x", namespace="other"),
+        ]
+    }
+    responses = iter(
+        [
+            prefill_only,
+            {"data": [{"id": "model"}]},
+            both,
+            {"data": []},
+            both,
+            {"data": [{"id": "model"}]},
+        ]
+    )
+    urls: list[str] = []
+
+    def fake_urlopen(url, timeout):
+        urls.append(url)
+        return _FakeHttpResponse(next(responses))
+
+    monkeypatch.setattr(f"{_MODULE}.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr(f"{_MODULE}.time.sleep", lambda _: None)
+    probes = []
+
+    wait_for_engine_registrations(
+        frontend_url="http://127.0.0.1:3000/v1/",
+        namespace="ns",
+        expected_components={"prefill": 1, "backend": 2},
+        model_name="model",
+        timeout_s=5,
+        check_alive=lambda: probes.append(True),
+    )
+
+    assert (
+        urls == ["http://127.0.0.1:3000/health", "http://127.0.0.1:3000/v1/models"] * 3
+    )
+    assert len(probes) == 3
+
+
+def test_wait_fails_at_once_when_an_engine_died(monkeypatch) -> None:
+    def dead():
+        raise RuntimeError("Megatron engines died: decode-0")
+
+    monkeypatch.setattr(f"{_MODULE}.time.sleep", lambda _: None)
+    with pytest.raises(RuntimeError, match="died: decode-0"):
+        wait_for_engine_registrations(
+            frontend_url="http://127.0.0.1:3000/v1",
+            namespace="ns",
+            expected_components={"prefill": 1, "backend": 1},
+            model_name="model",
+            timeout_s=5,
+            check_alive=dead,
+        )
+
+
+def test_wait_times_out_naming_what_is_missing(monkeypatch) -> None:
+    health = {"instances": [_instance("prefill", "p0")]}
+    monkeypatch.setattr(
+        f"{_MODULE}.urllib.request.urlopen",
+        lambda url, timeout: _FakeHttpResponse(
+            health if "health" in url else {"data": []}
+        ),
+    )
+    monkeypatch.setattr(f"{_MODULE}.time.sleep", lambda _: None)
+    clock = iter([0.0, 0.0, 10.0])
+    monkeypatch.setattr(f"{_MODULE}.time.monotonic", lambda: next(clock))
+    with pytest.raises(
+        RuntimeError, match=r"registered=\{'prefill': 1, 'backend': 0\}"
+    ):
+        wait_for_engine_registrations(
+            frontend_url="http://127.0.0.1:3000/v1",
+            namespace="ns",
+            expected_components={"prefill": 1, "backend": 1},
+            model_name="model",
+            timeout_s=5,
+            check_alive=lambda: None,
+        )
+
+
+@pytest.mark.parametrize(
+    ("expected_engines", "components"),
+    [
+        # vLLM: one count, every engine under the backend component.
+        pytest.param(2, {"backend": 2}, id="engine_count"),
+        # Megatron prefill/decode: a count per component.
+        pytest.param(
+            {"prefill": 1, "backend": 1}, {"prefill": 1, "backend": 1}, id="per_role"
+        ),
+    ],
+)
+def test_runtime_wait_takes_a_count_or_one_per_component(
+    monkeypatch, expected_engines, components
+) -> None:
+    runtime = _megatron_runtime(startup_timeout_s=7.0)
+    runtime._frontend_port = 3000
+    runtime._namespace = "ns"
+    monkeypatch.setattr(runtime, "_assert_services_alive", lambda: None)
+    waits = []
+    monkeypatch.setattr(
+        runtime_module,
+        "wait_for_engine_registrations",
+        lambda **kwargs: waits.append(kwargs),
+    )
+    probes = []
+
+    runtime.wait_for_engines(expected_engines, check_engines=lambda: probes.append(1))
+
+    (wait,) = waits
+    wait.pop("check_alive")()
+    assert probes == [1]
+    assert wait == {
+        "frontend_url": "http://127.0.0.1:3000/v1",
+        "namespace": "ns",
+        "expected_components": components,
+        "model_name": "model",
+        "timeout_s": 7.0,
+    }
+
+
+def test_runtime_wait_checks_its_own_processes(monkeypatch) -> None:
+    runtime = _megatron_runtime()
+    runtime._frontend_port = 3000
+    runtime._namespace = "ns"
+    # No service process was started: the probe says so before any HTTP call.
+    monkeypatch.setattr(
+        f"{_MODULE}.urllib.request.urlopen",
+        lambda url, timeout: pytest.fail("no HTTP before the liveness probe"),
+    )
+    with pytest.raises(RuntimeError, match="etcd is not alive"):
+        runtime.wait_for_engines({"prefill": 1}, check_engines=lambda: None)

@@ -11,12 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Generation over NeMo-RL-owned Megatron prefill/decode engines served through Dynamo.
+"""Generation over NeMo-RL-owned Megatron prefill/decode engines behind a Dynamo frontend.
 
 One engine is one ``MegatronGeneration`` over its own worker group, the same
 dedicated inference policy the Megatron backend already builds, with its role
-in its config. ``MegatronDynamoGeneration`` makes the engines exist, in refit
-rank order, and is their refit side.
+in its config. Once the first refit has built the engine, its rank zero hosts
+Megatron-LM's Dynamo adapter (``MegatronLLMEngine``, driven by a Dynamo
+``Worker`` task on the inference loop), which registers the engine with the
+frontend, forwards requests to the engine's coordinator, and carries the KV
+handoff between prefill and decode. ``MegatronDynamoGeneration`` makes the
+engines exist, in refit rank order, starts their endpoints, and is their refit
+side.
 """
 
 import copy
@@ -34,6 +39,10 @@ from transformers.tokenization_utils_base import PreTrainedTokenizerBase
 
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import RayVirtualCluster, _get_node_ip_local
+from nemo_rl.models.generation.dynamo.managed_runtime import (
+    ManagedDynamoRuntime,
+    wait_for_engine_registrations,
+)
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
     GenerationInterface,
@@ -41,6 +50,7 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.megatron.config import MCoreGenerationConfig
 from nemo_rl.models.generation.megatron.dynamo_config import (
+    DYNAMO_COMPONENT_BY_ROLE,
     MegatronDynamoCfg,
     MegatronDynamoRole,
     disaggregation_cfg,
@@ -224,6 +234,11 @@ class MegatronDynamoEngine:
     def prepare_for_generation(self, *, tags: list[str]) -> list[ray.ObjectRef]:
         return self._all("prepare_for_generation", tags=tags)
 
+    def attach_dynamo_events(self, *, parent_event_address: str) -> list[ray.ObjectRef]:
+        return self._all(
+            "attach_dynamo_events", parent_event_address=parent_event_address
+        )
+
     def set_rollout_weight_version(self, version: int) -> list[ray.ObjectRef]:
         return self._all("set_rollout_weight_version", version=version)
 
@@ -244,7 +259,16 @@ class MegatronDynamoGeneration(GenerationInterface):
     ``dynamo_cfg.prefill_engine`` / ``decode_engine`` overrides, so prefill and
     decode engines may differ in TP and PP (the KV handoff reshards between
     them). An engine's role, carried in its config, also picks the engine
-    variant and KV-transfer agents its ranks build.
+    variant and KV-transfer agents its ranks build and the Dynamo component it
+    registers under.
+
+    It also owns the ``ManagedDynamoRuntime`` (etcd, NATS and the frontend) the
+    engines register with, started right after the engines in the order the
+    vLLM backend uses, so the frontend runs from the engines' own environment.
+    The first resume after a refit is also the engines' startup: that refit
+    built them, so only now do their Dynamo endpoints start on each rank zero
+    and register with the frontend, and the resume waits until the frontend
+    lists every engine.
 
     This object is also the engines' refit side: every refit call the trainer
     makes here (collective init, prepare the weights, transfer, suspend,
@@ -257,11 +281,13 @@ class MegatronDynamoGeneration(GenerationInterface):
     owns no policy and no worker group of its own.
 
     Pickling keeps the engine records (plain data plus the workers' actor
-    handles) and drops the owning objects, so the SingleController actor's copy
-    drives refits without being able to shut an engine down.
+    handles), the frontend URL, the namespace and engine environment, and
+    drops the owning objects and the runtime, so the SingleController actor's
+    copy drives refits and starts the engines' endpoints without being able to
+    shut an engine or a service down.
 
-    Rollouts are not served yet: the engines register with no frontend, so
-    :meth:`validate_settings` refuses the switch and ``generate_async`` raises.
+    Rollouts are still not posted to the frontend, so :meth:`validate_settings`
+    refuses the switch and ``generate_async`` raises.
     """
 
     @classmethod
@@ -272,9 +298,9 @@ class MegatronDynamoGeneration(GenerationInterface):
         so a shape the engines could never serve is named as such. Router replay
         is refused next: the KV handoff moves a prompt's cache from a prefill to
         a decode engine but not its routing-replay buffers. Any config is then
-        refused, because the prefill/decode engines are built and refit but no
-        frontend serves rollouts from them yet, and the run would otherwise fail
-        at its first generation.
+        refused, because the prefill/decode engines are built, refit and
+        registered with the frontend, but nothing posts rollouts to it yet, and
+        the run would otherwise fail at its first generation.
         """
         MegatronGeneration.validate_settings(master_config)
         validate_megatron_dynamo_generation(master_config.policy["generation"])
@@ -286,8 +312,8 @@ class MegatronDynamoGeneration(GenerationInterface):
             )
         raise NotImplementedError(
             "policy.generation.dynamo=true is not served by MegatronGeneration yet: "
-            "the Megatron prefill/decode engines are built and refit, but no "
-            "frontend serves rollouts from them. Remove policy.generation.dynamo."
+            "the Megatron prefill/decode engines register with the frontend, but "
+            "nothing posts rollouts to it. Remove policy.generation.dynamo."
         )
 
     def __init__(
@@ -301,13 +327,18 @@ class MegatronDynamoGeneration(GenerationInterface):
         skip_weight_load: bool = False,
         reserved_http_server_ports: Optional[dict[int, int]] = None,
     ):
-        """Build one engine per role; the engines come up at the first refit.
+        """Build one engine per role, then start etcd, NATS and the frontend.
 
         Same signature as ``MegatronGeneration`` so setup builds either class the
-        same way. ``cluster`` contributes the node shape, port range and node
-        pins only; each engine gets its own one-node cluster. Its placement
-        groups stay unmaterialized, or the engines' GPUs would be booked twice.
-        ``policy`` (colocation) and ``processor`` (VLM prompts) are refused;
+        same way. The order the vLLM backend uses: the engines' workers first,
+        so the frontend runs from their environment, then the runtime. The
+        engines have no weights yet; they start serving and register at the
+        first refit (:meth:`resume_after_refit`).
+
+        ``cluster`` contributes the node shape, port range and node pins only;
+        each engine gets its own one-node cluster. Its placement groups stay
+        unmaterialized, or the engines' GPUs would be booked twice. ``policy``
+        (colocation) and ``processor`` (VLM prompts) are refused;
         ``name_prefix``, ``skip_weight_load`` and ``reserved_http_server_ports``
         do not apply, since every engine is built with ``skip_weight_load=True``
         and serves no HTTP server of its own.
@@ -355,40 +386,67 @@ class MegatronDynamoGeneration(GenerationInterface):
         self._node_resource_constraints = cluster.node_resource_constraints
         # Every control call is bounded: suspend and resume by their timeout_s
         # (control_timeout_s when None), one deadline per call, and
-        # prepare_refit_info by control_timeout_s.
+        # prepare_refit_info, the liveness checks and the endpoint stop at
+        # shutdown by control_timeout_s.
         self._control_timeout_s = float(self._dynamo_cfg.control_timeout_s)
         # One record per engine, in launch (refit rank) order; what refit calls use.
         self._engine_records: list[MegatronDynamoEngine] = []
         # The owning objects, in the same order; empty on a copy.
         self._engines: list[MegatronGeneration] = []
         self._clusters: list[RayVirtualCluster] = []
+        # Set once every engine's endpoint is started; a repeat call is a no-op.
+        self._endpoints_started = False
         # True on a copy that was unpickled (the SingleController actor's).
         self._is_client_copy = False
+        # The runtime stays with the driver; a pickled copy keeps the plain
+        # values below, which is all the first resume needs to serve the engines.
+        self._dynamo_runtime: Optional[ManagedDynamoRuntime] = None
+        self._dynamo_namespace = ""
+        self._dynamo_engine_env: dict[str, str] = {}
+        self._dynamo_frontend_url = ""
+        self._dynamo_fleet_ready = False
 
         validate_megatron_dynamo_generation(self.cfg)
         widths = engine_widths(self._policy_config)
         roles = engine_roles(disaggregation_cfg(self.cfg), cluster.world_size(), widths)
         try:
             self._start_engines(roles, widths)
+            runtime = ManagedDynamoRuntime(
+                dynamo_cfg=self._dynamo_cfg,
+                model_name=str(self._policy_config["model_name"]),
+                # The engines' venv carries ai-dynamo, so the frontend runs the
+                # same release as every engine.
+                frontend_python=self.engine_python(),
+            )
+            self._dynamo_runtime = runtime
+            runtime.start()
         except Exception:
             self.shutdown()
             raise
+        self._dynamo_namespace = runtime.namespace
+        self._dynamo_engine_env = runtime.engine_env
+        self._dynamo_frontend_url = runtime.frontend_url
+        self.dp_openai_server_base_urls = [runtime.frontend_url]
+        print(f"  [Dynamo] Forwarding rollouts to {runtime.frontend_url}", flush=True)
 
     # ------------------------------------------------------------------
     # Pickling: the SingleController actor gets a handles-only copy
     # ------------------------------------------------------------------
 
     def __getstate__(self) -> dict[str, Any]:
-        """Leave the owning objects behind when shipped to an actor.
+        """Leave the owning objects and the Dynamo runtime behind when shipped to an actor.
 
         A copy that dropped a ``MegatronGeneration`` or a ``RayVirtualCluster``
         would shut the engine down, so the copy keeps the engine records (plain
-        data plus worker handles) and drives refits through them.
+        data plus worker handles), the frontend URL, the namespace and engine
+        environment, and can drive refits and start the engines' endpoints but
+        owns no process.
         """
         state = self.__dict__.copy()
         state["_engines"] = []
         state["_clusters"] = []
         state["_tokenizer"] = None
+        state["_dynamo_runtime"] = None
         state["_is_client_copy"] = True
         return state
 
@@ -420,6 +478,59 @@ class MegatronDynamoGeneration(GenerationInterface):
     def num_engines(self) -> int:
         """How many engines run, each a refit shard of its own."""
         return len(self._engine_records)
+
+    def expected_components(self) -> dict[str, int]:
+        """Dynamo component name to the number of engines registering under it."""
+        counts: dict[str, int] = {}
+        for record in self._engine_records:
+            component = DYNAMO_COMPONENT_BY_ROLE[record.role]
+            counts[component] = counts.get(component, 0) + 1
+        return counts
+
+    def engine_python(self) -> str:
+        """The engines' interpreter; its environment carries ai-dynamo."""
+        if not self._engines:
+            raise RuntimeError("A copy of MegatronDynamoGeneration owns no engines")
+        return str(self._engines[0].worker_group.py_executable)
+
+    def check_alive(self) -> None:
+        """Raise if any engine's leading worker has died or its endpoint stopped serving.
+
+        Used while waiting for the engines to register with the frontend, so a
+        dead engine, or an endpoint task that failed or exited on rank zero,
+        fails the wait at once instead of at the startup timeout. Endpoints are
+        checked only once ``start_endpoints`` started all of them.
+        """
+        alive = ray.get(
+            [record.liveness_ref() for record in self._engine_records],
+            timeout=self._control_timeout_s,
+        )
+        dead = [
+            record.instance_id
+            for record, ok in zip(self._engine_records, alive)
+            if not ok
+        ]
+        if dead:
+            raise RuntimeError(f"Megatron engines died: {', '.join(dead)}")
+        if not self._endpoints_started:
+            return
+        errors = ray.get(
+            [
+                record.leader.dynamo_endpoint_error.remote()
+                for record in self._engine_records
+            ],
+            timeout=self._control_timeout_s,
+        )
+        stopped = [
+            f"{record.instance_id}: {error}"
+            for record, error in zip(self._engine_records, errors)
+            if error is not None
+        ]
+        if stopped:
+            raise RuntimeError(
+                "The Dynamo endpoint of Megatron engines stopped serving: "
+                + "; ".join(stopped)
+            )
 
     def get_inference_world_size(self) -> int | None:
         """Ranks across the engines: their widths summed."""
@@ -688,10 +799,13 @@ class MegatronDynamoGeneration(GenerationInterface):
         return True
 
     def resume_after_refit(self, *, timeout_s: float | None = None) -> None:
-        """Resume serving on every engine; the first resume is when the engines start serving.
+        """Resume serving on every engine; the first resume is also the engines' startup.
 
         Every engine is attempted even if another fails, so one bad engine
-        does not keep the rest down.
+        does not keep the rest down. The first refit built the engines, so only
+        now do their endpoints start and register with the frontend (as vLLM
+        engines do once they serve), and this waits until the frontend routes
+        the model before returning.
 
         Raises:
             RuntimeError: Any engine failed to resume.
@@ -704,6 +818,103 @@ class MegatronDynamoGeneration(GenerationInterface):
             raise RuntimeError(
                 "Megatron resume after weight update failed for " + "; ".join(errors)
             )
+        self._await_dynamo_fleet_ready()
+
+    def _await_dynamo_fleet_ready(self) -> None:
+        """Start the engines' endpoints and wait for the frontend to list them; once."""
+        if self._dynamo_fleet_ready:
+            return
+        model_name = str(self._policy_config["model_name"])
+        self.start_endpoints(
+            namespace=self._dynamo_namespace,
+            engine_env=self._dynamo_engine_env,
+            model_name=model_name,
+            timeout_s=self._dynamo_cfg.startup_timeout_s,
+        )
+        if self._dynamo_runtime is not None:
+            self._dynamo_runtime.wait_for_engines(
+                self.expected_components(), check_engines=self.check_alive
+            )
+        else:
+            # A copy without the service processes (the controller's) waits on
+            # the frontend over HTTP alone.
+            wait_for_engine_registrations(
+                frontend_url=self._dynamo_frontend_url,
+                namespace=self._dynamo_namespace,
+                expected_components=self.expected_components(),
+                model_name=model_name,
+                timeout_s=self._dynamo_cfg.startup_timeout_s,
+                check_alive=self.check_alive,
+            )
+        self._dynamo_fleet_ready = True
+
+    def start_endpoints(
+        self,
+        *,
+        namespace: str,
+        engine_env: Mapping[str, str],
+        model_name: str,
+        timeout_s: float,
+    ) -> None:
+        """Serve every engine through Dynamo; the engines must already be built.
+
+        Engine by engine, in record order: rank zero starts Megatron-LM's
+        adapter (``start_dynamo_endpoint``), then every rank points its events
+        at it (``attach_dynamo_events``) and rank zero's "ready" lets the adapter
+        register the engine. The vLLM backend does the same once its engines
+        serve; Megatron engines get their weights, and so their engine, at the
+        first refit, so this runs right after it. Goes through the workers'
+        handles, so the SingleController actor's copy can run it too; the
+        workers return the first call's endpoint on a repeat.
+
+        Args:
+            namespace: Dynamo namespace shared with the frontend.
+            engine_env: etcd / NATS variables from the managed runtime.
+            model_name: The served model; also the name it is served under.
+            timeout_s: Bound on the whole call.
+        """
+        if self._endpoints_started:
+            return
+        deadline = time.monotonic() + timeout_s
+        # Ports are node-local: a later engine on a node avoids the ports the
+        # earlier engines on that node took.
+        ports_by_node: dict[str, set[int]] = {}
+        for record in self._engine_records:
+            used_ports = ports_by_node.setdefault(record.node_ip, set())
+            try:
+                metadata = ray.get(
+                    record.leader.start_dynamo_endpoint.remote(
+                        namespace=namespace,
+                        manager_env=dict(engine_env),
+                        model_name=model_name,
+                        served_model_name=model_name,
+                        # Native rollouts post token-ID completions; chat stays off.
+                        endpoint_types=["completions"],
+                        engine_start_timeout_s=self._dynamo_cfg.startup_timeout_s,
+                        excluded_ports=sorted(used_ports),
+                    ),
+                    timeout=_seconds_left(deadline),
+                )
+                used_ports.update(
+                    {int(metadata["event_port"]), int(metadata["system_port"])}
+                )
+                ray.get(
+                    record.attach_dynamo_events(
+                        parent_event_address=metadata["parent_event_address"]
+                    ),
+                    timeout=_seconds_left(deadline),
+                )
+            except Exception as error:
+                error.add_note(
+                    f"while starting the Dynamo endpoint of {record.instance_id}"
+                )
+                raise
+            print(
+                f"  [Dynamo:{record.instance_id}] endpoint started on "
+                f"{metadata['node_ip']}, handoff owner={metadata['handoff_owner']}",
+                flush=True,
+            )
+        self._endpoints_started = True
 
     def finish_generation(self, *, release_gpu: bool = True) -> bool:
         """Dedicated engines keep serving between steps, as without Dynamo."""
@@ -718,8 +929,8 @@ class MegatronDynamoGeneration(GenerationInterface):
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Not served yet: the engines register with no frontend."""
         raise NotImplementedError(
-            "Megatron engines behind Dynamo do not serve rollouts yet; the "
-            "engines register with no frontend."
+            "Megatron engines behind Dynamo do not serve rollouts yet; nothing "
+            "posts requests to the frontend."
         )
 
     async def generate_async(
@@ -727,8 +938,8 @@ class MegatronDynamoGeneration(GenerationInterface):
     ) -> AsyncGenerator[tuple[int, BatchedDataDict[GenerationOutputSpec]], None]:
         """Not served yet: the engines register with no frontend."""
         raise NotImplementedError(
-            "Megatron engines behind Dynamo do not serve rollouts yet; the "
-            "engines register with no frontend."
+            "Megatron engines behind Dynamo do not serve rollouts yet; nothing "
+            "posts requests to the frontend."
         )
         yield  # pragma: no cover  (makes this an async generator)
 
@@ -895,10 +1106,10 @@ class MegatronDynamoGeneration(GenerationInterface):
         return next(iter(node_ips))
 
     def shutdown(self) -> bool:
-        """Stop every engine, then release their placement groups.
+        """Stop every engine's endpoint and policy, then the frontend, NATS and etcd.
 
         Best effort and idempotent: every failure is logged and the teardown
-        continues. A copy that owns no engine does nothing.
+        continues. A copy that owns neither engines nor services does nothing.
         """
         if self._is_client_copy:
             return True
@@ -913,20 +1124,43 @@ class MegatronDynamoGeneration(GenerationInterface):
         self._engine_records.clear()
         self._engines.clear()
         self._clusters.clear()
+        self._endpoints_started = False
+        # After the engines: they leave discovery as their processes exit.
+        runtime, self._dynamo_runtime = self._dynamo_runtime, None
+        if runtime is not None:
+            runtime.shutdown()
         return True
 
     def _stop_engine(self, index: int) -> bool:
-        """Stop one engine's policy; whether it stopped cleanly."""
-        try:
-            engine_stopped = self._engines[index].shutdown()
-        except Exception:
-            LOGGER.exception("Could not stop a Megatron engine")
-            return False
-        if not engine_stopped:
-            LOGGER.error("A Megatron engine did not shut down cleanly")
-        return engine_stopped
+        """Stop one engine's Dynamo endpoint and policy; whether both stopped cleanly.
+
+        A hung or failed endpoint stop is logged and the engine is shut down
+        anyway, which kills its workers.
+        """
+        stopped = True
+        if index < len(self._engine_records):
+            try:
+                ray.get(
+                    self._engine_records[index].leader.stop_dynamo_endpoint.remote(),
+                    timeout=self._control_timeout_s,
+                )
+            except Exception:
+                LOGGER.exception("Could not stop a Megatron engine's Dynamo endpoint")
+                stopped = False
+        if index < len(self._engines):
+            engine = self._engines[index]
+            try:
+                engine_stopped = engine.shutdown()
+            except Exception:
+                LOGGER.exception("Could not stop a Megatron engine")
+                stopped = False
+            else:
+                if not engine_stopped:
+                    LOGGER.error("A Megatron engine did not shut down cleanly")
+                    stopped = False
+        return stopped
 
     def __del__(self) -> None:
-        """Safety net so the engines do not outlive the object that built them."""
-        if getattr(self, "_engines", None):
+        """Safety net so the engines and services do not outlive the object that built them."""
+        if getattr(self, "_engines", None) or getattr(self, "_dynamo_runtime", None):
             self.shutdown()
