@@ -692,6 +692,57 @@ class TestMaybeAdaptTensorToHF:
 
 @pytest.mark.automodel
 @pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
+@pytest.mark.parametrize("lora_enabled", [False, True])
+def test_dtensor_v2_collective_refit_stages_cpu_offloaded_params(
+    monkeypatch, lora_enabled
+):
+    """Under cpu_offload the collective refit must not onload the whole model.
+
+    The IPC refit already stages CPU-offloaded shards one tensor at a time
+    (``stage_cpu_parameters``); the broadcast path onloaded the entire model
+    first, which on 80 GB GPUs with EP64 left no room for the packed buffers.
+    LoRA keeps the onload path until staging covers the merge.
+    """
+    worker = object.__new__(DTensorPolicyWorkerV2Impl)
+    model = _FakeTrainableModel()
+    moves = []
+    generator_calls = []
+    producer_calls = []
+
+    worker.model = model
+    worker.dtype = torch.bfloat16
+    worker.cpu_offload = True
+    worker.lora_enabled = lora_enabled
+    worker.model_update_group = object()
+    worker.move_to_cuda = lambda m: moves.append("cuda") or m
+    worker.move_to_cpu = lambda m: moves.append("cpu") or m
+
+    def fake_generator(m, dtype, *, stage_cpu_parameters=False):
+        # A plain function, not a generator: the producer is mocked and never
+        # iterates, so the call itself has to record the arguments.
+        generator_calls.append((m, dtype, stage_cpu_parameters))
+        return iter(())
+
+    monkeypatch.setattr(worker_mod, "dtensor_params_generator", fake_generator)
+    monkeypatch.setattr(
+        worker_mod,
+        "packed_broadcast_producer",
+        lambda **kwargs: producer_calls.append(kwargs),
+    )
+
+    DTensorPolicyWorkerV2Impl._broadcast_weights_for_collective(
+        worker, buffer_size_bytes=1, num_buffers=1
+    )
+
+    assert len(producer_calls) == 1
+    assert producer_calls[0]["group"] is worker.model_update_group
+    assert generator_calls == [(model, torch.bfloat16, not lora_enabled)]
+    # Staging replaces the onload/offload round trip; LoRA still takes it.
+    assert moves == (["cuda", "cpu"] if lora_enabled else [])
+
+
+@pytest.mark.automodel
+@pytest.mark.skipif(not NEMO_AUTOMODEL_AVAILABLE, reason="nemo_automodel not available")
 class TestDTensorParamsGenerator:
     """Tests for the dtensor_params_generator helper function."""
 
