@@ -414,6 +414,33 @@ class TestValidateAndPrepareConfig:
 
         assert result.is_generation_colocated is False
         assert os.environ.get("NCCL_CUMEM_ENABLE") == "0"
+        # Aggregated engines keep NCCL's default transport, so the trainer does too.
+        assert "NCCL_NET_PLUGIN" not in os.environ
+
+    @patch("nemo_rl.models.automodel.setup.AutoConfig")
+    @patch("nemo_rl.models.automodel.setup.resolve_model_class")
+    @patch("nemo_rl.models.automodel.setup.configure_dynamo_cache")
+    @patch.dict(os.environ, {}, clear=True)
+    def test_generation_disaggregated_sglang_shares_the_nccl_transport(
+        self,
+        mock_dynamo,
+        mock_resolve_class,
+        mock_autoconfig_class,
+        mock_config,
+        mock_autoconfig,
+    ):
+        """The trainer adopts the NCCL_NET_PLUGIN of disaggregated SGLang NIXL engines."""
+        mock_autoconfig_class.from_pretrained.return_value = mock_autoconfig
+        mock_resolve_class.return_value = Mock
+
+        mock_config["generation"]["backend"] = "sglang"
+        mock_config["generation"]["colocated"]["enabled"] = False
+        mock_config["generation"]["disaggregation"] = {"enabled": True}
+        mock_config["generation"]["sglang_cfg"] = {
+            "disagg": {"transfer_backend": "nixl"}
+        }
+        validate_and_prepare_config(mock_config, None, 0)
+        assert os.environ.get("NCCL_NET_PLUGIN") == "none"
 
     @patch("nemo_rl.models.automodel.setup.AutoConfig")
     @patch("nemo_rl.models.automodel.setup.resolve_model_class")

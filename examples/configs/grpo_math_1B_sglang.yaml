@@ -64,7 +64,8 @@ policy:
         # mooncake (SGLang default, no UCX) | nixl | mooncake_tcp.
         # Engines get WITH_NVIDIA_PEERMEM=0 (DMA-BUF registration) under mooncake
         # when nvidia-peermem is not loaded, and NCCL_NET_PLUGIN=none under nixl;
-        # values already set in the environment win.
+        # values already set in the environment win. nixl needs
+        # sglang_server_config.needs_offload: false.
         transfer_backend: mooncake
         # Comma-separated IB devices for the transport; null lets it pick.
         ib_device: null

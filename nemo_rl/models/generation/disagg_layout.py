@@ -42,6 +42,9 @@ from nemo_rl.models.generation.interfaces import DisaggConfig
 
 Role = Literal["prefill", "decode"]
 ROLES: tuple[Role, Role] = ("prefill", "decode")
+# NCCL variables every rank of the refit collective has to agree on: the
+# training ranks adopt the disaggregated engines' value of each.
+REFIT_PEER_ENV_KEYS = ("NCCL_NET_PLUGIN",)
 
 
 def as_dict(raw: Any) -> dict[str, Any]:

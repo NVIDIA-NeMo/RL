@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
+from collections.abc import Mapping
 from typing import Any, Literal, NotRequired, TypedDict, cast
 
 from pydantic import (
@@ -491,6 +493,71 @@ def sglang_disagg_server_kwargs(
     return kwargs
 
 
+# Present when the nvidia-peermem kernel module is loaded, which Mooncake's
+# default GPU-memory registration (ibv_reg_mr) relies on.
+NVIDIA_PEERMEM_MODULE = "/sys/module/nvidia_peermem"
+
+
+def disagg_transport_env(
+    pd_cfg: SGLangDisaggConfig,
+    environ: Mapping[str, str],
+    *,
+    peermem_loaded: bool | None = None,
+) -> dict[str, str]:
+    """Engine environment the configured KV transport needs on this host.
+
+    A value already present in ``environ`` is kept, so an operator can override
+    either default.
+
+    * ``nixl``: ``NCCL_NET_PLUGIN=none``. HPC-X's NCCL plugin loads a UCX
+      without CUDA support into TP>1 engines, which breaks NIXL's VRAM
+      registration; the same default the vLLM NIXL path uses.
+    * ``mooncake``: ``WITH_NVIDIA_PEERMEM=0`` when nvidia-peermem is not
+      loaded. Mooncake then registers GPU memory for RDMA through DMA-BUF
+      instead of ``ibv_reg_mr``, which without the module fails with
+      "Failed to register memory ...: Bad address" on every engine (GB200
+      containers, for one) and turns every KV transfer into an error.
+
+    Args:
+        pd_cfg: The resolved ``sglang_cfg.disagg`` block.
+        environ: The process environment to take overrides from.
+        peermem_loaded: Whether nvidia-peermem is loaded; probed from
+            :data:`NVIDIA_PEERMEM_MODULE` when None.
+    """
+    env: dict[str, str] = {}
+    if pd_cfg.transfer_backend == "nixl":
+        env["NCCL_NET_PLUGIN"] = environ.get("NCCL_NET_PLUGIN", "none")
+    elif pd_cfg.transfer_backend == "mooncake":
+        if peermem_loaded is None:
+            peermem_loaded = os.path.exists(NVIDIA_PEERMEM_MODULE)
+        if not peermem_loaded:
+            env["WITH_NVIDIA_PEERMEM"] = environ.get("WITH_NVIDIA_PEERMEM", "0")
+    return env
+
+
+def sglang_refit_peer_env(
+    config: SGLangConfig, environ: Mapping[str, str]
+) -> dict[str, str]:
+    """NCCL variables the training ranks must share with disaggregated SGLang engines.
+
+    The refit collective is one NCCL process group over the training ranks and
+    every engine rank, and NCCL picks its network transport once per process.
+    Training ranks that load NCCL's network plugin cannot exchange data with
+    engines that run without it (``nixl``, see :func:`disagg_transport_env`):
+    the first weight broadcast never completes. Returns the NCCL part of the
+    engines' transport environment for the trainer to adopt, resolved against
+    ``environ`` the way the engines' is, so a value already set there is kept.
+    """
+    if not resolve_sglang_disagg_layout(config).enabled:
+        return {}
+    engine_env = disagg_transport_env(resolve_sglang_disagg_config(config), environ)
+    return {
+        key: engine_env[key]
+        for key in disagg_layout.REFIT_PEER_ENV_KEYS
+        if key in engine_env
+    }
+
+
 def validate_sglang_disaggregation(config: SGLangConfig, *, use_nemo_gym: bool) -> None:
     """Refuse a disaggregated SGLang config that cannot run as written.
 
@@ -537,6 +604,18 @@ def validate_sglang_disaggregation(config: SGLangConfig, *, use_nemo_gym: bool) 
             f"'{SGLANG_DISAGG_PAUSE_MODE}' under disaggregation, got {pause_mode!r}: "
             "SGLang refuses 'retract' in PD mode and NeMo RL refuses 'in_place' "
             "for refit."
+        )
+    if (
+        pd_cfg.transfer_backend == "nixl"
+        and sglang_cfg["sglang_server_config"]["needs_offload"]
+    ):
+        raise ValueError(
+            "sglang_cfg.disagg.transfer_backend='nixl' cannot refit with "
+            "sglang_cfg.sglang_server_config.needs_offload=true: with the nixl "
+            "transport the memory saver cannot re-acquire the KV cache it "
+            "released for the refit (CUDA out of memory in "
+            "resume_memory_occupation, and the engines exit at the first "
+            "refit). Set needs_offload=false, or use mooncake."
         )
     if sglang_cfg["sglang_router_config"].get("use_external_router"):
         raise ValueError(

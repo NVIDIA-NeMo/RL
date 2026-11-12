@@ -29,21 +29,21 @@ import pytest
 from pydantic import ValidationError
 
 from nemo_rl.models.generation.interfaces import DisaggConfig
+from nemo_rl.models.generation.sglang import config as sglang_config
 from nemo_rl.models.generation.sglang import sglang_generation, sglang_router
 from nemo_rl.models.generation.sglang.config import (
     SGLANG_ROLE_ENGINE_ARG_KEYS,
     SGLangDisaggConfig,
+    disagg_transport_env,
     resolve_sglang_disagg_config,
     resolve_sglang_role_overrides,
     sglang_disagg_server_kwargs,
+    sglang_refit_peer_env,
     sglang_replica_width,
     sglang_role_engine_config,
     validate_sglang_disaggregation,
 )
-from nemo_rl.models.generation.sglang.sglang_generation import (
-    SGLangGeneration,
-    disagg_transport_env,
-)
+from nemo_rl.models.generation.sglang.sglang_generation import SGLangGeneration
 from nemo_rl.models.generation.sglang.sglang_router import RouterActor, _start_router
 from nemo_rl.models.generation.sglang.sglang_worker import (
     SGLangGenerationWorker,
@@ -222,6 +222,15 @@ def test_validation_accepts_a_sound_layout():
     validate_sglang_disaggregation(make_config(), use_nemo_gym=False)
 
 
+def test_validation_accepts_the_memory_saver_and_nixl_apart():
+    memory_saver = make_config(
+        **{"sglang_cfg.sglang_server_config.needs_offload": True}
+    )
+    validate_sglang_disaggregation(memory_saver, use_nemo_gym=False)
+    nixl = make_config(**{"sglang_cfg.disagg": {"transfer_backend": "nixl"}})
+    validate_sglang_disaggregation(nixl, use_nemo_gym=False)
+
+
 @pytest.mark.parametrize(
     "overrides, use_nemo_gym, match",
     [
@@ -233,6 +242,14 @@ def test_validation_accepts_a_sound_layout():
             {"sglang_cfg.sglang_server_config.pause_generation_mode": "retract"},
             False,
             "pause_generation_mode must be 'abort'",
+        ),
+        (
+            {
+                "sglang_cfg.disagg": {"transfer_backend": "nixl"},
+                "sglang_cfg.sglang_server_config.needs_offload": True,
+            },
+            False,
+            "needs_offload=true",
         ),
         (
             {
@@ -1033,7 +1050,23 @@ def test_transport_env_defaults_follow_the_transport_and_yield_to_the_environmen
 
 def test_transport_env_probes_the_peermem_module(monkeypatch):
     mooncake = SGLangDisaggConfig(transfer_backend="mooncake")
-    monkeypatch.setattr(sglang_generation.os.path, "exists", lambda p: False)
+    monkeypatch.setattr(sglang_config.os.path, "exists", lambda p: False)
     assert disagg_transport_env(mooncake, {}) == {"WITH_NVIDIA_PEERMEM": "0"}
-    monkeypatch.setattr(sglang_generation.os.path, "exists", lambda p: True)
+    monkeypatch.setattr(sglang_config.os.path, "exists", lambda p: True)
     assert disagg_transport_env(mooncake, {}) == {}
+
+
+def test_refit_peer_env_is_the_nccl_part_of_the_engine_transport_env(monkeypatch):
+    nixl = make_config(**{"sglang_cfg.disagg": {"transfer_backend": "nixl"}})
+    assert sglang_refit_peer_env(nixl, {}) == {"NCCL_NET_PLUGIN": "none"}
+    assert sglang_refit_peer_env(nixl, {"NCCL_NET_PLUGIN": "ucx"}) == {
+        "NCCL_NET_PLUGIN": "ucx"
+    }
+    # Mooncake's registration switch is the engines' alone.
+    monkeypatch.setattr(sglang_config.os.path, "exists", lambda p: False)
+    assert sglang_refit_peer_env(make_config(), {}) == {}
+    # Aggregated engines keep NCCL's default transport, whatever the block says.
+    aggregated = make_config(
+        disagg=False, **{"sglang_cfg.disagg": {"transfer_backend": "nixl"}}
+    )
+    assert sglang_refit_peer_env(aggregated, {}) == {}

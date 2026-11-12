@@ -902,10 +902,6 @@ def disagg_engine_env_defaults(config: VllmConfig) -> dict[str, str]:
     return env
 
 
-# NCCL variables every rank of the refit collective has to agree on.
-_REFIT_PEER_ENV_KEYS = ("NCCL_NET_PLUGIN",)
-
-
 def vllm_refit_peer_env(config: VllmConfig) -> dict[str, str]:
     """NCCL variables the training ranks must share with the vLLM engines.
 
@@ -922,7 +918,11 @@ def vllm_refit_peer_env(config: VllmConfig) -> dict[str, str]:
         **disagg_engine_env_defaults(config),
         **{str(key): str(value) for key, value in recipe_env.items()},
     }
-    return {key: engine_env[key] for key in _REFIT_PEER_ENV_KEYS if key in engine_env}
+    return {
+        key: engine_env[key]
+        for key in disagg_layout.REFIT_PEER_ENV_KEYS
+        if key in engine_env
+    }
 
 
 def vllm_kv_transfer_config_for_role(

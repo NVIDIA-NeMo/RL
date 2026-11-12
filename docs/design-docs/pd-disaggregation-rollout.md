@@ -356,15 +356,18 @@ is in flight at refit: GRPO refits between steps (async GRPO does not support SG
 and `SGLangGeneration.validate_settings` refuses the SingleController entrypoint, which
 refits with rollouts in flight. Prefill engines pause before decode engines and resume
 after them. Checked at setup: `colocated.enabled: false`, no external router,
-`pp_size: 1`, `pause_generation_mode: abort`, default `frontend_*` keys. A runnable
+`pp_size: 1`, `pause_generation_mode: abort`, default `frontend_*` keys, and
+`needs_offload: false` under `transfer_backend: nixl` (the memory saver cannot re-acquire
+the KV cache it released for a refit there; the engines exit at the first refit). A runnable
 recipe is `examples/configs/recipes/llm/grpo-qwen2.5-math-1.5b-instruct-2n8g-megatrontp1-sglang-pd-disagg.yaml`.
 
 Engines get the environment their KV transport needs (`disagg_transport_env`), with
 values already in the environment taking precedence: with `nixl`, `NCCL_NET_PLUGIN=none`
-as on the vLLM path; with `mooncake`, `WITH_NVIDIA_PEERMEM=0` when the nvidia-peermem
-kernel module is not loaded, so Mooncake registers GPU memory through DMA-BUF instead of
-`ibv_reg_mr` (without it every engine logs "Failed to register memory ...: Bad address"
-and every KV transfer fails; GB200 containers are the known case).
+as on the vLLM path, which the training workers adopt for the same reason as there (one
+refit process group, one NCCL transport); with `mooncake`, `WITH_NVIDIA_PEERMEM=0` when
+the nvidia-peermem kernel module is not loaded, so Mooncake registers GPU memory through
+DMA-BUF instead of `ibv_reg_mr` (without it every engine logs "Failed to register memory
+...: Bad address" and every KV transfer fails; GB200 containers are the known case).
 
 GPU budget:
 

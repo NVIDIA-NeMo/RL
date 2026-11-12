@@ -15,7 +15,7 @@
 import asyncio
 import logging
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import ray
@@ -39,8 +39,8 @@ from nemo_rl.models.generation.interfaces import (
 )
 from nemo_rl.models.generation.sglang.config import (
     SGLangConfig,
-    SGLangDisaggConfig,
     SGLangFaultToleranceConfig,
+    disagg_transport_env,
     resolve_sglang_disagg_config,
     resolve_sglang_disagg_layout,
     resolve_sglang_role_overrides,
@@ -79,47 +79,6 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
-
-# Present when the nvidia-peermem kernel module is loaded, which Mooncake's
-# default GPU-memory registration (ibv_reg_mr) relies on.
-NVIDIA_PEERMEM_MODULE = "/sys/module/nvidia_peermem"
-
-
-def disagg_transport_env(
-    pd_cfg: SGLangDisaggConfig,
-    environ: Mapping[str, str],
-    *,
-    peermem_loaded: bool | None = None,
-) -> dict[str, str]:
-    """Engine environment the configured KV transport needs on this host.
-
-    A value already present in ``environ`` is kept, so an operator can override
-    either default.
-
-    * ``nixl``: ``NCCL_NET_PLUGIN=none``. HPC-X's NCCL plugin loads a UCX
-      without CUDA support into TP>1 engines, which breaks NIXL's VRAM
-      registration; the same default the vLLM NIXL path uses.
-    * ``mooncake``: ``WITH_NVIDIA_PEERMEM=0`` when nvidia-peermem is not
-      loaded. Mooncake then registers GPU memory for RDMA through DMA-BUF
-      instead of ``ibv_reg_mr``, which without the module fails with
-      "Failed to register memory ...: Bad address" on every engine (GB200
-      containers, for one) and turns every KV transfer into an error.
-
-    Args:
-        pd_cfg: The resolved ``sglang_cfg.disagg`` block.
-        environ: The process environment to take overrides from.
-        peermem_loaded: Whether nvidia-peermem is loaded; probed from
-            :data:`NVIDIA_PEERMEM_MODULE` when None.
-    """
-    env: dict[str, str] = {}
-    if pd_cfg.transfer_backend == "nixl":
-        env["NCCL_NET_PLUGIN"] = environ.get("NCCL_NET_PLUGIN", "none")
-    elif pd_cfg.transfer_backend == "mooncake":
-        if peermem_loaded is None:
-            peermem_loaded = os.path.exists(NVIDIA_PEERMEM_MODULE)
-        if not peermem_loaded:
-            env["WITH_NVIDIA_PEERMEM"] = environ.get("WITH_NVIDIA_PEERMEM", "0")
-    return env
 
 
 class SGLangGeneration(GenerationInterface):
