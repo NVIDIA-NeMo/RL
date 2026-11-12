@@ -50,6 +50,7 @@ from nemo_rl.distributed.virtual_cluster import (
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     build_nemo_gym_actors,
+    set_nemo_gym_log_dir,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
 )
@@ -61,6 +62,7 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
+    sampler_replay_enabled,
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.vllm import VllmConfig, VllmGeneration
@@ -73,6 +75,7 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
+from nemo_rl.models.policy.utils import configure_lora_refit
 from nemo_rl.telemetry.config import TelemetryConfig
 from nemo_rl.telemetry.instrumentation import (
     RL_ITERATION_ATTR,
@@ -203,9 +206,9 @@ def check_vocab_equality(
         f"Effective vocab sizes differ between student and teacher. {skip_hint}"
     )
 
-    # 3) Chech model.config.vocab_size to guarantee the last dimension of the logits is the same
-    student_config = AutoConfig.from_pretrained(student_model_name)
-    teacher_config = AutoConfig.from_pretrained(teacher_model_name)
+    # 3) Compare text vocabulary sizes, including nested multimodal configs.
+    student_config = AutoConfig.from_pretrained(student_model_name).get_text_config()
+    teacher_config = AutoConfig.from_pretrained(teacher_model_name).get_text_config()
     assert student_config.vocab_size == teacher_config.vocab_size, (
         f"Model config vocab sizes differ between student and teacher. {skip_hint}"
     )
@@ -239,6 +242,11 @@ def setup(
     # Extract configuration
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
+    if generation_config is not None and sampler_replay_enabled(generation_config):
+        raise ValueError(
+            "policy.generation.sampler_replay.enabled requires SingleController with "
+            "NeMo Gym + vLLM; distillation does not capture sampler tensors."
+        )
     teacher_config = master_config.teacher
     loss_config = master_config.loss_fn
     data_config = master_config.data
@@ -256,6 +264,7 @@ def setup(
         "A generation config in the PolicyConfig is required for distillation"
     )
     checkpoint_engine_config = None
+    configure_lora_refit(policy_config)
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(
             policy_config, entry_point="distillation"
@@ -304,11 +313,16 @@ def setup(
 
     # Set random seed
     set_seed(distillation_config.seed)
+    enable_nemo_gym = bool(env_configs) and should_use_nemo_gym(master_config)
 
     # ==========================
     #         Logger
     # ==========================
     logger = Logger(logger_config)
+    if enable_nemo_gym:
+        # Before log_hyperparams, so the logged config shows where the Gym
+        # server logs actually go.
+        set_nemo_gym_log_dir(env_configs, logger.base_log_dir)
     logger.log_hyperparams(master_config.model_dump())
 
     # ==========================
@@ -364,7 +378,6 @@ def setup(
     # ==========================
     print("\n▶ Setting up compute cluster...", flush=True)
     colocated_inference = generation_config["colocated"]["enabled"]
-    enable_nemo_gym = bool(env_configs) and should_use_nemo_gym(master_config)
     nemo_gym_actor: Optional[EnvironmentInterface] = None
     segment_size = cluster_config.segment_size
 
@@ -560,6 +573,7 @@ def setup(
                     # The workers enforce this key whenever the recipe asks for
                     # one, so Gym's model server must send the same key.
                     policy_api_key=deferred_vllm.http_server_api_key,
+                    turn_checkpointing_enabled=False,
                 )
                 try:
                     validate_dataset_agent_coverage(
