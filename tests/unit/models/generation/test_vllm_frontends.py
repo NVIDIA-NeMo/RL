@@ -58,16 +58,6 @@ class _AsyncActor(_Actor):
         return result
 
 
-def _logger_report(inflight, changed_at):
-    return {
-        "inflight_batch_sizes": [inflight],
-        "num_pending_samples": [0],
-        "kv_cache_usage_perc": [0.5],
-        "generation_tokens": [7],
-        "gauges_changed_at": changed_at,
-    }
-
-
 @pytest.fixture
 def generation(monkeypatch):
     """Two engines with two frontends each, without Ray."""
@@ -81,9 +71,13 @@ def generation(monkeypatch):
             _Actor(
                 get_reserved_url=f"http://node{engine}:{9000 + index}/v1",
                 _get_raw_spec_counters={"vllm:generation_tokens": 10.0},
-                drain_latest_vllm_logger_metrics=_logger_report(
-                    100 * (index + 1), float(index)
-                ),
+                drain_latest_vllm_logger_metrics={
+                    "inflight_batch_sizes": [100 * (index + 1)],
+                    "num_pending_samples": [0],
+                    "kv_cache_usage_perc": [0.5],
+                    "generation_tokens": [7],
+                    "gauges_changed_at": float(index),
+                },
                 get_data_plane_snapshot={"puts": index} if index else None,
                 captured_call_progress={"weight_version": 3, "calls": [[index, 5]]},
             )

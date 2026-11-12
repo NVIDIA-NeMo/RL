@@ -35,12 +35,10 @@ source-sensitive compatibility patches:
 * ``install_output_loop_yield`` patches AsyncLLM's output loops at runtime. Its
   yield and reader-budget behavior is checked against a stand-in client, and a
   canary fails if the pinned vLLM moves the calls it relies on.
-* ``extra_engine_client_addresses`` wraps the address allocator an engine launch
-  calls, so the engine core gets clients beyond the one that launches it. It is
-  checked against a stand-in allocator, with a canary for the pinned vLLM.
-* ``_patch_vllm_detokenizer_linear_append`` rewrites how the detokenizer grows a
-  request's text. A stand-in holding its anchors checks the text is unchanged,
-  and a canary fails if the pinned vLLM moves the anchors.
+* ``extra_engine_client_addresses`` is checked against a stand-in allocator,
+  with a canary for the pinned vLLM.
+* ``_patch_vllm_detokenizer_linear_append`` is checked on a stand-in holding
+  its anchors, with a canary for the pinned vLLM.
 """
 
 import ast
@@ -949,7 +947,7 @@ def test_detokenizer_patch_anchor_still_matches_installed_vllm(tmp_path, monkeyp
 
     patched = copied.read_text()
     assert _DETOK_MARKER in patched, (
-        "the detokenizer patch did not apply to the installed vLLM; refit its "
+        "the detokenizer patch did not apply to the installed vLLM; update its "
         "anchors, or remove it if vLLM no longer grows output_text with +=."
     )
     ast.parse(patched)

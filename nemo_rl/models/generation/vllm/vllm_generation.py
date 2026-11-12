@@ -222,8 +222,7 @@ class VllmGeneration(GenerationInterface):
     # defaults, so shutdown() also works when __init__ failed before starting them.
     _dynamo_runtime: Optional["ManagedDynamoRuntime"] = None
     dynamo_frontend_url: Optional[str] = None
-    # Each engine's frontend actors, in client-index order
-    # (vllm_cfg.num_frontend_workers); they serve HTTP instead of the DP leaders.
+    # Each engine's HTTP frontend actors (vllm_cfg.num_frontend_workers).
     _frontends: Sequence[Sequence[Any]] = ()
 
     @classmethod
@@ -241,14 +240,15 @@ class VllmGeneration(GenerationInterface):
                 "picks engines itself, and a restarted shard does not register "
                 "with it. Disable fleet health."
             )
+        # Fleet health does not publish a restarted shard's frontends.
         if (
             vllm_num_frontend_workers(generation_config)
             and master_config.async_rl.generation_fleet_health.enabled
         ):
             raise ValueError(
                 "async_rl.generation_fleet_health.enabled=true is not supported "
-                "with policy.generation.vllm_cfg.num_frontend_workers yet: a "
-                "restarted shard's frontends are not published. Disable fleet health."
+                "with policy.generation.vllm_cfg.num_frontend_workers yet; "
+                "disable fleet health."
             )
 
     @staticmethod
@@ -754,8 +754,7 @@ class VllmGeneration(GenerationInterface):
                 pending, num_returns=len(pending), timeout=_FRONTEND_SLOW_CALL_S
             )
             if pending:
-                slow = set(pending)
-                waiting = [name for name, ref in zip(names, refs) if ref in slow]
+                waiting = [name for name, ref in zip(names, refs) if ref in pending]
                 print(
                     f"still waiting on vLLM frontends {waiting} (engine.frontend) "
                     f"for {method_name} after {time.monotonic() - started:.0f} s",
@@ -769,7 +768,7 @@ class VllmGeneration(GenerationInterface):
             return [None]  # Not applicable since this is sync
 
         if self._frontends:
-            # One URL per frontend, engine by engine: more URLs than shards.
+            # One URL per frontend, not per shard.
             return self._call_frontends("report_dp_openai_server_base_url")
 
         # Use run_all_workers_single_data for methods that don't need data

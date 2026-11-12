@@ -379,10 +379,8 @@ class VllmAsyncGenerationWorkerImpl(
     VllmAsyncCheckpointEngineRpcMixin,
     BaseVllmGenerationWorker,
 ):
-    # CPU actors that serve this engine's HTTP requests instead of this actor
-    # (vllm_cfg.num_frontend_workers), and the engine-core client addresses they
-    # attach to, in client-index order. Class defaults, so a worker built without
-    # __init__ has none.
+    # CPU actors serving this engine's HTTP (vllm_cfg.num_frontend_workers) and
+    # their client addresses. Class defaults cover workers built without __init__.
     _num_frontends = 0
     _frontends: Sequence[Any] = ()
     _frontend_client_addresses: Sequence[dict[str, str]] = ()
@@ -3266,7 +3264,6 @@ class VllmAsyncFrontendWorkerImpl(VllmAsyncGenerationWorkerImpl):
         """
         os.environ.update(env)
 
-        # Deferred: vLLM is imported only once the owner's environment is set.
         from vllm.v1.engine import core_client
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.v1.metrics.loggers import PrometheusStatLogger

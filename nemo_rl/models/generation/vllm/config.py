@@ -118,9 +118,8 @@ class VllmSpecificArgs(TypedDict):
     # Keeps refit and other control calls responsive. Requires async_engine: true.
     # None (default) disables it.
     output_loop_yield_budget_ms: NotRequired[float | None]
-    # CPU-only actors per engine that serve its HTTP requests, each on its own
-    # engine-core client on the engine's node. Request and per-token work then
-    # runs outside the actor that refits. Requires async_engine: true and
+    # Serve each engine's HTTP requests from this many CPU-only actors on its node,
+    # outside the actor that refits. Requires async_engine: true and
     # expose_http_server: true. 0 (default) serves from the engine's own actor.
     num_frontend_workers: NotRequired[int]
     # Sampling cadence for the optional vLLM metrics logger.

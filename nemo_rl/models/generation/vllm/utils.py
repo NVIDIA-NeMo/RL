@@ -1161,8 +1161,7 @@ def compute_spec_decode_metrics(
     return spec_metrics
 
 
-# vLLM logger gauges describe the whole engine, but vLLM sends each step's
-# scheduler stats to only one of the engine's clients.
+# Engine-wide gauges; vLLM sends each step's scheduler stats to only one client.
 LOGGER_GAUGE_KEYS = (
     "inflight_batch_sizes",
     "num_pending_samples",

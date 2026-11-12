@@ -1119,7 +1119,7 @@ def test_frontend_logger_reports_merge_into_one_engine_report():
         "generation_tokens": [10, 20, 30],
         "gauges_changed_at": 10.0,
     }
-    # Gauges from the freshest report; counters summed over the samples all have.
+    # Freshest report's gauges; counters summed over the latest samples all share.
     assert merge_frontend_logger_metrics([fresh, {}, stale]) == {
         "inflight_batch_sizes": [120],
         "num_pending_samples": [0],

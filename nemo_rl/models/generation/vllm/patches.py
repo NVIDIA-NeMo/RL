@@ -556,15 +556,9 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
 def _patch_vllm_detokenizer_linear_append(logger) -> None:
     """Stop the incremental detokenizer copying a request's text on every token.
 
-    ``BaseIncrementalDetokenizer.update`` grows ``self.output_text`` with ``+=``
-    per decoded token. The text is an attribute, so each ``+=`` builds a new
-    string: quadratic in the response length, in the process that owns the
-    AsyncLLM. Keep the newly decoded pieces in a list and join them when the
-    text is read, which a non-streaming request does once, at the end. The text
-    is the same.
-
-    Both edits are applied or neither. Returns without raising when an anchor is
-    missing, but logs at warning level.
+    ``BaseIncrementalDetokenizer.update`` grows the ``output_text`` attribute with
+    ``+=``, which copies the text. The patch keeps new pieces in a list, joined
+    when the text is read (once for a ``FINAL_ONLY`` request without stop strings).
     """
     try:
         file_to_patch = _get_vllm_file("v1/engine/detokenizer.py")
@@ -634,8 +628,8 @@ def _patch_vllm_detokenizer_linear_append(logger) -> None:
         if content.count(property_old) != 1 or content.count(old_snippet) != 1:
             logger.warning(
                 "Could not apply the vLLM detokenizer linear-append patch: its "
-                "anchors were not found in %s. The vLLM version may have changed. "
-                "Long responses cost quadratic CPU time in the generation actor.",
+                "anchors were not found in %s, so long responses cost quadratic "
+                "CPU time.",
                 file_to_patch,
             )
             return
@@ -1358,10 +1352,8 @@ def modelopt_moe_amax_aliases(model: "torch.nn.Module") -> Iterator[None]:
 def extra_engine_client_addresses(count: int) -> Iterator[list[dict[str, str]]]:
     """Give the engine core launched in this block ``count`` more client address pairs.
 
-    vLLM's API-server scale-out gives each server process its own client of one
-    engine core, on address pairs allocated before launch. This allocates such
-    pairs for the engine an ``AsyncLLM`` launches itself. The yielded list holds
-    them once the engine launches, in client-index order from 1.
+    The pairs let extra clients attach as in vLLM's API-server scale-out. The
+    yielded list fills when the engine launches, in client-index order from 1.
 
     Raises:
         RuntimeError: If the block did not launch exactly one engine, or the
@@ -1378,7 +1370,7 @@ def extra_engine_client_addresses(count: int) -> Iterator[list[dict[str, str]]]:
         addresses = original(vllm_config, num_api_servers + count, **kwargs)
         inputs = addresses.inputs[num_api_servers:]
         outputs = addresses.outputs[num_api_servers:]
-        # A client that binds its pair after launch needs a fixed path.
+        # A client that binds after launch needs a fixed path, not tcp://host:0.
         for address in inputs + outputs:
             if not address.startswith("ipc://"):
                 raise RuntimeError(
