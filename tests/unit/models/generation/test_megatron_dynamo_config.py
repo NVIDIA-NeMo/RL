@@ -19,7 +19,10 @@ from types import SimpleNamespace
 import pytest
 from pydantic import ValidationError
 
-from nemo_rl.models.generation import resolve_generation_class
+from nemo_rl.models.generation import (
+    configure_generation_config,
+    resolve_generation_class,
+)
 from nemo_rl.models.generation.interfaces import GenerationInterface
 from nemo_rl.models.generation.megatron import MegatronGeneration
 from nemo_rl.models.generation.megatron.dynamo_generation import (
@@ -132,8 +135,8 @@ def test_engine_layout_overrides_must_be_positive(key, size) -> None:
         megatron_dynamo_cfg({"dynamo_cfg": {"prefill_engine": {key: size}}})
 
 
-@pytest.mark.parametrize("backend", ["vllm", "sglang", "trtllm", "dynamo"])
-def test_dynamo_switch_is_refused_for_non_megatron_backends(backend) -> None:
+@pytest.mark.parametrize("backend", ["sglang", "trtllm", "dynamo"])
+def test_dynamo_switch_is_refused_for_backends_without_a_dynamo_path(backend) -> None:
     with pytest.raises(ValueError, match=f"does not apply to backend='{backend}'"):
         resolve_generation_class({"backend": backend, "dynamo": True})
 
@@ -144,6 +147,16 @@ def test_dynamo_switch_resolves_to_the_sibling_class() -> None:
     assert not issubclass(MegatronDynamoGeneration, MegatronGeneration)
     plain = {**_megatron_config(), "dynamo": False}
     assert resolve_generation_class(plain) is MegatronGeneration
+
+
+def test_dynamo_switch_passes_generation_config_validation_for_megatron() -> None:
+    """The shared ``dynamo`` switch also serves vLLM; its validation must not
+    refuse the Megatron backend."""
+    tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=1)
+    config = configure_generation_config(
+        _megatron_config(stop_token_ids=None), tokenizer
+    )
+    assert config["stop_token_ids"] == [1]
 
 
 def test_engines_take_their_width_from_the_policy_layout() -> None:
