@@ -286,6 +286,7 @@ class NemoRLChatEngine:
                 logprobs=body.get("logprobs"),
                 # From the raw request: _drop_none drops an explicit null.
                 top_logprobs=request.get("top_logprobs"),
+                stream=body.get("stream"),
                 generation_config=self._generation,
             )
         )

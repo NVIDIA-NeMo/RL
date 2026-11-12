@@ -869,6 +869,8 @@ CASES = [
     # Token information without top_logprobs, unset or sent as null.
     _Case("top_logprobs_unset", omit=("top_logprobs",), status=400),
     _Case("top_logprobs_null", fields={"top_logprobs": None}, status=400),
+    # Neither path stages a streamed call, and Gym never sends one.
+    _Case("stream", fields={"stream": True}, status=400),
     # A field vLLM refuses while the request is parsed, before any step runs.
     _Case(
         "field_error",

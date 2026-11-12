@@ -32,7 +32,7 @@ from typing import Any, Literal, Optional, Union
 
 import torch
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 from pydantic import PrivateAttr
 from vllm.entrypoints.chat_utils import load_chat_template
 from vllm.entrypoints.openai.chat_completion.protocol import (
@@ -849,6 +849,7 @@ def register_routes(
                     if "top_logprobs" in request.model_fields_set
                     else None
                 ),
+                stream=request.stream,
                 generation_config=generation_config,
             )
             for field, value in sampling.items():
@@ -874,15 +875,13 @@ def register_routes(
                 content=generator.model_dump(), status_code=generator.error.code
             )
 
-        elif isinstance(generator, ChatCompletionResponse):
-            content = model_dump_chat_response_with_dynamic_message_fields(generator)
-            # Token capture: stage the delta and ride the coords on the
-            # response; strips logprobs/ids (no-op when capture is off).
-            content = await save_capture(host, request, content)
-            return JSONResponse(content=content)
-
-        await abort_request_capture(host, request, "streaming_response")
-        return StreamingResponse(content=generator, media_type="text/event-stream")
+        # on_policy_sampling refused stream: true, so the reply is whole.
+        assert isinstance(generator, ChatCompletionResponse)
+        content = model_dump_chat_response_with_dynamic_message_fields(generator)
+        # Token capture: stage the delta and ride the coords on the
+        # response; strips logprobs/ids (no-op when capture is off).
+        content = await save_capture(host, request, content)
+        return JSONResponse(content=content)
 
     @app.post("/tokenize")
     async def tokenize(request: NeMoRLTokenizeRequest, raw_request: Request):

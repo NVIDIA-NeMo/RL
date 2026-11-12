@@ -534,20 +534,21 @@ def on_policy_sampling(
     n: Optional[int],
     logprobs: Optional[bool],
     top_logprobs: Optional[int],
+    stream: Optional[bool],
     generation_config: Any,
 ) -> dict[str, Any]:
     """The sampling a NeMo-Gym chat call is served with, on every serving path.
 
     The request must match the train or validation profile
     (:func:`check_sampling_param`), set no sampling the trainer does not
-    replay, sample one choice, and set ``top_logprobs`` when it asks for
-    token information. Floats are compared at f32: Dynamo's frontend carries
-    them as f32, so 0.7 arrives as 0.69999998.
+    replay, sample one choice, set ``top_logprobs`` when it asks for token
+    information, and not stream. Floats are compared at f32: Dynamo's frontend
+    carries them as f32, so 0.7 arrives as 0.69999998.
 
     Args:
         temperature, top_p, top_k, min_p, repetition_penalty, presence_penalty,
-            frequency_penalty, logit_bias, n, logprobs, top_logprobs: The
-            request's values; None (or missing) when it did not set them.
+            frequency_penalty, logit_bias, n, logprobs, top_logprobs, stream:
+            The request's values; None (or missing) when it did not set them.
         generation_config: ``policy.generation``.
 
     Returns:
@@ -596,6 +597,12 @@ def on_policy_sampling(
         raise OffPolicySamplingError(
             "`top_logprobs` must be set when requesting token information from "
             "NeMo RL's chat endpoint"
+        )
+    if stream:
+        # Capture refuses a streamed call, and vLLM's delta outputs would leave
+        # the Dynamo path only the last piece of an uncaptured one.
+        raise OffPolicySamplingError(
+            "request stream=true is not supported; NeMo-Gym calls do not stream"
         )
     is_train = (_f32(temperature), _f32(top_p)) == (
         profile["temperature"],
