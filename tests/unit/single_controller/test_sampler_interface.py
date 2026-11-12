@@ -1315,6 +1315,10 @@ class EchoSampler(InOrderSampler):
     """Stand-in for a user-defined sampler loaded by FQN."""
 
 
+class InheritedWeightFifoSampler(WeightFifoSampler):
+    """Custom policy retaining strict single-weight selection."""
+
+
 class CheckpointingEchoSampler(EchoSampler):
     """Custom sampler with a static replay-checkpoint capability."""
 

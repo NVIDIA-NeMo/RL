@@ -287,6 +287,16 @@ class BaseSampler(abc.ABC):
             )
         self._dispatch_index = dispatch_index
 
+    @property
+    @abc.abstractmethod
+    def requires_single_weight_batch(self) -> bool:
+        """Whether selection needs a complete batch from one weight version.
+
+        Concrete policies declare a boolean class attribute so setup can reject
+        incompatible drop policies before constructing the sampler.
+        """
+        ...
+
     # ── rollout-pump side ────────────────────────────────────────────────
     @abc.abstractmethod
     async def admit(
@@ -430,6 +440,7 @@ class WindowedSampler(BaseSampler):
 
     # Ungated restored groups are ordinary in-window candidates.
     supports_buffer_checkpoint: ClassVar[bool] = True
+    requires_single_weight_batch: ClassVar[bool] = False
 
     # Rollout never stops producing, so a lost group is made up by later ones: no spare
     # pool is needed, and only the tail of the data can leave a step short.
@@ -609,6 +620,7 @@ class ReadyFirstSampler(_GatedSampler):
 
     # Committed groups retain start_weight, which is sufficient for selection.
     supports_buffer_checkpoint: ClassVar[bool] = True
+    requires_single_weight_batch: ClassVar[bool] = False
 
     def __init__(
         self,
@@ -660,6 +672,7 @@ class WeightFifoSampler(_GatedSampler):
 
     # Committed groups retain start_weight, which is sufficient for selection.
     supports_buffer_checkpoint: ClassVar[bool] = True
+    requires_single_weight_batch: ClassVar[bool] = True
     # A replacement is dispatched at whatever the weight version is once the original
     # was given up on. Unless the trainer has not moved since, that is a newer version
     # than the bucket the replacement is meant to fill, and select -- which waits on the
@@ -727,6 +740,7 @@ class InOrderSampler(_GatedSampler):
     # Committed groups retain target_step, which is sufficient for selection.
     # The controller checkpoints the exact dispatch cursor separately.
     supports_buffer_checkpoint: ClassVar[bool] = True
+    requires_single_weight_batch: ClassVar[bool] = False
 
     uses_replacement_pool: ClassVar[bool] = True
     closes_short_at_exhaustion: ClassVar[bool] = False
@@ -861,6 +875,8 @@ class CustomSamplerConfig(BaseModel, extra="allow"):
     # attribute so setup can validate recovery requirements before allocating
     # cluster resources. Periodic rollout snapshots additionally require an
     # explicit boolean ``supports_training_claims = True`` declaration.
+    # Dynamic sampling and nonzero drop budgets require a boolean
+    # ``requires_single_weight_batch = False`` class declaration.
     target: str
 
 
@@ -937,6 +953,22 @@ def _sampler_class_for_config(cfg: SamplerConfig) -> type:
 def sampler_supports_transactional_admission(cfg: SamplerConfig) -> bool:
     """Whether admission can wait outside mutations while the pump refills prompts."""
     return issubclass(_sampler_class_for_config(cfg), TransactionalAdmissionSampler)
+
+
+def sampler_requires_single_weight_batch(cfg: SamplerConfig) -> bool:
+    """Read the resolved policy's selection requirement without constructing it.
+
+    Custom subclasses inherit their selection policy's declaration. Missing or
+    instance-only declarations fail before a run can enable filtering or drops.
+    """
+    sampler_cls = _sampler_class_for_config(cfg)
+    capability = getattr(sampler_cls, "requires_single_weight_batch", None)
+    if not isinstance(capability, bool):
+        raise TypeError(
+            f"{sampler_cls.__name__}.requires_single_weight_batch must be a "
+            f"boolean class attribute, got {capability!r}"
+        )
+    return capability
 
 
 def sampler_supports_buffer_checkpoint(cfg: SamplerConfig) -> bool:
