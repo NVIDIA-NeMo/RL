@@ -1748,6 +1748,15 @@ class AutomodelPolicyWorkerImpl(
 
         the optimizer states are saved only if `optimizer` and `optimizer_path` are provided.
         """
+        if self.optimizer is not None and optimizer_path is not None:
+            # Optimizers with low-precision state (TE FusedAdam with BF16 moments) build
+            # FP32 copies of every state in ``state_dict()``, on the state's device; on
+            # GPU that is +8 bytes/param at once (Step-5 600B on 128 H100s: ~37 GiB,
+            # save OOM after the last step). Stage the state on host memory first;
+            # ``prepare_for_training`` moves it back before the next step.
+            self.move_optimizer_to_device("cpu")
+            gc.collect()
+            torch.cuda.empty_cache()
         if self.draft_model is not None:
             from nemo_rl.models.automodel.draft.checkpoint import (
                 save_checkpoint_with_draft,
