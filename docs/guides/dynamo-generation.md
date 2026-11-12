@@ -35,6 +35,9 @@ With `dynamo: true`:
 - Each engine turns on vLLM's KV-cache events for `router_mode: kv` and
   registers with the frontend from inside its own worker process. Setup waits
   until the frontend routes to every engine.
+- With NeMo-Gym (`vllm_cfg.expose_http_server: true`), the frontend starts its
+  render workers when the first engine registers, while the trainer loads, so
+  Gym's first calls do not wait for them. Other runs start none.
 - vLLM publishes KV-cache events only for blocks its prefix cache stores. With
   `vllm_cfg.enable_prefix_caching: false`, the engines publish none, and the
   KV router routes on load alone.
