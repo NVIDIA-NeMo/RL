@@ -85,6 +85,7 @@ class SGLangGeneration(GenerationInterface):
         The SingleController pickles this handle into its actor, and the
         RolloutHealthMonitor thread cannot follow it (see ``__getstate__``).
         Fleet health tracks a worker group's shards, which SGLang does not have.
+        SGLang workers cannot abort a refit, so a refit deadline is refused too.
         """
         fault_tolerance = SGLangFaultToleranceConfig.model_validate(
             master_config.policy["generation"]["sglang_cfg"][
@@ -102,6 +103,12 @@ class SGLangGeneration(GenerationInterface):
                 "async_rl.generation_fleet_health.enabled=true is not supported with "
                 "policy.generation.backend='sglang'. Set "
                 "async_rl.generation_fleet_health.enabled=false."
+            )
+        if master_config.async_rl.generation_fleet_health.refit_timeout_s is not None:
+            raise ValueError(
+                "async_rl.generation_fleet_health.refit_timeout_s must be null with "
+                "policy.generation.backend='sglang'; SGLang workers cannot enforce a "
+                "refit deadline."
             )
 
     def __init__(

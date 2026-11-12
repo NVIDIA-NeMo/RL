@@ -5,6 +5,11 @@
 # SGLang fault tolerance is not supported on the SingleController (setup rejects it).
 defaults: grpo_math_1B_megatron_single_controller.yaml
 
+async_rl:
+  generation_fleet_health:
+    # SGLang workers cannot abort a refit, so setup rejects a refit deadline.
+    refit_timeout_s: null
+
 policy:
   generation:
     backend: "sglang"

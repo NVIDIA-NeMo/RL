@@ -237,7 +237,8 @@ def _make_master_config(
             **({} if sampler_cfg is None else {"sampler": sampler_cfg}),
         ),
     )
-    if backend == "dynamo":
+    if backend in ("dynamo", "sglang"):
+        # Neither backend can enforce a refit deadline, so setup requires null.
         master_config.async_rl.generation_fleet_health.refit_timeout_s = None
     return master_config
 
@@ -400,6 +401,20 @@ def test_setup_rejects_sglang_fleet_health_before_anything_builds(
     master_config.async_rl.generation_fleet_health.enabled = True
 
     with pytest.raises(ValueError, match="fleet_health.*backend='sglang'"):
+        setup_single_controller(master_config, MagicMock(pad_token_id=0))
+
+    patched_factories["_build_clusters"].assert_not_called()
+    patched_factories["_build_generation"].assert_not_called()
+
+
+def test_setup_rejects_sglang_refit_deadline_before_anything_builds(
+    patched_factories,
+):
+    """SGLang workers cannot abort a refit, so a deadline would be silently ignored."""
+    master_config = _make_master_config(backend="sglang")
+    master_config.async_rl.generation_fleet_health.refit_timeout_s = 300.0
+
+    with pytest.raises(ValueError, match="refit_timeout_s must be null.*'sglang'"):
         setup_single_controller(master_config, MagicMock(pad_token_id=0))
 
     patched_factories["_build_clusters"].assert_not_called()
