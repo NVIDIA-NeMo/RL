@@ -554,22 +554,29 @@ def _owned_staging_key(
 
     A call ``owner`` made is staged under ``owner``. A restore that continued
     the episode as ``owner`` carries earlier calls over, each stamped with the
-    attempt that staged it in ``source_capture_key``, as Gym's rebuild checks.
-    Returns None when the stamp names another rollout or a later attempt.
+    attempt that staged it in ``source_capture_key``. Gym's rebuild owns that
+    rule (``_staging_owner``); this calls it so the two cannot drift. The
+    ledger checks raw dicts, so plain namespaces stand in for Gym's models.
+    Returns None when Gym refuses the stamp.
     """
-    from nemo_gym.episode_types import EpisodeId
+    from types import SimpleNamespace
+
+    from nemo_gym.token_id_capture.staging.rebuild import (
+        ReceiptVerificationError,
+        _staging_owner,
+    )
     from nemo_gym.token_id_capture.staging.records import staging_key
 
-    if source_capture_key is None:
-        return staging_key(owner, model_call_id)
     try:
-        source = EpisodeId.from_capture_key(source_capture_key)
-        current = EpisodeId.from_capture_key(owner)
-    except ValueError:
+        source = _staging_owner(
+            SimpleNamespace(capture_key=owner),
+            SimpleNamespace(
+                source_capture_key=source_capture_key, model_call_id=model_call_id
+            ),
+        )
+    except ReceiptVerificationError:
         return None
-    if source.rollout_id != current.rollout_id or source.attempt > current.attempt:
-        return None
-    return staging_key(source_capture_key, model_call_id)
+    return staging_key(source, model_call_id)
 
 
 def _attempt_staging_keys(

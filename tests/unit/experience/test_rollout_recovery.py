@@ -287,49 +287,61 @@ def test_forest_recovery_rejects_malformed_saved_ownership(damage: str) -> None:
 
 
 def _continued_forest_state(
-    call0_owner: str | None = None, *, stamped: bool = True
+    carried_owner: Callable[[str], str] = lambda first_owner: first_owner,
+    *,
+    attempt: int = 1,
+    stamped: bool = True,
 ) -> dict[str, Any]:
-    """A sealed Forest attempt a turn restore continued as ``-a1``.
+    """A sealed Forest attempt a turn restore continued as ``-a<attempt>``.
 
-    ``call0`` was captured before the restore, so it stays under attempt 0's
-    key, stamped with it, unless ``call0_owner`` names another.
+    ``call0`` was captured before the first restore, so it stays under the key
+    ``carried_owner`` builds from attempt 0's key. At ``attempt=2``, ``call1``
+    was captured by ``-a1`` and stays under that key.
     """
     state = _forest_sealed_ledger().state_dict()
-    attempt = state["groups"][0]["siblings"][0]["attempts"][0]
-    receipt = attempt["receipt"]
+    attempt_state = state["groups"][0]["siblings"][0]["attempts"][0]
+    receipt = attempt_state["receipt"]
     first_owner = receipt["capture_key"]
-    owner = f"{first_owner}-a1"
-    attempt["gym_instance_id"] = "nemo_gym/replica-0"
-    attempt["gym_attempt"] = 1
+    owner = f"{first_owner}-a{attempt}"
+    attempt_state["gym_instance_id"] = "nemo_gym/replica-0"
+    attempt_state["gym_attempt"] = attempt
     receipt["capture_key"] = owner
+    carried = {"call0": carried_owner(first_owner)}
+    if attempt == 2:
+        carried["call1"] = f"{first_owner}-a1"
     for entry in receipt["manifest"]:
-        entry["staging_key"] = f"{owner}/{entry['model_call_id']}"
-    carried = receipt["manifest"][0]
-    carried["staging_key"] = f"{call0_owner or first_owner}/call0"
-    if stamped:
-        carried["source_capture_key"] = call0_owner or first_owner
-    attempt["staging_keys"] = _receipt_staging_keys(receipt)
+        source = carried.get(entry["model_call_id"], owner)
+        entry["staging_key"] = f"{source}/{entry['model_call_id']}"
+        if stamped and source != owner:
+            entry["source_capture_key"] = source
+    attempt_state["staging_keys"] = _receipt_staging_keys(receipt)
     return state
 
 
+@pytest.mark.parametrize("attempt", [1, 2])
 @pytest.mark.nemo_gym
-def test_continued_forest_attempt_keeps_calls_captured_before_the_restore() -> None:
-    ledger = RolloutRecoveryLedger.from_state_dict(_continued_forest_state())
+def test_continued_forest_attempt_keeps_calls_captured_before_the_restore(
+    attempt: int,
+) -> None:
+    state = _continued_forest_state(attempt=attempt)
+    ledger = RolloutRecoveryLedger.from_state_dict(state)
 
-    attempt = ledger.get_group("g7").siblings[0].current_attempt
-    assert attempt.staging_keys[0].endswith("/call0")
-    assert "-a1/" not in attempt.staging_keys[0]
+    keys = ledger.get_group("g7").siblings[0].current_attempt.staging_keys
+    assert keys[0].endswith("/call0")
+    assert "-a" not in keys[0]
+    if attempt == 2:
+        assert keys[1].endswith("-a1/call1")
 
 
 @pytest.mark.parametrize("call0", ["later_attempt", "other_rollout", "unstamped"])
 @pytest.mark.nemo_gym
 def test_continued_forest_attempt_rejects_rows_it_cannot_own(call0: str) -> None:
-    first_owner = _forest_sealed_ledger().get_group("g7").gate_rollout_id(0)
     if call0 == "unstamped":
         state = _continued_forest_state(stamped=False)
+    elif call0 == "later_attempt":
+        state = _continued_forest_state(lambda first_owner: f"{first_owner}-a2")
     else:
-        owner = f"{first_owner}-a2" if call0 == "later_attempt" else "g8_g0_aother"
-        state = _continued_forest_state(owner)
+        state = _continued_forest_state(lambda _: "g8_g0_aother")
     with pytest.raises(ValueError, match="foreign staging ownership"):
         RolloutRecoveryLedger.from_state_dict(state)
 

@@ -830,7 +830,10 @@ def test_continued_attempt_trains_calls_its_earlier_attempt_staged(
     actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
     actor._finalizer = forest.finalizer
 
-    result = actor.finalize(_continued_request(records, after[-1]))
+    request = _continued_request(records, after[-1])
+    # Cleanup reads capture_receipts; finalize() alone never checks it.
+    assert request.capture_receipts == request.receipts
+    result = actor.finalize(request)
 
     assert result.valid_row_count == 2
     assert_loss_once(forest, records, records)
