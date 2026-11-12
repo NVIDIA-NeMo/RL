@@ -56,6 +56,7 @@ from nemo_rl.algorithms.grpo import (
     _log_mixed_rewards_and_advantages_information,
     _logprob_sample_mask,
     _maybe_restore_async_replay_buffer_checkpoint,
+    _megatron_policy_train_iters,
     _needs_hf_refit_handshake,
     _raise_if_length_penalty_enabled_without_nemo_gym,
     _raise_if_reward_penalties_enabled_without_nemo_gym,
@@ -9703,3 +9704,23 @@ def test_trainers_never_let_over_length_prompts_vote(
     counterfactual = all_rows[response] / all_rows[response].var(correction=0).sqrt()
     assert counterfactual.abs().max().item() == pytest.approx(2.236, abs=1e-3)
     assert not torch.allclose(counterfactual[:2], advantages[0][response[0]])
+
+
+@pytest.mark.parametrize(
+    ("max_num_steps", "max_num_epochs", "steps_per_epoch", "expected"),
+    [
+        pytest.param(645, 1, 645, 645, id="step-limited"),
+        pytest.param(1000, 2, 300, 600, id="epoch-limited"),
+        pytest.param(1000, None, 300, 1000, id="no-epoch-cap"),
+        # Megatron-Bridge rejects train_iters=0 ("lr_decay_steps must be > 0").
+        pytest.param(0, 1, 645, 1, id="validation-only"),
+        pytest.param(10, 1, 0, 1, id="empty-dataloader"),
+    ],
+)
+def test_megatron_policy_train_iters_is_positive(
+    max_num_steps, max_num_epochs, steps_per_epoch, expected
+):
+    assert (
+        _megatron_policy_train_iters(max_num_steps, max_num_epochs, steps_per_epoch)
+        == expected
+    )

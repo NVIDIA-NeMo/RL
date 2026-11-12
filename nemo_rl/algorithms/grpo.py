@@ -488,6 +488,25 @@ class GRPOSaveState:
     next_nemo_gym_task_index: int = 0
 
 
+def _megatron_policy_train_iters(
+    max_num_steps: int, max_num_epochs: Optional[int], steps_per_epoch: int
+) -> int:
+    """Return the Megatron scheduler horizon (``train_iters``) of a GRPO run.
+
+    This is the number of optimizer steps the run can take: ``max_num_steps``,
+    capped by ``max_num_epochs`` passes over the training dataloader
+    (``steps_per_epoch`` batches each). Megatron-Bridge rejects a non-positive
+    horizon at setup ("lr_decay_steps must be > 0"), so it is clamped to at
+    least 1. Only runs without training steps are affected, e.g. a
+    validation-only run (``grpo.max_num_steps=0``, ``grpo.val_at_start=true``),
+    and they never advance the scheduler.
+    """
+    train_iters = max_num_steps
+    if max_num_epochs is not None:
+        train_iters = min(train_iters, max_num_epochs * steps_per_epoch)
+    return max(train_iters, 1)
+
+
 def _initial_grpo_save_state() -> GRPOSaveState:
     return GRPOSaveState(
         consumed_samples=0,
@@ -1461,12 +1480,9 @@ def setup(
 
     if policy_config.get("megatron_cfg", {}).get("enabled", False):
         ## NOTE: this is equal to the total number of scheduler steps
-        total_train_iters = grpo_config.max_num_steps
-        if grpo_config.max_num_epochs is not None:
-            total_train_iters = min(
-                total_train_iters, grpo_config.max_num_epochs * train_sample_count
-            )
-        policy_config["megatron_cfg"]["train_iters"] = total_train_iters
+        policy_config["megatron_cfg"]["train_iters"] = _megatron_policy_train_iters(
+            grpo_config.max_num_steps, grpo_config.max_num_epochs, train_sample_count
+        )
 
     # Megatron generation expresses recompute-after-refit engine-side via
     # `kv_cache_management_mode="recompute"`; the async loop's flag must agree.
