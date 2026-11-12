@@ -553,6 +553,100 @@ def _patch_vllm_shm_broadcast_bind_retry(logger) -> None:
         )
 
 
+def _patch_vllm_detokenizer_linear_append(logger) -> None:
+    """Stop the incremental detokenizer copying a request's text on every token.
+
+    ``BaseIncrementalDetokenizer.update`` grows ``self.output_text`` with ``+=``
+    per decoded token. The text is an attribute, so each ``+=`` builds a new
+    string: quadratic in the response length, in the process that owns the
+    AsyncLLM. Keep the newly decoded pieces in a list and join them when the
+    text is read, which a non-streaming request does once, at the end. The text
+    is the same.
+
+    Both edits are applied or neither. Returns without raising when an anchor is
+    missing, but logs at warning level.
+    """
+    try:
+        file_to_patch = _get_vllm_file("v1/engine/detokenizer.py")
+    except RuntimeError:
+        logger.warning("Could not locate detokenizer.py for the linear-append patch.")
+        return
+
+    marker = "_nrl_pending_text"
+    property_old = (
+        '        self.output_text = ""\n'
+        "\n"
+        "    def update(self, new_token_ids: list[int], stop_terminated: bool)"
+        " -> str | None:\n"
+    )
+    property_new = (
+        '        self.output_text = ""\n'
+        "\n"
+        "    # NeMo-RL: update() keeps newly decoded text in a list, joined on read.\n"
+        "    @property\n"
+        "    def output_text(self) -> str:\n"
+        "        self._nrl_join_pending_text()\n"
+        "        return self._nrl_output_text\n"
+        "\n"
+        "    @output_text.setter\n"
+        "    def output_text(self, value: str) -> None:\n"
+        "        self._nrl_output_text = value\n"
+        "        self._nrl_output_text_len = len(value)\n"
+        "        self._nrl_pending_text: list[str] = []\n"
+        "\n"
+        "    def _nrl_join_pending_text(self) -> None:\n"
+        "        if self._nrl_pending_text:\n"
+        '            self._nrl_output_text = "".join(\n'
+        "                (self._nrl_output_text, *self._nrl_pending_text)\n"
+        "            )\n"
+        "            self._nrl_pending_text.clear()\n"
+        "\n"
+        "    def update(self, new_token_ids: list[int], stop_terminated: bool)"
+        " -> str | None:\n"
+    )
+    old_snippet = (
+        "        stop_check_offset = len(self.output_text)\n"
+        "        for new_token_id in new_token_ids:\n"
+        "            self.token_ids.append(new_token_id)\n"
+        "            self.output_text += self.decode_next(new_token_id)\n"
+        "            # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014\n"
+        "            if self.min_tokens and self.num_output_tokens() <= self.min_tokens:\n"
+        "                stop_check_offset = len(self.output_text)\n"
+    )
+    new_snippet = (
+        "        stop_check_offset = self._nrl_output_text_len\n"
+        "        for new_token_id in new_token_ids:\n"
+        "            self.token_ids.append(new_token_id)\n"
+        "            new_text = self.decode_next(new_token_id)\n"
+        "            self._nrl_pending_text.append(new_text)\n"
+        "            self._nrl_output_text_len += len(new_text)\n"
+        "            # Support min_tokens, see https://github.com/vllm-project/vllm/pull/22014\n"
+        "            if self.min_tokens and self.num_output_tokens() <= self.min_tokens:\n"
+        "                stop_check_offset = self._nrl_output_text_len\n"
+        "        # Bound the small strings a request holds.\n"
+        "        if len(self._nrl_pending_text) > 4096:\n"
+        "            self._nrl_join_pending_text()\n"
+    )
+
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if marker in content:
+            return
+        if content.count(property_old) != 1 or content.count(old_snippet) != 1:
+            logger.warning(
+                "Could not apply the vLLM detokenizer linear-append patch: its "
+                "anchors were not found in %s. The vLLM version may have changed. "
+                "Long responses cost quadratic CPU time in the generation actor.",
+                file_to_patch,
+            )
+            return
+        write_back(
+            content.replace(property_old, property_new, 1).replace(
+                old_snippet, new_snippet, 1
+            )
+        )
+    logger.info("Patched vLLM's detokenizer to append decoded text in linear time.")
+
+
 def _patch_vllm_radio_layerscale_loader(logger) -> None:
     """Load explicit RADIO LayerScale weights and initialize folded weights.
 
@@ -1402,6 +1496,7 @@ def _apply_vllm_patches(
     _patch_vllm_tool_parser_namespace_tool(patch_logger)
     _patch_vllm_ray_executor_v2_tcpstore_port(patch_logger)
     _patch_vllm_shm_broadcast_bind_retry(patch_logger)
+    _patch_vllm_detokenizer_linear_append(patch_logger)
     _patch_vllm_radio_layerscale_loader(patch_logger)
     _patch_vllm_radio_native_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)

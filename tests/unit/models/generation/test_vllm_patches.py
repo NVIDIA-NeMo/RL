@@ -35,6 +35,9 @@ source-sensitive compatibility patches:
 * ``install_output_loop_yield`` patches AsyncLLM's output loops at runtime. Its
   yield and reader-budget behavior is checked against a stand-in client, and a
   canary fails if the pinned vLLM moves the calls it relies on.
+* ``_patch_vllm_detokenizer_linear_append`` rewrites how the detokenizer grows a
+  request's text. A stand-in holding its anchors checks the text is unchanged,
+  and a canary fails if the pinned vLLM moves the anchors.
 """
 
 import ast
@@ -44,6 +47,7 @@ import logging
 import os
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -72,6 +76,9 @@ _CAPTURER_PATCH_FN = "_patch_vllm_routed_experts_capture_router_fallback"
 _CAPTURER_MARKER = (
     "NeMo-RL patch (router fallback for monolithic routed-experts capture)"
 )
+_DETOK_SOURCE = "v1/engine/detokenizer.py"
+_DETOK_PATCH_FN = "_patch_vllm_detokenizer_linear_append"
+_DETOK_MARKER = "_nrl_pending_text"
 
 
 @pytest.fixture
@@ -670,6 +677,7 @@ def _stub_vllm_patches(monkeypatch, captured_extra_env_vars):
         "_patch_vllm_tool_parser_namespace_tool",
         "_patch_vllm_ray_executor_v2_tcpstore_port",
         "_patch_vllm_shm_broadcast_bind_retry",
+        "_patch_vllm_detokenizer_linear_append",
         "_patch_vllm_radio_layerscale_loader",
         "_patch_vllm_radio_native_loader",
         "_patch_vllm_radio_final_layernorm",
@@ -830,6 +838,118 @@ def test_init_workers_ray_reports_success_and_is_idempotent(monkeypatch, tmp_pat
 
     assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
     assert ray_executor.read_text() == once
+
+
+# _patch_vllm_detokenizer_linear_append
+
+
+def _detokenizer_stand_in() -> str:
+    """A minimal detokenizer source that holds both of the patch's anchors."""
+    property_old, _ = patch_snippets(_DETOK_PATCH_FN, "property_old", "property_new")
+    loop_old, _ = patch_snippets(_DETOK_PATCH_FN)
+    return (
+        "class Detokenizer:\n"
+        "    def __init__(self, min_tokens: int = 0):\n"
+        "        self.token_ids: list[int] = []\n"
+        "        self.min_tokens = min_tokens\n"
+        + property_old
+        + loop_old
+        + "        return stop_check_offset\n"
+        "\n"
+        "    def num_output_tokens(self) -> int:\n"
+        "        return len(self.token_ids)\n"
+        "\n"
+        "    def decode_next(self, token_id: int) -> str:\n"
+        '        return f"<{token_id}>"\n'
+    )
+
+
+def _load_detokenizer(source: Path) -> type:
+    namespace: dict = {}
+    exec(source.read_text(), namespace)
+    return namespace["Detokenizer"]
+
+
+@pytest.fixture
+def detokenizer_source(tmp_path, monkeypatch):
+    """The stand-in detokenizer, unpatched, where the patch looks for vLLM's."""
+    source = tmp_path / "detokenizer.py"
+    source.write_text(_detokenizer_stand_in())
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
+    return source
+
+
+@pytest.mark.parametrize("min_tokens", [0, 3])
+def test_detokenizer_patch_keeps_text_and_stop_offsets(detokenizer_source, min_tokens):
+    original = _load_detokenizer(detokenizer_source)(min_tokens)
+    patches._patch_vllm_detokenizer_linear_append(logging.getLogger(__name__))
+    patched = _load_detokenizer(detokenizer_source)(min_tokens)
+
+    for chunk in ([1], [2, 3], [4], [5, 6, 7]):
+        assert patched.update(chunk, False) == original.update(chunk, False)
+    assert patched.output_text == original.output_text
+    # A matched stop string truncates the text by assignment.
+    original.output_text = original.output_text[:5]
+    patched.output_text = patched.output_text[:5]
+    assert patched.update([8], False) == original.update([8], False)
+    assert patched.output_text == original.output_text == "<1><2<8>"
+
+
+def test_detokenizer_patch_bounds_the_pieces_a_request_holds(detokenizer_source):
+    patches._patch_vllm_detokenizer_linear_append(logging.getLogger(__name__))
+    detokenizer = _load_detokenizer(detokenizer_source)()
+
+    for token_id in range(4096):
+        detokenizer.update([token_id], False)
+    assert len(detokenizer._nrl_pending_text) == 4096
+    detokenizer.update([4096], False)
+    assert detokenizer._nrl_pending_text == []
+    assert detokenizer.output_text == "".join(f"<{i}>" for i in range(4097))
+
+
+def test_detokenizer_patch_is_idempotent(detokenizer_source):
+    patches._patch_vllm_detokenizer_linear_append(logging.getLogger(__name__))
+    once = detokenizer_source.read_text()
+    assert _DETOK_MARKER in once
+
+    patches._patch_vllm_detokenizer_linear_append(logging.getLogger(__name__))
+
+    assert detokenizer_source.read_text() == once
+
+
+def test_detokenizer_patch_never_applies_one_edit_alone(detokenizer_source, caplog):
+    loop_old, _ = patch_snippets(_DETOK_PATCH_FN)
+    reshaped = detokenizer_source.read_text().replace(
+        loop_old, "        stop_check_offset = 0\n"
+    )
+    detokenizer_source.write_text(reshaped)
+
+    with caplog.at_level(logging.WARNING):
+        patches._patch_vllm_detokenizer_linear_append(logging.getLogger(__name__))
+
+    assert detokenizer_source.read_text() == reshaped
+    assert "anchors were not found" in caplog.text
+
+
+@pytest.mark.vllm
+def test_detokenizer_patch_anchor_still_matches_installed_vllm(tmp_path, monkeypatch):
+    """If vLLM reshapes the detokenizer's update, fail here, not silently in a job."""
+    content = Path(patches._get_vllm_file(_DETOK_SOURCE)).read_text()
+    for names in (("property_old", "property_new"), ("old_snippet", "new_snippet")):
+        old, new = patch_snippets(_DETOK_PATCH_FN, *names)
+        content = content.replace(new, old)
+    copied = tmp_path / "detokenizer.py"
+    copied.write_text(content)
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+
+    patches._patch_vllm_detokenizer_linear_append(logging.getLogger(__name__))
+
+    patched = copied.read_text()
+    assert _DETOK_MARKER in patched, (
+        "the detokenizer patch did not apply to the installed vLLM; refit its "
+        "anchors, or remove it if vLLM no longer grows output_text with +=."
+    )
+    ast.parse(patched)
 
 
 # install_output_loop_yield
