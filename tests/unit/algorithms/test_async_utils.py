@@ -3741,6 +3741,45 @@ class TestAsyncTrajectoryCollector:
         assert collector._fatal_error_message is None
         assert not collector._generation_limit_cleared.is_set()
         assert target_weight not in collector._generating_targets
+
+    @pytest.mark.parametrize("still_needed,expect_wake", [(5, True), (0, False)])
+    def test_successful_underfilled_worker_wakes_generation_pause(
+        self, monkeypatch, still_needed, expect_wake
+    ):
+        """A successful worker that leaves its target short wakes the loop.
+
+        Regression: after checkpoint resume a carried-over remainder gap-fills
+        only part of a target. Without a wake the collection loop stayed parked
+        in the generation-limit wait (cleared only by set_weight_version) while
+        the trainer waited for that target, deadlocking the run.
+        """
+        collector = self.create_local_collector()
+        collector.running = True
+        target_weight = 7
+        collector._generating_targets.add(target_weight)
+        collector._generation_limit_cleared.clear()
+
+        async def succeed(**kwargs):
+            return None
+
+        monkeypatch.setattr(collector, "_collect_rollout_batch", succeed)
+        monkeypatch.setattr(
+            collector, "_target_still_short", lambda target: still_needed > 0
+        )
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=None,
+                generation_weight_version=6,
+                target_weight_version=target_weight,
+                num_generations=1,
+                use_nemo_gym=False,
+            )
+        )
+
+        assert target_weight not in collector._generating_targets
+        assert collector._failure_count == 0
+        assert collector._generation_limit_cleared.is_set() is expect_wake
         assert threading.current_thread() not in collector._inflight_threads
         collector.check_health()
 

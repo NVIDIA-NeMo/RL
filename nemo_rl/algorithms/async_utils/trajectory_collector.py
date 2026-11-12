@@ -1648,8 +1648,29 @@ class AsyncTrajectoryCollector:
             self._release_target(target_weight_version)
             with self._threads_lock:
                 self._inflight_threads.discard(_threading.current_thread())
-            if wake_generation_limits_after_cleanup:
+            # A worker that succeeds but leaves its target short (a gap-fill
+            # from a carried-over remainder, e.g. right after checkpoint
+            # resume) must also wake the loop: otherwise it stays parked in the
+            # generation-limit wait, which only set_weight_version() clears,
+            # while the trainer waits for that very target -> deadlock.
+            if wake_generation_limits_after_cleanup or (
+                self.running and self._target_still_short(target_weight_version)
+            ):
                 self._generation_limit_cleared.set()
+
+    def _target_still_short(self, target_weight_version: int) -> bool:
+        """Whether a just-released target still needs trajectories."""
+        try:
+            needed = ray.get(
+                self.replay_buffer.get_trajectories_needed.remote(
+                    target_weight_version,
+                    self._num_prompts_per_step,
+                    self._max_trajectory_age_steps,
+                )
+            )
+        except Exception:
+            return False
+        return isinstance(needed, int) and needed > 0
 
     @staticmethod
     def _build_task_index_map(
