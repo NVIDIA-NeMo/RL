@@ -1,0 +1,36 @@
+# One prefill EP2 engine and three decode EP2 engines share eight rollout GPUs.
+defaults: ./grpo-qwen3-30ba3b-thinking-swe1-4n4g-megatron-trtllm-noncolocated-gym.yaml
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-30ba3b-thinking-swe1-4n4g-megatron-trtllm-bf16-async-disagg-reshard-gym
+policy:
+  generation:
+    refit_transport: nccl_reshard
+    trtllm_cfg:
+      in_flight_weight_updates: ${grpo.async_grpo.in_flight_weight_updates}
+      recompute_kv_cache_after_weight_updates: ${grpo.async_grpo.recompute_kv_cache_after_weight_updates}
+      disagg_server:
+        ctx_router: conversation
+        gen_router: load_balancing
+        gen_tokids_ctxbytes: true
+        gen_strip_message_history: true
+    disaggregation:
+      enabled: true
+      num_prefill_engines: 1
+      num_decode_engines: 3
+      num_frontend_workers: 2
+      frontend_base_port: 8300
+      frontend_tokenize: true
+    trtllm_kwargs:
+      kv_cache_config:
+        # Partial block reuse is disabled in the existing PD nightly as well.
+        enable_partial_reuse: false
+      cache_transceiver_config:
+        backend: NIXL
+        kv_transfer_timeout_ms: 600000
+env:
+  nemo_gym:
+    uv_venv_dir: ${oc.env:HF_HOME}/gym_venvs
+logger:
+  log_dir: logs/grpo-qwen3-30ba3b-thinking-swe1-4n4g-megatron-trtllm-bf16-async-disagg-reshard-gym
+  wandb:
+    name: grpo-qwen3-30ba3b-thinking-swe1-4n4g-megatron-trtllm-bf16-async-disagg-reshard-gym

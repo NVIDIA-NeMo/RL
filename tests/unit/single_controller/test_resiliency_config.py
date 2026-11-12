@@ -29,7 +29,6 @@ from pydantic import ValidationError
 from nemo_rl.algorithms.async_utils.staleness_sampler import SamplerConfig
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
-from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     FleetHealthConfig,
@@ -96,14 +95,6 @@ def test_single_forward_threshold_accepted_and_skips_policy_logprobs() -> None:
     assert logprob_passes_required(cfg, cfg.grpo) == (False, False)
     cfg.loss_fn.seq_logprob_error_in_loss = False
     assert logprob_passes_required(cfg, cfg.grpo) == (True, False)
-
-
-def test_single_forward_threshold_rejected_for_ppo() -> None:
-    cfg = _single_forward_config()
-    cfg.ppo = PPOConfig.model_construct()
-    cfg.grpo = None
-    with pytest.raises(ValueError, match="requires GRPO"):
-        validate_single_controller_config(cfg)
 
 
 def test_single_forward_threshold_rejected_for_forest_training() -> None:

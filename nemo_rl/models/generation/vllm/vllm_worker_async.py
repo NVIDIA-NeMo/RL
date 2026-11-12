@@ -20,6 +20,7 @@ import gc
 import importlib.metadata
 import inspect
 import logging
+import os
 import secrets
 import sys
 import threading
@@ -59,6 +60,7 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.distributed.worker_group_utils import get_nsight_config_if_pattern_matches
 from nemo_rl.experience.route_assembly import boundary_route_rows
+from nemo_rl.models.generation.dynamo.config import dynamo_cfg, dynamo_enabled
 from nemo_rl.models.generation.prefix_recovery import (
     CaptureRegistry,
     NoPrefixRecovery,
@@ -95,8 +97,8 @@ from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
 from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
+from nemo_rl.models.generation.rollout_result import RolloutResult
 from nemo_rl.models.generation.vllm.request_pipeline import (
-    RolloutResult,
     rollout_output,
     rollout_result,
 )
@@ -390,6 +392,8 @@ class VllmAsyncGenerationWorkerImpl(
         self.http_server = None
         self._engine_loop = None
         self._http_engine_client = None
+        # The task serving this engine through Dynamo, when it is registered.
+        self._dynamo_endpoint_task: Optional[asyncio.Task] = None
 
         self._init_token_capture_state()
 
@@ -539,13 +543,36 @@ class VllmAsyncGenerationWorkerImpl(
                     stacklevel=1,
                 )
             llm_kwargs["compilation_config"] = CompilationConfig(**compilation_config)
-
-        self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
         self.stat_loggers = (
             [PrometheusStatLogger]
             if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
             else []
         )
+        if dynamo_enabled(self.cfg):
+            from nemo_rl.models.generation.dynamo.vllm_adapter import (
+                SnapshotStatLogger,
+                dynamo_kv_events_config,
+            )
+
+            # Dynamo's KV-aware router indexes the engine's own KV-cache events;
+            # the stat logger feeds its per-engine load signal.
+            llm_kwargs.setdefault(
+                "kv_events_config",
+                dynamo_kv_events_config(
+                    dynamo_cfg(self.cfg),
+                    prefix_caching=llm_kwargs["enable_prefix_caching"],
+                ),
+            )
+            self.stat_loggers.append(SnapshotStatLogger)
+        # AsyncEngineArgs leaves kv_events_config dicts unconverted.
+        if isinstance(llm_kwargs.get("kv_events_config"), dict):
+            from vllm.config import KVEventsConfig
+
+            llm_kwargs["kv_events_config"] = KVEventsConfig(
+                **llm_kwargs["kv_events_config"]
+            )
+
+        self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
         self.llm = AsyncLLM.from_engine_args(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
@@ -725,6 +752,53 @@ class VllmAsyncGenerationWorkerImpl(
             self.server_thread, self.base_url, self.http_server = (
                 self._setup_vllm_server()
             )
+
+    async def start_dynamo_endpoint_async(
+        self, *, namespace: str, engine_env: dict[str, str], leader_worker_idx: int
+    ) -> None:
+        """Register this engine with Dynamo and serve it from this actor's loop.
+
+        The loop is the one that owns the AsyncLLM, so Dynamo requests, refit,
+        pause and sleep interleave exactly as this worker's own requests do.
+        ``leader_worker_idx`` is this worker's index in its group; rollouts the
+        engine serves report it, as ``generate_async`` results do.
+        """
+        # ai-dynamo is optional: import it only for engines served through Dynamo.
+        from dynamo._core import fetch_model
+
+        from nemo_rl.models.generation.dynamo.engine_adapter import (
+            start_dynamo_endpoint,
+        )
+        from nemo_rl.models.generation.dynamo.vllm_adapter import DynamoVllmAdapter
+
+        # Dynamo fetches a Hub ID's whole checkpoint before it registers; the engine's
+        # weights come from refit, so register the config and tokenizer files only.
+        model_path = (
+            self.model_name
+            if os.path.exists(self.model_name)
+            else await fetch_model(self.model_name, ignore_weights=True)
+        )
+        kv_events = self.llm.vllm_config.kv_events_config
+        publishes = kv_events is not None and kv_events.enable_kv_cache_events
+        # The Dynamo functional overlays check the router applied these.
+        print(f"  [Dynamo] engine publishes KV events: {publishes}", flush=True)
+        self._dynamo_endpoint_task = start_dynamo_endpoint(
+            DynamoVllmAdapter(self, leader_worker_idx=leader_worker_idx),
+            model_path=model_path,
+            served_model_name=self.model_name,
+            namespace=namespace,
+            engine_env=engine_env,
+        )
+
+    async def dynamo_endpoint_error(self) -> Optional[str]:
+        """Why this engine's Dynamo endpoint stopped serving; None while it serves."""
+        task = self._dynamo_endpoint_task
+        if task is None or not task.done():
+            return None
+        if task.cancelled():
+            return "cancelled"
+        error = task.exception()
+        return "exited" if error is None else repr(error)
 
     async def get_reserved_url(self) -> Optional[str]:
         """Return the URL from the reserved socket, available before model loading."""
@@ -2485,7 +2559,8 @@ class VllmAsyncGenerationWorkerImpl(
 
         Returns:
             The result, and vLLM's final RequestOutput (None when no new token fits).
-            The final output supplies finish and usage metadata to Dynamo in PR #4905.
+            The final output supplies finish and usage metadata to Dynamo
+            (``dynamo/vllm_adapter.py``).
         """
         max_new_tokens = self._rollout_max_new_tokens(len(prompt_token_ids))
         if max_new_tokens == 0:

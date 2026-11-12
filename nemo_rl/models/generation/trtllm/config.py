@@ -122,6 +122,8 @@ class TrtllmSpecificArgs(TrtllmEngineKnobs):
 
 
 class TrtllmConfig(GenerationConfig):
+    # None uses the topology default; nccl_reshard refits routed experts with pure EP.
+    refit_transport: NotRequired[Literal["nccl_reshard"] | None]
     trtllm_cfg: TrtllmSpecificArgs
     # Escape hatch for arbitrary TRT-LLM LLM/AsyncLLM constructor kwargs not
     # covered by TrtllmSpecificArgs (e.g. sampler_type, enable_attention_dp).
