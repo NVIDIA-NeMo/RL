@@ -41,7 +41,7 @@ EOF
 
 Push the derived image to a registry visible to the training cluster and use it as `CONTAINER` in the launch commands below.
 
-Do not move the Gym virtual environments to a shared filesystem to avoid rebuilding them.
+Do not put the Gym virtual environments on a shared filesystem as a way to skip rebuilding them.
 To reuse them without rebuilding the image, see [Python Environments on Shared Filesystems](../../../cluster.md#python-environments-on-shared-filesystems).
 
 ## Download and prepare the data

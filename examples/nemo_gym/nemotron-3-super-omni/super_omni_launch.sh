@@ -199,11 +199,16 @@ mount_checked_vars=(MODEL_PATH TRAIN_PATH VAL_PATH PERSISTENT_CACHE)
 # GYM_VENV_DIR defaults to the image's /opt/gym_venvs, on the node's local disk.
 # Venvs on a shared filesystem make every node import and check thousands of
 # files there, which overloads its metadata servers; reuse built venvs across
-# runs with GYM_VENV_ARCHIVE instead.
+# runs with GYM_VENV_ARCHIVE instead. The check looks at the nearest existing
+# directory, because Gym creates GYM_VENV_DIR on first use.
 if [[ "${GYM_VENV_DIR}" != /opt/* ]]; then
-    gym_venv_fs="$(stat -f -c %T "${GYM_VENV_DIR}" 2>/dev/null || true)"
+    gym_venv_probe="${GYM_VENV_DIR}"
+    while [[ ! -e "${gym_venv_probe}" && "${gym_venv_probe}" != / ]]; do
+        gym_venv_probe="$(dirname "${gym_venv_probe}")"
+    done
+    gym_venv_fs="$(stat -f -c %T "${gym_venv_probe}" 2>/dev/null || true)"
     case "${gym_venv_fs}" in
-        lustre|nfs|nfs4|gpfs|beegfs|ceph|fuse.*)
+        lustre|nfs*|gpfs|fhgfs|beegfs|ceph*|fuse*|cifs|smb*|UNKNOWN*)
             echo "Error: GYM_VENV_DIR=${GYM_VENV_DIR} is on a shared filesystem (${gym_venv_fs})." >&2
             echo "  Keep Gym venvs on each node's local disk: leave GYM_VENV_DIR at /opt/gym_venvs and" >&2
             echo "  set GYM_VENV_ARCHIVE to reuse prebuilt venvs (docs/cluster.md)." >&2
@@ -217,14 +222,16 @@ if [[ -n "${GYM_VENV_ARCHIVE}" ]]; then
         echo "Error: GYM_VENV_ARCHIVE unpacks to /opt/gym_venvs, but GYM_VENV_DIR=${GYM_VENV_DIR}." >&2
         exit 1
     fi
-    if [[ ! -f "${GYM_VENV_ARCHIVE}" ]]; then
-        echo "Error: GYM_VENV_ARCHIVE=${GYM_VENV_ARCHIVE} is not a file." >&2
+    if [[ "${GYM_VENV_ARCHIVE}" != /* || ! -f "${GYM_VENV_ARCHIVE}" ]]; then
+        echo "Error: GYM_VENV_ARCHIVE=${GYM_VENV_ARCHIVE} must be the absolute path of an existing file." >&2
         exit 1
     fi
     mount_checked_vars+=(GYM_VENV_ARCHIVE)
-    # ray.sub runs SETUP_COMMAND on every node before Ray starts, and again on a retried start.
-    # Removing the image's /opt/gym_venvs first keeps any venv from mixing files from two builds.
-    export SETUP_COMMAND="${SETUP_COMMAND:+${SETUP_COMMAND}; }[ -e /opt/gym_venvs/.from-archive ] || { rm -rf /opt/gym_venvs && tar -C / -xf ${GYM_VENV_ARCHIVE} && touch /opt/gym_venvs/.from-archive; }"
+    # ray.sub runs SETUP_COMMAND on every node before Ray starts and ignores its
+    # exit status; the script ends the job through ray.sub's ENDED file instead.
+    gym_venv_unpack="bash $(printf %q "${SNAPSHOT_DIR}/examples/nemo_gym/gym_venv_archive.sh") unpack"
+    gym_venv_unpack+=" $(printf %q "${GYM_VENV_ARCHIVE}") \"\$(dirname \"\$0\")/ENDED\""
+    export SETUP_COMMAND="${SETUP_COMMAND:+${SETUP_COMMAND}$'\n'}${gym_venv_unpack}"
 fi
 for path_var in "${mount_checked_vars[@]}"; do
     path_value="${!path_var}"

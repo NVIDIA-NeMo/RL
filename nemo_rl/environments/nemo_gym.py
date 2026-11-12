@@ -668,8 +668,8 @@ def _gym_failure_row_error(
 def get_nemo_gym_uv_cache_dir() -> str | None:
     """Return the uv cache directory inside a container, or None outside one.
 
-    Inside a container (NRL_CONTAINER=1), returns the uv cache location so Gym
-    stores its caches in the expected shared path. Returns None outside a
+    Inside a container (NRL_CONTAINER=1), returns the container's uv cache
+    location so Gym's server installs reuse the cache the image ships. Returns None outside a
     container, meaning the caller should omit this arg and let Gym create the
     cache locally (the default when you may not be able to write to /opt).
     """
@@ -3774,9 +3774,10 @@ def _spinup_shards_concurrently(
                     f"budget before every replica finished setting up. Raise "
                     f"env.nemo_gym.spinup_timeout, or bake the Gym venvs into "
                     f"the image so a cold node starts faster. Without an image "
-                    f"rebuild, unpack a prebuilt archive of them on every node "
-                    f"(docs/cluster.md, 'Python Environments on Shared "
-                    f"Filesystems'); never build them on a shared filesystem."
+                    f"rebuild, unpack a prebuilt archive of them on every node and "
+                    f"set env.nemo_gym.skip_venv_if_present=true (docs/cluster.md, "
+                    f"'Python Environments on Shared Filesystems'); never build "
+                    f"them on a shared filesystem."
                 ) from error
             raise ShardSetupError(
                 f"NeMo-Gym shard '{shard_name}' (replica {replica}) {failure}: {error}"

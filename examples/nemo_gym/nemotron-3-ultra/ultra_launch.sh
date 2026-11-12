@@ -805,6 +805,8 @@ fi
 # Triton bundler skipping non-empty temp dirs). We rm -rf /tmp caches first,
 # then seed fresh from Lustre.
 # =============================================================================
+# A SETUP_COMMAND passed in by the user, such as the Gym venv unpack in docs/cluster.md, runs after this one.
+USER_SETUP_COMMAND="${SETUP_COMMAND:-}"
 read -r -d '' SETUP_COMMAND <<SETUPEOF || true
 command -v zstd >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq zstd; } 2>/dev/null || true
 echo "[CACHE SEED] Clearing stale /tmp caches and seeding from Lustre..."
@@ -846,6 +848,7 @@ _seed_cache "\$CACHE_READ/triton_cache.tar.zst" "\$LOCAL_TRI" "Triton"
 
 echo "[CACHE SEED] Done."
 SETUPEOF
+SETUP_COMMAND+="${USER_SETUP_COMMAND:+$'\n'${USER_SETUP_COMMAND}}"
 export SETUP_COMMAND
 
 # =============================================================================
