@@ -37,8 +37,8 @@ ARG HYBRID_EP_MULTINODE=1
 # wheel on these, so a wheel built for one list must not be reused for another, and
 # every uv cache mount id includes all four. NVCC_THREADS is left out: it does not
 # change the wheel.
-ARG TORCH_CUDA_ARCH_LIST="9.0 10.0"
-ARG NVTE_CUDA_ARCHS=90;100
+ARG TORCH_CUDA_ARCH_LIST="9.0 10.0 10.3"
+ARG NVTE_CUDA_ARCHS=90;100;103
 ARG FLASH_ATTN_CUDA_ARCHS
 ARG FLASH_MLA_DISABLE_SM90
 # Unprivileged runtime identity (for example the NeMo CI agent workloads) that owns the shared
@@ -251,7 +251,7 @@ ARG STRIP_UV_CACHE
 ENV UV_PROJECT_ENVIRONMENT=/opt/nemo_rl_venv
 ENV UV_LINK_MODE=copy
 
-# Ensure DeepEP is built for H100 and B200 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
+# Ensure DeepEP is built for H100, GB200 and GB300 (also mcore inference unified memory API now invokes a torch API that requires these to be set)
 ARG TORCH_CUDA_ARCH_LIST
 ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST}
 # Build-only knobs read by the flash-attn and FlashMLA source builds. Unset keeps
