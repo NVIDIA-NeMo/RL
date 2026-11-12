@@ -84,7 +84,12 @@ Build arguments:
 - `MAX_JOBS` controls parallel build jobs; tune it for the build machine.
 - `--build-context nemo-rl=.` builds from the current checkout. Without it, the Dockerfile pulls `NVIDIA-NeMo/RL.git#main`.
 
-On a Slurm cluster using [enroot](https://github.com/NVIDIA/enroot), convert the image to squashfs:
+Do not move the Gym virtual environments to a shared filesystem to avoid rebuilding them.
+To reuse them without rebuilding the image, see
+[Python Environments on Shared Filesystems](../../../cluster.md#python-environments-on-shared-filesystems).
+
+On a Slurm cluster using [enroot](https://github.com/NVIDIA/enroot), convert
+the image to squashfs:
 
 ```bash
 enroot import -o nemo-rl-lightning35.sqsh \
