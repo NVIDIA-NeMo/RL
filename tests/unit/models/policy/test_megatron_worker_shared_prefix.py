@@ -439,14 +439,25 @@ def test_stage_without_sharing_uses_the_base_packing_path(stage: Any) -> None:
 
     with patch.object(
         worker_module.TQWorkerMixin,
-        "_attach_or_repack_pack_metadata",
-        return_value=sentinel,
+        "_attach_or_repack_with_order",
+        return_value=(sentinel, None),
     ) as base:
         assert (
             worker._attach_or_repack_pack_metadata(_batch(), meta, stage=stage)
             is sentinel
         )
     assert base.call_args.kwargs["stage"] == stage
+
+
+def test_train_stage_attaches_group_ids_and_keeps_the_fetched_row_order() -> None:
+    # train_microbatch_presharded maps per-row results back through this order.
+    worker = _bare_worker(mode="train")
+    meta = _tq_meta(2, tags=[{GROUP_ID_TAG: "a"}, {GROUP_ID_TAG: "b"}])
+
+    data, row_order = worker._attach_or_repack_with_order(_batch(), meta, stage="train")
+
+    assert data[SHARED_PREFIX_GROUP_ID] == ["a", "b"]
+    assert row_order is None
 
 
 def test_teacher_with_an_inherited_logprobs_mode_uses_the_base_packing_path(
@@ -468,8 +479,10 @@ def test_teacher_with_an_inherited_logprobs_mode_uses_the_base_packing_path(
     # Resolved as MegatronPolicyWorkerImpl.__init__ does.
     worker._shared_prefix_cfg = get_shared_prefix_training_config(worker.cfg)
     worker._fetch = lambda meta: _batch(1)
-    worker.get_logprobs = lambda data, micro_batch_size=None: BatchedDataDict(
-        {"logprobs": torch.zeros(1, 4)}
+    worker.get_logprobs = (
+        lambda data, micro_batch_size=None, keep_on_gpu=False: BatchedDataDict(
+            {"logprobs": torch.zeros(1, 4)}
+        )
     )
     worker._write_back_result_field = MagicMock()
     meta = KVBatchMeta(
@@ -482,8 +495,8 @@ def test_teacher_with_an_inherited_logprobs_mode_uses_the_base_packing_path(
 
     with patch.object(
         worker_module.TQWorkerMixin,
-        "_attach_or_repack_pack_metadata",
-        side_effect=lambda data, meta, *, stage: data,
+        "_attach_or_repack_with_order",
+        side_effect=lambda data, meta, *, stage: (data, None),
     ) as base:
         worker.get_teacher_logprobs_presharded(meta)
 
