@@ -632,6 +632,21 @@ class MegatronGeneration(GenerationInterface):
             ray.cancel(futures)
             raise
 
+    def refresh_dp_openai_server_base_urls(
+        self, *, timeout_s: Optional[float] = None
+    ) -> None:
+        """Collect worker HTTP addresses after inference initialization completes."""
+        if (
+            not self.dp_openai_server_base_urls
+            and self.cfg["mcore_generation_config"]["expose_http_server"]
+        ):
+            url_futures = self._policy.worker_group.run_all_workers_single_data(
+                "report_dp_openai_server_base_url"
+            )
+            self.dp_openai_server_base_urls = [
+                url for url in ray.get(url_futures, timeout=timeout_s) if url is not None
+            ]
+
     def prepare_for_generation(self, *args: Any, **kwargs: Any) -> bool:
         """Initialize / re-enter inference mode on every worker.
 
@@ -642,16 +657,7 @@ class MegatronGeneration(GenerationInterface):
             "prepare_for_generation", **kwargs
         )
         ray.get(futures)
-        if (
-            not self.dp_openai_server_base_urls
-            and self.cfg["mcore_generation_config"]["expose_http_server"]
-        ):
-            url_futures = self._policy.worker_group.run_all_workers_single_data(
-                "report_dp_openai_server_base_url"
-            )
-            self.dp_openai_server_base_urls = [
-                url for url in ray.get(url_futures) if url is not None
-            ]
+        self.refresh_dp_openai_server_base_urls()
         return True
 
     def finish_generation(self, *, release_gpu: bool = True) -> bool:

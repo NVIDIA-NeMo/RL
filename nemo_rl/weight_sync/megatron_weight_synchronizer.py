@@ -337,6 +337,10 @@ class CoresidentRefit:
         )
         t2 = time.perf_counter()
         _get_fail_fast(gen.run_all_workers_single_data("coresident_resume"), timeout_s=self._control_timeout_s)
+        if not self._engine_running:
+            self._generation.refresh_dp_openai_server_base_urls(
+                timeout_s=self._control_timeout_s
+            )
         t3 = time.perf_counter()
         stats = {
             "coresident_pause_s": self._pause_s,
