@@ -57,7 +57,6 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneRuntimeConfig,
     KVBatchMeta,
 )
-from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
@@ -262,12 +261,6 @@ def validate_simulator_config(
             "weights, so it cannot run without one; trtllm and sglang have "
             "not been validated under the SingleController refit lifecycle "
             "this run drives."
-        )
-    if dynamo_enabled(generation_config):
-        raise NotImplementedError(
-            "rollout_only does not support policy.generation.dynamo=true yet: "
-            "Dynamo serving has not been validated under the refit lifecycle "
-            "this run drives. Set policy.generation.dynamo=false."
         )
     reject_online_quantization(master_config.policy["generation"])
     if generation_config["vllm_cfg"].get("load_format") == "dummy":

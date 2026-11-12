@@ -208,8 +208,14 @@ def _master_config(
     )
 
 
-def test_validate_accepts_vllm_rollout_only_recipe() -> None:
-    validate_simulator_config(_master_config(), SimulatorSettings(refit_time_s=5.0))
+@pytest.mark.parametrize("generation_extra", [{}, {"dynamo": True}])
+def test_validate_accepts_vllm_rollout_only_recipe(
+    generation_extra: dict[str, Any],
+) -> None:
+    validate_simulator_config(
+        _master_config(generation_extra=generation_extra),
+        SimulatorSettings(refit_time_s=5.0),
+    )
 
 
 def test_validate_rejects_ppo() -> None:
@@ -221,13 +227,6 @@ def test_validate_rejects_ppo() -> None:
 def test_validate_rejects_non_vllm_backends(backend: str) -> None:
     with pytest.raises(NotImplementedError, match="vllm"):
         validate_simulator_config(_master_config(backend=backend), SimulatorSettings())
-
-
-def test_validate_rejects_dynamo_serving() -> None:
-    with pytest.raises(NotImplementedError, match="policy.generation.dynamo=true"):
-        validate_simulator_config(
-            _master_config(generation_extra={"dynamo": True}), SimulatorSettings()
-        )
 
 
 def test_validate_rejects_dummy_load_format() -> None:

@@ -118,3 +118,7 @@ if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
         'min(data["train/simulated_train_time_s"]) >= 0' \
         'max(data["train/simulated_train_idle_skipped_s"]) <= 15'
 fi
+
+if [[ "$*" == *generation.dynamo=true* ]]; then
+    bash $SCRIPT_DIR/check_dynamo_overlay.sh $RUN_LOG
+fi

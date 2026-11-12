@@ -46,6 +46,8 @@ run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_con
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller.sh ++token_capture.enabled=true policy.model_name=silence09/DeepSeek-R1-Small-2layers ++policy.router_replay.enabled=true ++token_capture.defer_routed_experts_to_policy=true ++policy.generation.dynamo=true
 # Turn recovery: Gym checkpoint + TQ snapshot, kill, restore, re-sent calls.
 run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_turn_recovery.sh ++policy.generation.dynamo=true
+# Rollout-only simulator: the frontend serves Gym with the trainer stubbed out.
+run_test fast uv run --no-sync bash ./tests/functional/grpo_async_gym_single_controller_rollout_only.sh ++policy.generation.dynamo=true
 
 cd "${PROJECT_ROOT}/tests"
 if compgen -G ".coverage*" > /dev/null; then
