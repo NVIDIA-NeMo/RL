@@ -1756,7 +1756,7 @@ def setup_single_controller(
     # Claim constrained training nodes before unconstrained inference or Gym
     # tasks can consume them. This matters when inference topology alignment
     # falls back while the training cluster remains topology-constrained.
-    if dedicated_value:
+    if value_cluster is not None:
         reserve_disjoint_clusters(train_cluster, value_cluster)
     elif not colocated and segment_size is not None:
         train_cluster.get_placement_groups()
