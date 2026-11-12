@@ -782,7 +782,6 @@ class AutomodelPolicyWorkerImpl(
                     padding_token_id=self.tokenizer.pad_token_id or 0,
                     autocast_context_factory=self._autocast_context,
                     forward_only=eval_mode,
-                    is_reward_model=self._is_reward_model,
                     allow_flash_attn_args=self.allow_flash_attn_args,
                     global_valid_seqs=global_valid_seqs,
                     global_valid_toks=global_valid_toks,
@@ -963,7 +962,6 @@ class AutomodelPolicyWorkerImpl(
                     device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
                     padding_token_id=self.tokenizer.pad_token_id or 0,
-                    is_reward_model=False,
                     allow_flash_attn_args=self.allow_flash_attn_args,
                 )
 
@@ -1035,7 +1033,6 @@ class AutomodelPolicyWorkerImpl(
                     device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
                     padding_token_id=self.tokenizer.pad_token_id or 0,
-                    is_reward_model=True,
                     allow_flash_attn_args=False,
                 )
 
@@ -1122,7 +1119,6 @@ class AutomodelPolicyWorkerImpl(
                     device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
                     padding_token_id=self.tokenizer.pad_token_id or 0,
-                    is_reward_model=False,
                     allow_flash_attn_args=self.allow_flash_attn_args,
                 )
 
@@ -1218,7 +1214,6 @@ class AutomodelPolicyWorkerImpl(
                     device_mesh=self.device_mesh,
                     cp_size=self.cp_size,
                     padding_token_id=self.tokenizer.pad_token_id or 0,
-                    is_reward_model=False,
                     allow_flash_attn_args=self.allow_flash_attn_args,
                 )
                 with prepared.model_context_factory(), self._autocast_context():

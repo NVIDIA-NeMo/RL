@@ -27,7 +27,6 @@ topology (colocated vs. non-colocated) and the generation backend:
 from typing import Any, Optional
 
 from nemo_rl.models.generation.constants import (
-    DYNAMO_BACKEND,
     MEGATRON_BACKEND,
     SGLANG_BACKEND,
     TRTLLM_BACKEND,
@@ -60,9 +59,7 @@ def validate_offload_policy_before_refit(
         )
     supported_transports = (
         (None, "nccl_reshard")
-        if generation_backend == VLLM_BACKEND
-        else (None,)
-        if generation_backend == TRTLLM_BACKEND
+        if generation_backend in (VLLM_BACKEND, TRTLLM_BACKEND)
         else (None, "mcore", "nccl_reshard")
         if generation_backend == MEGATRON_BACKEND
         else ()
@@ -71,8 +68,8 @@ def validate_offload_policy_before_refit(
         raise ValueError(
             "offload_policy_before_refit requires non-colocated vLLM or Megatron "
             "generation with a collective, mcore, or nccl_reshard refit transport, "
-            "or non-colocated TensorRT-LLM generation with the default collective "
-            "transport."
+            "or non-colocated TensorRT-LLM generation with a collective or "
+            "nccl_reshard refit transport."
         )
 
 
@@ -92,7 +89,7 @@ def create_weight_synchronizer(
         policy: Policy object (ColocatablePolicyInterface).
         generation: Generation object (GenerationInterface).
         generation_backend: Name of the generation backend ("vllm", "sglang",
-            "megatron", or "dynamo").
+            "megatron", or "trtllm").
         colocated: Whether policy and generation share the same GPUs.
         train_cluster: RayVirtualCluster for training workers. Required for
             non-colocated deployments except SGLang, which owns its own group.
@@ -126,7 +123,6 @@ def create_weight_synchronizer(
         VLLM_BACKEND,
         SGLANG_BACKEND,
         MEGATRON_BACKEND,
-        DYNAMO_BACKEND,
         TRTLLM_BACKEND,
     }
     if generation_backend not in _SUPPORTED_BACKENDS:

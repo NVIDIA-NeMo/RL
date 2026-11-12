@@ -66,6 +66,7 @@ from nemo_rl.data_plane.schema import (
     ROUTE_ENCODING_ENVELOPE,
     ROUTE_ENCODING_LIST,
     ROUTE_ENCODING_NONE,
+    ROUTE_ENCODING_TENSOR,
     ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_EXPERTS_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
@@ -140,6 +141,47 @@ STAGING_FIELDS = [
 
 _MODE_TO_CODE = {"text": 0, "token_in": 1}
 _CODE_TO_MODE = {code: mode for mode, code in _MODE_TO_CODE.items()}
+GENERATION_CUT_STAGING_PREFIX = "__generation_cut__/"
+
+
+def generation_cut_staging_key(
+    checkpoint_id: str,
+    rollout_id: str,
+    model_call_id: str,
+    *,
+    chunk_sequence: int,
+) -> str:
+    """Return an immutable key for one checkpointed generation chunk."""
+    if not checkpoint_id or not rollout_id or not model_call_id:
+        raise ValueError("generation-cut key components must be non-empty")
+    if chunk_sequence < 0:
+        raise ValueError("generation-cut chunk sequence must be non-negative")
+    return (
+        f"{GENERATION_CUT_STAGING_PREFIX}{checkpoint_id}/{rollout_id}/"
+        f"{model_call_id}/{chunk_sequence}"
+    )
+
+
+def _staging_key_matches_snapshot(key: str, snapshot: StagedCallBaseSnapshot) -> bool:
+    """Match a physical TQ key to the row's logical call identity."""
+    if key == snapshot.staging_key:
+        return True
+    if not key.startswith(GENERATION_CUT_STAGING_PREFIX):
+        return False
+    checkpoint_and_identity = key.removeprefix(GENERATION_CUT_STAGING_PREFIX)
+    checkpoint_id, checkpoint_separator, identity_and_sequence = (
+        checkpoint_and_identity.partition("/")
+    )
+    logical_key, sequence_separator, chunk_sequence = identity_and_sequence.rpartition(
+        "/"
+    )
+    return bool(
+        checkpoint_id
+        and checkpoint_separator
+        and sequence_separator
+        and chunk_sequence.isdecimal()
+        and logical_key == snapshot.staging_key
+    )
 
 
 class MediaMetadataIntegrityError(ValueError):
@@ -429,7 +471,8 @@ class TQTokenSink:
     ``capture_media`` mirrors the staging partition's schema: a media-enabled
     partition registers ``MEDIA_STAGING_FIELDS`` and every row written here
     carries them (flags False + sentinels for text calls); a text-only
-    partition rejects attachments outright.
+    partition rejects media attachments. Route attachments are supported on
+    both kinds of partition.
     """
 
     def __init__(
@@ -458,7 +501,41 @@ class TQTokenSink:
         *,
         attachments: Mapping[str, Any] | None = None,
     ) -> StageResult:
-        """Write tokens, media and sampler attachments in one ``put``.
+        """Write a call's token row and its media under its staging key."""
+        return self._stage_at_key(
+            record,
+            record.staging_key,
+            attachments=attachments,
+        )
+
+    def stage_generation_prefix(
+        self,
+        record: StagedCallRecord,
+        *,
+        checkpoint_id: str,
+        chunk_sequence: int,
+        attachments: Mapping[str, Any] | None = None,
+    ) -> StageResult:
+        """Stage an immutable active-call prefix under a checkpoint-scoped key."""
+        return self._stage_at_key(
+            record,
+            generation_cut_staging_key(
+                checkpoint_id,
+                record.capture_key,
+                record.model_call_id,
+                chunk_sequence=chunk_sequence,
+            ),
+            attachments=attachments,
+        )
+
+    def _stage_at_key(
+        self,
+        record: StagedCallRecord,
+        key: str,
+        *,
+        attachments: Mapping[str, Any] | None = None,
+    ) -> StageResult:
+        """Write tokens, routes, media and sampler attachments in one ``put``.
 
         Success is returned only after the combined write was acknowledged,
         so ``staged`` coordinates vouch for tokens and pixels together. TQ has
@@ -469,10 +546,12 @@ class TQTokenSink:
         # Deferred: nemo_gym is an optional extra absent in non-gym runs.
         from nemo_gym.token_id_capture.staging.records import StageResult
 
-        key = record.staging_key
         write_started = False
         try:
             remaining = dict(attachments) if attachments is not None else None
+            if remaining is not None and ROUTED_EXPERTS_FIELD in remaining:
+                remaining.pop(ROUTED_EXPERTS_FIELD)
+                remaining = remaining or None
             sampler_columns: dict[str, torch.Tensor] = {}
             if remaining is not None and any(
                 key in remaining for key in SAMPLER_TOPK_FIELDS
@@ -594,9 +673,27 @@ class TQTokenSink:
                 )
             routed_len = 0
             routed_encoding = ROUTE_ENCODING_NONE
+            router_attachment = (attachments or {}).get(ROUTED_EXPERTS_FIELD)
+            if (
+                attachments is not None
+                and ROUTED_EXPERTS_FIELD in attachments
+                and not isinstance(router_attachment, torch.Tensor)
+            ):
+                raise ValueError("routed_experts attachment must be a tensor")
+            if router_attachment is not None and not isinstance(routed, dict):
+                raise ValueError(
+                    "routed_experts attachment requires its capture metadata"
+                )
             if routed is not None:
                 delta_len = len(record.token_ids_delta)
-                if isinstance(routed, str):
+                if isinstance(routed, dict):
+                    if not isinstance(router_attachment, torch.Tensor):
+                        raise ValueError(
+                            "routed_experts metadata requires a tensor attachment"
+                        )
+                    experts = router_attachment
+                    routed_encoding = ROUTE_ENCODING_TENSOR
+                elif isinstance(routed, str):
                     from nemo_rl.utils.routed_experts_codec import (
                         decode_routed_experts,
                     )
@@ -1043,7 +1140,7 @@ class TQTokenSource:
         for index, key in enumerate(staging_keys):
             row = _select_row(rows, index)
             snapshot = _row_to_base_snapshot(row)
-            if snapshot.staging_key != key:
+            if not _staging_key_matches_snapshot(key, snapshot):
                 raise KeyError(
                     f"staged row identity mismatch: requested {key!r}, got {snapshot.staging_key!r}"
                 )
@@ -1137,6 +1234,7 @@ def _row_to_base_snapshot(row: Any) -> StagedCallBaseSnapshot:
         ROUTE_ENCODING_NONE,
         ROUTE_ENCODING_ENVELOPE,
         ROUTE_ENCODING_LIST,
+        ROUTE_ENCODING_TENSOR,
     ):
         raise ValueError(f"unknown routed_experts_encoding {routed_encoding}")
 
