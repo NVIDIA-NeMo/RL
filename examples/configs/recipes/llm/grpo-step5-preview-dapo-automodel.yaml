@@ -67,6 +67,9 @@ policy:
     activation_checkpointing: true
     moe_parallelizer:
       ignore_router_for_ac: true
+      # Automodel default False keeps every layer unsharded after a no-backward logprob pass
+      # (~56 GiB/GPU at EP32 on 128 GPUs; full-16n r6 OOMed in get_logprobs).
+      reshard_after_forward: true
     automodel_kwargs:
       backend:
         # From Automodel examples/llm_finetune/stepfun/step_5_preview_tulu3_sft.yaml
