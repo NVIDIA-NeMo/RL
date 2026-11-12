@@ -1343,12 +1343,25 @@ _SWE_ROUTES = MultiHarnessRoutes(
 )
 
 
-def _check_restored_group(routes, *recorded):
-    """Run the resume check on group g-17 whose finished rows recorded these names."""
+def _swe_impl(routes):
     impl = _nemo_gym_impl(True)
     impl._task_to_env = {
         "nemo_gym": NemoGymShardSet(handles={"only": [Mock()]}, multi_harness=routes)
     }
+    return impl
+
+
+def _swe_sample():
+    return {
+        "extra_env_info": {
+            "task_id": {"taskset": "swe", "task_id": "1"},
+            "task_input": {},
+        }
+    }
+
+
+def _restored_group(*recorded):
+    """Group g-17: finished rows that recorded these names, then one unfinished row."""
     finished = [
         SimpleNamespace(
             current_attempt=SimpleNamespace(
@@ -1365,15 +1378,15 @@ def _check_restored_group(routes, *recorded):
             status=RolloutAttemptStatus.DISPATCHED, reward_log_context=None
         )
     )
+    return SimpleNamespace(group_id="g-17", siblings=[*finished, unfinished])
+
+
+def _check_restored_group(routes, *recorded):
+    """Run the resume check on group g-17 whose finished rows recorded these names."""
     RolloutManager._require_unchanged_harness(
-        SimpleNamespace(_impl=impl),
-        {
-            "extra_env_info": {
-                "task_id": {"taskset": "swe", "task_id": "1"},
-                "task_input": {},
-            }
-        },
-        SimpleNamespace(group_id="g-17", siblings=[*finished, unfinished]),
+        SimpleNamespace(_impl=_swe_impl(routes)),
+        _swe_sample(),
+        _restored_group(*recorded),
     )
 
 
@@ -1395,6 +1408,27 @@ def test_restored_group_that_would_change_harness_stops_the_run():
     ):
         with pytest.raises(RestoredHarnessChanged, match="'g-17'"):
             _check_restored_group(routes, recorded)
+
+
+def test_harness_change_stops_a_restored_group_before_any_state_changes():
+    harness = _SWE_ROUTES.select("swe", "g-17").harness
+    other = "pi_agent" if harness == "opencode_agent" else "opencode_agent"
+    manager = object.__new__(RolloutManager)
+    manager._impl = _swe_impl(_SWE_ROUTES)
+    manager._recovery_ledger = Mock()
+    manager._recovery_ledger.get_group.return_value = _restored_group(f"swe/{other}")
+    manager._recovery_mutation = Mock()
+    manager._tq_buffer = Mock()
+
+    with pytest.raises(RestoredHarnessChanged, match="'g-17'"):
+        _run(
+            manager._generate_for_finalization_attempt(
+                _swe_sample(), recovery_group_id="g-17", inflight_registry=None
+            )
+        )
+    # Raised before the ledger is rewritten or buffer slots are reserved.
+    manager._recovery_mutation.assert_not_called()
+    manager._tq_buffer.reserve.assert_not_called()
 
 
 def test_harness_change_on_resume_is_not_retried():

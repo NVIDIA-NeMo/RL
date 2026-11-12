@@ -129,7 +129,7 @@ env:
 - Each prompt group runs on one of its taskset's servers, chosen at random in proportion to the weight of the server's agent. With the weights above, about two thirds of the groups run on OpenCode.
 - Weights apply to the whole run. A set `weights` must list exactly the agents the servers run. A weight of 0 disables an agent, but its servers must still be listed and running; to drop a harness, remove its servers and its weight.
 
-GRPO compares a group's generations with the group's mean reward, so a group that mixed harnesses would train on the differences between harnesses. The choice is a hash of the group's ID, so every generation of a group, including retries, runs on the same server. Changing `multi_harness`, or the Gym servers it lists, across a resume is not supported: with token capture, a restored group that would finish on another harness stops the run.
+GRPO compares a group's generations with the group's mean reward, so a group that mixed harnesses would train on the differences between harnesses. The choice is a hash of the group's ID, so every generation of a group, including retries, runs on the same server. Changing `multi_harness`, or the Gym servers it lists, across a resume is not supported. With token capture, a restored group that would finish on a different agent type stops the run; a server replaced by another that runs the same agent type is not detected.
 
 Setup also checks that each listed server runs in exactly one shard (its replicas are fine) and that a taskset's servers share one Environment Server type and verifier: the same resources server for `single_agent_turn`, and the taskset in each server's `tasksets` for `harbor`. With `env.nemo_gym.shards`, every shard must use the shared `multi_harness` block.
 

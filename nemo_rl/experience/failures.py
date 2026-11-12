@@ -180,11 +180,12 @@ class RolloutRedispatchExhausted(RuntimeError):
 
 
 class RestoredHarnessChanged(RuntimeError):
-    """A restored prompt group would finish on another harness than it started on.
+    """A restored prompt group would finish on a different agent type.
 
     Raised when ``env.nemo_gym.multi_harness``, or the Gym servers it lists,
-    changed across a resume. Like :class:`RolloutRedispatchExhausted`, it is
-    terminal for the run, so the per-attempt retry loop re-raises it.
+    changed across a resume so that a group's agent type changed. Like
+    :class:`RolloutRedispatchExhausted`, it is terminal for the run, so the
+    per-attempt retry loop re-raises it.
     """
 
 

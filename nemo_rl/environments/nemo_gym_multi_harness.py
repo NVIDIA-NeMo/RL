@@ -29,9 +29,9 @@ config, resolves the routes, and sends them to every Gym actor. A group's
 server is a hash of its durable group ID mapped onto the weights. The driver
 and the actors therefore pick the same server, groups spread over the
 harnesses in proportion to the weights, and a retried group keeps its server
-without any stored state. A group restored after a resume keeps its server
-unless the configuration changed; the rollout manager then stops the run
-instead of finishing the group on another harness.
+without any stored state. With token capture, a group restored after a resume
+keeps its server too, or the rollout manager stops the run if the configuration
+changed. Other paths re-run an interrupted group whole under a new group ID.
 
 This module is imported on the driver, where Gym is not installed.
 """

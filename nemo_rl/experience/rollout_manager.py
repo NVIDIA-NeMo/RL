@@ -3004,13 +3004,14 @@ class RolloutManager:
     def _require_unchanged_harness(
         self, input_sample: DatumSpec, recovery_group: PromptGroupRecoveryRecord
     ) -> None:
-        """Refuse to finish a restored group on another harness than its sealed rows.
+        """Refuse to finish a restored group on a different agent type.
 
         A group's harness is recomputed from its ID, so it changes only when
         ``env.nemo_gym.multi_harness`` or the Gym servers it lists changed
-        across a resume. Each sealed row recorded its harness in its reward
-        log context; finishing the group under a different one would train one
-        GRPO group on two harnesses.
+        across a resume. Each sealed row recorded its agent type in its reward
+        log context; finishing the group on a different one would train one
+        GRPO group on two harnesses. A server replaced by another that runs the
+        same agent type is not detected.
         """
         row = input_sample.get("extra_env_info")
         if not isinstance(self._impl, AsyncNemoGymRolloutImpl) or not (
@@ -3033,11 +3034,11 @@ class RolloutManager:
             recorded = context.agent_name if context is not None else None
             if recorded != expected:
                 raise RestoredHarnessChanged(
-                    f"Restored prompt group {recovery_group.group_id!r} has finished "
-                    f"generations recorded as {recorded!r}, but the current "
-                    f"configuration runs the rest as {expected!r}. Changing "
-                    "env.nemo_gym.multi_harness, or the Gym servers it lists, "
-                    "across a resume is not supported."
+                    f"Restored prompt group {recovery_group.group_id!r} finished "
+                    f"generations on {recorded!r}, but the current configuration "
+                    f"runs the rest on {expected!r}. To resume, use the "
+                    "env.nemo_gym.multi_harness block and Gym agent configs from "
+                    "when the checkpoint was saved."
                 )
 
     async def _generate_for_finalization_attempt(
