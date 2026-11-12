@@ -3229,9 +3229,14 @@ class TestSetup:
             ) as mock_spinup,
             patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
             patch.object(sc_setup_mod, "MegatronGeneration") as mock_megatron,
+            patch.object(
+                sc_setup_mod, "megatron_generation_cls"
+            ) as mock_megatron_generation_cls,
             patch.object(sc_setup_mod, "ray") as mock_ray,
             router_patch,
         ):
+            # The non-colocated build picks its class through the factory.
+            mock_megatron_generation_cls.return_value = mock_megatron
             mock_megatron.reserve_http_server_addresses.return_value = (
                 reserved_urls,
                 reserved_http_server_ports,
