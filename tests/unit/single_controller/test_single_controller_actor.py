@@ -2578,7 +2578,7 @@ def _dropping_controller(*, credit_in_evict: bool):
 class _ClosesShortSampler(_OneThenEmptySampler):
     """Yields one group, then nothing: a windowed-style sampler at the end of the data."""
 
-    uses_replacement_pool = False
+    uses_pooled_replacements = False
     closes_short_at_exhaustion = True
 
     def __init__(self, meta: KVBatchMeta) -> None:
@@ -2649,7 +2649,7 @@ def test_the_closes_short_stub_declares_what_the_windowed_sampler_does() -> None
     windowed = WindowedSampler(MagicMock(), max_staleness_versions=1)
     stub = _ClosesShortSampler(MagicMock())
 
-    assert stub.uses_replacement_pool == windowed.uses_replacement_pool
+    assert stub.uses_pooled_replacements == windowed.uses_pooled_replacements
     assert stub.closes_short_at_exhaustion == windowed.closes_short_at_exhaustion
     for target_step in (None, 3):
         assert stub.charge_step_for_lost_group(
@@ -2673,7 +2673,7 @@ class _ReadyFirstFilteringSampler(_OneThenEmptySampler):
         self._real = ReadyFirstSampler(MagicMock(), max_staleness_versions=1)
         self.ctrl = None
 
-    uses_replacement_pool = True
+    uses_pooled_replacements = True
     closes_short_at_exhaustion = False
 
     def charge_step_for_lost_group(self, *, target_step, assembling_version):
@@ -2755,7 +2755,7 @@ def test_ready_first_replaces_a_filtered_group_then_shrinks_the_assembling_step(
 class _GatedUnstampedSampler(_FullStepSampler):
     """A whole step in one chunk, from a gated sampler that stamps no step."""
 
-    uses_replacement_pool = True
+    uses_pooled_replacements = True
     closes_short_at_exhaustion = False
 
     def charge_step_for_lost_group(
@@ -2798,7 +2798,7 @@ def test_unstamped_losses_preserve_selected_groups(
             provisional_shortfalls.append(dict(ctrl._rollout_runtime.batch_shortfall))
 
         class Sampler(_EmptySampler):
-            uses_replacement_pool = True
+            uses_pooled_replacements = True
             closes_short_at_exhaustion = False
 
             def __init__(self) -> None:
@@ -2899,7 +2899,7 @@ def test_selection_reconciliation_preserves_sampler_charge_policy(
     )
 
     class Sampler(_ChunkedSampler):
-        uses_replacement_pool = True
+        uses_pooled_replacements = True
         closes_short_at_exhaustion = False
 
         def charge_step_for_lost_group(self, *, target_step, assembling_version):

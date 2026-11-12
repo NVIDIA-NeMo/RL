@@ -1929,7 +1929,7 @@ class SingleControllerActor:
 
                         # Filtered groups spend only the dynamic-sampling budget.
                         filtered = outcome is RolloutOutcome.FILTERED
-                        if filtered and not self._sampler_uses_replacement_pool():
+                        if filtered and not self._sampler_uses_pooled_replacements():
                             async with self._dispatch_reservation(
                                 "prompt_reservations"
                             ) as cut:
@@ -2041,7 +2041,7 @@ class SingleControllerActor:
         async def maybe_refill() -> None:
             if (
                 not self._dynamic_sampling_enabled
-                or not self._sampler_uses_replacement_pool()
+                or not self._sampler_uses_pooled_replacements()
                 or self._dataloader_exhausted
                 or len(self._rollout_runtime.filtered_reserve)
                 >= self._algo_cfg.num_prompts_per_step
@@ -2242,7 +2242,7 @@ class SingleControllerActor:
             and not self._dynamic_sampling_enabled
         ):
             return False
-        if not self._sampler_uses_replacement_pool():
+        if not self._sampler_uses_pooled_replacements():
             return False
         if not self._rollout_runtime.sampler_stamps_target_steps:
             return False
@@ -2371,7 +2371,7 @@ class SingleControllerActor:
         failure_cfg = self._async_cfg.rollout_failure
         if failure_cfg.on_dropped_prompt != "replace":
             return None
-        if not self._sampler_uses_replacement_pool():
+        if not self._sampler_uses_pooled_replacements():
             return None
         if replacements_used >= failure_cfg.max_replacement_attempts:
             return None
@@ -2500,14 +2500,14 @@ class SingleControllerActor:
         )
         return lender_step
 
-    def _sampler_uses_replacement_pool(self) -> bool:
-        """Whether the sampler replaces a dropped group from the spare pool.
+    def _sampler_uses_pooled_replacements(self) -> bool:
+        """Whether the sampler replaces dropped groups using dedicated prompt pools.
 
         A custom sampler without ``DropAccountingSampler`` is treated like the built-in
         gated samplers, which a drop would otherwise stall.
         """
         if isinstance(self._sampler, DropAccountingSampler):
-            return self._sampler.uses_replacement_pool
+            return self._sampler.uses_pooled_replacements
         return True
 
     def _sampler_closes_short_at_exhaustion(self) -> bool:

@@ -151,7 +151,7 @@ class TestDropAccounting:
             target_step=3, assembling_version=7
         )
         assert charged == 3
-        assert sampler.uses_replacement_pool is True
+        assert sampler.uses_pooled_replacements is True
         assert sampler.closes_short_at_exhaustion is False
 
     @pytest.mark.parametrize(
@@ -173,11 +173,11 @@ class TestDropAccounting:
         """A weight_fifo replacement lands in a newer weight bucket, so it has no pool."""
         buf = FakeBuffer()
         assert (
-            WeightFifoSampler(buf, max_staleness_versions=1).uses_replacement_pool
+            WeightFifoSampler(buf, max_staleness_versions=1).uses_pooled_replacements
             is False
         )
         assert (
-            ReadyFirstSampler(buf, max_staleness_versions=1).uses_replacement_pool
+            ReadyFirstSampler(buf, max_staleness_versions=1).uses_pooled_replacements
             is True
         )
 
@@ -191,7 +191,7 @@ class TestDropAccounting:
             sampler.charge_step_for_lost_group(target_step=3, assembling_version=7)
             is None
         )
-        assert sampler.uses_replacement_pool is False
+        assert sampler.uses_pooled_replacements is False
         assert sampler.closes_short_at_exhaustion is True
 
     def test_a_custom_subclass_of_a_builtin_keeps_that_policy(self):
@@ -638,7 +638,7 @@ class TestWarnIfCustomSamplerLacksDropAccounting:
                 _custom("PartialDropAccounting")
             )
         text = str(record[0].message)
-        assert "only ['uses_replacement_pool']" in text
+        assert "only ['uses_pooled_replacements']" in text
         assert "closes_short_at_exhaustion" in text
         assert "charge_step_for_lost_group" in text
         assert "partial implementation is ignored" in text
@@ -1289,14 +1289,14 @@ class NoDropAccounting:
 class PartialDropAccounting:
     """Defines one member, which isinstance ignores because the rest are missing."""
 
-    uses_replacement_pool = False
+    uses_pooled_replacements = False
 
 
 class InstanceAttrDropAccounting:
     """Assigns the flags in __init__, where the setup check cannot see them."""
 
     def __init__(self) -> None:
-        self.uses_replacement_pool = False
+        self.uses_pooled_replacements = False
         self.closes_short_at_exhaustion = True
 
     def charge_step_for_lost_group(self, *, target_step, assembling_version):
@@ -1304,7 +1304,7 @@ class InstanceAttrDropAccounting:
 
 
 class FullDropAccounting:
-    uses_replacement_pool = False
+    uses_pooled_replacements = False
     closes_short_at_exhaustion = True
 
     def charge_step_for_lost_group(self, *, target_step, assembling_version):
