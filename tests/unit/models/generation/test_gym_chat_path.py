@@ -94,6 +94,7 @@ from nemo_rl.models.generation.prefix_recovery.restore import (  # noqa: E402
     restored_terminal,
 )
 from nemo_rl.models.generation.vllm import chat_server  # noqa: E402
+from nemo_rl.models.generation.vllm.utils import take_reasoning_ended  # noqa: E402
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
 )
@@ -253,6 +254,8 @@ class _Engine:
         self._kit = kit
         self._refuse = refuse
         self.runs: list[tuple[list[int], Any, Any]] = []
+        # The reasoning_ended each run was handed.
+        self.reasoning_ended: list[Optional[bool]] = []
         # How many of REPLY's tokens the prompt already ends with: a call
         # resumed from a checkpoint cut generates only the rest.
         self.resumed = 0
@@ -260,8 +263,11 @@ class _Engine:
     async def generate(self, prompt, sampling_params, request_id, **kwargs):
         if self._refuse is not None and self._refuse[0] == "generate":
             raise self._refuse[1]
+        # As the worker's engine client does before it submits the call.
+        take_reasoning_ended(sampling_params, kwargs)
         prompt_token_ids = list(prompt["prompt_token_ids"])
         self.runs.append((prompt_token_ids, sampling_params, _media(prompt)))
+        self.reasoning_ended.append(kwargs.get("reasoning_ended"))
         if self._refuse is not None and self._refuse[0] == "running":
             raise self._refuse[1]
         terminal = restored_terminal()
@@ -390,6 +396,8 @@ class _Outcome:
     failed: list[str] = field(default_factory=list)
     # The capture call Gym is told was refused before it was staged, if any.
     acknowledged: Optional[str] = None
+    # What the engine was told of each run's reasoning.
+    reasoning_ended: list[Optional[bool]] = field(default_factory=list)
 
 
 def _host(
@@ -458,6 +466,7 @@ async def _native(kit, host, sink, failed, body, *, measure: bool) -> _Outcome:
         sink.staged,
         failed,
         response.headers.get(CAPTURE_REFUSAL_HEADER),
+        host.llm.reasoning_ended,
     )
 
 
@@ -537,7 +546,14 @@ async def _dynamo(
             failed,
             acknowledged,
         )
-    return _Outcome(200, chunk, host.llm.runs, sink.staged, failed)
+    return _Outcome(
+        200,
+        chunk,
+        host.llm.runs,
+        sink.staged,
+        failed,
+        reasoning_ended=host.llm.reasoning_ended,
+    )
 
 
 def _generation(*, vllm_cfg=None, **chat_settings) -> dict[str, Any]:
@@ -607,6 +623,8 @@ KITS = {
     "vlm": _KitSpec(_generation(reasoning_parser=""), _vlm),
     # A tool parser with no structural tag: a forced tool sets structured outputs.
     "pythonic": _KitSpec(_generation(tool_parser="pythonic")),
+    # A reasoning parser that reads the prompt back to its last think token.
+    "deepseek_r1": _KitSpec(_generation(reasoning_parser="deepseek_r1")),
     # Router replay: the engine returns each token's routed experts.
     "router_replay": _KitSpec(
         {**GENERATION, "vllm_kwargs": {"enable_return_routed_experts": True}}
@@ -729,6 +747,8 @@ class _Case:
     acknowledged: bool = False
     # Turn 1's reply as the model wrote it and capture staged it.
     turn_1_reply: str = TURN_1_REPLY
+    # What the engine is told of the call's reasoning; unchecked when None.
+    reasoning_ended: Optional[bool] = None
 
 
 def _off_policy(name: str, value: Any) -> _Case:
@@ -924,6 +944,18 @@ CASES = [
         disconnect=True,
         failed=("client_disconnect",),
     ),
+    # Structured output after the model's own turn 1, whose reasoning the
+    # template drops: that turn's </think> does not end this turn's reasoning.
+    _Case(
+        "reasoning_not_ended_by_an_earlier_turn",
+        extras=lambda kit: {"required_prefix_token_ids": kit.turn_1_tokens()},
+        fields={
+            "chat_template_kwargs": {"enable_thinking": True},
+            "response_format": {"type": "json_object"},
+        },
+        kit="deepseek_r1",
+        reasoning_ended=False,
+    ),
     # Router replay stages each token's routed experts with the call.
     _Case(
         "router_replay",
@@ -999,6 +1031,10 @@ def test_a_gym_call_takes_the_same_steps_through_dynamo_as_natively(kits, case) 
     _assert_same_media(dynamo_media, native_media)
     assert (native_media is not None) == (case.kit == "vlm")
     assert dynamo_params == native_params
+    # ...and was told the same of the call's reasoning, read from its template.
+    assert dynamo.reasoning_ended == native.reasoning_ended
+    if case.reasoning_ended is not None:
+        assert native.reasoning_ended == [case.reasoning_ended]
     # Capture staged the same record and tensors, in the expected mode.
     assert [record.mode for record, _ in native.staged] == (
         [case.mode] if case.mode else []

@@ -521,6 +521,27 @@ def _f32(value: Optional[float]) -> Optional[float]:
     return None if value is None else float(np.float32(value))
 
 
+# SamplingParams.extra_args key: a native chat call's reasoning_ended, as
+# NeMo RL read it from the call's template render.
+REASONING_ENDED_ARG = "nemo_rl_reasoning_ended"
+
+
+def take_reasoning_ended(sampling_params: Any, engine_kwargs: dict[str, Any]) -> None:
+    """Hand the engine the ``reasoning_ended`` a call's SamplingParams carry.
+
+    vLLM's chat serving reads its own value from the spliced prompt, whose
+    earlier turns still hold their own end-of-reasoning tokens; this replaces
+    it and takes the argument back out of ``extra_args``. A call that carries
+    none is left as it is.
+    """
+    extra_args = sampling_params.extra_args
+    if not extra_args or REASONING_ENDED_ARG not in extra_args:
+        return
+    engine_kwargs["reasoning_ended"] = extra_args.pop(REASONING_ENDED_ARG)
+    if not extra_args:
+        sampling_params.extra_args = None
+
+
 def on_policy_sampling(
     *,
     temperature: Optional[float],

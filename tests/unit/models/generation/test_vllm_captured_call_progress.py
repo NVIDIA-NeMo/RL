@@ -63,7 +63,9 @@ def test_running_captured_calls_report_their_generated_tokens() -> None:
         client = _AsyncLLMHTTPClient(
             engine, asyncio.get_running_loop(), flat_logprobs=False
         )
-        sampling_params = SimpleNamespace(logprobs=None, prompt_logprobs=None)
+        sampling_params = SimpleNamespace(
+            logprobs=None, prompt_logprobs=None, extra_args=None
+        )
 
         async def serve(model_call_id: Optional[str], request_id: str) -> None:
             # What _begin_request_capture does in the request's task.

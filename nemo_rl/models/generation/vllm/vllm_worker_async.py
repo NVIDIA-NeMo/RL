@@ -88,6 +88,7 @@ from nemo_rl.models.generation.vllm.request_pipeline import (
 )
 from nemo_rl.models.generation.vllm.utils import (
     format_prompt_for_vllm_generation,
+    take_reasoning_ended,
     validate_rollout_prompt,
 )
 from nemo_rl.models.generation.vllm.vllm_worker import BaseVllmGenerationWorker
@@ -199,6 +200,7 @@ class _AsyncLLMHTTPClient:
             and sampling_params.prompt_logprobs is None
         ):
             sampling_params.flat_logprobs = True
+        take_reasoning_ended(sampling_params, kwargs)
         return self._generate(prompt, sampling_params, request_id, kwargs)
 
     async def _generate(

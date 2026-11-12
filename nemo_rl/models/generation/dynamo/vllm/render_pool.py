@@ -234,14 +234,7 @@ class _Worker:
         if rendered.request_max_tokens is not None:
             set_max_tokens(chat, rendered.request_max_tokens)
         parser = self._parser(chat)
-        reasoning_ended = None
         reasoning_parser_kwargs = None
-        if not chat.include_reasoning or chat._grammar_from_parser:
-            reasoning_ended = True
-        elif parser is not None and parser.reasoning_parser is not None:
-            reasoning_ended = parser.is_reasoning_end(
-                rendered.engine_prompt["prompt_token_ids"]
-            )
         if parser is not None and parser.reasoning_parser is not None:
             reasoning_parser_kwargs = {
                 "chat_template_kwargs": self.serving_chat._engine_chat_template_kwargs(
@@ -268,7 +261,7 @@ class _Worker:
             multimodal=multimodal,
             request=chat.model_dump(mode="json", exclude={"messages"}),
             request_max_tokens=rendered.request_max_tokens,
-            reasoning_ended=reasoning_ended,
+            reasoning_ended=rendered.reasoning_ended,
             reasoning_parser_kwargs=reasoning_parser_kwargs,
         )
 

@@ -666,7 +666,10 @@ async def test_async_vllm_http_client_runs_generation_on_owner_loop() -> None:
         async def use_client():
             tracing_enabled = await client.is_tracing_enabled()
             outputs = [
-                output async for output in client.generate(None, None, "request")
+                output
+                async for output in client.generate(
+                    None, types.SimpleNamespace(extra_args=None), "request"
+                )
             ]
             errored = client.errored
             return (
@@ -739,7 +742,9 @@ async def test_async_vllm_http_client_aborts_cancelled_generation(
     def cancel_from_http_thread():
         async def cancel():
             async def consume():
-                async for _ in client.generate(None, None, "cancelled-request"):
+                async for _ in client.generate(
+                    None, types.SimpleNamespace(extra_args=None), "cancelled-request"
+                ):
                     pass
 
             task = asyncio.create_task(consume())

@@ -87,6 +87,7 @@ from nemo_rl.models.generation.vllm.prompt_and_capture import (
     start_capture,
 )
 from nemo_rl.models.generation.vllm.utils import (
+    REASONING_ENDED_ARG,
     attach_routed_experts_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
@@ -131,6 +132,8 @@ class NeMoRLChatCompletionRequest(
     # The client's min_tokens before it is reduced by a restored prefix;
     # replaying the prefix's stop handling needs the original window.
     _original_min_tokens: int | None = PrivateAttr(default=None)
+    # reasoning_ended from the template render; None without a reasoning parser.
+    _template_reasoning_ended: bool | None = PrivateAttr(default=None)
 
 
 class NeMoRLMeasureChatRequest(NeMoRLChatCompletionRequest):
@@ -176,6 +179,24 @@ class NeMoRLTokenizeChatRequest(
 NeMoRLTokenizeRequest = Union[TokenizeCompletionRequest, NeMoRLTokenizeChatRequest]
 
 
+def reasoning_ended(
+    request: Any, parser: Any, template_token_ids: list[int]
+) -> Optional[bool]:
+    """Whether the model's reasoning is over before this call generates.
+
+    vLLM's rule (its chat serving's), read from the call's template render and
+    never from a spliced prompt: the model's own earlier turns still hold the
+    end-of-reasoning tokens the template drops from history, and they say
+    nothing about this turn. None without a reasoning parser.
+    """
+    if not request.include_reasoning or request._grammar_from_parser:
+        # A Mistral grammar from the parser has its own optional think rule.
+        return True
+    if parser is not None and parser.reasoning_parser is not None:
+        return parser.is_reasoning_end(template_token_ids)
+    return None
+
+
 class NeMoRLOpenAIServingMixin:
     """The chat preprocessing NeMo RL adds: prefix splice and token capture."""
 
@@ -214,6 +235,14 @@ class NeMoRLOpenAIServingMixin:
             if "maximum context length" in str(e):
                 LOGGER.warning("Prompt exceeds max_model_len: %s", e)
             raise
+
+        ended = None
+        if isinstance(request, ChatCompletionRequest):
+            ended = reasoning_ended(
+                request,
+                self._request_parser(request, render_kwargs),
+                engine_prompt["prompt_token_ids"],
+            )
 
         # Token capture: the admission is built once by the host and resolved
         # here, before branching; the ``ng_capture`` dict is never mutated.
@@ -270,8 +299,28 @@ class NeMoRLOpenAIServingMixin:
             serving_admission=serving_admission,
             verify_retained_media=verify_retained_media,
             request_max_tokens=request_max_tokens,
+            reasoning_ended=ended,
             conversation=conversation,
             engine_prompt=engine_prompt,
+        )
+
+    def _request_parser(self, request, render_kwargs: dict[str, Any]) -> Any:
+        """The call's parser, built as vLLM's chat serving builds its own.
+
+        None when no reasoning parser is configured: nothing reads it then.
+        """
+        parser_cls = render_kwargs["parser"]
+        if parser_cls is None or parser_cls.reasoning_parser_cls is None:
+            return None
+        chat_params = request.build_chat_params(
+            render_kwargs["default_template"],
+            render_kwargs["default_template_content_format"],
+        ).with_defaults(render_kwargs["default_template_kwargs"])
+        return parser_cls(
+            self.renderer.get_tokenizer(),
+            request.tools,
+            chat_template_kwargs=chat_params.chat_template_kwargs,
+            model_config=self.model_config,
         )
 
     # vLLM 0.25 moved chat preprocessing to
@@ -310,6 +359,9 @@ class NeMoRLOpenAIServingMixin:
             ),
             admission=admission,
         )
+        if isinstance(request, NeMoRLChatCompletionRequest):
+            # The request's SamplingParams carry it to the engine client.
+            request._template_reasoning_ended = rendered.reasoning_ended
         plan = await prepare_prompt(
             rendered,
             resolve_prefix=host._resolve_admission_prefix,
@@ -350,6 +402,8 @@ class RenderedChat:
     verify_retained_media: bool
     # The output budget the request asked for, before the render lowered it.
     request_max_tokens: Optional[int]
+    # Whether reasoning is over before the call generates (reasoning_ended).
+    reasoning_ended: Optional[bool]
     conversation: list[Any]
     # The full render, multimodal inputs included; its ids are the template's.
     engine_prompt: dict[str, Any]
@@ -812,6 +866,13 @@ def register_routes(
             sampling_params = super().to_sampling_params(*args, **kwargs)
             if self.ng_capture is not None:
                 host._prefix_recovery.on_sampling_params(self, sampling_params)
+            if self._template_reasoning_ended is not None:
+                # vLLM's serving reads its own from the spliced prompt; the
+                # worker's engine client hands the engine this one instead.
+                sampling_params.extra_args = {
+                    **(sampling_params.extra_args or {}),
+                    REASONING_ENDED_ARG: self._template_reasoning_ended,
+                }
             return sampling_params
 
     register_generation_cut_route(app, lambda: host._prefix_recovery)
