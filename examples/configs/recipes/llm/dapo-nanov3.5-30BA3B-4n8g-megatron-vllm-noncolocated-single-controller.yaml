@@ -1,0 +1,93 @@
+# Nano 3.5 SingleController DAPO with Megatron training and vLLM generation,
+# H100 4n8g: two training nodes and two generation nodes. Uniform-reward
+# groups are resampled from a pool the rollout pump refills on demand.
+#
+# No NeMo-Gym: the filter is a property of the rollout pump, not of the
+# environment, so the cheaper built-in math env exercises it just as well and
+# needs no dataset preparation step in CI.
+#
+# Non-capture on purpose. Setup rejects dynamic sampling together with
+# token_capture.enabled, because the capture path cannot borrow a finished
+# group from a later step and every drop would stall its step for a fresh
+# rollout.
+# Launch with:
+#   uv run examples/run_grpo_single_controller.py \
+#     --config examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-megatron-vllm-noncolocated-single-controller.yaml
+defaults: ./dapo-nanov3.5-30BA3B-4n8g-automodel-ep8.yaml
+grpo:
+  # One optimizer step per RL step: 8 prompts x 8 generations = batch 64.
+  num_prompts_per_step: 8
+  max_num_steps: 10
+  num_generations_per_prompt: 8
+  # SC does not support validation yet.
+  val_period: 0
+  val_at_start: false
+  # SC reads async_rl instead of the legacy async_grpo block.
+  async_grpo: null
+  # SC samples replacement groups itself.
+  batch_multiplier: 1
+  reward_scaling:
+    # Enable after https://github.com/NVIDIA-NeMo/RL/pull/4878 is merged.
+    enabled: false
+  reward_shaping:
+    # Enable after https://github.com/NVIDIA-NeMo/RL/pull/4882 is merged.
+    enabled: false
+policy:
+  train_global_batch_size: 64
+  offload_policy_before_refit: true
+  sequence_packing:
+    enabled: true
+  dynamic_batching:
+    enabled: false
+  automodel_cfg:
+    enabled: false
+  optimizer: null
+  scheduler: null
+  megatron_cfg:
+    enabled: true
+    activation_checkpointing: true
+    bias_activation_fusion: false
+    expert_model_parallel_size: 8
+    moe_router_dtype: fp32
+    optimizer:
+      lr: 1.0e-06
+      min_lr: 1.0e-06
+      weight_decay: 0.1
+    scheduler:
+      lr_warmup_iters: 10
+      lr_warmup_init: 1.0e-14
+  generation:
+    vllm_cfg:
+      async_engine: true
+    colocated:
+      enabled: false
+      resources:
+        gpus_per_node: 8
+        num_nodes: 2
+checkpointing:
+  checkpoint_dir: results/dapo-nanov3.5-30BA3B-4n8g-megatron-vllm-noncolocated-single-controller
+  metric_name: null
+  save_data_plane: true
+
+# TransferQueue is mandatory for SingleController.
+data_plane:
+  enabled: true
+token_capture:
+  enabled: false
+async_rl:
+  # Dynamic sampling requires the in_order sampler to stamp each target step.
+  sampler:
+    name: in_order
+    max_lookahead_versions: 1
+  min_groups_for_streaming_train: ${grpo.num_prompts_per_step}
+  max_inflight_prompts: ${grpo.num_prompts_per_step}
+  max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, 2}
+  rollout_failure:
+    on_dropped_prompt: replace
+    max_replacement_attempts: 1
+    replacement_reserve_prompts: ${grpo.num_prompts_per_step}
+logger:
+  log_dir: logs/dapo-nanov3.5-30BA3B-4n8g-megatron-vllm-noncolocated-single-controller
+  wandb:
+    project: nemo-rl
+    name: dapo-nanov3.5-30BA3B-4n8g-megatron-vllm-noncolocated-single-controller

@@ -50,7 +50,7 @@ One consequence worth knowing: registration is an *import side effect*, so a gro
 |---|---|---|
 | `job` | base | the whole-run root span (`rl.<algo>.job`) |
 | `setup` | RL | startup, before the first step: `rl.startup` and the `rl.setup.*` phases under it |
-| `checkpoint` | base | `rl.<algo>.checkpointing` — staging, which is what blocks the loop; `rl.checkpoint.finalize` — the asynchronous tail, open until the checkpoint is durable. See [Checkpoint spans](#a-checkpoint-takes-two-spans) |
+| `checkpoint` | base | `rl.<algo>.checkpointing` — staging, which is what blocks the loop; `rl.checkpoint.finalize` — the asynchronous tail, open until the checkpoint is durable. See [Checkpoint spans](#a-checkpoint-takes-two-spans). Also the Single-Controller's trace-only `rl.sc.rollout_checkpoint.save` (see [below](#trace-only-the-rollout-checkpoint-save)) |
 | `evaluate` | base | `rl.<algo>.evaluate` |
 | `model_init` | base | `rl.vllm.load_model` (generation worker), `rl.policy.load_model` / `rl.value.load_model` (training workers) |
 | `step` | base | `rl.<algo>.step` (one per training step) |
@@ -61,7 +61,7 @@ One consequence worth knowing: registration is an *import side effect*, so a gro
 | `advantage` | RL | `rl.<algo>.advantage_calculation` |
 | `policy_update` | RL | `rl.<algo>.policy_training` (and `rl.ppo.value_training` for PPO) |
 | `data_processing` | RL | `rl.<algo>.data_processing` |
-| `data_plane` | RL | `rl.data_plane.<op>` — one span per transfer-queue operation from a batch-shaped caller. The eleven ops give `rl.data_plane.register`, `rl.data_plane.claim_meta`, `rl.data_plane.get_data`, `rl.data_plane.check_consumption_status`, `rl.data_plane.put`, `rl.data_plane.get`, `rl.data_plane.list_sample_ids`, `rl.data_plane.clear`, `rl.data_plane.save_checkpoint`, `rl.data_plane.load_checkpoint`, `rl.data_plane.close` |
+| `data_plane` | RL | `rl.data_plane.<op>` — one span per transfer-queue operation from a batch-shaped caller. The eleven ops give `rl.data_plane.register`, `rl.data_plane.claim_meta`, `rl.data_plane.get_data`, `rl.data_plane.check_consumption_status`, `rl.data_plane.put`, `rl.data_plane.get`, `rl.data_plane.list_sample_ids`, `rl.data_plane.clear`, `rl.data_plane.save_checkpoint`, `rl.data_plane.load_checkpoint`, `rl.data_plane.close`. The nixl backend's checkpoint restore adds `rl.data_plane.restore_shards`, which covers reading the saved shards back into the store |
 | `per_prompt` | RL | spans emitted once per prompt: `rl.sc.generate_and_push`, the rollout path's `rl.data_plane.put`, and `rl.gym.run_rollouts` when the single controller dispatches it. A cardinality axis rather than a phase — see [Per-prompt spans](#per-prompt-spans) |
 | `efficiency` | RL | idle phases on async GRPO — driver-side `rl.idle.buffer_starvation`, `rl.idle.refit_bubble`, and collector-side `rl.idle.refit_event_wait`, `rl.idle.generation_limit_pause` |
 
@@ -100,11 +100,11 @@ The controlling group is shown for each; a span is emitted whenever its group is
 | **GRPO / PPO** (async only) | `rl.grpo.generation` / `rl.ppo.generation` — `rollout` group, emitted by the collector actor, one span per rollout batch; the name follows the algorithm the collector was built for |
 | **PPO** | `rl.ppo.job`, `rl.ppo.step`, `rl.ppo.data_processing`, `rl.ppo.generation`, `rl.ppo.reward_calculation`, `rl.ppo.policy_and_reference_logprobs`, `rl.ppo.advantage_calculation`, `rl.ppo.policy_training`, `rl.ppo.value_training`, `rl.ppo.checkpointing`, `rl.ppo.evaluate` |
 | **SFT** | `rl.sft.job`, `rl.sft.step`, `rl.sft.data_processing`, `rl.sft.policy_training`, `rl.sft.checkpointing`, `rl.sft.evaluate` |
-| **SFT v2** | `rl.sft_v2.driver` wraps setup and training in the driver; `rl.sft_v2.job` and `rl.sft_v2.step` run in the controller (all unbucketed). `rl.sft_v2.read_batch` and `rl.sft_v2.prepare_batch` run on loader owners (`data_processing`); `rl.sft_v2.policy_training` runs in the controller (`policy_update`). Trace context crosses both Ray calls. |
+| **SFT v2** | `rl.sft_v2.driver` wraps setup and training in the driver; `rl.sft_v2.job` and `rl.sft_v2.step` run in the controller (all unbucketed). `rl.sft_v2.setup_loaders` covers loader construction in the controller and `rl.sft_v2.build_loader` the matching work on each loader owner (both `setup`, both unbucketed) — see [the Energon worker pool](#the-energon-worker-pool). `rl.sft_v2.read_batch` and `rl.sft_v2.prepare_batch` run on loader owners (`data_processing`); `rl.sft_v2.policy_training` runs in the controller (`policy_update`). `rl.sft_v2.checkpointing` wraps the save's loop-blocking part in the controller (`checkpoint`), including the loader snapshot each owner takes inside it; with `async_save` off that is all of it, so it accounts for the gap between two `rl.sft_v2.step` spans. Under `sft.defer_async_checkpoint_finalize` the handoff moves to a later step boundary, so only `rl.checkpoint.finalize` says when that save became resumable, and the blocking wait for it is counted inside the next `rl.sft_v2.checkpointing`. Trace context crosses every Ray call whose callee opens a span; the lifecycle calls inherited from `lm_policy` do not carry it, and lose nothing by it. |
 | **DPO** | `rl.dpo.job`, `rl.dpo.step`, `rl.dpo.policy_training`, `rl.dpo.checkpointing`, `rl.dpo.evaluate` |
 | **RM** | `rl.rm.job`, `rl.rm.step`, `rl.rm.checkpointing`, `rl.rm.evaluate` |
 | **Distillation** | `rl.distillation.job`, `rl.distillation.step`, `rl.distillation.data_processing`, `rl.distillation.generation`, `rl.distillation.teacher_logprob_inference`, `rl.distillation.policy_training`, `rl.distillation.checkpointing`, `rl.distillation.evaluate` |
-| **SingleController** | `rl.sc.job`, `rl.sc.step`, `rl.sc.logprob_inference_prep`, `rl.sc.policy_and_reference_logprobs`, `rl.sc.value_inference_prep`, `rl.sc.value_inference`, `rl.sc.advantage_calculation`, `rl.sc.training_prep`, `rl.sc.policy_training`, `rl.sc.policy_optimizer_step`, `rl.sc.value_training`, `rl.sc.checkpointing` — opened inside the `SingleControllerActor`, which is where the run actually lives |
+| **SingleController** | `rl.sc.job`, `rl.sc.step`, `rl.sc.logprob_inference_prep`, `rl.sc.policy_and_reference_logprobs`, `rl.sc.value_inference_prep`, `rl.sc.value_inference`, `rl.sc.advantage_calculation`, `rl.sc.training_prep`, `rl.sc.policy_training`, `rl.sc.policy_optimizer_step`, `rl.sc.value_training`, `rl.sc.checkpointing`, `rl.sc.rollout_checkpoint.save` — opened inside the `SingleControllerActor`, which is where the run actually lives |
 | **SingleController** (rollout) | `rl.sc.generate_and_push` — `per_prompt` group (umbrella, so unbucketed), one span per dispatch attempt; and `idle/buffer_starvation` / `idle/refit_bubble` reusing async GRPO's `efficiency` category names. `rl.idle.buffer_starvation` is one span per *wait*, not per poll — the pump retries every 5 ms, so a span per iteration would bury a startup stall under thousands of them; it carries `rl.idle.polls` |
 | **Transfer queue** | `rl.data_plane.<op>` — `data_plane` group, or `per_prompt` when the caller is a rollout; emitted wherever a data-plane client is built (SC actor, `TQPolicy` / `TQValue` workers) |
 | **NeMo-Gym** | `rl.gym.run_rollouts` — one span per dispatch in the `NemoGym` actor, carrying `rl.gym.batch_size`; the HTTP calls Gym makes nest under it — see [NeMo-Gym spans](#nemo-gym-spans-cross-the-http-boundary). `rollout` group from the sync batch path, `per_prompt` from the single controller, which dispatches one per prompt. Umbrella either way, so unbucketed: these overlap |
@@ -174,7 +174,7 @@ carries no `rl.iteration` of its own. That covers more than worker internals:
 | --- | --- |
 | `rl.policy.load_model` and the other worker-side leaves | the policy workers |
 | `rl.gym.run_rollouts` | the `NemoGym` actor |
-| `rl.sft_v2.read_batch`, `rl.sft_v2.prepare_batch` | the Energon SFT worker |
+| `rl.sft_v2.build_loader`, `rl.sft_v2.read_batch`, `rl.sft_v2.prepare_batch` | the Energon SFT worker |
 | the async-GRPO collector's rollout spans | the collector actor |
 
 To scope those to a step, walk up to the driver-side ancestor that is stamped,
@@ -254,7 +254,7 @@ so the call site shows which of the two it is — see
 |---|---|
 | `job`, `step`, `rollout`, `model_init`, `evaluate`, `setup`, `per_prompt` (aliased `U_JOB`, `U_STEP`, …) | *(none — umbrella)* |
 | `generation`, `reward`, `policy_update` | `productive` |
-| `data_processing`, `data_plane`, `checkpoint`, `logprob`, `advantage` | `overhead` — except `rl.checkpoint.finalize`, which is unbucketed because it overlaps the next step (see below) |
+| `data_processing`, `data_plane`, `checkpoint`, `logprob`, `advantage` | `overhead` — except `rl.checkpoint.finalize` and `rl.sc.rollout_checkpoint.save`, which are unbucketed because they overlap training (see below) |
 | `efficiency` | `idle` for the two driver-side phases; *none* for the two collector-side ones (see below) |
 
 Rolled-up `rl.goodput` is **monitor-derived**, not emitted by NeMo-RL.
@@ -373,6 +373,27 @@ labelled `rl.efficiency.measurement="collector_wall_clock"` — sequential and s
 real durations, unlike the batch-worker categories, but on the collector's
 timeline rather than the driver's. See
 [Metrics — always filter on `rl.efficiency.measurement`](metrics.md#always-filter-on-rlefficiencymeasurement).
+
+#### Trace-only: the rollout checkpoint save
+
+The Single-Controller's background snapshot pump emits one
+`rl.sc.rollout_checkpoint.save` span per completed rollout save, in the
+`checkpoint` group but **without** `rl.bucket`. The pump runs while training
+continues, so an `overhead` bucket would charge wall clock the trainer spent
+productively a second time. The trainer checkpoint, `rl.sc.checkpointing`,
+stops the loop and keeps its `overhead` bucket.
+
+The span is rebuilt from the timings logged under `timing/rollout_checkpoint`
+rather than opened around the save: it ends at `telemetry/wall_time_seconds` and
+starts `total_save_seconds` earlier. Only the phase durations are known, not
+their offsets, so they are attributes rather than child spans:
+`rl.checkpoint.<logger key>` for each phase and volume field (for example
+`rl.checkpoint.barrier_wait_seconds`, `rl.checkpoint.replay_rows`), plus
+`rl.checkpoint.snapshot_sequence` and `rl.iteration` to tie a slow save to its
+snapshot. Restore emits no span: its phases run at different times in driver
+setup and in the controller. The `rl.checkpoint.*` metrics cover every save and
+restore regardless of span groups; see
+[Metrics](metrics.md#rollout-checkpoint-metrics-rlcheckpoint).
 
 #### Still reserved: the rest of the collector-side categories
 
@@ -588,11 +609,25 @@ exists to fence off. Gating it on `rollout` instead would put that volume in
 dataset size. The group has to describe the volume, not the phase, even though
 these spans sit inside the rollout.
 
-Completing the trace on the server side is a change in the Gym repository, not
-this one — its app has to call `nemo.lens.contrib.fastapi.instrument_fastapi`.
-Until it does, the header arrives and is ignored, and Gym's internal spans (if
-any) stay in their own traces. Everything up to and including the client-side
-HTTP span still nests correctly.
+Gym's servers export their own spans whenever NeMo-RL is exporting; you don't
+need to set anything. To pass options to Gym's `telemetry:` block, set
+`env.nemo_gym.telemetry`, for example `{span_groups: "default,sandbox"}`.
+
+- `enabled: false` turns off Gym's servers only. A `NEMO_LENS_ENABLED=1`
+  already in the environment still turns them on.
+- `span_groups` in this block controls Gym's servers and
+  `NEMO_RL_OTEL_SPAN_GROUPS` controls NeMo-RL's processes. A
+  `NEMO_GYM_OTEL_SPAN_GROUPS` or `NEMO_LENS_SPAN_GROUPS` in the environment
+  overrides the block.
+- `job` and `rollout` exist in both libraries, so naming either turns it on
+  for both.
+- Gym servers are named `nemo-rl/<server name>`; `service_name` in this block
+  has no effect.
+- If your recipe sets `skip_venv_if_present`, rebuild or re-prefetch Gym's
+  venvs after turning telemetry on. An older venv has no `nemo-lens`, so its
+  server sends nothing.
+- Known issue: all Gym servers share one `service.instance.id` until
+  [Gym#5100](https://github.com/NVIDIA-NeMo/Gym/pull/5100) merges.
 
 Two failure modes degrade quietly rather than breaking a rollout. Without
 `nemo-lens[aiohttp]` installed the constructor logs a warning once and Gym's
@@ -650,6 +685,33 @@ to `max_inflight_prompts`. The scope propagates to nested calls and to
 coroutines started inside it, but not to raw threads — a data-plane call handed
 to a thread pool would read as batch-shaped.
 
+## The Energon worker pool
+
+SFT v2 loads through Energon, which runs `data.energon.num_workers` `DataLoader`
+subprocesses behind each loader owner. Nothing installs a tracer in them — that
+would mean an OTLP exporter per subprocess and a span per batch per process — so
+they are covered from the consuming side, which is where the answer matters: the
+workers run ahead of training, so what a reader needs is whether a batch was
+ready when the step asked for it, not how long it took to build.
+
+They start later than the span names suggest. `SavableDataLoader.__iter__`
+returns a generator, so building the loader forks nothing; the subprocesses
+start on the first `next()`, inside step 1's `read_batch`.
+
+| Signal | What it says |
+|---|---|
+| `rl.sft_v2.setup_loaders` (controller) over `rl.sft_v2.build_loader` (each owner) | building the loader objects — dataset resolution, task encoder, cache pool — and **not** the worker subprocesses. Unbucketed, like every `setup` span. The controller span carries `rl.energon.workers_per_rank` and `rl.energon.batches_in_flight_per_rank`, the only record of the pool's size anywhere in telemetry; each `build_loader` child carries `rl.energon.rank`, `rl.energon.world_size` and `rl.energon.restored`, so multiplying by `world_size` gives the job total |
+| `rl.sft_v2.read_batch` (each owner, per step) | the blocking dequeue. Near zero while the workers keep up; the span that grows when they stop, and the span that contains worker startup on step 1 |
+
+Read the wait off the spans, not a metric. There is one `read_batch` span per
+owner per step, so worker startup on step 1 shows up. The teed gauges keep only
+the last value per export interval, so they miss one-off stalls.
+`rl.sft_v2.loader.latency.max` also covers prepare, register and publish as
+well as the dequeue.
+
+Queue depth at dequeue time is not exported, so a pool that is keeping up and
+one that is barely keeping up both read as a near-zero wait.
+
 ## Coverage gaps
 
 A group being enabled does not guarantee spans: something has to emit them. Known
@@ -670,6 +732,7 @@ blanks today, so an empty trace is not read as a broken exporter:
 | `run_vlm_grpo.py`, `run_grpo_sliding_puzzle.py`, `run_xtoken_off_policy_distillation.py`, `run_eval.py` | these call the instrumented loops but never `init_telemetry_driver`, so a `telemetry:` block in their configs parses, the run succeeds, and nothing is emitted — driver or worker |
 | Non-presharded worker calls | the presharded data-plane entrypoints are parented, but `lm_policy` / `lm_value`'s own `train` / `get_logprobs` / `get_values` and every vLLM worker method are dispatched without a carrier, so those spans stay separate traces correlated by `nemo.run.id` |
 | Worker `__init__` spans | `rl.*.load_model` is opened before any call carries context, so the load spans are roots no matter what the caller does |
+| Energon `DataLoader` subprocesses | uninstrumented by design, and not individually visible: no per-batch build, decode or queue-depth span. They are described from the consuming side instead — see [The Energon worker pool](#the-energon-worker-pool) |
 
 ## Resource attributes (process tags)
 

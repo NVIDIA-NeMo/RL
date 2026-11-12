@@ -435,7 +435,7 @@ xferdtensor(src_tensor, src_mesh, src_placement,
 and dispatches to one of two transports:
 
 * **Core NCCL reshard** — the reshard operation provided by the **nccl4py
-  wrapper** (`nccl.m2n.reshard`). When the package is accesible, this is the default:
+  wrapper** (`nccl.m2n.reshard`). When the package is accessible, this is the default:
   the local shards, mesh rank grids, and placements are handed to the NCCL library,
   which executes the cross-mesh redistribution natively.
 * **`xferdtensor_python_impl`** (`nemo_rl/weight_sync/xferdtensor_python.py`) — a pure

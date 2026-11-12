@@ -16,10 +16,10 @@ For the theory behind the method, see
 
 LoRA is implemented on two training backends, each with its own config schema:
 
-| Backend | Config path | Notes |
-| --- | --- | --- |
-| **Automodel** | `policy.automodel_cfg.lora_cfg` | This is the default backend. |
-| **Megatron Core** | `policy.megatron_cfg.peft` | Requires `policy.megatron_cfg.enabled=true` (and `policy.automodel_cfg.enabled=false`). |
+| Training backend | Config path | Rollout representation | Notes |
+| --- | --- | --- | --- |
+| **Automodel** | `policy.automodel_cfg.lora_cfg` | Native A/B with synchronous vLLM by default; merged is opt-in. | This is the default training backend. |
+| **Megatron Core** | `policy.megatron_cfg.peft` | Merged full weights. | Requires `policy.megatron_cfg.enabled=true`, `policy.automodel_cfg.enabled=false`, and `policy.generation.lora_refit_mode=merged` for rollout algorithms. |
 
 LoRA is supported across the SFT, GRPO, and DPO algorithms on both backends.
 
@@ -88,6 +88,31 @@ policy:
 - **`use_triton`** (bool): Use Triton-optimized kernels for better performance. **Note**: [Automodel does not support Triton for TP > 1](https://github.com/NVIDIA-NeMo/Automodel/blob/b2db55eee98dfe81a8bfe5e23ac4e57afd8ab261/nemo_automodel/recipes/llm/train_ft.py#L199). Set to `false` when `tensor_parallel_size > 1` to avoid compatibility issues.
 - **`restore_from`** (str, optional): Path to a donor PEFT adapter checkpoint (a directory containing `adapter_model.safetensors` + `adapter_config.json`, e.g. a previous run's `step_*/policy/weights`) whose adapter weights initialize this run's LoRA modules. See [Warm-Starting from a LoRA Checkpoint](#warm-starting-from-a-lora-checkpoint).
 
+### Grouped MoE Experts
+
+`match_all_linear: true` matches linear modules and skips Automodel's grouped
+expert modules. To adapt grouped experts, set `match_all_linear: false` and
+include their module names in `target_modules`, for example:
+
+```yaml
+policy:
+  automodel_cfg:
+    lora_cfg:
+      enabled: true
+      match_all_linear: false
+      target_modules: ['*_proj', '*experts']
+      dim: 8
+      alpha: 32
+  generation:
+    lora_refit_mode: merged
+```
+
+With merged refitting, the grouped expert adapters are merged into
+`gate_and_up_projs` and `down_projs` before conversion to the inference engine's
+weight format. The adapter tensors themselves are excluded from the refit.
+The example explicitly selects merged refitting; synchronous vLLM otherwise
+defaults to native adapter refitting.
+
 ## Megatron Configuration
 
 LoRA settings live under `policy.megatron_cfg.peft`:
@@ -109,6 +134,9 @@ policy:
       lora_dtype: None              # Adapter weights dtype
       share_expert_adapters: true   # Share one adapter across grouped MoE experts on each EP rank
       restore_from: null            # Warm start from a donor PEFT checkpoint (see below)
+  generation:
+    # Megatron LoRA does not yet export native vLLM adapter tensors.
+    lora_refit_mode: merged
 ```
 
 ### Megatron Parameter Details
@@ -182,13 +210,46 @@ GRPO supports LoRA on both backends. Enable the Automodel adapter with:
 uv run examples/run_grpo.py policy.automodel_cfg.lora_cfg.enabled=true
 ```
 
-The Automodel GRPO LoRA path uses a **merge-weight** approach: during generation, LoRA adapter
-weights are merged into the base linear weights. This improves performance at the cost of a
-small train/inference mismatch that we consider acceptable. If you require strict
-train/inference parity, use the
-[split-weight variant branch](https://github.com/NVIDIA-NeMo/RL/tree/ruit/lora_grpo_async),
-which may trade off some performance. For a comparison between merge-weight and split-weight,
-see [PR 1797: Support lora in dtensor grpo workflow by merging weight](https://github.com/NVIDIA-NeMo/RL/pull/1797).
+For Automodel training with synchronous vLLM generation, **native LoRA refit is the
+default**: NeMo RL sends only the factorized A/B tensors, replaces an in-memory vLLM
+adapter, and selects it on every generation request. The base model is loaded once and is
+not overwritten during adapter updates.
+
+Native refit currently supports the topology-default transport (colocated CUDA IPC or
+non-colocated NCCL) and matching BF16/FP16 trainer and rollout precision. It exports the
+trainer's LoRA tensors through the model's Automodel state-dict adapter when one is
+present, so custom model layouts such as grouped MoE are converted to conventional
+per-expert HF/PEFT factors with the orientation consumed by vLLM. It fails at setup for
+unsupported combinations such as asynchronous vLLM, vLLM's exposed HTTP server (NeMo
+Gym), speculative decoding, quantized rollout models, custom refit transports, DoRA,
+`moe_rank_scaling`, or Megatron LoRA. Models with dynamically updated MoE router bias
+fail before their first native refit rather than silently omitting that mutable state.
+Native refit also fails rather than silently dropping a trained module that the selected
+vLLM model implementation cannot apply. For example, Qwen2 does not expose `lm_head` as
+a native-LoRA module; configure its Automodel LoRA policy with
+`match_all_linear=false` and `exclude_modules=["*lm_head*"]`, or use merged refit.
+
+Individual recipes may still set
+`policy.automodel_cfg.automodel_kwargs.force_hf=true` for model-specific training or
+parallelization compatibility. That setting is independent of native refit; native refit
+itself accepts either HF-native LoRA names or names converted by a custom Automodel
+state-dict adapter.
+
+Native refit requires `policy.generation.backend: vllm`. Other rollout backends use the
+`merged` representation and must set `policy.generation.lora_refit_mode: merged`.
+
+The previous full-weight behavior remains available as an explicit compatibility or
+performance opt-in:
+
+```yaml
+policy:
+  generation:
+    lora_refit_mode: merged
+```
+
+Merged refit materializes `W + scale * B @ A` in the rollout dtype. In reduced precision,
+this can discard LoRA updates that are smaller than the BF16/FP16 spacing of the base
+weight and therefore can increase the trainer/generation logprob mismatch.
 
 See the [GRPO guide](grpo.md) for the full GRPO workflow.
 
