@@ -626,11 +626,14 @@ def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
     """Validate the single-forward threshold path before allocating workers.
 
     Shared by the GRPO and SingleController trainers, whose master configs are
-    separate classes with the fields read here.
+    separate classes with the fields read here. SingleController also runs it
+    for PPO, whose config has a ``ppo`` block instead of ``grpo``.
     """
     if not master_config.loss_fn.seq_logprob_error_in_loss:
         return
-    if master_config.grpo.seq_logprob_error_threshold is None:
+    ppo = getattr(master_config, "ppo", None)
+    algo = ppo if ppo is not None else master_config.grpo
+    if algo.seq_logprob_error_threshold is None:
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss requires seq_logprob_error_threshold"
         )
@@ -640,10 +643,17 @@ def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
             "loss_fn.seq_logprob_error_in_loss requires force_on_policy_ratio=true "
             "and token_level_loss=true"
         )
-    if master_config.grpo.adv_estimator.name != "grpo" or loss.use_kl_in_reward:
+    # Without the policy-logprob pass, KL-in-reward would have no policy logprobs.
+    if loss.use_kl_in_reward or (ppo is None and algo.adv_estimator.name != "grpo"):
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss requires the grpo advantage estimator "
-            "without use_kl_in_reward"
+            "(or PPO) without use_kl_in_reward"
+        )
+    # A forced ratio is exact only for the first optimizer step on a batch.
+    if ppo is not None and ppo.ppo_epochs != 1:
+        raise ValueError(
+            "loss_fn.seq_logprob_error_in_loss requires ppo.ppo_epochs=1, got "
+            f"ppo.ppo_epochs={ppo.ppo_epochs}"
         )
     policy = master_config.policy
     if "megatron_cfg" not in policy or not policy["megatron_cfg"]["enabled"]:
@@ -1960,12 +1970,14 @@ def setup(
     if refit_transport is not None and not (
         backend == "vllm"
         or (backend == "megatron" and refit_transport in ("mcore", "nccl_reshard"))
+        or (backend == "trtllm" and refit_transport == "nccl_reshard")
     ):
         raise NotImplementedError(
             f"refit_transport={refit_transport!r} is not supported for "
             f"policy.generation.backend={backend!r}. "
             "Set policy.generation.refit_transport=null. Megatron generation "
-            "supports refit_transport='mcore' or 'nccl_reshard'."
+            "supports refit_transport='mcore' or 'nccl_reshard'; TRT-LLM "
+            "generation supports 'nccl_reshard'."
         )
 
     if backend == "megatron":
