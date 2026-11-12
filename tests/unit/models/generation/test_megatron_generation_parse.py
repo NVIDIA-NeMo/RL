@@ -262,6 +262,23 @@ def test_handles_a_reply_with_no_generated_tokens(two_sample_batch):
 
 
 @pytest.mark.mcore
+@pytest.mark.parametrize("logprobs", [[], [-0.1], [-0.1, -0.2, -0.3]])
+def test_rejects_mismatched_generated_logprobs(
+    two_sample_batch: BatchedDataDict, logprobs: list[float]
+) -> None:
+    result = [
+        FakeInferenceReply(generated_tokens=[11], generated_log_probs=[-0.1]),
+        FakeInferenceReply(generated_tokens=[12, 13], generated_log_probs=logprobs),
+    ]
+
+    with pytest.raises(
+        RuntimeError,
+        match=f"result 1 has 2 generated tokens but {len(logprobs)} log probabilities",
+    ):
+        parse(two_sample_batch, result)
+
+
+@pytest.mark.mcore
 def test_http_server_port_reservation(monkeypatch):
     """The NeMo-Gym overlap contract, exercised back to back.
 

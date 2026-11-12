@@ -1378,6 +1378,15 @@ class MegatronGenerationMixin:
         result: list,
     ) -> BatchedDataDict[GenerationOutputSpec]:
         """Pack DynamicInferenceRequest results into a GenerationOutputSpec batch."""
+        for index, reply in enumerate(result):
+            token_count = len(reply.generated_tokens)
+            logprob_count = len(reply.generated_log_probs)
+            if token_count != logprob_count:
+                raise RuntimeError(
+                    f"Megatron inference result {index} has {token_count} generated "
+                    f"tokens but {logprob_count} log probabilities. "
+                    "Each generated token must have a log probability."
+                )
         input_lengths = data["input_lengths"]
         input_ids = data["input_ids"]
         batch_size = input_ids.size(0)
