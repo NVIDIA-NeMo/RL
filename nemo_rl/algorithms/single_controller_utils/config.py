@@ -1097,8 +1097,7 @@ def rollout_snapshots_enabled(master_config: MasterConfig) -> bool:
 
 def dedicated_value_enabled(master_config: MasterConfig) -> bool:
     value_config = getattr(master_config, "value", None)
-    resources = value_config.get("resources") if value_config else None
-    return bool(resources and resources.dedicated)
+    return bool(value_config and value_config.get("dedicated"))
 
 
 def algo_config(master_config: MasterConfig) -> GRPOConfig | PPOConfig:
@@ -1600,27 +1599,24 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         )
 
     value_resources = master_config.value.get("resources")  # type: ignore
-    if value_resources and value_resources.dedicated:
+    if dedicated_value_enabled(master_config):
         if not policy_megatron_cfg or not policy_megatron_cfg.get("enabled"):
             raise ValueError(
-                "value.resources.dedicated=true requires "
-                "policy.megatron_cfg.enabled=true"
+                "value.dedicated=true requires policy.megatron_cfg.enabled=true"
             )
         generation_config = master_config.policy["generation"]
         if generation_config["colocated"]["enabled"]:
-            raise ValueError(
-                "value.resources.dedicated=true requires non-colocated generation"
-            )
-        value_nodes = value_resources.num_nodes
+            raise ValueError("value.dedicated=true requires non-colocated generation")
+        value_nodes = value_resources.num_nodes if value_resources is not None else None
         if value_nodes is None or value_nodes < 1:
             raise ValueError(
-                "value.resources.dedicated=true requires value.resources.num_nodes >= 1"
+                "value.dedicated=true requires value.resources.num_nodes >= 1"
             )
         cluster_gpus = master_config.cluster.gpus_per_node
         inference_resources = generation_config["colocated"]["resources"]
         if inference_resources["gpus_per_node"] != cluster_gpus:
             raise ValueError(
-                "value.resources.dedicated=true requires generation to use full nodes"
+                "value.dedicated=true requires generation to use full nodes"
             )
         inference_nodes = inference_resources["num_nodes"] or 1
         if master_config.cluster.num_nodes - value_nodes - inference_nodes < 1:

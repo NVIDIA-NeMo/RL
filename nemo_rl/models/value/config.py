@@ -34,11 +34,7 @@ from nemo_rl.models.policy import (
 )
 
 
-class ValueResourcesConfig(BaseModel, extra="allow"):
-    dedicated: bool = Field(
-        default=False,
-        description="Place the SingleController PPO value model on dedicated GPU nodes.",
-    )
+class ValueResourcesConfig(BaseModel, extra="forbid"):
     num_nodes: int | None = Field(
         default=None,
         description="Number of full nodes reserved for a dedicated value model.",
@@ -69,6 +65,7 @@ class ValueConfig(TypedDict):
     # Backend configuration - Automodel or Megatron
     automodel_cfg: NotRequired[AutomodelConfig | AutomodelConfigDisabled]
     megatron_cfg: NotRequired[MegatronConfig | MegatronConfigDisabled]
+    dedicated: NotRequired[bool]
     resources: NotRequired[ValueResourcesConfig]
 
     # HuggingFace config overrides

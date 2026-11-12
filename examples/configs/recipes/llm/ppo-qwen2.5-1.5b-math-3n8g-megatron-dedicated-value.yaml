@@ -1,6 +1,7 @@
-defaults: ppo-qwen2.5-1.5b-math-3n2g-megatron-dedicated-value.yaml
+defaults: ../../ppo_math_1B_megatron_single_controller.yaml
 
 cluster:
+  num_nodes: 3
   gpus_per_node: 8
 
 policy:
@@ -8,3 +9,8 @@ policy:
     colocated:
       resources:
         gpus_per_node: 8
+
+value:
+  dedicated: true
+  resources:
+    num_nodes: 1

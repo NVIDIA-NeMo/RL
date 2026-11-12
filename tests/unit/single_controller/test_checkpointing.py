@@ -4012,7 +4012,7 @@ class TestPPOSaveOrder:
             "policy.save_checkpoint",
         ]
 
-    def test_failed_dedicated_critic_save_restores_mode(self, tmp_path):
+    def test_failed_dedicated_critic_save_does_not_start_cleanup(self, tmp_path):
         calls: list[str] = []
         actor = _ppo_save_actor(tmp_path, calls)
         actor._value_dedicated = True
@@ -4028,10 +4028,38 @@ class TestPPOSaveOrder:
                 )
             )
 
-        assert calls == [
-            "critic.prepare_for_training:resident",
-            "critic.finish_training:resident",
-        ]
+        assert calls == ["critic.prepare_for_training:resident"]
+
+    def test_cancelled_critic_save_does_not_start_cleanup(self, tmp_path):
+        calls: list[str] = []
+        actor = _ppo_save_actor(tmp_path, calls)
+        actor._value_dedicated = True
+        actor._value._keep_resident = True
+        started = threading.Event()
+        release = threading.Event()
+
+        def blocked_save(**kwargs: Any) -> None:
+            started.set()
+            release.wait(timeout=5)
+
+        actor._value.save_checkpoint = blocked_save
+
+        async def cancel_save() -> None:
+            task = asyncio.create_task(
+                actor._save_checkpoint(
+                    {}, is_policy_training_step=True, is_final_checkpoint=True
+                )
+            )
+            try:
+                assert await asyncio.to_thread(started.wait, 2)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(task, 1)
+            finally:
+                release.set()
+
+        asyncio.run(cancel_save())
+        assert "critic.finish_training:resident" not in calls
 
     def test_the_policy_is_offloaded_across_the_critic_save(
         self, tmp_path, monkeypatch

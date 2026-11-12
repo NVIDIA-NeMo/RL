@@ -4598,18 +4598,16 @@ class SingleControllerActor:
             # The value model writes synchronously, so unlike the policy below it is
             # fully on disk when this returns and needs no finalize wait.
             await asyncio.to_thread(self._value.prepare_for_training)
-            try:
-                await asyncio.to_thread(
-                    self._value.save_checkpoint,
-                    weights_path=os.path.join(checkpoint_path, "value", "weights"),
-                    optimizer_path=os.path.join(checkpoint_path, "value", "optimizer")
-                    if self._checkpointer.save_optimizer
-                    else None,
-                    tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
-                    is_final_checkpoint=is_final_checkpoint,
-                )
-            finally:
-                await asyncio.to_thread(self._value.finish_training)
+            await asyncio.to_thread(
+                self._value.save_checkpoint,
+                weights_path=os.path.join(checkpoint_path, "value", "weights"),
+                optimizer_path=os.path.join(checkpoint_path, "value", "optimizer")
+                if self._checkpointer.save_optimizer
+                else None,
+                tokenizer_path=os.path.join(checkpoint_path, "value", "tokenizer"),
+                is_final_checkpoint=is_final_checkpoint,
+            )
+            await asyncio.to_thread(self._value.finish_training)
             # Also covers a warmup step, which never ran prepare_for_training in
             # the pump and would otherwise save from CPU-resident params.
             if not self._value_dedicated:
@@ -5031,6 +5029,8 @@ class SingleControllerActor:
                     self._value.train_from_meta, full_meta, value_loss_fn
                 )
         else:
+            # Split exposes the per-chunk API, but this controller still collects
+            # all step chunks before training the critic.
             for _ in range(num_epochs):
                 await asyncio.to_thread(self._value.begin_train_step, value_loss_fn)
                 for meta in metas:

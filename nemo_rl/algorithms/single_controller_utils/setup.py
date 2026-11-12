@@ -111,6 +111,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
     prepare_segment_topology,
+    reserve_disjoint_clusters,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
@@ -462,15 +463,9 @@ def _build_clusters(
 
     # Worker groups sharing the training GPUs: the policy, plus the critic on
     # the PPO path.
-    train_worker_groups = (
-        1 if dedicated_value else 2 if is_ppo_run(master_config) else 1
-    )
+    train_worker_groups = 1 if not is_ppo_run(master_config) or dedicated_value else 2
 
     if colocated:
-        if dedicated_value:
-            raise ValueError(
-                "Dedicated value resources require non-colocated generation"
-            )
         # Policy (+ critic) + generation share GPUs — one cluster.
         node_constraints, remaining_ids, topology = prepare_segment_topology(
             segment_size,
@@ -1762,24 +1757,7 @@ def setup_single_controller(
     # tasks can consume them. This matters when inference topology alignment
     # falls back while the training cluster remains topology-constrained.
     if dedicated_value:
-        train_cluster.get_placement_groups()
-        value_cluster.get_placement_groups()
-        train_addresses = {
-            address
-            for address, _ in train_cluster.get_available_addresses_and_ports_batch(
-                [(node_index, 0) for node_index in range(train_cluster.node_count())]
-            )
-        }
-        value_addresses = {
-            address
-            for address, _ in value_cluster.get_available_addresses_and_ports_batch(
-                [(node_index, 0) for node_index in range(value_cluster.node_count())]
-            )
-        }
-        if shared_nodes := train_addresses & value_addresses:
-            raise RuntimeError(
-                f"Dedicated policy and value clusters share physical nodes: {shared_nodes}"
-            )
+        reserve_disjoint_clusters(train_cluster, value_cluster)
     elif not colocated and segment_size is not None:
         train_cluster.get_placement_groups()
 

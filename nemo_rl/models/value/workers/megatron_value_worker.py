@@ -399,8 +399,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
         init_telemetry_worker()
 
         self.cfg = config
-        resources = config.get("resources")
-        self._keep_resident = bool(resources and resources.dedicated)
+        self._keep_resident = bool(config.get("dedicated"))
         self.rank = get_rank_safe()
         # Fail on a bad manual_gc config before the expensive setup below; GC itself
         # is disabled at the end of __init__ (_maybe_enable_manual_gc).
