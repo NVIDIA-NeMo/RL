@@ -101,8 +101,8 @@ def resolve_generation_class(
         raise ValueError(
             "policy.generation.dynamo=true serves vLLM workers or Megatron "
             f"prefill/decode engines through Dynamo and does not apply to "
-            f"backend={backend!r}. Set policy.generation.backend to vllm or "
-            "megatron, or remove policy.generation.dynamo."
+            f"backend={backend!r}. Set policy.generation.backend=vllm or "
+            "policy.generation.backend=megatron, or remove policy.generation.dynamo."
         )
     if backend == "vllm":
         from nemo_rl.models.generation.vllm import VllmGeneration
@@ -171,8 +171,8 @@ def configure_generation_config(
         raise ValueError(
             "policy.generation.dynamo=true serves NeMo RL's vLLM workers or "
             "Megatron prefill/decode engines through Dynamo and does not apply to "
-            f"backend={config['backend']!r}. Set policy.generation.backend to vllm "
-            "or megatron, or remove policy.generation.dynamo."
+            f"backend={config['backend']!r}. Set policy.generation.backend=vllm or "
+            "policy.generation.backend=megatron, or remove policy.generation.dynamo."
         )
     if config.get("dynamo_cfg") is not None and not dynamo_enabled(config):
         raise ValueError(
