@@ -73,6 +73,11 @@ FROM scratch AS uv-cache-output-base
 FROM scratch AS custom-setup
 COPY docker/install_apptainer.sh /
 
+# The Dynamo service installer, mounted into the release stage. Taken from this recipe
+# rather than from the selected source, so that step does not depend on the source tree.
+FROM scratch AS dynamo-installer
+COPY docker/dynamo/ /
+
 # Shared helper for the uv cache mount's materialize/sync-back/strip dance
 # (docker/uv_cache_mount.sh), bind-mounted into every uv-writing RUN below so
 # the logic lives in one place instead of being pasted into each RUN body.
@@ -384,9 +389,10 @@ for extra in $WANTED_EXTRAS; do
     esac
     UV_LINK_MODE=hardlink uv sync --frozen --extra "$extra" --no-install-project
 done
-UV_LINK_MODE=hardlink uv sync --frozen $GROUP_FLAGS --no-install-project
+# The last sync also installs nemo_rl itself (see "Worker venvs" below).
+UV_LINK_MODE=hardlink uv sync --frozen $GROUP_FLAGS
 
-# Worker-venv prefetch, phase 1: third-party packages only.
+# Worker venvs.
 #
 # Each Ray actor runs in a venv under NEMO_RL_VENV_DIR. Actors that need the same set of
 # extras share one venv: it is built once as extras-<names>, and each actor's own path
@@ -396,15 +402,15 @@ UV_LINK_MODE=hardlink uv sync --frozen $GROUP_FLAGS --no-install-project
 # gigabytes of duplicated wheels. Built here, the N venvs cost directory entries and share
 # one copy of every wheel with the cache.
 #
-# Why not just run nemo_rl/utils/prefetch_venvs.py, which already knows how to build these?
-# Because it installs the nemo_rl project into each venv, and the source tree does not exist
-# yet -- this layer has only pyproject.toml, uv.lock and a couple of standalone files (see
-# the COPY above). The source arrives much later, in the release stage, deliberately: copying
-# it earlier would make every source edit invalidate this hour-long dependency build.
-# So the work is split. Here we do the expensive, cacheable half: every third-party package,
-# hardlinked, with --no-install-project so nemo_rl itself is left out. prefetch_venvs.py then
-# runs in the release stage and does the cheap half -- the editable nemo_rl install (a .pth
-# file) plus the python-<ClassName> wrapper scripts. Same venvs, finished in two places.
+# The venvs are finished here, nemo_rl included. The source tree does not exist yet -- this
+# layer has only pyproject.toml, uv.lock and a few standalone files (see the COPY above) --
+# and it arrives last, in the release stage, deliberately: copying it earlier would make
+# every source edit invalidate this hour-long dependency build. That is enough, because
+# nemo_rl is an editable install: it only records that the package lives in
+# /opt/nemo-rl/nemo_rl, and the files show up there when the source is copied in.
+# The python-<ClassName> wrapper scripts are written here too, the same way
+# nemo_rl/utils/prefetch_venvs.py writes them. Nothing after the source COPY touches a venv,
+# so a source-only change rebuilds no venv layer.
 #
 # nemo_rl/distributed/actor_environments.py is the single source of truth for which extras
 # each actor needs; the runtime registry imports the same dict. It is run as a script rather
@@ -420,17 +426,27 @@ while IFS=$'\t' read -r venv_name stage extras actors; do
     # A source from before the shared venvs lists one venv per actor, named after the
     # actor, with no fourth column.
     actors="${actors:-$venv_name}"
-    if [[ "$stage" == "trtllm" ]]; then
-        # tensorrt_llm does not exist yet; warm the base and finish in the TRT-LLM layer.
-        extras=""
-    fi
+    # A "trtllm"-stage venv gets a base-only warm here: tensorrt_llm does not exist yet,
+    # so the TRT-LLM layer finishes it.
     venv_path="${NEMO_RL_VENV_DIR}/${venv_name}"
     uv venv --allow-existing "$venv_path"
-    UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --frozen $extras --no-install-project
+    if [[ "$stage" == "trtllm" ]]; then
+        UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --frozen --no-install-project
+    else
+        UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink uv sync --frozen $extras
+    fi
     for actor in $actors; do
         if [[ "$actor" != "$venv_name" ]]; then
             ln -s "$venv_name" "${NEMO_RL_VENV_DIR}/${actor}"
         fi
+        wrapper="/usr/local/bin/python-${actor##*.}"
+        if [[ -e "$wrapper" ]]; then
+            echo "Two actors are named ${actor##*.}; their python-<ClassName> wrappers would collide" >&2
+            exit 1
+        fi
+        printf '#!/bin/bash\nVENV_PATH="%s"\nexport VIRTUAL_ENV="$VENV_PATH"\nexport PATH="$VENV_PATH/bin:$PATH"\nexec "$VENV_PATH/bin/python" "$@"\n' \
+            "${NEMO_RL_VENV_DIR}/${actor}" > "$wrapper"
+        chmod 755 "$wrapper"
     done
 done < /opt/actor_venvs.tsv
 
@@ -636,9 +652,9 @@ rm -f "$TRTLLM_SYNC_LOG"
 echo "TRT-LLM cache state after build:"
 du -sh "${UV_CACHE_DIR}" /root/.cache/trtllm-wheels
 
-# Worker-venv prefetch, phase 1 for the "trtllm"-stage actors:
+# Finish the "trtllm"-stage worker venvs:
 # the dependency layer gave them a base-only warm; now that the tensorrt_llm wheel exists,
-# top off the venv with the full extra set so that the added files hardlink in-layer.
+# top off the venv with the full extra set (and nemo_rl) so that the added files hardlink in-layer.
 # tensorrt_llm itself is new in this layer; trtllm-extra deps already present in the
 # dependency layer's cache (e.g. tilelang) get copied up here, a small accepted cost.
 # The dependency layer already wrote the actor list to /opt/actor_venvs.tsv, so this layer
@@ -652,7 +668,7 @@ while IFS=$'\t' read -r venv_name stage extras actors; do
     UV_PROJECT_ENVIRONMENT="$venv_path" UV_LINK_MODE=hardlink \
         TRTLLM_WHEEL_CACHE_DIR=/root/.cache/trtllm-wheels \
         TRTLLM_REQUIRE_CACHED_WHEEL=1 \
-        uv sync --frozen $extras --no-install-project
+        uv sync --frozen $extras
 done < /opt/actor_venvs.tsv
 
 # The main venv was never touched (the build ran in the throwaway venv), so
@@ -702,20 +718,12 @@ ARG NATS_VERSION=v2.11.6
 # Space-separated config paths whose NeMo Gym venvs are prefetched into the image
 # (empty default = skip). Consumed by the gym prefetch RUN below.
 ARG NEMO_GYM_PREFETCH_CONFIGS=
-ARG NEMO_RL_COMMIT
-ARG NVIDIA_BUILD_ID
-ARG NVIDIA_BUILD_REF
 ARG RC_DATE=00.00
 ARG TARGETARCH
 ARG RUNTIME_UID
 ARG RUNTIME_GID
 ARG ROOT_ONLY
 ARG STRIP_UV_CACHE
-ENV NEMO_RL_COMMIT=${NEMO_RL_COMMIT:-<unknown>}
-ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
-ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
-LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
-LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
 ENV NEMO_RL_DYNAMO_BIN_DIR=/opt/dynamo/bin
 
@@ -730,73 +738,110 @@ RUN printf '%s\n' /opt/amazon/ofi-nccl/lib /opt/amazon/efa/lib \
         > /etc/ld.so.conf.d/aws-efa.conf
 ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_PATH}"
 
-# Copy in source from build context (defaults to cloned repo, can be overridden)
-# Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
-COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
+# Every step from here to the source COPY reads nothing from the NeMo RL source tree, so a
+# source-only change reuses all of them and rebuilds only the few steps after the COPY.
+# Add a new step above the COPY unless it has to read the source.
 
 # The control-plane binaries Dynamo serving starts. Default image builds skip them.
 # Not a uv-writing RUN (install.sh only downloads etcd and nats-server), so it
 # needs no uv cache mount.
-RUN <<"EOF" bash -exu -o pipefail
+RUN --mount=from=dynamo-installer,src=/,dst=/tmp/dynamo-installer <<"EOF" bash -exu -o pipefail
 if [[ "${BUILD_DYNAMO:-0}" != "1" ]]; then
     echo "BUILD_DYNAMO is not 1; skipping the Dynamo service binaries"
     exit 0
 fi
-bash docker/dynamo/install.sh
+bash /tmp/dynamo-installer/install.sh
 EOF
+# ray's bundled Java worker jar ships an outdated httpcore5 with a known CVE
+# (GHSA-hf6x-8p5f-cgmf). NeMo-RL never uses Ray's Java cross-language worker,
+# and removing the jar doesn't affect ray.init(), remote tasks, actors, or
+# ray.serve (verified in NVIDIA-NeMo/Gym#3779/#3826). Sweep every venv (base and
+# per-backend worker venvs) and the shared uv cache (UV_CACHE_DIR, under /opt) that
+# it could have landed in; /root still holds the builder-local TRT-LLM caches. The
+# gym prefetch below sweeps the venvs it adds.
+RUN find /opt /root -name ray_dist.jar -delete
+
+# NOTICES.txt file points to where the OSS source code is archived
+RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
+    echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
+
+# Let an unprivileged runtime UID (for example 65532, the NeMo CI agent workloads) run this
+# image, which stays root by default. Create its home and the writable runtime paths callers
+# point caches and sources at, and hand it the prebuilt environment roots so it can create
+# entries there. Only the directories change owner: a recursive chown would copy every
+# hardlinked venv file into this layer. The uv cache and the venv contents already belong to
+# it; the layers that created them set that.
+RUN <<"EOF" bash -exu
+if [[ -n "${ROOT_ONLY:-}" ]]; then
+    echo "ROOT_ONLY is set; skipping the runtime user setup"
+    exit 0
+fi
+getent group "${RUNTIME_GID}" >/dev/null || groupadd --gid "${RUNTIME_GID}" nemo-runtime
+getent passwd "${RUNTIME_UID}" >/dev/null || useradd --no-log-init --uid "${RUNTIME_UID}" \
+    --gid "${RUNTIME_GID}" --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime
+install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /home/nemo-runtime /nemo_run \
+    "${NEMO_GYM_VENV_DIR}" /opt/nemo-rl-source /opt/nemo_rl_cache/uv /opt/nemo_rl_python
+chown "${RUNTIME_UID}:${RUNTIME_GID}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"
+# Sweep up anything still root-owned in the cache and venvs (the arm64 build left
+# nvidia/cusparselt root-owned). The runtime UID must be able to remove and replace files there
+# when it re-syncs offline. Only root-owned entries are touched, so files that already belong to
+# the runtime UID stay as they are and are not copied into this layer.
+find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
+    -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
+EOF
+USER ${RUNTIME_UID}:${RUNTIME_GID}
+RUN <<"EOF" bash -exu
+if [[ -n "${ROOT_ONLY:-}" ]]; then
+    echo "ROOT_ONLY is set; there is no runtime user to check"
+    exit 0
+fi
+uv --version
+"${UV_PROJECT_ENVIRONMENT}/bin/python" --version
+for dir in /home/nemo-runtime /nemo_run "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" \
+        "${NEMO_GYM_VENV_DIR}" /opt/nemo-rl-source /opt/nemo_rl_cache/uv /opt/nemo_rl_python; do
+    test -w "${dir}"
+done
+# The runtime UID owns the image's uv cache and the main venv's site-packages, and uv can open
+# that cache and check the venv against the lock with no network: what an offline
+# `uv run --extra <backend>` does before it installs the extra from the cache.
+test "$(uv cache dir)" = "${UV_CACHE_DIR}"
+test -O "${UV_CACHE_DIR}"
+test -O "$("${UV_PROJECT_ENVIRONMENT}/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+# STRIP_UV_CACHE builds intentionally ship an empty UV_CACHE_DIR (see the uv-writing
+# RUNs above), so there is no offline extra-install capability left to verify here.
+if [ -z "${STRIP_UV_CACHE:-}" ]; then
+    UV_OFFLINE=1 uv sync --frozen --inexact --no-install-project --no-install-workspace
+fi
+EOF
+USER root
+
+# Copy in source from build context (defaults to cloned repo, can be overridden)
+# Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
+COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
+
+# The steps that have to read the source. Each one re-runs on every source change.
+RUN <<"EOF" bash -exu
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),
 # so do a quick check before trying to unshallow.
-RUN git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
-RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
-    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
-# Same materialize/sync-back/strip dance as the dependency-install and
-# TRT-LLM RUNs -- this RUN's uv run/prefetch_venvs.py call below also needs
-# the plain, same-filesystem UV_CACHE_DIR to hardlink installs from. Already
-# exists from an earlier layer unless STRIP_UV_CACHE removed it there.
-source /tmp/uv-cache-helper/uv_cache_mount.sh
-uv_cache_restore
-trap 'uv_cache_persist' EXIT
-
-# Reuse the custom wheel the hermetic stage mirrored into /opt/trtllm_wheels
-# (the runtime default of the TRT-LLM build backend). It lives in that layer,
-# so it is present whether the TRT-LLM RUN executed on this builder or was
-# restored from the layer cache; do not read it from the builder-local cache
-# mount here. Normal uv artifacts stay in UV_CACHE_DIR.
-export TRTLLM_WHEEL_CACHE_DIR=/opt/trtllm_wheels
-export TRTLLM_REQUIRE_CACHED_WHEEL=1
-# Worker-venv prefetch, phase 2: the nemo_rl project itself.
-#
-# The other half of the split described in the dependency stage. Every venv already holds
-# its third-party packages, hardlinked in the layer that owns the uv cache. What was missing
-# is nemo_rl, because the source did not exist back there. It does now (COPY above), so
-# prefetch_venvs.py adds the editable install to each venv -- a .pth file, so this stays
-# cheap -- and writes the python-<ClassName> wrapper scripts into /usr/local/bin.
-#
-# This is why the venvs cannot simply be built here in one pass: hardlinking against the
-# dependency layer's cache from this layer would make overlayfs copy every wheel up.
-# Finish exactly the actors phase 1 built venvs for, by name. Re-deriving the list here
-# would mean filtering on the actor name again, which cannot tell that e.g.
-# AsyncTrajectoryCollector needs the vLLM extra -- so without vllm the two
-# passes would disagree and this layer would build three venvs the dependency layer
-# deliberately skipped. prefetch_venvs.py matches these positionally as substrings,
-# and a full FQN matches only itself. Each actor path is a symlink to its shared venv,
-# so actors that share one finish the same venv; the repeats change nothing.
-UV_LINK_MODE=hardlink uv run nemo_rl/utils/prefetch_venvs.py \
-    $(awk -F'\t' '{ print ($4 == "" ? $1 : $4) }' /opt/actor_venvs.tsv)
-# The editable installs, wrapper metadata, and build-backend wheels added above are new in
-# this layer; hand only those to the runtime UID so it can re-sync the venvs offline. Stays
-# unconditional even when STRIP_UV_CACHE is set -- see the dependency layer's chown above
-# for why.
+git rev-parse --is-shallow-repository | grep -q true && git fetch --unshallow || true
 if [[ -z "${ROOT_ONLY:-}" ]]; then
-    find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
-        -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
+    chown "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo-rl
+    # Local build contexts can come from a checkout with umask 0007. COPY preserves those
+    # root-owned modes; the runtime UID needs to read source files and traverse directories.
+    # Only entries that lack the permission are changed, so the rest are not copied into this layer.
+    find /opt/nemo-rl \( -type d ! -perm -a+rx -o -type f ! -perm -a+r \) -exec chmod a+rX {} +
+    test "$(stat -c %u /opt/nemo-rl)" = "${RUNTIME_UID}"
 fi
+# Generate container fingerprint for frozen environment support
+# Store outside /opt/nemo-rl to avoid being overwritten by user mounts
+python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
 EOF
 
 # Prefetch NeMo Gym internal venvs (gym servers like code_gen, math_with_judge, etc.)
 # into the image. Gated on NEMO_GYM_PREFETCH_CONFIGS (no-op by default). Runs after the
-# source COPY above so examples/nemo_gym/prefetch_venvs.py is present.
+# source COPY above so examples/nemo_gym/prefetch_venvs.py is present, which also makes it
+# re-run on every source change when it is enabled.
 # UV_LINK_MODE=symlink below applies to this outer `uv run` only. The gym server venvs
 # themselves are built in hardlink mode: examples/nemo_gym/prefetch_venvs.py pins
 # UV_LINK_MODE=hardlink in the Gym actor's runtime_env, because Gym's setup scripts shell
@@ -834,76 +879,20 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \
     UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS
     rm -f "${GYM_VLLM_OVERRIDE}"
+    # Same CVE cleanup as the sweep above, for the Gym venvs this step just created.
+    find "${NEMO_GYM_VENV_DIR}" "${UV_CACHE_DIR}" -name ray_dist.jar -delete
 fi
 EOF
-# ray's bundled Java worker jar ships an outdated httpcore5 with a known CVE
-# (GHSA-hf6x-8p5f-cgmf). NeMo-RL never uses Ray's Java cross-language worker,
-# and removing the jar doesn't affect ray.init(), remote tasks, actors, or
-# ray.serve (verified in NVIDIA-NeMo/Gym#3779/#3826). Sweep every venv (base,
-# per-backend worker venvs, gym-prefetched venvs) and the shared uv cache
-# (UV_CACHE_DIR, under /opt) that it could have landed in; /root still holds the
-# builder-local TRT-LLM caches.
-RUN find /opt /root -name ray_dist.jar -delete
-# Generate container fingerprint for frozen environment support
-# Store outside /opt/nemo-rl to avoid being overwritten by user mounts
-RUN python tools/generate_fingerprint.py > /opt/nemo_rl_container_fingerprint
 
-# NOTICES.txt file points to where the OSS source code is archived
-RUN echo "This distribution includes open source which is archived at the following URL: https://opensource.nvidia.com/oss/teams/nvidia/nemo-rl/${RC_DATE}:linux-${TARGETARCH}/index.html" > NOTICES.txt && \
-    echo "For further inquiries or assistance, contact us at oss-requests@nvidia.com" >> NOTICES.txt
-
-# Let an unprivileged runtime UID (for example 65532, the NeMo CI agent workloads) run this
-# image, which stays root by default. Create its home and the writable runtime paths callers
-# point caches and sources at, and hand it the prebuilt environment roots so it can create
-# entries there. Only the directories change owner: a recursive chown would copy every
-# hardlinked venv file into this layer. The uv cache and the venv contents already belong to
-# it; the layers that created them set that.
-RUN <<"EOF" bash -exu
-if [[ -n "${ROOT_ONLY:-}" ]]; then
-    echo "ROOT_ONLY is set; skipping the runtime user setup"
-    exit 0
-fi
-getent group "${RUNTIME_GID}" >/dev/null || groupadd --gid "${RUNTIME_GID}" nemo-runtime
-getent passwd "${RUNTIME_UID}" >/dev/null || useradd --no-log-init --uid "${RUNTIME_UID}" \
-    --gid "${RUNTIME_GID}" --create-home --home-dir /home/nemo-runtime --shell /bin/bash nemo-runtime
-install -d -o "${RUNTIME_UID}" -g "${RUNTIME_GID}" /home/nemo-runtime /nemo_run \
-    "${NEMO_GYM_VENV_DIR}" /opt/nemo-rl-source /opt/nemo_rl_cache/uv /opt/nemo_rl_python
-chown "${RUNTIME_UID}:${RUNTIME_GID}" /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}"
-# Sweep up anything still root-owned in the cache and venvs (the arm64 build left
-# nvidia/cusparselt root-owned). The runtime UID must be able to remove and replace files there
-# when it re-syncs offline. Only root-owned entries are touched, so files that already belong to
-# the runtime UID stay as they are and are not copied into this layer.
-find "${UV_CACHE_DIR}" "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" -xdev -uid 0 \
-    -exec chown -h "${RUNTIME_UID}:${RUNTIME_GID}" {} +
-# Local build contexts can come from a checkout with umask 0007. COPY preserves those
-# root-owned modes; the runtime UID needs to read source files and traverse directories.
-chmod -R a+rX /opt/nemo-rl
-EOF
-USER ${RUNTIME_UID}:${RUNTIME_GID}
-RUN <<"EOF" bash -exu
-if [[ -n "${ROOT_ONLY:-}" ]]; then
-    echo "ROOT_ONLY is set; there is no runtime user to check"
-    exit 0
-fi
-uv --version
-"${UV_PROJECT_ENVIRONMENT}/bin/python" --version
-for dir in /home/nemo-runtime /nemo_run /opt/nemo-rl "${UV_PROJECT_ENVIRONMENT}" "${NEMO_RL_VENV_DIR}" \
-        "${NEMO_GYM_VENV_DIR}" /opt/nemo-rl-source /opt/nemo_rl_cache/uv /opt/nemo_rl_python; do
-    test -w "${dir}"
-done
-# The runtime UID owns the image's uv cache and the main venv's site-packages, and uv can open
-# that cache and check the venv against the lock with no network: what an offline
-# `uv run --extra <backend>` does before it installs the extra from the cache.
-test "$(uv cache dir)" = "${UV_CACHE_DIR}"
-test -O "${UV_CACHE_DIR}"
-test -O "$("${UV_PROJECT_ENVIRONMENT}/bin/python" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
-# STRIP_UV_CACHE builds intentionally ship an empty UV_CACHE_DIR (see the uv-writing
-# RUNs above), so there is no offline extra-install capability left to verify here.
-if [ -z "${STRIP_UV_CACHE:-}" ]; then
-    UV_OFFLINE=1 uv sync --frozen --inexact --no-install-project --no-install-workspace
-fi
-EOF
-USER root
+# Build identity, last: these change on every build and nothing after them has to re-run.
+ARG NEMO_RL_COMMIT
+ARG NVIDIA_BUILD_ID
+ARG NVIDIA_BUILD_REF
+ENV NEMO_RL_COMMIT=${NEMO_RL_COMMIT:-<unknown>}
+ENV NVIDIA_BUILD_ID=${NVIDIA_BUILD_ID:-<unknown>}
+ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
+LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
+LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
 # Export the builder-local uv cache as a separate scratch image, same pattern
 # as the TRT-LLM ccache/wheel-cache below. CI builds this target immediately
