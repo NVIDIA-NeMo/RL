@@ -266,6 +266,30 @@ def _module_params_generator(
     for name, tensor in state_dict.items():
         if _is_lora_adapter_tensor(name):
             continue
+        if (
+            isinstance(tensor, DTensor)
+            and ".experts." in name
+            and _grouped_expert_lora_adapters(module_map, name)[0] is None
+        ):
+            # Grouped experts without LoRA: run the HF adapter on the shards
+            # (Automodel's adapters preserve DTensor placements; its own HF
+            # checkpoint export relies on that) and gather each HF tensor
+            # afterwards. Gathering first held the full fused tensor plus its
+            # transposed gate/up copies (Step-5: 8.25 + 4.12 GiB per layer).
+            for adapted_fqn, adapted_tensor in _maybe_adapt_tensor_to_hf(
+                model, name, tensor
+            ):
+                if isinstance(adapted_tensor, DTensor):
+                    adapted_tensor = _full_tensor_low_peak(adapted_tensor)
+                refit_dtype = _refit_tensor_dtype(
+                    adapted_fqn, adapted_tensor, target_dtype
+                )
+                yield (
+                    adapted_fqn,
+                    adapted_tensor.to(refit_dtype, non_blocking=True).contiguous(),
+                )
+                del adapted_tensor
+            continue
         full_tensor = (
             _full_tensor_low_peak(tensor) if isinstance(tensor, DTensor) else tensor
         )
