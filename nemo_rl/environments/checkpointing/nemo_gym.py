@@ -29,7 +29,7 @@ import time
 import uuid
 import warnings
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -51,14 +51,47 @@ from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
 if TYPE_CHECKING:
     from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneMutationCut
     from nemo_rl.algorithms.single_controller_utils.config import MasterConfig
+    from nemo_rl.data_plane.interfaces import DataPlaneClient
     from nemo_rl.experience.rollout_manager import RolloutManager
     from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
+    from nemo_rl.models.generation.interfaces import GenerationInterface
 
 # Rollout-deadline pause owned by a Gym checkpoint while it holds rollouts parked.
 _GYM_CHECKPOINT_DEADLINE_HOLDER = "gym_checkpoint"
 
 # Episodes named in a Gym checkpoint error; the rest are only counted.
 _GYM_EPISODE_SAMPLE_SIZE = 5
+
+
+@dataclass
+class GenerationCutStats:
+    """What one snapshot's generation cut achieved."""
+
+    # Gym's ``cut`` / ``cut_failed`` / ``cut_skipped`` counts.
+    counts: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class ObsoleteGenerationCutRows:
+    """Deletes ended calls' generation chunk rows when a snapshot starts.
+
+    A call's terminal write only retires its chunk rows, since the snapshot in
+    progress may name them; each snapshot deletes the ones retired before it.
+    """
+
+    generation: GenerationInterface
+    timeout_s: Optional[float]
+    # Numbers each snapshot's flush, so a worker skips a late one.
+    _epoch: int = 0
+
+    async def flush(self) -> None:
+        """Return once every worker deleted them; TQ saves no clear mid-way."""
+        self._epoch += 1
+        await asyncio.to_thread(
+            self.generation.flush_obsolete_generation_cut_rows,
+            self._epoch,
+            timeout_s=self.timeout_s,
+        )
 
 
 def _summarize_gym_episodes(
@@ -84,9 +117,14 @@ def build_gym_environment_checkpoint(
     *,
     env_handles: dict[str, Any],
     rollout_manager: RolloutManager,
-    dp_client: Any,
+    dp_client: DataPlaneClient,
+    generation: Optional[GenerationInterface] = None,
 ) -> GymEnvironmentCheckpoint:
-    """Build the Gym checkpoint and close Gym dispatch through its admission gate."""
+    """Build the Gym checkpoint and close Gym dispatch through its admission gate.
+
+    ``generation`` is required with prefix recovery: its workers delete ended
+    calls' generation chunk rows before each snapshot.
+    """
     staging_partition = master_config.token_capture.staging_partition
 
     async def list_staging_keys() -> list[str]:
@@ -97,6 +135,16 @@ def build_gym_environment_checkpoint(
             partition_id=staging_partition,
         )
 
+    obsolete_cut_rows: Optional[ObsoleteGenerationCutRows] = None
+    if master_config.rollout_recovery.generation_prefix_cuts_enabled:
+        if generation is None:
+            raise ValueError(
+                "prefix rollout recovery needs the generation handle to delete "
+                "ended calls' generation chunk rows"
+            )
+        obsolete_cut_rows = ObsoleteGenerationCutRows(
+            generation, master_config.token_capture.control_timeout_s
+        )
     environment_checkpoint = GymEnvironmentCheckpoint(
         GymCheckpointCoordinator(
             as_nemo_gym_shard_set(env_handles["nemo_gym"]),
@@ -109,6 +157,7 @@ def build_gym_environment_checkpoint(
         allow_restart_only_servers=(
             master_config.rollout_recovery.allow_restart_only_gym_servers
         ),
+        obsolete_cut_rows=obsolete_cut_rows,
     )
     rollout_manager.set_rollout_dispatch_admission_gate(
         environment_checkpoint.admission_gate
@@ -123,12 +172,14 @@ class GymEnvironmentSnapshot:
     checkpoint: GymEnvironmentCheckpoint
     commit: GymCheckpointCommitResult
     checkpoint_path: Path
+    # Filled in while the snapshot runs.
+    generation_cut: GenerationCutStats = field(default_factory=GenerationCutStats)
 
     @property
     def restarted_rollouts(self) -> int:
         return sum(len(episodes) for episodes in self.commit.manifest.restarts.values())
 
-    async def check_against_cut(self, cut: DataPlaneMutationCut) -> None:
+    async def check_against_cut(self, cut: DataPlaneMutationCut) -> frozenset[str]:
         """Require Gym ownership and referenced staging rows to match this cut.
 
         Gym may have exported episodes RL dropped while it was prepared: it
@@ -136,6 +187,10 @@ class GymEnvironmentSnapshot:
         They and their staged rows are left out of the saved manifest, since
         restore requires it to match RL's inventory and RL no longer continues
         them; a dropped group may already have cleaned those rows up.
+
+        Returns the staging rows the saved manifest keeps, which the TQ capture
+        must hold. ``commit`` still names the dropped episodes' rows, so callers
+        must use these instead.
         """
         cut.require_live()
         checkpoint, commit = self.checkpoint, self.commit
@@ -191,9 +246,11 @@ class GymEnvironmentSnapshot:
                 ),
             )
 
-        expected_staging_keys = {key for keys in staging_keys.values() for key in keys}
+        expected_staging_keys = frozenset(
+            key for keys in staging_keys.values() for key in keys
+        )
         if not expected_staging_keys:
-            return
+            return expected_staging_keys
         actual_staging_keys = set(await checkpoint._list_staging_keys())
         missing = sorted(expected_staging_keys - actual_staging_keys)
         if missing:
@@ -201,12 +258,18 @@ class GymEnvironmentSnapshot:
                 "Gym checkpoint references staging rows missing from live TQ state: "
                 f"missing={missing[:10]!r} (total={len(missing)})"
             )
+        return expected_staging_keys
 
     def metrics(self, paused_seconds: float) -> dict[str, float]:
+        # A dict literal: the telemetry drift test reads these keys from source.
         return {
             "gym_parked_seconds": paused_seconds,
             # Episodes Gym could not capture; they start over after a crash.
             "gym_restarted_episodes": float(self.restarted_rollouts),
+            **{
+                f"generation_{name}_calls": float(count)
+                for name, count in self.generation_cut.counts.items()
+            },
         }
 
 
@@ -221,6 +284,7 @@ class GymEnvironmentCheckpoint:
         rollout_manager: Any,
         list_staging_keys: Callable[[], Awaitable[Iterable[str]]],
         allow_restart_only_servers: bool = False,
+        obsolete_cut_rows: Optional[ObsoleteGenerationCutRows] = None,
     ) -> None:
         """Wrap ``coordinator``.
 
@@ -232,12 +296,15 @@ class GymEnvironmentCheckpoint:
                 to check the ones the committed episodes reference still exist.
             allow_restart_only_servers: Accept Gym servers whose rollouts start
                 over after a crash, with a warning, instead of refusing them.
+            obsolete_cut_rows: Deletes ended calls' generation chunk rows
+                before Gym prepares; set with prefix recovery.
         """
         self.coordinator = coordinator
         self._ledger = ledger
         self._rollout_manager = rollout_manager
         self._list_staging_keys = list_staging_keys
         self._allow_restart_only_servers = allow_restart_only_servers
+        self._obsolete_cut_rows = obsolete_cut_rows
         # Separate from the data-plane barrier: it pauses only Gym /run
         # submissions while a Gym checkpoint is prepared.
         self.admission_gate = DataPlaneCheckpointBarrier()
@@ -273,7 +340,7 @@ class GymEnvironmentCheckpoint:
         """Refuse, or warn about, Gym servers whose rollouts start over after a crash.
 
         Such a server's in-flight rollouts are reported as restarts at every
-        checkpoint, so turn-level recovery would quietly become
+        checkpoint, so turn- or prefix-level recovery would quietly become
         restart-from-task for them.
         """
         allowed = self._allow_restart_only_servers
@@ -286,7 +353,7 @@ class GymEnvironmentCheckpoint:
         }
         if restart_only and not allowed:
             raise ValueError(
-                "rollout_recovery.target_level='turn' cannot continue rollouts on "
+                "Turn and prefix recovery cannot continue rollouts on "
                 "these restart-only Gym servers, which start every in-flight "
                 f"rollout over after a crash: {restart_only!r}. Set "
                 "rollout_recovery.allow_restart_only_gym_servers=true to accept "
@@ -444,6 +511,9 @@ class GymEnvironmentCheckpoint:
             else f"rollout-{uuid.uuid4().hex}"
         )
         coordinator = self.coordinator
+        generation_cut = GenerationCutStats()
+        if self._obsolete_cut_rows is not None:
+            await self._obsolete_cut_rows.flush()
         async with self.admission_gate.checkpoint():
             # Gym parks every live rollout until resume, so the wait must not
             # count against their deadlines. A separate holder keeps a
@@ -456,7 +526,9 @@ class GymEnvironmentCheckpoint:
                 # it is still idle; dispatch is already closed, so nothing new
                 # races in.
                 await self._retire_dropped_episodes(checkpoint_id)
-                async with coordinator.prepared(checkpoint_id) as restarts:
+                async with coordinator.prepared(checkpoint_id) as prepared:
+                    restarts = prepared.restarts
+                    generation_cut.counts = dict(prepared.generation_cut_counts)
                     candidates = self.inventory()
                     # A row dropped since that retire is still running in Gym,
                     # which exports it; naming it keeps the export in scope, and
@@ -491,6 +563,7 @@ class GymEnvironmentCheckpoint:
                         checkpoint=self,
                         commit=commit,
                         checkpoint_path=Path(checkpoint_path),
+                        generation_cut=generation_cut,
                     )
             finally:
                 self._rollout_manager.resume_request_deadlines(

@@ -22,7 +22,8 @@
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
-# Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
+# Optional etcd and nats-server binaries for Dynamo serving
+# (policy.generation.dynamo=true; ai-dynamo itself ships in the vLLM venvs):
 #   --build-arg BUILD_DYNAMO=1
 # Optional: drop the uv cache from the image (smaller, but no offline `uv run --extra`):
 #   --build-arg STRIP_UV_CACHE=1
@@ -654,7 +655,6 @@ ARG BASE_IMAGE
 ARG UV_VERSION
 ARG HYBRID_EP_MULTINODE
 ARG BUILD_DYNAMO
-ARG DYNAMO_PYTHON_VERSION=3.12.11
 ARG ETCD_VERSION=v3.5.21
 ARG NATS_VERSION=v2.11.6
 # Space-separated config paths whose NeMo Gym venvs are prefetched into the image
@@ -674,7 +674,7 @@ ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
 LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
-ENV NEMO_RL_DYNAMO_VENV_DIR=/opt/dynamo_venv
+ENV NEMO_RL_DYNAMO_BIN_DIR=/opt/dynamo/bin
 
 # AWS EFA OFI plugin discovery (p4d / p5 / p5en multi-node NCCL via SRD).
 # The host's aws-efa-installer places libnccl-net-ofi.so under
@@ -691,19 +691,15 @@ ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_P
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
 COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 
-# Keep Dynamo's Python 3.12 dependency graph isolated from NeMo-RL's normal
-# Ray/vLLM environments. Default image builds do not create this environment.
+# The control-plane binaries Dynamo serving starts. Default image builds skip them.
+# Not a uv-writing RUN (install.sh only downloads etcd and nats-server), so it
+# needs no uv cache mount.
 RUN <<"EOF" bash -exu -o pipefail
 if [[ "${BUILD_DYNAMO:-0}" != "1" ]]; then
-    echo "BUILD_DYNAMO is not 1; skipping the managed Dynamo runtime"
+    echo "BUILD_DYNAMO is not 1; skipping the Dynamo service binaries"
     exit 0
 fi
-# Dynamo syncs its own lock (Python 3.12) into a --link-mode copy venv that nothing re-syncs at
-# runtime, so its wheels are never needed from the shared cache. A throwaway cache keeps them
-# out of this layer instead of shipping them twice, and out of the durable cache mount, so this
-# RUN needs neither the mount nor the uv_cache_mount.sh restore/persist.
-UV_CACHE_DIR=/tmp/dynamo-uv-cache bash docker/dynamo/install.sh
-rm -rf /tmp/dynamo-uv-cache
+bash docker/dynamo/install.sh
 EOF
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
 # Potentially not necessary if the repo is passed in as a complete repository (w/ full git history),

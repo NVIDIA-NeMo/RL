@@ -39,9 +39,11 @@ import pytest
 import torch
 
 from nemo_rl.data.captured_media import capture_processed_media
+from nemo_rl.models.generation.prefix_recovery import NoPrefixRecovery
 from nemo_rl.models.generation.vllm import utils as vllm_utils
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
+    _AsyncLLMHTTPClient,
 )
 
 # The server subclasses each of these (NeMoRLOnlineRenderer, and so on), so the
@@ -61,7 +63,25 @@ def _recorder(slot: str):
 
 
 _OnlineRenderer = _recorder("renderer")
-_OpenAIServingChat = _recorder("chat")
+
+
+class _OpenAIServingChat(_recorder("chat")):
+    async def chat_completion_full_generator(
+        self,
+        request,
+        result_generator,
+        request_id=None,
+        model_name=None,
+        conversation=None,
+        tokenizer=None,
+        request_metadata=None,
+        parser=None,
+        mm_token_counts=None,
+    ):
+        """vLLM 0.29's parameters, which setup checks; tests patch the body."""
+        raise NotImplementedError
+
+
 _ServingTokenization = _recorder("tokenize")
 
 
@@ -186,6 +206,19 @@ def _install_fake_vllm(monkeypatch):
         built.clear()
 
 
+class _AdmittedRequests:
+    """The capture registry's membership test, over requests admitted by ID."""
+
+    def __init__(self, admitted: dict) -> None:
+        self._admitted = admitted
+
+    def __contains__(self, request) -> bool:
+        return id(request) in self._admitted
+
+    def get(self, request):
+        return self._admitted.get(id(request))
+
+
 def _build_server(monkeypatch, serving_chat_kwargs, *, capture_requests=(), app=None):
     """Run the real server setup and hand back the three consumer stubs."""
     _install_fake_vllm(monkeypatch)
@@ -204,12 +237,29 @@ def _build_server(monkeypatch, serving_chat_kwargs, *, capture_requests=(), app=
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
         served_model_name="served-model", model="model-path"
     )
-    worker._capture_calls = {id(request): None for request in capture_requests}
+    worker._capture_registry = _AdmittedRequests(
+        {id(request): None for request in capture_requests}
+    )
+    # Its hooks do nothing, as a worker without generation-prefix cuts.
+    worker._prefix_recovery = NoPrefixRecovery()
     worker.routed_experts_dtype = torch.int16
 
     worker._setup_vllm_openai_api_server(app if app is not None else _FakeApp())
     assert _BUILT["chat"][0].kwargs["engine_client"] is worker._http_engine_client
     return _BUILT["renderer"], _BUILT["chat"], _BUILT["tokenize"]
+
+
+def _serving_chat_without_capture_state(monkeypatch: Any) -> Any:
+    """The real serving chat class, with no call admitted to capture."""
+    _, chats, _ = _build_server(monkeypatch, {})
+    serving = chats[0]
+    serving.renderer = types.SimpleNamespace(tokenizer=None)
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_return_routed_experts_enabled",
+        lambda _self: False,
+    )
+    return serving
 
 
 @pytest.mark.asyncio
@@ -258,6 +308,9 @@ async def test_captured_chat_logprobs_bypass(
         stream=stream,
         logprobs=logprobs,
         top_logprobs=0,
+        # NeMoRLChatCompletionRequest's defaults for a call with no restored prefix.
+        _restored_generation_token_ids=(),
+        _restored_prefix_terminal=None,
         return_tokens_as_token_ids=token_ids,
     )
     _, chats, _ = _build_server(
@@ -344,6 +397,104 @@ async def test_captured_chat_logprobs_bypass(
         assert choice.message.prompt_token_ids == [1, 2]
         assert choice.message.generation_token_ids == [7]
         assert choice.message.generation_log_probs == [-0.5]
+
+
+@pytest.mark.asyncio
+async def test_resumed_call_reports_usage_as_the_uninterrupted_call(monkeypatch):
+    """The restored prefix the engine served as prompt is counted as completion.
+
+    vLLM's parser sees the restored tokens before the tail, and the corrected
+    usage reaches request_metadata, both bound by name.
+    """
+    serving = _serving_chat_without_capture_state(monkeypatch)
+    serving.return_tokens_as_token_ids = False
+    request = types.SimpleNamespace(
+        ng_capture=None,
+        stream=False,
+        logprobs=False,
+        top_logprobs=0,
+        # Prompt [1, 2, 3]; the call resumed from generated prefix [4, 5].
+        _restored_generation_token_ids=(4, 5),
+        _restored_prefix_terminal=None,
+        return_tokens_as_token_ids=False,
+    )
+
+    class Parser:
+        name = "hermes"
+
+        def __init__(self) -> None:
+            self.seen_token_ids: list[int] = []
+
+        def parse(
+            self, model_output, request, *, enable_auto_tools, model_output_token_ids
+        ):
+            self.seen_token_ids = list(model_output_token_ids)
+            return model_output
+
+    parser = Parser()
+    request_metadata = types.SimpleNamespace(final_usage_info=None)
+
+    async def format_response(self, upstream_request, results, *args, **kwargs):
+        async for _ in results:
+            pass
+        # As vLLM's full generator does: parse the tail, read other attributes.
+        wrapped = kwargs["parser"]
+        wrapped.parse(
+            "tail",
+            upstream_request,
+            enable_auto_tools=True,
+            model_output_token_ids=[6, 7],
+        )
+        assert wrapped.name == "hermes"
+        response = sys.modules[
+            "vllm.entrypoints.openai.chat_completion.protocol"
+        ].ChatCompletionResponse()
+        response.choices = [types.SimpleNamespace(index=0, message=None, logprobs=None)]
+        response.prompt_token_ids = [1, 2, 3, 4, 5]
+        # vLLM's count: the prefix as prompt, the two-token tail as completion.
+        response.usage = types.SimpleNamespace(
+            prompt_tokens=5,
+            completion_tokens=2,
+            total_tokens=7,
+            prompt_tokens_details=None,
+        )
+        return response
+
+    monkeypatch.setattr(
+        _OpenAIServingChat,
+        "chat_completion_full_generator",
+        format_response,
+        raising=False,
+    )
+
+    async def results() -> AsyncIterator[Any]:
+        yield types.SimpleNamespace(
+            prompt_token_ids=[1, 2, 3, 4, 5],
+            outputs=[
+                types.SimpleNamespace(
+                    index=0,
+                    token_ids=[6, 7],
+                    logprobs=None,
+                    text="tail",
+                    finish_reason="stop",
+                    stop_reason=None,
+                )
+            ],
+        )
+
+    response = await serving.chat_completion_full_generator(
+        request, results(), request_metadata=request_metadata, parser=parser
+    )
+
+    assert parser.seen_token_ids == [4, 5, 6, 7]
+    assert request_metadata.final_usage_info is response.usage
+    usage = response.usage
+    assert (usage.prompt_tokens, usage.completion_tokens, usage.total_tokens) == (
+        3,
+        4,
+        7,
+    )
+    assert response.prompt_token_ids == [1, 2, 3]
 
 
 @pytest.mark.parametrize(
@@ -465,8 +616,13 @@ def test_capture_bypasses_upstream_route_encoding_without_changing_plain_request
         )
         for _ in range(2)
     ]
+    for request in requests:
+        # NeMoRLChatCompletionRequest's defaults for a call with no restored prefix.
+        request._restored_generation_token_ids = ()
+        request._restored_prefix_terminal = None
     _, chats, _ = _build_server(monkeypatch, {}, capture_requests=[requests[0]])
     chat = chats[0]
+    chat.renderer = types.SimpleNamespace(tokenizer=None)
     results = []
     for request_index in range(2):
         per_request = []
@@ -566,7 +722,9 @@ def test_prefix_splice_remaps_image_once(monkeypatch, capture_media):
     }
     captured = []
     admission = (
-        SimpleNamespace(mode="token_in", prev_len=4, request_replay=None)
+        SimpleNamespace(
+            mode="token_in", prev_len=4, request_replay=None, generation_cut=None
+        )
         if capture_media
         else None
     )
@@ -705,3 +863,136 @@ def test_prefix_overflow_precedes_media_validation(
     else:
         capture.assert_called_once()
         assert remap.call_count == (failure_stage == "remap")
+
+
+@pytest.mark.parametrize(
+    ("prefix_tokens", "max_tokens", "min_tokens", "terminal"),
+    [
+        # Two of six tokens restored: the tail may decode four, and owes two more.
+        (2, 4, 2, None),
+        # The restored prefix already used the whole budget: decode one token
+        # the response drops, with no minimum.
+        (6, 1, 0, "output_limit"),
+    ],
+)
+def test_restored_call_reaches_the_engine_with_the_remaining_budget(
+    monkeypatch, prefix_tokens, max_tokens, min_tokens, terminal
+):
+    """The engine sees the durable prefix as prompt and only what is left to decode."""
+    app = _FakeApp()
+    conversation = [10, 31, 2]
+    # The cut's rows: the generated tokens, with one non-generated token that
+    # a resumed call must not count as its own output.
+    delta = [40 + i for i in range(prefix_tokens)] + [99]
+    mask = [1.0] * prefix_tokens + [0.0]
+    admission = SimpleNamespace(
+        mode="token_in",
+        request_replay=None,
+        capture_key="r0",
+        model_call_id="c1",
+        generation_cut=SimpleNamespace(
+            prefix_token_count=prefix_tokens,
+            effective_output_limit=6,
+            terminal_finish_reason=None,
+            terminal_stop_reason=None,
+        ),
+    )
+
+    async def preprocess(self, *, messages, **kwargs):
+        return None, [{"prompt_token_ids": conversation + [11]}]
+
+    monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", preprocess, raising=False)
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_media", False, raising=False
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl, "_capture_admission", lambda self, r: admission
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_resolve_admission_prefix",
+        lambda self, admission: list(conversation),
+    )
+    monkeypatch.setattr(
+        NoPrefixRecovery,
+        "resolve_restore",
+        lambda self, admission, prefix: (
+            admission,
+            SimpleNamespace(token_ids_delta=delta, token_mask_delta=mask),
+        ),
+    )
+    monkeypatch.setattr(
+        VllmAsyncGenerationWorkerImpl,
+        "_enter_request_prefix",
+        lambda self, request, prefix: setattr(
+            request, "required_prefix_token_ids", prefix
+        ),
+    )
+    begin = MagicMock()
+    monkeypatch.setattr(VllmAsyncGenerationWorkerImpl, "_begin_request_capture", begin)
+    renderers, _, _ = _build_server(monkeypatch, {}, app=app)
+    renderer = renderers[0]
+    renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
+    renderer.model_config = SimpleNamespace(max_model_len=64)
+    endpoint = next(fn for path, fn in app.routes if path == "/v1/chat/completions")
+    request = endpoint.__annotations__["request"]()
+    request.max_tokens, request.max_completion_tokens, request.min_tokens = 6, None, 4
+    request.model_copy = lambda **kwargs: request
+
+    # vLLM may rebuild the prompt before it reaches the engine client.
+    built = []
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async."
+        "_build_restored_prefix_terminal_output",
+        lambda request_id, finished: built.append(finished) or "finished output",
+    )
+
+    class EngineThatMustNotDecode:
+        model_config = renderer = input_processor = vllm_config = None
+
+        def generate(self, *args, **kwargs):
+            raise AssertionError("a finished restored call reached the engine")
+
+    async def prepare_then_generate():
+        # One task, as on the server: the chat is prepared, then submitted.
+        _, (engine_prompt,) = await renderer.preprocess_chat(
+            request, [{"role": "assistant"}, {"role": "tool"}], None, None, {}
+        )
+        if terminal is None:
+            return engine_prompt, None
+        client = _AsyncLLMHTTPClient(
+            EngineThatMustNotDecode(), MagicMock(), flat_logprobs=False
+        )
+        outputs = [
+            output
+            async for output in client._generate(
+                {"prompt_token_ids": list(engine_prompt["prompt_token_ids"])},
+                None,
+                "chatcmpl-1",
+                {},
+            )
+        ]
+        return engine_prompt, outputs
+
+    engine_prompt, outputs = asyncio.run(prepare_then_generate())
+
+    assert engine_prompt["prompt_token_ids"] == conversation + delta
+    assert (request.max_tokens, request.min_tokens) == (max_tokens, min_tokens)
+    assert request._original_min_tokens == 4
+    assert begin.call_args.kwargs["resumed_generation_token_ids"] == delta[:-1]
+    if terminal is not None:
+        # Answered from the saved prefix, without decoding a token.
+        assert outputs == ["finished output"]
+        assert [finished.reason for finished in built] == [terminal]
+
+
+def test_setup_refuses_a_full_generator_without_the_restored_call_arguments():
+    from nemo_rl.models.generation.prefix_recovery.restore import (
+        _full_generator_signature,
+    )
+
+    async def renamed(self, request, result_generator, request_metadata, parsers=None):
+        pass
+
+    with pytest.raises(RuntimeError, match=r"no \['parser'\] parameter"):
+        _full_generator_signature(renamed)

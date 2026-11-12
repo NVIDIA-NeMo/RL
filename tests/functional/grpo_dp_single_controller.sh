@@ -61,3 +61,7 @@ if [[ "${RUN_CONVERGENCE_CHECKS:-1}" == "1" ]]; then
         'min(data["train/probs_ratio_clamped_max"]) > 0.79' \
         'max(data["train/probs_ratio_clamped_max"]) < 1.21'
 fi
+
+if [[ "$*" == *generation.dynamo=true* ]]; then
+    bash $SCRIPT_DIR/check_dynamo_overlay.sh $RUN_LOG
+fi

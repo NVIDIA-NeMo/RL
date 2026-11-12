@@ -425,6 +425,11 @@ class SingleControllerActor:
             stage_cfg.message_level_advantage_penalties_enabled
         )
         self._policy_logprobs_required = stage_cfg.policy_logprobs_required
+        # In-loss filtering decides rejections in the policy loss, which does not
+        # run during critic warmup; those steps take the separate pass instead.
+        self._warmup_policy_logprobs_required = (
+            self._is_ppo and master_config.loss_fn.seq_logprob_error_in_loss
+        )
         self._reference_logprobs_required = stage_cfg.reference_logprobs_required
         self._teacher_logprobs_required = stage_cfg.teacher_logprobs_required
         self._train_fields = _train_fields_for_step(
@@ -541,13 +546,14 @@ class SingleControllerActor:
         # it costs five minutes, not quietly at hour three of a run.
         self._env_handles = actor_args.env_handles
         # Rollout state the environment backend holds between turns. Only
-        # turn-level recovery keeps any; otherwise this is a no-op.
+        # turn- and prefix-level recovery keep any; otherwise this is a no-op.
         self._environment_checkpoint: EnvironmentCheckpoint = (
             build_environment_checkpoint(
                 master_config,
                 env_handles=self._env_handles,
                 rollout_manager=self._rollout_manager,
                 dp_client=self._dp_client,
+                generation=self._gen,
             )
         )
         # These two keep the getattr for a genuinely different reason: None is a
@@ -871,6 +877,12 @@ class SingleControllerActor:
 
         if await self._rollout_restorer.restore():
             self._rollout_recovery_enabled = True
+
+        # Capture the baseline before either pump can dispatch generation.
+        try:
+            await asyncio.to_thread(self._gen.snapshot_step_metrics)
+        except RayActorError as error:
+            log.warning("Skipping generation snapshot metrics: %s", error)
 
         # Start the rollout and train pumps, plus the watchdog
         rollout_task = asyncio.create_task(self._rollout_pump())
@@ -2593,6 +2605,9 @@ class SingleControllerActor:
             aborted_stale_inflight_groups = 0
             # Always True off the PPO path: the start step is pinned to 0 there.
             is_policy_training_step = self._train_steps >= policy_training_start_step
+            policy_logprobs_required = self._policy_logprobs_required or (
+                self._warmup_policy_logprobs_required and not is_policy_training_step
+            )
             consumed_metas: list[KVBatchMeta] = []
             consumed_training_claim_ids: list[str] = []
             consumed_group_count = 0
@@ -2802,14 +2817,6 @@ class SingleControllerActor:
                             train_meta.extra_info.pop(ROLLOUT_METRICS, [])
                         )
 
-                    if groups_dispatched == 0:
-                        try:
-                            await asyncio.to_thread(self._gen.snapshot_step_metrics)
-                        except RayActorError as error:
-                            log.warning(
-                                "Skipping generation snapshot metrics: %s", error
-                            )
-
                     # Safe mid-loop: colocated steps are assembled whole, so the loop closes after this.
                     # The gate reopens at the post-step _sync_weights wake, or after the save on save-bound steps.
                     if self._gen.blocks_training():
@@ -2866,10 +2873,7 @@ class SingleControllerActor:
                                 )
 
                     # Compute prev_logprobs / ref_logprobs
-                    if (
-                        self._policy_logprobs_required
-                        or self._reference_logprobs_required
-                    ):
+                    if policy_logprobs_required or self._reference_logprobs_required:
                         with (
                             self._timer.time("logprob_inference_prep"),
                             managed_span(
@@ -2896,7 +2900,7 @@ class SingleControllerActor:
                                 tracer=self._tracer,
                             ),
                         ):
-                            if self._policy_logprobs_required:
+                            if policy_logprobs_required:
                                 await asyncio.to_thread(
                                     self._trainer.get_logprobs_from_meta, train_meta
                                 )
@@ -2918,7 +2922,10 @@ class SingleControllerActor:
                         (
                             train_meta,
                             has_valid_training_tokens,
-                        ) = await self._advantage_stage(train_meta)
+                        ) = await self._advantage_stage(
+                            train_meta,
+                            policy_logprobs_required=policy_logprobs_required,
+                        )
                     if forest_training:
                         # The advantage stage has verified every owner/segment.
                         # Count those owners, not the physical rows or sampler tally.
@@ -3354,10 +3361,28 @@ class SingleControllerActor:
                         step_metrics[name] = Table(data=data, columns=["Full result"])
                 try:
                     step_metrics.update(
-                        await asyncio.to_thread(self._gen.get_step_metrics)
+                        await asyncio.to_thread(
+                            self._gen.get_step_metrics, keep_snapshot=True
+                        )
                     )
                 except RayActorError as error:
                     log.warning("Skipping generation step metrics: %s", error)
+                if self._master_config.rollout_recovery.generation_prefix_cuts_enabled:
+                    try:
+                        prefix_counts = await asyncio.to_thread(
+                            self._gen.get_generation_prefix_counts
+                        )
+                    except RayActorError as error:
+                        log.warning("Skipping generation-prefix metrics: %s", error)
+                    else:
+                        # Totals since the generation workers started, so a
+                        # restore or a failed cut shows up as a step in the curve.
+                        step_metrics.update(
+                            {
+                                f"generation_prefix/{name}": float(count)
+                                for name, count in prefix_counts.items()
+                            }
+                        )
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 step_metrics.update(
                     _pooled_opd_metrics(
@@ -5010,7 +5035,12 @@ class SingleControllerActor:
         assert result is not None
         return result
 
-    async def _advantage_stage(self, meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
+    async def _advantage_stage(
+        self,
+        meta: KVBatchMeta,
+        *,
+        policy_logprobs_required: Optional[bool] = None,
+    ) -> tuple[KVBatchMeta, bool]:
         """Fetch advantage inputs, compute advantages, and write them back.
 
         SC owns the prompt-group-scoped advantage stage because the selected
@@ -5083,6 +5113,7 @@ class SingleControllerActor:
                 train_step=(
                     self._train_steps if self._train_data_dump is not None else None
                 ),
+                policy_logprobs_required=policy_logprobs_required,
             )
             for shard in (shards if shards is not None else [meta])
         ]
