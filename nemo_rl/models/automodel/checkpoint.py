@@ -18,6 +18,7 @@ for saving and loading model checkpoints in Automodel policy workers.
 """
 
 import logging
+import gc
 import os
 import tempfile
 from collections.abc import Mapping
@@ -195,6 +196,27 @@ except Exception as e:  # pragma: no cover - defensive: never break import
         "(transformers #44627/#45358 workaround): %s",
         e,
     )
+
+
+def _stage_optimizer_state_on_cpu(optimizer: torch.optim.Optimizer) -> None:
+    """Initialize optimizer state and move it to host memory before a DCP load.
+
+    Both the master-dtype check and the DCP load build ``optimizer.state_dict()``.
+    Optimizers with low-precision state (TE FusedAdam with BF16 moments) return
+    FP32 copies of every state on the state's device; on GPU that is +8 B/param
+    at once (Step-5 600B on 128 H100s: resume OOM). Built on CPU, the copies
+    land in host memory; FusedAdam.load_state_dict re-creates the state on the
+    parameter device, and ``prepare_for_training`` moves state to CUDA anyway.
+    """
+    from torch.distributed.checkpoint.state_dict import _init_optim_state
+
+    _init_optim_state(optimizer)
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if isinstance(v, torch.Tensor) and v.device.type != "cpu":
+                state[k] = v.to("cpu")
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 class AutomodelCheckpointManager:
@@ -463,6 +485,7 @@ class AutomodelCheckpointManager:
 
         # load optimizer
         if optimizer_path and optimizer is not None:
+            _stage_optimizer_state_on_cpu(optimizer)
             self.check_master_weight_dtypes(model, optimizer, optimizer_path)
             self.checkpointer.load_optimizer(
                 optimizer=optimizer,
