@@ -232,6 +232,9 @@ def test_configure_generation_config_validates_refit_prequantize() -> None:
         configure_generation_config(generation_config, tokenizer)
 
 
+_SERVED_ASYNC = {"async_engine": True, "expose_http_server": True}
+
+
 @pytest.mark.parametrize(
     ("vllm_cfg", "match"),
     [
@@ -250,6 +253,22 @@ def test_configure_generation_config_validates_refit_prequantize() -> None:
         (
             {"output_loop_yield_budget_ms": 0, "async_engine": True},
             "output_loop_yield_budget_ms must be positive",
+        ),
+        (
+            {"num_frontend_workers": 2, "async_engine": True},
+            "num_frontend_workers requires",
+        ),
+        (
+            {"num_frontend_workers": 2, "expose_http_server": True},
+            "num_frontend_workers requires",
+        ),
+        (
+            {"num_frontend_workers": -1, **_SERVED_ASYNC},
+            "num_frontend_workers must be a non-negative integer",
+        ),
+        (
+            {"num_frontend_workers": True, **_SERVED_ASYNC},
+            "num_frontend_workers must be a non-negative integer",
         ),
     ],
 )
@@ -271,10 +290,32 @@ def test_async_actor_settings_reject_ignored_options(
             "async_engine": True,
             "expose_http_server": True,
         },
+        {"num_frontend_workers": 0},
+        {"num_frontend_workers": 4, **_SERVED_ASYNC},
     ],
 )
 def test_async_actor_settings_accept_supported_options(vllm_cfg: dict) -> None:
     validate_vllm_async_actor_settings(cast(VllmConfig, {"vllm_cfg": vllm_cfg}))
+
+
+@pytest.mark.parametrize(
+    ("generation_cfg", "unsupported"),
+    [
+        ({"dynamo": True}, "dynamo"),
+        ({"refit_transport": "vllm_zmq_sparse"}, "refit_transport=vllm_zmq_sparse"),
+        ({"quant_cfg": "nvfp4"}, "quant_cfg"),
+        ({"worker_extension_cls_fqn": "a.B"}, "worker_extension_cls_fqn"),
+    ],
+)
+def test_frontend_workers_reject_what_the_engine_actor_must_serve(
+    generation_cfg: dict, unsupported: str
+) -> None:
+    config = {
+        "vllm_cfg": {"num_frontend_workers": 2, **_SERVED_ASYNC},
+        **generation_cfg,
+    }
+    with pytest.raises(ValueError, match=f"not supported with: {unsupported}"):
+        validate_vllm_async_actor_settings(cast(VllmConfig, config))
 
 
 def test_async_actor_settings_allow_omitted_vllm_cfg() -> None:

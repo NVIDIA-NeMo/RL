@@ -43,6 +43,7 @@ from nemo_rl.models.generation.vllm.utils import (
     encode_counter_key,
     extract_generation_logprobs,
     format_prompt_for_vllm_generation,
+    merge_frontend_logger_metrics,
     model_dump_chat_response_with_dynamic_message_fields,
     pad_and_align_routed_expert_indices,
     remap_multimodal_placeholders,
@@ -1101,6 +1102,31 @@ def test_aggregate_spec_decode_counters():
     assert counters["vllm:spec_decode_num_draft_tokens"] == 750.0
     assert counters["vllm:spec_decode_num_accepted_tokens"] == 600.0
     assert "other_metric" not in counters
+
+
+def test_frontend_logger_reports_merge_into_one_engine_report():
+    fresh = {
+        "inflight_batch_sizes": [120],
+        "num_pending_samples": [0],
+        "kv_cache_usage_perc": [0.4],
+        "generation_tokens": [5, 7],
+        "gauges_changed_at": 20.0,
+    }
+    stale = {
+        "inflight_batch_sizes": [280],
+        "num_pending_samples": [8],
+        "kv_cache_usage_perc": [0.9],
+        "generation_tokens": [10, 20, 30],
+        "gauges_changed_at": 10.0,
+    }
+    # Gauges from the freshest report; counters summed over the samples all have.
+    assert merge_frontend_logger_metrics([fresh, {}, stale]) == {
+        "inflight_batch_sizes": [120],
+        "num_pending_samples": [0],
+        "kv_cache_usage_perc": [0.4],
+        "generation_tokens": [25, 37],
+    }
+    assert merge_frontend_logger_metrics([{}, {}]) == {}
 
 
 def test_compute_spec_decode_metrics():

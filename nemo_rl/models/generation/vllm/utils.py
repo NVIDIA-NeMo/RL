@@ -1161,6 +1161,36 @@ def compute_spec_decode_metrics(
     return spec_metrics
 
 
+# vLLM logger gauges describe the whole engine, but vLLM sends each step's
+# scheduler stats to only one of the engine's clients.
+LOGGER_GAUGE_KEYS = (
+    "inflight_batch_sizes",
+    "num_pending_samples",
+    "kv_cache_usage_perc",
+)
+# Cumulative per client.
+LOGGER_COUNTER_KEYS = ("generation_tokens",)
+GAUGES_CHANGED_AT_KEY = "gauges_changed_at"
+
+
+def merge_frontend_logger_metrics(
+    reports: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Merge one engine's frontend logger reports: freshest gauges, summed counters."""
+    reports = [report for report in reports if report]
+    if not reports:
+        return {}
+    freshest = max(reports, key=lambda report: report[GAUGES_CHANGED_AT_KEY])
+    merged: dict[str, Any] = {key: list(freshest[key]) for key in LOGGER_GAUGE_KEYS}
+    for key in LOGGER_COUNTER_KEYS:
+        histories = [report[key] for report in reports]
+        length = min(map(len, histories))
+        # Sum the latest samples every frontend has.
+        tails = [history[len(history) - length :] for history in histories]
+        merged[key] = [sum(values) for values in zip(*tails)]
+    return merged
+
+
 # TODO: Replace this hard-coded map with a generic plugin-registration
 # hook on ``VllmGeneration`` (e.g. a ``worker_cls_overrides`` registry populated
 # by ``nemo_rl.modelopt`` on import) so core has no knowledge of ModelOpt-specific

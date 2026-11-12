@@ -35,6 +35,9 @@ source-sensitive compatibility patches:
 * ``install_output_loop_yield`` patches AsyncLLM's output loops at runtime. Its
   yield and reader-budget behavior is checked against a stand-in client, and a
   canary fails if the pinned vLLM moves the calls it relies on.
+* ``extra_engine_client_addresses`` wraps the address allocator an engine launch
+  calls, so the engine core gets clients beyond the one that launches it. It is
+  checked against a stand-in allocator, with a canary for the pinned vLLM.
 * ``_patch_vllm_detokenizer_linear_append`` rewrites how the detokenizer grows a
   request's text. A stand-in holding its anchors checks the text is unchanged,
   and a canary fails if the pinned vLLM moves the anchors.
@@ -1128,3 +1131,71 @@ async def test_pinned_vllm_output_loops_match_the_patch() -> None:
     finally:
         socket.close(linger=0)
         context.term()
+
+
+# extra_engine_client_addresses
+
+
+@pytest.fixture
+def fake_address_allocator(monkeypatch):
+    """Stand-in for vLLM's address allocator; checks the patch restores it."""
+
+    def get_engine_zmq_addresses(vllm_config, num_api_servers=1, **kwargs):
+        scheme = "tcp://host:" if vllm_config == "tcp" else "ipc:///tmp/"
+        return SimpleNamespace(
+            inputs=[f"{scheme}in{i}" for i in range(num_api_servers)],
+            outputs=[f"{scheme}out{i}" for i in range(num_api_servers)],
+        )
+
+    module = types.ModuleType("vllm.v1.engine.core_client")
+    module.get_engine_zmq_addresses = get_engine_zmq_addresses
+    monkeypatch.setitem(
+        sys.modules, "vllm.v1.engine", types.ModuleType("vllm.v1.engine")
+    )
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.core_client", module)
+    yield module
+    assert module.get_engine_zmq_addresses is get_engine_zmq_addresses
+
+
+def test_engine_launch_gets_an_address_pair_per_extra_client(fake_address_allocator):
+    with patches.extra_engine_client_addresses(2) as pairs:
+        launched = fake_address_allocator.get_engine_zmq_addresses("cfg")
+
+    assert launched.inputs == ["ipc:///tmp/in0", "ipc:///tmp/in1", "ipc:///tmp/in2"]
+    assert pairs == [
+        {"input_address": "ipc:///tmp/in1", "output_address": "ipc:///tmp/out1"},
+        {"input_address": "ipc:///tmp/in2", "output_address": "ipc:///tmp/out2"},
+    ]
+
+
+def test_extra_clients_need_addresses_they_can_bind_later(fake_address_allocator):
+    with pytest.raises(RuntimeError, match="tcp://host:in1"):
+        with patches.extra_engine_client_addresses(1):
+            fake_address_allocator.get_engine_zmq_addresses("tcp")
+
+
+def test_engine_launch_that_skips_the_allocator_is_reported(fake_address_allocator):
+    with pytest.raises(RuntimeError, match="got 0"):
+        with patches.extra_engine_client_addresses(1):
+            pass
+
+
+@pytest.mark.vllm
+def test_pinned_vllm_client_addressing_matches_the_patch() -> None:
+    """Fail if the pinned vLLM changes how an engine core's clients get addresses."""
+    core_client = pytest.importorskip("vllm.v1.engine.core_client")
+    async_llm = pytest.importorskip("vllm.v1.engine.async_llm")
+
+    # The launching client allocates through the name the patch wraps.
+    launch = inspect.getsource(core_client.MPClient.__init__)
+    assert "get_engine_zmq_addresses(vllm_config)" in launch, (
+        "vLLM's MPClient no longer allocates its addresses through "
+        "core_client.get_engine_zmq_addresses; extra clients get no addresses"
+    )
+    allocator = inspect.signature(core_client.get_engine_zmq_addresses)
+    assert "num_api_servers" in allocator.parameters
+    # A later client attaches with its address pair and index.
+    attach = inspect.signature(async_llm.AsyncLLM.from_vllm_config)
+    assert {"client_addresses", "client_count", "client_index"} <= set(
+        attach.parameters
+    )

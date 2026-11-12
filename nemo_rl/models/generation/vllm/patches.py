@@ -1354,6 +1354,53 @@ def modelopt_moe_amax_aliases(model: "torch.nn.Module") -> Iterator[None]:
             delattr(module, alias)
 
 
+@contextmanager
+def extra_engine_client_addresses(count: int) -> Iterator[list[dict[str, str]]]:
+    """Give the engine core launched in this block ``count`` more client address pairs.
+
+    vLLM's API-server scale-out gives each server process its own client of one
+    engine core, on address pairs allocated before launch. This allocates such
+    pairs for the engine an ``AsyncLLM`` launches itself. The yielded list holds
+    them once the engine launches, in client-index order from 1.
+
+    Raises:
+        RuntimeError: If the block did not launch exactly one engine, or the
+            pairs are not IPC paths.
+    """
+    from vllm.v1.engine import core_client
+
+    pairs: list[dict[str, str]] = []
+    original = core_client.get_engine_zmq_addresses
+
+    def with_extra_clients(
+        vllm_config: Any, num_api_servers: int = 1, **kwargs: Any
+    ) -> Any:
+        addresses = original(vllm_config, num_api_servers + count, **kwargs)
+        inputs = addresses.inputs[num_api_servers:]
+        outputs = addresses.outputs[num_api_servers:]
+        # A client that binds its pair after launch needs a fixed path.
+        for address in inputs + outputs:
+            if not address.startswith("ipc://"):
+                raise RuntimeError(
+                    f"extra engine clients need IPC addresses, got {address}"
+                )
+        pairs.extend(
+            {"input_address": i, "output_address": o} for i, o in zip(inputs, outputs)
+        )
+        return addresses
+
+    core_client.get_engine_zmq_addresses = with_extra_clients
+    try:
+        yield pairs
+    finally:
+        core_client.get_engine_zmq_addresses = original
+    if len(pairs) != count:
+        raise RuntimeError(
+            f"expected one engine launch to take {count} extra client address "
+            f"pair(s), got {len(pairs)}"
+        )
+
+
 def install_output_loop_yield(llm: Any, *, reader_budget_s: float) -> None:
     """Make ``llm``'s output loops yield to other tasks on the event loop.
 

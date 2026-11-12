@@ -19,6 +19,7 @@ import secrets
 import time
 import warnings
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from typing import (
     TYPE_CHECKING,
@@ -58,6 +59,7 @@ from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     validate_vllm_async_actor_settings,
     validate_vllm_quantization_config,
+    vllm_num_frontend_workers,
 )
 from nemo_rl.models.generation.vllm.draft_utils import (
     DRAFT_DISABLE_MODULE_SHARING_ENV,
@@ -70,6 +72,7 @@ from nemo_rl.models.generation.vllm.utils import (
     assert_reload_refit_config_supported,
     compute_engine_step_metrics,
     compute_spec_decode_metrics,
+    merge_frontend_logger_metrics,
     resolve_generation_worker_cls,
 )
 from nemo_rl.models.generation.vllm.worker_utils import (
@@ -96,6 +99,9 @@ if TYPE_CHECKING:
     from nemo_rl.models.generation.dynamo.managed_runtime import ManagedDynamoRuntime
 
 logger = logging.getLogger(__name__)
+
+# How often a call to the frontends reports the ones it still waits on.
+_FRONTEND_SLOW_CALL_S = 60.0
 
 
 def resolve_refit_rank_prefixes(
@@ -216,6 +222,9 @@ class VllmGeneration(GenerationInterface):
     # defaults, so shutdown() also works when __init__ failed before starting them.
     _dynamo_runtime: Optional["ManagedDynamoRuntime"] = None
     dynamo_frontend_url: Optional[str] = None
+    # Each engine's frontend actors, in client-index order
+    # (vllm_cfg.num_frontend_workers); they serve HTTP instead of the DP leaders.
+    _frontends: Sequence[Sequence[Any]] = ()
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
@@ -231,6 +240,15 @@ class VllmGeneration(GenerationInterface):
                 "with policy.generation.dynamo=true yet: the Dynamo frontend "
                 "picks engines itself, and a restarted shard does not register "
                 "with it. Disable fleet health."
+            )
+        if (
+            vllm_num_frontend_workers(generation_config)
+            and master_config.async_rl.generation_fleet_health.enabled
+        ):
+            raise ValueError(
+                "async_rl.generation_fleet_health.enabled=true is not supported "
+                "with policy.generation.vllm_cfg.num_frontend_workers yet: a "
+                "restarted shard's frontends are not published. Disable fleet health."
             )
 
     @staticmethod
@@ -500,6 +518,14 @@ class VllmGeneration(GenerationInterface):
         if dynamo_enabled(self.cfg):
             self._start_dynamo_services()
 
+        if vllm_num_frontend_workers(self.cfg):
+            self._frontends = ray.get(
+                self.worker_group.run_all_workers_single_data(
+                    "report_frontends",
+                    run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
+                )
+            )
+
         if defer_model_load:
             # Workers only reserved ports — collect URLs immediately and defer
             # the heavy model loading (and HTTP server start) to load_and_start().
@@ -705,10 +731,46 @@ class VllmGeneration(GenerationInterface):
         results = ray.get(futures)
         return results
 
+    def _frontend_refs(self, method_name: str, **kwargs: Any) -> list[ray.ObjectRef]:
+        """Call every frontend; one ref each, engine by engine in client-index order."""
+        return [
+            getattr(frontend, method_name).remote(**kwargs)
+            for frontends in self._frontends
+            for frontend in frontends
+        ]
+
+    def _call_frontends(self, method_name: str, **kwargs: Any) -> list[Any]:
+        """Call every frontend and wait, logging the ones slow to answer."""
+        refs = self._frontend_refs(method_name, **kwargs)
+        names = [
+            f"{engine}.{index}"
+            for engine, frontends in enumerate(self._frontends)
+            for index in range(len(frontends))
+        ]
+        started = time.monotonic()
+        pending = refs
+        while pending:
+            _, pending = ray.wait(
+                pending, num_returns=len(pending), timeout=_FRONTEND_SLOW_CALL_S
+            )
+            if pending:
+                slow = set(pending)
+                waiting = [name for name, ref in zip(names, refs) if ref in slow]
+                print(
+                    f"still waiting on vLLM frontends {waiting} (engine.frontend) "
+                    f"for {method_name} after {time.monotonic() - started:.0f} s",
+                    flush=True,
+                )
+        return ray.get(refs)
+
     def _report_dp_openai_server_base_urls(self) -> list[Optional[str]]:
         """Report the data parallel OpenAI server base URLs of vLLM workers, only populated if it is async vLLM engine and the HTTP server is active."""
         if not self.cfg["vllm_cfg"]["async_engine"]:
             return [None]  # Not applicable since this is sync
+
+        if self._frontends:
+            # One URL per frontend, engine by engine: more URLs than shards.
+            return self._call_frontends("report_dp_openai_server_base_url")
 
         # Use run_all_workers_single_data for methods that don't need data
         futures = self.worker_group.run_all_workers_single_data(
@@ -727,6 +789,9 @@ class VllmGeneration(GenerationInterface):
         """
         if not self.cfg["vllm_cfg"]["async_engine"]:
             return [None]
+
+        if self._frontends:
+            return self._call_frontends("get_reserved_url")
 
         futures = self.worker_group.run_all_workers_single_data(
             "get_reserved_url",
@@ -866,6 +931,26 @@ class VllmGeneration(GenerationInterface):
             generation_cut_control_token,
             generation_cut_control_timeout_s,
         )
+        if self._frontends:
+            unsupported = [
+                name
+                for name, enabled in {
+                    "capture_media": capture_media,
+                    "generation-prefix cuts": generation_prefix_cuts_enabled,
+                    # Data-plane checkpoints do not save a frontend's store.
+                    "data_plane.backend=mooncake_cpu": (
+                        dp_cfg["backend"] == "mooncake_cpu"
+                    ),
+                }.items()
+                if enabled
+            ]
+            if unsupported:
+                raise ValueError(
+                    "vllm_cfg.num_frontend_workers does not support token capture "
+                    f"with: {', '.join(unsupported)}"
+                )
+            self._call_frontends("setup_token_capture", **asdict(setup))
+            return None
         futures = self.worker_group.run_all_workers_single_data(
             "setup_token_capture",
             **asdict(setup),
@@ -877,6 +962,8 @@ class VllmGeneration(GenerationInterface):
 
     def get_data_plane_snapshots(self) -> list[dict[str, Any]]:
         """Capture-client counters from every DP-leader worker that has one."""
+        if self._frontends:
+            return [s for s in self._call_frontends("get_data_plane_snapshot") if s]
         futures = self.worker_group.run_all_workers_single_data(
             "get_data_plane_snapshot",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
@@ -893,6 +980,9 @@ class VllmGeneration(GenerationInterface):
         here, once it rejoins the refit.
         """
         self._rollout_weight_version = version
+        if self._frontends:
+            self._call_frontends("set_rollout_weight_version", version=version)
+            return
         leaders = self._refit_leaders_by_shard()
         if self.fleet_monitor is not None:
             # The membership is the last reconcile's, but the handles are live: a shard
@@ -923,6 +1013,9 @@ class VllmGeneration(GenerationInterface):
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
         worker_metrics = ray.get(futures)
+        if self._frontends:
+            # Each of an engine's clients counts what it receives, its owner included.
+            worker_metrics += self._call_frontends("_get_raw_spec_counters")
 
         # Aggregate across workers
         return aggregate_spec_decode_counters(worker_metrics)
@@ -1980,16 +2073,24 @@ class VllmGeneration(GenerationInterface):
 
         futures: list[ray.ObjectRef] = []
         dp_indices: list[int] = []
-        for dp_idx in range(self.worker_group.dp_size):
-            worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_idx)
-            future = self.worker_group.run_single_worker_single_data(
-                worker_method_name,
-                worker_idx=worker_idx,
-            )
-            futures.append(future)
-            dp_indices.append(dp_idx)
+        if self._frontends:
+            reports = iter(self._call_frontends(worker_method_name))
+            dp_indices = list(range(len(self._frontends)))
+            results = [
+                merge_frontend_logger_metrics([next(reports) for _ in frontends])
+                for frontends in self._frontends
+            ]
+        else:
+            for dp_idx in range(self.worker_group.dp_size):
+                worker_idx = self.worker_group.get_dp_leader_worker_idx(dp_idx)
+                future = self.worker_group.run_single_worker_single_data(
+                    worker_method_name,
+                    worker_idx=worker_idx,
+                )
+                futures.append(future)
+                dp_indices.append(dp_idx)
 
-        results = ray.get(futures)
+            results = ray.get(futures)
         vllm_logger_metrics: dict[str, dict[int, list[Any]]] = {
             "inflight_batch_sizes": {},  # dp_idx -> list[int]
             "num_pending_samples": {},  # dp_idx -> list[int]
@@ -2029,6 +2130,9 @@ class VllmGeneration(GenerationInterface):
         if not self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             return
         if not self.cfg["vllm_cfg"].get("async_engine", False):
+            return
+        if self._frontends:
+            self._call_frontends("clear_vllm_logger_metrics")
             return
         futures = self.worker_group.run_all_workers_single_data(
             "clear_vllm_logger_metrics",
@@ -2113,7 +2217,7 @@ class VllmGeneration(GenerationInterface):
         """Collect each paused engine's running captured calls and their lengths."""
         if not self.cfg["vllm_cfg"]["async_engine"]:
             return []
-        futures = [
+        futures = self._frontend_refs("captured_call_progress") or [
             worker.captured_call_progress.remote()
             for worker in self._refit_leader_workers()
         ]
