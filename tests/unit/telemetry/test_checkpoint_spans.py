@@ -34,7 +34,7 @@ from nemo_rl.telemetry.instrumentation import (
     managed_span,
 )
 from nemo_rl.telemetry.span_groups import RLSpanGroup
-from nemo_rl.utils.checkpoint import CheckpointManager
+from nemo_rl.utils.checkpoint import CheckpointingConfig, CheckpointManager
 
 
 @pytest.fixture
@@ -45,15 +45,15 @@ def checkpoint_dir(tmp_path):
 @pytest.fixture
 def checkpointer(checkpoint_dir):
     return CheckpointManager(
-        {
-            "enabled": True,
-            "checkpoint_dir": checkpoint_dir,
-            "metric_name": "loss",
-            "higher_is_better": False,
-            "save_period": 1,
-            "keep_top_k": 3,
-            "save_optimizer": True,
-        }
+        CheckpointingConfig(
+            enabled=True,
+            checkpoint_dir=checkpoint_dir,
+            metric_name="loss",
+            higher_is_better=False,
+            save_period=1,
+            keep_top_k=3,
+            save_optimizer=True,
+        )
     )
 
 

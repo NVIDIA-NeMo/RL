@@ -202,9 +202,8 @@ def _make_master_config(
             val_at_end=False,
         ),
         policy=policy_config,
-        # Full block: setup builds a CheckpointManager unconditionally (resume
-        # lookup), which indexes these keys directly. Nothing is written while
-        # enabled=False and the dir doesn't exist.
+        # Setup needs checkpoint settings for resume lookup even when saving is
+        # disabled. Nothing is written while enabled=False and the dir doesn't exist.
         checkpointing=CheckpointingConfig(
             enabled=False,
             checkpoint_dir="results/_sc_setup_test_ckpt",

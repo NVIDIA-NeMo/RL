@@ -218,8 +218,9 @@ class CheckpointingConfig(BaseModel, extra="allow"):
             Requires ft_keep_latest_k to control how many of these are retained.
         checkpoint_must_save_by (Optional[str]): Deadline in DD:HH:MM:SS, measured from job start,
             by which a checkpoint is saved. None disables it.
-        pretrained_checkpoint (Optional[PretrainedCheckpointConfig]): Megatron checkpoint to restore
-            the initial weights from. None loads the weights from model_name.
+        pretrained_checkpoint (Optional[PretrainedCheckpointConfig]): Megatron checkpoint overriding
+            policy.pretrained_checkpoint for the initial weights. None leaves the policy setting
+            unchanged; model_name supplies the weights when neither setting specifies a checkpoint.
         save_optimizer (bool): Whether to save optimizer state with checkpoints.
         save_data_plane (bool): Whether SingleController checkpoints include the
             native TQ snapshot and replay-buffer metadata. Supported by the simple
