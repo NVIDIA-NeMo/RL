@@ -43,7 +43,12 @@ from nemo_rl.data.multimodal_utils import VLLM_CONTENT_KEY, VLLM_PROMPT_KEYS
 from nemo_rl.data_plane.schema import MASK_SAMPLE
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.environments.interfaces import EnvironmentInterface
-from nemo_rl.environments.nemo_gym import as_nemo_gym_shard_set
+from nemo_rl.environments.nemo_gym import (
+    as_nemo_gym_shard_set,
+    build_reward_component_columns,
+    extract_reward_components,
+    validate_reward_components_match_scalar,
+)
 from nemo_rl.environments.nemo_gym_multi_harness import (
     HARNESS_RESULT_KEY,
     MultiHarnessRoutes,
@@ -1972,8 +1977,31 @@ class AsyncNemoGymRolloutImpl:
         penalty_counts = apply_reward_penalties(
             token_results, self._reward_penalty_config
         )
+        # Check the verifier's own reward: effort shaping and the penalties
+        # above rewrite full_result["reward"] but not its components.
+        validate_reward_components_match_scalar(
+            [
+                {
+                    **result["full_result"],
+                    "reward": result.get(
+                        "reward_original", result["full_result"]["reward"]
+                    ),
+                }
+                for result in token_results
+            ]
+        )
+        # A sample without components gets zeros, as on the legacy path, so a
+        # verify result that omits them does not fail the group's payload.
+        component_columns = build_reward_component_columns(
+            [
+                None
+                if "receipt" in result
+                else extract_reward_components(result["full_result"])
+                for result in results
+            ]
+        )
         completions = []
-        for result in results:
+        for index, result in enumerate(results):
             env_extras = dict(completion_extras(result["full_result"]))
             attribution_key = get_nemo_gym_attribution_key(result)
             if attribution_key is not None:
@@ -2017,6 +2045,11 @@ class AsyncNemoGymRolloutImpl:
                     truncated=truncated,
                     reward=float(result["full_result"]["reward"]),
                     reward_original=result.get("reward_original"),
+                    reward_components={
+                        name: float(column[index])
+                        for name, column in component_columns.items()
+                    }
+                    or None,
                 )
             )
         return completions, penalty_counts

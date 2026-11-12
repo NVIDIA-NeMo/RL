@@ -773,6 +773,15 @@ def test_generation_top_logprobs_requires_capture():
     validate_single_controller_config(mc)
 
 
+def test_gdpo_requires_non_capture_rollouts():
+    mc = _make_master_config(megatron_enabled=True)
+    mc.grpo.adv_estimator = AdvEstimatorConfig(name="gdpo")
+    validate_single_controller_config(mc)
+    mc.token_capture.enabled = True
+    with pytest.raises(NotImplementedError, match="token_capture.enabled=false"):
+        validate_single_controller_config(mc)
+
+
 def test_token_capture_top_logprobs_rejects_megatron_generation():
     mc = _make_master_config(
         backend="megatron",

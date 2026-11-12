@@ -1207,6 +1207,45 @@ def test_result_to_completion_drops_mask_flag_when_gate_off():
     assert completion.env_extras["instance_config"]["other_key"] == "kept"
 
 
+def _component_result(reward, reward_components=None):
+    result = _mask_gate_result()
+    result["full_result"] = {"reward": reward}
+    if reward_components is not None:
+        result["full_result"]["reward_components"] = reward_components
+    return result
+
+
+def test_results_to_completions_carries_gym_reward_components():
+    completions, _ = _nemo_gym_impl(True)._results_to_completions(
+        [
+            _component_result(3.0, {"correctness": 1.0, "format": 2.0}),
+            _component_result(0.0),
+        ]
+    )
+    assert completions[0].reward_components == {
+        "reward/correctness": 1.0,
+        "reward/format": 2.0,
+    }
+    assert completions[1].reward_components == {
+        "reward/correctness": 0.0,
+        "reward/format": 0.0,
+    }
+
+
+def test_results_to_completions_leaves_single_reward_components_unset():
+    completions, _ = _nemo_gym_impl(True)._results_to_completions(
+        [_component_result(1.0)]
+    )
+    assert completions[0].reward_components is None
+
+
+def test_results_to_completions_rejects_components_not_summing_to_reward():
+    with pytest.raises(ValueError, match="reward_components sum"):
+        _nemo_gym_impl(True)._results_to_completions(
+            [_component_result(9.0, {"correctness": 1.0, "format": 2.0})]
+        )
+
+
 def test_gate_off_keeps_the_mask_flag_in_the_per_agent_metrics():
     """Dropping the flag from the completions must not drop it from the metrics:
     the gate-off mode exists for flags too coarse to honor, which is when the
@@ -1771,6 +1810,20 @@ def test_nemo_gym_receipt_rollout_metrics_leave_token_metrics_to_finalizer(
     assert metrics["turns_per_sample/histogram"] == [2, 1]
     # The finalizer reports every token metric from the verified rows.
     assert not any("tokens" in key for key in metrics)
+
+
+def test_reward_penalty_keeps_gym_reward_components():
+    impl = _nemo_gym_impl(True, {"penalize_empty_final_answer": True})
+    result = _reward_penalty_result([{"type": "message", "content": [{"text": ""}]}])
+    result["full_result"]["reward_components"] = {"correctness": 0.5, "format": 0.5}
+    result["reward_original"] = 1.0
+    completions, penalty_counts = impl._results_to_completions([result])
+    assert completions[0].reward == 0.0
+    assert penalty_counts["empty_final_answer"] == 1
+    assert completions[0].reward_components == {
+        "reward/correctness": 0.5,
+        "reward/format": 0.5,
+    }
 
 
 def _reward_penalty_result(output, assistant_overrides=None, assistant_tokens=None):
