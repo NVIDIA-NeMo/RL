@@ -32,7 +32,7 @@ import logging
 import os
 import time
 from collections import Counter
-from typing import TYPE_CHECKING, Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 
 import numpy as np
 import torch
@@ -55,6 +55,7 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_EXPERTS_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
+    SAMPLE_MASK,
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
@@ -143,8 +144,14 @@ def _unpack_route_fragments(
 def _attach_draft_sample_ids(
     data: BatchedDataDict[Any],
     sample_ids: list[str],
+    row_order: Optional[list[int]] = None,
 ) -> BatchedDataDict[Any]:
-    """Attach deterministic numeric IDs without using microbatch row order."""
+    """Attach deterministic numeric IDs that follow the rows of ``data``.
+
+    ``row_order[j]`` is the ``sample_ids`` index of row ``j`` after a local repack.
+    """
+    if row_order is not None:
+        sample_ids = [sample_ids[i] for i in row_order]
     if data["input_ids"].shape[0] != len(sample_ids):
         raise ValueError("stable sample-ID count must match the fetched training batch")
     data["draft_sample_ids"] = torch.tensor(
@@ -844,9 +851,19 @@ class TQWorkerMixin:
         as a side effect of the DP-shard call; the TQ presharded path receives a
         per-rank slice without them set, so we recompute here using ``self.cfg``.
         """
+        return self._apply_packing_prep_with_order(data)[0]
+
+    def _apply_packing_prep_with_order(
+        self, data: BatchedDataDict[Any]
+    ) -> tuple[BatchedDataDict[Any], Optional[list[int]]]:
+        """Like :meth:`_apply_packing_prep`, also returning the row permutation.
+
+        Packing and dynamic batching reorder rows; the second value maps each new
+        row to its index in ``data`` (None when rows keep their order).
+        """
         cfg = getattr(self, "cfg", None)
         if not isinstance(cfg, dict):
-            return data
+            return data, None
         seqpack = cfg.get("sequence_packing", {}) or {}
         dynbatch = cfg.get("dynamic_batching", {}) or {}
 
@@ -863,12 +880,12 @@ class TQWorkerMixin:
             microbatch_order = seqpack.get("microbatch_order")
             if microbatch_order is not None:
                 spa["microbatch_order"] = microbatch_order
-            packed, _ = data.shard_by_batch_size(
+            packed, order = data.shard_by_batch_size(
                 shards=1,
                 batch_size=None,
                 sequence_packing_args=spa,
             )
-            return packed[0]
+            return packed[0], cast(list[int], order)
 
         if dynbatch.get("enabled", False):
             dba = {
@@ -877,15 +894,15 @@ class TQWorkerMixin:
                 "sequence_length_round": dynbatch["sequence_length_round"],
                 "max_tokens_per_microbatch": dynbatch["train_mb_tokens"],
             }
-            sharded, _ = data.shard_by_batch_size(
+            sharded, order = data.shard_by_batch_size(
                 shards=1,
                 batch_size=None,
                 # pyrefly: ignore  # bad-argument-type
                 dynamic_batching_args=dba,
             )
-            return sharded[0]
+            return sharded[0], cast(list[int], order)
 
-        return data
+        return data, None
 
     def _attach_or_repack_pack_metadata(
         self,
@@ -901,14 +918,22 @@ class TQWorkerMixin:
         desyncs Megatron's per-microbatch collectives — trust the driver
         when it provided the metadata.
         """
+        return self._attach_or_repack_with_order(data, meta)[0]
+
+    def _attach_or_repack_with_order(
+        self,
+        data: BatchedDataDict[Any],
+        meta: "KVBatchMeta",
+    ) -> tuple[BatchedDataDict[Any], Optional[list[int]]]:
+        """:meth:`_attach_or_repack_pack_metadata` plus the local row permutation."""
         extra = meta.extra_info or {}
         if MICRO_BATCH_INDICES in extra and MICRO_BATCH_LENGTHS in extra:
             data.micro_batch_indices = extra[MICRO_BATCH_INDICES]
             data.micro_batch_lengths = extra[MICRO_BATCH_LENGTHS]
             if ELEM_COUNTS_PER_GB in extra:
                 data.elem_counts_per_gb = extra[ELEM_COUNTS_PER_GB]
-            return data
-        return self._apply_packing_prep(data)
+            return data, None
+        return self._apply_packing_prep_with_order(data)
 
     def _local_coords(self) -> dict[str, int]:
         """This worker's (axis -> local-rank) mapping.
@@ -1058,8 +1083,8 @@ class TQWorkerMixin:
     ) -> dict[str, Any]:
         """Per-rank training entrypoint. Fetch → packing prep → delegate."""
         data = self._fetch(meta)
-        data = self._attach_or_repack_pack_metadata(data, meta)
-        data = _attach_draft_sample_ids(data, meta.sample_ids)
+        data, row_order = self._attach_or_repack_with_order(data, meta)
+        data = _attach_draft_sample_ids(data, meta.sample_ids, row_order)
         return self.train(  # type: ignore[attr-defined]
             data,
             loss_fn=loss_fn,
@@ -1319,11 +1344,41 @@ class TQWorkerMixin:
         ``finish_train_step_presharded``.
         """
         data = self._fetch(meta)
-        data = self._attach_or_repack_pack_metadata(data, meta)
-        data = _attach_draft_sample_ids(data, meta.sample_ids)
-        self.train_microbatch(  # type: ignore[attr-defined]
+        data, row_order = self._attach_or_repack_with_order(data, meta)
+        data = _attach_draft_sample_ids(data, meta.sample_ids, row_order)
+        keep_mask = self.train_microbatch(  # type: ignore[attr-defined]
             data=data,
         )
+        if keep_mask is not None:
+            self._write_back_in_loss_keep_mask(meta, data, keep_mask, row_order)
+
+    def _write_back_in_loss_keep_mask(
+        self,
+        meta: "KVBatchMeta",
+        data: BatchedDataDict[Any],
+        keep_mask: list[float],
+        row_order: Optional[list[int]],
+    ) -> None:
+        """Write the in-loss filter's rejections into ``sample_mask``.
+
+        Later consumers of the batch, such as the PPO critic, then see the rows the
+        separate policy-logprob pass would have kept. ``keep_mask`` follows ``data``
+        rows; ``row_order`` maps them back to ``meta.sample_ids``.
+        """
+        sample_mask = data[SAMPLE_MASK].detach().cpu()
+        if len(keep_mask) != sample_mask.shape[0] or sample_mask.shape[0] != len(
+            meta.sample_ids
+        ):
+            raise RuntimeError(
+                f"in-loss keep mask has {len(keep_mask)} rows for a batch of "
+                f"{sample_mask.shape[0]} rows and {len(meta.sample_ids)} sample ids"
+            )
+        kept = sample_mask * torch.tensor(keep_mask, dtype=sample_mask.dtype)
+        if row_order is not None:
+            in_meta_order = torch.empty_like(kept)
+            in_meta_order[torch.tensor(row_order, dtype=torch.long)] = kept
+            kept = in_meta_order
+        self._write_back(meta, {SAMPLE_MASK: kept})
 
     @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/finish_train_step_presharded")

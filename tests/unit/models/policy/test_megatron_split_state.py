@@ -1372,6 +1372,78 @@ class TestFinish:
         assert m["sampling_importance_ratio"] == pytest.approx(1.0)  # ÷ toks
 
 
+def _in_loss_seq_filter_loss_fn():
+    from nemo_rl.algorithms.loss.loss_functions import (
+        ClippedPGLossConfig,
+        ClippedPGLossFn,
+    )
+
+    return ClippedPGLossFn(
+        ClippedPGLossConfig(
+            seq_logprob_error_in_loss=True,
+            force_on_policy_ratio=True,
+            token_level_loss=True,
+            reference_policy_kl_penalty=0,
+        ),
+        seq_logprob_error_threshold=2.0,
+    )
+
+
+class TestFinishInLossSeqFilter:
+    def test_divides_by_survivor_counts_summed_across_chunks(self, mock_module_symbols):
+        """Survivor counts from the loss, not the pre-filter masks, set 1/N."""
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        mock_module_symbols["mfb"].return_value = [
+            {
+                "loss": 3.0,
+                "seq_logprob_error_valid_seqs": 2.0,
+                "seq_logprob_error_valid_tokens": 300.0,
+                "num_masked_seqs_by_logprob_error": 6.0,
+                "unadvertised_metric": 300.0,
+            }
+        ]
+        w.begin_train_step(loss_fn=_in_loss_seq_filter_loss_fn())
+        # Each chunk has 8 seqs / 2048 tokens before filtering.
+        w.train_microbatch(_fake_batch())
+        w.train_microbatch(_fake_batch())
+        w.finish_train_step()
+
+        reduced = mock_module_symbols["all_reduce"].call_args_list[0].args[0]
+        assert reduced.tolist() == [4.0, 600.0]
+        w.model.scale_gradients.assert_called_once()
+        assert w.model.scale_gradients.call_args.args[0] == pytest.approx(1 / 600)
+        metrics = mock_module_symbols["agg"].call_args.kwargs["all_mb_metrics"]
+        assert [m["loss"] for m in metrics] == pytest.approx([3 / 600] * 2)
+        assert [m["num_masked_seqs_by_logprob_error"] for m in metrics] == [6.0] * 2
+        assert [m["unadvertised_metric"] for m in metrics] == pytest.approx([0.5] * 2)
+        assert {m["global_valid_toks"] for m in metrics} == {600.0}
+        assert {m["global_valid_seqs"] for m in metrics} == {4.0}
+
+    def test_empty_survivor_step_raises_before_any_update(self, mock_module_symbols):
+        from nemo_rl.algorithms.loss.interfaces import LossType
+
+        w = _make_worker(LossType.TOKEN_LEVEL)
+        mock_module_symbols["mfb"].return_value = [
+            {
+                "loss": 0.0,
+                "seq_logprob_error_valid_seqs": 0.0,
+                "seq_logprob_error_valid_tokens": 0.0,
+                "num_masked_seqs_by_logprob_error": 8.0,
+            }
+        ]
+        w.begin_train_step(loss_fn=_in_loss_seq_filter_loss_fn())
+        w.train_microbatch(_fake_batch())
+        with pytest.raises(RuntimeError, match="No valid response tokens remain"):
+            w.finish_train_step()
+
+        w.model.scale_gradients.assert_not_called()
+        w.optimizer.step.assert_not_called()
+        w.scheduler.step.assert_not_called()
+        assert w.model.config.grad_sync_func == "ORIGINAL_GRAD_SYNC_FUNC"
+
+
 # ── abort_train_step ─────────────────────────────────────────────────────
 
 

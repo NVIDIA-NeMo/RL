@@ -49,20 +49,35 @@ from nemo_rl.models.policy.tq_policy import TQPolicy
 class _SplitStubWorker(TQWorkerMixin):
     """Mixin host recording backend calls; fetch/attach are stubbed."""
 
-    def __init__(self, is_leader: bool = True):
+    def __init__(
+        self,
+        is_leader: bool = True,
+        *,
+        fetched=None,
+        row_order=None,
+        keep_mask=None,
+    ):
         self.calls: list[tuple] = []
         self._leader = is_leader
+        self._fetched = fetched
+        self._row_order = row_order
+        self._keep_mask = keep_mask
 
     def _fetch(self, meta):
         self.calls.append(("fetch", meta))
+        if self._fetched is not None:
+            return self._fetched
         return {
             "data_from": meta,
             "input_ids": torch.zeros(len(meta.sample_ids), 2, dtype=torch.int64),
         }
 
-    def _attach_or_repack_pack_metadata(self, data, meta):
+    def _attach_or_repack_with_order(self, data, meta):
         self.calls.append(("attach", meta))
-        return data
+        return data, self._row_order
+
+    def _write_back(self, meta, fields):
+        self.calls.append(("write_back", meta, fields))
 
     def _is_replica_leader(self) -> bool:
         return self._leader
@@ -73,6 +88,7 @@ class _SplitStubWorker(TQWorkerMixin):
 
     def train_microbatch(self, data):
         self.calls.append(("train_microbatch", data))
+        return self._keep_mask
 
     def finish_train_step(self):
         self.calls.append(("finish",))
@@ -132,6 +148,51 @@ class TestPreshardedWrappers:
         forward_ids = first.calls[-1][1]["draft_sample_ids"]
         reverse_ids = second.calls[-1][1]["draft_sample_ids"]
         assert torch.equal(forward_ids, reverse_ids.flip(0))
+
+    def test_draft_sample_ids_follow_repacked_rows(self):
+        meta = KVBatchMeta(
+            partition_id="train", task_name="train", sample_ids=["s0", "s1", "s2"]
+        )
+        in_meta_order = _SplitStubWorker()
+        repacked = _SplitStubWorker(row_order=[2, 0, 1])
+
+        in_meta_order.train_microbatch_presharded(meta=meta)
+        repacked.train_microbatch_presharded(meta=meta)
+
+        ids = in_meta_order.calls[-1][1]["draft_sample_ids"]
+        repacked_ids = repacked.calls[-1][1]["draft_sample_ids"]
+        assert repacked_ids.tolist() == ids[torch.tensor([2, 0, 1])].tolist()
+
+    def test_in_loss_rejections_land_in_sample_mask_in_meta_order(self):
+        """Packing reordered the rows; the write must follow meta.sample_ids."""
+        meta = KVBatchMeta(
+            partition_id="train", task_name="train", sample_ids=["s0", "s1", "s2"]
+        )
+        # Fetched row j is meta row row_order[j] after the local repack.
+        w = _SplitStubWorker(
+            fetched={
+                "sample_mask": torch.tensor([1.0, 1.0, 0.5]),
+                "input_ids": torch.zeros(3, 2, dtype=torch.int64),
+            },
+            row_order=[2, 0, 1],
+            keep_mask=[1.0, 0.0, 1.0],
+        )
+        w.train_microbatch_presharded(meta=meta)
+        name, written_meta, fields = w.calls[-1]
+        assert name == "write_back" and written_meta is meta
+        # s2 kept (1.0); s0 rejected; s1 kept with its own weight.
+        assert fields["sample_mask"].tolist() == [0.0, 0.5, 1.0]
+
+    def test_mismatched_keep_mask_fails_loudly(self):
+        w = _SplitStubWorker(
+            fetched={
+                "sample_mask": torch.tensor([1.0, 1.0]),
+                "input_ids": torch.zeros(2, 2, dtype=torch.int64),
+            },
+            keep_mask=[1.0],
+        )
+        with pytest.raises(RuntimeError, match="keep mask has 1 rows"):
+            w.train_microbatch_presharded(meta=_meta())
 
     def test_finish_tags_replica_leader(self):
         leader = _SplitStubWorker(is_leader=True)
