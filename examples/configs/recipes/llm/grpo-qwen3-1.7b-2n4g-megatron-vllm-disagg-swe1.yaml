@@ -61,6 +61,13 @@ policy:
       gpu_memory_utilization: 0.7
       # async_engine and expose_http_server, both required by disaggregation
       # (the frontends reach every engine over HTTP), are inherited as true.
+      http_server_serving_chat_kwargs:
+        # Qwen3-1.7B writes its tool calls as JSON inside <tool_call> tags.
+        # The inherited qwen3_coder parser reads the XML <function=...> shape,
+        # leaves them in the text, and the environment then scores every tool
+        # call as invalid (reward 0). hermes is the JSON parser, the vLLM
+        # counterpart of the TRT-LLM sibling's `tool_parser: qwen3`.
+        tool_parser: hermes
       disagg_frontend:
         prefill_router: conversation
         decode_router: load_balancing
@@ -86,8 +93,9 @@ policy:
         # launch environment if NIXL needs them, not in the recipe.
         # NCCL_NET_PLUGIN=none is set on the engines by VllmGeneration under
         # disaggregation (HPC-X's NCCL plugin would load a UCX without CUDA
-        # support into the TP>1 engines; see the design doc). Override here
-        # only to put it back.
+        # support into the TP>1 engines; see the design doc), and the training
+        # workers adopt it because they share the refit communicator with the
+        # engines. Override here only to put it back.
         # Shadow-validate 10% of the frontend-rendered prompts on the prefill
         # engines against a full engine-side render.
         NRL_TOKENIZE_SHADOW_RATE: "0.1"

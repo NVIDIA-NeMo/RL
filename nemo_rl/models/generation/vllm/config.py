@@ -869,6 +869,62 @@ def resolve_vllm_connector_profile(config: VllmConfig) -> ConnectorProfile:
     )
 
 
+def disagg_engine_env_defaults(config: VllmConfig) -> dict[str, str]:
+    """Environment every disaggregated engine process gets unless the recipe says otherwise.
+
+    Two variables, both for the NIXL connector; ``vllm_cfg.env_vars`` wins over
+    either.
+
+    ``VLLM_SSM_CONV_STATE_LAYOUT=DS``: NixlConnector moves a Mamba/SSM layer's
+    conv state in three reads and asserts the dim-first ("DS") state layout at
+    worker start, while vLLM's default is "SD". Inert for models without such
+    layers, so every NIXL engine gets it.
+
+    ``NCCL_NET_PLUGIN=none`` (GPU-staged KV only): NIXL's wheel bundles its
+    own CUDA-enabled UCX, but a UCX that is already
+    loaded in the process wins when NIXL's UCX plugin binds. In the NGC/HPC-X
+    based containers NCCL's network plugin (``libnccl-net.so``, found through
+    the loader cache) pulls HPC-X's UCX -- built without CUDA memory support --
+    into every TP>1 engine the moment NCCL initialises the TP group, and GPU KV
+    registration then fails with "VRAM memory is detected as host by UCX".
+    Keeping NCCL's plugin out of the engines leaves NCCL its built-in IB and
+    socket transports and lets NIXL use the UCX it ships. Only the NIXL
+    connector registering GPU memory needs this.
+    """
+    if not resolve_vllm_disagg_layout(config).enabled:
+        return {}
+    kv_transfer = resolve_vllm_kv_transfer_config(config)
+    if kv_transfer.kv_connector != "NixlConnector":
+        return {}
+    env = {"VLLM_SSM_CONV_STATE_LAYOUT": "DS"}
+    if kv_transfer.kv_buffer_device == "cuda":
+        env["NCCL_NET_PLUGIN"] = "none"
+    return env
+
+
+# NCCL variables every rank of the refit collective has to agree on.
+_REFIT_PEER_ENV_KEYS = ("NCCL_NET_PLUGIN",)
+
+
+def vllm_refit_peer_env(config: VllmConfig) -> dict[str, str]:
+    """NCCL variables the training ranks must share with the vLLM engines.
+
+    The refit collective is one NCCL communicator over the training ranks and
+    every engine rank, and NCCL picks its network transport once per process.
+    Training ranks that load NCCL's network plugin cannot connect to engines
+    that run without it (``disagg_engine_env_defaults``): creating the
+    communicator fails with "unhandled system error". Returns the engines'
+    effective value of each such variable, ``vllm_cfg.env_vars`` over the
+    disaggregation defaults, for the trainer to adopt.
+    """
+    recipe_env = (config.get("vllm_cfg") or {}).get("env_vars") or {}
+    engine_env = {
+        **disagg_engine_env_defaults(config),
+        **{str(key): str(value) for key, value in recipe_env.items()},
+    }
+    return {key: engine_env[key] for key in _REFIT_PEER_ENV_KEYS if key in engine_env}
+
+
 def vllm_kv_transfer_config_for_role(
     config: VllmConfig, role: VllmRole, *, engine_id: str
 ) -> dict[str, Any]:

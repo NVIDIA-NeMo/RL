@@ -287,7 +287,11 @@ move, and at which TP ratios, is vLLM's own check at engine start. Engines get
 `VLLM_SSM_CONV_STATE_LAYOUT=DS` by default (NixlConnector asserts it for Mamba layers;
 inert otherwise) and, with GPU-staged KV, `NCCL_NET_PLUGIN=none` (HPC-X's NCCL plugin
 loads a UCX without CUDA support into TP>1 engines, which breaks NIXL's VRAM
-registration); `vllm_cfg.env_vars` overrides both. Besides the frontend band, vLLM engines use two further per-node port
+registration); `vllm_cfg.env_vars` overrides both. The training workers adopt the engines'
+`NCCL_NET_PLUGIN`: the refit collective is one NCCL communicator over the training ranks and
+every engine rank, and it cannot form when the two sides pick different network transports
+(`megatron_cfg.env_vars` / `automodel_cfg.env_vars` choose one for the trainer explicitly).
+Besides the frontend band, vLLM engines use two further per-node port
 bands from `virtual_cluster.py`: the NIXL side channel (8556-8571) and the KV-events
 publishers of the `kv_cache_aware` router (8572-8587), one port per engine on a node.
 

@@ -26,6 +26,7 @@ from nemo_rl.models.generation.vllm.config import (
     resolve_vllm_role_overrides,
     validate_vllm_disaggregation,
     vllm_kv_transfer_config_for_role,
+    vllm_refit_peer_env,
     vllm_replica_width,
     vllm_role_engine_config,
 )
@@ -314,3 +315,30 @@ def test_in_flight_refit_guard_refuses_recompute_and_bidirectional():
             in_flight_weight_updates=True,
             recompute_kv_cache_after_weight_updates=False,
         )
+
+
+# -------------------------------------------------------------------------- #
+#  Refit collective
+# -------------------------------------------------------------------------- #
+
+
+def test_the_trainer_shares_the_engines_nccl_plugin_choice():
+    # Disaggregated NIXL engines run without NCCL's network plugin. The trainer
+    # is in the same refit communicator, and NCCL cannot connect ranks that
+    # picked different network transports.
+    assert vllm_refit_peer_env(_disagg()) == {"NCCL_NET_PLUGIN": "none"}
+    # A recipe that names a plugin for the engines names it for both sides.
+    assert vllm_refit_peer_env(_disagg(env_vars={"NCCL_NET_PLUGIN": "ucx"})) == {
+        "NCCL_NET_PLUGIN": "ucx"
+    }
+    # Nothing to align when the engines keep NCCL's default: no disaggregation,
+    # or host-staged KV (no GPU memory registered with UCX).
+    assert vllm_refit_peer_env(_config()) == {}
+    assert (
+        vllm_refit_peer_env(
+            _disagg(
+                kv_transfer={"kv_connector": "NixlConnector", "kv_buffer_device": "cpu"}
+            )
+        )
+        == {}
+    )
