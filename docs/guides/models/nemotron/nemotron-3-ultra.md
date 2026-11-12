@@ -91,7 +91,7 @@ Build args:
 - `--build-context nemo-rl=.` — build from your local checkout (otherwise the
   Dockerfile pulls `NVIDIA-NeMo/RL.git#main`).
 
-Do not move the Gym virtual environments to a shared filesystem to avoid rebuilding them.
+Do not put the Gym virtual environments on a shared filesystem as a way to skip rebuilding them.
 To reuse them without rebuilding the image, see
 [Python Environments on Shared Filesystems](../../../cluster.md#python-environments-on-shared-filesystems).
 
