@@ -95,12 +95,20 @@ def test_capture_stream_yields_ready_sibling_before_slow_drain(
         try:
             await asyncio.wait_for(drain_started.wait(), timeout=1)
             ready = await asyncio.wait_for(first, timeout=1)
-            assert ready[:3] == (1, {"name": "agent"}, {"owner": 1, "reward": 1.0})
+            assert ready[:3] == (
+                1,
+                {"name": "agent"},
+                {"owner": 1, "reward": 1.0, "attribution_key": "agent"},
+            )
             assert ready[3] is None
             assert not release_drain.is_set()
             release_drain.set()
             last = await asyncio.wait_for(anext(stream), timeout=1)
-            assert last[:3] == (0, {"name": "agent"}, {"owner": 0, "reward": 1.0})
+            assert last[:3] == (
+                0,
+                {"name": "agent"},
+                {"owner": 0, "reward": 1.0, "attribution_key": "agent"},
+            )
             assert 0 <= last[3]["test/postprocess_results_pct"] <= 100
             with pytest.raises(StopAsyncIteration):
                 await anext(stream)
@@ -907,8 +915,8 @@ def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() ->
     assert should_use_nemo_gym(config) is True
 
 
-def test_setup_nemo_gym_config_dynamo_exposes_http_server_via_vllm_cfg() -> None:
-    """Dynamo serves Gym through the vllm_cfg HTTP server settings."""
+def test_setup_nemo_gym_config_refuses_dynamo_serving() -> None:
+    """Dynamo does not serve NeMo-Gym's calls yet, so the pairing fails at startup."""
     from nemo_rl.algorithms.grpo import MasterConfig
     from nemo_rl.environments.nemo_gym import (
         setup_nemo_gym_config,
@@ -920,7 +928,8 @@ def test_setup_nemo_gym_config_dynamo_exposes_http_server_via_vllm_cfg() -> None
         data={},
         policy={
             "generation": {
-                "backend": "dynamo",
+                "backend": "vllm",
+                "dynamo": True,
                 "vllm_cfg": {"async_engine": False, "expose_http_server": False},
             }
         },
@@ -928,10 +937,8 @@ def test_setup_nemo_gym_config_dynamo_exposes_http_server_via_vllm_cfg() -> None
 
     setup_nemo_gym_config(config, tokenizer=None)
 
-    vllm_cfg = config.policy["generation"]["vllm_cfg"]
-    assert vllm_cfg["async_engine"] is True
-    assert vllm_cfg["expose_http_server"] is True
-    assert should_use_nemo_gym(config) is True
+    with pytest.raises(ValueError, match="does not serve NeMo-Gym rollouts yet"):
+        should_use_nemo_gym(config)
 
 
 def test_public_postprocess_waits_for_commit_instead_of_masking(monkeypatch) -> None:

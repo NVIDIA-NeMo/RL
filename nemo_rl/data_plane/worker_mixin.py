@@ -32,7 +32,7 @@ import logging
 import os
 import time
 from collections import Counter
-from typing import TYPE_CHECKING, Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional, cast
 
 import numpy as np
 import torch
@@ -42,7 +42,7 @@ from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.codec import pad_batch
 from nemo_rl.data_plane.column_io import fetch_columns
-from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
+from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, gdr_enabled
 from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
@@ -55,6 +55,7 @@ from nemo_rl.data_plane.schema import (
     ROUTED_EXPERTS_ENCODING_FIELD,
     ROUTED_EXPERTS_FIELD,
     ROUTED_EXTRAS_METADATA_FIELD,
+    SAMPLE_MASK,
     Layout,
 )
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SequencePackingArgs
@@ -417,8 +418,7 @@ class TQWorkerMixin:
         # mooncake, so no GDR to order against a CUDA context.
         if (
             not isinstance(cfg, LocalDataPlaneConfig)
-            and cfg["backend"] == "mooncake_cpu"
-            and backend_config(cfg).use_gdr
+            and gdr_enabled(cfg)
             and not torch.cuda.is_initialized()
         ):
             raise RuntimeError(
@@ -829,9 +829,19 @@ class TQWorkerMixin:
         as a side effect of the DP-shard call; the TQ presharded path receives a
         per-rank slice without them set, so we recompute here using ``self.cfg``.
         """
+        return self._apply_packing_prep_with_order(data)[0]
+
+    def _apply_packing_prep_with_order(
+        self, data: BatchedDataDict[Any]
+    ) -> tuple[BatchedDataDict[Any], Optional[list[int]]]:
+        """Like :meth:`_apply_packing_prep`, also returning the row permutation.
+
+        Packing and dynamic batching reorder rows; the second value maps each new
+        row to its index in ``data`` (None when rows keep their order).
+        """
         cfg = getattr(self, "cfg", None)
         if not isinstance(cfg, dict):
-            return data
+            return data, None
         seqpack = cfg.get("sequence_packing", {}) or {}
         dynbatch = cfg.get("dynamic_batching", {}) or {}
 
@@ -848,12 +858,12 @@ class TQWorkerMixin:
             microbatch_order = seqpack.get("microbatch_order")
             if microbatch_order is not None:
                 spa["microbatch_order"] = microbatch_order
-            packed, _ = data.shard_by_batch_size(
+            packed, order = data.shard_by_batch_size(
                 shards=1,
                 batch_size=None,
                 sequence_packing_args=spa,
             )
-            return packed[0]
+            return packed[0], cast(list[int], order)
 
         if dynbatch.get("enabled", False):
             dba = {
@@ -862,15 +872,15 @@ class TQWorkerMixin:
                 "sequence_length_round": dynbatch["sequence_length_round"],
                 "max_tokens_per_microbatch": dynbatch["train_mb_tokens"],
             }
-            sharded, _ = data.shard_by_batch_size(
+            sharded, order = data.shard_by_batch_size(
                 shards=1,
                 batch_size=None,
                 # pyrefly: ignore  # bad-argument-type
                 dynamic_batching_args=dba,
             )
-            return sharded[0]
+            return sharded[0], cast(list[int], order)
 
-        return data
+        return data, None
 
     def _attach_or_repack_pack_metadata(
         self,
@@ -893,14 +903,24 @@ class TQWorkerMixin:
         ignores it; the Megatron policy worker attaches shared-prefix row
         metadata when sharing is enabled for that stage.
         """
+        return self._attach_or_repack_with_order(data, meta, stage=stage)[0]
+
+    def _attach_or_repack_with_order(
+        self,
+        data: BatchedDataDict[Any],
+        meta: "KVBatchMeta",
+        *,
+        stage: Optional[Literal["train", "logprobs"]],
+    ) -> tuple[BatchedDataDict[Any], Optional[list[int]]]:
+        """:meth:`_attach_or_repack_pack_metadata` plus the local row permutation."""
         extra = meta.extra_info or {}
         if MICRO_BATCH_INDICES in extra and MICRO_BATCH_LENGTHS in extra:
             data.micro_batch_indices = extra[MICRO_BATCH_INDICES]
             data.micro_batch_lengths = extra[MICRO_BATCH_LENGTHS]
             if ELEM_COUNTS_PER_GB in extra:
                 data.elem_counts_per_gb = extra[ELEM_COUNTS_PER_GB]
-            return data
-        return self._apply_packing_prep(data)
+            return data, None
+        return self._apply_packing_prep_with_order(data)
 
     def _local_coords(self) -> dict[str, int]:
         """This worker's (axis -> local-rank) mapping.
@@ -999,6 +1019,7 @@ class TQWorkerMixin:
         *,
         result_key: str,
         tq_field: str,
+        keep_on_gpu: bool = False,
     ) -> None:
         """Single chokepoint for ``*_presharded`` write-backs.
 
@@ -1010,6 +1031,8 @@ class TQWorkerMixin:
             result: Worker output containing ``result_key``.
             result_key: Key into ``result`` for the tensor to write back.
             tq_field: Field name on the TQ side.
+            keep_on_gpu: Write the tensor from its own device instead of
+                copying it to CPU first.
         """
         if self._dp_client is None:
             return
@@ -1032,7 +1055,8 @@ class TQWorkerMixin:
                 f"result[{result_key!r}] has batch dim {val.shape[0]} "
                 f"but meta.sample_ids has {len(meta.sample_ids)}."
             )
-        self._write_back(meta, {tq_field: val.detach().to("cpu")})
+        val = val.detach() if keep_on_gpu else val.detach().to("cpu")
+        self._write_back(meta, {tq_field: val})
 
     @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/train_presharded")
@@ -1119,6 +1143,7 @@ class TQWorkerMixin:
         micro_batch_size: Optional[int] = None,
         opd_full_payload: Optional[str] = None,
         opd_full_payload_dtype: Optional[str] = None,
+        keep_outputs_on_gpu: bool = False,
         opd_full_payload_field: Optional[str] = None,
         opd_full_teacher_index: Optional[int] = None,
         opd_full_teacher_index_field: Optional[str] = None,
@@ -1131,6 +1156,10 @@ class TQWorkerMixin:
             opd_full_payload: When set (``"hidden_states"`` or ``"logits"``), also
                 emit the full-vocabulary teacher payload from the same forward.
             opd_full_payload_dtype: Torch dtype name for that payload.
+            keep_outputs_on_gpu: Keep everything this call writes (logprobs
+                and any full-vocabulary payload) on this rank's GPU until the
+                data-plane PUT instead of copying it to CPU. The driver sets it
+                only on a GDR data plane (``gdr_keep_teacher_payload_on_gpu``).
             opd_full_payload_field: Data-plane column the payload is written to.
             opd_full_teacher_index: This teacher group's stable index (see
                 ``create_teacher_worker_groups``), tagged onto every row this
@@ -1164,6 +1193,7 @@ class TQWorkerMixin:
             result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
                 data=data,
                 micro_batch_size=micro_batch_size,
+                keep_on_gpu=keep_outputs_on_gpu,
             )
         else:
             if opd_full_payload_field is None:
@@ -1192,13 +1222,17 @@ class TQWorkerMixin:
                 payload=opd_full_payload,
                 payload_dtype=opd_full_payload_dtype,
                 micro_batch_size=micro_batch_size,
+                keep_on_gpu=keep_outputs_on_gpu,
             )
             # None off the last pipeline stage, which is what keeps this to a
             # single writer: the payload never leaves the stage that produced it.
             teacher_full_payload = result.get("teacher_full_payload")
             if teacher_full_payload is not None:
+                # On GPU when keep_outputs_on_gpu is set: the GDR PUT copies it
+                # straight into TQ's staging buffer, and TQ synchronizes this
+                # device before it reads.
                 stage_local_fields = {
-                    opd_full_payload_field: teacher_full_payload.detach().cpu()
+                    opd_full_payload_field: teacher_full_payload.detach()
                 }
                 if opd_full_teacher_index_field is not None:
                     # Guarded above: a column without an index already raised,
@@ -1211,6 +1245,7 @@ class TQWorkerMixin:
                         (teacher_full_payload.shape[0],),
                         int(opd_full_teacher_index),
                         dtype=torch.int64,
+                        device=teacher_full_payload.device,
                     )
                 self._write_back_stage_local(meta, stage_local_fields)
             del teacher_full_payload
@@ -1219,6 +1254,7 @@ class TQWorkerMixin:
             result,
             result_key="logprobs",
             tq_field="teacher_reference_logprobs",
+            keep_on_gpu=keep_outputs_on_gpu,
         )
         del result
 
@@ -1294,10 +1330,40 @@ class TQWorkerMixin:
         ``finish_train_step_presharded``.
         """
         data = self._fetch(meta)
-        data = self._attach_or_repack_pack_metadata(data, meta, stage="train")
-        self.train_microbatch(  # type: ignore[attr-defined]
+        data, row_order = self._attach_or_repack_with_order(data, meta, stage="train")
+        keep_mask = self.train_microbatch(  # type: ignore[attr-defined]
             data=data,
         )
+        if keep_mask is not None:
+            self._write_back_in_loss_keep_mask(meta, data, keep_mask, row_order)
+
+    def _write_back_in_loss_keep_mask(
+        self,
+        meta: "KVBatchMeta",
+        data: BatchedDataDict[Any],
+        keep_mask: list[float],
+        row_order: Optional[list[int]],
+    ) -> None:
+        """Write the in-loss filter's rejections into ``sample_mask``.
+
+        Later consumers of the batch, such as the PPO critic, then see the rows the
+        separate policy-logprob pass would have kept. ``keep_mask`` follows ``data``
+        rows; ``row_order`` maps them back to ``meta.sample_ids``.
+        """
+        sample_mask = data[SAMPLE_MASK].detach().cpu()
+        if len(keep_mask) != sample_mask.shape[0] or sample_mask.shape[0] != len(
+            meta.sample_ids
+        ):
+            raise RuntimeError(
+                f"in-loss keep mask has {len(keep_mask)} rows for a batch of "
+                f"{sample_mask.shape[0]} rows and {len(meta.sample_ids)} sample ids"
+            )
+        kept = sample_mask * torch.tensor(keep_mask, dtype=sample_mask.dtype)
+        if row_order is not None:
+            in_meta_order = torch.empty_like(kept)
+            in_meta_order[torch.tensor(row_order, dtype=torch.long)] = kept
+            kept = in_meta_order
+        self._write_back(meta, {SAMPLE_MASK: kept})
 
     @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/finish_train_step_presharded")

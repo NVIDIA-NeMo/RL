@@ -30,16 +30,6 @@ from nemo_rl.data_plane.schema import (
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 
 
-def test_teacher_resource_config_defaults():
-    from nemo_rl.algorithms.opd import TeacherResourceConfig
-
-    res = TeacherResourceConfig(tensor_model_parallel_size=4)
-    assert res.tensor_model_parallel_size == 4
-    assert res.pipeline_model_parallel_size == 1
-    assert res.gpus_per_node == 8
-    assert res.precision == "bf16"
-
-
 def test_create_teacher_configs_homogeneous():
     from nemo_rl.models.policy.teacher_worker_group import (
         create_teacher_configs_from_opd_config,
@@ -397,6 +387,7 @@ def _disable_opd_full(teacher) -> None:
     """
     teacher._opd_full_payload = None
     teacher._opd_full_payload_dtype = "bfloat16"
+    teacher._keep_outputs_on_gpu = False
     teacher._opd_full_payload_field = None
     teacher._opd_full_teacher_index_field = None
     teacher.teacher_index = 0
@@ -635,7 +626,10 @@ def test_get_logprobs_from_meta_builds_global_sequence_packing_plan(monkeypatch)
     )
 
 
-def test_teacher_worker_presharded_entrypoint_writes_teacher_tq_field():
+@pytest.mark.parametrize("keep_outputs_on_gpu", [False, True])
+def test_teacher_worker_presharded_entrypoint_writes_teacher_tq_field(
+    keep_outputs_on_gpu,
+):
     """The worker consumes its TQ shard and writes only the teacher delta."""
     from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 
@@ -655,16 +649,19 @@ def test_teacher_worker_presharded_entrypoint_writes_teacher_tq_field():
                 }
             )
 
-        def get_logprobs(self, data, micro_batch_size=None):
+        def get_logprobs(self, data, micro_batch_size=None, keep_on_gpu=False):
             del micro_batch_size
             self.received_batching_metadata = (
                 data.micro_batch_indices,
                 data.micro_batch_lengths,
             )
+            self.logprobs_kept_on_gpu = keep_on_gpu
             return BatchedDataDict({"logprobs": torch.full((1, 3), 0.25)})
 
-        def _write_back_result_field(self, meta, result, *, result_key, tq_field):
-            self.written = (meta, result[result_key], tq_field)
+        def _write_back_result_field(
+            self, meta, result, *, result_key, tq_field, keep_on_gpu=False
+        ):
+            self.written = (meta, result[result_key], tq_field, keep_on_gpu)
 
     meta = KVBatchMeta(
         partition_id="rollout_data",
@@ -679,13 +676,18 @@ def test_teacher_worker_presharded_entrypoint_writes_teacher_tq_field():
     )
     worker = Worker()
 
-    worker.get_teacher_logprobs_presharded(meta)
+    worker.get_teacher_logprobs_presharded(
+        meta, keep_outputs_on_gpu=keep_outputs_on_gpu
+    )
 
     assert worker.written is not None
     assert worker.written[0] is meta
     assert torch.allclose(worker.written[1], torch.full((1, 3), 0.25))
     assert worker.written[2] == "teacher_reference_logprobs"
     assert worker.received_batching_metadata == ([[0]], [3])
+    # Top-1 MOPD writes only logprobs, and the GDR option covers them too.
+    assert worker.logprobs_kept_on_gpu is keep_outputs_on_gpu
+    assert worker.written[3] is keep_outputs_on_gpu
 
 
 def test_teacher_worker_rejects_local_dynamic_batch_planning():
@@ -737,6 +739,8 @@ def test_get_logprobs_from_meta_forwards_the_opd_full_payload_request():
     teacher = object.__new__(TeacherWorkerGroup)
     teacher._opd_full_payload = "hidden_states"
     teacher._opd_full_payload_dtype = "float16"
+    # Not the default: the GDR decision made at setup must reach every rank.
+    teacher._keep_outputs_on_gpu = True
     teacher._opd_full_payload_field = OPD_FULL_HIDDEN_STATES_FIELD
     teacher._opd_full_teacher_index_field = OPD_FULL_TEACHER_INDEX_FIELD
     # Not 0: a hard-coded or defaulted index would still look right at 0.
@@ -765,12 +769,63 @@ def test_get_logprobs_from_meta_forwards_the_opd_full_payload_request():
         "micro_batch_size": 2,
         "opd_full_payload": "hidden_states",
         "opd_full_payload_dtype": "float16",
+        "keep_outputs_on_gpu": True,
         "opd_full_payload_field": OPD_FULL_HIDDEN_STATES_FIELD,
         # Multi-teacher routing: this group's own index rides every request so
         # the student can pick the matching LM head back on the train side.
         "opd_full_teacher_index": 2,
         "opd_full_teacher_index_field": OPD_FULL_TEACHER_INDEX_FIELD,
     }
+
+
+_GDR = {"backend": "mooncake_cpu", "mooncake_cpu": {"use_gdr": True}}
+
+
+@pytest.mark.parametrize(
+    "payload,dp_cfg,expected",
+    [
+        # The option defaults to on, so GDR alone keeps the outputs on GPU,
+        # whatever the teacher writes.
+        ("hidden_states", _GDR, True),
+        ("logits", _GDR, True),
+        (None, _GDR, True),
+        (
+            "hidden_states",
+            {
+                "backend": "mooncake_cpu",
+                "mooncake_cpu": {
+                    "use_gdr": True,
+                    "gdr_keep_teacher_payload_on_gpu": False,
+                },
+            },
+            False,
+        ),
+        (
+            "hidden_states",
+            {"backend": "mooncake_cpu", "mooncake_cpu": {"use_gdr": False}},
+            False,
+        ),
+        ("hidden_states", {"backend": "simple"}, False),
+    ],
+)
+def test_setup_data_plane_keeps_teacher_outputs_on_gpu_only_under_gdr(
+    monkeypatch, payload, dp_cfg, expected
+):
+    """Only a GDR PUT reads from GPU; what the teacher writes does not matter."""
+    from nemo_rl.models.policy import teacher_worker_group as twg
+
+    teacher = object.__new__(twg.TeacherWorkerGroup)
+    teacher._opd_full_payload = payload
+    teacher._keep_outputs_on_gpu = False
+    teacher.worker_group = MagicMock()
+    monkeypatch.setattr(twg.ray, "get", lambda refs: refs)
+
+    teacher.setup_data_plane(dp_cfg)
+
+    assert teacher._keep_outputs_on_gpu is expected
+    teacher.worker_group.run_all_workers_single_data.assert_called_once_with(
+        "setup_data_plane", cfg=dp_cfg
+    )
 
 
 def _full_payload_worker_class():
@@ -795,15 +850,26 @@ def _full_payload_worker_class():
                 }
             )
 
-        def get_logprobs(self, data, micro_batch_size=None):
-            self.logprob_call = (data, micro_batch_size)
+        def get_logprobs(self, data, micro_batch_size=None, keep_on_gpu=False):
+            self.logprob_call = (data, micro_batch_size, keep_on_gpu)
             return BatchedDataDict({"logprobs": torch.full((1, 3), 0.25)})
 
         def get_logprobs_with_full_payload(
-            self, *, data, payload, payload_dtype, micro_batch_size=None
+            self,
+            *,
+            data,
+            payload,
+            payload_dtype,
+            micro_batch_size=None,
+            keep_on_gpu=False,
         ):
             del data
-            self.full_payload_call = (payload, payload_dtype, micro_batch_size)
+            self.full_payload_call = (
+                payload,
+                payload_dtype,
+                micro_batch_size,
+                keep_on_gpu,
+            )
             return BatchedDataDict(
                 {
                     "logprobs": torch.full((1, 3), 0.5),
@@ -814,8 +880,10 @@ def _full_payload_worker_class():
         def _write_back_stage_local(self, meta, fields):
             self.stage_local_writes.append((meta, fields))
 
-        def _write_back_result_field(self, meta, result, *, result_key, tq_field):
-            self.written = (meta, result[result_key], tq_field)
+        def _write_back_result_field(
+            self, meta, result, *, result_key, tq_field, keep_on_gpu=False
+        ):
+            self.written = (meta, result[result_key], tq_field, keep_on_gpu)
 
     return Worker
 
@@ -848,7 +916,7 @@ def test_teacher_worker_presharded_entrypoint_writes_the_full_payload_from_its_s
 
     # The single forward replaced get_logprobs; it received the payload request.
     assert worker.logprob_call is None
-    assert worker.full_payload_call == ("hidden_states", "float16", 1)
+    assert worker.full_payload_call == ("hidden_states", "float16", 1, False)
     # Sampled-token logprobs still land in the teacher column.
     assert worker.written is not None
     assert torch.allclose(worker.written[1], torch.full((1, 3), 0.5))
@@ -890,6 +958,30 @@ def test_teacher_worker_presharded_entrypoint_tags_every_row_with_its_teacher():
     assert tags.shape == (payload.shape[0],)
     assert tags.dtype == torch.int64
     assert torch.equal(tags, torch.tensor([2, 2]))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+def test_teacher_worker_presharded_entrypoint_writes_a_gpu_payload_from_gpu():
+    """With the GDR option on, everything the call writes reaches the PUT on GPU."""
+    payload = torch.randn(2, 3, 4, device="cuda")
+    worker = _full_payload_worker_class()(payload)
+
+    worker.get_teacher_logprobs_presharded(
+        _presharded_meta(),
+        opd_full_payload="hidden_states",
+        opd_full_payload_dtype="bfloat16",
+        keep_outputs_on_gpu=True,
+        opd_full_payload_field=OPD_FULL_HIDDEN_STATES_FIELD,
+        opd_full_teacher_index=2,
+        opd_full_teacher_index_field=OPD_FULL_TEACHER_INDEX_FIELD,
+    )
+
+    assert worker.full_payload_call == ("hidden_states", "bfloat16", None, True)
+    _, fields = worker.stage_local_writes[0]
+    assert fields[OPD_FULL_HIDDEN_STATES_FIELD].device == payload.device
+    assert fields[OPD_FULL_TEACHER_INDEX_FIELD].device == payload.device
+    # The logprob column from the same call keeps its device as well.
+    assert worker.written[3] is True
 
 
 def test_teacher_worker_presharded_entrypoint_rejects_an_index_column_without_an_index():

@@ -36,7 +36,7 @@ from collections import Counter, defaultdict
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, ClassVar, Literal, Optional
+from typing import Any, Callable, ClassVar, Literal, Optional
 
 import ray
 
@@ -64,9 +64,11 @@ from nemo_rl.data_plane.schema import (
     MICRO_BATCH_LENGTHS,
     ROUTE_PASSTHROUGH_FLAG,
     ROUTE_PLAN_TAG,
+    SAMPLER_TOPK_FIELDS,
     fields_with_optional_opd_full,
     fields_with_optional_routed_experts,
 )
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.telemetry.instrumentation import trace_context_kwargs
 from nemo_rl.utils.flops_tracker import get_theoretical_tflops
@@ -190,6 +192,7 @@ class TQPolicy(TQDriverMixin, Policy):
         # Data-plane clients outside the worker group (e.g. the rollout
         # actor); Ray actor handles exposing ``get_data_plane_snapshot``.
         self._extra_snapshot_sources: list[Any] = []
+        self._extra_snapshot_fns: list[Callable[[], list[dict[str, Any]]]] = []
 
         # Forward to workers (replaces ``Policy.setup_data_plane`` call
         # site in the trainer — TQPolicy bundles bootstrap + worker
@@ -326,7 +329,9 @@ class TQPolicy(TQDriverMixin, Policy):
         """Drop this step's bulk from TQ. Mirror of :meth:`prepare_step`."""
         self.discard_samples(meta.sample_ids, meta.partition_id)
 
-    def collect_data_plane_snapshots(self) -> list[dict[str, Any]]:
+    def collect_data_plane_snapshots(
+        self, driver_client: Any = None
+    ) -> list[dict[str, Any]]:
         """This driver's data-plane counters plus every worker rank's.
 
         The driver sees roughly a sixth of a step's traffic — the rollout
@@ -339,11 +344,14 @@ class TQPolicy(TQDriverMixin, Policy):
         to take training down. Measured at ~2.4 ms and ~1 kB per process.
         """
         snapshots: list[dict[str, Any]] = []
-        client = getattr(self, "dp_client", None)
+        client = driver_client or getattr(self, "dp_client", None)
         if is_metrics_client(client):
             # reset_step_window: this call is the once-per-step reader, and
             # a max only scopes to a step by being reset by its reader.
             snapshots.append(client.snapshot(reset_step_window=True))
+        own = getattr(self, "dp_client", None)
+        if own is not client and is_metrics_client(own):
+            snapshots.append(own.snapshot(reset_step_window=True))
         # Submitted before the worker fan-out blocks, so the round trips overlap.
         extra_refs = [
             source.get_data_plane_snapshot.remote()
@@ -367,14 +375,25 @@ class TQPolicy(TQDriverMixin, Policy):
             logger.warning("data-plane snapshot from extra sources failed: %s", exc)
         else:
             snapshots.extend(s for s in extra if s)
+        for fn in self._extra_snapshot_fns:
+            try:
+                snapshots.extend(fn())
+            except Exception as exc:  # noqa: BLE001 - metrics must never fail a step
+                logger.warning("data-plane snapshot from %s failed: %s", fn, exc)
         return snapshots
+
+    def add_data_plane_snapshot_fn(
+        self, fn: Callable[[], list[dict[str, Any]]]
+    ) -> None:
+        """Include a group of data-plane clients read through one call."""
+        self._extra_snapshot_fns.append(fn)
 
     def add_data_plane_snapshot_source(self, actor: Any) -> None:
         """Include a non-worker actor's data-plane client in the cluster view."""
         self._extra_snapshot_sources.append(actor)
 
     def get_data_plane_step_metrics(
-        self, step_time_s: float
+        self, step_time_s: float, driver_client: Any = None
     ) -> "tuple[dict[str, float], str] | None":
         """This step's data-plane cost and the scope it covers, or ``None``.
 
@@ -392,10 +411,11 @@ class TQPolicy(TQDriverMixin, Policy):
         falls back after N cluster steps differences against last step rather
         than reporting N steps' accumulated history as one.
         """
-        if not is_metrics_client(self.dp_client):
+        driver_client = driver_client or self.dp_client
+        if not is_metrics_client(driver_client):
             return None  # observability disabled -> plain adapter
         collect_started = time.perf_counter()
-        snapshots = self.collect_data_plane_snapshots()
+        snapshots = self.collect_data_plane_snapshots(driver_client)
         # The fan-out is part of what observability costs, and the larger
         # part: omitting it reported a twentieth of the real bill. Charged on
         # the fallback path too, where it is the cost of an attempt that
@@ -405,7 +425,7 @@ class TQPolicy(TQDriverMixin, Policy):
         # and closing the step window is what reading it means, so the client
         # is handed that snapshot rather than taking a second one -- a second
         # reset would zero every ``step/by_op/*/max_ms``.
-        driver = self.dp_client.get_step_metrics(step_time_s, snapshots[0], collect_ms)
+        driver = driver_client.get_step_metrics(step_time_s, snapshots[0], collect_ms)
         if len(snapshots) == 1:
             # The fan-out could not reach the workers, or there are none.
             return driver, "driver"
@@ -463,8 +483,12 @@ class TQPolicy(TQDriverMixin, Policy):
         timer: Optional[Timer],
         common_kwargs: dict[str, Any],
         include_router_replay: bool = False,
+        extra_fields: tuple[str, ...] = (),
     ) -> None:
         """Shared body of get_logprobs_from_meta / get_reference_policy_logprobs_from_meta.
+
+        ``extra_fields`` are fetched beyond ``LP_SEED_FIELDS`` (the captured sampler
+        head when prev logprobs replay the sampler's support).
 
         Logprob workers fetch ``LP_SEED_FIELDS`` plus the multimodal
         columns ``_isolated_meta`` unions in, so prev/ref logprobs see the
@@ -486,7 +510,9 @@ class TQPolicy(TQDriverMixin, Policy):
         # prev/ref logprobs and the training forward see identical model inputs.
         lp_meta = self._with_route_fields(
             meta,
-            self._with_shared_prefix_fields(LP_SEED_FIELDS, stage="logprobs"),
+            self._with_shared_prefix_fields(
+                LP_SEED_FIELDS + extra_fields, stage="logprobs"
+            ),
             task_name=task_name,
             want_routes=include_router_replay,
         )
@@ -533,6 +559,8 @@ class TQPolicy(TQDriverMixin, Policy):
         micro_batch_size: Optional[int] = None,
         timer: Optional[Timer] = None,
     ) -> None:
+        generation_cfg = self.cfg.get("generation")
+        replay = generation_cfg is not None and sampler_replay_enabled(generation_cfg)
         self._logprob_dispatch(
             meta,
             task_name="prev_lp",
@@ -541,6 +569,8 @@ class TQPolicy(TQDriverMixin, Policy):
             timer=timer,
             common_kwargs={"micro_batch_size": micro_batch_size},
             include_router_replay=True,
+            # Replay renormalizes prev logprobs over the captured sampler support.
+            extra_fields=SAMPLER_TOPK_FIELDS if replay else (),
         )
 
     def get_reference_policy_logprobs_from_meta(

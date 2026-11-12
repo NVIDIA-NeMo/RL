@@ -448,16 +448,23 @@ def _pad_sequence_aligned_tensors(
 
 
 def _masks_packed_sequence_padding(
-    megatron_cfg: Mapping[str, Any], *, create_router_padding_mask: bool
+    megatron_cfg: Mapping[str, Any],
+    *,
+    create_router_padding_mask: bool,
+    delegate_pack_to_model: bool = False,
 ) -> bool:
     """Whether packed forwards mask per-sequence padding from MoE routing.
 
-    HybridEP always masks it. Any other dispatcher masks it while expert-bias
-    updates are live (``create_router_padding_mask``), so alignment padding
-    never reaches expert-bias load counts. Dense packed microbatches and
-    shared-prefix units (dense fallbacks and star forwards) share this rule.
+    HybridEP masks it unless the model packs sequences itself
+    (``delegate_pack_to_model``), which never receives a caller-built mask. Any
+    dispatcher masks it while expert-bias updates are live
+    (``create_router_padding_mask``), so alignment padding never reaches
+    expert-bias load counts. Dense packed microbatches and shared-prefix units
+    (dense fallbacks and star forwards) share this rule.
     """
-    return uses_hybridep_flex_dispatcher(megatron_cfg) or create_router_padding_mask
+    return (
+        uses_hybridep_flex_dispatcher(megatron_cfg) and not delegate_pack_to_model
+    ) or create_router_padding_mask
 
 
 def get_microbatch_iterator(
@@ -670,9 +677,13 @@ def get_microbatch_iterator(
     elif cfg["sequence_packing"]["enabled"]:
         uses_hybridep = uses_hybridep_flex_dispatcher(cfg["megatron_cfg"])
         # Alignment padding between packed sequences must not reach expert-bias
-        # statistics with any dispatcher, not only HybridEP.
+        # statistics with any dispatcher, not only HybridEP. A self-packing model
+        # never receives a caller-built mask, so HybridEP alone requests none
+        # there; an expert-bias request still does and is rejected downstream.
         create_packed_seq_padding_mask = _masks_packed_sequence_padding(
-            cfg["megatron_cfg"], create_router_padding_mask=create_router_padding_mask
+            cfg["megatron_cfg"],
+            create_router_padding_mask=create_router_padding_mask,
+            delegate_pack_to_model=delegate_pack_to_model,
         )
         prepad_packed_seq_for_hybridep = uses_hybridep and cfg["megatron_cfg"].get(
             "moe_hybridep_prepad_packed_inputs"

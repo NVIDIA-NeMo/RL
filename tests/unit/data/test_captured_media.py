@@ -62,6 +62,7 @@ from nemo_rl.data_plane.tq_token_sink import (
     TQTokenSource,
 )
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
+from nemo_rl.experience.route_assembly import verify_route_fragment_integrity
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
@@ -161,22 +162,26 @@ def stage(
     )
     message = {"generation_token_ids": [31, 2], "generation_log_probs": [-0.25, -0.5]}
     if routes:
-        message["routed_experts"] = [[[0]]] * (len(prompt["prompt_token_ids"]) + 2)
+        message["routed_experts"] = torch.zeros(
+            len(prompt["prompt_token_ids"]) + 2, 1, 1, dtype=torch.int16
+        )
     payload = {
         "prompt_token_ids": prompt["prompt_token_ids"],
         "choices": [{"message": message}],
         MEDIA_SPANS_FIELD: [item.to_dict() for item in media.items],
     }
+    attachments = media.tensors
     if routes:
-        VllmAsyncGenerationWorkerImpl._delta_align_routed_experts(
+        routed = VllmAsyncGenerationWorkerImpl._delta_align_routed_experts(
             payload,
             prev_len=prev_len,
             prompt_len=len(prompt["prompt_token_ids"]),
             generated_len=2,
         )
-    # Pixels ride beside the record as opaque attachments: one sink write.
+        attachments = {**(attachments or {}), "routed_experts": routed}
+    # Pixels and routes ride beside the record as attachments: one sink write.
     coords = capture.complete_call_from_response(
-        capture.begin_call(admission), payload, attachments=media.tensors
+        capture.begin_call(admission), payload, attachments=attachments
     )
     assert coords.disposition == expect
     if expect != "staged":
@@ -769,19 +774,32 @@ def test_worker_restart_validates_retained_media(
         assert excinfo.value.code == "retained_media_changed"
 
 
-def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp):
+@pytest.mark.parametrize("with_routed_experts", [False, True])
+def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(
+    dp, monkeypatch, with_routed_experts
+):
     from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
 
+    def forbidden_codec(*args, **kwargs):
+        pytest.fail("captured routes must remain tensors alongside media")
+
+    for target in (
+        "nemo_rl.utils.routed_experts_codec.encode_routed_experts",
+        "nemo_rl.utils.routed_experts_codec.decode_routed_experts",
+        "nemo_rl.experience.route_assembly.encode_routed_experts",
+    ):
+        monkeypatch.setattr(target, forbidden_codec)
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
-    worker._capture_calls = {}
-    worker._capture_top_logprobs = 0
+    worker._init_token_capture_state()
+    sink = TQTokenSink(
+        dp,
+        staging_partition="staging",
+        capture_media=True,
+        media_pixel_dtype=torch.float32,
+    )
+    worker._capture_sink = sink
     worker.token_capture = RolloutTokenCapture(
-        sink=TQTokenSink(
-            dp,
-            staging_partition="staging",
-            capture_media=True,
-            media_pixel_dtype=torch.float32,
-        ),
+        sink=sink,
         weight_version_fn=lambda: 0,
         adapter=VLLMCaptureAdapter(),
     )
@@ -804,12 +822,28 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(dp
             }
         ]
     }
+    routes = torch.arange(6, dtype=torch.int16).reshape(3, 1, 2)
+    if with_routed_experts:
+        content["choices"][0]["message"]["routed_experts"] = routes
     response = worker._finish_request_capture(request, content)
     assert response["ng_commit_coords"]["disposition"] == "staged"
     assert "media" not in response and MEDIA_SPANS_FIELD not in response
-    assert worker._capture_calls == {}
+    assert "routed_experts" not in response["choices"][0]["message"]
+    json.dumps(response)
+    assert len(worker._capture_registry) == 0
     [media] = staged_media(dp, "r0/c1")
     torch.testing.assert_close(media.imgs, torch.ones(1, 6, 3))
+    if with_routed_experts:
+        source = TQTokenSource(dp, staging_partition="staging", capture_media=True)
+        [fetched] = source.fetch_for_finalization(
+            ["r0/c1"], include_route_fragments=True
+        )
+        torch.testing.assert_close(fetched.fragment.routes, routes)
+        assert verify_route_fragment_integrity(
+            fetched.fragment,
+            extras_digest_version=fetched.snapshot.extras_digest_version,
+            expected_extras_digest=fetched.snapshot.extras_digest,
+        )
 
 
 def video_prompt(tokens, videos, images=()):
@@ -1366,16 +1400,24 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     )
     _install_fake_vllm(monkeypatch)
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._init_token_capture_state()
     worker.__dict__.update(state.__dict__)
     worker.cfg = dict(
-        temperature=1.0, top_p=1.0, val_temperature=0.0, val_top_p=1.0, vllm_cfg={}
+        temperature=1.0,
+        top_p=1.0,
+        top_k=None,
+        val_temperature=0.0,
+        val_top_p=1.0,
+        val_top_k=None,
+        vllm_cfg={},
     )
     worker.token_capture = MagicMock(adapter=VLLMCaptureAdapter())
-    worker._capture_calls = {}
     worker._http_engine_client = MagicMock()
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = SimpleNamespace(
-        served_model_name="test", model="test"
+        served_model_name="test",
+        model="test",
+        try_get_generation_config=lambda: {},
     )
     app = _FakeApp()
     worker._setup_vllm_openai_api_server(app)
@@ -1393,6 +1435,11 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     handler = dict(app.routes)["/v1/chat/completions"]
     request = SimpleNamespace(
         top_k=-1,
+        min_p=None,
+        repetition_penalty=None,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        logit_bias=None,
         top_p=1.0,
         temperature=1.0,
         ng_capture=admission.model_dump(),
@@ -1419,7 +1466,7 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     inference.assert_not_awaited()
     worker.token_capture.begin_call.assert_not_called()
     worker.token_capture.complete_call_from_response.assert_not_called()
-    assert worker._capture_calls == {}
+    assert len(worker._capture_registry) == 0
 
     # Exercise Gym's actual middleware, which wraps upstream 400s as 500s.
     upstream = ClientResponseError(
