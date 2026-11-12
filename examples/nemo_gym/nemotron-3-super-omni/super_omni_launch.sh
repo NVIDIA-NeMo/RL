@@ -223,7 +223,8 @@ if [[ -n "${GYM_VENV_ARCHIVE}" ]]; then
     fi
     mount_checked_vars+=(GYM_VENV_ARCHIVE)
     # ray.sub runs SETUP_COMMAND on every node before Ray starts, and again on a retried start.
-    export SETUP_COMMAND="${SETUP_COMMAND:+${SETUP_COMMAND}; }[ -e /opt/gym_venvs/.from-archive ] || { tar -C / -xf ${GYM_VENV_ARCHIVE} && touch /opt/gym_venvs/.from-archive; }"
+    # Removing the image's /opt/gym_venvs first keeps any venv from mixing files from two builds.
+    export SETUP_COMMAND="${SETUP_COMMAND:+${SETUP_COMMAND}; }[ -e /opt/gym_venvs/.from-archive ] || { rm -rf /opt/gym_venvs && tar -C / -xf ${GYM_VENV_ARCHIVE} && touch /opt/gym_venvs/.from-archive; }"
 fi
 for path_var in "${mount_checked_vars[@]}"; do
     path_value="${!path_var}"

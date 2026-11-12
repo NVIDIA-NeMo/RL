@@ -332,12 +332,13 @@ Environments built this way use the image's own Python, so the archive only has 
 move the Gym version or change the image.
 
 In each training job, unpack the archive with `SETUP_COMMAND`, mount the archive's
-directory, and run with `env.nemo_gym.skip_venv_if_present=true`. The marker file keeps a
-retried Ray start from unpacking the archive twice. Unpack on every node, not only the nodes
+directory, and run with `env.nemo_gym.skip_venv_if_present=true`. The command removes the
+image's own `/opt/gym_venvs` first, so no environment mixes files from two builds, and the
+marker file keeps a retried Ray start from unpacking the archive twice. Unpack on every node, not only the nodes
 that host Gym servers, because Ray work that a Gym server starts can run on any node.
 
 ```sh
-SETUP_COMMAND='[ -e /opt/gym_venvs/.from-archive ] || { tar -C / -xf /shared/path/gym_venvs-<gym commit>.tar && touch /opt/gym_venvs/.from-archive; }' \
+SETUP_COMMAND='[ -e /opt/gym_venvs/.from-archive ] || { rm -rf /opt/gym_venvs && tar -C / -xf /shared/path/gym_venvs-<gym commit>.tar && touch /opt/gym_venvs/.from-archive; }' \
 COMMAND="uv run ./examples/nemo_gym/run_grpo_nemo_gym.py --config <recipe config> env.nemo_gym.skip_venv_if_present=true" \
 CONTAINER=... \
 MOUNTS="...,/shared/path:/shared/path:ro" \
