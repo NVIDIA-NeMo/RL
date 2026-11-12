@@ -356,7 +356,8 @@ def use_per_torch_version_extension_dir(env_vars: dict[str, str]) -> None:
         "~/.cache/torch_extensions"
     )
     # A worker inherits the folder its parent chose for the parent's torch version.
-    if os.path.basename(root).startswith("torch-"):
+    folder = os.path.basename(root)
+    if folder.startswith("torch-") and folder[len("torch-") :][:1].isdigit():
         root = os.path.dirname(root)
     env_vars["TORCH_EXTENSIONS_DIR"] = os.path.join(root, f"torch-{torch_version}")
 
