@@ -29,6 +29,7 @@ from tensordict import TensorDict
 from nemo_rl.algorithms.advantage_estimator import (
     AdvEstimatorConfig,
     GAEConfig,
+    GDPOAdvantageEstimator,
     GeneralizedAdvantageEstimator,
     create_advantage_estimator,
 )
@@ -567,6 +568,67 @@ def _pool_meta() -> KVBatchMeta:
             for i in range(NUM_GROUPS * GROUP_SIZE)
         ],
     )
+
+
+@pytest.mark.parametrize("scaling", [False, True])
+def test_gdpo_discovers_components_and_matches_legacy(scaling: bool) -> None:
+    rows = _rows()
+    for i, row in enumerate(rows.values()):
+        row["reward/a"] = torch.tensor(float(i % 3))
+        row["reward/b"] = torch.tensor(float(i % 4) / 3)
+        row["total_reward"] = row["reward/a"] + row["reward/b"]
+    store = _RowStore(rows)
+    algo = GRPOConfig(
+        seq_logprob_error_threshold=None,
+        adv_estimator=AdvEstimatorConfig(name="gdpo", reward_weights=[0.5, 2.0]),
+        reward_scaling=RewardScalingConfig(
+            enabled=scaling,
+            source_min=0.0,
+            source_max=1.0,
+            target_min=-1.0,
+            target_max=1.0,
+        ),
+    )
+    estimator = GDPOAdvantageEstimator(algo.adv_estimator, ClippedPGLossConfig())
+    meta = _pool_meta().with_fields(["reward/b", "reward/a"])
+    batch = {
+        key: torch.stack([row[key] for row in rows.values()])
+        for key in ("total_reward", "reward/a", "reward/b")
+    }
+    if scaling:
+        batch = {key: value.clamp(0, 1) * 2 - 1 for key, value in batch.items()}
+    expected = estimator.compute_advantage(
+        prompt_ids=torch.arange(NUM_GROUPS).repeat_interleave(GROUP_SIZE),
+        rewards=batch["total_reward"],
+        mask=torch.ones(NUM_GROUPS * GROUP_SIZE, SEQ),
+        repeated_batch=batch,
+        valid_mask=torch.ones(NUM_GROUPS * GROUP_SIZE),
+    )
+    computer = AdvantageComputer(
+        store,
+        config=_config(algo=algo, shardable=False),
+        advantage_estimator=estimator,
+    )
+    asyncio.run(computer.run(AdvantageRequest(meta=meta)))
+    actual = torch.stack([row["advantages"] for row in rows.values()])
+    torch.testing.assert_close(actual, expected)
+    assert rows["s2"]["reward/a"].item() == 2.0
+
+
+def test_gdpo_rejects_a_single_reward_payload() -> None:
+    algo = GRPOConfig(
+        seq_logprob_error_threshold=None,
+        adv_estimator=AdvEstimatorConfig(name="gdpo"),
+    )
+    computer = AdvantageComputer(
+        _RowStore(_rows()),
+        config=_config(algo=algo, shardable=False),
+        advantage_estimator=GDPOAdvantageEstimator(
+            algo.adv_estimator, ClippedPGLossConfig()
+        ),
+    )
+    with pytest.raises(ValueError, match="multiple reward/<name> columns"):
+        asyncio.run(computer.run(AdvantageRequest(meta=_pool_meta())))
 
 
 class _InlineActor:

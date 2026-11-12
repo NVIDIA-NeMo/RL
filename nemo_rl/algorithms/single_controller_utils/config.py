@@ -1543,16 +1543,10 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "grpo.length_penalty."
         )
 
-    # Rejected at setup: the advantage stage never fetches the reward/<name>
-    # columns, and the first advantage call is a full round of rollouts later.
-    if algo_cfg.adv_estimator.name == "gdpo":
+    if algo_cfg.adv_estimator.name == "gdpo" and master_config.token_capture.enabled:
         raise NotImplementedError(
-            "adv_estimator 'gdpo' is not supported on the SingleController "
-            "path. The advantage stage does not fetch the per-component reward "
-            "columns (reward/<name>), so the first advantage call would raise "
-            "'GDPO requires multiple reward components' after the run had "
-            "already paid for a full step of rollouts. Set adv_estimator.name "
-            "to 'grpo'."
+            "GDPO requires per-component rewards, which token capture does not "
+            "preserve. Set token_capture.enabled=false to use GDPO."
         )
 
     async_config = master_config.async_rl

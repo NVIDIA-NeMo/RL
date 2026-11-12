@@ -6137,9 +6137,7 @@ def test_advantage_stage_placeholders_never_vote(
         plane = _AdvantageDataPlane(data)
         ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
         ctrl._dp_client = plane
-        ctrl._advantage_cfg = AdvantageConfig(
-            repeated_batch_fields=["reward/a", "reward/b"]
-        )
+        ctrl._advantage_cfg = AdvantageConfig()
         ctrl._advantage_estimator = _create_advantage_estimator(master)
         ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
         ctrl._policy_logprobs_required = False
