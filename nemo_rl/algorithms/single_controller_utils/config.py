@@ -236,8 +236,8 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     # race the iteration order that checkpoint/resume accounting depends on. Diverting
     # happens before admit(), so a diverted batch never burns a target step.
     #
-    # Read only when on_dropped_prompt="replace". Borrowing draws on it too: a group is
-    # only ever taken from a later step when a spare is in hand to repay that step.
+    # Read when on_dropped_prompt="replace"; dynamic sampling uses its own pool.
+    # Fault-tolerance borrowing uses this pool to repay the later step.
     replacement_reserve_prompts: NonNegativeInt = 1
     # ── path-specific ──
     native: NativeRolloutFTConfig = Field(default_factory=NativeRolloutFTConfig)
@@ -738,7 +738,9 @@ class TaskSourceRecoveryGranularity:
 class RolloutRecoveryConfig(BaseModel, extra="allow"):
     """Retry and restore policy for unfinished token-capture prompt groups.
 
-    ``turn`` requests Gym participant recovery, ``sibling`` preserves completed
+    ``prefix`` restores Gym participant state and decoded tokens from an active
+    model call, ``turn`` requests Gym participant recovery and restarts an active
+    call from its preceding durable turn, ``sibling`` preserves completed
     generations and restarts unfinished siblings, and ``prompt_group`` restarts
     every sibling in an unfinished group. Overrides may only make a particular
     taskset, task source, or agent coarser than the global target.
@@ -757,9 +759,9 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     )
     # Seconds Gym gets to park its in-flight steps; see the exemplar YAML.
     gym_prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
-    # With target_level='turn', a Gym server whose checkpoint mode is
-    # restart_only (the default for agents and resources servers) starts every
-    # in-flight rollout over after a crash. False fails setup and names such
+    # With target_level='turn' or 'prefix', a Gym server whose checkpoint mode
+    # is restart_only (the default for agents and resources servers) starts
+    # every in-flight rollout over after a crash. False fails setup and names such
     # servers; true accepts them with a warning.
     allow_restart_only_gym_servers: bool = False
 
@@ -768,11 +770,11 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         """Reject the restart-only opt-in where Gym does not checkpoint rollouts."""
         if (
             self.allow_restart_only_gym_servers
-            and self.target_level is not RecoveryTargetLevel.TURN
+            and not self.target_level.requires_environment_checkpoint
         ):
             raise ValueError(
                 "rollout_recovery.allow_restart_only_gym_servers applies only to "
-                "target_level='turn'; with "
+                "target_level='turn' or 'prefix'; with "
                 f"target_level={self.target_level.value!r} every unfinished "
                 "rollout already starts over"
             )
@@ -798,19 +800,25 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
                     f"{mapping_name} may only force a coarser recovery level than "
                     f"target_level={self.target_level.value!r}; invalid={finer!r}"
                 )
-            if self.target_level is RecoveryTargetLevel.TURN and overrides:
+            if self.target_level.requires_environment_checkpoint and overrides:
                 # A checkpointing Gym deployment exports every live episode, so
                 # a coarser route on it would fall outside the commit scope.
                 raise ValueError(
-                    f"{mapping_name} is not supported with target_level='turn' "
-                    f"yet; got {sorted(overrides)!r}"
+                    f"{mapping_name} is not supported with "
+                    f"target_level={self.target_level.value!r} yet; "
+                    f"got {sorted(overrides)!r}"
                 )
         return self
 
     @property
     def turn_checkpointing_enabled(self) -> bool:
         """Whether Gym participant state is required for the requested target."""
-        return self.target_level is RecoveryTargetLevel.TURN
+        return self.target_level.requires_environment_checkpoint
+
+    @property
+    def generation_prefix_cuts_enabled(self) -> bool:
+        """Whether active model calls participate in Gym's checkpoint cut."""
+        return self.target_level.preserves_generation_prefix
 
     def resolve_for_prompt(
         self, prompt: Mapping[str, Any]
@@ -874,8 +882,11 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
 class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     """Frequent rollout-state snapshots anchored to durable trainer state.
 
-    ``snapshot_attempt_interval_s=None`` disables saving and restoring periodic
-    snapshots. A snapshot taken before the first trainer checkpoint is anchored
+    Rollout snapshots are on when ``snapshot_attempt_interval_s`` is set or with
+    turn-level recovery; see docs/guides/single-controller.md for when they are
+    saved.
+
+    A snapshot taken before the first trainer checkpoint is anchored
     to the initial model and a rollout-semantic configuration fingerprint. Later
     snapshots require the durable trainer checkpoint for the controller's
     current completed step; attempts are skipped until that exact anchor exists.
@@ -916,6 +927,7 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     """
 
     snapshot_attempt_interval_s: Annotated[Optional[float], Field(gt=0)] = None
+    snapshot_on_trainer_checkpoint: bool = True
     telemetry_interval_s: Annotated[Optional[float], Field(gt=0)] = None
     max_consecutive_failures: Annotated[int, Field(ge=1)] = 3
     keep_latest_k: Annotated[int, Field(ge=1)] = 2
@@ -998,7 +1010,6 @@ def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> No
         "loss_fn.seq_logprob_error_in_loss": loss.seq_logprob_error_in_loss,
         "grpo.use_dynamic_sampling": grpo.use_dynamic_sampling,
         "grpo.reward_shaping.enabled": grpo.reward_shaping.enabled,
-        "grpo.reward_scaling.enabled": grpo.reward_scaling.enabled,
         "grpo.calculate_advantages_on_gpu": bool(grpo.calculate_advantages_on_gpu),
         "grpo.invalid_tool_call_advantage": grpo.invalid_tool_call_advantage
         is not None,
@@ -1070,6 +1081,18 @@ def is_ppo_run(master_config: MasterConfig) -> bool:
     the attribute can genuinely be missing on a hand-built config.
     """
     return getattr(master_config, "ppo", None) is not None
+
+
+def rollout_snapshots_enabled(master_config: MasterConfig) -> bool:
+    """Whether the run saves and restores rollout snapshots.
+
+    Periodic snapshots turn them on, and so does turn-level recovery, whose
+    environment state only a rollout snapshot holds.
+    """
+    return (
+        master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None
+        or master_config.rollout_recovery.turn_checkpointing_enabled
+    )
 
 
 def algo_config(master_config: MasterConfig) -> GRPOConfig | PPOConfig:
@@ -1305,8 +1328,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
     Both directions on the critic: one the PPO path needs and does not have, and
-    one a GRPO run carries and would never build. Plus the reward-shaping and
-    sampling knobs SC reads on neither path.
+    one a GRPO run carries and would never build, plus sampling and length-penalty
+    settings the SC path does not implement.
     """
     algo_cfg = algo_config(master_config)
 
@@ -1320,15 +1343,20 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "with max_num_steps."
         )
 
+    # The SC dataloader batches num_prompts_per_step directly, so nothing over-generates.
+    if algo_cfg.batch_multiplier != 1.0:
+        raise ValueError(
+            f"batch_multiplier={algo_cfg.batch_multiplier} has no effect on the "
+            "SingleController path: the dataloader batches num_prompts_per_step "
+            "directly, so nothing over-generates. Set it to 1."
+        )
+
     # An enabled one here describes shaping this run does not do. An entry leaves
     # this list once the SC path implements it; overlong_filtering is applied in
     # the advantage stage from the raw completion flags in the TransferQueue.
     unsupported = [
         name
         for name, enabled in (
-            ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
-            ("reward_scaling", algo_cfg.reward_scaling.enabled),
-            ("reward_shaping", algo_cfg.reward_shaping.enabled),
             # getattr: PPO's config has no length_penalty field.
             ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
         )
@@ -1402,6 +1430,63 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "but max_buffered_rollouts is still validated against the wider one. "
             "Remove it, or add a `ppo` block with policy_training_start_step > 0."
         )
+
+    # Dynamic sampling uses a replacement budget separate from rollout failures.
+    if algo_cfg.use_dynamic_sampling:
+        # Zero within-group reward variance does not imply zero PPO advantage.
+        if is_ppo_run(master_config):
+            raise ValueError(
+                "ppo.use_dynamic_sampling must be false: zero within-group reward "
+                "variance does not imply zero PPO advantage. This filtering rule "
+                "is GRPO-only."
+            )
+        # Reached only for GRPO (PPO is rejected above); name the key accordingly.
+        algo_prefix = "grpo"
+        grpo_cfg = cast(GRPOConfig, algo_cfg)
+        if grpo_cfg.adv_estimator.name != "grpo":
+            raise ValueError(
+                "grpo.use_dynamic_sampling requires grpo.adv_estimator.name='grpo': "
+                "constant rewards do not imply zero advantage for other estimators."
+            )
+        for key in ("invalid_tool_call_advantage", "malformed_thinking_advantage"):
+            if getattr(grpo_cfg, key) not in (None, 0):
+                raise ValueError(
+                    f"grpo.use_dynamic_sampling requires grpo.{key} to be 0 or null: "
+                    "nonzero message-level overrides can train constant-reward groups."
+                )
+        # Capture cannot borrow future groups, so routine filtering would stall training.
+        if master_config.token_capture.enabled:
+            raise ValueError(
+                f"{algo_prefix}.use_dynamic_sampling is not supported together with "
+                "token_capture.enabled: on the capture path a replacement cannot borrow "
+                "a finished group from a later step, so every dropped group stalls its "
+                "step for a full fresh rollout. Disable one of the two."
+            )
+        if grpo_cfg.dynamic_sampling_max_gen_batches < 1:
+            raise ValueError(
+                f"{algo_prefix}.dynamic_sampling_max_gen_batches must be >= 1 when "
+                f"{algo_prefix}.use_dynamic_sampling is set (got "
+                f"{grpo_cfg.dynamic_sampling_max_gen_batches}): a step needs at least "
+                "the batch it was admitted with."
+            )
+        # By name: neither the stamping nor the interruptible admission wait this
+        # needs is knowable for a `custom` class at setup. #4784 reopens it.
+        if async_config.sampler.name != "in_order":
+            raise ValueError(
+                f"{algo_prefix}.use_dynamic_sampling requires "
+                "async_rl.sampler.name='in_order', but got "
+                f"'{async_config.sampler.name}': a filtered group is charged to the "
+                "target step the sampler stamps, and the spare pool is refilled while "
+                "the pump waits to admit, neither of which the other samplers "
+                "support yet."
+            )
+        if algo_cfg.num_generations_per_prompt < 2:
+            raise ValueError(
+                f"{algo_prefix}.use_dynamic_sampling requires "
+                "num_generations_per_prompt >= 2: a single generation has no "
+                "within-group spread, so every group would be filtered "
+                f"(got {algo_cfg.num_generations_per_prompt})."
+            )
 
     if not is_ppo_run(master_config):
         # A value block without `ppo` is inert -- nothing builds the critic --
@@ -1596,8 +1681,6 @@ def resolve_ppo_chunk_alignment(
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     if master_config.loss_fn.seq_logprob_error_in_loss:
-        if is_ppo_run(master_config):
-            raise ValueError("loss_fn.seq_logprob_error_in_loss requires GRPO")
         _validate_seq_logprob_error_in_loss(master_config)
     _validate_algo_settings(master_config)
 
@@ -1620,12 +1703,19 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             )
         # A rollout snapshot needs step_N published while training is still on
         # step N; a deferred finalize publishes it at a later step boundary.
-        if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:
+        # The deadline snapshot is exempt: the run publishes it first, then stops.
+        rollout_checkpoint_cfg = master_config.rollout_checkpointing
+        if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None or (
+            master_config.rollout_recovery.turn_checkpointing_enabled
+            and rollout_checkpoint_cfg.snapshot_on_trainer_checkpoint
+        ):
             raise ValueError(
                 "async_rl.defer_async_checkpoint_finalize cannot be combined with "
-                "rollout_checkpointing.snapshot_attempt_interval_s: rollout snapshots "
-                "need each step's policy checkpoint published before the next "
-                "optimizer step, and a deferred finalize publishes it later."
+                "rollout_checkpointing.snapshot_attempt_interval_s or, with "
+                "rollout_recovery.target_level='turn', "
+                "rollout_checkpointing.snapshot_on_trainer_checkpoint: rollout "
+                "snapshots need each step's policy checkpoint published before the "
+                "next optimizer step, and a deferred finalize publishes it later."
             )
 
     reward_penalties_enabled = any(
@@ -1845,6 +1935,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 f"token_capture.control_timeout_s ({gym_park_s}); a turn snapshot "
                 "can hold rollout dispatch that long."
             )
+    if recovery_config.generation_prefix_cuts_enabled and top_logprobs > 0:
+        # Sampler top-k is staged from a call's final response only, so a
+        # restored generation prefix would have no candidates for its tokens.
+        raise ValueError(
+            "rollout_recovery.target_level='prefix' does not support "
+            "policy.generation.top_logprobs > 0 (loss_fn.score_centering) yet"
+        )
     if token_capture_config.defer_routed_experts_to_policy and not (
         token_capture_config.enabled
     ):

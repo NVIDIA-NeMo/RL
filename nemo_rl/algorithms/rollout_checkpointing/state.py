@@ -72,6 +72,10 @@ class RolloutRuntimeState:
     # ones. Filled only by the rollout pump, which owns the dataloader iterator;
     # see the config docstring for why a dispatch task cannot pull from it.
     replacement_reserve: deque[DatumSpec] = field(default_factory=deque)
+    # Independent raw supply for dynamic-sampling replacements.
+    filtered_reserve: deque[DatumSpec] = field(default_factory=deque)
+    # Exhausted steps use the final train-or-skip floor instead of failing early.
+    steps_allowed_short: set[int] = field(default_factory=set)
     # Prompts dropped from each stamped target step. A stamping sampler will
     # only ever select num_prompts_per_step groups carrying that stamp, so a
     # dropped prompt leaves that step permanently one short and the train pump
@@ -107,7 +111,7 @@ class CapturedRolloutState:
     dataloader_state: dict[str, Any]
     sampler_dispatch_index: int
     next_nemo_gym_task_index: int
-    replacement_reserve: list[DatumSpec]
+    replacement_reserve: dict[str, list[DatumSpec]]
     replay_metadata: Optional[TQReplayMetadataState]
     rollout_recovery_payload: Optional[bytes]
     rollout_recovery_group_count: Optional[int]

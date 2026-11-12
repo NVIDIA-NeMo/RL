@@ -1,0 +1,11 @@
+# Placeholder suite for the nightly Gym-bump validation lane (H100, 8 GPUs per
+# node). The nemo-ci Gym bump pipeline bumps the Gym submodule and runs this
+# list. Seeded with the Gym smoke legs; extend with Gym-exercising recipes.
+
+########
+# GRPO #
+########
+
+# Gym smoke
+tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-quick.sh
+tests/test_suites/llm/grpo-nanov3-30BA3B-2n8g-megatron_generation-colocated-reshard-async-gym-quick.sh
