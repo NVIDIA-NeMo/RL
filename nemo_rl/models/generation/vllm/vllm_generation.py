@@ -74,10 +74,10 @@ from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
     VllmConfig,
     VllmDisaggFrontendConfig,
+    disagg_engine_env_defaults,
     resolve_vllm_connector_profile,
     resolve_vllm_disagg_frontend_config,
     resolve_vllm_disagg_layout,
-    resolve_vllm_kv_transfer_config,
     validate_vllm_async_actor_settings,
     validate_vllm_disaggregation,
     validate_vllm_disaggregation_for_refit,
@@ -261,39 +261,6 @@ def _record_vllm_generation_metrics(
             record_rl_metrics({BATCH_DURATION_KEY: batch_duration_s})
     except Exception:
         warn_once("vllm_inference_metrics", "nemo-lens: failed to record vLLM metrics")
-
-
-def disagg_engine_env_defaults(config: VllmConfig) -> dict[str, str]:
-    """Environment every disaggregated engine process gets unless the recipe says otherwise.
-
-    Two variables, both for the NIXL connector; ``vllm_cfg.env_vars`` wins over
-    either.
-
-    ``VLLM_SSM_CONV_STATE_LAYOUT=DS``: NixlConnector moves a Mamba/SSM layer's
-    conv state in three reads and asserts the dim-first ("DS") state layout at
-    worker start, while vLLM's default is "SD". Inert for models without such
-    layers, so every NIXL engine gets it.
-
-    ``NCCL_NET_PLUGIN=none`` (GPU-staged KV only): NIXL's wheel bundles its
-    own CUDA-enabled UCX, but a UCX that is already
-    loaded in the process wins when NIXL's UCX plugin binds. In the NGC/HPC-X
-    based containers NCCL's network plugin (``libnccl-net.so``, found through
-    the loader cache) pulls HPC-X's UCX -- built without CUDA memory support --
-    into every TP>1 engine the moment NCCL initialises the TP group, and GPU KV
-    registration then fails with "VRAM memory is detected as host by UCX".
-    Keeping NCCL's plugin out of the engines leaves NCCL its built-in IB and
-    socket transports and lets NIXL use the UCX it ships. Only the NIXL
-    connector registering GPU memory needs this.
-    """
-    if not resolve_vllm_disagg_layout(config).enabled:
-        return {}
-    kv_transfer = resolve_vllm_kv_transfer_config(config)
-    if kv_transfer.kv_connector != "NixlConnector":
-        return {}
-    env = {"VLLM_SSM_CONV_STATE_LAYOUT": "DS"}
-    if kv_transfer.kv_buffer_device == "cuda":
-        env["NCCL_NET_PLUGIN"] = "none"
-    return env
 
 
 class VllmGeneration(GenerationInterface):

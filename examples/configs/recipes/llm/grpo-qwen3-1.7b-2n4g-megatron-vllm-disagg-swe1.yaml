@@ -86,8 +86,9 @@ policy:
         # launch environment if NIXL needs them, not in the recipe.
         # NCCL_NET_PLUGIN=none is set on the engines by VllmGeneration under
         # disaggregation (HPC-X's NCCL plugin would load a UCX without CUDA
-        # support into the TP>1 engines; see the design doc). Override here
-        # only to put it back.
+        # support into the TP>1 engines; see the design doc), and the training
+        # workers adopt it because they share the refit communicator with the
+        # engines. Override here only to put it back.
         # Shadow-validate 10% of the frontend-rendered prompts on the prefill
         # engines against a full engine-side render.
         NRL_TOKENIZE_SHADOW_RATE: "0.1"
