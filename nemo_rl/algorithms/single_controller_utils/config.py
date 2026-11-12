@@ -488,6 +488,23 @@ class WatchdogConfig(BaseModel, extra="allow"):
         return self
 
 
+class RefitActorConfig(BaseModel, extra="allow"):
+    """Where the weight synchronizer runs.
+
+    By default the SingleController runs the refit transport in its own process: the
+    calls to every train worker and generation leader, and the wait on their replies.
+    ``enabled`` moves the synchronizer into a separate CPU Ray actor on the same node
+    (nemo_rl/weight_sync/refit_actor.py), so a busy controller does not delay the refit
+    and a slow refit does not occupy the controller. The controller keeps the rollout
+    gate, generation pause/resume, refit membership, the refit deadline and recovery.
+    Requires non-colocated generation and an NCCL transport (collective or
+    nccl_reshard).
+    """
+
+    # Run the weight synchronizer in a separate RefitActor. Off by default.
+    enabled: bool = False
+
+
 class AsyncRLConfig(BaseModel, extra="allow"):
     # Stream every consumed sample's untruncated token tensors to JSONL. Files
     # are published only after the optimizer step completes; disabled by default.
@@ -524,6 +541,8 @@ class AsyncRLConfig(BaseModel, extra="allow"):
     generation_router: GenerationRouterConfig = Field(
         default_factory=GenerationRouterConfig
     )
+    # Where the weight synchronizer runs (see RefitActorConfig).
+    refit_actor: RefitActorConfig = Field(default_factory=RefitActorConfig)
     # Recompute generation KV caches after each weight update.
     recompute_kv_cache_after_weight_updates: bool = True
     # Min ready groups the streaming trainer waits for before dispatching a batch.
@@ -1686,6 +1705,16 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
 
     async_config = master_config.async_rl
     algo_cfg = algo_config(master_config)
+
+    if (
+        async_config.refit_actor.enabled
+        and master_config.policy["generation"]["colocated"]["enabled"]
+    ):
+        raise ValueError(
+            "async_rl.refit_actor.enabled requires non-colocated generation: a colocated "
+            "refit is the engine's own wake-up and has to run where the engines are. "
+            "Set policy.generation.colocated.enabled=false or disable the refit actor."
+        )
 
     if async_config.defer_async_checkpoint_finalize:
         megatron_cfg = master_config.policy.get("megatron_cfg")

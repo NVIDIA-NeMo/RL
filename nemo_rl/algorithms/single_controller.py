@@ -233,6 +233,8 @@ from nemo_rl.utils.path_utils import (
     is_msc_path,
 )
 from nemo_rl.utils.timer import TimeoutChecker, Timer
+from nemo_rl.weight_sync import WeightSynchronizer, create_weight_synchronizer
+from nemo_rl.weight_sync.refit_actor import RemoteWeightSynchronizer
 
 if TYPE_CHECKING:
     from nemo_rl.experience.rollout_reassembler import FinalizedGroup
@@ -656,6 +658,13 @@ class SingleControllerActor:
         # Pin clusters so RayVirtualCluster.__del__ doesn't remove the PGs.
         self._train_cluster = actor_args.train_cluster
         self._inference_cluster = actor_args.inference_cluster
+        if isinstance(self._weight_synchronizer, RemoteWeightSynchronizer):
+            # The proxy arrived pickled inside actor_args, which keeps only its actor
+            # handle. Bind it to this process's generation, and let it rebuild a
+            # synchronizer here should the RefitActor ever need replacing.
+            self._weight_synchronizer.attach(
+                self._gen, synchronizer_factory=self._build_refit_synchronizer
+            )
 
         restored_trainer_version = (
             actor_args.save_state.trainer_version
@@ -4730,6 +4739,9 @@ class SingleControllerActor:
         is bounded-failure-first rather than resume-and-forget.
         """
         budget_s = self._refit_await_budget_s()
+        if isinstance(self._weight_synchronizer, RemoteWeightSynchronizer):
+            await self._sync_weights_in_refit_actor(kv_scales, what, budget_s)
+            return
         if budget_s is None:
             await asyncio.to_thread(
                 self._weight_synchronizer.sync_weights, kv_scales=kv_scales
@@ -4763,6 +4775,55 @@ class SingleControllerActor:
                 "bound has passed, so a generation rank is most likely alive but not "
                 "answering -- a Ray actor call has no timeout of its own, so waiting here "
                 "is unbounded. Giving up so the fleet can be reconciled and retried."
+            ) from None
+
+    def _build_refit_synchronizer(self) -> WeightSynchronizer:
+        """A fresh, uninitialized synchronizer, built as setup_single_controller builds it.
+
+        Only used to replace a dead RefitActor; the refit recovery that follows forces
+        the communicator rebuild.
+        """
+        generation_config = self._master_config.policy["generation"]
+        return create_weight_synchronizer(
+            policy=self._trainer,
+            generation=self._gen,
+            generation_backend=generation_config["backend"],
+            colocated=generation_config["colocated"]["enabled"],
+            train_cluster=self._train_cluster,
+            inference_cluster=self._inference_cluster,
+            refit_buffer_size_gb=self._master_config.policy.get("refit_buffer_size_gb"),
+            refit_timeout_s=self._async_cfg.generation_fleet_health.refit_timeout_s,
+        )
+
+    async def _sync_weights_in_refit_actor(
+        self,
+        kv_scales: Optional[dict[str, float]],
+        what: str,
+        budget_s: Optional[float],
+    ) -> None:
+        """``_sync_weights_within`` when the synchronizer runs in a RefitActor.
+
+        The refit is a Ray call to another process, so the controller awaits its
+        ObjectRef on the event loop: no thread is parked on it, and nothing is left
+        behind in this process when the deadline passes. A refit stuck past the deadline
+        stays stuck in the RefitActor instead, which the recovery's forced reconcile can
+        still reach (the actor runs several calls at once) or replace if it died.
+        """
+        refit_ref = await asyncio.to_thread(
+            self._weight_synchronizer.submit_sync_weights, kv_scales
+        )
+        refit_result = asyncio.wrap_future(refit_ref.future())
+        if budget_s is None:
+            await refit_result
+            return
+        try:
+            await asyncio.wait_for(refit_result, budget_s)
+        except asyncio.TimeoutError:
+            raise RefitAborted(
+                f"the {what} refit did not return from the RefitActor within "
+                f"{budget_s}s. Every worker-side bound has passed, so a generation rank "
+                "is most likely alive but not answering. Giving up so the fleet can be "
+                "reconciled and retried."
             ) from None
 
     async def _sync_weights(
