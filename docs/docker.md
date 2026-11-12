@@ -139,6 +139,17 @@ docker buildx build -f docker/Dockerfile \
     .
 ```
 
+## NeMo Gym Source From Another Directory
+
+NeMo Gym is installed from `3rdparty/Gym-workspace/Gym` inside the NeMo RL source. To build with a Gym tree that lives somewhere else, pass it as the `nemo-gym` build context. It is copied to the same path in the image, so `pyproject.toml` and `uv.lock` do not change:
+
+```sh
+docker buildx build -f docker/Dockerfile \
+    --build-context nemo-gym=<path-to-gym> \
+    --tag <registry>/nemo-rl:latest \
+    .
+```
+
 ## Custom Setup Commands
 
 By default, the Docker image installs [apptainer](https://apptainer.org/) (with a `singularity` symlink) via a pluggable `custom-setup` build stage. The default script is `docker/install_apptainer.sh`. You can override or skip this step at build time.
