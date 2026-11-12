@@ -170,6 +170,18 @@ def test_the_pool_renders_and_answers_with_the_checkpoints_template_and_parsers(
     assert json.loads(tool_call["function"]["arguments"]) == {"city": "Lyon"}
 
 
+def test_start_brings_up_every_worker_before_any_call(tiny_qwen3_model_path) -> None:
+    async def serve():
+        pool = RenderPool(SPEC, tiny_qwen3_model_path, workers=2)
+        try:
+            await pool.start()
+            return len(pool._executor._processes)
+        finally:
+            pool.shutdown()
+
+    assert asyncio.run(serve()) == 2
+
+
 def test_a_dead_worker_fails_only_its_calls(tiny_qwen3_model_path) -> None:
     body = {
         "model": "model",
