@@ -85,6 +85,30 @@ The Rust toolchain is only installed when `sglang` is built.
 --build-arg NRL_EXTRAS="vllm mcore automodel modelopt nemo_gym"
 ```
 
+## Compiling for Fewer GPU Types
+
+Several dependencies compile CUDA code once per GPU architecture, and that is most of a cold build. By default the image compiles for Hopper (`9.0`) and Blackwell (`10.0`). To compile for one GPU type only, narrow the lists:
+
+```sh
+docker buildx build -f docker/Dockerfile \
+    --build-arg TORCH_CUDA_ARCH_LIST=10.0 \
+    --build-arg NVTE_CUDA_ARCHS=100 \
+    --build-arg FLASH_ATTN_CUDA_ARCHS=100 \
+    --tag <registry>/nemo-rl:latest \
+    .
+```
+
+| Build argument | Default | Read by |
+|---|---|---|
+| `TORCH_CUDA_ARCH_LIST` | `9.0 10.0` | PyTorch C++/CUDA extension builds such as DeepEP. Also kept in the image, because DeepEP compiles kernels at run time. |
+| `NVTE_CUDA_ARCHS` | `90;100` | Transformer Engine. |
+| `FLASH_ATTN_CUDA_ARCHS` | flash-attn's own default | flash-attn. |
+| `FLASH_MLA_DISABLE_SM90` | unset | FlashMLA. Set to `1` to skip its Hopper kernels. |
+| `NVCC_THREADS` | flash-attn's own default | flash-attn (threads per `nvcc` call). |
+
+> [!WARNING]
+> `uv` does not know these settings went into a wheel it built. On a builder that keeps the BuildKit cache mount, a wheel compiled for the old list is reused after you change the list. Reset the mount first with `docker buildx prune --filter type=exec.cachemount`.
+
 ## Stripping the uv Cache
 
 By default, the release image keeps `uv`'s download cache (`/opt/nemo_rl_cache/uv`) on disk. This lets the image's unprivileged runtime user re-run `uv run --extra <backend>` fully offline, since every wheel it could need is already cached in the image. The tradeoff is a larger image.
