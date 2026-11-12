@@ -37,6 +37,7 @@ from nemo_rl.algorithms.advantage_estimator import (
     GeneralizedAdvantageEstimator,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    CustomSamplerConfig,
     ReadyFirstSamplerConfig,
     WeightFifoSamplerConfig,
     WindowedSamplerConfig,
@@ -781,8 +782,9 @@ def _dynamic_sampling_config(
         )
     sampler_cfg = {"name": sampler}
     if sampler == "custom":
-        # A custom sampler config requires a target; the validator does not import it.
-        sampler_cfg["target"] = "my_pkg.samplers:MySampler"
+        sampler_cfg["target"] = (
+            "nemo_rl.algorithms.async_utils.staleness_sampler:InOrderSampler"
+        )
     mc.async_rl = AsyncRLConfig(
         min_groups_for_streaming_train=_NUM_PROMPTS_PER_STEP,
         max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
@@ -834,6 +836,48 @@ class TestDynamicSamplingValidation:
 
     def test_accepts_a_custom_sampler(self):
         validate_single_controller_config(_dynamic_sampling_config(sampler="custom"))
+
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "nemo_rl.algorithms.async_utils.staleness_sampler:WeightFifoSampler",
+            "tests.unit.single_controller.test_sampler_interface:InheritedWeightFifoSampler",
+        ],
+    )
+    def test_rejects_custom_fixed_weight_selection(self, target):
+        mc = _dynamic_sampling_config()
+        mc.async_rl.sampler = CustomSamplerConfig(
+            target=target, max_staleness_versions=0
+        )
+
+        with pytest.raises(
+            ValueError, match="requires a complete batch from one weight"
+        ):
+            validate_single_controller_config(mc)
+
+    def test_rejects_custom_without_selection_declaration(self):
+        mc = _dynamic_sampling_config()
+        mc.async_rl.sampler = CustomSamplerConfig(
+            target="tests.unit.single_controller.test_sampler_interface:NoDropAccounting"
+        )
+
+        with pytest.raises(TypeError, match="requires_single_weight_batch"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_custom_fixed_weight_policy_before_cluster_allocation(self):
+        mc = _dynamic_sampling_config()
+        mc.async_rl.sampler = CustomSamplerConfig(
+            target="nemo_rl.algorithms.async_utils.staleness_sampler:WeightFifoSampler",
+            max_staleness_versions=0,
+        )
+
+        with patch.object(sc_setup_mod, "_build_clusters") as build_clusters:
+            with pytest.raises(
+                ValueError, match="requires a complete batch from one weight"
+            ):
+                setup_single_controller(mc, MagicMock())
+
+        build_clusters.assert_not_called()
 
     def test_accepts_shrink_because_filtering_replaces_regardless(self):
         # Filtering replaces uniform groups even when rollout failures shrink.

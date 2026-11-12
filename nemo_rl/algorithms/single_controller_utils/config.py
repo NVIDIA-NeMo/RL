@@ -35,6 +35,7 @@ from nemo_rl.algorithms.async_utils.staleness_sampler import (
     ReadyFirstSamplerConfig,
     SamplerConfig,
     required_buffer_capacity_for_config,
+    sampler_requires_single_weight_batch,
 )
 from nemo_rl.algorithms.grpo import (
     _REWARD_PENALTY_FLAGS,
@@ -1250,9 +1251,9 @@ def _validate_failure_settings(
     # assembling step leaves the bucket it came from short. The step waits on a group
     # nobody is generating and the run stalls with no error. A zero budget is exempt:
     # no drop is tolerated then, so nothing reaches that path.
-    if sampler_name == "weight_fifo" and drop_budget:
+    if drop_budget and sampler_requires_single_weight_batch(async_config.sampler):
         raise ValueError(
-            "async_rl.sampler.name='weight_fifo' cannot honour the drop budget "
+            f"async_rl.sampler.name={sampler_name!r} cannot honour the drop budget "
             f"(max_skipped_prompts={failure_config.max_skipped_prompts}, "
             f"max_consecutive_dropped_prompts="
             f"{failure_config.max_consecutive_dropped_prompts}): it builds each step "
@@ -1535,10 +1536,11 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             )
         # Reached only for GRPO (PPO is rejected above); name the key accordingly.
         algo_prefix = "grpo"
-        if async_config.sampler.name == "weight_fifo":
+        if sampler_requires_single_weight_batch(async_config.sampler):
             raise ValueError(
                 "grpo.use_dynamic_sampling cannot be combined with "
-                "async_rl.sampler.name='weight_fifo': replacements can carry a newer "
+                f"async_rl.sampler.name={async_config.sampler.name!r}: the resolved sampler "
+                "requires a complete batch from one weight version. Replacements can carry a newer "
                 "weight version and leave the oldest bucket permanently short. "
                 "Use 'in_order', 'ready_first', or 'windowed'."
             )
