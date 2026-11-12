@@ -1210,6 +1210,9 @@ class _FakeFastAPIApp:
 
         return decorator
 
+    def exception_handler(self, error_type):
+        return lambda func: func
+
 
 def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
     (
@@ -1852,7 +1855,16 @@ async def test_media_capture_rejected_keeps_its_own_code(monkeypatch):
 async def test_chat_handler_rejects_off_policy_sampling_and_pins_top_k(monkeypatch):
     """The route rejects off-policy sampling, then hands vLLM top_k=-1."""
     _, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
-    serving_chat.create_chat_completion = AsyncMock(return_value=iter(()))
+    response_type = sys.modules[
+        "vllm.entrypoints.openai.chat_completion.protocol"
+    ].ChatCompletionResponse
+    serving_chat.create_chat_completion = AsyncMock(return_value=response_type())
+    # The server module was just imported against the fakes; patch that copy.
+    monkeypatch.setattr(
+        sys.modules["nemo_rl.models.generation.vllm.chat_server"],
+        "model_dump_chat_response_with_dynamic_message_fields",
+        lambda _response: {"choices": []},
+    )
 
     off_policy = _fake_chat_request()
     off_policy.temperature = 0.5
@@ -4044,6 +4056,8 @@ def test_vllm_http_server(cluster, tokenizer):
         top_p=generation_config["top_p"],
         # We want to test the actual train flow and how this is used. So we need to get logprobs here.
         logprobs=True,
+        # As NeMo-Gym sends it: the chosen token's logprob only.
+        top_logprobs=0,
         max_tokens=1,
     )
 
@@ -4258,6 +4272,7 @@ def test_vllm_deferred_model_load(cluster, tokenizer):
         temperature=generation_config["temperature"],
         top_p=generation_config["top_p"],
         logprobs=True,
+        top_logprobs=0,
         return_tokens_as_token_ids=True,
         max_tokens=1,
     )
@@ -4418,6 +4433,7 @@ async def test_vllm_http_server_correct_merged_tokens_matches_baseline(
         top_p=generation_config["top_p"],
         # We want to test the actual train flow and how this is used. So we need to get logprobs here.
         logprobs=True,
+        top_logprobs=0,
         return_tokens_as_token_ids=True,
         max_tokens=1,
     )

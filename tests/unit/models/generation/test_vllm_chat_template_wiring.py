@@ -105,6 +105,9 @@ class _FakeApp:
     def post(self, path, **_kwargs):
         return self._register(path)
 
+    def exception_handler(self, _error_type):
+        return lambda fn: fn
+
     def get(self, path, **_kwargs):
         return self._register(path)
 
