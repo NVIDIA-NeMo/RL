@@ -88,6 +88,7 @@ unpack() {
     if staging="$(mktemp -d "$(dirname "${VENV_DIR}")/.gym_venvs.XXXXXX")" &&
         [[ "$(stat -c %s "${archive}" 2>/dev/null)" == "$(cat "${archive}.size" 2>/dev/null)" ]] &&
         tar -C "${staging}" -xf "${archive}" &&
+        [[ -s "${archive}.servers" ]] &&
         ! while read -r server; do
             [[ -x "${staging}/$(basename "${VENV_DIR}")/${server}/.venv/bin/python" ]] || echo "missing: ${server}"
         done < "${archive}.servers" | grep . >&2 &&
