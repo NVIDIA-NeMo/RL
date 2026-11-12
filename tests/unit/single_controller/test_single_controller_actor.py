@@ -4503,6 +4503,69 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
     assert "train_data_dump" not in ctrl._timer.get_timing_metrics()
 
 
+@pytest.mark.parametrize("pooled", [False, True])
+@pytest.mark.parametrize("flush_fails", [False, True])
+def test_train_pump_flushes_every_writer_before_publishing(
+    monkeypatch: pytest.MonkeyPatch, pooled: bool, flush_fails: bool
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0", "sample-1"],
+        fields=[],
+        sequence_lengths=[1, 1],
+        tags=_one_group_tags(2),
+    )
+    ctrl = _train_pump_controller(sampler=_FullStepSampler(meta))
+    ctrl._logger = MagicMock()
+    ctrl._sync_weights = AsyncMock(return_value=1)
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    events: list[str] = []
+
+    async def flush(name: str) -> None:
+        # Yield first, so a publish that did not wait would run before this ends.
+        await asyncio.sleep(0.01)
+        if flush_fails and name == "flush-last":
+            raise RuntimeError("flush failed")
+        events.append(name)
+
+    ctrl._train_data_dump = MagicMock()
+    ctrl._train_data_dump.finish_step.side_effect = lambda *_: events.append("publish")
+    if pooled:
+        ctrl._advantage_actors = [
+            SimpleNamespace(
+                flush_train_data_dump=SimpleNamespace(
+                    remote=lambda name=name: flush(name)
+                )
+            )
+            for name in ("flush-first", "flush-last")
+        ]
+    else:
+        def flush_inline() -> None:
+            if flush_fails:
+                raise RuntimeError("flush failed")
+            events.append("flush-last")
+
+        ctrl._advantage_actors = []
+        ctrl._advantage_computer = SimpleNamespace(
+            flush_train_data_dump=flush_inline
+        )
+    ctrl._trainer.finish_train_step = MagicMock(return_value={})
+
+    if flush_fails:
+        with pytest.raises(RuntimeError, match="flush failed"):
+            asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+        ctrl._train_data_dump.finish_step.assert_not_called()
+        assert "publish" not in events
+    else:
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+        assert events[-1] == "publish"
+        assert events.count("publish") == 1
+        assert {"flush-last"} <= set(events)
+        if pooled:
+            assert {"flush-first", "flush-last"} <= set(events[:-1])
+
+
 @pytest.mark.parametrize("log_full_result_tables", [False, True])
 def test_train_pump_consumes_recovered_penalty_and_effort_statistics_once(
     monkeypatch, log_full_result_tables

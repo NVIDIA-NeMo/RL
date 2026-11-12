@@ -14,6 +14,7 @@
 
 """Stream untruncated training tensors without retaining a second step batch."""
 
+import dataclasses
 import json
 import multiprocessing
 import os
@@ -83,12 +84,26 @@ class DebugWriter(ABC):
     finish_step on another once the step completes and close once at shutdown.
     """
 
-    def __init__(self, log_dir: str, *, shard_id: str = "0") -> None:
-        """Store the log directory and shard id and start with no rows written."""
+    def __init__(
+        self, log_dir: str, *, shard_id: str = "0", background: bool = False
+    ) -> None:
+        """Store the log directory and shard id and start with no rows written.
+
+        Args:
+            log_dir: Directory the writer stores rows under.
+            shard_id: Identifier of the shard that owns this writer.
+            background: Whether _write_chunk hands its writing to a separate
+                process; flush waits for the chunks handed over.
+        """
         self.log_dir = Path(log_dir)
         self.shard_id = shard_id
         self.step: int | None = None
         self.rows: int = 0
+        # Write in a separate process, with at most two pending chunks;
+        # flush() waits until they finish.
+        self._background = background
+        self._executor: ProcessPoolExecutor | None = None
+        self._pending: list[Future] = []
 
     def add_chunk(self, chunk: TrainChunk) -> ChunkReceipt:
         """Validate one chunk of per-sample rows and write it to storage.
@@ -153,10 +168,17 @@ class DebugWriter(ABC):
         self.rows = 0
 
     def flush(self) -> None:
-        """Wait until every accepted chunk is stored; the base writer stores at once."""
+        """Wait until every chunk handed to the background is written."""
+        pending, self._pending = self._pending, []
+        for future in pending:
+            future.result()
 
     def close(self) -> None:
-        """Release anything the writer still holds; the base writer holds nothing."""
+        """Finish the pending chunks and stop the background process."""
+        self.flush()
+        if self._executor is not None:
+            self._executor.shutdown()
+            self._executor = None
 
     @abstractmethod
     def _write_chunk(self, chunk: TrainChunk, *, replace: bool) -> ChunkReceipt:
@@ -165,6 +187,8 @@ class DebugWriter(ABC):
         The first chunk of a step comes with replace set, telling the writer to drop
         any rows already stored for that step.
         """
+        # Prepare storage before process submission to avoid races with caller reads.
+        # See JsonDebugWriter._write_chunk() for receipt and submission handling.
 
     @abstractmethod
     def _publish_step(self, step: int, receipts: list[ChunkReceipt]) -> None:
@@ -178,18 +202,6 @@ class JsonDebugWriter(DebugWriter):
     them with idx across the merged file. A failed step leaves part files, never a
     completed-looking JSONL file. Shards must share a filesystem with the controller.
     """
-
-    def __init__(
-        self, log_dir: str, *, shard_id: str = "0", background: bool = False
-    ) -> None:
-        """Set background to write each chunk in a separate process; see flush."""
-        super().__init__(log_dir, shard_id=shard_id)
-        # background: add_chunk hands the JSON writing to its own process (off
-        # the caller's GIL) and returns; flush() waits for it. At most two
-        # chunks are pending, which bounds the memory held for them.
-        self._background = background
-        self._executor: ProcessPoolExecutor | None = None
-        self._pending: list[Future] = []
 
     def _dump_path(self, step: int) -> Path:
         """Return the published JSONL path."""
@@ -208,8 +220,11 @@ class JsonDebugWriter(DebugWriter):
             shard_id=self.shard_id, rows=len(chunk.sample_ids), ref=str(part)
         )
         if not self._background:
-            _write_part(part, mode, chunk)
+            self._write_part(part, mode, chunk)
             return receipt
+        # Share the storages now: the queue feeder pickles after submit() returns,
+        # and its lazy sharing would race with the caller's later reads.
+        chunk = _share_chunk_storage(chunk)
         if self._executor is None:
             # spawn: never fork a process holding Ray and CUDA state.
             self._executor = ProcessPoolExecutor(
@@ -217,21 +232,34 @@ class JsonDebugWriter(DebugWriter):
             )
         if len(self._pending) == 2:
             self._pending.pop(0).result()
-        self._pending.append(self._executor.submit(_write_part, part, mode, chunk))
+        self._pending.append(self._executor.submit(self._write_part, part, mode, chunk))
         return receipt
 
-    def flush(self) -> None:
-        """Wait until every chunk handed to the background is written."""
-        pending, self._pending = self._pending, []
-        for future in pending:
-            future.result()
+    @staticmethod
+    def _write_part(part: Path, mode: str, chunk: TrainChunk) -> None:
+        """Write one validated chunk's rows to its part file (maybe in the background)."""
+        # unbind() splits dense and jagged columns alike into per-row tensors.
+        columns = {
+            k: list(v.detach().cpu().unbind())
+            for k, v in {**chunk.sequences, **chunk.scalars}.items()
+        }
+        lengths = chunk.input_lengths.detach().cpu().reshape(-1).tolist()
 
-    def close(self) -> None:
-        """Finish the pending chunks and stop the background process."""
-        self.flush()
-        if self._executor is not None:
-            self._executor.shutdown()
-            self._executor = None
+        with part.open(mode) as stream:
+            for i, length in enumerate(lengths):
+                row = {
+                    "step": chunk.step + 1,
+                    "sample_id": [chunk.sample_ids[i]],
+                    "input_lengths": [length],
+                    "metadata": [chunk.tags[i] if chunk.tags is not None else {}],
+                }
+                for key in chunk.sequences:
+                    row[key] = [columns[key][i][:length].tolist()]
+                for key in chunk.scalars:
+                    row[key] = [columns[key][i].tolist()]
+                stream.write(
+                    json.dumps(json_safe_nonfinite(row), allow_nan=False) + "\n"
+                )
 
     def _publish_step(self, step: int, receipts: list[ChunkReceipt]) -> None:
         """Merge the part files the receipts name into one JSONL file and publish it atomically."""
@@ -278,28 +306,28 @@ class JsonDebugWriter(DebugWriter):
             part.unlink()
 
 
-def _write_part(part: Path, mode: str, chunk: TrainChunk) -> None:
-    """Write one validated chunk's rows to its part file (maybe in the background)."""
-    # unbind() splits dense and jagged columns alike into per-row tensors.
-    columns = {
-        k: list(v.detach().cpu().unbind())
-        for k, v in {**chunk.sequences, **chunk.scalars}.items()
-    }
-    lengths = chunk.input_lengths.detach().cpu().reshape(-1).tolist()
+def _share_tensor_storage(tensor: torch.Tensor) -> torch.Tensor:
+    """Move the tensor's CPU storages, jagged values and offsets included, to shared memory."""
+    tensor = tensor.detach().cpu()
+    parts = (
+        [tensor.values(), tensor.offsets(), tensor.lengths()]
+        if tensor.is_nested
+        else [tensor]
+    )
+    for part in parts:
+        if part is not None:
+            part.share_memory_()
+    return tensor
 
-    with part.open(mode) as stream:
-        for i, length in enumerate(lengths):
-            row = {
-                "step": chunk.step + 1,
-                "sample_id": [chunk.sample_ids[i]],
-                "input_lengths": [length],
-                "metadata": [chunk.tags[i] if chunk.tags is not None else {}],
-            }
-            for key in chunk.sequences:
-                row[key] = [columns[key][i][:length].tolist()]
-            for key in chunk.scalars:
-                row[key] = [columns[key][i].tolist()]
-            stream.write(json.dumps(json_safe_nonfinite(row), allow_nan=False) + "\n")
+
+def _share_chunk_storage(chunk: TrainChunk) -> TrainChunk:
+    """Return the chunk with every tensor column in shared memory, ready to pickle."""
+    return dataclasses.replace(
+        chunk,
+        input_lengths=_share_tensor_storage(chunk.input_lengths),
+        sequences={k: _share_tensor_storage(v) for k, v in chunk.sequences.items()},
+        scalars={k: _share_tensor_storage(v) for k, v in chunk.scalars.items()},
+    )
 
 
 DEBUG_WRITER_REGISTRY: dict[str, Callable[..., DebugWriter]] = {
@@ -323,8 +351,8 @@ def make_debug_writer(
         cfg: Debug writer config naming the writer and any constructor keys.
         log_dir: Base log directory handed to the writer.
         shard_id: Identifier of the shard that owns the returned writer.
-        background: Write chunks in a separate process when the writer supports
-            it (JsonDebugWriter); other writers ignore it.
+        background: Write chunks in a separate process; passed to the writer's
+            constructor.
 
     Returns:
         The constructed writer.
@@ -345,10 +373,5 @@ def make_debug_writer(
             "DebugWriter subclass."
         )
     kwargs = dict(cfg.model_extra or {})
-    if (
-        background
-        and isinstance(writer_cls, type)
-        and issubclass(writer_cls, JsonDebugWriter)
-    ):
-        kwargs["background"] = True
+    kwargs["background"] = background
     return writer_cls(log_dir, shard_id=shard_id, **kwargs)

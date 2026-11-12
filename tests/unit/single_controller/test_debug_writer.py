@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import json
+from concurrent.futures import Future
 from dataclasses import replace
 from pathlib import Path
 
@@ -417,8 +418,15 @@ def test_nonfinite_logprobs_are_null_in_strict_json(tmp_path):
 
 
 class _RecordingWriter(DebugWriter):
-    def __init__(self, log_dir: str, *, shard_id: str, label: str = "unset") -> None:
-        super().__init__(log_dir, shard_id=shard_id)
+    def __init__(
+        self,
+        log_dir: str,
+        *,
+        shard_id: str,
+        background: bool = False,
+        label: str = "unset",
+    ) -> None:
+        super().__init__(log_dir, shard_id=shard_id, background=background)
         self.label = label
 
     def _write_chunk(self, chunk: TrainChunk, *, replace: bool) -> ChunkReceipt:
@@ -515,13 +523,82 @@ def test_background_dump_still_rejects_a_bad_chunk_at_once(
     assert writer._executor is None
 
 
-def test_make_debug_writer_passes_background_only_to_json_writers(
-    tmp_path: Path,
-) -> None:
+class _FakeExecutor:
+    """Executor stand-in that records submissions and completes them on demand."""
+
+    def __init__(self) -> None:
+        self.submitted: list[tuple] = []
+        self.futures: list[Future] = []
+
+    def submit(self, fn, *args) -> Future:
+        future: Future = Future()
+        self.submitted.append((fn, *args))
+        self.futures.append(future)
+        return future
+
+    def shutdown(self) -> None:
+        pass
+
+
+def test_make_debug_writer_passes_background_to_every_writer(tmp_path: Path) -> None:
     cfg = DebugWriterConfig(target=f"{__name__}._RecordingWriter", label="x")
-    assert isinstance(
-        make_debug_writer(cfg, str(tmp_path), background=True), _RecordingWriter
-    )
+    assert make_debug_writer(cfg, str(tmp_path), background=True)._background
+    assert not make_debug_writer(cfg, str(tmp_path))._background
     assert make_debug_writer(
         DebugWriterConfig(), str(tmp_path), background=True
     )._background
+
+
+def test_background_dump_returns_at_once_and_bounds_pending_chunks(
+    tmp_path: Path, chunk: TrainChunk
+) -> None:
+    writer = JsonDebugWriter(str(tmp_path), background=True)
+    executor = _FakeExecutor()
+    writer._executor = executor
+
+    # The first two chunks return while their writes are still pending.
+    writer.add_chunk(chunk)
+    writer.add_chunk(chunk)
+    assert len(executor.submitted) == 2
+
+    # The third waits for the oldest write before it submits.
+    executor.futures[0].set_result(None)
+    writer.add_chunk(chunk)
+    assert len(executor.submitted) == 3
+    assert len(writer._pending) == 2
+
+    # flush() blocks on the pending writes and propagates their failure.
+    executor.futures[1].set_result(None)
+    executor.futures[2].set_exception(OSError("disk full"))
+    with pytest.raises(OSError, match="disk full"):
+        writer.flush()
+    assert writer._pending == []
+
+
+def test_background_dump_shares_storages_before_submit(tmp_path: Path) -> None:
+    writer = JsonDebugWriter(str(tmp_path), background=True)
+    executor = _FakeExecutor()
+    writer._executor = executor
+    advantages = torch.arange(6, dtype=torch.float32).reshape(2, 3)
+    jagged = torch.nested.as_nested_tensor(
+        [torch.arange(2), torch.arange(3)], layout=torch.jagged
+    )
+    writer.add_chunk(
+        TrainChunk(
+            step=0,
+            sample_ids=["a", "b"],
+            tags=None,
+            input_lengths=torch.tensor([2, 3]),
+            sequences={"advantages": advantages},
+            scalars={"prompt_ids": jagged},
+        )
+    )
+
+    # The queue feeder pickles after submit() returns, so every storage must
+    # already be shared by then, or it is swapped under the caller's reads.
+    _, _, _, submitted = executor.submitted[0]
+    assert advantages.is_shared()
+    assert submitted.sequences["advantages"].is_shared()
+    values = submitted.scalars["prompt_ids"]
+    assert values.values().is_shared()
+    assert values.offsets().is_shared()
