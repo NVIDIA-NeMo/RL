@@ -37,6 +37,7 @@ import logging
 import math
 import os
 import pickle
+import time
 from collections.abc import AsyncGenerator
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -71,6 +72,8 @@ from nemo_rl.models.generation.dynamo.vllm.chat_engine import (
 )
 from nemo_rl.models.generation.dynamo.vllm.generation_cut import (
     CUT_PREFIXES_KEY,
+    CUT_REPLY_MARGIN_S,
+    DEADLINE_KEY,
     GENERATION_CUT_ANNOTATION,
     INVENTORY_KEY,
 )
@@ -228,10 +231,16 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
         # Deferred: Gym is optional outside framework-owned capture.
         from nemo_gym._checkpoint.generation_cut import GenerationCutInventory
 
-        inventory = GenerationCutInventory.model_validate(
-            (request.get("extra_args") or {})[INVENTORY_KEY]
+        extra_args = request.get("extra_args") or {}
+        inventory = GenerationCutInventory.model_validate(extra_args[INVENTORY_KEY])
+        deadline = extra_args.get(DEADLINE_KEY)
+        if deadline is not None:
+            # The frontend's wall-clock deadline on this host's monotonic clock,
+            # less the time the answer needs to get back.
+            deadline = time.monotonic() + (deadline - time.time()) - CUT_REPLY_MARGIN_S
+        receipt = await self._host._prefix_recovery.run_cut(
+            inventory, deadline=deadline
         )
-        receipt = await self._host._prefix_recovery.run_cut(inventory)
         yield {
             "token_ids": [],
             "index": 0,

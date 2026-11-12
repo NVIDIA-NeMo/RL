@@ -1515,6 +1515,22 @@ def test_generation_cut_past_its_deadline_fails_uncut_calls_without_staging(capl
     assert _uncut_reasons(caplog) == {"control_deadline": 1}
 
 
+def test_a_cut_runs_to_the_deadline_its_caller_gives_it():
+    """The Dynamo frontend hands every engine the deadline it waits to itself."""
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    _live_call(worker, [11, 12], [-0.1, -0.2], prompt_token_ids=(10,))
+    inventory = _single_call_inventory()
+
+    # This worker sets no control timeout of its own.
+    receipt = asyncio.run(
+        _cuts(worker).run_cut(inventory, deadline=time.monotonic() - 1.0)
+    )
+
+    assert [ack.disposition for ack in receipt.prefixes] == ["durable_failure"]
+    assert sink.generation_prefix_records == []
+
+
 def _active_call_inventory(
     worker, *calls: tuple[str, list[int]], output_limit: int | None = 16
 ) -> tuple[GenerationCutInventory, list]:

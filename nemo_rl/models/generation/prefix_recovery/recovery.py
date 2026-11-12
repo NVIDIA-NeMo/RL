@@ -266,11 +266,17 @@ class PrefixRecovery:
 
     # ---- A checkpoint cut -----------------------------------------------
 
-    async def run_cut(self, inventory: Any) -> Any:
-        """Cut every call Gym's inventory names, off the serving loop."""
-        # Measured from arrival so time queued behind a stale cut counts.
-        timeout_s = self._parts.control_timeout_s
-        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    async def run_cut(self, inventory: Any, *, deadline: float | None = None) -> Any:
+        """Cut every call Gym's inventory names, off the serving loop.
+
+        ``deadline`` is a ``time.monotonic()`` bound from a caller that waits
+        on one of its own (the Dynamo frontend). Without it the cut gets
+        ``control_timeout_s`` from its arrival here.
+        """
+        if deadline is None:
+            # Measured from arrival so time queued behind a stale cut counts.
+            timeout_s = self._parts.control_timeout_s
+            deadline = None if timeout_s is None else time.monotonic() + timeout_s
         return await asyncio.get_running_loop().run_in_executor(
             self._control_executor,
             functools.partial(self.checkpoint_cut, inventory, deadline=deadline),
@@ -878,5 +884,5 @@ class NoPrefixRecovery:
     def shutdown(self) -> None:
         pass
 
-    async def run_cut(self, inventory: Any) -> Any:
+    async def run_cut(self, inventory: Any, *, deadline: float | None = None) -> Any:
         raise RuntimeError("generation-prefix cuts are disabled on this worker")
