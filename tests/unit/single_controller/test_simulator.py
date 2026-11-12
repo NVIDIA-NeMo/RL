@@ -16,9 +16,11 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import sys
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -27,8 +29,10 @@ import torch
 from tensordict import TensorDict
 
 from examples import run_single_controller_simulator
+from nemo_rl.algorithms import single_controller as single_controller_module
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils import simulator as simulator_module
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
@@ -47,6 +51,7 @@ from nemo_rl.algorithms.single_controller_utils.simulator import (
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+from nemo_rl.data_plane.observability import MetricsDataPlaneClient
 
 _PARTITION = "rollout_data"
 _DP_CFG: dict[str, Any] = {
@@ -212,10 +217,17 @@ def test_validate_rejects_ppo() -> None:
         validate_simulator_config(_master_config(ppo=True), SimulatorSettings())
 
 
-@pytest.mark.parametrize("backend", ["megatron", "trtllm", "sglang", "dynamo"])
+@pytest.mark.parametrize("backend", ["megatron", "trtllm", "sglang"])
 def test_validate_rejects_non_vllm_backends(backend: str) -> None:
     with pytest.raises(NotImplementedError, match="vllm"):
         validate_simulator_config(_master_config(backend=backend), SimulatorSettings())
+
+
+def test_validate_rejects_dynamo_serving() -> None:
+    with pytest.raises(NotImplementedError, match="policy.generation.dynamo=true"):
+        validate_simulator_config(
+            _master_config(generation_extra={"dynamo": True}), SimulatorSettings()
+        )
 
 
 def test_validate_rejects_dummy_load_format() -> None:
@@ -437,9 +449,79 @@ def test_cpu_trainer_refuses_what_only_a_real_trainer_can_do() -> None:
     with pytest.raises(NotImplementedError):
         trainer.finalize_async_save()
     with pytest.raises(NotImplementedError):
+        trainer.poll_async_save()
+    with pytest.raises(NotImplementedError):
         _ = trainer.sharding_annotations
     with pytest.raises(NotImplementedError):
         _ = trainer.worker_group
+
+
+def _metrics_client() -> MetricsDataPlaneClient:
+    client = MetricsDataPlaneClient(NoOpDataPlaneClient())
+    client.register_partition(
+        partition_id=_PARTITION, fields=["x"], num_samples=1, consumer_tasks=["t"]
+    )
+    return client
+
+
+def test_cpu_trainer_reports_no_data_plane_metrics_without_observability() -> None:
+    _, trainer, _, _ = _trainer_with_group()
+    assert trainer.get_data_plane_step_metrics(1.0) is None
+
+
+def test_cpu_trainer_data_plane_metrics_cover_the_registered_rollout_side(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    trainer = CpuTrainer(dp_cfg=_DP_CFG, policy_config={}, dp_client=_metrics_client())
+    metrics, scope = trainer.get_data_plane_step_metrics(1.0)
+    assert scope == "driver"
+    assert metrics
+
+    def broken() -> list[dict[str, Any]]:
+        raise RuntimeError("worker gone")
+
+    actor = SimpleNamespace(
+        get_data_plane_snapshot=SimpleNamespace(
+            remote=lambda: _metrics_client().snapshot()
+        )
+    )
+    monkeypatch.setattr(simulator_module.ray, "get", lambda refs: refs)
+    trainer.add_data_plane_snapshot_source(actor)
+    trainer.add_data_plane_snapshot_fn(broken)
+    trainer.add_data_plane_snapshot_fn(lambda: [_metrics_client().snapshot()])
+    # The controller's own client is a second driver-side process view.
+    metrics, scope = trainer.get_data_plane_step_metrics(1.0, _metrics_client())
+    assert scope == "cluster"
+    # Driver client, trainer client, the actor and the one callable that answered.
+    assert metrics["now/n_processes"] == 4
+
+
+def test_cpu_trainer_has_every_member_the_controller_uses_on_its_trainer() -> None:
+    """The controller holds either trainer in ``self._trainer``.
+
+    A member only ``TQPolicy`` has fails a simulator run at its first use, which
+    no test of ``TQPolicy`` shows.
+    """
+    tree = ast.parse(Path(single_controller_module.__file__).read_text())
+    used = {
+        node.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Attribute)
+        and node.value.attr == "_trainer"
+        and isinstance(node.value.value, ast.Name)
+        and node.value.value.id == "self"
+    }
+    assert used, "the controller no longer keeps its trainer in self._trainer"
+    _, trainer, _, _ = _trainer_with_group()
+    missing = sorted(
+        name
+        for name in used
+        if name not in vars(trainer) and not hasattr(CpuTrainer, name)
+    )
+    assert not missing, (
+        f"CpuTrainer lacks trainer members the controller uses: {missing}"
+    )
 
 
 # ── the controller's simulated train step ───────────────────────────────────

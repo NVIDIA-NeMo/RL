@@ -30,18 +30,25 @@ error rather than silently running something else.
 
 from __future__ import annotations
 
+import logging
 import time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Optional, cast
+from typing import Any, Callable, Literal, Optional, cast
 
+import ray
 from tensordict import TensorDict
 
 from nemo_rl.algorithms import opd as opd_module
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     is_ppo_run,
+)
+from nemo_rl.data_plane import (
+    cluster_step_metrics,
+    is_metrics_client,
+    merge_snapshots,
 )
 from nemo_rl.data_plane.driver_mixin import TQDriverMixin
 from nemo_rl.data_plane.factory import build_data_plane_client
@@ -50,6 +57,7 @@ from nemo_rl.data_plane.interfaces import (
     DataPlaneRuntimeConfig,
     KVBatchMeta,
 )
+from nemo_rl.models.generation.dynamo.config import dynamo_enabled
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.generation.vllm.config import (
     REFITTABLE_FP8_KV_CACHE_DTYPES,
@@ -59,6 +67,8 @@ from nemo_rl.models.generation.vllm.config import (
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.timer import Timer
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+
+logger = logging.getLogger(__name__)
 
 SimulatorMode = Literal["rollout_only", "train_only", "train_rollout"]
 TrainBackend = Literal["cpu", "automodel", "mcore"]
@@ -184,7 +194,7 @@ def apply_simulator_overrides(
         raw_config["cluster"]["num_nodes"] = settings.num_nodes
     raw_config["data"]["validation"] = None
     generation = raw_config["policy"]["generation"]
-    if generation["backend"] in ("vllm", "dynamo") and "vllm_cfg" in generation:
+    if generation["backend"] == "vllm" and "vllm_cfg" in generation:
         # Where configure_generation_config would default a training run to
         # "dummy" (the first refit fills the weights in), there is no refit here.
         generation["vllm_cfg"].setdefault("load_format", "auto")
@@ -249,9 +259,15 @@ def validate_simulator_config(
         raise NotImplementedError(
             "rollout_only currently supports policy.generation.backend='vllm' "
             f"only; got {backend!r}. Megatron generation serves the trainer's own "
-            "weights, so it cannot run without one; trtllm, sglang and dynamo "
-            "have not been validated under the SingleController refit "
-            "lifecycle this run drives."
+            "weights, so it cannot run without one; trtllm and sglang have "
+            "not been validated under the SingleController refit lifecycle "
+            "this run drives."
+        )
+    if dynamo_enabled(generation_config):
+        raise NotImplementedError(
+            "rollout_only does not support policy.generation.dynamo=true yet: "
+            "Dynamo serving has not been validated under the refit lifecycle "
+            "this run drives. Set policy.generation.dynamo=false."
         )
     reject_online_quantization(master_config.policy["generation"])
     if generation_config["vllm_cfg"].get("load_format") == "dummy":
@@ -401,6 +417,9 @@ class CpuTrainer(TQDriverMixin):
         self._step_open = False
         self._step_rows = 0
         self.steps_completed = 0
+        self._prev_cluster_snapshot: dict[str, Any] = {}
+        self._extra_snapshot_sources: list[Any] = []
+        self._extra_snapshot_fns: list[Callable[[], list[dict[str, Any]]]] = []
 
     # ── data-plane lifecycle (what TQPolicy owns) ───────────────────────────
 
@@ -415,6 +434,68 @@ class CpuTrainer(TQDriverMixin):
         except Exception as error:  # noqa: BLE001 - mirrors TQPolicy.shutdown
             warnings.warn(f"Error closing data-plane client: {error}")
         return True
+
+    def add_data_plane_snapshot_fn(
+        self, fn: Callable[[], list[dict[str, Any]]]
+    ) -> None:
+        """Include a group of data-plane clients read through one call."""
+        self._extra_snapshot_fns.append(fn)
+
+    def add_data_plane_snapshot_source(self, actor: Any) -> None:
+        """Include a non-worker actor's data-plane client in the cluster view."""
+        self._extra_snapshot_sources.append(actor)
+
+    def get_data_plane_step_metrics(
+        self, step_time_s: float, driver_client: Any = None
+    ) -> tuple[dict[str, float], str] | None:
+        """This step's data-plane cost and the scope it covers, or ``None``.
+
+        The contract of ``TQPolicy.get_data_plane_step_metrics``. The cluster
+        view is the driver's clients plus the registered rollout-side sources;
+        it falls back to the driver's alone when none of them answered.
+
+        Args:
+            step_time_s: Step wall time, for the share of the step.
+            driver_client: The controller's client; defaults to this trainer's.
+
+        Returns:
+            ``(metrics, scope)`` with scope ``"cluster"`` or ``"driver"``, or
+            None when data-plane observability is off.
+        """
+        driver_client = driver_client or self.dp_client
+        if not is_metrics_client(driver_client):
+            return None
+        collect_started = time.perf_counter()
+        snapshots = [driver_client.snapshot(reset_step_window=True)]
+        if self.dp_client is not driver_client and is_metrics_client(self.dp_client):
+            snapshots.append(self.dp_client.snapshot(reset_step_window=True))
+        if self._extra_snapshot_sources:
+            try:
+                extra = ray.get(
+                    [
+                        source.get_data_plane_snapshot.remote()
+                        for source in self._extra_snapshot_sources
+                    ]
+                )
+            except Exception as error:  # noqa: BLE001 - metrics must never fail a step
+                logger.warning("data-plane snapshot from actors failed: %s", error)
+            else:
+                snapshots.extend(snapshot for snapshot in extra if snapshot)
+        for fn in self._extra_snapshot_fns:
+            try:
+                snapshots.extend(fn())
+            except Exception as error:  # noqa: BLE001 - metrics must never fail a step
+                logger.warning("data-plane snapshot from %s failed: %s", fn, error)
+        collect_ms = (time.perf_counter() - collect_started) * 1e3
+        driver = driver_client.get_step_metrics(step_time_s, snapshots[0], collect_ms)
+        if len(snapshots) == 1:
+            return driver, "driver"
+        merged = merge_snapshots(snapshots)
+        metrics = cluster_step_metrics(
+            merged, self._prev_cluster_snapshot, step_time_s, collect_ms
+        )
+        self._prev_cluster_snapshot = merged
+        return metrics, "cluster"
 
     # ── GPU phase transitions: nothing to move ──────────────────────────────
 
@@ -551,6 +632,10 @@ class CpuTrainer(TQDriverMixin):
     def finalize_async_save(self, *args: Any, **kwargs: Any) -> None:
         """Raise: see :meth:`save_checkpoint`."""
         raise NotImplementedError("CpuTrainer has no checkpoint to finalize")
+
+    def poll_async_save(self) -> bool:
+        """Raise: see :meth:`save_checkpoint`."""
+        raise NotImplementedError("CpuTrainer has no checkpoint to poll")
 
     @property
     def sharding_annotations(self) -> Any:
