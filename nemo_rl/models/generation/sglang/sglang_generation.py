@@ -56,6 +56,7 @@ from nemo_rl.models.generation.sglang.utils.ray_utils import (
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.venvs import make_actor_runtime_env
 from nemo_rl.weight_sync.interfaces import WeightSynchronizer
+from nemo_rl.weight_sync.membership import RefitMembership
 
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -90,6 +91,7 @@ class SGLangGeneration(GenerationInterface):
         self.all_engines: list = []
         self._router_actor: ray.actor.ActorHandle | None = None
         self.rollout_engine_lock: ray.actor.ActorHandle | None = None
+        self._refit_membership: RefitMembership | None = None
 
         fault_tolerance_config = SGLangFaultToleranceConfig.model_validate(
             sglang_cfg["sglang_cfg"]["sglang_fault_tolerance_config"]
@@ -247,9 +249,10 @@ class SGLangGeneration(GenerationInterface):
                 }.items()
             }
 
-            # Trainer and engine must agree on the NCCL transport; sglang's
-            # scheduler subprocess defaults to NCCL_CUMEM_ENABLE=0.
-            env_vars["NCCL_CUMEM_ENABLE"] = "0"
+            # Native M2N requires symmetric memory before NCCL initializes.
+            env_vars["NCCL_CUMEM_ENABLE"] = (
+                "1" if self.sglang_cfg.get("refit_transport") == "nccl_reshard" else "0"
+            )
 
             # Explicitly pass CUDA_VISIBLE_DEVICES through to the engine actor so
             # all engines see the same global value (Ray would otherwise remap it
@@ -438,7 +441,7 @@ class SGLangGeneration(GenerationInterface):
     ) -> bool:
         """Acknowledge the pause owned by the SGLang weight synchronizer.
 
-        Both SGLang transports pause and flush KV inside ``sync_weights`` before
+        SGLang transports pause and flush KV inside ``sync_weights`` before
         transferring weights. This hook issues no RPC; returning True prevents
         callers from flushing again after the synchronizer resumes generation.
         The synchronizer always clears KV, including when ``clear_cache=False``.
@@ -933,6 +936,70 @@ class SGLangGeneration(GenerationInterface):
         self, state_dict_info: Optional[dict[str, Any]]
     ) -> Optional[list[str]]:
         return None
+
+    def set_refit_membership(self, membership: RefitMembership) -> None:
+        """Record the single-engine membership used by NCCL reshard refit."""
+        if membership.surviving_shards != [0]:
+            raise ValueError("SGLang NCCL reshard requires one complete engine.")
+        self._refit_membership = membership
+
+    def _dispatch_nccl_reshard(
+        self, operation: str, payload: dict[str, Any]
+    ) -> list[ray.ObjectRef]:
+        engines, _, _, _ = self.get_updatable_engines()
+        if len(engines) != 1:
+            raise ValueError("SGLang NCCL reshard requires exactly one engine.")
+        return [engines[0].nccl_reshard_command.remote(operation, payload)]
+
+    def rebuild_collective(
+        self, membership: RefitMembership, ip: str, port: int
+    ) -> list[ray.ObjectRef]:
+        """Initialize the miscellaneous-weight communicator inside SGLang."""
+        return self._dispatch_nccl_reshard(
+            "init_collective",
+            {
+                "ip": ip,
+                "port": port,
+                "world_size": membership.world_size,
+                "train_world_size": membership.train_world_size,
+            },
+        )
+
+    def rebuild_nccl_reshard_comm_group(
+        self,
+        membership: RefitMembership,
+        *,
+        pp_ips: list[str],
+        pp_ports: list[int],
+        pp_size: int,
+        train_ranks_per_stage: int,
+        sub_world_size: int,
+    ) -> list[ray.ObjectRef]:
+        """Initialize the GPU-side bulk reshard communicators."""
+        if membership != self._refit_membership:
+            raise ValueError("SGLang reshard membership changed during setup.")
+        return self._dispatch_nccl_reshard(
+            "init_bulk",
+            {
+                "pp_ips": pp_ips,
+                "pp_ports": pp_ports,
+                "pp_size": pp_size,
+                "train_ranks_per_stage": train_ranks_per_stage,
+                "sub_world_size": sub_world_size,
+            },
+        )
+
+    def prepare_nccl_reshard_refit_info(self, refit_info: dict) -> None:
+        """Validate every destination view before the first weight transfer."""
+        ray.get(self._dispatch_nccl_reshard("prepare", {"refit_info": refit_info}))
+
+    def nccl_reshard_refit(
+        self, refit_timeout_s: Optional[float] = None
+    ) -> list[ray.ObjectRef]:
+        """Receive canonical BF16 shards and the packed miscellaneous weights."""
+        return self._dispatch_nccl_reshard(
+            "refit", {"refit_timeout_s": refit_timeout_s}
+        )
 
     def update_weights_via_ipc_zmq(self) -> list[ray.ObjectRef]:
         return []

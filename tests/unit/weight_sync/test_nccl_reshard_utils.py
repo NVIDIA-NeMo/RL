@@ -213,7 +213,7 @@ def test_check_nccl_reshard_refit_support_accepts_non_draft_speculators(
 
 def test_check_nccl_reshard_refit_support_collects_without_vllm_cfg() -> None:
     config = _valid_nccl_reshard_config()
-    config.policy["generation"]["backend"] = "sglang"
+    config.policy["generation"]["backend"] = "trtllm"
     config.policy["generation"].pop("vllm_cfg")
 
     with pytest.raises(ValueError) as exc_info:
@@ -296,8 +296,8 @@ def test_blockwise_compute_without_fp8_storage_keeps_logical_misc(gen_precision,
             "policy.generation.colocated.enabled must be False",
         ),
         (
-            {"backend": "sglang"},
-            "policy.generation.backend must be 'vllm' or 'megatron' (got 'sglang')",
+            {"backend": "trtllm"},
+            "policy.generation.backend must be 'vllm', 'megatron', or 'sglang' (got 'trtllm')",
         ),
     ],
 )

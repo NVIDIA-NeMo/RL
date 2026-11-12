@@ -1970,12 +1970,14 @@ def setup(
     if refit_transport is not None and not (
         backend == "vllm"
         or (backend == "megatron" and refit_transport in ("mcore", "nccl_reshard"))
+        or (backend == "sglang" and refit_transport == "nccl_reshard")
     ):
         raise NotImplementedError(
             f"refit_transport={refit_transport!r} is not supported for "
             f"policy.generation.backend={backend!r}. "
             "Set policy.generation.refit_transport=null. Megatron generation "
-            "supports refit_transport='mcore' or 'nccl_reshard'."
+            "supports refit_transport='mcore' or 'nccl_reshard'; SGLang supports "
+            "refit_transport='nccl_reshard'."
         )
 
     if backend == "megatron":
@@ -2069,6 +2071,8 @@ def setup(
             generation_backend=backend,
             colocated=colocated_inference,
             refit_buffer_size_gb=policy_config.get("refit_buffer_size_gb"),
+            train_cluster=train_cluster,
+            inference_cluster=inference_cluster,
         )
         # Only exchanges refit metadata. SGLang's own weight-update group is
         # established lazily on the first refit.

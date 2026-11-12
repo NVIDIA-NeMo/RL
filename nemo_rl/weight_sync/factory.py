@@ -21,7 +21,7 @@ topology (colocated vs. non-colocated) and the generation backend:
 - vLLM colocated -> IPC (ZMQ + CUDA IPC handles)
 - vLLM non-colocated -> NCCL collective
 - SGLang colocated -> Ray CUDA-IPC bucket transfer
-- SGLang non-colocated -> NCCL broadcast over SGLang's own weight-update group
+- SGLang non-colocated -> own NCCL broadcast group or shared NCCL reshard
 """
 
 from typing import Any, Optional
@@ -184,6 +184,26 @@ def create_weight_synchronizer(
         )
 
     if generation_backend == SGLANG_BACKEND:
+        if generation.cfg.get("refit_transport") == "nccl_reshard":
+            if colocated:
+                raise ValueError(
+                    "SGLang NCCL reshard requires non-colocated generation."
+                )
+            if train_cluster is None or inference_cluster is None:
+                raise ValueError(
+                    "SGLang NCCL reshard requires train/inference clusters."
+                )
+            from nemo_rl.weight_sync.sglang_weight_synchronizer import (
+                SGLangNcclReshardWeightSynchronizer,
+            )
+
+            return SGLangNcclReshardWeightSynchronizer(
+                policy=policy,
+                generation=generation,
+                train_cluster=train_cluster,
+                inference_cluster=inference_cluster,
+                refit_timeout_s=refit_timeout_s,
+            )
         # NOTE: this must stay *below* the checkpoint-engine guard above,
         # which rejects non-vLLM backends. Hoisting it would hand a
         # checkpoint-engine config to the SGLang synchronizer instead.

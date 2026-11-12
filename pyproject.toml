@@ -138,6 +138,7 @@ dependencies = [
 
 
 [project.optional-dependencies]
+nccl_m2n = ["nccl-extensions[cu13]==0.1.0; sys_platform != 'darwin'"]
 automodel = [
   # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
   "torch==2.13.0",

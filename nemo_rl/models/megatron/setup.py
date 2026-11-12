@@ -513,12 +513,14 @@ def configure_refit_environment(config) -> None:
     """Set the refit allocator mode before NCCL caches the value."""
     generation_cfg = config.get("generation")
     if generation_cfg is not None and not generation_cfg["colocated"]["enabled"]:
-        # Explicitly set NCCL_CUMEM_ENABLE for non-colocated refit.
-        # SGLang requires 0; the other refit communicators require 1.
-        # NCCL caches this process-wide at its first communicator creation, so
-        # set it before the training process group. See issue #564.
+        # M2N needs symmetric memory; every peer must select the same allocator
+        # before NCCL caches it at the first communicator. See issue #564.
         backend = generation_cfg["backend"]
-        os.environ["NCCL_CUMEM_ENABLE"] = "0" if backend == "sglang" else "1"
+        use_cumem = (
+            backend != "sglang"
+            or generation_cfg.get("refit_transport") == "nccl_reshard"
+        )
+        os.environ["NCCL_CUMEM_ENABLE"] = str(int(use_cumem))
 
 
 def _distributed_timeout_minutes(config: PolicyConfig | ValueConfig) -> Optional[float]:
