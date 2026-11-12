@@ -602,3 +602,26 @@ def test_background_dump_shares_storages_before_submit(tmp_path: Path) -> None:
     values = submitted.scalars["prompt_ids"]
     assert values.values().is_shared()
     assert values.offsets().is_shared()
+
+
+class _SubmittingWriter(_RecordingWriter):
+    def _write_chunk(self, chunk: TrainChunk, *, replace: bool) -> ChunkReceipt:
+        self._submit(len, chunk)
+        return super()._write_chunk(chunk, replace=replace)
+
+
+def test_custom_writer_gets_shared_storage_from_the_base_class(
+    tmp_path: Path, chunk: TrainChunk
+) -> None:
+    writer = _SubmittingWriter(str(tmp_path), shard_id="0", background=True)
+    executor = _FakeExecutor()
+    writer._executor = executor
+    advantages = torch.ones(2, 3)
+    writer.add_chunk(
+        replace(chunk, sequences={"advantages": advantages}, scalars={}, tags=None)
+    )
+
+    # The subclass only calls _submit(); add_chunk shared the storages first.
+    _, submitted = executor.submitted[0]
+    assert advantages.is_shared()
+    assert submitted.sequences["advantages"].is_shared()

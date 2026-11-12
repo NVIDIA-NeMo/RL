@@ -126,6 +126,10 @@ class DebugWriter(ABC):
             self.rows = 0
         self.step = chunk.step
 
+        # Share storages before any submission: the queue feeder pickles after
+        # submit() returns and would race with the caller's later reads.
+        if self._background:
+            chunk = _share_chunk_storage(chunk)
         receipt = self._write_chunk(chunk, replace=is_first_chunk)
         self.rows += receipt.rows
         return receipt
@@ -167,6 +171,17 @@ class DebugWriter(ABC):
         self.step = None
         self.rows = 0
 
+    def _submit(self, fn: Callable[..., None], *args: Any) -> None:
+        """Run fn(*args) in the background process, with at most two pending."""
+        if self._executor is None:
+            # spawn: never fork a process holding Ray and CUDA state.
+            self._executor = ProcessPoolExecutor(
+                max_workers=1, mp_context=multiprocessing.get_context("spawn")
+            )
+        if len(self._pending) == 2:
+            self._pending.pop(0).result()
+        self._pending.append(self._executor.submit(fn, *args))
+
     def flush(self) -> None:
         """Wait until every chunk handed to the background is written."""
         pending, self._pending = self._pending, []
@@ -187,8 +202,8 @@ class DebugWriter(ABC):
         The first chunk of a step comes with replace set, telling the writer to drop
         any rows already stored for that step.
         """
-        # Prepare storage before process submission to avoid races with caller reads.
-        # See JsonDebugWriter._write_chunk() for receipt and submission handling.
+        # With background set, add_chunk already shared the storages; hand the
+        # write to self._submit(). See JsonDebugWriter._write_chunk() for an example.
 
     @abstractmethod
     def _publish_step(self, step: int, receipts: list[ChunkReceipt]) -> None:
@@ -222,17 +237,7 @@ class JsonDebugWriter(DebugWriter):
         if not self._background:
             self._write_part(part, mode, chunk)
             return receipt
-        # Share the storages now: the queue feeder pickles after submit() returns,
-        # and its lazy sharing would race with the caller's later reads.
-        chunk = _share_chunk_storage(chunk)
-        if self._executor is None:
-            # spawn: never fork a process holding Ray and CUDA state.
-            self._executor = ProcessPoolExecutor(
-                max_workers=1, mp_context=multiprocessing.get_context("spawn")
-            )
-        if len(self._pending) == 2:
-            self._pending.pop(0).result()
-        self._pending.append(self._executor.submit(self._write_part, part, mode, chunk))
+        self._submit(self._write_part, part, mode, chunk)
         return receipt
 
     @staticmethod
