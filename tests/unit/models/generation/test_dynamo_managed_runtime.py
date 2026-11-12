@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import pickle
 import signal
 import subprocess
 import sys
@@ -19,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from nemo_rl.models.generation.dynamo import managed_runtime
 from nemo_rl.models.generation.dynamo.config import DynamoCfg, DynamoFrontendArgs
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     ManagedDynamoRuntime,
@@ -34,6 +36,7 @@ def _runtime(**frontend_args) -> ManagedDynamoRuntime:
         ),
         model_name="model",
         frontend_python="/venvs/vllm/bin/python",
+        ray_address="10.0.0.1:6379",
     )
 
 
@@ -285,19 +288,51 @@ def test_engine_wait_fails_immediately_when_an_engine_or_service_stops(
         runtime.wait_for_engines(1, check_engines=check_engines)
 
 
-def test_frontend_launches_from_the_given_interpreter(monkeypatch) -> None:
-    runtime = _runtime()
+def test_frontend_launches_nemo_rls_chat_engine_from_the_given_interpreter(
+    monkeypatch,
+) -> None:
+    runtime = _runtime(render_workers=3)
     runtime._frontend_port = 3000
+    runtime._generation_cut_port = 2400
     runtime._namespace = "nemo-rl-test"
     launched = []
     monkeypatch.setattr(
         "nemo_rl.models.generation.dynamo.managed_runtime.subprocess.Popen",
-        lambda command, **kwargs: launched.append(command) or _FakeProcess(),
+        lambda command, **kwargs: launched.append((command, kwargs["env"]))
+        or _FakeProcess(),
     )
 
     runtime._start_frontend()
+    runtime.publish_chat_capture(
+        dp_cfg={"backend": "simple"},
+        staging_partition="staging",
+        capture_media=False,
+        generation_cut_control_token="secret",
+        generation_cut_control_timeout_s=60.0,
+    )
 
-    assert launched[0][:3] == ["/venvs/vllm/bin/python", "-m", "dynamo.frontend"]
+    ((command, env),) = launched
+    # Dynamo's frontend, with NeMo RL's chat engine serving chat calls.
+    assert command[:3] == [
+        "/venvs/vllm/bin/python",
+        "-m",
+        "nemo_rl.models.generation.dynamo.vllm.frontend",
+    ]
+    assert env[managed_runtime.RENDER_WORKERS_ENV] == "3"
+    assert env[managed_runtime.RAY_ADDRESS_ENV] == "10.0.0.1:6379"
+    # NeMo-Gym's checkpoint generation cuts go to a port of the frontend's own.
+    assert env[managed_runtime.GENERATION_CUT_PORT_ENV] == "2400"
+    # Capture is set up after the engines register; the chat engine reads it
+    # from the file the frontend was told about.
+    with open(env[managed_runtime.CAPTURE_FILE_ENV], "rb") as capture_file:
+        assert pickle.load(capture_file) == {
+            "data_plane": {"backend": "simple"},
+            "staging_partition": "staging",
+            "capture_media": False,
+            "generation_cut_control_token": "secret",
+            "generation_cut_control_timeout_s": 60.0,
+        }
+    runtime.shutdown()
 
 
 def test_shutdown_logs_the_kv_events_the_router_applied(monkeypatch, capsys) -> None:

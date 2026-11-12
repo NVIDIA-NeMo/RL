@@ -216,22 +216,36 @@ class VllmGeneration(GenerationInterface):
     # defaults, so shutdown() also works when __init__ failed before starting them.
     _dynamo_runtime: Optional["ManagedDynamoRuntime"] = None
     dynamo_frontend_url: Optional[str] = None
+    dynamo_generation_cut_url: Optional[str] = None
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
         """Reject pure-config vLLM settings the SC entrypoint cannot honor."""
         generation_config = cast(VllmConfig, master_config.policy["generation"])
         assert_reload_refit_config_supported(generation_config)
-        if (
-            dynamo_enabled(generation_config)
-            and master_config.async_rl.generation_fleet_health.enabled
-        ):
-            raise ValueError(
-                "async_rl.generation_fleet_health.enabled=true is not supported "
-                "with policy.generation.dynamo=true yet: the Dynamo frontend "
-                "picks engines itself, and a restarted shard does not register "
-                "with it. Disable fleet health."
-            )
+        if dynamo_enabled(generation_config):
+            if master_config.async_rl.generation_router.enabled:
+                raise ValueError(
+                    "async_rl.generation_router.enabled=true does not apply with "
+                    "policy.generation.dynamo=true: NeMo-Gym calls the Dynamo "
+                    "frontend, which routes the whole fleet behind one URL. "
+                    "Disable the generation router."
+                )
+            if master_config.async_rl.generation_fleet_health.enabled:
+                raise ValueError(
+                    "async_rl.generation_fleet_health.enabled=true is not supported "
+                    "with policy.generation.dynamo=true yet: the Dynamo frontend "
+                    "picks engines itself, and a restarted shard does not register "
+                    "with it. Disable fleet health."
+                )
+            if master_config.env.get("should_use_nemo_gym") and generation_config[
+                "vllm_cfg"
+            ].get("skip_tokenizer_init"):
+                raise ValueError(
+                    "vllm_cfg.skip_tokenizer_init=true does not work with NeMo-Gym "
+                    "and policy.generation.dynamo=true: the engine detokenizes the "
+                    "replies Gym's chat calls get through the frontend."
+                )
 
     @staticmethod
     def init_cluster_placement_groups(
@@ -759,6 +773,29 @@ class VllmGeneration(GenerationInterface):
         self.device_uuids = self._report_device_id()
         self._register_dynamo_engines()
 
+    @property
+    def client_base_urls(self) -> list[Optional[str]]:
+        """Where OpenAI clients such as NeMo-Gym send requests.
+
+        The Dynamo frontend when it serves this fleet (``policy.generation.dynamo``);
+        otherwise every data-parallel shard's own server, as
+        ``dp_openai_server_base_urls``. Known before a deferred model load.
+        """
+        if self.dynamo_frontend_url is not None:
+            return [self.dynamo_frontend_url]
+        return self.dp_openai_server_base_urls
+
+    @property
+    def generation_cut_control_urls(self) -> Optional[list[str]]:
+        """Where NeMo-Gym sends checkpoint generation cuts, one per ``client_base_urls`` entry.
+
+        None when each base URL takes its own cuts, as every shard's server
+        does. The Dynamo frontend takes them on a port of its own.
+        """
+        if self.dynamo_generation_cut_url is not None:
+            return [self.dynamo_generation_cut_url]
+        return None
+
     def _start_dynamo_services(self) -> None:
         """Start the etcd, NATS and frontend this fleet's engines register with."""
         from nemo_rl.models.generation.dynamo.managed_runtime import (
@@ -771,10 +808,12 @@ class VllmGeneration(GenerationInterface):
             # The workers' venv carries ai-dynamo, so the frontend runs the same
             # release as every engine.
             frontend_python=self.worker_group.py_executable,
+            ray_address=ray.get_runtime_context().gcs_address,
         )
         runtime.start()
         self._dynamo_runtime = runtime
         self.dynamo_frontend_url = runtime.frontend_url
+        self.dynamo_generation_cut_url = runtime.generation_cut_control_url
 
     def _register_dynamo_engines(self) -> None:
         """Serve every shard's engine through Dynamo; wait until it routes to all."""
@@ -873,6 +912,20 @@ class VllmGeneration(GenerationInterface):
         )
         self._token_capture_media = agreed_media_columns(ray.get(futures))
         self._token_capture_setup = setup
+        if self._dynamo_runtime is not None:
+            # NeMo-Gym's calls through Dynamo read their prefix in the frontend,
+            # which also takes Gym's generation cuts for the engines.
+            self._dynamo_runtime.publish_chat_capture(
+                dp_cfg=dp_cfg,
+                staging_partition=staging_partition,
+                capture_media=capture_media,
+                generation_cut_control_token=(
+                    generation_cut_control_token
+                    if generation_prefix_cuts_enabled
+                    else None
+                ),
+                generation_cut_control_timeout_s=generation_cut_control_timeout_s,
+            )
         return self._token_capture_media
 
     def get_data_plane_snapshots(self) -> list[dict[str, Any]]:

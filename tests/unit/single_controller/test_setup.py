@@ -1213,6 +1213,7 @@ class TestSetup:
                 ["http://generation"],
                 MagicMock(name="tokenizer"),
                 policy_api_key=None,
+                generation_cut_control_urls=None,
             )
 
         assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is False
@@ -1239,11 +1240,13 @@ class TestSetup:
                 ["http://generation"],
                 MagicMock(name="tokenizer"),
                 policy_api_key=None,
+                generation_cut_control_urls=["http://generation-cuts"],
             )
 
         kwargs = mock_spinup.call_args.kwargs
         assert kwargs["turn_checkpointing_enabled"] is True
         assert kwargs["generation_prefix_cuts_enabled"] is generation_prefix_cuts
+        assert kwargs["generation_cut_control_urls"] == ["http://generation-cuts"]
         # The flag is a typed keyword, not an undeclared key in the capture config.
         assert "generation_prefix_cuts_enabled" not in kwargs["token_capture"]
 
@@ -2609,7 +2612,7 @@ class TestSetup:
         assert data_kwargs["is_vlm"] is True
         mock_spinup.assert_called_once_with(
             mc.env,
-            base_urls=patched_factories["fake_gen"].dp_openai_server_base_urls,
+            base_urls=patched_factories["fake_gen"].client_base_urls,
             model_name="test-model",
             # Reaches the actor once, at spinup, rather than riding along with every
             # run_rollouts call.
@@ -2618,6 +2621,10 @@ class TestSetup:
             use_fastokens=False,
             turn_checkpointing_enabled=False,
             generation_prefix_cuts_enabled=False,
+            # Where the generation backend takes Gym's checkpoint cuts.
+            generation_cut_control_urls=patched_factories[
+                "fake_gen"
+            ].generation_cut_control_urls,
             # The vLLM server's bearer token, handed to the Gym model server.
             policy_api_key=patched_factories["fake_gen"].http_server_api_key,
             token_capture=None,
@@ -2856,6 +2863,39 @@ class TestSetup:
         assert setup_kwargs["generation_cut_control_timeout_s"] == (
             mc.token_capture.control_timeout_s
         )
+
+    def test_dynamo_token_capture_tells_gym_to_speak_dynamo(self, patched_factories):
+        """The same vLLM workers stage the calls; Gym reaches them through the frontend."""
+        mc = _make_master_config(backend="vllm")
+        mc.policy["generation"].update(
+            {
+                "model_name": "test-model",
+                "stop_strings": None,
+                "stop_token_ids": None,
+                "top_k": None,
+                "dynamo": True,
+                "vllm_cfg": {"async_engine": True, "expose_http_server": True},
+            }
+        )
+        mc.token_capture.enabled = True
+        mc.env = {"should_use_nemo_gym": True, "nemo_gym": {}}
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+
+        with (
+            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+            patch.object(
+                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+            ),
+            patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
+            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+            patch(
+                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
+                return_value=[MagicMock()],
+            ),
+        ):
+            setup_single_controller(mc, MagicMock(pad_token_id=9))
+
+        assert mc.token_capture.generation_backend == "dynamo"
 
     def test_nemo_gym_coverage_failure_shuts_down_shards(self, patched_factories):
         mc = _make_master_config(colocated=False, backend="vllm")

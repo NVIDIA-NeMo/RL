@@ -158,7 +158,7 @@ env:
   nemo_gym:
     config_paths:
     - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
-    - responses_api_agents/verifiers_agent/configs/acereason-math.yaml
+    - responses_api_agents/verifiers_agent/configs/verifiers_agent.yaml
 
     # Use legacy agent orchestration.
     verifiers_agent_environment_server:

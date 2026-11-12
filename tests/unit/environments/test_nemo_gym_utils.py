@@ -1208,6 +1208,74 @@ def test_build_nemo_gym_actors_hands_every_actor_the_policy_api_key(
     assert all(cfg["policy_api_key"] == "per-job-key" for cfg in cluster.actor_configs)
 
 
+def test_build_nemo_gym_actors_gives_every_actor_the_dynamo_dialect(
+    detected_uv_dirs,
+):
+    """With Dynamo, each actor's composed config speaks Gym's Dynamo dialect.
+
+    The dialect is not a policy_model overlay, which a sharded plan would reject
+    as unowned. The frontend applies the native default template kwargs, so only
+    a shard's own kwargs reach Gym.
+    """
+    from nemo_rl.algorithms.grpo import MasterConfig
+
+    env = _shard_env_configs()
+    env["nemo_gym"]["shards"][1]["overrides"] = {
+        "policy_model": {
+            "responses_api_models": {
+                "vllm_model": {"chat_template_kwargs": {"enable_thinking": False}}
+            }
+        }
+    }
+    config = MasterConfig.model_construct(
+        env=env,
+        data={},
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "dynamo": True,
+                "vllm_cfg": {
+                    "http_server_serving_chat_kwargs": {
+                        "default_chat_template_kwargs": {"enable_thinking": True}
+                    }
+                },
+            }
+        },
+    )
+    setup_nemo_gym_config(config, tokenizer=None)
+    cluster = _FakeGymCluster()
+
+    with _patched_cluster(cluster):
+        nemo_gym_mod.build_nemo_gym_actors(
+            config.env,
+            base_urls=["http://frontend"],
+            model_name="test-model",
+            tokenizer=_TOKENIZER,
+            enable_router_replay=False,
+            use_fastokens=False,
+            turn_checkpointing_enabled=False,
+        )
+
+    template_kwargs = [
+        cfg["initial_global_config_dict"]["policy_model"]["responses_api_models"][
+            "vllm_model"
+        ].get("chat_template_kwargs")
+        for cfg in cluster.actor_configs
+    ]
+    # judged, then the tools shard's two replicas with their own override.
+    assert template_kwargs == [
+        None,
+        {"enable_thinking": False},
+        {"enable_thinking": False},
+    ]
+    for cfg in cluster.actor_configs:
+        gym_config = cfg["initial_global_config_dict"]
+        vllm_model = gym_config["policy_model"]["responses_api_models"]["vllm_model"]
+        assert vllm_model["dynamo_frontend"] is True
+        assert vllm_model["reasoning_field"] == "reasoning_content"
+        assert "dynamo_dialect" not in gym_config
+
+
 def test_unsharded_checkpointing_discovers_the_actor_at_startup(detected_uv_dirs):
     cluster = _FakeGymCluster()
     token_capture = {
@@ -1331,8 +1399,9 @@ def test_turn_recovery_rejects_typed_environment_servers(as_omegaconf):
         nemo_gym_mod._reject_typed_environment_servers(as_config(typed))
 
 
+@pytest.mark.parametrize("control_urls", [None, ["http://frontend:2400"]])
 def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
-    detected_uv_dirs,
+    detected_uv_dirs, control_urls
 ):
     config = build_nemo_gym_config(
         _env_configs(),
@@ -1342,6 +1411,7 @@ def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
         use_fastokens=False,
         turn_checkpointing_enabled=True,
         generation_prefix_cuts_enabled=True,
+        generation_cut_control_urls=control_urls,
         token_capture={
             "enabled": True,
             "capture_dir": "/capture",
@@ -1353,6 +1423,8 @@ def test_prefix_checkpointing_enables_generation_cuts_on_policy_model(
         "responses_api_models"
     ]["vllm_model"]
     assert model["checkpoint"] == {"policy": True, "generation_cuts": True}
+    # Only a backend that takes cuts elsewhere (a Dynamo frontend) names where.
+    assert model.get("generation_cut_control_url") == control_urls
 
 
 @pytest.mark.nemo_gym
@@ -1369,6 +1441,7 @@ def test_prefix_checkpointing_policy_overrides_are_gym_fields(detected_uv_dirs):
         use_fastokens=False,
         turn_checkpointing_enabled=True,
         generation_prefix_cuts_enabled=True,
+        generation_cut_control_urls=["http://frontend:2400"],
         token_capture={
             "enabled": True,
             "capture_dir": "/capture",
@@ -1379,6 +1452,7 @@ def test_prefix_checkpointing_policy_overrides_are_gym_fields(detected_uv_dirs):
     model = config["initial_global_config_dict"]["policy_model"][
         "responses_api_models"
     ]["vllm_model"]
+    assert "generation_cut_control_url" in model
     assert set(model) - set(VLLMModelConfig.model_fields) == set()
     checkpoint_config = VLLMModelConfig.model_fields["checkpoint"].annotation
     assert set(model["checkpoint"]) == {"policy", "generation_cuts"}

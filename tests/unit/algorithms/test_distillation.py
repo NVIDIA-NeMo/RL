@@ -1345,7 +1345,7 @@ def test_distillation_setup_nemo_gym_uses_deferred_vllm(monkeypatch, vllm_start_
         def __init__(self, cluster, config, defer_model_load=False):
             self.cfg = config
             self.defer_model_load = defer_model_load
-            self.dp_openai_server_base_urls = ["http://reserved-vllm"]
+            self.client_base_urls = ["http://reserved-vllm"]
             # The per-job bearer token the real class generates when the
             # recipe requires one; Gym's model server must receive it.
             self.http_server_api_key = "k"
