@@ -210,11 +210,11 @@ class _Worker:
         )
 
     def render(self, body: dict[str, Any], *, measure: bool = False) -> RenderedCall:
-        from nemo_rl.models.generation.vllm.prompt_and_capture import set_max_tokens
         from nemo_rl.models.generation.vllm.chat_server import (
             NeMoRLChatCompletionRequest,
             NeMoRLMeasureChatRequest,
         )
+        from nemo_rl.models.generation.vllm.prompt_and_capture import set_max_tokens
 
         request_cls = (
             NeMoRLMeasureChatRequest if measure else NeMoRLChatCompletionRequest

@@ -229,21 +229,37 @@ async def abort_request_capture(host: Any, request: Any, reason: str) -> None:
 
 
 class RenderedPrompt(Protocol):
-    """What :func:`prepare_prompt` reads from a call's render; each path's render has it."""
+    """What :func:`prepare_prompt` reads from a call's render.
+
+    Read-only members, so each path's frozen render dataclass fits.
+    """
 
     # The full render's token ids, in the template's coordinates.
-    template_token_ids: list[int]
+    @property
+    def template_token_ids(self) -> list[int]: ...
+
     # The render up to the last assistant turn, when a prefix will be spliced.
-    history_token_ids: Optional[list[int]]
+    @property
+    def history_token_ids(self) -> Optional[list[int]]: ...
+
     # The request's own prefix (Gym's echo) after the capture decision.
-    required_prefix_token_ids: Optional[list[int]]
+    @property
+    def required_prefix_token_ids(self) -> Optional[list[int]]: ...
+
     # Capture admissions: what is stored, and how the prompt is served; None
     # without capture.
-    admission: Any
-    serving_admission: Any
-    verify_retained_media: bool
+    @property
+    def admission(self) -> Any: ...
+
+    @property
+    def serving_admission(self) -> Any: ...
+
+    @property
+    def verify_retained_media(self) -> bool: ...
+
     # The output budget the request asked for; None when it set none.
-    request_max_tokens: Optional[int]
+    @property
+    def request_max_tokens(self) -> Optional[int]: ...
 
 
 @dataclass(frozen=True)
@@ -438,8 +454,8 @@ async def start_capture(
             admission = resolved_admission
         serving_admission = resolved_admission
     if restored is not None:
-        # The saved rows are the exact engine prompt at the cut; splicing them
-        # again could add or drop tokens (test_vllm_progress_read_layout.py).
+        # The saved rows are the exact engine prompt at the cut: never spliced or
+        # truncated again (test_vllm_progress_read_layout.py).
         splice = None
         prompt_token_ids = restored.prompt_token_ids
         terminal = classify_restored_terminal(
@@ -536,8 +552,8 @@ def error_reply(error: Exception) -> Optional[ErrorReply]:
     # Gym detects a context overflow by this text.
     overflow = "maximum context length" in message
     if isinstance(error, MediaCaptureRejected):
-        # A stable code, so Gym and the worker log can tell a retained-media
-        # re-tile from an engine error.
+        # First, since it is a ValueError too. A stable code lets Gym and the
+        # worker log tell a retained-media re-tile from an engine error.
         return ErrorReply(
             status=400,
             message=message,
@@ -584,9 +600,8 @@ def error_reply(error: Exception) -> Optional[ErrorReply]:
             acknowledge=False,
         )
     if isinstance(error, ValueError) and overflow:
-        # vLLM's get_max_tokens refuses an over-long prompt with a plain
-        # ValueError ("Input length (N) exceeds model's maximum context length
-        # (M)."); only that known refusal, before generation, settles capture.
+        # vLLM's get_max_tokens refuses an over-long prompt with a plain ValueError
+        # ("Input length (N) exceeds ..."); only that refusal settles capture.
         return ErrorReply(
             status=400,
             message=message,

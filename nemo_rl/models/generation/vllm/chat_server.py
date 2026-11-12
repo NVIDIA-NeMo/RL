@@ -73,16 +73,16 @@ from nemo_rl.models.generation.prefix_recovery.restore import (
 from nemo_rl.models.generation.vllm.captured_chat_logprobs import (
     CapturedChatLogprobsMixin,
 )
-from nemo_rl.models.generation.vllm.prompt_and_capture import (
-    abort_request_capture,
-    start_capture,
-    abort_capture,
-    save_capture,
-    prepare_prompt,
-    set_max_tokens,
-)
 from nemo_rl.models.generation.vllm.generation_cut_route import (
     register_generation_cut_route,
+)
+from nemo_rl.models.generation.vllm.prompt_and_capture import (
+    abort_capture,
+    abort_request_capture,
+    prepare_prompt,
+    save_capture,
+    set_max_tokens,
+    start_capture,
 )
 from nemo_rl.models.generation.vllm.utils import (
     attach_routed_experts_to_chat_response_choices,
@@ -445,10 +445,11 @@ class ResumedCallReplyMixin:
         **kwargs,
     ):
         restored_token_ids = request._restored_generation_token_ids
+        engine_results = result_generator
 
         async def restored_results():
             final_res = None
-            async for res in result_generator:
+            async for res in engine_results:
                 final_res = res
             if final_res is None:
                 return
@@ -818,9 +819,8 @@ def register_routes(
                 request, raw_request
             )
         except BaseException as error:
-            # A cancel before generation starts propagates here directly; one
-            # that lands mid-generation is swallowed by vLLM and re-raised by
-            # NeMoRLOpenAIServingChatMixin.chat_completion_full_generator.
+            # A cancel before generation propagates here directly; vLLM swallows a
+            # later one, and NeMoRLOpenAIServingChatMixin's full generator re-raises it.
             failure = await abort_capture(host, request, error)
             if failure is None:
                 raise

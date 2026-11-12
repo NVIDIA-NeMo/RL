@@ -80,10 +80,10 @@ from nemo_rl.models.generation.score_centering import (
 )
 from nemo_rl.models.generation.vllm.prompt_and_capture import (
     PreparedPrompt,
-    abort_request_capture,
-    start_capture,
     abort_capture,
+    abort_request_capture,
     save_capture,
+    start_capture,
 )
 from nemo_rl.models.generation.vllm.utils import (
     chat_generation_tokens,
@@ -369,9 +369,8 @@ class DynamoVllmAdapter(DynamoEngineAdapter):
             chat, engine_prompt, wire, engine_client, context
         )
         if plan.admission is not None and context.is_stopped():
-            # Dynamo aborts the vLLM request on a disconnect but never
-            # cancels this generator: fail the capture, as the native
-            # endpoint's cancellation does, instead of staging it.
+            # Dynamo aborts the vLLM request on a disconnect but never cancels
+            # this generator: fail the capture, as natively, instead of staging it.
             await abort_request_capture(host, chat, "client_disconnect")
             return None
         completion = final_output.outputs[0]
