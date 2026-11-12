@@ -229,7 +229,7 @@ class TQValue(TQDriverMixin, Value):
     def train_microbatches_from_meta(
         self, meta: KVBatchMeta, timer: Optional[Timer] = None
     ) -> None:
-        """Accumulate a token-only chunk using the existing presharded worker API."""
+        """Accumulate a training chunk using the existing presharded worker API."""
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._isolated_meta(
             meta,

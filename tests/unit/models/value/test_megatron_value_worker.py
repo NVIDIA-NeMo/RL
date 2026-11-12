@@ -537,7 +537,7 @@ def test_finish_training_updates_eval_cache_before_parameter_offload(
     )
 
 
-def test_split_value_accepts_uneven_packed_dp_shard():
+def test_split_value_accepts_uneven_packed_dp_shard_and_sanitizes_media_mask():
     from nemo_rl.models.value.workers.megatron_value_worker import (
         MegatronValueWorkerImpl,
     )
@@ -560,11 +560,17 @@ def test_split_value_accepts_uneven_packed_dp_shard():
         model=SimpleNamespace(no_sync=nullcontext),
         defer_fp32_logits=False,
         cfg={"megatron_cfg": {"empty_unused_memory_level": 0}},
+        # Qwen2.5-VL-style forwards do not accept the transported mask.
+        media_placeholder_token_id=None,
     )
     data = BatchedDataDict(
         {
+            "input_ids": torch.ones((65, 2), dtype=torch.long, device="cuda"),
             "sample_mask": torch.ones(65, device="cuda"),
             "token_mask": torch.ones((65, 2), device="cuda"),
+            "media_token_validity_mask": torch.ones(
+                (65, 2), dtype=torch.bool, device="cuda"
+            ),
         }
     )
     rerun = SimpleNamespace(
@@ -574,7 +580,7 @@ def test_split_value_accepts_uneven_packed_dp_shard():
         patch(
             "nemo_rl.models.value.workers.megatron_value_worker.get_microbatch_iterator",
             return_value=(iter(()), 1, 1, None, 2),
-        ),
+        ) as get_microbatch_iterator,
         patch("nemo_rl.models.value.workers.megatron_value_worker.LossPostProcessor"),
         patch(
             "nemo_rl.models.value.workers.megatron_value_worker.get_rerun_state_machine",
@@ -600,6 +606,8 @@ def test_split_value_accepts_uneven_packed_dp_shard():
     assert state.counts[2].item() == 65
     assert state.num_chunks == 1
     assert not state.failed
+    assert get_microbatch_iterator.call_args.args[0] is data
+    assert "media_token_validity_mask" not in data
 
 
 def test_finish_training_preserves_model_move_contract(monkeypatch):

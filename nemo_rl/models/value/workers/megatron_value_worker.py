@@ -886,6 +886,7 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                 raise ValueError(
                     "each value train chunk must contain complete microbatches per DP rank"
                 )
+            attach_media_token_validity_mask(data, self.media_placeholder_token_id)
             sample_mask = data["sample_mask"]
             state.counts[0] += sample_mask.sum()
             state.counts[1] += (
