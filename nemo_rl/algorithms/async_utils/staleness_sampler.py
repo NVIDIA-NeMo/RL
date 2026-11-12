@@ -202,8 +202,12 @@ class DropAccountingSampler(Protocol):
     instance -- would honour them.
     """
 
-    uses_replacement_pool: ClassVar[bool]
-    """Whether a dropped group is replaced from a pool of spare prompts."""
+    uses_pooled_replacements: ClassVar[bool]
+    """Whether dropped groups use pool-based replacements.
+
+    Filtering and rollout failures use separate prompt pools and budgets. Each
+    feature enables its pool independently when the sampler uses this strategy.
+    """
 
     closes_short_at_exhaustion: ClassVar[bool]
     """Whether the last step may close on the groups that exist once the data runs out."""
@@ -240,7 +244,7 @@ class BaseSampler(abc.ABC):
     supports_training_claims: ClassVar[bool] = True
 
     # Defaults for DropAccountingSampler, right for a gated sampler that does not stamp.
-    uses_replacement_pool: ClassVar[bool] = True
+    uses_pooled_replacements: ClassVar[bool] = True
     closes_short_at_exhaustion: ClassVar[bool] = False
 
     def __init__(self, buffer: TQReplayBuffer) -> None:
@@ -444,7 +448,7 @@ class WindowedSampler(BaseSampler):
 
     # Rollout never stops producing, so a lost group is made up by later ones: no spare
     # pool is needed, and only the tail of the data can leave a step short.
-    uses_replacement_pool: ClassVar[bool] = False
+    uses_pooled_replacements: ClassVar[bool] = False
     closes_short_at_exhaustion: ClassVar[bool] = True
 
     def __init__(
@@ -678,7 +682,7 @@ class WeightFifoSampler(_GatedSampler):
     # than the bucket the replacement is meant to fill, and select -- which waits on the
     # oldest in-window bucket alone -- then waits on a bucket nothing can top up. A pool
     # that only works when the timing happens to line up is not one worth having.
-    uses_replacement_pool: ClassVar[bool] = False
+    uses_pooled_replacements: ClassVar[bool] = False
 
     def __init__(self, buffer: TQReplayBuffer, *, max_staleness_versions: int) -> None:
         super().__init__(buffer, gate_window=max_staleness_versions)
@@ -742,7 +746,7 @@ class InOrderSampler(_GatedSampler):
     supports_buffer_checkpoint: ClassVar[bool] = True
     requires_single_weight_batch: ClassVar[bool] = False
 
-    uses_replacement_pool: ClassVar[bool] = True
+    uses_pooled_replacements: ClassVar[bool] = True
     closes_short_at_exhaustion: ClassVar[bool] = False
 
     def __init__(
@@ -1015,7 +1019,7 @@ def sampler_supports_training_claims(cfg: SamplerConfig) -> bool:
 
 
 _DROP_ACCOUNTING_MEMBERS = (
-    "uses_replacement_pool",
+    "uses_pooled_replacements",
     "closes_short_at_exhaustion",
     "charge_step_for_lost_group",
 )
@@ -1055,7 +1059,7 @@ def warn_if_custom_sampler_lacks_drop_accounting(cfg: SamplerConfig) -> None:
         "charged to its own target_step (or the step being assembled if the sampler "
         "stamps none). That is right for a gated sampler. A sampler that keeps "
         "producing without a gate, like windowed, should implement "
-        "DropAccountingSampler with uses_replacement_pool = False and "
+        "DropAccountingSampler with uses_pooled_replacements = False and "
         "closes_short_at_exhaustion = True. Declare the flags as class attributes: "
         "this check runs before the sampler is constructed, so flags assigned in "
         "__init__ are not visible here even though the controller would honour them.",
