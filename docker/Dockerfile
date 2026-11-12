@@ -75,8 +75,9 @@ COPY docker/install_apptainer.sh /
 # Shared helper for the uv cache mount's materialize/sync-back/strip dance
 # (docker/uv_cache_mount.sh), bind-mounted into every uv-writing RUN below so
 # the logic lives in one place instead of being pasted into each RUN body.
+# docker/resolve_extras.sh rides along: it decides which extras this image builds.
 FROM scratch AS uv-cache-helper
-COPY docker/uv_cache_mount.sh /
+COPY docker/uv_cache_mount.sh docker/resolve_extras.sh /
 
 FROM ${BASE_IMAGE} AS base
 # An environment variable to indicate that we are in a container.
@@ -150,12 +151,21 @@ RUN GITHUB_ARTIFACTORY=github.com \
     && cp -r "${CMAKE_INSTALLER}/share/"* /usr/local/share/ \
     && rm -rf "${CMAKE_INSTALLER}" "${CMAKE_INSTALLER}.tar.gz"
 
-# Rust toolchain for setuptools-rust extensions in SGLang.
+# Rust toolchain for setuptools-rust extensions in SGLang. Skipped when SGLang is not built.
+ARG NRL_EXTRAS
+ARG SKIP_SGLANG_BUILD
 ENV PATH="/root/.cargo/bin:$PATH"
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path --profile minimal \
-    && rustc --version \
-    && cargo --version
+RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper <<"EOF" bash -exu -o pipefail
+source /tmp/uv-cache-helper/resolve_extras.sh
+case " $(nrl_wanted_extras) " in
+    *" sglang "*) ;;
+    *) echo "SGLang is not built; skipping the Rust toolchain"; exit 0 ;;
+esac
+curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --no-modify-path --profile minimal
+rustc --version
+cargo --version
+EOF
 
 # Install uv and python outside /root so an unprivileged runtime UID (for example
 # 65532) can execute them: /root is not traversable by other users, and the project
@@ -223,6 +233,11 @@ ARG HYBRID_EP_MULTINODE
 ARG TARGETARCH
 ARG TRTLLM_CCACHE_MAXSIZE=20G
 ARG TRTLLM_BUILD_JOBS=24
+# Space-separated extras to build; empty builds all of them. docker/resolve_extras.sh
+# has the full list and rejects unknown names.
+ARG NRL_EXTRAS
+# Space-separated dependency groups to install; empty installs all of them.
+ARG NRL_GROUPS
 ARG RUNTIME_UID
 ARG RUNTIME_GID
 ARG STRIP_UV_CACHE
@@ -306,6 +321,19 @@ source /tmp/uv-cache-helper/uv_cache_mount.sh
 uv_cache_restore force
 trap 'uv_cache_persist prune' EXIT
 
+source /tmp/uv-cache-helper/resolve_extras.sh
+WANTED_EXTRAS=$(nrl_wanted_extras)
+SKIP_EXTRAS=$(nrl_skipped_extras)
+# The TRT-LLM layer reads this to decide whether to build tensorrt_llm.
+printf '%s\n' $WANTED_EXTRAS > /opt/nrl_extras.txt
+GROUP_FLAGS="--all-groups"
+if [[ -n "${NRL_GROUPS:-}" ]]; then
+    GROUP_FLAGS="--no-default-groups"
+    for group in $NRL_GROUPS; do
+        GROUP_FLAGS="$GROUP_FLAGS --group $group"
+    done
+fi
+
 uv venv --seed
 # Drop what the restored cache carried in that uv.lock no longer pins -- versions from
 # older locks, which neither the seed export's `uv cache prune --ci` (it keeps every
@@ -340,16 +368,15 @@ apt-get update
 apt-get install -y --no-install-recommends libnvidia-ml-dev
 # Everything is hardlinked against the uv cache; this layer holds exactly one real copy of every wheel.
 UV_LINK_MODE=hardlink uv sync --frozen --no-install-project
-if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
-    UV_LINK_MODE=hardlink uv sync --frozen --extra vllm --no-install-project
-fi
-if [[ -z "${SKIP_SGLANG_BUILD:-}" ]]; then
-    UV_LINK_MODE=hardlink uv sync --frozen --extra sglang --no-install-project
-fi
-UV_LINK_MODE=hardlink uv sync --frozen --extra mcore --no-install-project
-UV_LINK_MODE=hardlink uv sync --frozen --extra automodel --no-install-project
-UV_LINK_MODE=hardlink uv sync --frozen --extra modelopt --no-install-project
-UV_LINK_MODE=hardlink uv sync --frozen --all-groups --no-install-project
+for extra in $WANTED_EXTRAS; do
+    # nemo_gym is only ever installed into worker venvs, and tensorrt_llm is built
+    # in its own layer below.
+    case "$extra" in
+        nemo_gym | trtllm) continue ;;
+    esac
+    UV_LINK_MODE=hardlink uv sync --frozen --extra "$extra" --no-install-project
+done
+UV_LINK_MODE=hardlink uv sync --frozen $GROUP_FLAGS --no-install-project
 
 # Worker-venv prefetch, phase 1: third-party packages only.
 #
@@ -373,16 +400,7 @@ UV_LINK_MODE=hardlink uv sync --frozen --all-groups --no-install-project
 # each actor needs; the runtime registry imports the same dict. It is run as a script rather
 # than imported, because importing it would execute nemo_rl/__init__.py, which does real work
 # (fingerprint check, sys.path setup) that cannot run in this layer.
-SKIP_EXTRAS=""
-if [[ -n "${SKIP_VLLM_BUILD:-}" ]]; then
-    SKIP_EXTRAS="$SKIP_EXTRAS vllm"
-fi
-if [[ -n "${SKIP_SGLANG_BUILD:-}" ]]; then
-    SKIP_EXTRAS="$SKIP_EXTRAS sglang"
-fi
-if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
-    SKIP_EXTRAS="$SKIP_EXTRAS trtllm"
-fi
+# SKIP_EXTRAS (every extra this image does not build) drops the actors that need one.
 # Write the list once, in a plain redirect so `set -e` catches a failure here
 # instead of silently prefetching nothing.
 "${UV_PROJECT_ENVIRONMENT}/bin/python" nemo_rl/distributed/actor_environments.py all $SKIP_EXTRAS \
@@ -464,8 +482,8 @@ trap 'uv_cache_persist' EXIT
 # above would let an out-of-date lock ship silently. Keep it before the SKIP exit.
 uv lock --check
 
-if [[ -n "${SKIP_TRTLLM_BUILD:-}" ]]; then
-    echo "SKIP_TRTLLM_BUILD is set; skipping the isolated TRT-LLM build"
+if ! grep -qx trtllm /opt/nrl_extras.txt; then
+    echo "The trtllm extra is not built (NRL_EXTRAS / SKIP_TRTLLM_BUILD); skipping the isolated TRT-LLM build"
     exit 0
 fi
 

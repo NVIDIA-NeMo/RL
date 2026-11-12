@@ -39,6 +39,27 @@ The release image ships `uv`'s download cache (`/opt/nemo_rl_cache/uv`) so an un
 
 Right after that cache is restored, before any `uv sync`, `docker/prune_uv_cache.py` removes exactly those superseded entries: index wheels and source builds whose `(package, version)` the current `uv.lock` no longer pins, and git builds/checkouts for commits it no longer pins, across every extra (installed in this build or not). Running first means it only judges restored content, so the build-isolation dependencies the syncs resolve outside `uv.lock` (setuptools, a build-time torch, ...) are kept. It runs in the same layer the syncs fill, because deleting files in a later layer only hides them and the image still ships them, and the result is synced back into the cache mount. It never removes a wheel the offline-install promise depends on, since that promise is itself "every wheel `uv.lock` could need." This runs automatically on every build; there is no flag to disable it.
 
+## Building Only Some Backends
+
+Each backend is a uv extra (`vllm`, `sglang`, `mcore`, `automodel`, `modelopt`, `nemo_gym`, `trtllm`). By default the image builds all of them. To build only the ones you use, list them in `NRL_EXTRAS`:
+
+```sh
+docker buildx build -f docker/Dockerfile \
+    --build-arg NRL_EXTRAS="mcore vllm nemo_gym" \
+    --tag <registry>/nemo-rl:latest \
+    .
+```
+
+| Build argument | Default | Effect |
+|---|---|---|
+| `NRL_EXTRAS` | all extras | Only these extras are installed, and only the worker virtual environments that need no other extra are prefetched. An unknown name fails the build. |
+| `NRL_GROUPS` | all dependency groups | Only these dependency groups (for example `build`) are installed in the main virtual environment. |
+
+The Rust toolchain is only installed when `sglang` is built. The `SKIP_*_BUILD` arguments below still work and remove an extra from the list.
+
+> [!NOTE]
+> A backend left out of the build is fetched and built on first use, the same as with the `SKIP_*_BUILD` arguments below.
+
 ## Skipping vLLM or SGLang Dependencies
 
 If you don't need vLLM, SGLang, or TRT-LLM support, you can skip building those dependencies to reduce build time and image size. Use the `SKIP_VLLM_BUILD`, `SKIP_SGLANG_BUILD`, and/or `SKIP_TRTLLM_BUILD` build arguments:
