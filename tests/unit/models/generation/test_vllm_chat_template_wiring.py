@@ -162,7 +162,13 @@ def _install_fake_vllm(monkeypatch):
         ChatCompletionRequest=type(
             "ChatCompletionRequest",
             (BaseModel,),
-            {"model_config": ConfigDict(extra="allow")},
+            {
+                "model_config": ConfigDict(extra="allow"),
+                # What vLLM's rule for reasoning_ended reads off a request.
+                "__annotations__": {"include_reasoning": bool},
+                "include_reasoning": True,
+                "_grammar_from_parser": False,
+            },
         ),
         ChatCompletionResponse=placeholder("ChatCompletionResponse"),
     )

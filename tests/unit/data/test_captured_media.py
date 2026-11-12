@@ -1430,6 +1430,7 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     renderer.renderer = SimpleNamespace(
         tokenizer=SimpleNamespace(decode=str, eos_token_id=2)
     )
+    renderer.model_config = SimpleNamespace(max_model_len=4096)
     inference = AsyncMock()
 
     async def create_chat_completion(request, raw_request):
@@ -1447,6 +1448,11 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
         logit_bias=None,
         top_p=1.0,
         temperature=1.0,
+        n=1,
+        logprobs=False,
+        top_logprobs=None,
+        model_fields_set=set(),
+        stream=False,
         ng_capture=admission.model_dump(),
         required_prefix_token_ids=None,
         model_copy=lambda **kwargs: request,
