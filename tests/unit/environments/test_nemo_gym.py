@@ -42,6 +42,7 @@ from nemo_rl.data.utils import setup_response_data
 from nemo_rl.distributed.ray_actor_environment_registry import (
     get_actor_python_env,
 )
+from nemo_rl.environments.gym_checkpoint_adapter import GymCheckpointInstance
 from nemo_rl.environments.nemo_gym import (
     ExternalServiceReadinessConfig,
     NemoGym,
@@ -134,8 +135,10 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
         ]
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
-                del head_server_config
+            def run_examples(
+                self, examples, head_server_config, route_failures_to_sidecar=False
+            ):
+                del head_server_config, route_failures_to_sidecar
                 for row in examples:
                     row["agent_ref"] = {"name": "resolved_agent"}
 
@@ -149,6 +152,7 @@ def test_rollout_progress_counter_is_built_after_gym_resolves_task_source(
             rch = _RolloutCollectionHelper()
             head_server_config = object()
             _token_capture_enabled = False
+            _forest_training = False
             _tokenizer = object()
             # run_rollouts is a thin span-opening wrapper that delegates the
             # streaming to _stream_rollouts, so the mock has to supply the real
@@ -337,7 +341,8 @@ def test_extract_static_video_message_resolves_local_file(tmp_path):
     assert messages[0]["content"][1]["type"] == "video"
 
 
-def test_extract_static_video_message_accepts_cached_frames(tmp_path):
+@pytest.mark.parametrize("with_timing", [False, True])
+def test_extract_static_video_message_accepts_cached_frames(tmp_path, with_timing):
     frame_paths = []
     for index in range(2):
         frame_path = tmp_path / f"frame_{index:04d}.png"
@@ -365,6 +370,13 @@ def test_extract_static_video_message_accepts_cached_frames(tmp_path):
         }
     }
 
+    if with_timing:
+        for part, index in zip(
+            example["responses_create_params"]["input"][0]["content"], [0, 24]
+        ):
+            part.update(_video_frame_index=index, _video_fps=23.976)
+    expected_indices = [0, 24] if with_timing else [0, 1]
+    expected_fps = 23.976 if with_timing else 1.0
     messages, resolved_path = _extract_static_video_messages(example)
 
     assert resolved_path is None
@@ -377,14 +389,18 @@ def test_extract_static_video_message_accepts_cached_frames(tmp_path):
         isinstance(part["image"], Image.Image) for part in messages[0]["content"][:2]
     )
     assert all(part["_is_video_frame"] for part in messages[0]["content"][:2])
-    assert [part["_video_frame_index"] for part in messages[0]["content"][:2]] == [0, 1]
-    assert [part["_video_fps"] for part in messages[0]["content"][:2]] == [1.0, 1.0]
+    assert [
+        part["_video_frame_index"] for part in messages[0]["content"][:2]
+    ] == expected_indices
+    assert [part["_video_fps"] for part in messages[0]["content"][:2]] == [
+        expected_fps
+    ] * 2
 
     _, frames, frame_indices, fps = _flatten_nemotron_video_frame_messages(messages)
 
     assert len(frames) == 2
-    assert frame_indices == [0, 1]
-    assert fps == 1.0
+    assert frame_indices == expected_indices
+    assert fps == expected_fps
 
 
 def test_extract_static_video_message_ignores_still_image_only_row():
@@ -816,7 +832,9 @@ def test_video_datum_requires_explicit_video_data_config(tmp_path):
 
 def test_recipe_video_defaults_reach_nemo_gym_data_processor(monkeypatch, tmp_path):
     data_path = tmp_path / "video-gym.jsonl"
-    data_path.write_text(json.dumps({"row": 1}) + "\n", encoding="utf-8")
+    video_part = {"type": "input_video", "video_url": "clip.mp4"}
+    row = {"responses_create_params": {"input": [{"content": [video_part]}]}}
+    data_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
     expected_media_config = {
         "num_frames": 32,
         "video_sampling_style": "nemotron_vl",
@@ -858,7 +876,7 @@ def test_recipe_video_defaults_reach_nemo_gym_data_processor(monkeypatch, tmp_pa
     )
     processor = SimpleNamespace(
         apply_chat_template=lambda *args: None,
-        tokenizer=object(),
+        tokenizer=SimpleNamespace(bos_token_id=None),
     )
 
     train_dataset, _ = setup_response_data(
@@ -1149,7 +1167,10 @@ def test_nemotron_video_timestamps_match_vllm_integer_milliseconds():
     )
 
 
-def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_path):
+@pytest.mark.parametrize("with_timing", [False, True])
+def test_nemotron_cached_video_uses_native_lossless_manifest(
+    monkeypatch, tmp_path, with_timing
+):
     frame_paths = []
     for index in range(4):
         frame_path = tmp_path / f"frame_{index:04d}.png"
@@ -1187,10 +1208,15 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
             },
         }
     }
+    if with_timing:
+        for part, index in zip(
+            example["responses_create_params"]["input"][0]["content"], [0, 6, 12, 18]
+        ):
+            part.update(_video_frame_index=index, _video_fps=23.976)
     manifest_calls = []
 
-    def fake_manifest_builder(paths):
-        manifest_calls.append(paths)
+    def fake_manifest_builder(paths, *, frame_indices, frame_fps):
+        manifest_calls.append((paths, frame_indices, frame_fps))
         return "data:video/x-nemo-rl-cached-frames;base64,dGVzdA=="
 
     monkeypatch.setattr(
@@ -1230,7 +1256,13 @@ def test_nemotron_cached_video_uses_native_lossless_manifest(monkeypatch, tmp_pa
     )
 
     assert datum is not None
-    assert manifest_calls == [[str(path) for path in frame_paths]]
+    assert manifest_calls == [
+        (
+            [str(path) for path in frame_paths],
+            [0, 6, 12, 18] if with_timing else [None] * 4,
+            [23.976] * 4 if with_timing else [None] * 4,
+        )
+    ]
     outbound = datum["extra_env_info"]["responses_create_params"]
     assert outbound["input"][0]["content"] == [
         {
@@ -1341,7 +1373,7 @@ def test_nemo_gym_stub_module():
 def nemo_gym_vllm_generation(cluster, nemo_gym_tokenizer):  # noqa: F811
     generation_config = deepcopy(basic_vllm_test_config)
     master_config = MasterConfig.model_construct(
-        policy={"generation": generation_config}
+        policy={"generation": generation_config}, data={}
     )
     setup_nemo_gym_config(master_config, nemo_gym_tokenizer)
 
@@ -1400,6 +1432,8 @@ openai_model:
         model_name=nemo_gym_vllm_generation.cfg["model_name"],
         base_urls=nemo_gym_vllm_generation.dp_openai_server_base_urls,
         initial_global_config_dict=safe_load(yaml_str),
+        checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
+        turn_checkpointing_enabled=False,
     )
     env = NemoGym.options(
         runtime_env={
@@ -2035,8 +2069,10 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         postprocess_calls = []
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
-                del head_server_config
+            def run_examples(
+                self, examples, head_server_config, route_failures_to_sidecar=False
+            ):
+                del head_server_config, route_failures_to_sidecar
                 content = examples[0]["responses_create_params"]["input"][0]["content"]
                 assert content[0]["video_url"].startswith("data:video/mp4;base64,")
                 assert content[1]["image_url"].startswith("data:image/png;base64,")
@@ -2055,6 +2091,7 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
             # streaming to _stream_rollouts, so the mock has to supply the real
             # one for the generator below to produce anything.
             _stream_rollouts = NemoGym.__ray_metadata__.modified_class._stream_rollouts
+            _forest_training = False
 
             def _require_spinup(self):
                 pass
@@ -2086,10 +2123,20 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         ):
             streamed_results.append(result)
 
-        assert postprocess_calls == [(nemo_gym_row, nemo_gym_result, tokenizer, True)]
+        assert postprocess_calls == [
+            (
+                nemo_gym_row,
+                nemo_gym_result,
+                tokenizer,
+                True,
+            )
+        ]
         assert streamed_results[0][0] == 7
         assert streamed_results[0][1] == nemo_gym_row["agent_ref"]
-        assert streamed_results[0][2] == {"message_log": []}
+        assert streamed_results[0][2] == {
+            "message_log": [],
+            "attribution_key": "legacy_test_agent",
+        }
 
     asyncio.run(_run())
 
@@ -2132,7 +2179,10 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
                 return [" ".join(map(str, token_ids)) for token_ids in batches]
 
         class _RolloutCollectionHelper:
-            def run_examples(self, examples, head_server_config):
+            def run_examples(
+                self, examples, head_server_config, route_failures_to_sidecar=False
+            ):
+                del route_failures_to_sidecar
                 assert head_server_config.backend == "megatron"
                 dispatched_row = examples[0]
                 dispatched_part = dispatched_row["responses_create_params"]["input"][0][
@@ -2174,6 +2224,7 @@ def test_nemo_gym_megatron_multimodal_response_round_trip(tmp_path, modality):
             _tokenizer = _Tokenizer()
             _processor = None
             _token_capture_enabled = False
+            _forest_training = False
             # Bind the real postprocess: the assertions below are about its
             # message_log output, not about run_rollouts' dispatch alone.
             _postprocess_nemo_gym_to_nemo_rl_result = NemoGym.__ray_metadata__.modified_class._postprocess_nemo_gym_to_nemo_rl_result
@@ -2442,6 +2493,7 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
 
     import nemo_gym.cli as gym_cli
     import nemo_gym.rollout_collection as gym_rollout_collection
+    import nemo_gym.server_utils as gym_server_utils
     from omegaconf import OmegaConf
 
     import nemo_rl.environments.nemo_gym as nemo_gym_mod
@@ -2461,6 +2513,9 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
 
     monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
     monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    monkeypatch.setattr(
+        gym_server_utils.ServerClient, "load_from_global_config", MagicMock()
+    )
     monkeypatch.setattr(nemo_gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
     monkeypatch.delenv("NEMO_RL_POLICY_API_KEY", raising=False)
 
@@ -2483,3 +2538,151 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
     without_key = spin_up(None)
     assert without_key["policy_api_key"] == "dummy_key"
     assert "NEMO_RL_POLICY_API_KEY" not in os.environ
+
+
+def _fake_gym_run_helper(monkeypatch, gym_mod, gym_cli, gym_rollout_collection):
+    """Capture the global config `_spinup` hands to Gym, without starting one."""
+    from unittest.mock import MagicMock
+
+    import nemo_gym.server_utils as gym_server_utils
+    from omegaconf import OmegaConf
+
+    started = []
+
+    class _FakeRunHelper:
+        def start(self, *, global_config_dict_parser_config):
+            started.append(
+                OmegaConf.to_container(
+                    global_config_dict_parser_config.initial_global_config_dict,
+                    resolve=False,
+                )
+            )
+
+    monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
+    monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    # _spinup resolves the rollout client up front, which would otherwise reach
+    # the head server the fake RunHelper never started.
+    monkeypatch.setattr(
+        gym_server_utils.ServerClient, "load_from_global_config", MagicMock()
+    )
+    monkeypatch.setattr(gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+    return started
+
+
+@pytest.mark.nemo_gym
+def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkeypatch):
+    """The telemetry block is added only when this actor exports, merged with the user's."""
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    started = _fake_gym_run_helper(
+        monkeypatch, nemo_gym_mod, gym_cli, gym_rollout_collection
+    )
+    # Read straight from the env, so the run id and the traces/metrics switches
+    # reach Gym's servers even with traces off -- not read back off an SDK
+    # provider that a traces-off run never installs.
+    monkeypatch.setenv("NEMO_RL_OTEL_RUN_ID", "a-run")
+    monkeypatch.setenv("NEMO_RL_OTEL_EXPORTER", "console")
+    monkeypatch.setenv("NEMO_RL_OTEL_TRACES_ENABLED", "0")
+    monkeypatch.setenv("NEMO_RL_OTEL_METRICS_ENABLED", "1")
+    # Published to os.environ directly; seed it so monkeypatch restores it.
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+
+    def spin_up(handle, gym_config=None):
+        monkeypatch.setattr(nemo_gym_mod, "get_telemetry_handle", lambda: handle)
+        # The user's block arrives inside the Gym config dict, so go through the builder.
+        cfg = nemo_gym_mod._build_gym_actor_config(
+            dict(gym_config or {}),
+            base_urls=["http://127.0.0.1:1/v1"],
+            model_name="policy",
+            enable_router_replay=False,
+            use_fastokens=False,
+            checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
+            turn_checkpointing_enabled=False,
+            generation_prefix_cuts_enabled=False,
+        )
+        NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
+        return started[-1]
+
+    # Telemetry off, and up but not exporting: the block must not appear at all.
+    assert "telemetry" not in spin_up(None)
+    assert "telemetry" not in spin_up(SimpleNamespace(is_exporting=False))
+
+    exporting = SimpleNamespace(is_exporting=True)
+    # Traces off, yet run id and the switches still ride along.
+    assert spin_up(exporting)["telemetry"] == {
+        "enabled": True,
+        "run_id": "a-run",
+        "exporter": "console",
+        "traces_enabled": False,
+        "metrics_enabled": True,
+    }
+
+    # A user block is merged into ours, not swapped in.
+    configured = spin_up(exporting, {"telemetry": {"span_groups": "default,sandbox"}})
+    assert configured["telemetry"]["span_groups"] == "default,sandbox"
+    assert configured["telemetry"]["enabled"] is True
+    assert configured["telemetry"]["run_id"] == "a-run"
+    # An explicit false opts the Gym side out without turning off RL's own.
+    opted_out = spin_up(exporting, {"telemetry": {"enabled": False}})
+    assert opted_out["telemetry"]["enabled"] is False
+
+
+@pytest.mark.nemo_gym
+def test_spinup_forwards_job_identity_to_gym_servers(monkeypatch):
+    """Job-level resource attributes reach Gym's servers; per-process ones do not."""
+    import os
+    from types import SimpleNamespace as NS
+
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+    from nemo.lens import derive_nv_dl_run_uuid
+    from nemo.lens.resources.attributes import parse_otel_resource_attributes
+    from nemo.lens.semconv import NV_DL_RUN_UUID
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    started = _fake_gym_run_helper(
+        monkeypatch, nemo_gym_mod, gym_cli, gym_rollout_collection
+    )
+    monkeypatch.setattr(
+        nemo_gym_mod, "get_telemetry_handle", lambda: NS(is_exporting=True)
+    )
+    monkeypatch.setenv("NEMO_RL_OTEL_RUN_ID", "a-run")
+
+    def spin_up():
+        cfg = nemo_gym_mod._build_gym_actor_config(
+            {},
+            base_urls=["http://127.0.0.1:1/v1"],
+            model_name="policy",
+            enable_router_replay=False,
+            use_fastokens=False,
+            checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
+            turn_checkpointing_enabled=False,
+            generation_prefix_cuts_enabled=False,
+        )
+        NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
+        return parse_otel_resource_attributes(os.environ["OTEL_RESOURCE_ATTRIBUTES"])
+
+    # Nothing pre-seeded: the job identity a server cannot know is forwarded.
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+    published = spin_up()
+    assert published["nv.dl.campaign.stage"] == "RL"
+    assert published[NV_DL_RUN_UUID] == derive_nv_dl_run_uuid(run_id="a-run")
+    # Everything a server determines for itself stays behind.
+    for per_process in (
+        "service.name",
+        "service.instance.id",
+        "nv.dl.rank",
+        "process.pid",
+        "nemo.run.id",
+    ):
+        assert per_process not in published, per_process
+    # Gym gets our run id rather than minting its own.
+    assert started[-1]["telemetry"]["run_id"] == "a-run"
+
+    # A launcher's value must win over the actor's.
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "nv.dl.campaign.stage=SFT")
+    assert spin_up()["nv.dl.campaign.stage"] == "SFT"

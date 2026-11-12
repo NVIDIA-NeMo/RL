@@ -134,6 +134,55 @@ state remains GPU resident; choose a fraction that leaves enough GPU memory for
 the colocated generation backend. Optimizer CPU offload is independent of
 activation CPU offload.
 
+#### Manual garbage collection
+
+Python's automatic garbage collector runs a full (generation-2) collection on
+whichever process crosses its allocation threshold first. In a multi-rank Megatron
+job that rank stops for the length of the collection, and every other rank waits
+for it at the next collective. With many ranks, these unaligned pauses add up: on
+a 32-node SFT run, collections of about 1 s landed on up to 90 of 128 ranks at
+different points of one step, stretching 66 s steps to 75-85 s.
+
+`manual_gc` mirrors Megatron-LM's option of the same name. The Megatron policy
+workers turn automatic garbage collection off at the end of worker setup and run
+a full collection on every rank together, once every `manual_gc_interval`
+optimizer steps:
+
+```yaml
+policy:
+  megatron_cfg:
+    manual_gc: true
+    manual_gc_interval: 10  # optimizer steps between collections
+```
+
+- `manual_gc_interval` must be a positive integer when `manual_gc` is `true`;
+  anything else is rejected at worker setup. NeMo RL has no counterpart to
+  Megatron-LM's collections around evaluation, so without an interval nothing
+  would ever collect.
+- The interval counts optimizer steps on both training paths: the monolithic
+  `train()` used by SFT, DPO and RM (one optimizer step per global batch), and the
+  split-step API used by the single controller (`finish_train_step`).
+- Model, optimizer and checkpoint setup run with automatic collection on; the
+  first manual collection, at the end of setup, frees their garbage.
+- Processes forked from the worker, such as data loader workers, get automatic
+  collection back.
+- For PPO, the Megatron value workers have the same stall and take the same keys
+  under `value.megatron_cfg`; set them there separately.
+- Distillation teachers never run a training step, so they do not inherit the
+  student's `manual_gc`, and setting it in a teacher's `megatron_cfg_overrides`
+  is rejected.
+
+Choosing the interval is a trade between step-time consistency and host memory.
+Reference counting still frees most objects immediately; only garbage held in
+reference cycles waits for the next collection, so host memory grows between
+collections by however much cyclic garbage a step creates. Each manual
+collection also costs about as much as one automatic full collection did, just
+on every rank at the same point. Start with `10`, then compare runs with
+`manual_gc` off and on: mean and p99 step time, and the peak host RSS of the
+policy workers. Raise the interval if the collection time is visible in every
+tenth step; lower it if host memory keeps climbing. The option only changes the
+Megatron workers that train; vLLM and other actors keep the default collector.
+
 ### Automodel Backend
 To enable Automodel training:
 
@@ -177,7 +226,7 @@ export HF_HOME="/shared/nfs/huggingface"
 - **Prefer HF_HOME**: If you already have `HF_HOME` mounted across nodes, this reduces the number of environment variables to manage.
 - **Sufficient space**: Ensure adequate disk space for the converted model checkpoints.
 
-### Force Reconvert ###
+### Force Reconvert
 
 By default, NeMo RL skips the HF → Megatron conversion if a converted checkpoint already exists at the target path. If you need to force a fresh conversion (e.g., after updating megatron-bridge or changing `hf_config_overrides`), set the following option in your config:
 
@@ -188,3 +237,18 @@ policy:
 ```
 
 This is equivalent to deleting the converted checkpoint directory and rerunning — the old checkpoint will be overwritten with a freshly converted one.
+
+### Parallel Checkpoint Reads ###
+
+When Megatron loads a `torch_dist` checkpoint from a local or shared filesystem, each rank reads its checkpoint files with several threads instead of PyTorch's single stream. This roughly halved per-rank read time in our measurements. The example configs turn it on with 4 threads; set it to 1 to use PyTorch's reader:
+
+```yaml
+policy:
+  megatron_cfg:
+    checkpoint:
+      parallel_read_threads: 4  # 1 = off
+```
+
+- Only Megatron `torch_dist` loads from a filesystem path use it; `msc://` checkpoints and the Automodel backend keep PyTorch's reader.
+- Peak host memory per rank grows to about 1 GiB of read-ahead plus twice the largest checkpoint item.
+- It replaces PyTorch's `FileSystemReader.read_data`, checked against the version in torch 2.11 to 2.13. If a torch upgrade changes that function, setup fails with a message to set `parallel_read_threads: 1` or update `nemo_rl/models/megatron/ckpt_parallel_read.py`.

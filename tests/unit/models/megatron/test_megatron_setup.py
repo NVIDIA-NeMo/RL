@@ -818,6 +818,49 @@ class TestApplyParallelismConfig:
 
 @pytest.mark.mcore
 class TestApplyMultimodalConfig:
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "radio_force_cpe_eval_mode",
+            "freeze_vision_encoder",
+            "freeze_vision_projector",
+            "freeze_audio_encoder",
+            "freeze_audio_projector",
+        ],
+    )
+    def test_teacher_skips_inherited_tower_controls(self, key):
+        from nemo_rl.models.megatron.setup import _apply_multimodal_config
+
+        model_cfg = SimpleNamespace()
+        config = {"megatron_cfg": {key: True, "_provider_override_allowlist": []}}
+        _apply_multimodal_config(model_cfg, config)
+        assert vars(model_cfg) == {}
+
+    def test_teacher_applies_explicit_tower_control(self):
+        from nemo_rl.models.megatron.setup import _apply_multimodal_config
+
+        model_cfg = SimpleNamespace(radio_force_cpe_eval_mode=False)
+        config = {
+            "megatron_cfg": {
+                "radio_force_cpe_eval_mode": True,
+                "_provider_override_allowlist": ["radio_force_cpe_eval_mode"],
+            }
+        }
+        _apply_multimodal_config(model_cfg, config)
+        assert model_cfg.radio_force_cpe_eval_mode is True
+
+    def test_teacher_rejects_explicit_unsupported_tower_control(self):
+        from nemo_rl.models.megatron.setup import _apply_multimodal_config
+
+        config = {
+            "megatron_cfg": {
+                "radio_force_cpe_eval_mode": True,
+                "_provider_override_allowlist": ["radio_force_cpe_eval_mode"],
+            }
+        }
+        with pytest.raises(ValueError, match="only supported by a multimodal provider"):
+            _apply_multimodal_config(SimpleNamespace(), config)
+
     def test_maps_legacy_omni_freeze_controls(self):
         from nemo_rl.models.megatron.setup import _apply_multimodal_config
 
@@ -1499,6 +1542,163 @@ class TestApplyPrecisionConfig:
 
     @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
     @pytest.mark.parametrize(
+        ("zero_train_gen_mismatch", "fp8_cfg_param", "error_match"),
+        [
+            (True, True, None),
+            (True, False, "only with megatron_cfg.fp8_cfg.fp8_param enabled"),
+            (False, True, "sets fp8_param or fp4_param"),
+            (False, False, "sets fp8_param or fp4_param"),
+        ],
+    )
+    def test_te_precision_config_fp8_param_only_under_zero_kl(
+        self,
+        mock_load_recipe,
+        tmp_path,
+        zero_train_gen_mismatch,
+        fp8_cfg_param,
+        error_match,
+    ):
+        """A per-module fp8_param needs zero_train_gen_mismatch and fp8_cfg.fp8_param."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        block = {
+            "fp8_quantization_recipe": "mxfp8",
+            "fp8_param": True,
+            "override_quantized_autocast": True,
+            "override_nonquantized_autocast": True,
+        }
+        mock_load_recipe.return_value = self._quant_recipe(
+            {"mxfp8": {"training_recipe": block, "evaluation_recipe": dict(block)}}
+        )
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "te_precision_config_file": str(recipe_file),
+                "zero_train_gen_mismatch": zero_train_gen_mismatch,
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8": "e4m3",
+                    "fp8_recipe": "mxfp8",
+                    "fp8_param": fp8_cfg_param,
+                },
+            }
+        }
+
+        with pytest.warns(UserWarning, match="fp8_cfg"):
+            if error_match:
+                with pytest.raises(ValueError, match=error_match):
+                    _apply_precision_config(model_cfg, config, torch.bfloat16)
+            else:
+                _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    @pytest.mark.parametrize(
+        "flag",
+        ["override_quantized_autocast", "override_nonquantized_autocast"],
+    )
+    @pytest.mark.parametrize("block", ["training_recipe", "evaluation_recipe"])
+    @pytest.mark.parametrize("zero_train_gen_mismatch", [True, False])
+    def test_zero_kl_mxfp8_requires_both_autocast_overrides(
+        self, mock_load_recipe, tmp_path, flag, block, zero_train_gen_mismatch
+    ):
+        """Zero-KL MXFP8 needs both autocast overrides; other MXFP8 recipes do not."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        recipe = {
+            "fp8_quantization_recipe": "mxfp8",
+            "override_quantized_autocast": True,
+            "override_nonquantized_autocast": True,
+        }
+        recipes = {
+            "training_recipe": dict(recipe),
+            "evaluation_recipe": dict(recipe),
+        }
+        recipes[block][flag] = False
+        mock_load_recipe.return_value = self._quant_recipe({"mxfp8": recipes})
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "zero_train_gen_mismatch": zero_train_gen_mismatch,
+                "te_precision_config_file": str(recipe_file),
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8": "e4m3",
+                    "fp8_recipe": "mxfp8",
+                    "fp8_param": False,
+                },
+            }
+        }
+
+        with pytest.warns(UserWarning, match="fp8_cfg"):
+            if zero_train_gen_mismatch:
+                with pytest.raises(ValueError, match=flag):
+                    _apply_precision_config(model_cfg, config, torch.bfloat16)
+            else:
+                _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+    _MXFP8_BLOCK = {
+        "fp8_quantization_recipe": "mxfp8",
+        "override_quantized_autocast": True,
+        "override_nonquantized_autocast": True,
+    }
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    @pytest.mark.parametrize(
+        ("recipes", "mismatch"),
+        [
+            ({"training_recipe": _MXFP8_BLOCK, "evaluation_recipe": {}}, True),
+            ({"training_recipe": {}, "evaluation_recipe": _MXFP8_BLOCK}, True),
+            ({"training_recipe": _MXFP8_BLOCK}, False),
+            (
+                {"training_recipe": _MXFP8_BLOCK, "evaluation_recipe": _MXFP8_BLOCK},
+                False,
+            ),
+            ({"training_recipe": {}, "evaluation_recipe": {}}, False),
+        ],
+        ids=["mxfp8-empty", "empty-mxfp8", "mxfp8-inherit", "mxfp8-mxfp8", "bf16-bf16"],
+    )
+    @pytest.mark.parametrize("zero_train_gen_mismatch", [True, False])
+    def test_zero_kl_requires_matching_training_and_evaluation_precision(
+        self, mock_load_recipe, tmp_path, recipes, mismatch, zero_train_gen_mismatch
+    ):
+        """An explicit empty evaluation_recipe is BF16, not inherited training."""
+        from nemo_rl.models.megatron.setup import _apply_precision_config
+
+        recipe_file = tmp_path / "te_precision.yaml"
+        recipe_file.write_text("{}")
+        model_cfg = SimpleNamespace(bf16=False, fp16=False)
+        mock_load_recipe.return_value = self._quant_recipe(
+            {"block": {k: dict(v) for k, v in recipes.items()}}
+        )
+        config = {
+            "megatron_cfg": {
+                "pipeline_dtype": "bfloat16",
+                "zero_train_gen_mismatch": zero_train_gen_mismatch,
+                "te_precision_config_file": str(recipe_file),
+                "fp8_cfg": {
+                    "enabled": True,
+                    "fp8": "e4m3",
+                    "fp8_recipe": "mxfp8",
+                    "fp8_param": False,
+                },
+            }
+        }
+
+        with pytest.warns(UserWarning, match="fp8_cfg"):
+            if zero_train_gen_mismatch and mismatch:
+                with pytest.raises(ValueError, match="the same precision"):
+                    _apply_precision_config(model_cfg, config, torch.bfloat16)
+            else:
+                _apply_precision_config(model_cfg, config, torch.bfloat16)
+
+    @patch("nemo_rl.models.megatron.setup.load_quantization_recipe")
+    @pytest.mark.parametrize(
         "megatron_cfg",
         [
             {"pipeline_dtype": "bfloat16"},
@@ -2156,44 +2356,6 @@ class TestApplyPrecisionConfig:
         assert model_cfg.first_last_layers_bf16 is True
         assert model_cfg.num_layers_at_start_in_bf16 == 2
         assert model_cfg.num_layers_at_end_in_bf16 == 4
-
-    def test_te_precision_recipe_matches_attention_and_mlp_modules(self):
-        from pathlib import Path
-
-        from megatron.core.quantization.quant_config import MatchContext
-
-        from nemo_rl.models.megatron.setup import _apply_precision_config
-
-        recipe_path = (
-            Path(__file__).resolve().parents[4]
-            / "examples/te_precision/attn_bf16_mlp_nvfp4.yaml"
-        )
-        model_cfg = SimpleNamespace()
-        _apply_precision_config(
-            model_cfg,
-            {
-                "megatron_cfg": {
-                    "pipeline_dtype": "bfloat16",
-                    "te_precision_config_file": str(recipe_path),
-                }
-            },
-            torch.bfloat16,
-        )
-
-        def match(module_path):
-            return model_cfg.quant_recipe.match_to_config_key(
-                MatchContext(module_path=module_path, layer_number=0)
-            )
-
-        assert match("decoder.layers.0.self_attention.linear_qkv") == "bf16"
-        assert match("decoder.layers.0.self_attention.linear_proj") == "bf16"
-        assert match("decoder.layers.0.mlp.experts.linear_fc1") == "nvfp4"
-        assert match("decoder.layers.0.mlp.experts.linear_fc2") == "nvfp4"
-        assert match("decoder.layers.0.mlp.linear_fc1") == "bf16"
-        assert match("decoder.layers.0.mlp.linear_fc2") == "bf16"
-        assert match("decoder.layers.0.mlp.shared_experts.linear_fc1") == "bf16"
-        assert match("decoder.layers.0.mlp.shared_experts.linear_fc2") == "bf16"
-        assert match("decoder.layers.0.input_layernorm") == "bf16"
 
 
 @pytest.mark.mcore
@@ -2901,6 +3063,69 @@ class TestValidateChunkingConfig:
         # Should not raise
         _validate_chunking_config(config)
 
+    @staticmethod
+    def _reuse_config(**overrides):
+        config = {
+            "logprob_chunk_size": 1024,
+            "megatron_cfg": {"defer_fp32_logits": True, "reuse_logits_storage": True},
+            "sequence_packing": {"enabled": True, "fuse_loss": True},
+        }
+        config.update(overrides)
+        return config
+
+    def test_logits_storage_reuse_with_fused_chunked_packing(self):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        _validate_chunking_config(self._reuse_config())
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"logprob_chunk_size": None},
+            {"logprob_chunk_size": 0},
+            {"sequence_packing": {"enabled": False}},
+            {"sequence_packing": {"enabled": True, "fuse_loss": False}},
+            {"sequence_packing": {"enabled": True}},
+        ],
+        ids=["no-chunk", "zero-chunk", "no-packing", "unfused", "fuse-unset"],
+    )
+    def test_logits_storage_reuse_rejects_paths_that_ignore_it(self, overrides):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        config = self._reuse_config(**overrides)
+        with pytest.raises(ValueError, match="reuse_logits_storage=true requires"):
+            _validate_chunking_config(config)
+
+    def test_logits_storage_reuse_off_skips_its_checks(self):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        config = self._reuse_config(sequence_packing={"enabled": False})
+        config["megatron_cfg"]["reuse_logits_storage"] = False
+        _validate_chunking_config(config)
+
+    @pytest.mark.parametrize(
+        "generation",
+        [{"top_k": 10, "top_p": 1.0}, {"top_k": None, "top_p": 0.9}],
+        ids=["top-k", "top-p"],
+    )
+    def test_logits_storage_reuse_rejects_training_filtering(self, generation):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        config = self._reuse_config(generation=generation)
+        with pytest.raises(ValueError, match="top-k/top-p filtering"):
+            _validate_chunking_config(config)
+
+        # Filtering alone is fine when the reuse is off.
+        config["megatron_cfg"]["reuse_logits_storage"] = False
+        _validate_chunking_config(config)
+
+    @pytest.mark.parametrize("top_k", [None, -1], ids=["none", "negative"])
+    def test_logits_storage_reuse_with_unfiltered_generation(self, top_k):
+        from nemo_rl.models.megatron.setup import _validate_chunking_config
+
+        config = self._reuse_config(generation={"top_k": top_k, "top_p": 1.0})
+        _validate_chunking_config(config)
+
 
 @pytest.mark.mcore
 class TestCreateCheckpointConfig:
@@ -2931,7 +3156,22 @@ class TestCreateCheckpointConfig:
         assert checkpoint_config.async_save is False
         assert checkpoint_config.fully_parallel_save is True
         assert checkpoint_config.fully_parallel_load is True
-        assert checkpoint_config.load_rng is False
+        assert checkpoint_config.load_rng is True
+
+    @pytest.mark.parametrize("resume_weights", [False, True])
+    @pytest.mark.parametrize("resume_optimizer", [False, True])
+    def test_rng_restore_follows_training_weights(
+        self, tmp_path, resume_weights, resume_optimizer
+    ):
+        from nemo_rl.models.megatron.setup import _create_checkpoint_config
+
+        config = _create_checkpoint_config(
+            str(tmp_path / "pretrained"),
+            str(tmp_path / "weights") if resume_weights else None,
+            str(tmp_path / "optimizer") if resume_optimizer else None,
+        )
+        assert config.load_rng is resume_weights
+        assert config.load_optim is resume_optimizer
 
     def test_missing_ckpt_cfg_defaults_to_sync_save(self, tmp_path):
         """An absent checkpoint block keeps Megatron Bridge's default (sync save).
@@ -3777,35 +4017,6 @@ class TestValidateAndSetConfig:
 
 
 @pytest.mark.mcore
-class TestRuntimeConfigNamedTuple:
-    """Tests for RuntimeConfig named tuple."""
-
-    def test_runtime_config_fields(self):
-        """Test that RuntimeConfig has all expected fields."""
-        from nemo_rl.models.megatron.config import RuntimeConfig
-
-        runtime_config = RuntimeConfig(
-            megatron_cfg=MagicMock(),
-            model_cfg=MagicMock(),
-            dtype=torch.bfloat16,
-            optimizer_cpu_offload=False,
-            offload_optimizer_for_logprob=True,
-            offload_optimizer_for_refit=False,
-            is_generation_colocated=True,
-            sampling_params=None,
-            final_padded_vocab_size=32000,
-        )
-
-        assert runtime_config.dtype == torch.bfloat16
-        assert runtime_config.optimizer_cpu_offload is False
-        assert runtime_config.offload_optimizer_for_logprob is True
-        assert runtime_config.is_generation_colocated is True
-        assert runtime_config.offload_optimizer_for_refit is False
-        assert runtime_config.sampling_params is None
-        assert runtime_config.final_padded_vocab_size == 32000
-
-
-@pytest.mark.mcore
 class TestModelAndOptimizerStateNamedTuple:
     """Tests for ModelAndOptimizerState named tuple."""
 
@@ -4032,7 +4243,6 @@ class TestSetupModelConfig:
         ("field_name", "field_value"),
         [
             ("multi_latent_attention", True),
-            ("hybrid_layer_pattern", "M*-"),
             ("experimental_attention_variant", "gated_delta_net"),
         ],
     )
@@ -4046,6 +4256,7 @@ class TestSetupModelConfig:
 
         model_cfg = self._make_model_cfg_mock()
         model_cfg.multi_latent_attention = False
+        model_cfg.is_hybrid_model = False
         model_cfg.hybrid_layer_pattern = None
         model_cfg.experimental_attention_variant = None
         setattr(model_cfg, field_name, field_value)
@@ -4077,6 +4288,7 @@ class TestSetupModelConfig:
 
         model_cfg = self._make_model_cfg_mock()
         model_cfg.multi_latent_attention = False
+        model_cfg.is_hybrid_model = False
         model_cfg.hybrid_layer_pattern = None
         model_cfg.experimental_attention_variant = None
         bridge = MagicMock()
@@ -6116,3 +6328,46 @@ class TestPeftWarmStart:
         # The hook receives the resolved donor iteration directory.
         assert mock_hook.call_args.args[2] == str(donor_iter_dir)
         assert mock_hook.call_args.args[0].peft.share_expert_adapters is False
+
+
+@pytest.mark.mcore
+def test_apply_mtp_config_nonzero_layers_keeps_mtp_sources():
+    from types import SimpleNamespace
+
+    from nemo_rl.models.megatron.setup import _apply_mtp_config
+
+    model_cfg = SimpleNamespace(
+        mtp_num_layers=0,
+        mtp_hybrid_override_pattern="M",
+        mtp_use_repeated_layer=True,
+        hybrid_override_pattern="M-M*-/M",
+    )
+    config = {"megatron_cfg": {"mtp_num_layers": 1}}
+
+    _apply_mtp_config(model_cfg, config)
+
+    assert model_cfg.mtp_num_layers == 1
+    assert model_cfg.mtp_hybrid_override_pattern == "M"
+    assert model_cfg.mtp_use_repeated_layer is True
+    assert model_cfg.hybrid_override_pattern == "M-M*-/M"
+
+
+@pytest.mark.mcore
+def test_apply_mtp_config_respects_teacher_provider_allowlist():
+    """MTP settings apply only when the teacher provider allowlist permits them."""
+    from types import SimpleNamespace
+
+    from nemo_rl.models.megatron.setup import _apply_mtp_config
+
+    model_cfg = SimpleNamespace(mtp_num_layers=1, mtp_use_repeated_layer=True)
+    config = {
+        "megatron_cfg": {
+            "mtp_num_layers": 0,
+            "_provider_override_allowlist": ["tensor_model_parallel_size"],
+        }
+    }
+
+    _apply_mtp_config(model_cfg, config)
+
+    assert model_cfg.mtp_num_layers == 1
+    assert model_cfg.mtp_use_repeated_layer is True

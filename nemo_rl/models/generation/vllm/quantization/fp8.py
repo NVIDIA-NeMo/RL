@@ -14,9 +14,10 @@
 
 import os
 import warnings
+import weakref
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field, replace
-from typing import Any
+from typing import Any, get_args
 from unittest.mock import patch
 
 import ray
@@ -32,7 +33,11 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.engine.core import EngineCoreProc
 from vllm.v1.engine.utils import CoreEngineProcManager
 
-from nemo_rl.models.generation.vllm.config import REFITTABLE_FP8_KV_CACHE_DTYPES
+from nemo_rl.models.generation.vllm.config import (
+    NATIVE_MXFP8_LINEAR_KERNELS,
+    REFITTABLE_FP8_KV_CACHE_DTYPES,
+    resolve_vllm_kv_cache_dtype,
+)
 from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
     MXFP8_SCALE_SUFFIX,
     canonicalize_mxfp8_refit_output,
@@ -64,6 +69,7 @@ MXFP8_BLOCK_QUANT_KWARGS = {
 }
 
 DEFAULT_QUANTIZATION_IGNORED_LAYERS = ("lm_head",)
+_MXFP8_CHECKPOINT_SCALE_SUFFIX = "_scale_from_checkpoint"
 
 
 @dataclass(frozen=True)
@@ -297,10 +303,24 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
     if vllm_cfg.get("is_mx") and not use_fp8_weights:
         raise ValueError("is_mx=True requires precision='fp8'")
     config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    kv_cache_dtype = vllm_cfg["kv_cache_dtype"]
+    kv_cache_dtype = resolve_vllm_kv_cache_dtype(vllm_cfg)
+    if kv_cache_dtype == "fp8_per_token_head":
+        # vLLM is an optional dependency outside generation workers.
+        from vllm.config.cache import CacheDType
+
+        if kv_cache_dtype not in get_args(CacheDType):
+            raise ValueError(
+                "fp8_per_token_head requires vLLM with fp8_per_token_head support"
+            )
 
     # Validate configuration: kv_cache_dtype
-    supported_kv_cache_dtypes = ["auto", "fp8", "fp8_e4m3", "fp8_ds_mla"]
+    supported_kv_cache_dtypes = [
+        "auto",
+        "fp8",
+        "fp8_e4m3",
+        "fp8_ds_mla",
+        "fp8_per_token_head",
+    ]
     if kv_cache_dtype not in supported_kv_cache_dtypes:
         raise ValueError(
             f"kv_cache_dtype must be one of {supported_kv_cache_dtypes}, but got {kv_cache_dtype}"
@@ -481,7 +501,6 @@ def init_fp8(vllm_cfg, model_name, model_parallel_size):
         "kv_cache_dtype": kv_cache_dtype,
         "hf_overrides": {"quantization_config": fp8_block_quant_kwargs},
     }
-
     return vllm_kwargs
 
 
@@ -622,6 +641,30 @@ def quantize_mxfp8_weight(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     return canonicalize_mxfp8_refit_output(weight.shape, value, scale)
 
 
+def _is_flashinfer_mxfp8_linear_kernel(kernel: object, kernel_name: str) -> bool:
+    if kernel is None:
+        return False
+    try:
+        from vllm.model_executor.kernels.linear.mxfp8 import flashinfer
+    except ImportError:
+        return False
+
+    kernel_type = getattr(flashinfer, kernel_name, None)
+    return isinstance(kernel_type, type) and isinstance(kernel, kernel_type)
+
+
+def uses_native_mxfp8_linear_refit(module: torch.nn.Module) -> bool:
+    """Return whether the layer uses a native MXFP8 kernel requiring reload."""
+    quant_method = getattr(module, "quant_method", None)
+    kernel = getattr(quant_method, "kernel", None)
+    if kernel is None:
+        return False
+    return any(
+        _is_flashinfer_mxfp8_linear_kernel(kernel, kernel_name)
+        for kernel_name in NATIVE_MXFP8_LINEAR_KERNELS.values()
+    )
+
+
 def get_quantized_weight_iterator(
     weights: Iterable[tuple[str, torch.Tensor]],
     model_runner: Any,
@@ -632,6 +675,17 @@ def get_quantized_weight_iterator(
     model = model_runner.model
 
     for k, v in weights:
+        if (
+            global_fp8_config is not None
+            and global_fp8_config.is_mx
+            and k.endswith(_MXFP8_CHECKPOINT_SCALE_SUFFIX)
+        ):
+            weight_name = k.removesuffix(_MXFP8_CHECKPOINT_SCALE_SUFFIX)
+            module = get_module_from_param_name(model, weight_name)
+            if module is not None and uses_native_mxfp8_linear_refit(module):
+                yield weight_name + "_scale", v
+                continue
+
         grouped_weight_name = _grouped_expert_weight_name_from_scale(k)
         if grouped_weight_name is not None:
             if global_fp8_config.refit_prequantize and _is_fp8_weight(
@@ -709,12 +763,14 @@ def get_quantized_weight_iterator(
             )
         param_scale = torch.squeeze(param_scale, dim=-1)
         if is_mx:
-            if refit_with_reload_api:
-                yield k, param_lp
-                yield k + "_scale", param_scale
-            else:
-                yield k, param_lp
-                yield k + "_scale_from_checkpoint", param_scale
+            module = get_module_from_param_name(model, k)
+            scale_suffix = (
+                "_scale"
+                if refit_with_reload_api or uses_native_mxfp8_linear_refit(module)
+                else "_scale_from_checkpoint"
+            )
+            yield k, param_lp
+            yield k + scale_suffix, param_scale
         else:
             yield k, param_lp
             yield k + "_scale_inv", param_scale
@@ -1032,9 +1088,42 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
                 prefer_copy=True,
             )
         else:
-            # Instead of creating new torch.nn.Parameter, we update the data in place.
-            layer.weight.data.copy_(dg_weight)
-            layer.weight_scale_inv.data.copy_(dg_weight_scale)
+            for name, processed_weight in (
+                ("weight", dg_weight),
+                ("weight_scale_inv", dg_weight_scale),
+            ):
+                parameter = getattr(layer, name)
+                if (
+                    parameter.shape == processed_weight.shape
+                    and parameter.dtype == processed_weight.dtype
+                ):
+                    parameter.data.copy_(processed_weight)
+                else:
+                    if name == "weight_scale_inv":
+                        if not hasattr(layer, "_nrl_fp8_checkpoint_scale"):
+                            layer._nrl_fp8_checkpoint_scale = torch.empty_like(
+                                parameter.data
+                            )
+                        runtime_scale = getattr(layer, "_nrl_fp8_runtime_scale", None)
+                        if (
+                            runtime_scale is not None
+                            and runtime_scale.shape == processed_weight.shape
+                            and runtime_scale.dtype == processed_weight.dtype
+                        ):
+                            runtime_scale.copy_(processed_weight)
+                            parameter.data = runtime_scale
+                        else:
+                            parameter.data = processed_weight.data
+                        layer._nrl_fp8_runtime_scale = parameter.data
+                    else:
+                        parameter.data = processed_weight.data
+
+
+def prepare_fp8_linear_refit(model: torch.nn.Module) -> None:
+    for layer in model.modules():
+        checkpoint_scale = getattr(layer, "_nrl_fp8_checkpoint_scale", None)
+        if checkpoint_scale is not None:
+            layer.weight_scale_inv.data = checkpoint_scale
 
 
 def process_weights_after_loading(self, layer) -> None:
@@ -1119,30 +1208,57 @@ def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
     else:
         kernel = getattr(self, "kernel", None)
         kernel_name = type(kernel).__name__ if kernel is not None else None
-        if kernel_name == "FlashInferCutedslMxfp8LinearKernel":
-            # vLLM 0.25 prefers the CuTe-DSL kernel, but it stores the weight
-            # column-major [K, N] while this refit-friendly override (and the
-            # MXFP8 refit loader) keeps the canonical [N, K] layout. The
-            # CUTLASS kernel consumes [N, K] and is supported wherever
-            # CuTe-DSL is (both require SM100), so swap it in.
-            from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
-                FlashInferCutlassMxfp8LinearKernel,
-            )
+        # Under auto, CuTe-DSL is demoted to CUTLASS; TRTLLM requires explicit selection.
+        if _is_flashinfer_mxfp8_linear_kernel(
+            kernel, "FlashInferCutedslMxfp8LinearKernel"
+        ):
+            from vllm.config import get_current_vllm_config_or_none
 
-            kernel = FlashInferCutlassMxfp8LinearKernel(kernel.config)
-            self.kernel = kernel
-            kernel_name = type(kernel).__name__
-            # Record it: this demotes vLLM's first-choice MXFP8 linear kernel
-            # on every such layer, so anyone comparing NeMo-RL rollout
-            # throughput against a plain vLLM MXFP8 serve has an explanation
-            # in the log rather than only in this comment.
-            logger.warning_once(
-                "NeMo-RL MXFP8 refit requires the [N, K] weight layout; "
-                "replacing vLLM's preferred FlashInferCutedslMxfp8LinearKernel "
-                "with FlashInferCutlassMxfp8LinearKernel. Expect a rollout "
-                "throughput difference vs. plain vLLM serving."
-            )
-        if kernel_name != "FlashInferCutlassMxfp8LinearKernel":
+            vllm_config = get_current_vllm_config_or_none()
+            if vllm_config is None:
+                # Defaulting to "auto" here would silently demote an explicit
+                # flashinfer_cutedsl selection to CUTLASS.
+                raise RuntimeError(
+                    "process_weights_after_loading_mxfp8_linear requires "
+                    "set_current_vllm_config to resolve kernel_config.linear_backend"
+                )
+            if vllm_config.kernel_config.linear_backend == "auto":
+                from vllm.model_executor.kernels.linear.mxfp8.flashinfer import (
+                    FlashInferCutlassMxfp8LinearKernel,
+                )
+
+                kernel = FlashInferCutlassMxfp8LinearKernel(kernel.config)
+                self.kernel = kernel
+                kernel_name = type(kernel).__name__
+                logger.warning_once(
+                    "NeMo-RL MXFP8 refit keeps FlashInfer CUTLASS as the default "
+                    "linear backend. Set linear_backend=flashinfer_cutedsl to "
+                    "select vLLM's CuTe-DSL kernel explicitly."
+                )
+
+        if uses_native_mxfp8_linear_refit(layer):
+            runtime = getattr(layer, "_nrl_mxfp8_runtime_parameters", None)
+            if runtime is not None:
+                runtime_kernel, runtime_weight, runtime_scale = runtime
+                if (
+                    runtime_kernel is type(kernel)
+                    and runtime_weight() is layer.weight
+                    and runtime_scale() is layer.weight_scale
+                ):
+                    return
+
+            kernel.process_weights_after_loading(layer)
+            if runtime is None:
+                layer._nrl_mxfp8_runtime_parameters = (
+                    type(kernel),
+                    weakref.ref(layer.weight),
+                    weakref.ref(layer.weight_scale),
+                )
+            return
+
+        if not _is_flashinfer_mxfp8_linear_kernel(
+            kernel, "FlashInferCutlassMxfp8LinearKernel"
+        ):
             raise AssertionError(
                 f"Unsupported MXFP8 linear kernel for refit: {kernel_name}"
             )
@@ -1288,9 +1404,8 @@ def create_weights_mxfp8_moe(
 def process_weights_after_loading_moe(self, layer) -> None:
     """This function is used to process the weights after loading for a FusedMoE layer.
 
-    Compared to the original process_weights_after_loading in vllm, we use .copy_() instead of
-    replace_parameter() to avoid creating new torch.nn.Parameter objects, because that removes
-    the weight_loader attribute which we need for refit.
+    Preserve parameter storage when the converted layout is compatible, and retain
+    weight_loader when the backend requires a different shape or dtype.
 
     Updated for vLLM >= 0.25, which passes a RoutedExperts module as `layer` and
     sets up the MoE kernel via make_fp8_moe_kernel(routing_tables=...); 0.29
@@ -1320,23 +1435,27 @@ def process_weights_after_loading_moe(self, layer) -> None:
         w2_input_scale=w2_input_scale,
     )
 
-    if global_fp8_config.is_deepseek_v4:
-        # DSV4 restores checkpoint layouts before refit. Preserve compatible
-        # storage and retain loaders when converting to a different layout.
-        replace_parameter(layer, "w13_weight", w13, prefer_copy=True)
-        replace_parameter(layer, "w2_weight", w2, prefer_copy=True)
-        replace_parameter(
-            layer, f"w13_{self.weight_scale_name}", w13_scale, prefer_copy=True
-        )
-        replace_parameter(
-            layer, f"w2_{self.weight_scale_name}", w2_scale, prefer_copy=True
-        )
-    else:
-        # Use .copy_() to preserve weight_loader attribute on Parameters.
-        layer.w13_weight.copy_(w13)
-        layer.w2_weight.copy_(w2)
-        getattr(layer, f"w13_{self.weight_scale_name}").copy_(w13_scale)
-        getattr(layer, f"w2_{self.weight_scale_name}").copy_(w2_scale)
+    converted_weights = (
+        ("w13_weight", w13),
+        ("w2_weight", w2),
+        (f"w13_{self.weight_scale_name}", w13_scale),
+        (f"w2_{self.weight_scale_name}", w2_scale),
+    )
+    if not global_fp8_config.is_deepseek_v4:
+        for name, converted_weight in converted_weights:
+            parameter = getattr(layer, name)
+            if (
+                parameter.shape != converted_weight.shape
+                or parameter.dtype != converted_weight.dtype
+            ):
+                raise ValueError(
+                    f"FP8 MoE refit does not support {name} layout changes with this model/backend"
+                )
+    for name, converted_weight in converted_weights:
+        if global_fp8_config.is_deepseek_v4:
+            replace_parameter(layer, name, converted_weight, prefer_copy=True)
+        else:
+            getattr(layer, name).copy_(converted_weight)
 
     # Set up the MoE kernel on initial load only (same as upstream _setup_kernel
     # but without replace_parameter). Gate on is None, not hasattr, because

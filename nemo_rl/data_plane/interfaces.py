@@ -151,6 +151,17 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     HBM capacity of that buffer per active GDR client. CPU-only clients keep
     using the registered host-buffer path.
 
+    ``gdr_keep_teacher_payload_on_gpu`` only matters for MOPD with
+    ``use_gdr: true``. When true, each teacher keeps what it writes to the data
+    plane on the GPU until the PUT: its logprobs and, with full-vocabulary MOPD,
+    its hidden-state or logits payload. The GDR PUT then copies them GPU to GPU
+    into its staging buffer instead of GPU -> CPU -> GPU. The cost is teacher
+    GPU memory: each teacher holds its share of one prompt group's outputs until
+    the PUT, which for a full-vocabulary payload is tokens x hidden (or
+    vocabulary) size x payload dtype bytes, and briefly about twice that while
+    it is joined and packed. Set it to false to copy them to CPU first, which
+    was the behavior before this option. It is ignored without ``use_gdr``.
+
     Every RDMA rail on the host is offered to mooncake (see ``rdma_devices``).
     That is only safe with ``MC_ENABLE_DEST_DEVICE_AFFINITY=1``, which pins each
     transfer's peer rail to the local one by name; on a rail-isolated RoCE
@@ -169,6 +180,7 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
     staging_buffer_size: int = 536870912  # 512 MiB per pool slot
     use_gdr: bool = False
     gdr_staging_buffer_mb: PositiveInt = 1024
+    gdr_keep_teacher_payload_on_gpu: bool = True
     # >0: only CPU MooncakeStorageUnit actors own Mooncake memory (this many
     # bytes each); every other process is a client and off the save path.
     storage_unit_segment_size: NonNegativeInt = 0
@@ -191,6 +203,96 @@ class MooncakeCpuConfig(BaseModel, extra="allow"):
         if segment_size is not None:
             return segment_size
         return 0 if self.storage_unit_segment_size else self.global_segment_size
+
+
+class NixlSsdConfig(BaseModel, extra="forbid"):
+    """SSD tier of the nixl storage units (see ``tq_nixl.ssd_config``).
+
+    A put the unit's RAM cannot take goes to a file under ``path`` (node-local,
+    absolute) through an IO area of ``staging_bytes`` carved from the slab.
+    """
+
+    enabled: bool = False
+    path: str | None = None  # absolute; required when enabled
+    staging_bytes: PositiveInt | None = None  # None: unit_slab_bytes // 4
+    pickup_s: float = 10.0
+
+    @model_validator(mode="after")
+    def _require_absolute_path_when_enabled(self) -> "NixlSsdConfig":
+        if self.enabled and not (self.path and Path(self.path).is_absolute()):
+            raise ValueError(
+                "data_plane.nixl.ssd.enabled=true requires data_plane.nixl.ssd.path "
+                f"to be an absolute node-local SSD directory, got {self.path!r}."
+            )
+        return self
+
+
+class NixlAgentConfig(BaseModel, extra="forbid"):
+    """The NIXL agent every nixl client and unit creates."""
+
+    backend_name: str = "UCX"
+    backend_init_params: dict[str, Any] = Field(default_factory=dict)
+
+
+class NixlStoreConfig(BaseModel, extra="allow"):
+    """Sizing and placement for ``backend="nixl"``. Ignored otherwise.
+
+    The NIXL data plane (``nemo_rl.data_plane.nixl``) is a TransferQueue storage
+    backend. Storage lives in CPU ``NixlStorageUnit`` actors that own one
+    registered DRAM slab each; trainer / vLLM / controller processes are clients
+    that move bytes with one-sided NIXL RDMA and send small control messages
+    (alloc / release) to units over ZMQ. Ray only starts the units.
+
+    Transport: RDMA only. Clients and units refuse to start unless ``UCX_TLS``
+    is an explicit RDMA list (default ``rc,cuda_copy,cuda_ipc,self,sm``, the
+    NIXL refit's list) and ``UCX_NET_DEVICES`` names RDMA devices; NIXL's UCX
+    backend honours those env vars over its own params.
+
+    Unit placement, as in SimpleStorage or the Mooncake storage units:
+    ``storage_unit_placement`` picks the nodes (``all``: every alive GPU node,
+    or a list of clusters, ``train`` / ``inference``); ``num_storage_units``
+    round-robins units over them (``None``: one per node), or
+    ``storage_units_per_node`` puts that many on each of them. One unit per
+    node is enough: a unit's CPU only serves small control calls while RDMA
+    moves the bytes, and 2x the units measured no faster at 86 nodes. With
+    ``numa="auto"`` the k-th unit on a multi-socket node is pinned (CPUs + slab
+    memory) to socket ``k % sockets``; single-socket nodes are unaffected.
+    """
+
+    num_storage_units: PositiveInt | None = None
+    storage_units_per_node: PositiveInt | None = None
+    storage_unit_placement: list[Literal["train", "inference"]] | Literal["all"] = "all"
+    # Explicit unit nodes; when unset, _init_tq resolves storage_unit_placement.
+    node_ids: list[str] | None = None
+    unit_slab_bytes: int = 17179869184  # 16 GiB pinned per unit
+    # A put over this is split at key boundaries; None: a quarter of the put
+    # area (the slab minus SSD staging).
+    max_blob_bytes: PositiveInt | None = None
+    numa: Literal["auto", "off"] = "auto"
+    # Client registered-buffer pool: base buffers plus kept-registered oversize ones.
+    client_staging_bytes: int = 1073741824  # 1 GiB per base buffer
+    client_staging_buffers: PositiveInt = 2
+    client_pool_max_bytes: int = 4294967296  # oversize buffers kept registered
+    # Put path: zero-copy (register the caller's memory) inside this window,
+    # parallel copy into a pooled buffer above parallel_copy_min_bytes.
+    zero_copy_min_bytes: int = 1048576
+    zero_copy_max_bytes: int = 33554432
+    parallel_copy_min_bytes: int = 16777216
+    # read_pin_s must be >= transfer_timeout_s + lease_margin_s (checked at
+    # start): a read pins its blobs for read_pin_s.
+    # None: exactly that sum, so raising the transfer timeout raises the pin.
+    read_pin_s: float | None = None
+    transfer_timeout_s: float = 120.0
+    lease_margin_s: float = 30.0
+    # Deadline of one put / get, bounding all of its waits; None: 2x transfer.
+    op_timeout_s: float | None = None
+    # Unfinished NIXL transfers may retain this much memory before the
+    # process refuses further transfers (DataPlaneFatal).
+    graveyard_max_bytes: int = 4294967296
+    # Debug: report non-finite floats and all-False masks on put and get.
+    debug_check_finite: bool = False
+    ssd: NixlSsdConfig = Field(default_factory=NixlSsdConfig)
+    nixl: NixlAgentConfig = Field(default_factory=NixlAgentConfig)
 
 
 class DataPlaneConfig(TypedDict):
@@ -222,16 +324,17 @@ class DataPlaneConfig(TypedDict):
 
     enabled: bool
     impl: Literal["transfer_queue"]
-    backend: Literal["simple", "mooncake_cpu"]
+    backend: Literal["simple", "mooncake_cpu", "nixl"]
     claim_meta_poll_interval_s: float
     simple: NotRequired[SimpleStorageConfig]
     mooncake_cpu: NotRequired[MooncakeCpuConfig]
+    nixl: NotRequired[NixlStoreConfig]
     controller_address: NotRequired[str]
     ack_timeout_ms: NotRequired[int]
     observability: NotRequired["ObservabilityConfig"]
 
 
-_CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple", "mooncake_cpu"})
+_CHECKPOINTABLE_BACKENDS: frozenset[str] = frozenset({"simple", "mooncake_cpu", "nixl"})
 
 
 def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
@@ -249,6 +352,7 @@ def data_plane_supports_checkpointing(cfg: DataPlaneConfig) -> bool:
 _BACKEND_MODELS: dict[str, type[BaseModel]] = {
     "simple": SimpleStorageConfig,
     "mooncake_cpu": MooncakeCpuConfig,
+    "nixl": NixlStoreConfig,
 }
 
 
@@ -267,6 +371,11 @@ def backend_config(cfg: DataPlaneConfig) -> Any:
     if isinstance(nested, BaseModel):
         nested = nested.model_dump(exclude_unset=True)
     return _BACKEND_MODELS[backend].model_validate(nested)
+
+
+def gdr_enabled(cfg: DataPlaneConfig) -> bool:
+    """Return whether the selected TransferQueue backend requests GDR."""
+    return cfg["backend"] == "mooncake_cpu" and bool(backend_config(cfg).use_gdr)
 
 
 def storage_unit_placement(cfg: DataPlaneConfig) -> list[str] | Literal["all"] | None:
@@ -509,7 +618,7 @@ class DataPlaneClient(ABC):
 
     The methods are split into three groups by intent. Argument order
     mirrors the underlying ``transfer_queue`` API 1:1 so a future adapter
-    (e.g. ``nv-dataplane``) is a thin pass-through too.
+    (e.g. the NIXL data plane) is a thin pass-through too.
 
     A. *Task-mediated* — used by stages that wait for upstream production
        via the per-task consumer counter:
@@ -661,6 +770,11 @@ class DataPlaneClient(ABC):
         fallback): bulk schemas are wide and silent over-fetch is the
         most expensive shape the wire can take. Callers must name what
         they read.
+
+        Every requested field must exist on every requested row, or the
+        backend raises. Callers reading rows that carry different fields
+        (e.g. image and text samples) split the request by row set, as
+        :func:`nemo_rl.data_plane.column_io.fetch_columns` does for media.
 
         Args:
             sample_ids: Uids to fetch.
