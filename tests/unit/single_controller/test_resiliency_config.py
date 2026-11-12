@@ -26,7 +26,10 @@ from typing import get_args
 import pytest
 from pydantic import ValidationError
 
-from nemo_rl.algorithms.async_utils.staleness_sampler import SamplerConfig
+from nemo_rl.algorithms.async_utils.staleness_sampler import (
+    CustomSamplerConfig,
+    SamplerConfig,
+)
 from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.single_controller_utils.config import (
@@ -624,6 +627,25 @@ class TestADropBudgetIsAcceptedUnderEverySampler:
         with pytest.raises(ValueError, match="weight_fifo.*drop budget"):
             validate_single_controller_config(cfg)
 
+    @pytest.mark.parametrize(
+        "target",
+        [
+            "nemo_rl.algorithms.async_utils.staleness_sampler:WeightFifoSampler",
+            "tests.unit.single_controller.test_sampler_interface:InheritedWeightFifoSampler",
+        ],
+    )
+    @pytest.mark.parametrize(
+        "budget", ["max_skipped_prompts", "max_consecutive_dropped_prompts"]
+    )
+    def test_custom_fixed_weight_policy_rejects_a_nonzero_budget(self, target, budget):
+        cfg = _master_config(
+            sampler=CustomSamplerConfig(target=target, max_staleness_versions=0),
+            rollout_failure={budget: 1},
+        )
+
+        with pytest.raises(ValueError, match="custom.*drop budget"):
+            validate_single_controller_config(cfg)
+
     def test_every_built_in_accepts_the_budget(self):
         """Read off the union, so a sampler added later is covered by default."""
         built_ins = [
@@ -666,10 +688,17 @@ class TestADropBudgetIsAcceptedUnderEverySampler:
         with pytest.warns(UserWarning, match="on_dropped_prompt"):
             validate_single_controller_config(cfg)
 
-    def test_a_custom_sampler_is_not_second_guessed(self):
-        """Whether it stamps is knowable only to its author, so it is not second-guessed."""
+    def test_a_compatible_custom_sampler_accepts_a_nonzero_budget(self):
         cfg = _master_config(
-            sampler={"name": "custom", "target": "my_pkg.samplers:MySampler"},
+            sampler=CustomSamplerConfig(
+                target="nemo_rl.algorithms.async_utils.staleness_sampler:InOrderSampler"
+            ),
             rollout_failure={"max_consecutive_dropped_prompts": 2},
+        )
+        validate_single_controller_config(cfg)
+
+    def test_a_zero_budget_does_not_require_importing_a_custom_sampler(self):
+        cfg = _master_config(
+            sampler=CustomSamplerConfig(target="my_pkg.samplers:MySampler")
         )
         validate_single_controller_config(cfg)
