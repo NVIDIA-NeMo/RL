@@ -225,6 +225,7 @@ def _fake_worker(*, is_model_owner: bool = True) -> VllmAsyncGenerationWorkerImp
     """A real worker's token-capture state, minus the engine."""
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
     worker._init_token_capture_state()
+    worker.cfg = {"vllm_cfg": {}}
     worker.is_model_owner = is_model_owner
     worker._http_engine_client = None
     return worker

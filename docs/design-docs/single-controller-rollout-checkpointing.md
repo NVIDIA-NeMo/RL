@@ -113,6 +113,34 @@ A rollout snapshot attempt runs in this order:
 Every attempt logs its outcome under `rollout/checkpoint_outcome`, and every saved
 snapshot its timings under `timing/rollout_checkpoint`.
 
+## Pipelined Generation-Prefix Writes
+
+Generation-prefix writes can use direct column encoding, bounded preparation/write
+overlap, and a separate colocated CPU TQ writer actor. All are opt-in under
+`policy.generation.vllm_cfg` and require async HTTP serving with text-only prefix
+capture. Router-replay tensors are supported. The writer actor requires the
+TransferQueue `simple` backend; terminal writes and restore reads retain their
+existing client. Checkpoint records and digests are unchanged.
+
+| Key under `policy.generation.vllm_cfg` | Type / default | Purpose |
+|---|---|---|
+| `prefix_writer_actor` | bool / `false` | Run prefix PUTs in one CPU actor on the generation node. |
+| `prefix_write_pipeline.enabled` | bool / `false` | Overlap preparation with one write stream; requires direct column encoding. |
+| `prefix_write_pipeline.direct_column_encoding` | bool / `false` | Build owned batch columns directly; independent of pipeline/actor enablement. |
+| `prefix_write_pipeline.max_pending_inventories` | positive int / `128` | Reject admission beyond this many pending inventories. |
+| `prefix_write_pipeline.max_buffered_payload_bytes` | positive int / `536870912` | Bound estimated queued/in-flight numeric payload plus a preparation reservation. |
+| `prefix_write_pipeline.max_batch_payload_bytes` | positive int / `134217728` | Bound one merged write; a larger single row fails its cut and regenerates. |
+| `prefix_write_pipeline.max_batch_rows` | positive int / `256` | Bound rows per merged write. |
+| `prefix_write_pipeline.max_batch_tokens` | positive int / `4194304` | Bound token positions per merged write. |
+| `prefix_write_pipeline.coalesce_wait_seconds` | nonnegative float / `0.01` | Coalescing window for compatible prepared rows. |
+
+The buffer must hold at least two maximum batches. It does not bound total RSS:
+live token histories, Python records, temporary encoding buffers and transport
+copies occupy additional memory. Preparation retains each call's lifecycle until
+its write is acknowledged and the cut seals. Duplicate in-flight inventories
+share a result; inventories sharing calls serialize. Closing an HTTP waiter does
+not cancel an admitted write. No receipt advertises a prefix before TQ durability.
+
 ## Restoring
 
 `restore()` runs once, after the weights are in sync and before the pumps start. It

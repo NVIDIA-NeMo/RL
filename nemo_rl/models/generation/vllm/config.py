@@ -25,6 +25,7 @@ from pydantic import (
     PositiveInt,
 )
 
+from nemo_rl.data_plane.prefix_pipeline import PrefixWritePipelineConfig
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     get_num_routed_experts,
@@ -111,6 +112,11 @@ class VllmSpecificArgs(TypedDict):
     # server that ask for logprobs but not prompt logprobs, so it requires
     # async_engine: true and expose_http_server: true. Default false.
     flat_logprobs: NotRequired[bool]
+    # Prefix-only TQ serialization/PUTs in one colocated CPU actor. Default off.
+    # Requires async HTTP capture, prefix cuts, and SimpleStorage; no media yet.
+    prefix_writer_actor: NotRequired[bool]
+    # Optional direct columns and bounded preparation/write overlap; default off.
+    prefix_write_pipeline: NotRequired[PrefixWritePipelineConfig]
     # Bound how long vLLM's front-end output loops may hold the generation actor's
     # event loop under a backlog: output_handler yields once per engine step and the
     # output-socket reader after this many ms of continuous work (20 is a good value).
@@ -345,6 +351,36 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
     vllm_cfg = config.get("vllm_cfg")
     if vllm_cfg is None:
         return
+    writer_actor = vllm_cfg.get("prefix_writer_actor")
+    if writer_actor is not None and not isinstance(writer_actor, bool):
+        raise ValueError(
+            "policy.generation.vllm_cfg.prefix_writer_actor must be boolean"
+        )
+    if writer_actor and not (
+        vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
+    ):
+        raise ValueError(
+            "prefix_writer_actor requires async_engine and expose_http_server"
+        )
+    pipeline_raw = vllm_cfg.get("prefix_write_pipeline")
+    if pipeline_raw is not None:
+        pipeline = PrefixWritePipelineConfig.model_validate(pipeline_raw)
+        if pipeline.enabled and not pipeline.direct_column_encoding:
+            raise ValueError("Prefix write pipeline requires direct column encoding")
+        if (pipeline.enabled or pipeline.direct_column_encoding) and not (
+            vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
+        ):
+            raise ValueError(
+                "Prefix write pipeline/encoder requires async HTTP serving"
+            )
+        if (
+            pipeline.enabled
+            and pipeline.max_buffered_payload_bytes
+            < 2 * pipeline.max_batch_payload_bytes
+        ):
+            raise ValueError(
+                "Prefix pipeline buffer must hold a write and one preparation reservation"
+            )
     if vllm_cfg.get("flat_logprobs") and not (
         vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
     ):
