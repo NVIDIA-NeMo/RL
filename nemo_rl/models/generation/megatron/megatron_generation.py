@@ -649,6 +649,9 @@ class MegatronGeneration(GenerationInterface):
         *,
         capture_media: bool = False,
         top_logprobs: int = 0,
+        generation_prefix_cuts_enabled: bool = False,
+        generation_cut_control_token: str | None = None,
+        generation_cut_control_timeout_s: float | None = None,
     ) -> "Optional[MediaColumnSpec]":
         """Install MInf's canonical prompt and completion capture hooks.
 
@@ -658,6 +661,10 @@ class MegatronGeneration(GenerationInterface):
         if top_logprobs != 0:
             raise NotImplementedError(
                 "Megatron generation does not capture sampler top-k"
+            )
+        if generation_prefix_cuts_enabled:
+            raise NotImplementedError(
+                "generation-prefix recovery is not implemented for Megatron inference"
             )
         if not self.cfg["mcore_generation_config"]["expose_http_server"]:
             raise ValueError(

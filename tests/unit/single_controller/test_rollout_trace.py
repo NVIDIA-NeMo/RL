@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -28,14 +30,25 @@ from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     bootstrap_compatibility_identity,
 )
 from nemo_rl.algorithms.rollout_checkpointing.trace import (
+    BATCH_AGE_TOKENS_METRIC,
+    BATCH_AGE_VERSION_SUM_METRIC,
     ROLLOUT_TRACE_FILENAME,
+    RefitCuts,
     RolloutTrace,
+    batch_age_by_step,
+    batch_age_group_metrics,
+    pop_batch_age,
 )
 from nemo_rl.algorithms.single_controller import SingleControllerActor
+from nemo_rl.algorithms.single_controller_utils import AsyncRLConfig
+from nemo_rl.data_plane import KVBatchMeta
+from nemo_rl.data_plane.schema import ROLLOUT_METRICS
+from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 from nemo_rl.experience.rollout_recovery import (
     RecoveryTargetLevel,
     RolloutRecoveryLedger,
 )
+from nemo_rl.utils.timer import Timer
 from tests.unit.experience.test_rollout_manager import (
     _FakeCaptureBuffer,
     _make_capture_manager,
@@ -51,6 +64,13 @@ from tests.unit.single_controller.test_checkpointing import (
     _actor_master_config,
     _make_actor_args,
     _run_train_pump,
+)
+from tests.unit.single_controller.test_finalizer_lifecycle import (
+    _controller as _finalizer_controller,
+)
+from tests.unit.single_controller.test_finalizer_lifecycle import (
+    _RemoteFinalize,
+    _request,
 )
 
 
@@ -286,6 +306,197 @@ def test_a_published_snapshot_and_a_restore_are_traced(tmp_path: Path) -> None:
     assert published["path"].endswith("snapshot_000001")
     assert published["step"] == 0
     assert published["t"] >= published["cut_time"]
+
+
+def test_a_call_counts_its_tokens_under_each_version_a_refit_split_it_at() -> None:
+    cuts = RefitCuts()
+    # Call c1 began on v3 and had 200 tokens when the v4 refit paused it, and
+    # 260 when the v5 refit did. c2 began on v4 and ran past no refit.
+    cuts.record(3, 4, [["c1", 200]])
+    cuts.record(4, 5, [["c1", 260]])
+
+    assert cuts.tokens_by_version([("c1", 3, 300), ("c2", 4, 50)]) == {
+        3: 200,
+        4: 60 + 50,
+        5: 40,
+    }
+    # Publishing forgets the call: counted again, it stays on its first version.
+    assert cuts.tokens_by_version([("c1", 3, 300)]) == {3: 300}
+
+
+def test_refit_cuts_forget_calls_too_old_to_train() -> None:
+    cuts = RefitCuts()
+    cuts.record(3, 4, [["old", 10]])
+    cuts.record(5, 6, [["new", 10]])
+
+    cuts.forget_before(4)
+
+    assert cuts.tokens_by_version([("old", 3, 20), ("new", 5, 20)]) == {
+        3: 20,
+        5: 10,
+        6: 10,
+    }
+
+
+def test_batch_age_weights_each_version_by_its_tokens() -> None:
+    events = [
+        {
+            "event": "group_published",
+            "group_id": "g1",
+            "tokens_by_version": {"3": 1200},
+        },
+        {"event": "group_published", "group_id": "g2", "tokens_by_version": {"4": 150}},
+        {
+            "event": "step_trained",
+            "step": 6,
+            "trainer_version": 7,
+            "trained_version": 6,
+            "group_ids": ["g1", "g2"],
+        },
+    ]
+    expected = (1200 * 3 + 150 * 2) / 1350
+
+    assert batch_age_by_step(events) == {6: expected}
+    # The step metric computes the same number from the per-group sums.
+    per_group = {"reward": [1.0, 0.0]}
+    for counts in ({3: 1200}, {4: 150}):
+        for name, value in batch_age_group_metrics(counts).items():
+            per_group.setdefault(name, []).append(value)
+    assert pop_batch_age(per_group, trained_version=6) == expected
+    assert per_group == {"reward": [1.0, 0.0]}
+    assert pop_batch_age({}, trained_version=6) is None
+
+
+def _sync_weights_controller(trace: RolloutTrace, progress: list[dict]) -> Any:
+    """A bare controller that can run one _sync_weights with a pausing engine."""
+    ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+    ctrl._rollout_trace = trace
+    ctrl._async_cfg = AsyncRLConfig()
+    ctrl._rollout_permitted = asyncio.Event()
+    ctrl._gen_fleet = None
+    ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
+    ctrl._trainer = SimpleNamespace(sync_params_before_refit=MagicMock())
+    ctrl._timer = Timer()
+    ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
+    ctrl._gen = SimpleNamespace(
+        pause_generation_for_refit=MagicMock(return_value=True),
+        captured_call_progress=MagicMock(return_value=progress),
+        requires_kv_scale_sync=False,
+        resume_generation_after_refit=MagicMock(return_value=True),
+        set_rollout_weight_version=MagicMock(),
+    )
+    ctrl._rollout_recovery_enabled = False
+    ctrl._master_config = SimpleNamespace(
+        env={"should_use_nemo_gym": True},
+        policy={
+            "generation": {
+                "backend": "vllm",
+                "vllm_cfg": {"async_engine": True, "expose_http_server": True},
+            }
+        },
+        token_capture=SimpleNamespace(enabled=True),
+    )
+    ctrl._inflight_by_group_id = {}
+    ctrl._trainer_version = 4
+    ctrl._refit_cuts = RefitCuts()
+    ctrl._sampler = SimpleNamespace()
+    return ctrl
+
+
+@pytest.mark.parametrize("trace_on", [True, False])
+def test_a_refit_records_where_each_running_call_switches_weights(
+    tmp_path: Path, trace_on: bool
+) -> None:
+    """Batch age is logged without the trace, so the refit read does not need it."""
+    trace = RolloutTrace(tmp_path / ROLLOUT_TRACE_FILENAME if trace_on else None)
+    progress = [{"weight_version": 3, "calls": [["c1", 200]]}]
+    ctrl = _sync_weights_controller(trace, progress)
+
+    asyncio.run(ctrl._sync_weights())
+    trace.close()
+
+    # c1's first 200 tokens came from v3, the rest from v4, the synced version.
+    assert ctrl._refit_cuts.tokens_by_version([("c1", 3, 250)]) == {3: 200, 4: 50}
+
+
+def test_the_refit_read_runs_after_the_weights_land() -> None:
+    """A call that arrives during the transfer reports 0 tokens: all count as new."""
+    order: list[str] = []
+    ctrl = _sync_weights_controller(RolloutTrace(None), [])
+    ctrl._weight_synchronizer.sync_weights.side_effect = lambda **_: order.append(
+        "transfer"
+    )
+    ctrl._gen.captured_call_progress.side_effect = (
+        lambda **_: order.append("read") or []
+    )
+    ctrl._gen.resume_generation_after_refit.side_effect = lambda **_: (
+        order.append("resume") or True
+    )
+
+    asyncio.run(ctrl._sync_weights())
+
+    assert order == ["transfer", "read", "resume"]
+
+
+def test_a_failed_refit_read_still_resumes_generation() -> None:
+    ctrl = _sync_weights_controller(RolloutTrace(None), [])
+    ctrl._gen.captured_call_progress.side_effect = AttributeError("renamed field")
+
+    with pytest.warns(UserWarning, match="AttributeError"):
+        asyncio.run(ctrl._sync_weights())
+
+    ctrl._gen.resume_generation_after_refit.assert_called_once()
+    assert ctrl._rollout_permitted.is_set()
+    assert ctrl._refit_cuts.tokens_by_version([("c1", 3, 10)]) == {3: 10}
+
+
+def test_without_token_capture_a_refit_asks_for_no_call_progress() -> None:
+    ctrl = _sync_weights_controller(RolloutTrace(None), [])
+    ctrl._master_config.token_capture.enabled = False
+
+    asyncio.run(ctrl._sync_weights())
+
+    ctrl._gen.captured_call_progress.assert_not_called()
+
+
+def test_a_published_group_traces_each_call_and_its_version(tmp_path: Path) -> None:
+    meta = KVBatchMeta(
+        partition_id="canonical",
+        task_name="train",
+        sample_ids=["group_g0"],
+        fields=["input_ids"],
+        sequence_lengths=[3],
+        tags=[{"weight_version": 3}],
+    )
+    result = FinalizedGroup(
+        meta=meta,
+        group_min_wv=3,
+        group_max_wv=4,
+        staging_keys=[],
+        call_versions=[("c1", 3, 10), ("c2", 4, 5)],
+    )
+    actor = SimpleNamespace(finalize=_RemoteFinalize(result=result))
+    ctrl = _finalizer_controller(actor)
+    ctrl._rollout_trace = RolloutTrace(tmp_path / ROLLOUT_TRACE_FILENAME)
+    ctrl._refit_cuts = RefitCuts()
+    # The v4 refit paused c1 after 6 of its 10 tokens.
+    ctrl._refit_cuts.record(3, 4, [["c1", 6]])
+
+    assert asyncio.run(ctrl._finalize_with_actor(_request(), {})) is result
+    ctrl._rollout_trace.close()
+
+    (published,) = [
+        event
+        for event in _events(tmp_path / ROLLOUT_TRACE_FILENAME)
+        if event["event"] == "group_published"
+    ]
+    assert published["group_id"] == "group"
+    assert published["tokens_by_version"] == {"3": 6, "4": 4 + 5}
+    # The same counts reach the step's batch age through the rollout metrics.
+    committed_meta = ctrl._buffer.commit_finalized.await_args.args[2]
+    (group_metrics,) = committed_meta.extra_info[ROLLOUT_METRICS]
+    assert group_metrics[BATCH_AGE_TOKENS_METRIC] == 15
+    assert group_metrics[BATCH_AGE_VERSION_SUM_METRIC] == 6 * 3 + 9 * 4
 
 
 def test_a_rollout_cancelled_mid_run_is_traced_as_cancelled() -> None:

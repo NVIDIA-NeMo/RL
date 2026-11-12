@@ -124,16 +124,6 @@ def main() -> None:
             "SingleController PPO entrypoint (run_grpo_single_controller.py); "
             "the legacy PPO entrypoint requires whole_batch."
         )
-    adv_estimator = config.ppo.adv_estimator
-    if (
-        adv_estimator.normalize_over != "kept_rows"
-        or adv_estimator.whiten_execution_padding
-    ):
-        raise ValueError(
-            "ppo.adv_estimator.normalize_over and whiten_execution_padding are "
-            "only supported by the SingleController PPO entrypoint "
-            "(run_grpo_single_controller.py)."
-        )
 
     # Print config
     print("Final config:")

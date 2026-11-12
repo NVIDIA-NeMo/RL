@@ -99,7 +99,6 @@ GENERATION = REPO_ROOT / "nemo_rl" / "models" / "generation"
 GENERATION_BACKENDS = [
     "interfaces.py",
     "vllm/vllm_generation.py",
-    "dynamo/dynamo_generation.py",
     "trtllm/trtllm_generation.py",
     "megatron/megatron_generation.py",
     "sglang/sglang_generation.py",

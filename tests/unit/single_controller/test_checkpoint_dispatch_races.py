@@ -32,7 +32,8 @@ import asyncio
 import contextlib
 import hashlib
 import threading
-from collections.abc import Callable
+from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -241,6 +242,7 @@ def _sidecar_state(ledger: RolloutRecoveryLedger) -> dict[str, Any]:
     """Ledger state plus the controller-owned keys every sidecar must carry."""
     return {
         **ledger.state_dict(),
+        "steps_allowed_short": [],
         "reward_settings": None,
         "finalizer_metrics_by_group": {},
         "finalizer_rewards_by_group": {},
@@ -360,8 +362,9 @@ class _BlockingRolloutManager:
         target_step: int | None = None,
         inflight_registry: dict[str, Any] | None = None,
         lineage_group_id: str | None = None,
+        replacement_index: int = 0,
     ) -> RolloutOutcome:
-        del inflight_registry
+        del inflight_registry, replacement_index
         if lineage_group_id is None:
             lineage_group_id = self.reserve_prompt_group(
                 None,
@@ -557,6 +560,13 @@ def _reserve_controller() -> Any:
     controller._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
     controller._rollout_runtime.sampler_stamps_target_steps = True
     controller._rollout_recovery_enabled = True
+    # Dynamic sampling off: these fixtures exercise the fault-tolerance path.
+    controller._dynamic_sampling_enabled = False
+    controller._filtered_prompt_budget = 0
+    controller._rollout_runtime.filtered_reserve = deque()
+    controller._filtered_prompts_by_step = {}
+    controller._rollout_runtime.steps_allowed_short = set()
+    controller._dataloader_exhausted = False
     controller._async_cfg = SimpleNamespace(
         rollout_failure=SimpleNamespace(
             on_dropped_prompt="replace",
@@ -580,7 +590,10 @@ def test_dispatch_cursor_alone_assigns_the_next_batch_to_step_8() -> None:
     assert asyncio.run(exercise()) == 8
 
 
-def test_checkpoint_after_fetch_before_admit_owns_the_prompt(tmp_path) -> None:
+@pytest.mark.parametrize("skipped_step", [False, True])
+def test_checkpoint_after_fetch_before_admit_owns_the_prompt(
+    tmp_path, skipped_step: bool
+) -> None:
     """A checkpoint cut inside admit retains the fetched batch for recovery."""
 
     async def exercise() -> None:
@@ -610,6 +623,7 @@ def test_checkpoint_after_fetch_before_admit_owns_the_prompt(tmp_path) -> None:
             max_num_epochs=1,
             data_plane_checkpoint=True,
         )
+        config.checkpointing["metric_name"] = "train:loss"
         actor_args = _make_actor_args(
             save_state=save_state,
             dataloader=dataloader,
@@ -626,11 +640,20 @@ def test_checkpoint_after_fetch_before_admit_owns_the_prompt(tmp_path) -> None:
         assert controller._sampler.dispatch_index == 6
 
         try:
-            await controller._save_checkpoint(
-                {"loss": 1.0},
-                is_policy_training_step=True,
-                is_final_checkpoint=False,
-            )
+            if skipped_step:
+                with pytest.warns(UserWarning, match="a skipped data-exhausted step"):
+                    await controller._save_checkpoint(
+                        {"skipped_step": 1},
+                        is_policy_training_step=True,
+                        is_final_checkpoint=False,
+                    )
+                assert not hasattr(save_state, "train:loss")
+            else:
+                await controller._save_checkpoint(
+                    {"loss": 1.0},
+                    is_policy_training_step=True,
+                    is_final_checkpoint=False,
+                )
         finally:
             sampler.release_admission.set()
             await _wait_for_event_or_pump(rollout_manager.started, pump)
@@ -1123,6 +1146,7 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
         saved_state = build_rollout_recovery_state(
             saved_ledger,
             batch_shortfall={6: 1},
+            steps_allowed_short={6},
             sampler_stamps_target_steps=True,
         )
         saved_state["schema_version"] = schema_version
@@ -1209,6 +1233,12 @@ def test_recovery_replays_step_7_without_readmitting_the_batch(
         assert sampler.admission_commits == 0
         assert sampler.dispatch_index == 7
         assert controller._rollout_runtime.batch_shortfall == {6: 1}
+        assert controller._rollout_runtime.steps_allowed_short == {6}
+        controller._algo_cfg = SimpleNamespace(num_prompts_per_step=2)
+        controller._async_cfg.rollout_failure = SimpleNamespace(
+            min_step_batch_fraction=1.0
+        )
+        assert controller._target_groups_for_step(6) == 1
         assert controller._rollout_runtime.sampler_stamps_target_steps is True
         recovery_metrics = controller._logger.log_metrics.call_args.args[0]
         assert recovery_metrics["groups_unfinished_found"] == 1.0
@@ -1262,6 +1292,7 @@ async def _turn_recovery_restart(
     saved_state = build_rollout_recovery_state(
         saved_ledger,
         batch_shortfall={},
+        steps_allowed_short=set(),
         sampler_stamps_target_steps=True,
     )
     recovery_path = tmp_path / ROLLOUT_RECOVERY_STATE_FILENAME
@@ -1860,7 +1891,7 @@ def test_checkpoint_waits_for_replacement_reserve_refill() -> None:
 
         async def refill() -> None:
             async with controller._data_plane_checkpoint_barrier.mutation():
-                assert controller._divert_batch_to_reserve(batch)
+                assert await controller._divert_batch_to_reserve(batch)
                 mutation_applied.set()
                 await release_mutation.wait()
 
@@ -1904,7 +1935,7 @@ def test_checkpoint_waits_for_replacement_pop_and_reownership() -> None:
 
         async def replace() -> None:
             async with controller._data_plane_checkpoint_barrier.mutation() as cut:
-                replacement = controller._take_replacement(7, 0)
+                replacement = controller._take_replacement(0)
                 assert replacement is not None
                 manager.discard_prompt_group(cut, old_group_id)
                 manager.reserve_prompt_group(cut, replacement, target_step=7)
@@ -1939,6 +1970,164 @@ def test_checkpoint_waits_for_replacement_pop_and_reownership() -> None:
     asyncio.run(exercise())
 
 
+@pytest.mark.parametrize("exhausted", [False, True])
+def test_checkpoint_completes_while_filtered_replacement_waits(exhausted: bool) -> None:
+    """An empty-pool consumer must not prevent the snapshot needed before refill."""
+
+    async def exercise() -> None:
+        controller = _reserve_controller()
+        controller._filtered_prompt_budget = 20
+        manager = controller._rollout_manager
+        barrier = controller._data_plane_checkpoint_barrier
+        async with barrier.mutation() as cut:
+            old_id = manager.reserve_prompt_group(
+                cut, _reserve_prompt(20), target_step=7
+            )
+        replaced = asyncio.Event()
+        checkpoint_entered = asyncio.Event()
+        release_checkpoint = asyncio.Event()
+
+        async def replace() -> None:
+            async with controller._replacement_mutation(filtered=True) as cut:
+                spare = controller._pop_filtered_replacement(7)
+                manager.discard_prompt_group(cut, old_id)
+                if spare is not None:
+                    manager.reserve_prompt_group(cut, spare, target_step=7)
+            replaced.set()
+
+        async def checkpoint() -> None:
+            async with barrier.checkpoint():
+                assert not controller._rollout_runtime.filtered_reserve
+                assert [g.prompt_id for g in manager.recovery_ledger.groups()] == ["20"]
+                checkpoint_entered.set()
+                await release_checkpoint.wait()
+
+        consumer = asyncio.create_task(replace())
+        await asyncio.sleep(0)
+        saver = asyncio.create_task(checkpoint())
+        await checkpoint_entered.wait()
+
+        async def refill() -> None:
+            async with barrier.mutation("prompt_reservations"):
+                if exhausted:
+                    controller._dataloader_exhausted = True
+                else:
+                    controller._rollout_runtime.filtered_reserve.append(
+                        _reserve_prompt(21)
+                    )
+
+        refiller = asyncio.create_task(refill())
+        await asyncio.sleep(0)
+        assert not replaced.is_set()
+        release_checkpoint.set()
+        await asyncio.gather(consumer, saver, refiller)
+        assert [g.prompt_id for g in manager.recovery_ledger.groups()] == (
+            [] if exhausted else ["21"]
+        )
+        assert controller._filtered_prompts_by_step == ({} if exhausted else {7: 1})
+        assert (7 in controller._rollout_runtime.steps_allowed_short) == exhausted
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=5))
+
+
+def test_filtered_replacement_rechecks_pool_after_waiting_for_checkpoint() -> None:
+    """Two consumers racing for one spare retry without spending another budget unit."""
+
+    async def exercise() -> None:
+        controller = _reserve_controller()
+        controller._filtered_prompt_budget = 20
+        manager = controller._rollout_manager
+        barrier = controller._data_plane_checkpoint_barrier
+        async with barrier.mutation() as cut:
+            old_ids = [
+                manager.reserve_prompt_group(cut, _reserve_prompt(i), target_step=7)
+                for i in (20, 30)
+            ]
+        controller._rollout_runtime.filtered_reserve.append(_reserve_prompt(21))
+        checkpoint_entered = asyncio.Event()
+        release_checkpoint = asyncio.Event()
+
+        async def checkpoint() -> None:
+            async with barrier.checkpoint():
+                checkpoint_entered.set()
+                await release_checkpoint.wait()
+
+        async def replace(old_id: str) -> None:
+            async with controller._replacement_mutation(filtered=True) as cut:
+                spare = controller._pop_filtered_replacement(7)
+                assert spare is not None
+                manager.discard_prompt_group(cut, old_id)
+                manager.reserve_prompt_group(cut, spare, target_step=7)
+
+        saver = asyncio.create_task(checkpoint())
+        await checkpoint_entered.wait()
+        consumers = [asyncio.create_task(replace(old_id)) for old_id in old_ids]
+        while barrier._waiting_mutations < 2:
+            await asyncio.sleep(0)
+        release_checkpoint.set()
+        await saver
+        while controller._rollout_runtime.filtered_reserve:
+            await asyncio.sleep(0)
+        # A second checkpoint can enter while the losing consumer waits for refill.
+        async with barrier.checkpoint():
+            owners = {g.prompt_id for g in manager.recovery_ledger.groups()}
+            assert "21" in owners
+            assert len(owners & {"20", "30"}) == 1
+        async with barrier.mutation():
+            controller._rollout_runtime.filtered_reserve.append(_reserve_prompt(22))
+        await asyncio.gather(*consumers)
+        assert sorted(g.prompt_id for g in manager.recovery_ledger.groups()) == [
+            "21",
+            "22",
+        ]
+        assert controller._filtered_prompts_by_step == {7: 2}
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=5))
+
+
+def test_checkpoint_waits_for_filtered_pop_and_reownership() -> None:
+    """A popped filter spare and its new ledger owner belong to the same cut."""
+
+    async def exercise() -> None:
+        controller = _reserve_controller()
+        controller._filtered_prompt_budget = 20
+        manager = controller._rollout_manager
+        barrier = controller._data_plane_checkpoint_barrier
+        async with barrier.mutation() as cut:
+            old_id = manager.reserve_prompt_group(
+                cut, _reserve_prompt(20), target_step=7
+            )
+        controller._rollout_runtime.filtered_reserve.append(_reserve_prompt(21))
+        popped = asyncio.Event()
+        release_replacement = asyncio.Event()
+        checkpoint_entered = asyncio.Event()
+
+        async def replace() -> None:
+            async with controller._replacement_mutation(filtered=True) as cut:
+                spare = controller._pop_filtered_replacement(7)
+                assert spare is not None
+                popped.set()
+                await release_replacement.wait()
+                manager.discard_prompt_group(cut, old_id)
+                manager.reserve_prompt_group(cut, spare, target_step=7)
+
+        async def checkpoint() -> None:
+            async with barrier.checkpoint():
+                checkpoint_entered.set()
+                assert not controller._rollout_runtime.filtered_reserve
+                assert [g.prompt_id for g in manager.recovery_ledger.groups()] == ["21"]
+
+        consumer = asyncio.create_task(replace())
+        await popped.wait()
+        saver = asyncio.create_task(checkpoint())
+        await asyncio.sleep(0)
+        assert not checkpoint_entered.is_set()
+        release_replacement.set()
+        await asyncio.gather(consumer, saver)
+
+    asyncio.run(asyncio.wait_for(exercise(), timeout=5))
+
+
 def test_reserve_drain_is_recoverable_before_sampler_admission() -> None:
     """After pool removal, RESERVED ledger records own the whole batch."""
 
@@ -1953,7 +2142,10 @@ def test_reserve_drain_is_recoverable_before_sampler_admission() -> None:
 
         async def block_admission(
             group_ids: list[str],
+            *,
+            wait_until_admissible: Callable[[], Awaitable[None]] | None = None,
         ) -> int:
+            assert wait_until_admissible is None
             admission_started.set()
             await release_admission.wait()
             async with controller._data_plane_checkpoint_barrier.mutation() as cut:
@@ -1990,7 +2182,7 @@ def test_reserve_drain_is_recoverable_before_sampler_admission() -> None:
             (21, 7),
         }
 
-    asyncio.run(exercise())
+    asyncio.run(asyncio.wait_for(exercise(), timeout=5))
 
 
 def test_recovery_rejects_a_corrupt_ledger_sidecar(tmp_path) -> None:

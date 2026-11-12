@@ -193,6 +193,22 @@ same prompts in runs that never stopped. A model call redone after a turn-level
 resume is not visible here: that needs the time the environment parked each
 rollout, which it does not report yet.
 
+Batch age, the token-weighted number of policy updates between generating a
+token and training on it, is logged every step as `batch_age` when token capture
+is on, and each `group_published` event carries the same per-version token
+counts, so the trace gives the same number per step:
+
+```bash
+python -m nemo_rl.algorithms.rollout_checkpointing.trace <log_dir>/rollout_trace.jsonl
+```
+
+vLLM keeps running calls across a refit, so a call's tokens count under the
+version it began on until a refit paused it, and under the version that refit
+installed from there on. At each refit the controller reads each running
+captured call's token count from vLLM's output-processor request state, which
+has no public API; a backend that does not report it counts every token of a
+call under the version the call began on.
+
 ## Rules for New Code
 
 - Keep backend-specific code out of `single_controller.py` and `rollout_recovery.py`. Code

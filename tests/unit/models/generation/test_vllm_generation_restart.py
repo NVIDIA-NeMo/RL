@@ -94,6 +94,9 @@ class TestRestartShardTokenCapture:
         "staging_partition": "rollout_staging",
         "capture_media": False,
         "top_logprobs": 4,
+        "generation_prefix_cuts_enabled": False,
+        "generation_cut_control_token": None,
+        "generation_cut_control_timeout_s": None,
     }
 
     @staticmethod
@@ -118,6 +121,7 @@ class TestRestartShardTokenCapture:
             workers=[leader],
             get_dp_leader_worker_idx=lambda shard: 0,
             recreate_worker=MagicMock(),
+            run_all_workers_single_data=MagicMock(return_value=[None]),
         )
         gen.model_parallel_size = 1
         gen.cfg = {"vllm_cfg": {"async_engine": True}}
@@ -148,6 +152,28 @@ class TestRestartShardTokenCapture:
             "set_rollout_weight_version",
             "report_dp_openai_server_base_url",
         ]
+
+    def test_a_replacement_keeps_generation_prefix_cuts(self, monkeypatch):
+        # A replacement installed without the cut arguments would answer every
+        # generation cut with 404, so the calls it serves lose their prefixes.
+        from nemo_rl.models.generation.vllm import vllm_generation
+
+        gen, calls = self._generation()
+        monkeypatch.setattr(vllm_generation.ray, "get", lambda ref: ref)
+        setup = {
+            **self.SETUP,
+            "generation_prefix_cuts_enabled": True,
+            "generation_cut_control_token": "control-token",
+            "generation_cut_control_timeout_s": 30.0,
+        }
+        dp_cfg, staging_partition = setup.pop("dp_cfg"), setup.pop("staging_partition")
+        gen.setup_token_capture(dp_cfg, staging_partition, **setup)
+
+        gen.restart_shard(0)
+
+        calls.setup_token_capture.assert_called_once_with(
+            dp_cfg=dp_cfg, staging_partition=staging_partition, **setup
+        )
 
     def test_nothing_is_installed_when_capture_was_never_set_up(self, monkeypatch):
         from nemo_rl.models.generation.vllm import vllm_generation

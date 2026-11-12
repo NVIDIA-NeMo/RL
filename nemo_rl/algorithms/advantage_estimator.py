@@ -45,7 +45,7 @@ import math
 from typing import Annotated, Literal, Optional
 
 import torch
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field
 
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.utils import (
@@ -89,33 +89,6 @@ class GAEConfig(BaseModel, extra="allow"):
     gae_lambda_policy: Optional[float] = None
     # Length-adaptive λ_policy = 1 - 1/(α·l). 0 = disabled.
     length_adaptive_alpha: float = 0.0
-    # Rows whose response tokens GAE runs and whitens over. "kept_rows": only
-    # rows that train. "all_rows": also rows excluded from the loss by
-    # sample_mask, which still never train; execution padding is excluded.
-    normalize_over: Literal["kept_rows", "all_rows"] = "kept_rows"
-    # With all_rows, also whiten over Forest execution padding, so padding
-    # copies weigh into the mean and variance. Padding still carries no loss.
-    whiten_execution_padding: bool = False
-
-    @model_validator(mode="after")
-    def validate_whitening_population(self) -> "GAEConfig":
-        # Only GAE reads these population options.
-        if self.name != "gae" and (
-            self.normalize_over != "kept_rows" or self.whiten_execution_padding
-        ):
-            raise ValueError(
-                "normalize_over and whiten_execution_padding require name=gae"
-            )
-        # normalize_over only picks the whitening population.
-        if self.normalize_over == "all_rows" and not self.normalize_advantages:
-            raise ValueError(
-                "normalize_over=all_rows requires normalize_advantages=true"
-            )
-        if self.whiten_execution_padding and self.normalize_over != "all_rows":
-            raise ValueError(
-                "whiten_execution_padding requires normalize_over=all_rows"
-            )
-        return self
 
 
 class GRPOAdvantageEstimator:

@@ -48,6 +48,7 @@ from nemo_rl.algorithms.grpo import (
     _binary_participation,
     _clip_grpo_advantages,
     compute_and_apply_seq_logprob_error_masking,
+    scale_rewards,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -404,6 +405,10 @@ class AdvantageComputer:
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
+        # Scale before baselines/metrics; keep DataPlane rewards raw for replay.
+        rewards = scale_rewards(
+            BatchedDataDict({"total_reward": rewards}), cfg.algo.reward_scaling
+        )["total_reward"]
         token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
@@ -579,25 +584,8 @@ class AdvantageComputer:
                 data,
                 adv_cfg.teacher_logprobs_field,
             )
-        # Tokens GAE runs and whitens over; advantages are zeroed outside mask.
-        gae_mask = mask
         if cfg.is_ppo:
             kwargs["values"] = tensor_field(data, adv_cfg.values_field)
-            estimator_cfg = cfg.algo.adv_estimator
-            if (
-                estimator_cfg.name == "gae"
-                and estimator_cfg.normalize_over == "all_rows"
-            ):
-                # Every real row's response tokens, including rows the loss
-                # masks; execution padding counts only with
-                # whiten_execution_padding.
-                real_rows = (
-                    (owner_batch.row_owner >= 0).to(token_mask.dtype)
-                    if owner_batch is not None
-                    and not estimator_cfg.whiten_execution_padding
-                    else torch.ones_like(final_sample_mask)
-                )
-                gae_mask = token_mask * real_rows.unsqueeze(-1)
 
         # Training predicts token t from position t - 1, so token_mask[:, 1:]
         # is the exact mask used when global_valid_toks and the loss are built.
@@ -642,7 +630,7 @@ class AdvantageComputer:
             result = self._advantage_estimator.compute_advantage(
                 prompt_ids=prompt_ids,
                 rewards=rewards,
-                mask=gae_mask,
+                mask=mask,
                 repeated_batch=repeated_batch,
                 valid_mask=advantage_valid_mask,
                 normalization_mask=token_mask * advantage_valid_mask.unsqueeze(-1),
