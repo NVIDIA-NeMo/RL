@@ -791,16 +791,7 @@ class TQPolicy(TQDriverMixin, Policy):
         ]
         if not sequence_lengths:
             return list(dp_metas)
-        _, dynamic_args = self._packing_args("train_mb_tokens")
-        sequence_round = (
-            int(dynamic_args["sequence_length_round"])
-            if dynamic_args is not None
-            else 1
-        )
-        pad_multiple = max(
-            [int(meta.extra_info.get("pad_to_multiple", 1)) for meta in dp_metas]
-        )
-        target = round_up(max(sequence_lengths), max(pad_multiple, sequence_round))
+        target = round_up(max(sequence_lengths), self._forward_pad_multiple(dp_metas))
         return [
             replace(
                 meta,

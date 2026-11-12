@@ -13,11 +13,16 @@
 # limitations under the License.
 import gc
 import weakref
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 from torch import nn
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Replicate, distribute_tensor
 
 try:
     import nemo_automodel  # noqa: F401
@@ -29,9 +34,109 @@ from nemo_automodel.components.moe.megatron.token_dispatcher import (
 )
 
 from nemo_rl.models.automodel.utils import (
+    initialize_mamba_extensions,
+    move_model_buffers_to_device,
     release_moe_dispatcher_state,
     resolve_model_class,
+    warmup_compiled_rms_norm,
 )
+
+
+@pytest.mark.automodel
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mamba_registration_preserves_state_and_runs_native_forward() -> None:
+    from nemo_automodel.components.models.nemotron_v3.layers import (
+        NemotronV3Mamba2Mixer,
+    )
+
+    config = SimpleNamespace(
+        hidden_size=128,
+        mamba_num_heads=4,
+        mamba_head_dim=64,
+        ssm_state_size=16,
+        n_groups=1,
+        chunk_size=128,
+        conv_kernel=4,
+        use_conv_bias=True,
+        mamba_hidden_act="silu",
+        time_step_limit=(0.0, float("inf")),
+        time_step_min=0.001,
+        time_step_max=0.1,
+        time_step_floor=1e-4,
+        use_bias=False,
+        layer_norm_epsilon=1e-5,
+    )
+    device = torch.device("cuda", torch.cuda.current_device())
+    with torch.random.fork_rng(devices=[device.index]):
+        mixer = NemotronV3Mamba2Mixer(config, layer_idx=0).to(
+            device=device, dtype=torch.bfloat16
+        )
+        mixer._fp32_params.float()
+        state = {
+            name: value.detach().clone() for name, value in mixer.state_dict().items()
+        }
+        cpu_rng = torch.get_rng_state().clone()
+        cuda_rng = torch.cuda.get_rng_state().clone()
+        assert initialize_mamba_extensions(mixer)
+        assert torch.equal(torch.get_rng_state(), cpu_rng)
+        assert torch.equal(torch.cuda.get_rng_state(), cuda_rng)
+        assert all(parameter.grad is None for parameter in mixer.parameters())
+        assert all(
+            torch.equal(mixer.state_dict()[name], value)
+            for name, value in state.items()
+        )
+        inputs = torch.randn(
+            1, 128, 128, device=device, dtype=torch.bfloat16, requires_grad=True
+        )
+        output = mixer(inputs)
+        assert output.shape == inputs.shape and torch.isfinite(output).all()
+        output.float().square().mean().backward()
+        assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
+        assert all(
+            parameter.grad is not None and torch.isfinite(parameter.grad).all()
+            for parameter in mixer.parameters()
+        )
+
+
+@pytest.mark.automodel
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_compiled_norm_warmup_preserves_model_and_rng(dtype: torch.dtype) -> None:
+    from nemo_automodel.components.models.common.utils import Float32RMSNorm
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    with torch.random.fork_rng(devices=[device.index]):
+        model = nn.Sequential(Float32RMSNorm(128, device=device, dtype=dtype))
+        model.eval()
+        state = {
+            key: value.detach().clone() for key, value in model.state_dict().items()
+        }
+        cpu_rng = torch.get_rng_state().clone()
+        cuda_rng = torch.cuda.get_rng_state().clone()
+        warmup_compiled_rms_norm(model)
+        assert torch.equal(torch.get_rng_state(), cpu_rng)
+        assert torch.equal(torch.cuda.get_rng_state(), cuda_rng)
+        assert not model.training and all(p.grad is None for p in model.parameters())
+        assert all(
+            torch.equal(model.state_dict()[key], value) for key, value in state.items()
+        )
+        inputs = torch.randn(
+            (1, 3, 128), device=device, dtype=dtype, requires_grad=True
+        )
+        output = model(inputs)
+        expected = (
+            inputs.float()
+            * torch.rsqrt(inputs.float().square().mean(-1, keepdim=True) + model[0].eps)
+        ).to(dtype)
+        torch.testing.assert_close(output, expected)
+        output.sum().backward()
+        assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
+        assert (
+            model[0].weight.grad is not None
+            and torch.isfinite(model[0].weight.grad).all()
+        )
 
 
 @pytest.mark.automodel
@@ -160,3 +265,82 @@ def test_release_moe_dispatcher_state_ignores_dense_models():
     model = nn.Sequential(nn.Linear(2, 2), nn.ReLU())
     model[0].token_dispatcher = None
     assert release_moe_dispatcher_state(model) == 0
+
+
+@pytest.mark.automodel
+@pytest.mark.parametrize("source_device", ["cpu", "cuda"])
+def test_move_buffers_preserves_aliases_and_readable_state_dict(
+    source_device: str,
+) -> None:
+    if source_device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required for a device-crossing buffer round trip")
+    model = nn.Module()
+    model.child = nn.Module()
+    values = torch.arange(6, dtype=torch.float32, device=source_device)
+    model.register_buffer("persistent", values)
+    model.child.register_buffer("alias", values)
+    model.register_buffer(
+        "indices", torch.arange(3, device=source_device), persistent=False
+    )
+    original_identity = id(model.persistent)
+    assert move_model_buffers_to_device(model, "cpu") is model
+    assert id(model.persistent) == original_identity
+    assert model.child.alias is model.persistent
+    assert model.indices.dtype == torch.int64
+    assert model.indices.device.type == "cpu"
+    state = model.state_dict()
+    assert set(state) == {"persistent", "child.alias"}
+    torch.testing.assert_close(state["persistent"], torch.arange(6).float())
+    torch.testing.assert_close(state["child.alias"], state["persistent"])
+    move_model_buffers_to_device(model, source_device)
+    assert model.persistent.device.type == source_device
+    assert model.child.alias is model.persistent
+    torch.testing.assert_close(
+        model.state_dict()["persistent"].cpu(), torch.arange(6).float()
+    )
+
+
+def _distributed_buffer_roundtrip(rank: int, rendezvous: str) -> None:
+    dist.init_process_group(
+        backend="cpu:gloo,cuda:nccl",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=1,
+    )
+    try:
+        mesh = init_device_mesh("cuda", (1,))
+        model = nn.Module()
+        model.child = nn.Module()
+        values = torch.arange(6, dtype=torch.float32, device="cuda")
+        buffer = distribute_tensor(values, mesh, [Replicate()])
+        model.register_buffer("bias", buffer)
+        model.child.register_buffer("alias", buffer)
+        original_identity = id(buffer)
+
+        move_model_buffers_to_device(model, "cpu")
+        assert model.bias.device.type == "cpu"
+        assert id(model.bias) == original_identity
+        assert model.child.alias is model.bias
+        torch.testing.assert_close(
+            model.state_dict()["bias"].to_local(), torch.arange(6).float()
+        )
+        move_model_buffers_to_device(model, "cuda")
+        assert model.bias.device.type == "cuda"
+        assert model.child.alias is model.bias
+        torch.testing.assert_close(
+            model.state_dict()["bias"].to_local().cpu(), torch.arange(6).float()
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.automodel
+def test_move_distributed_buffers_preserves_state_dict(tmp_path: Path) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for a DTensor buffer device round trip")
+    mp.spawn(
+        _distributed_buffer_roundtrip,
+        args=(str(tmp_path / "buffer-rendezvous"),),
+        nprocs=1,
+        join=True,
+    )

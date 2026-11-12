@@ -100,6 +100,7 @@ from nemo_rl.experience.rollout_recovery import RecoveryTargetLevel
 from nemo_rl.experience.rollouts import EffortLevelsConfig
 from nemo_rl.models.generation.interfaces import SamplerReplayConfig
 from nemo_rl.models.generation.megatron.megatron_generation import MegatronGeneration
+from nemo_rl.models.policy import Eagle3DraftConfig
 from nemo_rl.utils.config import (
     load_config,
     register_omegaconf_resolvers,
@@ -867,8 +868,13 @@ class TestSetup:
         mc.policy.update(
             {
                 "precision": "bfloat16",
+                "sequence_packing": {"enabled": False},
+                "dynamic_batching": {"enabled": False},
                 "automodel_cfg": {
                     "enabled": True,
+                    "tensor_parallel_size": 1,
+                    "context_parallel_size": 1,
+                    "sequence_parallel": False,
                     "lora_cfg": {"enabled": True, "dim": 16, "alpha": 64},
                 },
             }
@@ -4654,3 +4660,61 @@ def test_generation_top_logprobs_requires_score_centering_or_replay():
     mc.policy["generation"]["top_logprobs"] = 4
     with pytest.raises(ValueError, match="only read by loss_fn.score_centering"):
         validate_single_controller_config(mc)
+
+
+@pytest.mark.parametrize(
+    "invalid", ["tp", "cp", "sequence_parallel", "packing", "force_hf", "disabled"]
+)
+def test_captured_omni_automodel_rejects_unsupported_backend_before_allocation(
+    invalid: str,
+) -> None:
+    config = _make_master_config()
+    config.token_capture.enabled = True
+    config.policy["is_vlm"] = True
+    config.policy["sequence_packing"] = {"enabled": invalid == "packing"}
+    config.policy["automodel_cfg"] = {
+        "enabled": invalid != "disabled",
+        "tensor_parallel_size": 2 if invalid == "tp" else 1,
+        "context_parallel_size": 2 if invalid == "cp" else 1,
+        "sequence_parallel": invalid == "sequence_parallel",
+        "automodel_kwargs": {"force_hf": invalid == "force_hf"},
+    }
+    with pytest.raises(ValueError, match="Omni media token capture requires"):
+        validate_single_controller_config(config)
+
+
+@pytest.mark.parametrize(
+    "unsupported",
+    [
+        "tp",
+        "cp",
+        "sequence_parallel",
+        "packing",
+        "dynamic",
+        "precision",
+        "draft",
+        "nll",
+    ],
+)
+def test_automodel_split_rejects_unimplemented_modes_before_allocation(unsupported):
+    config = _make_master_config()
+    config.policy["is_vlm"] = False
+    config.policy["automodel_cfg"] = {
+        "enabled": True,
+        "tensor_parallel_size": 2 if unsupported == "tp" else 1,
+        "context_parallel_size": 2 if unsupported == "cp" else 1,
+        "sequence_parallel": unsupported == "sequence_parallel",
+    }
+    config.policy["sequence_packing"] = {"enabled": unsupported == "packing"}
+    config.policy["dynamic_batching"] = {"enabled": unsupported == "dynamic"}
+    config.policy["precision"] = "float16" if unsupported == "precision" else "bfloat16"
+    if unsupported == "nll":
+        config.loss_fn.positive_example_nll_weight = 0.1
+    if unsupported == "draft":
+        config.policy["draft"] = Eagle3DraftConfig(
+            enabled=True, model_name="test-draft"
+        )
+    with pytest.raises(
+        ValueError, match="SingleController Automodel training requires"
+    ):
+        validate_single_controller_config(config)

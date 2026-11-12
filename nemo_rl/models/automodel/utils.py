@@ -17,6 +17,7 @@ from typing import Any, Dict
 # configs to Mistral3FP8VLM. Without it, HF's stock FP8Linear path runs and produces
 # 0-d weight_scale_inv params that FSDP2 rejects.
 import nemo_automodel.components.models.mistral3_vlm  # noqa: F401
+import torch
 from nemo_automodel._transformers.auto_model import (
     NeMoAutoModelForCausalLM,
     NeMoAutoModelForImageTextToText,
@@ -46,6 +47,60 @@ AUTOMODEL_FACTORY: Dict[str, Any] = {
     "mistral3": NeMoAutoModelForImageTextToText,
     "llama4": NeMoAutoModelForImageTextToText,
 }
+
+
+def move_model_buffers_to_device(
+    model: nn.Module, device: str | torch.device
+) -> nn.Module:
+    """Move registered buffers while preserving their tensor identity and aliases."""
+    for buffer in model.buffers():
+        # Swapping also updates device metadata; .data assignment can leave stale storage.
+        torch.utils.swap_tensors(buffer, buffer.to(device))
+    return model
+
+
+def initialize_mamba_extensions(model: nn.Module) -> bool:
+    """Register native Mamba CUDA extensions before asynchronous FSDP forwards."""
+    # Keep Mamba's optional CUDA dependencies out of unrelated model paths.
+    from nemo_automodel.components.models.nemotron_v3.layers import (
+        NemotronV3Mamba2Mixer,
+    )
+
+    if not any(isinstance(module, NemotronV3Mamba2Mixer) for module in model.modules()):
+        return False
+    # CUDA registration can wait for work that another rank has not enqueued yet.
+    import mamba_ssm.ops.triton.ssd_combined  # noqa: F401
+
+    return True
+
+
+def warmup_compiled_rms_norm(model: nn.Module) -> int:
+    """Initialize native compiled norms without changing model state or RNG."""
+    from nemo_automodel.components.models.common.utils import Float32RMSNorm
+
+    variants = list(
+        dict.fromkeys(
+            (module.weight.shape[0], module.eps, module.weight.dtype)
+            for module in model.modules()
+            if isinstance(module, Float32RMSNorm)
+        )
+    )
+    if not variants:
+        return 0
+    device_index = torch.cuda.current_device()
+    device = torch.device("cuda", device_index)
+    # Lazy compiler initialization allocates CUDA constants and can synchronize
+    # against outstanding FSDP collectives when ranks reach their first norm apart.
+    with torch.random.fork_rng(devices=[device_index]):
+        for width, eps, dtype in variants:
+            norm = Float32RMSNorm(width, eps=eps, device=device, dtype=dtype)
+            inputs = torch.zeros((1, 2, width), device=device, dtype=dtype)
+            with torch.no_grad():
+                norm(inputs)
+            with torch.enable_grad():
+                norm(inputs.requires_grad_()).sum().backward()
+            torch.cuda.synchronize(device)
+    return len(variants)
 
 
 def resolve_model_class(model_name: str) -> Any:

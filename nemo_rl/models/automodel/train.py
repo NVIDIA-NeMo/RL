@@ -24,18 +24,20 @@ Key differences from megatron approach:
 """
 
 from collections import defaultdict
-from contextlib import AbstractContextManager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Iterator, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 from nemo_automodel.components.distributed.context_parallel import (
     ContextParallelSharder,
 )
 from nemo_automodel.components.distributed.tensor_utils import to_local_if_dtensor
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 from transformers.models.gemma3.modeling_gemma3 import (
     Gemma3ForCausalLM,
@@ -95,6 +97,86 @@ class PreparedModelForward:
     model_context_factory: Callable[[], AbstractContextManager[Any]]
 
 
+@contextmanager
+def _captured_omni_projector_context(
+    model: nn.Module,
+    model_batch: dict[str, Any],
+    device_mesh: Optional[DeviceMesh],
+) -> Iterator[None]:
+    """Align sharded projector calls across image and text-only microbatches."""
+    architectures = getattr(getattr(model, "config", None), "architectures", ())
+    projector = getattr(model, "vision_projector", None)
+    if (
+        device_mesh is None
+        or not set(architectures or ()).intersection(
+            {"NemotronH_Nano_Omni_Reasoning_V3", "NemotronH_Omni_Reasoning_V3"}
+        )
+        or not isinstance(projector, nn.Module)
+        or not isinstance(projector, FSDPModule)
+    ):
+        yield
+        return
+
+    pixels = model_batch.get("pixel_values")
+    has_images = pixels is not None and pixels.shape[0] > 0
+    image_ranks = torch.tensor(
+        int(has_images), device=model_batch["input_ids"].device, dtype=torch.int32
+    )
+    dist.all_reduce(
+        image_ranks, op=dist.ReduceOp.MAX, group=device_mesh["dp"].get_group()
+    )
+    if not bool(image_ranks.item()):
+        yield
+        return
+
+    vision = getattr(model, "vision_model", None)
+    sharded_vision = isinstance(vision, FSDPModule)
+    if sharded_vision:
+        # RADIO is called once per image; keep one gather per microbatch.
+        vision.set_reshard_after_forward(False, recurse=False)
+    if has_images:
+        try:
+            yield
+        finally:
+            if sharded_vision:
+                vision.reshard()
+        return
+
+    calls = 0
+
+    def empty_projection(
+        module: nn.Module, args: tuple[Any, ...], output: torch.Tensor
+    ) -> torch.Tensor:
+        nonlocal calls
+        calls += 1
+        if calls > 1:
+            return output
+        if sharded_vision:
+            size = model.force_image_size
+            dummy = output.new_zeros((1, 3, size, size))
+            projected = model.extract_feature_dynamic(dummy, [(size, size)])
+        else:
+            width = projector.norm.weight.shape[0]
+            empty = output.new_empty((1, 0, width))
+            projected = projector(empty)
+        # A zero edge participates in mixed-batch reductions; all-text steps
+        # return before this hook so unused weights retain grad=None.
+        return output + projected.sum().to(output.dtype) * 0
+
+    embedding = model.language_model.get_input_embeddings()
+    handle = embedding.register_forward_hook(empty_projection)
+    try:
+        yield
+        if calls != 1:
+            raise RuntimeError(
+                "Native Omni must embed inputs once before vision projection"
+            )
+    finally:
+        handle.remove()
+        if sharded_vision:
+            vision.reshard()
+
+
 def _build_model_batch(
     model: nn.Module,
     processed_inputs: ProcessedInputs,
@@ -116,7 +198,9 @@ def _build_model_batch(
 
     if processed_inputs.is_multimodal:
         model_batch.update(
-            filter_multimodal_kwargs_for_model(model, processed_inputs.vlm_kwargs)
+            filter_multimodal_kwargs_for_model(
+                model, processed_inputs.vlm_kwargs, input_ids=processed_inputs.input_ids
+            )
         )
         model_batch.pop("flash_attn_kwargs", None)
 
@@ -171,11 +255,16 @@ def prepare_model_forward(
     )
 
     if cp_size <= 1:
+        context_factory: Callable[[], AbstractContextManager[Any]] = nullcontext
+        if "num_frames" in processed_inputs.vlm_kwargs:
+            context_factory = partial(
+                _captured_omni_projector_context, model, model_batch, device_mesh
+            )
         return PreparedModelForward(
             model_batch=model_batch,
             cp_size=cp_size,
             cp_sharder=None,
-            model_context_factory=nullcontext,
+            model_context_factory=context_factory,
         )
 
     # Automodel's generic CP prep reads ``batch["labels"]`` unconditionally and

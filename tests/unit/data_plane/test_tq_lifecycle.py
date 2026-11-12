@@ -35,6 +35,8 @@ import torch
 from tensordict import TensorDict
 
 transfer_queue = pytest.importorskip("transfer_queue")  # noqa: F841
+from transfer_queue.controller import TransferQueueController
+from transfer_queue.metadata import BatchMeta
 
 from nemo_rl.data_plane.column_io import kv_first_write, read_columns
 from nemo_rl.data_plane.interfaces import DataPlaneClient, KVBatchMeta
@@ -118,6 +120,9 @@ def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
 
     monkeypatch.setattr(tq_adapter.tq, "kv_batch_put", fake_put)
     monkeypatch.setattr(tq_adapter.tq, "kv_clear", fake_clear)
+    tq_client = MagicMock()
+    tq_client.kv_retrieve_meta.return_value = BatchMeta.empty()
+    monkeypatch.setattr(tq_adapter.tq, "get_client", lambda: tq_client)
     # bootstrap=False only connects to an existing controller; stubbing that
     # lets the real __init__ run, so this test cannot drift from it.
     monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
@@ -173,6 +178,82 @@ def test_register_partition_uses_unique_schema_warmup_key(monkeypatch) -> None:
     ]
 
 
+def test_registration_preserves_live_typed_columns_after_client_deserialization(
+    monkeypatch,
+) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    controller = TransferQueueController.__ray_metadata__.modified_class(
+        polling_mode=True
+    )
+    metadata = controller.kv_retrieve_meta(["persisted"], "restored", create=True)
+    schema = {
+        name: {
+            "dtype": dtype,
+            "shape": (2,),
+            "is_nested": False,
+            "is_non_tensor": False,
+        }
+        for name, dtype in [
+            ("ids", torch.int64),
+            ("logprobs", torch.float32),
+            ("keep", torch.bool),
+        ]
+    }
+    assert controller.update_production_status(
+        "restored", list(metadata.global_indexes), schema
+    )
+    baseline = controller.kv_retrieve_meta(["persisted"], "restored").field_schema
+    tq_client = MagicMock()
+    tq_client.kv_retrieve_meta.side_effect = controller.kv_retrieve_meta
+    monkeypatch.setattr(tq_adapter.tq, "get_client", lambda: tq_client)
+    monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
+    put = MagicMock(side_effect=AssertionError("Must not rewrite live typed columns"))
+    monkeypatch.setattr(tq_adapter.tq, "kv_batch_put", put)
+    client = tq_adapter.TQDataPlaneClient(
+        {
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "simple",
+            "claim_meta_poll_interval_s": 0.5,
+        },
+        bootstrap=False,
+    )
+    for current in [client, pickle.loads(pickle.dumps(client))]:
+        current.register_partition("restored", list(schema), 1, ["train"])
+        actual = controller.kv_retrieve_meta(["persisted"], "restored")
+        assert actual.global_indexes == metadata.global_indexes
+        assert actual.field_schema == baseline
+    put.assert_not_called()
+
+
+def test_registration_metadata_failure_prevents_checkpoint_reload(
+    monkeypatch, tmp_path
+) -> None:
+    from nemo_rl.data_plane.adapters import transfer_queue as tq_adapter
+
+    tq_client = MagicMock()
+    tq_client.kv_retrieve_meta.side_effect = RuntimeError("metadata query failed")
+    monkeypatch.setattr(tq_adapter.tq, "get_client", lambda: tq_client)
+    monkeypatch.setattr(tq_adapter, "_connect_existing", lambda: None)
+    put = MagicMock()
+    monkeypatch.setattr(tq_adapter.tq, "kv_batch_put", put)
+    client = tq_adapter.TQDataPlaneClient(
+        {
+            "enabled": True,
+            "impl": "transfer_queue",
+            "backend": "simple",
+            "claim_meta_poll_interval_s": 0.5,
+        },
+        bootstrap=False,
+    )
+    with pytest.raises(RuntimeError, match="metadata query failed"):
+        client.register_partition("restored", ["ids"], 1, ["train"])
+    with pytest.raises(RuntimeError, match="requires a clean TQ client"):
+        client.load_checkpoint(tmp_path)
+    put.assert_not_called()
+
+
 def test_data_operation_guard_covers_the_full_interface() -> None:
     public_abstract_methods = {
         name
@@ -192,6 +273,7 @@ def test_each_public_data_operation_marks_the_client_dirty(
     tq_meta = MagicMock(size=1, global_indexes=[0], custom_meta=[{}])
     tq_client = MagicMock()
     tq_client.get_meta.return_value = tq_meta
+    tq_client.kv_retrieve_meta.return_value = BatchMeta.empty()
     tq_client.kv_retrieve_keys.return_value = ["sample-0"]
     tq_client.check_consumption_status.return_value = True
     monkeypatch.setattr(tq_adapter.tq, "get_client", MagicMock(return_value=tq_client))
@@ -501,6 +583,25 @@ def test_smoke_round_trip(tq_client) -> None:
     assert tq_client.check_consumption_status("smoke", ["read"])
 
     tq_client.clear_samples(sample_ids=None, partition_id="smoke")
+
+
+def test_registering_live_partition_preserves_typed_rows_through_real_client(tq_client):
+    partition = "schema-restored-live"
+    keys = ["typed-row"]
+    original = TensorDict(
+        {"ids": torch.tensor([[2, 7]]), "keep": torch.tensor([[True, False]])},
+        batch_size=[1],
+    )
+    tq_client.put_samples(keys, partition, fields=original)
+    # Both clients have no warmed-field cache, as happens after native restore
+    # and when the learner client is deserialized into another process.
+    for client in [tq_client, pickle.loads(pickle.dumps(tq_client))]:
+        client.register_partition(partition, ["ids", "keep", "pending"], 1, ["read"])
+        actual = client.get_samples(keys, partition, ["ids", "keep"])
+        assert torch.equal(actual["ids"], original["ids"])
+        assert torch.equal(actual["keep"], original["keep"])
+        assert client.list_sample_ids(partition) == keys
+    tq_client.clear_samples(None, partition)
 
 
 def test_get_samples_rejects_batch_missing_a_requested_column(tq_client) -> None:

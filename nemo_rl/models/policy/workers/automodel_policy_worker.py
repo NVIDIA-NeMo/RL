@@ -16,6 +16,7 @@ import gc
 import warnings
 from collections.abc import Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
+from dataclasses import dataclass
 from typing import Any, Generator, Iterable, Optional, cast
 
 import ray
@@ -33,7 +34,8 @@ from torch.distributed.tensor import DTensor
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
 )
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType, MetricNormalizer
+from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -67,7 +69,12 @@ from nemo_rl.models.automodel.train import (
     forward_with_post_processing_fn,
     prepare_model_forward,
 )
-from nemo_rl.models.automodel.utils import release_moe_dispatcher_state
+from nemo_rl.models.automodel.utils import (
+    initialize_mamba_extensions,
+    move_model_buffers_to_device,
+    release_moe_dispatcher_state,
+    warmup_compiled_rms_norm,
+)
 from nemo_rl.models.megatron.router_replay import router_replay_enabled
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.interfaces import (
@@ -423,6 +430,18 @@ def _maybe_adapt_tensor_to_hf(
     return [(fqn, tensor)]
 
 
+@dataclass
+class _AutomodelTrainStepState:
+    """Local unnormalized gradients and metrics for one logical optimizer step."""
+
+    loss_fn: LossFunction
+    micro_batch_size: int
+    local_counts: torch.Tensor
+    losses: list[float]
+    metrics: list[dict[str, Any]]
+    chunks: int
+
+
 # Classes with @ray.remote can't be inherited from, so we split the implementation out.
 # This is useful when using worker extension classes.
 class AutomodelPolicyWorkerImpl(
@@ -482,6 +501,7 @@ class AutomodelPolicyWorkerImpl(
 
         # Store configuration
         self.cfg = config
+        self._train_step_state: Optional[_AutomodelTrainStepState] = None
 
         # Reconstruct tokenizer/processor locally to avoid pickling across
         # incompatible transformers versions (v4 head node → v5 worker).
@@ -594,6 +614,13 @@ class AutomodelPolicyWorkerImpl(
         # field name (not positional unpacking) so optional fields appended to
         # ModelAndOptimizerState stay backward compatible across workers.
         self.model = model_and_optimizer_state.model
+        if initialize_mamba_extensions(self.model):
+            print("Registered native Mamba CUDA extensions before distributed forwards")
+        warmed_norms = warmup_compiled_rms_norm(self.model)
+        if warmed_norms:
+            print(
+                f"Initialized {warmed_norms} compiled RMSNorm variants before distributed forwards"
+            )
         self.optimizer = model_and_optimizer_state.optimizer
         self.scheduler = model_and_optimizer_state.scheduler
         self.is_hf_model = model_and_optimizer_state.is_hf_model
@@ -823,26 +850,7 @@ class AutomodelPolicyWorkerImpl(
                     # a shared global clip let the draft's larger gradients
                     # scale down the policy's updates on every step. The draft
                     # is clipped separately below.
-                    grad_norm = scale_grads_and_clip_grad_norm(
-                        self.max_grad_norm,
-                        [self.model],
-                        norm_type=2.0,
-                        pp_enabled=False,
-                        device_mesh=self.device_mesh,
-                        moe_mesh=self.moe_mesh,
-                        ep_axis_name="ep"
-                        if self.moe_mesh is not None
-                        and "ep" in self.moe_mesh.mesh_dim_names
-                        else None,
-                        pp_axis_name=None,
-                        foreach=True,
-                        num_label_tokens=1,
-                        dp_group_size=self.dp_size * self.cp_size,
-                    )
-                    grad_norm = torch.tensor(
-                        grad_norm, device="cpu", dtype=torch.float32
-                    )
-                    warn_if_inf_grad_norm(grad_norm)
+                    grad_norm = self._clip_policy_gradients()
 
                     # Independent draft clip with the same max norm; the
                     # returned pre-clip norm doubles as the reported metric.
@@ -896,6 +904,197 @@ class AutomodelPolicyWorkerImpl(
 
             self.timer.stop("train")
             return metrics
+
+    def _clip_policy_gradients(self) -> torch.Tensor:
+        norm = scale_grads_and_clip_grad_norm(
+            self.max_grad_norm,
+            [self.model],
+            norm_type=2.0,
+            pp_enabled=False,
+            device_mesh=self.device_mesh,
+            moe_mesh=self.moe_mesh,
+            ep_axis_name="ep"
+            if self.moe_mesh is not None and "ep" in self.moe_mesh.mesh_dim_names
+            else None,
+            pp_axis_name=None,
+            foreach=True,
+            num_label_tokens=1,
+            dp_group_size=self.dp_size * self.cp_size,
+        )
+        grad_norm = torch.tensor(norm, device="cpu", dtype=torch.float32)
+        warn_if_inf_grad_norm(grad_norm)
+        return grad_norm
+
+    def _assert_step_open(self) -> _AutomodelTrainStepState:
+        if self._train_step_state is None:
+            raise RuntimeError("begin_train_step must open a step first")
+        return self._train_step_state
+
+    @wrap_with_nvtx_name("automodel_policy_worker/begin_train_step")
+    def begin_train_step(
+        self,
+        loss_fn: LossFunction,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+    ) -> None:
+        """Open a logical step whose chunks backpropagate unnormalized sums."""
+        if self._train_step_state is not None:
+            raise RuntimeError("a train step is already open; finish or abort it first")
+        if (
+            self.tp_size != 1
+            or self.cp_size != 1
+            or self.enable_seq_packing
+            or self.cfg["automodel_cfg"]["sequence_parallel"]
+            or self.cfg["dynamic_batching"]["enabled"]
+            or self.draft_runtime is not None
+            or self.dtype not in (torch.float32, torch.bfloat16)
+            or getattr(loss_fn, "requires_survivor_normalization", False)
+            or getattr(loss_fn, "positive_example_nll_weight", 0) != 0
+        ):
+            raise NotImplementedError(
+                "Automodel split training requires TP=CP=1, fixed microbatches, "
+                "FP32/BF16, no sequence packing, draft, positive-example NLL, or in-loss survivor filtering"
+            )
+        gbs = self.cfg["train_global_batch_size"] if gbs is None else gbs
+        mbs = self.cfg["train_micro_batch_size"] if mbs is None else mbs
+        if gbs <= 0 or gbs % self.dp_size or mbs <= 0:
+            raise ValueError(
+                "Invalid global or micro batch size for Automodel split training"
+            )
+        self.model.train()
+        self.optimizer.zero_grad()
+        self.timer.start("train")
+        self._train_step_state = _AutomodelTrainStepState(
+            loss_fn=loss_fn,
+            micro_batch_size=mbs,
+            local_counts=torch.zeros(2, device="cuda", dtype=torch.float64),
+            losses=[],
+            metrics=[],
+            chunks=0,
+        )
+
+    @wrap_with_nvtx_name("automodel_policy_worker/train_microbatch")
+    def train_microbatch(self, data: BatchedDataDict[Any]) -> None:
+        """Accumulate FSDP-reduced gradients without updating model or scheduler."""
+        state = self._assert_step_open()
+        if data.size % state.micro_batch_size:
+            raise ValueError("Automodel split chunks must contain whole microbatches")
+        data = data.to("cuda")
+        self.model.train()
+        sequence_dim, _ = check_sequence_dim(data)
+        mask = data["sample_mask"]
+        local_seqs = mask.sum()
+        local_toks = (data["token_mask"][:, 1:] * mask.unsqueeze(-1)).sum()
+        state.local_counts += torch.stack((local_seqs, local_toks)).to(torch.float64)
+        iterator, iterator_len = get_microbatch_iterator(
+            data,
+            self.cfg,
+            state.micro_batch_size,
+            self.dp_mesh,
+            tokenizer=self.tokenizer,
+        )
+        processor = LossPostProcessor(
+            loss_fn=state.loss_fn,
+            cfg=self.cfg,
+            cp_mesh=self.cp_mesh,
+            cp_size=self.cp_size,
+            dp_size=self.dp_size,
+            sampling_params=self.sampling_params,
+            tp_mesh=self.tp_mesh,
+        )
+        one = torch.ones((), device="cuda")
+        results = automodel_forward_backward(
+            model=self.model,
+            data_iterator=iterator,
+            post_processing_fn=processor,
+            device_mesh=self.device_mesh,
+            padding_token_id=self.tokenizer.pad_token_id or 0,
+            autocast_context_factory=self._autocast_context,
+            forward_only=False,
+            allow_flash_attn_args=self.allow_flash_attn_args,
+            global_valid_seqs=one,
+            global_valid_toks=one,
+            sampling_params=self.sampling_params,
+            sequence_dim=sequence_dim,
+            dp_size=self.dp_size,
+            cp_size=self.cp_size,
+            num_global_batches=1,
+            num_valid_microbatches=iterator_len,
+            router_replay_gates=self._router_replay_gates,
+        )
+        for _, metrics in results:
+            if metrics["num_valid_samples"] > 0:
+                state.losses.append(float(metrics["loss"]))
+                state.metrics.append(metrics)
+        state.chunks += 1
+
+    @wrap_with_nvtx_name("automodel_policy_worker/finish_train_step")
+    def finish_train_step(self) -> dict[str, Any]:
+        """Normalize the complete logical batch, clip, and apply one update."""
+        state = self._assert_step_open()
+        if not state.chunks:
+            raise RuntimeError("Cannot finish an empty Automodel train step")
+        counts = state.local_counts.clone()
+        torch.distributed.all_reduce(counts, group=self.dp_mesh.get_group())
+        seqs, toks = (float(value) for value in counts.tolist())
+        token_loss = state.loss_fn.loss_type is LossType.TOKEN_LEVEL
+        denominator = toks if token_loss else seqs
+        if toks <= 0 or seqs <= 0:
+            raise RuntimeError(
+                "Automodel train step has no valid training tokens or sequences"
+            )
+        inverse = 1.0 / denominator
+        for parameter in self.model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(inverse)
+        normalizers = getattr(state.loss_fn, "metric_normalizations", None)
+        fallback = MetricNormalizer.TOKENS if token_loss else MetricNormalizer.SEQUENCES
+        metrics = []
+        for original in state.metrics:
+            kinds = {
+                key: (normalizers or {}).get(
+                    key,
+                    MetricNormalizer.NONE
+                    if "_min" in key or "_max" in key
+                    else fallback,
+                )
+                for key in original
+            }
+            normalized = rescale_loss_metrics(
+                original,
+                kinds,
+                token_factor=1.0 / max(toks, 1),
+                sequence_factor=1.0 / max(seqs, 1),
+            )
+            normalized.update(
+                lr=self.optimizer.param_groups[0]["lr"],
+                global_valid_seqs=seqs,
+                global_valid_toks=toks,
+            )
+            metrics.append(normalized)
+        norm = self._clip_policy_gradients()
+        self.optimizer.step()
+        self._update_moe_gate_bias_if_supported()
+        self.scheduler.step()
+        self.optimizer.zero_grad()
+        result = aggregate_training_statistics(
+            losses=[sum(state.losses) * inverse],
+            all_mb_metrics=metrics,
+            grad_norm=norm,
+            dp_group=self.dp_mesh.get_group(),
+            dtype=self.dtype,
+        )
+        self._train_step_state = None
+        self.timer.stop("train")
+        return result
+
+    @wrap_with_nvtx_name("automodel_policy_worker/abort_train_step")
+    def abort_train_step(self) -> None:
+        """Discard partial gradients while preserving optimizer and scheduler state."""
+        if self._train_step_state is not None:
+            self.optimizer.zero_grad()
+            self._train_step_state = None
+            self.timer.stop("train")
 
     @wrap_with_nvtx_name("automodel_policy_worker/get_logprobs")
     def get_logprobs(
@@ -1673,11 +1872,8 @@ class AutomodelPolicyWorkerImpl(
     def move_buffer_to_device(
         self, model: nn.Module, device: str | torch.device
     ) -> nn.Module:
-        # FSDP modules do not move buffers to the device automatically
-        for v in model.buffers():
-            torch.utils.swap_tensors(v, v.to(device))
-
-        return model
+        # FSDP modules do not move buffers to the device automatically.
+        return move_model_buffers_to_device(model, device)
 
     def move_to_cuda(self, model: torch.nn.Module) -> torch.nn.Module:
         model = self.move_to_device(model, "cuda")

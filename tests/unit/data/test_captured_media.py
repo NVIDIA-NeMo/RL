@@ -43,7 +43,11 @@ from nemo_rl.data.captured_media import (
 from nemo_rl.data.captured_media import (
     capture_processed_media as _capture_processed_media,
 )
-from nemo_rl.data.multimodal_utils import reassemble_packed_multimodal, row_shapes_key
+from nemo_rl.data.multimodal_utils import (
+    reassemble_packed_multimodal,
+    row_shapes_key,
+    unpack_dynamic_image_patches,
+)
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.data_plane.schema import DP_TRAIN_FIELDS
 from nemo_rl.data_plane.tq_token_sink import (
@@ -1948,3 +1952,44 @@ def test_text_only_forest_keeps_pinned_media_columns_on_padding(dp):
     assert fields["pixel_values"].dtype == torch.float32
     assert fields["sample_mask"].tolist() == [1.0, 0.0, 0.0, 0.0]
     assert dp.list_sample_ids("staging") == []
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_captured_patch_inverse_preserves_pixels_and_gradients(
+    dtype: torch.dtype,
+) -> None:
+    sizes = torch.tensor([[4, 8], [8, 4]], dtype=torch.int32)
+    pixels = torch.arange(2 * 3 * 8 * 8, dtype=dtype).reshape(2, 3, 8, 8)
+    pixels.requires_grad_()
+    patches = pack_images(pixels, sizes, patch_size=2).squeeze(0)
+    restored = unpack_dynamic_image_patches(patches, sizes, patch_size=2)
+    for index, (h, w) in enumerate(sizes.tolist()):
+        assert torch.equal(restored[index, :, :h, :w], pixels[index, :, :h, :w])
+        assert torch.count_nonzero(restored[index, :, h:, :]) == 0
+        assert torch.count_nonzero(restored[index, :, :, w:]) == 0
+    restored.sum().backward()
+    for index, (h, w) in enumerate(sizes.tolist()):
+        assert torch.equal(
+            pixels.grad[index, :, :h, :w], torch.ones_like(pixels[index, :, :h, :w])
+        )
+        assert torch.count_nonzero(pixels.grad[index, :, h:, :]) == 0
+        assert torch.count_nonzero(pixels.grad[index, :, :, w:]) == 0
+
+
+@pytest.mark.parametrize(
+    "sizes, patch_rows", [([[0, 4]], 0), ([[3, 4]], 3), ([[4, 4]], 3), ([[4, 4]], 5)]
+)
+def test_captured_patch_inverse_rejects_corrupt_geometry(
+    sizes: list[list[int]], patch_rows: int
+) -> None:
+    with pytest.raises(ValueError, match="geometry|patch count"):
+        unpack_dynamic_image_patches(
+            torch.zeros(patch_rows, 12), torch.tensor(sizes), patch_size=2
+        )
+
+
+def test_captured_patch_inverse_accepts_empty_text_row() -> None:
+    result = unpack_dynamic_image_patches(
+        torch.empty(0, 12), torch.empty(0, 2, dtype=torch.int32), patch_size=2
+    )
+    assert result.shape == (0, 3, 0, 0)

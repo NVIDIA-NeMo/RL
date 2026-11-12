@@ -1,0 +1,24 @@
+# Mixed coding harness routes share the single recipe's Super VL learner and reward.
+defaults: mm_coding_multi.yaml
+
+checkpointing:
+  checkpoint_dir: results/grpo-super35-mm-coding-mixed
+
+# A multi-turn history can retain the reference and several preview images.
+policy:
+  generation:
+    vllm_kwargs:
+      limit_mm_per_prompt:
+        image: 32
+
+env:
+  nemo_gym:
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/mm_coding_training/configs/mm_coding_mixed.yaml
+    - nemo_gym/sandbox/providers/opensandbox/configs/opensandbox.yaml
+
+logger:
+  log_dir: logs/grpo-super35-mm-coding-mixed
+  wandb:
+    name: super35-mm-coding-mixed-acceptance

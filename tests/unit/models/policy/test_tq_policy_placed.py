@@ -40,7 +40,11 @@ def _meta(rank: int, fields: list[str]) -> KVBatchMeta:
 
 def _policy() -> tuple[TQPolicy, MagicMock]:
     policy = object.__new__(TQPolicy)
-    policy.cfg = {"train_global_batch_size": 4, "train_micro_batch_size": 1}
+    policy.cfg = {
+        "train_global_batch_size": 4,
+        "train_micro_batch_size": 1,
+        "make_sequence_length_divisible_by": 1,
+    }
     policy._router_replay_enabled = False
     policy._opd_full_field = None  # opd_full off, as __init__ leaves it
     policy.flops_tracker = None
@@ -85,6 +89,65 @@ def test_train_placed_microbatches_keeps_fields_and_replica_delivery() -> None:
         "pipeline_parallel",
     ]
     worker_group.get_all_worker_results.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "model_multiple,producer_multiple,dynamic_round,expected",
+    [(256, 16, None, 13312), (64, 48, 80, 13440)],
+)
+def test_forward_padding_honors_all_alignment_requirements(
+    model_multiple: int,
+    producer_multiple: int,
+    dynamic_round: int | None,
+    expected: int,
+) -> None:
+    policy, _ = _policy()
+    policy.cfg["make_sequence_length_divisible_by"] = model_multiple
+    if dynamic_round is not None:
+        policy.use_dynamic_batches = True
+        policy.dynamic_batching_args = {"sequence_length_round": dynamic_round}
+        policy.cfg["dynamic_batching"] = {"train_mb_tokens": 16384}
+    meta = _meta(0, ["input_ids"])
+    meta.sequence_lengths = [13199, 13200]
+    meta.extra_info["pad_to_multiple"] = producer_multiple
+
+    policy._stamp_pad_seqlen(meta)
+    policy._stamp_pad_seqlen(meta)
+
+    assert meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] == expected
+    assert meta.sequence_lengths == [13199, 13200]
+
+
+def test_placed_forward_padding_combines_model_and_each_producer_grid() -> None:
+    policy, worker_group = _policy()
+    policy.cfg["make_sequence_length_divisible_by"] = 256
+    metas = [_meta(0, ["input_ids"]), _meta(1, ["input_ids"])]
+    for meta, multiple in zip(metas, [16, 48]):
+        meta.sequence_lengths = [13199, 13200]
+        meta.extra_info.update(
+            pad_to_multiple=multiple, global_forward_pad_seqlen=65536
+        )
+
+    policy.train_placed_microbatches(metas)
+
+    dispatched = worker_group.run_all_workers_sharded_data.call_args.kwargs["meta"]
+    assert [meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] for meta in dispatched] == [
+        13824,
+        13824,
+    ]
+    assert all(meta.extra_info[GLOBAL_FORWARD_PAD_SEQLEN] == 65536 for meta in metas)
+    assert all(meta.sequence_lengths == [13199, 13200] for meta in dispatched)
+
+
+def test_placed_forward_rejects_invalid_producer_alignment_before_dispatch() -> None:
+    policy, worker_group = _policy()
+    metas = [_meta(0, ["input_ids"]), _meta(1, ["input_ids"])]
+    metas[1].extra_info["pad_to_multiple"] = 0
+
+    with pytest.raises(ValueError, match="padding multiples must be positive"):
+        policy.train_placed_microbatches(metas)
+
+    worker_group.run_all_workers_sharded_data.assert_not_called()
 
 
 def test_train_placed_microbatches_requires_one_batch_per_dp_rank() -> None:

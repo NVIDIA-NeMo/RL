@@ -58,6 +58,177 @@ configured.
 
 ## Example Recipes
 
+### Single-answer multimodal coding through NeMo Gym
+
+The internal Gym `mm_coding_training` component supports Chart2Code, MMSVG
+Img2SVG/Text2SVG, Image2Struct LaTeX and Design2Code. The recipe
+[`mm_coding_single.yaml`](../../../../examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_single.yaml)
+inherits the Super Automodel/vLLM setup and replaces the task, data and Gym
+bindings. Its default limit is **three optimizer updates**. The recovery helper
+then targets a fourth update in a fresh process. This acceptance test is not a
+production training budget or a claim of improved benchmark performance. It uses 8 training and
+8 generation nodes, 4 GPUs per node, as inherited from the agentic recipe.
+No jobs are started by preparing or resolving it.
+
+Install the internal Gym contribution in the runtime used by the driver and
+Gym server workers. Its component and config must be visible from every node;
+a stock public Gym checkout alone does not supply the internal component.
+Configure the remote sandbox provider and quality judge on the trusted Gym
+side, following that component's README. Do not put judge or registry keys in
+training rows, model requests or candidate sandboxes.
+
+Source-owned acquisition and split conversion remain upstream. Adapt prepared
+`nemo-rl-mm-coding` task records with:
+
+```bash
+uv run examples/nemo_gym/nemotron-3.5-super-vl/prepare_mm_coding_single.py \
+  --input /approved/source/train-tasks.jsonl --output /shared/coding/train.jsonl \
+  --reference-root /shared/coding/assets --split train --max-output-tokens 8192
+```
+
+For an existing source Gym JSONL envelope, add `--input-format legacy-row`.
+This reads the original task metadata and rebuilds the agent-facing input; it
+does not reuse old harness instructions or completions. Run the adapter
+separately for an approved validation split. The adapter preserves
+prompt text and image bytes, puts reference source only in verifier metadata,
+rejects duplicate task IDs and refuses to overwrite an existing dataset. It
+does not prove that a caller-labeled split is free of held-out evaluation data.
+
+Before allocating GPUs, run the runtime check in the driver and every actor
+interpreter (Gym and generation included):
+
+```bash
+python examples/nemo_gym/nemotron-3.5-super-vl/check_mm_coding_runtime.py
+# For multi or mixed, match the adapter's mode and optional harness subset:
+python examples/nemo_gym/nemotron-3.5-super-vl/check_mm_coding_runtime.py --mode multi
+```
+
+The current NeMo RL Gym submodule pin predates the submitted Gym package layout
+and public session/sandbox-lending APIs. Merely adding the resources config does not update actor
+interpreters: default actor commands use `uv run --locked`. Install the submitted
+internal Gym revision and its dependencies into each deployment-owned runtime,
+and configure the deployment to retain those environments. The existing
+`NEMO_RL_VENV_DIR` selects the deployment-owned per-actor venv cache. Prebuild
+those venvs with `nemo_rl/utils/prefetch_venvs.py`, install the reviewed Gym
+revision into every Gym-dependent actor venv and the driver, and run
+`uv pip check --python <actor-venv>/bin/python` plus this preflight under each
+interpreter. Retain the exact dependency reports. Use a new cache directory
+for this experiment; do not modify another run's cached environments. Leave
+`NRL_FORCE_REBUILD_VENVS` unset so the already-provisioned per-actor venvs are
+reused. A dependency conflict must be resolved in the runtime packaging rather
+than hidden with a skipped dependency check. Do not use the stock
+Gym pin or assume `NEMO_GYM_EXTRA_ROOTS` alone upgrades core APIs. A supported
+runtime packaging/pin update and real actor startup are merge gates for this
+draft. The check verifies API/component discovery only, not model kernels,
+credentials, network reachability, token capture or optimizer correctness.
+
+OpenCode multi/mixed additionally requires Gym's harness-note token-capture
+support ([Gym #5833](https://github.com/NVIDIA-NeMo/Gym/pull/5833), or the merged
+successor). OpenCode can append its own assistant step-limit note or lowercase
+a tool name; a Gym revision without the fix can lose the model-call parent and
+mask the rollout. The mode-aware preflight refuses the missing module before
+GPU allocation. The default migration path is single + OpenCode multi/mixed;
+Codex and Hermes are deferred from this submission. The multimodal session path
+uses OpenCode, matching the Environment Server migration guidance. Module
+discovery is a prerequisite, not proof
+that a rollout's tokens, images and logprobs were captured correctly.
+
+Set `MM_CODING_TRAIN_DATA` and `MM_CODING_VALIDATION_DATA` to the adapted files,
+and `MM_CODING_REFERENCE_ROOT` to their shared reference root. Both data paths
+are required; the recipe never falls back to the synthetic examples or an
+evaluation test set. Then launch through `examples/run_grpo_single_controller.py`
+with `--config examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_single.yaml`.
+
+These coding recipes enable the existing SingleController token-capture path
+and native data-plane checkpointing. Typed multi-turn environment results do
+not contain a legacy terminal response; they require captured model-call tokens
+and images. The legacy `run_grpo_nemo_gym.py` entrypoint does not support that
+capture path. Recovery uses the existing `sibling` boundary; this does not claim
+in-flight typed-episode turn recovery.
+
+Automodel split training accumulates gradients across chunks and applies the
+complete batch normalization before one optimizer and scheduler update. This
+path supports FP32/BF16, TP=CP=1 and fixed microbatches. Dynamic batching,
+sequence packing/parallelism, draft co-training, positive-example NLL and
+in-loss survivor filtering are rejected before GPU allocation.
+
+Captured still images use the native Automodel `NemotronOmni` dynamic-resolution
+forward. The learner restores the packed patches to padded pixels without
+resizing or changing pixel values, and keeps each image's native dimensions.
+This path requires TP=CP=1, sequence packing/parallelism disabled, and the custom
+model (`force_hf` disabled). Native video requires Megatron. Geometry, image-token
+counts and selective media masks that the native forward cannot represent fail
+explicitly before a forward; they do not fall back to text-only training.
+
+After provisioning the role environments, run
+`bash tests/functional/mm_coding_super35_train_resume.sh mixed -- <Hydra overrides>`
+inside an approved GPU allocation. Set `MM_CODING_ACCEPTANCE_ROOT` to a new
+output directory and supply the **matching mode's** train/validation files.
+The helper runs three updates, exits, and starts a separate process targeting
+step four with the same optimizer, checkpoint root and data. Override
+`MM_CODING_SAVE_STEPS` for a different test duration. It does not submit jobs.
+Set `MM_CODING_CHECKPOINT_ROOT` to use separate checkpoint storage; logs remain
+under `MM_CODING_ACCEPTANCE_ROOT`. Both paths must be new: the helper rejects
+existing checkpoint directories, including empty directories and dangling links,
+so the first phase cannot resume an earlier test.
+Pass resource overrides explicitly: the inherited production recipe requests
+16 nodes, including eight generation nodes. Successful process exits and
+checkpoint directories are preliminary; inspect the retained native restore,
+optimizer, token/image/logprob and data-cursor evidence before accepting recovery.
+
+The recipe uses learner TP1/CP1 without packing or sequence parallelism, keeps
+the model's image processor and raw vLLM logprobs, and masks invalid Gym
+measurements. `policy.is_vlm: true` selects processor loading in the training
+entrypoint, including for mixed batches that also contain text-only tasks.
+Existing NeMo RL model support is reused; the trainer, optimizer
+and GRPO loss are unchanged. The compatible Gym runtime described above must
+still be provisioned and validated.
+Renderer/judge failures are excluded; measured model execution failures remain
+eligible zero rewards. The quality reward is distinct from official evaluation
+metrics, whose EFB configurations remain separate.
+
+Use `--mode multi` for stock OpenCode sessions per task, or
+`--mode mixed` for the source task-family single/multi proportions. `--seed`
+and `--epoch` freeze routing when preparing the file, before GRPO siblings are
+expanded. The model-visible task prompt is preserved; multi adds workspace and
+preview instructions. Private grading metadata stays outside model input.
+Before reusing previously prepared multi/mixed rows, verify that their typed
+tasksets select only `mm-coding:opencode` and their system prompts explain that
+only the self-contained final answer file reaches a fresh grading sandbox.
+Regenerate rows that fail either check with the current adapter; an explicit
+`--harnesses opencode` argument alone does not update an existing prompt.
+Use the matching [`mm_coding_multi.yaml`](../../../../examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_multi.yaml)
+or [`mm_coding_mixed.yaml`](../../../../examples/nemo_gym/nemotron-3.5-super-vl/mm_coding_mixed.yaml)
+recipe. All three recipes share the learner, optimizer and reward settings. Multi and
+mixed permit up to 32 images per request instead of the single-answer cap of
+2, so retained reference/preview observations do not fail after two images. The
+16384-token context and adapter/model-server request limits still apply.
+The OpenCode model name follows `policy.model_name`. Its output limit follows
+`policy.generation.max_new_tokens`, and its context budget is the total sequence
+length minus that output limit. Keep the output limit below the total length.
+The Gym deployment also needs PR #5719 (public lifecycle and `LentSandboxes`)
+and the typed catalog-row validator follow-up, or their merged successors.
+Use the exact reviewed dependency SHAs, not an unpinned moving branch. OpenCode
+must be preinstalled in the remote image; supply pinned ripgrep and plugin
+bundles through the resource owner's runtime files before sandbox activation.
+The task network is `model_only`, so runtime downloads during an episode fail.
+Only the policy model is externally advertised; agent, head and judge stay on
+loopback. Preserve these boundaries in actor deployments.
+
+Multi rows route typed tasksets to Gym's existing sandboxed harnesses; single
+rows use the `single_agent_turn_legacy` simple-agent relay. This contribution does not port the
+experimental V2 asynchronous controller or change GRPO loss/optimizer behavior.
+
+The acceptance recipe prepares three GRPO steps and saves optimizer state at
+each step. This configuration does not establish that those steps or recovery
+have run on the submitted source.
+
+The source experiments passed two-step Super acceptance on a different pinned
+runtime and checkpoint. The recipe selects the documented public Super 3.5 VL
+BF16 model; the historical row90 Base result is not a new GPU acceptance for
+this recipe. Record exact source/model/image pins, real smoke rollouts and any
+new training/recovery results with the draft before advancing it to merge.
+
 Automodel training with vLLM generation. The text and image recipes colocate
 generation with training; the agentic recipe runs async GRPO with generation on
 its own node pool. The recipe YAMLs are the source of truth.
