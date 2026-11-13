@@ -393,7 +393,10 @@ members = [
   # globally we must choose 1.X otherwise we run into pickle issues from ray.
   "research/template_project",
   "research/flow_grpo",
+  "research/speechlm_gspo",
 ]
+# Separately locked actor environments of research projects.
+exclude = ["research/speechlm_gspo/envs/*"]
 
 [[tool.uv.index]]
 name = "pypi"
