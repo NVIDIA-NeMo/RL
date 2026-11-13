@@ -95,6 +95,7 @@ The generated fields are:
 | `POOL_STARTUP_TIMEOUT` | no | `3600` | Seconds allowed for startup. |
 | `POOL_SHARED_PATHS` | no | empty | Newline-separated absolute paths under `EXTERNAL_VLLM_SHARED_ROOT` that the pool container must access. |
 | `POOL_ENV_VARS` | no | empty | Newline-separated `NAME=value` assignments applied before vLLM starts. |
+| `POOL_CACHE_DIR` | no | empty | Persistent JIT compile cache under `EXTERNAL_VLLM_SHARED_ROOT` (vLLM, TorchInductor, Triton, FlashInfer). Each node copies it to local disk before Ray starts and writes new entries back in the background (`cache_sync.sh`), so later jobs skip recompiling. `NRL_COMPILE_CACHE_FORCE_FRESH=1` starts empty but still writes back. The script is `nemo_rl/utils/cache_sync.sh` in the checkout these tools are in, or `NRL_COMPILE_CACHE_SYNC_SCRIPT`. |
 | `POOL_VLLM_ARGS` | no | empty | Newline-separated vLLM CLI arguments, one argv entry per line. |
 
 Registration validates required fields, positive topology values, TCP port
@@ -195,6 +196,10 @@ available, the wrapper falls back to the installed `nemo_rl` package.
 `CONTAINER` must provide
 `EXTERNAL_VLLM_LB_PYTHON` with `aiohttp` installed.
 
+### Persistent compile caches for NeMo RL workers
+
+The vLLM and Megatron workers can keep their JIT caches the same way; see [Persistent JIT Compile Caches](../../docs/guides/persistent-jit-caches.md).
+
 ## Slurm submission
 
 The wrapper requires exactly two hetgroups. Submit the NeMo RL nodes first and
@@ -218,6 +223,10 @@ sbatch \
   --time=04:00:00 \
   tools/external_gym_vllm/run_in_allocation.sh
 ```
+
+Test-suite scripts submit this way through `tools/launch` when their CONFIG
+section sets `NUM_EXTERNAL_SERVICE_NODES`; see "External vLLM pools" in
+`tests/test_suites/README.md`.
 
 Slurm gang-schedules the two components. Replica `srun` steps explicitly use
 hetgroup 1 and load-balancer steps explicitly use hetgroup 0. When starting

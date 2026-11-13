@@ -152,10 +152,14 @@ sbatch ray.sub \
   - Number of GPUs each Ray worker node claims. To determine this, run `nvidia-smi` on a worker node.
 * - `DEDICATED_RAY_HEAD=0`
   - Set to `1` to run the first allocated node as a GPU-free Ray head: it hosts
-    only the Ray control plane and the driver, advertises `--num-gpus=0`, and
+    the Ray control plane and the driver, advertises `--num-gpus=0`, and
     carries neither `worker_units` nor the topology resources, so no GPU actor
     or topology-constrained placement group can land on it. Use this when driver
     or head-node memory pressure is destabilizing training.
+
+    The head also advertises a `ray_head: 1` resource. Single-controller GRPO and
+    PPO runs (`examples/run_grpo_single_controller.py`) place the controller
+    there, next to the control plane instead of beside GPU workers.
 
     **You must shrink the driver's node count yourself.** `ray.sub` cannot see
     inside your `COMMAND`, so it only prints the effective GPU-node count. With
@@ -197,6 +201,9 @@ sbatch ray.sub \
     subcommands invoke (`unsquashfs` for `enroot create`, `squashfuse` and
     `fuse-overlayfs` for starting a `.sqsh` image directly). With
     `tools/launch`, pass the variable through `EXTRA_ENV`.
+* - `NRL_COMPILE_CACHE_SHARED_DIR`, `NRL_COMPILE_CACHE_LOCAL_DIR`
+  - Keep vLLM's and Megatron's JIT compile caches between jobs. Unset by default.
+    See [Persistent JIT Compile Caches](guides/persistent-jit-caches.md).
 * - `BASE_LOG_DIR=$SLURM_SUBMIT_DIR`
   - Base directory for storing Ray logs. Defaults to the Slurm submission directory ([SLURM_SUBMIT_DIR](https://slurm.schedmd.com/sbatch.html#OPT_SLURM_SUBMIT_DIR)).
 * - `LOKI_PUSH_URL`

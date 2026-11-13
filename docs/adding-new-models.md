@@ -393,15 +393,15 @@ The script generates from a counting prompt, appends the output back into the pr
 
 ## [6.vllm_routed_experts_completeness.py](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/model_diagnostics/6.vllm_routed_experts_completeness.py)
 
-Checks that vLLM returns a routed-experts record for **every** generated route, which router replay (R3) relies on for MoE models. Requires a vLLM build that supports `enable_return_routed_experts`. It reproduces rare omissions seen with prefix caching plus chunked prefill, where a few samples come back missing routed-expert rows even though most are complete.
+Checks that vLLM returns a routed-experts record for **every** generated route, which router replay (R3) relies on for MoE models. Requires a vLLM build that supports `enable_return_routed_experts`. Prefix caching is always on, because vLLM refuses to return routed experts without it. The prompts share a long prefix, so the check also covers routes that come from cached blocks.
 
 ```sh
 # Baseline — expect num_failures: 0
 uv run --extra vllm tools/model_diagnostics/6.vllm_routed_experts_completeness.py Qwen/Qwen3-30B-A3B
 
-# Stress the known failure mode (prefix caching + chunked prefill)
+# Also split long prompts across steps (chunked prefill)
 uv run --extra vllm tools/model_diagnostics/6.vllm_routed_experts_completeness.py \
-    Qwen/Qwen3-30B-A3B --enable-prefix-caching --enable-chunked-prefill
+    Qwen/Qwen3-30B-A3B --enable-chunked-prefill
 ```
 
 For each prompt it compares the number of returned routed-expert rows (prompt + completion) against the expected `valid_length - 1`, and reports any sample with missing or surplus routes. It prints a JSON summary and exits non-zero if any sample is incomplete:
@@ -409,7 +409,6 @@ For each prompt it compares the number of returned routed-expert rows (prompt + 
 ```
 {
   "enable_chunked_prefill": false,
-  "enable_prefix_caching": false,
   "failures": [],
   "model": "Qwen/Qwen3-30B-A3B",
   "num_failures": 0,

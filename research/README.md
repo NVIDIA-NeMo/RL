@@ -62,9 +62,14 @@ Authors are encouraged to write tests for their research projects. This template
 
 Unit and functional tests are discovered under `research/*/tests/unit/` and
 `research/*/tests/functional/*.sh`. Before running them, CI changes into the
-project directory and runs `uv sync --locked --inexact --group test`. Declare
+project directory and runs `uv sync --locked --group test`. Declare
 runtime dependencies and a `test` dependency group in the project's
 `pyproject.toml`, add the project to the root uv workspace, and update `uv.lock`.
+
+Each research project can pin a different torch. When you switch projects in one
+venv, run the exact `uv sync --locked --group test` (no `--inexact`) or use a fresh
+environment; otherwise packages built for the previous project's torch (for
+example TransformerEngine) stay behind and fail with an `undefined symbol` error.
 
 Suite scripts under `research/<project>/tests/test_suites/**/*.sh` must be
 listed by their repository-relative path in one of the core
