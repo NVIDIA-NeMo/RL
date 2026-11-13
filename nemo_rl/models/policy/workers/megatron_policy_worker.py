@@ -4807,7 +4807,7 @@ class MegatronPolicyWorkerImpl(
         """Compare draft weights with the misc metadata sent at prepare time."""
         # The consumer sizes its buffers from misc_meta, so drift must fail
         # through the preflight token, not as a mismatched packed broadcast.
-        misc_meta = self.nccl_reshard_refit_infos[0]["misc_meta"]
+        misc_meta = self.nccl_reshard_refit_infos[0].get("misc_meta", {})
         for name, tensor in draft_weights:
             meta = misc_meta.get(name)
             if meta is None:
