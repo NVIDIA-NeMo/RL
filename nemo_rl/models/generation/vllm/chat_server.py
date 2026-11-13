@@ -23,6 +23,7 @@ where vLLM is installed.
 
 import asyncio
 import copy
+import functools
 import logging
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -380,6 +381,9 @@ class NeMoRLOpenAIServingMixin:
         plan = await prepare_prompt(
             rendered,
             resolve_prefix=host._resolve_admission_prefix,
+            run_blocking=functools.partial(
+                host._run_capture_io, host._capture_read_executor
+            ),
             turn_end_token_ids=turn_end_token_ids(
                 self._model_stop_token_ids, self.renderer.tokenizer
             ),

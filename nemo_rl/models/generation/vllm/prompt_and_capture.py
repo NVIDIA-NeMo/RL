@@ -36,7 +36,7 @@ This module imports vLLM; import it only where vLLM is installed.
 import asyncio
 import logging
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Collection, Optional, Protocol
+from typing import Any, Awaitable, Callable, Collection, Optional, Protocol
 
 import torch
 from vllm.entrypoints.serve.exception_handling.error_response import (
@@ -357,6 +357,7 @@ async def prepare_prompt(
     max_model_len: int,
     measure_only: bool,
     tokenizer: Any = None,
+    run_blocking: Callable[..., Awaitable[Any]] = asyncio.to_thread,
 ) -> PreparedPrompt:
     """Prepare a rendered call's prompt: the ids the engine runs, and its output budget.
 
@@ -364,6 +365,8 @@ async def prepare_prompt(
         rendered: The call's render.
         resolve_prefix: Reads a token-in admission's prefix from TQ. It blocks,
             so it runs off the event loop.
+        run_blocking: Runs ``resolve_prefix`` off the event loop; the vLLM
+            worker passes its capture read pool.
         turn_end_token_ids: Every id a turn can end on; the splice cuts by them.
         max_model_len: The engine's context length.
         measure_only: Whether Gym only measures the prompt. Such a call counts
@@ -379,7 +382,7 @@ async def prepare_prompt(
     prefix = rendered.required_prefix_token_ids
     serving = rendered.serving_admission
     if serving is not None and serving.mode == "token_in":
-        prefix = await asyncio.to_thread(resolve_prefix, serving)
+        prefix = await run_blocking(resolve_prefix, serving)
     splice = None
     prompt_token_ids = rendered.template_token_ids
     if prefix is not None:
@@ -494,9 +497,8 @@ async def start_capture(
     media = None
     media_admission = admission if splice is None else serving_admission
     if restored is None and media_admission is not None:
-        # Off-loop: a retained-media check reads staged calls.
-        media = await asyncio.to_thread(
-            host._capture_request_media,
+        # A retained-media check reads staged calls (off-loop when media capture is on).
+        media = await host._capture_request_media_async(
             engine_prompt,
             admission=media_admission,
             splice=splice,
@@ -505,7 +507,8 @@ async def start_capture(
     elif restored is not None:
         # The saved rows are the prompt, but its media still sits where the
         # prepared prompt's splice puts it. Off-loop: it hashes the pixels.
-        media = await asyncio.to_thread(
+        media = await host._run_capture_io(
+            host._capture_read_executor,
             host._capture_restored_media,
             engine_prompt,
             admission=admission,
@@ -552,7 +555,9 @@ async def save_capture(host: Any, request: Any, content: dict) -> dict:
     round trip.
     """
     try:
-        return await asyncio.to_thread(host._finish_request_capture, request, content)
+        return await host._run_capture_io(
+            host._capture_write_executor, host._finish_request_capture, request, content
+        )
     except asyncio.CancelledError:
         # Queued executor work may never start after cancellation.
         # If staging already claimed the capture, abort is a no-op.
