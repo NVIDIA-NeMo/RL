@@ -2777,6 +2777,12 @@ class RolloutManager:
                     )
                     self._stats.skipped += 1
                     return RolloutOutcome.SKIPPED
+                print(
+                    f"retrying prompt idx={input_sample['idx']} after deterministic "
+                    f"failure {data_attempts}/{policy.max_data_attempts} "
+                    f"({reason}: {error})",
+                    flush=True,
+                )
                 # A data retry, NOT a re-dispatch: the fleet is fine, this prompt is
                 # suspect. Recording it as a re-dispatch made rollout/redispatch_total --
                 # documented above as the sign the fleet is degrading -- climb for bad
@@ -2932,6 +2938,12 @@ class RolloutManager:
                 ):
                     self._stats.record_data_failure(reason)
                     raise
+                print(
+                    f"retrying prompt idx={input_sample['idx']} after deterministic "
+                    f"failure {data_attempts}/{policy.max_data_attempts} "
+                    f"({reason}: {error})",
+                    flush=True,
+                )
                 self._stats.record_data_retry(reason)
                 continue
 
