@@ -150,6 +150,30 @@ docker buildx build -f docker/Dockerfile \
     .
 ```
 
+## Example: a Smaller Image for One Setup
+
+The build arguments above can be combined. This builds only the Megatron, vLLM and NeMo Gym backends, for GB300 only, to run as root, with a Gym tree from another directory:
+
+```sh
+docker buildx build -f docker/Dockerfile \
+    --build-arg NRL_EXTRAS="mcore vllm nemo_gym" \
+    --build-arg TORCH_CUDA_ARCH_LIST=10.3 \
+    --build-arg NVTE_CUDA_ARCHS=103 \
+    --build-arg ROOT_ONLY=1 \
+    --build-arg STRIP_UV_CACHE=1 \
+    --build-context nemo-gym=<path-to-gym> \
+    --tag <registry>/nemo-rl:latest \
+    .
+```
+
+| Setting | Section |
+|---|---|
+| `NRL_EXTRAS`, `NRL_GROUPS` | [Building Only Some Backends](#building-only-some-backends) |
+| `TORCH_CUDA_ARCH_LIST`, `NVTE_CUDA_ARCHS`, `FLASH_ATTN_CUDA_ARCHS`, `FLASH_MLA_DISABLE_SM90`, `NVCC_THREADS` | [Compiling for Fewer GPU Types](#compiling-for-fewer-gpu-types) |
+| `ROOT_ONLY` | [Root-Only Image](#root-only-image) |
+| `STRIP_UV_CACHE` | [Stripping the uv Cache](#stripping-the-uv-cache) |
+| `nemo-gym` build context | [NeMo Gym Source From Another Directory](#nemo-gym-source-from-another-directory) |
+
 ## Custom Setup Commands
 
 By default, the Docker image installs [apptainer](https://apptainer.org/) (with a `singularity` symlink) via a pluggable `custom-setup` build stage. The default script is `docker/install_apptainer.sh`. You can override or skip this step at build time.
