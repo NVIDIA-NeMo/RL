@@ -32,18 +32,27 @@ import time
 from collections import Counter
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
+import torch
+
+from nemo_rl.data_plane.schema import ROUTED_EXPERTS_FIELD
 from nemo_rl.models.generation.prefix_recovery.parts import PrefixRecoveryParts
 from nemo_rl.models.generation.prefix_recovery.restore import (
     _generation_cut_blockers,
     restore_reply_text,
 )
+from nemo_rl.models.generation.prefix_recovery.routes import (
+    _cut_chunk_routes,
+    _join_chunk_routes,
+    _prefix_routes_sha256,
+)
 from nemo_rl.models.generation.prefix_recovery.state import (
     _CompletedCaptureState,
     _RequestCaptureState,
 )
+from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
 
 LOGGER = logging.getLogger(__name__)
 
@@ -94,10 +103,11 @@ def _require_inventory_identity(
 
 @dataclass(frozen=True)
 class _ResolvedGenerationCut:
-    """A verified restored prefix and the media its call carried."""
+    """A verified restored prefix, with its call's media and router-replay routes."""
 
     snapshot: Any
     media: Any | None = None
+    routed_experts: torch.Tensor | None = None
 
 
 def _ends_inside_character(tokenizer: Any, generated_token_ids: list[int]) -> bool:
@@ -199,9 +209,25 @@ class PrefixRecovery:
             )
             finish_reason = getattr(output, "finish_reason", None)
             stop_reason = getattr(output, "stop_reason", None)
+            terminal_routes = None
+            if state.routed_experts_dtype is not None and finish_reason is not None:
+                route_parts = [
+                    value
+                    for value in (
+                        getattr(request_output, "prompt_routed_experts", None),
+                        getattr(output, "routed_experts", None),
+                    )
+                    if value is not None
+                ]
+                if route_parts:
+                    terminal_routes = torch.cat(
+                        [torch.as_tensor(value) for value in route_parts], dim=0
+                    )
         except (RuntimeError, TypeError, ValueError) as error:
             state.record_error(f"{type(error).__name__}: {error}")
             return
+        if terminal_routes is not None:
+            state.record_terminal_routes(terminal_routes)
         state.record(
             generation_token_ids,
             generation_logprobs,
@@ -303,7 +329,7 @@ class PrefixRecovery:
 
     def _record_progress(
         self, states: list[_RequestCaptureState], *, deadline: float | None
-    ) -> None:
+    ) -> dict[str, list[Any]]:
         """Record the tokens each call decoded since its last record.
 
         One read at an engine output boundary copies every call's new token
@@ -312,18 +338,30 @@ class PrefixRecovery:
         engine has finished but whose consumer has not yet taken the output is
         read whole, with its finish reason. One the engine does not hold (not
         yet submitted, or aborted) keeps what it has recorded.
+
+        Returns:
+            The route pieces the same read copied, by model call ID, for each
+            router-replay call whose final output has not already brought its
+            routes; a cut stages its routes from these.
         """
         pending = [
             (state, state.call.model_call_id, state.recorded_token_count)
             for state in states
         ]
         if not pending:
-            return
+            return {}
+        route_calls = frozenset(
+            model_call_id
+            for state, model_call_id, _ in pending
+            if state.routed_experts_dtype is not None
+            and state.snapshot().terminal_routed_experts is None
+        )
         reader = self._parts.progress_reader
         try:
             read = reader.read(
                 [(model_call_id, start) for _, model_call_id, start in pending],
                 timeout_s=None if deadline is None else deadline - time.monotonic(),
+                route_calls=route_calls,
             )
         except TimeoutError:
             LOGGER.warning(
@@ -331,7 +369,7 @@ class PrefixRecovery:
                 "deadline; %d calls are cut at the tokens they have recorded",
                 len(pending),
             )
-            return
+            return {}
         with self._lock:
             self._counts["progress_reads"] += 1
             self._counts["progress_read_calls"] += len(pending)
@@ -343,10 +381,13 @@ class PrefixRecovery:
             read.wait_seconds * 1e3,
             read.hold_seconds * 1e3,
         )
+        route_pieces = {}
         for state, model_call_id, start in pending:
             progress = read.progress.get(model_call_id)
             if progress is None:
                 continue
+            if progress.route_pieces is not None:
+                route_pieces[model_call_id] = progress.route_pieces
             try:
                 generated_logprobs = reader.logprobs(
                     progress.token_ids, progress.logprobs, start=start
@@ -361,6 +402,7 @@ class PrefixRecovery:
                 finish_reason=progress.finish_reason,
                 stop_reason=progress.stop_reason,
             )
+        return route_pieces
 
     @staticmethod
     def _failed_ack(prefix: Any, *, reason: str, uncut: Counter[str]) -> Any:
@@ -427,8 +469,14 @@ class PrefixRecovery:
         state: _RequestCaptureState,
         checkpoint_id: str,
         uncut: Counter[str],
+        *,
+        route_pieces: list[Any] | None = None,
     ) -> Any | None:
-        """Cut one live call, or return ``None`` if abort won the race."""
+        """Cut one live call, or return ``None`` if abort won the race.
+
+        ``route_pieces`` are the call's router-replay route pieces, copied with
+        its tokens by the cut's progress read.
+        """
         from nemo_gym._checkpoint.generation_cut import (
             GenerationCutPrefixAck,
         )
@@ -521,29 +569,70 @@ class PrefixRecovery:
                     else "incomplete_utf8_boundary",
                     uncut=uncut,
                 )
+            try:
+                chunk_routes = self._chunk_routes(
+                    owned, state, progress, frozen, route_pieces
+                )
+            except (TypeError, ValueError) as error:
+                # Only this call regenerates; the rest of the inventory is cut,
+                # and the next checkpoint tries this call again.
+                owned.rollback(checkpoint_id)
+                LOGGER.warning(
+                    "cannot cut model call %s: routed experts: %s: %s",
+                    prefix.model_call_id,
+                    type(error).__name__,
+                    error,
+                )
+                return self._failed_ack(
+                    prefix, reason="routed_experts_unavailable", uncut=uncut
+                )
             staged_key = None
             try:
+                # The advertised prefix digest covers tokens and call extras,
+                # not routes: each chunk's own digest covers its routes, and a
+                # restore checks every chunk's routes against it.
+                call_extras = self._parts.prefix_row_extras(state)
                 cumulative_record = capture.build_prefix_record(
                     state.call,
                     prompt_token_ids=state.prompt_token_ids,
                     generated_token_ids=generated_token_ids,
                     generated_logprobs=frozen.generated_logprobs,
-                    extras=self._parts.prefix_row_extras(state),
+                    extras=call_extras,
                 )
                 if frozen.chunk_token_ids:
-                    chunk_record = (
-                        cumulative_record
-                        if not progress.staging_keys
-                        else capture.build_generation_chunk_record(
+                    route_extras = None
+                    attachments = None
+                    if chunk_routes is not None:
+                        route_extras = {
+                            ROUTED_EXPERTS_FIELD: routed_experts_tensor_metadata(
+                                chunk_routes
+                            )
+                        }
+                        attachments = {ROUTED_EXPERTS_FIELD: chunk_routes}
+                    if progress.staging_keys:
+                        chunk_record = capture.build_generation_chunk_record(
                             state.call,
                             generated_token_ids=frozen.chunk_token_ids,
                             generated_logprobs=frozen.chunk_logprobs,
+                            extras=route_extras,
                         )
-                    )
+                    elif route_extras is None:
+                        chunk_record = cumulative_record
+                    else:
+                        # The first chunk is the whole prefix so far, with its
+                        # routes beside the call's extras.
+                        chunk_record = capture.build_prefix_record(
+                            state.call,
+                            prompt_token_ids=state.prompt_token_ids,
+                            generated_token_ids=generated_token_ids,
+                            generated_logprobs=frozen.generated_logprobs,
+                            extras={**(call_extras or {}), **route_extras},
+                        )
                     result = sink.stage_generation_prefix(
                         chunk_record,
                         checkpoint_id=checkpoint_id,
                         chunk_sequence=frozen.chunk_sequence,
+                        attachments=attachments,
                     )
                     staged_key = result.staging_key
                     if not result.ok:
@@ -587,6 +676,40 @@ class PrefixRecovery:
                 raise
             return acknowledgement
 
+    @staticmethod
+    def _chunk_routes(
+        owned: Any,
+        state: _RequestCaptureState,
+        progress: Any,
+        frozen: Any,
+        route_pieces: list[Any] | None,
+    ) -> torch.Tensor | None:
+        """The router-replay routes of the chunk a cut stages, or None.
+
+        A finished call's own output carries its routes; otherwise the cut's
+        progress read copied the engine's route pieces with its tokens.
+
+        Raises:
+            ValueError: the routes do not cover every token the cut stages.
+        """
+        dtype = state.routed_experts_dtype
+        if dtype is None:
+            return None
+        frozen_count = len(frozen.generated_token_ids)
+        staged = frozen_count - len(frozen.chunk_token_ids)
+        engine_routes = progress.terminal_routed_experts
+        if engine_routes is None and route_pieces is not None and frozen_count > staged:
+            engine_routes = owned.absorb_engine_route_pieces(route_pieces)
+        return _cut_chunk_routes(
+            engine_routes,
+            dtype=dtype,
+            prev_len=state.call.admission.prev_len,
+            prompt_len=len(state.prompt_token_ids),
+            restored=state.restored_routed_experts,
+            staged=staged,
+            frozen=frozen_count,
+        )
+
     def checkpoint_cut(self, inventory: Any, *, deadline: float | None = None) -> Any:
         """Stage a stable prefix for every call named by Gym's frozen inventory.
 
@@ -610,7 +733,7 @@ class PrefixRecovery:
             if (state := self._registry.get_by_model_call_id(prefix.model_call_id))
             is not None
         ]
-        self._record_progress(active_states, deadline=deadline)
+        route_pieces = self._record_progress(active_states, deadline=deadline)
         acknowledgements = []
         # Why each uncut call was left uncut; Gym counts them per checkpoint.
         uncut: Counter[str] = Counter()
@@ -633,7 +756,13 @@ class PrefixRecovery:
             state = self._registry.get_by_model_call_id(prefix.model_call_id)
             try:
                 acknowledgement = (
-                    self._cut_active(prefix, state, inventory.checkpoint_id, uncut)
+                    self._cut_active(
+                        prefix,
+                        state,
+                        inventory.checkpoint_id,
+                        uncut,
+                        route_pieces=route_pieces.get(prefix.model_call_id),
+                    )
                     if state is not None
                     else None
                 )
@@ -680,8 +809,11 @@ class PrefixRecovery:
         # Gym requires at least one staging key per continuation.
         staging_keys = list(continuation.staging_keys)
         # The finalization read also returns each row's extras, which carry a
-        # media call's spans and tensor digests; plain ``fetch`` does not.
-        chunks = self._parts.staging_source.fetch_for_finalization(staging_keys)
+        # media call's spans and tensor digests, and its route fragment when
+        # router replay is on; plain ``fetch`` returns neither.
+        chunks = self._parts.staging_source.fetch_for_finalization(
+            staging_keys, include_route_fragments=self._parts.router_replay
+        )
         if len(chunks) != len(staging_keys):
             raise RuntimeError("generation-cut fetch did not return every staged chunk")
         if not chunks:
@@ -693,23 +825,29 @@ class PrefixRecovery:
         admission: Any,
         prefix_token_ids: list[int],
         chunks: list[Any] | None = None,
-    ) -> Any:
+    ) -> _ResolvedGenerationCut:
         """Rebuild the cumulative prefix from an admission's staged chunks.
 
         ``chunks`` are the already-fetched chunks, so a restore that also reads
-        their media fetches once; they are fetched here when omitted.
+        their media fetches once; they are fetched here when omitted. With
+        router replay on, each chunk's routes are verified and joined too.
         """
         continuation = admission.generation_cut
         if chunks is None:
             chunks = self._fetch_chunks(continuation)
         snapshots = [chunk.snapshot for chunk in chunks]
         # A media call's spans and tensor digests ride the first chunk's extras,
-        # and the advertised prefix digest covers them.
-        if any(chunk.extras is not None for chunk in chunks[1:]):
+        # and the advertised prefix digest covers them. The source pops each
+        # chunk's route payload out of its decoded extras, so a router-replay
+        # chunk with nothing else decodes as ``{}``.
+        if any(chunk.extras for chunk in chunks[1:]):
             raise RuntimeError(
                 "only the first generation-cut chunk may carry call extras"
             )
-        extras = chunks[0].extras
+        # The cut digested no extras for a text call, so match it.
+        extras = chunks[0].extras or None
+        # Routes are checked per chunk and stay out of the prefix digest.
+        routed_experts = _join_chunk_routes(chunks, required=self._parts.router_replay)
         weight_versions = [snapshot.weight_version for snapshot in snapshots]
         if weight_versions != sorted(weight_versions):
             raise RuntimeError(
@@ -787,7 +925,8 @@ class PrefixRecovery:
         LOGGER.info(
             "generation prefix restored: rollout_id=%s model_call_id=%s "
             "source_model_call_id=%s prefix_tokens=%d prefix_digest=%s "
-            "weight_version_span=[%d,%d] prefix_ids_sha256=%s",
+            "weight_version_span=[%d,%d] prefix_ids_sha256=%s "
+            "prefix_routes_sha256=%s",
             admission.capture_key,
             admission.model_call_id,
             continuation.source_model_call_id,
@@ -796,8 +935,11 @@ class PrefixRecovery:
             weight_versions[0],
             weight_versions[-1],
             prefix_ids_sha256,
+            _prefix_routes_sha256(
+                routed_experts, generated_prefix_tokens=len(generated_prefix_ids)
+            ),
         )
-        return snapshot
+        return _ResolvedGenerationCut(snapshot=snapshot, routed_experts=routed_experts)
 
     def resolve_restore(
         self, admission: Any, prefix_token_ids: list[int]
@@ -808,8 +950,8 @@ class PrefixRecovery:
         generating the whole response from the turn boundary is always valid,
         so a prefix that cannot be fetched, whose media cannot be restored,
         or that does not match its admission costs time, not the rollout.
-        Returns the admission to serve and the verified prefix with its media,
-        or the admission without its cut and None.
+        Returns the admission to serve and the verified prefix with its media
+        and routes, or the admission without its cut and None.
         """
         continuation = admission.generation_cut
         if continuation is None:
@@ -818,7 +960,8 @@ class PrefixRecovery:
             # One fetch serves both the media and the prefix.
             chunks = self._fetch_chunks(continuation)
             media = self._parts.restore_media(chunks)
-            snapshot = self._rebuild_prefix(admission, prefix_token_ids, chunks)
+            resolved = self._rebuild_prefix(admission, prefix_token_ids, chunks)
+            snapshot = resolved.snapshot
             # Checked here, before the prefix is spliced into the prompt; Gym's
             # begin_call repeats it and would otherwise fail the call.
             if snapshot.digest != continuation.prefix_digest:
@@ -829,7 +972,7 @@ class PrefixRecovery:
                     f"rebuilt prefix has {generated} generated tokens, "
                     f"admission expects {continuation.prefix_token_count}"
                 )
-            return admission, _ResolvedGenerationCut(snapshot=snapshot, media=media)
+            return admission, replace(resolved, media=media)
         except Exception:  # noqa: BLE001 - any unusable prefix regenerates
             LOGGER.warning(
                 "cannot restore the generation prefix of model call %s; "

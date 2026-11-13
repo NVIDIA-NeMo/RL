@@ -274,7 +274,7 @@ def test_prefix_completion_retires_old_keys() -> None:
 
 
 def _dump_restored_run(
-    tmp_path: Path, *, flushed_keys: list[str]
+    tmp_path: Path, *, flushed_keys: list[str], phase2_log_text: str | None = None
 ) -> argparse.Namespace:
     """A phase-two trainer dump, log, and selection for ``verify-completion``."""
     from nemo_rl.algorithms.single_controller_utils.debug_writer import (
@@ -331,13 +331,14 @@ def _dump_restored_run(
         )
     )
     phase2_log = tmp_path / "phase2.log"
-    phase2_log.write_text(_completion_log("call-a"))
+    phase2_log.write_text(phase2_log_text or _completion_log("call-a"))
     return argparse.Namespace(
         selection_file=str(selection),
         recovery_log_dir=str(log_dir),
         recovery_staging_keys=str(staging_keys),
         recovery_flush_keys=str(flush_keys),
         phase2_log=str(phase2_log),
+        require_routes=False,
     )
 
 
@@ -764,3 +765,38 @@ def test_selected_snapshot_must_have_cut_every_active_call() -> None:
             snapshot,
             "rollout checkpoint save completed: /ckpt/snapshot_000002 (step=0)",
         )
+
+
+def _with_route_hashes(log: str, *, restored: str, completed: str) -> str:
+    """Append router replay's prefix route hashes to restore and completion lines."""
+    return "".join(
+        f"{line} prefix_routes_sha256="
+        f"{restored if 'prefix restored:' in line else completed}\n"
+        for line in log.splitlines()
+    )
+
+
+@pytest.mark.parametrize(
+    ("restored", "completed"),
+    [
+        ("a" * 64, "a" * 64),
+        ("a" * 64, "b" * 64),
+        ("a" * 64, "none"),
+        (None, None),
+    ],
+    ids=["staged", "recomputed", "dropped", "unlogged"],
+)
+def test_verify_completion_requires_the_restored_routes_to_be_staged(
+    tmp_path: Path, restored: str | None, completed: str | None
+) -> None:
+    log = _completion_log("call-a")
+    if restored is not None:
+        log = _with_route_hashes(log, restored=restored, completed=completed)
+    args = _dump_restored_run(tmp_path, flushed_keys=[], phase2_log_text=log)
+    args.require_routes = True
+
+    if restored is not None and restored == completed:
+        _SNAPSHOT_HELPER.verify_completion(args)
+    else:
+        with pytest.raises(AssertionError, match="restored prefix routes"):
+            _SNAPSHOT_HELPER.verify_completion(args)

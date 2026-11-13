@@ -1580,6 +1580,7 @@ def _generation_cut_route(
                 progress_reader=None,
                 prefix_row_extras=lambda state: None,
                 restore_media=lambda chunks: None,
+                router_replay=False,
             )
         )
         recovery.checkpoint_cut = checkpoint_cut

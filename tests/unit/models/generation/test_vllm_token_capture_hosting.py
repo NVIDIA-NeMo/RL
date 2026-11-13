@@ -26,6 +26,8 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
+import sys
 import threading
 import time
 from collections import Counter
@@ -33,8 +35,10 @@ from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import asdict, replace
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
 
@@ -44,6 +48,7 @@ from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
     GENERATION_CUT_ROUTE,
     GenerationCutInventory,
     GenerationCutPrefix,
+    GenerationCutPrefixAck,
 )
 from nemo_gym.token_id_capture.staging.capture import (  # noqa: E402
     CaptureError,
@@ -51,6 +56,7 @@ from nemo_gym.token_id_capture.staging.capture import (  # noqa: E402
 )
 from nemo_gym.token_id_capture.staging.records import (  # noqa: E402
     CaptureAdmission,
+    StagedCallBaseSnapshot,
     StagedCallRecord,
     StageResult,
 )
@@ -63,24 +69,38 @@ from nemo_rl.data.captured_media import (  # noqa: E402
     MediaColumnSpec,
     media_tensor_digests,
 )
+from nemo_rl.data_plane.schema import (  # noqa: E402
+    ROUTE_ENCODING_TENSOR,
+    ROUTED_EXPERTS_FIELD,
+)
 from nemo_rl.data_plane.tq_token_sink import (  # noqa: E402
     FetchedStagedCall,
     StagedPrefix,
     TQTokenSink,
 )
+from nemo_rl.experience.route_assembly import RouteFragment  # noqa: E402
 from nemo_rl.models.generation.prefix_recovery import (  # noqa: E402
+    GenerationProgress,
     NoPrefixRecovery,
     PrefixRecovery,
     PrefixRecoveryParts,
     ProgressRead,
 )
+from nemo_rl.models.generation.prefix_recovery.recovery import (  # noqa: E402
+    _ResolvedGenerationCut,
+)
 from nemo_rl.models.generation.prefix_recovery.restore import (  # noqa: E402
+    _build_restored_prefix_terminal_output,
     _classify_restored_prefix_terminal,
     _count_restored_prefix_as_completion,
     _generation_cut_blockers,
     _remaining_generation_limits_after_prefix,
+    _restored_prefix_terminal_routes,
     _RestoredPrefixTerminal,
     restore_reply_text,
+)
+from nemo_rl.models.generation.prefix_recovery.routes import (  # noqa: E402
+    _EngineRouteCache,
 )
 from nemo_rl.models.generation.prefix_recovery.state import (  # noqa: E402
     _FrozenCut,
@@ -93,6 +113,7 @@ from nemo_rl.models.generation.vllm.progress_reader import (  # noqa: E402
     VllmProgressReader,
 )
 from nemo_rl.models.generation.vllm.utils import (  # noqa: E402
+    attach_routed_experts_to_chat_response_choices,
     extract_generation_logprobs,
 )
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
@@ -158,7 +179,7 @@ class _ByteTokenizer:
 class _NoCallsInVllm:
     """A progress reader none of whose captured calls has reached the engine."""
 
-    def read(self, calls, *, timeout_s):
+    def read(self, calls, *, timeout_s, route_calls=frozenset()):
         return ProgressRead({}, 0.0, 0.0)
 
     def logprobs(self, token_ids, logprobs, *, start):
@@ -203,6 +224,7 @@ def _cuts(
             progress_reader=progress_reader or _NoCallsInVllm(),
             prefix_row_extras=worker._generation_cut_record_payload,
             restore_media=worker._restore_generation_cut_media,
+            router_replay=worker._cut_routes_dtype is not None,
         )
     )
     worker._prefix_recovery = recovery
@@ -1331,8 +1353,9 @@ class _MemoryPrefixSource:
         )
 
     def fetch_for_finalization(
-        self, staging_keys: list[str]
+        self, staging_keys: list[str], *, include_route_fragments: bool = False
     ) -> list[FetchedStagedCall]:
+        assert not include_route_fragments
         self.calls.append(list(staging_keys))
         return [
             FetchedStagedCall(
@@ -1759,6 +1782,7 @@ def _record_cut_constraints(state, sampling_params) -> None:
             progress_reader=_NoCallsInVllm(),
             prefix_row_extras=lambda state: None,
             restore_media=lambda chunks: None,
+            router_replay=False,
         )
     ).on_sampling_params(object(), sampling_params)
 
@@ -2053,7 +2077,11 @@ def test_generation_cut_digest_written_at_the_cut_is_the_one_restore_rebuilds(
             },
             stream=False,
         )
-        return _cuts(resumed)._rebuild_prefix(resumed._capture_admission(request), [])
+        return (
+            _cuts(resumed)
+            ._rebuild_prefix(resumed._capture_admission(request), [])
+            .snapshot
+        )
 
     # Restore recomputes the cumulative digest from the staged chunks, the
     # first chunk's media extras included, and must reach the cut's digest:
@@ -2419,7 +2447,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
     resumed_worker = _resumed_worker(sink, records={cut_key: cut_record})
     admission = resumed_worker._capture_admission(request)
     with caplog.at_level(logging.INFO):
-        cut = _cuts(resumed_worker)._rebuild_prefix(admission, [])
+        cut = _cuts(resumed_worker)._rebuild_prefix(admission, []).snapshot
     expected_sha = hashlib.sha256(b"12,13").hexdigest()
     assert f"prefix_ids_sha256={expected_sha}" in caplog.text
     # Gym's begin_call rejects a cut whose digest disagrees with its admission.
@@ -2437,9 +2465,9 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
             [10, 12, 13],
             admission=bad_digest_admission,
             prefix_token_ids=[],
-            generation_cut=_cuts(resumed_worker)._rebuild_prefix(
-                bad_digest_admission, []
-            ),
+            generation_cut=_cuts(resumed_worker)
+            ._rebuild_prefix(bad_digest_admission, [])
+            .snapshot,
             resumed_generation_token_ids=[12, 13],
         )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
@@ -2508,6 +2536,698 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
         second_receipt.prefixes[0].staging_keys
     )
     assert "generation prefix restored:" in caplog.text
+
+
+def _route_fetched_call(
+    staging_key: str, record: StagedCallRecord, routes: torch.Tensor
+) -> FetchedStagedCall:
+    """A cut chunk as the staging source reads it back, its routes popped out."""
+    extras = dict(record.extras or {})
+    del extras[ROUTED_EXPERTS_FIELD]
+    snapshot = StagedCallBaseSnapshot.model_validate(
+        record.model_dump(exclude={"extras"})
+    )
+    return FetchedStagedCall(
+        staging_key=staging_key,
+        snapshot=snapshot,
+        routed_len=int(routes.shape[0]),
+        fragment=RouteFragment(
+            routes=routes,
+            encoding=ROUTE_ENCODING_TENSOR,
+            extras_metadata_json=json.dumps(
+                extras, sort_keys=True, separators=(",", ":")
+            ).encode(),
+        ),
+        extras=extras,
+    )
+
+
+# Router replay: one layer and top-1, so each route row is a single expert ID.
+_ROUTER_REPLAY_CALL = {"rollout_id": "r0", "model_call_id": "c1", "mode": "text"}
+
+
+def _routes(*experts: int) -> torch.Tensor:
+    return torch.tensor(experts, dtype=torch.int16).view(-1, 1, 1)
+
+
+def _staged_routes(attachments: dict[str, torch.Tensor] | None) -> list[int]:
+    assert attachments is not None
+    return attachments[ROUTED_EXPERTS_FIELD].flatten().tolist()
+
+
+def _route_pieces(routes: torch.Tensor) -> list[torch.Tensor]:
+    """Split routes into one piece per row, as vLLM appends them while decoding."""
+    return [routes[row : row + 1] for row in range(routes.shape[0])]
+
+
+class _EngineRoutes:
+    """vLLM's per-call route pieces, as a cut's progress read copies them.
+
+    A progress reader that reads no new tokens (tests record them through
+    ``_observe``). ``by_call`` holds each model call's routes so far; tests
+    only ever extend them, as vLLM only appends.
+    """
+
+    def __init__(self) -> None:
+        self.by_call: dict[str, torch.Tensor] = {}
+        self.reads: list[str] = []
+        self._pieces: dict[str, list[torch.Tensor]] = {}
+
+    def read(self, calls, *, timeout_s, route_calls=frozenset()):
+        return ProgressRead(
+            {
+                model_call_id: GenerationProgress(
+                    token_ids=[],
+                    logprobs=None,
+                    finish_reason=None,
+                    stop_reason=None,
+                    route_pieces=(
+                        self._read_pieces(model_call_id)
+                        if model_call_id in route_calls
+                        else None
+                    ),
+                )
+                for model_call_id, _ in calls
+            },
+            0.0,
+            0.0,
+        )
+
+    def logprobs(self, token_ids, logprobs, *, start):
+        if not token_ids:
+            return []
+        return extract_generation_logprobs(token_ids, logprobs, start=start)
+
+    def _read_pieces(self, model_call_id: str) -> list[torch.Tensor] | None:
+        self.reads.append(model_call_id)
+        routes = self.by_call.get(model_call_id)
+        if routes is None:
+            return None
+        # vLLM keeps each published piece and only appends, so a later read
+        # returns the same piece objects followed by the new ones. Routes a
+        # test replaced outright stand for a different request's pieces.
+        pieces = self._pieces.get(model_call_id, [])
+        if len(pieces) > routes.shape[0] or not all(
+            torch.equal(piece, routes[row : row + 1])
+            for row, piece in enumerate(pieces)
+        ):
+            pieces = []
+        pieces.extend(_route_pieces(routes)[len(pieces) :])
+        self._pieces[model_call_id] = pieces
+        return list(pieces)
+
+
+def _router_replay_worker(
+    sink: _MemorySink, *, weight_version: int
+) -> VllmAsyncGenerationWorkerImpl:
+    worker = _worker_with_capture(sink)
+    worker._cut_routes_dtype = torch.int16
+    worker._rollout_weight_version = weight_version
+    return worker
+
+
+def _router_replay_call(
+    sink: _MemorySink,
+    *,
+    ng_capture: dict[str, Any] = _ROUTER_REPLAY_CALL,
+    prompt: tuple[int, ...] = (10, 11),
+) -> tuple[VllmAsyncGenerationWorkerImpl, _FakeRequest, _EngineRoutes]:
+    """An active router-replay call whose cuts take routes from ``_EngineRoutes``."""
+    worker = _router_replay_worker(sink, weight_version=7)
+    engine_routes = _EngineRoutes()
+    _cuts(worker, progress_reader=engine_routes)
+    request = _FakeRequest(ng_capture=dict(ng_capture), stream=False)
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, list(prompt))
+    worker._capture_registry.get(request).set_effective_output_limit(128)
+    return worker, request, engine_routes
+
+
+def _cumulative_output(token_ids: list[int]) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id="engine-request",
+        outputs=[
+            SimpleNamespace(
+                token_ids=token_ids,
+                logprobs=[
+                    {token_id: SimpleNamespace(logprob=-0.1)} for token_id in token_ids
+                ],
+            )
+        ],
+    )
+
+
+def _observe(
+    worker: VllmAsyncGenerationWorkerImpl, request: _FakeRequest, token_ids: list[int]
+) -> None:
+    _cuts(worker).observe(request, _cumulative_output(token_ids))
+
+
+def _cut(
+    worker: VllmAsyncGenerationWorkerImpl,
+    checkpoint_id: str,
+    *,
+    model_call_id: str = "c1",
+) -> GenerationCutPrefixAck:
+    (ack,) = (
+        _cuts(worker)
+        .checkpoint_cut(
+            _single_call_inventory(model_call_id, checkpoint_id=checkpoint_id)
+        )
+        .prefixes
+    )
+    return ack
+
+
+def _staged_route_chunks(
+    sink: _MemorySink, staging_keys: tuple[str, ...]
+) -> list[FetchedStagedCall]:
+    staged = {
+        key: (record, attachments)
+        for key, (_, record), attachments in zip(
+            sink.generation_prefix_keys,
+            sink.generation_prefix_records,
+            sink.generation_prefix_attachments,
+            strict=True,
+        )
+    }
+    return [
+        _route_fetched_call(key, staged[key][0], staged[key][1][ROUTED_EXPERTS_FIELD])
+        for key in staging_keys
+    ]
+
+
+def _resume(
+    sink: _MemorySink,
+    ack: GenerationCutPrefixAck,
+    *,
+    source: dict[str, Any] = _ROUTER_REPLAY_CALL,
+    prefix_token_ids: tuple[int, ...] = (),
+) -> tuple[VllmAsyncGenerationWorkerImpl, _FakeRequest, _ResolvedGenerationCut]:
+    """Restore a cut on a new worker and begin its resumed call."""
+    worker = _router_replay_worker(sink, weight_version=9)
+    request = _FakeRequest(
+        ng_capture={
+            **source,
+            "rollout_id": f"{source['rollout_id']}-a1",
+            "model_call_id": f"{source['model_call_id']}-resumed",
+            "generation_cut": {
+                "source_capture_key": source["rollout_id"],
+                "source_model_call_id": source["model_call_id"],
+                "staging_keys": list(ack.staging_keys),
+                "prefix_token_count": ack.prefix_token_count,
+                "prefix_digest": ack.prefix_digest,
+                "effective_output_limit": ack.effective_output_limit,
+                "terminal_finish_reason": ack.terminal_finish_reason,
+            },
+        },
+        stream=False,
+    )
+    admission = worker._capture_admission(request)
+    resolved = _cuts(worker)._rebuild_prefix(
+        admission,
+        list(prefix_token_ids),
+        _staged_route_chunks(sink, ack.staging_keys),
+    )
+    cut = resolved.snapshot
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        worker,
+        request,
+        [*prefix_token_ids, *cut.token_ids_delta],
+        admission=admission,
+        prefix_token_ids=list(prefix_token_ids),
+        generation_cut=cut,
+        generation_cut_routed_experts=resolved.routed_experts,
+        resumed_generation_token_ids=[
+            token_id
+            for token_id, mask in zip(
+                cut.token_ids_delta, cut.token_mask_delta, strict=True
+            )
+            if mask == 1.0
+        ],
+    )
+    return worker, request, resolved
+
+
+def _finish_with_routes(
+    worker: VllmAsyncGenerationWorkerImpl,
+    request: _FakeRequest,
+    generated_token_ids: list[int],
+    routes: torch.Tensor | None,
+) -> tuple[StagedCallRecord, dict[str, torch.Tensor] | None]:
+    """Finish a call with vLLM's full-sequence routes; return its staged row."""
+    content = _served_content(generated_token_ids, [-0.4] * len(generated_token_ids))
+    if routes is not None:
+        content["choices"][0]["message"]["routed_experts"] = routes
+    VllmAsyncGenerationWorkerImpl._finish_request_capture(worker, request, content)
+    return worker._capture_sink.records[-1], worker._capture_sink.attachments[-1]
+
+
+def test_router_replay_survives_repeated_prefix_cuts_and_resume(caplog) -> None:
+    sink = _MemorySink()
+    worker, request, engine_routes = _router_replay_call(sink)
+    _observe(worker, request, [12, 13])
+    # vLLM routes both prompt tokens and the first generated one.
+    engine_routes.by_call["c1"] = _routes(1, 2, 3)
+    assert len(_cut(worker, "checkpoint-1").staging_keys) == 1
+    # vLLM outputs are cumulative, and so are its routes.
+    _observe(worker, request, [12, 13, 14])
+    engine_routes.by_call["c1"] = _routes(1, 2, 3, 4)
+    ack = _cut(worker, "checkpoint-2")
+    # The first chunk carries the full routes and the final placeholder; the
+    # next one route per new token, replacing that placeholder.
+    assert [
+        _staged_routes(attachments)
+        for attachments in sink.generation_prefix_attachments
+    ] == [[1, 2, 3, -1], [4]]
+
+    with caplog.at_level(logging.INFO):
+        resumed, resumed_request, resolved = _resume(sink, ack)
+    assert resolved.routed_experts.flatten().tolist() == [1, 2, 3, 4, -1]
+
+    first, second = _staged_route_chunks(sink, ack.staging_keys)
+    tampered = first.fragment.routes.clone()
+    tampered[0, 0, 0] = 99
+    with pytest.raises(RuntimeError, match="failed integrity check"):
+        _cuts(resumed)._rebuild_prefix(
+            resumed._capture_admission(resumed_request),
+            [],
+            [replace(first, fragment=replace(first.fragment, routes=tampered)), second],
+        )
+
+    with caplog.at_level(logging.INFO):
+        staged, attachments = _finish_with_routes(
+            resumed, resumed_request, [15], _routes(90, 91, 92, 93, 5, 0)
+        )
+    # The restored prefix keeps the routes it was sampled under.
+    assert _staged_routes(attachments) == [1, 2, 3, 4, 5, 0]
+    assert staged.weight_version == 7
+    # Restore and completion log the same kept rows: the generated prefix
+    # tokens' routes except the last, whose route the resumed prefill computes.
+    kept_sha = hashlib.sha256(
+        torch.tensor([[[3]], [[4]]], dtype=torch.int32).numpy().tobytes()
+    ).hexdigest()
+    logged = re.findall(
+        r"generation prefix (restored|completed): .*prefix_routes_sha256=(\S+)",
+        caplog.text,
+    )
+    assert logged == [("restored", kept_sha), ("completed", kept_sha)]
+
+
+def test_router_replay_cut_drops_routes_past_its_frozen_tokens() -> None:
+    sink = _MemorySink()
+    worker, request, engine_routes = _router_replay_call(sink)
+    _observe(worker, request, [12, 13])
+    # Decoding observes no routes; only a cut reads them.
+    assert engine_routes.reads == []
+    # vLLM routed two more tokens than the call recorded.
+    engine_routes.by_call["c1"] = _routes(1, 2, 3, 4, 5)
+
+    assert _cut(worker, "checkpoint-1").disposition == "durable_prefix"
+    assert engine_routes.reads == ["c1"]
+    # Prompt rows, the first generated token's row, then the final placeholder.
+    assert _staged_routes(sink.generation_prefix_attachments[0]) == [1, 2, 3, -1]
+
+
+def test_progress_read_copies_route_pieces_only_for_router_replay_calls(
+    monkeypatch,
+):
+    routed = _engine_request([20, 21], [-0.1, -0.2])
+    routed.routed_experts_chunks = _route_pieces(_routes(1, 2))
+    text = _engine_request([30], [-0.3], request_id="chatcmpl-2")
+    text.routed_experts_chunks = _route_pieces(_routes(5))
+    client = _progress_client(_OutputProcessor(routed, text))
+    reader = _progress_reader(monkeypatch, client)
+    client._captured_requests.update({"chatcmpl-1": "c1", "chatcmpl-2": "c2"})
+
+    read = reader.read(
+        [("c1", 0), ("c2", 0)], timeout_s=None, route_calls=frozenset({"c1"})
+    )
+
+    with_routes, without_routes = read.progress["c1"], read.progress["c2"]
+    assert with_routes.route_pieces == routed.routed_experts_chunks
+    # vLLM keeps appending to its list; the copy does not grow with it.
+    assert with_routes.route_pieces is not routed.routed_experts_chunks
+    assert without_routes.route_pieces is None
+
+
+def test_router_replay_cut_takes_routes_from_its_progress_read(monkeypatch) -> None:
+    sink = _MemorySink()
+    worker = _router_replay_worker(sink, weight_version=7)
+    decoding = _engine_request([12, 13], [-0.1, -0.2])
+    # Prefill routed both prompt tokens, then decode routed the first sample;
+    # the last sampled token is not routed until the next step prefills it.
+    routes = _routes(1, 2, 3)
+    decoding.routed_experts_chunks = [routes[:2], routes[2:]]
+    client = _progress_client(_OutputProcessor(decoding))
+    _cuts(worker, progress_reader=_progress_reader(monkeypatch, client))
+    request = _captured_text_call(worker)
+    worker._capture_registry.get(request).set_effective_output_limit(128)
+    client._captured_requests["chatcmpl-1"] = "c1"
+
+    assert _cut(worker, "checkpoint-1").disposition == "durable_prefix"
+    # Tokens and routes came from one read at the same output boundary.
+    (_, record) = sink.generation_prefix_records[0]
+    assert record.token_ids_delta[-2:] == [12, 13]
+    assert _staged_routes(sink.generation_prefix_attachments[0]) == [1, 2, 3, -1]
+
+
+def test_router_replay_bad_routes_fail_only_that_call_and_every_checkpoint_goes_on() -> (
+    None
+):
+    sink = _MemorySink()
+    worker, bad_request, engine_routes = _router_replay_call(sink)
+    good_request = _FakeRequest(
+        ng_capture={"rollout_id": "r1", "model_call_id": "c2", "mode": "text"},
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, good_request, [10, 11])
+    worker._capture_registry.get(good_request).set_effective_output_limit(128)
+    _observe(worker, bad_request, [12])
+    _observe(worker, good_request, [12])
+    # Not [tokens, layers, topk]: a route error, not a caller bug.
+    engine_routes.by_call["c1"] = torch.tensor([1, 2], dtype=torch.int16)
+    engine_routes.by_call["c2"] = _routes(1, 2)
+
+    def cut(checkpoint_id: str) -> dict[str, str]:
+        receipt = _cuts(worker).checkpoint_cut(
+            GenerationCutInventory.build(
+                checkpoint_id=checkpoint_id,
+                server_name="policy_model",
+                active_prefixes=[
+                    GenerationCutPrefix(
+                        ticket_id=f"{checkpoint_id}-{model_call_id}",
+                        rollout_id=rollout_id,
+                        attempt=0,
+                        model_call_id=model_call_id,
+                        admitted_at=1.0,
+                    )
+                    for rollout_id, model_call_id in (("r0", "c1"), ("r1", "c2"))
+                ],
+            )
+        )
+        return {ack.model_call_id: ack.disposition for ack in receipt.prefixes}
+
+    assert cut("checkpoint-1") == {"c1": "durable_failure", "c2": "durable_prefix"}
+
+
+def test_router_replay_route_buffer_copies_only_new_rows_as_it_grows() -> None:
+    """A cut costs the rows decoded since the last one, not the history."""
+    cache = _EngineRouteCache(torch.int16)
+    pieces = _route_pieces(_routes(1, 2, 3))
+
+    first = cache.absorb(pieces)
+    assert len(cache._buffer) == 3
+    # Full, so the next rows double the buffer once. Joined pieces are not
+    # read again: a changed old piece is ignored, only the new one is read.
+    pieces[0] = _routes(99)
+    pieces.append(_routes(4))
+    second = cache.absorb(pieces)
+    grown = cache._buffer
+    assert len(grown) == 6
+    # Within capacity, rows land in the same buffer without copying the rest.
+    pieces.append(_routes(5))
+    third = cache.absorb(pieces)
+    assert cache._buffer is grown
+    assert third.flatten().tolist() == [1, 2, 3, 4, 5]
+    # Routes a cut already read never change.
+    assert first.flatten().tolist() == [1, 2, 3]
+    assert second.flatten().tolist() == [1, 2, 3, 4]
+    assert third.dtype == torch.int16
+
+
+@pytest.mark.parametrize(
+    ("pieces", "match"),
+    [
+        (
+            [
+                torch.zeros((2, 4, 2), dtype=torch.int16),
+                torch.zeros((1, 3, 2), dtype=torch.int16),
+            ],
+            r"integer \[rows, layers, topk\]",
+        ),
+        ([torch.zeros(3, dtype=torch.int16)], r"integer \[rows, layers, topk\]"),
+        ([torch.zeros((2, 4, 2))], r"integer \[rows, layers, topk\]"),
+        ([], "has not routed any token"),
+    ],
+    ids=["mismatched", "not_3d", "not_integer", "empty"],
+)
+def test_vllm_route_pieces_that_do_not_fit_are_a_route_error(pieces, match) -> None:
+    cache = _EngineRouteCache(torch.int16)
+
+    with pytest.raises(ValueError, match=match):
+        cache.absorb(pieces)
+    # A rejected read leaves the buffer as it was.
+    assert (cache._buffer, cache._piece_count) == (None, 0)
+
+
+@pytest.mark.parametrize(
+    ("piece_dtypes", "routed_experts_dtype"),
+    [
+        ((np.uint8, np.uint8), torch.int16),
+        ((np.uint8, np.uint8), torch.int8),
+        ((np.uint16, np.uint16), torch.int16),
+        ((np.uint8, np.int32), torch.int16),
+    ],
+    ids=["uint8_to_int16", "uint8_to_int8", "uint16", "mixed_dtypes"],
+)
+def test_vllm_numpy_route_pieces_join_in_bulk_and_only_once(
+    piece_dtypes, routed_experts_dtype
+) -> None:
+    """vLLM publishes unsigned numpy pieces; the cache keeps signed routes."""
+    cache = _EngineRouteCache(routed_experts_dtype)
+    pieces = [
+        np.full((2, 3, 2), value, dtype=dtype)
+        for value, dtype in enumerate(piece_dtypes, start=1)
+    ]
+
+    first = cache.absorb(pieces).clone()
+    pieces.append(np.full((1, 3, 2), 7, dtype=piece_dtypes[0]))
+    second = cache.absorb(pieces)
+
+    assert second.dtype == routed_experts_dtype
+    assert second[:, 0, 0].tolist() == [1, 1, 2, 2, 7]
+    assert torch.equal(second[:4], first)
+    assert cache._piece_count == 3
+
+
+@pytest.mark.parametrize(
+    ("later_read", "match"),
+    [
+        (
+            lambda pieces: [*pieces, torch.zeros((1, 2, 1), dtype=torch.int16)],
+            "changed model dimensions",
+        ),
+        (lambda pieces: pieces[:-1], "shrank"),
+        (lambda pieces: [*pieces[:-1], _routes(3)], "replaced"),
+        # Numpy would wrap expert 200 into the int8 cache as -56, a wrong expert.
+        (lambda pieces: [*pieces, _routes(200)], "do not fit"),
+    ],
+    ids=["other_model_dims", "shrank", "replaced", "id_overflow"],
+)
+def test_vllm_later_route_reads_that_do_not_fit_are_a_route_error(
+    later_read, match
+) -> None:
+    """Rows already joined are never read again, so a bad later read fails the
+    cut and leaves the buffer as it was, instead of drifting from vLLM."""
+    cache = _EngineRouteCache(torch.int8)
+    pieces = _route_pieces(_routes(1, 2, 3))
+    joined = cache.absorb(pieces).clone()
+
+    with pytest.raises(ValueError, match=match):
+        cache.absorb(later_read(pieces))
+    assert (cache._piece_count, cache._rows) == (3, 3)
+    assert torch.equal(torch.from_numpy(cache._buffer[:3]), joined)
+
+
+@pytest.mark.parametrize("engine_routes_served", ["missing", "short"])
+def test_router_replay_cut_without_full_engine_routes_fails_and_retries(
+    engine_routes_served: str,
+) -> None:
+    """Padding missing rows would put routes on the wrong tokens, and a later
+    cut would stage rows that no longer line up, failing the restore digest."""
+    sink = _MemorySink()
+    worker, request, engine_routes = _router_replay_call(sink)
+    _observe(worker, request, [12, 13])
+    # Two prompt rows and the first generated token's row are needed. Missing:
+    # vLLM finished the request before the cut read it, and the HTTP layer had
+    # not yet observed the final output.
+    if engine_routes_served == "short":
+        engine_routes.by_call["c1"] = _routes(1, 2)
+
+    assert _cut(worker, "checkpoint-1").disposition == "durable_failure"
+    assert engine_routes.reads == ["c1"]
+    assert sink.generation_prefix_records == []
+    progress = worker._capture_registry.get(request).snapshot()
+    assert (progress.cut_in_progress, progress.staged_token_count) == (False, 0)
+
+    # Once vLLM's routes cover the frozen tokens, the call is cut again, and
+    # each later cut's chunks rebuild exactly the digest it advertised.
+    engine_routes.by_call["c1"] = _routes(1, 2, 3)
+    first = _cut(worker, "checkpoint-2")
+    assert _resume(sink, first)[2].snapshot.digest == first.prefix_digest
+    _observe(worker, request, [12, 13, 14])
+    engine_routes.by_call["c1"] = _routes(1, 2, 3, 4)
+    second = _cut(worker, "checkpoint-3")
+    assert len(second.staging_keys) == 2
+    assert _resume(sink, second)[2].snapshot.digest == second.prefix_digest
+
+
+@pytest.mark.parametrize("served_routes", ["missing", "other_model_dims"])
+def test_router_replay_resumed_call_with_unfit_routes_still_finishes(
+    served_routes: str, caplog
+) -> None:
+    """Like routes the delta alignment rejects, routes the restored prefix
+    cannot be merged into are dropped, not raised: the handler stages after
+    its abort path has closed, so a raise would fail the call and leak it."""
+    sink = _MemorySink()
+    worker, request, engine_routes = _router_replay_call(sink)
+    _observe(worker, request, [12, 13])
+    engine_routes.by_call["c1"] = _routes(1, 2, 3)
+    resumed, resumed_request, _ = _resume(sink, _cut(worker, "checkpoint-1"))
+    # The right length, so the delta alignment keeps it, but two layers where
+    # the restored prefix has one: only the merge can reject it.
+    routes = (
+        torch.zeros((5, 2, 1), dtype=torch.int16)
+        if served_routes == "other_model_dims"
+        else None
+    )
+
+    with caplog.at_level(logging.WARNING):
+        staged, attachments = _finish_with_routes(
+            resumed, resumed_request, [14], routes
+        )
+
+    assert staged.model_call_id == "c1-resumed"
+    assert ROUTED_EXPERTS_FIELD not in (staged.extras or {})
+    assert ROUTED_EXPERTS_FIELD not in (attachments or {})
+    assert len(resumed._capture_registry) == 0
+    assert (
+        "restored prefix does not fit"
+        if served_routes == "other_model_dims"
+        else "staged no routed_experts"
+    ) in caplog.text
+
+
+def test_router_replay_prefix_cut_after_the_final_token_resumes_with_routes(
+    monkeypatch,
+) -> None:
+    """A restored prefix that is already finished never reaches the engine;
+    its built output must still carry routes, or router replay fails the call."""
+    # vLLM's output types, minus vLLM: CompletionOutput has routed_experts.
+    monkeypatch.setitem(
+        sys.modules,
+        "vllm.outputs",
+        SimpleNamespace(
+            CompletionOutput=lambda **kwargs: SimpleNamespace(**kwargs),
+            RequestOutput=lambda **kwargs: SimpleNamespace(**kwargs),
+        ),
+    )
+    sink = _MemorySink()
+    worker, request, engine_routes = _router_replay_call(sink)
+    # The cut lands after vLLM's final token, before terminal staging.
+    final_output = _cumulative_output([12, 13])
+    final_output.outputs[0].finish_reason = "length"
+    final_output.outputs[0].stop_reason = None
+    final_output.prompt_routed_experts = _routes(1, 2)
+    final_output.outputs[0].routed_experts = _routes(3)
+    _cuts(worker).observe(request, final_output)
+    ack = _cut(worker, "checkpoint-1")
+    # The final output carried the routes; the engine was not asked.
+    assert engine_routes.reads == []
+    assert ack.terminal_finish_reason == "length"
+
+    resumed, resumed_request, resolved = _resume(sink, ack)
+    assert resolved.routed_experts.flatten().tolist() == [1, 2, 3, -1]
+    terminal = replace(
+        _classify_restored_prefix_terminal(
+            prompt_token_ids=[10, 11, 12, 13],
+            prefix_token_count=2,
+            requested_output_tokens=ack.effective_output_limit,
+            model_max_tokens=4096,
+            terminal_finish_reason="length",
+        ),
+        routed_experts=_restored_prefix_terminal_routes(
+            resolved.routed_experts, prev_len=0
+        ),
+    )
+    choice = SimpleNamespace(index=0, message=SimpleNamespace(routed_experts=None))
+    attach_routed_experts_to_chat_response_choices(
+        SimpleNamespace(choices=[choice]),
+        _build_restored_prefix_terminal_output("request", terminal),
+        device=torch.device("cpu"),
+        routed_experts_dtype=torch.int16,
+        encode_for_wire=False,
+    )
+    # The restored prefix's routes, and no route for the final token, as an
+    # uninterrupted call's response has.
+    assert choice.message.routed_experts.flatten().tolist() == [1, 2, 3, -1]
+
+    _, attachments = _finish_with_routes(
+        resumed, resumed_request, [], choice.message.routed_experts
+    )
+    assert _staged_routes(attachments) == [1, 2, 3, -1]
+
+
+def test_router_replay_prefix_resume_keeps_the_parent_boundary_route() -> None:
+    """A multi-turn call's cut chunks stage one route per token; its resumed
+    canonical row also carries the parent's last-token route, which the
+    reassembler writes back over the parent's placeholder."""
+    sink = _MemorySink()
+    # A real sink checks every row's route length; only its TQ store is mocked.
+    validating_sink = TQTokenSink(MagicMock(), staging_partition="staging")
+    validating_sink._store = MagicMock()
+    ng_capture = {
+        "rollout_id": "r0",
+        "model_call_id": "c2",
+        "parent_call_id": "c1",
+        "prev_len": 3,
+        "mode": "token_in",
+        "required_prefix_token_ids": [10, 11, 12],
+        "parent_chain_hash": "1" * 64,
+    }
+    worker, request, engine_routes = _router_replay_call(
+        sink, ng_capture=ng_capture, prompt=(10, 11, 12, 20, 21)
+    )
+    # Engine rows cover positions 0..5; the parent's last token (position 2)
+    # is routed by this call's prefill, but the delta starts at position 3.
+    _observe(worker, request, [22, 23])
+    engine_routes.by_call["c2"] = _routes(1, 2, 3, 4, 5, 6)
+    _cut(worker, "checkpoint-1", model_call_id="c2")
+    _observe(worker, request, [22, 23, 24])
+    engine_routes.by_call["c2"] = _routes(1, 2, 3, 4, 5, 6, 7)
+    ack = _cut(worker, "checkpoint-2", model_call_id="c2")
+    cut_records = [record for _, record in sink.generation_prefix_records]
+    assert [record.prev_len for record in cut_records] == [3, 3]
+    assert [
+        _staged_routes(attachments)
+        for attachments in sink.generation_prefix_attachments
+    ] == [[4, 5, 6, -1], [7]]
+    for sequence, (record, attachments) in enumerate(
+        zip(cut_records, sink.generation_prefix_attachments, strict=True)
+    ):
+        assert validating_sink.stage_generation_prefix(
+            record,
+            checkpoint_id="checkpoint",
+            chunk_sequence=sequence,
+            attachments=attachments,
+        ).ok
+
+    resumed, resumed_request, resolved = _resume(
+        sink, ack, source=ng_capture, prefix_token_ids=(10, 11, 12)
+    )
+    assert resolved.routed_experts.flatten().tolist() == [4, 5, 6, 7, -1]
+
+    # Current-policy routes for positions 0..7 plus the unrouted final token.
+    staged, attachments = _finish_with_routes(
+        resumed,
+        resumed_request,
+        [25],
+        _routes(90, 91, 92, 93, 94, 95, 96, 97, 0),
+    )
+    # Parent boundary (position 2) and the generated tail come from this
+    # call; the restored prefix keeps the routes it was sampled under.
+    assert _staged_routes(attachments) == [92, 4, 5, 6, 7, 97, 0]
+    assert validating_sink.stage(staged, attachments=attachments).ok
 
 
 @pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32])
