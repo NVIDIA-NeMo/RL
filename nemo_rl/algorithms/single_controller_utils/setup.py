@@ -80,6 +80,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
 from nemo_rl.algorithms.single_controller_utils.config import (
     MasterConfig,
     algo_config,
+    dedicated_value_enabled,
     forest_execution_row_multiple,
     is_ppo_run,
     logprob_passes_required,
@@ -110,6 +111,7 @@ from nemo_rl.distributed.virtual_cluster import (
     _get_free_port_local,
     _get_node_ip_local,
     prepare_segment_topology,
+    reserve_disjoint_clusters,
 )
 from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
@@ -428,12 +430,14 @@ def _build_clusters(
 ) -> tuple[
     RayVirtualCluster,
     RayVirtualCluster,
+    Optional[RayVirtualCluster],
     Optional[dict[str, tuple[str, int]]],
 ]:
     """Allocate student clusters while leaving validated nodes for teachers.
 
-    Colocated (Megatron generation only) shares one cluster for policy and generation and
-    returns it for both arms; other backends split nodes into train + inference clusters.
+    Colocated (Megatron generation only) shares one cluster for policy and generation;
+    other backends split nodes into training and inference clusters. Dedicated value
+    resources reserve a third cluster.
     """
     cluster_config = master_config.cluster
     generation_config = master_config.policy["generation"]
@@ -445,7 +449,11 @@ def _build_clusters(
     port_range_low = cluster_config.master_port_range_low
     port_range_high = cluster_config.master_port_range_high
     teacher_nodes = _non_colocated_teacher_node_count(master_config)
-    policy_nodes = num_nodes - teacher_nodes
+    dedicated_value = dedicated_value_enabled(master_config)
+    value_nodes = (
+        cast(int, master_config.value["resources"].num_nodes) if dedicated_value else 0
+    )
+    policy_nodes = num_nodes - teacher_nodes - value_nodes
     if policy_nodes <= 0:
         raise ValueError(
             "cluster.num_nodes must leave at least one node for the student after "
@@ -455,7 +463,7 @@ def _build_clusters(
 
     # Worker groups sharing the training GPUs: the policy, plus the critic on
     # the PPO path.
-    train_worker_groups = 2 if is_ppo_run(master_config) else 1
+    train_worker_groups = 1 if not is_ppo_run(master_config) or dedicated_value else 2
 
     if colocated:
         # Policy (+ critic) + generation share GPUs — one cluster.
@@ -484,7 +492,7 @@ def _build_clusters(
             segment_size=segment_size,
             node_resource_constraints=node_constraints,
         )
-        return cluster, cluster, teacher_topology
+        return cluster, cluster, None, teacher_topology
 
     # Non-colocated: split node into train + inference clusters.
     inference_resources = generation_config["colocated"]["resources"]
@@ -509,6 +517,7 @@ def _build_clusters(
         )
 
     train_constraints = None
+    value_constraints = None
     inference_constraints = None
     train_segment_size = None
     inference_segment_size = None
@@ -536,6 +545,13 @@ def _build_clusters(
             remaining_topology = {
                 node_id: topology[node_id] for node_id in remaining_ids
             }
+            if dedicated_value:
+                value_constraints, value_remaining_ids, _ = prepare_segment_topology(
+                    segment_size, value_nodes, topology=remaining_topology, role="value"
+                )
+                remaining_topology = {
+                    node_id: topology[node_id] for node_id in value_remaining_ids
+                }
             generation_config_dict = cast(dict[str, Any], generation_config)
             if backend == "vllm":
                 vllm_cfg = generation_config_dict["vllm_cfg"]
@@ -604,7 +620,20 @@ def _build_clusters(
         segment_size=inference_segment_size,
         node_resource_constraints=inference_constraints,
     )
-    return train_cluster, inference_cluster, teacher_topology
+    value_cluster = None
+    if dedicated_value:
+        value_cluster = RayVirtualCluster(
+            name="sc_value_cluster",
+            bundle_ct_per_node_list=[gpus_per_node] * value_nodes,
+            use_gpus=True,
+            num_gpus_per_node=gpus_per_node,
+            max_colocated_worker_groups=1,
+            port_range_low=port_range_low,
+            port_range_high=port_range_high,
+            segment_size=segment_size,
+            node_resource_constraints=value_constraints,
+        )
+    return train_cluster, inference_cluster, value_cluster, teacher_topology
 
 
 def _build_generation(
@@ -1717,16 +1746,19 @@ def setup_single_controller(
     setup_timing_metrics = SetupTimingMetrics()
 
     # Create clusters
-    train_cluster, inference_cluster, teacher_segment_topology = _build_clusters(
-        master_config
+    train_cluster, inference_cluster, value_cluster, teacher_segment_topology = (
+        _build_clusters(master_config)
     )
+    dedicated_value = value_cluster is not None
     colocated = generation_config["colocated"]["enabled"]
     segment_size = master_config.cluster.segment_size
 
     # Claim constrained training nodes before unconstrained inference or Gym
     # tasks can consume them. This matters when inference topology alignment
     # falls back while the training cluster remains topology-constrained.
-    if not colocated and segment_size is not None:
+    if value_cluster is not None:
+        reserve_disjoint_clusters(train_cluster, value_cluster)
+    elif not colocated and segment_size is not None:
         train_cluster.get_placement_groups()
 
     # Claim teacher placement groups before deferred generation starts NeMo-Gym,
@@ -1765,6 +1797,7 @@ def setup_single_controller(
     clusters_by_name: dict[str, RayVirtualCluster] = {
         "train": train_cluster,
         "inference": inference_cluster,
+        **({"value": value_cluster} if value_cluster is not None else {}),
         **{f"teacher:{name}": c for name, c in teacher_clusters.items()},
     }
     storage_unit_node_ids = plan_storage_unit_nodes(dp_config, clusters_by_name)
@@ -1793,10 +1826,9 @@ def setup_single_controller(
     ) -> tuple[Any, Optional[TQValue], dict[str, float]]:
         """Build the trainer, then the critic when this is a PPO run.
 
-        Serial, and with the trainer offloaded in between, because both worker
-        groups live on the same training GPUs: leaving the policy resident
-        while the critic loads is what OOMs a tight fit. The trainer comes back
-        to GPU before returning so callers see the same state GRPO leaves them.
+        Shared workers load serially, with the policy offloaded while the critic
+        loads. Dedicated value workers load onto their own cluster and both
+        models remain resident.
 
         Args:
             reserved_http_server_ports: Pre-published OpenAI server ports keyed
@@ -1828,23 +1860,27 @@ def setup_single_controller(
         if not is_ppo_run(master_config):
             return trainer, None, time_metrics
 
-        trainer.offload_to_cpu()
+        if not dedicated_value:
+            trainer.offload_to_cpu()
         value, time_metrics["value_time"] = _build_value(
-            train_cluster,
+            value_cluster if value_cluster is not None else train_cluster,
             master_config,
             tokenizer,
             seed=algo_cfg.seed,
             weights_path=value_weights_path,
             optimizer_path=value_optimizer_path,
         )
-        # Blocks on the critic's async Ray __init__, then parks it on CPU.
-        value.finish_training()
+        # Blocks on the critic's async Ray __init__.
         ppo_group_multiple, ppo_min_remaining_groups = resolve_ppo_chunk_alignment(
             master_config,
             trainer.sharding_annotations.get_axis_size("data_parallel"),
             value.sharding_annotations.get_axis_size("data_parallel"),
         )
-        trainer.prepare_for_training()
+        if dedicated_value:
+            value.prepare_for_training()
+        else:
+            value.finish_training()
+            trainer.prepare_for_training()
         return trainer, value, time_metrics
 
     def _build_generation_then_trainer(

@@ -1378,3 +1378,27 @@ class RayVirtualCluster:
         user calls shutdown().
         """
         self.shutdown()
+
+
+def reserve_disjoint_clusters(
+    train_cluster: RayVirtualCluster, value_cluster: RayVirtualCluster
+) -> None:
+    """Reserve training clusters and reject overlapping physical nodes."""
+    train_cluster.get_placement_groups()
+    value_cluster.get_placement_groups()
+    train_addresses = {
+        address
+        for address, _ in train_cluster.get_available_addresses_and_ports_batch(
+            [(node_index, 0) for node_index in range(train_cluster.node_count())]
+        )
+    }
+    value_addresses = {
+        address
+        for address, _ in value_cluster.get_available_addresses_and_ports_batch(
+            [(node_index, 0) for node_index in range(value_cluster.node_count())]
+        )
+    }
+    if shared_nodes := train_addresses & value_addresses:
+        raise RuntimeError(
+            f"Dedicated policy and value clusters share physical nodes: {shared_nodes}"
+        )

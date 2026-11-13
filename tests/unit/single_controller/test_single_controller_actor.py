@@ -2433,6 +2433,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._trainer = _NoOpTrainer()
     ctrl._is_ppo = False
     ctrl._streaming_ppo = False
+    ctrl._value_dedicated = False
     ctrl._ppo_epochs = 1
     ctrl._critic_ppo_epochs = 1
     ctrl._value = None
@@ -3170,12 +3171,15 @@ class _NoOpValue:
     def __init__(self, calls: list[str] | None = None, prefix: str = "") -> None:
         self.calls: list[str] = [] if calls is None else calls
         self._prefix = prefix
+        self.resident_calls: list[tuple[str, bool]] = []
+        self._keep_resident = False
         self.trained_sample_ids: list[list[str]] = []
 
     def _record(self, name: str) -> None:
         self.calls.append(f"{self._prefix}{name}")
 
     def prepare_for_inference(self) -> None:
+        self.resident_calls.append(("prepare_for_inference", self._keep_resident))
         self._record("prepare_for_inference")
 
     def get_values_from_meta(self, meta: KVBatchMeta) -> None:
@@ -3183,9 +3187,11 @@ class _NoOpValue:
         self._record("get_values_from_meta")
 
     def finish_inference(self) -> None:
+        self.resident_calls.append(("finish_inference", self._keep_resident))
         self._record("finish_inference")
 
     def prepare_for_training(self) -> None:
+        self.resident_calls.append(("prepare_for_training", self._keep_resident))
         self._record("prepare_for_training")
 
     def begin_train_step(self, loss_fn) -> None:
@@ -3215,6 +3221,7 @@ class _NoOpValue:
         }
 
     def finish_training(self) -> None:
+        self.resident_calls.append(("finish_training", self._keep_resident))
         self._record("finish_training")
 
 
@@ -3340,6 +3347,45 @@ def test_train_pump_parks_the_policy_on_cpu_across_the_critic_stages(
         "critic.train_microbatches_from_meta",
         "critic.finish_train_step",
         "critic.finish_training",
+    ]
+
+
+@pytest.mark.parametrize("policy_logprobs_required", [False, True])
+def test_dedicated_value_keeps_both_models_resident_during_ppo_step(
+    monkeypatch, policy_logprobs_required
+) -> None:
+    meta = _single_group_meta()
+    calls: list[str] = []
+    value = _NoOpValue(calls=calls, prefix="critic.")
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta), value=value
+    )
+    ctrl._value_dedicated = True
+    value._keep_resident = True
+    ctrl._policy_logprobs_required = policy_logprobs_required
+    trainer = _OrderRecordingTrainer(calls)
+    trainer.prepare_for_lp_inference = MagicMock(wraps=trainer.prepare_for_lp_inference)
+    trainer.offload_to_cpu = MagicMock(wraps=trainer.offload_to_cpu)
+    trainer.finish_inference = MagicMock(wraps=trainer.finish_inference)
+    ctrl._trainer = trainer
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    trainer.offload_to_cpu.assert_not_called()
+    trainer.finish_inference.assert_not_called()
+    if policy_logprobs_required:
+        trainer.prepare_for_lp_inference.assert_called_once_with(
+            keep_train_buffers=True
+        )
+    else:
+        trainer.prepare_for_lp_inference.assert_not_called()
+    assert value.resident_calls == [
+        ("prepare_for_inference", True),
+        ("finish_inference", True),
+        ("prepare_for_training", True),
+        ("finish_training", True),
     ]
 
 
@@ -3805,6 +3851,25 @@ def test_streaming_ppo_split_value_replays_each_chunk_per_epoch(
     assert "critic.train_from_meta" not in calls
     assert calls.index("refit") < calls.index("critic.begin_train_step")
     assert controller._trainer_version == controller._train_steps == 1
+
+
+def test_streaming_ppo_dedicated_value_keeps_policy_resident(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, metas, calls = _streaming_ppo_controller(monkeypatch)
+    controller._value_dedicated = True
+    controller._value._keep_resident = True
+
+    asyncio.run(asyncio.wait_for(controller._train_pump(), timeout=1.0))
+
+    assert calls.count("critic.get_values_from_meta") == len(metas)
+    assert calls.count("policy.train_microbatches_from_meta") == len(metas)
+    assert "policy.pause_train_step_with_offloading" not in calls
+    assert "policy.offload_to_cpu" not in calls
+    assert controller._value.resident_calls == [
+        ("prepare_for_inference", True),
+        ("finish_inference", True),
+    ] * len(metas) + [("prepare_for_training", True), ("finish_training", True)]
 
 
 @pytest.mark.parametrize("warmup", [False, True])

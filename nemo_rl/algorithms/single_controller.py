@@ -130,6 +130,7 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     MasterConfig,
     algo_config,
+    dedicated_value_enabled,
     is_ppo_run,
     rollout_snapshots_enabled,
     validate_forest_objective,
@@ -410,6 +411,7 @@ class SingleControllerActor:
         )
         self._ppo_group_multiple = actor_args.ppo_group_multiple
         self._ppo_min_remaining_groups = actor_args.ppo_min_remaining_groups
+        self._value_dedicated: bool = dedicated_value_enabled(master_config)
         # GRPO has no epoch knob: it makes one optimizer step per RL step.
         self._ppo_epochs: int = self._algo_cfg.ppo_epochs if self._is_ppo else 1
         self._critic_ppo_epochs: int = (
@@ -2832,7 +2834,7 @@ class SingleControllerActor:
                         # per model, which is saving the offload/onloading cost.
                         # Keep accumulated policy gradients resident while
                         # offloading policy parameters/optimizer for the critic.
-                        if not value_inference_prepared:
+                        if not value_inference_prepared and not self._value_dedicated:
                             with (
                                 self._timer.time("value_inference_prep"),
                                 managed_span(
@@ -2890,7 +2892,7 @@ class SingleControllerActor:
                             # normalizer still counts all of them.
                             await asyncio.to_thread(
                                 self._trainer.prepare_for_lp_inference,
-                                keep_train_buffers=step_open,
+                                keep_train_buffers=step_open or self._value_dedicated,
                             )
                         with (
                             self._timer.time("policy_and_reference_logprobs"),
@@ -2909,7 +2911,6 @@ class SingleControllerActor:
                                     self._trainer.get_reference_policy_logprobs_from_meta,
                                     train_meta,
                                 )
-
                     # Compute advantages
                     with (
                         self._timer.time("advantage_calculation"),
@@ -3112,12 +3113,15 @@ class SingleControllerActor:
                                 tracer=self._tracer,
                             ),
                         ):
-                            if step_open:
-                                await asyncio.to_thread(
-                                    self._trainer.pause_train_step_with_offloading
-                                )
-                            else:
-                                await asyncio.to_thread(self._trainer.offload_to_cpu)
+                            if not self._value_dedicated:
+                                if step_open:
+                                    await asyncio.to_thread(
+                                        self._trainer.pause_train_step_with_offloading
+                                    )
+                                else:
+                                    await asyncio.to_thread(
+                                        self._trainer.offload_to_cpu
+                                    )
                             await asyncio.to_thread(self._value.prepare_for_inference)
                         value_inference_prepared = True
 
@@ -3238,7 +3242,8 @@ class SingleControllerActor:
                             await asyncio.to_thread(
                                 self._trainer.sync_params_before_refit
                             )
-                        await asyncio.to_thread(self._trainer.offload_to_cpu)
+                        if not self._value_dedicated:
+                            await asyncio.to_thread(self._trainer.offload_to_cpu)
                         if self._gen.blocks_training():
                             await asyncio.to_thread(self._trainer.finish_inference)
                     # GAE has produced the frozen predictions and targets for
@@ -4588,7 +4593,8 @@ class SingleControllerActor:
             # serialized. The critic goes first because offloading the policy runs
             # finalize_async_save, which would block on the policy's own write if
             # that had already been staged.
-            await asyncio.to_thread(self._trainer.offload_to_cpu)
+            if not self._value_dedicated:
+                await asyncio.to_thread(self._trainer.offload_to_cpu)
             # The value model writes synchronously, so unlike the policy below it is
             # fully on disk when this returns and needs no finalize wait.
             await asyncio.to_thread(self._value.prepare_for_training)
@@ -4604,7 +4610,8 @@ class SingleControllerActor:
             await asyncio.to_thread(self._value.finish_training)
             # Also covers a warmup step, which never ran prepare_for_training in
             # the pump and would otherwise save from CPU-resident params.
-            await asyncio.to_thread(self._trainer.prepare_for_training)
+            if not self._value_dedicated:
+                await asyncio.to_thread(self._trainer.prepare_for_training)
 
         # Save policy model
         # With async_save this returns after D2H staging; disk writes finish
@@ -4988,9 +4995,9 @@ class SingleControllerActor:
 
         Tensors never touch SC: workers fetch the sequence columns from
         DataPlane and commit the per-token prediction back under ``values``,
-        which the advantage stage then reads alongside the rewards. The model is
-        offloaded after the forward. Streaming may prepare it before the chunk's
-        rollout data is ready to overlap the residency switch with generation.
+        which the advantage stage then reads alongside the rewards. Shared
+        workers offload after the forward; dedicated workers keep it resident.
+        Streaming may prepare it before the chunk's rollout data is ready.
 
         Args:
             meta: Selected chunk's metadata.
@@ -5022,8 +5029,8 @@ class SingleControllerActor:
                     self._value.train_from_meta, full_meta, value_loss_fn
                 )
         else:
-            # Split prepares the API for per-chunk value streaming in a later PR;
-            # this controller still trains the critic after policy refit.
+            # Split exposes the per-chunk API, but this controller still collects
+            # all step chunks before training the critic.
             for _ in range(num_epochs):
                 await asyncio.to_thread(self._value.begin_train_step, value_loss_fn)
                 for meta in metas:
