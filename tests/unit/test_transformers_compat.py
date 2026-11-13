@@ -279,6 +279,6 @@ def test_deepseek_v3_tokenizer_patch_rejects_unverified_versions(
 ) -> None:
     # Patch the guard's live import target, not a collection-time module alias.
     live_transformers = import_module("transformers")
-    monkeypatch.setattr(live_transformers, "__version__", "5.21.0")
-    with pytest.raises(AssertionError, match="verified on 5.12.1 and 5.20.1"):
+    monkeypatch.setattr(live_transformers, "__version__", "5.20.0")
+    with pytest.raises(AssertionError, match="verified against <5.20"):
         _patch_transformers_tokenizer_class_set()
