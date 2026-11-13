@@ -464,6 +464,8 @@ def test_subagent_failures_reach_final_training_rows(
     )
     assert_loss_once(forest, [] if masked else selected, records)
     assert result.valid_row_count == (0 if masked else (5 if len(selected) == 8 else 4))
+    # Termination rates count the rollout once, not once per segment row.
+    assert result.metrics["finalize/truncated_count"] == float(truncated and not masked)
     if result.meta is not None:
         for key, tag in zip(result.meta.sample_ids, result.meta.tags, strict=True):
             row = forest.plane.rows["canonical", key]
@@ -798,6 +800,57 @@ def test_selected_forest_publishes_once(
     result = publish(forest, records, selected)
     assert result.valid_row_count == expected_rows
     assert_loss_once(forest, selected, records)
+
+
+def _continued_request(records: list, terminal: Any) -> ReassemblyRequest:
+    # A turn restore continued rollout "attempt" as "attempt-a1".
+    return ReassemblyRequest(
+        group_id="group",
+        rollout_ids=("attempt-a1",),
+        canonical_sample_ids=("group_g0",),
+        receipts=(
+            {**receipt(records, terminal=terminal), "capture_key": "attempt-a1"},
+        ),
+        rewards=(1.0,),
+        fallback_weight_version=7,
+        prompt_idx=99,
+        mask_sample=(False,),
+        logical_selections=(selection(records),),
+    )
+
+
+def test_continued_attempt_trains_calls_its_earlier_attempt_staged(
+    forest: ForestCapture,
+) -> None:
+    before, _ = forest.capture([None])
+    after, _ = forest.capture([None], owner="attempt-a1")
+    # The restore carried the earlier call over, stamped with its staging owner.
+    carried = [r.model_copy(update={"source_capture_key": "attempt"}) for r in before]
+    records = carried + after
+    actor = object.__new__(RolloutReassemblerActor.__ray_metadata__.modified_class)
+    actor._finalizer = forest.finalizer
+
+    request = _continued_request(records, after[-1])
+    # Cleanup reads capture_receipts; finalize() alone never checks it.
+    assert request.capture_receipts == request.receipts
+    result = actor.finalize(request)
+
+    assert result.valid_row_count == 2
+    assert_loss_once(forest, records, records)
+
+
+@pytest.mark.parametrize("first", ["another_rollout", "unstamped"])
+def test_continued_attempt_refuses_rows_it_cannot_own(
+    forest: ForestCapture, first: str
+) -> None:
+    owner = "other" if first == "another_rollout" else "attempt"
+    before, _ = forest.capture([None], owner=owner)
+    after, _ = forest.capture([None], owner="attempt-a1")
+    if first == "another_rollout":
+        before = [r.model_copy(update={"source_capture_key": owner}) for r in before]
+
+    with pytest.raises(ValueError, match="Foreign capture scope"):
+        _continued_request(before + after, after[-1]).capture_receipts
 
 
 def test_shared_action_masks_counts_and_prompt_are_owned_once(
@@ -1308,7 +1361,8 @@ def test_capture_lengths_count_unique_generations_before_padding(
         reward_log_contexts=[RewardLogContext("agent", None)],
     )
     assert result.meta is not None and result.meta.size == 4
-    metrics = result.meta.extra_info[ROLLOUT_METRICS][0]
+    assert ROLLOUT_METRICS not in result.meta.extra_info
+    metrics = result.token_metrics
     # This harness generates exactly one token per model call. Contexts and
     # duplicated ancestors in sibling rows must not change that population.
     assert metrics["gen_tokens_per_sample/histogram"] == [len(selected)]

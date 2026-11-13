@@ -31,7 +31,7 @@ IGNORE=(
     "--ignore=unit/test_config_validation.py"
 )
 
-uv run --no-sync bash -x ./tests/run_unit.sh "unit/" "test_mxfp8_rollout_recipes.py" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
+uv run --no-sync bash -x ./tests/run_unit.sh "unit/" "${IGNORE[@]}" "${EXCLUDED_UNIT_TESTS[@]}" --cov=nemo_rl --cov-report=term-missing --cov-report=json --hf-gated
 
 # Skip research tests in fast mode
 if [[ "${FAST:-0}" != "1" ]]; then
@@ -39,7 +39,7 @@ if [[ "${FAST:-0}" != "1" ]]; then
         [[ -d "$i" ]] || continue
         project_dir=$(dirname "$(dirname "$i")")
         pushd "$project_dir"
-        uv sync --locked --inexact --group test
+        uv sync --locked --group test
         uv run --no-sync pytest tests/unit
         popd
     done

@@ -1,9 +1,6 @@
 # Automodel v0.6.0 and Context-Parallel Integration
 
-This design note describes NeMo RL's Automodel integration after the
-Automodel dependency was pinned to the official `v0.6.0` tag. It also explains the
-migration from NeMo RL's fixed context-parallel (CP) layout to Automodel's model-owned
-sharding protocol.
+This design note describes NeMo RL's Automodel integration after the Automodel dependency was pinned to the official `v0.6.0` tag. It also explains the migration from NeMo RL's fixed context-parallel (CP) layout to Automodel's model-owned sharding protocol.
 
 ## 1. Scope and Baselines
 
@@ -14,20 +11,13 @@ The before-and-after comparisons in this document use the following fixed baseli
 | Before the upgrade | `13b9dae09c31d9069575ce24de1e234943da7b92` | `24b47e856263d313b942f0ed666c63fff83306b4` from `main`; package version `0.4.0` |
 | After the upgrade | This integration | [`v0.6.0`](https://github.com/NVIDIA-NeMo/Automodel/tree/v0.6.0) at `89c248a1743b47e135bab5a3e08856d2e24f3bd3` |
 
-The support matrices below describe the **NeMo RL Automodel integration**, not every
-capability available in upstream Automodel. In particular, a model or layout can be
-supported upstream while still being rejected by a NeMo RL worker guard. "Supported"
-means that the NeMo RL path implements CP and does not explicitly reject the combination;
-it does not mean that every model, topology, and sequence length has been tested.
+The support matrices below describe the **NeMo RL Automodel integration**, not every capability available in upstream Automodel. In particular, a model or layout can be supported upstream while still being rejected by a NeMo RL worker guard. "Supported" means that the NeMo RL path implements CP and does not explicitly reject the combination; it does not mean that every model, topology, and sequence length has been tested.
 
 ## 2. Automodel v0.6.0 Upgrade
 
 ### 2.1 Submodule and Environment
 
-The submodule now records the exact commit referenced by the `v0.6.0` tag instead of
-tracking Automodel's moving `main` branch. Moving or recreating the upstream tag does not
-change an existing checkout automatically; NeMo RL must explicitly update its gitlink to
-adopt a different commit.
+The submodule now records the exact commit referenced by the `v0.6.0` tag instead of tracking Automodel's moving `main` branch. Moving or recreating the upstream tag does not change an existing checkout automatically; NeMo RL must explicitly update its gitlink to adopt a different commit.
 
 The dependency changes in `pyproject.toml` are:
 
@@ -40,14 +30,9 @@ The dependency changes in `pyproject.toml` are:
 | Shared `apache-tvm-ffi` override | `>=0.1.9` | `==0.1.11` |
 | `megatron-fsdp` | No root constraint | Git constraint at [`455389c4`](https://github.com/yuhezhang-ai/Megatron-LM/commit/455389c480af6b3acdca74c7830c68b3274eb083) |
 
-The Automodel, vLLM, and MCore environments select Transformers 5.12.1. The SGLang
-extra remains independently pinned to Transformers 5.6.0. The `megatron-fsdp` constraint
-mirrors Automodel's source and revision so `uv` can resolve the transitive URL dependency
-consistently. The lock file was regenerated as part of the dependency upgrade.
+The Automodel, vLLM, and MCore environments select Transformers 5.12.1. The SGLang extra remains independently pinned to Transformers 5.6.0. The `megatron-fsdp` constraint mirrors Automodel's source and revision so `uv` can resolve the transitive URL dependency consistently. The lock file was regenerated as part of the dependency upgrade.
 
-Automodel's TileLang kernels also require the 0.1.11 TVM FFI ABI. In the container,
-`z3/lib` is added to `LD_LIBRARY_PATH` because TileLang's symlinked worker-venv layout can
-otherwise prevent `libtvm_compiler.so` from finding `libz3.so`.
+Automodel's TileLang kernels also require the 0.1.11 TVM FFI ABI. In the container, `z3/lib` is added to `LD_LIBRARY_PATH` because TileLang's symlinked worker-venv layout can otherwise prevent `libtvm_compiler.so` from finding `libz3.so`.
 
 ### 2.2 Distributed Setup and Model Loading
 
@@ -60,8 +45,7 @@ Automodel v0.6.0 consolidates distributed setup and model loading:
 | FSDP backend | `FSDP2Config(backend="nccl")` | No `backend` field; NeMo RL initializes the process-group backend separately |
 | MoE config import | `components.moe.config` | `components.distributed.config` |
 
-The main upstream API change is Automodel
-[#2266](https://github.com/NVIDIA-NeMo/Automodel/pull/2266):
+The main upstream API change is Automodel [#2266](https://github.com/NVIDIA-NeMo/Automodel/pull/2266):
 
 ```python
 mesh_context = MeshContext.build(
@@ -87,47 +71,23 @@ model = model_class.from_pretrained(
 
 ### 2.3 Other API and Compatibility Changes
 
-- `BackendConfig` now comes from `components.models.common.utils`
-  ([#1172](https://github.com/NVIDIA-NeMo/Automodel/pull/1172)).
-- `Checkpointer._should_write_hf_metadata()` became the module-level
-  `_should_write_hf_metadata(config)`.
-- `save_consolidated` now uses the canonical `"false"`, `"final"`, and `"every"`
-  modes ([#2289](https://github.com/NVIDIA-NeMo/Automodel/pull/2289)). NeMo RL
-  exposes these Automodel-only settings under `policy.automodel_cfg`, delegates
-  normalization to Automodel, explicitly marks terminal checkpoint saves, and
-  supports all three modes. Automodel still accepts legacy booleans, but NeMo RL
-  intentionally exposes only canonical strings: use quoted `"false"` instead of
-  the YAML boolean `false`, and use `"every"` instead of `true`.
-  Timeout-triggered saves remain resumable recovery checkpoints and are not marked
-  as terminal saves.
-  NeMo RL retains ownership of async-save finalization, metric selection, and
-  checkpoint retention, so overlapping or otherwise unsupported upstream settings
-  are rejected instead of silently ignored. Automodel policy saves are asynchronous
-  and finalized before checkpoint promotion; value saves are synchronous because
-  their callers promote the checkpoint immediately after `Value.save_checkpoint()`
-  returns. Automodel's checkpoint CPU offload, consolidation staging, and
-  Transformers v4 compatibility settings are not exposed yet. As with the Megatron
-  backend, checkpoint resource settings are fixed when workers start; an individual
-  save supplies only its destination and whether it is the final checkpoint.
+- `BackendConfig` now comes from `components.models.common.utils` ([#1172](https://github.com/NVIDIA-NeMo/Automodel/pull/1172)).
+- `Checkpointer._should_write_hf_metadata()` became the module-level `_should_write_hf_metadata(config)`.
+- `save_consolidated` now uses the canonical `"false"`, `"final"`, and `"every"` modes ([#2289](https://github.com/NVIDIA-NeMo/Automodel/pull/2289)). NeMo RL exposes these Automodel-only settings under `policy.automodel_cfg`, delegates normalization to Automodel, explicitly marks terminal checkpoint saves, and supports all three modes. Automodel still accepts legacy booleans, but NeMo RL intentionally exposes only canonical strings: use quoted `"false"` instead of the YAML boolean `false`, and use `"every"` instead of `true`.
+  Timeout-triggered saves remain resumable recovery checkpoints and are not marked as terminal saves.
+  NeMo RL retains ownership of async-save finalization, metric selection, and checkpoint retention, so overlapping or otherwise unsupported upstream settings are rejected instead of silently ignored. Automodel policy saves are asynchronous and finalized before checkpoint promotion; value saves are synchronous because their callers promote the checkpoint immediately after `Value.save_checkpoint()` returns. Automodel's checkpoint CPU offload, consolidation staging, and Transformers v4 compatibility settings are not exposed yet. As with the Megatron backend, checkpoint resource settings are fixed when workers start; an individual save supplies only its destination and whether it is the final checkpoint.
 
 The upgrade removes three compatibility workarounds:
 
-- NeMo RL now imports Automodel's exported `NeMoAutoModelForTokenClassification` instead
-  of maintaining a local shim
-  ([#1634](https://github.com/NVIDIA-NeMo/Automodel/pull/1634)).
-- The `_restore_loaded_model_dtype()` monkeypatch is no longer needed because Automodel
-  preserves an explicitly requested FP32 parameter dtype
-  ([#2419](https://github.com/NVIDIA-NeMo/Automodel/pull/2419)).
-- The Gemma 4 KV-sharing `use_cache=True` workaround is removed. Transformers 5.12.1
-  contains the required fix, so Automodel training continues with `use_cache=False`
-  ([Transformers #45312](https://github.com/huggingface/transformers/pull/45312)).
+- NeMo RL now imports Automodel's exported `NeMoAutoModelForTokenClassification` instead of maintaining a local shim ([#1634](https://github.com/NVIDIA-NeMo/Automodel/pull/1634)).
+- The `_restore_loaded_model_dtype()` monkeypatch is no longer needed because Automodel preserves an explicitly requested FP32 parameter dtype ([#2419](https://github.com/NVIDIA-NeMo/Automodel/pull/2419)).
+- The Gemma 4 KV-sharing `use_cache=True` workaround is removed. Transformers 5.12.1 contains the required fix, so Automodel training continues with `use_cache=False` ([Transformers #45312](https://github.com/huggingface/transformers/pull/45312)).
 
 ## 3. Context-Parallel Integration
 
 ### 3.1 Model-Owned Sharding
 
-Automodel [#2937](https://github.com/NVIDIA-NeMo/Automodel/pull/2937) unifies CP input
-handling across model families and attention backends through `ContextParallelSharder`:
+Automodel [#2937](https://github.com/NVIDIA-NeMo/Automodel/pull/2937) unifies CP input handling across model families and attention backends through `ContextParallelSharder`:
 
 ```python
 cp_sharder = ContextParallelSharder(model, device_mesh, batch)
@@ -137,16 +97,9 @@ with train_ctx():
     output = model(**sharded_batch)
 ```
 
-`shard()` selects the model- and backend-specific strategy, pads and shards the batch,
-returns the forward context, and stores the resulting `ShardLayout` on
-`cp_sharder.shard_layout`. The layout records how local tokens map to global positions and
-the sequence lengths before and after padding. The sharder then exposes
-`shard_token_tensor()` and `gather_token_tensor()` so callers can map targets, masks,
-logprobs, and logits through the exact layout used by the forward pass.
+`shard()` selects the model- and backend-specific strategy, pads and shards the batch, returns the forward context, and stores the resulting `ShardLayout` on `cp_sharder.shard_layout`. The layout records how local tokens map to global positions and the sequence lengths before and after padding. The sharder then exposes `shard_token_tensor()` and `gather_token_tensor()` so callers can map targets, masks, logprobs, and logits through the exact layout used by the forward pass.
 
-Automodel therefore owns the model-input layout and attention communication. NeMo RL keeps
-canonical, unsharded algorithm data and uses the sharder to compute losses or restore
-public outputs such as full-sequence logprobs and top-k logits.
+Automodel therefore owns the model-input layout and attention communication. NeMo RL keeps canonical, unsharded algorithm data and uses the sharder to compute losses or restore public outputs such as full-sequence logprobs and top-k logits.
 
 ### 3.2 Support Matrix Before the Upgrade
 
@@ -180,16 +133,15 @@ This matrix describes the current NeMo RL integration pinned to Automodel `v0.6.
 | DPO | Supported | Full-sequence policy/reference logprobs are restored through the sharder before loss computation |
 | Same-tokenizer distillation | Supported | Top-k and student outputs are restored through the sharder; replicated loss uses `loss * DP` |
 | X-token distillation | Conditional | Specialized heterogeneous TP/CP path remains; no sequence packing, and each teacher/student sequence length must be divisible by its own CP size for the contiguous IPC windows |
-| PPO | Not supported end to end | Actor policy can use CP, but the Automodel critic/value path still requires `CP=1` |
-| Reward-model training and scoring | Not supported | RM setup and `ScorePostProcessor` reject `CP>1` |
+| PPO | Supported | Both the actor policy and token-level Automodel critic/value path support CP |
+| Reward-model training and scoring | Not supported | Standalone RM training and sequence-level reward scoring do not support CP |
 | CP with sequence packing | Not supported in NeMo RL | The integration still rejects it, even though the upstream sharder can represent packed/THD layouts |
 | CP with Automodel sequence parallel | Not supported | The existing TP sequence-parallel guard remains |
 | Non-packed sequence length | Supported with padding | The generic sharder pads and trims automatically; x-token keeps the divisibility restriction described above |
 
 ### 3.4 GRPO Workflow Before and After
 
-The GRPO algorithm remains unchanged. The refactor changes how `policy.train()` and
-`policy.get_logprobs()` map between canonical RL data and the model's local CP layout.
+The GRPO algorithm remains unchanged. The refactor changes how `policy.train()` and `policy.get_logprobs()` map between canonical RL data and the model's local CP layout.
 
 #### Before
 
@@ -207,8 +159,7 @@ flowchart TB
     J --> K["backward: loss * DP * CP"]
 ```
 
-NeMo RL implemented the layout twice: once for the model input and again for targets and
-logprobs. This coupled the loss path to Automodel's legacy round-robin assumptions.
+NeMo RL implemented the layout twice: once for the model input and again for targets and logprobs. This coupled the loss path to Automodel's legacy round-robin assumptions.
 
 #### After
 
@@ -238,10 +189,7 @@ For `CP=1`, the worker keeps the direct fast path without constructing a sharder
 
 ### 3.5 X-Token Distillation Workflow Before and After
 
-The outer algorithm is unchanged: tokenize and align fixed text, export teacher full-vocab
-logits over CUDA IPC, then compute projection-based KD and student CE. The refactor changes
-how teacher and student model layouts are converted into the contiguous windows required by
-the IPC and alignment contracts.
+The outer algorithm is unchanged: tokenize and align fixed text, export teacher full-vocab logits over CUDA IPC, then compute projection-based KD and student CE. The refactor changes how teacher and student model layouts are converted into the contiguous windows required by the IPC and alignment contracts.
 
 #### Before
 
@@ -264,8 +212,7 @@ flowchart TB
     L --> M["backward and optimizer step"]
 ```
 
-Teacher export, student relayout, and alignment localization all depended on the fixed
-legacy layout.
+Teacher export, student relayout, and alignment localization all depended on the fixed legacy layout.
 
 #### After
 
@@ -298,6 +245,4 @@ flowchart TB
 | Alignment | Student fields traveled through `cp_buffers` | Canonical fields are globally shifted, then sliced |
 | Preserved x-token logic | CUDA IPC, heterogeneous TP/CP, projection, chunk alignment, and multi-teacher aggregation | Unchanged; these remain NeMo RL responsibilities |
 
-X-token KD and CE keep a partitioned gradient contract, so `cp_gradient_fanout=1` and the
-effective backward scale remains `loss * DP * CP`. This differs from GRPO's replicated
-full-sequence loss.
+X-token KD and CE keep a partitioned gradient contract, so `cp_gradient_fanout=1` and the effective backward scale remains `loss * DP * CP`. This differs from GRPO's replicated full-sequence loss.

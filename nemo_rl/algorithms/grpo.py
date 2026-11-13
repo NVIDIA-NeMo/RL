@@ -13,6 +13,7 @@
 # limitations under the License.
 import gc
 import json
+import math
 import os
 import time
 import warnings
@@ -127,11 +128,11 @@ from nemo_rl.experience.rollouts import (
     run_nemo_gym_rollout_sync,
     should_mask_flagged_samples,
 )
-from nemo_rl.models.generation.dynamo import DynamoConfig, DynamoGeneration
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
     GenerationSamplingParams,
+    sampler_replay_enabled,
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
@@ -294,6 +295,32 @@ class RewardScalingConfig(BaseModel, extra="allow"):
     source_max: float = 1.0
     target_min: float = 0.0
     target_max: float = 1.0
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> "RewardScalingConfig":
+        """Validate enabled scaling bounds before any backend consumes them."""
+        if not self.enabled:
+            return self
+        non_finite = [
+            f"{name}={value}"
+            for name, value in (
+                ("source_min", self.source_min),
+                ("source_max", self.source_max),
+                ("target_min", self.target_min),
+                ("target_max", self.target_max),
+            )
+            if not math.isfinite(value)
+        ]
+        if non_finite:
+            raise ValueError(
+                f"reward_scaling bounds must be finite, got {', '.join(non_finite)}."
+            )
+        if self.source_min >= self.source_max:
+            raise ValueError(
+                f"reward_scaling.source_min={self.source_min} must be less "
+                f"than reward_scaling.source_max={self.source_max}."
+            )
+        return self
 
 
 class AsyncGRPOConfig(BaseModel, extra="allow"):
@@ -559,11 +586,54 @@ class MasterConfig(BaseModel, extra="allow"):
 # ===============================================================================
 
 
-def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
-    """Validate the single-forward threshold path before allocating workers."""
+def _validate_val_sampling(master_config: MasterConfig) -> None:
+    """Reject validation sampling params that rollouts cannot honor.
+
+    Validation-only sampling is honored only on the NeMo-Gym vLLM and TRT-LLM
+    rollout paths; everywhere else validation must sample exactly like training.
+    """
+    generation_config = master_config.policy["generation"]
+    val_sampling_overridden = (
+        generation_config["val_temperature"] != generation_config["temperature"]
+        or generation_config["val_top_p"] != generation_config["top_p"]
+        or generation_config["val_top_k"] != generation_config["top_k"]
+    )
+    if not val_sampling_overridden:
+        return
+    assert generation_config["backend"] in ("vllm", "trtllm") and should_use_nemo_gym(
+        master_config
+    ), (
+        "generation.val_temperature/val_top_p/val_top_k differing from the "
+        "train sampling params is only supported for vLLM and TRT-LLM "
+        "NeMo-Gym rollouts."
+    )
+    # NeMo-Gym requests carry only temperature/top_p; the vLLM and TRT-LLM
+    # servers pin top_k to the train or validation profile, telling them apart
+    # by those two.
+    assert (
+        generation_config["val_top_k"] == generation_config["top_k"]
+        or generation_config["val_temperature"] != generation_config["temperature"]
+        or generation_config["val_top_p"] != generation_config["top_p"]
+    ), (
+        "generation.val_top_k differs from top_k while val_temperature/val_top_p "
+        "equal the train values: the Gym server cannot tell validation requests "
+        "apart and would sample them with top_k. Change val_temperature or "
+        "val_top_p too, or keep val_top_k equal to top_k."
+    )
+
+
+def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
+    """Validate the single-forward threshold path before allocating workers.
+
+    Shared by the GRPO and SingleController trainers, whose master configs are
+    separate classes with the fields read here. SingleController also runs it
+    for PPO, whose config has a ``ppo`` block instead of ``grpo``.
+    """
     if not master_config.loss_fn.seq_logprob_error_in_loss:
         return
-    if master_config.grpo.seq_logprob_error_threshold is None:
+    ppo = getattr(master_config, "ppo", None)
+    algo = ppo if ppo is not None else master_config.grpo
+    if algo.seq_logprob_error_threshold is None:
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss requires seq_logprob_error_threshold"
         )
@@ -573,10 +643,17 @@ def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
             "loss_fn.seq_logprob_error_in_loss requires force_on_policy_ratio=true "
             "and token_level_loss=true"
         )
-    if master_config.grpo.adv_estimator.name != "grpo" or loss.use_kl_in_reward:
+    # Without the policy-logprob pass, KL-in-reward would have no policy logprobs.
+    if loss.use_kl_in_reward or (ppo is None and algo.adv_estimator.name != "grpo"):
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss requires the grpo advantage estimator "
-            "without use_kl_in_reward"
+            "(or PPO) without use_kl_in_reward"
+        )
+    # A forced ratio is exact only for the first optimizer step on a batch.
+    if ppo is not None and ppo.ppo_epochs != 1:
+        raise ValueError(
+            "loss_fn.seq_logprob_error_in_loss requires ppo.ppo_epochs=1, got "
+            f"ppo.ppo_epochs={ppo.ppo_epochs}"
         )
     policy = master_config.policy
     if "megatron_cfg" not in policy or not policy["megatron_cfg"]["enabled"]:
@@ -639,19 +716,6 @@ def _needs_hf_refit_handshake(
     return not (nccl_reshard_refit_enabled and not colocated_inference)
 
 
-def _uses_managed_noncolocated_refit(
-    generation_backend: str,
-    nccl_reshard_refit_enabled: bool,
-    offload_policy_before_refit: bool,
-) -> bool:
-    """Whether non-colocated setup must attach a weight synchronizer."""
-    return (
-        nccl_reshard_refit_enabled
-        or generation_backend == "dynamo"
-        or offload_policy_before_refit
-    )
-
-
 def _shutdown_completed_nemo_gym_startup(
     future: Future[tuple[NemoGymShardSet, float]] | None,
 ) -> None:
@@ -702,9 +766,9 @@ def setup(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     loss_config: ClippedPGLossConfig = master_config.loss_fn
-    if loss_config.score_centering:
+    if loss_config.score_centering or sampler_replay_enabled(generation_config):
         raise ValueError(
-            "Score centering requires SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy GRPO trainer does not capture sampler tensors."
+            "Score centering and policy.generation.sampler_replay.enabled require SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy GRPO trainer does not capture sampler tensors."
         )
     env_configs = master_config.env
     data_config = master_config.data
@@ -732,20 +796,6 @@ def setup(
     if generation_config["backend"] == "vllm":
         normalize_nvfp4_pertoken_policy_config(policy_config, entry_point="grpo")
         normalize_vllm_refit_config(cast(VllmConfig, generation_config))
-    elif generation_config["backend"] == "dynamo":
-        # Validate the complete managed-Dynamo boundary before allocating Ray
-        # placement groups or starting any external services.
-        if grpo_config.async_grpo.in_flight_weight_updates:
-            raise ValueError(
-                "grpo.async_grpo.in_flight_weight_updates must be false when "
-                "policy.generation.backend='dynamo'; managed Dynamo drains "
-                "rollouts before layerwise weight refit"
-            )
-        generation_config.setdefault("vllm_kwargs", {})["hf_overrides"] = (
-            policy_config.get("hf_config_overrides") or {}
-        )
-        generation_config = DynamoConfig.model_validate(generation_config).model_dump()
-        policy_config["generation"] = generation_config
 
     # generation.disaggregation is written in backend-agnostic terms, but only
     # the TRT-LLM backend implements it today: every other backend would
@@ -774,27 +824,7 @@ def setup(
     _validate_seq_logprob_error_in_loss(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
 
-    # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
-    # path; everywhere else validation must sample exactly like training.
-    val_sampling_overridden = (
-        generation_config["val_temperature"] != generation_config["temperature"]
-        or generation_config["val_top_p"] != generation_config["top_p"]
-        or generation_config["val_top_k"] != generation_config["top_k"]
-    )
-    if val_sampling_overridden:
-        assert generation_config["backend"] == "vllm" and should_use_nemo_gym(
-            master_config
-        ), (
-            "generation.val_temperature/val_top_p/val_top_k differing from the "
-            "train sampling params is only supported for vLLM NeMo-Gym rollouts."
-        )
-        # The NeMo-Gym path only stamps temperature/top_p onto requests and
-        # rejects any top_k at rollout time, so a val_top_k override can never
-        # be honored — fail here instead of at the first validation step.
-        assert not generation_config["val_top_k"], (
-            "generation.val_top_k is not supported: the NeMo-Gym rollout path "
-            "only honors val_temperature/val_top_p. Leave val_top_k null."
-        )
+    _validate_val_sampling(master_config)
     assert grpo_config.val_num_generations_per_prompt >= 1, (
         "grpo.val_num_generations_per_prompt must be >= 1"
     )
@@ -1297,10 +1327,6 @@ def setup(
                     gpus_per_instance = replica_width(
                         cast(TrtllmConfig, generation_config)
                     )
-                elif generation_config["backend"] == "dynamo":
-                    gpus_per_instance = DynamoConfig.model_validate(
-                        generation_config
-                    ).engine_world_size
                 else:
                     sglang_cfg = generation_config.get("sglang_cfg", {})
                     gpus_per_instance = sglang_cfg.get("gpus_per_server", 1)
@@ -1374,10 +1400,6 @@ def setup(
                 MegatronGeneration.init_cluster_placement_groups(
                     inference_cluster, policy_config
                 )
-            elif generation_config["backend"] == "dynamo":
-                # Managed Dynamo creates one single-node engine per placement
-                # group and does not need a backend-specific PG strategy.
-                inference_cluster.get_placement_groups()
             else:
                 {
                     "vllm": VllmGeneration,
@@ -1932,37 +1954,6 @@ def setup(
             )
             setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
 
-    elif backend == "dynamo":
-        # Managed Dynamo owns a fixed worker fleet on the inference virtual cluster.
-
-        def init_dynamo():
-            t0 = time.perf_counter()
-            generation = DynamoGeneration(
-                cluster=inference_cluster,
-                config=generation_config,
-                tokenizer=tokenizer,
-                tokenizer_config=policy_config["tokenizer"],
-            )
-            return generation, time.perf_counter() - t0
-
-        policy_generation, policy = initialize_generation_with_policy(
-            init_generation_fn=init_dynamo,
-            colocated_inference=False,
-            setup_timing_metrics=setup_timing_metrics,
-        )
-
-        if enable_nemo_gym:
-            nemo_gym_actor, nemo_gym_time = _spinup_nemo_gym(
-                policy_generation.dp_openai_server_base_urls,
-                generation_config["model_name"],
-            )
-            setup_timing_metrics.nemo_gym_init_time_s = nemo_gym_time
-
-        print(
-            f"  ✓ Using Dynamo backend (frontend: {policy_generation.frontend_url})",
-            flush=True,
-        )
-
     # Record when worker initialization completes (for calculating other setup time)
     worker_init_complete_time = time.perf_counter() - setup_start_time
 
@@ -1979,12 +1970,14 @@ def setup(
     if refit_transport is not None and not (
         backend == "vllm"
         or (backend == "megatron" and refit_transport in ("mcore", "nccl_reshard"))
+        or (backend == "trtllm" and refit_transport == "nccl_reshard")
     ):
         raise NotImplementedError(
             f"refit_transport={refit_transport!r} is not supported for "
             f"policy.generation.backend={backend!r}. "
             "Set policy.generation.refit_transport=null. Megatron generation "
-            "supports refit_transport='mcore' or 'nccl_reshard'."
+            "supports refit_transport='mcore' or 'nccl_reshard'; TRT-LLM "
+            "generation supports 'nccl_reshard'."
         )
 
     if backend == "megatron":
@@ -2002,12 +1995,8 @@ def setup(
         and checkpoint_engine_config is None
     ):
         t0 = time.perf_counter()
-        # init collective
-        if _uses_managed_noncolocated_refit(
-            generation_backend=backend,
-            nccl_reshard_refit_enabled=nccl_reshard_refit_enabled,
-            offload_policy_before_refit=offload_policy_before_refit,
-        ):
+        # init collective; these refits need an attached weight synchronizer.
+        if nccl_reshard_refit_enabled or offload_policy_before_refit:
             policy_generation.weight_synchronizer = create_weight_synchronizer(
                 policy=policy,
                 generation=policy_generation,
@@ -4669,6 +4658,8 @@ def _grpo_train_impl(
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
+                if "attribution_key" in repeated_batch:
+                    log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages["content"]
                 log_data["rewards"] = rewards.tolist()
                 if master_config.grpo.use_dynamic_sampling:
@@ -4921,15 +4912,20 @@ def validate(
         )
 
         total_rewards = []
-        total_lengths = []
+        # Sum of per-batch mean length x rollouts, so a partial batch weighs less.
+        total_length_tokens = 0.0
         all_message_logs = []  # Collect all message logs
 
-        max_batches = (
-            master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
-        )
+        max_val_samples = master_config.grpo.max_val_samples
+        val_batch_size = master_config.grpo.val_batch_size
+        # Include the partial final batch, then trim it to the prompt cap.
+        max_batches = -(-max_val_samples // val_batch_size)
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
+            num_left = max_val_samples - batch_idx * val_batch_size
+            if val_batch.size > num_left:
+                val_batch = val_batch.slice(0, num_left)
 
             if val_num_generations_per_prompt > 1:
                 val_batch = val_batch.repeat_interleave(val_num_generations_per_prompt)
@@ -5015,8 +5011,11 @@ def validate(
                     ),
                 )
 
-            total_rewards.extend(val_batch["total_reward"].tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+            batch_rewards = val_batch["total_reward"].tolist()
+            total_rewards.extend(batch_rewards)
+            total_length_tokens += gen_metrics["mean_gen_tokens_per_sample"] * len(
+                batch_rewards
+            )
 
             # Collect message logs for later display
             to_env = [
@@ -5051,9 +5050,7 @@ def validate(
         else:
             accuracy = 0.0
 
-        avg_length = (
-            sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
-        )
+        avg_length = total_length_tokens / num_samples if num_samples > 0 else 0.0
 
         val_metrics = {
             "accuracy": accuracy,
@@ -5283,17 +5280,17 @@ def async_grpo_train(
             media to NeMo Gym prompt rows.
     """
     # Ensure we are running with a compatible async generation backend.
-    # Async GRPO supports vLLM, Megatron, TRT-LLM, and Dynamo;
+    # Async GRPO supports vLLM, Megatron, and TRT-LLM;
     # SGLang async rollouts do not support the async GRPO replay path.
     generation_config = master_config.policy["generation"]
     backend = generation_config.get("backend", "") if generation_config else ""
-    assert backend in ("vllm", "megatron", "trtllm", "dynamo"), (
-        "Async GRPO supports the vLLM, Megatron, TRT-LLM, and Dynamo generation backends; "
+    assert backend in ("vllm", "megatron", "trtllm"), (
+        "Async GRPO supports the vLLM, Megatron, and TRT-LLM generation backends; "
         f"got policy.generation.backend={backend!r}."
     )
     assert should_use_async_rollouts(generation_config), (
-        "Async GRPO requires Dynamo, Megatron, or an async vLLM or TRT-LLM "
-        "generation engine. Set policy.generation.backend=dynamo, "
+        "Async GRPO requires Megatron, or an async vLLM or TRT-LLM "
+        "generation engine. Set "
         "policy.generation.vllm_cfg.async_engine=true (vLLM), or "
         "policy.generation.trtllm_cfg.async_engine=true (TRT-LLM). "
         "Megatron Inference always uses its async engine."
@@ -5590,7 +5587,7 @@ def async_grpo_train(
             raise
 
     # Generation must hold the policy's real weights before any backend starts
-    # collecting. In particular, vLLM and Dynamo start with dummy weights when
+    # collecting. In particular, vLLM starts with dummy weights when
     # the first refit supplies model parameters.
     ray.get(trajectory_collector.set_weight_version.remote(weight_version))
     ray.get(trajectory_collector.start_collection.remote(CyclingDataLoader(dataloader)))
@@ -6643,6 +6640,8 @@ def async_grpo_train(
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
+                if "attribution_key" in repeated_batch:
+                    log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages_content
                 log_data["rewards"] = rewards.tolist()
                 if master_config.grpo.use_dynamic_sampling:

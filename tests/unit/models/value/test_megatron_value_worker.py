@@ -29,10 +29,11 @@ Modeled after `tests/unit/models/policy/test_megatron_worker.py`.
 """
 
 import os
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import ray
@@ -50,6 +51,90 @@ from nemo_rl.models.value.lm_value import Value
 from nemo_rl.utils.checkpoint import CheckpointManager
 
 pytestmark = pytest.mark.mcore
+
+
+def test_value_media_mask_only_for_explicit_model_forward() -> None:
+    """Qwen2.5-style forwards must not receive the rollout media mask."""
+    from nemo_rl.models.megatron.common import model_media_placeholder_token_id
+
+    class _WithMask(torch.nn.Module):
+        image_token_index = 42
+
+        def forward(self, input_ids, media_token_validity_mask=None):
+            del media_token_validity_mask
+            return input_ids
+
+    class _WithoutMask(torch.nn.Module):
+        image_token_index = 42
+
+        def forward(self, input_ids):
+            return input_ids
+
+    assert model_media_placeholder_token_id(_WithMask()) == 42
+    assert model_media_placeholder_token_id(_WithoutMask()) is None
+
+
+def test_value_head_hook_replaces_nested_vlm_language_head() -> None:
+    """VLM critics must replace the head used by the nested language model."""
+    from megatron.bridge.training.utils.train_utils import LinearForLastLayer
+
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        make_value_head_hook,
+    )
+
+    class _VLMChunk:
+        post_process = True
+        pg_collection = None
+
+        def __init__(self) -> None:
+            self.language_model = SimpleNamespace(
+                output_layer=torch.nn.Linear(4, 16, bias=False)
+            )
+
+        def sharded_state_dict(
+            self, prefix: str = "", sharded_offsets=(), metadata=None
+        ):
+            del sharded_offsets, metadata
+            return {
+                f"{prefix}language_model.output_layer.weight": (
+                    self.language_model.output_layer.weight
+                ),
+                f"{prefix}language_model.decoder.weight": torch.ones(1),
+            }
+
+    non_post_process_chunk = SimpleNamespace(post_process=False)
+    chunk = _VLMChunk()
+    result = make_value_head_hook(hidden_size=4, sequence_parallel=False)(
+        [non_post_process_chunk, chunk]
+    )
+
+    assert result == [non_post_process_chunk, chunk]
+    assert isinstance(chunk.language_model.output_layer, LinearForLastLayer)
+    assert chunk.language_model.output_layer.out_features == 1
+    assert not hasattr(chunk, "output_layer")
+
+    assert "language_model.output_layer.weight" in chunk.sharded_state_dict()
+    with chunk.hide_loss_modules():
+        state = chunk.sharded_state_dict()
+    assert "language_model.output_layer.weight" not in state
+    assert "language_model.decoder.weight" in state
+
+
+def test_value_head_parent_supports_gpt_and_rejects_unknown_layouts() -> None:
+    """The scalar head helper must handle GPT chunks and fail closed otherwise."""
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        _value_head_parent,
+    )
+
+    output_layer = torch.nn.Linear(4, 8, bias=False)
+    gpt_chunk = SimpleNamespace(output_layer=output_layer)
+
+    parent, path = _value_head_parent(gpt_chunk)
+
+    assert parent is gpt_chunk
+    assert path == "output_layer"
+    with pytest.raises(AttributeError, match="no supported output layer"):
+        _value_head_parent(SimpleNamespace())
 
 
 def test_get_values_suspends_activation_offload() -> None:
@@ -76,10 +161,14 @@ def test_get_values_suspends_activation_offload() -> None:
     model_config = SimpleNamespace(fine_grained_activation_offloading=True)
     model = SimpleNamespace(config=model_config, eval=lambda: None)
     worker = SimpleNamespace(
+        _train_step_state=None,
         cfg={"train_micro_batch_size": 1},
         model=model,
         _policy_like_cfg={},
         mcore_state=SimpleNamespace(straggler_timer=None),
+        defer_fp32_logits=False,
+        media_placeholder_token_id=None,
+        model_slices_context_parallel_inputs=False,
     )
     observed_states: list[tuple[bool, bool]] = []
 
@@ -119,6 +208,101 @@ def test_get_values_suspends_activation_offload() -> None:
     assert observed_states == [(False, False)]
     assert model_config.fine_grained_activation_offloading is True
     assert manager.do_offload is True
+
+
+def test_get_values_passes_multimodal_batch_to_model_forward(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Value inference must not silently become image-blind."""
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    batch = BatchedDataDict(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "pixel_values": torch.ones(1, 4),
+            "image_grid_thw": torch.tensor([[1, 1, 1]]),
+            "media_token_validity_mask": torch.tensor([[True, False]]),
+        }
+    )
+    processed = SimpleNamespace(
+        data_dict=batch,
+        input_ids_cp_sharded=torch.tensor([[1, 2]]),
+        attention_mask=None,
+        position_ids=None,
+        packed_seq_params=None,
+        cu_seqlens_padded=None,
+        media_token_validity_mask=batch["media_token_validity_mask"],
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(fine_grained_activation_offloading=False),
+        eval=lambda: None,
+    )
+    worker = SimpleNamespace(
+        _train_step_state=None,
+        cfg={"train_micro_batch_size": 1},
+        model=model,
+        _policy_like_cfg={},
+        mcore_state=SimpleNamespace(straggler_timer=None),
+        defer_fp32_logits=False,
+        # Exercise the explicit-mask critic path. The None case intentionally
+        # removes it, as covered by the multimodal-utils mask tests.
+        media_placeholder_token_id=1,
+        model_slices_context_parallel_inputs=True,
+    )
+
+    def run_forward_only(**kwargs: Any) -> list[dict[str, torch.Tensor]]:
+        output, collect = kwargs["forward_step_func"](iter([processed]), model)
+        _, collected = collect(output)
+        return [collected]
+
+    with (
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_microbatch_iterator",
+            return_value=(iter([]), 1, 1, 2, 2),
+        ) as get_microbatch_iterator,
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_forward_backward_func",
+            return_value=run_forward_only,
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.model_forward",
+            return_value=torch.ones(1, 2, 1),
+        ) as model_forward,
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_pipeline_model_parallel_group",
+            return_value=None,
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.is_pipeline_last_stage",
+            return_value=True,
+        ),
+        patch("nemo_rl.models.value.workers.megatron_value_worker.broadcast_tensor"),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.cuda.nvtx.range_push"),
+        patch("torch.cuda.nvtx.range_pop"),
+    ):
+        result = MegatronValueWorkerImpl.get_values(worker, batch)
+
+    assert model_forward.call_args.kwargs["data_dict"] is batch
+    assert "pixel_values" in model_forward.call_args.kwargs["data_dict"]
+    assert (
+        model_forward.call_args.kwargs["media_token_validity_mask"]
+        is batch["media_token_validity_mask"]
+    )
+    assert (
+        model_forward.call_args.kwargs["model_slices_context_parallel_inputs"] is True
+    )
+    assert (
+        get_microbatch_iterator.call_args.kwargs["model_slices_context_parallel_inputs"]
+        is True
+    )
+    torch.testing.assert_close(result["values"], torch.tensor([[0.0, 1.0]]))
+    assert (
+        "MegatronValueWorker multimodal input fields: image_grid_thw,pixel_values"
+        in capsys.readouterr().out
+    )
 
 
 def _create_value_test_config(
@@ -332,11 +516,13 @@ def test_finish_training_updates_eval_cache_before_parameter_offload(
         events.append("optimizer_cpu")
 
     worker = SimpleNamespace(
+        _train_step_state=None,
         model=model,
         optimizer=object(),
         optimizer_cpu_offload=optimizer_cpu_offload,
         move_model=move_model,
         move_optimizer=move_optimizer,
+        cfg={"megatron_cfg": {}},
     )
     with (
         patch("nemo_rl.models.value.workers.megatron_value_worker.gc.collect"),
@@ -351,8 +537,81 @@ def test_finish_training_updates_eval_cache_before_parameter_offload(
     )
 
 
-def test_finish_training_evals_before_model_offload(monkeypatch):
-    """Mamba decode caches must refresh before CUDA parameter storage is released."""
+def test_split_value_accepts_uneven_packed_dp_shard_and_sanitizes_media_mask():
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    state = SimpleNamespace(
+        loss_fn=object(),
+        mbs=1,
+        gbs=128,
+        counts=torch.zeros(3, device="cuda"),
+        metrics=[],
+        num_microbatches=0,
+        num_chunks=0,
+        failed=False,
+    )
+    worker = SimpleNamespace(
+        _assert_train_step_open=lambda: state,
+        _restore_train_hooks=lambda current_state: None,
+        _policy_like_cfg={"sequence_packing": {"enabled": True}},
+        mcore_state=SimpleNamespace(straggler_timer=None),
+        model=SimpleNamespace(no_sync=nullcontext),
+        defer_fp32_logits=False,
+        cfg={"megatron_cfg": {"empty_unused_memory_level": 0}},
+        # Qwen2.5-VL-style forwards do not accept the transported mask.
+        media_placeholder_token_id=None,
+    )
+    data = BatchedDataDict(
+        {
+            "input_ids": torch.ones((65, 2), dtype=torch.long, device="cuda"),
+            "sample_mask": torch.ones(65, device="cuda"),
+            "token_mask": torch.ones((65, 2), device="cuda"),
+            "media_token_validity_mask": torch.ones(
+                (65, 2), dtype=torch.bool, device="cuda"
+            ),
+        }
+    )
+    rerun = SimpleNamespace(
+        should_run_forward_backward=MagicMock(side_effect=[True, False])
+    )
+    with (
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_microbatch_iterator",
+            return_value=(iter(()), 1, 1, None, 2),
+        ) as get_microbatch_iterator,
+        patch("nemo_rl.models.value.workers.megatron_value_worker.LossPostProcessor"),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.get_rerun_state_machine",
+            return_value=rerun,
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.megatron_forward_backward",
+            return_value=[],
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.is_pipeline_last_stage",
+            return_value=False,
+        ),
+        patch(
+            "nemo_rl.models.value.workers.megatron_value_worker.broadcast_loss_metrics_from_last_stage",
+            return_value=[],
+        ),
+        patch("torch.cuda.nvtx.range_push"),
+        patch("torch.cuda.nvtx.range_pop"),
+    ):
+        MegatronValueWorkerImpl.train_microbatch(worker, data)
+
+    assert state.counts[2].item() == 65
+    assert state.num_chunks == 1
+    assert not state.failed
+    assert get_microbatch_iterator.call_args.args[0] is data
+    assert "media_token_validity_mask" not in data
+
+
+def test_finish_training_preserves_model_move_contract(monkeypatch):
+    """Check that offloading preserves the model move-parameter contract."""
     from nemo_rl.models.value.workers.megatron_value_worker import (
         MegatronValueWorkerImpl,
     )
@@ -364,8 +623,10 @@ def test_finish_training_evals_before_model_offload(monkeypatch):
     events = []
     move_kwargs = []
     worker = object.__new__(MegatronValueWorkerImpl)
+    worker._train_step_state = None
     worker.model = _EvalModel()
     worker.optimizer = None
+    worker.cfg = {"megatron_cfg": {}}
     worker.move_model = lambda model, device, **kwargs: (
         events.append("move_model") or move_kwargs.append(kwargs) or model
     )
@@ -376,6 +637,36 @@ def test_finish_training_evals_before_model_offload(monkeypatch):
 
     assert events == ["eval", "move_model"]
     assert move_kwargs == [{"move_params": True, "move_grads": True}]
+
+
+@pytest.mark.parametrize("clear_caches", [True, False])
+def test_finish_training_clears_transient_caches_when_configured(
+    monkeypatch, clear_caches: bool
+) -> None:
+    """clear_memory_caches_before_refit releases the critic's RoPE/MoE caches too."""
+    from nemo_rl.models.value.workers import megatron_value_worker
+    from nemo_rl.models.value.workers.megatron_value_worker import (
+        MegatronValueWorkerImpl,
+    )
+
+    events: list[str] = []
+    model = SimpleNamespace(eval=lambda: events.append("eval"))
+    worker = object.__new__(MegatronValueWorkerImpl)
+    worker.model = model
+    worker.optimizer = None
+    worker._train_step_state = None
+    worker.cfg = {"megatron_cfg": {"clear_memory_caches_before_refit": clear_caches}}
+    worker.move_model = lambda m, device, **kwargs: (events.append("move_model") or m)
+    monkeypatch.setattr(
+        megatron_value_worker,
+        "clear_transient_megatron_caches",
+        lambda m: events.append("clear") if m is model else None,
+    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+
+    MegatronValueWorkerImpl.finish_training(worker)
+
+    assert events == ["eval", "move_model"] + (["clear"] if clear_caches else [])
 
 
 @pytest.fixture

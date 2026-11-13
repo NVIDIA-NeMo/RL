@@ -16,7 +16,7 @@ import os
 import time
 import traceback
 import warnings
-from typing import Any, NotRequired, Optional, TypedDict, TypeVar, cast
+from typing import Any, Literal, NotRequired, Optional, TypedDict, TypeVar, cast
 
 import numpy as np
 import ray
@@ -91,6 +91,7 @@ from nemo_rl.experience.rollouts import (
 )
 from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
+    sampler_replay_enabled,
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.sglang.config import SGLangConfig
@@ -218,6 +219,8 @@ class PPOConfig(BaseModel, extra="allow"):
     # Number of critic (value) passes over each rollout batch. Defaults to
     # ppo_epochs (see validate_epoch) unless explicitly set.
     critic_ppo_epochs: int = 4
+    # SingleController only: split accumulates chunks; whole_batch uses train_from_meta.
+    value_training_mode: Literal["split", "whole_batch"] = "whole_batch"
     reward_shaping: RewardShapingConfig = Field(default_factory=RewardShapingConfig)
     reward_scaling: RewardScalingConfig = Field(default_factory=RewardScalingConfig)
     adv_estimator: GAEConfig = Field(default_factory=GAEConfig)
@@ -369,9 +372,9 @@ def setup(
     generation_config = master_config.policy["generation"]
     env_configs = master_config.env
     loss_config: ClippedPGLossConfig = master_config.loss_fn
-    if loss_config.score_centering:
+    if loss_config.score_centering or sampler_replay_enabled(generation_config):
         raise ValueError(
-            "Score centering requires SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy PPO trainer does not capture sampler tensors."
+            "Score centering and policy.generation.sampler_replay.enabled require SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy PPO trainer does not capture sampler tensors."
         )
     ppo_config = master_config.ppo
     data_config = master_config.data
@@ -380,8 +383,8 @@ def setup(
 
     if loss_config.seq_logprob_error_in_loss:
         raise ValueError(
-            "loss_fn.seq_logprob_error_in_loss is not supported by PPO. "
-            "Use the non-streaming GRPO trainer."
+            "loss_fn.seq_logprob_error_in_loss is not supported by the legacy PPO "
+            "trainer. Use the SingleController trainer with ppo.ppo_epochs=1."
         )
 
     assert generation_config is not None, (
@@ -436,19 +439,17 @@ def setup(
                 "value.sequence_packing.enabled=true."
             )
     else:
-        # Automodel PPO value model currently doesn't support sequence packing and CP.
         assert (value_config.get("automodel_cfg") or {}).get("enabled"), (
             "Exactly one of value.megatron_cfg.enabled or value.automodel_cfg.enabled "
             "must be true for the PPO value model."
         )
-        assert value_config["sequence_packing"]["enabled"] is False, (
-            "Sequence packing is currently not supported for the Automodel PPO value model. "
-            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
-        )
-        assert value_config["automodel_cfg"]["context_parallel_size"] == 1, (
-            "Context parallelism (CP>1) is currently not supported for the Automodel PPO value model. "
-            "See https://github.com/NVIDIA-NeMo/RL/issues/2951."
-        )
+        if value_config["automodel_cfg"]["context_parallel_size"] > 1:
+            assert not value_config["sequence_packing"]["enabled"], (
+                "Automodel context parallelism is incompatible with value sequence "
+                "packing. Set value.sequence_packing.enabled=false when "
+                "value.automodel_cfg.context_parallel_size>1."
+            )
+
     # Set seed for all random number generators
     set_seed(ppo_config.seed)
 
@@ -533,6 +534,10 @@ def setup(
             == policy_config["train_global_batch_size"]
         ), (
             "force_on_policy_ratio requires train_global_batch_size == num_prompts_per_step * num_generations_per_prompt"
+        )
+        # Later epochs on the same batch would train without any trust region.
+        assert ppo_config.ppo_epochs == 1, (
+            f"force_on_policy_ratio requires ppo.ppo_epochs=1, got {ppo_config.ppo_epochs}"
         )
         os.environ["NRL_IGNORE_TP_ACCURACY_CHECK"] = "1"
         print("  ✓ force_on_policy_ratio enabled")

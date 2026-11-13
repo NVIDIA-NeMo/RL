@@ -2133,7 +2133,10 @@ def test_nemo_gym_run_rollouts_normalizes_mixed_media_before_dispatch(tmp_path):
         ]
         assert streamed_results[0][0] == 7
         assert streamed_results[0][1] == nemo_gym_row["agent_ref"]
-        assert streamed_results[0][2] == {"message_log": []}
+        assert streamed_results[0][2] == {
+            "message_log": [],
+            "attribution_key": "legacy_test_agent",
+        }
 
     asyncio.run(_run())
 
@@ -2409,11 +2412,11 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
     NeMo-Gym's vllm_model sets logprobs=True and return_tokens_as_token_ids=True to extract
     per-token ids and logprobs for training (Gym omits top_logprobs on the capture path, so
     vLLM applies its default; Gym PR #1612 additionally pins top_logprobs=0, which is
-    equivalent). vLLM computes `logprobs = top_logprobs if logprobs else None`, so omitting
-    top_logprobs (default 0) or sending 0 returns logprobs, while an explicit null returns
-    none and silently empties the captured token ids. This exercises the real HTTP path where
-    that translation lives (the offline LLM API does not), so a vLLM bump that changes the
-    contract fails here instead of silently freezing training.
+    equivalent). Omitting top_logprobs (default 0), sending 0 and sending an explicit null
+    must all return per-token logprobs; a request that returns none silently empties the
+    captured token ids. This exercises the real HTTP path where that translation lives (the
+    offline LLM API does not), so a vLLM bump that changes the contract fails here instead
+    of silently freezing training.
 
     All three cases share the (expensive) vLLM fixture, so they run in a single test rather
     than as separate parametrized cases.
@@ -2463,20 +2466,9 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
     _assert_has_token_ids(_chat(_OMIT_TOP_LOGPROBS), "omitted top_logprobs")
     _assert_has_token_ids(_chat(0), "top_logprobs=0")
 
-    # Explicit null is the divergence that motivates the Gym fix: vLLM returns no logprobs
-    # (200 with logprobs=None) or rejects the request outright. Both mean capture gets
-    # nothing. If a future vLLM makes null behave like 0, this fails and signals the Gym
-    # workaround can be relaxed.
-    null_resp = _chat(None)
-    if null_resp.status_code == 200:
-        assert null_resp.json()["choices"][0].get("logprobs") is None
-    else:
-        # A rejection must be a client-side validation error, not an unrelated server failure
-        # that would let this branch pass vacuously.
-        assert 400 <= null_resp.status_code < 500, (
-            f"expected null top_logprobs accepted-with-None or rejected as 4xx, "
-            f"got {null_resp.status_code}: {null_resp.text}"
-        )
+    # An explicit null used to return no logprobs, which is why Gym pins top_logprobs=0.
+    # vLLM 0.33 treats null like 0.
+    _assert_has_token_ids(_chat(None), "top_logprobs=null")
 
 
 @pytest.mark.nemo_gym
@@ -2535,3 +2527,151 @@ def test_spinup_hands_gym_the_policy_api_key_through_the_environment(monkeypatch
     without_key = spin_up(None)
     assert without_key["policy_api_key"] == "dummy_key"
     assert "NEMO_RL_POLICY_API_KEY" not in os.environ
+
+
+def _fake_gym_run_helper(monkeypatch, gym_mod, gym_cli, gym_rollout_collection):
+    """Capture the global config `_spinup` hands to Gym, without starting one."""
+    from unittest.mock import MagicMock
+
+    import nemo_gym.server_utils as gym_server_utils
+    from omegaconf import OmegaConf
+
+    started = []
+
+    class _FakeRunHelper:
+        def start(self, *, global_config_dict_parser_config):
+            started.append(
+                OmegaConf.to_container(
+                    global_config_dict_parser_config.initial_global_config_dict,
+                    resolve=False,
+                )
+            )
+
+    monkeypatch.setattr(gym_cli, "RunHelper", _FakeRunHelper)
+    monkeypatch.setattr(gym_rollout_collection, "RolloutCollectionHelper", MagicMock())
+    # _spinup resolves the rollout client up front, which would otherwise reach
+    # the head server the fake RunHelper never started.
+    monkeypatch.setattr(
+        gym_server_utils.ServerClient, "load_from_global_config", MagicMock()
+    )
+    monkeypatch.setattr(gym_mod, "_get_node_ip_local", lambda: "127.0.0.1")
+    return started
+
+
+@pytest.mark.nemo_gym
+def test_spinup_projects_a_telemetry_block_only_when_this_process_exports(monkeypatch):
+    """The telemetry block is added only when this actor exports, merged with the user's."""
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    started = _fake_gym_run_helper(
+        monkeypatch, nemo_gym_mod, gym_cli, gym_rollout_collection
+    )
+    # Read straight from the env, so the run id and the traces/metrics switches
+    # reach Gym's servers even with traces off -- not read back off an SDK
+    # provider that a traces-off run never installs.
+    monkeypatch.setenv("NEMO_RL_OTEL_RUN_ID", "a-run")
+    monkeypatch.setenv("NEMO_RL_OTEL_EXPORTER", "console")
+    monkeypatch.setenv("NEMO_RL_OTEL_TRACES_ENABLED", "0")
+    monkeypatch.setenv("NEMO_RL_OTEL_METRICS_ENABLED", "1")
+    # Published to os.environ directly; seed it so monkeypatch restores it.
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+
+    def spin_up(handle, gym_config=None):
+        monkeypatch.setattr(nemo_gym_mod, "get_telemetry_handle", lambda: handle)
+        # The user's block arrives inside the Gym config dict, so go through the builder.
+        cfg = nemo_gym_mod._build_gym_actor_config(
+            dict(gym_config or {}),
+            base_urls=["http://127.0.0.1:1/v1"],
+            model_name="policy",
+            enable_router_replay=False,
+            use_fastokens=False,
+            checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
+            turn_checkpointing_enabled=False,
+            generation_prefix_cuts_enabled=False,
+        )
+        NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
+        return started[-1]
+
+    # Telemetry off, and up but not exporting: the block must not appear at all.
+    assert "telemetry" not in spin_up(None)
+    assert "telemetry" not in spin_up(SimpleNamespace(is_exporting=False))
+
+    exporting = SimpleNamespace(is_exporting=True)
+    # Traces off, yet run id and the switches still ride along.
+    assert spin_up(exporting)["telemetry"] == {
+        "enabled": True,
+        "run_id": "a-run",
+        "exporter": "console",
+        "traces_enabled": False,
+        "metrics_enabled": True,
+    }
+
+    # A user block is merged into ours, not swapped in.
+    configured = spin_up(exporting, {"telemetry": {"span_groups": "default,sandbox"}})
+    assert configured["telemetry"]["span_groups"] == "default,sandbox"
+    assert configured["telemetry"]["enabled"] is True
+    assert configured["telemetry"]["run_id"] == "a-run"
+    # An explicit false opts the Gym side out without turning off RL's own.
+    opted_out = spin_up(exporting, {"telemetry": {"enabled": False}})
+    assert opted_out["telemetry"]["enabled"] is False
+
+
+@pytest.mark.nemo_gym
+def test_spinup_forwards_job_identity_to_gym_servers(monkeypatch):
+    """Job-level resource attributes reach Gym's servers; per-process ones do not."""
+    import os
+    from types import SimpleNamespace as NS
+
+    import nemo_gym.cli as gym_cli
+    import nemo_gym.rollout_collection as gym_rollout_collection
+    from nemo.lens import derive_nv_dl_run_uuid
+    from nemo.lens.resources.attributes import parse_otel_resource_attributes
+    from nemo.lens.semconv import NV_DL_RUN_UUID
+
+    import nemo_rl.environments.nemo_gym as nemo_gym_mod
+
+    started = _fake_gym_run_helper(
+        monkeypatch, nemo_gym_mod, gym_cli, gym_rollout_collection
+    )
+    monkeypatch.setattr(
+        nemo_gym_mod, "get_telemetry_handle", lambda: NS(is_exporting=True)
+    )
+    monkeypatch.setenv("NEMO_RL_OTEL_RUN_ID", "a-run")
+
+    def spin_up():
+        cfg = nemo_gym_mod._build_gym_actor_config(
+            {},
+            base_urls=["http://127.0.0.1:1/v1"],
+            model_name="policy",
+            enable_router_replay=False,
+            use_fastokens=False,
+            checkpoint_instance=GymCheckpointInstance("nemo_gym", 0),
+            turn_checkpointing_enabled=False,
+            generation_prefix_cuts_enabled=False,
+        )
+        NemoGym.__ray_metadata__.modified_class(cfg)._spinup()
+        return parse_otel_resource_attributes(os.environ["OTEL_RESOURCE_ATTRIBUTES"])
+
+    # Nothing pre-seeded: the job identity a server cannot know is forwarded.
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "")
+    published = spin_up()
+    assert published["nv.dl.campaign.stage"] == "RL"
+    assert published[NV_DL_RUN_UUID] == derive_nv_dl_run_uuid(run_id="a-run")
+    # Everything a server determines for itself stays behind.
+    for per_process in (
+        "service.name",
+        "service.instance.id",
+        "nv.dl.rank",
+        "process.pid",
+        "nemo.run.id",
+    ):
+        assert per_process not in published, per_process
+    # Gym gets our run id rather than minting its own.
+    assert started[-1]["telemetry"]["run_id"] == "a-run"
+
+    # A launcher's value must win over the actor's.
+    monkeypatch.setenv("OTEL_RESOURCE_ATTRIBUTES", "nv.dl.campaign.stage=SFT")
+    assert spin_up()["nv.dl.campaign.stage"] == "SFT"

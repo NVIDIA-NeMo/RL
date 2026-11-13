@@ -38,6 +38,25 @@ from nemo_rl.modelopt.utils import (
     resolve_quant_cfg,
 )
 
+_FAKE_K_NVFP4_STATIC = object()
+
+
+def _fake_modelopt_linear_method_cls() -> type:
+    """A stand-in for vLLM's generic ModelOpt linear method holding NVFP4 weights."""
+    return type(
+        "ModelOptLinearMethod",
+        (),
+        {"spec": types.SimpleNamespace(weight=_FAKE_K_NVFP4_STATIC)},
+    )
+
+
+def _install_fake_quant_utils(monkeypatch):
+    module = types.ModuleType(
+        "vllm.model_executor.layers.quantization.utils.quant_utils"
+    )
+    module.kNvfp4Static = _FAKE_K_NVFP4_STATIC
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+
 
 @pytest.fixture(autouse=True)
 def _install_optional_modelopt_config_api(monkeypatch):
@@ -243,14 +262,13 @@ def _install_fake_vllm_reload(monkeypatch):
         "vllm.model_executor.layers.quantization.modelopt"
     )
     modelopt_module.ModelOptNvFp4FusedMoE = type("ModelOptNvFp4FusedMoE", (), {})
-    modelopt_module.ModelOptNvFp4LinearMethod = type(
-        "ModelOptNvFp4LinearMethod", (), {}
-    )
+    modelopt_module.ModelOptLinearMethod = _fake_modelopt_linear_method_cls()
     monkeypatch.setitem(
         sys.modules,
         "vllm.model_executor.layers.quantization.modelopt",
         modelopt_module,
     )
+    _install_fake_quant_utils(monkeypatch)
     attention_module = types.ModuleType("vllm.model_executor.layers.attention")
     attention_module.Attention = type("Attention", (torch.nn.Module,), {})
     attention_module.MLAAttention = type("MLAAttention", (torch.nn.Module,), {})
@@ -318,14 +336,30 @@ def _install_fake_registered_vllm_modelopt(monkeypatch):
         linear_module,
     )
 
-    class FakeModelOptNvFp4LinearMethod:
-        def __init__(self, quant_config):
-            self.quant_config = quant_config
+    class FakeModelOptLinearMethod:
+        def __init__(self, spec, ctx, format_scheme=None):
+            self.spec = spec
+            self.ctx = ctx
+            self.fmt = format_scheme
+            self.kernel = None
 
         def create_weights(self, layer, *args, **kwargs):
             del args, kwargs
-            if not hasattr(layer, "input_scale"):
+            # Mirror vLLM 0.33: only the W4A16 format scheme registers a
+            # throwaway input_scale, and the kernel is picked here.
+            if self.fmt is not None:
                 layer.input_scale = torch.nn.Parameter(torch.ones(1))
+            self.kernel = types.SimpleNamespace(source="native")
+
+        def process_weights_after_loading(self, layer):
+            layer.weight_global_scale = torch.nn.Parameter(
+                layer.weight_scale_2.max().to(torch.float32), requires_grad=False
+            )
+            del layer.weight_scale_2
+            self.kernel.process_weights_after_loading(layer)
+
+        def apply(self, layer, x, bias=None):
+            return self.kernel.apply_weights(layer=layer, x=x, bias=bias)
 
     class FakeModelOptNvFp4FusedMoE:
         def __init__(self, quant_config, moe_config):
@@ -378,27 +412,27 @@ def _install_fake_registered_vllm_modelopt(monkeypatch):
             else:
                 self.moe_quant_config = types.SimpleNamespace(source="native")
 
-    class FakeModelOptNvFp4W4A16LinearMethod(FakeModelOptNvFp4LinearMethod):
-        pass
-
     class FakeModelOptNvFp4Config:
-        LinearMethodCls = FakeModelOptNvFp4LinearMethod
         FusedMoEMethodCls = FakeModelOptNvFp4FusedMoE
 
         def __init__(self, quant_method="NVFP4", group_size=16):
-            self.quant_method = quant_method
-            self.group_size = group_size
-            # Mirror vLLM 0.25: __init__ installs LinearMethodCls as an
-            # *instance* attribute keyed off quant_method, shadowing any
-            # subclass class attribute.
-            if quant_method == "NVFP4":
-                self.LinearMethodCls = FakeModelOptNvFp4LinearMethod
-            elif quant_method == "W4A16_NVFP4":
-                self.LinearMethodCls = FakeModelOptNvFp4W4A16LinearMethod
-            else:
+            if quant_method not in ("NVFP4", "W4A16_NVFP4"):
                 raise ValueError(
                     f"Unsupported ModelOpt NVFP4 quant_algo: {quant_method}"
                 )
+            self.quant_method = quant_method
+            self.group_size = group_size
+
+        def get_quant_method(self, layer, prefix):
+            del layer, prefix
+            # Mirror vLLM 0.33: linears get the generic method, and W4A16
+            # adds a format scheme for the legacy on-disk input_scale.
+            is_w4a16 = self.quant_method == "W4A16_NVFP4"
+            return FakeModelOptLinearMethod(
+                types.SimpleNamespace(weight=_FAKE_K_NVFP4_STATIC),
+                types.SimpleNamespace(group_size=self.group_size),
+                object() if is_w4a16 else None,
+            )
 
         @classmethod
         def from_config(cls, config):
@@ -420,7 +454,7 @@ def _install_fake_registered_vllm_modelopt(monkeypatch):
         "vllm.model_executor.layers.quantization.modelopt"
     )
     modelopt_module.ModelOptNvFp4Config = FakeModelOptNvFp4Config
-    modelopt_module.ModelOptNvFp4LinearMethod = FakeModelOptNvFp4LinearMethod
+    modelopt_module.ModelOptLinearMethod = FakeModelOptLinearMethod
     modelopt_module.ModelOptNvFp4FusedMoE = FakeModelOptNvFp4FusedMoE
     monkeypatch.setitem(
         sys.modules,
@@ -523,7 +557,7 @@ def _install_fake_registered_vllm_modelopt(monkeypatch):
     quant_utils_module = types.ModuleType(
         "vllm.model_executor.layers.quantization.utils.quant_utils"
     )
-    quant_utils_module.kNvfp4Static = object()
+    quant_utils_module.kNvfp4Static = _FAKE_K_NVFP4_STATIC
     monkeypatch.setitem(
         sys.modules,
         "vllm.model_executor.layers.quantization.utils.quant_utils",
@@ -614,13 +648,13 @@ def _patch_real_quant_load(monkeypatch, backend, forwarded=None):
         monkeypatch.setattr(
             backend.VllmInternalWorkerExtension,
             "_load_weights",
-            lambda self, weights: forwarded.extend(weights) or "loaded",
+            lambda self, weights, coverage=None: forwarded.extend(weights) or "loaded",
         )
 
 
 def _mark_as_modelopt_layer(model):
     modelopt_module = sys.modules["vllm.model_executor.layers.quantization.modelopt"]
-    model.quant_method = modelopt_module.ModelOptNvFp4LinearMethod()
+    model.quant_method = modelopt_module.ModelOptLinearMethod()
     return model
 
 
@@ -1163,6 +1197,21 @@ def test_modelopt_moe_manifest_requires_complete_w4a4_family(monkeypatch):
         )
 
 
+def test_real_quant_prepare_refit_info_rejects_draft_manifest(monkeypatch):
+    """A draft manifest must fail at preparation, before any weight is loaded."""
+    backend = _import_vllm_quant_backend(monkeypatch)
+    extension = _make_real_quant_extension(backend, torch.nn.Module(), [])
+    _patch_real_quant_load(monkeypatch, backend)
+
+    with pytest.raises(RuntimeError, match="does not support draft finalization"):
+        extension.prepare_refit_info(
+            {
+                "model.layers.0.mlp.up_proj.weight": ((4, 4), torch.uint8),
+                "draft.layers.0.self_attn.qkv_proj.weight": ((4, 4), torch.bfloat16),
+            }
+        )
+
+
 def test_real_quant_load_weights_expands_non_gated_experts_per_expert(
     monkeypatch,
 ):
@@ -1439,7 +1488,7 @@ def test_real_quant_pre_ack_fence_is_device_wide_and_load_does_not_fence(
     monkeypatch.setattr(
         backend.VllmInternalWorkerExtension,
         "_load_weights",
-        lambda _self, _weights: events.append("load") or "loaded",
+        lambda _self, _weights, coverage=None: events.append("load") or "loaded",
     )
     monkeypatch.setattr(
         backend,
@@ -1477,9 +1526,7 @@ def test_real_quant_rejects_incomplete_modelopt_layerwise_reload(
     )
     modelopt_base = type("ModelOptNvFp4FusedMoE", (), {})
     modelopt_module.ModelOptNvFp4FusedMoE = modelopt_base
-    modelopt_module.ModelOptNvFp4LinearMethod = type(
-        "ModelOptNvFp4LinearMethod", (), {}
-    )
+    modelopt_module.ModelOptLinearMethod = _fake_modelopt_linear_method_cls()
     monkeypatch.setitem(
         sys.modules,
         "vllm.model_executor.layers.quantization.modelopt",
@@ -1511,8 +1558,8 @@ def test_real_quant_accepts_processed_modelopt_layerwise_reload(monkeypatch):
         "vllm.model_executor.layers.quantization.modelopt"
     )
     modelopt_module.ModelOptNvFp4FusedMoE = type("ModelOptNvFp4FusedMoE", (), {})
-    modelopt_base = type("ModelOptNvFp4LinearMethod", (), {})
-    modelopt_module.ModelOptNvFp4LinearMethod = modelopt_base
+    modelopt_base = _fake_modelopt_linear_method_cls()
+    modelopt_module.ModelOptLinearMethod = modelopt_base
     monkeypatch.setitem(
         sys.modules,
         "vllm.model_executor.layers.quantization.modelopt",
@@ -2051,7 +2098,7 @@ def test_real_quant_ipc_rejects_invalid_key_manifest(
     extension.zmq_socket = FakeSocket()
     extension.state_dict_info = state_dict_info
     extension.maybe_init_zmq = lambda: None
-    extension._load_weights = lambda _weights: None
+    extension._load_weights = lambda _weights, coverage=None: None
     monkeypatch.setattr(
         backend.VllmQuantInternalWorkerExtension,
         "_is_real_quant_model",
@@ -2133,7 +2180,8 @@ def test_real_quant_ipc_payload_loads_weights_and_handles_gpt_oss(monkeypatch):
     }
     extension.maybe_init_zmq = lambda: None
 
-    def load_weights(weights):
+    def load_weights(weights, *, coverage=None):
+        assert coverage is None
         for name, weight in weights:
             view_refs.append(weakref.ref(weight))
             loaded.append((name, weight.clone()))
@@ -2517,12 +2565,13 @@ def test_register_nemo_modelopt_nvfp4_uses_public_vllm_registry(monkeypatch):
     source_config = {"quant_algo": "W4A16_NVFP4", "group_size": 16}
     w4a16_config = fake_vllm.registry[NEMO_MODELOPT_W4A16].from_config(source_config)
     assert source_config["quant_algo"] == "W4A16_NVFP4"
-    # vLLM 0.25 understands W4A16_NVFP4 natively; the algo passes through.
+    # vLLM understands W4A16_NVFP4 natively; the algo passes through.
     assert w4a16_config.parsed_config["quant_algo"] == "W4A16_NVFP4"
     assert w4a16_config.get_name() == NEMO_MODELOPT_W4A16
-    # The base __init__ installs its own LinearMethodCls instance attribute;
-    # the NeMo config must rebind it to the refit-friendly Marlin method.
-    assert w4a16_config.LinearMethodCls.__name__ == "NemoModelOptW4A16LinearMethod"
+    # vLLM hands linears its generic method; the NeMo config must swap in the
+    # refit-friendly Marlin method.
+    linear_method = w4a16_config.get_quant_method(object(), "layer")
+    assert type(linear_method).__name__ == "NemoModelOptW4A16LinearMethod"
 
     with pytest.raises(ValueError, match="requires quant_algo='W4A16_NVFP4'"):
         fake_vllm.registry[NEMO_MODELOPT_W4A16].from_config({"quant_algo": "NVFP4"})
@@ -2574,10 +2623,7 @@ def test_registered_w4a16_dense_method_supports_weight_loader_v2(monkeypatch):
 
     register_nemo_modelopt_nvfp4()
 
-    w4a16_config_cls = fake_vllm.registry[NEMO_MODELOPT_W4A16]
-    assert fake_vllm.weight_loader_v2_supported == [
-        w4a16_config_cls.LinearMethodCls.__name__
-    ]
+    assert fake_vllm.weight_loader_v2_supported == ["NemoModelOptW4A16LinearMethod"]
 
 
 def test_registered_w4a4_moe_loader_is_sanitizer_compatible(monkeypatch):
@@ -2721,7 +2767,7 @@ def test_registered_w4a16_dense_method_uses_marlin_weight_only(monkeypatch):
     config = fake_vllm.registry[NEMO_MODELOPT_W4A16].from_config(
         {"quant_algo": "W4A16_NVFP4", "group_size": 16}
     )
-    quant_method = config.LinearMethodCls(config)
+    quant_method = config.get_quant_method(object(), "layer")
 
     created_layer = torch.nn.Module()
     quant_method.create_weights(created_layer)

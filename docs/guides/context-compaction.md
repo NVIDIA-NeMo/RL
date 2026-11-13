@@ -2,9 +2,7 @@
 
 This opt-in SingleController GRPO path lets a harness rewrite its semantic history while NeMo-RL owns the resulting training rows. It builds on the ordinary worker token/media capture path. It does not patch upstream vLLM.
 
-The underlying mechanism is **forest training**: selected captured calls become
-training paths with one reward and advantage per logical rollout. Compaction is
-one use case; branches and independent context roots use the same reconstruction.
+The underlying mechanism is **forest training**: selected captured calls become training paths with one reward and advantage per logical rollout. Compaction is one use case; branches and independent context roots use the same reconstruction.
 The walkthrough below uses the default `returned_history` selection policy.
 
 The editable SVG figures below are adapted from Terry Kong’s review illustrations: [data flow](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-data-flow.html), [calls to rows](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-calls-to-rows.html), [compaction guards](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-dropped-group.html), and [batch size](https://terrykong.github.io/gh-pages-poc/terryk/pr-4124-cc-batch-size.html). The reference figures retain his layout and visual conventions, updated for the implementation described here; the three introductory figures expand the same example step by step. Token IDs and row counts in the figures are illustrative.
@@ -83,9 +81,7 @@ Candidate admission reconstructs staging ancestry from existing call parent link
 
 `/context/{attempt}/measure` uses the same Responses conversion, candidate admission, RL preprocessing and splice decision as generation. It returns a count and an explicit feature acknowledgement, never tokens. It creates no call intent, staged record, or capture acknowledgement. Model/template/processor configuration must remain fixed during an attempt.
 
-Staging wire models use `capture_key` for the current capture attempt. Restored calls use
-`source_capture_key` for their earlier staging owner. Gym and RL must upgrade together; logical
-rollout IDs and the storage-key and digest formats stay unchanged.
+Staging wire models use `capture_key` for the current capture attempt. Restored calls use `source_capture_key` for their earlier staging owner. Gym and RL must upgrade together; logical rollout IDs and the storage-key and digest formats stay unchanged.
 
 The existing ledger tracks exact attempted call IDs. A missing worker acknowledgement remains pending, even if the HTTP request has ended, because the worker may still have written or be writing. After the agent returns, RL closes new admissions under the ledger lock, then waits up to 300 seconds for already-admitted calls without recorded failures to resolve. A recorded failure ends the wait for that call without acknowledging its writes. If capture remains incomplete, RL masks that entire logical rollout, including any partial history; a first-call failure needs no accepted-response witness. Healthy siblings can still train. A group with no valid input layout is dropped. Pending calls are excluded from immediate cleanup, and their possible late writes remain isolated under the original attempt ID until staging-partition teardown. They cannot become a parent or be reused by a fresh attempt. Repeated ambiguous failures can therefore retain staging storage until teardown.
 
@@ -105,60 +101,21 @@ Enable `token_capture.enabled: true` and `token_capture.forest_training: true` o
 
 `token_capture.selection_policy` controls training membership:
 
-- `returned_history` (default) matches ordinary returned history or call references
-  to capture records. It preserves the existing evidence requirements and excludes
-  calls absent from that history.
-- `all_captured` includes recorded calls across abandoned retries and independent
-  branches. Unscored leaves with `failed` or `unknown` status, or an `incomplete`
-  status with a non-length finish reason such as `content_filter`, are excluded.
-  These calls remain selected if they have children or are the scored call, so
-  completion checks can mask the rollout. Missing required completion metadata
-  remains an error. Length-limited calls remain eligible, subject to the existing
-  logical-rollout `overlong_filtering` policy. This policy does not require the
-  full execution history, but still requires an attributable scored
-  terminal through `terminal_response_id` or the
-  returned response's identity/content. Capture order is not a terminal witness.
-  For `A → B` and `A → C`, both branches train; it does not choose the latest
-  sibling. Shared `A` contributes loss once, and both rows share the rollout's
-  reward and advantage.
+- `returned_history` (default) matches ordinary returned history or call references to capture records. It preserves the existing evidence requirements and excludes calls absent from that history.
+- `all_captured` includes recorded calls across abandoned retries and independent branches. Unscored leaves with `failed` or `unknown` status, or an `incomplete` status with a non-length finish reason such as `content_filter`, are excluded.
+  These calls remain selected if they have children or are the scored call, so completion checks can mask the rollout. Missing required completion metadata remains an error. Length-limited calls remain eligible, subject to the existing logical-rollout `overlong_filtering` policy. This policy does not require the full execution history, but still requires an attributable scored terminal through `terminal_response_id` or the returned response's identity/content. Capture order is not a terminal witness.
+  For `A → B` and `A → C`, both branches train; it does not choose the latest sibling. Shared `A` contributes loss once, and both rows share the rollout's reward and advantage.
 
-Both policies reuse capture validation, completion checks, forest reconstruction,
-and once-only loss ownership for shared ancestors. Pending calls, lost capture
-evidence, and failed selected executions still mask the logical rollout. A failure
-record does not acknowledge a pending worker's writes or transfer them to cleanup.
-Failed parents and failed scored calls remain invalid. Neither policy infers
-agent roles. `all_captured` requires `forest_training: true`; it does not enable
-per-agent rewards or remove the execution restrictions below.
+Both policies reuse capture validation, completion checks, forest reconstruction, and once-only loss ownership for shared ancestors. Pending calls, lost capture evidence, and failed selected executions still mask the logical rollout. A failure record does not acknowledge a pending worker's writes or transfer them to cleanup.
+Failed parents and failed scored calls remain invalid. Neither policy infers agent roles. `all_captured` requires `forest_training: true`; it does not enable per-agent rewards or remove the execution restrictions below.
 
-A cancellation recorded as `request_finished_without_staged_coordinates` does
-not mask the rollout when the call already has a committed capture, no calls
-remain pending, and the failed call is outside the selected calls. A failure on
-a selected call, a missing capture, or any other capture-failure reason still
-masks the rollout. This exception does not add calls to training.
+A cancellation recorded as `request_finished_without_staged_coordinates` does not mask the rollout when the call already has a committed capture, no calls remain pending, and the failed call is outside the selected calls. A failure on a selected call, a missing capture, or any other capture-failure reason still masks the rollout. This exception does not add calls to training.
 
-Custom policies use the same setting, for example
-`selection_policy: my_harness.training:select_calls`. The module must be importable
-in both the controller and Gym actor environments. Policy resolution happens during
-configuration validation, so an unknown name, missing import, or non-callable target
-fails before rollout.
+Custom policies use the same setting, for example `selection_policy: my_harness.training:select_calls`. The module must be importable in both the controller and Gym actor environments. Policy resolution happens during configuration validation, so an unknown name, missing import, or non-callable target fails before rollout.
 
-The synchronous function takes `(records, result)`: this attempt's `list[CallRecord]`
-and the ordinary harness result dictionary. It returns
-`(selected_records, terminal_response_id)`. Return a nonempty list of unique,
-unchanged records from the supplied capture and the served `response_id` of the
-scored call within that list. Selection order determines root/path priority;
-captured parents still determine reconstruction. The interface permits `None` as
-the terminal type, but a trainable selection must identify its scored response;
-the adapter rejects a missing terminal rather than guessing one. Custom selectors
-own membership and reward attribution, not segment definitions. They use the same
-completion checks, failure masking, and reconstruction as built-ins. Non-default
-policies require `forest_training: true`.
+The synchronous function takes `(records, result)`: this attempt's `list[CallRecord]` and the ordinary harness result dictionary. It returns `(selected_records, terminal_response_id)`. Return a nonempty list of unique, unchanged records from the supplied capture and the served `response_id` of the scored call within that list. Selection order determines root/path priority; captured parents still determine reconstruction. The interface permits `None` as the terminal type, but a trainable selection must identify its scored response; the adapter rejects a missing terminal rather than guessing one. Custom selectors own membership and reward attribution, not segment definitions. They use the same completion checks, failure masking, and reconstruction as built-ins. Non-default policies require `forest_training: true`.
 
-Every selected continuation must also have its captured parent selected. If
-returned history or a custom policy omits a required parent, only that logical
-rollout is masked with `selection_not_closed`; omitted calls are not added to
-training. `finalize/selection_not_closed_rollouts` counts these outcomes. Capture
-records remain available for cleanup, and healthy siblings can still train.
+Every selected continuation must also have its captured parent selected. If returned history or a custom policy omits a required parent, only that logical rollout is masked with `selection_not_closed`; omitted calls are not added to training. `finalize/selection_not_closed_rollouts` counts these outcomes. Capture records remain available for cleanup, and healthy siblings can still train.
 
 For a SingleController configuration that otherwise supports Gym token capture, set these overrides together:
 
@@ -197,42 +154,18 @@ The learner must use non-interleaved Megatron with fixed batches or ordinary seq
 
 The figure illustrates fixed-batch padding, computed per prompt group using data-parallel size and compatible microbatch sizes. With packing, the row count only needs to be divisible by the data-parallel size; the existing packer balances the resulting bins. Logical rewards and advantages remain per rollout; padding has no reward vote or loss. Packing preserves separate attention contexts for the rows and does not share prefix computation. Model-specific packing restrictions still apply.
 
-Optional `grpo.advantage_clip_low` and `grpo.advantage_clip_high` clamp each
-logical rollout's advantage before it is broadcast to its rows. Filtered owners
-and execution padding retain zero advantages, even when zero lies outside the
-configured clipping interval.
+Optional `grpo.advantage_clip_low` and `grpo.advantage_clip_high` clamp each logical rollout's advantage before it is broadcast to its rows. Filtered owners and execution padding retain zero advantages, even when zero lies outside the configured clipping interval.
 
-Optional `grpo.seq_logprob_error_threshold` thresholds the mean multiplicative
-absolute probability error across all uniquely owned generated tokens in a logical
-rollout. Each token has equal weight, so splitting the same generations into more
-segments does not change the decision. If the pooled error exceeds the threshold,
-all rows of that rollout are excluded from loss. The shared
-`grpo.masked_reward_policy` controls baseline participation: `exclude` also removes
-the rollout's reward; `include` retains it once, regardless of segment count.
+Optional `grpo.seq_logprob_error_threshold` thresholds the mean multiplicative absolute probability error across all uniquely owned generated tokens in a logical rollout. Each token has equal weight, so splitting the same generations into more segments does not change the decision. If the pooled error exceeds the threshold, all rows of that rollout are excluded from loss. The shared `grpo.masked_reward_policy` controls baseline participation: `exclude` also removes the rollout's reward; `include` retains it once, regardless of segment count.
 Use `exclude` to retain the earlier forest-training baseline behavior.
-Replayed prefix tokens and execution padding do not participate;
-with top-k/top-p filtering enabled, unsupported negative-infinity tokens are also
-excluded from this diagnostic. With the threshold unset, errors are diagnostic
-only. Sequence-error metrics remain per physical row, so a retained segment can
-have error above the threshold when its rollout's pooled error is below it.
+Replayed prefix tokens and execution padding do not participate; with top-k/top-p filtering enabled, unsupported negative-infinity tokens are also excluded from this diagnostic. With the threshold unset, errors are diagnostic only. Sequence-error metrics remain per physical row, so a retained segment can have error above the threshold when its rollout's pooled error is below it.
 The masked-sequence count includes every row excluded by the rollout decision.
 
-Optional `token_capture.min_valid_fraction_per_group` compares the fraction of
-verified logical rollouts with the configured minimum. Each rollout counts once,
-regardless of segment count, and execution padding is excluded. A group below the
-minimum is discarded and the controller seeks a replacement within its existing
-replacement budget. The default, `None`, disables this group-level filter.
+Optional `token_capture.min_valid_fraction_per_group` compares the fraction of verified logical rollouts with the configured minimum. Each rollout counts once, regardless of segment count, and execution padding is excluded. A group below the minimum is discarded and the controller seeks a replacement within its existing replacement budget. The default, `None`, disables this group-level filter.
 
 Batch cardinality and advantages count logical rollouts, not physical rows. The environment-filtered metric also counts each flagged rollout once, excluding padding. If any selected generation stops for a length limit, the entire rollout is marked truncated; `grpo.overlong_filtering` then excludes all of its rows. This differs from checking only whether the final physical row reaches the sequence limit. Reward shaping, reward penalties, and message-level advantage overrides remain unsupported for forest training. Future length penalties must use the rollout's total generated tokens across all rows, preserving one reward per logical rollout.
 
-Captured-rollout length metrics are emitted after tensor verification, with one
-observation per logical rollout. `gen_tokens_per_sample` sums uniquely owned
-generated tokens across its rows; `max_gen_tokens_per_turn` is the largest actual
-model generation, and `total_tokens_per_sample` is its longest verified context
-chain. Rewritten input, shared-prefix copies, and execution padding do not count
-as generated output. Environment masking does not erase verified generations;
-unverifiable owners contribute zero. These are generation statistics before
-learner-side filtering, not counts of tokens ultimately used in the loss.
+Captured-rollout length metrics are emitted after tensor verification, with one observation per logical rollout. `gen_tokens_per_sample` sums uniquely owned generated tokens across its rows; `max_gen_tokens_per_turn` is the largest actual model generation, and `total_tokens_per_sample` is its longest verified context chain. Rewritten input, shared-prefix copies, and execution padding do not count as generated output. Environment masking does not erase verified generations; unverifiable owners contribute zero. These are generation statistics before learner-side filtering, not counts of tokens ultimately used in the loss.
 
 The implementation supports concurrent capture through Responses and Chat, bounded resampling of definite responses, ordinary text/images supported by the foundation processor path, token-level GRPO, and direct route assembly. It retains existing forest-training guards on deferred route assembly, incompatible objectives, message-level advantage overrides and non-unit dataset loss multipliers. Buffered Responses SSE is supported through a non-streaming upstream call. Incremental engine streaming, provider-managed conversation state, assistant prefill, and engine prompt truncation are rejected. Ordinary capture keeps its existing path with the option disabled.
 

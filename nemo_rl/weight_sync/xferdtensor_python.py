@@ -151,6 +151,27 @@ def _compute_shard_slices(global_shape, mesh_shape, coordinates, placements):
     return result
 
 
+def local_shard_slices(param_info, rank) -> tuple[slice, ...]:
+    """Return this destination rank's slices of an HF-global tensor.
+
+    ``param_info`` is one bulk param of a reshard plan; its ``dst_mesh_info``
+    and ``dst_placements`` say how the destination shards the
+    ``global_shape`` tensor.
+    """
+    mesh_tensor = _mesh_rank_tensor(param_info["dst_mesh_info"])
+    coordinates = (mesh_tensor == rank).nonzero(as_tuple=False)
+    if coordinates.numel() == 0:
+        raise ValueError(f"Rank {rank} is absent from the destination mesh")
+    return tuple(
+        _compute_shard_slices(
+            param_info["global_shape"],
+            list(mesh_tensor.shape),
+            coordinates[0].tolist(),
+            param_info["dst_placements"],
+        )
+    )
+
+
 def _rank_regions(mesh, placements, global_shape):
     ranks = _mesh_rank_tensor(mesh)
     mesh_shape = tuple(int(size) for size in ranks.shape)
