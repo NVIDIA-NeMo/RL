@@ -32,6 +32,13 @@ from nemo_rl.models.megatron.draft.dspark import (
 )
 
 
+def _ensure_dp_cp_group(metadata: dict[str, Any] | None) -> dict[str, Any]:
+    # Resolve the replica group once so the body and both heads share it.
+    from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group
+
+    return ensure_metadata_has_dp_cp_group(metadata)
+
+
 def _provider_tensor_descriptor(
     tensor: torch.Tensor | None,
     *,
@@ -221,6 +228,7 @@ class _DSparkProviderAdapter(nn.Module):
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Compose body and head checkpoint metadata without target tensors."""
+        metadata = _ensure_dp_cp_group(metadata)
         checkpointable_body = cast(_CheckpointableBody, self.body)
         body_state = checkpointable_body.sharded_state_dict(
             prefix=f"{prefix}body.",

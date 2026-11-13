@@ -65,7 +65,12 @@ class _SplitStubWorker(TQWorkerMixin):
 
     def _fetch(self, meta):
         self.calls.append(("fetch", meta))
-        return {"data_from": meta} if self._fetched is None else self._fetched
+        if self._fetched is not None:
+            return self._fetched
+        return {
+            "data_from": meta,
+            "input_ids": torch.zeros(len(meta.sample_ids), 2, dtype=torch.int64),
+        }
 
     def _attach_or_repack_with_order(self, data, meta):
         self.calls.append(("attach", meta))
@@ -118,7 +123,45 @@ class TestPreshardedWrappers:
         out = w.train_microbatch_presharded(meta=meta)
         assert out is None  # metrics accumulate in the open-step state
         assert [c[0] for c in w.calls] == ["fetch", "attach", "train_microbatch"]
-        assert w.calls[-1][1] == {"data_from": meta}
+        dispatched = w.calls[-1][1]
+        assert dispatched["data_from"] is meta
+        assert dispatched["draft_sample_ids"].dtype == torch.int64
+        assert dispatched["draft_sample_ids"].shape == (2,)
+
+    def test_stable_sample_ids_do_not_depend_on_microbatch_order(self):
+        first = _SplitStubWorker()
+        second = _SplitStubWorker()
+        forward = KVBatchMeta(
+            partition_id="train",
+            task_name="train",
+            sample_ids=["prompt-a_g0", "prompt-b_g0"],
+        )
+        reverse = KVBatchMeta(
+            partition_id="train",
+            task_name="train",
+            sample_ids=["prompt-b_g0", "prompt-a_g0"],
+        )
+
+        first.train_microbatch_presharded(meta=forward)
+        second.train_microbatch_presharded(meta=reverse)
+
+        forward_ids = first.calls[-1][1]["draft_sample_ids"]
+        reverse_ids = second.calls[-1][1]["draft_sample_ids"]
+        assert torch.equal(forward_ids, reverse_ids.flip(0))
+
+    def test_draft_sample_ids_follow_repacked_rows(self):
+        meta = KVBatchMeta(
+            partition_id="train", task_name="train", sample_ids=["s0", "s1", "s2"]
+        )
+        in_meta_order = _SplitStubWorker()
+        repacked = _SplitStubWorker(row_order=[2, 0, 1])
+
+        in_meta_order.train_microbatch_presharded(meta=meta)
+        repacked.train_microbatch_presharded(meta=meta)
+
+        ids = in_meta_order.calls[-1][1]["draft_sample_ids"]
+        repacked_ids = repacked.calls[-1][1]["draft_sample_ids"]
+        assert repacked_ids.tolist() == ids[torch.tensor([2, 0, 1])].tolist()
 
     def test_in_loss_rejections_land_in_sample_mask_in_meta_order(self):
         """Packing reordered the rows; the write must follow meta.sample_ids."""
@@ -127,7 +170,10 @@ class TestPreshardedWrappers:
         )
         # Fetched row j is meta row row_order[j] after the local repack.
         w = _SplitStubWorker(
-            fetched={"sample_mask": torch.tensor([1.0, 1.0, 0.5])},
+            fetched={
+                "sample_mask": torch.tensor([1.0, 1.0, 0.5]),
+                "input_ids": torch.zeros(3, 2, dtype=torch.int64),
+            },
             row_order=[2, 0, 1],
             keep_mask=[1.0, 0.0, 1.0],
         )
@@ -139,7 +185,11 @@ class TestPreshardedWrappers:
 
     def test_mismatched_keep_mask_fails_loudly(self):
         w = _SplitStubWorker(
-            fetched={"sample_mask": torch.tensor([1.0, 1.0])}, keep_mask=[1.0]
+            fetched={
+                "sample_mask": torch.tensor([1.0, 1.0]),
+                "input_ids": torch.zeros(2, 2, dtype=torch.int64),
+            },
+            keep_mask=[1.0],
         )
         with pytest.raises(RuntimeError, match="keep mask has 1 rows"):
             w.train_microbatch_presharded(meta=_meta())
@@ -266,6 +316,25 @@ class TestTQPolicySplitFanout:
 
         train_meta = mock_shard.call_args.args[0]
         assert train_meta.fields == [*DP_TRAIN_FIELDS, ROUTED_EXPERTS_FIELD]
+
+    def test_train_microbatches_honors_narrowed_train_fields(self):
+        p, _ = _make_tq_policy()
+        meta = _meta()
+        narrowed_fields = tuple(
+            field for field in DP_TRAIN_FIELDS if field != "prev_logprobs"
+        )
+        with (
+            patch.object(TQPolicy, "_stamp_pad_seqlen"),
+            patch.object(TQPolicy, "_packing_args", return_value=(None, None)),
+            patch(
+                "nemo_rl.models.policy.tq_policy.shard_meta_for_dp",
+                return_value=([meta, meta], None),
+            ) as mock_shard,
+        ):
+            p.train_microbatches_from_meta(meta, train_fields=narrowed_fields)
+
+        train_meta = mock_shard.call_args.args[0]
+        assert train_meta.fields == list(narrowed_fields)
 
     def test_finish_dedupes_replica_twins(self):
         """TP/CP twins return identical metric copies; aggregating without

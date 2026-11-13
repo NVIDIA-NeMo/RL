@@ -56,6 +56,7 @@ from nemo_rl.weight_sync.membership import (
 from nemo_rl.weight_sync.nccl_reshard_utils import (
     check_trtllm_nccl_reshard_bulk_params,
     make_nccl_reshard_refit_info_wire_safe,
+    vllm_context_parallel_violations,
 )
 
 
@@ -151,6 +152,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         return {
             "tp_size": tp_size,
             "ep_size": megatron_cfg.get("expert_model_parallel_size", 1),
+            "cp_size": megatron_cfg.get("context_parallel_size", 1),
             # MCore accepts None and resolves it to TP in ModelParallelConfig;
             # normalize at this boundary so the plan builder receives only ints.
             "etp_size": tp_size if etp_size is None else etp_size,
@@ -177,6 +179,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                     "tp_size": tp_size,
                     "ep_size": ep_size,
                     "etp_size": tp_size if ep_size == 1 else 1,
+                    "cp_size": 1,
                     "pp_size": vllm_cfg.get("pipeline_parallel_size", 1),
                     "world_size": None,
                 }
@@ -194,6 +197,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                     "ep_size": megatron_cfg["expert_model_parallel_size"],
                     # Match MCore's effective default: an omitted/None ETP uses TP.
                     "etp_size": tp_size if etp_size is None else etp_size,
+                    "cp_size": 1,
                     "pp_size": megatron_cfg["pipeline_model_parallel_size"],
                     "world_size": None,
                 }
@@ -205,6 +209,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
                     "tp_size": layout["tp_size"],
                     "ep_size": layout["ep_size"],
                     "etp_size": layout["etp_size"],
+                    "cp_size": 1,
                     "pp_size": layout["pp_size"],
                     "world_size": layout["world_size"],
                 }
@@ -274,6 +279,13 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
 
     def init_communicator(self) -> None:
         """Build both communicator families and the refit plan, over the whole fleet."""
+        generation_cfg = self._policy.cfg["generation"]
+        if generation_cfg["backend"] == "vllm":
+            # Reject before any collective, also for callers that skip the setup check.
+            violations = vllm_context_parallel_violations(generation_cfg)
+            if violations:
+                raise ValueError("\n".join(violations))
+
         self._build(
             desired_membership(
                 absent_shards=[],
@@ -303,6 +315,17 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         train_world_size = membership.train_world_size
         world_size = membership.world_size
         inference_world_size = world_size - train_world_size
+        # Before any collective: a rebuild re-enters here, and a topology that
+        # cannot be split into PP stages would otherwise fail after the
+        # communicators are already half-built.
+        pp_size = train_parallelism["pp_size"]
+        if pp_size <= 0 or train_world_size % pp_size != 0:
+            raise ValueError(
+                f"Cannot divide train_world_size={train_world_size} into "
+                f"TP={train_parallelism['tp_size']} "
+                f"EP={train_parallelism['ep_size']} "
+                f"CP={train_parallelism['cp_size']} PP={pp_size}."
+            )
 
         # 1. model_update_group: shared channel for the misc packed-broadcast
         #    (and the FP8 KV-cache scales).  Same setup as the collective path.
@@ -332,7 +355,6 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         ray.get(futures_train + futures_inference)
 
         # Build per-layout/stage bulk groups; finish bulk before misc to avoid communicator deadlocks.
-        pp_size = train_parallelism["pp_size"]
         train_gpus_per_node = self._train_cluster.num_gpus_per_node
         train_ranks_per_stage = train_world_size // pp_size
         pp_stages = [r // train_ranks_per_stage for r in range(train_world_size)]
@@ -397,7 +419,7 @@ class NcclReshardWeightSynchronizer(WeightSynchronizer):
         ):
             gen_parallelism = {
                 key: layout[key]
-                for key in ("tp_size", "ep_size", "etp_size", "pp_size")
+                for key in ("tp_size", "ep_size", "etp_size", "cp_size", "pp_size")
             }
             nccl_reshard_refit_info = self._policy.prepare_nccl_reshard_refit_info(
                 train_parallelism,
