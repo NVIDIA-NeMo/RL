@@ -2892,6 +2892,61 @@ class TestAsyncTrajectoryCollector:
         ray.kill(buffer)
         ray.kill(mock_env)
 
+    @pytest.mark.parametrize("short_by", [1, 0])
+    def test_short_current_target_is_backfilled_after_refit(self, short_by):
+        """A target still short when the weights reach it is filled at age 0.
+
+        Regression: a frontier-aligned resume regenerated abandoned ordinals,
+        gap-filling target 42 with a partial batch; the refit to version 42
+        landed before the rest was reserved. The look-ahead window at version
+        42 is [43], so target 42 stayed short forever and training deadlocked.
+        """
+        collector = self.create_local_collector()
+        num_prompts = collector._num_prompts_per_step
+        max_age = collector._max_trajectory_age_steps
+        assert num_prompts >= 2
+        target = 42
+
+        buffer = ReplayBuffer.remote(
+            max_size=4 * num_prompts, drop_incomplete_targets_on_restore=False
+        )
+        try:
+            seed = ReplayBuffer.remote(
+                max_size=4 * num_prompts, drop_incomplete_targets_on_restore=False
+            )
+            for _ in range(num_prompts - short_by):
+                ray.get(
+                    seed.add.remote(
+                        {"batch": {"data": "x"}, "rollout_metrics": {}},
+                        weight_version=target - 1,
+                        target_weight_version=target,
+                    )
+                )
+            state = ray.get(seed.state_dict.remote())
+            ray.kill(seed)
+            ray.get(
+                buffer.load_state_dict.remote(
+                    state,
+                    num_prompts_per_step=num_prompts,
+                    current_training_step=target,
+                    max_age_steps=max_age,
+                )
+            )
+
+            collector = self.create_local_collector(replay_buffer=buffer)
+            collector.initial_weight_version = target - 2
+            collector.current_weight_version = target
+
+            reserved = collector._get_next_target_for_generation(target)
+            if short_by:
+                assert reserved == target
+                assert not collector._should_pause_for_generation_limits()
+            else:
+                # Full current target: behave exactly as before (look ahead).
+                assert reserved == target + 1
+        finally:
+            ray.kill(buffer)
+
     def test_release_target_is_idempotent(self):
         """A batch worker can safely release its target exactly once."""
         collector = self.create_local_collector()
@@ -3741,6 +3796,45 @@ class TestAsyncTrajectoryCollector:
         assert collector._fatal_error_message is None
         assert not collector._generation_limit_cleared.is_set()
         assert target_weight not in collector._generating_targets
+
+    @pytest.mark.parametrize("still_needed,expect_wake", [(5, True), (0, False)])
+    def test_successful_underfilled_worker_wakes_generation_pause(
+        self, monkeypatch, still_needed, expect_wake
+    ):
+        """A successful worker that leaves its target short wakes the loop.
+
+        Regression: after checkpoint resume a carried-over remainder gap-fills
+        only part of a target. Without a wake the collection loop stayed parked
+        in the generation-limit wait (cleared only by set_weight_version) while
+        the trainer waited for that target, deadlocking the run.
+        """
+        collector = self.create_local_collector()
+        collector.running = True
+        target_weight = 7
+        collector._generating_targets.add(target_weight)
+        collector._generation_limit_cleared.clear()
+
+        async def succeed(**kwargs):
+            return None
+
+        monkeypatch.setattr(collector, "_collect_rollout_batch", succeed)
+        monkeypatch.setattr(
+            collector, "_target_still_short", lambda target: still_needed > 0
+        )
+
+        asyncio.run(
+            collector._run_rollout_batch_worker(
+                repeated_batch=None,
+                generation_weight_version=6,
+                target_weight_version=target_weight,
+                num_generations=1,
+                use_nemo_gym=False,
+            )
+        )
+
+        assert target_weight not in collector._generating_targets
+        assert collector._failure_count == 0
+        assert collector._generation_limit_cleared.is_set() is expect_wake
         assert threading.current_thread() not in collector._inflight_threads
         collector.check_health()
 
