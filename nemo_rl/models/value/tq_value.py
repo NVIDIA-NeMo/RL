@@ -154,6 +154,7 @@ class TQValue(TQDriverMixin, Value):
         gbs: Optional[int] = None,
         mbs: Optional[int] = None,
         timer: Optional[Timer] = None,
+        train_fields: tuple[str, ...] = DP_VALUE_TRAIN_FIELDS,
     ) -> dict[str, Any]:
         """1-hop counterpart to train. One call is one optimizer step.
 
@@ -164,6 +165,7 @@ class TQValue(TQDriverMixin, Value):
             gbs: Global batch size; defaults to the config's train_global_batch_size.
             mbs: Micro batch size; defaults to the config's train_micro_batch_size.
             timer: Optional timer for nested value_training measurements.
+            train_fields: Columns the workers fetch for this step.
 
         Returns:
             Aggregated training-step output dict.
@@ -174,7 +176,7 @@ class TQValue(TQDriverMixin, Value):
         spa, dba = self._packing_args("train_mb_tokens")
         train_meta = self._isolated_meta(
             meta,
-            fields=list(DP_VALUE_TRAIN_FIELDS),
+            fields=list(train_fields),
             task_name="value_train",
             # See get_values: token-only inputs, so no multimodal union.
             include_multimodal=False,

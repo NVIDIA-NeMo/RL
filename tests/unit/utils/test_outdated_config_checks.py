@@ -39,6 +39,42 @@ def test_forest_config_has_no_obsolete_switch(config):
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("normalize_over", "kept_rows"),
+        ("normalize_over", "all_rows"),
+        ("normalize_over", None),
+        ("whiten_execution_padding", False),
+        ("whiten_execution_padding", True),
+        ("whiten_execution_padding", None),
+    ],
+)
+def test_removed_forest_whitening_options_fail_at_startup(key, value):
+    with pytest.raises(ValueError, match="ppo.adv_estimator.*" + key):
+        check_outdated_config({"ppo": {"adv_estimator": {key: value}}})
+
+
+@pytest.mark.parametrize("source", ["row0", "cyclic", None])
+def test_removed_forest_padding_source_fails_at_startup(source):
+    with pytest.raises(ValueError, match="forest_pad_source.*Remove"):
+        check_outdated_config({"token_capture": {"forest_pad_source": source}})
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {},
+        {"ppo": None, "token_capture": None},
+        {"ppo": {"adv_estimator": {"name": "gae", "normalize_advantages": True}}},
+        {"token_capture": {"forest_training": True, "forest_padding_scope": "step"}},
+    ],
+)
+def test_forest_config_without_deferred_options_is_accepted(config):
+    check_outdated_config(config)
+
+
 # The entrypoints under test are every file under ENTRYPOINTS_DIRS that imports
 # MasterConfig, plus ENTRYPOINTS_EXTRA_FILES.
 ENTRYPOINTS_DIRS = ["examples", "research"]

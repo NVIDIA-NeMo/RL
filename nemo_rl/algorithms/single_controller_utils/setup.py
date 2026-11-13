@@ -21,6 +21,7 @@ runtime_envs and breaks Ray's resource resolution (see the PR #2692 follow-up).
 
 from __future__ import annotations
 
+import math
 import os
 import time
 import warnings
@@ -67,6 +68,7 @@ from nemo_rl.algorithms.metric_utils import (
     print_setup_timing_summary,
 )
 from nemo_rl.algorithms.ppo import MasterConfig as PPOMasterConfig
+from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.rollout_checkpointing.manifest import (
     BOOTSTRAP_DIRNAME,
     BootstrapCompatibilityIdentity,
@@ -214,6 +216,9 @@ class SingleControllerActorArgs:
     value_loss_fn: Optional[LossFunction] = None
     ppo_group_multiple: int = 1
     ppo_min_remaining_groups: int = 0
+    # Row multiple the controller pads each Forest training batch to under
+    # token_capture.forest_padding_scope=step; 1 when groups pad themselves.
+    forest_step_row_multiple: int = 1
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -842,6 +847,30 @@ def _spinup_gym(
         ),
     )
     return shard_set, time.perf_counter() - t0
+
+
+def _forest_execution_row_multiple(
+    master_config: MasterConfig,
+    algo_cfg: GRPOConfig | PPOConfig,
+    trainer: TQPolicy,
+    value: Optional[TQValue],
+) -> int:
+    """Rows per Forest group must split evenly for the policy and any critic."""
+    multiple = forest_execution_row_multiple(
+        trainer.cfg,
+        dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
+        logprobs_required=any(logprob_passes_required(master_config, algo_cfg)),
+    )
+    if value is None:
+        return multiple
+    return math.lcm(
+        multiple,
+        forest_execution_row_multiple(
+            value.cfg,
+            dp_size=value.sharding_annotations.get_axis_size("data_parallel"),
+            logprobs_required="logprob_batch_size" in value.cfg,
+        ),
+    )
 
 
 def _generation_max_seq_len(generation_config) -> int:
@@ -2374,12 +2403,26 @@ def setup_single_controller(
         )
     if token_capture_cfg.forest_training:
         # Padding or borrowed inputs may appear in any step. Validate the loaded
-        # model before admitting rollouts, even if the first batch needs neither.
+        # models before admitting rollouts, even if the first batch needs neither.
+        exclude_router_padding = token_capture_cfg.exclude_padding_from_router_stats
         ray.get(
             trainer.worker_group.run_all_workers_single_data(
-                "validate_forest_execution_padding"
+                "validate_forest_execution_padding",
+                exclude_padding_from_router_stats=exclude_router_padding,
             )
         )
+        if value is not None:
+            ray.get(
+                value.worker_group.run_all_workers_single_data(
+                    "configure_forest_router_padding",
+                    exclude_padding_from_router_stats=exclude_router_padding,
+                )
+            )
+    forest_row_multiple = (
+        _forest_execution_row_multiple(master_config, algo_cfg, trainer, value)
+        if token_capture_cfg.forest_training
+        else 1
+    )
     rollout_manager = RolloutManager(
         tokenizer=tokenizer,
         task_to_env=env_handles,
@@ -2405,12 +2448,8 @@ def setup_single_controller(
         retry_policy=_build_retry_policy(master_config),
         forest_training=token_capture_cfg.forest_training,
         execution_row_multiple=(
-            forest_execution_row_multiple(
-                trainer.cfg,
-                dp_size=trainer.sharding_annotations.get_axis_size("data_parallel"),
-                logprobs_required=any(logprob_passes_required(master_config, algo_cfg)),
-            )
-            if token_capture_cfg.forest_training
+            forest_row_multiple
+            if token_capture_cfg.forest_padding_scope == "group"
             else 1
         ),
         effort_config=_get_effort_config(cast(GRPOMasterConfig, master_config)),
@@ -2464,5 +2503,10 @@ def setup_single_controller(
         value_loss_fn=value_loss_fn,
         ppo_group_multiple=ppo_group_multiple,
         ppo_min_remaining_groups=ppo_min_remaining_groups,
+        forest_step_row_multiple=(
+            forest_row_multiple
+            if token_capture_cfg.forest_padding_scope == "step"
+            else 1
+        ),
     )
     return actor_args, setup_timing_metrics

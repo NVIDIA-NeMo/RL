@@ -557,7 +557,7 @@ class _RowStore:
     def put_samples(self, *, sample_ids, fields, **kwargs) -> None:
         for row, sid in enumerate(sample_ids):
             for name in fields.keys():
-                self.rows[sid][name] = fields[name][row].clone()
+                self.rows.setdefault(sid, {})[name] = fields[name][row].clone()
 
 
 def _rows() -> dict[str, dict[str, torch.Tensor]]:

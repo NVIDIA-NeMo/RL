@@ -54,6 +54,7 @@ from megatron.core.rerun_state_machine import get_rerun_state_machine
 from transformers import PreTrainedTokenizerBase
 
 from nemo_rl.algorithms.loss.interfaces import LossFunction, LossType, MetricNormalizer
+from nemo_rl.data_plane.schema import ROUTER_EXCLUDED_ROWS
 from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.model_utils import allgather_cp_sharded_tensor
@@ -90,6 +91,10 @@ from nemo_rl.models.megatron.train import (
 )
 from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
 from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.megatron_policy_worker import (
+    require_router_padding_exclusion,
+    validate_forest_routers,
+)
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
 from nemo_rl.models.value.config import ValueConfig
 from nemo_rl.models.value.interfaces import ValueOutputSpec
@@ -509,8 +514,23 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
             self.optimizer,
         )
 
+        # Set by configure_forest_router_padding when Forest padding is
+        # excluded from router statistics; otherwise the critic keeps them.
+        self._forest_router_padding_mask = False
+
         print(f"MegatronValueWorker initialized on rank {self.rank}")
         self._maybe_enable_manual_gc()
+
+    def configure_forest_router_padding(
+        self, *, exclude_padding_from_router_stats: bool
+    ) -> None:
+        """Run the policy's Forest router checks; set the critic's padding mask flag."""
+        validate_forest_routers(self.model)
+        if exclude_padding_from_router_stats:
+            self._forest_router_padding_mask = require_router_padding_exclusion(
+                self.model,
+                pack_sequences=self._policy_like_cfg["sequence_packing"]["enabled"],
+            )
 
     def enable_forward_pre_hook(self):
         if isinstance(self.model, DistributedDataParallel):
@@ -596,6 +616,10 @@ class MegatronValueWorkerImpl(ManualGCMixin, TQWorkerMixin, AbstractPolicyWorker
                     self._policy_like_cfg,
                     mbs,
                     straggler_timer=self.mcore_state.straggler_timer,
+                    create_router_padding_mask=(
+                        self._forest_router_padding_mask
+                        and ROUTER_EXCLUDED_ROWS in batch
+                    ),
                 )
                 total_num_microbatches += int(num_microbatches)
 

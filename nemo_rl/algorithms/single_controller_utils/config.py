@@ -706,6 +706,15 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
     # all_captured includes every captured call, including abandoned attempts.
     # Custom policies use an importable package.module:function path.
     selection_policy: str = "returned_history"
+    # Forest only. Keep execution padding and failed owners' borrowed inputs out
+    # of MoE expert-bias statistics on the policy and a PPO critic; the critic
+    # then also masks sequence-packing padding. Off (default): those tokens
+    # count, matching ordinary training.
+    exclude_padding_from_router_stats: bool = False
+    # Forest only. Where execution padding brings rows to the policy and critic
+    # row multiple. group: each published group (default). step: once per
+    # training batch, which pads far fewer rows when groups hold few rollouts.
+    forest_padding_scope: Literal["group", "step"] = "group"
 
     @model_validator(mode="after")
     def validate_selection_policy(self) -> "TokenCaptureConfig":
@@ -714,6 +723,13 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
             raise ValueError(
                 f"selection_policy={self.selection_policy} requires forest_training=true"
             )
+        forest_only = {
+            "exclude_padding_from_router_stats": self.exclude_padding_from_router_stats,
+            "forest_padding_scope": self.forest_padding_scope != "group",
+        }
+        if not self.forest_training and any(forest_only.values()):
+            names = ", ".join(name for name, set_ in forest_only.items() if set_)
+            raise ValueError(f"token_capture.{names} requires forest_training=true")
         return self
 
 
@@ -996,10 +1012,18 @@ class MasterConfig(BaseModel, extra="allow"):
         return self
 
 
-def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> None:
-    """Keep the initial Forest objective identical at startup and before fanout."""
+def validate_forest_objective(
+    algo_cfg: GRPOConfig | PPOConfig, loss: ClippedPGLossConfig
+) -> None:
+    """Keep the initial Forest objective identical at startup and before fanout.
+
+    GRPO uses one advantage per logical rollout; PPO runs GAE per physical row.
+    """
+    is_ppo = isinstance(algo_cfg, PPOConfig)
+    section = "ppo" if is_ppo else "grpo"
     unsupported = {
-        "grpo.adv_estimator.name": grpo.adv_estimator.name != "grpo",
+        f"{section}.adv_estimator.name": algo_cfg.adv_estimator.name
+        != ("gae" if is_ppo else "grpo"),
         "loss_fn.token_level_loss": not loss.token_level_loss,
         "loss_fn.sequence_level_importance_ratios": loss.sequence_level_importance_ratios,
         "loss_fn.truncated_importance_sampling_type": loss.truncated_importance_sampling_type
@@ -1008,19 +1032,23 @@ def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> No
         "loss_fn.positive_example_nll_weight": loss.positive_example_nll_weight != 0,
         # The loss filters physical rows; forest training masks whole owners.
         "loss_fn.seq_logprob_error_in_loss": loss.seq_logprob_error_in_loss,
-        "grpo.use_dynamic_sampling": grpo.use_dynamic_sampling,
-        "grpo.reward_shaping.enabled": grpo.reward_shaping.enabled,
-        "grpo.calculate_advantages_on_gpu": bool(grpo.calculate_advantages_on_gpu),
-        "grpo.invalid_tool_call_advantage": grpo.invalid_tool_call_advantage
+        f"{section}.use_dynamic_sampling": algo_cfg.use_dynamic_sampling,
+        f"{section}.reward_shaping.enabled": algo_cfg.reward_shaping.enabled,
+        f"{section}.invalid_tool_call_advantage": algo_cfg.invalid_tool_call_advantage
         is not None,
-        "grpo.malformed_thinking_advantage": grpo.malformed_thinking_advantage
+        f"{section}.malformed_thinking_advantage": algo_cfg.malformed_thinking_advantage
         is not None,
     }
+    if not is_ppo:
+        # PPOConfig has no GPU advantage option.
+        unsupported["grpo.calculate_advantages_on_gpu"] = bool(
+            algo_cfg.calculate_advantages_on_gpu
+        )
     bad = [name for name, enabled in unsupported.items() if enabled]
     if bad:
         raise ValueError(
-            "Forest training (token_capture.forest_training) requires standard token-level GRPO; "
-            f"unsupported settings: {', '.join(bad)}"
+            "Forest training (token_capture.forest_training) requires token-level "
+            f"GRPO or PPO with GAE; unsupported settings: {', '.join(bad)}"
         )
 
 
@@ -1040,11 +1068,14 @@ def logprob_passes_required(
 
 
 def forest_execution_row_multiple(
-    policy: PolicyConfig, *, dp_size: int, logprobs_required: bool
+    policy: PolicyConfig | ValueConfig, *, dp_size: int, logprobs_required: bool
 ) -> int:
     """Common row divisibility for fixed or packed Megatron consumers.
 
     Policy and reference forwards share this trainer's mesh and logprob MBS.
+    A PPO critic is a second consumer on its own mesh; its value forward uses
+    ``logprob_batch_size`` when set, so callers pass ``logprobs_required`` from
+    that key's presence.
     Packed consumers form their own bins and only need complete DP shards.
     Non-interleaved PP admits any positive microbatch count; interleaved PP
     and dynamic batching require separate qualification.
@@ -1564,7 +1595,9 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             warnings.warn(
                 "Streaming PPO with ppo.adv_estimator.normalize_advantages=true "
                 "normalizes GAE advantages per chunk instead of across the full "
-                "batch. Changing chunk boundaries can change normalized advantages.",
+                "batch. Changing chunk boundaries can change normalized advantages. "
+                "Set async_rl.min_groups_for_streaming_train to "
+                "ppo.num_prompts_per_step for full-batch PPO.",
                 stacklevel=2,
             )
 
@@ -1582,9 +1615,11 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         failure_config.max_skipped_prompts
         + failure_config.max_consecutive_dropped_prompts
     )
-    if drop_budget > 0:
+    # Forest critics train on the step's actual rows (gbs = its row count), so a
+    # short step is fine there.
+    if drop_budget > 0 and not master_config.token_capture.forest_training:
         raise ValueError(
-            "PPO on the SingleController path requires "
+            "PPO on the SingleController path without Forest training requires "
             "async_rl.rollout_failure.max_skipped_prompts=0 and "
             "max_consecutive_dropped_prompts=0, but they sum to "
             f"{drop_budget}. A drop shortens the step, but the critic split API "
@@ -1641,6 +1676,16 @@ def resolve_ppo_chunk_alignment(
     value_config = master_config.value
     if value_config is None:
         raise ValueError("PPO requires a value model configuration")
+    ppo_config = master_config.ppo
+    assert ppo_config is not None
+    min_groups = master_config.async_rl.min_groups_for_streaming_train
+    min_remaining_groups = (
+        (min_groups + 1) // 2 if min_groups < ppo_config.num_prompts_per_step else 0
+    )
+    if master_config.token_capture.forest_training:
+        # Forest groups vary in row count, and execution padding already aligns
+        # every chunk to both models, so any group count works.
+        return 1, min_remaining_groups
 
     def sample_multiple(config: PolicyConfig | ValueConfig, dp_size: int) -> int:
         if config["dynamic_batching"]["enabled"] or (
@@ -1655,8 +1700,6 @@ def resolve_ppo_chunk_alignment(
         sample_multiple(master_config.policy, policy_dp),
         sample_multiple(value_config, value_dp),
     )
-    ppo_config = master_config.ppo
-    assert ppo_config is not None
     group_multiple = sample_alignment // math.gcd(
         sample_alignment, ppo_config.num_generations_per_prompt
     )
@@ -1665,16 +1708,12 @@ def resolve_ppo_chunk_alignment(
             "PPO num_prompts_per_step must be divisible by the policy/value "
             f"group multiple ({group_multiple}) to avoid an incomplete final chunk"
         )
-    min_groups = master_config.async_rl.min_groups_for_streaming_train
     if min_groups < group_multiple:
         raise ValueError(
             "PPO min_groups_for_streaming_train must be at least the "
             f"policy/value group multiple ({group_multiple}) so each chunk "
             "contains complete microbatches on every DP rank"
         )
-    min_remaining_groups = (
-        (min_groups + 1) // 2 if min_groups < ppo_config.num_prompts_per_step else 0
-    )
     return group_multiple, min_remaining_groups
 
 
@@ -1895,31 +1934,42 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             "siblings have no durable receipts to recover"
         )
     if token_capture_config.forest_training:
-        if master_config.grpo is None:
-            raise ValueError("forest training requires GRPO")
+        forest_algo_cfg = algo_config(master_config)
         if not token_capture_config.enabled:
             raise ValueError(
                 "token_capture.forest_training requires token_capture.enabled=true"
             )
         if (
-            master_config.grpo.invalid_tool_call_advantage is not None
-            or master_config.grpo.malformed_thinking_advantage is not None
+            forest_algo_cfg.invalid_tool_call_advantage is not None
+            or forest_algo_cfg.malformed_thinking_advantage is not None
         ):
             raise ValueError(
                 "forest training does not support message-level advantage overrides"
             )
         if token_capture_config.defer_routed_experts_to_policy:
             raise ValueError("forest training requires direct routed-expert assembly")
-        validate_forest_objective(master_config.grpo, master_config.loss_fn)
+        validate_forest_objective(forest_algo_cfg, master_config.loss_fn)
         if reward_penalties_enabled or opd_module.is_opd_enabled(master_config):
             raise ValueError(
                 "Forest does not support reward penalties or on-policy distillation"
             )
-        # Validate the fixed-batch policy shape before workers/generation start.
-        # Setup recomputes Q from the actual trainer DP mesh.
+        # Validate the fixed-batch policy and critic shapes before
+        # workers/generation start. Setup recomputes Q from the actual DP meshes.
         forest_execution_row_multiple(
             master_config.policy, dp_size=1, logprobs_required=True
         )
+        if is_ppo_run(master_config):
+            if forest_algo_cfg.value_training_mode != "whole_batch":  # type: ignore
+                # Forest pads the whole step to the critic's DP and microbatch
+                # sizes; split mode shards each chunk on its own.
+                raise ValueError(
+                    "forest training requires ppo.value_training_mode=whole_batch"
+                )
+            forest_execution_row_multiple(
+                master_config.value,  # type: ignore
+                dp_size=1,
+                logprobs_required="logprob_batch_size" in master_config.value,  # type: ignore
+            )
     if recovery_config.turn_checkpointing_enabled:
         # A turn snapshot holds rollout dispatch through Gym's prepare, commit and
         # drain, and the stall watchdog keeps counting meanwhile.

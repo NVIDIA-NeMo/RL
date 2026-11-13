@@ -56,6 +56,7 @@ from nemo_rl.data_plane.schema import (
     MALFORMED_THINKING_MASK,
     MASK_SAMPLE,
     ROUTE_PLAN_TAG,
+    ROUTER_EXCLUDED_ROWS,
     SAMPLER_TOPK_LOGPROBS_FIELD,
     SAMPLER_TOPK_TOKEN_IDS_FIELD,
     TRUNCATED,
@@ -1304,6 +1305,10 @@ class RolloutReassembler:
             train_batch[SAMPLER_TOPK_TOKEN_IDS_FIELD] = sampler_topk_token_ids
             train_batch[SAMPLER_TOPK_LOGPROBS_FIELD] = sampler_topk_logprobs
         if logical is not None:
+            # Padding and failed owners borrow inputs; their tokens are not data.
+            train_batch[ROUTER_EXCLUDED_ROWS] = torch.tensor(
+                [not row.valid for row in rows], dtype=torch.bool
+            )
             for key in (INVALID_TOOL_CALL_MASK, MALFORMED_THINKING_MASK):
                 values = torch.zeros((n, max_len), dtype=torch.bool)
                 for index, row in enumerate(rows):
