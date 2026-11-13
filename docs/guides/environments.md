@@ -65,6 +65,39 @@ if multi_rewards is not None:
 ```
 For instance, when running `examples/configs/gdpo_math_1B.yaml`, the batch will contain `reward/correctness`, `reward/integer`, and `reward/format`. More details can be found in `HFMultiRewardVerifyWorker`. Users can implement their own multi-reward environments by returning a dict from `step()` with keys using the `reward/` prefix.
 
+### Stop strings in multi-turn environments
+
+Tool-using environments usually need generation to stop at the end of an action (for example `</tool_call>` or `</search>`), so the environment can run the tool and append its result before the model continues.
+
+The stop strings for each turn come from two places:
+
+- **First turn:** the `stop_strings` field of each sample's `DatumSpec`, set by your data processor. `policy.generation.stop_strings` from the config is merged in as well.
+- **Later turns:** the `next_stop_strings` your environment returns from `step()`.
+
+If you only return `next_stop_strings` from the environment, the first turn runs with no stop strings. The model then writes past its first action and can generate its own fake tool output, which the environment then follows with the real result. Set the first turn's stop strings in the data processor:
+
+```python
+def my_task_processor(datum_dict, task_data_spec, tokenizer, max_seq_length, idx):
+    ...
+    return DatumSpec(
+        message_log=message_log,
+        length=length,
+        extra_env_info=extra_env_info,
+        loss_multiplier=1.0,
+        idx=idx,
+        task_name=datum_dict["task_name"],
+        stop_strings=["</tool_call>", "</answer>"],
+    )
+```
+
+Or set them for every sample in the config:
+
+```yaml
+policy:
+  generation:
+    stop_strings: ["</tool_call>", "</answer>"]
+```
+
 ## Code Environment
 
 The Code Environment is designed for code generation and execution tasks. It provides a sandboxed environment for executing Python code and evaluating the results.
