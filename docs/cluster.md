@@ -138,9 +138,20 @@ sbatch ray.sub \
     environment to prevent the host's cache from interfering with the container's cache. 
     Set `UV_CACHE_DIR_OVERRIDE` if you have a customized `uv` environment (e.g., 
     with pre-downloaded packages or specific configurations) that you want to persist 
-    and reuse across container runs. This variable should point to a path on a shared 
-    filesystem accessible by all nodes (head and workers). This path will be mounted 
-    into the container and will override the container's default `UV_CACHE_DIR`.
+    and reuse across container runs. The path must be visible to all nodes (head and
+    workers); it is mounted into the container and overrides the container's default
+    `UV_CACHE_DIR`. On a shared filesystem, every `uv` install on every node then reads
+    and writes that cache, which loads the filesystem's metadata servers; to reuse built
+    environments across runs, see
+    [Python Environments on Shared Filesystems](#python-environments-on-shared-filesystems) instead.
+* - `SETUP_COMMAND`
+  - Shell commands that `ray.sub` runs inside the container on every node, head and
+    workers, before it starts Ray, in the directory `ray.sub` was submitted from. They
+    run again if starting Ray is retried, so make them safe to repeat. `ray.sub` does not
+    check their exit status, so a failing command does not stop the job unless it ends
+    the job itself. See
+    [Reuse Prebuilt Gym Environments Without Rebuilding the Image](#reuse-prebuilt-gym-environments-without-rebuilding-the-image)
+    for an example.
 * - `CPUS_PER_WORKER`
   - CPUs each Ray worker node claims. If unset, `ray.sub` auto-detects this from
     Slurm (the `CPUTot` of the first allocated node) so that Ray sees every CPU
@@ -273,6 +284,94 @@ sbatch ray.sub \
 > are already taken by some other service backgrounded on your cluster.
 > The defaults above are the source-of-truth port layout defined in `ray.sub`;
 > keep this table in sync with that block if the defaults ever change.
+
+### Python Environments on Shared Filesystems
+
+NeMo RL and NeMo Gym run Python from virtual environments: one per Ray actor type under
+`NEMO_RL_VENV_DIR`, and one per Gym server under `NEMO_GYM_VENV_DIR`, which NeMo RL passes to
+Gym as `env.nemo_gym.uv_venv_dir`. Each environment holds tens of thousands of small files.
+Every process that starts from an environment stats and opens many of them, and every `uv`
+sync or lock check walks all of them. On a parallel filesystem such as Lustre, each of those
+operations is a request to a small set of metadata servers that every job on the cluster
+shares. Many nodes building, checking or importing environments from one shared path can
+overload those servers and stall the filesystem for every user.
+
+Keep environments on each node's local disk:
+
+- Do not set `NEMO_RL_VENV_DIR`, `NEMO_GYM_VENV_DIR` or `env.nemo_gym.uv_venv_dir` to a path
+  on a shared filesystem. Images built from `docker/Dockerfile` set them to `/opt/ray_venvs`
+  and `/opt/gym_venvs`, inside the container's root filesystem. Outside such an image, their
+  defaults are `<NeMo RL checkout>/venvs` and each server's directory in the Gym checkout,
+  which on a cluster are usually shared storage, so point both variables at node-local disk.
+- Prefer environments built into the image. To build the Gym server environments your recipe
+  uses into the image, pass `--build-arg NEMO_GYM_PREFETCH_CONFIGS="<recipe configs>"` to
+  `docker build`, and run with `env.nemo_gym.skip_venv_if_present=true`.
+- When you cannot rebuild the image, for example while you change a Gym checkout, build the
+  Gym server environments once in the image you train with, store them as one archive file,
+  and unpack the archive on every node at startup, as described below.
+- Otherwise, in images built from `docker/Dockerfile`, leave the defaults. Each job then builds
+  the Gym server environments inside its containers, which costs startup time but keeps the
+  environments off the shared filesystem.
+
+These steps cover virtual environments only; other per-server data, such as the setup trees
+some Gym servers keep under the Gym checkout's `cache/` directory, is not included. They also
+assume the container's root filesystem is on the node's local disk, which is the usual enroot
+setup. To check, run `df /opt` inside the container.
+
+#### Reuse Prebuilt Gym Environments Without Rebuilding the Image
+
+`examples/nemo_gym/gym_venv_archive.sh` builds the archive and unpacks it.
+
+The build job and every training job must use the same `CONTAINER` and mount the same Gym
+checkout at `/opt/nemo-rl/3rdparty/Gym-workspace/Gym`, as described in
+[Option 3 of Dependency Management](design-docs/dependency-management.md#option-3-classic-workflow---mounting-modified-submodules).
+Gym installs each server's requirements from the Gym checkout the image imports, so without
+that mount the archive holds the environments of the image's own Gym, not yours. The recipe
+config must leave `env.nemo_gym.uv_venv_dir` at `/opt/gym_venvs`. Nothing checks that an
+archive matches a job's Gym or image, so name it after both, and build a new one after you move
+the Gym version, change a Gym server's dependencies or switch images. The image must also
+already have the system libraries some Gym servers need, which `docker/Dockerfile` installs in
+its Gym prefetch step (for example the X11 libraries `ether0` needs); the archive cannot carry
+them.
+
+Build in a one-node job, from the NeMo RL checkout inside the container:
+
+```sh
+srun --nodes=1 --no-container-mount-home \
+  --container-image="$CONTAINER" --container-mounts="$MOUNTS" --container-workdir="$PWD" \
+  bash examples/nemo_gym/gym_venv_archive.sh build \
+    /shared/path/gym_venvs-<gym commit>-<image tag>.tar <recipe config>
+```
+
+The script clears `/opt/gym_venvs`, so the archive holds only the environments the recipe
+config uses, built from your Gym. It builds them with the same CUDA torch backend and vLLM
+wheel override as the image's own prefetch step, so a build on a node without GPUs does not
+pick CPU torch. If the image was built with non-default `NEMO_GYM_CUDA` or
+`NEMO_GYM_VLLM_VERSION` build arguments, set the same values for the build. It stops on the first
+error, and only a finished build replaces the archive.
+Next to the archive it writes `<archive>.servers`, which lists the environments, and
+`<archive>.size`.
+
+In each training job, unpack the archive with `SETUP_COMMAND`, mount the archive's directory,
+and run with `env.nemo_gym.skip_venv_if_present=true`. Without that setting, Gym reinstalls
+on top of the unpacked environments. Unpack on every node, not only the nodes that host Gym
+servers, because Ray work that a Gym server starts can run on any node.
+
+```sh
+SETUP_COMMAND='bash examples/nemo_gym/gym_venv_archive.sh unpack /shared/path/gym_venvs-<gym commit>-<image tag>.tar "$(dirname "$0")/ENDED"' \
+COMMAND="uv run ./examples/nemo_gym/run_grpo_nemo_gym.py --config <recipe config> env.nemo_gym.skip_venv_if_present=true" \
+CONTAINER=... \
+MOUNTS="...,/shared/path:/shared/path:ro" \
+sbatch ... ray.sub
+```
+
+The unpack checks the archive's size, extracts it next to `/opt/gym_venvs`, and checks that
+every listed environment is present. Only then does it replace `/opt/gym_venvs` and write a
+marker that makes a retried Ray start skip the unpack. If any step fails, it keeps the
+existing environments and touches the `ENDED` file passed to it. `ray.sub` writes its setup
+command into its log directory and stops the job when that directory's `ENDED` file appears,
+so the job ends with the error in the node's Ray log instead of rebuilding every environment
+at startup.
 
 ### Topology-Aware Placement for MoE (avoiding cross-rack stalls)
 

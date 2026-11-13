@@ -68,6 +68,8 @@ EXTRA_MOUNTS="${EXTRA_MOUNTS:-}"
 EXTRA_HYDRA_ARGS="${EXTRA_HYDRA_ARGS:-}"
 NRL_FORCE_REBUILD_VENVS="${NRL_FORCE_REBUILD_VENVS:-false}"
 GYM_VENV_DIR="${GYM_VENV_DIR:-/opt/gym_venvs}"
+# A tar of opt/gym_venvs built in CONTAINER; see "Python Environments on Shared Filesystems" in docs/cluster.md.
+GYM_VENV_ARCHIVE="${GYM_VENV_ARCHIVE:-}"
 WANDB_PROJ="${WANDB_PROJ:-grpo-super-omni}"
 DRY_RUN="${DRY_RUN:-false}"
 
@@ -194,24 +196,73 @@ export MOUNTS="${EXTRA_MOUNTS:+${EXTRA_MOUNTS},}${BASE_MOUNTS}"
 # fails with "Repo id must be in the form 'repo_name' or 'namespace/repo_name'",
 # which says nothing about mounts. Check here instead.
 mount_checked_vars=(MODEL_PATH TRAIN_PATH VAL_PATH PERSISTENT_CACHE)
-# GYM_VENV_DIR defaults to a container-internal path, which needs no mount. It
-# only has to be checked when pointed at host storage -- worth doing, because
-# putting it on a shared filesystem is how Gym's skip_venv_if_present actually
-# takes effect: the container-local default is discarded with the container, so
-# every run rebuilds ~175 packages per resource server.
+# GYM_VENV_DIR defaults to the image's /opt/gym_venvs, on the node's local disk.
+# Venvs on a shared filesystem make every node import and check thousands of
+# files there, which overloads its metadata servers; reuse built venvs across
+# runs with GYM_VENV_ARCHIVE instead. A mount that covers GYM_VENV_DIR is checked
+# at its host path, even under /opt; the image's own unmounted /opt is not.
+# The check looks at the nearest existing directory, because Gym creates
+# GYM_VENV_DIR on first use.
+gym_venv_host_dir=""
+[[ "${GYM_VENV_DIR}" != /opt/* ]] && gym_venv_host_dir="${GYM_VENV_DIR}"
+IFS=',' read -ra gym_venv_mount_specs <<< "${MOUNTS}"
+for spec in "${gym_venv_mount_specs[@]}"; do
+    IFS=: read -r mount_host mount_container _ <<< "${spec}"
+    mount_container="${mount_container:-${mount_host}}"
+    mount_container="${mount_container%/}"
+    if [[ -n "${mount_host}" && ( "${GYM_VENV_DIR}" == "${mount_container}" || "${GYM_VENV_DIR}" == "${mount_container}/"* ) ]]; then
+        gym_venv_host_dir="${mount_host%/}${GYM_VENV_DIR#"${mount_container}"}"
+        break
+    fi
+done
+if [[ -n "${gym_venv_host_dir}" ]]; then
+    gym_venv_probe="${gym_venv_host_dir}"
+    while [[ ! -e "${gym_venv_probe}" && "${gym_venv_probe}" != / ]]; do
+        gym_venv_probe="$(dirname "${gym_venv_probe}")"
+    done
+    gym_venv_fs="$(stat -f -c %T "${gym_venv_probe}" 2>/dev/null || true)"
+    case "${gym_venv_fs}" in
+        lustre|nfs*|gpfs|fhgfs|beegfs|ceph*|fuse*|cifs|smb*|UNKNOWN*)
+            echo "Error: GYM_VENV_DIR=${GYM_VENV_DIR} is on a shared filesystem (${gym_venv_fs}, host path ${gym_venv_host_dir})." >&2
+            echo "  Keep Gym venvs on each node's local disk: leave GYM_VENV_DIR at /opt/gym_venvs and" >&2
+            echo "  set GYM_VENV_ARCHIVE to reuse prebuilt venvs (docs/cluster.md)." >&2
+            exit 1
+            ;;
+    esac
+fi
 [[ "${GYM_VENV_DIR}" != /opt/* ]] && mount_checked_vars+=(GYM_VENV_DIR)
+if [[ -n "${GYM_VENV_ARCHIVE}" ]]; then
+    if [[ "${GYM_VENV_DIR}" != /opt/gym_venvs ]]; then
+        echo "Error: GYM_VENV_ARCHIVE unpacks to /opt/gym_venvs, but GYM_VENV_DIR=${GYM_VENV_DIR}." >&2
+        exit 1
+    fi
+    if [[ "${GYM_VENV_ARCHIVE}" != /* || ! -f "${GYM_VENV_ARCHIVE}" ]]; then
+        echo "Error: GYM_VENV_ARCHIVE=${GYM_VENV_ARCHIVE} must be the absolute path of an existing file." >&2
+        exit 1
+    fi
+    mount_checked_vars+=(GYM_VENV_ARCHIVE)
+    # ray.sub runs SETUP_COMMAND on every node before Ray starts and ignores its
+    # exit status; the script ends the job through ray.sub's ENDED file instead.
+    gym_venv_unpack="NEMO_GYM_VENV_DIR=$(printf %q "${GYM_VENV_DIR}") bash $(printf %q "${SNAPSHOT_DIR}/examples/nemo_gym/gym_venv_archive.sh") unpack"
+    gym_venv_unpack+=" $(printf %q "${GYM_VENV_ARCHIVE}") \"\$(dirname \"\$0\")/ENDED\""
+    export SETUP_COMMAND="${SETUP_COMMAND:+${SETUP_COMMAND}$'\n'}${gym_venv_unpack}"
+fi
 for path_var in "${mount_checked_vars[@]}"; do
     path_value="${!path_var}"
     mounted=false
     IFS=',' read -ra mount_specs <<< "${MOUNTS}"
     for spec in "${mount_specs[@]}"; do
-        host_path="${spec%%:*}"
-        [[ -n "${host_path}" && "${path_value}" == "${host_path}"* ]] && mounted=true && break
+        IFS=: read -r host_path container_path _ <<< "${spec}"
+        # The path is passed into the container as is, so only a mount that keeps it there counts.
+        [[ -z "${container_path}" || "${container_path%/}" == "${host_path%/}" ]] || continue
+        [[ -n "${host_path}" && ( "${path_value}" == "${host_path%/}" || "${path_value}" == "${host_path%/}/"* ) ]] \
+            && mounted=true && break
     done
     if [[ "${mounted}" != true ]]; then
         echo "Error: ${path_var}=${path_value}" >&2
-        echo "  is not under any path in MOUNTS, so it will not exist in the container." >&2
-        echo "  Add its filesystem to EXTRA_MOUNTS, e.g." >&2
+        echo "  is not under any path in MOUNTS that keeps the same path inside the container," >&2
+        echo "  so it will not exist there under that name. Add its filesystem to EXTRA_MOUNTS" >&2
+        echo "  with matching host and container paths, e.g." >&2
         echo "    EXTRA_MOUNTS=/host/path:/host/path,/other/path:/other/path" >&2
         exit 1
     fi
@@ -242,6 +293,7 @@ SBATCH_ARGS=(
 if [[ "${DRY_RUN}" == true ]]; then
     echo "[dry-run] COMMAND:"
     echo "${COMMAND}"
+    echo "[dry-run] SETUP_COMMAND: ${SETUP_COMMAND:-<none>}"
     echo "[dry-run] sbatch invocation:"
     echo "${SBATCH_ARGS[@]}"
 else

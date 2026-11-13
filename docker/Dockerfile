@@ -754,10 +754,12 @@ EOF
 # themselves are built in hardlink mode: examples/nemo_gym/prefetch_venvs.py pins
 # UV_LINK_MODE=hardlink in the Gym actor's runtime_env, because Gym's setup scripts shell
 # out to `uv pip install --no-cache`, which uv refuses to combine with symlink installs.
-# Gym pins vllm==0.29.0; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
+# Gym pins vllm; override it to vLLM's default prebuilt CUDA wheel so Gym's venvs share
 # RL's torch/nvidia stack. UV_TORCH_BACKEND keeps torch on the same CUDA backend.
-ARG NEMO_GYM_CUDA=cu130
-ARG NEMO_GYM_VLLM_VERSION=0.29.0
+# The defaults live in examples/nemo_gym/gym_vllm_override.sh, which gym_venv_archive.sh also uses;
+# these build arguments override them.
+ARG NEMO_GYM_CUDA
+ARG NEMO_GYM_VLLM_VERSION
 RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
     --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu
 if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
@@ -779,10 +781,12 @@ if [[ -n "${NEMO_GYM_PREFETCH_CONFIGS:-}" ]]; then
     source /tmp/uv-cache-helper/uv_cache_mount.sh
     uv_cache_restore
     trap 'uv_cache_persist' EXIT
-    case "${TARGETARCH:-amd64}" in arm64) WHEEL_ARCH=aarch64 ;; *) WHEEL_ARCH=x86_64 ;; esac
+    # A build argument left unset takes the helper's default.
+    [[ -n "${NEMO_GYM_CUDA:-}" ]] || unset NEMO_GYM_CUDA
+    [[ -n "${NEMO_GYM_VLLM_VERSION:-}" ]] || unset NEMO_GYM_VLLM_VERSION
+    source /opt/nemo-rl/examples/nemo_gym/gym_vllm_override.sh
     GYM_VLLM_OVERRIDE=/opt/nemo-rl/.gym-vllm-override.txt
-    printf 'vllm @ https://github.com/vllm-project/vllm/releases/download/v%s/vllm-%s-cp38-abi3-manylinux_2_28_%s.whl\n' \
-        "${NEMO_GYM_VLLM_VERSION}" "${NEMO_GYM_VLLM_VERSION}" "${WHEEL_ARCH}" > "${GYM_VLLM_OVERRIDE}"
+    gym_write_vllm_override "${GYM_VLLM_OVERRIDE}" "${TARGETARCH:-amd64}"
     UV_TORCH_BACKEND="${NEMO_GYM_CUDA}" \
     UV_OVERRIDE="${GYM_VLLM_OVERRIDE}" \
     UV_LINK_MODE=symlink uv run python examples/nemo_gym/prefetch_venvs.py $NEMO_GYM_PREFETCH_CONFIGS

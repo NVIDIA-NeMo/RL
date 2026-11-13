@@ -668,8 +668,8 @@ def _gym_failure_row_error(
 def get_nemo_gym_uv_cache_dir() -> str | None:
     """Return the uv cache directory inside a container, or None outside one.
 
-    Inside a container (NRL_CONTAINER=1), returns the uv cache location so Gym
-    stores its caches in the expected shared path. Returns None outside a
+    Inside a container (NRL_CONTAINER=1), returns the container's uv cache
+    location so Gym's server installs reuse the cache the image ships. Returns None outside a
     container, meaning the caller should omit this arg and let Gym create the
     cache locally (the default when you may not be able to write to /opt).
     """
@@ -682,9 +682,10 @@ def get_nemo_gym_venv_dir() -> str | None:
     """Return the NeMo Gym venv directory from NEMO_GYM_VENV_DIR, or None.
 
     Returns the value of NEMO_GYM_VENV_DIR if set, otherwise None. When None
-    the caller should omit this arg and let Gym create venvs locally (the
-    default when a container is not used since you may not be able to write
-    to /opt).
+    the caller omits this arg, and Gym creates each server's venv inside that
+    server's directory in the Gym checkout. NEMO_GYM_VENV_DIR must not point at
+    a shared filesystem; see "Python Environments on Shared Filesystems" in
+    docs/cluster.md.
     """
     return os.environ.get("NEMO_GYM_VENV_DIR")
 
@@ -3772,7 +3773,11 @@ def _spinup_shards_concurrently(
                     f"NeMo-Gym shards used the whole {spinup_timeout}s startup "
                     f"budget before every replica finished setting up. Raise "
                     f"env.nemo_gym.spinup_timeout, or bake the Gym venvs into "
-                    f"the image so a cold node starts faster."
+                    f"the image so a cold node starts faster. Without an image "
+                    f"rebuild, unpack a prebuilt archive of them on every node and "
+                    f"set env.nemo_gym.skip_venv_if_present=true (docs/cluster.md, "
+                    f"'Python Environments on Shared Filesystems'); never build "
+                    f"them on a shared filesystem."
                 ) from error
             raise ShardSetupError(
                 f"NeMo-Gym shard '{shard_name}' (replica {replica}) {failure}: {error}"

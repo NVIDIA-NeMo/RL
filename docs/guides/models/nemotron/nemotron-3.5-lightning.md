@@ -105,6 +105,10 @@ Build arguments:
 - `--build-context nemo-rl=.` builds from the current checkout. Without it,
   the Dockerfile pulls `NVIDIA-NeMo/RL.git#main`.
 
+Do not put the Gym virtual environments on a shared filesystem as a way to skip rebuilding them.
+To reuse them without rebuilding the image, see
+[Python Environments on Shared Filesystems](../../../cluster.md#python-environments-on-shared-filesystems).
+
 On a Slurm cluster using [enroot](https://github.com/NVIDIA/enroot), convert
 the image to squashfs:
 
