@@ -128,6 +128,11 @@ from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
 
 LOGGER = logging.getLogger(__name__)
 
+# Thread caps for token-capture TQ I/O. Writes keep the default executor's
+# size: more threads only queue more puts on TQ's single client loop per process.
+_CAPTURE_READ_THREADS = 64
+_CAPTURE_WRITE_THREADS = 32
+
 
 # The captured model call the current HTTP request serves. Set when capture
 # begins the call, in the request's task, and read by the engine client when the
@@ -440,6 +445,15 @@ class VllmAsyncGenerationWorkerImpl(
         self._capture_media = False
         self._capture_patch_size: int | None = None
         self._capture_image_token_id: int | None = None
+        # Capture TQ I/O gets its own pools instead of the default executor, so
+        # a backlog of staging writes cannot hold up the prefix reads that admit
+        # new turns. Each thread mostly waits on a TQ future.
+        self._capture_read_executor = ThreadPoolExecutor(
+            max_workers=_CAPTURE_READ_THREADS, thread_name_prefix="nrl-capture-read"
+        )
+        self._capture_write_executor = ThreadPoolExecutor(
+            max_workers=_CAPTURE_WRITE_THREADS, thread_name_prefix="nrl-capture-write"
+        )
         # TQTokenSource installed by setup_token_capture. The media path reads
         # parent-chain rows through it directly; prefix resolution goes through
         # the shared ChainPrefixCache below.
@@ -1054,7 +1068,7 @@ class VllmAsyncGenerationWorkerImpl(
         splice: PrefixSplice | None = None,
         verify_retained_media: bool = False,
     ) -> CapturedMedia | None:
-        """Run off-loop: resolve retained geometry and snapshot processed pixels."""
+        """Resolve retained geometry and snapshot processed pixels (blocking TQ reads)."""
         if admission is None:
             return None
         if not self._capture_media:
@@ -1166,6 +1180,30 @@ class VllmAsyncGenerationWorkerImpl(
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
         """Resolve a staging chain through the shared, cached TQ read."""
         return self._chain_prefix.fetch(staging_chain)
+
+    async def _run_capture_io(
+        self, executor: ThreadPoolExecutor, fn: Any, /, *args: Any, **kwargs: Any
+    ) -> Any:
+        """``asyncio.to_thread`` on a capture pool, keeping the caller's contextvars."""
+        call = functools.partial(contextvars.copy_context().run, fn, *args, **kwargs)
+        return await asyncio.get_running_loop().run_in_executor(executor, call)
+
+    async def _capture_request_media_async(
+        self, engine_prompt: dict[str, Any], **kwargs: Any
+    ) -> CapturedMedia | None:
+        """Snapshot media on the read pool; inline when media capture is off.
+
+        Without media capture the snapshot only checks the prompt, so it does not
+        queue for a thread on every call.
+        """
+        if not self._capture_media:
+            return self._capture_request_media(engine_prompt, **kwargs)
+        return await self._run_capture_io(
+            self._capture_read_executor,
+            self._capture_request_media,
+            engine_prompt,
+            **kwargs,
+        )
 
     def _resolve_admission_prefix(self, admission: Any) -> list[int]:
         """Resolve a ``CaptureAdmission`` to the flat prefix the engine prompt starts with."""
@@ -1641,10 +1679,16 @@ class VllmAsyncGenerationWorkerImpl(
                 resumed_generation_token_ids: list[int] = []
                 restored_request_output_tokens: int | None = None
                 if serving_admission is not None:
-                    capture_prefix_token_ids = await asyncio.to_thread(
-                        worker_self._resolve_admission_prefix, serving_admission
+                    capture_prefix_token_ids = await worker_self._run_capture_io(
+                        worker_self._capture_read_executor,
+                        worker_self._resolve_admission_prefix,
+                        serving_admission,
                     )
-                    resolved_admission, generation_cut = await asyncio.to_thread(
+                    (
+                        resolved_admission,
+                        generation_cut,
+                    ) = await worker_self._run_capture_io(
+                        worker_self._capture_read_executor,
                         worker_self._prefix_recovery.resolve_restore,
                         serving_admission,
                         capture_prefix_token_ids,
@@ -1695,8 +1739,7 @@ class VllmAsyncGenerationWorkerImpl(
                         )
                     # Token capture, text mode: the full render is the exact
                     # engine prompt.
-                    media = await asyncio.to_thread(
-                        worker_self._capture_request_media,
+                    media = await worker_self._capture_request_media_async(
                         res[1][0],
                         admission=admission,
                         verify_retained_media=verify_retained_media,
@@ -1813,8 +1856,7 @@ class VllmAsyncGenerationWorkerImpl(
                 # media capture), so a restored prompt has no media to capture.
                 media = None
                 if generation_cut is None:
-                    media = await asyncio.to_thread(
-                        worker_self._capture_request_media,
+                    media = await worker_self._capture_request_media_async(
                         engine_prompt,
                         admission=serving_admission,
                         splice=splice,
@@ -2294,8 +2336,11 @@ class VllmAsyncGenerationWorkerImpl(
                 # Off-loop: the sink write inside complete_call is a blocking
                 # TQ round trip (see the staging protocol's serving-host rule).
                 try:
-                    content = await asyncio.to_thread(
-                        worker_self._finish_request_capture, request, content
+                    content = await worker_self._run_capture_io(
+                        worker_self._capture_write_executor,
+                        worker_self._finish_request_capture,
+                        request,
+                        content,
                     )
                 except asyncio.CancelledError:
                     # Queued executor work may never start after cancellation.
@@ -3053,6 +3098,12 @@ class VllmAsyncGenerationWorkerImpl(
             prefix_recovery = getattr(self, "_prefix_recovery", None)
             if prefix_recovery is not None:
                 prefix_recovery.shutdown()
+            for executor in (
+                getattr(self, "_capture_read_executor", None),
+                getattr(self, "_capture_write_executor", None),
+            ):
+                if executor is not None:
+                    executor.shutdown(wait=False, cancel_futures=True)
             if self.server_thread is not None:
                 self.http_server.should_exit = True
                 await asyncio.to_thread(self.server_thread.join)
