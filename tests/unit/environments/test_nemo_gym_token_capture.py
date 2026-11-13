@@ -246,7 +246,7 @@ def test_megatron_capture_handler_admits_media_requests(content_part: dict) -> N
 
     admission = CaptureAdmission(capture_key="r0", model_call_id="c1", mode="text")
     context = CaptureContext(
-        rollout_id="r0",
+        capture_key="r0",
         model_call_id="c1",
         token_sink=None,
         lineage_store=InMemoryLineageStore(),

@@ -42,6 +42,7 @@ env:
     # Use legacy agent orchestration.
     example_tool_call_multireward_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:

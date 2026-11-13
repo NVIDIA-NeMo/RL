@@ -311,6 +311,7 @@ env:
             name: genrm_simple_agent_reasoning_off
     single_step_tool_use_with_argument_comparison_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
