@@ -159,6 +159,9 @@ class RolloutSelection:
     response_ids: tuple[str, ...]
     action_flags: tuple[ActionOutputFlags, ...]
     truncated: bool = False
+    # Gym segment rewards resolved to the selected calls, parallel to response_ids
+    # (None where the verifier set none). None when the rollout has no segment rewards.
+    call_rewards: tuple[float | None, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -172,6 +175,8 @@ class SegmentReceipt:
     truncated: bool = False
     # Image columns occupy the selected terminal's existing staging key.
     action_flags: tuple[ActionOutputFlags, ...] | None = None
+    # Parallel to selected_response_ids, as RolloutSelection.call_rewards.
+    call_rewards: tuple[float | None, ...] | None = None
 
 
 @dataclass
@@ -183,6 +188,10 @@ class _LogicalRows:
     staging_keys: list[str]
     truncated: list[bool]
     valid_owner_count: int
+    # Rows that train on a Gym segment reward, and owners masked because one
+    # segment's calls carry different segment rewards.
+    segment_reward_rows: int = 0
+    segment_reward_conflict_owners: int = 0
 
 
 @dataclass
@@ -543,7 +552,8 @@ class RolloutReassembler:
         penalty_counts: dict[str, int] = {}
         reward_metrics: dict[str, float] = {}
         # Forest applies shaping once, using the scored call rather than an arbitrary
-        # graph endpoint. Other segments retain the same logical rollout reward.
+        # graph endpoint. Other segments retain the same logical rollout reward
+        # (Gym segment rewards ride on row tags instead).
         if not forest_training or reward_call_id is not None:
             reward_spans = row.link_spans
             if reward_call_id is not None:
@@ -957,6 +967,10 @@ class RolloutReassembler:
             metrics["finalize/logical_owner_count"] = float(len(rollout_ids))
             metrics["finalize/valid_logical_owner_count"] = float(
                 logical.valid_owner_count
+            )
+            metrics["finalize/segment_reward_rows"] = float(logical.segment_reward_rows)
+            metrics["finalize/segment_reward_conflict_owners"] = float(
+                logical.segment_reward_conflict_owners
             )
         # Per-row counts are pooled by the consuming controller once per
         # committed group, alongside the retained reward observations;
@@ -1465,9 +1479,13 @@ class RolloutReassembler:
                 (not selected and not parsed.capture_poisoned)
                 or len(set(selected)) != len(selected)
                 or len(selection.action_flags) != len(selected)
+                or (
+                    selection.call_rewards is not None
+                    and len(selection.call_rewards) != len(selected)
+                )
             ):
                 raise ValueError(
-                    "Selected responses must be nonempty, unique, and have parallel action flags"
+                    "Selected responses must be nonempty, unique, and have parallel action flags and rewards"
                 )
             if parsed.capture_poisoned:
                 # One masked owner needs no accepted-response or initial-prompt
@@ -1495,6 +1513,11 @@ class RolloutReassembler:
             if parsed.terminal_model_call_id not in by_call:
                 raise ValueError("Scored terminal is absent from selected calls")
             flags_by_call = dict(zip(by_call, selection.action_flags, strict=True))
+            rewards_by_call = (
+                dict(zip(by_call, selection.call_rewards, strict=True))
+                if selection.call_rewards is not None
+                else None
+            )
             graph = {
                 call_id: (record.parent_call_id,)
                 if record.parent_call_id is not None
@@ -1566,6 +1589,14 @@ class RolloutReassembler:
                             flags_by_call[record.model_call_id] for record in chain
                         ),
                         truncated=selection.truncated,
+                        call_rewards=(
+                            tuple(
+                                rewards_by_call[record.model_call_id]
+                                for record in chain
+                            )
+                            if rewards_by_call is not None
+                            else None
+                        ),
                     )
                 )
             plans.append(owner_plan)
@@ -1762,6 +1793,26 @@ class RolloutReassembler:
                 original_prompt = root.token_ids[: root.prompt_len]
             if not original_prompt:
                 raise ValueError(f"{owner_id}: empty initial grouping prompt")
+            # A segment trains on the Gym segment reward of the calls it owns,
+            # and on the rollout reward when none of them has one.
+            segment_rewards: list[float | None] = []
+            for segment, owned in zip(segments, owned_responses, strict=True):
+                entries = {
+                    reward
+                    for response_id, reward in zip(
+                        segment.selected_response_ids, segment.call_rewards or ()
+                    )
+                    if response_id in owned and reward is not None
+                }
+                if len(entries) > 1 and owner_valid:
+                    owner_valid = False
+                    prepared.segment_reward_conflict_owners += 1
+                    print(
+                        f"  finalize: {owner_id} segment {len(segment_rewards)} owns "
+                        f"calls with segment rewards {sorted(entries)}; owner masked",
+                        flush=True,
+                    )
+                segment_rewards.append(entries.pop() if len(entries) == 1 else None)
             if owner_valid:
                 if reward_row is None:
                     raise ValueError(f"{owner_id}: missing scored-call reward evidence")
@@ -1788,6 +1839,8 @@ class RolloutReassembler:
                 ]
             for ordinal, row in enumerate(rebuilt):
                 segment = segments[ordinal]
+                segment_reward = segment_rewards[ordinal] if owner_valid else None
+                prepared.segment_reward_rows += segment_reward is not None
                 flags = tuple(
                     flags
                     for response_id, flags in zip(
@@ -1824,6 +1877,11 @@ class RolloutReassembler:
                         ),
                         "num_assistant_messages": len(owned_responses[ordinal]),
                     }
+                    | (
+                        {"segment_reward": segment_reward}
+                        if segment_reward is not None
+                        else {}
+                    )
                 )
         prepared.staging_keys = list(dict.fromkeys(prepared.staging_keys))
         return prepared

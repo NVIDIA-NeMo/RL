@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import math
 import uuid
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -634,13 +635,20 @@ def _selection_from_state(raw: Any) -> RolloutSelection | None:
     )
 
     expected_fields = {field.name for field in dataclasses.fields(RolloutSelection)}
+    # Selections saved before segment rewards existed have no call_rewards.
+    if isinstance(raw, dict) and "call_rewards" not in raw:
+        raw = {**raw, "call_rewards": None}
     if not isinstance(raw, dict) or set(raw) != expected_fields:
         raise ValueError(
             "Forest recovery selection must contain every descriptor field: "
             f"expected={sorted(expected_fields)}, "
             f"found={sorted(map(str, raw)) if isinstance(raw, dict) else type(raw).__name__}"
         )
-    responses, flags = raw["response_ids"], raw["action_flags"]
+    responses, flags, rewards = (
+        raw["response_ids"],
+        raw["action_flags"],
+        raw["call_rewards"],
+    )
     if (
         not isinstance(responses, tuple)
         or not all(isinstance(response, str) and response for response in responses)
@@ -655,9 +663,21 @@ def _selection_from_state(raw: Any) -> RolloutSelection | None:
             or not all(isinstance(value, bool) for value in flag.values())
             for flag in flags
         )
+        or (
+            rewards is not None
+            and (
+                not isinstance(rewards, tuple)
+                or len(rewards) != len(responses)
+                or any(
+                    reward is not None
+                    and (type(reward) is not float or not math.isfinite(reward))
+                    for reward in rewards
+                )
+            )
+        )
     ):
         raise ValueError(
-            "Forest recovery selection has invalid response IDs or action flags"
+            "Forest recovery selection has invalid response IDs, action flags or call rewards"
         )
     selection_state: dict[str, Any] = {
         **raw,
