@@ -481,6 +481,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     def _iter_real_quant_refit_params(
         self,
         kv_scales: dict[str, float] | None = None,
+        *,
+        draft_weights: tuple[tuple[str, torch.Tensor], ...],
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Export packed NVFP4 weights and scales for real-quant vLLM rollout."""
         from nemo_rl.modelopt.utils import DEFAULT_NVFP4_IGNORE
@@ -501,11 +503,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             ignore_patterns=ignore,
         )
 
-        if self.draft_model is not None:
-            from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
-
-            for name, tensor in export_eagle_weights_to_hf(self.draft_model):
-                yield f"draft.{name}", tensor
+        yield from draft_weights
 
         if not vllm_cfg["kv_cache_dtype"].startswith("fp8"):
             return
@@ -603,7 +601,12 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 if name not in existing_names:
                     yield name, amax
 
-    def _iter_params_with_optional_kv_scales(self, kv_scales=None):
+    def _iter_params_with_optional_kv_scales(
+        self,
+        kv_scales=None,
+        *,
+        draft_weights: tuple[tuple[str, torch.Tensor], ...],
+    ):
         """Pre-fold weights on-the-fly via lazy proxy tasks.
 
         Wraps each conversion task so that reading task.param_weight returns
@@ -611,12 +614,18 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         is computed lazily when export_hf_weights accesses it, so only one
         extra weight-sized tensor exists at a time — O(1) extra memory.
 
+        ``draft_weights`` is the preflighted draft export. It is forwarded
+        unchanged, so quant folding never runs the draft PP broadcast.
+
         Raises:
             RuntimeError: If weight folding fails for a specific parameter,
                 with context about which parameter caused the failure.
         """
         if self._use_real_quant_refit():
-            yield from self._iter_real_quant_refit_params(kv_scales)
+            yield from self._iter_real_quant_refit_params(
+                kv_scales,
+                draft_weights=draft_weights,
+            )
             return
 
         class _FoldedTask:
@@ -670,7 +679,10 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         self.refit_conversion_tasks = folded_tasks
         try:
             yielded_names = set()
-            for name, tensor in super()._iter_params_with_optional_kv_scales(kv_scales):
+            for name, tensor in super()._iter_params_with_optional_kv_scales(
+                kv_scales,
+                draft_weights=draft_weights,
+            ):
                 if "weight_quantizer" in name:
                     continue
                 yielded_names.add(name)

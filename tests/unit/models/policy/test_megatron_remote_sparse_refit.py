@@ -31,10 +31,13 @@ _REFIT_CONFIG = VllmSparseRefitConfig(
 
 
 def _worker(weights=()):
-    def export():
-        return iter(weights)
+    def export(*, draft_weights):
+        return iter([*weights, *draft_weights])
 
-    return SimpleNamespace(_iter_params_with_optional_kv_scales=export)
+    return SimpleNamespace(
+        _iter_params_with_optional_kv_scales=export,
+        _draft_weights_for_refit=lambda: (),
+    )
 
 
 def test_remote_sparse_initializes_canonical_hf_baseline() -> None:
