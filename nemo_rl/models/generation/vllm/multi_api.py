@@ -50,7 +50,9 @@ class MultiAPIServerPool:
     def raise_if_unavailable(self) -> None:
         """Reject operations after the first failure."""
         if self._failure is not None:
-            raise RuntimeError(f"HTTP API pool failed: {self._failure}") from self._failure
+            raise RuntimeError(
+                f"HTTP API pool failed: {self._failure}"
+            ) from self._failure
 
     def create_engine(self, engine_args: Any, stat_loggers: list[Any]) -> Any:
         """Launch one shared engine and attach its frontend clients.
