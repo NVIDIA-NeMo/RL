@@ -31,6 +31,18 @@ math_verify_func = math_metric(
 boxed = lambda x: "\\boxed{" + x + "}" if not x.startswith("\\boxed{") else x
 
 
+def _extract_last_tag_content(response: str, tag: str) -> Optional[str]:
+    """Return the content of the last complete <{tag}>...</{tag}> block, or None.
+
+    The last block is the final answer, so a tag mentioned earlier in the
+    reasoning or an answer the model later revised is not scored. This matches
+    the `<answer>` split in math_environment and the last boxed answer in
+    geo3k_reward.
+    """
+    matches = re.findall(rf"<{tag}>([\s\S]*?)</{tag}>", response)
+    return matches[-1] if matches else None
+
+
 def math_expression_reward(
     ground_truth: str, response: str, tag: str = "answer"
 ) -> tuple[float, bool]:
@@ -38,9 +50,8 @@ def math_expression_reward(
 
     The `tag` is customizable and must be specified as part of the user COT prompt text file.
     """
-    match = re.search(rf"<{tag}>([\s\S]*)</{tag}>", response)
-    if match:
-        answer = match.group(1)
+    answer = _extract_last_tag_content(response, tag)
+    if answer is not None:
         try:
             score, _ = math_verify_func([boxed(ground_truth)], [boxed(answer)])
             return float(score), score > 0.1
@@ -74,9 +85,8 @@ def exact_answer_alphanumeric_reward(
 
     The `answer_tag` is customizable and must be specified as part of the user COT prompt text file.
     """
-    match = re.search(rf"<{answer_tag}>([\s\S]*)</{answer_tag}>", response)
-    if match:
-        answer = match.group(1)
+    answer = _extract_last_tag_content(response, answer_tag)
+    if answer is not None:
         # Remove all non-alphanumeric characters (including whitespace, punctuation, etc.)
         answer_clean = "".join(c for c in answer if c.isalnum()).lower()
         ground_truth_clean = "".join(c for c in ground_truth if c.isalnum()).lower()
@@ -95,10 +105,8 @@ def bbox_giou_reward(
 
     The `answer_tag` is customizable and must be specified as part of the user COT prompt text file.
     """
-    match = re.search(rf"<{answer_tag}>([\s\S]*)</{answer_tag}>", response)
-    if match:
-        answer = match.group(1)
-    else:
+    answer = _extract_last_tag_content(response, answer_tag)
+    if answer is None:
         return 0.0, False
 
     try:

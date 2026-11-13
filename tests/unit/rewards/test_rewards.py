@@ -257,3 +257,27 @@ def test_bbox_giou_reward_combined():
     reward, is_correct = combined_reward(ground_truth_bbox, no_think_no_answer_response)
     assert_allclose(reward, 0.0, atol=1e-6)
     assert is_correct is False
+
+
+def test_rewards_score_the_last_answer_block():
+    # The reasoning mentions the tag before the final answer.
+    response = (
+        "<think>i will reply in <answer></answer> tags</think> <answer>42</answer>"
+    )
+    assert exact_answer_alphanumeric_reward("42", response) == (1.0, True)
+    reward, is_correct = math_expression_reward("42", response)
+    assert_allclose(reward, 1.0, atol=1e-6)
+    assert is_correct is True
+
+    # The model revises its answer; only the final block is graded.
+    revised = "<answer>3</answer> wait, that is wrong. <answer>4</answer>"
+    assert math_expression_reward("4", revised)[1] is True
+    assert math_expression_reward("3", revised)[1] is False
+    assert exact_answer_alphanumeric_reward("4", revised) == (1.0, True)
+    assert exact_answer_alphanumeric_reward("3", revised) == (0.0, False)
+
+    bbox = "[0.1, 0.1, 0.5, 0.5]"
+    repeated = f"<answer>[0.6, 0.6, 0.9, 0.9]</answer> let me fix that. <answer>{bbox}</answer>"
+    reward, is_correct = bbox_giou_reward(bbox, repeated)
+    assert_allclose(reward, 1.0, atol=1e-6)
+    assert is_correct is True
