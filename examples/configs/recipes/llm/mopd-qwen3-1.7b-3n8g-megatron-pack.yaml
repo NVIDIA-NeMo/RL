@@ -105,6 +105,7 @@ env:
     # Use legacy agent orchestration.
     math_with_judge_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -112,6 +113,7 @@ env:
             name: math_with_judge_simple_agent
     code_gen_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -126,6 +128,7 @@ env:
             name: workplace_assistant_simple_agent
     mcqa_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -133,6 +136,7 @@ env:
             name: mcqa_simple_agent
     instruction_following_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
@@ -140,6 +144,7 @@ env:
             name: instruction_following_simple_agent
     structured_outputs_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
