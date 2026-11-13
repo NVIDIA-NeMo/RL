@@ -303,6 +303,10 @@ prompt share it) and gets nothing from the bidirectional cache; the frontend war
 
 Colocated generation is not supported yet; set `colocated.enabled: false`.
 
+With `backend: NIXL`, run with `export UCX_NET_DEVICES=all` so the KV transfer uses the
+RDMA HCAs instead of the image's management NIC (see
+`tests/test_suites/llm/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1.sh`).
+
 GPU budget:
 
 ```

@@ -78,7 +78,10 @@ from nemo_rl.experience.reward_penalties import (
     RewardLogContext,
     finalize_capture_reward,
 )
-from nemo_rl.experience.rollout_recovery import _receipt_staging_keys
+from nemo_rl.experience.rollout_recovery import (
+    _owned_staging_key,
+    _receipt_staging_keys,
+)
 from nemo_rl.experience.route_assembly import (
     ROUTE_MISSING_SENTINEL,
     RouteFragment,
@@ -131,6 +134,9 @@ class FinalizedRollout:
     output_masks: dict[str, list[bool]] = field(default_factory=dict)
     # One length per owned call, even when adjacent generations have no input gap.
     generation_lengths: tuple[int, ...] = ()
+    # (model call ID, weight version stamped when it began, tokens it generated)
+    # for the same owned calls.
+    call_versions: tuple[tuple[str, int, int], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -206,6 +212,9 @@ class FinalizedGroup:
     # Token metrics counted from the verified rows. The controller merges them
     # with the Gym rollout metrics into the group's ROLLOUT_METRICS sidecar.
     token_metrics: dict[str, Any] = field(default_factory=dict)
+    # Each trained call's (model call ID, weight version it began on, tokens it
+    # generated), across the group's verified rollouts; empty when dropped.
+    call_versions: list[tuple[str, int, int]] = field(default_factory=list)
 
 
 def _capture_token_metrics(
@@ -706,6 +715,11 @@ class RolloutReassembler:
             token_mask=token_mask,
             generation_lengths=tuple(
                 length
+                for call_id, _, length in row.link_spans
+                if call_id not in loss_excluded_call_ids
+            ),
+            call_versions=tuple(
+                (call_id, records_by_call[call_id].weight_version, length)
                 for call_id, _, length in row.link_spans
                 if call_id not in loss_excluded_call_ids
             ),
@@ -1404,6 +1418,7 @@ class RolloutReassembler:
             meta=meta,
             group_min_wv=group_min_wv,
             group_max_wv=group_max_wv,
+            call_versions=[call for row in valid_rows for call in row.call_versions],
             staging_keys=(staging_keys if self._defer_routed_experts_to_policy else []),
             canonical_output_tokens=sum(
                 int(mask) for row in valid_rows for mask in row.token_mask
@@ -1427,7 +1442,6 @@ class RolloutReassembler:
         from nemo_gym.token_id_capture.staging.records import (
             CallRecord,
             RolloutReceipt,
-            staging_key,
         )
 
         if len(selections) != len(rollout_ids):
@@ -1439,7 +1453,10 @@ class RolloutReassembler:
             parsed = RolloutReceipt.model_validate(receipt)
             _receipt_staging_keys(receipt)
             if parsed.capture_key != owner or any(
-                record.staging_key != staging_key(owner, record.model_call_id)
+                record.staging_key
+                != _owned_staging_key(
+                    owner, record.model_call_id, record.source_capture_key
+                )
                 for record in parsed.manifest
             ):
                 raise ValueError("Foreign capture ownership in selected attempt")
@@ -1573,10 +1590,7 @@ class RolloutReassembler:
         No publication or cleanup happens before this method completes.
         """
         # Optional Gym dependency; ordinary/non-Gym import paths remain unchanged.
-        from nemo_gym.token_id_capture.staging.records import (
-            RolloutReceipt,
-            staging_key,
-        )
+        from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
         n = len(rollout_ids)
         if not n or len(logical_segments) != n:
@@ -1624,7 +1638,11 @@ class RolloutReassembler:
                 if parsed is not None:
                     if parsed.capture_key != expected_id or any(
                         record.staging_key
-                        != staging_key(expected_id, record.model_call_id)
+                        != _owned_staging_key(
+                            expected_id,
+                            record.model_call_id,
+                            record.source_capture_key,
+                        )
                         for record in parsed.manifest
                     ):
                         raise ValueError("foreign receipt/staging ownership")

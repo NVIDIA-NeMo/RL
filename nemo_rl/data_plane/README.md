@@ -1,7 +1,7 @@
 # nemo_rl.data_plane
 
 Stable boundary between NeMo-RL and the underlying data-plane backend
-(currently `transfer_queue`; future: `nv-dataplane`). Every call site in
+(currently `transfer_queue`). Every call site in
 `nemo_rl/algorithms`, `nemo_rl/experience`, `nemo_rl/models` goes through
 `DataPlaneClient`. No code imports `transfer_queue` directly outside the
 adapter.
@@ -53,7 +53,7 @@ data_plane/{column_io, preshard}   ← producer/consumer helpers
 data_plane/interfaces.py           ← stable boundary (DataPlaneClient)
         │
         ▼
-data_plane/adapters/               ← TransferQueue / NoOp / future nv-dataplane
+data_plane/adapters/               ← TransferQueue / NoOp
 ```
 
 ---
@@ -647,7 +647,11 @@ rollout actor (registered via `TQPolicy.add_data_plane_snapshot_source`,
 since it builds its own client off the worker group), and logs the combined
 result under `data_plane/cluster/` instead of the driver's own, so
 `kv_first_write` is in these totals. It falls back to `data_plane/driver/` when the fan-out finds only one
-process. Measured: **~2.4 ms and ~1 kB per process per step** for 10
+process. The single controller logs the same `data_plane/cluster/` series and
+adds the processes that do its I/O: the trainer's workers and own client, the
+finalizer and advantage actors, the vLLM token-capture clients, and the PPO
+critic and OPD/MOPD teacher workers. Without these, a run with token capture and
+advantage workers reported `0.0 MB moved`. Measured: **~2.4 ms and ~1 kB per process per step** for 10
 processes, against a 6x wider view of the traffic. The fan-out is
 best-effort — a rank that cannot answer is dropped rather than failing the
 step.

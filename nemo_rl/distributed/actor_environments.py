@@ -37,6 +37,11 @@ from __future__ import annotations
 
 import sys
 
+NEMO_GYM_ACTOR_FQN = "nemo_rl.environments.nemo_gym.NemoGym"
+ROLLOUT_REASSEMBLER_ACTOR_FQN = (
+    "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor"
+)
+
 # Actor fully-qualified name -> the uv extras its virtual environment needs.
 # ``None`` means the actor runs on the driver's interpreter and gets no venv.
 # Every extra must exist in ``[project.optional-dependencies]`` of pyproject.toml.
@@ -54,7 +59,6 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
         "nemo_gym",
     ],
     "nemo_rl.models.generation.sglang.sglang_worker.SGLangGenerationWorker": ["sglang"],
-    "nemo_rl.models.generation.dynamo.dynamo_worker.DynamoVllmWorker": None,
     "nemo_rl.models.policy.workers.automodel_policy_worker.AutomodelPolicyWorker": [
         "automodel"
     ],
@@ -100,13 +104,11 @@ ACTOR_ENVIRONMENTS: dict[str, list[str] | None] = {
     # with VllmGenerationWorker avoids duplicate venv caches.
     "nemo_rl.experience.sync_rollout_actor.SyncRolloutActor": ["vllm"],
     # Captured rollout finalization imports Gym's staging/rebuild package.
-    "nemo_rl.experience.rollout_reassembler_actor.RolloutReassemblerActor": [
-        "nemo_gym"
-    ],
+    ROLLOUT_REASSEMBLER_ACTOR_FQN: ["nemo_gym"],
     # transfer_queue + mooncake are core dependencies: no extra venv.
     "nemo_rl.data_plane.mooncake_storage_unit.MooncakeStorageUnit": None,
     "nemo_rl.environments.tools.retriever.RAGEnvironment": None,
-    "nemo_rl.environments.nemo_gym.NemoGym": ["nemo_gym"],
+    NEMO_GYM_ACTOR_FQN: ["nemo_gym"],
     # ModelOpt quantization-aware workers
     "nemo_rl.modelopt.models.generation.vllm_quant_worker.VllmQuantGenerationWorker": [
         "modelopt",

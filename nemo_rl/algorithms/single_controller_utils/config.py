@@ -40,6 +40,7 @@ from nemo_rl.algorithms.grpo import (
     _REWARD_PENALTY_FLAGS,
     GRPOConfig,
     RewardPenaltyConfig,
+    _validate_seq_logprob_error_in_loss,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
@@ -47,6 +48,7 @@ from nemo_rl.algorithms.logits_sampling_utils import (
 )
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig
+from nemo_rl.algorithms.loss.utils import skips_policy_logprob_pass
 from nemo_rl.algorithms.opd import OnPolicyDistillationConfig
 from nemo_rl.algorithms.ppo import PPOConfig
 from nemo_rl.algorithms.single_controller_utils.debug_writer import DebugWriterConfig
@@ -71,9 +73,11 @@ from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
     RecoveryTargetLevel,
 )
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
+    resolve_vllm_logprobs_mode,
 )
 from nemo_rl.models.policy import AutomodelConfig, MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
@@ -232,8 +236,8 @@ class RolloutFailureConfig(BaseModel, extra="allow"):
     # race the iteration order that checkpoint/resume accounting depends on. Diverting
     # happens before admit(), so a diverted batch never burns a target step.
     #
-    # Read only when on_dropped_prompt="replace". Borrowing draws on it too: a group is
-    # only ever taken from a later step when a spare is in hand to repay that step.
+    # Read when on_dropped_prompt="replace"; dynamic sampling uses its own pool.
+    # Fault-tolerance borrowing uses this pool to repay the later step.
     replacement_reserve_prompts: NonNegativeInt = 1
     # ── path-specific ──
     native: NativeRolloutFTConfig = Field(default_factory=NativeRolloutFTConfig)
@@ -734,7 +738,9 @@ class TaskSourceRecoveryGranularity:
 class RolloutRecoveryConfig(BaseModel, extra="allow"):
     """Retry and restore policy for unfinished token-capture prompt groups.
 
-    ``turn`` requests Gym participant recovery, ``sibling`` preserves completed
+    ``prefix`` restores Gym participant state and decoded tokens from an active
+    model call, ``turn`` requests Gym participant recovery and restarts an active
+    call from its preceding durable turn, ``sibling`` preserves completed
     generations and restarts unfinished siblings, and ``prompt_group`` restarts
     every sibling in an unfinished group. Overrides may only make a particular
     taskset, task source, or agent coarser than the global target.
@@ -753,9 +759,9 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     )
     # Seconds Gym gets to park its in-flight steps; see the exemplar YAML.
     gym_prepare_timeout_s: Annotated[float, Field(gt=0)] = 300.0
-    # With target_level='turn', a Gym server whose checkpoint mode is
-    # restart_only (the default for agents and resources servers) starts every
-    # in-flight rollout over after a crash. False fails setup and names such
+    # With target_level='turn' or 'prefix', a Gym server whose checkpoint mode
+    # is restart_only (the default for agents and resources servers) starts
+    # every in-flight rollout over after a crash. False fails setup and names such
     # servers; true accepts them with a warning.
     allow_restart_only_gym_servers: bool = False
 
@@ -764,11 +770,11 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
         """Reject the restart-only opt-in where Gym does not checkpoint rollouts."""
         if (
             self.allow_restart_only_gym_servers
-            and self.target_level is not RecoveryTargetLevel.TURN
+            and not self.target_level.requires_environment_checkpoint
         ):
             raise ValueError(
                 "rollout_recovery.allow_restart_only_gym_servers applies only to "
-                "target_level='turn'; with "
+                "target_level='turn' or 'prefix'; with "
                 f"target_level={self.target_level.value!r} every unfinished "
                 "rollout already starts over"
             )
@@ -794,19 +800,25 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
                     f"{mapping_name} may only force a coarser recovery level than "
                     f"target_level={self.target_level.value!r}; invalid={finer!r}"
                 )
-            if self.target_level is RecoveryTargetLevel.TURN and overrides:
+            if self.target_level.requires_environment_checkpoint and overrides:
                 # A checkpointing Gym deployment exports every live episode, so
                 # a coarser route on it would fall outside the commit scope.
                 raise ValueError(
-                    f"{mapping_name} is not supported with target_level='turn' "
-                    f"yet; got {sorted(overrides)!r}"
+                    f"{mapping_name} is not supported with "
+                    f"target_level={self.target_level.value!r} yet; "
+                    f"got {sorted(overrides)!r}"
                 )
         return self
 
     @property
     def turn_checkpointing_enabled(self) -> bool:
         """Whether Gym participant state is required for the requested target."""
-        return self.target_level is RecoveryTargetLevel.TURN
+        return self.target_level.requires_environment_checkpoint
+
+    @property
+    def generation_prefix_cuts_enabled(self) -> bool:
+        """Whether active model calls participate in Gym's checkpoint cut."""
+        return self.target_level.preserves_generation_prefix
 
     def resolve_for_prompt(
         self, prompt: Mapping[str, Any]
@@ -870,8 +882,11 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
 class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     """Frequent rollout-state snapshots anchored to durable trainer state.
 
-    ``snapshot_attempt_interval_s=None`` disables saving and restoring periodic
-    snapshots. A snapshot taken before the first trainer checkpoint is anchored
+    Rollout snapshots are on when ``snapshot_attempt_interval_s`` is set or with
+    turn-level recovery; see docs/guides/single-controller.md for when they are
+    saved.
+
+    A snapshot taken before the first trainer checkpoint is anchored
     to the initial model and a rollout-semantic configuration fingerprint. Later
     snapshots require the durable trainer checkpoint for the controller's
     current completed step; attempts are skipped until that exact anchor exists.
@@ -903,14 +918,22 @@ class RolloutCheckpointConfig(BaseModel, extra="forbid"):
     periodic-checkpoint failures are tolerated before the controller aborts the
     run. A successful or skipped attempt resets the counter; checkpoint
     invariant failures still fail immediately.
+
+    ``trace=True`` appends one JSON line per rollout event to
+    ``rollout_trace.jsonl`` in the log directory, to check what a stop and
+    restore cost. Per-rollout events need ``rollout_recovery`` dispatch. It does
+    not enable checkpointing. The events are listed in
+    ``nemo_rl/algorithms/rollout_checkpointing/trace.py``.
     """
 
     snapshot_attempt_interval_s: Annotated[Optional[float], Field(gt=0)] = None
+    snapshot_on_trainer_checkpoint: bool = True
     telemetry_interval_s: Annotated[Optional[float], Field(gt=0)] = None
     max_consecutive_failures: Annotated[int, Field(ge=1)] = 3
     keep_latest_k: Annotated[int, Field(ge=1)] = 2
     restore_mode: Literal["latest", "trainer_checkpoint"] = "latest"
     extra_fingerprint_excluded_paths: list[str] = Field(default_factory=list)
+    trace: bool = False
 
     @model_validator(mode="after")
     def validate_extra_fingerprint_excluded_paths(self) -> "RolloutCheckpointConfig":
@@ -983,9 +1006,10 @@ def validate_forest_objective(grpo: GRPOConfig, loss: ClippedPGLossConfig) -> No
         == "seq-mask-tis",
         "loss_fn.use_kl_in_reward": loss.use_kl_in_reward,
         "loss_fn.positive_example_nll_weight": loss.positive_example_nll_weight != 0,
+        # The loss filters physical rows; forest training masks whole owners.
+        "loss_fn.seq_logprob_error_in_loss": loss.seq_logprob_error_in_loss,
         "grpo.use_dynamic_sampling": grpo.use_dynamic_sampling,
         "grpo.reward_shaping.enabled": grpo.reward_shaping.enabled,
-        "grpo.reward_scaling.enabled": grpo.reward_scaling.enabled,
         "grpo.calculate_advantages_on_gpu": bool(grpo.calculate_advantages_on_gpu),
         "grpo.invalid_tool_call_advantage": grpo.invalid_tool_call_advantage
         is not None,
@@ -1005,9 +1029,8 @@ def logprob_passes_required(
 ) -> tuple[bool, bool]:
     """Return policy/reference forward requirements for both setup and execution."""
     return (
-        not (
-            master_config.loss_fn.force_on_policy_ratio
-            and algo_cfg.seq_logprob_error_threshold is None
+        not skips_policy_logprob_pass(
+            master_config.loss_fn, algo_cfg.seq_logprob_error_threshold
         ),
         bool(
             master_config.loss_fn.reference_policy_kl_penalty > 0
@@ -1058,6 +1081,18 @@ def is_ppo_run(master_config: MasterConfig) -> bool:
     the attribute can genuinely be missing on a hand-built config.
     """
     return getattr(master_config, "ppo", None) is not None
+
+
+def rollout_snapshots_enabled(master_config: MasterConfig) -> bool:
+    """Whether the run saves and restores rollout snapshots.
+
+    Periodic snapshots turn them on, and so does turn-level recovery, whose
+    environment state only a rollout snapshot holds.
+    """
+    return (
+        master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None
+        or master_config.rollout_recovery.turn_checkpointing_enabled
+    )
 
 
 def algo_config(master_config: MasterConfig) -> GRPOConfig | PPOConfig:
@@ -1293,8 +1328,8 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
     """Reject algorithm blocks the SingleController path cannot honour.
 
     Both directions on the critic: one the PPO path needs and does not have, and
-    one a GRPO run carries and would never build. Plus the reward-shaping and
-    sampling knobs SC reads on neither path.
+    one a GRPO run carries and would never build, plus sampling and length-penalty
+    settings the SC path does not implement.
     """
     algo_cfg = algo_config(master_config)
 
@@ -1308,15 +1343,20 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "with max_num_steps."
         )
 
+    # The SC dataloader batches num_prompts_per_step directly, so nothing over-generates.
+    if algo_cfg.batch_multiplier != 1.0:
+        raise ValueError(
+            f"batch_multiplier={algo_cfg.batch_multiplier} has no effect on the "
+            "SingleController path: the dataloader batches num_prompts_per_step "
+            "directly, so nothing over-generates. Set it to 1."
+        )
+
     # An enabled one here describes shaping this run does not do. An entry leaves
     # this list once the SC path implements it; overlong_filtering is applied in
     # the advantage stage from the raw completion flags in the TransferQueue.
     unsupported = [
         name
         for name, enabled in (
-            ("use_dynamic_sampling", algo_cfg.use_dynamic_sampling),
-            ("reward_scaling", algo_cfg.reward_scaling.enabled),
-            ("reward_shaping", algo_cfg.reward_shaping.enabled),
             # getattr: PPO's config has no length_penalty field.
             ("length_penalty", getattr(algo_cfg, "length_penalty", None) is not None),
         )
@@ -1390,6 +1430,63 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
             "but max_buffered_rollouts is still validated against the wider one. "
             "Remove it, or add a `ppo` block with policy_training_start_step > 0."
         )
+
+    # Dynamic sampling uses a replacement budget separate from rollout failures.
+    if algo_cfg.use_dynamic_sampling:
+        # Zero within-group reward variance does not imply zero PPO advantage.
+        if is_ppo_run(master_config):
+            raise ValueError(
+                "ppo.use_dynamic_sampling must be false: zero within-group reward "
+                "variance does not imply zero PPO advantage. This filtering rule "
+                "is GRPO-only."
+            )
+        # Reached only for GRPO (PPO is rejected above); name the key accordingly.
+        algo_prefix = "grpo"
+        grpo_cfg = cast(GRPOConfig, algo_cfg)
+        if grpo_cfg.adv_estimator.name != "grpo":
+            raise ValueError(
+                "grpo.use_dynamic_sampling requires grpo.adv_estimator.name='grpo': "
+                "constant rewards do not imply zero advantage for other estimators."
+            )
+        for key in ("invalid_tool_call_advantage", "malformed_thinking_advantage"):
+            if getattr(grpo_cfg, key) not in (None, 0):
+                raise ValueError(
+                    f"grpo.use_dynamic_sampling requires grpo.{key} to be 0 or null: "
+                    "nonzero message-level overrides can train constant-reward groups."
+                )
+        # Capture cannot borrow future groups, so routine filtering would stall training.
+        if master_config.token_capture.enabled:
+            raise ValueError(
+                f"{algo_prefix}.use_dynamic_sampling is not supported together with "
+                "token_capture.enabled: on the capture path a replacement cannot borrow "
+                "a finished group from a later step, so every dropped group stalls its "
+                "step for a full fresh rollout. Disable one of the two."
+            )
+        if grpo_cfg.dynamic_sampling_max_gen_batches < 1:
+            raise ValueError(
+                f"{algo_prefix}.dynamic_sampling_max_gen_batches must be >= 1 when "
+                f"{algo_prefix}.use_dynamic_sampling is set (got "
+                f"{grpo_cfg.dynamic_sampling_max_gen_batches}): a step needs at least "
+                "the batch it was admitted with."
+            )
+        # By name: neither the stamping nor the interruptible admission wait this
+        # needs is knowable for a `custom` class at setup. #4784 reopens it.
+        if async_config.sampler.name != "in_order":
+            raise ValueError(
+                f"{algo_prefix}.use_dynamic_sampling requires "
+                "async_rl.sampler.name='in_order', but got "
+                f"'{async_config.sampler.name}': a filtered group is charged to the "
+                "target step the sampler stamps, and the spare pool is refilled while "
+                "the pump waits to admit, neither of which the other samplers "
+                "support yet."
+            )
+        if algo_cfg.num_generations_per_prompt < 2:
+            raise ValueError(
+                f"{algo_prefix}.use_dynamic_sampling requires "
+                "num_generations_per_prompt >= 2: a single generation has no "
+                "within-group spread, so every group would be filtered "
+                f"(got {algo_cfg.num_generations_per_prompt})."
+            )
 
     if not is_ppo_run(master_config):
         # A value block without `ppo` is inert -- nothing builds the critic --
@@ -1470,6 +1567,15 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "batch. Changing chunk boundaries can change normalized advantages.",
                 stacklevel=2,
             )
+
+    # A forced ratio equals the true one only on the first optimizer step taken
+    # on a batch; later epochs would train without any trust region.
+    if master_config.loss_fn.force_on_policy_ratio and algo_cfg.ppo_epochs != 1:
+        raise ValueError(
+            "loss_fn.force_on_policy_ratio=true requires ppo.ppo_epochs=1, got "
+            f"ppo.ppo_epochs={algo_cfg.ppo_epochs}. Set "
+            "loss_fn.force_on_policy_ratio=false to run multiple policy epochs."
+        )
 
     failure_config = async_config.rollout_failure
     drop_budget = (
@@ -1575,11 +1681,7 @@ def resolve_ppo_chunk_alignment(
 def validate_single_controller_config(master_config: MasterConfig) -> None:
     """Validate cross-section SingleController constraints before setup."""
     if master_config.loss_fn.seq_logprob_error_in_loss:
-        raise ValueError(
-            "loss_fn.seq_logprob_error_in_loss is not supported by SingleController: "
-            "its advantage baselines depend on the pre-training sequence mask. "
-            "Use the non-streaming GRPO trainer."
-        )
+        _validate_seq_logprob_error_in_loss(master_config)
     _validate_algo_settings(master_config)
 
     async_config = master_config.async_rl
@@ -1601,12 +1703,19 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             )
         # A rollout snapshot needs step_N published while training is still on
         # step N; a deferred finalize publishes it at a later step boundary.
-        if master_config.rollout_checkpointing.snapshot_attempt_interval_s is not None:
+        # The deadline snapshot is exempt: the run publishes it first, then stops.
+        rollout_checkpoint_cfg = master_config.rollout_checkpointing
+        if rollout_checkpoint_cfg.snapshot_attempt_interval_s is not None or (
+            master_config.rollout_recovery.turn_checkpointing_enabled
+            and rollout_checkpoint_cfg.snapshot_on_trainer_checkpoint
+        ):
             raise ValueError(
                 "async_rl.defer_async_checkpoint_finalize cannot be combined with "
-                "rollout_checkpointing.snapshot_attempt_interval_s: rollout snapshots "
-                "need each step's policy checkpoint published before the next "
-                "optimizer step, and a deferred finalize publishes it later."
+                "rollout_checkpointing.snapshot_attempt_interval_s or, with "
+                "rollout_recovery.target_level='turn', "
+                "rollout_checkpointing.snapshot_on_trainer_checkpoint: rollout "
+                "snapshots need each step's policy checkpoint published before the "
+                "next optimizer step, and a deferred finalize publishes it later."
             )
 
     reward_penalties_enabled = any(
@@ -1626,10 +1735,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         or top_logprobs < 0
     ):
         raise ValueError("policy.generation.top_logprobs must be a nonnegative integer")
-    if top_logprobs > 0 and not master_config.loss_fn.score_centering:
+    score_centering = master_config.loss_fn.score_centering
+    replay = sampler_replay_enabled(generation_cfg)
+    if top_logprobs > 0 and not (score_centering or replay):
         raise ValueError(
-            "policy.generation.top_logprobs > 0 is only read by loss_fn.score_centering; "
-            "set it to 0 or enable score centering"
+            "policy.generation.top_logprobs > 0 is only read by loss_fn.score_centering "
+            "and policy.generation.sampler_replay.enabled; set it to 0 or enable one"
         )
     if top_logprobs > 0:
         if master_config.policy["generation"]["backend"] != "vllm":
@@ -1640,18 +1751,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             raise ValueError(
                 "policy.generation.top_logprobs requires token_capture.enabled=true"
             )
-    if master_config.loss_fn.score_centering:
+    if score_centering:
         if top_logprobs == 0:
             raise ValueError(
                 "loss_fn.score_centering requires policy.generation.top_logprobs > 0"
             )
-        generation_cfg = master_config.policy["generation"]
         temperature = generation_cfg["temperature"]
-        logprobs_mode = (generation_cfg.get("vllm_cfg") or {}).get("logprobs_mode")
-        if logprobs_mode is None:
-            logprobs_mode = (generation_cfg.get("vllm_kwargs") or {}).get(
-                "logprobs_mode"
-            )
+        logprobs_mode = resolve_vllm_logprobs_mode(cast(VllmConfig, generation_cfg))
         if temperature <= 0 or not math.isfinite(temperature):
             raise ValueError(
                 "loss_fn.score_centering requires a finite positive sampling temperature"
@@ -1666,13 +1772,27 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "processed_logprobs when policy.generation.temperature != 1.0"
             )
         if (
-            generation_cfg.get("top_p") != 1.0
-            or generation_cfg.get("top_k") is not None
+            need_top_k_or_top_p_filtering(
+                TrainingSamplingParams(
+                    top_k=generation_cfg["top_k"], top_p=generation_cfg["top_p"]
+                )
+            )
+            and not replay
         ):
             raise ValueError(
-                "loss_fn.score_centering needs unfiltered sampling "
-                "(policy.generation.top_p=1, top_k=null) so the captured top-k is "
-                "the sampling distribution"
+                "loss_fn.score_centering with top-k/top-p sampling requires "
+                "policy.generation.sampler_replay.enabled=true: the estimator is "
+                "exact only over the support the sampler drew from"
+            )
+    if score_centering or replay:
+        # Both score the trainer's logits at the captured sampler head ids.
+        top_k = generation_cfg["top_k"]
+        if top_k is not None and top_logprobs < top_k:
+            raise ValueError(
+                "loss_fn.score_centering and policy.generation.sampler_replay.enabled "
+                "with top-k sampling require policy.generation.top_logprobs >= "
+                "policy.generation.top_k, so the captured head holds the kept set. "
+                "See docs/guides/sampler-replay.md#head-size-and-top-p"
             )
 
         automodel_cfg = master_config.policy.get("automodel_cfg")
@@ -1683,16 +1803,23 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 or enabled_automodel_cfg["context_parallel_size"] > 1
             ):
                 raise ValueError(
-                    "loss_fn.score_centering supports Automodel only with "
-                    "tensor_parallel_size=1 and context_parallel_size=1; use Megatron for TP/CP"
+                    "loss_fn.score_centering and policy.generation.sampler_replay.enabled "
+                    "support Automodel only with tensor_parallel_size=1 and "
+                    "context_parallel_size=1; use Megatron for TP/CP"
                 )
         megatron_cfg = master_config.policy.get("megatron_cfg") or {}
         if megatron_cfg.get("enabled") and megatron_cfg.get(
             "use_fused_linear_logprobs"
         ):
             raise ValueError(
-                "loss_fn.score_centering needs vocabulary logits; disable "
+                "loss_fn.score_centering and policy.generation.sampler_replay.enabled "
+                "need vocabulary logits; disable "
                 "policy.megatron_cfg.use_fused_linear_logprobs"
+            )
+        if megatron_cfg.get("enabled") and megatron_cfg.get("reuse_logits_storage"):
+            raise ValueError(
+                "loss_fn.score_centering reads the packed logits again; disable "
+                "policy.megatron_cfg.reuse_logits_storage"
             )
 
     if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:
@@ -1732,14 +1859,8 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "the ready_first sampler requires "
                 "loss_fn.use_importance_sampling_correction=true"
             )
-        if (
-            master_config.loss_fn.force_on_policy_ratio
-            and not master_config.loss_fn.use_cispo
-        ):
-            raise ValueError(
-                "the ready_first sampler requires "
-                "loss_fn.force_on_policy_ratio=false unless loss_fn.use_cispo=true"
-            )
+        # TIS corrects generation staleness; a forced ratio stays exact with one
+        # optimizer step per batch (enforced for PPO in _validate_algo_settings).
 
     # Top-k retention keys off checkpointing.metric_name, but SC has no
     # validation loop yet (see _save_checkpoint), so a "val:" metric would
@@ -1814,6 +1935,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 f"token_capture.control_timeout_s ({gym_park_s}); a turn snapshot "
                 "can hold rollout dispatch that long."
             )
+    if recovery_config.generation_prefix_cuts_enabled and top_logprobs > 0:
+        # Sampler top-k is staged from a call's final response only, so a
+        # restored generation prefix would have no candidates for its tokens.
+        raise ValueError(
+            "rollout_recovery.target_level='prefix' does not support "
+            "policy.generation.top_logprobs > 0 (loss_fn.score_centering) yet"
+        )
     if token_capture_config.defer_routed_experts_to_policy and not (
         token_capture_config.enabled
     ):

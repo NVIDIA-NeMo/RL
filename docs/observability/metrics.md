@@ -81,12 +81,12 @@ The rollout checkpoint benchmark focuses on the following questions:
 4. Did scheduled checkpoint attempts succeed at the intended cadence?
 5. How much completed rollout work was reused after restart?
 
-Each prefix is one dictionary built in `nemo_rl/algorithms/single_controller.py`; the fields are the keys of that dictionary:
+Each prefix is one dictionary built in `nemo_rl/algorithms/single_controller.py` or, for rollout checkpointing, in `nemo_rl/algorithms/rollout_checkpointing/`; the fields are the keys of that dictionary:
 
 - `rollout/throughput`, from `_collect_and_log_rollout_throughput_metrics`: raw backend decoding throughput compared with output committed for training, plus how many live data-plane mutations an exclusive checkpoint delayed and for how long. The raw throughput is absent when the backend does not expose compatible cumulative counters. With token capture, committed tokens are counted exactly from valid staged rows; without it, they are estimated by multiplying the reported per-sample mean by the number of completions, so compare like-for-like runs.
-- `timing/rollout_checkpoint`, from `_save_rollout_checkpoint`: end-to-end save latency and its storage, fencing, controller-sidecar and atomic-publication components, and the logical volume the snapshot captured. `controller_sidecar_bytes` excludes the native TQ payload, because the current TQ checkpoint API does not report bytes written; NeMo-RL deliberately does not scan the shared checkpoint directory, because that scan would perturb the benchmark.
-- `rollout/checkpoint_outcome`, from `_log_rollout_checkpoint_outcome`: the result, reason and effective cadence of every scheduled snapshot attempt.
-- `timing/rollout_recovery`, from `_log_rollout_restore_metrics` and `_redispatch_restored_rollouts` (the load timings start in `single_controller_utils/setup.py`): restore latency, where `total_load_seconds` is the sum of the disjoint restore phases, then the training-ready groups restored without generation, the unfinished groups found for redispatch, and the sibling work preserved or rerun.
+- `timing/rollout_checkpoint`, from `RolloutSnapshotter.save_snapshot`: end-to-end save latency and its storage, fencing, controller-sidecar and atomic-publication components, and the logical volume the snapshot captured. `controller_sidecar_bytes` excludes the native TQ payload, because the current TQ checkpoint API does not report bytes written; NeMo-RL deliberately does not scan the shared checkpoint directory, because that scan would perturb the benchmark.
+- `rollout/checkpoint_outcome`, from `RolloutSnapshotter._log_outcome`: the result, reason and effective cadence of every scheduled snapshot attempt.
+- `timing/rollout_recovery`, from `RolloutRestorer._log_restore_metrics` and `RolloutRestorer.redispatch_restored` (the load timings start in `single_controller_utils/setup.py`): restore latency, where `total_load_seconds` is the sum of the disjoint restore phases, then the training-ready groups restored without generation, the unfinished groups found for redispatch, and the sibling work preserved or rerun.
 
 Recovery counters describe work reconstructed at restore time, not a promise
 that every restored group will eventually train. After recovery, the configured
@@ -215,7 +215,7 @@ The counters carry the step's delta, so summing them across steps reconstructs t
 
 **What counts as failed.** vLLM's finish reasons are `stop`, `length`, `abort`, `error` and `repetition`. Only `stop` and `length` leave a usable sample behind, and `length` is a normal RL outcome — a rollout routinely runs to `max_tokens` — so those two are `ok` and *everything else* is `failed`. Counting the remainder rather than an explicit deny-list keeps `ok + failed` equal to the engine's own total even if a future vLLM adds a reason we have not heard of.
 
-These are the family names vLLM registers. The reader returns family names, which `prometheus_client` strips of `_total`, so no suffixed alias is needed on this path — unlike the HTTP-scrape path in `nemo_rl/models/generation/dynamo/metrics.py`, where sample names do carry it. `test_engine_metric_names_match_vllm` checks the copies against vLLM itself. A series that matches nothing is **omitted**, leaving a visible gap in the dashboard rather than a plausible-looking zero, and so is one whose total went backwards, which means an engine restarted mid-step.
+These are the family names vLLM registers. The reader returns family names, which `prometheus_client` strips of `_total`, so no suffixed alias is needed on this path. `test_engine_metric_names_match_vllm` checks the copies against vLLM itself. A series that matches nothing is **omitted**, leaving a visible gap in the dashboard rather than a plausible-looking zero, and so is one whose total went backwards, which means an engine restarted mid-step.
 
 ## Driver-side generation metrics (`gen_ai.*`)
 

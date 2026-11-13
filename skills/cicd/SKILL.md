@@ -86,7 +86,7 @@ Common failure patterns:
 | `semantic-pull-request` fails | PR title doesn't follow Conventional Commits | Fix PR title; see `contributing` skill |
 | Linting fails | Style violation | Run `uv run ruff check --fix . && uv run ruff format .` |
 | Unit test failure | Code regression or missing dependency | Reproduce locally; see `testing` skill |
-| `CPU config checks` fails (on a PR, the rest of the run is cancelled) | A recipe config, test-suite list or nightly GPU-hour budget check failed (`tests/unit/test_recipes_and_test_suites.py`, `tests/unit/test_config_validation.py`) | Reproduce with `cd tests && uv run --group test pytest unit/test_recipes_and_test_suites.py unit/test_config_validation.py`; the job runs on a GitHub-hosted CPU runner |
+| `CPU config checks` fails (on a PR, the rest of the run is cancelled) | A recipe config, test-suite list or nightly GPU-hour budget check failed (`tests/unit/test_recipes_and_test_suites.py`, `tests/unit/test_config_validation.py`) | Reproduce on Linux (the lockfile has no macOS wheels) with `cd tests && RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 HF_HOME=${HF_HOME:-$HOME/.cache/huggingface} uv run --group test pytest unit/test_recipes_and_test_suites.py unit/test_config_validation.py`; the job runs on a GitHub-hosted CPU runner with these two variables set |
 
 ---
 
@@ -99,8 +99,8 @@ gh run rerun <run-id> --failed --repo NVIDIA-NeMo/RL
 ```
 
 In the UI this is **Re-run jobs → Re-run failed jobs**. It keeps every job that
-already passed and also re-runs jobs that were skipped because they depended on
-a failed job.
+already passed and also re-runs jobs that were cancelled or skipped because of
+a failed job, including a run cancelled by a failing `CPU config checks` job.
 
 Rules for agents:
 

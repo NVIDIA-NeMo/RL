@@ -27,21 +27,23 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.async_utils.replay_buffer import (
+    DATA_PLANE_CHECKPOINT_DIR,
     REPLAY_BUFFER_METADATA_FILENAME,
     DataPlaneCheckpointBarrier,
     TQReplayBuffer,
 )
 from nemo_rl.algorithms.async_utils.staleness_sampler import InOrderSampler
 from nemo_rl.algorithms.grpo import GRPOConfig
+from nemo_rl.algorithms.rollout_checkpointing.state import ResumeSource
 from nemo_rl.algorithms.single_controller import (
-    DATA_PLANE_CHECKPOINT_DIR,
+    RolloutRuntimeState,
     SingleControllerActor,
 )
 from nemo_rl.algorithms.single_controller_utils.config import RolloutRecoveryConfig
 from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.failures import RolloutDataFailure
-from nemo_rl.experience.interfaces import PromptGroupRecord
+from nemo_rl.experience.interfaces import Completion, PromptGroupRecord
 from nemo_rl.experience.rollout_manager import (
     RolloutManager,
     RolloutRetryPolicy,
@@ -53,6 +55,9 @@ from nemo_rl.experience.rollout_recovery import (
     RolloutRecoveryLedger,
 )
 from tests.unit.single_controller import _checkpoint_scenarios as scenarios
+from tests.unit.single_controller._rollout_checkpoints import (
+    attach_rollout_checkpointing,
+)
 
 _GROUP_SIZE = 2
 _PROMPTS_PER_STEP = 3
@@ -165,6 +170,10 @@ def _manager(
         max_skipped_prompts=8,
     )
     manager._stats = RolloutStats()
+    manager._filter_zero_variance_groups = False
+    manager._masked_reward_policy = None
+    manager._overlong_filtering = False
+    manager._step_rewards = {}
     manager._canonical_groups_finalized = 0
     manager._canonical_output_tokens = 0
     manager._recovery_siblings_reused = 0
@@ -197,6 +206,7 @@ def _controller(
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     controller = object.__new__(controller_cls)
+    controller._rollout_runtime = RolloutRuntimeState()
     controller._data_plane_checkpoint_barrier = barrier
     controller._buffer = buffer
     controller._dp_client = client
@@ -241,26 +251,31 @@ def _controller(
     controller._trainer_version = 0
     controller._train_steps = 0
     controller._current_epoch = 0
-    controller._sampler_stamps_target_steps = False
     controller._rollout_recovery_enabled = True
+    # Dynamic sampling off: these fixtures exercise the fault-tolerance path.
+    controller._dynamic_sampling_enabled = False
+    controller._filtered_prompt_budget = 0
+    controller._rollout_runtime.filtered_reserve = deque()
+    controller._filtered_prompts_by_step = {}
+    controller._rollout_runtime.steps_allowed_short = set()
+    controller._dataloader_exhausted = False
     controller._restored_replay_groups_to_regenerate = []
-    controller._batch_shortfall = {}
+    controller._rollout_runtime.batch_shortfall = {}
     controller._batch_replacements = {}
     controller._batch_promotions = {}
     controller._finalizer_actors = []
-    controller._finalizer_metrics_by_group = {}
-    controller._finalizer_rewards_by_group = {}
-    controller._replacement_reserve = deque(replacement_reserve or [])
+    controller._rollout_runtime.replacement_reserve = deque(replacement_reserve or [])
     controller._rollout_slot_waiters = 0
     controller._rollout_permitted_waiters = 0
     controller._buffer_capacity_waiters = 0
     controller._rollout_completion_durations_s = deque(maxlen=10_000)
     controller._rollout_queue_wait_durations_s = deque(maxlen=10_000)
     controller._logger = MagicMock()
-    controller._last_checkpoint_path = (
-        str(checkpoint_path) if checkpoint_path is not None else None
+    controller._resume = ResumeSource(
+        path=str(checkpoint_path) if checkpoint_path is not None else None,
+        data_plane_metadata=checkpoint_metadata,
     )
-    controller._data_plane_checkpoint_metadata = checkpoint_metadata
+    attach_rollout_checkpointing(controller)
     return controller
 
 
@@ -342,7 +357,9 @@ async def _exercise_round_trip(
     checkpoint_path = tmp_path / "step_0"
     checkpoint_path.mkdir()
     async with first._data_plane_checkpoint_barrier.checkpoint() as cut:
-        snapshot = await first._capture_rollout_checkpoint_cut(cut, checkpoint_path)
+        snapshot = await first._rollout_snapshots.capture(
+            cut, checkpoint_path, "rollout_snapshot"
+        )
     assert snapshot.replay_metadata is not None
     assert snapshot.rollout_recovery_payload is not None
     torch.save(
@@ -364,15 +381,16 @@ async def _exercise_round_trip(
         loader=_Loader([], dataset),
         generation=_Generation(),
         dispatch_index=snapshot.sampler_dispatch_index,
-        replacement_reserve=snapshot.replacement_reserve,
+        replacement_reserve=snapshot.replacement_reserve["replacement"],
         checkpoint_path=checkpoint_path,
         checkpoint_metadata=checkpoint_metadata,
     )
-    restored_group_count = await restored._maybe_restore_replay_buffer()
-    await restored._maybe_restore_rollout_recovery(
+    attach_rollout_checkpointing(restored)
+    restored_group_count = await restored._rollout_restorer._restore_replay_buffer()
+    await restored._rollout_restorer._restore_recovery_ledger(
         restored_replay_groups=restored_group_count
     )
-    restored._validate_restored_sampler_cursor()
+    restored._rollout_restorer._validate_sampler_cursor()
     assert restored._sampler.dispatch_index == snapshot.sampler_dispatch_index
     restored._rollout_manager.prompt_by_group_id.update(
         first._rollout_manager.prompt_by_group_id
@@ -399,7 +417,7 @@ async def _exercise_round_trip(
         ).values()
         for prompt_idx in prompt_indices
     }
-    spares = {prompt["idx"] for prompt in restored._replacement_reserve}
+    spares = {prompt["idx"] for prompt in restored._rollout_runtime.replacement_reserve}
     assert present | spares | {1} == set(range(15))
 
     recovery_metrics: dict[str, float] = {}
@@ -427,3 +445,76 @@ def test_borrow_and_repayment_survive_controller_checkpoint_restore(
 ) -> None:
     """A saved sampler cursor preserves every prompt after borrow and repayment."""
     asyncio.run(_exercise_round_trip(tmp_path, monkeypatch))
+
+
+@pytest.mark.parametrize("reserved", [False, True])
+def test_restored_empty_filter_pool_refills_before_slot_or_admission_wait(
+    monkeypatch: pytest.MonkeyPatch, reserved: bool
+) -> None:
+    """Restored work must make progress with an empty pool and one generation slot."""
+    monkeypatch.setattr(
+        scenarios._rb, "record_to_train_batch", scenarios._stub_converter
+    )
+
+    class Generation(_Generation):
+        async def run_rollout(self, input_sample: dict[str, Any]) -> PromptGroupRecord:
+            record = await super().run_rollout(input_sample)
+            rewards = [1.0, 1.0] if input_sample["idx"] < 10 else [0.0, 1.0]
+            record.completions = [
+                Completion(message_log=[], env_extras=None, truncated=False, reward=r)
+                for r in rewards
+            ]
+            return record
+
+    async def exercise() -> None:
+        dataset = {i: _prompt(i) for i in [0, 1, 10, 11, 12]}
+        controller = _controller(
+            client=_client(register=True),
+            loader=_Loader([_batch([10, 11, 12])], dataset),
+            generation=Generation(),
+            dispatch_index=0 if reserved else 1,
+        )
+        controller._async_cfg.max_inflight_prompts = 1
+        controller._async_cfg.rollout_failure.on_dropped_prompt = "shrink"
+        controller._sampler.set_gate_window(0 if reserved else 3)
+        controller._dynamic_sampling_enabled = True
+        controller._filtered_prompt_budget = 30
+        manager = controller._rollout_manager
+        manager._filter_zero_variance_groups = True
+        barrier = controller._data_plane_checkpoint_barrier
+        async with barrier.mutation() as cut:
+            manager.reserve_prompt_group(cut, _prompt(0), target_step=0, admitted=True)
+            manager.reserve_prompt_group(
+                cut,
+                _prompt(1),
+                target_step=None if reserved else 1,
+                admitted=not reserved,
+                admission_id="restored-reserved" if reserved else None,
+            )
+            saved = manager.recovery_ledger.state_dict()
+            manager._recovery_ledger = RolloutRecoveryLedger()
+            manager.recovery_ledger.load_state_dict(cut, saved)
+            for group in manager.recovery_ledger.groups():
+                manager.recovery_ledger.bind_runtime_prompt(
+                    cut, group.group_id, _prompt(int(group.prompt_id))
+                )
+        assert not controller._rollout_runtime.filtered_reserve
+
+        async def advance_trainer() -> None:
+            if reserved:
+                while manager.stats.committed < 1:
+                    await asyncio.sleep(0.01)
+                controller._trainer_version = 1
+
+        await asyncio.wait_for(
+            asyncio.gather(controller._rollout_pump(), advance_trainer()), timeout=5
+        )
+        assert manager.stats.zero_variance_groups == 2
+        assert manager.stats.committed == 2
+        assert controller._filtered_prompts_by_step == {0: 1, 1: 1}
+        assert controller._rollout_runtime.batch_shortfall == {}
+        assert controller._dataloader_exhausted
+        assert controller._rollout_exhausted.is_set()
+        assert controller._buffer_capacity._value == _CAPACITY - 2
+
+    asyncio.run(exercise())
