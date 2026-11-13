@@ -28,16 +28,28 @@ from nemo_rl.algorithms.single_controller_utils.setup import (
     SingleControllerActorArgs,
     setup_single_controller,
 )
+from nemo_rl.algorithms.single_controller_utils.simulator import (
+    CpuTrainer,
+    NoOpWeightSynchronizer,
+    SimulatorSettings,
+    apply_simulator_overrides,
+    validate_simulator_config,
+)
 
 __all__ = [
     "AdvantageConfig",
     "AsyncRLConfig",
+    "CpuTrainer",
     "MasterConfig",
+    "NoOpWeightSynchronizer",
     "RolloutCheckpointConfig",
     "RolloutFailureConfig",
+    "SimulatorSettings",
     "SingleControllerActorArgs",
     "WatchdogConfig",
     "algo_config",
+    "apply_simulator_overrides",
     "is_ppo_run",
     "setup_single_controller",
+    "validate_simulator_config",
 ]

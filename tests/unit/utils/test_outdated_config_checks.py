@@ -431,8 +431,8 @@ def _generation_config(**generation) -> dict:
             r"dynamo_cfg\.metrics_exclude_prefixes",
         ),
         (
-            {"dynamo_cfg": {"worker_args": {"extra_cli_args": []}}},
-            r"dynamo_cfg\.worker_args was",
+            {"dynamo_cfg": {"worker_args": {"tool_call_parser": "hermes"}}},
+            r"dynamo_cfg\.worker_args was removed",
         ),
         (
             {"dynamo_cfg": {"frontend_args": {"tokenizer_cache": False}}},

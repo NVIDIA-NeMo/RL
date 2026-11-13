@@ -49,6 +49,6 @@ echo "KV events the router applied: ${applied:-0}"
   || fail "The KV router applied none of the engines' KV-cache events"
 
 dynamo_bin_dir=${NEMO_RL_DYNAMO_BIN_DIR:-/opt/dynamo/bin}
-if pgrep -f "[d]ynamo.frontend|${dynamo_bin_dir}/[e]tcd|${dynamo_bin_dir}/[n]ats-server"; then
+if pgrep -f "[d]ynamo\.vllm\.frontend|${dynamo_bin_dir}/[e]tcd|${dynamo_bin_dir}/[n]ats-server"; then
   fail "Managed Dynamo services remain after shutdown"
 fi
