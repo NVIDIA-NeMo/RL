@@ -25,6 +25,7 @@ import torch
 from nemo_rl.experience.route_assembly import RouteLayout
 from nemo_rl.models.generation.interfaces import (
     ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+    resolve_routed_experts_dtype,
 )
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.utils.r3_trace import (
@@ -231,7 +232,7 @@ def router_replay_dimensions(model_config: Any) -> tuple[int, int]:
 
 
 def router_replay_layout(model_config: Any) -> RouteLayout:
-    """Return the model-owned route layout: MoE layer numbers, total layers, top-k.
+    """Return the model-owned route layout: MoE layer numbers, total layers, top-k, dtype.
 
     This is what the deferred route executor needs to accept a vLLM fragment
     with one column per transformer layer next to a MInf fragment with one
@@ -243,6 +244,9 @@ def router_replay_layout(model_config: Any) -> RouteLayout:
         moe_layer_numbers=tuple(_global_moe_layer_numbers(model_config)),
         total_num_layers=int(getattr(model_config, "num_layers")),
         top_k=top_k,
+        dtype=resolve_routed_experts_dtype(
+            getattr(model_config, "num_moe_experts", None)
+        ),
     )
 
 

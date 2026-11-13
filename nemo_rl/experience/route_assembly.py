@@ -87,6 +87,12 @@ class RouteLayout:
     """1-based global layer numbers of the MoE layers, ascending."""
     total_num_layers: int
     top_k: int
+    dtype: torch.dtype = torch.int16
+    """Carry dtype of the assembled routes (``resolve_routed_experts_dtype``).
+
+    The default restates ``ROUTED_EXPERTS_FALLBACK_DTYPE`` so this module
+    imports without the generation interfaces.
+    """
 
     def __post_init__(self) -> None:
         if not self.moe_layer_numbers or self.top_k <= 0:
@@ -103,16 +109,20 @@ class RouteLayout:
             )
 
     @classmethod
-    def compressed(cls, *, num_moe_layers: int, top_k: int) -> "RouteLayout":
+    def compressed(
+        cls, *, num_moe_layers: int, top_k: int, dtype: torch.dtype = torch.int16
+    ) -> "RouteLayout":
         """A MoE-only layout for callers that know only ``(num_moe_layers, top_k)``.
 
-        Direct mode learns these from the fetched fragments themselves and has
-        no model config, so it can never need column selection.
+        Direct mode learns these (and the dtype) from the fetched fragments
+        themselves and has no model config, so it can never need column
+        selection.
         """
         return cls(
             moe_layer_numbers=tuple(range(1, num_moe_layers + 1)),
             total_num_layers=num_moe_layers,
             top_k=top_k,
+            dtype=dtype,
         )
 
     @property
@@ -225,8 +235,9 @@ def execute_route_plan(
 
     Returns:
         ``(tensor, None)`` on success — ``[canonical_len, num_moe_layers,
-        topk]`` int16, sentinel-filled wherever no fragment contributed — or
-        ``(None, reason)`` with a reason from the shared vocabulary.
+        topk]`` in ``layout.dtype``, sentinel-filled wherever no fragment
+        contributed — or ``(None, reason)`` with a reason from the shared
+        vocabulary.
     """
     # Deferred: nemo_gym is an optional extra absent in non-gym runs.
     from nemo_gym.token_id_capture.staging.routes import classify_route_span
@@ -237,7 +248,7 @@ def execute_route_plan(
     routed = torch.full(
         (canonical_len, num_moe_layers, top_k),
         ROUTE_MISSING_SENTINEL,
-        dtype=torch.int16,
+        dtype=layout.dtype,
     )
     position = 0
     for span in plan.spans:
@@ -266,15 +277,15 @@ def execute_route_plan(
             if routes is None:
                 return None, ROUTE_FAILURE_MODEL_SHAPE
             if span.boundary_rows:
-                routed[position - 1] = routes[0].to(torch.int16)
+                routed[position - 1] = routes[0].to(layout.dtype)
                 routes = routes[1:]
             if mode == "full":
-                routed[position : position + contribution] = routes.to(torch.int16)
+                routed[position : position + contribution] = routes.to(layout.dtype)
             else:
                 tail_start = position + span.carry_len
                 routed[tail_start : position + contribution] = routes[
                     -span.generation_len :
-                ].to(torch.int16)
+                ].to(layout.dtype)
         position += contribution
     if plan.spans and position != canonical_len:
         return None, ROUTE_FAILURE_ASSEMBLED_LENGTH
