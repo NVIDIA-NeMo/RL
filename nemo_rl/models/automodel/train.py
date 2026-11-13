@@ -617,7 +617,7 @@ class LossPostProcessor:
         dp_size: int,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
-        precomputed_logprobs: bool = False,
+        prepare_fn: Optional[Callable[..., Any]] = None,
         draft_runtime: Optional[Any] = None,
         tp_mesh: Optional[DeviceMesh] = None,
     ):
@@ -633,8 +633,10 @@ class LossPostProcessor:
             dp_size: Data parallel size
             enable_seq_packing: Whether sequence packing is enabled
             sampling_params: Sampling parameters
-            precomputed_logprobs: Whether ``logits`` already contains token
-                log probabilities and should bypass vocabulary reduction.
+            prepare_fn: Optional override for the default ``prepare_loss_input``.
+                Called as ``prepare_fn(logits, data, loss_fn, **parallel_kwargs)``
+                and returns ``(loss_input, data)``; research policies use it to
+                hand the loss precomputed scores.
             draft_runtime: Optional draft co-training runtime (dspark/dflash
                 or eagle3); when set, the policy loss is combined with the
                 draft loss and the policy's raw logits are stashed as the
@@ -650,7 +652,7 @@ class LossPostProcessor:
         self.dp_size = dp_size
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
-        self.precomputed_logprobs = precomputed_logprobs
+        self.prepare_fn = prepare_fn
         self.draft_runtime = draft_runtime
         self.tp_mesh = tp_mesh
         self._cp_gradient_fanout = (
@@ -740,19 +742,21 @@ class LossPostProcessor:
             if self.tp_mesh is not None and self.tp_mesh.size() == 1:
                 local_vocab_group = self.tp_mesh.get_group()
 
-        # Wrap prepare_loss_input with sampling_params
-        prepare_loss_input_wrapped = partial(
-            prepare_loss_input,
-            sampling_params=self.sampling_params,
-            precomputed_logprobs=self.precomputed_logprobs,
-            chunk_size=chunk_size if local_vocab_group is not None else None,
-            vocab_parallel_group=local_vocab_group,
-            vocab_parallel_rank=0 if local_vocab_group is not None else None,
-            context_parallel_group=(
-                self.cp_mesh.get_group() if self.cp_size > 1 else None
-            ),
-            cp_sharder=token_layout,
-        )
+        # A custom prepare_fn overrides the default logit prep.
+        if self.prepare_fn is not None:
+            prepare_loss_input_wrapped = self.prepare_fn
+        else:
+            prepare_loss_input_wrapped = partial(
+                prepare_loss_input,
+                sampling_params=self.sampling_params,
+                chunk_size=chunk_size if local_vocab_group is not None else None,
+                vocab_parallel_group=local_vocab_group,
+                vocab_parallel_rank=0 if local_vocab_group is not None else None,
+                context_parallel_group=(
+                    self.cp_mesh.get_group() if self.cp_size > 1 else None
+                ),
+                cp_sharder=token_layout,
+            )
         # Wrap loss function for sequence packing if needed
         if self.enable_seq_packing:
             cu_seqlens_q_cpu = to_cpu_int_tuple(
@@ -812,7 +816,7 @@ class LogprobsPostProcessor:
         cfg: PolicyConfig,
         enable_seq_packing: bool = False,
         sampling_params: Optional[TrainingSamplingParams] = None,
-        shift_targets: bool = True,
+        shift_labels: bool = True,
     ):
         """Initialize LogprobsPostProcessor.
 
@@ -820,13 +824,13 @@ class LogprobsPostProcessor:
             cfg: Configuration dictionary
             enable_seq_packing: Whether sequence packing is enabled
             sampling_params: Sampling parameters
-            shift_targets: Whether position ``i`` scores token ``i+1``.
+            shift_labels: Whether position ``i`` scores token ``i+1``.
         """
         self.cfg = cfg
         self.enable_seq_packing = enable_seq_packing
         self.sampling_params = sampling_params
         self.logprob_chunk_size = cfg.get("logprob_chunk_size", None)
-        self.shift_targets = shift_targets
+        self.shift_labels = shift_labels
 
     def __call__(
         self,
@@ -904,11 +908,11 @@ class LogprobsPostProcessor:
                 cp_sharder,
                 chunk_size=self.logprob_chunk_size,
                 sampling_params=self.sampling_params,  # top-k and top-p filtering
-                shift_targets=self.shift_targets,
+                shift_labels=self.shift_labels,
             )
 
             assert token_logprobs.shape[1] == (
-                seq_len - 1 if self.shift_targets else seq_len
+                seq_len - 1 if self.shift_labels else seq_len
             )
         else:
             seq_len = processed_inputs.seq_len
@@ -919,15 +923,15 @@ class LogprobsPostProcessor:
                     score_ids,
                     chunk_size=self.logprob_chunk_size,
                     sampling_params=self.sampling_params,  # top-k and top-p filtering
-                    shift_targets=self.shift_targets,
+                    shift_labels=self.shift_labels,
                 )
             else:
                 # Non-DTensor path (no TP sharding)
                 token_logprobs = self._compute_local_logprobs(
-                    logits, score_ids, shift_targets=self.shift_targets
+                    logits, score_ids, shift_labels=self.shift_labels
                 )
 
-        if self.shift_targets:
+        if self.shift_labels:
             # Prepend 0 for first token to maintain sequence length. Position-
             # aligned scoring drops no position, so it needs no such padding.
             token_logprobs = torch.cat(
@@ -977,14 +981,14 @@ class LogprobsPostProcessor:
         self,
         logits: torch.Tensor,
         input_ids: torch.Tensor,
-        shift_targets: bool = True,
+        shift_labels: bool = True,
     ) -> torch.Tensor:
         """Compute logprobs locally without distributed processing.
 
         Args:
             logits: Model output logits
             input_ids: Token IDs to score
-            shift_targets: If True (default), position ``i`` scores token ``i+1``
+            shift_labels: If True (default), position ``i`` scores token ``i+1``
                 and the returned sequence is one shorter. If False, position
                 ``i`` scores token ``i`` and every position is kept -- the
                 masked diffusion convention.
@@ -1000,7 +1004,7 @@ class LogprobsPostProcessor:
         # Input shapes:
         #   logits: [batch_size, sequence_length, vocab_size] - logits for each position
         #   token_ids: [batch_size, sequence_length] - actual tokens
-        next_tokens = (input_ids[:, 1:] if shift_targets else input_ids).to(
+        next_tokens = (input_ids[:, 1:] if shift_labels else input_ids).to(
             logits.device
         )
         target_seq_len = int(next_tokens.shape[1])

@@ -220,7 +220,7 @@ class TestOutput:
 
         result = worker._gdpo_elbo_logprobs(
             processed_mb=microbatch,
-            post_processing_fn=LogprobsPostProcessor(cfg={}, shift_targets=False),
+            post_processing_fn=LogprobsPostProcessor(cfg={}, shift_labels=False),
             sequence_dim=1,
         )
 

@@ -44,7 +44,7 @@ policy:
   masked_diffusion:
     enabled: true
     mask_id: null
-    shift_targets: false
+    shift_labels: false
     likelihood:
       type: "sdmc"
       quadrature: "gauss-3"
@@ -135,12 +135,11 @@ loss_fn:
   sequence_level_importance_ratios: true
   token_level_loss: false
   use_importance_sampling_correction: false
-  position_aligned_logprobs: true
 ```
 
-`position_aligned_logprobs` reflects that a dLLM scores token `i` at position `i`,
-with no autoregressive shift to undo. It must agree with `policy.masked_diffusion.shift_targets`.
-The current KL estimators require token log probabilities, so both policy KL and
+A dLLM scores token `i` at position `i`, so the policy hands the loss
+`shift_labels=False` (from `policy.masked_diffusion.shift_labels`) and no column
+is dropped from the per-token metadata. The current KL estimators require token log probabilities, so both policy KL and
 reward KL are unsupported for the sequence-level ELBO.
 
 Generation-time log probabilities are likewise unavailable for iterative

@@ -284,7 +284,7 @@ class SdmcElboEstimator:
             point: The mask point the log probabilities were computed for.
             logprobs: Position-aligned log probabilities of the *clean* tokens
                 under the masked input, shape ``[batch, seq_len]``. Position
-                ``i`` must score token ``i`` -- see ``shift_targets=False`` in
+                ``i`` must score token ``i`` -- see ``shift_labels=False`` in
                 :func:`nemo_rl.distributed.model_utils.from_parallel_logits_to_logprobs`.
 
         Returns:

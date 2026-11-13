@@ -34,7 +34,6 @@ VALID_LOSS = ClippedPGLossConfig(
     token_level_loss=False,
     use_importance_sampling_correction=False,
     reference_policy_kl_penalty=0.0,
-    position_aligned_logprobs=True,
 )
 
 
@@ -81,7 +80,7 @@ def test_raw_dict_is_coerced_with_basemodel_defaults():
     assert isinstance(cfg, MaskedDiffusionConfig)
     assert cfg.likelihood.quadrature == "gauss-2"
     assert cfg.likelihood.mc_samples == 1
-    assert cfg.shift_targets is False
+    assert cfg.shift_labels is False
 
 
 def test_already_validated_config_passes_through():
@@ -154,27 +153,6 @@ def test_token_logprob_dependent_loss_options_are_rejected(setting, value, error
     loss = make_loss(**{setting: value})
     with pytest.raises(ValueError, match=error):
         validate(make_policy(), loss)
-
-
-def test_loss_must_not_shift_when_policy_is_position_aligned():
-    """The default loss shift is an off-by-one against dLLM logprobs."""
-    loss = make_loss(position_aligned_logprobs=False)
-    with pytest.raises(ValueError, match="position_aligned_logprobs"):
-        validate(make_policy(), loss)
-
-
-def test_loss_must_shift_when_policy_emits_next_token_logprobs():
-    """The mirror case: a shifting policy needs the loss to shift too."""
-    policy = make_policy()
-    policy["masked_diffusion"]["shift_targets"] = True
-    with pytest.raises(ValueError, match="position_aligned_logprobs"):
-        validate(policy)
-
-
-def test_consistent_shifting_pair_is_allowed():
-    policy = make_policy()
-    policy["masked_diffusion"]["shift_targets"] = True
-    validate(policy, make_loss(position_aligned_logprobs=False))
 
 
 VALID_GENERATION = {

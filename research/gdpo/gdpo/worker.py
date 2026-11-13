@@ -14,6 +14,7 @@
 """Automodel policy-worker extension for GDPO."""
 
 import warnings
+from functools import partial
 from typing import Any
 
 import ray
@@ -51,6 +52,21 @@ from nemo_rl.models.policy.workers.automodel_policy_worker import (
 )
 
 
+def _elbo_loss_input(
+    logits: torch.Tensor,
+    data: BatchedDataDict[Any],
+    loss_fn: Any,
+    *,
+    shift_labels: bool,
+    **kwargs: Any,
+) -> tuple[dict[str, Any], BatchedDataDict[Any]]:
+    """Hand the per-position ELBO, already accumulated over quadrature points, to the loss."""
+    return {
+        "next_token_logprobs": logits.to(torch.float32),
+        "shift_labels": shift_labels,
+    }, data
+
+
 @ray.remote(
     runtime_env=get_runtime_env_for_policy_worker("automodel_policy_worker")
 )  # pragma: no cover
@@ -73,11 +89,13 @@ class AutomodelGDPOPolicyWorker(AutomodelPolicyWorkerImpl):
         )
 
     def _make_loss_post_processor(self, **kwargs: Any):
-        kwargs["precomputed_logprobs"] = True
+        kwargs["prepare_fn"] = partial(
+            _elbo_loss_input, shift_labels=self.diffusion_cfg.shift_labels
+        )
         return super()._make_loss_post_processor(**kwargs)
 
     def _make_logprobs_post_processor(self, **kwargs: Any):
-        kwargs["shift_targets"] = self.diffusion_cfg.shift_targets
+        kwargs["shift_labels"] = self.diffusion_cfg.shift_labels
         return super()._make_logprobs_post_processor(**kwargs)
 
     def _forward_backward(self, **kwargs: Any) -> list[tuple[Any, dict[str, Any]]]:

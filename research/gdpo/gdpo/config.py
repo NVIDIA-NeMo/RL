@@ -70,7 +70,7 @@ class MaskedDiffusionConfig(BaseModel, extra="allow"):
     than failing, so there is no static default. Leave unset to read it from the
     model's own config (LLaDA publishes ``mask_token_id``)."""
 
-    shift_targets: bool = False
+    shift_labels: bool = False
     """Whether position ``i`` scores token ``i+1`` rather than token ``i``."""
 
     likelihood: SdmcLikelihoodConfig = Field(default_factory=SdmcLikelihoodConfig)

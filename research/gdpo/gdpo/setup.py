@@ -133,9 +133,8 @@ def validate_gdpo_config(
             "log probabilities to compare with policy ELBOs. Set it to null."
         )
 
-    diffusion_cfg = masked_diffusion_config_from_policy(policy_cfg)
     _validate_generation(policy_cfg.get("generation"))
-    _validate_loss(loss_cfg, diffusion_cfg)
+    _validate_loss(loss_cfg)
 
 
 def denoise_config_from_generation(generation_cfg: "GenerationConfig") -> DenoiseConfig:
@@ -187,9 +186,7 @@ def _validate_generation(generation_cfg: Optional["GenerationConfig"]) -> None:
         )
 
 
-def _validate_loss(
-    loss_cfg: "ClippedPGLossConfig", diffusion_cfg: MaskedDiffusionConfig
-) -> None:
+def _validate_loss(loss_cfg: "ClippedPGLossConfig") -> None:
     """Rejects loss settings the ELBO cannot be substituted into."""
     # The ELBO is a *sequence* likelihood: only its masked sum is meaningful, so
     # only a sequence-level ratio is well defined. A token-level ratio would
@@ -228,18 +225,4 @@ def _validate_loss(
             "loss_fn.use_kl_in_reward is not supported with "
             "policy.masked_diffusion.enabled=true: reward KL requires token log probabilities, "
             "not per-position ELBO contributions."
-        )
-    # The policy decides whether its log probabilities are position-aligned; the
-    # loss decides whether to drop a column off every other per-token tensor to
-    # match. Disagreement is an off-by-one at every position that still runs, so
-    # require them to be stated consistently rather than inferring one silently.
-    position_aligned = loss_cfg.position_aligned_logprobs
-    if position_aligned == diffusion_cfg.shift_targets:
-        raise ValueError(
-            f"loss_fn.position_aligned_logprobs={position_aligned} is "
-            f"inconsistent with policy.masked_diffusion.shift_targets="
-            f"{diffusion_cfg.shift_targets}. A policy that scores token i at "
-            "position i (shift_targets=false) emits log probabilities as long "
-            "as the sequence, which the loss must not shift "
-            "(position_aligned_logprobs=true), and vice versa."
         )

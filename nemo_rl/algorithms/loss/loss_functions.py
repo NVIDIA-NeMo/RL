@@ -180,13 +180,6 @@ class ClippedPGLossConfig(BaseModel, extra="allow"):
     # If False (default), correction is applied at the token level as in the
     # original GRPO paper.
     sequence_level_importance_ratios: bool = False
-    # Whether the incoming log probabilities are position-aligned (position i
-    # scores token i, so the tensor is as long as the sequence) rather than
-    # next-token (position i scores token i+1, one shorter). Masked diffusion
-    # policies produce the former; autoregressive policies the latter. It
-    # decides whether the other per-token tensors drop their first column to
-    # line up, so a wrong value is a silent off-by-one across every position.
-    position_aligned_logprobs: bool = False
 
     # --- Clipping ---
     ratio_clip_min: float = 0.2
@@ -438,7 +431,6 @@ class ClippedPGLossFn(LossFunction):
 
         # Whether to compute importance weights per-sequence instead of per-token.
         self.sequence_level_importance_ratios = cfg.sequence_level_importance_ratios
-        self.position_aligned_logprobs = cfg.position_aligned_logprobs
         self.positive_example_nll_weight = cfg.positive_example_nll_weight
         self.metrics_level = cfg.metrics_level
         self.enable_torch_compile = cfg.enable_torch_compile
@@ -728,6 +720,8 @@ class ClippedPGLossFn(LossFunction):
         opd_full_cross_entropy: Optional[Tensor] = None,
         policy_support_mask: Optional[Tensor] = None,
         policy_logprobs_at_sampler_topk: Optional[Tensor] = None,
+        *,
+        shift_labels: bool = True,
     ) -> tuple[torch.Tensor, dict]:
         """Clipped Policy Gradient RL loss, or the full-vocabulary MOPD reverse KL.
 
@@ -748,6 +742,9 @@ class ClippedPGLossFn(LossFunction):
                 the ``opd_full`` branch.
             opd_full_entropy: Optional ``sum_v p_s log p_s`` diagnostic.
             opd_full_cross_entropy: Optional ``-sum_v p_s log p_t`` diagnostic.
+            shift_labels: Drop the first column of token-aligned metadata for
+                next-token prediction. Set False for same-position diffusion
+                scores ``[B, S]``. This flag never shifts the supplied scores.
 
         Returns:
             Tuple of the scalar loss and its metric dict.
@@ -760,6 +757,8 @@ class ClippedPGLossFn(LossFunction):
             "ClippedPGLossFn requires global_valid_toks"
         )
         if self.opd_full is not None:
+            if not shift_labels:
+                raise ValueError("opd_full does not support shift_labels=False")
             return self._opd_full_call(
                 data=data,
                 global_valid_seqs=global_valid_seqs,
@@ -773,21 +772,17 @@ class ClippedPGLossFn(LossFunction):
             "ClippedPGLossFn requires next_token_logprobs"
         )
         curr_logprobs = next_token_logprobs
-        # Next-token log probabilities are one shorter than the sequence, so
-        # every other per-token tensor drops its first column to line up.
-        # Position-aligned log probabilities keep every position, so nothing is
-        # dropped -- see ClippedPGLossConfig.position_aligned_logprobs.
-        aligned = slice(None) if self.position_aligned_logprobs else slice(1, None)
-        token_mask = data["token_mask"][:, aligned]
+        start = 1 if shift_labels else 0
+        token_mask = data["token_mask"][:, start:]
         sample_mask = data["sample_mask"]
-        advantages = data["advantages"][:, aligned]
+        advantages = data["advantages"][:, start:]
         # Skip loading prev_logprobs when force_on_policy_ratio=True (will use curr_logprobs instead)
         prev_logprobs = (
-            None if self.force_on_policy_ratio else data["prev_logprobs"][:, aligned]
+            None if self.force_on_policy_ratio else data["prev_logprobs"][:, start:]
         )
-        generation_logprobs = data["generation_logprobs"][:, aligned]
+        generation_logprobs = data["generation_logprobs"][:, start:]
         if self.reference_policy_kl_penalty != 0:
-            reference_policy_logprobs = data["reference_policy_logprobs"][:, aligned]
+            reference_policy_logprobs = data["reference_policy_logprobs"][:, start:]
             curr_logprobs_unfiltered = data.get(
                 "curr_logprobs_unfiltered", curr_logprobs
             )
@@ -1105,7 +1100,7 @@ class ClippedPGLossFn(LossFunction):
             )
             centering, head_mass = compute_score_centering_term(
                 policy_logprobs_at_sampler_topk,
-                sampler_topk_logprobs=data["sampler_topk_logprobs"][:, 1:],
+                sampler_topk_logprobs=data["sampler_topk_logprobs"][:, start:],
                 importance_sampling_mode=self._score_centering_is_mode,
                 is_bounds=self._get_score_centering_is_bounds(),
                 token_mask=mask,

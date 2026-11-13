@@ -58,7 +58,7 @@ def test_train_scorer_builds_the_logprobs_post_processor_upstream_accepts():
 
     def make_logprobs_post_processor(**kwargs):
         # The real constructor raises TypeError on renamed or removed kwargs.
-        built.append(LogprobsPostProcessor(**kwargs, shift_targets=False))
+        built.append(LogprobsPostProcessor(**kwargs, shift_labels=False))
         return built[-1]
 
     worker = types.SimpleNamespace(
