@@ -304,9 +304,7 @@ class AdvantageOutcome:
     opd_stat_sumsq: float = 0.0
     opd_stat_count: int = 0
     opd_gap_sum: float = 0.0
-    # Seconds this call spent serializing the training dump. Reported back
-    # because the writing moved off the controller with the rest of the
-    # stage, and the controller still owns the timer the metric lands in.
+    # Seconds spent preparing and submitting this chunk, including backpressure.
     train_data_dump_s: float = 0.0
     # What this call stored in the dump, so the controller's publish can tell a
     # missing chunk from an empty one.
@@ -334,15 +332,23 @@ class AdvantageComputer:
         self._dp_client = dp_client
         self._config = config
         self._advantage_estimator = advantage_estimator
-        # One writer per shard: the pool runs these concurrently, so they must
-        # not share a file. The controller merges them on publish.
+        # One writer per shard, so concurrent shards never share a file; the
+        # controller merges them after flush_train_data_dump.
         self._train_data_dump = (
             make_debug_writer(
-                config.debug_writer, config.train_data_dump_dir, shard_id=shard_id
+                config.debug_writer,
+                config.train_data_dump_dir,
+                shard_id=shard_id,
+                background=True,
             )
             if config.train_data_dump_dir is not None
             else None
         )
+
+    def flush_train_data_dump(self) -> None:
+        """Wait until this process's dump chunks are written (before the merge)."""
+        if self._train_data_dump is not None:
+            self._train_data_dump.flush()
 
     async def run(self, request: AdvantageRequest) -> AdvantageOutcome:
         """Run one call's advantage stage and return its reduced results."""
