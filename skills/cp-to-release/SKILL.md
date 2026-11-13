@@ -10,12 +10,9 @@ when_to_use: >-
 
 Input: the original PR number `N` (already merged). Optional: a release branch name; otherwise use the newest `origin/rX.Y.Z`.
 
-Release flow since r0.8.0: PRs merge into the release branch first, and a label auto cherry-picks
-them back to main. A manual cp is needed when a PR was merged into main instead of the release
-branch first. (Up to r0.7.0 it was the reverse: main first, auto cp to release.)
+Release flow since r0.8.0: PRs merge into the release branch first, and a label auto cherry-picks them back to main. A manual cp is needed when a PR was merged into main instead of the release branch first. (Up to r0.7.0 it was the reverse: main first, auto cp to release.)
 
-The user invoking this skill authorizes the cherry-pick commit, push, PR, label, and
-`/ok to test` — no pause-before-commit for the clean path. Do not assign reviewers; the user does.
+The user invoking this skill authorizes the cherry-pick commit, push, PR, label, and `/ok to test` — no pause-before-commit for the clean path. Do not assign reviewers; the user does.
 
 ## Steps
 
@@ -35,8 +32,7 @@ Run from the NeMo-RL checkout. `$GITHUB_TOKEN` (`public_repo` scope) must be set
    ```
    Also check `git ls-remote origin refs/heads/<user>/cp-<N>` is empty; if the branch exists, ask.
 
-3. **Branch + cherry-pick in a worktree**, so the user's main checkout (often dirty, on another
-   branch) is untouched. Put it under a temp directory:
+3. **Branch + cherry-pick in a worktree**, so the user's main checkout (often dirty, on another branch) is untouched. Put it under a temp directory:
    ```bash
    git worktree add -b <user>/cp-<N> <tmpdir>/cp-<N> origin/<rel>
    cd <tmpdir>/cp-<N> && git cherry-pick -s <merge_commit_sha>
@@ -44,13 +40,11 @@ Run from the NeMo-RL checkout. `$GITHUB_TOKEN` (`public_repo` scope) must be set
    `-s` is required: the commit must carry the user's own `Signed-off-by` alongside the author's.
    Forgetting it means amend + force-push + a second `/ok to test`.
 
-4. **Conflicts: stop and hand back.** Show the conflicting files; do not auto-resolve. After the
-   user resolves and continues, verify before pushing:
+4. **Conflicts: stop and hand back.** Show the conflicting files; do not auto-resolve. After the user resolves and continues, verify before pushing:
    - `git log -1` — the cherry-pick committed, and has the user's `Signed-off-by`.
    - `grep -n "^<<<<<<< \|^=======$\|^>>>>>>> " <files>` — no leftover markers.
    - Per file, compare the `+` lines with the original:
-     `diff <(git diff HEAD~1..HEAD -- <f> | grep '^+' | grep -v '^+++' | sort) <(git show <merge_sha> -- <f> | grep '^+' | grep -v '^+++' | sort)`
-     and report any extra/missing lines.
+     `diff <(git diff HEAD~1..HEAD -- <f> | grep '^+' | grep -v '^+++' | sort) <(git show <merge_sha> -- <f> | grep '^+' | grep -v '^+++' | sort)` and report any extra/missing lines.
 
 5. **Push and open a PR** targeting the release branch, never `main`:
    ```bash
@@ -62,13 +56,9 @@ Run from the NeMo-RL checkout. `$GITHUB_TOKEN` (`public_repo` scope) must be set
      - Clean: `manually cp #<N> into <rel> branch since it was merged into main instead of <rel> first.`
      - Conflict: append the conflict, e.g. `... first. There's a conflict in `<file>` (<why, e.g. depends on #M which is not in <rel>>).`
 
-6. **Labels + CI.** Copy the original's `CI:*` labels (`POST /issues/<pr>/labels`). Do not copy
-   `cherry-pick-to-main` (it makes the bot cherry-pick the PR back to main) or release labels such
-   as `r0.8.0`. Then post
-   `/ok to test <full head sha>` as an issue comment.
+6. **Labels + CI.** Copy the original's `CI:*` labels (`POST /issues/<pr>/labels`). Do not copy `cherry-pick-to-main` (it makes the bot cherry-pick the PR back to main) or release labels such as `r0.8.0`. Then post `/ok to test <full head sha>` as an issue comment.
 
-7. **Report**: PR number (bare `#N`), base, commit sha, labels, that `/ok to test` was
-   posted, and the worktree path (`git worktree remove <path>` to clean up).
+7. **Report**: PR number (bare `#N`), base, commit sha, labels, that `/ok to test` was posted, and the worktree path (`git worktree remove <path>` to clean up).
 
 ## Reference PRs
 

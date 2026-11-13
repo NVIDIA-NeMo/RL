@@ -8,17 +8,9 @@
 | Total variation (TV) | Compare the draft and target token distributions. |
 | Confidence | Predict token acceptance when a confidence head is present. |
 
-The function processes draft tokens in bounded chunks. It keeps target
-logits and the target output head stop-gradient. The Markov head uses
-previous-token IDs from the target vocabulary. Loss labels use the selected
-draft-vocabulary order. The two vocabularies can have different sizes.
+The function processes draft tokens in bounded chunks. It keeps target logits and the target output head stop-gradient. The Markov head uses previous-token IDs from the target vocabulary. Loss labels use the selected draft-vocabulary order. The two vocabularies can have different sizes.
 
-The function returns one `DraftLossStats` value. Its numerators combine the
-CE, TV, and confidence losses with the configured loss weights. Position
-weights scale both numerators and denominators. Reduce counts across
-data-parallel ranks before you call `DraftLossStats.normalized`.
+The function returns one `DraftLossStats` value. Its numerators combine the CE, TV, and confidence losses with the configured loss weights. Position weights scale both numerators and denominators. Reduce counts across data-parallel ranks before you call `DraftLossStats.normalized`.
 
-`build_dspark_provider` attaches the Markov head and optional confidence head
-to a checkpointable draft body. PR #3711 defines the head shapes and
-checkpoint keys.
+`build_dspark_provider` attaches the Markov head and optional confidence head to a checkpointable draft body. PR #3711 defines the head shapes and checkpoint keys.
 Training-loop configuration and rollout execution are outside this change.
