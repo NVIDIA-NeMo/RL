@@ -355,6 +355,8 @@ def test_run_rollouts_shapes_completion_reward_and_emits_low_metrics():
 
     # length_reward = min(1, 1.0 * (1 - 100/1000)) = 0.9 -> 1.0 + 1.0 * 0.9 = 1.9
     assert completions[0].reward == pytest.approx(1.9)
+    # Dynamic sampling filters on the reward from before shaping.
+    assert completions[0].reward_original == pytest.approx(1.0)
     # Downstream reward metrics are computed from the shaped Completion.
     assert metrics["total_reward/mean"] == pytest.approx(1.9)
     assert metrics["mean_length_reward_low"] == pytest.approx(0.9)

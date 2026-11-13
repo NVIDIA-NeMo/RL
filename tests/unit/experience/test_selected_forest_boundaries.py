@@ -1304,6 +1304,12 @@ def test_forest_shaping_and_observations_are_per_owner(
     assert observation.rollout_id == "attempt"
     assert observation.reward == pytest.approx(2.0 - (scored_index + 1) / 10)
     assert observation.log_context.agent_name == "test-agent"
+    # Raw voting flags ride beside the observation, one per observation.
+    assert result.reward_mask_sample == [False]
+    assert len(result.reward_truncated) == 1
+    # The Gym reward is the dispatcher's input, before effort shaping.
+    assert result.reward_original == [1.0]
+    assert result.loss_multiplier == 1.0
     assert result.metrics[f"finalize/effort/low/{scored_index + 1}"] == 1
     for key in result.meta.sample_ids[:3]:
         assert forest.plane.rows["canonical", key][

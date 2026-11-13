@@ -34,7 +34,10 @@ from nemo_rl.algorithms.opd import TQTeacherLogprobCoordinator
 from nemo_rl.algorithms.single_controller import (
     RolloutRuntimeState,
     SingleControllerActor,
-    _BelowValidFraction,
+)
+from nemo_rl.algorithms.single_controller_utils.utils import (
+    BelowValidFractionGroup,
+    ZeroVarianceGroup,
 )
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS, ROUTE_PLAN_TAG
@@ -130,8 +133,15 @@ def _controller(actor: object) -> Any:
             min_valid_fraction_per_group=None,
             forest_training=False,
         ),
-        grpo=SimpleNamespace(num_prompts_per_step=1),
+        grpo=SimpleNamespace(
+            num_prompts_per_step=1,
+            masked_reward_policy="include",
+            overlong_filtering=False,
+        ),
     )
+    ctrl._algo_cfg = ctrl._master_config.grpo
+    ctrl._is_ppo = False
+    ctrl._dynamic_sampling_enabled = False
     ctrl._trainer_version = 3
     ctrl._train_steps = 3
     return ctrl
@@ -501,12 +511,14 @@ def test_below_threshold_group_never_becomes_selectable() -> None:
         ctrl._finalize_with_actor(_request(), {}, target_step=3, replacements_used=0)
     )
 
-    assert outcome == _BelowValidFraction(
-        valid_count=1,
-        total_count=2,
+    assert outcome == BelowValidFractionGroup(
         replacement=None,
         lineage_group_id=None,
+        target_step=3,
         reward_observations=[FinalizedReward("group_g0", "group_g0", 1.0, None)],
+        zero_variance=True,
+        valid_count=1,
+        total_count=2,
     )
     assert ctrl._buffer.group_ids == ()
     assert client.ready_during_clear == [False, False]
@@ -540,17 +552,21 @@ def test_below_threshold_replacement_is_reserved_in_the_cleanup_cut(
     ctrl._rollout_recovery_enabled = recovery
     ctrl._rollout_recovery_ledger.__contains__.return_value = True
     ctrl._rollout_manager.reserve_prompt_group.return_value = "spare-group"
+    ctrl._buffer.promote_ready_group = MagicMock(return_value=None)
+    ctrl._batch_promotions = {}
 
     outcome = asyncio.run(
         ctrl._finalize_with_actor(_request(), {}, target_step=3, replacements_used=0)
     )
 
-    assert outcome == _BelowValidFraction(
-        valid_count=1,
-        total_count=2,
+    assert outcome == BelowValidFractionGroup(
         replacement=spare,
         lineage_group_id="spare-group" if recovery else None,
+        target_step=3,
         reward_observations=[FinalizedReward("group_g0", "group_g0", 1.0, None)],
+        zero_variance=True,
+        valid_count=1,
+        total_count=2,
     )
     ctrl._buffer.commit_finalized.assert_not_awaited()
     ctrl._buffer.abort.assert_called_once_with("group")
@@ -569,6 +585,244 @@ def test_below_threshold_replacement_is_reserved_in_the_cleanup_cut(
         ctrl._rollout_manager.reserve_prompt_group.assert_not_called()
     assert not ctrl._rollout_runtime.replacement_reserve
     assert ctrl._rollout_runtime.batch_shortfall == {}
+
+
+def test_below_threshold_replacement_borrows_a_finished_group_and_repays_the_lender() -> (
+    None
+):
+    ctrl = _controller(
+        SimpleNamespace(finalize=_RemoteFinalize(result=_below_threshold_result()))
+    )
+    _below_threshold(ctrl, spares=[{"idx": 99}])
+    ctrl._rollout_recovery_ledger.__contains__.return_value = True
+    ctrl._rollout_manager.reserve_prompt_group.return_value = "spare-group"
+    ctrl._batch_promotions = {}
+    ctrl._buffer.promote_ready_group = MagicMock(return_value=5)
+
+    outcome = asyncio.run(
+        ctrl._finalize_with_actor(_request(), {}, target_step=3, replacements_used=0)
+    )
+
+    ctrl._buffer.promote_ready_group.assert_called_once_with(to_target_step=3)
+    assert ctrl._batch_promotions == {3: 1}
+    # The spare is owed to the lender, so it is reserved for the lender's step.
+    assert outcome.target_step == 5
+    assert outcome.lineage_group_id == "spare-group"
+    (_, reserved), kwargs = ctrl._rollout_manager.reserve_prompt_group.call_args
+    assert reserved == {"idx": 99}
+    assert kwargs == {"target_step": 5}
+    assert ctrl._rollout_runtime.batch_shortfall == {}
+
+
+def _signal_result(
+    rewards: list[float],
+    *,
+    truncated: list[bool] | None = None,
+    mask_sample: list[bool] | None = None,
+    reward_original: list[float] | None = None,
+) -> FinalizedGroup:
+    count = len(rewards)
+    return FinalizedGroup(
+        meta=KVBatchMeta(
+            partition_id="canonical",
+            task_name="train",
+            sample_ids=[f"group_g{i}" for i in range(count)],
+            fields=["input_ids"],
+            sequence_lengths=[3] * count,
+            tags=[{"weight_version": 3}] * count,
+        ),
+        group_min_wv=3,
+        group_max_wv=3,
+        staging_keys=["group_g0/call"],
+        reward_observations=[
+            FinalizedReward(f"group_g{i}", f"group_g{i}", reward, None)
+            for i, reward in enumerate(rewards)
+        ],
+        reward_mask_sample=mask_sample or [False] * count,
+        reward_truncated=truncated or [False] * count,
+        reward_original=list(rewards if reward_original is None else reward_original),
+        valid_row_count=count,
+        total_row_count=count,
+    )
+
+
+def _dynamic_sampling(
+    ctrl: Any,
+    *,
+    spares: list[dict[str, Any]],
+    exhausted: bool = False,
+    policy: str = "include",
+    overlong_filtering: bool = False,
+    lender_step: int | None = None,
+) -> None:
+    ctrl._dynamic_sampling_enabled = True
+    ctrl._algo_cfg.masked_reward_policy = policy
+    ctrl._algo_cfg.overlong_filtering = overlong_filtering
+    ctrl._algo_cfg.dynamic_sampling_max_gen_batches = 10
+    ctrl._filtered_prompt_budget = 10 * ctrl._algo_cfg.num_prompts_per_step
+    ctrl._filtered_prompts_by_step = {}
+    ctrl._batch_promotions = {}
+    ctrl._dataloader_exhausted = exhausted
+    ctrl._rollout_runtime.filtered_reserve = deque(spares)
+    ctrl._rollout_runtime.sampler_stamps_target_steps = True
+    ctrl._rollout_runtime.batch_shortfall = {}
+    ctrl._rollout_runtime.steps_allowed_short = set()
+    ctrl._rollout_recovery_enabled = False
+    ctrl._buffer.promote_ready_group = MagicMock(return_value=lender_step)
+
+
+def _finalize_for_step_3(ctrl: Any) -> Any:
+    return asyncio.run(
+        ctrl._finalize_with_actor(_request(), {}, target_step=3, replacements_used=0)
+    )
+
+
+def test_zero_variance_group_is_rejected_before_commit_and_replaced() -> None:
+    """The spare comes from the filtered pool and is charged to the step's budget."""
+    spare = {"idx": 7}
+    result = _signal_result([1.0, 1.0])
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    _dynamic_sampling(ctrl, spares=[spare])
+
+    outcome = _finalize_for_step_3(ctrl)
+
+    assert outcome == ZeroVarianceGroup(
+        replacement=spare,
+        lineage_group_id=None,
+        target_step=3,
+        reward_observations=result.reward_observations,
+        zero_variance=True,
+    )
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+    ctrl._buffer.abort.assert_called_once_with("group")
+    assert not ctrl._rollout_runtime.filtered_reserve
+    assert ctrl._filtered_prompts_by_step == {3: 1}
+    assert ctrl._rollout_runtime.batch_shortfall == {}
+    # Not a fault-tolerance replacement, so that pool is untouched.
+    assert not ctrl._rollout_runtime.replacement_reserve
+    assert ctrl._available_finalizers.qsize() == 1
+
+
+def test_zero_variance_group_borrows_a_finished_group_and_repays_the_lender() -> None:
+    ctrl = _controller(
+        SimpleNamespace(finalize=_RemoteFinalize(result=_signal_result([0.0, 0.0])))
+    )
+    _dynamic_sampling(ctrl, spares=[{"idx": 7}], lender_step=5)
+    ctrl._rollout_recovery_enabled = True
+    ctrl._rollout_recovery_ledger.__contains__.return_value = True
+    ctrl._rollout_manager.reserve_prompt_group.return_value = "spare-group"
+
+    outcome = _finalize_for_step_3(ctrl)
+
+    ctrl._buffer.promote_ready_group.assert_called_once_with(to_target_step=3)
+    assert ctrl._batch_promotions == {3: 1}
+    # The spare is owed to the lender, so it is reserved for the lender's step,
+    # in the same cut that discarded the rejected group's ledger entry.
+    assert outcome.target_step == 5
+    assert outcome.lineage_group_id == "spare-group"
+    (discard_cut, discarded), _ = ctrl._rollout_recovery_ledger.discard_group.call_args
+    (reserve_cut, reserved), kwargs = (
+        ctrl._rollout_manager.reserve_prompt_group.call_args
+    )
+    assert discarded == "group"
+    assert reserved == {"idx": 7}
+    assert kwargs == {"target_step": 5}
+    assert reserve_cut is discard_cut
+
+
+def test_zero_variance_group_closes_its_step_short_when_no_spare_is_left() -> None:
+    ctrl = _controller(
+        SimpleNamespace(finalize=_RemoteFinalize(result=_signal_result([1.0, 1.0])))
+    )
+    _dynamic_sampling(ctrl, spares=[], exhausted=True)
+
+    outcome = _finalize_for_step_3(ctrl)
+
+    assert isinstance(outcome, ZeroVarianceGroup)
+    assert outcome.replacement is None
+    assert ctrl._rollout_runtime.batch_shortfall == {3: 1}
+    assert 3 in ctrl._rollout_runtime.steps_allowed_short
+    ctrl._buffer.promote_ready_group.assert_not_called()
+    ctrl._buffer.commit_finalized.assert_not_awaited()
+
+
+def test_group_with_reward_spread_commits_and_leaves_the_pool_alone() -> None:
+    result = _signal_result([1.0, 0.0])
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    _dynamic_sampling(ctrl, spares=[{"idx": 7}])
+
+    assert _finalize_for_step_3(ctrl) is result
+
+    ctrl._buffer.commit_finalized.assert_awaited_once()
+    assert len(ctrl._rollout_runtime.filtered_reserve) == 1
+    assert ctrl._filtered_prompts_by_step == {}
+
+
+def test_zero_variance_group_commits_when_dynamic_sampling_is_off() -> None:
+    result = _signal_result([1.0, 1.0])
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+
+    assert _finalize_for_step_3(ctrl) is result
+
+    ctrl._buffer.commit_finalized.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("policy", "rejected"),
+    [("exclude", True), ("include", False)],
+)
+def test_only_the_voting_rows_decide_the_filter(policy: str, rejected: bool) -> None:
+    """The truncated 0.0 is the only spread; under exclude it does not vote."""
+    result = _signal_result([0.0, 1.0, 1.0, 1.0], truncated=[True, False, False, False])
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    _dynamic_sampling(ctrl, spares=[{"idx": 7}], policy=policy, overlong_filtering=True)
+
+    outcome = _finalize_for_step_3(ctrl)
+
+    assert isinstance(outcome, ZeroVarianceGroup) is rejected
+    if not rejected:
+        assert outcome is result
+
+
+@pytest.mark.parametrize(
+    ("trained", "gym", "rejected"),
+    [
+        # Effort shaping or a penalty made the trained rewards differ; the Gym
+        # reward did not, so the group carries no task signal.
+        ([1.9, 1.0], [1.0, 1.0], True),
+        ([0.0, 1.0], [1.0, 1.0], True),
+        # Only the trained rewards are uniform; the Gym rewards still differ.
+        ([0.0, 0.0], [0.0, 1.0], False),
+    ],
+)
+def test_the_filter_reads_the_original_reward_not_the_trained_reward(
+    trained: list[float], gym: list[float], rejected: bool
+) -> None:
+    result = _signal_result(trained, reward_original=gym)
+    ctrl = _controller(SimpleNamespace(finalize=_RemoteFinalize(result=result)))
+    _dynamic_sampling(ctrl, spares=[{"idx": 7}])
+
+    outcome = _finalize_for_step_3(ctrl)
+
+    assert isinstance(outcome, ZeroVarianceGroup) is rejected
+
+
+def test_below_valid_fraction_is_decided_before_zero_variance() -> None:
+    """A group that fails both takes a fault-tolerance spare, not a filtered one."""
+    ctrl = _controller(
+        SimpleNamespace(finalize=_RemoteFinalize(result=_below_threshold_result()))
+    )
+    _below_threshold(ctrl, spares=[{"idx": 1}])
+    _dynamic_sampling(ctrl, spares=[{"idx": 2}])
+    ctrl._rollout_runtime.replacement_reserve = deque([{"idx": 1}])
+    ctrl._rollout_runtime.sampler_stamps_target_steps = True
+
+    outcome = _finalize_for_step_3(ctrl)
+
+    assert isinstance(outcome, BelowValidFractionGroup)
+    assert outcome.replacement == {"idx": 1}
+    assert len(ctrl._rollout_runtime.filtered_reserve) == 1
+    assert ctrl._filtered_prompts_by_step == {}
 
 
 def test_actor_rpc_failure_is_fatal_and_does_not_retry_or_requeue_actor() -> None:

@@ -841,14 +841,11 @@ class TestDynamicSamplingValidation:
             _dynamic_sampling_config(on_dropped_prompt="shrink")
         )
 
-    def test_rejects_token_capture(self):
-        # The capture path cannot borrow a finished group from a later step, so every
-        # drop would stall its step for a full fresh rollout.
+    def test_accepts_token_capture(self):
         mc = _dynamic_sampling_config()
         mc.token_capture.enabled = True
 
-        with pytest.raises(ValueError, match="token_capture.enabled"):
-            validate_single_controller_config(mc)
+        validate_single_controller_config(mc)
 
     def test_rejects_a_zero_generation_batch_allowance(self):
         mc = _dynamic_sampling_config(max_gen_batches=0)

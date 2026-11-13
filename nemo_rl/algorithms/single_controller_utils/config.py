@@ -1552,14 +1552,6 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                     f"grpo.use_dynamic_sampling requires grpo.{key} to be 0 or null: "
                     "nonzero message-level overrides can train constant-reward groups."
                 )
-        # Capture cannot borrow future groups, so routine filtering would stall training.
-        if master_config.token_capture.enabled:
-            raise ValueError(
-                f"{algo_prefix}.use_dynamic_sampling is not supported together with "
-                "token_capture.enabled: on the capture path a replacement cannot borrow "
-                "a finished group from a later step, so every dropped group stalls its "
-                "step for a full fresh rollout. Disable one of the two."
-            )
         if grpo_cfg.dynamic_sampling_max_gen_batches < 1:
             raise ValueError(
                 f"{algo_prefix}.dynamic_sampling_max_gen_batches must be >= 1 when "

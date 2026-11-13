@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 import torch
@@ -25,6 +25,11 @@ from tensordict import TensorDict
 
 from nemo_rl.algorithms.metric_utils import REWARD_KEY
 from nemo_rl.data_plane import KVBatchMeta
+
+if TYPE_CHECKING:
+    from nemo_rl.data.interfaces import DatumSpec
+    from nemo_rl.experience.reward_penalties import FinalizedReward
+    from nemo_rl.experience.rollout_reassembler import FinalizedGroup
 
 # Reduction rules for all_mb_metrics. Mirror grpo.py / grpo_sync.py.
 _MB_METRIC_MIN: frozenset[str] = frozenset(
@@ -175,6 +180,48 @@ class AdvantagePartial:
             minimum=float(values.min()),
             maximum=float(values.max()),
         )
+
+
+@dataclass(frozen=True)
+class RejectedGroup:
+    """A finalized group the controller rejected before commit.
+
+    The group never became selectable. ``replacement`` is the spare prompt taken
+    in the same mutation cut that cleaned the group up (None when the step was
+    credited short instead), ``target_step`` the step it was reserved for, and
+    ``lineage_group_id`` its ledger reservation when rollout recovery is enabled.
+    ``reward_observations`` are the valid rows' rewards and ``zero_variance``
+    whether the rows that vote carried no signal; the pump still tallies both
+    into the step's reward metrics.
+    """
+
+    replacement: Optional[DatumSpec]
+    lineage_group_id: Optional[str]
+    target_step: Optional[int]
+    reward_observations: list[FinalizedReward]
+    zero_variance: bool
+
+
+@dataclass(frozen=True)
+class BelowValidFractionGroup(RejectedGroup):
+    """Rejected by ``token_capture.min_valid_fraction_per_group``."""
+
+    valid_count: int
+    total_count: int
+
+
+@dataclass(frozen=True)
+class ZeroVarianceGroup(RejectedGroup):
+    """Rejected by dynamic sampling: the voting rewards left every row zero advantage.
+
+    ``target_step`` is the lender's when the dropped step was filled from a later
+    step's finished group, which the replacement then repays.
+    """
+
+
+type FinalizeOutcome = FinalizedGroup | RejectedGroup | None
+"""What ``_finalize_with_actor`` returns: the group committed, a group the controller
+rejected, or ``None`` when the finalizer dropped it as a structural outcome."""
 
 
 def reduce_advantage_pump_metrics(

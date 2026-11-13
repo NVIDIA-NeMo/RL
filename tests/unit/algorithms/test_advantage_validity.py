@@ -187,7 +187,7 @@ def test_reinforce_pp_none_valid_mask_keeps_legacy_all_valid_behavior():
 @pytest.mark.parametrize("include", [False, True])
 @pytest.mark.parametrize("leave_one_out", [False, True])
 @pytest.mark.parametrize("normalize", [False, True])
-def test_gdpo_statistics_match_participating_rewards(include, leave_one_out, normalize):
+def test_gdpo_statistics_match_voting_rewards(include, leave_one_out, normalize):
     """Check actual final values, including weighted components and whitening."""
     prompt_ids = torch.tensor([[0]] * 4 + [[1]] * 4)
     loss_weights = torch.tensor([1.0, 1.0, 1.0, 0.0, 1.0, 1.0, 1.0, 0.0])

@@ -196,6 +196,14 @@ class FinalizedGroup:
     canonical_output_tokens: int = 0
     metrics: dict[str, float] = field(default_factory=dict)
     reward_observations: list[FinalizedReward] = field(default_factory=list)
+    # Parallel to ``reward_observations``: each row's environment ``mask_sample``
+    # flag, truncation and original reward (before effort shaping and penalties), plus
+    # the group's dataset loss weight. Which rewards vote in the group baseline
+    # depends on controller-side policy, so the raw flags travel instead of a verdict.
+    reward_mask_sample: list[bool] = field(default_factory=list)
+    reward_truncated: list[bool] = field(default_factory=list)
+    reward_original: list[float] = field(default_factory=list)
+    loss_multiplier: float = 1.0
     # True when the finalizer rejected the whole group as a structural outcome
     # (see drop_reason); the caller aborts the slot instead of committing it.
     # Policy decisions like a low valid-rollout fraction are made by the caller,
@@ -1092,6 +1100,13 @@ class RolloutReassembler:
         # termination rates like the penalty counts; receipt-side rates only
         # saw a placeholder truncated=False.
         truncated_flags = self._truncated_flags(rows, logical)
+        reward_mask_sample = [
+            mask_sample[index] for index, _, row in reward_rows if row.valid
+        ]
+        reward_truncated = [
+            truncated_flags[index] for index, _, row in reward_rows if row.valid
+        ]
+        reward_original = [rewards[slot] for _, slot, row in reward_rows if row.valid]
         metrics["finalize/truncated_count"] = 0.0
         for index, slot, row in reward_rows:
             if row.valid:
@@ -1121,6 +1136,9 @@ class RolloutReassembler:
             metrics=metrics,
             rollouts_ms=_rollouts_ms,
             reward_observations=reward_observations,
+            reward_mask_sample=reward_mask_sample,
+            reward_truncated=reward_truncated,
+            reward_original=reward_original,
             logical=logical,
             execution_row_multiple=execution_row_multiple,
             canonical_sample_ids=canonical_sample_ids,
@@ -1154,6 +1172,9 @@ class RolloutReassembler:
         metrics: dict[str, float],
         rollouts_ms: float,
         reward_observations: list[FinalizedReward],
+        reward_mask_sample: list[bool],
+        reward_truncated: list[bool],
+        reward_original: list[float],
         logical: Optional[_LogicalRows],
         execution_row_multiple: int,
         canonical_sample_ids: list[str],
@@ -1425,6 +1446,10 @@ class RolloutReassembler:
             ),
             metrics=metrics,
             reward_observations=reward_observations,
+            reward_mask_sample=reward_mask_sample,
+            reward_truncated=reward_truncated,
+            reward_original=reward_original,
+            loss_multiplier=loss_multiplier,
             valid_row_count=len(valid_rows),
             total_row_count=real_row_count,
         )

@@ -19,7 +19,12 @@ from types import SimpleNamespace
 import pytest
 
 from nemo_rl.data_plane.schema import MASK_SAMPLE
-from nemo_rl.experience.dynamic_sampling import rewards_carry_no_signal
+from nemo_rl.experience.dynamic_sampling import (
+    rewards_carry_no_signal,
+    voting_rewards,
+    voting_rewards_from_finalized,
+    voting_rewards_from_record,
+)
 from nemo_rl.experience.rollout_manager import RolloutManager
 
 
@@ -49,9 +54,10 @@ def test_rewards_carry_no_signal(rewards, expected):
     assert rewards_carry_no_signal(rewards) is expected
 
 
-def _completion(reward, *, truncated=False, mask_sample=False):
+def _completion(reward, *, truncated=False, mask_sample=False, reward_original=None):
     return SimpleNamespace(
         reward=reward,
+        reward_original=reward_original,
         truncated=truncated,
         env_extras={MASK_SAMPLE: True} if mask_sample else None,
     )
@@ -100,6 +106,70 @@ def test_a_zero_weight_group_is_trivial_under_either_policy():
 
     for policy in ("include", "exclude", None):
         assert _manager(policy)._is_zero_variance_group(record) is True
+
+
+@pytest.mark.parametrize(
+    ("policy", "overlong_filtering", "expected"),
+    [
+        ("include", False, [0.0, 1.0, 0.5, 0.25]),
+        ("include", True, [0.0, 1.0, 0.5, 0.25]),
+        ("exclude", False, [0.0, 0.5, 0.25]),
+        ("exclude", True, [0.5, 0.25]),
+        (None, True, [0.0, 1.0, 0.5, 0.25]),
+    ],
+)
+def test_the_record_and_finalized_adapters_pick_the_same_voters(
+    policy, overlong_filtering, expected
+):
+    """The capture path has a finalized group, not a record; both must pick the same voters."""
+    completions = [
+        _completion(0.0, truncated=True),
+        _completion(1.0, mask_sample=True),
+        _completion(0.5),
+        _completion(0.25),
+    ]
+
+    from_flags = voting_rewards(
+        [c.reward for c in completions],
+        mask_sample=[c.env_extras is not None for c in completions],
+        truncated=[c.truncated for c in completions],
+        loss_multiplier=1.0,
+        masked_reward_policy=policy,
+        overlong_filtering=overlong_filtering,
+    )
+
+    assert from_flags == expected
+    assert from_flags == voting_rewards_from_record(
+        _record(completions),
+        masked_reward_policy=policy,
+        overlong_filtering=overlong_filtering,
+    )
+    finalized = SimpleNamespace(
+        reward_original=[c.reward for c in completions],
+        reward_mask_sample=[c.env_extras is not None for c in completions],
+        reward_truncated=[c.truncated for c in completions],
+        loss_multiplier=1.0,
+    )
+    assert from_flags == voting_rewards_from_finalized(
+        finalized,
+        masked_reward_policy=policy,
+        overlong_filtering=overlong_filtering,
+    )
+
+
+def test_voting_rewards_read_the_original_reward_when_a_completion_has_one():
+    """Effort shaping and penalties rewrite ``reward``; voting reads the Gym value."""
+    completions = [
+        _completion(1.9, reward_original=1.0),
+        _completion(0.0, reward_original=1.0),
+        _completion(0.5),
+    ]
+
+    assert voting_rewards_from_record(
+        _record(completions),
+        masked_reward_policy="include",
+        overlong_filtering=False,
+    ) == [1.0, 1.0, 0.5]
 
 
 def test_unfiltered_reward_counts_kept_and_dropped_groups():

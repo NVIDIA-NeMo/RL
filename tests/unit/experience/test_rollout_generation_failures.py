@@ -536,7 +536,11 @@ class _FakeGymMethod:
             return (
                 rowidx,
                 {"name": "agent"},
-                {"input_message_log": [], "message_log": []},
+                {
+                    "input_message_log": [],
+                    "message_log": [],
+                    "full_result": {"reward": 1.0},
+                },
                 None,
             )
 

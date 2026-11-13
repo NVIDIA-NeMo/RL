@@ -46,7 +46,6 @@ from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller import (
     RolloutRuntimeState,
     SingleControllerActor,
-    _BelowValidFraction,
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
@@ -54,6 +53,10 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     RolloutRecoveryConfig,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import SingleControllerActorArgs
+from nemo_rl.algorithms.single_controller_utils.utils import (
+    BelowValidFractionGroup,
+    ZeroVarianceGroup,
+)
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_manager import RolloutManager, RolloutOutcome
@@ -122,6 +125,8 @@ def _init_pump_ledgers(ctrl: Any) -> None:
     # Dynamic sampling off: the filter never fires, so no test here draws on its
     # budget unless it opts in.
     ctrl._dynamic_sampling_enabled = False
+    ctrl._is_ppo = False
+    ctrl._filtered_spares_claimed = 0
     ctrl._filtered_prompt_budget = 0
     ctrl._rollout_runtime.filtered_reserve = deque()
     ctrl._filtered_prompts_by_step = {}
@@ -1515,12 +1520,14 @@ def test_below_valid_fraction_outcome_substitutes_or_closes_short(
 ) -> None:
     """The pump acts on the finalize cut's decision instead of re-deciding it."""
     spare = {"message_log": [[{"role": "user", "content": "spare"}]], "idx": 1}
-    rejected = _BelowValidFraction(
-        valid_count=3,
-        total_count=4,
+    rejected = BelowValidFractionGroup(
         replacement=spare if has_spare else None,
         lineage_group_id="spare-group" if has_spare else None,
+        target_step=0,
         reward_observations=[],
+        zero_variance=True,
+        valid_count=3,
+        total_count=4,
     )
     committed = FinalizedGroup(
         meta=None, group_min_wv=0, group_max_wv=0, staging_keys=[]
@@ -1595,6 +1602,238 @@ def test_below_valid_fraction_outcome_substitutes_or_closes_short(
     assert "(3/4 < 0.8)" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("has_spare", [False, True])
+def test_zero_variance_outcome_substitutes_from_the_filtered_pool_or_closes_short(
+    has_spare: bool, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A filtered group draws only the dynamic-sampling budget, never a failure retry."""
+    spare = {"message_log": [[{"role": "user", "content": "spare"}]], "idx": 1}
+    # Step 1 lent the finished group that filled step 0, so the spare repays step 1.
+    rejected = ZeroVarianceGroup(
+        replacement=spare if has_spare else None,
+        lineage_group_id="spare-group" if has_spare else None,
+        target_step=1,
+        reward_observations=[],
+        zero_variance=True,
+    )
+    committed = FinalizedGroup(
+        meta=None, group_min_wv=0, group_max_wv=0, staging_keys=[]
+    )
+
+    async def run() -> None:
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1, diagnostics=False, rollout_failure=_failure_cfg()
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(
+                min_valid_fraction_per_group=None, forest_training=False
+            ),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        request = SimpleNamespace(group_id="group")
+        ctrl._rollout_manager = SimpleNamespace(
+            generate_for_finalization=AsyncMock(return_value=(request, {})),
+            record_finalizer_dropped_prompt=MagicMock(),
+            record_group_rewards=MagicMock(),
+            stats=SimpleNamespace(committed=0, zero_variance_groups=0),
+        )
+        _init_pump_ledgers(ctrl)
+        ctrl._finalizer_actors = [object()]
+        ctrl._finalize_with_actor = AsyncMock(side_effect=[rejected, committed])
+        ctrl._buffer = _RecordingBuffer()
+        ctrl._sampler = InOrderSampler(ctrl._buffer, max_lookahead_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(1)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        await ctrl._rollout_pump()
+
+        # The spare is generated for the step the finalize cut reserved it for, and
+        # it does not spend the fault-tolerance budget.
+        assert [call.kwargs for call in ctrl._finalize_with_actor.await_args_list] == [
+            {"target_step": 0, "replacements_used": 0}
+        ] + ([{"target_step": 1, "replacements_used": 0}] if has_spare else [])
+        assert ctrl._rollout_manager.stats.zero_variance_groups == 1
+        assert ctrl._rollout_manager.stats.committed == int(has_spare)
+        assert ctrl._buffer_capacity._value == int(not has_spare)
+        assert ctrl._inflight_rollouts == 0
+        # A filtered group is a healthy rollout, not an infrastructure drop.
+        ctrl._rollout_manager.record_finalizer_dropped_prompt.assert_not_called()
+        generate = ctrl._rollout_manager.generate_for_finalization
+        if has_spare:
+            assert generate.await_count == 2
+            assert generate.await_args.args == (spare,)
+            assert generate.await_args.kwargs["lineage_group_id"] == "spare-group"
+            # Counted against the step that was repaid.
+            assert ctrl._batch_replacements == {1: 1}
+            tallies = ctrl._rollout_manager.record_group_rewards.call_args_list
+            assert [call.kwargs["replacement_index"] for call in tallies] == [0, 1]
+        else:
+            assert generate.await_count == 1
+
+    asyncio.run(run())
+    assert "its voting rewards carry no signal" in capsys.readouterr().out
+
+
+def test_a_group_rejected_for_both_reasons_tallies_each_attempt_once(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Fault-tolerance and filtered replacements share one tally index sequence."""
+    below_valid = BelowValidFractionGroup(
+        replacement={"message_log": [[{"role": "user", "content": "a"}]], "idx": 1},
+        lineage_group_id=None,
+        target_step=0,
+        reward_observations=[],
+        zero_variance=False,
+        valid_count=3,
+        total_count=4,
+    )
+    zero_variance = ZeroVarianceGroup(
+        replacement={"message_log": [[{"role": "user", "content": "b"}]], "idx": 2},
+        lineage_group_id=None,
+        target_step=0,
+        reward_observations=[],
+        zero_variance=True,
+    )
+    committed = FinalizedGroup(
+        meta=None, group_min_wv=0, group_max_wv=0, staging_keys=[]
+    )
+
+    async def run() -> None:
+        ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+        ctrl._async_cfg = SimpleNamespace(
+            max_inflight_prompts=1, diagnostics=False, rollout_failure=_failure_cfg()
+        )
+        ctrl._master_config = SimpleNamespace(
+            grpo=GRPOConfig.model_construct(max_num_epochs=1),
+            token_capture=SimpleNamespace(
+                min_valid_fraction_per_group=0.8, forest_training=False
+            ),
+        )
+        ctrl._algo_cfg = ctrl._master_config.grpo
+        request = SimpleNamespace(group_id="group")
+        ctrl._rollout_manager = SimpleNamespace(
+            generate_for_finalization=AsyncMock(return_value=(request, {})),
+            record_finalizer_dropped_prompt=MagicMock(),
+            record_group_rewards=MagicMock(),
+            stats=SimpleNamespace(committed=0, zero_variance_groups=0),
+        )
+        _init_pump_ledgers(ctrl)
+        ctrl._finalizer_actors = [object()]
+        ctrl._finalize_with_actor = AsyncMock(
+            side_effect=[below_valid, zero_variance, committed]
+        )
+        ctrl._buffer = _RecordingBuffer()
+        ctrl._sampler = InOrderSampler(ctrl._buffer, max_lookahead_versions=1)
+        ctrl._dataloader = [
+            BatchedDataDict({"message_log": [[{"role": "user", "content": "prompt"}]]})
+        ]
+        ctrl._rollout_permitted = asyncio.Event()
+        ctrl._rollout_permitted.set()
+        ctrl._rollout_exhausted = asyncio.Event()
+        ctrl._buffer_capacity = asyncio.Semaphore(1)
+        ctrl._inflight_rollouts = 0
+        ctrl._inflight_by_group_id = {}
+        ctrl._dispatched_rollouts = set()
+        ctrl._trainer_version = 0
+        ctrl._current_epoch = 0
+
+        await ctrl._rollout_pump()
+
+        # Only the fault-tolerance replacement spends that budget.
+        assert [
+            call.kwargs["replacements_used"]
+            for call in ctrl._finalize_with_actor.await_args_list
+        ] == [0, 1, 1]
+        tallies = ctrl._rollout_manager.record_group_rewards.call_args_list
+        assert [call.kwargs["replacement_index"] for call in tallies] == [0, 1, 2]
+        assert ctrl._rollout_manager.stats.zero_variance_groups == 1
+        assert ctrl._rollout_manager.stats.committed == 1
+
+    asyncio.run(run())
+    capsys.readouterr()
+
+
+def _claiming_controller(*, spares: int, exhausted: bool = False) -> Any:
+    ctrl = object.__new__(SingleControllerActor.__ray_metadata__.modified_class)
+    ctrl._dynamic_sampling_enabled = True
+    ctrl._rollout_runtime = RolloutRuntimeState()
+    ctrl._rollout_runtime.filtered_reserve = deque({"idx": i} for i in range(spares))
+    ctrl._filtered_spares_claimed = 0
+    ctrl._dataloader_exhausted = exhausted
+    return ctrl
+
+
+def test_claiming_a_filtered_spare_waits_until_one_is_unclaimed() -> None:
+    """Two finalizing groups cannot both count on the pool's only spare."""
+
+    async def run() -> None:
+        ctrl = _claiming_controller(spares=1)
+
+        async def second_claim() -> int:
+            async with ctrl._claim_filtered_spare():
+                return ctrl._filtered_spares_claimed
+
+        async with ctrl._claim_filtered_spare():
+            assert ctrl._filtered_spares_claimed == 1
+            waiting = asyncio.create_task(second_claim())
+            await asyncio.sleep(0.25)
+            assert not waiting.done()
+            # The pump refilled the pool, so a second spare can be promised.
+            ctrl._rollout_runtime.filtered_reserve.append({"idx": 9})
+            assert await asyncio.wait_for(waiting, timeout=5) == 2
+        assert ctrl._filtered_spares_claimed == 0
+
+    asyncio.run(run())
+
+
+def test_a_claim_is_released_when_finalization_fails() -> None:
+    async def run() -> None:
+        ctrl = _claiming_controller(spares=1)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            async with ctrl._claim_filtered_spare():
+                raise RuntimeError("boom")
+
+        assert ctrl._filtered_spares_claimed == 0
+
+    asyncio.run(run())
+
+
+def test_no_claim_is_made_once_the_dataloader_is_exhausted() -> None:
+    """Nothing will refill an empty pool, so waiting for it would hang the group."""
+
+    async def run() -> None:
+        ctrl = _claiming_controller(spares=0, exhausted=True)
+
+        async with ctrl._claim_filtered_spare():
+            assert ctrl._filtered_spares_claimed == 0
+
+    asyncio.run(run())
+
+
+def test_claiming_does_nothing_without_dynamic_sampling() -> None:
+    async def run() -> None:
+        ctrl = _claiming_controller(spares=0)
+        ctrl._dynamic_sampling_enabled = False
+
+        async with ctrl._claim_filtered_spare():
+            assert ctrl._filtered_spares_claimed == 0
+
+    asyncio.run(run())
+
+
 def test_actor_path_releases_generation_permit_before_finalization() -> None:
     class _SplitRolloutManager:
         def __init__(self) -> None:
@@ -1634,10 +1873,13 @@ def test_actor_path_releases_generation_permit_before_finalization() -> None:
             del request, rollout_metrics, target_step
             finalizers_started += 1
             await release_finalizers.wait()
-            return SimpleNamespace(
+            return FinalizedGroup(
+                meta=None,
+                group_min_wv=0,
+                group_max_wv=0,
+                staging_keys=[],
                 valid_row_count=1,
                 total_row_count=1,
-                reward_observations=[],
             )
 
         controller_cls = SingleControllerActor.__ray_metadata__.modified_class
@@ -1807,10 +2049,13 @@ def test_actor_finalization_discards_recovery_ledger_ownership(
                 manager.recovery_ledger.discard_group(cut, request.group_id)
             if not committed:
                 return None
-            return SimpleNamespace(
+            return FinalizedGroup(
+                meta=None,
+                group_min_wv=0,
+                group_max_wv=0,
+                staging_keys=[],
                 valid_row_count=1,
                 total_row_count=1,
-                reward_observations=[],
             )
 
         ctrl._finalize_with_actor = _finalize

@@ -1,0 +1,31 @@
+# DAPO-style sibling of the SingleController token-capture Gym nightly: dynamic
+# sampling drops a group whose rollouts all score the same before it is
+# finalized and replaces it from the filtering pool, and the reward is shaped
+# and scaled as in the DAPO recipes. This is the nightly that exercises that
+# rejection with real captured rows, including the cleanup of the staged rows and
+# the spare's ledger reservation.
+# Launch with:
+#   uv run examples/run_grpo_single_controller.py \
+#     --config examples/configs/recipes/llm/dapo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture.yaml
+defaults: ./grpo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture.yaml
+
+grpo:
+  use_dynamic_sampling: true
+  # Map the 0/1 task reward to [-1, 1] before the overlong penalty is subtracted.
+  reward_scaling:
+    enabled: true
+    target_min: -1.0
+  # Soft penalty on the last 512 tokens before the generation limit.
+  reward_shaping:
+    enabled: true
+    overlong_buffer_length: 512
+    overlong_buffer_penalty: 1
+    max_response_length: ${policy.generation.max_new_tokens}
+
+checkpointing:
+  checkpoint_dir: results/dapo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture
+
+logger:
+  log_dir: logs/dapo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture
+  wandb:
+    name: dapo-nanov3-30BA3B-2n8g-megatron_generation-noncolocated-async-gym-single-controller-token_capture

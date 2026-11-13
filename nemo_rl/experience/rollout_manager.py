@@ -52,9 +52,9 @@ from nemo_rl.experience.dynamic_sampling import (
     StepRewardStats,
     drain_step_reward_metrics,
     mask_sample_flagged,
-    participating_rewards,
     record_group_rewards,
     rewards_carry_no_signal,
+    voting_rewards_from_record,
 )
 from nemo_rl.experience.failures import (
     FailureClass,
@@ -1534,6 +1534,8 @@ class AsyncNemoGymRolloutImpl:
                         else None,
                     )
                 else:
+                    # Effort shaping and the penalties rewrite this reward in place.
+                    result["reward_original"] = float(result["full_result"]["reward"])
                     shaping_by_rowidx[rowidx] = _apply_effort_shaping(
                         [result], [inputs_by_rowidx[rowidx]], self._effort_config
                     )
@@ -1926,6 +1928,7 @@ class AsyncNemoGymRolloutImpl:
                     env_extras=env_extras,
                     truncated=truncated,
                     reward=float(result["full_result"]["reward"]),
+                    reward_original=result.get("reward_original"),
                 )
             )
         return completions, penalty_counts
@@ -2500,9 +2503,9 @@ class RolloutManager:
             dispatch_recorder=dispatch_recorder,
         )
 
-    def _participating_rewards(self, record: PromptGroupRecord) -> list[float]:
+    def _voting_rewards(self, record: PromptGroupRecord) -> list[float]:
         """This group's voting rewards under the run's masking policy."""
-        return participating_rewards(
+        return voting_rewards_from_record(
             record,
             masked_reward_policy=self._masked_reward_policy,
             overlong_filtering=self._overlong_filtering,
@@ -2510,7 +2513,7 @@ class RolloutManager:
 
     def _is_zero_variance_group(self, record: PromptGroupRecord) -> bool:
         """Whether this group's voters leave every row zero advantage."""
-        return rewards_carry_no_signal(self._participating_rewards(record))
+        return rewards_carry_no_signal(self._voting_rewards(record))
 
     def record_group_rewards(
         self,
@@ -2676,7 +2679,7 @@ class RolloutManager:
                     self._consecutive_infra_drops = 0
                     self._stats.zero_variance_groups += 1
                     rewards = [c.reward for c in record.completions]
-                    voting = self._participating_rewards(record)
+                    voting = self._voting_rewards(record)
                     self.record_group_rewards(
                         target_step,
                         rewards,
