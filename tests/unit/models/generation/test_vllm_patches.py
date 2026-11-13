@@ -17,11 +17,6 @@
 The two port patches ship their own suites. This module covers the other
 source-sensitive compatibility patches:
 
-* ``_patch_vllm_tool_parser_namespace_tool`` is the most load-bearing patch in
-  the repo -- it is the only thing that makes vLLM 0.25.1 importable against
-  the pinned ``openai==2.6.1``. If upstream reorders that import block the
-  patch logs a warning and returns, and every engine then dies on
-  ``import vllm.tool_parsers``. So the anchor needs pinning.
 * ``_patch_vllm_glm_decoder_sequence_parallel_moe`` restores the vLLM 0.24
   decoder boundary for GLM-5.1/5.2 while leaving MoE-local SP enabled.
 * the ``VLLM_RAY_EXTRA_ENV_VARS_TO_COPY`` merge replaced the old
@@ -43,6 +38,7 @@ import inspect
 import json
 import logging
 import os
+import shutil
 import sys
 import types
 from pathlib import Path
@@ -57,9 +53,6 @@ from tests.unit.models.generation.vllm_patch_source_utils import (
     write_unpatched_copy,
 )
 
-_TOOL_PARSER_SOURCE = "tool_parsers/utils.py"
-_PATCH_FN = "_patch_vllm_tool_parser_namespace_tool"
-_MARKER = "except ImportError:  # openai < 2.25.0 predates namespace tools"
 _RADIO_SOURCE = "model_executor/models/radio.py"
 _RADIO_PATCH_FN = "_patch_vllm_radio_layerscale_loader"
 _RADIO_MARKER = "and not ls_param.is_meta"
@@ -187,7 +180,10 @@ def test_modelopt_moe_amax_aliases_satisfy_installed_vllm_loader(
             super().__init__()
             self.layer_name = "model.layers.1.mixer.experts"
             self.moe_config = SimpleNamespace(
-                hidden_dim_unpadded=1, num_experts=2, num_logical_experts=2
+                hidden_dim_unpadded=1,
+                num_experts=2,
+                num_logical_experts=2,
+                is_act_and_mul=False,
             )
             self.expert_map_manager = SimpleNamespace(num_fused_shared_experts=0)
             self.ckpt_gate_proj_name = "up_proj"
@@ -234,15 +230,6 @@ def test_modelopt_moe_amax_aliases_satisfy_installed_vllm_loader(
 
 
 @pytest.fixture
-def patched_tool_parser_source(tmp_path, monkeypatch):
-    """The installed tool_parsers/utils.py, unpatched then patched in tmp."""
-    copied = write_unpatched_copy(_TOOL_PARSER_SOURCE, _PATCH_FN, tmp_path / "utils.py")
-    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
-    patches._patch_vllm_tool_parser_namespace_tool(logging.getLogger(__name__))
-    return copied
-
-
-@pytest.fixture
 def patched_radio_source(tmp_path, monkeypatch):
     """The installed vLLM RADIO loader, unpatched then patched in tmp."""
     copied = write_unpatched_copy(_RADIO_SOURCE, _RADIO_PATCH_FN, tmp_path / "radio.py")
@@ -273,53 +260,6 @@ def patched_moe_source(tmp_path, monkeypatch):
         logging.getLogger(__name__), required=True
     )
     return copied
-
-
-@pytest.mark.vllm
-def test_namespace_tool_patch_anchor_still_matches_installed_vllm(
-    patched_tool_parser_source,
-):
-    """A source edit becomes a silent no-op if upstream reorders the import."""
-    content = patched_tool_parser_source.read_text()
-    assert _MARKER in content, (
-        "the NamespaceTool compat patch did not apply to the installed vLLM; "
-        "its anchor import block has probably changed upstream. Every vLLM "
-        "engine will fail to import tool_parsers against the pinned openai."
-    )
-    ast.parse(content)  # the edit must leave valid Python
-
-
-@pytest.mark.vllm
-def test_namespace_tool_patch_is_idempotent(patched_tool_parser_source, monkeypatch):
-    """Every worker on a node runs the patch against the same file."""
-    before = patched_tool_parser_source.read_text()
-    monkeypatch.setattr(
-        patches, "_get_vllm_file", lambda _relative: str(patched_tool_parser_source)
-    )
-    patches._patch_vllm_tool_parser_namespace_tool(logging.getLogger(__name__))
-    assert patched_tool_parser_source.read_text() == before
-
-
-@pytest.mark.vllm
-def test_namespace_tool_stub_never_matches(patched_tool_parser_source):
-    """The stub must be a plain class, so isinstance() is always False.
-
-    All upstream uses are ``isinstance(tool, NamespaceTool)`` guarding a
-    namespace-tools branch, so degrading to "no namespace tools" is correct for
-    a client that cannot construct them -- but only if nothing can be an
-    instance of the stub.
-    """
-    namespace: dict = {}
-    tree = ast.parse(patched_tool_parser_source.read_text())
-    stub = next(
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ClassDef) and node.name == "NamespaceTool"
-    )
-    exec(compile(ast.Module(body=[stub], type_ignores=[]), "<stub>", "exec"), namespace)
-    stub_cls = namespace["NamespaceTool"]
-    for value in ({}, "tool", 0, None, object()):
-        assert not isinstance(value, stub_cls)
 
 
 @pytest.mark.vllm
@@ -587,13 +527,65 @@ def test_capture_router_fallback_patch_anchor_still_matches_installed_vllm(
     monolithic_branch = content.split(_CAPTURER_MARKER, 1)[1]
     monolithic_branch = monolithic_branch.split("not supported with monolithic", 1)[0]
     # In-kernel capture still wins when the kernel supports it ...
-    assert "fused_experts.set_capture_fn(capture_fn)" in monolithic_branch
+    assert "routing_sink = RoutedExpertsSink(" in monolithic_branch
     # ... and a kernel without it now falls back to the router instead of raising.
     assert "module.router.set_capture_fn(capture_fn)" in monolithic_branch
-    assert monolithic_branch.index(
-        "fused_experts.set_capture_fn"
-    ) < monolithic_branch.index("module.router.set_capture_fn")
+    assert monolithic_branch.index("RoutedExpertsSink(") < monolithic_branch.index(
+        "module.router.set_capture_fn"
+    )
     ast.parse(content)
+
+
+@pytest.mark.vllm
+def test_every_vllm_source_patch_applies_to_installed_vllm(
+    monkeypatch, tmp_path, caplog
+):
+    """Run the worker's patch entry point on copies of the installed vLLM files.
+
+    Most source patches only log a warning when their anchor is gone, so a vLLM
+    bump can drop one without failing anything until a GPU job hits it. This
+    turns every such warning into a test failure, with the optional
+    routed-experts capture patches required, so a new vLLM pin is checked
+    against every patch at once.
+    """
+    installed = patches._get_vllm_file
+    copies: dict[str, str] = {}
+
+    def copy_of_installed(relative_path: str) -> str:
+        # Patch a copy, so the test never edits site-packages.
+        if relative_path not in copies:
+            copy = tmp_path / "vllm" / relative_path
+            copy.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(installed(relative_path), copy)
+            copies[relative_path] = str(copy)
+        return copies[relative_path]
+
+    monkeypatch.setattr(patches, "_get_vllm_file", copy_of_installed)
+    # _apply_vllm_patches extends this env var; setenv restores it afterwards.
+    monkeypatch.setenv(
+        "VLLM_RAY_EXTRA_ENV_VARS_TO_COPY",
+        os.environ.get("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", ""),
+    )
+    patch_logger = logging.getLogger("vllm_patch")
+    patch_logger.addHandler(caplog.handler)
+    try:
+        with caplog.at_level(logging.WARNING, logger="vllm_patch"):
+            patches._apply_vllm_patches(require_moe_routed_experts_capture=True)
+    finally:
+        patch_logger.removeHandler(caplog.handler)
+
+    misses = sorted(
+        {
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "vllm_patch" and record.levelno >= logging.WARNING
+        }
+    )
+    assert not misses, "vLLM source patches did not apply:\n" + "\n".join(misses)
+    assert copies, "no vLLM file was patched"
+    for path in copies.values():
+        with open(path) as f:
+            ast.parse(f.read(), filename=path)
 
 
 @pytest.mark.vllm
@@ -636,7 +628,10 @@ def test_capture_router_fallback_patch_binds_router_for_unsupported_kernel(
         "def bind(module, quant_method, fused_experts, capture_fn, "
         "FusedMoEExpertsMonolithic, BaseRouter):\n"
         "    num_bound = 0\n"
-        "    if True:\n" + old_snippet + "        return num_bound\n"
+        "    if True:\n"
+        "        if quant_method.is_monolithic:\n"
+        + old_snippet
+        + "        return num_bound\n"
     )
     monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(source))
     assert patches._patch_vllm_routed_experts_capture_router_fallback(
@@ -646,15 +641,20 @@ def test_capture_router_fallback_patch_binds_router_for_unsupported_kernel(
     exec(compile(source.read_text(), str(source), "exec"), namespace)
 
     class Monolithic:
+        moe_config = object()
+
         def __init__(self, supports):
             self.supports = supports
-            self.bound = None
 
         def supports_routing_replay_capture(self):
             return self.supports
 
-        def set_capture_fn(self, fn):
-            self.bound = fn
+    class Sink:
+        def __init__(self, moe_config, fn):
+            self.moe_config = moe_config
+            self.capture_fn = fn
+
+    namespace["RoutedExpertsSink"] = Sink
 
     class Router:
         def __init__(self):
@@ -666,50 +666,52 @@ def test_capture_router_fallback_patch_binds_router_for_unsupported_kernel(
     capture_fn = object()
     quant_method = SimpleNamespace(is_monolithic=True)
 
+    def new_module(router):
+        return SimpleNamespace(
+            router=router, routed_experts=SimpleNamespace(routing_sink=None)
+        )
+
     kernel, router = Monolithic(True), Router()
-    module = SimpleNamespace(router=router)
+    module = new_module(router)
     assert (
         namespace["bind"](module, quant_method, kernel, capture_fn, Monolithic, Router)
         == 1
     )
-    assert kernel.bound is capture_fn and router.bound is None
+    sink = module.routed_experts.routing_sink
+    assert sink.capture_fn is capture_fn and sink.moe_config is kernel.moe_config
+    assert router.bound is None
 
     kernel, router = Monolithic(False), Router()
-    module = SimpleNamespace(router=router)
+    module = new_module(router)
     assert (
         namespace["bind"](module, quant_method, kernel, capture_fn, Monolithic, Router)
         == 1
     )
-    assert kernel.bound is None and router.bound is capture_fn
+    assert module.routed_experts.routing_sink is None and router.bound is capture_fn
 
     kernel = Monolithic(False)
-    module = SimpleNamespace(router=object())
+    module = new_module(object())
     with pytest.raises(ValueError, match="not supported with monolithic"):
         namespace["bind"](module, quant_method, kernel, capture_fn, Monolithic, Router)
 
 
 def _install_fake_vllm_modules(monkeypatch):
     vllm_module = types.ModuleType("vllm")
-    envs_module = types.ModuleType("vllm.envs")
-    envs_module.VLLM_USE_RAY_V2_EXECUTOR_BACKEND = True
     logger_module = types.ModuleType("vllm.logger")
     logger_module.init_logger = lambda name: logging.getLogger(name)
-    vllm_module.envs = envs_module
     vllm_module.logger = logger_module
     monkeypatch.setitem(sys.modules, "vllm", vllm_module)
-    monkeypatch.setitem(sys.modules, "vllm.envs", envs_module)
     monkeypatch.setitem(sys.modules, "vllm.logger", logger_module)
 
 
 def _stub_vllm_patches(monkeypatch, captured_extra_env_vars):
     monkeypatch.setattr(
         patches,
-        "_patch_vllm_init_workers_ray",
-        lambda _py, extra: captured_extra_env_vars.append(extra) or False,
+        "_forward_env_vars_to_ray_workers",
+        lambda extra: captured_extra_env_vars.append(extra),
     )
     for patch_name in (
         "_patch_vllm_llama_eagle3_own_lm_head",
-        "_patch_vllm_tool_parser_namespace_tool",
         "_patch_vllm_ray_executor_v2_tcpstore_port",
         "_patch_vllm_shm_broadcast_bind_retry",
         "_patch_vllm_radio_layerscale_loader",
@@ -752,7 +754,6 @@ def test_apply_vllm_patches_threads_routed_experts_capture_requirement(
     )
 
     patches._apply_vllm_patches(
-        "py",
         extra_env_vars=["USER_VAR"],
         require_moe_routed_experts_capture=require_capture,
     )
@@ -774,16 +775,10 @@ def test_vllm_worker_threads_routed_experts_capture_into_source_patches(
     monkeypatch.setattr(
         vllm_worker,
         "_apply_vllm_patches",
-        lambda py,
-        *,
-        extra_env_vars,
-        nemotron_h_fp32_lm_head,
-        require_moe_routed_experts_capture: (
+        lambda *, extra_env_vars, require_moe_routed_experts_capture: (
             patch_calls.append(
                 {
-                    "py": py,
                     "extra_env_vars": extra_env_vars,
-                    "nemotron_h_fp32_lm_head": nemotron_h_fp32_lm_head,
                     "require_moe_routed_experts_capture": require_moe_routed_experts_capture,
                 }
             )
@@ -808,7 +803,6 @@ def test_vllm_worker_threads_routed_experts_capture_into_source_patches(
 
     assert patch_calls == [
         {
-            "py": sys.executable,
             "extra_env_vars": ["EXPLICIT_VAR"],
             "require_moe_routed_experts_capture": require_capture,
         }
@@ -830,54 +824,20 @@ def test_vllm_worker_threads_routed_experts_capture_into_source_patches(
         ),
     ],
 )
-def test_ray_extra_env_vars_merge_is_additive(
-    monkeypatch, tmp_path, existing, extra, expected
-):
+def test_ray_extra_env_vars_merge_is_additive(monkeypatch, existing, extra, expected):
     """vLLM 0.25 replaced the ADDITIONAL_ENV_VARS source patch with this hook.
 
     It must add to whatever the caller already set rather than overwrite it --
     otherwise user ``extra_env_vars`` silently stop reaching the Ray workers.
     """
-    ray_executor = tmp_path / "ray_executor.py"
-    ray_executor.write_text("self._init_workers_ray(placement_group)\n")
-    monkeypatch.setattr(patches, "_get_vllm_file", lambda _r: str(ray_executor))
-
     if existing is None:
         monkeypatch.delenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", raising=False)
     else:
         monkeypatch.setenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", existing)
 
-    patches._patch_vllm_init_workers_ray("py", extra)
+    patches._forward_env_vars_to_ray_workers(extra)
 
     assert os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] == expected
-
-
-def test_init_workers_ray_reports_a_missing_anchor(monkeypatch, tmp_path):
-    """A reshaped call site must not be reported as a successful patch."""
-    ray_executor = tmp_path / "ray_executor.py"
-    ray_executor.write_text("self._init_workers_ray_renamed(placement_group)\n")
-    monkeypatch.setattr(patches, "_get_vllm_file", lambda _r: str(ray_executor))
-    monkeypatch.delenv("VLLM_RAY_EXTRA_ENV_VARS_TO_COPY", raising=False)
-
-    assert patches._patch_vllm_init_workers_ray("py", None) is False
-    # The env merge still has to happen; it is independent of the file patch.
-    assert os.environ["VLLM_RAY_EXTRA_ENV_VARS_TO_COPY"] == (
-        "RAY_ENABLE_UV_RUN_RUNTIME_ENV"
-    )
-
-
-def test_init_workers_ray_reports_success_and_is_idempotent(monkeypatch, tmp_path):
-    """Patching twice against the same file still reports success."""
-    ray_executor = tmp_path / "ray_executor.py"
-    ray_executor.write_text("self._init_workers_ray(placement_group)\n")
-    monkeypatch.setattr(patches, "_get_vllm_file", lambda _r: str(ray_executor))
-
-    assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
-    once = ray_executor.read_text()
-    assert 'runtime_env={"py_executable": "py-exec"}' in once
-
-    assert patches._patch_vllm_init_workers_ray("py-exec", None) is True
-    assert ray_executor.read_text() == once
 
 
 # install_output_loop_yield

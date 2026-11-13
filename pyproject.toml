@@ -26,11 +26,11 @@ dependencies = [
   "pip",        # Required for frozen environments; uv venv --seed may not reliably install pip
   "ninja",      # for flash-attn parallel build
   # Deliberately a range, not an exact pin: each backend extra pins the torch its
-  # wheels were built against (vllm/mcore/automodel/trtllm: 2.13.0; sglang:
-  # 2.11.0) and resolves in its own uv conflict fork, so the base spec must admit
-  # both. The ceiling keeps the driver venv from drifting to a newer torch on a
-  # relock; it resolves to the highest allowed (2.13.0), matching vLLM.
-  "torch>=2.11,<2.14",
+  # wheels were built against (vllm: 2.14.0; mcore/automodel/trtllm: 2.13.0;
+  # sglang: 2.11.0) and resolves in its own uv conflict fork, so the base spec must
+  # admit all of them. The ceiling keeps the driver venv from drifting to a newer
+  # torch on a relock; it resolves to the highest allowed (2.14.0), matching vLLM.
+  "torch>=2.11,<2.15",
   "triton; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "colored==2.2.3",
   "ray[default]>=2.58.0",                                                                                # CVE mitigation
@@ -54,7 +54,7 @@ dependencies = [
   "plotly",
   "sympy>=1.14.0",
   "pillow>=12.3.0",                                                                                      # Address CVE (Pillow 12.3.0)
-  "torchvision>=0.26,<0.29",                                                                             # tracks the torch range above (0.26 <-> 2.11, 0.28 <-> 2.13)
+  "torchvision>=0.26,<0.30",                                                                             # tracks the torch range above (0.26 <-> 2.11, 0.29 <-> 2.14)
   # torchaudio and torchcodec are NOT installed in the container image.
   # Run tools/install_audio_deps.sh before using audio features or audio tests.
   # Backend environments pin independently: Megatron-Bridge requires >=5.15,
@@ -85,10 +85,8 @@ dependencies = [
   # rev is lens main past v0.3.0, which still declares 0.2.0 in its
   # package_info, so a 0.3.0 floor would not resolve. The aiohttp extra is what stamps a traceparent on
   # the HTTP calls NeMo-Gym's client makes, so a Gym rollout continues the
-  # run's trace rather than starting its own; the fastapi extra is what Gym
-  # copies into its server venvs so the server reads that traceparent rather
-  # than starting a new trace.
-  "nemo-lens[sdk,aiohttp,fastapi]>=0.2.0",
+  # run's trace rather than starting its own.
+  "nemo-lens[sdk,aiohttp]>=0.2.0",
   # Headers for transformer-engine's no-build-isolation install, and the runtime floor for
   # TE 2.18 fused-attention backward with 256-wide heads on SM 10.x (cuDNN >= 9.23.0 for
   # bshd/sbhd, >= 9.25.0 for thd; see TE fused_attn.cpp). Keep equal to the override below.
@@ -138,13 +136,13 @@ dependencies = [
 
 
 [project.optional-dependencies]
-# Megatron-Core requires cuDNN frontend 1.32; other backends retain 1.25.
-# Keep these pins per backend so the existing conflicting extras resolve separately.
 automodel = [
-  # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
+  # Colocated with vLLM engines (CUDA-IPC refit), so vLLM must be able to open the
+  # CUDA IPC handles this torch writes. torch 2.13 and 2.14 (vLLM) write the same
+  # handle version. Not moved to 2.14: its headers need C++20, which DeepEP,
+  # flash-attn, mamba-ssm and causal-conv1d (built from source here) do not use.
   "torch==2.13.0",
   "torchvision==0.28.0",
-  "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "nemo-automodel[moe]",
   # Automodel's FLA kernels require this TileLang version on Hopper.
   # Keep this scoped to the automodel fork; sglang intentionally pins TileLang 0.1.8.
@@ -163,33 +161,44 @@ automodel = [
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
 ]
 vllm = [
-  # ABI of the vLLM 0.29.0 cu130 wheels.
-  "torch==2.13.0",
-  "torchvision==0.28.0",
-  "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  "transformers==5.12.1",
+  # ABI of the vLLM 0.33.0 cu130 wheels.
+  "torch==2.14.0",
+  "torchvision==0.29.0",
+  "transformers==5.16.1",
   "tilelang==0.1.12; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "cuda-python",
-  "deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@67fc64863d43521080bf2005e6528d0fceee9510",
-  # deep_ep also needs libibverbs-dev
-  # sudo apt-get update
-  # sudo apt-get install libibverbs-dev
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
+  # No standalone deep_gemm: the vLLM wheel ships its own prebuilt DeepGEMM
+  # (vllm.third_party.deep_gemm) and only falls back to it when `import deep_gemm`
+  # fails, so a separately pinned build would shadow the one vLLM was tested with.
+  # No deep_ep either: the pinned DeepEP compiles as C++17, which torch 2.14's
+  # headers reject, and NeMo-RL's vLLM engines use vLLM's default
+  # allgather_reducescatter all2all backend, which does not need it.
   # PyPI publishes the default cu130 wheels for both supported architectures.
-  # https://github.com/vllm-project/vllm/releases/tag/v0.29.0
-  "vllm==0.29.0",
+  # https://github.com/vllm-project/vllm/releases/tag/v0.33.0
+  "vllm==0.33.0",
   "num2words>=0.5.14",
-  "flashinfer-python==0.6.18",
-  "flashinfer-cubin==0.6.18",
-  "flashinfer-jit-cache==0.6.18",
-  "nvidia-cutlass-dsl[cu13]==4.6.2",
+  "flashinfer-python==0.7.2.post1",
+  "flashinfer-cubin==0.7.2.post1",
+  "flashinfer-jit-cache==0.7.2.post1",
+  # flashinfer-jit-cache 0.7.2 is a meta package over one wheel per GPU arch. They only
+  # exist on the flashinfer cu130 index, and [tool.uv.sources] index pins only apply to
+  # direct requirements, so each one is named here.
+  # sm110a and sm121a ship aarch64 wheels only (see the matching override-dependencies).
+  "flashinfer-jit-cache-sm80==0.7.2.post1",
+  "flashinfer-jit-cache-sm89==0.7.2.post1",
+  "flashinfer-jit-cache-sm90a==0.7.2.post1",
+  "flashinfer-jit-cache-sm100a==0.7.2.post1",
+  "flashinfer-jit-cache-sm103a==0.7.2.post1",
+  "flashinfer-jit-cache-sm110a==0.7.2.post1; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm120f==0.7.2.post1",
+  "flashinfer-jit-cache-sm121a==0.7.2.post1; platform_machine == 'aarch64'",
+  "nvidia-cutlass-dsl[cu13]==4.8.0",
 ]
 sglang = [
   # sglang-miles (3003d70f) and sglang-kernel 0.4.5 are built against torch 2.11;
   # on 2.13 sgl_kernel fails with `undefined symbol: _ZNK2at10TensorBase14const_data_ptr…`.
   "torch==2.11.0",
   "torchvision==0.26.0",
-  "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # sgl-project/sglang branch `sglang-miles` (based on v0.5.16). Needed for the
   # begin_weight_update / end_weight_update refit session: quantized weights
   # carry derived scales (swizzled blockscales, g1/g2 alphas) that have to be
@@ -222,7 +231,10 @@ mcore = [
   # dependency megatron-core[dev,mlm] and its [tool.uv.sources] path mapping, so Megatron-LM
   # pyproject changes propagate on bump without any mirror here.
   "megatron-bridge[te,ssm]",
-  # Colocated with vLLM engines (CUDA-IPC refit); must share vLLM's torch ABI.
+  # Colocated with vLLM engines (CUDA-IPC refit), so vLLM must be able to open the
+  # CUDA IPC handles this torch writes. torch 2.13 and 2.14 (vLLM) write the same
+  # handle version. Not moved to 2.14: its headers need C++20, which DeepEP,
+  # flash-attn, mamba-ssm and causal-conv1d (built from source here) do not use.
   "torch==2.13.0",
   "torchvision==0.28.0",
   "transformers==5.20.1",
@@ -235,9 +247,6 @@ mcore = [
   # zero_train_gen_mismatch / batch_invariant_mode pins on both train and generation.
   # Pinned to b19: b20+ need apache-tvm-ffi>=0.1.12, but the shared override keeps 0.1.11.
   "flash-attn-4==4.0.0b19 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  # Core's tool.uv constraint is not inherited by downstream projects. Older
-  # Quack releases use CuTe APIs moved by the required CUTLASS 4.8 runtime.
-  "quack-kernels>=0.6.5 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # mamba-ssm/causal-conv1d LOOK redundant (megatron-bridge[ssm] pulls them), but do not
   # remove them: [tool.uv.sources] git pins only attach to direct requirements, and the
   # conflicting extras resolve in separate forks — without these direct deps the mcore fork
@@ -245,11 +254,11 @@ mcore = [
   "mamba-ssm",
   "causal-conv1d",
   "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
-  "flashinfer-python==0.7.2.post1",
-  "flashinfer-cubin==0.7.2.post1",
-  "flashinfer-jit-cache==0.7.2.post1",
+  "flashinfer-python==0.6.18.post1",
+  "flashinfer-cubin==0.6.18.post1",
+  "flashinfer-jit-cache==0.6.18.post1",
   "flash_mla ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
-  "nvidia-cutlass-dsl[cu13]==4.8.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
+  "nvidia-cutlass-dsl[cu13]==4.6.2 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "torch-memory-saver>=0.0.9.post1",
   "nvshmem4py-cu13>=0.2.1",
   "cupy-cuda13x",
@@ -268,7 +277,6 @@ trtllm = [
   # feat/rl_rc's requirements.txt needs torch>=2.13.0,<=2.14.0a0.
   "torch==2.13.0",
   "torchvision==0.28.0",
-  "nvidia-cudnn-frontend==1.25.0; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   "tensorrt-llm==1.3.0rc28",
   # tensorrt-llm pins nvidia-cutlass-dsl[cu13]==4.8.0.dev0; uv only admits pre-releases
   # that are requested explicitly, so name its pre-release sub-packages here too.
@@ -373,13 +381,27 @@ nv-grouped-gemm = { git = "https://github.com/fanshiqing/grouped_gemm", tag = "v
 # FlashMLA derives its version from the Git revision in setup.py. Keep this pin
 # synchronized with the static dependency metadata below.
 flash_mla = { git = "https://github.com/deepseek-ai/FlashMLA", rev = "b7643bd54521f563b839b98289b5cd048c062ba2" }
-# Shared export, checkpoint and pipeline-calibration support for pinned Bridge/Core.
-# Includes grouped checkpoint sharding fixes; the ModelOpt worker hides all
-# AnyQuantizer containers when toggling DDP hooks.
-nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "cc4b76d74625b42cca1967118628b25ed326a3d1" }
+# Pinned to 43fd41a58 (2026-08-15, release cherry-pick branch). It carries #2054 ("Fix vLLM
+# 0.24+ compatibility": the vLLM plugin registers on `RoutedExperts`; the older plugin
+# registered on `fused_moe.layer.FusedMoE`, which vLLM >= 0.28 removed, and NeMo-RL's explicit
+# re-import then failed with "RowParallelLinear already registered") but NOT 2ded5aba3
+# (#1550, 2026-08-07). Do not move to a revision that contains #1550 without porting
+# nemo_rl/modelopt: its per-expert `GroupedQuantizer` modules break the Megatron fakequant
+# DDP hook bookkeeping (`KeyError: GroupedQuantizer(...)` in `disable_forward_pre_hook`) and
+# real-quant dist-checkpoint sharding validation (`Invalid access pattern for
+# ShardedTensor(... experts.N.linear_fc1.weight_quantizer._amax`).
+nvidia-modelopt = { git = "https://github.com/NVIDIA/Model-Optimizer", rev = "43fd41a58d52c4e6e5dec1d1ff5989ecc737ae1a" }
 nvidia-resiliency-ext = { git = "https://github.com/NVIDIA/nvidia-resiliency-ext.git", tag = "v0.7.0" }
 flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm80 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm89 = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm90a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm100a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm103a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm110a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm120f = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm121a = { index = "flashinfer-cu130" }
 
 [tool.uv.workspace]
 members = [
@@ -403,6 +425,11 @@ url = "https://download.pytorch.org/whl/cu130"
 explicit = true
 
 [[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[[tool.uv.index]]
 name = "flashinfer"
 # Keep this spelling (trailing slash included) identical to Megatron-Bridge's
 # flashinfer [[tool.uv.index]] entry: uv treats differently spelled URLs for the
@@ -413,9 +440,7 @@ explicit = true
 [[tool.uv.index]]
 name = "flashinfer-cu130"
 url = "https://flashinfer.ai/whl/cu130"
-# FlashInfer 0.7 splits its JIT cache into transitive SM-specific packages.
-# This index serves only the CUDA 13.0 JIT-cache family.
-explicit = false
+explicit = true
 
 [tool.uv]
 managed = true
@@ -430,7 +455,6 @@ no-build-isolation-package = [
   "mamba-ssm",
   "causal-conv1d",
   "fast-hadamard-transform",
-  "deep_gemm",
   "deep_ep",
   "flash_mla",
   "nv-grouped-gemm",          # from mlm (added here to make sure it's built no isolation since mlm workspace uses setup.py)
@@ -453,19 +477,14 @@ link-mode = "copy"
 # vllm defaults to opencv for video IO but falls back to torchcodec.
 # The timm override is needed because sglang requires timm==1.0.16.
 override-dependencies = [
-  # The JIT-cache shim's CPU-specific wheels declare different providers.
-  # Unify their metadata for uv's universal lock; these two ship only on ARM.
-  { package = { name = "flashinfer-jit-cache", version = "0.7.2.post1+cu130" }, dependencies = [
-    "flashinfer-jit-cache-sm110a==0.7.2.post1+cu130; platform_machine == 'aarch64'",
-    "flashinfer-jit-cache-sm121a==0.7.2.post1+cu130; platform_machine == 'aarch64'",
-  ] },
-  # Preserve TRT-LLM's existing frontend override without constraining Megatron.
-  { package = { name = "tensorrt-llm" }, dependencies = [
-    "nvidia-cudnn-frontend==1.25.0",
-  ] },
+  # uv reads flashinfer-jit-cache's requirements from its aarch64 wheel, which also lists
+  # these two aarch64-only GPU-arch wheels; without the marker an x86_64 sync fails on them.
+  "flashinfer-jit-cache-sm110a==0.7.2.post1; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm121a==0.7.2.post1; platform_machine == 'aarch64'",
   "transformer-engine[pytorch,core_cu13]==2.18.0",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.26.0.51; sys_platform != 'darwin'",
+  "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
   # NCCL 2.30.4 fixes a context-parallel hang on GB200 when GPUs are non-contiguous;
   # 2.30.7 additionally fixes hangs in the NCCL m2n reshard (<link to NCCL release note / internal bug>).
   # Keep NCCL shared with the isolated Dynamo environment across torch upgrades.
@@ -533,7 +552,7 @@ override-dependencies = [
   # kinds behind `rl.host.memory.*` -- a rev rather than a tag because there is
   # no release carrying the last of those yet. Drop this once Megatron-LM bumps
   # to the same or newer rev.
-  "nemo-lens[sdk,aiohttp,fastapi] @ git+https://github.com/NVIDIA-NeMo/Lens.git@4d045c03186b90afdc815db46b671f6a21bc7e98",
+  "nemo-lens[sdk,aiohttp] @ git+https://github.com/NVIDIA-NeMo/Lens.git@4d045c03186b90afdc815db46b671f6a21bc7e98",
 ]
 
 # CVE fixes
@@ -609,7 +628,6 @@ conflicts = [
 flash-attn = [{ requirement = "torch", match-runtime = true }]
 # Git-sourced packages CAN use match-runtime = true if we provide dependency-metadata
 deep_ep = [{ requirement = "torch", match-runtime = true }]
-deep_gemm = [{ requirement = "torch", match-runtime = true }]
 transformer-engine-torch = [{ requirement = "torch", match-runtime = true }]
 mamba-ssm = [{ requirement = "torch", match-runtime = true }]
 causal-conv1d = [{ requirement = "torch", match-runtime = true }]
@@ -660,12 +678,6 @@ requires-dist = ["torch", "packaging", "ninja", "causal-conv1d"]
 name = "deep_ep"
 # This version has to match the version in the commit/rev/tag used
 version = "1.2.1+17cfb81"
-requires-dist = ["torch", "packaging", "ninja"]
-
-[[tool.uv.dependency-metadata]]
-name = "deep_gemm"
-# This version has to match the version in the commit/rev/tag used
-version = "2.5.0"
 requires-dist = ["torch", "packaging", "ninja"]
 
 [[tool.uv.dependency-metadata]]
@@ -726,8 +738,6 @@ markers = [
   "sglang: marks tests that require the sglang extra",
   "trtllm: marks tests that require the trtllm extra",
   "nemo_gym: marks tests that require the nemo_gym extra",
-  "nixl: marks tests that need NIXL and UCX restricted to RDMA",
-  "gpu: marks tests that need a CUDA device",
 ]
 
 [tool.pyrefly]
@@ -736,7 +746,6 @@ project-excludes = ["**/*venv/**/*"]
 
 [tool.coverage.run]
 concurrency = ["thread", "multiprocessing"]
-source_pkgs = ["nemo_rl"]
 omit = ["/tmp/*"]
 
 [tool.coverage.paths]

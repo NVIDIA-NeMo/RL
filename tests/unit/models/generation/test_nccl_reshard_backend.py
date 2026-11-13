@@ -824,7 +824,11 @@ def test_legacy_refit_map_is_built_after_comm_groups_exist(
     ext._validate_native_layerwise_refit = MagicMock()
     expected_map = HFToLocalParamMap()
     ext.build_hf_to_local_param_map = MagicMock(return_value=expected_map)
-    refit_info = {"layer_names": [], "per_layer_params": {}}
+    refit_info = {
+        "layer_names": [],
+        "per_layer_params": {},
+        "source_uses_real_reshard_op": False,
+    }
     monkeypatch.setattr(
         "nemo_rl.weight_sync.nccl_reshard_utils.restore_refit_info_placements",
         lambda value: value,

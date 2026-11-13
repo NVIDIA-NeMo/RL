@@ -7,7 +7,7 @@ defaults: ../../vlm_grpo_3B.yaml
 #
 # Requirements: see docs/guides/models/nemotron/nemotron-3.5-super-vl.md
 #   - Automodel r0.6.0 @ b916107a5 or later (the submodule pin on main).
-#   - Stock vLLM 0.29.0 (pyproject pin) plus NeMo RL's vLLM source patches:
+#   - Stock vLLM 0.33.0 (pyproject pin) plus NeMo RL's vLLM source patches:
 #     the RADIO final vision LayerNorm (_patch_vllm_radio_final_layernorm) and
 #     the transformers-native RADIO weight-name loader
 #     (_patch_vllm_radio_native_loader). Both apply automatically when the

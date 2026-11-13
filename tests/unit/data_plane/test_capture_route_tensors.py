@@ -112,19 +112,13 @@ def test_served_capture_bypasses_codec_through_route_consumers(
     dtype, prev_len, has_routes, has_sampler_topk, forbid_route_codec
 ):
     client = _StagingClient()
-    worker = SimpleNamespace(
-        _capture_calls={}, _capture_top_logprobs=2 if has_sampler_topk else 0
-    )
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._init_token_capture_state()
+    worker._capture_top_logprobs = 2 if has_sampler_topk else 0
     worker.token_capture = RolloutTokenCapture(
         sink=TQTokenSink(client, staging_partition="staging"),
         weight_version_fn=lambda: 7,
         adapter=VLLMCaptureAdapter(),
-    )
-    worker._capture_admission = (
-        VllmAsyncGenerationWorkerImpl._capture_admission.__get__(worker)
-    )
-    worker._delta_align_routed_experts = (
-        VllmAsyncGenerationWorkerImpl._delta_align_routed_experts
     )
     admission = {"capture_key": "r", "model_call_id": "c", "mode": "text"}
     prompt = [10, 11]
@@ -164,7 +158,7 @@ def test_served_capture_bypasses_codec_through_route_consumers(
             output,
             device=torch.device("cpu"),
             routed_experts_dtype=dtype,
-            encode_for_wire=id(request) not in worker._capture_calls,
+            encode_for_wire=request not in worker._capture_registry,
         )
     if has_sampler_topk:
         sampler_ids = torch.tensor([[22, 23]], dtype=torch.int32)

@@ -124,7 +124,9 @@ def patched_model(tmp_path, monkeypatch):
     end = next(
         i
         for i, node in enumerate(tower.body)
-        if isinstance(node, ast.AnnAssign) and node.target.attr == "sound_encoder"
+        if isinstance(node, ast.Assign)
+        and isinstance(node.targets[0], ast.Name)
+        and node.targets[0].id == "mlp1"
     )
     initialization = ast.Module(body=tower.body[start:end], type_ignores=[])
 
@@ -256,7 +258,7 @@ def test_final_norm_patch_rejects_unknown_source_atomically(tmp_path, monkeypatc
     target = tmp_path / "nano_nemotron_vl.py"
     target.write_text("class NemotronH_Nano_VL_V2: pass\n")
     monkeypatch.setattr(patches, "_get_vllm_file", lambda relative: str(target))
-    with pytest.raises(RuntimeError, match="requires the vLLM 0.29"):
+    with pytest.raises(RuntimeError, match="requires the vLLM 0.33"):
         patches._patch_vllm_radio_final_layernorm(logging.getLogger(__name__))
     assert target.read_text() == "class NemotronH_Nano_VL_V2: pass\n"
 

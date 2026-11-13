@@ -39,8 +39,7 @@ uv run --no-sync tests/json_dump_tb_logs.py "$LOG_DIR" --output_path "$JSON_METR
 
 # Real-quant rollout must go through the ModelOpt NVFP4 vLLM kernel path.
 grep -q "VllmQuantInternalWorkerExtension" "$RUN_LOG"
-grep -q "Detected ModelOpt NVFP4 checkpoint" "$RUN_LOG"
-grep -q "quantization=modelopt" "$RUN_LOG"  # vLLM logs the native ModelOpt quantization method.
+grep -q "quantization=modelopt" "$RUN_LOG"  # vLLM 0.33 logs the native ModelOpt method; it no longer prints "Detected ModelOpt NVFP4 checkpoint".
 grep -q "nvfp4_experts_weightonly.yaml" "$RUN_LOG"
 assert_not_grep "FakeQuantWorker" "$RUN_LOG" \
     "Real-quant run unexpectedly used FakeQuantWorker"

@@ -266,3 +266,25 @@ class TestPatchTransformersModuleDir:
                 assert sys.path.count(modules_dir) == 1
             finally:
                 sys.path[:] = before
+
+
+def test_torch_extension_dir_gets_a_folder_per_torch_version(monkeypatch):
+    from nemo_rl import use_per_torch_version_extension_dir
+
+    monkeypatch.setattr("importlib.metadata.version", lambda _name: "2.14.0")
+    env_vars = {"TORCH_EXTENSIONS_DIR": "/cache/ext"}
+
+    use_per_torch_version_extension_dir(env_vars)
+
+    assert env_vars["TORCH_EXTENSIONS_DIR"] == "/cache/ext/torch-2.14.0"
+
+
+def test_torch_extension_dir_replaces_the_folder_inherited_from_a_parent(monkeypatch):
+    from nemo_rl import use_per_torch_version_extension_dir
+
+    monkeypatch.setattr("importlib.metadata.version", lambda _name: "2.13.0")
+    env_vars = {"TORCH_EXTENSIONS_DIR": "/cache/ext/torch-2.14.0"}
+
+    use_per_torch_version_extension_dir(env_vars)
+
+    assert env_vars["TORCH_EXTENSIONS_DIR"] == "/cache/ext/torch-2.13.0"

@@ -301,9 +301,8 @@ For long runs on queues with short wall times, enable periodic checkpointing and
 A healthy W4A16 real-rollout run should include these lines or equivalent vLLM logs:
 
 ```text
-quantization=modelopt
-Detected ModelOpt NVFP4 checkpoint
-Using NvFp4LinearBackend.MARLIN for NVFP4 GEMM
+quantization=nemo_modelopt_w4a16_nvfp4
+Weight-only FP4 compression will be used leveraging the Marlin kernel
 MegatronQuantPolicyWorker[rank=0]: Packed ... groups of tensors
 ```
 
