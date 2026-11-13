@@ -1135,6 +1135,16 @@ class RayVirtualCluster:
         )
         return [pg for pg in self._node_placement_groups if pg.bundle_specs]
 
+    def get_node_ids(self) -> list[str]:
+        """The distinct Ray nodes this cluster's placement groups occupy, in order."""
+        return list(
+            dict.fromkeys(
+                node_id
+                for pg in self.get_placement_groups()
+                for node_id in placement_group_table(pg)["bundles_to_node_id"].values()
+            )
+        )
+
     def world_size(self) -> int:
         return self._world_size
 

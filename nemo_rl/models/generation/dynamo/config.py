@@ -34,21 +34,32 @@ class DynamoFrontendArgs(BaseModel, extra="forbid"):
     router_mode: Literal[
         "round-robin",
         "random",
-        "power-of-two",
         "kv",
         "least-loaded",
         "device-aware-weighted",
     ] = "kv"
     # Idle seconds a NeMo-Gym token-capture session stays on one engine, as native
-    # pins each Gym session to one server; None disables it. Needs Dynamo 1.7
-    # (ai-dynamo/dynamo#15333): 1.5.1 drops a chat call's session id. Dynamo keeps
-    # at most 65,536 sessions (HTTP 529 past that).
+    # pins each Gym session to one server; None disables it.
     session_affinity_ttl_secs: Annotated[int, Field(gt=0, le=31_536_000)] | None = 300
+    # Most sessions the affinity table holds; a new one past it gets HTTP 529.
+    # Every frontend holds the whole fleet's sessions, so size it for all of them.
+    # Entries are allocated as sessions start and reaped after the TTL, so the cap
+    # only bounds memory; Dynamo's own 65,536 is below NT4-scale concurrency.
+    session_affinity_max_entries: PositiveInt = 16_777_216
+    # Frontends, spread round-robin over the generation nodes, each with its own
+    # router. More than one adds --router-replica-sync, so every router sees the
+    # requests the others have in flight. NeMo-Gym keeps each session on one.
+    num_frontends: PositiveInt = 1
     # Processes that render NeMo-Gym's chat calls and build their replies (the
     # checkpoint's template, tokenizer, HF processor and vLLM's parsers); each
-    # uses one core. See docs/guides/dynamo-generation.md for sizing.
+    # uses one core. Every frontend runs its own. See
+    # docs/guides/dynamo-generation.md for sizing.
     render_workers: PositiveInt = 8
     extra_cli_args: list[str] = Field(default_factory=list)
+    # Extra environment for every frontend, for settings Dynamo reads only from
+    # the environment, e.g. DYN_TCP_LISTEN_BACKLOG. It may not set a variable
+    # the runtime manages.
+    extra_env: dict[str, str] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def _chat_is_nemo_rls(self) -> "DynamoFrontendArgs":

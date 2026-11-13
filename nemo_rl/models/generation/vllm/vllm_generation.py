@@ -15,6 +15,7 @@
 import asyncio
 import logging
 import os
+import random
 import secrets
 import time
 import warnings
@@ -214,11 +215,11 @@ class _TokenCaptureSetup:
 
 class VllmGeneration(GenerationInterface):
     # Dynamo serving (policy.generation.dynamo): __init__ starts etcd, NATS and
-    # the frontend; each engine registers itself once its AsyncLLM runs. Class
+    # the frontends; each engine registers itself once its AsyncLLM runs. Class
     # defaults, so shutdown() also works when __init__ failed before starting them.
     _dynamo_runtime: Optional["ManagedDynamoRuntime"] = None
-    dynamo_frontend_url: Optional[str] = None
-    dynamo_generation_cut_url: Optional[str] = None
+    dynamo_frontend_urls: tuple[str, ...] = ()
+    dynamo_generation_cut_urls: tuple[str, ...] = ()
 
     @classmethod
     def validate_settings(cls, master_config: "MasterConfig") -> None:
@@ -230,7 +231,7 @@ class VllmGeneration(GenerationInterface):
                 raise ValueError(
                     "async_rl.generation_router.enabled=true does not apply with "
                     "policy.generation.dynamo=true: NeMo-Gym calls the Dynamo "
-                    "frontend, which routes the whole fleet behind one URL. "
+                    "frontends, each of which routes to the whole fleet. "
                     "Disable the generation router."
                 )
             if master_config.async_rl.generation_fleet_health.enabled:
@@ -514,7 +515,7 @@ class VllmGeneration(GenerationInterface):
         self._rollout_weight_version: Optional[int] = None
 
         if dynamo_enabled(self.cfg):
-            self._start_dynamo_services()
+            self._start_dynamo_services(cluster)
 
         if defer_model_load:
             # Workers only reserved ports — collect URLs immediately and defer
@@ -796,8 +797,8 @@ class VllmGeneration(GenerationInterface):
         otherwise every data-parallel shard's own server, as
         ``dp_openai_server_base_urls``. Known before a deferred model load.
         """
-        if self.dynamo_frontend_url is not None:
-            return [self.dynamo_frontend_url]
+        if self.dynamo_frontend_urls:
+            return list(self.dynamo_frontend_urls)
         return self.dp_openai_server_base_urls
 
     @property
@@ -805,14 +806,17 @@ class VllmGeneration(GenerationInterface):
         """Where NeMo-Gym sends checkpoint generation cuts, one per ``client_base_urls`` entry.
 
         None when each base URL takes its own cuts, as every shard's server
-        does. The Dynamo frontend takes them on a port of its own.
+        does. Each Dynamo frontend takes them on a port of its own.
         """
-        if self.dynamo_generation_cut_url is not None:
-            return [self.dynamo_generation_cut_url]
+        if self.dynamo_generation_cut_urls:
+            return list(self.dynamo_generation_cut_urls)
         return None
 
-    def _start_dynamo_services(self) -> None:
-        """Start the etcd, NATS and frontend this fleet's engines register with."""
+    def _start_dynamo_services(self, cluster: RayVirtualCluster) -> None:
+        """Start the etcd, NATS and frontends this fleet's engines register with.
+
+        The frontends run on this fleet's own nodes.
+        """
         from nemo_rl.models.generation.dynamo.managed_runtime import (
             ManagedDynamoRuntime,
         )
@@ -828,10 +832,10 @@ class VllmGeneration(GenerationInterface):
             # its chat server on it.
             serves_chat=bool(self.cfg["vllm_cfg"].get("expose_http_server")),
         )
-        runtime.start()
+        runtime.start(frontend_node_ids=cluster.get_node_ids())
         self._dynamo_runtime = runtime
-        self.dynamo_frontend_url = runtime.frontend_url
-        self.dynamo_generation_cut_url = runtime.generation_cut_control_url
+        self.dynamo_frontend_urls = tuple(runtime.frontend_urls)
+        self.dynamo_generation_cut_urls = tuple(runtime.generation_cut_control_urls)
 
     def _publish_dynamo_chat_settings(
         self, chat_settings: RayQueue, loads: list[ray.ObjectRef]
@@ -1709,9 +1713,7 @@ class VllmGeneration(GenerationInterface):
         Media-backed prompts keep this class's own dispatch: the engine does not
         yet take them through the frontend.
         """
-        return self.dynamo_frontend_url is not None and not (
-            VLLM_PROMPT_KEYS & data.keys()
-        )
+        return bool(self.dynamo_frontend_urls) and not (VLLM_PROMPT_KEYS & data.keys())
 
     async def _generate_through_dynamo(
         self, data: BatchedDataDict[GenerationDatumSpec], greedy: bool
@@ -1741,7 +1743,7 @@ class VllmGeneration(GenerationInterface):
             greedy=greedy,
             stop_strings=stop_strings,
         )
-        url = f"{self.dynamo_frontend_url}/completions"
+        url = f"{random.choice(self.dynamo_frontend_urls)}/completions"
         try:
             engine_data = await post_rollout(
                 url, payload, dynamo_cfg(self.cfg).request_timeout_s

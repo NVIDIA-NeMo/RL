@@ -265,6 +265,7 @@ project-includes = [
   "nemo_rl/models/generation/dynamo/__init__.py",
   "nemo_rl/models/generation/dynamo/config.py",
   "nemo_rl/models/generation/dynamo/managed_runtime.py",
+  "nemo_rl/models/generation/dynamo/service_watchdog.py",
   "nemo_rl/models/generation/dynamo/engine_adapter.py",
   "nemo_rl/models/generation/dynamo/vllm/__init__.py",
   "nemo_rl/models/generation/dynamo/vllm/adapter.py",

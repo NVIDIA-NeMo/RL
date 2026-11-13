@@ -16,6 +16,7 @@
 
 import asyncio
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,6 +31,7 @@ from nemo_gym._checkpoint.generation_cut import (  # noqa: E402
 from nemo_rl.models.generation.dynamo import managed_runtime  # noqa: E402
 from nemo_rl.models.generation.dynamo.config import DynamoCfg  # noqa: E402
 from nemo_rl.models.generation.dynamo.managed_runtime import (  # noqa: E402
+    FrontendHost,
     ManagedDynamoRuntime,
 )
 from nemo_rl.models.generation.dynamo.vllm.generation_cut import (  # noqa: E402
@@ -149,7 +151,16 @@ def test_a_cut_reaches_every_engine_and_each_call_gets_its_engines_answer(
         ray_address="10.0.0.1:6379",
         serves_chat=True,
     )
-    driver._chat_dir = str(tmp_path)
+    # The driver publishes through this frontend's host, in-process here.
+    host = FrontendHost()
+    host._chat_dir = str(tmp_path)
+    monkeypatch.setattr(managed_runtime, "ray", SimpleNamespace(get=lambda refs: refs))
+    driver._frontend_hosts = [
+        SimpleNamespace(
+            publish_chat_capture=SimpleNamespace(remote=host.publish_chat_capture)
+        )
+    ]
+    driver._started = True
 
     async def run():
         fan_out = EngineCutFanOut(runtime, asyncio.get_running_loop())

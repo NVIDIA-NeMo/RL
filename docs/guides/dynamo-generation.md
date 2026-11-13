@@ -30,12 +30,13 @@ With `dynamo: true`:
 - `vllm_cfg.async_engine` is turned on, because Dynamo drives the engine's
   `AsyncLLM`. Settings Dynamo does not serve are rejected at startup; see
   [Not supported](#not-supported).
-- The driver starts etcd, NATS and `dynamo.frontend`. The frontend runs from the
-  vLLM workers' own venv, so it is the same ai-dynamo release.
+- The driver starts etcd and NATS. Each `dynamo.frontend` runs on a generation
+  node, from a small Ray actor, in the vLLM workers' own venv, so it is the same
+  ai-dynamo release.
 - Each engine turns on vLLM's KV-cache events for `router_mode: kv` and
-  registers with the frontend from inside its own worker process. Setup waits
-  until the frontend routes to every engine.
-- With NeMo-Gym (`vllm_cfg.expose_http_server: true`), the frontend starts its
+  registers with the frontends from inside its own worker process. Setup waits
+  until every frontend routes to every engine.
+- With NeMo-Gym (`vllm_cfg.expose_http_server: true`), each frontend starts its
   render workers at launch and builds them while the engines load, from the
   settings one engine sends before it loads. Gym's first calls then do not
   wait for them. Other runs start none.
@@ -57,9 +58,12 @@ shows them all:
 | `startup_timeout_s` | 600 | Bounds service start-up and engine registration |
 | `request_timeout_s` | null | Deadline for one NeMo RL rollout through the frontend. null waits as long as generation takes, as native does; on the SingleController, `async_rl.rollout_failure.native.generation_timeout_s` bounds both paths |
 | `frontend_args.router_mode` | `kv` | Frontend routing policy |
-| `frontend_args.session_affinity_ttl_secs` | 300 | Keeps a NeMo-Gym token-capture rollout on one engine while it is idle for up to this many seconds; null disables it. Takes effect from Dynamo 1.7: Dynamo 1.5.1 drops the session id of a chat call served by NeMo RL's chat engine. Dynamo keeps at most 65,536 sessions and answers a new one past that with HTTP 529 |
-| `frontend_args.render_workers` | 8 | Processes in the frontend that render NeMo-Gym's chat calls and build their replies; every Gym call in the fleet shares them. Each holds its own tokenizer and processor, about 1.7–2.3 GB. On one Grace core of a GB200, one serves about 640 single-turn calls/s, 45 for a 21K-token agentic history (22 with its prefix splice), or 200 with 1–4 images |
+| `frontend_args.session_affinity_ttl_secs` | 300 | Keeps a NeMo-Gym token-capture rollout on one engine while it is idle for up to this many seconds; null disables it |
+| `frontend_args.session_affinity_max_entries` | 16,777,216 | Most sessions the frontends hold at once, across all of them; a new one past it gets HTTP 529. Entries are allocated as sessions start, so a high cap costs nothing until it is used |
+| `frontend_args.num_frontends` | 1 | Frontends, each with its own router, spread round-robin over the generation nodes. More than one adds `--router-replica-sync`, so each router sees the requests the others have in flight; NeMo-Gym keeps each session on one frontend, and NeMo RL's own rollouts pick one at random |
+| `frontend_args.render_workers` | 8 | Processes in each frontend that render NeMo-Gym's chat calls and build their replies; every Gym call that frontend serves shares them. Each holds its own tokenizer and processor, about 1.7–2.3 GB. On one Grace core of a GB200, one serves about 640 single-turn calls/s, 45 for a 21K-token agentic history (22 with its prefix splice), or 200 with 1–4 images |
 | `frontend_args.extra_cli_args` | `[]` | Extra `dynamo.frontend` flags. `--dyn-chat-processor` and `--custom-jinja-template` are rejected: NeMo RL renders chat itself |
+| `frontend_args.extra_env` | `{}` | Extra frontend environment, for settings Dynamo reads only from the environment, such as `DYN_TCP_LISTEN_BACKLOG`. Variables the runtime manages are rejected |
 
 The etcd and nats-server binaries are found in `NEMO_RL_DYNAMO_BIN_DIR` when it
 is set (the image sets it to `/opt/dynamo/bin`), and on `PATH` otherwise.
@@ -134,12 +138,13 @@ running calls at each checkpoint, and re-sends each cut call after a restore.
 Two things differ from the native endpoint:
 
 - **Where the cut goes.** Gym sends the cut beside the URL its calls go to,
-  which is the frontend, but the calls run in the engines. The frontend process
+  which is a frontend, but the calls run in the engines. Each frontend process
   takes the cut on a port of its own, from the same range as etcd and NATS, and
   sends it to every engine over Dynamo's request plane; each engine cuts the
-  calls it holds, up to the frontend's deadline
+  calls it holds, up to that frontend's deadline
   (`token_capture.control_timeout_s` from the cut's arrival there). Setup tells
-  Gym the port (`generation_cut_control_url` in Gym's `vllm_model` config). The port is needed until a Dynamo frontend route
+  Gym each frontend's port (`generation_cut_control_url` in Gym's `vllm_model`
+  config, one per `base_url`). The port is needed until a Dynamo frontend route
   can take a POST
   ([ai-dynamo/dynamo#18486](https://github.com/ai-dynamo/dynamo/issues/18486)).
 - **What the router sees for a resumed call.** The engine replaces the prompt

@@ -401,6 +401,14 @@ def test_create_sorted_bundle_indices_for_unified_pg():
     assert 1 in cluster._sorted_bundle_indices
 
 
+def test_node_ids_name_each_node_of_the_cluster_once():
+    cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=False)
+    try:
+        assert cluster.get_node_ids() == [ray.get_runtime_context().get_node_id()]
+    finally:
+        cluster.shutdown()
+
+
 def test_not_create_sorted_bundle_indices_for_per_node_pg():
     """Test that sorted bundle indices are not created for a per-node placement group."""
     cluster = RayVirtualCluster(bundle_ct_per_node_list=[2], use_gpus=True)

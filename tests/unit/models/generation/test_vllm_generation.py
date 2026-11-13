@@ -3167,7 +3167,7 @@ def _dynamo_master_config(
     ("settings", "error"),
     [
         ({}, None),
-        ({"router": True}, "routes the whole fleet behind one URL"),
+        ({"router": True}, "each of which routes to the whole fleet"),
         ({"fleet_health": True}, "Disable fleet health"),
         # Gym's replies need the engine's tokenizer; NeMo RL's rollouts do not.
         ({"gym": True, "skip_tokenizer_init": True}, "skip_tokenizer_init"),
@@ -3276,7 +3276,7 @@ def test_vllm_dynamo_rollouts_go_through_the_frontend(monkeypatch):
         "_pad_token_id": 0,
         "vllm_cfg": {"max_model_len": 16},
     }
-    generation.dynamo_frontend_url = "http://frontend/v1"
+    generation.dynamo_frontend_urls = ("http://frontend/v1",)
     data = BatchedDataDict(
         {
             "input_ids": torch.tensor([[5, 6, 0]]),

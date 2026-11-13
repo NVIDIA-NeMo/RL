@@ -177,27 +177,41 @@ def reject_outdated_mcore_generation_keys(config: dict[str, Any]) -> None:
             )
 
 
+def _dynamo_frontend_args(config: dict[str, Any]) -> dict[str, Any]:
+    """``policy.generation.dynamo_cfg.frontend_args``, or ``{}`` when absent."""
+    node: Any = config
+    for key in ("policy", "generation", "dynamo_cfg", "frontend_args"):
+        if not isinstance(node, dict):
+            return {}
+        node = node.get(key)
+    return node if isinstance(node, dict) else {}
+
+
 def reject_outdated_dynamo_router_reset_states(config: dict[str, Any]) -> None:
     """Fail when the Dynamo frontend's removed router-reset-states key is present.
 
     Args:
         config: The config as the user wrote it, resolved to plain dicts.
     """
-    policy = config.get("policy")
-    if not isinstance(policy, dict):
-        return
-    generation = policy.get("generation")
-    if not isinstance(generation, dict):
-        return
-    dynamo_cfg = generation.get("dynamo_cfg")
-    if not isinstance(dynamo_cfg, dict):
-        return
-    frontend_args = dynamo_cfg.get("frontend_args")
-    if isinstance(frontend_args, dict) and "router_reset_states" in frontend_args:
+    if "router_reset_states" in _dynamo_frontend_args(config):
         raise ValueError(
             "policy.generation.dynamo_cfg.frontend_args.router_reset_states was "
             "removed: Dynamo 1.4 dropped the frontend's --router-reset-states flag. "
             "Delete the key."
+        )
+
+
+def reject_outdated_dynamo_router_mode(config: dict[str, Any]) -> None:
+    """Fail on the Dynamo router mode that Dynamo 1.7 removed.
+
+    Args:
+        config: The config as the user wrote it, resolved to plain dicts.
+    """
+    if _dynamo_frontend_args(config).get("router_mode") == "power-of-two":
+        raise ValueError(
+            "policy.generation.dynamo_cfg.frontend_args.router_mode='power-of-two' "
+            "was removed: Dynamo 1.7 dropped the power-of-two router. Use "
+            "'least-loaded', or 'kv' to route on cached prefixes."
         )
 
 
@@ -334,6 +348,7 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     reject_outdated_metric_name_format(config)
     reject_outdated_mcore_generation_keys(config)
     reject_outdated_dynamo_router_reset_states(config)
+    reject_outdated_dynamo_router_mode(config)
     reject_outdated_dynamo_backend(config)
     reject_outdated_context_compaction(config)
     reject_outdated_rollout_recovery_granularity(config)
