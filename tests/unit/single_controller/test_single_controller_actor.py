@@ -2387,6 +2387,8 @@ class _NoOpDataPlane:
 def _train_pump_controller(*, sampler) -> object:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    # Every pumped step ends in _log_data_plane_metrics, which reads this.
+    ctrl._dp_backend = "simple"
     ctrl._rollout_runtime = RolloutRuntimeState()
     ctrl._master_config = SimpleNamespace(
         token_capture=TokenCaptureConfig(),
