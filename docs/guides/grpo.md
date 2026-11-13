@@ -126,12 +126,7 @@ data:
 
 ##### Custom datasets defined outside NeMo RL
 
-If you want to plug in a dataset class that lives outside the `nemo_rl`
-package (so you don't have to edit the built-in registry), set
-`dataset_name` to a fully qualified dotted import path. The dispatcher
-will import the module and resolve the class. The class must accept the
-same kwargs as the built-in datasets (i.e. the full data config) and
-implement `set_task_spec` and `set_processor`.
+If you want to plug in a dataset class that lives outside the `nemo_rl` package (so you don't have to edit the built-in registry), set `dataset_name` to a fully qualified dotted import path. The dispatcher will import the module and resolve the class. The class must accept the same kwargs as the built-in datasets (i.e. the full data config) and implement `set_task_spec` and `set_processor`.
 
 ```yaml
 data:
@@ -139,8 +134,7 @@ data:
     dataset_name: my_pkg.my_module.MyDataset  # importable from PYTHONPATH
 ```
 
-The class must be importable — install it as a package or add its
-parent directory to `PYTHONPATH` before launching training.
+The class must be importable — install it as a package or add its parent directory to `PYTHONPATH` before launching training.
 
 We support using a single dataset for both train and validation by using `split_validation_size` to set the validation ratio.
 This works for any dataset class that calls `split_train_validation` in its `__init__` — which today includes most built-in datasets, among them [OpenAssistant](../../nemo_rl/data/datasets/response_datasets/oasst.py), [OpenMathInstruct-2](../../nemo_rl/data/datasets/response_datasets/openmathinstruct2.py), [OpenR1-Math-220k](../../nemo_rl/data/datasets/response_datasets/openr1_math.py), [ResponseDataset](../../nemo_rl/data/datasets/response_datasets/response_dataset.py), and [Tulu3SftMixtureDataset](../../nemo_rl/data/datasets/response_datasets/tulu3.py).
@@ -367,98 +361,29 @@ GRPO uses temperature, top-p (nucleus sampling), and top-k sampling during rollo
 
 ### Masked rewards in advantage statistics
 
-`grpo.masked_reward_policy` decides which rollout rows vote in the advantage
-statistics. It never changes the sample or token loss masks. It applies to
-synchronous GRPO (legacy and TransferQueue trainers), asynchronous GRPO and
-SingleController, and it covers GRPO's group baseline/std, GDPO's per-reward
-baseline/std and final batch normalization, Reinforce++'s optional group
-baseline and token-level batch normalization, the `env_baseline` behind the
-`baseline_reward/pct_*` diagnostics, and dynamic-sampling admission:
+`grpo.masked_reward_policy` decides which rollout rows vote in the advantage statistics. It never changes the sample or token loss masks. It applies to synchronous GRPO (legacy and TransferQueue trainers), asynchronous GRPO and SingleController, and it covers GRPO's group baseline/std, GDPO's per-reward baseline/std and final batch normalization, Reinforce++'s optional group baseline and token-level batch normalization, the `env_baseline` behind the `baseline_reward/pct_*` diagnostics, and dynamic-sampling admission:
 
-- `include` (default): every row with a nonzero dataset weight votes, including
-  rows the environment flagged with `mask_sample`, truncated rows under
-  `overlong_filtering`, and rows removed by sequence-logprob-error masking.
-  Their rewards still shape their siblings' baselines although they contribute
-  no loss. Rows whose dataset-level `loss_multiplier` is `0` never vote, on any
-  trainer (see below). For the legacy and TransferQueue loops the GRPO and GDPO
-  group statistics are unchanged from earlier releases, which let every row
-  vote: a dataset-level weight is shared by a whole prompt group, so excluding
-  it moves no trainable row's baseline. SingleController previously excluded
-  all of these rows (`valid_mask=final_sample_mask`) and now lets the masked,
-  truncated and sequence-error rows vote under `include`.
-- `exclude`: only rows with a nonzero loss weight vote, using the masks known at
-  each stage: the environment, pre-existing loss-weight and overlong masks
-  before the logprob pass (dynamic-sampling admission, baseline/std,
-  `env_baseline`), and the final sample mask, including sequence-logprob-error
-  masking, at the estimator.
+- `include` (default): every row with a nonzero dataset weight votes, including rows the environment flagged with `mask_sample`, truncated rows under `overlong_filtering`, and rows removed by sequence-logprob-error masking.
+  Their rewards still shape their siblings' baselines although they contribute no loss. Rows whose dataset-level `loss_multiplier` is `0` never vote, on any trainer (see below). For the legacy and TransferQueue loops the GRPO and GDPO group statistics are unchanged from earlier releases, which let every row vote: a dataset-level weight is shared by a whole prompt group, so excluding it moves no trainable row's baseline. SingleController previously excluded all of these rows (`valid_mask=final_sample_mask`) and now lets the masked, truncated and sequence-error rows vote under `include`.
+- `exclude`: only rows with a nonzero loss weight vote, using the masks known at each stage: the environment, pre-existing loss-weight and overlong masks before the logprob pass (dynamic-sampling admission, baseline/std, `env_baseline`), and the final sample mask, including sequence-logprob-error masking, at the estimator.
 
-Participation is binary. A fractional `loss_multiplier` such as `0.5` still
-weights the loss, but the row votes with full weight in the statistics; only a
-weight of exactly `0` removes it under `exclude`. For example, with rewards
-`[1, 1, 0]`, a masked last row and leave-one-out disabled, the valid rows'
-baseline is `2/3` under `include` and `1` under `exclude`; with rewards `[0, 1]`
-and loss weights `[0.5, 0.5]` the baseline is `0.5` for both rows under either
-policy.
+Participation is binary. A fractional `loss_multiplier` such as `0.5` still weights the loss, but the row votes with full weight in the statistics; only a weight of exactly `0` removes it under `exclude`. For example, with rewards `[1, 1, 0]`, a masked last row and leave-one-out disabled, the valid rows' baseline is `2/3` under `include` and `1` under `exclude`; with rewards `[0, 1]` and loss weights `[0.5, 0.5]` the baseline is `0.5` for both rows under either policy.
 
-Rows whose dataset-level `loss_multiplier` is `0` never vote, on any trainer
-and under either policy. The data processors assign that weight to prompts
-that do not fit the sequence limit before any rollout happens, so their
-rollouts are unusable rows, not masked rewards; counting them would, for
-example, let their response tokens enter Reinforce++'s batch normalization,
-which earlier releases never did. SingleController reads the weight from its
-data-plane `sample_mask`, which also carries the token-capture placeholders
-(no usable tokens) that it excludes under both policies; the legacy and
-TransferQueue trainers take it from `loss_multiplier` before their own filters
-rewrite that column, and carry no placeholder rows. An environment-masked row
-with a usable rollout is a masked reward; a placeholder or an over-length
-prompt is not.
+Rows whose dataset-level `loss_multiplier` is `0` never vote, on any trainer and under either policy. The data processors assign that weight to prompts that do not fit the sequence limit before any rollout happens, so their rollouts are unusable rows, not masked rewards; counting them would, for example, let their response tokens enter Reinforce++'s batch normalization, which earlier releases never did. SingleController reads the weight from its data-plane `sample_mask`, which also carries the token-capture placeholders (no usable tokens) that it excludes under both policies; the legacy and TransferQueue trainers take it from `loss_multiplier` before their own filters rewrite that column, and carry no placeholder rows. An environment-masked row with a usable rollout is a masked reward; a placeholder or an over-length prompt is not.
 
-The `train/baseline_reward/histogram` and `baseline_reward/pct_{0,1,mixed}`
-diagnostics of the legacy and TransferQueue trainers count the rows that vote
-under the configured policy, the same mask the estimator receives: every row
-with a nonzero dataset weight under `include`, the rows with a nonzero final
-loss weight under `exclude`. A
-non-voting row still receives a baseline entry (under the leave-one-out baseline
-it is the mean of its voting siblings' rewards, which is neither 0 nor 1), so
-counting it would report an all-correct group as mixed. When no row votes, the
-three percentages are reported as 0.
+The `train/baseline_reward/histogram` and `baseline_reward/pct_{0,1,mixed}` diagnostics of the legacy and TransferQueue trainers count the rows that vote under the configured policy, the same mask the estimator receives: every row with a nonzero dataset weight under `include`, the rows with a nonzero final loss weight under `exclude`. A non-voting row still receives a baseline entry (under the leave-one-out baseline it is the mean of its voting siblings' rewards, which is neither 0 nor 1), so counting it would report an all-correct group as mixed. When no row votes, the three percentages are reported as 0.
 
-Independently of the policy, the TransferQueue trainer now zeroes the loss
-weight of rows the environment flags with `mask_sample` after dynamic sampling
-and reports `num_mask_sample_filtered`, as the legacy loop does. Earlier
-releases ignored the flag in that trainer and trained those rows at full loss
-weight.
+Independently of the policy, the TransferQueue trainer now zeroes the loss weight of rows the environment flags with `mask_sample` after dynamic sampling and reports `num_mask_sample_filtered`, as the legacy loop does. Earlier releases ignored the flag in that trainer and trained those rows at full loss weight.
 
-The policy and reference logprob passes receive the statistics participation
-mask instead of the loss weights. Under top-k/top-p filtering the workers zero
-every policy logprob outside `token_mask * sample_mask`; the reference pass is
-computed without filtering (see
-[Top-p and top-k filtering](#top-p-and-top-k-filtering)), so its logprobs are
-always real. A loss-masked row that votes under `include` therefore keeps real
-policy logprobs, and Reinforce++'s KL-in-reward and batch normalization see
-its real KL term instead of a zeroed policy logprob against a real reference.
-Under `exclude` both masks select the same rows. Training always receives the
-loss weights.
+The policy and reference logprob passes receive the statistics participation mask instead of the loss weights. Under top-k/top-p filtering the workers zero every policy logprob outside `token_mask * sample_mask`; the reference pass is computed without filtering (see [Top-p and top-k filtering](#top-p-and-top-k-filtering)), so its logprobs are always real. A loss-masked row that votes under `include` therefore keeps real policy logprobs, and Reinforce++'s KL-in-reward and batch normalization see its real KL term instead of a zeroed policy logprob against a real reference.
+Under `exclude` both masks select the same rows. Training always receives the loss weights.
 
-Reinforce++ normalizes over the response tokens of participating rows, never
-over prompt or padding tokens; this also applies when `minus_baseline=false`.
-GDPO normalizes over participating rows with an unbiased standard deviation and
-returns zeros when at most one row participates; Reinforce++ returns zeros when
-no token participates. Groups with at most one participating reward keep a zero
-group-relative reward difference. SingleController skips advantage computation
-when a whole chunk has no trainable tokens, under either policy.
+Reinforce++ normalizes over the response tokens of participating rows, never over prompt or padding tokens; this also applies when `minus_baseline=false`.
+GDPO normalizes over participating rows with an unbiased standard deviation and returns zeros when at most one row participates; Reinforce++ returns zeros when no token participates. Groups with at most one participating reward keep a zero group-relative reward difference. SingleController skips advantage computation when a whole chunk has no trainable tokens, under either policy.
 
-The default is a policy decision made with the post-training team, not a
-finding that `exclude` is numerically wrong, and no controlled convergence
-comparison between the two settings has been established. To run one, use the
-paired
-[exclude experiment config](../../examples/configs/experiments/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-exclude.yaml)
-and [include experiment config](../../examples/configs/experiments/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-include.yaml),
-which differ only in `grpo.masked_reward_policy`, or override that key on your
-existing config. Keep the revisions and all other settings identical.
+The default is a policy decision made with the post-training team, not a finding that `exclude` is numerically wrong, and no controlled convergence comparison between the two settings has been established. To run one, use the paired [exclude experiment config](../../examples/configs/experiments/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-exclude.yaml) and [include experiment config](../../examples/configs/experiments/grpo-qwen2.5-1.5b-1n1g-dtensor2tp1-masked-reward-include.yaml), which differ only in `grpo.masked_reward_policy`, or override that key on your existing config. Keep the revisions and all other settings identical.
 
-This setting does not change PPO, OPD, DPO, SFT, or reward-model training. They
-do not use these group-relative reward estimators.
+This setting does not change PPO, OPD, DPO, SFT, or reward-model training. They do not use these group-relative reward estimators.
 
 ## Performance Optimizations
 
@@ -498,8 +423,7 @@ policy:
 - The `fused_linear_logprobs_chunk_size` parameter controls the trade-off between memory savings and compute throughput. The default value of 256 is a good starting point.
 
 ## Loss
-For the optional correction based on the sampler's captured top-k distribution,
-see [Score Centering](score-centering.md).
+For the optional correction based on the sampler's captured top-k distribution, see [Score Centering](score-centering.md).
 
 We use the [ClippedPGLossFn](../../nemo_rl/algorithms/loss/loss_functions.py) to calculate the loss for GRPO. Formally,
 
@@ -516,8 +440,7 @@ where:
 - $\beta$ is the KL penalty coefficient
 - $\pi_{\text{ref}}$ is the reference policy
 
-It also supports "Dual-Clipping" from [Ye et al. (2019)](https://arxiv.org/pdf/1912.09729), which
-imposes an additional upper bound on the probability ratio when advantages are negative.
+It also supports "Dual-Clipping" from [Ye et al. (2019)](https://arxiv.org/pdf/1912.09729), which imposes an additional upper bound on the probability ratio when advantages are negative.
 This prevents excessive policy updates. $rA \ll 0$ -> $cA$(clipped).
 The loss function is modified to the following when A_t < 0:
 
@@ -783,8 +706,7 @@ Under tensor parallelism (TP), enabling top-p or top-k adds communication overhe
 
 ### Leave-one-out baseline and reward normalization
 
-For a prompt with $N$ rollouts and rewards $r_1 \dots r_N$, `use_leave_one_out_baseline: true`
-gives rollout $i$ the baseline
+For a prompt with $N$ rollouts and rewards $r_1 \dots r_N$, `use_leave_one_out_baseline: true` gives rollout $i$ the baseline
 
 $$
 b_i = \frac{1}{N-1} \sum_{j \neq i} r_j
@@ -802,17 +724,13 @@ where:
 - $\epsilon = 10^{-6}$
 - both $b_i$ and $\sigma_i$ use the other $N-1$ rollouts, never $r_i$
 
-If those $N-1$ rewards are all equal, their true standard deviation is zero and there
-is no meaningful scale for normalization. NeMo RL skips the division for that rollout:
+If those $N-1$ rewards are all equal, their true standard deviation is zero and there is no meaningful scale for normalization. NeMo RL skips the division for that rollout:
 
 $$
 A_i = r_i - b_i \quad \text{when} \quad \min_{j \neq i} r_j = \max_{j \neq i} r_j
 $$
 
-So for $r = [0,\ 0.95,\ 0.95,\ 0.95,\ 0.95,\ 0.95,\ 0.95,\ 0.95]$, rollout 1 gets
-$A_1 = -0.95$. The `std` division is manually skipped to avoid dividing by FP32
-rounding errors from computing the difference between the square of the mean and
-the mean of the square.
+So for $r = [0,\ 0.95,\ 0.95,\ 0.95,\ 0.95,\ 0.95,\ 0.95,\ 0.95]$, rollout 1 gets $A_1 = -0.95$. The `std` division is manually skipped to avoid dividing by FP32 rounding errors from computing the difference between the square of the mean and the mean of the square.
 
 Two consequences:
 
@@ -820,20 +738,13 @@ Two consequences:
 - Only groups that have exactly the same reward (after LOO) will skip normalization.
 Small `std` that is not a consequence of rounding errors will not be skipped.
 
-Dynamic sampling uses a separate whole-group test, $\min_j r_j = \max_j r_j$ over all $N$,
-so a prompt group is kept or dropped together, independently of leave-one-out baseline
-semantics.
+Dynamic sampling uses a separate whole-group test, $\min_j r_j = \max_j r_j$ over all $N$, so a prompt group is kept or dropped together, independently of leave-one-out baseline semantics.
 
 ## Metrics
 This feature is controlled by the parameters `wandb_name` and `tb_name`. We track a few metrics during training for scientific experimentation and to validate correctness as the run progresses.
 
-`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described
-below. Set it to `minimal` to skip optional diagnostic kernels; the loss
-and objective bookkeeping remain unchanged. Both modes report
-`token_mult_prob_error` to monitor training–generation logprob mismatch.
-`loss_fn.enable_torch_compile` can
-be enabled separately to compile the tensor-only actor objective (it is opt-in
-because backend and distributed-layout support should be validated first).
+`loss_fn.metrics_level` defaults to `full`, preserving all diagnostics described below. Set it to `minimal` to skip optional diagnostic kernels; the loss and objective bookkeeping remain unchanged. Both modes report `token_mult_prob_error` to monitor training–generation logprob mismatch.
+`loss_fn.enable_torch_compile` can be enabled separately to compile the tensor-only actor objective (it is opt-in because backend and distributed-layout support should be validated first).
 
 ### Multiplicative Token Probability Error
 This feature is controlled by the parameter `token_mult_prob_error`. It measures the error introduced when token probabilities are scaled multiplicatively, which can affect model calibration and output consistency. This is equal to the 'Logprob consistency metric' defined in [Adding New Models](../adding-new-models.md#importance-of-log-probability-consistency-in-training-and-inference):
@@ -928,11 +839,7 @@ Note that this method only has an effect when training involves more than one re
 
 #### Per-reward weights
 
-The aggregation weights \\( w_n \\) in \\( A^{(i,j)} = \sum_{n=1}^{N} w_n A_n^{(i,j)} \\)
-are configurable via `reward_weights`, an optional list with one entry per reward
-component, ordered alphabetically by component name (matching the sorted `reward/<name>`
-keys). When omitted, all weights default to `1.0` (equal weighting). For example, to
-down-weight the second and third rewards:
+The aggregation weights \\( w_n \\) in \\( A^{(i,j)} = \sum_{n=1}^{N} w_n A_n^{(i,j)} \\) are configurable via `reward_weights`, an optional list with one entry per reward component, ordered alphabetically by component name (matching the sorted `reward/<name>` keys). When omitted, all weights default to `1.0` (equal weighting). For example, to down-weight the second and third rewards:
 ```
 grpo:
   adv_estimator:
@@ -980,8 +887,7 @@ GRPO supports LoRA on both the Automodel and Megatron backends. To enable LoRA o
 uv run examples/run_grpo.py policy.automodel_cfg.lora_cfg.enabled=true
 ```
 
-Automodel GRPO with synchronous vLLM uses native A/B adapter refit by default. Set
-`policy.generation.lora_refit_mode=merged` to switch to merged refit.
+Automodel GRPO with synchronous vLLM uses native A/B adapter refit by default. Set `policy.generation.lora_refit_mode=merged` to switch to merged refit.
 
 For the full reference — backend support, the Automodel vs Megatron schema comparison, config examples, parameter details, and example recipes — see the dedicated [LoRA guide](lora.md).
 

@@ -2411,15 +2411,13 @@ def test_vllm_http_logprobs_contract(nemo_gym_vllm_generation):
 
     NeMo-Gym's vllm_model sets logprobs=True, top_logprobs=0 and
     return_tokens_as_token_ids=True to extract per-token ids and logprobs for training.
-    vLLM computes `logprobs = top_logprobs if logprobs else None`, so sending 0 returns
-    logprobs, while an explicit null would return none and silently empty the captured
-    token ids. This exercises the real HTTP path where that translation lives (the offline
-    LLM API does not), so a vLLM bump that changes the contract fails here instead of
-    silently freezing training.
+    A reply without per-token logprobs silently empties the captured token ids. This
+    exercises the real HTTP path where that translation lives (the offline LLM API does
+    not), so a vLLM bump that changes the contract fails here instead of silently
+    freezing training.
 
-    NeMo RL's server requires top_logprobs with logprobs. vLLM alone would serve an
-    omitted field with its default 0, but Dynamo's frontend hands NeMo RL an omitted
-    field and an explicit null alike, so both serving paths refuse both.
+    NeMo RL's server requires top_logprobs with logprobs: both serving paths refuse an
+    omitted field and an explicit null, which vLLM alone would serve like 0.
 
     All three cases share the (expensive) vLLM fixture, so they run in a single test rather
     than as separate parametrized cases.

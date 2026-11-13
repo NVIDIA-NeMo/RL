@@ -95,9 +95,7 @@ GB200 YAML configs should inherit from their 8g counterparts and override:
 
 ## External vLLM pools
 
-A test that needs fixed models served beside training (for example judge models) can run them as
-external vLLM pools in a second Slurm hetgroup. Add `NUM_EXTERNAL_SERVICE_NODES` to the CONFIG
-section, and register the pools in a `.pools` file next to the script with the same base name:
+A test that needs fixed models served beside training (for example judge models) can run them as external vLLM pools in a second Slurm hetgroup. Add `NUM_EXTERNAL_SERVICE_NODES` to the CONFIG section, and register the pools in a `.pools` file next to the script with the same base name:
 
 ```sh
 # ===== BEGIN CONFIG =====
@@ -108,19 +106,11 @@ EXTERNAL_VLLM_SEGMENT_SIZE=2     # optional --segment for hetgroup 1
 # ===== END CONFIG =====
 ```
 
-`tools/launch` sources `tools/external_gym_vllm/pool_config.sh` and then the `.pools` file, and
-submits the job through `tools/external_gym_vllm/run_in_allocation.sh`. The `.pools` file calls
-`register_external_vllm_pool` once per pool (see `tools/external_gym_vllm/README.md`) and puts the
-Hydra overrides that carry each pool's URL placeholder in `EXTERNAL_VLLM_SCRIPT_ARGS`. The wrapper
-replaces the placeholders with the load balancers' addresses. Model paths must be under
-`EXTERNAL_VLLM_SHARED_ROOT` (default `/lustre`). Example:
-`llm/grpo-nemotron3.5-super-120BA12B-56n4g-megatron-rlvr-single-controller-gym-quick.pools`.
+`tools/launch` sources `tools/external_gym_vllm/pool_config.sh` and then the `.pools` file, and submits the job through `tools/external_gym_vllm/run_in_allocation.sh`. The `.pools` file calls `register_external_vllm_pool` once per pool (see `tools/external_gym_vllm/README.md`) and puts the Hydra overrides that carry each pool's URL placeholder in `EXTERNAL_VLLM_SCRIPT_ARGS`. The wrapper replaces the placeholders with the load balancers' addresses. Model paths must be under `EXTERNAL_VLLM_SHARED_ROOT` (default `/lustre`). Example: `llm/grpo-nemotron3.5-super-120BA12B-56n4g-megatron-rlvr-single-controller-gym-quick.pools`.
 
 ## Launching with code snapshots
 
-We provide a convenience script that will create a code snapshot and launch `NUM_RUNS` number of slurm jobs (`NUM_RUNS` is defined in the script itself). We create a code snapshot to
-ensure that even as the master repo changes its code, you can always run your experiment with
-the snapshot of the code at the time the experiment was initially launched.
+We provide a convenience script that will create a code snapshot and launch `NUM_RUNS` number of slurm jobs (`NUM_RUNS` is defined in the script itself). We create a code snapshot to ensure that even as the master repo changes its code, you can always run your experiment with the snapshot of the code at the time the experiment was initially launched.
 
 ```sh
 # Launch
@@ -147,9 +137,7 @@ ls -lh ../code_snapshots/sft-llama3.2-1b-1n8g-automodel.v3/recipes/llm/sft-llama
 # -rw-r--r-- 1 terryk dip  94K Apr 23 18:23 run.log
 ```
 
-As a convenience, there's also a `continue.sh` script under that will launch
-another run using the same arguments. This is helpful if your job was
-unexpectedly cancelled or you want to run it for a little longer.
+As a convenience, there's also a `continue.sh` script under that will launch another run using the same arguments. This is helpful if your job was unexpectedly cancelled or you want to run it for a little longer.
 
 ```sh
 # This launches one more run of the same experiment

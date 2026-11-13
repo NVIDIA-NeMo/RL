@@ -20,11 +20,9 @@ from dataclasses import asdict, dataclass, field, replace
 from typing import Any, get_args
 from unittest.mock import patch
 
-import ray
 import torch
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModel, DeepseekV3Config, PretrainedConfig
-from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.linear import LinearBase
@@ -146,46 +144,24 @@ def set_refit_manifest_names(names: set[str] | None) -> None:
 
 def monkey_patch_vllm_ray_executor(fp8_config):
     if fp8_config.model_parallel_size > 1:
-        if envs.VLLM_USE_RAY_V2_EXECUTOR_BACKEND:
-            from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
+        from vllm.v1.executor.ray_executor_v2 import RayWorkerProc
 
-            original_initialize_worker = RayWorkerProc.initialize_worker
+        original_initialize_worker = RayWorkerProc.initialize_worker
 
-            def patched_initialize_worker(self, *args, **kwargs):
-                # Resolve state in the worker's module because cloudpickle snapshots
-                # globals referenced by nested functions.
-                from nemo_rl.models.generation.vllm.quantization import fp8
+        def patched_initialize_worker(self, *args, **kwargs):
+            # Resolve state in the worker's module because cloudpickle snapshots
+            # globals referenced by nested functions.
+            from nemo_rl.models.generation.vllm.quantization import fp8
 
-                if not fp8.fp8_patches_applied:
-                    fp8.apply_fp8_patches(None, fp8_config)
+            if not fp8.fp8_patches_applied:
+                fp8.apply_fp8_patches(None, fp8_config)
 
-                return original_initialize_worker(self, *args, **kwargs)
+            return original_initialize_worker(self, *args, **kwargs)
 
-            # RayExecutorV2 creates ray.remote(RayWorkerProc) after this hook. Ray
-            # copies inherited methods onto its generated actor subclass and
-            # serializes it by value, so actors receive this driver-side replacement.
-            RayWorkerProc.initialize_worker = patched_initialize_worker
-            return
-
-        # we patch vllm's collective_rpc so that before vllm initalizes the model on each rank, we execute
-        # a ray remote that patches each worker with the required fp8 vllm patches
-        from vllm.v1.executor.ray_executor import RayDistributedExecutor
-
-        original_run_workers = RayDistributedExecutor.collective_rpc
-
-        def patched_run_workers(self, *args, **kwargs):
-            global fp8_patches_applied
-            if not fp8_patches_applied:
-                futures = [
-                    worker.execute_method.remote(apply_fp8_patches, fp8_config)
-                    for worker in self.workers
-                ]
-                [ray.get(future) for future in futures]
-                fp8_patches_applied = True
-
-            return original_run_workers(self, *args, **kwargs)
-
-        RayDistributedExecutor.collective_rpc = patched_run_workers
+        # RayExecutorV2 creates ray.remote(RayWorkerProc) after this hook. Ray
+        # copies inherited methods onto its generated actor subclass and
+        # serializes it by value, so actors receive this driver-side replacement.
+        RayWorkerProc.initialize_worker = patched_initialize_worker
     else:
         # for single gpu there is no ray, so just call the patches
         apply_fp8_patches(None, fp8_config)
@@ -222,10 +198,16 @@ def apply_fp8_patches(self, fp8_config):
             patcher2 = patch(func2_path, process_weights_after_loading_moe)
             fp8_state.vllm_patches.append(patcher2)
             if global_fp8_config.is_mx:
+                from vllm.model_executor.layers.quantization.modelopt import (
+                    ModelOptLinearMethod,
+                )
+
                 fp8_state.vllm_patches.append(
                     patch(
-                        "vllm.model_executor.layers.quantization.modelopt.ModelOptMxFp8LinearMethod.process_weights_after_loading",
-                        process_weights_after_loading_mxfp8_linear,
+                        "vllm.model_executor.layers.quantization.modelopt.ModelOptLinearMethod.process_weights_after_loading",
+                        route_mxfp8_linear_post_load(
+                            ModelOptLinearMethod.process_weights_after_loading
+                        ),
                     )
                 )
                 fp8_state.vllm_patches.append(
@@ -1080,13 +1062,8 @@ def maybe_post_process_fp8_weight_block(layer: torch.nn.Module):
             bmm_batch_size=bmm_batch_size,
         )
         if is_bmm:
-            replace_parameter(layer, "weight", dg_weight, prefer_copy=True)
-            replace_parameter(
-                layer,
-                "weight_scale_inv",
-                dg_weight_scale,
-                prefer_copy=True,
-            )
+            replace_parameter(layer, "weight", dg_weight)
+            replace_parameter(layer, "weight_scale_inv", dg_weight_scale)
         else:
             for name, processed_weight in (
                 ("weight", dg_weight),
@@ -1179,6 +1156,28 @@ def process_weights_after_loading(self, layer) -> None:
     # with block quantization. We must do the same to avoid AttributeError.
     if not hasattr(layer, "input_scale"):
         layer.input_scale = None
+
+
+def route_mxfp8_linear_post_load(
+    vllm_process_weights_after_loading: Callable[[Any, Any], None],
+) -> Callable[[Any, Any], None]:
+    """Send MXFP8 linears to NeMo-RL's post-load and other formats to vLLM's.
+
+    vLLM uses one ModelOptLinearMethod for every ModelOpt linear format, so the
+    MXFP8 refit post-load cannot replace the method outright.
+    """
+
+    def process_weights_after_loading(self, layer) -> None:
+        from vllm.model_executor.layers.quantization.utils.quant_utils import (
+            kMxfp8Static,
+        )
+
+        if self.spec.weight == kMxfp8Static:
+            process_weights_after_loading_mxfp8_linear(self, layer)
+        else:
+            vllm_process_weights_after_loading(self, layer)
+
+    return process_weights_after_loading
 
 
 def process_weights_after_loading_mxfp8_linear(self, layer) -> None:
@@ -1453,7 +1452,7 @@ def process_weights_after_loading_moe(self, layer) -> None:
                 )
     for name, converted_weight in converted_weights:
         if global_fp8_config.is_deepseek_v4:
-            replace_parameter(layer, name, converted_weight, prefer_copy=True)
+            replace_parameter(layer, name, converted_weight)
         else:
             getattr(layer, name).copy_(converted_weight)
 
@@ -1878,6 +1877,7 @@ def apply_monolithic_mxfp8_moe(
         topk_group=layer.topk_group,
         e_score_correction_bias=layer.e_score_correction_bias,
         routed_scaling_factor=layer.routed_scaling_factor,
+        routing_sink=layer.routing_sink,
     )
     return output[..., :unpadded_hidden_size].contiguous()
 
@@ -1897,8 +1897,10 @@ def process_weights_after_loading_kv(self, layer) -> None:
     deletion.
     """
     from vllm.platforms import current_platform
-    from vllm.utils.torch_utils import is_quantized_kv_cache
-    from vllm.v1.kv_cache_interface import kv_cache_uses_per_token_head_scales
+    from vllm.v1.kv_cache_interface import (
+        is_quantized_kv_cache,
+        kv_cache_uses_per_token_head_scales,
+    )
 
     # Per-token-head quantized KV cache: scales are computed dynamically per
     # (token, head) in the kernel at cache-write time. Nothing to refit here.
