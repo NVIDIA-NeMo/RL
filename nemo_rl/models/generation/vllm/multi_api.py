@@ -44,6 +44,7 @@ class MultiAPIServerPool:
         self.connections: list[Connection] = []
         self.engine_manager: Any = None
         self.coordinator: Any = None
+        self._zmq_listeners: Any = None
         self._command_lock = asyncio.Lock()
         self._failure: BaseException | None = None
 
@@ -67,8 +68,9 @@ class MultiAPIServerPool:
         # vLLM and Ray are optional outside generation workers.
         import ray
         from prometheus_client import values
+        from vllm.v1.engine.admission_control import SharedAdmissionStats
         from vllm.v1.engine.async_llm import AsyncLLM
-        from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
+        from vllm.v1.engine.utils import bind_engine_zmq_listeners, launch_core_engines
         from vllm.v1.executor.abstract import Executor
         from vllm.v1.metrics import reader
         from vllm.v1.metrics.prometheus import (
@@ -82,10 +84,6 @@ class MultiAPIServerPool:
         parallel = config.parallel_config
         if parallel.data_parallel_size != 1 or parallel.data_parallel_backend == "ray":
             raise ValueError("HTTP API pooling currently requires local vLLM DP=1")
-        addresses = get_engine_zmq_addresses(config, self.count)
-        if any(not address.startswith("ipc://") for address in addresses.inputs):
-            raise ValueError("HTTP API pooling requires colocated IPC engine clients")
-
         setup_multiprocess_prometheus()
         # The owning Ray actor imported prometheus before selecting multi-process
         # serving. New collectors must use the same mmap backend as spawned clients.
@@ -100,6 +98,17 @@ class MultiAPIServerPool:
         parent_result: concurrent.futures.Future[Any] = concurrent.futures.Future()
         parent_thread: threading.Thread | None = None
         try:
+            self._zmq_listeners = bind_engine_zmq_listeners(config, self.count)
+            addresses = self._zmq_listeners.addresses
+            if any(not address.startswith("ipc://") for address in addresses.inputs):
+                raise ValueError(
+                    "HTTP API pooling requires colocated IPC engine clients"
+                )
+            admission_counters = (
+                context.RawArray("q", SharedAdmissionStats.num_counters(self.count))
+                if config.scheduler_config.max_num_queued_reqs is not None
+                else None
+            )
             with launch_core_engines(
                 config, executor, not engine_args.disable_log_stats, addresses
             ) as launch:
@@ -110,8 +119,12 @@ class MultiAPIServerPool:
                     client_addresses = {
                         "input_address": addresses.inputs[index],
                         "output_address": addresses.outputs[index],
+                        "input_listener": self._zmq_listeners.inputs[index].socket,
+                        "output_listener": self._zmq_listeners.outputs[index].socket,
                         "tensor_queue": launch.tensor_queue,
                     }
+                    if admission_counters is not None:
+                        client_addresses["mp_admission_counters"] = admission_counters
                     process = context.Process(
                         target=self.run_api_process,
                         name=f"NRL-HTTP-{index}",
@@ -132,14 +145,20 @@ class MultiAPIServerPool:
                         },
                     )
                     process.start()
+                    self._zmq_listeners.inputs[index].close()
+                    self._zmq_listeners.outputs[index].close()
                     child.close()
                     self.children.append(process)
                     self.connections.append(parent)
                 owner_addresses = {
                     "input_address": addresses.inputs[0],
                     "output_address": addresses.outputs[0],
+                    "input_listener": self._zmq_listeners.inputs[0].socket,
+                    "output_listener": self._zmq_listeners.outputs[0].socket,
                     "tensor_queue": launch.tensor_queue,
                 }
+                if admission_counters is not None:
+                    owner_addresses["mp_admission_counters"] = admission_counters
 
                 def make_owner_client() -> None:
                     try:
@@ -160,8 +179,8 @@ class MultiAPIServerPool:
                     except BaseException as error:
                         parent_result.set_exception(error)
 
-                # Clients bind before the launch context performs its engine
-                # handshake; their constructors wait for that handshake to finish.
+                # Clients adopt their listeners before the launch context performs
+                # its engine handshake; constructors wait for that handshake.
                 parent_thread = threading.Thread(target=make_owner_client, daemon=True)
                 parent_thread.start()
                 launch.watched_frontend_processes = self.children
@@ -232,13 +251,16 @@ class MultiAPIServerPool:
         self.connections.clear()
 
     def close_engines(self) -> None:
-        """Shut down the shared engine manager and its coordinator."""
+        """Shut down the shared engines and clean up frontend IPC listeners."""
         if self.engine_manager is not None:
             self.engine_manager.shutdown()
             self.engine_manager = None
         if self.coordinator is not None:
             self.coordinator.shutdown()
             self.coordinator = None
+        if self._zmq_listeners is not None:
+            self._zmq_listeners.cleanup()
+            self._zmq_listeners = None
 
     @staticmethod
     def receive_reply(connection: Connection, timeout: float = 600) -> Any:

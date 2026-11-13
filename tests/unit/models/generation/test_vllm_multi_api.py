@@ -19,6 +19,7 @@ import pickle
 import sys
 import threading
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call, patch
@@ -34,6 +35,136 @@ spec.loader.exec_module(module)
 
 
 class MultiAPITest(unittest.IsolatedAsyncioTestCase):
+    def test_engine_listener_handoff_and_cleanup(self):
+        for queue_limit, fail_start in [(None, False), (32, False), (32, True)]:
+            with self.subTest(queue_limit=queue_limit, fail_start=fail_start):
+                owner = SimpleNamespace(
+                    cfg={},
+                    _reserved_socket=Mock(),
+                    _reserved_node_ip="localhost",
+                    routed_experts_dtype="int32",
+                )
+                pool = module.MultiAPIServerPool(owner, 2)
+                config = SimpleNamespace(
+                    parallel_config=SimpleNamespace(
+                        data_parallel_size=1, data_parallel_backend="mp"
+                    ),
+                    scheduler_config=SimpleNamespace(max_num_queued_reqs=queue_limit),
+                )
+                engine_args = SimpleNamespace(
+                    create_engine_config=Mock(return_value=config),
+                    disable_log_stats=False,
+                    enable_log_requests=False,
+                )
+                listeners = Mock(
+                    inputs=[Mock(), Mock()],
+                    outputs=[Mock(), Mock()],
+                    addresses=SimpleNamespace(
+                        inputs=["ipc://input0", "ipc://input1"],
+                        outputs=["ipc://output0", "ipc://output1"],
+                    ),
+                )
+                launch = SimpleNamespace(
+                    engine_manager=Mock(), coordinator=None, tensor_queue=object()
+                )
+
+                @contextmanager
+                def launch_engines(cfg, executor, log_stats, addresses):
+                    self.assertIs(cfg, config)
+                    self.assertIs(addresses, listeners.addresses)
+                    yield launch
+
+                context = Mock()
+                parent, child = Mock(), Mock()
+                context.Pipe.return_value = parent, child
+                parent.recv.return_value = ("ok", None)
+                if fail_start:
+                    context.Process.return_value.start.side_effect = OSError(
+                        "spawn failed"
+                    )
+                make_engine = Mock(return_value=Mock())
+                bind_listeners = Mock(return_value=listeners)
+                modules = {
+                    "ray": SimpleNamespace(
+                        get_runtime_context=lambda: SimpleNamespace(namespace="test")
+                    ),
+                    "prometheus_client": SimpleNamespace(values=Mock()),
+                    "vllm.v1.engine.admission_control": SimpleNamespace(
+                        SharedAdmissionStats=SimpleNamespace(
+                            num_counters=lambda count: count * 8
+                        )
+                    ),
+                    "vllm.v1.engine.async_llm": SimpleNamespace(AsyncLLM=make_engine),
+                    "vllm.v1.engine.utils": SimpleNamespace(
+                        bind_engine_zmq_listeners=bind_listeners,
+                        launch_core_engines=launch_engines,
+                    ),
+                    "vllm.v1.executor.abstract": SimpleNamespace(
+                        Executor=SimpleNamespace(get_class=lambda cfg: object)
+                    ),
+                    "vllm.v1.metrics": SimpleNamespace(reader=SimpleNamespace()),
+                    "vllm.v1.metrics.prometheus": SimpleNamespace(
+                        get_prometheus_registry=Mock(),
+                        setup_multiprocess_prometheus=Mock(),
+                    ),
+                }
+                with (
+                    patch.dict(sys.modules, modules),
+                    patch.dict(module.os.environ),
+                    patch.object(
+                        module.multiprocessing, "get_context", return_value=context
+                    ),
+                ):
+                    if fail_start:
+                        with self.assertRaisesRegex(OSError, "spawn failed"):
+                            pool.create_engine(engine_args, [])
+                        listeners.cleanup.assert_called_once_with()
+                        launch.engine_manager.shutdown.assert_called_once_with()
+                        make_engine.assert_not_called()
+                        pool.close_engines()
+                        listeners.cleanup.assert_called_once_with()
+                        continue
+                    self.assertIs(
+                        pool.create_engine(engine_args, []), make_engine.return_value
+                    )
+                bind_listeners.assert_called_once_with(config, 2)
+                child_addresses = context.Process.call_args.kwargs["args"][4]
+                owner_addresses = make_engine.call_args.kwargs["client_addresses"]
+                for index, addresses in enumerate([owner_addresses, child_addresses]):
+                    self.assertIs(
+                        addresses["input_listener"], listeners.inputs[index].socket
+                    )
+                    self.assertIs(
+                        addresses["output_listener"], listeners.outputs[index].socket
+                    )
+                    self.assertIs(addresses["tensor_queue"], launch.tensor_queue)
+                listeners.inputs[1].close.assert_called_once_with()
+                listeners.outputs[1].close.assert_called_once_with()
+                listeners.inputs[0].close.assert_not_called()
+                listeners.outputs[0].close.assert_not_called()
+                if queue_limit is None:
+                    context.RawArray.assert_not_called()
+                    self.assertNotIn("mp_admission_counters", owner_addresses)
+                    self.assertNotIn("mp_admission_counters", child_addresses)
+                else:
+                    context.RawArray.assert_called_once_with("q", 16)
+                    self.assertIs(
+                        owner_addresses["mp_admission_counters"],
+                        context.RawArray.return_value,
+                    )
+                    self.assertIs(
+                        child_addresses["mp_admission_counters"],
+                        context.RawArray.return_value,
+                    )
+                self.assertEqual(launch.watched_frontend_processes, pool.children)
+                listeners.cleanup.assert_not_called()
+                make_engine.return_value.shutdown()
+                pool.stop_children()
+                pool.close_engines()
+                pool.close_engines()
+                listeners.cleanup.assert_called_once_with()
+                launch.engine_manager.shutdown.assert_called_once_with()
+
     def test_spawn_target_does_not_capture_pool(self):
         pool = module.MultiAPIServerPool(threading.Lock(), 2)
         with patch.dict(sys.modules, {module.__name__: module}):
