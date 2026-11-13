@@ -17,7 +17,12 @@ import math
 import pytest
 import torch
 
-from nemo_rl.algorithms.grpo import compute_and_apply_seq_logprob_error_masking
+from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
+    MasterConfig,
+    _validate_seq_logprob_error_in_loss,
+    compute_and_apply_seq_logprob_error_masking,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig, ClippedPGLossFn
 from nemo_rl.algorithms.loss.interfaces import (
     SEQ_LOGPROB_KEEP_MASK_KEY,
@@ -30,6 +35,23 @@ from nemo_rl.algorithms.loss.utils import (
 from nemo_rl.algorithms.loss.wrapper import SequencePackingLossWrapper
 from nemo_rl.algorithms.utils import compute_seq_logprob_errors
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+
+
+def test_legacy_in_loss_filter_rejects_excluded_reward_statistics() -> None:
+    config = MasterConfig.model_construct(
+        grpo=GRPOConfig(
+            masked_reward_policy="exclude", seq_logprob_error_threshold=2.0
+        ),
+        loss_fn=ClippedPGLossConfig(
+            force_on_policy_ratio=True, seq_logprob_error_in_loss=True
+        ),
+        policy={"megatron_cfg": {"enabled": True}},
+    )
+    with pytest.raises(ValueError, match="masked_reward_policy.*exclude"):
+        _validate_seq_logprob_error_in_loss(config)
+
+    config.grpo.masked_reward_policy = "include"
+    _validate_seq_logprob_error_in_loss(config)
 
 
 @pytest.mark.parametrize(

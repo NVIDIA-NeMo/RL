@@ -115,6 +115,38 @@ def test_single_forward_threshold_requires_a_threshold() -> None:
         validate_single_controller_config(cfg)
 
 
+@pytest.mark.parametrize("min_groups", [1, 8])
+def test_in_loss_filter_rejects_excluded_reward_statistics(min_groups: int) -> None:
+    cfg = _single_forward_config()
+    cfg.async_rl.min_groups_for_streaming_train = min_groups
+    cfg.grpo.masked_reward_policy = "exclude"
+
+    with pytest.raises(ValueError, match="masked_reward_policy.*exclude"):
+        validate_single_controller_config(cfg)
+
+
+@pytest.mark.parametrize("masked_reward_policy", ["include", "exclude"])
+def test_separate_filter_preserves_reward_policy(masked_reward_policy: str) -> None:
+    cfg = _single_forward_config()
+    cfg.loss_fn.seq_logprob_error_in_loss = False
+    cfg.grpo.masked_reward_policy = masked_reward_policy
+
+    validate_single_controller_config(cfg)
+    assert logprob_passes_required(cfg, cfg.grpo) == (True, False)
+
+
+def test_reinforce_plus_plus_requires_full_batch_statistics() -> None:
+    cfg = _master_config()
+    cfg.grpo.adv_estimator.name = "reinforce_plus_plus"
+    cfg.async_rl.min_groups_for_streaming_train = 2
+
+    with pytest.raises(ValueError, match="reinforce_plus_plus.*min_groups"):
+        validate_single_controller_config(cfg)
+
+    cfg.async_rl.min_groups_for_streaming_train = cfg.grpo.num_prompts_per_step
+    validate_single_controller_config(cfg)
+
+
 class TestRolloutFailureValidation:
     def test_backoff_ceiling_below_base_is_rejected(self):
         with pytest.raises(ValidationError, match="max_backoff_s"):

@@ -655,6 +655,19 @@ def _validate_seq_logprob_error_in_loss(master_config: Any) -> None:
             "loss_fn.seq_logprob_error_in_loss requires ppo.ppo_epochs=1, got "
             f"ppo.ppo_epochs={ppo.ppo_epochs}"
         )
+    # The loss cannot remove rejected rows from statistics already computed.
+    if ppo is None and algo.masked_reward_policy == "exclude":
+        raise ValueError(
+            "grpo.masked_reward_policy=exclude is incompatible with "
+            "loss_fn.seq_logprob_error_in_loss=true. Set masked_reward_policy=include "
+            "or seq_logprob_error_in_loss=false to filter before advantage calculation."
+        )
+    if ppo is not None and ppo.adv_estimator.normalize_advantages:
+        raise ValueError(
+            "ppo.adv_estimator.normalize_advantages=true is incompatible with "
+            "loss_fn.seq_logprob_error_in_loss=true. Set normalize_advantages=false "
+            "or seq_logprob_error_in_loss=false to normalize over the filtered batch."
+        )
     policy = master_config.policy
     if "megatron_cfg" not in policy or not policy["megatron_cfg"]["enabled"]:
         raise ValueError(

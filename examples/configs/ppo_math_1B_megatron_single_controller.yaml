@@ -44,7 +44,7 @@ async_rl:
   # Recompute generation KV caches after each weight update.
   recompute_kv_cache_after_weight_updates: true
   # Full-batch default. Reduce this to stream forwards, GAE, and policy backward;
-  # requires ppo_epochs=1. normalize_advantages=true then normalizes per chunk.
+  # requires ppo_epochs=1 and normalize_advantages=false.
   # Value training stays full batch.
   min_groups_for_streaming_train: ${ppo.num_prompts_per_step}
   # Cap on in-flight generate_and_push calls in the rollout pump.

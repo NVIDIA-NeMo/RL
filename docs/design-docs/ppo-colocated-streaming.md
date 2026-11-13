@@ -13,7 +13,7 @@ ppo:
   ppo_epochs: 1
   critic_ppo_epochs: 2
   adv_estimator:
-    normalize_advantages: true
+    normalize_advantages: false
 async_rl:
   min_groups_for_streaming_train: 32
   sampler:
@@ -48,7 +48,7 @@ Other algorithms and full-batch PPO retain their selection behavior.
 
 ## Advantage normalization and support limits
 
-**Warning:** with `normalize_advantages: true`, streaming normalizes advantages independently within each chunk, while full-batch execution normalizes over the complete batch. Changing chunk boundaries can therefore change policy gradients.
+Setup rejects streaming with `normalize_advantages: true`, because normalizing independently within each chunk changes advantages when chunk boundaries change. Set `normalize_advantages: false` to stream, or set `async_rl.min_groups_for_streaming_train` equal to `ppo.num_prompts_per_step` to normalize over the full batch.
 Critic returns are unaffected; gradient/loss normalization still uses the full update's valid count.
 
 Streaming requires `ppo_epochs=1`, an in-order or ready-first sampler, separate generation GPUs, and classic Megatron DDP (including expert gradient buffers). Setup rejects Megatron FSDP and MXFP8 parameters with `policy.megatron_cfg.optimizer.use_distributed_optimizer: true`, regardless of `overlap_param_gather`: MXFP8 shares parameter and gradient storage in that configuration, so parameter offload cannot preserve resident gradients.

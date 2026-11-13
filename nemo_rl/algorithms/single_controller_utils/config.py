@@ -1586,6 +1586,16 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 f"(got {algo_cfg.num_generations_per_prompt})."
             )
 
+    if (
+        algo_cfg.adv_estimator.name == "reinforce_plus_plus"
+        and async_config.min_groups_for_streaming_train < algo_cfg.num_prompts_per_step
+    ):
+        raise ValueError(
+            "reinforce_plus_plus requires async_rl.min_groups_for_streaming_train "
+            "== grpo.num_prompts_per_step: its advantage normalization needs the "
+            "full batch. Use full-batch chunks or the grpo advantage estimator."
+        )
+
     if not is_ppo_run(master_config):
         # A value block without `ppo` is inert -- nothing builds the critic --
         # and a config carrying one is asking for PPO by every reading except
@@ -1664,11 +1674,10 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
                 "policy.megatron_cfg.fp8_cfg.fp8_param or use full-batch PPO."
             )
         if algo_cfg.adv_estimator.normalize_advantages:
-            warnings.warn(
-                "Streaming PPO with ppo.adv_estimator.normalize_advantages=true "
-                "normalizes GAE advantages per chunk instead of across the full "
-                "batch. Changing chunk boundaries can change normalized advantages.",
-                stacklevel=2,
+            raise ValueError(
+                "ppo.adv_estimator.normalize_advantages=true requires "
+                "async_rl.min_groups_for_streaming_train == ppo.num_prompts_per_step. "
+                "Set normalize_advantages=false to use streaming chunks."
             )
 
     # A forced ratio equals the true one only on the first optimizer step taken
