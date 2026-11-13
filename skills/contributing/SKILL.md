@@ -14,6 +14,7 @@ The rules live in `references/`, one file per theme. Before writing or changing 
 |------|--------|
 | [comments-docstrings-and-docs](references/comments-docstrings-and-docs.md) | comments, docstrings and docs a change adds, edits or moves |
 | [config](references/config.md) | config a change adds, reads or overrides, and config models built in tests |
+| [config-validation](references/config-validation.md) | validation of user configs loaded from YAML |
 | [copyright](references/copyright.md) | NVIDIA copyright header on files a change adds |
 | [dead-code](references/dead-code.md) | names a change adds, removes or stops using |
 | [error-handling](references/error-handling.md) | exceptions a change catches, and misconfigurations it must reject |
