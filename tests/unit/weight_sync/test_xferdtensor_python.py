@@ -334,3 +334,25 @@ def test_striped_geometry_distributes_replica_receives():
         3: ((4, 6), (0, 4)),
         5: ((6, 8), (0, 4)),
     }
+
+
+def test_destination_follows_a_source_on_the_python_path(monkeypatch):
+    from nemo_rl.weight_sync import xferdtensor
+
+    monkeypatch.delenv("NRL_XFERDTENSOR_PYTHON", raising=False)
+    monkeypatch.delenv("NRL_XFERDTENSOR_GOLDEN", raising=False)
+    monkeypatch.setattr(xferdtensor, "_reshard", object())
+    assert xferdtensor.uses_real_reshard_op()
+
+    xferdtensor.follow_source_reshard_path(False)
+
+    assert not xferdtensor.uses_real_reshard_op()
+
+
+def test_destination_without_the_real_op_rejects_a_source_that_uses_it(monkeypatch):
+    from nemo_rl.weight_sync import xferdtensor
+
+    monkeypatch.setattr(xferdtensor, "_reshard", None)
+
+    with pytest.raises(RuntimeError, match="nccl-extensions"):
+        xferdtensor.follow_source_reshard_path(True)
