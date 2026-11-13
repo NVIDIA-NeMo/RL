@@ -2511,17 +2511,6 @@ class VllmAsyncGenerationWorkerImpl(
         async def health() -> dict[str, str]:
             return {"status": "ok"}
 
-        @app.get("/metrics")
-        async def metrics() -> Response:
-            # vLLM metrics are optional outside generation workers.
-            from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-            from vllm.v1.metrics.prometheus import get_prometheus_registry
-
-            return Response(
-                generate_latest(get_prometheus_registry()),
-                media_type=CONTENT_TYPE_LATEST,
-            )
-
         app = self._setup_vllm_openai_api_server(app)
         if self._sparse_refit_receiver is not None:
             self._sparse_refit_receiver.setup_api_server(app)
