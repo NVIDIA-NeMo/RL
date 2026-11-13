@@ -2,13 +2,18 @@
   "upstream_pr": "https://github.com/vllm-project/vllm/pull/62065",
   "upstream_head": "03b2648165d24128611cd15818f4ecf51c0a0205",
   "qualified_version": "0.30.0+g116da885561b.cu132",
-  "patch_sha256": "aefb55ac0e46594afd217904b34617d0cf81462d5ea18877a88af747d44a17ef",
-  "backport_wire_version": 15062065,
+  "patch_sha256": "afb1077af21483929b968d70676d6ec1cb06dcd9adbd9c53adab53b84f9ed4f5",
+  "backport_wire_version": 15062066,
   "files": [
     {
       "path": "distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py",
       "original_sha256": "84298fe8617a72fc538847e344f145d222fa6fabc4a8d4a87b6337582a665be3",
-      "patched_sha256": "0d8a9d369ede73b70e1872fc2cc38cd5ad2b5dda230339afac9474d74f564c7b"
+      "patched_sha256": "aa5fd0542915ef8f317b799420e1564dc20ebc53c29ce895ff372e996c18d9e1"
+    },
+    {
+      "path": "distributed/kv_transfer/kv_connector/v1/nixl/job_failure.py",
+      "original_sha256": null,
+      "patched_sha256": "13c0e093a2ad01dd757c3023b98385b3558b7cdb90c61f75bdd863a2cbd14609"
     },
     {
       "path": "distributed/kv_transfer/kv_connector/v1/nixl/lease_slots.py",
@@ -18,7 +23,7 @@
     {
       "path": "distributed/kv_transfer/kv_connector/v1/nixl/metadata.py",
       "original_sha256": "fc20bf1d2188301ab70ee6c091d2e80025c22d21716fa62b23249d995a7be411",
-      "patched_sha256": "315c7c73a6e37dc7d258215ae50ffbc3c593697cf79e39c27f0b775dba0c1f07"
+      "patched_sha256": "44be52eb2e275c4d4051f8a5fc107d5580c426cc4db1225486f80a37a05e1433"
     },
     {
       "path": "distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py",
@@ -28,7 +33,7 @@
     {
       "path": "distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py",
       "original_sha256": "9c8461f3301a17f35ed5f52c682054d22f5f8aa2ca09e74ce71368972c5efb81",
-      "patched_sha256": "275af4b56e926efba5644ad419492265f54cb0664ea7a6c6151dd1f1e3d95477"
+      "patched_sha256": "a3e8b2d298539197565aa654cd02a661cd130ee1f32d0fcd6a0d0ef9d82c55ab"
     },
     {
       "path": "distributed/kv_transfer/kv_connector/v1/nixl/stats.py",
