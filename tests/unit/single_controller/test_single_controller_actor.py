@@ -4815,15 +4815,14 @@ def test_train_pump_flushes_every_writer_before_publishing(
             for name in ("flush-first", "flush-last")
         ]
     else:
+
         def flush_inline() -> None:
             if flush_fails:
                 raise RuntimeError("flush failed")
             events.append("flush-last")
 
         ctrl._advantage_actors = []
-        ctrl._advantage_computer = SimpleNamespace(
-            flush_train_data_dump=flush_inline
-        )
+        ctrl._advantage_computer = SimpleNamespace(flush_train_data_dump=flush_inline)
     ctrl._trainer.finish_train_step = MagicMock(return_value={})
 
     if flush_fails:
