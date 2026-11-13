@@ -65,10 +65,6 @@ The main pipeline (`cicd-main.yml`) runs through these stages:
 
 To retry the same commit, re-run only the failed jobs (**Re-run jobs → Re-run failed jobs**, or `gh run rerun <run-id> --failed`). This also re-runs cancelled jobs, so it recovers a run that the CPU config checks cancelled. **Re-run all jobs** repeats every GPU job that already passed. See [CONTRIBUTING.md](https://github.com/NVIDIA-NeMo/RL/blob/main/CONTRIBUTING.md).
 
-## Code Review
-
-Commenting `/claude-review` on a PR triggers an AI-powered code review. This is restricted to org members.
-
 ## Nightly Runs
 
 - Full test suite runs daily at **09:00 UTC** on `main`. Failures send Slack alerts.
@@ -107,7 +103,6 @@ All release workflows are manual (`workflow_dispatch`) with dry-run defaults:
 | `semantic-pull-request.yml` | PR | PR title validation |
 | `labeler.yaml` | PR | Auto-label by file path |
 | `lockfile-check.yml` | PR (dependency paths) | uv.lock freshness vs submodule pyprojects |
-| `claude-review.yml` | `/claude-review` comment | AI code review |
 | `healthcheck_vms.yml` | schedule (07:00 UTC), dispatch | GPU runner health |
 | `automodel-submodule-checks.yml` | PR | Submodule validation |
 | `merge-queue-retry.yml` | PR dequeued (timeout) | Auto-retry merge queue |
