@@ -40,6 +40,7 @@ from nemo_rl.experience.failures import (
     GenerationUnavailable,
     GymAdmissionClosed,
     GymRowFailure,
+    GymTerminalEpisodeFailure,
     GymTransportError,
     NoHealthyShards,
     RolloutDataFailure,
@@ -50,6 +51,7 @@ from nemo_rl.experience.failures import (
     RolloutTimeout,
     classify_rollout_failure,
     http_status_is_infra,
+    is_terminal_gym_episode_failure,
 )
 
 
@@ -214,6 +216,38 @@ def test_infra_and_data_are_disjoint_branches_of_one_base():
     assert issubclass(RolloutDataFailure, RolloutFailure)
     assert not issubclass(RolloutInfraFailure, RolloutDataFailure)
     assert not issubclass(RolloutDataFailure, RolloutInfraFailure)
+
+
+@pytest.mark.parametrize("wrapper", ["direct", "cause", "ray", "group"])
+def test_terminal_episode_failure_survives_serialization_and_wrappers(
+    wrapper: str,
+) -> None:
+    terminal = GymTerminalEpisodeFailure("task weather:0 failed during seed")
+    restored = ray_cloudpickle.loads(ray_cloudpickle.dumps(terminal))
+    assert isinstance(restored, GymTerminalEpisodeFailure)
+    assert str(restored) == str(terminal)
+    error = restored
+    if wrapper == "cause":
+        error = RuntimeError("rollout wrapper")
+        error.__cause__ = restored
+    elif wrapper == "ray":
+        error = ray.exceptions.RayTaskError("run_rollouts", "traceback", restored)
+    elif wrapper == "group":
+        error = ExceptionGroup(
+            "siblings failed", [GenerationUnavailable("worker lost"), restored]
+        )
+
+    assert is_terminal_gym_episode_failure(error)
+    assert classify_rollout_failure(error) is FailureClass.DATA
+
+
+def test_terminal_episode_detection_ignores_context_and_terminates_on_cycles() -> None:
+    error = RuntimeError("unrelated failure")
+    error.__context__ = GymTerminalEpisodeFailure("earlier failure")
+    error.__cause__ = error
+
+    assert not is_terminal_gym_episode_failure(error)
+    assert not is_terminal_gym_episode_failure(GenerationUnavailable("retry me"))
 
 
 class TestTheRayActorBoundary:

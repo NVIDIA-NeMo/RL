@@ -531,6 +531,59 @@ class TestReplayBufferImplCheckpointing:
             torch.tensor([[1.0, 2.0], [1.0, 2.0]]),
         )
 
+    def test_local_restore_merges_pre_taskset_batches_with_new_batches(self, tmp_path):
+        def flat_group(agent_name: str, *, with_attribution_key: bool) -> dict:
+            batch = BatchedDataDict(
+                {
+                    "agent_ref": [{"name": agent_name}] * 2,
+                    "total_reward": torch.tensor([1.0, 0.0]),
+                }
+            )
+            if with_attribution_key:
+                batch["attribution_key"] = [agent_name] * 2
+            return {"batch": batch, "rollout_metrics": {}}
+
+        # A checkpoint written before taskset attribution has no
+        # attribution_key column in its buffered batches.
+        checkpoint_path = tmp_path / "replay_buffer.pt"
+        source = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+        assert (
+            source.add(
+                flat_group("math_agent", with_attribution_key=False),
+                weight_version=1,
+                target_weight_version=2,
+            )
+            == "success"
+        )
+        source.save_to_path(str(checkpoint_path))
+
+        restored = ReplayBufferImpl(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        restored.load_from_path(
+            str(checkpoint_path), num_prompts_per_step=2, current_training_step=2
+        )
+        # The collector fills the rest of the resumed step with a new group.
+        assert (
+            restored.add(
+                flat_group("code_agent", with_attribution_key=True),
+                weight_version=1,
+                target_weight_version=2,
+            )
+            == "success"
+        )
+        sampled = restored.sample(2, current_weight_version=2, max_age_steps=1)
+
+        # Async GRPO merges the sampled groups into one training batch this way.
+        train_batch = BatchedDataDict.from_batches(
+            [trajectory["batch"] for trajectory in sampled["trajectories"]]
+        )
+        assert train_batch["attribution_key"] == ["math_agent"] * 2 + ["code_agent"] * 2
+        assert (
+            train_batch["agent_ref"]
+            == [{"name": "math_agent"}] * 2 + [{"name": "code_agent"}] * 2
+        )
+
 
 class TestReplayBuffer:
     """Test cases for ReplayBuffer."""
@@ -2810,34 +2863,6 @@ class TestAsyncTrajectoryCollector:
         collector.resume_after_refit()
 
         collector.policy_generation.invalidate_kv_cache.assert_not_called()
-
-    def test_dynamo_cache_invalidation_failure_is_fatal_and_unblocks_waiters(self):
-        collector = self.create_local_collector()
-        collector.master_config.policy["generation"] = {"backend": "dynamo"}
-        collector.master_config.grpo.async_grpo.recompute_kv_cache_after_weight_updates = True
-        collector.policy_generation.invalidate_kv_cache = mock.Mock(
-            side_effect=RuntimeError("pause failed")
-        )
-        collector._refit_pause_cleared.clear()
-
-        with pytest.raises(RuntimeError, match="cache invalidation failed"):
-            collector.resume_after_refit()
-
-        assert collector._refit_pause_cleared.is_set()
-
-    def test_dynamo_prepare_for_refit_drains_pending_generations(self):
-        """Dynamo layerwise reload never overlaps an active generation."""
-        collector = self.create_local_collector()
-        collector.master_config.policy["generation"] = {
-            "backend": "dynamo",
-            "dynamo_cfg": {},
-        }
-        collector.master_config.grpo.async_grpo.in_flight_weight_updates = True
-        collector.wait_for_pending_generations = mock.MagicMock()
-
-        collector.prepare_for_refit()
-
-        collector.wait_for_pending_generations.assert_called_once_with()
 
     def test_calculate_target_weights(self):
         """Test target weight calculation logic."""

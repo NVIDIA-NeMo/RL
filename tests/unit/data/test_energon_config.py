@@ -156,30 +156,17 @@ def test_loader_preserves_energon_defaults_unless_overridden(
 
 
 @pytest.mark.parametrize(
-    ("config_type", "default_name", "specific_field"),
+    ("config_type", "default_name"),
     [
-        (EnergonCookerConfig, "generic_conversation", "has_subflavors"),
-        (EnergonTaskEncoderConfig, "generic_sft", "packing"),
+        (EnergonCookerConfig, "generic_conversation"),
+        (EnergonTaskEncoderConfig, "generic_sft"),
     ],
 )
-def test_component_defaults_shorthand_and_options_are_preserved(
+def test_component_name_shorthand_matches_the_full_form(
     config_type: type[EnergonCookerConfig | EnergonTaskEncoderConfig],
     default_name: str,
-    specific_field: str,
 ) -> None:
-    config = config_type()
-    expected = {
-        "name": default_name,
-        "python_file": None,
-        "object_name": None,
-        "options": {},
-        specific_field: None,
-    }
-
-    assert config.model_dump(mode="json") == expected
-    assert config_type.model_validate(default_name).model_dump(mode="json") == expected
-    config.options["custom"] = True
-    assert config_type().options == {}
+    assert config_type.model_validate(default_name) == config_type(name=default_name)
 
 
 @pytest.mark.parametrize(

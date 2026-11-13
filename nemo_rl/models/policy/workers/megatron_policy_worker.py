@@ -60,7 +60,7 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
 )
-from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.algorithms.loss.interfaces import SEQ_LOGPROB_KEEP_MASK_KEY, LossFunction
 from nemo_rl.algorithms.loss.loss_functions import ClippedPGLossFn
 from nemo_rl.algorithms.loss.utils import rescale_loss_metrics
 from nemo_rl.algorithms.metric_utils import LEARNING_RATE_KEY
@@ -88,6 +88,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     NvFp4PerTokenRolloutConfig,
 )
 from nemo_rl.models.megatron.common import (
+    clear_transient_megatron_caches,
     get_aux_loss_track_names,
     get_moe_metrics,
 )
@@ -158,10 +159,12 @@ from nemo_rl.models.policy.workers.checkpoint_engine import (
     maybe_preinit_nixl_checkpoint_engine,
 )
 from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.telemetry.instrumentation import accepts_trace_context
 from nemo_rl.telemetry.setup import (
     init_telemetry_worker,
     traced_worker_init,
 )
+from nemo_rl.utils import compile_cache
 from nemo_rl.utils.grad_norm import warn_if_inf_grad_norm
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
@@ -679,6 +682,46 @@ def _meta_tensor_alloc_context():
         torch.zeros_like = real_zeros_like
 
 
+def _uses_in_loss_seq_filter(loss_fn: Any) -> bool:
+    """Whether the loss drops rows itself and needs survivor normalization."""
+    return (
+        isinstance(loss_fn, ClippedPGLossFn) and loss_fn.requires_survivor_normalization
+    )
+
+
+def _local_survivor_counts(
+    metrics: list[dict[str, Any]], device: torch.device
+) -> torch.Tensor:
+    """Local ``[kept_seqs, kept_toks]`` summed over this rank's microbatches."""
+    return torch.tensor(
+        [
+            sum(m["seq_logprob_error_valid_seqs"] for m in metrics),
+            sum(m["seq_logprob_error_valid_tokens"] for m in metrics),
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+
+
+def _pop_keep_masks(metrics: list[dict[str, Any]]) -> Optional[list[float]]:
+    """Remove the per-row in-loss keep masks and join them in row order, if any."""
+    masks = [
+        m.pop(SEQ_LOGPROB_KEEP_MASK_KEY)
+        for m in metrics
+        if SEQ_LOGPROB_KEEP_MASK_KEY in m
+    ]
+    return [keep for mask in masks for keep in mask] if masks else None
+
+
+def _raise_if_no_survivors(kept_toks: torch.Tensor) -> None:
+    if kept_toks.item() == 0:
+        raise RuntimeError(
+            "No valid response tokens remain after in-loss sequence-logprob "
+            "filtering; refusing an empty optimizer update. Check "
+            "seq_logprob_error_threshold in the grpo or ppo block."
+        )
+
+
 def _reserved_http_server_port_for_rank(
     reserved_http_server_ports: Optional[dict[int, int]], rank: int
 ) -> Optional[int]:
@@ -846,6 +889,7 @@ class MegatronPolicyWorkerImpl(
         del num_gpus_per_node  # not needed; one GPU per worker
         resources: dict[str, Any] = {"num_gpus": num_gpus}
         env_vars: dict[str, str] = {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
+        env_vars.update(compile_cache.env_overrides("megatron"))
         init_kwargs: dict[str, Any] = {}
         return resources, env_vars, init_kwargs, {}
 
@@ -871,6 +915,10 @@ class MegatronPolicyWorkerImpl(
         # save; Megatron-Bridge only sees msc:// URLs once MSC is enabled.
         maybe_enable_msc(weights_path, optimizer_path)
         make_empty_cache_best_effort_under_expandable_segments()
+        # Wait for the trainer's persistent compile cache before anything compiles
+        # (kernels are compiled during setup); kernels compiled before the copy
+        # lands miss the cache and get compiled again.
+        compile_cache.seed("megatron")
         self.is_refit_destination = is_refit_destination
         self._bulk_refit_conversion_tasks: list[Any] = []
         # NVML-based and guarded on torch.cuda.is_initialized(), so this does
@@ -1321,14 +1369,9 @@ class MegatronPolicyWorkerImpl(
         CP/TP replicas must not be counted as additional samples.
         """
         metrics = losses_reduced
-        counts = torch.tensor(
-            [
-                sum(m["seq_logprob_error_valid_seqs"] for m in metrics),
-                sum(m["seq_logprob_error_valid_tokens"] for m in metrics),
-            ],
-            dtype=torch.float64,
-            device=global_valid_toks.device,
-        )
+        # This path has no critic to hand the per-row keep mask to.
+        _pop_keep_masks(metrics)
+        counts = _local_survivor_counts(metrics, global_valid_toks.device)
         if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
             torch.distributed.all_reduce(
                 counts, group=parallel_state.get_data_parallel_group()
@@ -1342,12 +1385,8 @@ class MegatronPolicyWorkerImpl(
 
         # counts is a tensor with 2 elements: [kept_seqs, kept_toks]
         kept_seqs, kept_toks = counts
-        if kept_toks.item() == 0 and not eval_mode:
-            raise RuntimeError(
-                "No valid response tokens remain after in-loss sequence-logprob "
-                "filtering; refusing an empty optimizer update. Check "
-                "grpo.seq_logprob_error_threshold."
-            )
+        if not eval_mode:
+            _raise_if_no_survivors(kept_toks)
         # Counts are weighted by sample_mask and may be positive fractions.
         # Only replace zero denominators (possible during evaluation).
         token_denominator = torch.where(kept_toks > 0, kept_toks, 1.0)
@@ -1575,10 +1614,7 @@ class MegatronPolicyWorkerImpl(
                 if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
                     torch.cuda.empty_cache()
 
-                if (
-                    isinstance(loss_fn, ClippedPGLossFn)
-                    and loss_fn.requires_survivor_normalization
-                ):
+                if _uses_in_loss_seq_filter(loss_fn):
                     (
                         losses_reduced,
                         global_valid_seqs,
@@ -2072,15 +2108,17 @@ class MegatronPolicyWorkerImpl(
     def train_microbatch(
         self,
         data: BatchedDataDict[Any],
-    ) -> None:
+    ) -> Optional[list[float]]:
         """One DP slice of data → one ``forward_backward_func`` invocation.
 
         Wrapped in ``self.model.no_sync()`` so the mcore DDP hooks
         accumulate ``param.main_grad`` locally on each rank without
         dispatching a per-call DP reduce. The single true reduce is done
-        explicitly in ``finish_train_step``. Returns nothing: gradients
-        land in ``param.main_grad`` and per-microbatch metrics accumulate
-        in the open-step state until ``finish_train_step`` surfaces them.
+        explicitly in ``finish_train_step``. Gradients land in
+        ``param.main_grad`` and per-microbatch metrics accumulate in the
+        open-step state until ``finish_train_step`` surfaces them. Returns the
+        in-loss filter's per-row keep mask in ``data`` row order, or None when
+        the loss does not filter rows.
 
         Multimodal validity-mask and model-owned packing/CP behavior match the
         regular ``train`` path.
@@ -2089,7 +2127,7 @@ class MegatronPolicyWorkerImpl(
         if state.get("offloaded", False):
             raise RuntimeError("prepare_for_training must restore the offloaded step")
         try:
-            self._train_microbatch_body(state, data)
+            return self._train_microbatch_body(state, data)
         except Exception:
             # The body left all three mcore hooks nulled when begin_train_step
             # opened the step. If we propagate without restoring, future steps
@@ -2115,7 +2153,7 @@ class MegatronPolicyWorkerImpl(
         self,
         state: dict[str, Any],
         data: BatchedDataDict[Any],
-    ) -> None:
+    ) -> Optional[list[float]]:
         if should_reduce_loss_across_context_parallel(data):
             raise NotImplementedError(
                 "Direct packed SFT rows are not supported by the split training API"
@@ -2269,6 +2307,7 @@ class MegatronPolicyWorkerImpl(
         mb_metrics_collected = broadcast_loss_metrics_from_last_stage(
             mb_metrics_collected
         )
+        keep_mask = _pop_keep_masks(mb_metrics_collected)
 
         for m in mb_metrics_collected:
             draft_payload = m.get(DRAFT_STEP_PAYLOAD_KEY)
@@ -2284,6 +2323,7 @@ class MegatronPolicyWorkerImpl(
             # the global_loss aggregation at finish.
             if "loss" in m:
                 state["mb_losses"].append(m["loss"])
+        return keep_mask
 
     @wrap_with_nvtx_name("megatron_policy_worker/finish_train_step")
     def finish_train_step(self) -> dict[str, Any]:
@@ -2325,9 +2365,18 @@ class MegatronPolicyWorkerImpl(
         # from the same policy config on every DP rank, and Megatron runs
         # the same microbatch count on all of them.
         draft_step_state: DraftStepState = state["draft_step_state"]
-        policy_counts = torch.stack(
-            [state["local_valid_seqs"], state["local_valid_toks"]]
-        ).to(torch.float64)
+        loss_fn = state["loss_fn"]
+        in_loss_filter = _uses_in_loss_seq_filter(loss_fn)
+        if in_loss_filter:
+            # Chunks backpropagated unnormalized survivor sums, so divide by the
+            # survivor counts. Metrics are already on every PP stage; reduce DP only.
+            policy_counts = _local_survivor_counts(
+                state["all_mb_metrics"], state["local_valid_toks"].device
+            )
+        else:
+            policy_counts = torch.stack(
+                [state["local_valid_seqs"], state["local_valid_toks"]]
+            ).to(torch.float64)
         to_reduce = torch.cat(
             [
                 policy_counts,
@@ -2340,6 +2389,8 @@ class MegatronPolicyWorkerImpl(
         global_valid_seqs = to_reduce[0]
         global_valid_toks = to_reduce[1]
         draft_step_state.set_global_counts(to_reduce[2:])
+        if in_loss_filter:
+            _raise_if_no_survivors(global_valid_toks)
 
         if state["loss_type"] == LossType.TOKEN_LEVEL:
             n_true = global_valid_toks
@@ -2644,6 +2695,7 @@ class MegatronPolicyWorkerImpl(
         data: BatchedDataDict[Any],
         micro_batch_size: Optional[int] = None,
         require_router_replay: bool = True,
+        keep_on_gpu: bool = False,
     ) -> BatchedDataDict[LogprobOutputSpec]:
         """Get the logprobs of the model for a batch of data.
 
@@ -2651,7 +2703,8 @@ class MegatronPolicyWorkerImpl(
         Input data is assumed to be right-padded. The method internally converts to
         left-padded format for computation, and returns outputs in right-padded format.
         If micro_batch_size is provided, it will be used instead of the configured
-        logprob_batch_size.
+        logprob_batch_size. With ``keep_on_gpu`` the logprobs stay on this GPU
+        instead of being copied to pinned CPU memory.
 
         Returns:
           a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
@@ -2742,6 +2795,8 @@ class MegatronPolicyWorkerImpl(
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs")
 
+        if keep_on_gpu:
+            return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs)
         # TODO: @nan: will remove in the future
         cpu_logprobs = torch.empty_like(
             logprobs,
@@ -2933,6 +2988,7 @@ class MegatronPolicyWorkerImpl(
         payload: str,
         payload_dtype: str,
         micro_batch_size: Optional[int] = None,
+        keep_on_gpu: bool = False,
     ) -> BatchedDataDict[TeacherFullPayloadOutputSpec]:
         """Run a teacher forward returning sampled-token logprobs and the full payload.
 
@@ -2950,11 +3006,15 @@ class MegatronPolicyWorkerImpl(
             payload: ``"hidden_states"`` or ``"logits"``.
             payload_dtype: Torch dtype name for the transported payload.
             micro_batch_size: Overrides the configured logprob batch size.
+            keep_on_gpu: Keep both outputs on this GPU instead of copying them
+                to CPU; the payload then skips the per-microbatch copy during
+                the forward.
 
         Returns:
             A BatchedDataDict with ``logprobs`` ``[B, S]`` on every rank and
-            ``teacher_full_payload`` ``[B, S, D]`` on CPU on the last pipeline
-            stage (``None`` elsewhere).
+            ``teacher_full_payload`` ``[B, S, D]`` on the last pipeline stage
+            (``None`` elsewhere), both on this GPU if ``keep_on_gpu``, else on
+            CPU.
 
         Raises:
             ValueError: If ``payload`` is ``"hidden_states"`` but this teacher
@@ -3021,6 +3081,7 @@ class MegatronPolicyWorkerImpl(
                 cfg=self.cfg,
                 payload=payload,
                 payload_dtype=getattr(torch, payload_dtype),
+                keep_payload_on_gpu=keep_on_gpu,
                 sampling_params=self.sampling_params,
             ),
             forward_only=True,
@@ -3038,9 +3099,9 @@ class MegatronPolicyWorkerImpl(
                     [o["logprobs"] for o in list_of_outputs], target_len=seq_length
                 )
             }
-            # Already on CPU: the post-processor moves each microbatch off the
-            # device as it is produced, so this pad-and-concatenate never puts
-            # the payload back on the GPU.
+            # Unless keep_on_gpu, already on CPU: the post-processor
+            # moves each microbatch off the device as it is produced, so this
+            # pad-and-concatenate never puts the payload back on the GPU.
             teacher_full_payload = pad_and_concat(
                 [o["teacher_full_payload"] for o in list_of_outputs],
                 target_len=seq_length,
@@ -3052,7 +3113,7 @@ class MegatronPolicyWorkerImpl(
         no_grad.__exit__(None, None, None)
         self.timer.stop("get_logprobs_with_full_payload")
         return BatchedDataDict[TeacherFullPayloadOutputSpec](
-            logprobs=logprobs.to("cpu"),
+            logprobs=logprobs if keep_on_gpu else logprobs.to("cpu"),
             teacher_full_payload=teacher_full_payload,
         )
 
@@ -4696,6 +4757,7 @@ class MegatronPolicyWorkerImpl(
         # The plan is consumed (provider mutated to the inference layout); release it.
         self._colocated_reshard_plan = None
 
+    @accepts_trace_context
     @torch.no_grad()
     @wrap_with_nvtx_name("megatron_policy_worker/pause_train_step_with_offloading")
     def pause_train_step_with_offloading(self) -> None:
@@ -4872,7 +4934,7 @@ class MegatronPolicyWorkerImpl(
             self._clear_fp8_caches()
 
         if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit", False):
-            self._clear_rope_and_moe_dispatcher_caches()
+            clear_transient_megatron_caches(self.model)
 
         torch.randn(1).cuda()  # wake up torch allocator
         if (
@@ -4893,59 +4955,6 @@ class MegatronPolicyWorkerImpl(
             f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
         )
         no_grad.__exit__(None, None, None)
-
-    def _clear_rope_and_moe_dispatcher_caches(self) -> None:
-        """Clear rotary-embedding and MoE dispatcher caches repopulated by forwards."""
-        # Clear RotaryEmbedding's @lru_cache(maxsize=32). The cache accumulates one
-        # entry per unique (max_seq_len, offset, packed_seq) seen, and each entry is
-        # a GPU tensor (the concatenated sin/cos embedding). With training + logprob
-        # runs at different sequence lengths, the cache fills quickly and the tensors
-        # anchor large CUDA segments.
-        try:
-            from megatron.core.models.common.embeddings.rotary_pos_embedding import (
-                RotaryEmbedding,
-            )
-
-            RotaryEmbedding.forward.cache_clear()
-        except Exception:
-            pass
-
-        # Clear MoE token dispatcher persistent routing tensors.
-        #
-        # MoETokenDispatcher is a plain Python class (NOT an nn.Module), so iterating
-        # self.model.modules() never yields it. We must access it via the token_dispatcher
-        # attribute on MoELayer nn.Module objects.
-        #
-        # When recompute_mlp=True and fp8=True,
-        # transformer_layer._forward_mlp wraps self.mlp (the MoE layer) with te_checkpoint.
-        # te_checkpoint._CheckpointFunction.backward recomputes the forward with
-        # torch.enable_grad(), which causes dispatch_preprocess to store
-        #   dispatcher.probs = routing_probs   (with grad_fn, under enable_grad)
-        # This creates a reference cycle:
-        #   _CheckpointFunctionBackward → ctx → ctx.run_function=mlp
-        #   → mlp.token_dispatcher.probs → probs.grad_fn → ... → _CheckpointFunctionBackward
-        #
-        # Breaking this cycle by nulling dispatcher.probs frees BOTH:
-        #   - the routing tensors
-        #   - the te_checkpoint ctx saved tensors
-        try:
-            for module in self.model.modules():
-                if not hasattr(module, "token_dispatcher"):
-                    continue
-                dispatcher = module.token_dispatcher
-                if dispatcher is None:
-                    continue
-                for attr in (
-                    "probs",  # AllToAll + AllGather
-                    "routing_map",  # AllToAll
-                    "reversed_local_input_permutation_mapping",  # AllToAll
-                    "local_probs",  # AllGather
-                    "local_map",  # AllGather
-                ):
-                    if isinstance(getattr(dispatcher, attr, None), torch.Tensor):
-                        setattr(dispatcher, attr, None)
-        except Exception:
-            pass
 
     @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
     def offload_after_refit(self):
@@ -5141,6 +5150,11 @@ class MegatronPolicyWorkerImpl(
                 self.mcore_state.train_state.consumed_train_samples = (
                     self.scheduler.num_steps
                 )
+
+            # Free cached CUDA blocks to avoid OOM at checkpoint save.
+            gc.collect()
+            torch.cuda.empty_cache()
+
             save_checkpoint(
                 state=self.mcore_state,
                 model=[self.model],

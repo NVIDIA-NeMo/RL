@@ -452,8 +452,12 @@ def get_microbatch_iterator(
     elif cfg["sequence_packing"]["enabled"]:
         uses_hybridep = uses_hybridep_flex_dispatcher(cfg["megatron_cfg"])
         # Alignment padding between packed sequences must not reach expert-bias
-        # statistics with any dispatcher, not only HybridEP.
-        create_packed_seq_padding_mask = uses_hybridep or create_router_padding_mask
+        # statistics with any dispatcher, not only HybridEP. A self-packing model
+        # never receives a caller-built mask, so HybridEP alone requests none
+        # there; an expert-bias request still does and is rejected downstream.
+        create_packed_seq_padding_mask = (
+            uses_hybridep and not delegate_pack_to_model
+        ) or create_router_padding_mask
         prepad_packed_seq_for_hybridep = uses_hybridep and cfg["megatron_cfg"].get(
             "moe_hybridep_prepad_packed_inputs"
         )
