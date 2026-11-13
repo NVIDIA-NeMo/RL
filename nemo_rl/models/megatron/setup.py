@@ -2331,6 +2331,62 @@ def _create_megatron_config(
     )
 
 
+@contextmanager
+def _hide_draft_from_checkpoint_load(model, active):
+    """Make attached draft modules contribute nothing to a checkpoint load.
+
+    When the preload is skipped (quantized runs), the authoritative load runs with the
+    draft module already attached, so the loader demands draft weights from a base policy
+    checkpoint that cannot contain them:
+
+        KeyError: draft_model.body.fc.weight from model not in state dict
+
+    Patch the DRAFT MODULE itself rather than the chunks in ``model``: the loader unwraps
+    Float16Module/DDP before building the sharded state dict, so patching the wrapper is
+    not observed. Walking ``.module`` chains finds the attached drafter either way.
+
+    The drafter loads its own released weights in build_model, so contributing nothing
+    here loses nothing.
+    """
+    if not active:
+        yield
+        return
+
+    def _iter_draft_modules(chunks):
+        for chunk in chunks if isinstance(chunks, list) else [chunks]:
+            seen = set()
+            node = chunk
+            while node is not None and id(node) not in seen:
+                seen.add(id(node))
+                drafter = getattr(node, "draft_model", None)
+                if drafter is not None:
+                    yield drafter
+                node = getattr(node, "module", None)
+
+    patched = []
+    for drafter in _iter_draft_modules(model):
+        for attr in ("sharded_state_dict", "state_dict"):
+            original = getattr(drafter, attr, None)
+            if original is None:
+                continue
+
+            def empty(*args, **kwargs):
+                return {}
+
+            patched.append((drafter, attr, original))
+            setattr(drafter, attr, empty)
+    print(
+        f"[draft] hid {len(patched)} state-dict accessor(s) on "
+        f"{len({id(d) for d, _, _ in patched})} draft module(s) for the checkpoint load",
+        flush=True,
+    )
+    try:
+        yield
+    finally:
+        for drafter, attr, original in patched:
+            setattr(drafter, attr, original)
+
+
 def _create_draft_pre_wrap_hook(
     policy_cfg: PolicyConfig,
     megatron_cfg: ConfigContainer,
@@ -2608,11 +2664,24 @@ def setup_model_and_optimizer(
         megatron_cfg.checkpoint.pretrained_checkpoint is not None
         and checkpoint_exists(megatron_cfg.checkpoint.pretrained_checkpoint)
     )
+    # Under the ModelOpt quant worker the pretrained path is REDIRECTED to the quantized
+    # checkpoint cache (validate_model_paths appends _quant_checkpoint_cache_suffix and
+    # requires has_modelopt_state). The non-draft flow is consistent because its load runs
+    # after _restore_modelopt_state_pre_load has quantized the model. The draft preload
+    # runs at PRE-WRAP, before quantization, so it would load a quantized checkpoint into
+    # an unquantized model and fail on TE _extra_state:
+    #     Missing key in checkpoint state_dict:
+    #       ...layers.1.mlp.experts.experts.linear_fc1._extra_state/shard_192_512
+    # No strictness setting fixes that -- the two sides genuinely disagree. (strict= on
+    # _load_checkpoint_from_path only reaches torch.nn.Module.load_state_dict, not the
+    # dist-checkpoint load plan where this raises.)
+    quantization_enabled = policy_cfg.get("quant_cfg") is not None
     preload_policy_from_pretrained_for_draft = (
         draft_enabled
         and not use_peft  # The PEFT pre-wrap hook loads the pretrained base policy before adapters are attached.
         and not resume_checkpoint_exists  # Resume checkpoints already carry the attached draft module state.
         and pretrained_checkpoint_exists
+        and not quantization_enabled
     )
 
     mixed_precision_wrapper = Float16Module
@@ -2834,7 +2903,12 @@ def setup_model_and_optimizer(
     if should_load_checkpoint:
         if pre_load_checkpoint_hook is not None:
             pre_load_checkpoint_hook(state, model)
-        with _sync_consumed_samples_on_scheduler_load(state, scheduler):
+        with (
+            _hide_draft_from_checkpoint_load(
+                model, draft_enabled and not preload_policy_from_pretrained_for_draft
+            ),
+            _sync_consumed_samples_on_scheduler_load(state, scheduler),
+        ):
             load_checkpoint(
                 state,
                 model,

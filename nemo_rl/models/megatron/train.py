@@ -373,6 +373,10 @@ def forward_with_post_processing_fn(
     # opd_full capture below the unqualified name reads as the generic one. Not
     # done here: it would pull draft/*.py and three @patch paths in
     # test_train.py into an unrelated feature's review.
+    # Block drafters (LiLiCorr, DFlash) tap the layers their CHECKPOINT names, which the
+    # provider resolves; the eagle3 heuristic this otherwise falls back to picks different
+    # layers, and that is silent -- the draft trains on hidden states it was never built
+    # to read and the only symptom is an acceptance length that never becomes useful.
     capture_context, capture = get_capture_context(
         model,
         enable_hidden_capture,

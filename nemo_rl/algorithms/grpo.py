@@ -158,7 +158,7 @@ from nemo_rl.models.megatron.router_replay import (
 from nemo_rl.models.megatron.zero_train_gen_mismatch import validate_zero_train_gen_kl
 from nemo_rl.models.policy import PolicyConfig
 from nemo_rl.models.policy.draft_config import (
-    MEGATRON_BLOCK_DRAFT_ALGOS,
+    BLOCK_DRAFT_ALGOS_NEEDING_SAMPLE_IDS,
     coerce_draft_config,
 )
 from nemo_rl.models.policy.draft_sample_ids import stable_draft_sample_ids
@@ -2773,7 +2773,7 @@ def _draft_needs_sample_ids(policy_config: PolicyConfig) -> bool:
     return (
         draft is not None
         and draft.enabled
-        and draft.speculator_type in MEGATRON_BLOCK_DRAFT_ALGOS
+        and draft.speculator_type in BLOCK_DRAFT_ALGOS_NEEDING_SAMPLE_IDS
     )
 
 

@@ -303,10 +303,14 @@ class DraftLossWrapper:
             raise ValueError("global_valid_toks is required for DraftLossWrapper.")
         policy_data = data
         if self.draft_provider is not None:
+            # Per-step drafter outputs (dataclasses, even modules) live in `data`
+            # for loss_stats; the policy loss slices every entry per sequence.
             transient_output_keys = {
                 "dflash_output",
                 "dspark_output",
                 "eagle3_output",
+                "lilicorr_output",
+                "lilicorr_head",
             } & data.keys()
             if transient_output_keys:
                 policy_data = copy(data)
@@ -326,6 +330,7 @@ class DraftLossWrapper:
         # Function-local import: step_state lives under models.megatron.draft,
         # whose package import pulls the modelopt chain non-megatron users avoid.
         from nemo_rl.models.megatron.draft.step_state import (
+            DRAFT_AUX_LOSS_KEY,
             DRAFT_STEP_PAYLOAD_KEY,
             DraftStepState,
         )
@@ -368,7 +373,11 @@ class DraftLossWrapper:
                 )
             else:
                 assert stats is not None
-                if self.draft_provider.config.speculator_type in ("dflash", "dspark"):
+                if self.draft_provider.config.speculator_type in (
+                    "dflash",
+                    "dspark",
+                    "lilicorr",
+                ):
                     if self.draft_normalization_counts is None:
                         raise RuntimeError(
                             "block-draft synchronous loss requires full-batch global counts"
@@ -379,15 +388,28 @@ class DraftLossWrapper:
                 draft_loss = stats.normalized(
                     normalization_counts=normalization_counts,
                 )
-        return self._combine(policy_loss, draft_loss, metrics)
+        return self._combine(
+            policy_loss, draft_loss, metrics, aux_loss=data.get(DRAFT_AUX_LOSS_KEY)
+        )
 
     def _combine(
         self,
         policy_loss: torch.Tensor,
         draft_loss: torch.Tensor,
         metrics: dict[str, Any],
+        aux_loss: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         from nemo_rl.models.megatron.draft.step_state import DRAFT_LOSS_METRIC_KEY
+
+        # A drafter whose objective is not just next-token CE (LiLiCorr's candidate
+        # lattice, say) contributes an extra term the draft forward computed, since only
+        # it holds the lattice tensors and the head. Added INSIDE the draft weighting so
+        # policy.draft.loss_weight scales the whole draft contribution, not just part of
+        # it -- otherwise turning the weight down would leave the extra term at full
+        # strength and quietly keep perturbing the policy.
+        if aux_loss is not None:
+            draft_loss = draft_loss + aux_loss
+            metrics["draft_aux_loss"] = float(aux_loss.detach().item())
 
         combined_loss = policy_loss + self.loss_weight * draft_loss
         draft_loss_value = float(draft_loss.detach().item())

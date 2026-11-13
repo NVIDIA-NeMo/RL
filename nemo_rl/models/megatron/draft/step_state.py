@@ -168,3 +168,11 @@ class DraftStepState:
             main_grad = getattr(param, "main_grad", None)
             if main_grad is not None:
                 main_grad.mul_(correction)
+
+
+# Channel for a draft objective term that does not fit DraftLossStats' per-slot shape
+# (LiLiCorr's candidate-lattice path NLL is one scalar per block, not one value per
+# slot). The provider writes it during loss_stats; DraftLossWrapper adds it inside the
+# draft weighting. Routed through the batch dict for the same reason dflash_output is:
+# the provider and the wrapper do not hold a reference to each other.
+DRAFT_AUX_LOSS_KEY = "draft_aux_loss_tensor"

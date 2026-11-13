@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, ContextManager, Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
-from megatron.core.utils import unwrap_model
 from torch import Tensor, nn
 
 if TYPE_CHECKING:
@@ -84,7 +83,12 @@ class HiddenStateCapture:
         model: nn.Module,
         aux_layer_indices: Optional[Tuple[int, ...]] = None,
     ):
-        self.model = unwrap_model(model)
+        from nemo_rl.models.megatron.draft.utils import unwrap_policy_language_model
+
+        # Hook the GPT/Mamba language model, not a VL wrapper around it: the
+        # wrapper has no .embedding / .output_layer and its forward never sees
+        # decoder_input, so embeddings and output hidden states went uncaptured.
+        self.model = unwrap_policy_language_model(model)
         self.num_layers = self.model.config.num_layers
 
         self.aux_layer_indices = (
@@ -156,6 +160,20 @@ class HiddenStateCapture:
 
         return hook
 
+    def _make_decoder_input_hook(self):
+        # VL wrappers (NemotronVLModel's llava_model) embed tokens themselves, merge
+        # in image features and call the language model with `decoder_input`, which
+        # bypasses `embedding.forward`. That tensor is what the embedding would have
+        # produced (same layout, sequence-parallel scatter included), so take it.
+        def hook(_module, args, kwargs):
+            decoder_input = kwargs.get("decoder_input")
+            if decoder_input is None and len(args) > 3:
+                decoder_input = args[3]  # GPTModel/MambaModel positional slot
+            if isinstance(decoder_input, Tensor):
+                self._captured["embeds"] = decoder_input.detach()
+
+        return hook
+
     def _make_output_hidden_hook(self):
         def hook(_module, args):
             if not args:
@@ -173,6 +191,11 @@ class HiddenStateCapture:
         if self.is_first_stage and hasattr(self.model, "embedding"):
             self._hooks.append(
                 self.model.embedding.register_forward_hook(self._make_embedding_hook())
+            )
+            self._hooks.append(
+                self.model.register_forward_pre_hook(
+                    self._make_decoder_input_hook(), with_kwargs=True
+                )
             )
 
         if self.is_last_stage and hasattr(self.model, "output_layer"):

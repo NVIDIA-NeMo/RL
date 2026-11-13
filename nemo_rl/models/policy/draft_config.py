@@ -304,6 +304,123 @@ class MegatronDSparkDraftConfig(_MegatronBlockDraftConfigBase):
 
 MEGATRON_BLOCK_DRAFT_ALGOS = ("dflash", "dspark")
 
+# Speculators whose training needs a stable per-row anchor schedule, and therefore
+# draft_sample_ids on every batch. DELIBERATELY separate from
+# MEGATRON_BLOCK_DRAFT_ALGOS above: that tuple also drives the config discriminator,
+# where membership plus target taps selects a "megatron_<algo>" variant. lilicorr has no
+# such variant -- it is a single checkpoint-driven config -- so adding it there would
+# route to a tag that does not exist and fail validation instead.
+BLOCK_DRAFT_ALGOS_NEEDING_SAMPLE_IDS = MEGATRON_BLOCK_DRAFT_ALGOS + ("lilicorr",)
+
+
+class LiLiCorrDraftConfig(_MegatronBlockDraftConfigBase):
+    """Co-training a PRETRAINED LiLiCorr drafter against a live target (Megatron).
+
+    Parented on the Megatron block-drafter base rather than the Automodel one: this
+    runs through the Megatron train step, and the Automodel base would silently admit
+    fields that path never reads.
+
+    It differs from MegatronDFlash/MegatronDSpark in where the architecture comes from.
+    Those build a drafter FROM this config and therefore require
+    ``target_hidden_state_layer_ids``. LiLiCorr starts from a released checkpoint, so the
+    reranker geometry (hidden size, head count, layer count, candidate topk) and the
+    target taps are read from that checkpoint's ``config.json``. Making them configurable
+    here would let a value drift from the trained weights, which is a silent accuracy
+    loss rather than an error.
+    """
+
+    # The body always runs CP=1; the target's CP-sharded hidden states are gathered
+    # before reaching it, so the POLICY is free to run context parallel.
+    supports_context_parallel: ClassVar[bool] = True
+    supports_sequence_packing: ClassVar[bool] = True
+    supports_target_sequence_parallel: ClassVar[bool] = True
+
+    speculator_type: Literal["lilicorr"] = "lilicorr"
+    enabled: bool = False
+    model_name: str | None = None
+    model_revision: str | None = None
+    aux_layer_indices: None = Field(default=None, exclude=True, repr=False)
+    # Recipes derive from the DFlash one, which sets num_layers as the drafter's own
+    # depth. LiLiCorr reads depth from the checkpoint, so this is accepted only to be
+    # cross-checked against it below: silently ignoring a value that disagrees with the
+    # weights is the same silent-accuracy-loss failure the rest of this class avoids.
+    num_layers: Annotated[int, Field(gt=0)] | None = None
+    loss_weight: Annotated[float, Field(gt=0)] = 0.1
+    learning_rate: Annotated[float, Field(gt=0)] = 1.0e-4
+    optimizer: DraftOptimizerConfig | None = None
+
+    # Plan geometry, shared with the other Megatron block drafters so the anchor
+    # schedule, loss mask and normalization counts can be reused rather than
+    # reimplemented. gamma and mask_token_id default to the drafter checkpoint's
+    # own block_size / mask_token_id -- setting them to anything else trains
+    # against a block shape the weights were not built for.
+    anchors_per_sample: Annotated[int, Field(gt=0)] = 64
+    gamma: Annotated[int, Field(gt=0)] | None = None
+    mask_token_id: Annotated[int, Field(ge=0)] | None = None
+    seed: int = 0
+    vocab_tile_size: Annotated[int, Field(gt=0)] = 256
+    position_decay: Annotated[float, Field(gt=0, le=1)] = 1.0
+    max_cp_boundary_exclusion_fraction: Annotated[float, Field(ge=0, le=1)] = 0.25
+    update_probe_enabled: bool = False
+
+    @model_validator(mode="after")
+    def _fill_geometry_from_checkpoint(self) -> Self:
+        """Read gamma/mask_token_id/taps from the drafter checkpoint when unset."""
+        if not self.enabled or not self.model_name:
+            return self
+        import json
+        import os
+
+        config_path = os.path.join(self.model_name, "config.json")
+        if not os.path.isfile(config_path):
+            return self
+        with open(config_path) as handle:
+            checkpoint = json.load(handle)
+        dflash = checkpoint.get("dflash_config", {})
+        if self.gamma is None:
+            block_size = checkpoint.get("block_size", dflash.get("block_size"))
+            if block_size is not None:
+                # gamma counts MASK slots only. A DFlash block is one anchor plus gamma
+                # masks, and the reranker scores exactly the mask slots
+                # (num_candidate_slots = block_size - 1), so gamma = block_size - 1.
+                # Mapping gamma straight from block_size makes the block one slot too
+                # long and the head rejects it at the first step.
+                object.__setattr__(self, "gamma", int(block_size) - 1)
+        if self.mask_token_id is None and dflash.get("mask_token_id") is not None:
+            object.__setattr__(self, "mask_token_id", int(dflash["mask_token_id"]))
+        if self.target_hidden_state_layer_ids is None and dflash.get(
+            "target_layer_ids"
+        ):
+            object.__setattr__(
+                self,
+                "target_hidden_state_layer_ids",
+                [int(i) for i in dflash["target_layer_ids"]],
+            )
+
+        # Cross-check an inherited num_layers against the weights rather than ignoring it.
+        if self.num_layers is not None:
+            ckpt_layers = checkpoint.get("num_hidden_layers")
+            if ckpt_layers is not None and self.num_layers != ckpt_layers:
+                raise ValueError(
+                    f"policy.draft.num_layers={self.num_layers} disagrees with the "
+                    f"drafter checkpoint's num_hidden_layers={ckpt_layers} "
+                    f"({self.model_name}). Remove the override; LiLiCorr takes its "
+                    f"depth from the checkpoint."
+                )
+        return self
+
+    # Optional override of the taps read from the checkpoint. Left None, the checkpoint's
+    # target_layer_ids win -- which is what a released drafter was trained against.
+    target_hidden_state_layer_ids: Annotated[list[int], Field(min_length=1)] | None = (
+        None
+    )
+    # The reranker's three-term objective. These have no analogue in DFlash's projected
+    # soft CE or DSpark's hard-CE/TVD/confidence terms, which is the part of LiLiCorr
+    # that is genuinely new rather than a rewiring.
+    reranker_ce_alpha: Annotated[float, Field(ge=0)] = 1.0
+    reranker_margin_alpha: Annotated[float, Field(ge=0)] = 1.0
+    reranker_penalty_alpha: Annotated[float, Field(ge=0)] = 1.0
+
 
 def _speculator_type(v: Any) -> str:
     """Discriminator callback: default a missing tag to eagle3.
@@ -336,6 +453,7 @@ DraftConfig = Annotated[
         Annotated[DFlashDraftConfig, Tag("dflash")],
         Annotated[MegatronDFlashDraftConfig, Tag("megatron_dflash")],
         Annotated[MegatronDSparkDraftConfig, Tag("megatron_dspark")],
+        Annotated[LiLiCorrDraftConfig, Tag("lilicorr")],
     ],
     Discriminator(_speculator_type),
 ]

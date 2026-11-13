@@ -34,7 +34,35 @@ from megatron.core.utils import unwrap_model
 from modelopt.torch.quantization.nn import AnyQuantizer
 from modelopt.torch.quantization.nn.modules.quant_module import QuantModule
 from modelopt.torch.quantization.nn.modules.tensor_quantizer import TensorQuantizer
-from modelopt.torch.quantization.utils import apply_without_qdq
+
+try:
+    from modelopt.torch.quantization.utils import apply_without_qdq
+except ImportError:  # ModelOpt predating #3124, which is where this landed upstream.
+    # Faithful port of modelopt.torch.quantization.utils.core_utils.apply_without_qdq.
+    # Kept so real-quant refit works on ModelOpt pins that predate it.
+    def apply_without_qdq(quantizer, inputs):
+        """Apply the quantizer's pre-quant scale/rotation without quantizing.
+
+        Rows a quantized module computes in high precision still need the transforms
+        (an AWQ / SmoothQuant scale the stored weight compensates for), otherwise they
+        are inconsistent with the quantized rows beside them.
+        """
+        from modelopt.torch.quantization.nn import SequentialQuantizer
+
+        members = (
+            list(quantizer)
+            if isinstance(quantizer, SequentialQuantizer)
+            else [quantizer]
+        )
+        for member in members:
+            disabled = member._disabled
+            member._disabled = True
+            try:
+                inputs = member(inputs)
+            finally:
+                member._disabled = disabled
+        return inputs
+
 
 import nemo_rl.models.policy.workers.megatron_policy_worker as megatron_policy_worker
 from nemo_rl.modelopt.models.policy.workers.utils import (
@@ -487,12 +515,51 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
 
         return self._get_modelopt_export_plan().conversion_tasks
 
+    @staticmethod
+    @contextmanager
+    def _detach_draft_modules(model):
+        """Temporarily unregister attached draft modules from the module tree.
+
+        Megatron-Bridge builds the export plan by walking named_parameters() and
+        requires an HF mapping for every one. A co-trained drafter has none -- it is
+        not part of the policy's HF architecture and is refit separately, outside the
+        export plan -- so leaving it attached fails validation with
+
+            ValueError: No mapping found for the following Megatron parameter(s):
+              draft_model.body.fc.weight
+              draft_model.lilicorr.anchor_out_head.weight
+              ...
+
+        Unregister via ``_modules`` rather than setattr(None): nn.Module keeps
+        submodules there, and assigning None would leave a dangling entry instead of
+        removing it from the traversal.
+        """
+        chunks = model if isinstance(model, list) else [model]
+        detached = []
+        try:
+            for chunk in chunks:
+                node = chunk
+                seen = set()
+                while node is not None and id(node) not in seen:
+                    seen.add(id(node))
+                    mods = getattr(node, "_modules", None)
+                    if mods is not None and "draft_model" in mods:
+                        detached.append((node, mods.pop("draft_model")))
+                    node = getattr(node, "module", None)
+            yield
+        finally:
+            for node, drafter in detached:
+                node._modules["draft_model"] = drafter
+
     def _get_modelopt_export_plan(self):
         plan = getattr(self, "_modelopt_export_plan", None)
         if plan is not None:
             return plan
 
-        plan = self.megatron_bridge.build_hf_modelopt_export_plan([self.model])
+        # The drafter is excluded from the policy's export plan: it has no HF mapping
+        # and its weights are streamed separately (see _iter_draft_weights_for_refit).
+        with self._detach_draft_modules(self.model):
+            plan = self.megatron_bridge.build_hf_modelopt_export_plan([self.model])
         self.refit_conversion_tasks = plan.conversion_tasks
         self._modelopt_export_plan = plan
         return plan
@@ -508,9 +575,29 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 "generation.vllm_cfg.kv_cache_dtype=auto"
             )
         if self.draft_model is not None:
-            raise NotImplementedError(
-                "ModelOpt real-quant refit does not support speculative draft weights"
-            )
+            # A drafter is allowed: it is NOT part of the ModelOpt export plan.
+            #
+            # This config is injected as vLLM hf_overrides["quantization_config"], which
+            # applies to the MAIN model. vLLM loads the speculative drafter from its own
+            # `speculative_config["model"]` path with that checkpoint's own (bf16) config,
+            # so the policy can be NVFP4 while the drafter stays bf16. Draft weights are
+            # streamed separately by _iter_draft_weights_for_refit / the draft_weights
+            # argument, outside the export plan.
+            #
+            # What WOULD be wrong is a drafter that is itself quantized, since its tensors
+            # would then need deployment metadata this config does not describe. Assert
+            # that narrower invariant instead of refusing every drafter.
+            quantized_draft_params = [
+                name
+                for name, _ in self.draft_model.named_parameters()
+                if "weight_quantizer" in name or "_quantizer." in name
+            ]
+            if quantized_draft_params:
+                raise NotImplementedError(
+                    "ModelOpt real-quant refit does not support a QUANTIZED speculative "
+                    f"drafter; found {len(quantized_draft_params)} quantizer params, e.g. "
+                    f"{quantized_draft_params[0]}"
+                )
         return copy.deepcopy(self._get_modelopt_export_plan().quantization_config)
 
     def _iter_real_quant_refit_groups(
@@ -553,20 +640,44 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         self,
         kv_scales: dict[str, float] | None = None,
         *,
+        include_draft: bool = True,
         draft_metadata_only: bool = False,
         draft_weights: tuple[tuple[str, torch.Tensor], ...] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
-        """Export canonical ModelOpt deployment tensors for non-IPC transports."""
+        """Export canonical ModelOpt deployment tensors for non-IPC transports.
+
+        The co-trained drafter is not in the ModelOpt export plan, so its BF16
+        ``draft.*`` tensors follow the policy groups. The same iterator builds the
+        refit metadata and the broadcast, so both sides agree on the drafter.
+        """
         groups = iter(self._iter_real_quant_refit_groups(kv_scales))
         while True:
             try:
                 group = next(groups)
             except StopIteration:
-                return
+                break
             try:
                 yield from group
             finally:
                 del group
+        if not include_draft:
+            return
+        if draft_weights is None:
+            yield from self._iter_draft_weights_for_refit(
+                metadata_only=draft_metadata_only
+            )
+        else:
+            yield from draft_weights
+
+    def _iter_real_quant_refit_groups_with_draft(
+        self, kv_scales: dict[str, float] | None = None
+    ) -> Generator[tuple[tuple[str, torch.Tensor], ...], None, None]:
+        """ModelOpt deployment groups, then the BF16 drafter as one final group."""
+        yield from self._iter_real_quant_refit_groups(kv_scales)
+        # Every rank runs this: the drafter export broadcasts across PP lanes.
+        draft = tuple(self._iter_draft_weights_for_refit(metadata_only=False))
+        if draft:
+            yield draft
 
     @torch.no_grad()
     def stream_weights_via_ipc_zmq(self, buffer_size_bytes=0, kv_scales=None) -> None:
@@ -578,44 +689,13 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
 
         stream_weights_via_ipc_zmq_impl(
-            params_generator=self._iter_real_quant_refit_groups(kv_scales),
+            params_generator=self._iter_real_quant_refit_groups_with_draft(kv_scales),
             buffer_size_bytes=buffer_size_bytes,
             zmq_socket=self.zmq_socket,
             rank=self.rank,
             worker_name=str(self),
             drain_between_groups=True,
         )
-
-        if draft_weights is None:
-            yield from self._iter_draft_weights_for_refit(
-                metadata_only=draft_metadata_only
-            )
-        else:
-            yield from draft_weights
-
-        if not vllm_cfg["kv_cache_dtype"].startswith("fp8"):
-            return
-
-        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
-            get_vllm_qkv_scale_names,
-        )
-
-        keys: list[str] = []
-        for layer_idx in range(self.megatron_bridge.transformer_config.num_layers):
-            keys.extend(get_vllm_qkv_scale_names(layer_idx).values())
-
-        for param_name in keys:
-            scale_value = (
-                kv_scales[param_name] if kv_scales and param_name in kv_scales else 1.0
-            )
-            yield (
-                param_name,
-                torch.tensor(
-                    scale_value,
-                    dtype=torch.float32,
-                    device="cuda",
-                ).reshape(1),
-            )
 
     @staticmethod
     def _find_weight_quantizer(
@@ -719,6 +799,7 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 )
             yield from self._iter_real_quant_refit_params(
                 kv_scales,
+                include_draft=include_draft,
                 draft_metadata_only=draft_metadata_only,
                 draft_weights=draft_weights,
             )

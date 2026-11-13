@@ -86,6 +86,11 @@ class DFlashBodyConfig:
     rope_theta: float = 1_000_000.0
     rms_norm_eps: float = 1e-6
     initializer_range: float = 0.02
+    # Grouped dynamic convolution around each sublayer (DFlash2 / LiLiCorr
+    # checkpoints' ``dflash_config.conv_kernel_size`` / ``conv_group_size``).
+    # 0 disables it, which is the plain DFlash body.
+    conv_kernel_size: int = 0
+    conv_group_size: int = 0
 
     def __post_init__(self) -> None:
         integer_fields = (
@@ -112,6 +117,77 @@ class DFlashBodyConfig:
         ):
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{field_name} must be finite and positive")
+        if (self.conv_kernel_size > 0) != (self.conv_group_size > 0):
+            raise ValueError(
+                "conv_kernel_size and conv_group_size must be set together"
+            )
+        if self.conv_group_size > 0 and self.hidden_size % self.conv_group_size:
+            raise ValueError("conv_group_size must divide hidden_size")
+
+
+class DFlashGroupedConv(nn.Module):
+    """Grouped dynamic depthwise convolution over the positions of one block.
+
+    Port of ModelOpt's ``DFlashGroupedConv`` (and vLLM's DFlash2 layer), with the
+    same parameter names and layout so a released checkpoint loads and exports
+    without renaming. Position ``k`` of a block reads positions ``k - tap`` of
+    the same block only. Each tap's weight is ``base_kernel + delta``, where the
+    per-position ``delta`` comes from ``kernel_projection`` of the sublayer input.
+
+    Replicated across tensor parallelism: it acts on the full hidden size
+    (sublayer input before the column-parallel q/k/v or gate/up projections,
+    and output after the row-parallel o_proj / down_proj), like the norms.
+    """
+
+    def __init__(
+        self, hidden_size: int, taps: int, group_size: int, params_dtype: torch.dtype
+    ) -> None:
+        super().__init__()
+        self.taps = int(taps)
+        self.group_size = int(group_size)
+        self.num_groups = int(hidden_size) // self.group_size
+        # [input/output side, tap, channel]. Identity at tap 0 until loaded.
+        base_kernel = torch.zeros(2, self.taps, int(hidden_size), dtype=params_dtype)
+        base_kernel[:, 0] = 1.0
+        self.base_kernel = nn.Parameter(base_kernel)
+        self.kernel_projection = nn.Linear(
+            int(hidden_size),
+            2 * self.taps * self.num_groups,
+            bias=False,
+            dtype=params_dtype,
+        )
+        nn.init.zeros_(self.kernel_projection.weight)
+
+    def _convolve(self, blocks: Tensor, delta: Tensor, side: int) -> Tensor:
+        # blocks: [num_blocks, block_size, hidden]; delta: [..., block, taps, groups]
+        num_blocks, block_size, hidden_size = blocks.shape
+        grouped = blocks.view(num_blocks, block_size, self.num_groups, self.group_size)
+        base = self.base_kernel[side].view(self.taps, self.num_groups, self.group_size)
+        # base * x + delta * x, never the dense [taps, hidden] coefficient tensor:
+        # autograd would keep that multiplicand alive until backward.
+        output = base[0] * grouped + delta[:, :, 0].unsqueeze(-1) * grouped
+        for tap in range(1, min(self.taps, block_size)):
+            shifted = nn.functional.pad(
+                grouped[:, : block_size - tap], (0, 0, 0, 0, tap, 0)
+            )
+            output = (
+                output + base[tap] * shifted + delta[:, :, tap].unsqueeze(-1) * shifted
+            )
+        return output.reshape(num_blocks, block_size, hidden_size)
+
+    def prepare(self, hidden_states: Tensor) -> tuple[Tensor, Tensor]:
+        """Convolve the sublayer input; return it with the output side's kernel."""
+        coefficients = self.kernel_projection(hidden_states).view(
+            *hidden_states.shape[:2], 2, self.taps, self.num_groups
+        )
+        return (
+            self._convolve(hidden_states, coefficients[:, :, 0], side=0),
+            coefficients[:, :, 1],
+        )
+
+    def finish(self, hidden_states: Tensor, coefficients: Tensor) -> Tensor:
+        """Convolve the sublayer output with the kernel from :meth:`prepare`."""
+        return self._convolve(hidden_states, coefficients, side=1)
 
 
 class QwenRMSNorm(nn.Module):
@@ -368,6 +444,17 @@ class _DFlashDecoderLayer(_ShardedModule):
             eps=config.rms_norm_eps,
             params_dtype=parallel_config.params_dtype,
         )
+        self.attention_conv: DFlashGroupedConv | None = None
+        self.mlp_conv: DFlashGroupedConv | None = None
+        if config.conv_kernel_size > 0:
+            conv_args = dict(
+                hidden_size=config.hidden_size,
+                taps=config.conv_kernel_size,
+                group_size=config.conv_group_size,
+                params_dtype=parallel_config.params_dtype,
+            )
+            self.attention_conv = DFlashGroupedConv(**conv_args)
+            self.mlp_conv = DFlashGroupedConv(**conv_args)
 
 
 def _rotate_half(hidden_states: Tensor) -> Tensor:
@@ -681,6 +768,11 @@ class DFlashBody(_ShardedModule):
             layer = cast(_DFlashDecoderLayer, layer_module)
             residual = hidden_states
             normalized = layer.input_layernorm(hidden_states)
+            attention_kernel = None
+            if layer.attention_conv is not None:
+                # Only the block (query) stream is convolved; the trunk K/V come
+                # from target hidden states, as in vLLM's DFlash2 layer.
+                normalized, attention_kernel = layer.attention_conv.prepare(normalized)
             trunk_key = layer.self_attn.k_norm(
                 layer.self_attn.k_proj(target_hidden).view(
                     batch_size,
@@ -739,12 +831,21 @@ class DFlashBody(_ShardedModule):
                 sequence_layout=sequence_layout,
                 context_parallel_group=context_parallel_group,
             )
-            hidden_states = residual + layer.self_attn.o_proj(
+            attention_update = layer.self_attn.o_proj(
                 attention_output.flatten(start_dim=2)
             )
-            hidden_states = hidden_states + layer.mlp(
-                layer.post_attention_layernorm(hidden_states)
-            )
+            if layer.attention_conv is not None:
+                attention_update = layer.attention_conv.finish(
+                    attention_update, attention_kernel
+                )
+            hidden_states = residual + attention_update
+            mlp_input = layer.post_attention_layernorm(hidden_states)
+            if layer.mlp_conv is not None:
+                mlp_input, mlp_kernel = layer.mlp_conv.prepare(mlp_input)
+                mlp_update = layer.mlp_conv.finish(layer.mlp(mlp_input), mlp_kernel)
+            else:
+                mlp_update = layer.mlp(mlp_input)
+            hidden_states = hidden_states + mlp_update
 
         output = self.norm(hidden_states)
         return torch.where(

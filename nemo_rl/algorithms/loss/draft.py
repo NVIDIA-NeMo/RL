@@ -555,6 +555,14 @@ class _StreamingProjectedVocabParallelSoftCE(torch.autograd.Function):
         flat_bin_ids = bin_ids.reshape(-1)
         flat_hidden_gradient = torch.empty_like(flat_hidden, dtype=torch.float32)
         output_weight_fp32 = output_weight.detach().float()
+        # Only a drafter-owned, trainable head needs this; the policy head is detached.
+        # Each rank owns its vocab rows and the hidden is TP-replicated, so the local
+        # rows' gradient needs no TP reduction.
+        output_weight_gradient = (
+            torch.zeros_like(output_weight, dtype=torch.float32)
+            if ctx.needs_input_grad[1]
+            else None
+        )
 
         for start in range(0, flat_hidden.shape[0], ctx.token_chunk_size):
             end = min(start + ctx.token_chunk_size, flat_hidden.shape[0])
@@ -572,6 +580,10 @@ class _StreamingProjectedVocabParallelSoftCE(torch.autograd.Function):
             logits_gradient = student_probs.sub_(teacher_probs)
             logits_gradient.mul_(row_scale.unsqueeze(-1))
             flat_hidden_gradient[start:end].copy_(logits_gradient @ output_weight_fp32)
+            if output_weight_gradient is not None:
+                output_weight_gradient.addmm_(
+                    logits_gradient.T, flat_hidden[start:end].float()
+                )
 
         if ctx.tp_group is not None:
             torch.distributed.all_reduce(
@@ -583,7 +595,9 @@ class _StreamingProjectedVocabParallelSoftCE(torch.autograd.Function):
             flat_hidden_gradient.reshape_as(student_hidden).to(
                 dtype=student_hidden.dtype
             ),
-            None,
+            None
+            if output_weight_gradient is None
+            else output_weight_gradient.to(dtype=output_weight.dtype),
             None,
             None,
             None,
@@ -707,8 +721,13 @@ def projected_streaming_vocab_parallel_soft_ce(
     bin_ids: torch.Tensor | None = None,
     weights: torch.Tensor | None = None,
     _skip_tp_metadata_check: bool = False,
+    train_output_weight: bool = False,
 ) -> DraftLossStats:
     """Project hidden states against preselected teacher rows with TP-safe metadata.
+
+    ``output_weight`` is never trained unless ``train_output_weight`` is set: the
+    policy head must not learn from the draft loss even if a caller forgets to
+    detach it. Only a drafter-owned head (LiLiCorr ``has_own_lm_head``) sets it.
 
     TP ranks agree on a fixed structural header and exact mask/bin/weight metadata
     before validation or loss collectives, so malformed rank-local inputs fail together.
@@ -792,6 +811,8 @@ def projected_streaming_vocab_parallel_soft_ce(
         raise ValueError(f"token_chunk_size must be positive, got {token_chunk_size}.")
     bin_ids, weights, num_bins = _resolve_draft_bins(mask, bin_ids, weights)
 
+    if not train_output_weight:
+        output_weight = output_weight.detach()
     num_tokens = student_hidden.numel() // student_hidden.shape[-1]
     if num_tokens <= token_chunk_size:
         vocab_parallel_hidden = _SumTensorParallelHiddenGradient.apply(
@@ -800,7 +821,8 @@ def projected_streaming_vocab_parallel_soft_ce(
         )
         student_logits = (
             vocab_parallel_hidden.reshape(-1, student_hidden.shape[-1])
-            @ output_weight.detach().T
+            # Detached above unless train_output_weight, so only an owned head trains.
+            @ output_weight.T
         )
         # Bins are already resolved above; the public entry point would
         # re-validate them with another host sync.
@@ -843,6 +865,7 @@ def dflash_projected_vocab_parallel_soft_ce(
     position_decay: float,
     token_chunk_size: int,
     tp_group: torch.distributed.ProcessGroup | None,
+    train_output_weight: bool = False,
 ) -> DraftLossStats:
     """Map DFlash block slots to the live target head and indexed teacher rows.
 
@@ -980,4 +1003,5 @@ def dflash_projected_vocab_parallel_soft_ce(
         weights=weights,
         token_chunk_size=token_chunk_size,
         tp_group=tp_group,
+        train_output_weight=train_output_weight,
     )

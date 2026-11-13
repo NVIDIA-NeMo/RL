@@ -1364,7 +1364,137 @@ def ensure_vllm_source_compat() -> None:
     _patch_vllm_radio_native_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_nano_vl_projector_loader(patch_logger)
+    _patch_vllm_lilicorr_split_refit(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
+
+
+_LILICORR_COVERAGE_OLD = """        missing = expected - seen
+        if missing:
+            raise ValueError(
+                f"LiLiCorr checkpoint coverage mismatch: missing={sorted(missing)}"
+            )
+"""
+_LILICORR_COVERAGE_NEW = """        missing = expected - seen
+        # NeMo RL: an RL refit streams the drafter over several load_weights
+        # calls, so check coverage only for a complete load (vllm#66069).
+        from vllm.model_executor.model_loader.mtp_validation import (
+            is_mtp_completeness_check_enabled as _nrl_coverage_check_enabled,
+        )
+
+        if missing and _nrl_coverage_check_enabled():
+            raise ValueError(
+                f"LiLiCorr checkpoint coverage mismatch: missing={sorted(missing)}"
+            )
+"""
+
+
+_LILICORR_MATERIALIZE_OLD = """    @torch.no_grad()
+    def materialize_inference_buffers(
+        self, device: torch.device, dtype: torch.dtype
+    ) -> None:
+        \"\"\"Build inference-only views/copies after checkpoint weights are loaded.\"\"\"
+"""
+_LILICORR_MATERIALIZE_NEW = """    @torch.no_grad()
+    def materialize_inference_buffers(
+        self, device: torch.device, dtype: torch.dtype
+    ) -> None:
+        \"\"\"NeMo RL: rebuild, then refill existing buffers IN PLACE.
+
+        Captured CUDA graphs hold the first buffers' storage; rebinding new
+        tensors after a refit would leave the graphs scoring with stale head
+        weights.
+        \"\"\"
+        names = (
+            "_attn_bias",
+            "_fused_edge_weight",
+            "_fused_edge_bias",
+            "_factor_input_splits",
+            "_rank_frac_col",
+            "_is_top1_col",
+        )
+        previous = {name: getattr(self, name, None) for name in names}
+        self._nrl_build_inference_buffers(device, dtype)
+
+        def same(a, b):
+            return a.shape == b.shape and a.dtype == b.dtype and a.device == b.device
+
+        for name in names:
+            old, new = previous[name], getattr(self, name)
+            if old is None:
+                continue
+            if isinstance(old, tuple):
+                if len(old) == len(new) and all(same(o, n) for o, n in zip(old, new)):
+                    for o, n in zip(old, new):
+                        o.copy_(n)
+                    setattr(self, name, old)
+            elif same(old, new):
+                old.copy_(new)
+                setattr(self, name, old)
+
+    @torch.no_grad()
+    def _nrl_build_inference_buffers(
+        self, device: torch.device, dtype: torch.dtype
+    ) -> None:
+        \"\"\"Build inference-only views/copies after checkpoint weights are loaded.\"\"\"
+"""
+_LILICORR_INIT_OLD = """        self._rank_frac_col: torch.Tensor
+        self._is_top1_col: torch.Tensor
+
+"""
+_LILICORR_INIT_NEW = """        self._rank_frac_col: torch.Tensor
+        self._is_top1_col: torch.Tensor
+        # NeMo RL: build the buffers at construction. A dummy-weight start (the
+        # drafter's weights arrive by refit) never runs load_weights, so the first
+        # forward would find none; the first refit refills them in place.
+        if not self.slot_embedding.is_meta:
+            self.materialize_inference_buffers(
+                self.slot_embedding.device, self.slot_embedding.dtype
+            )
+
+"""
+
+
+def _patch_vllm_lilicorr_split_refit(logger) -> None:
+    """Make vLLM 0.33's LiLiCorr drafter work as an RL-refit speculator.
+
+    1. ``load_weights`` raised unless every head/convolution tensor arrived in one
+       call; a refit streams the drafter in buckets. Gate the check on vLLM's
+       ``is_mtp_completeness_check_enabled`` scope (``_load_draft_weights``
+       disables it; startup loads keep it). ModelUpdateCoverage still proves every
+       streamed draft tensor loaded.
+    2. Inference buffers are built only in ``load_weights``, so a dummy-weight
+       start (weights by refit) failed on the first forward. Build them at
+       construction.
+    3. Rebuilding replaced the buffer tensors, which captured CUDA graphs would
+       not see. Refill them in place.
+    Port of vllm-project/vllm#66069 (closed unmerged) and the in-place refill of
+    #64692 to vLLM 0.33. Each call site still rebuilds after every load, which is
+    a pure function of the head weights loaded so far.
+    """
+    try:
+        file_to_patch = _get_vllm_file("model_executor/models/lilicorr.py")
+    except RuntimeError:
+        # vLLM builds without LiLiCorr (< 0.31) have nothing to patch.
+        logger.info("vLLM has no LiLiCorr drafter; skipping LiLiCorr refit patch.")
+        return
+
+    replacements = (
+        (_LILICORR_COVERAGE_OLD, _LILICORR_COVERAGE_NEW),
+        (_LILICORR_MATERIALIZE_OLD, _LILICORR_MATERIALIZE_NEW),
+        (_LILICORR_INIT_OLD, _LILICORR_INIT_NEW),
+    )
+    with _locked_file_patch(file_to_patch) as (content, write_back):
+        if all(new in content for _, new in replacements):
+            return
+        if any(content.count(old) != 1 for old, _ in replacements):
+            raise RuntimeError(
+                "LiLiCorr refit patch requires the vLLM 0.33 lilicorr.py or its "
+                f"fully patched form: {file_to_patch}"
+            )
+        for old, new in replacements:
+            content = content.replace(old, new, 1)
+        write_back(content)
+    logger.info("Patched LiLiCorr for split refits, dummy starts and in-place buffers.")
 
 
 def _apply_vllm_patches(
@@ -1385,6 +1515,7 @@ def _apply_vllm_patches(
     _patch_vllm_radio_native_loader(patch_logger)
     _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_nano_vl_projector_loader(patch_logger)
+    _patch_vllm_lilicorr_split_refit(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
     _patch_vllm_moe_routed_experts_capture(
         patch_logger, required=require_moe_routed_experts_capture

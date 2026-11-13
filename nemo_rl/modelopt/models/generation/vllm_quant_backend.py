@@ -45,6 +45,20 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
     def _supports_unquantized_flashinfer_trtllm_refit(self) -> bool:
         return False
 
+    def _validate_native_layerwise_refit(
+        self, transport: WeightUpdateTransport | None = None
+    ) -> None:
+        # The base guard (extended in #3638 to native MXFP8 linear kernels) rejects an
+        # FP8 KV cache because the *targeted* layerwise reload leaves static KV scales
+        # outside its lifecycle. ModelOpt real-quant does not use the targeted reload:
+        # it reloads the whole model (_get_native_layerwise_reload_targets -> [model])
+        # and refits KV scales itself in _kv_scale_refit. Its MXFP8 linears trip the
+        # native-MXFP8 branch, so without this the recipe's FP8 KV cache fails at the
+        # first refit, which it did not before #3638.
+        if self._is_real_quant_model():
+            return
+        super()._validate_native_layerwise_refit(transport)
+
     def maybe_init_zmq(self) -> None:
         """Use a longer timeout only for ModelOpt real-quant refits."""
         super().maybe_init_zmq()
@@ -84,12 +98,11 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         state_dict_info: dict[str, Any],
         serialized_fp8_config: Optional[dict[str, Any]] = None,
     ) -> Optional[list[str]]:
-        if self._is_real_quant_model() and any(
-            name.startswith("draft.") for name in state_dict_info
-        ):
-            raise RuntimeError(
-                "ModelOpt real-quant refit does not support draft finalization"
-            )
+        # Co-trained `draft.` weights are allowed: the drafter is a separate vLLM
+        # module built from its own (unquantized) config -- vLLM applies neither
+        # the target's dict hf_overrides nor, for dflash-family methods, its
+        # quantization to it -- so it takes plain BF16 tensors outside the
+        # ModelOpt export plan. _load_weights / the IPC loader route them.
         # Real ModelOpt refits must not enter legacy FP8 prequantization.
         return super().prepare_refit_info(
             state_dict_info,
@@ -109,10 +122,17 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
             def load_weights(weights: Iterable[tuple[str, torch.Tensor]]) -> Any:
                 if not isinstance(weights, list):
                     weights = list(weights)
-                input_names = tuple(name for name, _ in weights)
-                result = self.model_runner.model.load_weights(weights)
+                policy_weights, draft_weights = self._split_policy_and_draft_weights(
+                    weights
+                )
+                result = self.model_runner.model.load_weights(policy_weights)
                 if coverage is not None:
-                    coverage.record_loaded(input_names)
+                    coverage.record_loaded(tuple(name for name, _ in policy_weights))
+                self._load_and_record_draft_weights(
+                    draft_weights,
+                    tuple(f"draft.{name}" for name, _ in draft_weights),
+                    coverage=coverage,
+                )
                 return result
 
             return buffer[:used_bytes].clone(), load_weights
@@ -195,9 +215,21 @@ class VllmQuantInternalWorkerExtension(VllmInternalWorkerExtension):
         if self._is_real_quant_model():
             # Native reload owns placement. A default-device mode here also
             # dispatches every metadata operation through Python.
-            self._load_full_hf_weights(weights)
+            policy_weights, draft_weights = self._split_policy_and_draft_weights(
+                weights
+            )
+            self._load_full_hf_weights(policy_weights)
             if coverage is not None:
-                coverage.record_loaded(input_names)
+                coverage.record_loaded(
+                    tuple(name for name in input_names if not name.startswith("draft."))
+                )
+            # The drafter is outside the native reload targets ([main model]):
+            # it loads directly, and finalize() runs its post-load processing.
+            self._load_and_record_draft_weights(
+                draft_weights,
+                tuple(name for name in input_names if name.startswith("draft.")),
+                coverage=coverage,
+            )
             return
 
         weights = route_moe_input_quantizer_amax(

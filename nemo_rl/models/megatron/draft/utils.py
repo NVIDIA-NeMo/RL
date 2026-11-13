@@ -14,12 +14,13 @@
 
 from __future__ import annotations
 
+import os
 import json
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Mapping, cast
+from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Tuple, cast
 
 import torch
 import torch.distributed as dist
@@ -1901,6 +1902,16 @@ def _dflash_weight_layout(
         "mlp.up_proj.weight": ((intermediate_size, hidden_size), 0),
         "mlp.down_proj.weight": ((hidden_size, intermediate_size), 1),
     }
+    taps = int(getattr(config, "conv_kernel_size", 0))
+    if taps > 0:
+        # Grouped convolutions act on the full hidden size and are replicated.
+        num_groups = hidden_size // int(config.conv_group_size)
+        for conv in ("attention_conv", "mlp_conv"):
+            layouts[f"{conv}.base_kernel"] = ((2, taps, hidden_size), None)
+            layouts[f"{conv}.kernel_projection.weight"] = (
+                (2 * taps * num_groups, hidden_size),
+                None,
+            )
     try:
         return layouts[suffix]
     except KeyError as exc:
@@ -2081,9 +2092,25 @@ def export_dspark_heads_to_hf(
     return exported
 
 
+def unwrap_policy_language_model(policy_model_chunk: MegatronModule) -> Any:
+    """Return the GPT/Mamba language model inside a policy chunk.
+
+    VL wrappers (NemotronVLModel / NemotronOmniModel) keep it under
+    ``.llava_model.language_model``; plain LLM chunks are the model itself.
+    """
+    model = unwrap_model(policy_model_chunk)
+    llava_model = getattr(model, "llava_model", None)
+    if llava_model is not None:
+        model = llava_model
+    language_model = getattr(model, "language_model", None)
+    if language_model is not None:
+        model = language_model
+    return model
+
+
 def get_policy_lm_head_weight(policy_model_chunk: MegatronModule) -> torch.Tensor:
     """Return the local policy LM-head shard for draft initialization."""
-    unwrapped_policy_model = unwrap_model(policy_model_chunk)
+    unwrapped_policy_model = unwrap_policy_language_model(policy_model_chunk)
     if getattr(unwrapped_policy_model, "share_embeddings_and_output_weights", False):
         return unwrapped_policy_model.shared_embedding_or_output_weight()
     return unwrapped_policy_model.output_layer.weight
@@ -2343,3 +2370,57 @@ def build_draft_model(
         param.grad_norm_group = DRAFT_GRAD_NORM_GROUP
 
     return draft_model
+
+
+def resolve_draft_aux_layer_indices(draft_cfg: Any) -> Optional[Tuple[int, ...]]:
+    """Resolve which target layers the drafter reads, for the Megatron capture.
+
+    A block drafter (dflash, dspark, lilicorr) is pretrained against specific target
+    layers, named in its own checkpoint as ``dflash_config.target_layer_ids``. The
+    capture otherwise falls back to the eagle3 heuristic, which picks different layers
+    on the same target -- the draft then trains on features it was never built to read,
+    with no error and no symptom beyond a drafter that never reaches a useful
+    acceptance length.
+
+    ``target_layer_ids`` already uses the "output of decoder layer i" convention that
+    Megatron's capture indexes by (``global_idx = layer_number - 1``), so no shift is
+    applied here. That is NOT true of ``aux_hidden_state_layer_ids`` in speculators /
+    vLLM checkpoints, which are offset by one; the automodel path shifts those at
+    ``automodel/draft/setup.py``.
+
+    Returns None when nothing pins the layers, which preserves the eagle3 fallback.
+    """
+    explicit = getattr(draft_cfg, "aux_layer_indices", None)
+    if explicit:
+        return tuple(int(i) for i in explicit)
+
+    model_name = getattr(draft_cfg, "model_name", None)
+    if not model_name:
+        return None
+
+    config_path = os.path.join(model_name, "config.json")
+    if not os.path.isfile(config_path):
+        return None
+
+    with open(config_path) as handle:
+        checkpoint_config = json.load(handle)
+
+    layer_ids = checkpoint_config.get("dflash_config", {}).get("target_layer_ids")
+    if not layer_ids:
+        return None
+
+    resolved = tuple(int(i) for i in layer_ids)
+    if any(i < 0 for i in resolved):
+        raise ValueError(
+            f"[draft] {config_path} names negative target_layer_ids {resolved}. "
+            "Refusing to guess which layers the drafter reads."
+        )
+
+    num_target_layers = checkpoint_config.get("num_target_layers")
+    if num_target_layers is not None and max(resolved) >= int(num_target_layers):
+        raise ValueError(
+            f"[draft] {config_path} names target_layer_ids {resolved}, but the "
+            f"checkpoint reports only {num_target_layers} target layers. The drafter "
+            "and the target it is being co-trained against do not agree."
+        )
+    return resolved

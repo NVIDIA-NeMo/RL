@@ -148,6 +148,22 @@ def _abort_layerwise_reload(root: torch.nn.Module) -> None:
         LOADING_LAYERS.discard(layer)
 
 
+def _draft_refit_load_scope() -> Any:
+    """Disable vLLM's per-call drafter completeness check for one refit load.
+
+    A refit streams the drafter in buckets, so any single ``load_weights`` call
+    is partial by design. vLLM's own weight-transfer engines take the same
+    scope. Completeness is still enforced per refit by ModelUpdateCoverage.
+    """
+    try:
+        from vllm.model_executor.model_loader.mtp_validation import (
+            disable_mtp_completeness_check,
+        )
+    except ImportError:  # vLLM without the scope also has no per-call check
+        return nullcontext()
+    return disable_mtp_completeness_check()
+
+
 def _refresh_hpc_modules_after_layerwise_reload(model: torch.nn.Module) -> None:
     """Rebuild kernel-specific state omitted by vLLM's layerwise finalizer.
 
@@ -1279,7 +1295,8 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         if strict_cotraining:
             _assert_drafter_owns_modules(self.model_runner, draft_model, draft_weights)
         draft_weights = self._trim_vocab_padding(draft_model, draft_weights)
-        draft_model.load_weights(weights=draft_weights)
+        with _draft_refit_load_scope():
+            draft_model.load_weights(weights=draft_weights)
         return True
 
     def _mtp_drafter_refit_enabled(self) -> bool:
@@ -1482,7 +1499,27 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
         self._load_hf_weights(self._without_tied_embedding_aliases(policy_weights))
         if coverage is not None:
             coverage.record_loaded(policy_input_names)
-        # Eagle3 draft weights are exported with the `draft.` prefix.
+        self._load_and_record_draft_weights(
+            draft_weights, draft_input_names, coverage=coverage
+        )
+        # MTP drafters co-trained with the policy receive their weights from the
+        # policy stream (no `draft.` prefix), so feed it the policy weights too.
+        self._maybe_refit_mtp_drafter(policy_weights)
+
+    def _load_and_record_draft_weights(
+        self,
+        draft_weights: list[tuple[str, torch.Tensor]],
+        draft_input_names: tuple[str, ...],
+        *,
+        coverage: ModelUpdateCoverage | None = None,
+    ) -> None:
+        """Route co-trained ``draft.`` weights to the speculator and record coverage.
+
+        Shared by every load path, including subclasses that load the policy
+        stream their own way (e.g. ModelOpt real-quant), so the drafter is never
+        silently left on its startup weights.
+        """
+        # Co-trained draft weights are exported with the `draft.` prefix.
         if self._draft_runtime_adapter is None:
             draft_loaded = self._load_draft_weights(draft_weights)
         else:
@@ -1494,9 +1531,6 @@ class VllmInternalWorkerExtension(RefitBuilderInterface):
                 coverage.record_loaded(draft_input_names)
             else:
                 coverage.record_owner_skip(draft_input_names, component="draft")
-        # MTP drafters co-trained with the policy receive their weights from the
-        # policy stream (no `draft.` prefix), so feed it the policy weights too.
-        self._maybe_refit_mtp_drafter(policy_weights)
 
     @torch.no_grad()
     def _install_native_lora(self, lora_tensors: dict[str, torch.Tensor]) -> None:
