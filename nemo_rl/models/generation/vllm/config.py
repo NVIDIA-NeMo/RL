@@ -37,6 +37,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     NvFp4PerTokenRolloutConfig,
     resolve_boundary_ignore_patterns,
 )
+from nemo_rl.models.generation.vllm.worker_utils import resolve_vllm_dp_size
 
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
@@ -366,6 +367,23 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
             )
         if config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS:
             raise ValueError("Multiple HTTP API servers do not support sparse refit")
+        vllm_kwargs = config.get("vllm_kwargs") or {}
+        data_parallel_size = vllm_kwargs.get("data_parallel_size")
+        tp_size = vllm_cfg.get("tensor_parallel_size")
+        ep_size = vllm_cfg.get("expert_parallel_size")
+        if (
+            (data_parallel_size is not None and data_parallel_size != 1)
+            or vllm_kwargs.get("data_parallel_backend") == "ray"
+            or (
+                tp_size is not None
+                and ep_size is not None
+                and resolve_vllm_dp_size(tp_size, ep_size) != 1
+            )
+        ):
+            raise ValueError(
+                "Multiple HTTP API servers require local vLLM DP=1 and "
+                "data_parallel_backend other than 'ray'"
+            )
     if vllm_cfg.get("flat_logprobs") and not (
         vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
     ):
