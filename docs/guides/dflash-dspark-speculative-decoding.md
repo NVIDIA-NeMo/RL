@@ -16,7 +16,7 @@ training.
 | Component | Supported configuration |
 | --- | --- |
 | Training backend | Megatron Core |
-| Target tensor parallelism | TP2 |
+| Target tensor parallelism | TP2 is the tested layout. Other TP sizes must divide the draft dimensions. |
 | Target pipeline parallelism | PP1 with no virtual pipeline parallelism |
 | Target context parallelism | CP1, CP2, or CP4 |
 | Sequence packing | Optional at CP1; required at CP2 and CP4 |
@@ -211,9 +211,10 @@ If `optimizer` is `null`, draft parameters use the policy optimizer settings.
 - `context_parallel_size > 1` with packing disabled
 - `context_parallel_size > 1` without `data_plane.enabled=true`, or with
   `grpo.async_grpo.enabled=true`
-- async GRPO with `data_plane.enabled=false`
 - target sequence parallelism with packing disabled
-- target TP other than 2, or training PP/virtual PP greater than 1
+- target TP that does not divide the draft dimensions (attention heads, KV
+  heads, hidden size, intermediate size, and vocabulary), or training PP/virtual
+  PP greater than 1
 - generation CP or PP greater than 1
 - `use_fused_linear_logprobs=true`
 - a generation method that does not match the training speculator

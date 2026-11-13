@@ -169,6 +169,69 @@ def test_dflash_config_rejects_duplicate_target_taps() -> None:
         )
 
 
+_BLOCK_DRAFT_BASE = {
+    "enabled": True,
+    "anchors_per_sample": 4,
+    "mask_token_id": 151665,
+    "target_hidden_state_layer_ids": [1, 17, 33],
+}
+
+
+@pytest.mark.parametrize(
+    ("config_cls", "overrides", "match"),
+    [
+        (
+            MegatronDFlashDraftConfig,
+            {"gamma": 5, "target_hidden_state_layer_ids": [-1, 17]},
+            "non-negative",
+        ),
+        (
+            MegatronDSparkDraftConfig,
+            {"block_size": 7, "target_hidden_state_layer_ids": [-1, 17]},
+            "non-negative",
+        ),
+        (
+            MegatronDSparkDraftConfig,
+            {"block_size": 7, "target_hidden_state_layer_ids": [1, 1]},
+            "unique",
+        ),
+        (
+            MegatronDSparkDraftConfig,
+            {
+                "block_size": 7,
+                "confidence_enabled": False,
+                "confidence_with_markov": True,
+            },
+            "confidence_with_markov requires confidence_enabled",
+        ),
+        (
+            MegatronDSparkDraftConfig,
+            {
+                "block_size": 7,
+                "ce_loss_weight": 0.0,
+                "tv_loss_weight": 0.0,
+                "confidence_loss_weight": 0.0,
+            },
+            "at least one DSpark loss weight must be positive",
+        ),
+    ],
+    ids=[
+        "dflash-negative-tap",
+        "dspark-negative-tap",
+        "dspark-duplicate-tap",
+        "dspark-markov-without-confidence",
+        "dspark-all-zero-loss-weights",
+    ],
+)
+def test_block_draft_config_rejects_invalid_contract(
+    config_cls: type[MegatronDFlashDraftConfig] | type[MegatronDSparkDraftConfig],
+    overrides: dict[str, object],
+    match: str,
+) -> None:
+    with pytest.raises(ValidationError, match=match):
+        config_cls.model_validate({**_BLOCK_DRAFT_BASE, **overrides})
+
+
 def test_coerce_draft_config_accepts_a_raw_mapping() -> None:
     """PolicyConfig is a TypedDict, so hand-built configs arrive as dicts.
 

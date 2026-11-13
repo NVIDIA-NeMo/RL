@@ -2762,7 +2762,10 @@ class MegatronPolicyWorkerImpl(
             draft_update_result = finalize_draft_update_probe(
                 self.draft_model, draft_update_probe
             )
-            require_draft_update(draft_update_result)
+            # A skipped step (non-finite gradients) changes no parameters by
+            # design.
+            if update_successful:
+                require_draft_update(draft_update_result)
             log.info(format_draft_update_probe(draft_update_result))
 
         draft_grad_norm = None
