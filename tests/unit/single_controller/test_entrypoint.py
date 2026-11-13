@@ -19,6 +19,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import ray
 
 from examples import run_grpo_single_controller
 from nemo_rl.algorithms.grpo import GRPOConfig
@@ -109,8 +110,10 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         "remote",
         MagicMock(return_value=actor),
     )
-    monkeypatch.setattr(run_grpo_single_controller.ray, "get", ray_get)
-    monkeypatch.setattr(run_grpo_single_controller.ray, "wait", ray_wait)
+    # The liveness watch lives in single_controller_utils.utils now; ray is one
+    # module object, so patching it here reaches that helper too.
+    monkeypatch.setattr(ray, "get", ray_get)
+    monkeypatch.setattr(ray, "wait", ray_wait)
     monkeypatch.setattr(
         run_grpo_single_controller,
         "shutdown_environments",
