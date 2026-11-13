@@ -14,6 +14,7 @@
 
 import asyncio
 import contextlib
+import gc
 import importlib.util
 import inspect
 import json
@@ -66,6 +67,7 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
     _AsyncLLMHTTPClient,
+    _tune_actor_interpreter,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
@@ -259,6 +261,51 @@ basic_automodel_test_config: PolicyConfig = {
 
 
 @pytest.mark.vllm
+def test_tune_actor_interpreter_applies_gil_and_gc_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    monkeypatch.setattr(sys, "setswitchinterval", lambda s: calls.append(("si", s)))
+    monkeypatch.setattr(gc, "set_threshold", lambda *t: calls.append(("th", t)))
+    monkeypatch.setattr(gc, "collect", lambda: calls.append(("collect",)))
+    monkeypatch.setattr(gc, "freeze", lambda: calls.append(("freeze",)))
+
+    _tune_actor_interpreter(
+        {
+            "actor_gil_switch_interval_ms": 0.5,
+            "actor_gc_threshold": [50000, 50, 100],
+            "actor_gc_freeze": True,
+        }
+    )
+
+    assert calls == [
+        ("si", 0.0005),
+        ("th", (50000, 50, 100)),
+        ("collect",),
+        ("freeze",),
+    ]
+
+
+def test_tune_actor_interpreter_leaves_defaults_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for module, name in (
+        (sys, "setswitchinterval"),
+        (gc, "set_threshold"),
+        (gc, "freeze"),
+    ):
+        monkeypatch.setattr(module, name, MagicMock(side_effect=AssertionError(name)))
+
+    _tune_actor_interpreter(
+        {
+            "actor_gil_switch_interval_ms": None,
+            "actor_gc_threshold": None,
+            "actor_gc_freeze": False,
+        }
+    )
+    _tune_actor_interpreter({})
+
+
 def test_prepare_refit_info_skips_missing_metadata():
     generation = VllmGeneration.__new__(VllmGeneration)
     generation.worker_group = MagicMock()
