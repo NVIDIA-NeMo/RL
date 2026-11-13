@@ -1,18 +1,8 @@
 # Router Replay
 
-Router Replay, or R3, records MoE router choices made during rollout generation
-and replays those choices in the policy's forward passes (Megatron or automodel). This keeps each generated
-token's expert assignment consistent across rollout, logprob, and training
-stages. Without replay, two valid router implementations can choose different
-experts for the same token, which introduces train-vs-rollout logprob mismatch
-that is unrelated to the policy update.
+Router Replay, or R3, records MoE router choices made during rollout generation and replays those choices in the policy's forward passes (Megatron or automodel). This keeps each generated token's expert assignment consistent across rollout, logprob, and training stages. Without replay, two valid router implementations can choose different experts for the same token, which introduces train-vs-rollout logprob mismatch that is unrelated to the policy update.
 
-Router Replay is disabled by default. It is not needed for dense models. The
-current NeMo RL integration supports MoE policy training on the Megatron and
-Automodel backends with vLLM rollout generation, and Megatron policy training
-with Megatron Inference (MInf) generation through the SingleController
-token-capture path. Other inference/generation backends are not wired into
-Router Replay.
+Router Replay is disabled by default. It is not needed for dense models. The current NeMo RL integration supports MoE policy training on the Megatron and Automodel backends with vLLM rollout generation, and Megatron policy training with Megatron Inference (MInf) generation through the SingleController token-capture path. Other inference/generation backends are not wired into Router Replay.
 
 ## Configuration
 
@@ -26,23 +16,14 @@ policy:
 
 ### vLLM generation
 
-When Router Replay is enabled with vLLM, NeMo RL configures rollout generation
-to return routed expert indices by setting `enable_return_routed_experts=True`
-in the vLLM kwargs. The generation payload is then carried through the normal
-rollout and policy data path as the `routed_experts` field.
+When Router Replay is enabled with vLLM, NeMo RL configures rollout generation to return routed expert indices by setting `enable_return_routed_experts=True` in the vLLM kwargs. The generation payload is then carried through the normal rollout and policy data path as the `routed_experts` field.
 
 Keep `policy.generation.vllm_cfg.enable_prefix_caching=true` with Router Replay.
-vLLM stores the routed experts next to its prefix-cache blocks and returns them
-for cached prefix tokens too, so it refuses to return routed experts with prefix
-caching off. NeMo RL rejects that combination when the engine is created.
+vLLM stores the routed experts next to its prefix-cache blocks and returns them for cached prefix tokens too, so it refuses to return routed experts with prefix caching off. NeMo RL rejects that combination when the engine is created.
 
 ### Megatron Inference generation
 
-MInf Router Replay is supported only by the SingleController NeMo-Gym path:
-launch with `examples/run_grpo_single_controller.py` (`examples/run_grpo.py`
-rejects this combination) on top of a config that already meets the
-[Single-Controller requirements](single-controller.md), such as
-`data_plane.enabled: true`. Then set:
+MInf Router Replay is supported only by the SingleController NeMo-Gym path: launch with `examples/run_grpo_single_controller.py` (`examples/run_grpo.py` rejects this combination) on top of a config that already meets the [Single-Controller requirements](single-controller.md), such as `data_plane.enabled: true`. Then set:
 
 ```yaml
 env:
@@ -58,24 +39,11 @@ policy:
       pipeline_model_parallel_size: 1
 ```
 
-MInf records routes per pipeline stage and never gathers them across stages,
-so config validation requires the generation model to run with
-`pipeline_model_parallel_size: 1`; the generation layout inherits the training
-layout unless overridden in `mcore_generation_config`. Both `async_sched_mode`
-values record routes.
+MInf records routes per pipeline stage and never gathers them across stages, so config validation requires the generation model to run with `pipeline_model_parallel_size: 1`; the generation layout inherits the training layout unless overridden in `mcore_generation_config`. Both `async_sched_mode` values record routes.
 
-MInf produces routes with shape `[T - 1, L, K]`. Its serving-side canonical
-stager appends the terminal fallback row, delta-aligns the routes using Gym's
-capture admission, and commits them to TransferQueue with the token IDs and
-logprobs. Deferred route materialization in the policy worker is not supported
-for MInf. See the [token-capture ledger design](../design-docs/token-capture-ledger.md#minf-router-replay)
-for the component-level data flow and multi-turn boundary behavior.
+MInf produces routes with shape `[T - 1, L, K]`. Its serving-side canonical stager appends the terminal fallback row, delta-aligns the routes using Gym's capture admission, and commits them to TransferQueue with the token IDs and logprobs. Deferred route materialization in the policy worker is not supported for MInf. See the [token-capture ledger design](../design-docs/token-capture-ledger.md#minf-router-replay) for the component-level data flow and multi-turn boundary behavior.
 
-For models that also train MoE-based MTP heads, Router Replay skips MTP
-routers by default. This keeps MTP routers on their native routing decisions
-while replaying rollout routes only in the decoder layers. Set
-`NRL_ROUTER_REPLAY_EXCLUDE_MTP=0` only when intentionally debugging the legacy
-behavior that replays MTP routers too.
+For models that also train MoE-based MTP heads, Router Replay skips MTP routers by default. This keeps MTP routers on their native routing decisions while replaying rollout routes only in the decoder layers. Set `NRL_ROUTER_REPLAY_EXCLUDE_MTP=0` only when intentionally debugging the legacy behavior that replays MTP routers too.
 
 An example recipe is available at:
 
@@ -91,45 +59,28 @@ examples/configs/recipes/llm/grpo-qwen3-30ba3b-10n8g-megatron-cp2-r3-async-singl
 
 ### Automodel Policy Backend
 
-With the automodel backend, enabling Router Replay builds every Automodel MoE gate
-with a replay hook (`moe_overrides.enable_routing_replay`) and replays the rollout
-routes in the `get_logprobs` forward and in the training forward and backward.
+With the automodel backend, enabling Router Replay builds every Automodel MoE gate with a replay hook (`moe_overrides.enable_routing_replay`) and replays the rollout routes in the `get_logprobs` forward and in the training forward and backward.
 Reference-policy logprobs never replay rollout routes. Current requirements:
 
-- The model must use an Automodel MoE implementation; the HF / `force_hf` path has
-  no replay hooks and fails at worker setup. A gate class that builds a replay hook
-  but never consults it (for example Automodel's Kimi K3 gate) fails with a
-  `RuntimeError` at the first replayed forward instead of silently routing live.
-- Sequence packing, `automodel_cfg.context_parallel_size > 1`, and
-  `automodel_cfg.sequence_parallel` are not supported yet and fail at setup, as does
-  `token_capture.defer_routed_experts_to_policy`.
-- vLLM may emit one route slot per MoE layer or one per decoder layer (hybrid
-  models such as NemotronH); both layouts are mapped to the gates automatically.
-- Batch padding is never replayed. Rows other than all-`-1` missing routes that are
-  partially negative, out of range, or repeat an expert are rejected as corrupt.
+- The model must use an Automodel MoE implementation; the HF / `force_hf` path has no replay hooks and fails at worker setup. A gate class that builds a replay hook but never consults it (for example Automodel's Kimi K3 gate) fails with a `RuntimeError` at the first replayed forward instead of silently routing live.
+- Sequence packing, `automodel_cfg.context_parallel_size > 1`, and `automodel_cfg.sequence_parallel` are not supported yet and fail at setup, as does `token_capture.defer_routed_experts_to_policy`.
+- vLLM may emit one route slot per MoE layer or one per decoder layer (hybrid models such as NemotronH); both layouts are mapped to the gates automatically.
+- Batch padding is never replayed. Rows other than all-`-1` missing routes that are partially negative, out of range, or repeat an expert are rejected as corrupt.
 
-Example: `examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-automodel-ep8-r3.yaml`
-(Nemotron-3.5 Lightning) keeps `train/token_mult_prob_error` near 1.010 for all steps
-and halves `train/gen_kl_error` (0.00037 vs 0.00086). Without Router Replay
-(`dapo-nanov3.5-30BA3B-4n8g-automodel-ep8.yaml`), 0-2 tokens per step disagreed by 10-31
-nats between vLLM and training, spiking the mean to 1e6-3e9 on about 20% of steps.
+Example: `examples/configs/recipes/llm/dapo-nanov3.5-30BA3B-4n8g-automodel-ep8-r3.yaml` (Nemotron-3.5 Lightning) keeps `train/token_mult_prob_error` near 1.010 for all steps and halves `train/gen_kl_error` (0.00037 vs 0.00086). Without Router Replay (`dapo-nanov3.5-30BA3B-4n8g-automodel-ep8.yaml`), 0-2 tokens per step disagreed by 10-31 nats between vLLM and training, spiking the mean to 1e6-3e9 on about 20% of steps.
 Both recipes leave vLLM prefix caching on.
 
 ## Validation
 
 Router Replay validation covers two end-to-end questions:
 
-1. whether rollout routes are carried through TransferQueue, packing, context
-   parallel slicing, and Megatron replay without changing token identity;
-2. whether matched R3-on runs reduce train-vs-rollout mismatch relative to
-   matched R3-off controls.
+1. whether rollout routes are carried through TransferQueue, packing, context parallel slicing, and Megatron replay without changing token identity;
+2. whether matched R3-on runs reduce train-vs-rollout mismatch relative to matched R3-off controls.
 
 ### Validation and Trace Debugging
 
-Router Replay on the Megatron policy can emit JSONL traces for a small number of
-training steps. This is intended for correctness debugging, not long training runs.
-The variables below apply to the Megatron policy only; the automodel policy always
-excludes MTP routers, always validates routes, and emits no traces.
+Router Replay on the Megatron policy can emit JSONL traces for a small number of training steps. This is intended for correctness debugging, not long training runs.
+The variables below apply to the Megatron policy only; the automodel policy always excludes MTP routers, always validates routes, and emits no traces.
 
 | Environment variable | Default | Meaning |
 | --- | --- | --- |
@@ -171,10 +122,8 @@ The checker verifies that:
 
 ### Effectiveness Check
 
-1. Run matched R3-off controls to check that the PR does not regress existing
-   packed-sequence and context-parallel Megatron training paths.
-2. Run matched R3-on/R3-off pairs to measure whether Router Replay reduces
-   train-vs-rollout mismatch under the intended rollout settings.
+1. Run matched R3-off controls to check that the PR does not regress existing packed-sequence and context-parallel Megatron training paths.
+2. Run matched R3-on/R3-off pairs to measure whether Router Replay reduces train-vs-rollout mismatch under the intended rollout settings.
 
 The main metrics to inspect are:
 
@@ -187,23 +136,15 @@ Validation report: <https://api.wandb.ai/links/nvidia-nemo-fw-public/lxoovk60>
 
 ### Fallback for Missing Routes
 
-In rare cases, vLLM can return fewer routed-expert entries than expected for a
-sample. NeMo RL represents each missing token route with an all-`-1` sentinel.
-The policy (Megatron or automodel) then uses its normal router only for those
-missing token routes, while all returned vLLM routes are still replayed exactly.
+In rare cases, vLLM can return fewer routed-expert entries than expected for a sample. NeMo RL represents each missing token route with an all-`-1` sentinel.
+The policy (Megatron or automodel) then uses its normal router only for those missing token routes, while all returned vLLM routes are still replayed exactly.
 
-The fallback is intentionally route-local: it does not disable Router Replay for
-the whole batch or sample.
+The fallback is intentionally route-local: it does not disable Router Replay for the whole batch or sample.
 
-The final token of every sequence also uses the sentinel: vLLM never runs a
-sequence's last sampled token through the model, so it has no route to replay.
+The final token of every sequence also uses the sentinel: vLLM never runs a sequence's last sampled token through the model, so it has no route to replay.
 This is expected and is not counted as a missing route.
 
-When fallback is used, the vLLM worker emits a `R3 router replay fallback:` warning
-to the run log naming the affected sample count and missing token-route count.
-Fallback should normally be absent or rare; frequent warnings mean a meaningful
-share of token routes used the policy's normal router instead of replay.
+When fallback is used, the vLLM worker emits a `R3 router replay fallback:` warning to the run log naming the affected sample count and missing token-route count.
+Fallback should normally be absent or rare; frequent warnings mean a meaningful share of token routes used the policy's normal router instead of replay.
 
-The generation backend also computes
-`r3/routed_experts_fallback_token_route_fraction`, but no training loop currently
-forwards it to the metric logger, so do not rely on it in dashboards or gates.
+The generation backend also computes `r3/routed_experts_fallback_token_route_fraction`, but no training loop currently forwards it to the metric logger, so do not rely on it in dashboards or gates.

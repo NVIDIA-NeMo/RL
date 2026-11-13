@@ -2,31 +2,21 @@
 
 **Technical Report:** [NVIDIA Nemotron 3 Ultra Technical Report](https://research.nvidia.com/labs/nemotron/files/NVIDIA-Nemotron-3-Ultra-Technical-Report.pdf)
 
-This guide explains how to post-train the Nemotron 3 Ultra model with NeMo RL on
-**GB200 NVL72** (ARM64 / aarch64) hardware.
+This guide explains how to post-train the Nemotron 3 Ultra model with NeMo RL on **GB200 NVL72** (ARM64 / aarch64) hardware.
 
 ## Overview
 
-Nemotron 3 Ultra is post-trained with a multi-stage pipeline that mixes
-Reinforcement Learning with Verifiable Rewards (RLVR), RLHF, and Multi-Teacher
-On-Policy Distillation (MOPD) from a panel of specialised teacher models. The
-main stages are:
+Nemotron 3 Ultra is post-trained with a multi-stage pipeline that mixes Reinforcement Learning with Verifiable Rewards (RLVR), RLHF, and Multi-Teacher On-Policy Distillation (MOPD) from a panel of specialised teacher models. The main stages are:
 
-1. **Student RLVR** — produces the student policy from the supervised
-   fine-tuning (SFT) checkpoint using GRPO with verifiable rewards.
-2. **Teacher training** — trains a panel of teachers (the Student RLVR policy
-   itself serves as the general teacher, alongside specialised teachers such as
-   reasoning, instruction-following/abstention, RLHF chat, and SWE).
+1. **Student RLVR** — produces the student policy from the supervised fine-tuning (SFT) checkpoint using GRPO with verifiable rewards.
+2. **Teacher training** — trains a panel of teachers (the Student RLVR policy itself serves as the general teacher, alongside specialised teachers such as reasoning, instruction-following/abstention, RLHF chat, and SWE).
 3. **MOPD** — on-policy distillation from the student into the teacher panel.
 
-Every stage shares the same launcher (`ultra_launch.sh`) and a per-stage YAML
-config under `examples/nemo_gym/nemotron-3-ultra/`.
+Every stage shares the same launcher (`ultra_launch.sh`) and a per-stage YAML config under `examples/nemo_gym/nemotron-3-ultra/`.
 
 ### Checkpoint flow
 
-The pipeline starts from an SFT checkpoint and produces a panel of teacher
-checkpoints that, together with the Student RLVR output, feed MOPD. The Student
-RLVR policy itself serves as the general teacher:
+The pipeline starts from an SFT checkpoint and produces a panel of teacher checkpoints that, together with the Student RLVR output, feed MOPD. The Student RLVR policy itself serves as the general teacher:
 
 ```
         ┌─────┐
@@ -61,10 +51,7 @@ RLVR policy itself serves as the general teacher:
 
 ## Container
 
-Ultra uses vLLM and requires an **aarch64 (arm64)** image for GB200 NVL72
-nodes. Prebake the NeMo Gym virtual environments used by the recipes to avoid
-building them when each training job starts. From the root of the repository,
-build the image with the Gym virtual environments for the Ultra recipes:
+Ultra uses vLLM and requires an **aarch64 (arm64)** image for GB200 NVL72 nodes. Prebake the NeMo Gym virtual environments used by the recipes to avoid building them when each training job starts. From the root of the repository, build the image with the Gym virtual environments for the Ultra recipes:
 
 ```bash
 docker buildx build \
@@ -83,34 +70,24 @@ docker buildx build \
 ```
 
 Build args:
-- `NEMO_GYM_PREFETCH_CONFIGS` — space-separated union configs whose Gym virtual
-  environments are baked into the image.
+- `NEMO_GYM_PREFETCH_CONFIGS` — space-separated union configs whose Gym virtual environments are baked into the image.
 - `SKIP_SGLANG_BUILD=1` — Ultra runs on vLLM; skip the SGLang build.
 - `SKIP_TRTLLM_BUILD=1` — Ultra does not use TensorRT-LLM; skip its build.
 - `MAX_JOBS` — parallel build jobs; tune to your machine.
-- `--build-context nemo-rl=.` — build from your local checkout (otherwise the
-  Dockerfile pulls `NVIDIA-NeMo/RL.git#main`).
+- `--build-context nemo-rl=.` — build from your local checkout (otherwise the Dockerfile pulls `NVIDIA-NeMo/RL.git#main`).
 
-To run on the cluster with Slurm, convert the image to a squashfs (`.sqsh`)
-with [enroot](https://github.com/NVIDIA/enroot):
+To run on the cluster with Slurm, convert the image to a squashfs (`.sqsh`) with [enroot](https://github.com/NVIDIA/enroot):
 
 ```bash
 enroot import -o nemo-rl-container.sqsh \
   docker://<your-registry>/nemo-rl:main-ultra-prefetched-venvs
 ```
 
-Pass the resulting image as `CONTAINER` in every launch command below (shown as
-`CONTAINER=/path/to/nemo-rl-container` — a `.sqsh` path, or a registry image URI
-if you're not using enroot). All Ultra stages run from this single image.
+Pass the resulting image as `CONTAINER` in every launch command below (shown as `CONTAINER=/path/to/nemo-rl-container` — a `.sqsh` path, or a registry image URI if you're not using enroot). All Ultra stages run from this single image.
 
 ## Download and prepare the data
 
-The training blends are published as
-[`nvidia/Nemotron-RL-Ultra-Training-Blends`](https://huggingface.co/datasets/nvidia/Nemotron-RL-Ultra-Training-Blends),
-one JSONL per stage: `rlvr1`, `rlvr2`, `ifbench`, `rlhf`, `reasoning`, `swe`, and
-`mopd`. Math rows that originate from `BytedTsinghua-SIA/DAPO-Math-17k` and
-`Skywork/Skywork-OR1-RL-Data` ship as placeholders; the bundled
-`fill_placeholders.py` restores them from the original datasets on Hugging Face.
+The training blends are published as [`nvidia/Nemotron-RL-Ultra-Training-Blends`](https://huggingface.co/datasets/nvidia/Nemotron-RL-Ultra-Training-Blends), one JSONL per stage: `rlvr1`, `rlvr2`, `ifbench`, `rlhf`, `reasoning`, `swe`, and `mopd`. Math rows that originate from `BytedTsinghua-SIA/DAPO-Math-17k` and `Skywork/Skywork-OR1-RL-Data` ship as placeholders; the bundled `fill_placeholders.py` restores them from the original datasets on Hugging Face.
 
 ```bash
 export DATA_DIR=/path/to/ultra/data
@@ -124,10 +101,7 @@ cd ultra-blends
 ./fill_placeholders.py --input-dir . --output-dir "$DATA_DIR"   # requires uv
 ```
 
-This produces `$DATA_DIR/{rlvr1,rlvr2,ifbench,rlhf,reasoning,swe,mopd}.jsonl`. Hold
-out the last 100 rows of each blend as a validation split — the launch commands
-below consume `<name>.train.jsonl` as `TRAIN_PATH` and `<name>.val.jsonl` as
-`VAL_PATH`:
+This produces `$DATA_DIR/{rlvr1,rlvr2,ifbench,rlhf,reasoning,swe,mopd}.jsonl`. Hold out the last 100 rows of each blend as a validation split — the launch commands below consume `<name>.train.jsonl` as `TRAIN_PATH` and `<name>.val.jsonl` as `VAL_PATH`:
 
 ```bash
 cd "$DATA_DIR"
@@ -137,15 +111,11 @@ for name in rlvr1 rlvr2 ifbench rlhf reasoning swe mopd; do
 done
 ```
 
-By electing to use the external datasets you are responsible for confirming their
-licenses are fit for your intended use.
+By electing to use the external datasets you are responsible for confirming their licenses are fit for your intended use.
 
-The SWE stage additionally requires per-instance `.sif` container images built
-from SWE-Gym and SWE-rebench-V2 — see [SWE Teacher](#swe-teacher) for the build
-steps.
+The SWE stage additionally requires per-instance `.sif` container images built from SWE-Gym and SWE-rebench-V2 — see [SWE Teacher](#swe-teacher) for the build steps.
 
-For now, each stage takes a JSONL training file and a JSONL validation file
-(see [Launch script](#launch-script) below).
+For now, each stage takes a JSONL training file and a JSONL validation file (see [Launch script](#launch-script) below).
 
 ## Prepare the code
 
@@ -156,11 +126,7 @@ cd RL
 
 ## Build the sandbox container
 
-Several [Gym](https://github.com/NVIDIA-NeMo/Gym) environments used during
-training (notably `ns_tools` for stateful Python execution with math
-verification, and `math_formal_lean` for Lean4 proof verification) rely on a
-sandbox container. Build it from the
-[NeMo-Skills Dockerfile](https://github.com/NVIDIA-NeMo/Skills/blob/main/dockerfiles/Dockerfile.sandbox):
+Several [Gym](https://github.com/NVIDIA-NeMo/Gym) environments used during training (notably `ns_tools` for stateful Python execution with math verification, and `math_formal_lean` for Lean4 proof verification) rely on a sandbox container. Build it from the [NeMo-Skills Dockerfile](https://github.com/NVIDIA-NeMo/Skills/blob/main/dockerfiles/Dockerfile.sandbox):
 
 ```bash
 git clone https://github.com/NVIDIA-NeMo/Skills.git
@@ -169,8 +135,7 @@ git checkout b620e79   # Skills commit pinned for the Ultra release
 docker build -t nemo-skills-sandbox:latest -f dockerfiles/Dockerfile.sandbox .
 ```
 
-For SLURM clusters using [enroot](https://github.com/NVIDIA/enroot), convert
-to a `.sqsh`:
+For SLURM clusters using [enroot](https://github.com/NVIDIA/enroot), convert to a `.sqsh`:
 
 ```bash
 enroot import -o nemo-skills-sandbox.sqsh dockerd://nemo-skills-sandbox:latest
@@ -178,11 +143,7 @@ enroot import -o nemo-skills-sandbox.sqsh dockerd://nemo-skills-sandbox:latest
 
 ## Launch script
 
-Every stage is submitted with `examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh`,
-run from the repo root. The launcher
-handles SLURM submission, code snapshotting, persistent cache management, and
-container mounts — stage-specific hyperparameters (batch size, advantage clip,
-MoE parallelism, learning rate) live in the per-stage YAML.
+Every stage is submitted with `examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh`, run from the repo root. The launcher handles SLURM submission, code snapshotting, persistent cache management, and container mounts — stage-specific hyperparameters (batch size, advantage clip, MoE parallelism, learning rate) live in the per-stage YAML.
 
 Set the following before each `bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh` invocation:
 
@@ -204,14 +165,9 @@ Set the following before each `bash examples/nemo_gym/nemotron-3-ultra/ultra_lau
 | `NL2BASH_BASE_URL` | _Optional._ URL of a separately-deployed NL2Bash judge service. Same semantics as `GENRM_BASE_URL`. |
 | `SAFETY_JUDGE_MODEL` | Content-safety judge: HF repo id or local path. Default is [`nvidia/Nemotron-Content-Safety-Reasoning-4B`](https://huggingface.co/nvidia/Nemotron-Content-Safety-Reasoning-4B). |
 
-> **Serving GenRM outside Gym.** For a separately deployed OpenAI-compatible
-> endpoint, set `GENRM_BASE_URL=http://<host>:<port>/v1`. Judging is then routed
-> to that endpoint instead of being served from the Gym pool, allowing one
-> deployment to back multiple training runs.
+> **Serving GenRM outside Gym.** For a separately deployed OpenAI-compatible endpoint, set `GENRM_BASE_URL=http://<host>:<port>/v1`. Judging is then routed to that endpoint instead of being served from the Gym pool, allowing one deployment to back multiple training runs.
 >
-> To co-schedule dedicated model servers with training in one Slurm
-> heterogeneous allocation, set `EXTERNAL_JUDGES=1` — see
-> [External judge services](#external-judge-services) below.
+> To co-schedule dedicated model servers with training in one Slurm heterogeneous allocation, set `EXTERNAL_JUDGES=1` — see [External judge services](#external-judge-services) below.
 
 Optional knobs:
 
@@ -229,40 +185,16 @@ Optional knobs:
 
 ### External judge services
 
-By default the GenRM and NL2Bash judges are served by NeMo Gym inside the
-training Ray cluster, consuming part of `NUM_GYM_NODES`. Setting
-`EXTERNAL_JUDGES=1` instead serves them as fixed-model vLLM pools in a second
-Slurm heterogeneous component. This keeps judge serving off the training Ray
-cluster, so a judge restart or OOM cannot destabilise training, and it lets each
-judge be scaled independently of the Gym pool.
+By default the GenRM and NL2Bash judges are served by NeMo Gym inside the training Ray cluster, consuming part of `NUM_GYM_NODES`. Setting `EXTERNAL_JUDGES=1` instead serves them as fixed-model vLLM pools in a second Slurm heterogeneous component. This keeps judge serving off the training Ray cluster, so a judge restart or OOM cannot destabilise training, and it lets each judge be scaled independently of the Gym pool.
 
-The launcher registers both pools through the
-[external Gym vLLM pool helpers](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/external_gym_vllm/README.md)
-and submits `tools/external_gym_vllm/run_in_allocation.sh` instead of `ray.sub`.
-That wrapper starts every replica in its own private Ray cluster, brings up one
-OpenAI-compatible load balancer per pool, substitutes the load-balancer URLs
-into the driver command, and starts `ray.sub` on the training component while
-the models are still loading. The NeMo Gym actor waits until every load
-balancer reports all of its replicas healthy before rollouts begin. If a
-required service exits, the training job is stopped.
+The launcher registers both pools through the [external Gym vLLM pool helpers](https://github.com/NVIDIA-NeMo/RL/blob/main/tools/external_gym_vllm/README.md) and submits `tools/external_gym_vllm/run_in_allocation.sh` instead of `ray.sub`.
+That wrapper starts every replica in its own private Ray cluster, brings up one OpenAI-compatible load balancer per pool, substitutes the load-balancer URLs into the driver command, and starts `ray.sub` on the training component while the models are still loading. The NeMo Gym actor waits until every load balancer reports all of its replicas healthy before rollouts begin. If a required service exits, the training job is stopped.
 
-In this mode `GENRM_MODEL` and `NL2BASH_JUDGE_MODEL` are the checkpoints the
-pools serve, and Gym addresses them by `GENRM_SERVED_MODEL_NAME` /
-`NL2BASH_SERVED_MODEL_NAME` (both `model` by default). Setting
-`GENRM_BASE_URL` or `NL2BASH_BASE_URL` by hand is rejected, since the wrapper
-supplies those.
+In this mode `GENRM_MODEL` and `NL2BASH_JUDGE_MODEL` are the checkpoints the pools serve, and Gym addresses them by `GENRM_SERVED_MODEL_NAME` / `NL2BASH_SERVED_MODEL_NAME` (both `model` by default). Setting `GENRM_BASE_URL` or `NL2BASH_BASE_URL` by hand is rejected, since the wrapper supplies those.
 
-Each pool is registered only when its model variable is set, so set at least
-one of them. Stages declare only the judges they use — `rlhf_teacher` has no
-NL2Bash block, `reasoning_teacher` has no GenRM block, `swe_teacher` has
-neither — and setting a judge the stage does not declare makes the driver fail
-on an unknown config key.
+Each pool is registered only when its model variable is set, so set at least one of them. Stages declare only the judges they use — `rlhf_teacher` has no NL2Bash block, `reasoning_teacher` has no GenRM block, `swe_teacher` has neither — and setting a judge the stage does not declare makes the driver fail on an unknown config key.
 
-`BASE_LOG_DIR` and `EXTERNAL_VLLM_TOOLS_DIR_HOST` (the repo's
-`tools/external_gym_vllm`) must resolve under `EXTERNAL_VLLM_SHARED_ROOT`,
-because the wrapper bind-mounts that root into the service containers. Since
-`RESULTS_DIR` defaults to a path relative to the repo, pass an explicit
-`BASE_LOG_DIR` on the shared filesystem when the checkout lives elsewhere.
+`BASE_LOG_DIR` and `EXTERNAL_VLLM_TOOLS_DIR_HOST` (the repo's `tools/external_gym_vllm`) must resolve under `EXTERNAL_VLLM_SHARED_ROOT`, because the wrapper bind-mounts that root into the service containers. Since `RESULTS_DIR` defaults to a path relative to the repo, pass an explicit `BASE_LOG_DIR` on the shared filesystem when the checkout lives elsewhere.
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -273,14 +205,7 @@ because the wrapper bind-mounts that root into the service containers. Since
 | `NL2BASH_REPLICAS`, `NL2BASH_TENSOR_PARALLEL_SIZE` | `4`, `4` | Independent DP=1 NL2Bash servers and TP per server |
 | `EXTERNAL_VLLM_SEGMENT_SIZE` | `4` | SLURM `--segment` for the external component |
 
-Node counts are derived from the replica shapes, not set directly:
-`nodes = REPLICAS × TENSOR_PARALLEL_SIZE / GPUS_PER_NODE` per pool. The two
-components are validated separately — `NUM_TRAIN_NODES + NUM_GEN_NODES +
-NUM_GYM_NODES` must be a multiple of `SEGMENT_SIZE`, and the external node total
-must be a multiple of `EXTERNAL_VLLM_SEGMENT_SIZE`. With both judges external,
-`NUM_GYM_NODES` only has to cover the safety judge. Model paths, the parser
-plugin, and `BASE_LOG_DIR` must live under `EXTERNAL_VLLM_SHARED_ROOT`
-(`/lustre` by default), which is mounted into the service containers.
+Node counts are derived from the replica shapes, not set directly: `nodes = REPLICAS × TENSOR_PARALLEL_SIZE / GPUS_PER_NODE` per pool. The two components are validated separately — `NUM_TRAIN_NODES + NUM_GEN_NODES + NUM_GYM_NODES` must be a multiple of `SEGMENT_SIZE`, and the external node total must be a multiple of `EXTERNAL_VLLM_SEGMENT_SIZE`. With both judges external, `NUM_GYM_NODES` only has to cover the safety judge. Model paths, the parser plugin, and `BASE_LOG_DIR` must live under `EXTERNAL_VLLM_SHARED_ROOT` (`/lustre` by default), which is mounted into the service containers.
 `INTERACTIVE=1` is not supported in this mode.
 
 Building on the [Phase 1](#phase-1--49k-context-128-steps) invocation, add:
@@ -302,18 +227,13 @@ SAFETY_JUDGE_MODEL=nvidia/Nemotron-Content-Safety-Reasoning-4B \
 bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 ```
 
-That allocates 64 + 172 + 4 = 240 NeMo RL nodes (a multiple of `SEGMENT_SIZE`,
-with Gym now hosting only the safety judge) plus 16 GenRM + 4 NL2Bash = 20
-external nodes. Set only `GENRM_MODEL` or only `NL2BASH_JUDGE_MODEL` to move
-just that judge out of Gym — useful for the teacher stages, which declare only
-the judges they use.
+That allocates 64 + 172 + 4 = 240 NeMo RL nodes (a multiple of `SEGMENT_SIZE`, with Gym now hosting only the safety judge) plus 16 GenRM + 4 NL2Bash = 20 external nodes. Set only `GENRM_MODEL` or only `NL2BASH_JUDGE_MODEL` to move just that judge out of Gym — useful for the teacher stages, which declare only the judges they use.
 
 ## Stage 1 — Student RLVR
 
 GRPO with verifiable rewards on the Ultra SFT checkpoint.
 
-Student RLVR is split into two phases that share the same `EXP_NAME` so the
-second phase resumes from the first phase's checkpoint:
+Student RLVR is split into two phases that share the same `EXP_NAME` so the second phase resumes from the first phase's checkpoint:
 
 | | Phase 1 | Phase 2 |
 |---|---|---|
@@ -323,8 +243,7 @@ second phase resumes from the first phase's checkpoint:
 | `NRL_MAX_STEPS` to set | `128` | `178` (= 128 + 50) |
 | `group_answer_length_penalty_coeff` | 0.25 | 0.08 |
 
-Both phases share TP=8, EP=64, CP=8, PP=1, GBS=8192 (512 prompts × 16
-generations), advantage clip ±20, and the 256-node cluster shape.
+Both phases share TP=8, EP=64, CP=8, PP=1, GBS=8192 (512 prompts × 16 generations), advantage clip ±20, and the 256-node cluster shape.
 
 ### Phase 1 — 49k context, 128 steps
 
@@ -353,10 +272,7 @@ bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 
 ### Phase 2 — 65k context, ~50 more steps
 
-Same env vars as Phase 1 but swap the config, raise `NRL_MAX_STEPS`, and point
-at the Phase 2 training data file. Keep `EXP_NAME` and `RESULTS_DIR` identical
-to Phase 1 so `CheckpointManager` auto-resumes from the latest Phase 1
-checkpoint.
+Same env vars as Phase 1 but swap the config, raise `NRL_MAX_STEPS`, and point at the Phase 2 training data file. Keep `EXP_NAME` and `RESULTS_DIR` identical to Phase 1 so `CheckpointManager` auto-resumes from the latest Phase 1 checkpoint.
 
 ```bash
 EXP_NAME=ultra-student-rlvr \
@@ -381,26 +297,19 @@ HF_TOKEN=$HF_TOKEN \
 bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 ```
 
-Note: Phase 1 and Phase 2 use different training blends (`rlvr1.train.jsonl` and
-`rlvr2.train.jsonl`); see the [Download and prepare the data](#download-and-prepare-the-data)
-section above.
+Note: Phase 1 and Phase 2 use different training blends (`rlvr1.train.jsonl` and `rlvr2.train.jsonl`); see the [Download and prepare the data](#download-and-prepare-the-data) section above.
 
-The launcher reports the experiment directory layout, sample monitoring
-commands, and (on submission) the SLURM job id.
+The launcher reports the experiment directory layout, sample monitoring commands, and (on submission) the SLURM job id.
 
 ## Stage 2 — Teacher training
 
-The teacher panel is a set of specialised RL runs that each start from the
-Student RLVR output (Stage 1) (see [Checkpoint flow](#checkpoint-flow) above). Each teacher
-runs independently with its own YAML config under `examples/nemo_gym/nemotron-3-ultra/`.
+The teacher panel is a set of specialised RL runs that each start from the Student RLVR output (Stage 1) (see [Checkpoint flow](#checkpoint-flow) above). Each teacher runs independently with its own YAML config under `examples/nemo_gym/nemotron-3-ultra/`.
 
 The teachers don't depend on each other and can run in parallel.
 
 ### IFBench Teacher
 
-RLHF teacher specializing in instruction following, abstention, and refusal
-behavior. Trained at 49k context with a smaller batch (`GBS=2048`) and lower
-learning rate (`lr=2.5e-6`) than the student RLVR stage.
+RLHF teacher specializing in instruction following, abstention, and refusal behavior. Trained at 49k context with a smaller batch (`GBS=2048`) and lower learning rate (`lr=2.5e-6`) than the student RLVR stage.
 
 **Config:** `examples/nemo_gym/nemotron-3-ultra/ifbench_teacher.yaml`
 - TP=8, EP=64, CP=8, PP=1
@@ -436,9 +345,7 @@ bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 
 ### RLHF Teacher
 
-General-purpose RLHF teacher trained against the pairwise GenRM comparison
-signal alone. Same training shape as the IFBench teacher (cluster, batch,
-learning rate, context).
+General-purpose RLHF teacher trained against the pairwise GenRM comparison signal alone. Same training shape as the IFBench teacher (cluster, batch, learning rate, context).
 
 **Config:** `examples/nemo_gym/nemotron-3-ultra/rlhf_teacher.yaml`
 - TP=8, EP=64, CP=8, PP=1
@@ -470,18 +377,11 @@ HF_TOKEN=$HF_TOKEN \
 bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 ```
 
-This is the teacher referred to as `NRL_CHAT_TEACHER1` / `NRL_RLHF_TEACHER` in
-the MOPD config — it provides the `genrm_simple_agent` and
-`genrm_simple_agent_reasoning_off` teacher signals.
+This is the teacher referred to as `NRL_CHAT_TEACHER1` / `NRL_RLHF_TEACHER` in the MOPD config — it provides the `genrm_simple_agent` and `genrm_simple_agent_reasoning_off` teacher signals.
 
 ### Reasoning Teacher
 
-General reasoning teacher. The training data subsamples an RLVR
-blend, where every prompt is graded by the `equivalence_llm_judge` agent
-(LLM-judge equivalence over freeform short answers). The output checkpoint
-serves the `code_gen`, `ns_tools`, `math_with_judge`,
-`equivalence_llm_judge`, and `mcqa` agent slots in MOPD — one checkpoint,
-many roles.
+General reasoning teacher. The training data subsamples an RLVR blend, where every prompt is graded by the `equivalence_llm_judge` agent (LLM-judge equivalence over freeform short answers). The output checkpoint serves the `code_gen`, `ns_tools`, `math_with_judge`, `equivalence_llm_judge`, and `mcqa` agent slots in MOPD — one checkpoint, many roles.
 
 **Config:** `examples/nemo_gym/nemotron-3-ultra/reasoning_teacher.yaml`
 - TP=8, EP=32, CP=8, PP=1 (half the expert parallelism of Student RLVR)
@@ -516,10 +416,7 @@ bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 
 ### SWE Teacher
 
-Software-engineering RLVR teacher trained against code execution. The
-`swe_agents` agent runs the policy's candidate fixes inside apptainer (`.sif`)
-container images for each SWE-Gym / SWE-rebench-V2 instance and rewards
-the rollout based on test pass/fail.
+Software-engineering RLVR teacher trained against code execution. The `swe_agents` agent runs the policy's candidate fixes inside apptainer (`.sif`) container images for each SWE-Gym / SWE-rebench-V2 instance and rewards the rollout based on test pass/fail.
 
 **Config:** `examples/nemo_gym/nemotron-3-ultra/swe_teacher.yaml`
 - TP=8, EP=32, CP=32, PP=1 (large CP for long context)
@@ -530,11 +427,7 @@ the rollout based on test pass/fail.
 
 ### Building the SIF images
 
-Each rollout runs inside a per-instance apptainer (`.sif`) image resolved from
-`${SIF_DIR}` via the agent's `container_formatter`. Since this recipe targets
-GB200 (aarch64) and the upstream SWE images ship for x86 only, the images must
-be rebuilt for ARM — one per instance — then converted to `.sif`. The resulting
-directory is reused across runs.
+Each rollout runs inside a per-instance apptainer (`.sif`) image resolved from `${SIF_DIR}` via the agent's `container_formatter`. Since this recipe targets GB200 (aarch64) and the upstream SWE images ship for x86 only, the images must be rebuilt for ARM — one per instance — then converted to `.sif`. The resulting directory is reused across runs.
 
 The released SWE blend draws from two benchmarks:
 
@@ -543,16 +436,9 @@ The released SWE blend draws from two benchmarks:
 | SWE-Gym | `SWE-Gym/SWE-Gym` | `swegym/sweb.eval.arm64.{instance_id}.sif` | 206 |
 | SWE-rebench-V2 | `nebius/SWE-rebench-V2` | `swerebench/{instance_id}.sif` | 7,610 |
 
-**1. Prerequisites.** Docker, Apptainer, and `uv` on the build host. Build on an
-ARM64 (GB200) node so images are natively aarch64 with no emulation. You also
-need a container **registry** to publish to: set `REGISTRY` to its endpoint and
-`docker login` to it first. The build scripts push every per-instance image
-there, and the conversion step (3) pulls them back to produce the `.sif` files —
-so the registry must be reachable from both the build and the convert hosts.
+**1. Prerequisites.** Docker, Apptainer, and `uv` on the build host. Build on an ARM64 (GB200) node so images are natively aarch64 with no emulation. You also need a container **registry** to publish to: set `REGISTRY` to its endpoint and `docker login` to it first. The build scripts push every per-instance image there, and the conversion step (3) pulls them back to produce the `.sif` files — so the registry must be reachable from both the build and the convert hosts.
 
-Install Apptainer on the build host via the official PPA, pinned to the version
-the training container ships (so the `.sif` format matches — see
-`docker/install_apptainer.sh`):
+Install Apptainer on the build host via the official PPA, pinned to the version the training container ships (so the `.sif` format matches — see `docker/install_apptainer.sh`):
 
 ```bash
 sudo add-apt-repository -y ppa:apptainer/ppa
@@ -560,9 +446,7 @@ sudo apt-get update
 sudo apt-get install -y "apptainer=1.5.0-2-1~$(. /etc/os-release && echo "$VERSION_CODENAME")"
 ```
 
-> **Storage.** The registry accumulates ~7,800 images, plus the converted `.sif`
-> set on the build host. The pushed images can be deleted once every `.sif` has
-> been built.
+> **Storage.** The registry accumulates ~7,800 images, plus the converted `.sif` set on the build host. The pushed images can be deleted once every `.sif` has been built.
 
 **2. Build the per-instance images.**
 ```bash
@@ -601,12 +485,8 @@ python3 scripts/build_eval_cleanup.py \
 deactivate; cd ..
 ```
 
-**3. Convert to `.sif` and lay out `${SIF_DIR}`.** `build_swe_sif_images.py` pulls
-each published image and runs `apptainer build` under the exact filename the
-recipe expects — SWE-Gym from the `swe-gym:sweb.eval.arm64.<id>` tags, and
-SWE-rebench-V2 from the verified (`passed_match`) instances in `eval_report.json`.
-It skips images already converted and continues past any that are missing (e.g.
-instances that failed to build), recording them in `${SIF_DIR}/missing_instances.txt`.
+**3. Convert to `.sif` and lay out `${SIF_DIR}`.** `build_swe_sif_images.py` pulls each published image and runs `apptainer build` under the exact filename the recipe expects — SWE-Gym from the `swe-gym:sweb.eval.arm64.<id>` tags, and SWE-rebench-V2 from the verified (`passed_match`) instances in `eval_report.json`.
+It skips images already converted and continues past any that are missing (e.g. instances that failed to build), recording them in `${SIF_DIR}/missing_instances.txt`.
 Run it from the NeMo RL repo root:
 ```bash
 export SIF_DIR=/path/to/sif/images
@@ -643,16 +523,12 @@ bash examples/nemo_gym/nemotron-3-ultra/ultra_launch.sh
 
 ## Stage 3 — MOPD
 
-Multi-Teacher On-Policy Distillation. The Student RLVR output is the student; each
-Gym agent is routed to one of the Stage 2 teacher checkpoints. Trains the
-student to match per-agent teacher distributions.
+Multi-Teacher On-Policy Distillation. The Student RLVR output is the student; each Gym agent is routed to one of the Stage 2 teacher checkpoints. Trains the student to match per-agent teacher distributions.
 
 **Config:** `examples/nemo_gym/nemotron-3-ultra/mopd.yaml`
 - TP=8, EP=64, CP=32, PP=1, max context 192k
 - Teacher parallelism: TP=8, CP=2, EP=16, 4 nodes per teacher
-- Routing: agent → teacher checkpoint baked into the YAML via
-  `${_teachers.<role>}` references; only `_teachers.general` is required and
-  every other slot falls back to it.
+- Routing: agent → teacher checkpoint baked into the YAML via `${_teachers.<role>}` references; only `_teachers.general` is required and every other slot falls back to it.
 - Default cluster shape: 224 nodes (64 training + 128 vLLM + 12 Gym + 20 teachers).
 
 ### Teacher mapping
@@ -667,10 +543,7 @@ student to match per-agent teacher distributions.
 
 ### Launch
 
-Pass `STAGE_TYPE=mopd` to the launcher to enable the teacher-pool node math
-and the `_teachers.X` Hydra overrides. `NRL_GENERAL_TEACHER_PATH` is required;
-the other four teacher paths are optional and fall back to general when
-unset.
+Pass `STAGE_TYPE=mopd` to the launcher to enable the teacher-pool node math and the `_teachers.X` Hydra overrides. `NRL_GENERAL_TEACHER_PATH` is required; the other four teacher paths are optional and fall back to general when unset.
 
 ```bash
 STAGE_TYPE=mopd \

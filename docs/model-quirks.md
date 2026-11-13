@@ -50,9 +50,7 @@ If you encounter timeout errors, the system will suggest doubling the current ti
 
 ## AutoModel Parameter Freezing (`freeze_config`)
 
-VLM/omni recipes on the Automodel backend control which sub-towers
-train via a declarative `freeze_config` under
-`policy.model_kwargs.automodel_kwargs`:
+VLM/omni recipes on the Automodel backend control which sub-towers train via a declarative `freeze_config` under `policy.model_kwargs.automodel_kwargs`:
 
 ```yaml
 automodel_kwargs:
@@ -62,29 +60,17 @@ automodel_kwargs:
     freeze_language_model: false
 ```
 
-AutoModel applies this at build time (`apply_parameter_freezing`, before the
-optimizer is created). Note the following sharp edges:
+AutoModel applies this at build time (`apply_parameter_freezing`, before the optimizer is created). Note the following sharp edges:
 
-- **No default auto-freeze.** If `freeze_config` is omitted, *nothing* is
-  frozen. Earlier versions unconditionally froze the visual encoder for
-  text-only training; that implicit safety net is gone. A text-only config run
-  on a vision/audio-capable checkpoint without `freeze_config` will create
-  optimizer state for parameters that never receive gradients, which leads to
-  a **checkpoint-resume key mismatch**.
-- **Typos fail silently.** A misspelled `freeze_*` key is ignored and falls
-  back to the default (unfrozen) — no error is raised. Verify the keys exactly
-  match `freeze_vision_tower` / `freeze_audio_tower` / `freeze_language_model`.
+- **No default auto-freeze.** If `freeze_config` is omitted, *nothing* is frozen. Earlier versions unconditionally froze the visual encoder for text-only training; that implicit safety net is gone. A text-only config run on a vision/audio-capable checkpoint without `freeze_config` will create optimizer state for parameters that never receive gradients, which leads to a **checkpoint-resume key mismatch**.
+- **Typos fail silently.** A misspelled `freeze_*` key is ignored and falls back to the default (unfrozen) — no error is raised. Verify the keys exactly match `freeze_vision_tower` / `freeze_audio_tower` / `freeze_language_model`.
 
 Every shipped recipe sets `freeze_config`, so in-repo recipes are unaffected.
 This matters only for custom configs.
 
 ## Megatron Parameter Freezing (`freeze_config`)
 
-The Megatron backend has its own `freeze_config` at a different path
-(`policy.megatron_cfg.freeze_config`) with **different keys** than the
-AutoModel version above — the dict is forwarded to the Megatron model's
-`freeze()` method, so the keys follow that model's signature and vary
-by model family (audio-capable models add e.g. `freeze_audio_model`):
+The Megatron backend has its own `freeze_config` at a different path (`policy.megatron_cfg.freeze_config`) with **different keys** than the AutoModel version above — the dict is forwarded to the Megatron model's `freeze()` method, so the keys follow that model's signature and vary by model family (audio-capable models add e.g. `freeze_audio_model`):
 
 ```yaml
 policy:
@@ -95,6 +81,4 @@ policy:
       freeze_language_model: false
 ```
 
-The two configs are not interchangeable: copying the AutoModel keys
-(`freeze_vision_tower` / `freeze_audio_tower`) here raises a `TypeError`
-from the model's `freeze()`.
+The two configs are not interchangeable: copying the AutoModel keys (`freeze_vision_tower` / `freeze_audio_tower`) here raises a `TypeError` from the model's `freeze()`.

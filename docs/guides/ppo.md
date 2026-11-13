@@ -200,10 +200,7 @@ ppo:
   critic_ppo_epochs: ${ppo.ppo_epochs}  # critic passes; follows actor by default
 ```
 
-Each pass uses the same returns and advantage estimates computed from the initial
-rollout. Both epoch counts must be at least 1 and can be configured independently;
-the exemplar uses interpolation so the critic follows the actor unless explicitly
-overridden.
+Each pass uses the same returns and advantage estimates computed from the initial rollout. Both epoch counts must be at least 1 and can be configured independently; the exemplar uses interpolation so the critic follows the actor unless explicitly overridden.
 
 ### Critic Warmup
 

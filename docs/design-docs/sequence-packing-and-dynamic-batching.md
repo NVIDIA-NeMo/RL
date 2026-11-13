@@ -88,11 +88,7 @@ We have the policy backends perform the actual packing because implementations c
 
 #### 2. Packing Algorithms (`nemo_rl/data/packing/algorithms.py`)
 
-Six packing algorithms are implemented. Modified First Fit Decreasing is the
-default recommendation for trainer-owned packing. Energon-owned SFT supports
-all six through the same interface, and its recipes use Balanced Greedy
-Knapsack because it matched MFFD bin utilization in validation while spreading
-sequences evenly across physical packs.
+Six packing algorithms are implemented. Modified First Fit Decreasing is the default recommendation for trainer-owned packing. Energon-owned SFT supports all six through the same interface, and its recipes use Balanced Greedy Knapsack because it matched MFFD bin utilization in validation while spreading sequences evenly across physical packs.
 
 ##### Concatenative Packer 
 - Sequential concatenation until bin capacity is reached
@@ -239,11 +235,7 @@ All together, we see **speedups in the ~2-3x range** when enabling sequence pack
 
 ### HybridEP with Packed Sequences
 
-Packed sequence lengths can differ across expert-parallel ranks. HybridEP
-collectives require every participating rank to use an aligned input length;
-otherwise a run can hang when communication overlaps. For the supported
-pipeline-parallel-size-one, MTP-disabled path, enable NeMo-RL's one-time input
-pre-padding:
+Packed sequence lengths can differ across expert-parallel ranks. HybridEP collectives require every participating rank to use an aligned input length; otherwise a run can hang when communication overlaps. For the supported pipeline-parallel-size-one, MTP-disabled path, enable NeMo-RL's one-time input pre-padding:
 
 ```yaml
 policy:
@@ -257,16 +249,9 @@ policy:
     enabled: true
 ```
 
-`moe_hybridep_prepad_packed_inputs: true` aligns the packed input length across
-the HybridEP group once before the forward pass. This avoids issuing an
-additional scalar alignment collective inside every MoE layer, where it can
-interleave with expert-parameter collectives and hang.
+`moe_hybridep_prepad_packed_inputs: true` aligns the packed input length across the HybridEP group once before the forward pass. This avoids issuing an additional scalar alignment collective inside every MoE layer, where it can interleave with expert-parameter collectives and hang.
 
-The option is not enabled by default because this NeMo-RL-owned pre-padding
-path does not currently support pipeline parallelism or MTP. NeMo-RL rejects
-unsupported combinations during setup. When the option is omitted or `false`,
-no uneven-input alignment is applied, so HybridEP with packed sequences requires
-this option.
+The option is not enabled by default because this NeMo-RL-owned pre-padding path does not currently support pipeline parallelism or MTP. NeMo-RL rejects unsupported combinations during setup. When the option is omitted or `false`, no uneven-input alignment is applied, so HybridEP with packed sequences requires this option.
 
 ## Dynamic Batching
 
@@ -394,12 +379,7 @@ class SequencePackingArgs(TypedDict):
     sequence_length_pad_multiple: int  # CP/TP alignment factor
 ```
 
-`microbatch_order` controls only the execution order of bins already assigned to
-each data-parallel rank. `packer` (and an omitted value for backward compatibility)
-preserves the packer's order. `largest_first` executes each rank's bins by
-nonincreasing padded-token count, allowing smaller microbatches to reuse allocator
-segments established by the largest shape. It does not change bin contents, rank
-assignment, or total padded tokens.
+`microbatch_order` controls only the execution order of bins already assigned to each data-parallel rank. `packer` (and an omitted value for backward compatibility) preserves the packer's order. `largest_first` executes each rank's bins by nonincreasing padded-token count, allowing smaller microbatches to reuse allocator segments established by the largest shape. It does not change bin contents, rank assignment, or total padded tokens.
 
 ## Integration with Training Pipeline
 
