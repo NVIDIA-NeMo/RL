@@ -83,7 +83,6 @@ from nemo_rl.experience.rollout_recovery import (
     PromptGroupPhase,
     PromptGroupStatus,
     RecoveryGranularity,
-    RecoveryTargetLevel,
     RolloutAttemptStatus,
     RolloutRecoveryLedger,
     SiblingSealResult,
@@ -2778,6 +2777,12 @@ class RolloutManager:
                     )
                     self._stats.skipped += 1
                     return RolloutOutcome.SKIPPED
+                print(
+                    f"retrying prompt idx={input_sample['idx']} after deterministic "
+                    f"failure {data_attempts}/{policy.max_data_attempts} "
+                    f"({reason}: {error})",
+                    flush=True,
+                )
                 # A data retry, NOT a re-dispatch: the fleet is fine, this prompt is
                 # suspect. Recording it as a re-dispatch made rollout/redispatch_total --
                 # documented above as the sign the fleet is degrading -- climb for bad
@@ -2933,6 +2938,12 @@ class RolloutManager:
                 ):
                     self._stats.record_data_failure(reason)
                     raise
+                print(
+                    f"retrying prompt idx={input_sample['idx']} after deterministic "
+                    f"failure {data_attempts}/{policy.max_data_attempts} "
+                    f"({reason}: {error})",
+                    flush=True,
+                )
                 self._stats.record_data_retry(reason)
                 continue
 
@@ -3017,11 +3028,12 @@ class RolloutManager:
         if pending_owners:
             environment_instance_id = next(iter(pending_owners))
         elif (
-            pending_indices and recovery_group.restore_level is RecoveryTargetLevel.TURN
+            pending_indices
+            and recovery_group.restore_level.requires_environment_checkpoint
         ):
             if not isinstance(self._impl, AsyncNemoGymRolloutImpl):
                 raise RuntimeError(
-                    "turn-level recovery requires the NeMo-Gym rollout path"
+                    "turn/prefix recovery requires the NeMo-Gym rollout path"
                 )
             environment_instance_id = self._impl.select_checkpoint_instance(
                 attempt_input_sample

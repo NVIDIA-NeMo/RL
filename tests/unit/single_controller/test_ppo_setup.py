@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -44,6 +45,7 @@ from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
 from nemo_rl.algorithms.ppo import PPOConfig
+from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -52,6 +54,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
+    logprob_passes_required,
     validate_single_controller_config,
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
@@ -280,6 +283,156 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="the `ppo` block is absent"):
             validate_single_controller_config(mc)
 
+    def test_vlm_architecture_signature_uses_media_structure(self):
+        from nemo_rl.algorithms.single_controller_utils.config import (
+            _vlm_architecture_signature,
+        )
+
+        config = SimpleNamespace(
+            model_type="qwen2_5_vl",
+            architectures=["Qwen2_5_VLForConditionalGeneration"],
+            get_text_config=lambda: SimpleNamespace(model_type="qwen2"),
+            vision_config=SimpleNamespace(model_type="qwen2_5_vl_vision"),
+            image_token_id=151655,
+            video_token_id=151656,
+            vision_start_token_id=151652,
+            vision_end_token_id=151653,
+        )
+        with patch(
+            "transformers.AutoConfig.from_pretrained", return_value=config
+        ) as load:
+            signature = _vlm_architecture_signature(
+                "/models/policy", {"revision": "validated"}
+            )
+
+        load.assert_called_once_with(
+            "/models/policy", trust_remote_code=True, revision="validated"
+        )
+        assert signature == (
+            "qwen2_5_vl",
+            ("Qwen2_5_VLForConditionalGeneration",),
+            "qwen2",
+            "qwen2_5_vl_vision",
+            (
+                ("image_token_id", 151655),
+                ("video_token_id", 151656),
+                ("vision_start_token_id", 151652),
+                ("vision_end_token_id", 151653),
+            ),
+        )
+
+    def test_vlm_tokenizer_signature_uses_vocab_and_special_tokens(self):
+        from nemo_rl.algorithms.single_controller_utils.config import (
+            _vlm_tokenizer_signature,
+        )
+
+        tokenizer = SimpleNamespace(
+            get_vocab=lambda: {"<image>": 2, "answer": 1},
+            bos_token_id=10,
+            eos_token_id=11,
+            pad_token_id=12,
+            unk_token_id=13,
+            sep_token_id=None,
+            cls_token_id=None,
+            mask_token_id=None,
+        )
+        with patch(
+            "transformers.AutoTokenizer.from_pretrained", return_value=tokenizer
+        ) as load:
+            signature = _vlm_tokenizer_signature(
+                {
+                    "name": "/tokenizers/policy",
+                    "tokenizer_kwargs": {"use_fast": False},
+                },
+                "/models/fallback",
+            )
+
+        load.assert_called_once_with(
+            "/tokenizers/policy", trust_remote_code=True, use_fast=False
+        )
+        assert signature[0] == 2
+        assert len(signature[1]) == 64
+        assert signature[2] == (10, 11, 12, 13, None, None, None)
+
+    def test_rejects_vlm_ppo_without_both_model_names(self):
+        mc = _ppo_master_config()
+        mc.policy["is_vlm"] = True
+        assert mc.value is not None
+        mc.value["model_name"] = ""
+
+        with pytest.raises(
+            ValueError, match="requires model_name for both the policy and critic"
+        ):
+            validate_single_controller_config(mc)
+
+    def test_rejects_vlm_policy_with_a_different_critic_model(self):
+        mc = _ppo_master_config()
+        mc.policy["is_vlm"] = True
+        mc.policy["model_name"] = "Qwen/Qwen2.5-VL-3B-Instruct"
+
+        with (
+            patch(
+                "nemo_rl.algorithms.single_controller_utils.config._vlm_architecture_signature",
+                side_effect=[("qwen2_5_vl",), ("qwen3",)],
+            ),
+            pytest.raises(ValueError, match="compatible policy and critic VLM"),
+        ):
+            validate_single_controller_config(mc)
+
+    def test_accepts_vlm_policy_with_the_same_vlm_critic(self):
+        mc = _ppo_master_config()
+        mc.policy["is_vlm"] = True
+        mc.policy["model_name"] = "Qwen/Qwen2.5-VL-3B-Instruct"
+        mc.policy["tokenizer"]["name"] = mc.policy["model_name"]
+        assert mc.value is not None
+        mc.value["model_name"] = mc.policy["model_name"]
+        mc.value["tokenizer"]["name"] = mc.policy["model_name"]
+
+        validate_single_controller_config(mc)
+
+    def test_accepts_compatible_vlm_checkpoints_at_different_paths(self):
+        mc = _ppo_master_config()
+        mc.policy["is_vlm"] = True
+        mc.policy["model_name"] = "/checkpoints/policy-vlm"
+        mc.policy["tokenizer"]["name"] = "/tokenizers/policy"
+        assert mc.value is not None
+        mc.value["model_name"] = "/checkpoints/value-vlm"
+        mc.value["tokenizer"]["name"] = "/tokenizers/value"
+
+        with (
+            patch(
+                "nemo_rl.algorithms.single_controller_utils.config._vlm_architecture_signature",
+                side_effect=[("qwen2_5_vl",), ("qwen2_5_vl",)],
+            ),
+            patch(
+                "nemo_rl.algorithms.single_controller_utils.config._vlm_tokenizer_signature",
+                side_effect=[("same-vocab",), ("same-vocab",)],
+            ),
+        ):
+            validate_single_controller_config(mc)
+
+    def test_rejects_vlm_critic_with_an_incompatible_tokenizer(self):
+        mc = _ppo_master_config()
+        mc.policy["is_vlm"] = True
+        mc.policy["model_name"] = "/checkpoints/policy-vlm"
+        mc.policy["tokenizer"]["name"] = "/tokenizers/policy"
+        assert mc.value is not None
+        mc.value["model_name"] = "/checkpoints/value-vlm"
+        mc.value["tokenizer"]["name"] = "/tokenizers/value"
+
+        with (
+            patch(
+                "nemo_rl.algorithms.single_controller_utils.config._vlm_architecture_signature",
+                side_effect=[("qwen2_5_vl",), ("qwen2_5_vl",)],
+            ),
+            patch(
+                "nemo_rl.algorithms.single_controller_utils.config._vlm_tokenizer_signature",
+                side_effect=[("policy-vocab",), ("value-vocab",)],
+            ),
+            pytest.raises(ValueError, match="compatible policy and critic tokenizers"),
+        ):
+            validate_single_controller_config(mc)
+
     @pytest.mark.parametrize("critic_epochs", [1, 2])
     def test_accepts_streaming_with_one_policy_epoch(self, critic_epochs):
         mc = _ppo_master_config(min_groups_for_streaming_train=1, megatron_enabled=True)
@@ -477,23 +630,17 @@ class TestPPOValidation:
             self._warmup_ckpt_config(constant_structure=False)
         )
 
-    @pytest.mark.parametrize(
-        "enable",
-        [
-            lambda cfg: setattr(cfg.reward_shaping, "enabled", True),
-        ],
-        ids=[
-            "reward_shaping",
-        ],
-    )
-    def test_rejects_shaping_the_sc_path_does_not_implement(self, enable):
+    def test_accepts_dapo_reward_shaping_on_a_ppo_run(self) -> None:
+        """SC setup accepts a validated PPO reward-shaping configuration."""
         mc = _ppo_master_config()
-        enable(mc.ppo)
+        mc.ppo.reward_shaping = RewardShapingConfig(
+            enabled=True,
+            overlong_buffer_length=512,
+            overlong_buffer_penalty=1,
+            max_response_length=4096,
+        )
 
-        with pytest.raises(
-            NotImplementedError, match="not supported on the SingleController"
-        ):
-            validate_single_controller_config(mc)
+        validate_single_controller_config(mc)
 
     def test_rejects_length_penalty_until_sc_applies_it(self):
         # The SC path has no length-penalty hook yet; fail at setup rather
@@ -1151,3 +1298,42 @@ class TestTrainClusterSizesForTheCritic:
         else:
             # The critic never lands on the inference cluster.
             assert inference.kwargs["max_colocated_worker_groups"] == 1
+
+
+def _in_loss_ppo_config(*, streaming: bool = False) -> MasterConfig:
+    mc = _ppo_master_config(
+        megatron_enabled=True,
+        min_groups_for_streaming_train=1 if streaming else _NUM_PROMPTS_PER_STEP,
+    )
+    mc.ppo.ppo_epochs = 1
+    mc.ppo.seq_logprob_error_threshold = 2.0
+    mc.loss_fn.seq_logprob_error_in_loss = True
+    mc.loss_fn.force_on_policy_ratio = True
+    mc.loss_fn.token_level_loss = True
+    return mc
+
+
+class TestInLossSeqFilterForPPO:
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_accepts_one_policy_epoch_and_skips_policy_logprobs(
+        self, streaming: bool
+    ) -> None:
+        mc = _in_loss_ppo_config(streaming=streaming)
+
+        validate_single_controller_config(mc)
+        policy_pass, _ = logprob_passes_required(mc, mc.ppo)
+        assert not policy_pass
+
+    def test_rejects_multiple_policy_epochs(self) -> None:
+        mc = _in_loss_ppo_config()
+        mc.ppo.ppo_epochs = 4
+
+        with pytest.raises(ValueError, match="requires ppo.ppo_epochs=1"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_kl_in_reward(self) -> None:
+        mc = _in_loss_ppo_config()
+        mc.loss_fn.use_kl_in_reward = True
+
+        with pytest.raises(ValueError, match="without use_kl_in_reward"):
+            validate_single_controller_config(mc)

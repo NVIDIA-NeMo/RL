@@ -1968,6 +1968,8 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs(
     assert len(dump_timings) == 1
     assert math.isfinite(dump_timings[0]) and dump_timings[0] > 0
 
+    # The stage writes in the background; the controller flushes before merging.
+    ctrl._advantage_computer.flush_train_data_dump()
     ctrl._train_data_dump.finish_step(0, ctrl._train_data_dump_receipts)
     dumped = [
         json.loads(line)
@@ -2371,7 +2373,8 @@ class _StepMetricRecordingGeneration:
     def snapshot_step_metrics(self) -> None:
         self._record("snapshot_step_metrics")
 
-    def get_step_metrics(self) -> dict[str, float]:
+    def get_step_metrics(self, *, keep_snapshot: bool = False) -> dict[str, float]:
+        assert keep_snapshot
         self._record("get_step_metrics")
         return {"vllm/spec_acceptance_rate": 0.8}
 
@@ -2394,6 +2397,7 @@ def _train_pump_controller(*, sampler) -> object:
         # The pump's step epilogue reads the save triggers even when saving
         # is disabled.
         checkpointing={"enabled": False, "save_period": 10},
+        rollout_recovery=SimpleNamespace(generation_prefix_cuts_enabled=False),
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -2411,6 +2415,7 @@ def _train_pump_controller(*, sampler) -> object:
     ctrl._timeout.start_iterations()
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._policy_logprobs_required = False
+    ctrl._warmup_policy_logprobs_required = False
     ctrl._reference_logprobs_required = False
     ctrl._teacher_logprobs_required = False
     ctrl._train_data_dump = None
@@ -2439,7 +2444,7 @@ def _train_pump_controller(*, sampler) -> object:
         requires_kv_scale_sync=False,
         blocks_training=lambda: False,
         snapshot_step_metrics=lambda: None,
-        get_step_metrics=lambda: {},
+        get_step_metrics=lambda *, keep_snapshot=False: {},
     )
     ctrl._rollout_manager = SimpleNamespace(
         set_weight_version=MagicMock(),
@@ -2943,7 +2948,39 @@ def test_train_pump_aggregates_selected_rollout_metrics_across_chunks(
     assert "histogram/gen_tokens_length" not in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("dies_in", [None, "snapshot_step_metrics", "get_step_metrics"])
+@pytest.mark.parametrize("snapshot_fails", [False, True])
+def test_run_pumps_snapshots_generation_before_dispatch(
+    monkeypatch, snapshot_fails: bool
+) -> None:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = controller_cls.__new__(controller_cls)
+    ctrl._environment_checkpoint = SimpleNamespace(check_startup=AsyncMock())
+    ctrl._weight_synchronizer = SimpleNamespace(is_stale=False)
+    ctrl._rollout_manager = SimpleNamespace(set_weight_version=MagicMock())
+    ctrl._trainer_version = 0
+    ctrl._rollout_restorer = SimpleNamespace(restore=AsyncMock(return_value=False))
+    events = []
+
+    def snapshot() -> None:
+        events.append("snapshot")
+        if snapshot_fails:
+            raise ActorDiedError()
+
+    def stop_before_dispatch(coroutine: Any) -> None:
+        coroutine.close()
+        events.append("dispatch")
+        raise RuntimeError("stop before dispatch")
+
+    ctrl._gen = SimpleNamespace(snapshot_step_metrics=snapshot)
+    monkeypatch.setattr(asyncio, "create_task", stop_before_dispatch)
+
+    with pytest.raises(RuntimeError, match="stop before dispatch"):
+        asyncio.run(ctrl._run_pumps())
+
+    assert events == ["snapshot", "dispatch"]
+
+
+@pytest.mark.parametrize("dies_in", [None, "get_step_metrics"])
 def test_train_pump_collects_generation_metrics_at_step_boundaries(
     monkeypatch, dies_in
 ) -> None:
@@ -2968,7 +3005,6 @@ def test_train_pump_collects_generation_metrics_at_step_boundaries(
     asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
 
     assert events == [
-        "snapshot_step_metrics",
         "begin_train_step",
         "train_microbatches",
         "train_microbatches",
@@ -2980,6 +3016,39 @@ def test_train_pump_collects_generation_metrics_at_step_boundaries(
         assert "vllm/spec_acceptance_rate" not in train_metrics
     else:
         assert train_metrics["vllm/spec_acceptance_rate"] == pytest.approx(0.8)
+
+
+def test_train_pump_logs_generation_prefix_restores_with_prefix_cuts(
+    monkeypatch,
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0"],
+        fields=[],
+        sequence_lengths=[1],
+        tags=_one_group_tags(1),
+    )
+    events: list[str] = []
+    ctrl = _train_pump_controller(sampler=_ChunkedSampler(meta, chunks=2))
+    ctrl._trainer = _StepMetricRecordingTrainer(events)
+    ctrl._gen = _StepMetricRecordingGeneration(events, dies_in=None)
+    ctrl._gen.get_generation_prefix_counts = lambda: {
+        "restored_calls": 3,
+        "restored_prefix_tokens": 120,
+        "progress_read_hold_us": 2,
+    }
+    ctrl._master_config.rollout_recovery.generation_prefix_cuts_enabled = True
+    ctrl._sync_weights = AsyncMock(return_value=0)
+    ctrl._logger = MagicMock()
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    train_metrics = ctrl._logger.log_metrics.call_args_list[0].args[0]
+    assert train_metrics["generation_prefix/restored_calls"] == 3.0
+    assert train_metrics["generation_prefix/restored_prefix_tokens"] == 120.0
+    assert train_metrics["generation_prefix/progress_read_hold_us"] == 2.0
 
 
 @pytest.mark.parametrize(
@@ -3035,7 +3104,7 @@ def test_train_pump_chunked_step_by_engine_regime(
         blocks_training=lambda: engine_blocks_training,
         finish_generation=_finish_generation,
         snapshot_step_metrics=lambda: None,
-        get_step_metrics=lambda: {},
+        get_step_metrics=lambda *, keep_snapshot=False: {},
     )
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
@@ -3385,7 +3454,7 @@ def test_train_pump_freezes_the_policy_during_critic_warmup(
                 ctrl._rollout_permitted.is_set()
             ),
             snapshot_step_metrics=lambda: None,
-            get_step_metrics=lambda: {},
+            get_step_metrics=lambda *, keep_snapshot=False: {},
         )
         ctrl._rollout_permitted = asyncio.Event()
         ctrl._rollout_permitted.set()
@@ -3440,6 +3509,38 @@ def test_train_pump_trains_the_policy_once_warmup_is_over(monkeypatch, capsys) -
     ctrl._sync_weights.assert_awaited_once_with(calibration_data=None)
     # Announced exactly once, on the step that crosses the boundary.
     assert capsys.readouterr().out.count("Critic warmup complete") == 1
+
+
+@pytest.mark.parametrize("warmup", [True, False])
+def test_in_loss_ppo_runs_the_policy_logprob_pass_only_during_critic_warmup(
+    monkeypatch, warmup
+) -> None:
+    """With in-loss filtering the policy loss decides rejections, but it does not
+    run during critic warmup, so those steps take the separate pass instead."""
+    meta = _single_group_meta()
+    ctrl, _ = _ppo_train_pump_controller(
+        sampler=_OneThenEmptySampler(meta),
+        policy_training_start_step=1,
+    )
+    ctrl._warmup_policy_logprobs_required = True
+    if not warmup:
+        ctrl._train_steps = 1
+        ctrl._trainer_version = 1
+        ctrl._algo_cfg.max_num_steps = 2
+    trainer = MagicMock(spec=_NoOpTrainer)
+    trainer.get_logprobs_from_meta = MagicMock()
+    trainer.finish_train_step.return_value = {}
+    ctrl._trainer = trainer
+    ctrl._advantage_stage = AsyncMock(return_value=(meta, True))
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+
+    asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=1.0))
+
+    assert trainer.get_logprobs_from_meta.call_count == (1 if warmup else 0)
+    # The advantage stage then applies the threshold exactly as with the flag off.
+    assert ctrl._advantage_stage.await_args.kwargs == {
+        "policy_logprobs_required": warmup
+    }
 
 
 def test_train_pump_groups_ppo_epochs_by_model(monkeypatch) -> None:
@@ -3656,8 +3757,11 @@ def _streaming_ppo_controller(
     ctrl._policy_logprobs_required = True
     validity = iter(valid_chunks)
 
-    async def advantage_stage(meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
+    async def advantage_stage(
+        meta: KVBatchMeta, *, policy_logprobs_required: bool | None = None
+    ) -> tuple[KVBatchMeta, bool]:
         assert "values" in meta.fields
+        assert policy_logprobs_required is True
         calls.append("gae")
         return meta.with_fields(["advantages", "returns"]), next(validity)
 
@@ -4646,6 +4750,9 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
         # The chunk above stands in for the stage's write, so stand in for the
         # receipt it would have reported alongside it too.
         ctrl._train_data_dump_receipts = [receipt]
+        # ...and for the in-process stage the commit flushes before merging.
+        ctrl._advantage_actors = []
+        ctrl._advantage_computer = SimpleNamespace(flush_train_data_dump=lambda: None)
 
     def finish_training() -> dict:
         assert not final.exists()
@@ -4667,6 +4774,69 @@ def test_train_pump_logs_dump_timing_after_optimizer_step(
         assert logged_timings[0]["train_data_dump"] > 2.0
         assert not final.with_suffix(".jsonl.partial").exists()
     assert "train_data_dump" not in ctrl._timer.get_timing_metrics()
+
+
+@pytest.mark.parametrize("pooled", [False, True])
+@pytest.mark.parametrize("flush_fails", [False, True])
+def test_train_pump_flushes_every_writer_before_publishing(
+    monkeypatch: pytest.MonkeyPatch, pooled: bool, flush_fails: bool
+) -> None:
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=["sample-0", "sample-1"],
+        fields=[],
+        sequence_lengths=[1, 1],
+        tags=_one_group_tags(2),
+    )
+    ctrl = _train_pump_controller(sampler=_FullStepSampler(meta))
+    ctrl._logger = MagicMock()
+    ctrl._sync_weights = AsyncMock(return_value=1)
+    monkeypatch.setattr(single_controller.ray, "cluster_resources", lambda: {})
+    events: list[str] = []
+
+    async def flush(name: str) -> None:
+        # Yield first, so a publish that did not wait would run before this ends.
+        await asyncio.sleep(0.01)
+        if flush_fails and name == "flush-last":
+            raise RuntimeError("flush failed")
+        events.append(name)
+
+    ctrl._train_data_dump = MagicMock()
+    ctrl._train_data_dump_receipts = []
+    ctrl._train_data_dump.finish_step.side_effect = lambda *_: events.append("publish")
+    if pooled:
+        ctrl._advantage_actors = [
+            SimpleNamespace(
+                flush_train_data_dump=SimpleNamespace(
+                    remote=lambda name=name: flush(name)
+                )
+            )
+            for name in ("flush-first", "flush-last")
+        ]
+    else:
+
+        def flush_inline() -> None:
+            if flush_fails:
+                raise RuntimeError("flush failed")
+            events.append("flush-last")
+
+        ctrl._advantage_actors = []
+        ctrl._advantage_computer = SimpleNamespace(flush_train_data_dump=flush_inline)
+    ctrl._trainer.finish_train_step = MagicMock(return_value={})
+
+    if flush_fails:
+        with pytest.raises(RuntimeError, match="flush failed"):
+            asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+        ctrl._train_data_dump.finish_step.assert_not_called()
+        assert "publish" not in events
+    else:
+        asyncio.run(asyncio.wait_for(ctrl._train_pump(), timeout=5.0))
+        assert events[-1] == "publish"
+        assert events.count("publish") == 1
+        assert {"flush-last"} <= set(events)
+        if pooled:
+            assert {"flush-first", "flush-last"} <= set(events[:-1])
 
 
 @pytest.mark.parametrize("log_full_result_tables", [False, True])

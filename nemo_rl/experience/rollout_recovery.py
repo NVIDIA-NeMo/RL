@@ -204,6 +204,7 @@ class RecoveryGranularity(StrEnum):
 class RecoveryTargetLevel(StrEnum):
     """Finest requested restart boundary for an unfinished rollout."""
 
+    PREFIX = "prefix"
     TURN = "turn"
     SIBLING = "sibling"
     PROMPT_GROUP = "prompt_group"
@@ -219,8 +220,18 @@ class RecoveryTargetLevel(StrEnum):
 
     @property
     def rank(self) -> int:
-        """0 for ``turn``; a larger rank restarts more work. Follows declaration order."""
+        """0 for ``prefix``; a larger rank restarts more work. Follows declaration order."""
         return list(RecoveryTargetLevel.__members__.values()).index(self)
+
+    @property
+    def requires_environment_checkpoint(self) -> bool:
+        """Whether recovery needs environment checkpoint state for the active episode."""
+        return self in {RecoveryTargetLevel.PREFIX, RecoveryTargetLevel.TURN}
+
+    @property
+    def preserves_generation_prefix(self) -> bool:
+        """Whether recovery continues an active model call from decoded tokens."""
+        return self is RecoveryTargetLevel.PREFIX
 
 
 class RolloutAttemptStatus(StrEnum):
@@ -460,10 +471,10 @@ class UnresolvedCaptureAcknowledgement(ValueError):
 def _holds_environment_episode(
     record: PromptGroupRecoveryRecord, sibling: RolloutSiblingRecord
 ) -> bool:
-    """Whether this sibling's current attempt is live environment state."""
+    """Whether this sibling's current attempt is live turn/prefix environment state."""
     return (
         record.status is PromptGroupStatus.GENERATING
-        and record.restore_level is RecoveryTargetLevel.TURN
+        and record.restore_level.requires_environment_checkpoint
         and sibling.current_attempt.holds_environment_state
     )
 
@@ -536,6 +547,38 @@ def _receipt_staging_keys(receipt: Optional[dict[str, Any]]) -> list[str]:
     return list(dict.fromkeys(staging_keys))
 
 
+def _owned_staging_key(
+    owner: str, model_call_id: str, source_capture_key: str | None
+) -> str | None:
+    """Return the staging key one manifest call of ``owner``'s receipt must have.
+
+    A call ``owner`` made is staged under ``owner``. A restore that continued
+    the episode as ``owner`` carries earlier calls over, each stamped with the
+    attempt that staged it in ``source_capture_key``. Gym's rebuild owns that
+    rule (``_staging_owner``); this calls it so the two cannot drift. The
+    ledger checks raw dicts, so plain namespaces stand in for Gym's models.
+    Returns None when Gym refuses the stamp.
+    """
+    from types import SimpleNamespace
+
+    from nemo_gym.token_id_capture.staging.rebuild import (
+        ReceiptVerificationError,
+        _staging_owner,
+    )
+    from nemo_gym.token_id_capture.staging.records import staging_key
+
+    try:
+        source = _staging_owner(
+            SimpleNamespace(capture_key=owner),
+            SimpleNamespace(
+                source_capture_key=source_capture_key, model_call_id=model_call_id
+            ),
+        )
+    except ReceiptVerificationError:
+        return None
+    return staging_key(source, model_call_id)
+
+
 def _attempt_staging_keys(
     gate_id: str,
     receipt: dict[str, Any] | None,
@@ -565,7 +608,8 @@ def _attempt_staging_keys(
                 not isinstance(call_id, str)
                 or not call_id
                 or "/" in call_id
-                or entry["staging_key"] != f"{gate_id}/{call_id}"
+                or entry["staging_key"]
+                != _owned_staging_key(gate_id, call_id, entry.get("source_capture_key"))
             ):
                 raise ValueError(
                     "Forest recovery has foreign staging ownership: "
@@ -828,7 +872,7 @@ class RolloutRecoveryLedger:
                             episode.attempt,
                         )
                         if (
-                            record.restore_level is RecoveryTargetLevel.TURN
+                            record.restore_level.requires_environment_checkpoint
                             and attempt.status
                             in {
                                 RolloutAttemptStatus.DISPATCHED,
@@ -861,7 +905,7 @@ class RolloutRecoveryLedger:
         unused_restores = restored - consumed_restores
         if unused_restores:
             raise ValueError(
-                "environment restored episodes are not owned by dispatched turn-level "
+                "environment restored episodes are not owned by dispatched environment-state "
                 f"rollouts: {sorted(unused_restores)!r}"
             )
 
@@ -941,7 +985,7 @@ class RolloutRecoveryLedger:
         self,
         instance_ids: set[str] | frozenset[str],
     ) -> dict[str, tuple[EnvironmentEpisode, ...]]:
-        """Return active turn-level environment episodes grouped by owning actor."""
+        """Return active turn/prefix environment episodes grouped by owning actor."""
         inventory: dict[str, list[EnvironmentEpisode]] = {
             instance_id: [] for instance_id in instance_ids
         }
@@ -953,13 +997,13 @@ class RolloutRecoveryLedger:
                 instance_id = attempt.environment_instance_id
                 if instance_id is None:
                     raise RuntimeError(
-                        "cannot checkpoint a dispatched turn-level rollout without "
+                        "cannot checkpoint a dispatched environment-state rollout without "
                         f"environment ownership: group={record.group_id!r}, "
                         f"generation_index={sibling.generation_index}"
                     )
                 if instance_id not in inventory:
                     raise RuntimeError(
-                        f"turn-level rollout references unavailable environment instance "
+                        f"environment-state rollout references unavailable environment instance "
                         f"{instance_id!r}"
                     )
                 inventory[instance_id].append(
@@ -998,6 +1042,20 @@ class RolloutRecoveryLedger:
                 ):
                     held[instance_id].add(episode)
         return held
+
+    def has_dispatched_generation_prefix(self) -> bool:
+        """Whether a dispatched attempt may be growing a recoverable prefix.
+
+        Decoding advances such an attempt without mutating the data plane, so a
+        snapshot cadence keyed only on data-plane mutations would never cut it.
+        """
+        return any(
+            record.status is PromptGroupStatus.GENERATING
+            and record.restore_level.preserves_generation_prefix
+            and sibling.current_attempt.status is RolloutAttemptStatus.DISPATCHED
+            for record in self._groups.values()
+            for sibling in record.siblings
+        )
 
     def _record_environment_retirements(
         self, record: PromptGroupRecoveryRecord
@@ -1193,12 +1251,12 @@ class RolloutRecoveryLedger:
             raise ValueError("only reserved rollout attempts may be dispatched")
         for attempt in attempts:
             if (
-                record.restore_level is RecoveryTargetLevel.TURN
+                record.restore_level.requires_environment_checkpoint
                 and attempt.environment_instance_id is None
                 and environment_instance_id is None
             ):
                 raise ValueError(
-                    "turn-level rollout dispatch requires an environment checkpoint owner"
+                    "turn/prefix rollout dispatch requires an environment checkpoint owner"
                 )
             if attempt.environment_instance_id is not None:
                 if environment_instance_id != attempt.environment_instance_id:

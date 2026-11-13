@@ -425,25 +425,28 @@ def test_apply_top_k_top_p_matches_vllm_upstream(top_k, top_p, test_name):
     our_result, _ = apply_top_k_top_p(logits_3d.clone(), top_k=top_k, top_p=top_p)
 
     # vLLM upstream: expects [batch, vocab], takes tensor k/p with shape [batch]
-    # Process each sequence position separately (vLLM doesn't batch over seq_len)
+    # Process each sequence position separately (vLLM doesn't batch over seq_len).
+    # vLLM filters with a Triton kernel whenever Triton is installed, so its
+    # inputs must be on the GPU.
+    device = torch.device("cuda")
     vllm_results = []
     for seq_idx in range(seq_len):
-        logits_2d = logits_3d[:, seq_idx, :].clone()  # [batch, vocab]
+        logits_2d = logits_3d[:, seq_idx, :].clone().to(device)  # [batch, vocab]
 
         # Convert scalar parameters to tensors for vLLM
         k_tensor = (
             None
             if top_k is None
-            else torch.full((batch_size,), top_k, dtype=torch.long)
+            else torch.full((batch_size,), top_k, dtype=torch.long, device=device)
         )
         p_tensor = (
             None
             if top_p is None
-            else torch.full((batch_size,), top_p, dtype=torch.float32)
+            else torch.full((batch_size,), top_p, dtype=torch.float32, device=device)
         )
 
         vllm_result = vllm_apply_top_k_top_p(logits_2d, k=k_tensor, p=p_tensor)
-        vllm_results.append(vllm_result)
+        vllm_results.append(vllm_result.cpu())
 
     vllm_result_3d = torch.stack(vllm_results, dim=1)  # [batch, seq, vocab]
 

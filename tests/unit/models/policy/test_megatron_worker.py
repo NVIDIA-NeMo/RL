@@ -430,6 +430,7 @@ def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
         local_hf_param_specs=lambda: (),
     )
     worker = object.__new__(MegatronPolicyWorkerImpl)
+    worker.nccl_reshard_refit_infos = {}
     worker.refit_conversion_tasks = [task]
     worker.model = object()
     worker.megatron_bridge = SimpleNamespace(
@@ -450,6 +451,8 @@ def test_nccl_reshard_all_misc_refit_supports_empty_bulk(pp_size: int) -> None:
         gen_world_size=1,
     )
 
+    assert worker.nccl_reshard_refit_infos == {0: info}
+    assert "nccl_reshard_refit_info" not in vars(worker)
     assert info["layer_names"] == []
     assert info["per_layer_params"] == {}
     assert list(info["misc_meta"]) == [misc_name]
@@ -505,6 +508,7 @@ def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     worker.model = object()
     worker.model_update_group = object()
+    worker.nccl_reshard_refit_infos = {}
     worker.refit_conversion_tasks = export_tasks
     worker._calculate_refit_param_info = MagicMock(return_value=[])
     worker._build_bulk_refit_conversion_tasks = MagicMock(
@@ -552,6 +556,8 @@ def test_nccl_reshard_bulk_metadata_and_misc_scales_are_separate(
         "packed_broadcast_producer",
         lambda *, iterator, **kwargs: received.extend(iterator),
     )
+    # Misc is shared across layouts and always reads the first layout's metadata.
+    worker.nccl_reshard_refit_infos[1] = {"misc_meta": {}}
     worker._broadcast_misc_params_packed(kv_scales={"unused": 1.0})
     assert [name for name, _ in received] == list(expected_misc)
     assert all(tensor is expected_misc[name] for name, tensor in received)
@@ -1307,15 +1313,13 @@ def test_regular_model_does_not_delegate_packing():
 
 
 def test_model_cp_slicing_capability_is_detected():
-    from nemo_rl.models.policy.workers.megatron_policy_worker import (
-        _model_slices_context_parallel_inputs,
-    )
+    from nemo_rl.models.megatron.common import model_slices_context_parallel_inputs
 
     class ModelSlicesContextParallelInputs:
         model_slices_context_parallel_inputs = True
 
-    assert _model_slices_context_parallel_inputs(ModelSlicesContextParallelInputs())
-    assert not _model_slices_context_parallel_inputs(object())
+    assert model_slices_context_parallel_inputs(ModelSlicesContextParallelInputs())
+    assert not model_slices_context_parallel_inputs(object())
 
 
 def test_model_cp_slicing_accepts_data_plane_setup():
@@ -1780,30 +1784,33 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
 
     worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
     worker.my_pp_stage = 0
-    worker.pp_comm_group = object()
+    worker.pp_comm_group = {0: object()}
+    worker.cfg = {"generation": {"backend": "vllm"}}
     worker._broadcast_misc_params_packed = MagicMock()
     source = torch.arange(8, dtype=source_dtype).reshape(4, 2)
     wire_dtype = torch.bfloat16 if source_dtype == torch.uint8 else source_dtype
     if source_dtype != torch.uint8:
         source = 1 + source / 1024
     layer_names = ["model.layers.0", "model.layers.1"]
-    worker.nccl_reshard_refit_info = {
-        "layer_names": layer_names,
-        "per_layer_params": {
-            layer: [
-                {
-                    "name": f"{layer}.mlp.{proj}_proj.weight",
-                    "global_shape": [2, 2],
-                    "dtype": str(wire_dtype),
-                    "src_mesh_info": object(),
-                    "src_placements": (),
-                    "dst_mesh_info": object(),
-                    "dst_placements": (),
-                }
-                for proj in ("gate", "up")
-            ]
-            for layer in layer_names
-        },
+    worker.nccl_reshard_refit_infos = {
+        0: {
+            "layer_names": layer_names,
+            "per_layer_params": {
+                layer: [
+                    {
+                        "name": f"{layer}.mlp.{proj}_proj.weight",
+                        "global_shape": [2, 2],
+                        "dtype": str(wire_dtype),
+                        "src_mesh_info": object(),
+                        "src_placements": (),
+                        "dst_mesh_info": object(),
+                        "dst_placements": (),
+                    }
+                    for proj in ("gate", "up")
+                ]
+                for layer in layer_names
+            },
+        }
     }
     current_stream = object()
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: current_stream)
@@ -1844,7 +1851,7 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
 
     worker._iter_local_hf_param_shards = iter_shards
     worker.hf_to_local_param_map = worker._build_source_hf_to_local_param_map(
-        worker.nccl_reshard_refit_info
+        worker.nccl_reshard_refit_infos[0]
     )
     first_spec = worker.hf_to_local_param_map.get(
         f"{layer_names[0]}.mlp.gate_proj.weight"
@@ -1870,7 +1877,7 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
     first_spec.post = post
 
     def transfer(src, *args) -> None:
-        assert args[-2] is worker.pp_comm_group
+        assert args[-2] is worker.pp_comm_group[0]
         assert args[-1] is current_stream
         if failure_stage == "transfer":
             raise RuntimeError("injected transfer failure")
@@ -1912,6 +1919,104 @@ def test_megatron_refit_hooks_refresh_after_updates_and_failures(
         source.add_(10)
 
     assert worker._broadcast_misc_params_packed.call_count == 2
+    # vLLM keeps empty_cache() after the bulk send; TRT-LLM reshard skips it.
+    assert torch.cuda.empty_cache.call_count == 2
+    worker.cfg = {
+        "generation": {"backend": "trtllm", "refit_transport": "nccl_reshard"}
+    }
+    torch.cuda.empty_cache.reset_mock()
+    worker._nccl_reshard_refit()
+    torch.cuda.empty_cache.assert_not_called()
+
+
+def test_nccl_reshard_send_materializes_each_layer_once_for_every_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import nemo_rl.models.policy.workers.megatron_policy_worker as worker_module
+    import nemo_rl.weight_sync.xferdtensor as transfer_module
+
+    worker = object.__new__(worker_module.MegatronPolicyWorkerImpl)
+    worker.my_pp_stage = 0
+    layer_names = ["model.layers.0", "model.layers.1"]
+    names = [f"{layer}.mlp.experts.down_proj.weight" for layer in layer_names]
+
+    def plan(role: str) -> dict:
+        # The role stands in for each layout's destination mesh.
+        return {
+            "layer_names": list(layer_names),
+            "per_layer_params": {
+                layer: [
+                    {
+                        "name": name,
+                        "global_shape": [4, 2, 2],
+                        "src_mesh_info": role,
+                        "src_placements": (),
+                        "dst_mesh_info": role,
+                        "dst_placements": (),
+                    }
+                ]
+                for layer, name in zip(layer_names, names)
+            },
+        }
+
+    worker.nccl_reshard_refit_infos = {0: plan("prefill"), 1: plan("decode")}
+    groups = {0: object(), 1: object()}
+    worker.pp_comm_group = groups
+    events = []
+
+    def make_spec(name: str) -> SimpleNamespace:
+        def materialize() -> worker_module.RefitCtx:
+            events.append(("materialize", name))
+            return worker_module.RefitCtx(buf=MagicMock(name=name))
+
+        return SimpleNamespace(
+            materialize=materialize,
+            post=lambda ctx: events.append(("post", ctx.buf._mock_name)),
+        )
+
+    specs = {name: make_spec(name) for name in names}
+    worker.hf_to_local_param_map = SimpleNamespace(get=specs.get)
+    materialize_stream = object()
+    streams = {0: MagicMock(), 1: MagicMock()}
+    layout_of = {"prefill": 0, "decode": 1}
+
+    def transfer(src, _src_mesh, _src_pl, _dst, dst_mesh, _dst_pl, group, stream):
+        assert group is groups[layout_of[dst_mesh]]
+        assert stream is streams[layout_of[dst_mesh]]
+        events.append(("send", dst_mesh, src._local_tensor._mock_name))
+
+    monkeypatch.setattr(transfer_module, "xferdtensor", transfer)
+
+    assert worker._nccl_reshard_layout_indices() == [0, 1]
+    worker._send_bulk_params([0, 1], streams, materialize_stream)
+
+    n0, n1 = names
+    assert events == [
+        ("materialize", n0),
+        ("send", "prefill", n0),
+        ("send", "decode", n0),
+        ("post", n0),
+        ("materialize", n1),
+        ("send", "prefill", n1),
+        ("send", "decode", n1),
+        ("post", n1),
+    ]
+    # Each send stream waits for the materialization it reads.
+    for stream in streams.values():
+        assert stream.wait_stream.call_count == 2
+
+    saved_plan = worker.nccl_reshard_refit_infos.pop(1)
+    with pytest.raises(KeyError, match="1"):
+        worker._send_bulk_params([0, 1], streams, materialize_stream)
+    worker.nccl_reshard_refit_infos[1] = saved_plan
+    saved_group = groups.pop(1)
+    with pytest.raises(KeyError, match="1"):
+        worker._send_bulk_params([0, 1], streams, materialize_stream)
+    groups[1] = saved_group
+
+    worker.nccl_reshard_refit_infos[1]["layer_names"] = layer_names[::-1]
+    with pytest.raises(RuntimeError, match="orders the bulk layers differently"):
+        worker._send_bulk_params([0, 1], streams, materialize_stream)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA streams")
@@ -3461,8 +3566,8 @@ def test_worker_initialization_preserves_only_restored_rng(
             "_model_has_chunkwise_cp",
             "_model_needs_router_padding_mask",
             "_model_self_packs_mtp_loss_mask",
-            "_model_slices_context_parallel_inputs",
-            "_model_accepts_media_token_validity_mask",
+            "model_slices_context_parallel_inputs",
+            "model_media_placeholder_token_id",
             "_reserved_http_server_port_for_rank",
         )
     }
@@ -6701,3 +6806,39 @@ def test_megatron_policy_flops_range_check(tiny_llama_model_path):
     finally:
         policy.shutdown()
         cluster.shutdown()
+
+
+def test_reshard_group_rebuild_replaces_only_requested_layout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nemo_rl.distributed import refit_watchdog, stateless_process_group
+    from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+
+    worker = AbstractPolicyWorker()
+    old_prefill, decode, new_prefill = MagicMock(), MagicMock(), MagicMock()
+    worker.pp_comm_group = {0: old_prefill, 1: decode}
+    old_map = worker.pp_comm_group
+    events = []
+    monkeypatch.setattr(
+        stateless_process_group, "StatelessProcessGroup", lambda **kwargs: new_prefill
+    )
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    new_prefill.init_nccl_communicator.side_effect = lambda **kwargs: events.append(
+        "init"
+    )
+    monkeypatch.setattr(
+        refit_watchdog, "release_within", lambda *args: events.append("release")
+    )
+    worker.init_nccl_reshard_comm_group(
+        pp_ips=["127.0.0.1"],
+        pp_ports=[1500],
+        pp_size=1,
+        my_pp_stage=0,
+        sub_world_size=4,
+        my_rank_in_group=0,
+        layout_index=0,
+    )
+    assert worker.pp_comm_group == {0: new_prefill, 1: decode}
+    assert old_map == {0: old_prefill, 1: decode}
+    assert events == ["init", "release"]
