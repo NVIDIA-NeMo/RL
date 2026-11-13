@@ -541,6 +541,13 @@ class _FakeExecutor:
         pass
 
 
+def test_make_debug_writer_rejects_a_background_key_in_the_config(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="'background'"):
+        make_debug_writer(DebugWriterConfig(background=True), str(tmp_path))
+
+
 def test_make_debug_writer_passes_background_to_every_writer(tmp_path: Path) -> None:
     cfg = DebugWriterConfig(target=f"{__name__}._RecordingWriter", label="x")
     assert make_debug_writer(cfg, str(tmp_path), background=True)._background

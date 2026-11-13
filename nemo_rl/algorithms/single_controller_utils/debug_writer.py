@@ -51,6 +51,9 @@ class TrainChunk:
             and advantages.
         scalars: Per-sample columns written as given; variable-length values must
             be jagged tensors rather than padded.
+
+    With background writing, add_chunk moves the CPU tensors of the chunk to
+    shared memory, so the caller must not modify them after it returns.
     """
 
     step: int
@@ -82,6 +85,10 @@ class DebugWriter(ABC):
 
     Each shard calls add_chunk on its own instance, and the controller calls
     finish_step on another once the step completes and close once at shutdown.
+
+    A subclass that defines __init__ must accept log_dir, the keyword-only
+    shard_id and background, and pass them to this base. Extra keys of the
+    debug_writer config arrive as further keyword arguments.
     """
 
     def __init__(
@@ -378,5 +385,10 @@ def make_debug_writer(
             "DebugWriter subclass."
         )
     kwargs = dict(cfg.model_extra or {})
+    if "background" in kwargs:
+        raise ValueError(
+            "debug_writer sets 'background' itself; remove the 'background' key "
+            "from the debug_writer config."
+        )
     kwargs["background"] = background
     return writer_cls(log_dir, shard_id=shard_id, **kwargs)
