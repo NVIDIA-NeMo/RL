@@ -13,8 +13,8 @@
 # limitations under the License.
 
 # Phase control shared by the prefix-recovery functional tests. Source it after
-# setting TEST_DIR; a test starts phase one in its own process group and keeps
-# its PID in PHASE1_PID.
+# setting PROJECT_ROOT and TEST_DIR; a test starts phase one in its own process
+# group and keeps its PID in PHASE1_PID.
 
 PHASE1_PID=""
 
@@ -36,6 +36,26 @@ stop_phase1() {
             return 1
         fi
         sleep 1
+    done
+}
+
+# Recover exactly the selected prefix: keep only the selected snapshot and no
+# trainer checkpoint, either of which would represent work performed after the
+# simulated crash. Sets SNAPSHOT_DIR to the restored snapshot.
+restore_selected_snapshot() {
+    local selection_file=$1 selected_backup=$2 checkpoint_dir=$3
+    local snapshot_root trainer_checkpoint
+    SNAPSHOT_DIR=$(uv run --directory "${PROJECT_ROOT}" --no-sync python -c \
+        'import json, sys; print(json.load(open(sys.argv[1]))["snapshot"])' \
+        "${selection_file}")
+    snapshot_root=$(dirname "${SNAPSHOT_DIR}")
+    rm -rf "${snapshot_root}"
+    mkdir -p "${snapshot_root}"
+    cp -a "${selected_backup}" "${SNAPSHOT_DIR}"
+    for trainer_checkpoint in "${checkpoint_dir}"/step_*; do
+        if [[ -d "${trainer_checkpoint}" ]]; then
+            rm -rf "${trainer_checkpoint}"
+        fi
     done
 }
 

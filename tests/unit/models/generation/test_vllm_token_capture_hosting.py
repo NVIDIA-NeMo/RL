@@ -59,7 +59,6 @@ from nemo_rl.data.captured_media import (  # noqa: E402
     MEDIA_TENSOR_DIGESTS_FIELD,
     CapturedMedia,
     CapturedMediaItem,
-    MediaCaptureRejected,
     MediaColumnSpec,
     media_tensor_digests,
 )
@@ -202,7 +201,6 @@ def _cuts(
             control_timeout_s=None,
             progress_reader=progress_reader or _NoCallsInVllm(),
             prefix_row_extras=worker._generation_cut_record_payload,
-            restore_media=worker._restore_generation_cut_media,
         )
     )
     worker._prefix_recovery = recovery
@@ -587,15 +585,19 @@ def test_restored_call_replays_its_prefix_with_the_original_settings(monkeypatch
 
 
 def _captured_text_call(
-    worker, model_call_id: str = "c1", prompt_token_ids: tuple[int, ...] = (10, 11)
+    worker,
+    model_call_id: str = "c1",
+    prompt_token_ids: tuple[int, ...] = (10, 11),
+    *,
+    media: CapturedMedia | None = None,
 ) -> _FakeRequest:
-    """Begin capturing a parentless text call of rollout ``r0``."""
+    """Begin capturing a parentless text-mode call of rollout ``r0``."""
     request = _FakeRequest(
         ng_capture={"rollout_id": "r0", "model_call_id": model_call_id, "mode": "text"},
         stream=False,
     )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
-        worker, request, list(prompt_token_ids)
+        worker, request, list(prompt_token_ids), media=media
     )
     return request
 
@@ -607,9 +609,10 @@ def _live_call(
     *,
     model_call_id: str = "c1",
     prompt_token_ids: tuple[int, ...] = (10, 11),
+    media: CapturedMedia | None = None,
 ):
     """Begin one captured call that has decoded ``generated_token_ids``."""
-    request = _captured_text_call(worker, model_call_id, prompt_token_ids)
+    request = _captured_text_call(worker, model_call_id, prompt_token_ids, media=media)
     state = worker._capture_registry.get(request)
     state.set_effective_output_limit(8)
     state.record(generated_token_ids, logprobs)
@@ -1758,7 +1761,6 @@ def _record_cut_constraints(state, sampling_params) -> None:
             control_timeout_s=None,
             progress_reader=_NoCallsInVllm(),
             prefix_row_extras=lambda state: None,
-            restore_media=lambda chunks: None,
         )
     ).on_sampling_params(object(), sampling_params)
 
@@ -1912,33 +1914,19 @@ def _captured_image_media() -> CapturedMedia:
     )
 
 
-def _worker_with_active_media_prefix(
-    sink: _MemorySink, media: CapturedMedia | None = None
-):
-    worker = _worker_with_capture(sink)
-    request = _FakeRequest(
-        ng_capture={
-            "rollout_id": "r0",
-            "model_call_id": "c1",
-            "parent_call_id": None,
-            "prev_len": 0,
-            "mode": "text",
-        },
-        stream=False,
-    )
+def _live_image_call(worker, media: CapturedMedia | None = None):
+    """An active call whose prompt is one image's two placeholder tokens."""
     media = media or _captured_image_media()
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(
-        worker, request, [18, 18], media=media
+    request, state = _live_call(
+        worker, [20], [-0.1], prompt_token_ids=(18, 18), media=media
     )
-    state = worker._capture_registry.get(request)
-    state.set_effective_output_limit(8)
-    state.record([20], [-0.1])
-    return worker, request, state, media
+    return request, state, media
 
 
 def test_generation_cut_stages_media_digests_only_with_first_prefix_row():
     sink = _MemorySink()
-    worker, _, state, media = _worker_with_active_media_prefix(sink)
+    worker = _worker_with_capture(sink)
+    _, state, media = _live_image_call(worker)
 
     first_receipt = _cuts(worker).checkpoint_cut(
         _single_call_inventory(checkpoint_id="checkpoint-1")
@@ -1966,8 +1954,9 @@ def test_generation_cut_stages_media_digests_only_with_first_prefix_row():
 
 def test_generation_cut_refuses_media_captured_without_digests(caplog):
     sink = _MemorySink()
-    worker, _, state, _ = _worker_with_active_media_prefix(
-        sink, replace(_captured_image_media(), tensor_digests=None)
+    worker = _worker_with_capture(sink)
+    _, state, _ = _live_image_call(
+        worker, replace(_captured_image_media(), tensor_digests=None)
     )
 
     with caplog.at_level(logging.ERROR):
@@ -1983,38 +1972,97 @@ def test_generation_cut_refuses_media_captured_without_digests(caplog):
     assert state.snapshot().staged_token_count == 0
 
 
-def _worker_with_active_text_prefix(sink: _MemorySink):
-    worker = _worker_with_capture(sink)
-    request = _FakeRequest(
+def _restore_request(ack, *, source=("r0", "c1"), model_call_id="c2") -> _FakeRequest:
+    """The call Gym sends to resume ``ack``'s cut of ``source``."""
+    return _FakeRequest(
         ng_capture={
-            "rollout_id": "r0",
-            "model_call_id": "c1",
-            "parent_call_id": None,
-            "prev_len": 0,
+            "rollout_id": "r0-a1",
+            "model_call_id": model_call_id,
             "mode": "text",
+            "generation_cut": {
+                "source_capture_key": source[0],
+                "source_model_call_id": source[1],
+                "staging_keys": list(ack.staging_keys),
+                "prefix_token_count": ack.prefix_token_count,
+                "prefix_digest": ack.prefix_digest,
+                "effective_output_limit": ack.effective_output_limit,
+            },
         },
         stream=False,
     )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11])
-    state = worker._capture_registry.get(request)
-    state.set_effective_output_limit(8)
-    state.record([20], [-0.1])
-    return worker, state
+
+
+def _cut_again_after_restore(sink, worker, ack, monkeypatch):
+    """Restore an image call's cut, reprocess its image, and cut the resumed call.
+
+    The second cut's cumulative record takes its extras from the reprocessed
+    media, while a restore rebuilds them from the first run's row.
+    """
+    records = {
+        key: record
+        for key, record in zip(
+            sink.generation_prefix_keys,
+            (record for _, record in sink.generation_prefix_records),
+            strict=True,
+        )
+    }
+    resumed = _resumed_worker(
+        sink, records=records, weight_version=worker._rollout_weight_version
+    )
+    resumed._capture_media = resumed._hash_captured_media = True
+    request = _restore_request(ack)
+    admission, snapshot = _cuts(resumed).resolve_restore(
+        resumed._capture_admission(request), []
+    )
+    assert snapshot is not None
+    # vLLM reprocesses the same image; the worker hashes it and checks it
+    # against the digests the first run's row saved.
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.capture_processed_media",
+        lambda *args, **kwargs: replace(_captured_image_media(), tensor_digests=None),
+    )
+    media = resumed._capture_restored_media(
+        {"prompt_token_ids": [18, 18, 20]},
+        admission=admission,
+        splice=None,
+        snapshot=snapshot,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        resumed,
+        request,
+        [18, 18, 20],
+        admission=admission,
+        prefix_token_ids=[],
+        media=media,
+        generation_cut=snapshot,
+        resumed_generation_token_ids=[20],
+    )
+    resumed._capture_registry.get(request).record([21], [-0.2])
+    (second,) = (
+        _cuts(resumed)
+        .checkpoint_cut(
+            _single_call_inventory("c2", checkpoint_id="checkpoint-2", attempt=1)
+        )
+        .prefixes
+    )
+    # The first run's row, then the resumed call's new chunk.
+    assert len(second.staging_keys) == 2
+    assert second.staging_keys[0] == ack.staging_keys[0]
+    return second
 
 
 @pytest.mark.parametrize(
-    ("media", "cuts"),
-    [(False, 1), (True, 1), (True, 2)],
-    ids=["text", "image_one_cut", "image_two_cuts"],
+    ("cuts", "resumed"),
+    [(1, False), (2, False), (1, True)],
+    ids=["image_one_cut", "image_two_cuts", "image_resumed_then_cut"],
 )
 def test_generation_cut_digest_written_at_the_cut_is_the_one_restore_rebuilds(
-    media: bool, cuts: int
+    cuts: int, resumed: bool, monkeypatch
 ):
+    # test_usable_restored_prefix_is_resumed covers a text call's digest.
     sink = _MemorySink()
-    if media:
-        worker, _, state, _ = _worker_with_active_media_prefix(sink)
-    else:
-        worker, state = _worker_with_active_text_prefix(sink)
+    worker = _worker_with_capture(sink)
+    _, state, _ = _live_image_call(worker)
     for index in range(cuts):
         if index:
             state.record([21], [-0.2])
@@ -2022,6 +2070,10 @@ def test_generation_cut_digest_written_at_the_cut_is_the_one_restore_rebuilds(
             _single_call_inventory(checkpoint_id=f"checkpoint-{index + 1}")
         )
     (ack,) = receipt.prefixes
+    source = ("r0", "c1")
+    if resumed:
+        ack = _cut_again_after_restore(sink, worker, ack, monkeypatch)
+        source = ("r0-a1", "c2")
     records = dict(
         zip(
             sink.generation_prefix_keys,
@@ -2031,45 +2083,28 @@ def test_generation_cut_digest_written_at_the_cut_is_the_one_restore_rebuilds(
     )
     assert list(records) == list(ack.staging_keys)
     first = records[ack.staging_keys[0]]
-    assert (MEDIA_TENSOR_DIGESTS_FIELD in (first.extras or {})) is media
+    assert MEDIA_TENSOR_DIGESTS_FIELD in first.extras
 
     def resolve(staged: dict[str, StagedCallRecord]):
         resumed = _resumed_worker(
             sink, records=staged, weight_version=worker._rollout_weight_version
         )
-        request = _FakeRequest(
-            ng_capture={
-                "rollout_id": "r0-a1",
-                "model_call_id": "c2",
-                "mode": "text",
-                "generation_cut": {
-                    "source_capture_key": "r0",
-                    "source_model_call_id": "c1",
-                    "staging_keys": list(ack.staging_keys),
-                    "prefix_token_count": ack.prefix_token_count,
-                    "prefix_digest": ack.prefix_digest,
-                    "effective_output_limit": ack.effective_output_limit,
-                },
-            },
-            stream=False,
-        )
+        request = _restore_request(ack, source=source)
         return _cuts(resumed)._rebuild_prefix(resumed._capture_admission(request), [])
 
     # Restore recomputes the cumulative digest from the staged chunks, the
     # first chunk's media extras included, and must reach the cut's digest:
     # Gym's begin_call rejects a restored snapshot whose digest differs.
     assert resolve(records).digest == ack.prefix_digest
-    if media:
-        # The tensor digests are covered: a changed one changes the digest.
-        digests = dict(first.extras[MEDIA_TENSOR_DIGESTS_FIELD])
-        digests["imgs"] = {**digests["imgs"], "sha256": "0" * 64}
-        tampered = first.model_copy(
-            update={"extras": {**first.extras, MEDIA_TENSOR_DIGESTS_FIELD: digests}}
-        )
-        assert (
-            resolve({**records, ack.staging_keys[0]: tampered}).digest
-            != ack.prefix_digest
-        )
+    # The tensor digests are covered: a changed one changes the digest.
+    digests = dict(first.extras[MEDIA_TENSOR_DIGESTS_FIELD])
+    digests["imgs"] = {**digests["imgs"], "sha256": "0" * 64}
+    tampered = first.model_copy(
+        update={"extras": {**first.extras, MEDIA_TENSOR_DIGESTS_FIELD: digests}}
+    )
+    assert (
+        resolve({**records, ack.staging_keys[0]: tampered}).digest != ack.prefix_digest
+    )
 
 
 class _BlockingPrefixSink(_MemorySink):
@@ -2096,7 +2131,8 @@ def _assert_stages_captured_tensors(attachments, tensors) -> None:
 
 def test_media_terminal_completion_waits_for_prefix_cut_then_replaces_it():
     sink = _BlockingPrefixSink()
-    worker, request, _, media = _worker_with_active_media_prefix(sink)
+    worker = _worker_with_capture(sink)
+    request, _, media = _live_image_call(worker)
     terminal_entered = threading.Event()
     terminal_finished = threading.Event()
 
@@ -2131,43 +2167,10 @@ def test_media_terminal_completion_waits_for_prefix_cut_then_replaces_it():
     assert sink.cleared_generation_prefix_keys == list(receipt.prefixes[0].staging_keys)
 
 
-class _FailTerminalSink(_MemorySink):
-    def __init__(self) -> None:
-        super().__init__()
-        self.terminal_attempts: list[tuple[StagedCallRecord, dict | None]] = []
-
-    def stage(
-        self, record: StagedCallRecord, *, attachments: dict | None = None
-    ) -> StageResult:
-        self.terminal_attempts.append((record, attachments))
-        return StageResult(
-            ok=False,
-            staging_key=record.staging_key,
-            error="injected terminal staging failure",
-        )
-
-
-def test_media_call_whose_terminal_staging_fails_clears_its_cut_rows():
-    sink = _FailTerminalSink()
-    worker, request, state, media = _worker_with_active_media_prefix(sink)
-    receipt = _cuts(worker).checkpoint_cut(
-        _single_call_inventory(checkpoint_id="checkpoint-1")
-    )
-
-    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
-        worker, request, _served_content([20, 21], [-0.1, -0.2])
-    )
-
-    assert content["ng_commit_coords"]["disposition"] == "capture_failed"
-    _assert_stages_captured_tensors(sink.terminal_attempts[0][1], media.tensors)
-    # As for a text call, the failed call's cut rows are retired with it.
-    _flush_retired_rows(worker)
-    assert sink.cleared_generation_prefix_keys == list(receipt.prefixes[0].staging_keys)
-
-
 def test_canonical_media_row_survives_prefix_cleanup_failure(caplog):
     sink = _FailingClearSink()
-    worker, request, _, media = _worker_with_active_media_prefix(sink)
+    worker = _worker_with_capture(sink)
+    request, _, media = _live_image_call(worker)
     _cuts(worker).checkpoint_cut(_single_call_inventory(checkpoint_id="checkpoint-1"))
 
     content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
@@ -2355,7 +2358,7 @@ def test_usable_restored_prefix_is_resumed():
     served, resolved = _cuts(worker).resolve_restore(admission, [])
 
     assert served is admission
-    assert resolved.snapshot.digest == cut_record.digest
+    assert resolved.digest == cut_record.digest
     _flush_retired_rows(worker)
     assert sink.cleared_generation_prefix_keys == []
 
@@ -2366,7 +2369,6 @@ def test_usable_restored_prefix_is_resumed():
         "missing chunk",
         "chunk newer than the worker",
         "digest mismatch",
-        "media row unreadable",
     ],
 )
 def test_unusable_restored_prefix_regenerates_instead_of_failing(failure, caplog):
@@ -2386,14 +2388,6 @@ def test_unusable_restored_prefix_regenerates_instead_of_failing(failure, caplog
                 )
             }
         )
-    if failure == "media row unreadable":
-        # The media comes from the same fetch, inside the same fallback.
-        def unreadable_media(chunks):
-            raise MediaCaptureRejected("Generation-prefix media metadata is missing")
-
-        worker._restore_generation_cut_media = unreadable_media
-        _cuts(worker, staging_source=worker._staging_source)
-
     with caplog.at_level(logging.WARNING):
         served, resolved = _cuts(worker).resolve_restore(admission, [])
 
@@ -2852,10 +2846,10 @@ def test_request_capture_topk_partial_write_returns_capture_failed():
     assert len(worker._capture_registry) == 0
 
 
-def _cut_active_call(worker, sink, model_call_id: str = "c1"):
+def _cut_active_call(worker, sink, model_call_id: str = "c1", **call):
     """Begin one captured call and stage its prefix at a generation cut."""
     request, state = _live_call(
-        worker, [20, 21], [-0.1, -0.2], model_call_id=model_call_id
+        worker, [20, 21], [-0.1, -0.2], model_call_id=model_call_id, **call
     )
     inventory = _single_call_inventory(model_call_id)
     _cuts(worker).checkpoint_cut(inventory)
@@ -2882,13 +2876,20 @@ class _FailingTerminalSink(_MemorySink):
     def stage(
         self, record: StagedCallRecord, *, attachments: dict | None = None
     ) -> StageResult:
+        self.attachments.append(attachments)
         return StageResult(ok=False, error="tq unavailable")
 
 
-def test_call_whose_terminal_staging_fails_clears_its_cut_rows():
+@pytest.mark.parametrize("media", [False, True], ids=["text", "image"])
+def test_call_whose_terminal_staging_fails_clears_its_cut_rows(media: bool):
     sink = _FailingTerminalSink()
     worker = _worker_with_capture(sink)
-    request = _cut_active_call(worker, sink)
+    image = _captured_image_media() if media else None
+    request = _cut_active_call(
+        worker,
+        sink,
+        **({"prompt_token_ids": (18, 18), "media": image} if media else {}),
+    )
 
     content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
         worker,
@@ -2897,6 +2898,8 @@ def test_call_whose_terminal_staging_fails_clears_its_cut_rows():
     )
 
     assert content["ng_commit_coords"]["disposition"] == "capture_failed"
+    if media:
+        _assert_stages_captured_tensors(sink.attachments[0], image.tensors)
     _flush_retired_rows(worker)
     assert sink.cleared_generation_prefix_keys == sink.generation_prefix_keys
 
@@ -2965,6 +2968,10 @@ def test_omni_capture_setup_rejects_video_pruning(
             generation_prefix_cuts_enabled=True,
             generation_cut_control_token="secret",
         )
+        # Prefix cuts need the vLLM HTTP server's client; the progress reader it
+        # would wrap is covered by the progress-read tests.
+        worker._http_engine_client = MagicMock(name="http_engine_client")
+        worker._progress_reader = MagicMock(name="progress_reader")
     if pruning_rate:
         with pytest.raises(ValueError, match="video token pruning"):
             asyncio.run(

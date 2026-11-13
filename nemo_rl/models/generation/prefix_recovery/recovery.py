@@ -32,7 +32,6 @@ import time
 from collections import Counter
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from typing import Any, Literal
 
 from nemo_rl.models.generation.prefix_recovery.parts import PrefixRecoveryParts
@@ -90,14 +89,6 @@ def _require_inventory_identity(
             f"inventory_rollout_id={prefix.rollout_id!r}, "
             f"worker_capture_key={worker_capture_key!r}"
         )
-
-
-@dataclass(frozen=True)
-class _ResolvedGenerationCut:
-    """A verified restored prefix and the media its call carried."""
-
-    snapshot: Any
-    media: Any | None = None
 
 
 def _ends_inside_character(tokenizer: Any, generated_token_ids: list[int]) -> bool:
@@ -675,8 +666,9 @@ class PrefixRecovery:
                 self._receipts.pop(next(iter(self._receipts)))
         return receipt
 
-    def _fetch_chunks(self, continuation: Any) -> list[Any]:
-        """Fetch the staged chunks named by a ``GenerationCutContinuation``, in order."""
+    def _rebuild_prefix(self, admission: Any, prefix_token_ids: list[int]) -> Any:
+        """Fetch an admission's staged prefix chunks and rebuild the cumulative prefix."""
+        continuation = admission.generation_cut
         # Gym requires at least one staging key per continuation.
         staging_keys = list(continuation.staging_keys)
         # The finalization read also returns each row's extras, which carry a
@@ -684,24 +676,6 @@ class PrefixRecovery:
         chunks = self._parts.staging_source.fetch_for_finalization(staging_keys)
         if len(chunks) != len(staging_keys):
             raise RuntimeError("generation-cut fetch did not return every staged chunk")
-        if not chunks:
-            raise RuntimeError("generation-cut continuation has no staged chunks")
-        return chunks
-
-    def _rebuild_prefix(
-        self,
-        admission: Any,
-        prefix_token_ids: list[int],
-        chunks: list[Any] | None = None,
-    ) -> Any:
-        """Rebuild the cumulative prefix from an admission's staged chunks.
-
-        ``chunks`` are the already-fetched chunks, so a restore that also reads
-        their media fetches once; they are fetched here when omitted.
-        """
-        continuation = admission.generation_cut
-        if chunks is None:
-            chunks = self._fetch_chunks(continuation)
         snapshots = [chunk.snapshot for chunk in chunks]
         # A media call's spans and tensor digests ride the first chunk's extras,
         # and the advertised prefix digest covers them.
@@ -801,24 +775,20 @@ class PrefixRecovery:
 
     def resolve_restore(
         self, admission: Any, prefix_token_ids: list[int]
-    ) -> tuple[Any, _ResolvedGenerationCut | None]:
+    ) -> tuple[Any, Any | None]:
         """Resolve an admission's restored prefix, or drop it so the call regenerates.
 
         Gym has already consumed the restored cut when it sends this call, and
         generating the whole response from the turn boundary is always valid,
-        so a prefix that cannot be fetched, whose media cannot be restored,
-        or that does not match its admission costs time, not the rollout.
-        Returns the admission to serve and the verified prefix with its media,
-        or the admission without its cut and None.
+        so a prefix that cannot be fetched or does not match its admission
+        costs time, not the rollout. Returns the admission to serve and the
+        verified prefix snapshot, or the admission without its cut and None.
         """
         continuation = admission.generation_cut
         if continuation is None:
             return admission, None
         try:
-            # One fetch serves both the media and the prefix.
-            chunks = self._fetch_chunks(continuation)
-            media = self._parts.restore_media(chunks)
-            snapshot = self._rebuild_prefix(admission, prefix_token_ids, chunks)
+            snapshot = self._rebuild_prefix(admission, prefix_token_ids)
             # Checked here, before the prefix is spliced into the prompt; Gym's
             # begin_call repeats it and would otherwise fail the call.
             if snapshot.digest != continuation.prefix_digest:
@@ -829,7 +799,7 @@ class PrefixRecovery:
                     f"rebuilt prefix has {generated} generated tokens, "
                     f"admission expects {continuation.prefix_token_count}"
                 )
-            return admission, _ResolvedGenerationCut(snapshot=snapshot, media=media)
+            return admission, snapshot
         except Exception:  # noqa: BLE001 - any unusable prefix regenerates
             LOGGER.warning(
                 "cannot restore the generation prefix of model call %s; "
@@ -889,7 +859,7 @@ class NoPrefixRecovery:
 
     def resolve_restore(
         self, admission: Any, prefix_token_ids: list[int]
-    ) -> tuple[Any, _ResolvedGenerationCut | None]:
+    ) -> tuple[Any, Any | None]:
         if admission.generation_cut is None:
             return admission, None
         # Gym only sends a restored cut to a worker that acknowledged one, so

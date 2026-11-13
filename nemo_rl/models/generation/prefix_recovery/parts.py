@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -55,6 +55,3 @@ class PrefixRecoveryParts:
     # Extras for a call's first prefix row, from the media its capture state
     # holds; None for a call without media.
     prefix_row_extras: Callable[[_RequestCaptureState], dict[str, Any] | None]
-    # A restored call's media, read back from its fetched prefix chunks; None
-    # when the worker does not capture media.
-    restore_media: Callable[[Sequence[Any]], Any | None]

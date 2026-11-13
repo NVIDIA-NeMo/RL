@@ -167,36 +167,6 @@ def _media_items_from_extras(
     return items
 
 
-def _verify_resumed_media_prompt(
-    reprocessed_token_ids: list[int],
-    *,
-    prefix_token_ids: list[int],
-    generation_cut: Any,
-) -> None:
-    """Require a resumed media call to reprocess into its durable prompt.
-
-    The call resumes from the exact engine prompt at the cut: its carried
-    prefix followed by the cut's prompt tokens. Its media placeholders are
-    re-derived from the reprocessed prompt, so a reprocessed prompt that
-    differs would place them over the wrong tokens.
-
-    Raises:
-        MediaCaptureRejected: With ``retained_media_changed`` on a mismatch.
-    """
-    prompt_delta = [
-        token_id
-        for token_id, mask in zip(
-            generation_cut.token_ids_delta, generation_cut.token_mask_delta, strict=True
-        )
-        if mask == 0.0
-    ]
-    if reprocessed_token_ids != [*prefix_token_ids, *prompt_delta]:
-        raise MediaCaptureRejected(
-            "Reprocessed multimodal prompt differs from the durable generation prefix",
-            code="retained_media_changed",
-        )
-
-
 # Paths the bearer-token check protects: the OpenAI-compatible routes this module
 # registers, which NeMo-Gym's model server calls. The sparse-refit routes the
 # receiver registers on the same app carry their own header token
@@ -989,7 +959,6 @@ class VllmAsyncGenerationWorkerImpl(
                     control_timeout_s=generation_cut_control_timeout_s,
                     progress_reader=self._progress_reader,
                     prefix_row_extras=self._generation_cut_record_payload,
-                    restore_media=self._restore_generation_cut_media,
                 )
             )
         if not capture_media:
@@ -1250,26 +1219,40 @@ class VllmAsyncGenerationWorkerImpl(
             MEDIA_TENSOR_DIGESTS_FIELD: media.tensor_digests,
         }
 
-    def _restore_generation_cut_media(
-        self, chunks: Sequence[Any]
-    ) -> CapturedMedia | None:
-        """Read one call's media items and tensor digests from its first prefix row."""
-        if not self._capture_media:
-            return None
-        first = chunks[0]
+    def _restore_generation_cut_media(self, snapshot: Any) -> CapturedMedia:
+        """Read a restored call's media items and tensor digests from its verified prefix.
+
+        The prefix digest Gym checked covers these extras, so only a bug in our
+        own writer can leave them unreadable.
+        """
         items = _media_items_from_extras(
-            first.extras,
-            first.snapshot,
+            snapshot.extras,
+            snapshot,
             missing_message="Generation-prefix media metadata is missing",
         )
-        digests = first.extras.get(MEDIA_TENSOR_DIGESTS_FIELD)
-        if not isinstance(digests, dict):
-            raise MediaCaptureRejected("Generation-prefix media digests are missing")
-        if bool(items) != bool(digests):
-            raise MediaCaptureRejected(
-                "Generation-prefix media metadata and digests disagree"
-            )
-        return CapturedMedia(items=items, tensors=None, tensor_digests=digests)
+        return CapturedMedia(
+            items=items,
+            tensors=None,
+            tensor_digests=snapshot.extras[MEDIA_TENSOR_DIGESTS_FIELD],
+        )
+
+    def _capture_restored_media(
+        self,
+        engine_prompt: dict[str, Any],
+        *,
+        admission: Any,
+        splice: PrefixSplice,
+        snapshot: Any,
+    ) -> CapturedMedia | None:
+        """Reprocess a restored call's media and check it against the digests its cut saved."""
+        if not self._capture_media:
+            return None
+        return self._capture_request_media(
+            engine_prompt,
+            admission=admission,
+            splice=splice,
+            restored=self._restore_generation_cut_media(snapshot),
+        )
 
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
         """Resolve a staging chain through the shared, cached TQ read."""
@@ -1759,14 +1742,13 @@ class VllmAsyncGenerationWorkerImpl(
                     verify_retained_media = decision.verify_retained_media
                 capture_prefix_token_ids: list[int] | None = None
                 generation_cut = None
-                restored_generation_media = None
                 resumed_generation_token_ids: list[int] = []
                 restored_request_output_tokens: int | None = None
                 if serving_admission is not None:
                     capture_prefix_token_ids = await asyncio.to_thread(
                         worker_self._resolve_admission_prefix, serving_admission
                     )
-                    resolved_admission, resolved_cut = await asyncio.to_thread(
+                    resolved_admission, generation_cut = await asyncio.to_thread(
                         worker_self._prefix_recovery.resolve_restore,
                         serving_admission,
                         capture_prefix_token_ids,
@@ -1776,9 +1758,6 @@ class VllmAsyncGenerationWorkerImpl(
                     if serving_admission is admission:
                         admission = resolved_admission
                     serving_admission = resolved_admission
-                    if resolved_cut is not None:
-                        generation_cut = resolved_cut.snapshot
-                        restored_generation_media = resolved_cut.media
                     engine_prefix_token_ids = list(capture_prefix_token_ids)
                     if generation_cut is not None:
                         plan = plan_restore(
@@ -1952,17 +1931,12 @@ class VllmAsyncGenerationWorkerImpl(
                         template_prefix_token_ids=actual_corresponding_token_ids,
                         template_token_ids=engine_prompt["prompt_token_ids"],
                     )
-                    _verify_resumed_media_prompt(
-                        media_splice.token_ids,
-                        prefix_token_ids=list(capture_prefix_token_ids or ()),
-                        generation_cut=generation_cut,
-                    )
                     media = await asyncio.to_thread(
-                        worker_self._capture_request_media,
+                        worker_self._capture_restored_media,
                         engine_prompt,
                         admission=admission,
                         splice=media_splice,
-                        restored=restored_generation_media,
+                        snapshot=generation_cut,
                     )
                 # Must precede the reassignment below: the remap reads the
                 # current value of prompt_token_ids as the template-coordinate

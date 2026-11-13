@@ -160,40 +160,14 @@ PY
 source "${SCRIPT_DIR}/_gym_prefix_recovery_phases.sh"
 install_phase_cleanup "${CHECKPOINT_DIR}" "${SELECTED_BACKUP}"
 
-# The Omni CLEVR token-capture topology (one Megatron training GPU with a frozen
-# language model, one async vLLM GPU) plus the text prefix-recovery settings.
+# The text prefix-recovery settings, on the YAML's Omni CLEVR topology (one
+# Megatron training GPU with a frozen language model, one async vLLM GPU).
 COMMON_OVERRIDES=(
-    cluster.num_nodes=1
-    cluster.gpus_per_node=2
-    ++cluster.segment_size=1
     # Quoted for Hydra: a bare compute capability (9.0, 10.0) parses as a
     # float, which the string-typed env_vars field rejects.
     policy.megatron_cfg.env_vars.TORCH_CUDA_ARCH_LIST="'${TORCH_CUDA_ARCH_LIST}'"
-    policy.megatron_cfg.tensor_model_parallel_size=1
-    policy.megatron_cfg.expert_model_parallel_size=1
-    policy.megatron_cfg.expert_tensor_parallel_size=1
-    policy.megatron_cfg.context_parallel_size=1
-    policy.megatron_cfg.sequence_parallel=true
-    policy.megatron_cfg.activation_checkpointing=true
-    ++policy.megatron_cfg.freeze_config.freeze_language_model=true
-    +policy.megatron_cfg.bias_dropout_fusion=false
-    policy.megatron_cfg.optimizer.optimizer_cpu_offload=false
-    policy.megatron_cfg.optimizer.optimizer_offload_fraction=0.0
-    ++policy.megatron_cfg.optimizer.params_dtype=bfloat16
-    ++policy.megatron_cfg.optimizer.main_grads_dtype=bfloat16
-    ++policy.megatron_cfg.optimizer.main_params_dtype=float16
-    ++policy.megatron_cfg.optimizer.exp_avg_dtype=bfloat16
-    ++policy.megatron_cfg.optimizer.exp_avg_sq_dtype=bfloat16
-    ++policy.megatron_cfg.optimizer.store_param_remainders=false
-    policy.generation.colocated.enabled=false
-    policy.generation.colocated.resources.num_nodes=1
-    policy.generation.colocated.resources.gpus_per_node=1
     policy.generation.max_new_tokens="${POLICY_MAX_NEW_TOKENS}"
-    policy.generation.vllm_cfg.tensor_parallel_size=1
-    policy.generation.vllm_cfg.expert_parallel_size=1
-    policy.generation.vllm_cfg.pipeline_parallel_size=1
     policy.generation.vllm_cfg.max_model_len="${MAX_MODEL_LEN}"
-    policy.generation.vllm_cfg.gpu_memory_utilization=0.6
     ++policy.generation.vllm_kwargs.max_num_batched_tokens="${MAX_MODEL_LEN}"
     # Near-greedy decoding keeps each list (and so each decode) predictable.
     policy.generation.temperature=1.0
@@ -201,11 +175,8 @@ COMMON_OVERRIDES=(
     # The trainer replays the top_p filter, so it needs vLLM's logprobs after
     # that filter.
     ++policy.generation.vllm_cfg.logprobs_mode=processed_logprobs
-    ++async_rl.generation_fleet_health.refit_timeout_s=null
     policy.max_total_sequence_length="${MAX_MODEL_LEN}"
     policy.train_global_batch_size="${TRAIN_GLOBAL_BATCH_SIZE}"
-    policy.train_micro_batch_size=1
-    data_plane.simple.num_storage_units=2
     # Keep each step's prompt membership fixed across runs.
     data.shuffle=false
     data.train.data_path="${TEST_DATA}"
@@ -214,9 +185,6 @@ COMMON_OVERRIDES=(
     grpo.num_prompts_per_step="${NUM_PROMPTS}"
     grpo.num_generations_per_prompt="${NUM_GENERATIONS}"
     grpo.max_num_steps="${MAX_STEPS}"
-    grpo.val_period=0
-    grpo.val_at_start=false
-    grpo.val_at_end=false
     async_rl.sampler.name=in_order
     async_rl.sampler.max_lookahead_versions=0
     async_rl.min_groups_for_streaming_train="${NUM_PROMPTS}"
@@ -245,9 +213,6 @@ COMMON_OVERRIDES=(
     # Each run dumps its trained rows (train_data_step*.jsonl in its log dir)
     # for verify-completion.
     ++async_rl.log_full_train_data=true
-    logger.tensorboard_enabled=true
-    logger.wandb_enabled=false
-    logger.monitor_gpus=false
 )
 
 OMNI_CMD=(
@@ -278,21 +243,7 @@ uv run --no-sync python "${SNAPSHOT_HELPER}" select \
     --min-cut-groups "${NUM_PROMPTS}"
 
 stop_phase1
-SNAPSHOT_DIR=$(uv run --no-sync python -c \
-    'import json, sys; print(json.load(open(sys.argv[1]))["snapshot"])' \
-    "${SELECTION_FILE}")
-SNAPSHOT_ROOT=$(dirname "${SNAPSHOT_DIR}")
-
-# Recover exactly the prefix selected above. A newer periodic snapshot or a
-# trainer checkpoint would represent work performed after the simulated crash.
-rm -rf "${SNAPSHOT_ROOT}"
-mkdir -p "${SNAPSHOT_ROOT}"
-cp -a "${SELECTED_BACKUP}" "${SNAPSHOT_DIR}"
-for trainer_checkpoint in "${CHECKPOINT_DIR}"/step_*; do
-    if [[ -d "${trainer_checkpoint}" ]]; then
-        rm -rf "${trainer_checkpoint}"
-    fi
-done
+restore_selected_snapshot "${SELECTION_FILE}" "${SELECTED_BACKUP}" "${CHECKPOINT_DIR}"
 
 echo "=== Phase 2: reprocess the images, verify them, and finish each suffix ==="
 # Do not cut the replacement requests again while they consume the prefix.

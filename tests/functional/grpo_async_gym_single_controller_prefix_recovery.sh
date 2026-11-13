@@ -217,21 +217,7 @@ uv run --directory "$PROJECT_ROOT" --no-sync python "$SNAPSHOT_HELPER" select \
 
 stop_phase1
 cp "$BASE_RUN_LOG" "$PHASE1_LOG"
-SNAPSHOT_DIR=$(uv run --directory "$PROJECT_ROOT" --no-sync python -c \
-    'import json, sys; print(json.load(open(sys.argv[1]))["snapshot"])' \
-    "$SELECTION_FILE")
-SNAPSHOT_ROOT=$(dirname "$SNAPSHOT_DIR")
-
-# Recover exactly the prefix selected above. A newer periodic snapshot or a
-# trainer checkpoint would represent work performed after the simulated crash.
-rm -rf "$SNAPSHOT_ROOT"
-mkdir -p "$SNAPSHOT_ROOT"
-cp -a "$SELECTED_BACKUP" "$SNAPSHOT_DIR"
-for trainer_checkpoint in "$CHECKPOINT_DIR"/step_*; do
-    if [[ -d "$trainer_checkpoint" ]]; then
-        rm -rf "$trainer_checkpoint"
-    fi
-done
+restore_selected_snapshot "$SELECTION_FILE" "$SELECTED_BACKUP" "$CHECKPOINT_DIR"
 
 # Avoid cutting the replacement request again while verifying that it consumes
 # the selected prefix and reaches normal completion.

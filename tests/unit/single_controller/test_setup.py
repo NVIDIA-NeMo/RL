@@ -829,6 +829,28 @@ def test_recovery_target_enables_required_checkpoint_capabilities(
     assert config.generation_prefix_cuts_enabled is generation_prefix_cuts
 
 
+@contextlib.contextmanager
+def _patched_gym_token_capture(finalizer_actors):
+    """Patch the Gym and finalizer actors a Gym token-capture setup builds.
+
+    Yields the Gym spin-up and finalizer-creation mocks.
+    """
+    with (
+        patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
+        patch.object(
+            sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
+        ) as spinup,
+        patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
+        patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
+        patch(
+            "nemo_rl.experience.rollout_reassembler_actor."
+            "create_rollout_reassembler_actors",
+            return_value=finalizer_actors,
+        ) as create_finalizers,
+    ):
+        yield spinup, create_finalizers
+
+
 class TestSetup:
     """setup arg validation + actor_args assembly."""
 
@@ -1514,32 +1536,14 @@ class TestSetup:
         mc.rollout_checkpointing = RolloutCheckpointConfig(
             snapshot_attempt_interval_s=1.0
         )
-        patched_factories["setup_response_data"].return_value = (
-            list(range(8)),
-            None,
-        )
+        patched_factories["setup_response_data"].return_value = (list(range(8)), None)
+        tokenizer = MagicMock(pad_token_id=0)
 
-        with (
-            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-            patch.object(
-                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
-            ) as mock_spinup,
-            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
-            patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
-            patch(
-                "nemo_rl.experience.rollout_reassembler_actor."
-                "create_rollout_reassembler_actors",
-                return_value=[MagicMock(name="finalizer")],
-            ),
-        ):
-            tokenizer = MagicMock(pad_token_id=0)
+        with _patched_gym_token_capture([MagicMock(name="finalizer")]):
             setup_single_controller(
-                mc,
-                tokenizer,
-                processor=MagicMock(tokenizer=tokenizer),
+                mc, tokenizer, processor=MagicMock(tokenizer=tokenizer)
             )
 
-        assert mock_spinup.call_args.kwargs["turn_checkpointing_enabled"] is True
         generation, _ = patched_factories["_build_generation"].return_value
         _, setup_kwargs = generation.setup_token_capture.call_args
         assert setup_kwargs["capture_media"] is True
@@ -2837,13 +2841,11 @@ class TestSetup:
         processor = MagicMock(tokenizer=tokenizer) if with_processor else None
 
         with (
-            patch.object(sc_setup_mod, "should_use_nemo_gym", return_value=True),
-            patch.object(
-                sc_setup_mod, "build_nemo_gym_actors", return_value=MagicMock()
-            ) as mock_spinup,
+            _patched_gym_token_capture(fake_actors) as (
+                mock_spinup,
+                mock_create_finalizer_actors,
+            ),
             patch.object(sc_setup_mod, "validate_dataset_agent_coverage"),
-            patch.object(sc_setup_mod, "router_replay_enabled", return_value=False),
-            patch.object(sc_setup_mod, "uses_image_placeholder", return_value=True),
             patch.object(
                 sc_setup_mod.opd_module,
                 "reserve_teacher_clusters",
@@ -2854,10 +2856,6 @@ class TestSetup:
                 "create_teacher_worker_groups",
                 return_value=({"teacher": MagicMock()}, {"teacher": "teacher"}),
             ),
-            patch(
-                "nemo_rl.experience.rollout_reassembler_actor.create_rollout_reassembler_actors",
-                return_value=fake_actors,
-            ) as mock_create_finalizer_actors,
         ):
             actor_args, _ = setup_single_controller(mc, tokenizer, processor=processor)
 

@@ -24,7 +24,7 @@ import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
-from typing import TYPE_CHECKING, Any, Literal, NoReturn
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 
@@ -182,39 +182,24 @@ def verify_restored_media(captured: CapturedMedia, restored: CapturedMedia) -> N
             generation-prefix row.
 
     Raises:
-        MediaCaptureRejected: With ``retained_media_changed`` on the first of
-            an item, tensor-name, dtype/shape, or byte mismatch.
+        MediaCaptureRejected: ``retained_media_changed`` when the items or
+            any tensor's dtype, shape, or bytes differ.
     """
-
-    def reject(what: str) -> NoReturn:
+    current = captured.tensor_digests or {}
+    staged = restored.tensor_digests or {}
+    if captured.items != restored.items or current != staged:
+        # Name what differs, so a rejection can be triaged from the log.
+        changed = sorted(
+            name
+            for name in current.keys() | staged.keys()
+            if current.get(name) != staged.get(name)
+        )
         raise MediaCaptureRejected(
-            f"Restored generation media {what} differs from reprocessed input",
+            "Restored generation media differs from reprocessed input "
+            f"(items equal: {captured.items == restored.items}; "
+            f"changed tensors: {changed})",
             code="retained_media_changed",
         )
-
-    if captured.items != restored.items:
-        reject("metadata")
-    staged = restored.tensor_digests
-    if staged is None:
-        raise MediaCaptureRejected("Restored generation media has no tensor digests")
-    current = (
-        captured.tensor_digests
-        if captured.tensor_digests is not None
-        else media_tensor_digests(captured.tensors)
-    )
-    if set(current) != set(staged):
-        reject("tensor set")
-    for name, digest in current.items():
-        expected = staged[name]
-        if not isinstance(expected, dict):
-            reject(f"tensor {name!r} digest")
-        if (digest["dtype"], digest["shape"]) != (
-            expected.get("dtype"),
-            expected.get("shape"),
-        ):
-            reject(f"tensor {name!r} dtype or shape")
-        if digest["sha256"] != expected.get("sha256"):
-            reject(f"tensor {name!r} bytes")
 
 
 def verified_media_items(call: FetchedStagedCall) -> tuple[CapturedMediaItem, ...]:
