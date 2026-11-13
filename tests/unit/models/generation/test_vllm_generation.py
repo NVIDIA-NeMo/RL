@@ -3183,6 +3183,69 @@ def test_vllm_validate_settings_rejects_what_dynamo_cannot_serve(settings, error
         VllmGeneration.validate_settings(master_config)
 
 
+@pytest.mark.parametrize("announced", [True, False])
+def test_vllm_dynamo_chat_settings_reach_the_frontend_while_the_engines_load(
+    monkeypatch, announced: bool
+):
+    from ray.util.queue import Empty
+
+    from nemo_rl.models.generation.vllm import vllm_generation
+
+    events: list = []
+    settings = {"nemo_rl_chat": {"engine_args": {}}}
+
+    class _Queue:
+        def __init__(self, actor_options):
+            self.shut_down = False
+
+        def get(self, timeout):
+            if not announced:
+                raise Empty
+            return settings
+
+        def shutdown(self):
+            self.shut_down = True
+
+    monkeypatch.setattr(vllm_generation, "RayQueue", _Queue)
+    monkeypatch.setattr(vllm_generation.ray, "get", lambda refs: refs)
+    # A load that ends before any settings arrive: the driver stops waiting.
+    monkeypatch.setattr(
+        vllm_generation.ray, "wait", lambda refs, num_returns, timeout: (refs, [])
+    )
+    for step in (
+        "_post_init",
+        "_report_dp_openai_server_base_urls",
+        "_report_device_id",
+        "_register_dynamo_engines",
+    ):
+        monkeypatch.setattr(VllmGeneration, step, lambda self: None)
+    leader = types.SimpleNamespace(
+        announce_dynamo_chat_settings_to=types.SimpleNamespace(
+            remote=lambda queue: events.append(("announce to", queue))
+        )
+    )
+    generation = object.__new__(VllmGeneration)
+    generation.worker_group = types.SimpleNamespace(
+        workers=[leader],
+        get_dp_leader_worker_idx=lambda shard: 0,
+        run_all_workers_single_data=lambda method, **kwargs: (
+            events.append(method) or ["load"]
+        ),
+    )
+    generation._dynamo_runtime = types.SimpleNamespace(
+        serves_chat=True,
+        publish_chat_settings=lambda published: events.append(("publish", published)),
+    )
+
+    generation.load_and_start()
+
+    # The leader is asked before it loads, and the frontend gets what it sent.
+    (_, queue), load, *published = events
+    assert load == "load_model"
+    assert published == ([("publish", settings)] if announced else [])
+    assert queue.shut_down
+
+
 def test_vllm_dynamo_rollouts_go_through_the_frontend(monkeypatch):
     from nemo_rl.experience.failures import GenerationUnavailable
     from nemo_rl.models.generation.dynamo import rollout_client

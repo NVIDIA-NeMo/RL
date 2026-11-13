@@ -147,6 +147,7 @@ def test_a_cut_reaches_every_engine_and_each_call_gets_its_engines_answer(
         model_name="model",
         frontend_python="python",
         ray_address="10.0.0.1:6379",
+        serves_chat=True,
     )
     driver._chat_dir = str(tmp_path)
 

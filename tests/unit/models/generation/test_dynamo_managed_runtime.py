@@ -29,7 +29,7 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
 )
 
 
-def _runtime(**frontend_args) -> ManagedDynamoRuntime:
+def _runtime(serves_chat: bool = False, **frontend_args) -> ManagedDynamoRuntime:
     return ManagedDynamoRuntime(
         dynamo_cfg=DynamoCfg(
             startup_timeout_s=5, frontend_args=DynamoFrontendArgs(**frontend_args)
@@ -37,6 +37,7 @@ def _runtime(**frontend_args) -> ManagedDynamoRuntime:
         model_name="model",
         frontend_python="/venvs/vllm/bin/python",
         ray_address="10.0.0.1:6379",
+        serves_chat=serves_chat,
     )
 
 
@@ -288,10 +289,11 @@ def test_engine_wait_fails_immediately_when_an_engine_or_service_stops(
         runtime.wait_for_engines(1, check_engines=check_engines)
 
 
+@pytest.mark.parametrize("serves_chat", [True, False])
 def test_frontend_launches_nemo_rls_chat_engine_from_the_given_interpreter(
-    monkeypatch,
+    monkeypatch, serves_chat: bool
 ) -> None:
-    runtime = _runtime(render_workers=3)
+    runtime = _runtime(serves_chat, render_workers=3)
     runtime._frontend_port = 3000
     runtime._generation_cut_port = 2400
     runtime._namespace = "nemo-rl-test"
@@ -331,6 +333,19 @@ def test_frontend_launches_nemo_rls_chat_engine_from_the_given_interpreter(
             "capture_media": False,
             "generation_cut_control_token": "secret",
             "generation_cut_control_timeout_s": 60.0,
+        }
+    # Only a run that serves chat names the file an engine's chat settings
+    # arrive in before it loads; the frontend starts its render workers on it.
+    assert (managed_runtime.CHAT_SETTINGS_FILE_ENV in env) is serves_chat
+    if serves_chat:
+        monkeypatch.setenv(
+            managed_runtime.CHAT_SETTINGS_FILE_ENV,
+            env[managed_runtime.CHAT_SETTINGS_FILE_ENV],
+        )
+        assert managed_runtime.read_chat_settings() is None
+        runtime.publish_chat_settings({"nemo_rl_chat": {"engine_args": {}}})
+        assert managed_runtime.read_chat_settings() == {
+            "nemo_rl_chat": {"engine_args": {}}
         }
     runtime.shutdown()
 

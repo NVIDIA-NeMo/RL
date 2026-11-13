@@ -31,6 +31,8 @@ parsed by the same code as NeMo RL's native vLLM server:
 
 The engine publishes its engine args and chat settings at registration
 (``EngineConfig.runtime_data``), so this engine renders exactly as it would.
+For a run that serves chat it also sends them before it loads, and the render
+workers are built from them meanwhile (:class:`ChatEngineFactory`).
 """
 
 from __future__ import annotations
@@ -43,15 +45,18 @@ import os
 import threading
 import time
 import uuid
+from collections.abc import Coroutine
 from typing import Any, AsyncGenerator, Optional, TypedDict
 
 from dynamo.llm import PythonAsyncEngine
 from dynamo.llm.exceptions import HttpError, InvalidArgument
 
+from nemo_rl.models.generation.dynamo.engine_adapter import weight_free_model_path
 from nemo_rl.models.generation.dynamo.managed_runtime import (
     RAY_ADDRESS_ENV,
     RENDER_WORKERS_ENV,
     read_chat_capture,
+    read_chat_settings,
 )
 from nemo_rl.models.generation.dynamo.vllm.render_pool import (
     RenderPool,
@@ -233,6 +238,38 @@ def _log_failed_start(task: asyncio.Task[None]) -> None:
         )
 
 
+async def _start_chat_workers(pool: RenderPool) -> None:
+    """Do what the first chat call would otherwise wait for.
+
+    The render workers start, and the steps a call runs are imported (they
+    import vLLM) in a thread, so the frontend's event loop keeps serving.
+    A call that arrives first waits for the workers, as without this.
+    """
+    await asyncio.gather(
+        pool.start(),
+        asyncio.to_thread(
+            importlib.import_module,
+            "nemo_rl.models.generation.vllm.prompt_and_capture",
+        ),
+    )
+
+
+class _StepTimes:
+    """How long each step of a chat call took, for the first call's log line."""
+
+    def __init__(self) -> None:
+        self._last = time.monotonic()
+        self._seconds: dict[str, float] = {}
+
+    def mark(self, step: str) -> None:
+        now = time.monotonic()
+        self._seconds[step] = now - self._last
+        self._last = now
+
+    def __str__(self) -> str:
+        return ", ".join(f"{step} {took:.1f}s" for step, took in self._seconds.items())
+
+
 class NemoRLChatEngine:
     """Serves NeMo-Gym's chat calls for one model's engines."""
 
@@ -248,27 +285,10 @@ class NemoRLChatEngine:
         self._routed_engine = routed_engine
         self._generation = spec["generation"]
         self._capture = capture
-        # Held here: the event loop keeps only a weak reference to its tasks.
-        self._start_task: Optional[asyncio.Task[None]] = None
-
-    def start(self) -> None:
-        """Do in the background what the first chat call would wait for.
-
-        The render workers start, and the steps a call runs are imported (they
-        import vLLM) in a thread, so the frontend's event loop keeps serving.
-        A call that arrives first waits for the workers, as without this.
-        """
-        self._start_task = asyncio.get_running_loop().create_task(self._start())
-        self._start_task.add_done_callback(_log_failed_start)
-
-    async def _start(self) -> None:
-        await asyncio.gather(
-            self._pool.start(),
-            asyncio.to_thread(
-                importlib.import_module,
-                "nemo_rl.models.generation.vllm.prompt_and_capture",
-            ),
-        )
+        # The first call, and the first one served, each log once: what the
+        # frontend's start-up cost NeMo-Gym's first step.
+        self._first_call = True
+        self._first_served_call = True
 
     async def generate(
         self, request: dict[str, Any], context: Any = None
@@ -332,8 +352,14 @@ class NemoRLChatEngine:
         )
         request_fields: set[str] = set(GymRequestFields.model_fields)
         body.update(extras.model_dump(include=request_fields))
+        first_call, self._first_call = self._first_call, False
+        steps = _StepTimes()
         info = await self._pool.info()
+        steps.mark("render workers")
+        if first_call:
+            LOGGER.info("The first chat call waited for the %s", steps)
         rendered = await self._pool.render(body, measure=extras.ng_measure)
+        steps.mark("render")
         plan = await prepare_prompt(
             rendered,
             resolve_prefix=self._capture.resolve_prefix,
@@ -341,6 +367,7 @@ class NemoRLChatEngine:
             max_model_len=info["max_model_len"],
             measure_only=extras.ng_measure,
         )
+        steps.mark("prefix and splice")
         if extras.ng_measure:
             return self._chunk(
                 request,
@@ -378,6 +405,7 @@ class NemoRLChatEngine:
             "extra_args": {CALL_KEY: wire},
         }
         engine_data = await self._call_engine(preprocessed, context)
+        steps.mark("engine")
         if (refusal := engine_data.get("refusal")) is not None:
             # The engine refused the call before it ran, with the native status.
             ack = _capture_refusal_ack(extras) if refusal["acknowledge"] else ""
@@ -394,6 +422,10 @@ class NemoRLChatEngine:
             engine_data["output"],
             engine_data.get("restored"),
         )
+        steps.mark("reply")
+        if self._first_served_call:
+            self._first_served_call = False
+            LOGGER.info("The first chat call served took: %s", steps)
         (choice,) = response["choices"]
         return self._chunk(
             request,
@@ -469,10 +501,106 @@ class NemoRLChatEngine:
 
 
 class ChatEngineFactory:
-    """Dynamo's ``chat_engine_factory``: one chat engine per model's engines."""
+    """Dynamo's ``chat_engine_factory``: one chat engine per model's engines.
+
+    The render workers are built from an engine's chat settings, which reach
+    the frontend when the engine registers. For a run that serves chat the
+    driver also hands over the settings one engine sends before it loads
+    (``read_chat_settings``): :meth:`start_render_workers` starts the workers
+    at launch and builds them from those, and registration keeps them when the
+    engines register the same ``policy.generation``.
+    """
 
     def __init__(self) -> None:
         self._capture = _CaptureSource()
+        # The workers started at launch and the settings they were built from
+        # (None until those arrive), until a registration takes them.
+        self._early_pool: Optional[RenderPool] = None
+        self._early_spec: Optional[dict[str, Any]] = None
+        # Held here: the event loop keeps only a weak reference to its tasks.
+        self._tasks: list[asyncio.Task[None]] = []
+
+    def start_render_workers(self) -> None:
+        """Start the render workers before any engine registers.
+
+        Call it on the frontend's loop, in a run that serves chat.
+        """
+        self._early_pool = self._new_pool(start=True)
+        self._run(self._build_early_pool(self._early_pool))
+
+    def _run(self, work: Coroutine[Any, Any, None]) -> None:
+        task = asyncio.get_running_loop().create_task(work)
+        task.add_done_callback(_log_failed_start)
+        self._tasks.append(task)
+
+    def _new_pool(self, *, start: bool) -> RenderPool:
+        pool = RenderPool(workers=int(os.environ[RENDER_WORKERS_ENV]))
+        if start:
+            self._run(_start_chat_workers(pool))
+        return pool
+
+    async def _build_early_pool(self, pool: RenderPool) -> None:
+        """Build ``pool`` from the settings an engine sends before it loads."""
+        launched = time.monotonic()
+        while (runtime_data := read_chat_settings()) is None:
+            if self._early_pool is not pool:
+                return
+            await asyncio.sleep(0.2)
+        spec = runtime_data[RUNTIME_DATA_KEY]
+        # The directory an engine registers from; registration brings Dynamo's
+        # copy of the same files.
+        model_dir = await weight_free_model_path(spec["generation"]["model_name"])
+        if self._early_pool is not pool:
+            # The engines registered meanwhile, and their settings built it.
+            return
+        self._early_spec = spec
+        pool.build(spec, model_dir)
+        LOGGER.info(
+            "Building the render workers from the chat settings an engine sent "
+            "%.1fs after the frontend launched, before it loaded",
+            time.monotonic() - launched,
+        )
+
+    def _take_early_pool(
+        self, spec: dict[str, Any], model_dir: str
+    ) -> Optional[RenderPool]:
+        """The workers started at launch, built for ``spec``; None without them.
+
+        Workers built from settings sent early are kept when the engines
+        register the same ``generation`` (``policy.generation``), which every
+        engine derives its engine args from. The engine args are not compared:
+        vLLM fills in more of them while it builds the engine (scheduler
+        limits, resolved model paths), and no render uses those.
+        """
+        pool, self._early_pool = self._early_pool, None
+        early_spec, self._early_spec = self._early_spec, None
+        if pool is None:
+            return None
+        if early_spec is None:
+            # No settings came before registration: the workers have imported
+            # vLLM and build now.
+            pool.build(spec, model_dir)
+            return pool
+        early, registered = early_spec["generation"], spec["generation"]
+        changed = sorted(
+            key
+            for key in early.keys() | registered.keys()
+            if early.get(key) != registered.get(key)
+        )
+        if changed:
+            LOGGER.warning(
+                "The engines registered policy.generation settings other than "
+                "the ones one sent before it loaded (%s); restarting the render "
+                "workers",
+                ", ".join(changed),
+            )
+            pool.shutdown()
+            return None
+        LOGGER.info(
+            "The engines registered the settings the render workers were built "
+            "from; keeping the workers"
+        )
+        return pool
 
     async def chat_engine_factory(
         self, instance_id: Any, mdc: Any, routed_engine: Any
@@ -486,14 +614,15 @@ class ChatEngineFactory:
                 f"(runtime_data[{RUNTIME_DATA_KEY!r}]); only NeMo RL's engines are "
                 "served by this frontend"
             )
-        pool = RenderPool(
-            spec, mdc.local_dir(), workers=int(os.environ[RENDER_WORKERS_ENV])
-        )
+        pool = self._take_early_pool(spec, mdc.local_dir())
+        if pool is None:
+            # NeMo-Gym's calls need this flag, and the native worker starts its
+            # chat server on it. Without it no chat call comes, so nothing starts.
+            pool = self._new_pool(
+                start=bool(spec["generation"]["vllm_cfg"].get("expose_http_server"))
+            )
+            pool.build(spec, mdc.local_dir())
         engine = NemoRLChatEngine(
             pool=pool, routed_engine=routed_engine, spec=spec, capture=self._capture
         )
-        if spec["generation"]["vllm_cfg"].get("expose_http_server"):
-            # NeMo-Gym's calls need this flag, and the native worker starts its
-            # chat server on it. Without it no chat call comes, so nothing starts.
-            engine.start()
         return PythonAsyncEngine(engine.generate, asyncio.get_running_loop())

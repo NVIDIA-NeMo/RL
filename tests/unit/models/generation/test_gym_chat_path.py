@@ -653,6 +653,8 @@ def _build_kit(kit_spec: _KitSpec, path: str) -> _Kit:
             )
         )
     )[chat_engine.RUNTIME_DATA_KEY]
+    pool = RenderPool(workers=1)
+    pool.build(spec, path)
     return _Kit(
         path=path,
         generation=generation,
@@ -662,7 +664,7 @@ def _build_kit(kit_spec: _KitSpec, path: str) -> _Kit:
         model_config=model_config,
         vllm_config=vllm_config,
         renderer=renderer_from_config(vllm_config),
-        pool=RenderPool(spec, path, workers=1),
+        pool=pool,
     )
 
 

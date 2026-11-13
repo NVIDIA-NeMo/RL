@@ -33,7 +33,7 @@ from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from dynamo._core import Context
+from dynamo._core import Context, fetch_model
 from dynamo.common.backend import (
     EngineConfig,
     GenerateChunk,
@@ -179,6 +179,17 @@ class DynamoEngineAdapter(LLMEngine):
 
     async def cleanup(self) -> None:
         """Nothing to release: the worker owns its engine and shuts it down."""
+
+
+async def weight_free_model_path(model: str) -> str:
+    """A local directory with ``model``'s config and tokenizer files.
+
+    ``model`` itself when it is a local path; for a Hub ID, Dynamo's snapshot
+    of it without the weights.
+    """
+    if os.path.exists(model):
+        return model
+    return await fetch_model(model, ignore_weights=True)
 
 
 def start_dynamo_endpoint(

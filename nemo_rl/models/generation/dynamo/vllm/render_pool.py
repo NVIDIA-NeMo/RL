@@ -26,15 +26,22 @@ native chat server uses, from the engine's own engine args, and runs:
   output, so the reply is the one the native server builds.
 
 Jobs queue FIFO in the pool; nothing renders on the event loop.
+
+A worker imports vLLM before it has the settings it is built from, so the
+frontend can start the workers at launch, before any engine has registered.
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib
+import json
 import logging
 import multiprocessing
 import os
 import pickle
+import shutil
+import tempfile
 import time
 import uuid
 from concurrent.futures import ProcessPoolExecutor
@@ -92,20 +99,28 @@ class RenderedCall:
     reasoning_parser_kwargs: Optional[dict[str, Any]]
 
 
+def _import_vllm() -> None:
+    """Import everything a worker builds and serves with."""
+    import vllm.platforms
+
+    # A frontend host may have no accelerator; vLLM only renders here, as in
+    # Dynamo's own frontend. vLLM's explicit CPU target selects its CPU
+    # platform. An accelerator host keeps its own, which validates the
+    # engine's args (quantization, for one) as the engine does.
+    if vllm.platforms.resolve_current_platform_cls_qualname().endswith(
+        ".UnspecifiedPlatform"
+    ):
+        os.environ["VLLM_TARGET_DEVICE"] = "cpu"
+    # The chat server imports the rest of vLLM that a worker uses.
+    importlib.import_module("nemo_rl.models.generation.vllm.chat_server")
+
+
 class _Worker:
     """The vLLM objects one worker process renders and responds with."""
 
     def __init__(self, spec: dict[str, Any], model_dir: str):
-        import vllm.platforms
-
-        # A frontend host may have no accelerator; vLLM only renders here, as in
-        # Dynamo's own frontend. vLLM's explicit CPU target selects its CPU
-        # platform. An accelerator host keeps its own, which validates the
-        # engine's args (quantization, for one) as the engine does.
-        if vllm.platforms.resolve_current_platform_cls_qualname().endswith(
-            ".UnspecifiedPlatform"
-        ):
-            os.environ["VLLM_TARGET_DEVICE"] = "cpu"
+        started = time.monotonic()
+        _import_vllm()
 
         from types import SimpleNamespace
 
@@ -199,6 +214,7 @@ class _Worker:
                 model_stop_token_ids(self.model_config, cfg), self.tokenizer
             )
         )
+        self.build_seconds = time.monotonic() - started
 
     def _parser(self, chat: Any) -> Any:
         parser_cls = self.serving_chat.parser_cls
@@ -354,9 +370,26 @@ class _Worker:
         return response.model_dump(mode="json", exclude_none=True)
 
 
-def _init_worker(spec: dict[str, Any], model_dir: str) -> None:
+def _wait_for_settings(path: str) -> tuple[dict[str, Any], str]:
+    """The settings :meth:`RenderPool.build` writes, once it has."""
+    frontend = multiprocessing.parent_process()
+    while not os.path.exists(path):
+        # None will come once the pool is shut down or the frontend is gone.
+        if not os.path.isdir(os.path.dirname(path)) or (
+            frontend is not None and not frontend.is_alive()
+        ):
+            raise SystemExit("the render pool went away before it had settings")
+        time.sleep(0.1)
+    with open(path) as settings_file:
+        settings = json.load(settings_file)
+    return settings["spec"], settings["model_dir"]
+
+
+def _init_worker(settings_path: str) -> None:
     global _WORKER
-    _WORKER = _Worker(spec, model_dir)
+    # Before the wait, so that only the build is left once the settings arrive.
+    _import_vllm()
+    _WORKER = _Worker(*_wait_for_settings(settings_path))
 
 
 def _render(body: dict[str, Any], measure: bool) -> RenderedCall:
@@ -379,22 +412,45 @@ def _info() -> dict[str, Any]:
     return {
         "turn_end_token_ids": _WORKER.turn_end_token_ids,
         "max_model_len": _WORKER.model_config.max_model_len,
+        "build_seconds": _WORKER.build_seconds,
     }
 
 
 class RenderPool:
     """``workers`` processes that render and answer chat calls, FIFO.
 
-    :meth:`start` starts them all. Without it the executor starts one for each
-    job submitted while none is idle, so the first calls wait for them.
+    A worker imports vLLM, then waits for the settings :meth:`build` gives the
+    pool, so :meth:`start` can come first. :meth:`start` starts them all;
+    without it the executor starts one for each job submitted while none is
+    idle, so the first calls wait for them.
     """
 
-    def __init__(self, spec: dict[str, Any], model_dir: str, *, workers: int):
-        self._spec = spec
-        self._model_dir = model_dir
+    def __init__(self, *, workers: int):
         self._workers = workers
+        # Where build() writes the settings; a restarted pool's workers read
+        # them here too.
+        self._settings_dir = tempfile.mkdtemp(prefix="nemorl_render_pool_")
+        self._settings_path = os.path.join(self._settings_dir, "settings.json")
+        self._built_at: Optional[float] = None
         self._executor = self._start()
         self._info: Optional[dict[str, Any]] = None
+
+    def build(self, spec: dict[str, Any], model_dir: str) -> None:
+        """Give the workers what they are built from.
+
+        ``spec`` is the engine's chat settings (``chat_runtime_data``), and
+        ``model_dir`` a local directory with the model's config and tokenizer
+        files.
+        """
+        if self._built_at is not None:
+            raise RuntimeError("the render pool already has its settings")
+        with tempfile.NamedTemporaryFile(
+            "w", dir=self._settings_dir, delete=False
+        ) as settings_file:
+            json.dump({"spec": spec, "model_dir": model_dir}, settings_file)
+        # Renamed into place, so a worker never reads a partial file.
+        os.replace(settings_file.name, self._settings_path)
+        self._built_at = time.monotonic()
 
     def _start(self) -> ProcessPoolExecutor:
         return ProcessPoolExecutor(
@@ -402,7 +458,7 @@ class RenderPool:
             # Fork would copy the frontend's Rust runtime and event loop.
             mp_context=multiprocessing.get_context("spawn"),
             initializer=_init_worker,
-            initargs=(self._spec, self._model_dir),
+            initargs=(self._settings_path,),
         )
 
     async def _submit(self, fn: Callable[..., Any], *args: Any) -> Any:
@@ -427,16 +483,25 @@ class RenderPool:
             raise
 
     async def start(self) -> None:
-        """Start every worker now: one job each, submitted while none is idle."""
+        """Start every worker now: one job each, submitted while none is idle.
+
+        Returns when the first is ready, which takes :meth:`build`'s settings.
+        """
         started = time.monotonic()
         infos = await asyncio.gather(
             *(self._submit(_info) for _ in range(self._workers))
         )
         self._info = infos[0]
+        ready = time.monotonic()
+        assert self._built_at is not None
         LOGGER.info(
-            "The render pool's first of %d workers is ready after %.1fs",
+            "The render pool's first of %d workers is ready %.1fs after they "
+            "started and %.1fs after their settings arrived; it took %.1fs to "
+            "build",
             self._workers,
-            time.monotonic() - started,
+            ready - started,
+            ready - self._built_at,
+            self._info["build_seconds"],
         )
 
     async def info(self) -> dict[str, Any]:
@@ -463,3 +528,4 @@ class RenderPool:
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
+        shutil.rmtree(self._settings_dir, ignore_errors=True)

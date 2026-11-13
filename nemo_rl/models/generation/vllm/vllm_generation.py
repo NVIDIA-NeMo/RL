@@ -32,6 +32,8 @@ from typing import (
 import numpy as np
 import ray
 from ray.util.placement_group import PlacementGroup
+from ray.util.queue import Empty
+from ray.util.queue import Queue as RayQueue
 
 from nemo_rl.data.multimodal_utils import VLLM_PROMPT_KEYS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict, SlicedDataDict
@@ -756,11 +758,24 @@ class VllmGeneration(GenerationInterface):
         heavy model loading. Updates dp_openai_server_base_urls with the actual
         running server URLs and populates device_uuids.
         """
+        chat_settings: Optional[RayQueue] = None
+        if self._dynamo_runtime is not None and self._dynamo_runtime.serves_chat:
+            # The frontend builds its render workers from one engine's chat
+            # settings while the engines load, so NeMo-Gym's first calls do
+            # not wait for them.
+            chat_settings = RayQueue(actor_options={"num_cpus": 0})
+            leader = self.worker_group.workers[
+                self.worker_group.get_dp_leader_worker_idx(0)
+            ]
+            ray.get(leader.announce_dynamo_chat_settings_to.remote(chat_settings))
+
         # Call load_model() on all model-owner workers
         futures = self.worker_group.run_all_workers_single_data(
             "load_model",
             run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
         )
+        if chat_settings is not None:
+            self._publish_dynamo_chat_settings(chat_settings, futures)
         ray.get(futures)
 
         # Post-init (collective rpc functions needed for async engine)
@@ -809,11 +824,37 @@ class VllmGeneration(GenerationInterface):
             # release as every engine.
             frontend_python=self.worker_group.py_executable,
             ray_address=ray.get_runtime_context().gcs_address,
+            # NeMo-Gym's chat calls need the flag, and the native worker starts
+            # its chat server on it.
+            serves_chat=bool(self.cfg["vllm_cfg"].get("expose_http_server")),
         )
         runtime.start()
         self._dynamo_runtime = runtime
         self.dynamo_frontend_url = runtime.frontend_url
         self.dynamo_generation_cut_url = runtime.generation_cut_control_url
+
+    def _publish_dynamo_chat_settings(
+        self, chat_settings: RayQueue, loads: list[ray.ObjectRef]
+    ) -> None:
+        """Hand the frontend the chat settings an engine sends before it loads.
+
+        Returns without them once any of ``loads`` has ended: registration
+        then gives the frontend its settings, as without this.
+        """
+        assert self._dynamo_runtime is not None
+        try:
+            while True:
+                try:
+                    settings = chat_settings.get(timeout=1)
+                except Empty:
+                    ended, _ = ray.wait(loads, num_returns=1, timeout=0)
+                    if ended:
+                        return
+                    continue
+                self._dynamo_runtime.publish_chat_settings(settings)
+                return
+        finally:
+            chat_settings.shutdown()
 
     def _register_dynamo_engines(self) -> None:
         """Serve every shard's engine through Dynamo; wait until it routes to all."""

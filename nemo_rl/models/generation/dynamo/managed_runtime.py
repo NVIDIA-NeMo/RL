@@ -124,6 +124,10 @@ def _managed_namespace() -> str:
 # writes the capture config, the Ray cluster its TQ reads go through, and the
 # port it takes NeMo-Gym's generation cuts on (dynamo/vllm/generation_cut.py).
 RENDER_WORKERS_ENV = "NEMO_RL_DYNAMO_RENDER_WORKERS"
+# Where the driver writes the chat settings an engine sends before it loads.
+# Set only for a run that serves chat: the frontend then starts its render
+# workers at launch.
+CHAT_SETTINGS_FILE_ENV = "NEMO_RL_DYNAMO_CHAT_SETTINGS_FILE"
 CAPTURE_FILE_ENV = "NEMO_RL_DYNAMO_CAPTURE_FILE"
 RAY_ADDRESS_ENV = "NEMO_RL_DYNAMO_RAY_ADDRESS"
 GENERATION_CUT_PORT_ENV = "NEMO_RL_DYNAMO_GENERATION_CUT_PORT"
@@ -138,6 +142,15 @@ def read_chat_capture() -> dict[str, Any] | None:
         return pickle.load(capture_file)
 
 
+def read_chat_settings() -> dict[str, Any] | None:
+    """What ``publish_chat_settings`` wrote for this frontend; None before it has."""
+    path = os.environ[CHAT_SETTINGS_FILE_ENV]
+    if not os.path.exists(path):
+        return None
+    with open(path) as settings_file:
+        return json.load(settings_file)
+
+
 class ManagedDynamoRuntime:
     """Own etcd, NATS and the frontend that NeMo RL's vLLM engines register with."""
 
@@ -148,6 +161,7 @@ class ManagedDynamoRuntime:
         model_name: str,
         frontend_python: str,
         ray_address: str,
+        serves_chat: bool,
     ) -> None:
         """Describe the services; nothing starts until :meth:`start`.
 
@@ -158,11 +172,15 @@ class ManagedDynamoRuntime:
                 the vLLM workers' own.
             ray_address: The Ray cluster's GCS address; the frontend's chat
                 engine reads token-capture prefixes from TQ through it.
+            serves_chat: Whether the engines expose chat
+                (``vllm_cfg.expose_http_server``, which NeMo-Gym requires). The
+                frontend then starts its render workers at launch.
         """
         self._dynamo_cfg = dynamo_cfg
         self._model_name = model_name
         self._frontend_python = frontend_python
         self._ray_address = ray_address
+        self.serves_chat = serves_chat
         self._chat_dir: str | None = None
         self._namespace = _managed_namespace()
         self._host = ""
@@ -390,6 +408,10 @@ class ManagedDynamoRuntime:
             self._dynamo_cfg.frontend_args.render_workers
         )
         frontend_env[CAPTURE_FILE_ENV] = os.path.join(self._chat_dir, "capture.pkl")
+        if self.serves_chat:
+            frontend_env[CHAT_SETTINGS_FILE_ENV] = os.path.join(
+                self._chat_dir, "chat_settings.json"
+            )
         frontend_env[RAY_ADDRESS_ENV] = self._ray_address
         frontend_env[GENERATION_CUT_PORT_ENV] = str(self._generation_cut_port)
         dynamo_venv = os.path.dirname(os.path.dirname(self._frontend_python))
@@ -415,14 +437,10 @@ class ManagedDynamoRuntime:
         bearer token a generation cut must carry, None to refuse every cut;
         ``generation_cut_control_timeout_s`` bounds one cut across the engines.
         """
-        if self._chat_dir is None:
-            raise RuntimeError("Managed Dynamo runtime has not been started")
-        path = os.path.join(self._chat_dir, "capture.pkl")
         # Pickled: the data-plane config holds pydantic storage configs.
-        with tempfile.NamedTemporaryFile(
-            "wb", dir=self._chat_dir, suffix=".pkl", delete=False
-        ) as capture_file:
-            pickle.dump(
+        self._write_chat_file(
+            "capture.pkl",
+            pickle.dumps(
                 {
                     "data_plane": dp_cfg,
                     "staging_partition": staging_partition,
@@ -431,11 +449,28 @@ class ManagedDynamoRuntime:
                     "generation_cut_control_timeout_s": (
                         generation_cut_control_timeout_s
                     ),
-                },
-                capture_file,
-            )
+                }
+            ),
+        )
+
+    def publish_chat_settings(self, settings: dict[str, Any]) -> None:
+        """Hand the frontend the chat settings an engine sent before it loaded.
+
+        ``settings`` is what the engine publishes at registration
+        (``chat_runtime_data``). The frontend builds its render workers from
+        them while the engines load, and registration confirms them.
+        """
+        self._write_chat_file("chat_settings.json", json.dumps(settings).encode())
+
+    def _write_chat_file(self, name: str, content: bytes) -> None:
+        if self._chat_dir is None:
+            raise RuntimeError("Managed Dynamo runtime has not been started")
+        with tempfile.NamedTemporaryFile(
+            "wb", dir=self._chat_dir, delete=False
+        ) as chat_file:
+            chat_file.write(content)
         # Renamed into place, so the chat engine never reads a partial file.
-        os.replace(capture_file.name, path)
+        os.replace(chat_file.name, os.path.join(self._chat_dir, name))
 
     def wait_for_engines(
         self, expected_engines: int, check_engines: Callable[[], None]

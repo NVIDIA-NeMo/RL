@@ -23,15 +23,20 @@ The arguments are ``dynamo.frontend``'s own. Its ``main`` builds one
 Rust preprocessor. ``/v1/completions`` (NeMo RL's own rollouts, token ids in)
 is unchanged. It wraps ``DistributedRuntime`` the same way, to serve NeMo-Gym's
 checkpoint generation cuts through the frontend's own runtime
-(:mod:`~nemo_rl.models.generation.dynamo.vllm.generation_cut`).
+(:mod:`~nemo_rl.models.generation.dynamo.vllm.generation_cut`) and, in a run
+that serves chat, to start the render workers at launch.
 """
 
+import os
 import sys
 
 
 def main() -> None:
     import dynamo.frontend.main as frontend_main
 
+    from nemo_rl.models.generation.dynamo.managed_runtime import (
+        CHAT_SETTINGS_FILE_ENV,
+    )
     from nemo_rl.models.generation.dynamo.vllm.chat_engine import ChatEngineFactory
     from nemo_rl.models.generation.dynamo.vllm.generation_cut import (
         start_generation_cut_server,
@@ -52,13 +57,16 @@ def main() -> None:
 
     distributed_runtime = frontend_main.DistributedRuntime
 
-    def with_generation_cuts(loop, *args, **kwargs):
+    def on_the_frontends_loop(loop, *args, **kwargs):
         runtime = distributed_runtime(loop, *args, **kwargs)
         start_generation_cut_server(runtime, loop)
+        if CHAT_SETTINGS_FILE_ENV in os.environ:
+            # The driver names the file for a run that serves chat.
+            factory.start_render_workers()
         return runtime
 
     frontend_main.EntrypointArgs = with_chat_engine
-    frontend_main.DistributedRuntime = with_generation_cuts
+    frontend_main.DistributedRuntime = on_the_frontends_loop
     sys.argv[0] = "dynamo.frontend"
     frontend_main.main()
 

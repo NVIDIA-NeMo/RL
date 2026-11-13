@@ -105,10 +105,23 @@ args and the `policy.generation` chat settings. The chat engine builds a
 render pool (`dynamo/vllm/render_pool.py`) from them: `render_workers` spawned
 processes, each holding the vLLM renderer and chat serving the native server
 builds. Rendering is CPU-bound Python, and the frontend serves every call on
-one event loop, so it runs in the pool, first in first out. The workers start
-when the first engine registers, if the engines expose chat
-(`vllm_cfg.expose_http_server`, which NeMo-Gym requires and the native worker
-starts its server on); a run without it starts none. Per call:
+one event loop, so it runs in the pool, first in first out.
+
+When the engines expose chat (`vllm_cfg.expose_http_server`, which NeMo-Gym
+requires and the native worker starts its server on), the workers are built
+while the engines load, so NeMo-Gym's first calls do not wait for them:
+
+- the frontend starts the workers at launch, and each imports vLLM;
+- an engine sends the driver its settings as soon as it has its engine args,
+  before it builds the engine. The driver hands them to the frontend in a
+  file, as it does the capture config, and the workers build from them;
+- at registration the chat engine keeps the workers if the engines register
+  the same `policy.generation`, and replaces them otherwise. It does not
+  compare the engine args, which vLLM adds to while it builds the engine
+  (scheduler limits, resolved model paths; no render uses those). Workers that
+  got no settings before registration build then.
+
+A run without chat starts none. Per call:
 
 1. the pool renders it with the native server's render step
    (`_render_chat_call`, shared with `vllm/chat_server.py`), including the

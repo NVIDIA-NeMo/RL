@@ -418,6 +418,27 @@ def test_engines_register_the_block_size_kv_events_are_hashed_with() -> None:
     assert config.runtime_data == vllm_adapter.chat_runtime_data(host)
 
 
+def test_an_engine_sends_its_chat_settings_before_it_builds_the_engine(
+    monkeypatch,
+) -> None:
+    host = _host(_FakeLLM())
+    sent: list[dict] = []
+    host.announce_dynamo_chat_settings_to(SimpleNamespace(put=sent.append))
+    sent_before_the_build: list[list[dict]] = []
+
+    def build(engine_args, stat_loggers):
+        sent_before_the_build.append(list(sent))
+        return _FakeLLM()
+
+    monkeypatch.setattr("vllm.v1.engine.async_llm.AsyncLLM.from_engine_args", build)
+
+    host._create_engine({"model": "/models/m", "max_model_len": MAX_MODEL_LEN})
+
+    # What it publishes at registration, while the frontend can still build its
+    # render workers ahead of it.
+    assert sent_before_the_build == [[vllm_adapter.chat_runtime_data(host)]]
+
+
 def test_engines_publish_what_the_frontends_chat_engine_renders_with() -> None:
     host = _host(_FakeLLM())
     host.llm_async_engine_args = vllm.AsyncEngineArgs(
