@@ -1,13 +1,15 @@
 # Removing a Config Key
 
-Deleting a key from the schema and the shipped YAMLs is only half the job. Users have their own configs. If nothing rejects the old key they get one of two bad outcomes:
+Deleting a previously supported key from the schema and the shipped YAMLs is only half the job. Users have their own configs. If nothing rejects the old key they get one of two bad outcomes:
 
 - **Silently ignored.** The run starts, the setting does nothing, and the user believes it took effect. This is the worse one — a `_v2: false` config would have run on a backend the user did not ask for.
 - **Failing late.** The error surfaces wherever the key happened to be read — a checkpoint-save path fires at the first save interval, hours in.
 
-So every removal ships with a rejection that fires at startup.
+Every removal of previously supported config ships with a rejection that fires at startup.
 
 ## Scope: removed, not deprecated
+
+Check the PR base and the key's history before adding a migration check. A spelling or shape introduced and replaced within the same PR has no existing user migration contract: update its consumers, configs and tests directly, without adding an outdated-config rejection, registration or dedicated migration tests. For example, `value.resources.dedicated` was introduced and replaced by `value.dedicated` within #5037; it did not need a migration check. Source: [review discussion](https://github.com/NVIDIA-NeMo/RL/pull/5037#discussion_r4547587219).
 
 This module is only for config the code no longer accepts. A key that still works but is discouraged does not belong here — every function in it raises, so putting a soft deprecation here breaks runs that are still valid. Warn from the consumer instead, and move the key here once it is actually removed.
 
