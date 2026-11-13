@@ -2977,9 +2977,7 @@ class VllmGeneration(GenerationInterface):
             )
         if not self.worker_group or not self.worker_group.workers:
             raise RuntimeError("Worker group is not initialized")
-        futures = self._fan_out(
-            "flush_obsolete_generation_cut_rows_async", epoch=epoch
-        )
+        futures = self._fan_out("flush_obsolete_generation_cut_rows_async", epoch=epoch)
         if not all(ray.get(futures, timeout=timeout_s)):
             raise RuntimeError(
                 "flush_obsolete_generation_cut_rows failed on an async vLLM engine"

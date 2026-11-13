@@ -2613,6 +2613,8 @@ class TestSetup:
             enable_router_replay=False,
             use_fastokens=False,
             turn_checkpointing_enabled=False,
+            # No PD disaggregation frontends in this config.
+            forward_session_id_as_conversation_id=False,
             generation_prefix_cuts_enabled=False,
             # The vLLM server's bearer token, handed to the Gym model server.
             policy_api_key=patched_factories["fake_gen"].http_server_api_key,

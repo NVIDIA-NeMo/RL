@@ -187,7 +187,6 @@ def _is_prefill_leg(request: Any) -> bool:
     return bool(isinstance(params, dict) and params.get("do_remote_decode"))
 
 
-
 # The captured model call the current HTTP request serves. Set when capture
 # begins the call, in the request's task, and read by the engine client when the
 # same task submits the call to the engine, which links the engine request ID to

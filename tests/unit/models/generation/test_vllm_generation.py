@@ -1344,6 +1344,8 @@ def _fake_chat_request():
         return_tokens_as_token_ids=None,
         logprobs=False,
         top_logprobs=None,
+        # Set only on a PD disaggregation prefill leg.
+        return_prompt_token_ids_b64=None,
         # NeMoRLChatCompletionRequest's private defaults for a call that
         # restores no generation prefix.
         _restored_generation_token_ids=(),

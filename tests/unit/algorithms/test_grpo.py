@@ -5041,6 +5041,8 @@ def test_setup_starts_nemo_gym_for_trtllm(monkeypatch, mock_grpo_components):
         turn_checkpointing_enabled=False,
         # A TensorRT-LLM server checks no bearer token on its OpenAI routes.
         policy_api_key=None,
+        # Only vLLM PD disaggregation frontends key requests by conversation.
+        forward_session_id_as_conversation_id=False,
     )
     validate_coverage.assert_called_once_with(
         nemo_gym_shard_set, {"train": dataset, "validation": None}
