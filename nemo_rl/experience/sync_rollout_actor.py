@@ -311,7 +311,14 @@ class SyncRolloutActor:
         router_replay_enabled = bool(
             (cfg.policy.get("router_replay") or {}).get("enabled", False)
         )
-        if router_replay_enabled and ROUTED_EXPERTS_FIELD not in flat:
+        # A token-free batch (every rollout masked before the model spoke) has
+        # nothing to route; only batches with trainable tokens must carry routes.
+        has_generation_tokens = bool(flat["token_loss_mask"].sum().item() > 0)
+        if (
+            router_replay_enabled
+            and ROUTED_EXPERTS_FIELD not in flat
+            and has_generation_tokens
+        ):
             raise RuntimeError(
                 "policy.router_replay.enabled=true requires routed_experts in "
                 "the rollout bulk payload, but rollout flattening did not "

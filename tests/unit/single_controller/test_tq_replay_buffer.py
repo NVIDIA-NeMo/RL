@@ -732,6 +732,44 @@ class TestTQReplayBufferReserveCommit:
         assert dp.depth() == 0
         assert buf.ready_list == [False]
 
+    def test_commit_allows_a_token_free_group_without_routed_experts(self, monkeypatch):
+        """All completions masked/token-free: nothing to route, so R3 must not fail the run."""
+
+        def _token_free(
+            record,
+            *,
+            pad_value_dict,
+            include_message_violation_fields,
+            per_token_multimodal_fields: tuple[str, ...] = (),
+        ):
+            del (
+                record,
+                pad_value_dict,
+                include_message_violation_fields,
+                per_token_multimodal_fields,
+            )
+            return BatchedDataDict[Any](
+                {
+                    "input_ids": torch.ones((_N_GENS, 3), dtype=torch.long),
+                    "input_lengths": torch.full((_N_GENS,), 3, dtype=torch.long),
+                    "token_mask": torch.ones((_N_GENS, 3), dtype=torch.float32),
+                    "mask_sample": torch.ones(_N_GENS, dtype=torch.bool),
+                    "total_reward": torch.zeros(_N_GENS, dtype=torch.float32),
+                }
+            )
+
+        monkeypatch.setattr(_replay_buffer_module, "record_to_train_batch", _token_free)
+        dp = FakeDataPlaneClient()
+        buf = _make_buffer(dp, require_routed_experts=True)
+        group_id = buf.reserve(weight_version=3)
+        _run(
+            buf.commit(
+                group_id, _make_record(), start_weight_version=3, end_weight_version=3
+            )
+        )
+        assert len(dp.put_calls) == 1
+        assert buf.ready_list == [True]
+
     def test_commit_raises_for_unknown_group_id(self):
         dp = FakeDataPlaneClient()
         buf = _make_buffer(dp)
