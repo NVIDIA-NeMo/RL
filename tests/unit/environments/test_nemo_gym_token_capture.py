@@ -932,6 +932,12 @@ def test_setup_nemo_gym_config_megatron_keeps_async_rollout_check_satisfied() ->
         ({"extra_body": {"bad_words": ["x"]}}, "bad_words"),
         # The frontend accepts stop_token_ids but drops it before our chat engine.
         ({"extra_body": {"stop_token_ids": [7]}}, "stop_token_ids"),
+        # Gym sends sampling_overrides keys on every request too.
+        ({"sampling_overrides": {"bad_words": ["x"]}}, "sampling_overrides.bad_words"),
+        (
+            {"sampling_overrides": {"logprob_token_ids": [7]}},
+            "sampling_overrides.*logprob_token_ids",
+        ),
     ],
 )
 def test_gym_actor_config_dynamo_turns_on_gyms_dynamo_dialect(

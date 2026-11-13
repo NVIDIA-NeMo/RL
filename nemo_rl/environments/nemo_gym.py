@@ -3050,32 +3050,32 @@ def _apply_dynamo_dialect(nemo_gym_dict: dict[str, Any]) -> None:
     policy_model = dict(nemo_gym_dict.get("policy_model") or {})
     models = dict(policy_model.get("responses_api_models") or {})
     vllm_model = dict(models.get("vllm_model") or {})
-    extra_body = vllm_model.get("extra_body") or {}
-    if "bad_words" in extra_body:
-        raise ValueError(
-            "vllm_model.extra_body.bad_words is not supported with "
-            "policy.generation.dynamo=true: the Dynamo frontend answers every "
-            "request carrying it with HTTP 400."
-        )
     # Dynamo accepts these vLLM fields (its PASSTHROUGH_EXTRA_FIELDS) but never
     # serializes them to a Python chat engine, so ours would never see them.
-    dropped = sorted(
-        {
-            "allowed_token_ids",
-            "bad_words_token_ids",
-            "cache_salt",
-            "detokenize",
-            "logprob_token_ids",
-            "stop_token_ids",
-        }
-        & extra_body.keys()
-    )
-    if dropped:
-        raise ValueError(
-            f"vllm_model.extra_body {dropped} is not supported with "
-            "policy.generation.dynamo=true: the Dynamo frontend accepts these "
-            "fields but drops them before NeMo RL's chat engine sees them."
-        )
+    dropped_by_frontend = {
+        "allowed_token_ids",
+        "bad_words_token_ids",
+        "cache_salt",
+        "detokenize",
+        "logprob_token_ids",
+        "stop_token_ids",
+    }
+    # Gym puts the keys of both blocks on every request as top-level fields.
+    for block in ("extra_body", "sampling_overrides"):
+        fields = vllm_model.get(block) or {}
+        if "bad_words" in fields:
+            raise ValueError(
+                f"vllm_model.{block}.bad_words is not supported with "
+                "policy.generation.dynamo=true: the Dynamo frontend answers every "
+                "request carrying it with HTTP 400."
+            )
+        dropped = sorted(dropped_by_frontend & fields.keys())
+        if dropped:
+            raise ValueError(
+                f"vllm_model.{block} {dropped} is not supported with "
+                "policy.generation.dynamo=true: the Dynamo frontend accepts these "
+                "fields but drops them before NeMo RL's chat engine sees them."
+            )
     vllm_model["dynamo_frontend"] = True
     # The frontend reads `reasoning` as another name for `reasoning_content` and
     # refuses an echoed assistant turn that carries both, Gym's default.
