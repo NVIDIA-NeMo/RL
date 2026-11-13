@@ -15,6 +15,7 @@
 import asyncio
 import contextvars
 import copy
+import functools
 import gc
 import logging
 import secrets
@@ -23,6 +24,7 @@ import time
 import uuid
 import warnings
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import Any, AsyncGenerator, Optional, cast
 
@@ -105,6 +107,11 @@ from nemo_rl.telemetry.setup import shutdown_telemetry
 from nemo_rl.utils.routed_experts_codec import routed_experts_tensor_metadata
 
 LOGGER = logging.getLogger(__name__)
+
+# Thread caps for token-capture TQ I/O. Writes keep the default executor's
+# size: more threads only queue more puts on TQ's single client loop per process.
+_CAPTURE_READ_THREADS = 64
+_CAPTURE_WRITE_THREADS = 32
 
 
 # The captured model call the current HTTP request serves. Set when capture
@@ -464,6 +471,15 @@ class VllmAsyncGenerationWorkerImpl(
         # Pixtral: the staging column's pinned dtype, which captured pixels are
         # cast to. None for Omni, whose pixels already arrive in it.
         self._capture_cast_pixel_dtype: torch.dtype | None = None
+        # Capture TQ I/O gets its own pools instead of the default executor, so
+        # a backlog of staging writes cannot hold up the prefix reads that admit
+        # new turns. Each thread mostly waits on a TQ future.
+        self._capture_read_executor = ThreadPoolExecutor(
+            max_workers=_CAPTURE_READ_THREADS, thread_name_prefix="nrl-capture-read"
+        )
+        self._capture_write_executor = ThreadPoolExecutor(
+            max_workers=_CAPTURE_WRITE_THREADS, thread_name_prefix="nrl-capture-write"
+        )
         # TQTokenSource installed by setup_token_capture. The media path reads
         # parent-chain rows through it directly; prefix resolution goes through
         # the shared ChainPrefixCache below.
@@ -1188,7 +1204,7 @@ class VllmAsyncGenerationWorkerImpl(
         verify_retained_media: bool = False,
         restored: CapturedMedia | None = None,
     ) -> CapturedMedia | None:
-        """Run off-loop: resolve retained geometry and snapshot processed pixels."""
+        """Resolve retained geometry and snapshot processed pixels (blocking TQ reads)."""
         if admission is None:
             return None
         if not self._capture_media:
@@ -1362,6 +1378,30 @@ class VllmAsyncGenerationWorkerImpl(
     def _fetch_chain_prefix(self, staging_chain: list[str]) -> list[int]:
         """Resolve a staging chain through the shared, cached TQ read."""
         return self._chain_prefix.fetch(staging_chain)
+
+    async def _run_capture_io(
+        self, executor: ThreadPoolExecutor, fn: Any, /, *args: Any, **kwargs: Any
+    ) -> Any:
+        """``asyncio.to_thread`` on a capture pool, keeping the caller's contextvars."""
+        call = functools.partial(contextvars.copy_context().run, fn, *args, **kwargs)
+        return await asyncio.get_running_loop().run_in_executor(executor, call)
+
+    async def _capture_request_media_async(
+        self, engine_prompt: dict[str, Any], **kwargs: Any
+    ) -> CapturedMedia | None:
+        """Snapshot media on the read pool; inline when media capture is off.
+
+        Without media capture the snapshot only checks the prompt, so it does not
+        queue for a thread on every call.
+        """
+        if not self._capture_media:
+            return self._capture_request_media(engine_prompt, **kwargs)
+        return await self._run_capture_io(
+            self._capture_read_executor,
+            self._capture_request_media,
+            engine_prompt,
+            **kwargs,
+        )
 
     def _resolve_admission_prefix(self, admission: Any) -> list[int]:
         """Resolve a ``CaptureAdmission`` to the flat prefix the engine prompt starts with."""
@@ -2251,6 +2291,12 @@ class VllmAsyncGenerationWorkerImpl(
             if self._api_server_pool is not None:
                 await self._api_server_pool.command("stop")
                 self._api_server_pool.stop_children()
+            for executor in (
+                getattr(self, "_capture_read_executor", None),
+                getattr(self, "_capture_write_executor", None),
+            ):
+                if executor is not None:
+                    executor.shutdown(wait=False, cancel_futures=True)
             if self.server_thread is not None:
                 self.http_server.should_exit = True
                 await asyncio.to_thread(self.server_thread.join)
