@@ -663,7 +663,6 @@ class AdvantageComputer:
                 malformed_thinking_advantage=cfg.algo.malformed_thinking_advantage,
             )
 
-        response_advantages = torch.masked_select(advantages, mask.bool())
         metric_rows = (
             owner_batch.representative_rows if owner_batch is not None else slice(None)
         )
@@ -676,7 +675,7 @@ class AdvantageComputer:
         opd_stat_count = 0
         opd_gap_sum = 0.0
         if cfg.teacher_logprobs_required:
-            valid = response_advantages.detach().double()
+            valid = torch.masked_select(advantages, mask.bool()).detach().double()
             opd_stat_sum = float(valid.sum())
             opd_stat_sumsq = float((valid * valid).sum())
             opd_stat_count = int(valid.numel())
@@ -693,7 +692,7 @@ class AdvantageComputer:
         if not cfg.is_ppo and owner_batch is None:
             assert isinstance(cfg.algo, GRPOConfig)
             advantages = _clip_grpo_advantages(advantages, cfg.algo)
-            response_advantages = torch.masked_select(advantages, mask.bool())
+        response_advantages = torch.masked_select(advantages, mask.bool())
         advantage_partial = AdvantagePartial.from_values(response_advantages)
 
         train_data_dump_s = 0.0
