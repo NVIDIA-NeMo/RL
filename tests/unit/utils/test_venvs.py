@@ -59,6 +59,31 @@ def test_create_local_venv():
             assert "Sphinx package is installed" in result.stdout
 
 
+def test_force_rebuild_replaces_a_link_to_a_shared_venv(tmp_path: Path) -> None:
+    shared = tmp_path / "extras-vllm"
+    (shared / "bin").mkdir(parents=True)
+    (shared / "bin" / "python").touch()
+    (tmp_path / "actor.Worker").symlink_to("extras-vllm")
+
+    def fake_run(cmd: list[str], **kwargs: Any) -> None:
+        if cmd[:2] == ["uv", "venv"]:
+            os.makedirs(cmd[-1], exist_ok=True)
+
+    with (
+        patch.dict(os.environ, {"NEMO_RL_VENV_DIR": str(tmp_path)}),
+        patch.object(venv_module.subprocess, "run", side_effect=fake_run),
+    ):
+        create_local_venv.__wrapped__(
+            py_executable="uv run --extra vllm",
+            venv_name="actor.Worker",
+            force_rebuild=True,
+        )
+
+    assert not (tmp_path / "actor.Worker").is_symlink()
+    assert (tmp_path / "actor.Worker").is_dir()
+    assert (shared / "bin" / "python").exists()
+
+
 def test_add_hf_modules_cache_to_pythonpath():
     result = add_hf_modules_cache_to_pythonpath(
         {

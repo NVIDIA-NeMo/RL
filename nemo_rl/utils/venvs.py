@@ -106,9 +106,14 @@ def create_local_venv(
     venv_path = os.path.join(NEMO_RL_VENV_DIR, venv_name)
 
     # Force rebuild if requested
-    if force_rebuild and os.path.exists(venv_path):
+    if force_rebuild and os.path.lexists(venv_path):
         logger.info(f"Force rebuilding venv at {venv_path}")
-        shutil.rmtree(venv_path)
+        if os.path.islink(venv_path):
+            # In the image, an actor's path links to a venv shared with other actors.
+            # Remove only the link so the rebuild cannot change their venv.
+            os.unlink(venv_path)
+        else:
+            shutil.rmtree(venv_path)
 
     logger.info(f"Creating new venv at {venv_path}")
 
