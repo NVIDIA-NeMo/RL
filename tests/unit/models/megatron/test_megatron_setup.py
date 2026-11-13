@@ -4453,6 +4453,49 @@ class TestSetupModelConfig:
 
         mock_ac.assert_called_once_with("test-model", trust_remote_code=True)
 
+    @pytest.mark.parametrize("fmt", [None, "megatron_bridge"])
+    def test_loaded_provider_discards_runtime_callbacks(
+        self, tmp_path: Path, request: pytest.FixtureRequest, fmt: str | None
+    ) -> None:
+        from nemo_rl.models.megatron.setup import setup_model_config
+
+        self._apply_patches(request)
+        iteration = tmp_path if fmt else tmp_path / "iter_0000000"
+        iteration.mkdir(exist_ok=True)
+        (iteration / "run_config.yaml").touch()
+        model_cfg = self._make_model_cfg_mock()
+        callback = MagicMock()
+        model_cfg.no_sync_func = callback
+        model_cfg.grad_sync_func = [callback]
+        model_cfg.param_sync_func = callback
+        model_cfg.finalize_model_grads_func = callback
+        model_cfg.grad_scale_func = callback
+        model_cfg.hidden_size = 4096
+        config = {
+            "pretrained_checkpoint": {"format": fmt, "path": str(tmp_path)}
+            if fmt
+            else None,
+            "megatron_cfg": {},
+        }
+        with patch(
+            "nemo_rl.models.megatron.setup.load_model_config",
+            return_value=(model_cfg, None),
+        ):
+            setup_model_config(
+                config,
+                rank=0,
+                dtype=torch.bfloat16,
+                hf_model_name="test-model",
+                pretrained_path=str(tmp_path),
+            )
+        assert model_cfg.no_sync_func is None
+        assert model_cfg.grad_sync_func is None
+        assert model_cfg.param_sync_func is None
+        assert model_cfg.finalize_model_grads_func is None
+        assert model_cfg.grad_scale_func is None
+        assert model_cfg.hidden_size == 4096
+        callback.assert_not_called()
+
     def test_megatron_bridge_with_hf_config_overrides_warns(self, tmp_path, request):
         """hf_config_overrides set with megatron_bridge format must emit a UserWarning."""
         from nemo_rl.models.megatron.setup import setup_model_config

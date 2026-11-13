@@ -1089,6 +1089,14 @@ def setup_model_config(
             )
             raise
 
+        # Saved callbacks belong to the checkpoint's model and optimizer instances.
+        # Finalization binds these hooks to the newly constructed runtime objects.
+        model_cfg.no_sync_func = None
+        model_cfg.grad_sync_func = None
+        model_cfg.param_sync_func = None
+        model_cfg.finalize_model_grads_func = None
+        model_cfg.grad_scale_func = None
+
     # Construct the final provider with model-only overrides before applying
     # NeMo-RL's first-class Megatron settings. Conflicts are rejected so the
     # provider and the user-facing config cannot disagree about the same field.
