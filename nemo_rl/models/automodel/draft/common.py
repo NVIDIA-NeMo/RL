@@ -13,7 +13,7 @@
 # limitations under the License.
 #
 # Extends nemo_automodel.components.speculative.dspark.common (3rdparty
-# Automodel r0.6.0). Unchanged helpers are re-exported from there; only the
+# Automodel). Unchanged helpers are re-exported from there; only the
 # RL-co-training deltas live here:
 # - DSparkForwardOutput: adds ``first_supervised_slot`` for the dflash
 #   bonus-anchor layout (slot 0 carries no loss).

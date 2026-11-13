@@ -190,7 +190,7 @@ term and captures already-computed intermediate policy tensors along the way.
 ### Automodel Reuse Boundary
 
 `nemo_rl/models/automodel/draft/` is a thin extension layer over
-`nemo_automodel.components.speculative.*` (Automodel r0.6.0). Attention masks
+`nemo_automodel.components.speculative.*`. Attention masks
 and the unchanged helpers are imported from there; the DSpark/DFlash model and
 loss are local copies whose RL deltas are listed in each file's header, and
 EAGLE3's per-position KL, loss mask and accuracy counting follow speculators'

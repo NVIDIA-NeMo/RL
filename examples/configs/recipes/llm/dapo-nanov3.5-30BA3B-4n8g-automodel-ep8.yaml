@@ -72,7 +72,7 @@ policy:
         attn: te
         linear: te
         rms_norm: torch_fp32
-        experts: gmm
+        experts: torch_mm
         dispatcher: hybridep
         rope_fusion: false
         enable_hf_state_dict_adapter: true
