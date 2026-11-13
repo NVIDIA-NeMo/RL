@@ -314,18 +314,6 @@ def reject_outdated_rollout_recovery_granularity(config: dict[str, Any]) -> None
     raise ValueError(message)
 
 
-def reject_outdated_value_dedicated(config: dict[str, Any]) -> None:
-    """Reject the former value.resources.dedicated setting."""
-    value_config = config.get("value")
-    if not isinstance(value_config, dict):
-        return
-    resources = value_config.get("resources")
-    if isinstance(resources, dict) and "dedicated" in resources:
-        raise ValueError(
-            "value.resources.dedicated is no longer accepted; move it to value.dedicated."
-        )
-
-
 def check_outdated_config(config: dict[str, Any]) -> None:
     """Fail fast on config the code no longer accepts, naming the migration to apply.
 
@@ -337,7 +325,6 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     Args:
         config: The config as the user wrote it, resolved by OmegaConf.to_container.
     """
-    reject_outdated_value_dedicated(config)
     reject_outdated_automodel_block(config)
     reject_outdated_teacher_projection_matrix_path(config)
     reject_outdated_dataset_config(config)
