@@ -398,6 +398,15 @@ The SC path splits the async-GRPO loop across a rollout pump and a train pump th
 - `_rollout_pump`: pulls prompts from the dataloader, calls `sampler.admit`, dispatches `RolloutManager.generate_and_push`, and honours `max_inflight_prompts` as a backpressure cap.
 - `_train_pump`: for each chunk, `sampler.evict → sampler.select → _value_stage (PPO only) → policy/reference logprobs → _advantage_stage → TQPolicy backward`. Streaming PPO accumulates gradients with `begin_train_step / train_microbatches_from_meta` across chunks, then runs `finish_train_step → policy refit → _value_train_epochs (assembled or split) → dp_client.clear_samples`.
 
+#### 6. TransferQueue controller overrides (`nemo_rl/data_plane/adapters/tq_controller_patch.py`)
+
+The TransferQueue controller serves every data-plane request on one thread, so `tq.init` starts it with two overrides of the pinned TransferQueue:
+
+- `kv_retrieve_meta` reads the field mask with one `.tolist()` instead of one tensor read per field. Results are identical.
+- `FieldMeta.remove_samples` skips the nested-to-regular relabel. Stock TransferQueue re-checks every nested field's label on every clear, at a cost of O(live rows). The situation that triggers a relabel does happen in NeMo-RL, but nothing in NeMo-RL reads the label. Readers of row shapes get them from `BatchMeta.get_shapes`, which serves the same shape for every row under either label. So skipping the relabel changes no data a run sees, and a clear costs O(cleared rows).
+
+Only `nemo_rl/data_plane` may import `transfer_queue`, so no other code can read that label. `test_only_the_data_plane_imports_transfer_queue` in `tests/unit/data_plane/test_architecture_invariants.py` enforces this. `test_rows_survive_a_clear_that_stock_would_collapse` checks that rows round-trip unchanged on the `simple` and `mooncake_cpu` backends.
+
 ### Coordination Flow
 
 1. **Driver setup**: `setup_single_controller` builds the worker groups, virtual cluster, dp client, dataloader, `TQReplayBuffer`, `RolloutManager`, and weight synchronizer, and packs them into a `SingleControllerActorArgs` that the entrypoint cloudpickles into the actor.
