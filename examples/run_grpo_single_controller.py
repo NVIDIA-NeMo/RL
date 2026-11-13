@@ -79,27 +79,11 @@ def parse_args() -> tuple[argparse.Namespace, list[str]]:
 
 
 def _controller_placement() -> dict[str, Any]:
-    """Pin the controller to the dedicated Ray head when the cluster has one.
-
-    The controller's host-memory peak is set by cohort postprocessing, which is
-    fixed by the batch shape rather than by cluster size, so a node it shares
-    with GPU workers can exhaust host memory. ``ray.sub``'s
-    ``DEDICATED_RAY_HEAD=1`` reserves one compute-free node and advertises it as
-    ``ray_head``, and ``advantage_actor._placement_node_ids`` already keeps the
-    advantage pool off that node on the assumption this claim exists.
-
-    Read the live cluster rather than the env var, so a launcher that asked for a
-    head it did not get falls back instead of pinning to nothing. Claim the whole
-    unit rather than a fraction: the point is that nothing else lands here. Set
-    ``NRL_PIN_CONTROLLER_TO_HEAD=0`` to keep the reserved head but leave the
-    controller to Ray's normal scheduling.
+    """Pin the controller to ray.sub's dedicated head (the ``ray_head`` resource) when the cluster has one.
 
     Returns:
-        Keyword arguments for ``SingleControllerActor.options``, empty when the
-        cluster has no dedicated head or the pin is disabled.
+        ``SingleControllerActor.options`` kwargs; empty when there is no ``ray_head``.
     """
-    if os.environ.get("NRL_PIN_CONTROLLER_TO_HEAD", "1") != "1":
-        return {}
     if ray.cluster_resources().get("ray_head", 0) >= 1:
         return {"resources": {"ray_head": 1}}
     return {}
@@ -288,10 +272,13 @@ def _run_with_controller_liveness_watch(
 
     ping() returning is the liveness signal. A slow reply is not a freeze, so the check
     only escalates once the loop has been unresponsive for the same budget the in-actor
-    watchdog uses to call a stall.
+    watchdog uses to call a stall. A controller that never answered a ping is reported
+    as unstarted rather than stalled: an unschedulable actor and a wedged loop look the
+    same from here, but they are fixed in different places.
     """
     run_ref = sc.run.remote()
     last_pong_at = time.monotonic()
+    started = False
 
     while True:
         ready, _ = ray.wait([run_ref], timeout=watchdog_config.interval_s)
@@ -308,6 +295,12 @@ def _run_with_controller_liveness_watch(
                 flush=True,
             )
             if unresponsive_s > watchdog_config.stall_timeout_s:
+                if not started:
+                    raise RuntimeError(
+                        f"SingleController has not started after {unresponsive_s:.0f}s. "
+                        "With a dedicated Ray head it can only run there; check that "
+                        "the head has a free CPU (`ray status`)."
+                    ) from error
                 raise RuntimeError(
                     "SingleController event loop has been unresponsive for "
                     f"{unresponsive_s:.0f}s (stall_timeout_s="
@@ -315,6 +308,7 @@ def _run_with_controller_liveness_watch(
                     "on that loop and cannot report this."
                 ) from error
         else:
+            started = True
             last_pong_at = time.monotonic()
 
 

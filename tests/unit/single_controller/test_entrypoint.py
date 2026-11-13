@@ -14,8 +14,10 @@
 
 import io
 import sys
+import time
 from argparse import Namespace
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
@@ -26,6 +28,7 @@ from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
+    WatchdogConfig,
 )
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
 from nemo_rl.utils.logger import LoggerConfig
@@ -180,7 +183,6 @@ def test_cleanup_is_best_effort_and_preserves_run_error(
 def test_a_dedicated_ray_head_claims_the_whole_unit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("NRL_PIN_CONTROLLER_TO_HEAD", raising=False)
     monkeypatch.setattr(
         run_grpo_single_controller.ray,
         "cluster_resources",
@@ -190,20 +192,6 @@ def test_a_dedicated_ray_head_claims_the_whole_unit(
     assert run_grpo_single_controller._controller_placement() == {
         "resources": {"ray_head": 1}
     }
-
-
-def test_the_pin_can_be_switched_off_on_a_cluster_that_has_a_head(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The reservation and the pin are separable, which ray.sub cannot express."""
-    monkeypatch.setenv("NRL_PIN_CONTROLLER_TO_HEAD", "0")
-    monkeypatch.setattr(
-        run_grpo_single_controller.ray,
-        "cluster_resources",
-        lambda: {"ray_head": 1.0, "GPU": 8.0},
-    )
-
-    assert run_grpo_single_controller._controller_placement() == {}
 
 
 def test_no_dedicated_head_leaves_the_controller_unpinned(
@@ -227,7 +215,6 @@ def test_main_applies_the_placement_when_launching_the_controller(
     main_context: SimpleNamespace,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("NRL_PIN_CONTROLLER_TO_HEAD", raising=False)
     # Overrides the fixture's headless cluster.
     monkeypatch.setattr(
         run_grpo_single_controller.ray,
@@ -247,6 +234,62 @@ def test_main_requests_no_resource_without_a_dedicated_head(
     run_grpo_single_controller.main()
 
     main_context.actor_options.assert_called_once_with()
+
+
+def _watch_a_controller_that_never_finishes(
+    monkeypatch: pytest.MonkeyPatch, pongs: int
+) -> None:
+    """Drive the liveness watch with a run that never completes and ``pongs`` replies."""
+    remaining = pongs
+
+    def never_ready(refs: Any, timeout: float | None = None) -> tuple[list, list]:
+        # Real ray.wait blocks for the interval; without that the watch spins hot
+        # and never reaches stall_timeout_s.
+        time.sleep(timeout or 0)
+        return [], list(refs)
+
+    def ping(_ref: Any, timeout: float | None = None) -> None:
+        nonlocal remaining
+        if remaining <= 0:
+            raise TimeoutError("ping timed out")
+        remaining -= 1
+
+    monkeypatch.setattr(run_grpo_single_controller.ray, "wait", never_ready)
+    monkeypatch.setattr(run_grpo_single_controller.ray, "get", ping)
+
+
+def test_a_controller_that_never_answers_is_reported_as_unstarted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pin to a full head leaves the actor PENDING, which is not a stalled loop."""
+    _watch_a_controller_that_never_finishes(monkeypatch, pongs=0)
+    sc = SimpleNamespace(
+        run=SimpleNamespace(remote=MagicMock(return_value="run")),
+        ping=SimpleNamespace(remote=MagicMock(return_value="ping")),
+    )
+
+    with pytest.raises(RuntimeError, match="has not started") as excinfo:
+        run_grpo_single_controller._run_with_controller_liveness_watch(
+            sc, WatchdogConfig(interval_s=0.01, stall_timeout_s=0.02)
+        )
+
+    assert "the head has a free CPU" in str(excinfo.value)
+
+
+def test_a_controller_that_answered_once_is_reported_as_stalled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once it has replied it was schedulable, so a later silence is the event loop."""
+    _watch_a_controller_that_never_finishes(monkeypatch, pongs=1)
+    sc = SimpleNamespace(
+        run=SimpleNamespace(remote=MagicMock(return_value="run")),
+        ping=SimpleNamespace(remote=MagicMock(return_value="ping")),
+    )
+
+    with pytest.raises(RuntimeError, match="event loop has been unresponsive"):
+        run_grpo_single_controller._run_with_controller_liveness_watch(
+            sc, WatchdogConfig(interval_s=0.01, stall_timeout_s=0.02)
+        )
 
 
 def test_main_configures_generation_for_trained_mtp(

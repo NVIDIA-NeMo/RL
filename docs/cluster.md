@@ -157,12 +157,9 @@ sbatch ray.sub \
     or topology-constrained placement group can land on it. Use this when driver
     or head-node memory pressure is destabilizing training.
 
-    The head also advertises a `ray_head: 1` resource. Under single-controller
-    GRPO the controller claims that whole unit, so it runs alongside the control
-    plane rather than beside GPU workers, and the advantage actors keep off the
-    node. Without `DEDICATED_RAY_HEAD=1` there is no such resource and the
-    controller is scheduled normally. Set `NRL_PIN_CONTROLLER_TO_HEAD=0` to keep
-    the reserved head but leave the controller to Ray's normal scheduling.
+    The head also advertises a `ray_head: 1` resource. Single-controller GRPO and
+    PPO runs (`examples/run_grpo_single_controller.py`) place the controller
+    there, next to the control plane instead of beside GPU workers.
 
     **You must shrink the driver's node count yourself.** `ray.sub` cannot see
     inside your `COMMAND`, so it only prints the effective GPU-node count. With
