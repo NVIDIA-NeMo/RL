@@ -140,6 +140,7 @@ from nemo_rl.algorithms.single_controller_utils.debug_writer import (
 )
 from nemo_rl.algorithms.single_controller_utils.logical_advantage import (
     has_logical_owners,
+    rollout_loss_step_metrics,
 )
 from nemo_rl.algorithms.single_controller_utils.setup import (
     SingleControllerActorArgs,
@@ -815,6 +816,7 @@ class SingleControllerActor:
             "sequence_lengths": [],
             "seq_logprob_error_metrics": [],
             "sample_mask_metrics": [],
+            "rollout_loss_counts": [],
             **{key: [] for key in VIOLATION_TAG_KEYS},
         }
         self._opd_gap_sum = 0.0
@@ -3331,8 +3333,19 @@ class SingleControllerActor:
                     }
                 )
                 step_metrics.update(
-                    reduce_advantage_pump_metrics(**self._step_log_dict)
+                    reduce_advantage_pump_metrics(
+                        **{
+                            key: values
+                            for key, values in self._step_log_dict.items()
+                            if key != "rollout_loss_counts"
+                        }
+                    )
                 )
+                rollout_loss_counts = self._step_log_dict.get("rollout_loss_counts")
+                if rollout_loss_counts:
+                    # Rollout weights turn the workers' token and row masses
+                    # into the rollout count and a weight sum; report counts.
+                    step_metrics.update(rollout_loss_step_metrics(rollout_loss_counts))
                 per_group_rollout_metrics: dict[str, list[Any]] = {}
                 for group_metrics in selected_rollout_metrics:
                     for metric_name, value in group_metrics.items():
@@ -5196,6 +5209,10 @@ class SingleControllerActor:
             )
         if outcome.train_data_dump_receipt is not None:
             self._train_data_dump_receipts.append(outcome.train_data_dump_receipt)
+        if outcome.rollout_loss_counts is not None:
+            self._step_log_dict.setdefault("rollout_loss_counts", []).append(
+                outcome.rollout_loss_counts
+            )
 
     # ── utility helpers ────────────────────────────────────────────────────
     def _retune_lookahead_versions(self) -> None:
