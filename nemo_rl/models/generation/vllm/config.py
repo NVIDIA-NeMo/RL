@@ -25,7 +25,7 @@ from pydantic import (
     PositiveInt,
 )
 
-from nemo_rl.models.generation.dynamo.config import DynamoCfg
+from nemo_rl.models.generation.dynamo.config import DynamoCfg, dynamo_enabled
 from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     get_num_routed_experts,
@@ -118,6 +118,10 @@ class VllmSpecificArgs(TypedDict):
     # Keeps refit and other control calls responsive. Requires async_engine: true.
     # None (default) disables it.
     output_loop_yield_budget_ms: NotRequired[float | None]
+    # Serve each engine's HTTP requests from this many CPU-only actors on its node,
+    # outside the actor that refits. Requires async_engine: true and
+    # expose_http_server: true. 0 (default) serves from the engine's own actor.
+    num_frontend_workers: NotRequired[int]
     # Sampling cadence for the optional vLLM metrics logger.
     vllm_metrics_logger_interval: NotRequired[float]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
@@ -348,11 +352,50 @@ def validate_vllm_quantization_config(config: VllmConfig) -> None:
         )
 
 
+def vllm_num_frontend_workers(config: VllmConfig) -> int:
+    """CPU frontends per engine; 0 serves HTTP from the engine's own actor."""
+    return (config.get("vllm_cfg") or {}).get("num_frontend_workers") or 0
+
+
+def _validate_vllm_frontend_settings(config: VllmConfig) -> None:
+    """Reject settings that vllm_cfg.num_frontend_workers does not support."""
+    vllm_cfg = config["vllm_cfg"]
+    count = vllm_cfg.get("num_frontend_workers")
+    if not count:
+        return
+    key = "policy.generation.vllm_cfg.num_frontend_workers"
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise ValueError(f"{key} must be a non-negative integer, got {count!r}.")
+    if not (vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")):
+        raise ValueError(
+            f"{key} requires async_engine: true and expose_http_server: true."
+        )
+    # Each of these needs the engine actor's own server or worker class.
+    refit_transport = config.get("refit_transport")
+    unsupported = [
+        name
+        for name, enabled in {
+            "dynamo": dynamo_enabled(config),
+            f"refit_transport={refit_transport}": (
+                refit_transport in VLLM_SPARSE_REFIT_TRANSPORTS
+            ),
+            "quant_cfg": config.get("quant_cfg") is not None,
+            "worker_extension_cls_fqn": (
+                config.get("worker_extension_cls_fqn") is not None
+            ),
+        }.items()
+        if enabled
+    ]
+    if unsupported:
+        raise ValueError(f"{key} is not supported with: {', '.join(unsupported)}.")
+
+
 def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
     """Reject async-actor options that would otherwise be silently ignored."""
     vllm_cfg = config.get("vllm_cfg")
     if vllm_cfg is None:
         return
+    _validate_vllm_frontend_settings(config)
     if vllm_cfg.get("flat_logprobs") and not (
         vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
     ):

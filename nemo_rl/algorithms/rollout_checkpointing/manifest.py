@@ -72,6 +72,7 @@ _BOOTSTRAP_FINGERPRINT_EXCLUDED_PATHS = frozenset(
         "policy.generation.vllm_cfg.env_vars",
         "policy.generation.vllm_cfg.http_refit_api_key_env_var",
         "policy.generation.vllm_cfg.http_refit_server_port",
+        "policy.generation.vllm_cfg.num_frontend_workers",
         "policy.generation.vllm_cfg.zmq_refit_server_port",
         "policy.optimizer",
         "policy.scheduler",

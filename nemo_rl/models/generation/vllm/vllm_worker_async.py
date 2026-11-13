@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import contextlib
 import contextvars
 import copy
 import functools
@@ -39,6 +40,7 @@ import uvicorn
 from packaging.version import Version
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from nemo_rl.data.captured_media import (
     CapturedMedia,
@@ -96,13 +98,23 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
-from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
+from nemo_rl.models.generation.vllm.config import (
+    VllmConfig,
+    parse_nvfp4_pertoken_rollout,
+    vllm_num_frontend_workers,
+)
+from nemo_rl.models.generation.vllm.patches import (
+    extra_engine_client_addresses,
+    install_output_loop_yield,
+)
 from nemo_rl.models.generation.rollout_result import RolloutResult
 from nemo_rl.models.generation.vllm.request_pipeline import (
     rollout_output,
     rollout_result,
 )
 from nemo_rl.models.generation.vllm.utils import (
+    GAUGES_CHANGED_AT_KEY,
+    LOGGER_GAUGE_KEYS,
     attach_routed_experts_to_chat_response_choices,
     attach_token_information_to_chat_response_choices,
     attach_sampler_topk_logprobs_to_chat_response_choices,
@@ -177,6 +189,20 @@ def install_http_server_api_key_check(app: FastAPI, api_key: str) -> None:
 
 
 from nemo_rl.distributed.refit_watchdog import RefitAborted, is_refit_abort
+
+# Set by the engine's actor while it loads the model; its frontends need the same.
+_FRONTEND_ENV_VARS = ("VLLM_USE_V1", "VLLM_ALLOW_INSECURE_SERIALIZATION")
+# vLLM's ready timeout suits a model load; a frontend's engine core is already up.
+_FRONTEND_ENGINE_READY_TIMEOUT_S = 120
+_FRONTEND_CONNECT_TIMEOUT_S = 600.0
+# Leaves the engine's actor time for its own cleanup within the worker group's limit.
+_FRONTEND_SHUTDOWN_TIMEOUT_S = 10.0
+
+
+def _last_line(error: BaseException) -> str:
+    """The message of an error raised in another actor, without its traceback."""
+    lines = str(error).strip().splitlines()
+    return lines[-1] if lines else type(error).__name__
 
 
 class _AsyncLLMHTTPClient:
@@ -353,6 +379,12 @@ class VllmAsyncGenerationWorkerImpl(
     VllmAsyncCheckpointEngineRpcMixin,
     BaseVllmGenerationWorker,
 ):
+    # CPU actors serving this engine's HTTP (vllm_cfg.num_frontend_workers) and
+    # their client addresses. Class defaults cover workers built without __init__.
+    _num_frontends = 0
+    _frontends: Sequence[Any] = ()
+    _frontend_client_addresses: Sequence[dict[str, str]] = ()
+
     def __init__(
         self,
         config,
@@ -394,6 +426,8 @@ class VllmAsyncGenerationWorkerImpl(
         self._http_engine_client = None
         # The task serving this engine through Dynamo, when it is registered.
         self._dynamo_endpoint_task: Optional[asyncio.Task] = None
+        if bundle_indices is not None:
+            self._num_frontends = vllm_num_frontend_workers(config)
 
         self._init_token_capture_state()
 
@@ -406,13 +440,17 @@ class VllmAsyncGenerationWorkerImpl(
             defer_model_load,
         )
 
+        if self._num_frontends:
+            # Created now so their reserved URLs are known before a deferred load.
+            self._create_frontends()
+
         if not self.is_model_owner or not defer_model_load:
             return
 
         self._deferred_bundle_indices = bundle_indices
         self._deferred_seed = seed
 
-        if self.cfg["vllm_cfg"].get("expose_http_server"):
+        if self.cfg["vllm_cfg"].get("expose_http_server") and not self._num_frontends:
             self._reserve_port()
 
         self.llm = None
@@ -573,28 +611,28 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
-        self.llm = AsyncLLM.from_engine_args(
-            self.llm_async_engine_args, stat_loggers=self.stat_loggers
+        extra_clients = (
+            extra_engine_client_addresses(self._num_frontends)
+            if self._num_frontends
+            else contextlib.nullcontext([])
         )
-        # Keep vLLM's output loops from monopolizing this actor's event loop under a
-        # generation backlog (see install_output_loop_yield).
-        output_loop_yield_budget_ms = self.cfg["vllm_cfg"].get(
-            "output_loop_yield_budget_ms"
-        )
-        if output_loop_yield_budget_ms is not None:
-            from nemo_rl.models.generation.vllm.patches import (
-                install_output_loop_yield,
+        with extra_clients as self._frontend_client_addresses:
+            self.llm = AsyncLLM.from_engine_args(
+                self.llm_async_engine_args, stat_loggers=self.stat_loggers
             )
-
-            install_output_loop_yield(
-                self.llm, reader_budget_s=output_loop_yield_budget_ms / 1000
-            )
+        self._install_output_loop_yield()
 
         # vLLM Metrics Logger
         # Metrics logger only enabled for per-actor, model-owner only
         self._vllm_metrics_lock = threading.Lock()
         if self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False):
             self._start_vllm_metrics_logger()
+
+    def _install_output_loop_yield(self) -> None:
+        """Bound how long vLLM's output loops hold this actor's event loop, if set."""
+        budget_ms = self.cfg["vllm_cfg"].get("output_loop_yield_budget_ms")
+        if budget_ms is not None:
+            install_output_loop_yield(self.llm, reader_budget_s=budget_ms / 1000)
 
     def _start_vllm_metrics_logger(self) -> None:
         """Start a background thread that periodically collects vLLM logger metrics.
@@ -743,15 +781,101 @@ class VllmAsyncGenerationWorkerImpl(
         if self._sparse_refit_receiver is not None:
             hostnames = await self.llm.collective_rpc("report_node_hostname", args=())
             self._sparse_refit_receiver.set_worker_hostnames(hostnames)
-        if self.llm is not None and self.cfg["vllm_cfg"].get("expose_http_server"):
-            self._http_engine_client = _AsyncLLMHTTPClient(
-                self.llm,
-                self._engine_loop,
-                flat_logprobs=bool(self.cfg["vllm_cfg"].get("flat_logprobs")),
+        if self._frontends:
+            await self._connect_frontends()
+        elif self.llm is not None and self.cfg["vllm_cfg"].get("expose_http_server"):
+            self._start_http_server()
+
+    def _start_http_server(self) -> None:
+        """Serve this actor's AsyncLLM over HTTP."""
+        self._http_engine_client = _AsyncLLMHTTPClient(
+            self.llm,
+            self._engine_loop,
+            flat_logprobs=bool(self.cfg["vllm_cfg"].get("flat_logprobs")),
+        )
+        self.server_thread, self.base_url, self.http_server = self._setup_vllm_server()
+
+    def _create_frontends(self) -> None:
+        """Start this engine's frontend actors on this node."""
+        frontend_cls = VllmAsyncFrontendWorker.options(
+            # Zero resources: placement groups may hold all of the node's CPUs.
+            num_cpus=0,
+            num_gpus=0,
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=ray.get_runtime_context().get_node_id(), soft=False
+            ),
+            # Env vars are inherited; the interpreter is pinned to this actor's venv.
+            runtime_env={"py_executable": self.py_executable},
+        )
+        self._frontends = [
+            frontend_cls.remote(self.cfg, extra_env_vars=self._extra_env_vars)
+            for _ in range(self._num_frontends)
+        ]
+
+    async def _connect_frontends(self) -> None:
+        """Attach every frontend to the engine core and start its HTTP server."""
+        text_only = (self.cfg.get("vllm_kwargs") or {}).get("language_model_only")
+        if self.llm.model_config.multimodal_config is not None and not text_only:
+            raise RuntimeError(
+                "vllm_cfg.num_frontend_workers does not support multimodal inputs; "
+                "set vllm_kwargs.language_model_only=true"
             )
-            self.server_thread, self.base_url, self.http_server = (
-                self._setup_vllm_server()
+        addresses = self._frontend_client_addresses
+        env = {k: os.environ[k] for k in _FRONTEND_ENV_VARS if k in os.environ}
+        connects = [
+            asyncio.ensure_future(
+                frontend.connect.remote(
+                    vllm_config=self.llm.vllm_config,
+                    engine_args=self.llm_async_engine_args,
+                    routed_experts_dtype=self.routed_experts_dtype,
+                    client_addresses=address,
+                    client_count=len(addresses) + 1,
+                    client_index=index,
+                    env=env,
+                )
             )
+            for index, (frontend, address) in enumerate(
+                zip(self._frontends, addresses, strict=True), start=1
+            )
+        ]
+        await asyncio.wait(connects, timeout=_FRONTEND_CONNECT_TIMEOUT_S)
+        problems, cause = [], None
+        for index, (connect, address) in enumerate(zip(connects, addresses), start=1):
+            where = f"client {index} on {address['input_address']}"
+            if not connect.done():
+                connect.cancel()
+                problems.append(
+                    f"{where}: no answer in {_FRONTEND_CONNECT_TIMEOUT_S:.0f} s"
+                )
+            elif (error := connect.exception()) is not None:
+                cause = cause or error
+                problems.append(f"{where}: {_last_line(error)}")
+        if problems:
+            raise RuntimeError(
+                f"vLLM engine on {_get_node_ip_local()} (pid {os.getpid()}) could not "
+                f"connect its frontends: {'; '.join(problems)}"
+            ) from cause
+        urls = [c.result() for c in connects]
+        print(f"vLLM engine serves through {len(urls)} frontend(s): {urls}", flush=True)
+
+    async def report_frontends(self) -> list[Any]:
+        """This engine's frontend actors, in client-index order."""
+        return list(self._frontends)
+
+    async def _shutdown_frontends(self) -> None:
+        frontends, self._frontends = self._frontends, []
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *[frontend.shutdown.remote() for frontend in frontends],
+                    return_exceptions=True,
+                ),
+                timeout=_FRONTEND_SHUTDOWN_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            print("vLLM frontends did not shut down in time; killing them", flush=True)
+        for frontend in frontends:
+            ray.kill(frontend)
 
     async def start_dynamo_endpoint_async(
         self, *, namespace: str, engine_env: dict[str, str], leader_worker_idx: int
@@ -3053,6 +3177,9 @@ class VllmAsyncGenerationWorkerImpl(
             prefix_recovery = getattr(self, "_prefix_recovery", None)
             if prefix_recovery is not None:
                 prefix_recovery.shutdown()
+            if self._frontends:
+                # Before the engine goes: their clients are attached to it.
+                await self._shutdown_frontends()
             if self.server_thread is not None:
                 self.http_server.should_exit = True
                 await asyncio.to_thread(self.server_thread.join)
@@ -3094,8 +3221,131 @@ class VllmAsyncGenerationWorkerImpl(
                 pass
 
 
+class VllmAsyncFrontendWorkerImpl(VllmAsyncGenerationWorkerImpl):
+    """CPU-only OpenAI server on its own client of another actor's engine core."""
+
+    def __init__(
+        self, config: VllmConfig, extra_env_vars: Optional[list[str]] = None
+    ) -> None:
+        self._last_logger_gauges: tuple[Any, ...] | None = None
+        self._logger_gauges_changed_at = 0.0
+        super().__init__(config, bundle_indices=None, extra_env_vars=extra_env_vars)
+        # Token capture and the metrics logger only run on a model owner.
+        self.is_model_owner = True
+        self._reserve_port()
+
+    def load_model(self) -> None:
+        raise RuntimeError("a frontend loads no model; its engine calls connect()")
+
+    async def connect(
+        self,
+        *,
+        vllm_config: Any,
+        engine_args: Any,
+        routed_experts_dtype: Any,
+        client_addresses: dict[str, str],
+        client_count: int,
+        client_index: int,
+        env: dict[str, str],
+    ) -> Optional[str]:
+        """Attach to the engine core its owner launched and serve HTTP.
+
+        Args:
+            vllm_config: The owner's vLLM config.
+            engine_args: The owner's AsyncEngineArgs.
+            routed_experts_dtype: The owner's routed-experts dtype.
+            client_addresses: This client's input and output address.
+            client_count: The engine core's clients, the owner included.
+            client_index: This client's index; the owner is 0.
+            env: Environment the owner set while loading the model.
+
+        Returns:
+            The HTTP server's base URL.
+        """
+        os.environ.update(env)
+
+        from vllm.v1.engine import core_client
+        from vllm.v1.engine.async_llm import AsyncLLM
+        from vllm.v1.metrics.loggers import PrometheusStatLogger
+
+        self._engine_loop = asyncio.get_running_loop()
+        self.llm_async_engine_args = engine_args
+        self.routed_experts_dtype = routed_experts_dtype
+        metrics_logger = self.cfg["vllm_cfg"].get("enable_vllm_metrics_logger", False)
+        self.stat_loggers = [PrometheusStatLogger] if metrics_logger else []
+        # The ready message adds the engine's KV blocks to the owner's count again.
+        vllm_config.cache_config.num_gpu_blocks = None
+        # vLLM read this timeout from the environment on import.
+        core_client.VLLM_ENGINE_READY_TIMEOUT_S = _FRONTEND_ENGINE_READY_TIMEOUT_S
+        # With client_addresses, AsyncLLM attaches to the running engine core.
+        try:
+            self.llm = AsyncLLM.from_vllm_config(
+                vllm_config,
+                stat_loggers=self.stat_loggers,
+                enable_log_requests=engine_args.enable_log_requests,
+                disable_log_stats=engine_args.disable_log_stats,
+                client_addresses=client_addresses,
+                client_count=client_count,
+                client_index=client_index,
+            )
+        except TimeoutError as error:
+            raise RuntimeError(
+                f"frontend {client_index} got no ready message from its engine core "
+                f"in {_FRONTEND_ENGINE_READY_TIMEOUT_S} s on "
+                f"{client_addresses['input_address']}"
+            ) from error
+        self._install_output_loop_yield()
+        self._vllm_metrics_lock = threading.Lock()
+        if metrics_logger:
+            self._start_vllm_metrics_logger()
+        self._start_http_server()
+        return self.base_url
+
+    def _with_gauge_freshness(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Stamp when the gauges last changed; merged reports keep the freshest."""
+        if not payload:
+            return payload
+        latest = tuple((payload[key] or [None])[-1] for key in LOGGER_GAUGE_KEYS)
+        if latest != self._last_logger_gauges:
+            self._last_logger_gauges = latest
+            self._logger_gauges_changed_at = time.time()
+        payload[GAUGES_CHANGED_AT_KEY] = self._logger_gauges_changed_at
+        return payload
+
+    def get_vllm_logger_metrics(self) -> dict[str, Any]:
+        return self._with_gauge_freshness(super().get_vllm_logger_metrics())
+
+    def drain_latest_vllm_logger_metrics(self) -> dict[str, Any]:
+        return self._with_gauge_freshness(super().drain_latest_vllm_logger_metrics())
+
+    async def shutdown(self) -> bool:
+        """Stop serving and close this client; the engine core is its owner's."""
+        try:
+            if self.server_thread is not None:
+                self.http_server.should_exit = True
+                await asyncio.to_thread(self.server_thread.join)
+                self.server_thread = None
+            if self.llm is not None:
+                self.llm.shutdown()
+                self.llm = None
+            return True
+        except Exception as e:
+            print(f"Error during vLLM frontend shutdown: {e}")
+            return False
+        finally:
+            try:
+                await asyncio.shield(asyncio.to_thread(shutdown_telemetry))
+            except asyncio.CancelledError:
+                pass
+
+
 @ray.remote(
     runtime_env={**get_nsight_config_if_pattern_matches("vllm_async_generation_worker")}
 )  # pragma: no cover
 class VllmAsyncGenerationWorker(VllmAsyncGenerationWorkerImpl):
+    pass
+
+
+@ray.remote  # pragma: no cover
+class VllmAsyncFrontendWorker(VllmAsyncFrontendWorkerImpl):
     pass

@@ -195,6 +195,7 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
                 "colocated": {"enabled": True, "resources": {"gpus": 8}},
                 "port_range_low": 3000,
                 "port_range_high": 4000,
+                "vllm_cfg": {"async_engine": True, "num_frontend_workers": 0},
             },
         },
         "data": {
@@ -231,6 +232,7 @@ def test_bootstrap_fingerprint_ignores_default_operational_paths() -> None:
                 "colocated": {"enabled": False, "resources": {"gpus": 16}},
                 "port_range_low": 5000,
                 "port_range_high": 6000,
+                "vllm_cfg": {"async_engine": True, "num_frontend_workers": 4},
             },
         },
         "data": {**base["data"], "num_workers": 16},

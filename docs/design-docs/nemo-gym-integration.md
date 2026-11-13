@@ -66,6 +66,18 @@ covers the vLLM backend only: the Megatron, TRT-LLM and Dynamo exposed servers
 check no credential and their Gym actors keep `dummy_key` (Dynamo rejects the
 setting at configuration time rather than ignoring it).
 
+By default each vLLM engine's HTTP server runs in the actor that owns the
+engine, where request handling and per-token work share one Python process with
+weight refit. Set `policy.generation.vllm_cfg.num_frontend_workers: N` (with
+`async_engine: true` and `expose_http_server: true`) to serve each engine from
+`N` CPU-only actors on its node instead. Each attaches to the engine core as its
+own client, so `dp_openai_server_base_urls` carries `N` URLs per engine and
+NeMo Gym spreads its sessions over them. Frontends support text token capture;
+multimodal inputs, media capture, generation-prefix cuts, capture on
+`data_plane.backend: mooncake_cpu`, `async_rl.generation_fleet_health`, Dynamo,
+the sparse refit transports, `quant_cfg` and `worker_extension_cls_fqn` are
+refused at startup.
+
 For complete examples, see `examples/nemo_gym/run_grpo_nemo_gym.py`, `examples/nemo_gym/run_distillation_nemo_gym.py`, and their associated configs under `examples/nemo_gym/`.
 
 ### Dataset formats and routing
