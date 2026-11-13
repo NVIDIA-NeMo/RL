@@ -45,6 +45,12 @@ class MultiAPIServerPool:
         self.engine_manager: Any = None
         self.coordinator: Any = None
         self._command_lock = asyncio.Lock()
+        self._failure: BaseException | None = None
+
+    def raise_if_unavailable(self) -> None:
+        """Reject operations after the first failure."""
+        if self._failure is not None:
+            raise RuntimeError(f"HTTP API pool failed: {self._failure}") from self._failure
 
     def create_engine(self, engine_args: Any, stat_loggers: list[Any]) -> Any:
         """Launch one shared engine and attach its frontend clients.
@@ -162,7 +168,9 @@ class MultiAPIServerPool:
                 self.receive_reply(connection)
             print(f"NRL HTTP API pool ready: {self.count} processes, one engine")
             return engine
-        except BaseException:
+        except BaseException as error:
+            if self._failure is None:
+                self._failure = error
             self.stop_children()
             self.close_engines()
             if parent_result.done() and parent_result.exception() is None:
@@ -183,6 +191,8 @@ class MultiAPIServerPool:
             Reply payloads in child frontend order.
         """
         async with self._command_lock:
+            if name != "stop":
+                self.raise_if_unavailable()
             try:
                 for process, connection in zip(
                     self.children, self.connections, strict=True
@@ -197,7 +207,9 @@ class MultiAPIServerPool:
                     )
                 )
                 return list(replies)
-            except BaseException:
+            except BaseException as error:
+                if self._failure is None:
+                    self._failure = error
                 self.stop_children()
                 self.close_engines()
                 raise
