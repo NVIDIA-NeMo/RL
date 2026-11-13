@@ -158,12 +158,12 @@ Startup rejects these with `dynamo: true`:
   and a restarted shard does not register with it yet.
 - `async_rl.generation_router`: the frontend already routes the fleet behind one
   URL.
-- `extra_body.bad_words` on the policy model
+- `bad_words` in `extra_body` or `sampling_overrides` on the policy model
   (`env.nemo_gym.policy_model.responses_api_models.vllm_model`): the frontend
   answers every request carrying it with HTTP 400. Startup checks only this
   overlay, not Gym's own YAMLs.
-- `extra_body` `stop_token_ids`, `allowed_token_ids`, `bad_words_token_ids`,
-  `cache_salt`, `logprob_token_ids` or `detokenize` on the policy model: the
+- `stop_token_ids`, `allowed_token_ids`, `bad_words_token_ids`, `cache_salt`,
+  `logprob_token_ids` or `detokenize` in either block on the policy model: the
   frontend accepts them but drops them before NeMo RL's chat engine sees them.
 - `vllm_cfg.skip_tokenizer_init: true` with NeMo-Gym: the engine detokenizes
   the replies Gym's calls get through the frontend.
