@@ -1429,6 +1429,9 @@ def _setup_fake_vllm_app(
     worker._prefix_recovery = NoPrefixRecovery()
     worker._capture_top_logprobs = 0
     worker._cut_routes_dtype = None
+    worker._capture_media = False
+    worker._capture_read_executor = ThreadPoolExecutor(max_workers=1)
+    worker._capture_write_executor = ThreadPoolExecutor(max_workers=1)
     worker.token_capture = None
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
@@ -2114,10 +2117,27 @@ async def test_chat_completion_cancelled_on_client_disconnect(monkeypatch, logpr
         await asyncio.gather(task, return_exceptions=True)
 
 
+def test_capture_io_without_pools_runs_on_the_default_executor() -> None:
+    """A worker built without _init_token_capture_state still runs capture I/O."""
+    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
+
+    async def run() -> tuple[int, str]:
+        return await worker._run_capture_io(
+            worker._capture_read_executor,
+            lambda a, b: (a + b, threading.current_thread().name),
+            1,
+            2,
+        )
+
+    total, thread_name = asyncio.run(run())
+    assert total == 3
+    assert not thread_name.startswith("nrl-capture-")
+
+
 def test_chat_disconnect_releases_capture_queued_for_finalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A disconnect releases capture when the executor has not started staging."""
+    """A disconnect releases capture when the write pool has not started staging."""
     worker, serving_chat, chat_handler = _setup_fake_vllm_chat_handler(monkeypatch)
     response_type = sys.modules[
         "vllm.entrypoints.openai.chat_completion.protocol"
@@ -2135,9 +2155,7 @@ def test_chat_disconnect_releases_capture_queued_for_finalization(
     token_capture, call = _track_request_capture(worker, request)
 
     async def exercise() -> None:
-        # Use a separate loop so its executor cannot affect other async tests.
         loop = asyncio.get_running_loop()
-        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
         busy = asyncio.Event()
         release = threading.Event()
 
@@ -2145,13 +2163,13 @@ def test_chat_disconnect_releases_capture_queued_for_finalization(
             loop.call_soon_threadsafe(busy.set)
             release.wait()
 
-        blocker = loop.run_in_executor(None, occupy_executor)
+        blocker = loop.run_in_executor(worker._capture_write_executor, occupy_executor)
         task = None
         try:
             await asyncio.wait_for(busy.wait(), 5)
             task = asyncio.create_task(chat_handler(request, MagicMock()))
             # The serving stub completes synchronously; the handler's first
-            # suspension queues real asyncio.to_thread work behind the blocker.
+            # suspension queues the staging write behind the blocker.
             await asyncio.sleep(0)
             serving_chat.create_chat_completion.assert_awaited_once()
             assert not task.done()
