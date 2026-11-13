@@ -104,13 +104,13 @@ run_quant_rollout_case() {
 
     assert_grep "VllmQuantInternalWorkerExtension" "$run_log"
     if [[ "$real_quant" == "true" ]]; then
-        assert_grep "Detected ModelOpt NVFP4 checkpoint" "$run_log"
+        assert_grep "quantization=nemo_modelopt_" "$run_log"
         assert_not_grep "FakeQuantWorker" "$run_log"
         assert_not_grep "VLLM_QUANT_CFG" "$run_log"
     else
         assert_grep "FakeQuantWorker" "$run_log"
         assert_grep "VllmQuantGenerationWorker.*Inserted [1-9][0-9]* quantizers" "$run_log"
-        assert_not_grep "Detected ModelOpt NVFP4 checkpoint" "$run_log"
+        assert_not_grep "quantization=nemo_modelopt_" "$run_log"
     fi
 }
 
