@@ -4530,6 +4530,7 @@ def test_train_pump_flushes_every_writer_before_publishing(
         events.append(name)
 
     ctrl._train_data_dump = MagicMock()
+    ctrl._train_data_dump_receipts = []
     ctrl._train_data_dump.finish_step.side_effect = lambda *_: events.append("publish")
     if pooled:
         ctrl._advantage_actors = [
