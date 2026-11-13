@@ -1992,13 +1992,11 @@ class RolloutRecoveryLedger:
                 reward = attempt_state.get("reward")
                 mask_sample = attempt_state.get("mask_sample")
                 raw_checks = attempt_state.get("reward_checks")
-                if raw_checks is not None and (
-                    not isinstance(raw_checks, dict)
-                    or set(raw_checks)
-                    != {"duplicated_reasoning", "empty_final_answer", "low_effort"}
-                ):
-                    raise ValueError("invalid reward_checks record")
-                checks = RewardChecks(**raw_checks) if raw_checks is not None else None
+                checks = (
+                    RewardChecks.from_state(raw_checks)
+                    if raw_checks is not None
+                    else None
+                )
                 log_context = parse_reward_log_context(
                     attempt_state.get("reward_log_context")
                 )

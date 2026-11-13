@@ -618,3 +618,95 @@ def test_final_reward_distribution_and_agent_tables_are_pooled_exactly(attributi
         "sample_id": "sample-0",
     }
     assert aggregate_capture_reward_metrics({}, []) == {}
+
+
+def test_length_penalty_reward_settings_roundtrip_and_detect_changes():
+    from nemo_rl.utils.length_penalty import LengthPenaltyConfig, LengthPenaltyParams
+
+    config = LengthPenaltyConfig(
+        default=LengthPenaltyParams(length_type="chars", total_bonus=0.2)
+    )
+    settings = CaptureRewardSettings.from_configs(
+        RewardPenaltyConfig(), None, None, config
+    )
+    restored = CaptureRewardSettings.from_state(settings.to_state())
+    assert restored == settings
+    restored.require_compatible(settings)
+    with pytest.raises(ValueError, match="grpo.length_penalty"):
+        restored.require_compatible(
+            CaptureRewardSettings.from_configs(RewardPenaltyConfig(), None, None)
+        )
+
+
+def test_length_penalty_settings_preserve_partial_agent_overrides():
+    from nemo_rl.utils.length_penalty import (
+        LengthPenaltyConfig,
+        LengthPenaltyParams,
+        prepare_length_penalty_input,
+    )
+
+    config = LengthPenaltyConfig(
+        default=LengthPenaltyParams(
+            length_type="chars", group_total_length_penalty_coeff=0.2
+        ),
+        agent_overrides={"agent": LengthPenaltyParams(total_bonus=0.1)},
+    )
+    settings = CaptureRewardSettings.from_configs(
+        RewardPenaltyConfig(), None, None, config
+    )
+    restored = CaptureRewardSettings.from_state(settings.to_state())
+    result = {
+        "full_result": {
+            "reward": 1.0,
+            "response": {"output": [{"type": "message", "content": "hello"}]},
+        },
+        "agent_ref": {"name": "agent"},
+    }
+    sample = prepare_length_penalty_input(result, result, restored.length_penalty, None)
+    assert sample.answer_length == 5
+    assert restored.length_penalty.agent_overrides["agent"].model_fields_set == {
+        "total_bonus"
+    }
+
+
+def test_length_metrics_pool_valid_rollouts_across_unequal_groups():
+    observations = [
+        FinalizedReward(f"row{i}", f"rollout{i}", reward, None)
+        for i, reward in enumerate((1.1, 0.9, 1.0))
+    ]
+    metrics = aggregate_capture_reward_metrics(
+        {
+            "finalize/length_penalty/env_reward_mean_sum": [2.0, 1.0],
+            "finalize/length_penalty/adjusted_frac_sum": [2.0, 0.0],
+        },
+        observations,
+    )
+    assert metrics["length_penalty/env_reward_mean"] == 1.0
+    assert metrics["length_penalty/adjusted_frac"] == pytest.approx(2 / 3)
+
+
+def test_checkpoint_inventory_retains_length_penalty_settings():
+    from nemo_rl.algorithms.grpo import GRPOConfig
+    from nemo_rl.algorithms.rollout_checkpointing.inventory import (
+        capture_reward_settings,
+    )
+    from nemo_rl.algorithms.single_controller_utils.config import (
+        MasterConfig,
+        TokenCaptureConfig,
+    )
+    from nemo_rl.utils.length_penalty import LengthPenaltyConfig, LengthPenaltyParams
+
+    config = LengthPenaltyConfig(
+        default=LengthPenaltyParams(length_type="chars", total_bonus=0.2)
+    )
+    master = MasterConfig.model_construct(
+        grpo=GRPOConfig(length_penalty=config),
+        ppo=None,
+        token_capture=TokenCaptureConfig(enabled=True),
+        reward_penalties=RewardPenaltyConfig(),
+        env={},
+    )
+    saved = capture_reward_settings(master)
+    assert saved.length_penalty is config
+    restored = CaptureRewardSettings.from_state(saved.to_state())
+    restored.require_compatible(saved)

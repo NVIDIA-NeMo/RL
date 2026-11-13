@@ -400,3 +400,125 @@ def test_reward_checks_remain_metadata_only_and_reach_finalizer():
     )
     actor.finalize(request)
     assert actor._finalizer.finalize_group.call_args.kwargs["reward_checks"] == [checks]
+
+
+@pytest.mark.nemo_gym
+@pytest.mark.parametrize("length_type", ["chars", "all_generated_tokens"])
+def test_length_penalty_uses_logical_owners_before_execution_padding(length_type):
+    pytest.importorskip("nemo_gym.token_id_capture.staging")
+    from nemo_gym.token_id_capture.staging.records import RolloutReceipt
+
+    from nemo_rl.data_plane.adapters.noop import NoOpDataPlaneClient
+    from nemo_rl.data_plane.tq_token_sink import TQTokenSink
+    from nemo_rl.experience.reward_penalties import RewardChecks
+    from nemo_rl.experience.rollout_reassembler import (
+        ActionOutputFlags,
+        RolloutReassembler,
+        RolloutSelection,
+    )
+    from nemo_rl.utils.length_penalty import (
+        LengthPenaltyConfig,
+        LengthPenaltyParams,
+        prepare_length_penalty_input,
+    )
+    from tests.unit.data_plane.token_capture_test_fixtures import _manifest, _record
+
+    plane = NoOpDataPlaneClient()
+    plane.register_partition("staged", [], 32, ["finalize"])
+    plane.register_partition("train", [], 16, ["train"])
+    sink = TQTokenSink(plane, staging_partition="staged")
+    receipts, selections, checks = [], [], []
+    config = LengthPenaltyConfig(
+        default=LengthPenaltyParams(
+            length_type=length_type, group_total_length_penalty_coeff=0.2
+        )
+    )
+    for owner, parents in (("first", [None, 0, 0, None]), ("second", [None])):
+        records, prefixes = [], []
+        for index, parent in enumerate(parents):
+            carry = [10, 11] if parent is None else [30 + index]
+            prefix = [] if parent is None else prefixes[parent]
+            tokens = carry + [20 + index]
+            record = _record(
+                rollout_id=owner,
+                model_call_id=f"{owner}-c{index}",
+                parent_call_id=None if parent is None else f"{owner}-c{parent}",
+                prev_len=len(prefix),
+                token_ids=tokens,
+                token_mask=[0.0] * len(carry) + [1.0],
+                logprobs=[0.0] * len(carry) + [-0.1],
+                weight_version=0,
+                parent_chain_hash=None
+                if parent is None
+                else records[parent].chain_hash,
+                cumulative_prefix=prefix,
+            )
+            records.append(record)
+            prefixes.append(prefix + tokens)
+            assert sink.stage(record).ok
+        manifest = [_manifest(record) for record in records]
+        receipts.append(
+            RolloutReceipt(
+                capture_key=owner,
+                terminal_model_call_id=records[-1].model_call_id,
+                manifest=manifest,
+                terminal_selection="declared",
+            ).model_dump()
+        )
+        selections.append(
+            RolloutSelection(
+                tuple(record.response_id for record in manifest),
+                tuple(ActionOutputFlags(False, False) for _ in records),
+            )
+        )
+        result = {
+            "agent_ref": {"name": "agent"},
+            "full_result": {
+                "reward": 1.0,
+                "response": {
+                    "output": [{"type": "message", "content": "x" * len(records)}]
+                },
+            },
+        }
+        checks.append(
+            RewardChecks(
+                False,
+                False,
+                False,
+                prepare_length_penalty_input(result, result, config, None),
+            )
+        )
+    finalized = RolloutReassembler(
+        plane,
+        partition_id="train",
+        staging_partition="staged",
+        pad_token_id=0,
+        max_seq_len=1024,
+        length_penalty_config=config,
+    ).finalize_group(
+        "group",
+        ["first", "second"],
+        receipts,
+        [1.0, 1.0],
+        mask_sample=[False, False],
+        fallback_weight_version=0,
+        prompt_idx=7,
+        canonical_sample_ids=["group_g0", "group_g1"],
+        logical_selections=selections,
+        execution_row_multiple=8,
+        reward_checks=checks,
+    )
+    assert finalized.meta.size == 8
+    assert finalized.metrics["finalize/valid_logical_owner_count"] == 2
+    assert finalized.token_metrics["gen_tokens_per_sample/histogram"] == [4, 1]
+    assert [row.reward for row in finalized.reward_observations] == pytest.approx(
+        [0.9, 1.1]
+    )
+    batch = plane.get_samples(finalized.meta.sample_ids, "train", ["total_reward"])
+    for reward, tag in zip(
+        batch["total_reward"].tolist(), finalized.meta.tags, strict=True
+    ):
+        assert reward == pytest.approx(
+            0.0 if tag["is_execution_padding"] else [0.9, 1.1][tag["logical_slot"]]
+        )
+    plane.close()

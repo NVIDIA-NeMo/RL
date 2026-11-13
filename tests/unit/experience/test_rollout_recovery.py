@@ -2305,6 +2305,8 @@ def test_reward_checks_seals_and_survives_checkpoint(granularity):
         seal(evidence)
         seal(evidence)
         for field in dataclasses.fields(evidence):
+            if field.name == "length_penalty":
+                continue
             with pytest.raises(ValueError, match="conflicting duplicate"):
                 seal(dataclasses.replace(evidence, **{field.name: False}))
     else:
@@ -2833,3 +2835,31 @@ def test_checkpoint_requires_short_step_permissions_for_new_schema() -> None:
         parse_rollout_recovery_state(state)
     state["schema_version"] = 7
     assert parse_rollout_recovery_state(state).steps_allowed_short == set()
+
+
+def test_length_penalty_metadata_survives_sealed_attempt_restore():
+    from nemo_rl.experience.reward_penalties import RewardChecks
+    from nemo_rl.utils.length_penalty import LengthPenaltyInput
+
+    ledger = _forest_sealed_ledger()
+    state = ledger.state_dict()
+    sample = LengthPenaltyInput(
+        "agent",
+        2,
+        4,
+        False,
+        False,
+        [1.0, 1.0],
+        [3.0, 5.0],
+        {"total": {"a": 3, "b": 6, "f": 0.5}},
+    )
+    evidence = RewardChecks(False, True, False, sample)
+    state["groups"][0]["siblings"][0]["attempts"][0]["reward_checks"] = (
+        dataclasses.asdict(evidence)
+    )
+    restored = RolloutRecoveryLedger.from_state_dict(state)
+    _bind(restored, "g7", _prompt())
+    assert restored.state_dict() == state
+    assert (
+        restored.get_group("g7").siblings[0].current_attempt.reward_checks == evidence
+    )

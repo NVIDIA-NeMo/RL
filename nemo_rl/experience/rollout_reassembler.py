@@ -97,6 +97,10 @@ from nemo_rl.experience.route_plan import (
     encoded_route_plan_size_bytes,
     validate_route_plan,
 )
+from nemo_rl.utils.length_penalty import (
+    LengthPenaltyConfig,
+    apply_group_length_penalties_from_inputs,
+)
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.grpo import RewardPenaltyConfig
@@ -399,6 +403,7 @@ class RolloutReassembler:
         pad_token_id: int,
         max_seq_len: int,
         reward_penalty_config: RewardPenaltyConfig | None = None,
+        length_penalty_config: LengthPenaltyConfig | None = None,
         effort_config: EffortLevelsConfig | None = None,
         router_replay_enabled: bool = False,
         defer_routed_experts_to_policy: bool = False,
@@ -409,6 +414,7 @@ class RolloutReassembler:
         top_logprobs: int = 0,
     ) -> None:
         self._reward_penalty_config = reward_penalty_config
+        self._length_penalty_config = length_penalty_config
         # Decodes generations for the malformed-think-tag string check.
         self._tokenizer = tokenizer
         self._thinking_tags = thinking_tags
@@ -947,6 +953,7 @@ class RolloutReassembler:
             )
             mask_sample = logical.mask_sample
         _rollouts_ms = (time.perf_counter() - _group_t0) * 1000.0
+        length_metrics = self._apply_length_penalty(rows, logical, checks_by_rollout)
         valid_rows = [row for row in rows if row.valid]
         staging_keys = (
             logical.staging_keys
@@ -1102,6 +1109,8 @@ class RolloutReassembler:
             for _, slot, row in reward_rows
             if row.valid
         ]
+        for name, value in length_metrics.items():
+            metrics[f"finalize/{name}_sum"] = value * len(reward_observations)
         # Truncated rollouts among the reward observations, pooled into
         # termination rates like the penalty counts; receipt-side rates only
         # saw a placeholder truncated=False.
@@ -1151,7 +1160,52 @@ class RolloutReassembler:
             loss_multiplier=loss_multiplier,
         )
         finalized.token_metrics = token_metrics
+        finalized.token_metrics.update(length_metrics)
         return finalized
+
+    def _apply_length_penalty(
+        self,
+        rows: list[FinalizedRollout],
+        logical: _LogicalRows | None,
+        checks: tuple[RewardChecks | None, ...],
+    ) -> dict[str, float]:
+        """Adjust each verified logical rollout once before publishing any rows."""
+        config = self._length_penalty_config
+        if config is None:
+            return {}
+        owner_indices: dict[int, list[int]] = {}
+        for index, row in enumerate(rows):
+            if row.valid:
+                slot = (
+                    logical.tags[index]["logical_slot"]
+                    if logical is not None
+                    else index
+                )
+                owner_indices.setdefault(slot, []).append(index)
+        if not owner_indices:
+            return {}
+        inputs, rewards, generated, bypass = [], [], [], []
+        for slot, indices in owner_indices.items():
+            evidence = checks[slot]
+            if evidence is None or evidence.length_penalty is None:
+                raise ValueError(
+                    "length penalty requires saved rollout length metadata; restart rollouts"
+                )
+            inputs.append(evidence.length_penalty)
+            rewards.append(rows[indices[0]].reward)
+            generated.append(sum(sum(rows[index].token_mask) for index in indices))
+            bypass.append(evidence.low_effort)
+        adjusted, metrics = apply_group_length_penalties_from_inputs(
+            inputs,
+            rewards,
+            generated_lengths=[int(value) for value in generated],
+            low_effort=bypass,
+            config=config,
+        )
+        for indices, reward in zip(owner_indices.values(), adjusted, strict=True):
+            for index in indices:
+                rows[index] = replace(rows[index], reward=reward)
+        return metrics
 
     def _truncated_flags(
         self, rows: Sequence[FinalizedRollout], logical: Optional[_LogicalRows]

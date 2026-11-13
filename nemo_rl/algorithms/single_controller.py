@@ -3446,6 +3446,7 @@ class SingleControllerActor:
                             (
                                 "finalize/penalty_count/",
                                 "finalize/effort/",
+                                "finalize/length_penalty/",
                                 "finalize/truncated_count",
                             )
                         )
