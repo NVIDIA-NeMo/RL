@@ -49,7 +49,7 @@ from nemo_rl.data_plane.adapters.tq_controller_checkpoint import (
     configure_controller_checkpoint,
 )
 from nemo_rl.data_plane.adapters.tq_controller_patch import assert_stock_tq_version
-from nemo_rl.data_plane.checkpoint import CheckpointCapture
+from nemo_rl.data_plane.checkpoint import CheckpointCapture, CheckpointReleaseError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -316,15 +316,20 @@ def capture_simple_checkpoint(
         timeout_s=timeout_s,
     )
     setup_finished = time.monotonic()
+    # The caller holds its mutation barrier, so a frozen actor must not stall it.
+    deadline = setup_finished + timeout_s
     try:
-        ray.get(capture.controller.nrl_capture_snapshot.remote(capture.token))
+        _wait_all(
+            [capture.controller.nrl_capture_snapshot.remote(capture.token)],
+            timeout_s=timeout_s,
+        )
         controller_finished = time.monotonic()
         refs = []
         try:
             for unit in units:
                 refs.append(unit.nrl_capture_snapshot.remote(capture.token))
         finally:
-            unit_ids = _wait_all(refs)
+            unit_ids = _wait_all(refs, timeout_s=max(0.0, deadline - time.monotonic()))
         storage_finished = time.monotonic()
         if len(set(unit_ids)) != len(units) or set(unit_ids) != set(expected_ids):
             raise RuntimeError("Captured SimpleStorage units differ from TQ manager")
@@ -350,6 +355,9 @@ def capture_simple_checkpoint(
     except BaseException:
         try:
             capture.release()
-        except Exception:
-            LOGGER.exception("Failed to release an incomplete SimpleStorage capture")
+        except Exception as error:
+            raise CheckpointReleaseError(
+                f"Cannot confirm release of SimpleStorage capture {capture.token}; "
+                "storage actors may still retain it, so stop checkpointing"
+            ) from error
         raise
