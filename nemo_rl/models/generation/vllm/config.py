@@ -118,6 +118,22 @@ class VllmSpecificArgs(TypedDict):
     # Keeps refit and other control calls responsive. Requires async_engine: true.
     # None (default) disables it.
     output_loop_yield_budget_ms: NotRequired[float | None]
+    # GIL switch interval of the async generation actor's process, in ms (Python's
+    # default is 5). vLLM's output loop holds the GIL most of the time under a large
+    # backlog, so a thread that releases it for a native call (the TransferQueue
+    # client loop, the HTTP server) can wait up to this long to get it back, once per
+    # call. 0.5 is a good value with token capture. Requires async_engine: true.
+    # None (default) keeps Python's default.
+    actor_gil_switch_interval_ms: NotRequired[float | None]
+    # After the engine starts, collect once and freeze the surviving objects out of
+    # later garbage collections, so a full collection scans only what serving
+    # allocates. Requires async_engine: true. Default false.
+    actor_gc_freeze: NotRequired[bool]
+    # gc.set_threshold for the async generation actor's process, as
+    # [gen0, gen1, gen2]. [50000, 50, 100] collects far less often than Python's
+    # defaults when many requests are in flight. Requires async_engine: true.
+    # None (default) keeps Python's defaults.
+    actor_gc_threshold: NotRequired[list[int] | None]
     # Sampling cadence for the optional vLLM metrics logger.
     vllm_metrics_logger_interval: NotRequired[float]
     # Whether to show a tqdm progress bar during generation. Defaults to vLLM's own default (True) when absent. Only applies when async_engine is False.
@@ -362,17 +378,42 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
             "and expose_http_server: true."
         )
     budget_ms = vllm_cfg.get("output_loop_yield_budget_ms")
-    if budget_ms is None:
-        return
-    if not vllm_cfg.get("async_engine"):
+    if budget_ms is not None:
+        if not vllm_cfg.get("async_engine"):
+            raise ValueError(
+                "policy.generation.vllm_cfg.output_loop_yield_budget_ms requires "
+                "async_engine: true."
+            )
+        if budget_ms <= 0:
+            raise ValueError(
+                "policy.generation.vllm_cfg.output_loop_yield_budget_ms must be "
+                f"positive (or null to disable), got {budget_ms}."
+            )
+    interval_ms = vllm_cfg.get("actor_gil_switch_interval_ms")
+    threshold = vllm_cfg.get("actor_gc_threshold")
+    for key, set_ in (
+        ("actor_gil_switch_interval_ms", interval_ms is not None),
+        ("actor_gc_freeze", bool(vllm_cfg.get("actor_gc_freeze"))),
+        ("actor_gc_threshold", threshold is not None),
+    ):
+        if set_ and not vllm_cfg.get("async_engine"):
+            raise ValueError(
+                f"policy.generation.vllm_cfg.{key} requires async_engine: true."
+            )
+    if interval_ms is not None and interval_ms <= 0:
         raise ValueError(
-            "policy.generation.vllm_cfg.output_loop_yield_budget_ms requires "
-            "async_engine: true."
+            "policy.generation.vllm_cfg.actor_gil_switch_interval_ms must be "
+            f"positive (or null for Python's default), got {interval_ms}."
         )
-    if budget_ms <= 0:
+    if threshold is not None and (
+        len(threshold) != 3
+        or any(
+            not isinstance(x, int) or isinstance(x, bool) or x < 0 for x in threshold
+        )
+    ):
         raise ValueError(
-            "policy.generation.vllm_cfg.output_loop_yield_budget_ms must be positive "
-            f"(or null to disable), got {budget_ms}."
+            "policy.generation.vllm_cfg.actor_gc_threshold must be three "
+            f"non-negative integers [gen0, gen1, gen2] (or null), got {threshold}."
         )
 
 

@@ -251,6 +251,30 @@ def test_configure_generation_config_validates_refit_prequantize() -> None:
             {"output_loop_yield_budget_ms": 0, "async_engine": True},
             "output_loop_yield_budget_ms must be positive",
         ),
+        (
+            {"actor_gil_switch_interval_ms": 0.5, "async_engine": False},
+            "actor_gil_switch_interval_ms requires async_engine",
+        ),
+        (
+            {"actor_gc_freeze": True, "async_engine": False},
+            "actor_gc_freeze requires async_engine",
+        ),
+        (
+            {"actor_gc_threshold": [50000, 50, 100], "async_engine": False},
+            "actor_gc_threshold requires async_engine",
+        ),
+        (
+            {"actor_gil_switch_interval_ms": 0, "async_engine": True},
+            "actor_gil_switch_interval_ms must be positive",
+        ),
+        (
+            {"actor_gc_threshold": [50000, 50], "async_engine": True},
+            "actor_gc_threshold must be three",
+        ),
+        (
+            {"actor_gc_threshold": [50000, 50, -1], "async_engine": True},
+            "actor_gc_threshold must be three",
+        ),
     ],
 )
 def test_async_actor_settings_reject_ignored_options(
@@ -270,6 +294,17 @@ def test_async_actor_settings_reject_ignored_options(
             "output_loop_yield_budget_ms": 20,
             "async_engine": True,
             "expose_http_server": True,
+        },
+        {
+            "actor_gil_switch_interval_ms": None,
+            "actor_gc_freeze": False,
+            "actor_gc_threshold": None,
+        },
+        {
+            "actor_gil_switch_interval_ms": 0.5,
+            "actor_gc_freeze": True,
+            "actor_gc_threshold": [50000, 50, 100],
+            "async_engine": True,
         },
     ],
 )

@@ -266,6 +266,9 @@ policy: &POLICY_BASE
             distributed_executor_backend: null
             flat_logprobs: false # Requires async_engine: true and expose_http_server: true. Store logprobs in vLLM's FlatLogprobs (not for requests asking for prompt logprobs); avoids long GC pauses on the generation actor under large backlogs
             output_loop_yield_budget_ms: null # Requires async_engine: true. e.g. 20: make vLLM's output loops yield so refit/control calls are not starved under a backlog
+            actor_gil_switch_interval_ms: null # Requires async_engine: true. e.g. 0.5: threads that release the GIL (TransferQueue client, HTTP server) get it back sooner from vLLM's output loop
+            actor_gc_freeze: false # Requires async_engine: true. Freeze the post-startup heap out of later garbage collections
+            actor_gc_threshold: null # Requires async_engine: true. e.g. [50000, 50, 100]: collect less often with many requests in flight
         vllm_kwargs: {}
 
         colocated:
