@@ -25,6 +25,7 @@ replace-imports-with-any = [
   "zstandard.*",
 ]
 project-includes = [
+  "nemo_rl/models/generation/vllm/tito.py",
   "docker/prune_uv_cache.py",
   "nemo_rl/experience/dynamic_sampling.py",
   "nemo_rl/environments/call_selection.py",

@@ -1581,6 +1581,49 @@ class VllmAsyncGenerationWorkerImpl(
                     if actual_request_max_tokens is not None:
                         self._set_max_tokens(request, 1)
 
+                if worker_self.cfg["vllm_cfg"].get("tito_model") == "qwen3":
+                    # Optional path: preserve the native renderer when disabled.
+                    from nemo_rl.models.generation.vllm.tito import (
+                        preprocess_captured_qwen3,
+                    )
+
+                    incremental = await preprocess_captured_qwen3(
+                        worker=worker_self,
+                        online_renderer=self,
+                        request=request,
+                        messages=messages_for_replace_prefix_tokens,
+                        default_template=default_template,
+                        default_template_content_format=default_template_content_format,
+                        default_template_kwargs=default_template_kwargs,
+                        tool_dicts=tool_dicts,
+                        parser=parser,
+                        skip_mm_cache=skip_mm_cache,
+                    )
+                    if incremental is not None:
+                        res, adapter = incremental
+                        prompt_ids = res[1][0]["prompt_token_ids"]
+                        if actual_request_max_tokens is not None:
+                            self._clamp_max_tokens(
+                                request, actual_request_max_tokens, prompt_ids
+                            )
+                        media = await asyncio.to_thread(
+                            worker_self._capture_request_media,
+                            res[1][0],
+                            admission=adapter.decision.serving,
+                            verify_retained_media=adapter.decision.verify_retained_media,
+                        )
+                        worker_self._enter_request_prefix(
+                            request, adapter.prefix_token_ids
+                        )
+                        worker_self._begin_request_capture(
+                            request,
+                            prompt_ids,
+                            admission=adapter.decision.storage,
+                            prefix_token_ids=adapter.prefix_token_ids,
+                            media=media,
+                        )
+                        return res
+
                 try:
                     res = await super().preprocess_chat(
                         request=request,

@@ -224,6 +224,7 @@ policy: &POLICY_BASE
         stop_strings: null
         lora_refit_mode: native
         vllm_cfg:
+          tito_model: null
             async_engine: false
             precision: ${...precision}
             kv_cache_dtype: "auto"

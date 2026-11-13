@@ -20,6 +20,7 @@ generation:
   stop_token_ids: null
   stop_strings: null
   vllm_cfg:
+    tito_model: null
     async_engine: false
     precision: "bfloat16"
     fp32_lm_head: false

@@ -5569,3 +5569,72 @@ def test_async_vllm_http_client_forwards_admission_checks() -> None:
         client.check_admission(3, request_id="req-3")
 
     assert calls == [(1, None), (2, "req-2"), (3, "req-3")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["disabled", "fallback", "incremental"])
+async def test_captured_tito_preserves_worker_capture_lifecycle(monkeypatch, mode):
+    from nemo_rl.models.generation.vllm import tito
+
+    worker, serving_chat, _ = _setup_fake_vllm_chat_handler(monkeypatch)
+    worker._capture_media = False
+    worker._capture_admission = MagicMock(return_value=None)
+    worker._capture_request_media = MagicMock(return_value=None)
+    worker._begin_request_capture = MagicMock()
+    worker._enter_request_prefix = MagicMock()
+    if mode != "disabled":
+        worker.cfg["vllm_cfg"]["tito_model"] = "qwen3"
+    online = serving_chat.kwargs["online_renderer"]
+    native_result = ([{"role": "user", "content": "new"}], [{"prompt_token_ids": [9]}])
+    incremental_result = (native_result[0], [{"prompt_token_ids": [1, 2, 3]}])
+    adapter = types.SimpleNamespace(
+        prefix_token_ids=[1, 2],
+        decision=types.SimpleNamespace(
+            storage="storage", serving="serving", verify_retained_media=True
+        ),
+    )
+    helper = AsyncMock(
+        return_value=(incremental_result, adapter) if mode == "incremental" else None
+    )
+    monkeypatch.setattr(tito, "preprocess_captured_qwen3", helper)
+    native = AsyncMock(return_value=native_result)
+    monkeypatch.setattr(
+        sys.modules["vllm.renderers.online_renderer"].OnlineRenderer,
+        "preprocess_chat",
+        native,
+        raising=False,
+    )
+    request = types.SimpleNamespace(required_prefix_token_ids=None)
+    result = await online.preprocess_chat(
+        request,
+        native_result[0],
+        None,
+        "string",
+        None,
+    )
+    if mode == "incremental":
+        assert result == incremental_result
+        native.assert_not_called()
+        worker._begin_request_capture.assert_called_once_with(
+            request,
+            [1, 2, 3],
+            admission="storage",
+            prefix_token_ids=[1, 2],
+            media=None,
+        )
+        worker._enter_request_prefix.assert_called_once_with(request, [1, 2])
+    else:
+        assert result == native_result
+        native.assert_awaited_once()
+        worker._begin_request_capture.assert_called_once_with(
+            request,
+            [9],
+            admission=None,
+            prefix_token_ids=None,
+            media=None,
+            generation_cut=None,
+            resumed_generation_token_ids=[],
+        )
+        worker._enter_request_prefix.assert_not_called()
+        if mode == "disabled":
+            helper.assert_not_called()
