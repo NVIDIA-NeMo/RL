@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 import json
+import threading
 from concurrent.futures import Future
 from dataclasses import replace
 from pathlib import Path
@@ -561,9 +562,15 @@ def test_background_dump_returns_at_once_and_bounds_pending_chunks(
     writer.add_chunk(chunk)
     assert len(executor.submitted) == 2
 
-    # The third waits for the oldest write before it submits.
+    # The third blocks on the oldest write and submits only after it finishes.
+    third = threading.Thread(target=writer.add_chunk, args=(chunk,))
+    third.start()
+    third.join(timeout=0.5)
+    assert third.is_alive()
+    assert len(executor.submitted) == 2
     executor.futures[0].set_result(None)
-    writer.add_chunk(chunk)
+    third.join(timeout=5)
+    assert not third.is_alive()
     assert len(executor.submitted) == 3
     assert len(writer._pending) == 2
 
