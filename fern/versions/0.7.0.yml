@@ -1,0 +1,289 @@
+tabs:
+  docs:
+    display-name: Developer Guide
+    slug: ''
+  api:
+    display-name: API Reference
+    slug: api-reference
+navigation:
+- tab: docs
+  layout:
+  - section: About
+    contents:
+    - page: Overview
+      path: ./0.7.0/pages/about/overview.md
+      slug: overview
+    - page: Performance
+      path: ./0.7.0/pages/about/performance-summary.md
+      slug: performance-summary
+    - page: Model Support
+      path: ./0.7.0/pages/about/model-support.md
+      slug: model-support
+    - page: Features and Roadmap
+      path: ./0.7.0/pages/about/features.md
+      slug: features
+    - page: Training and Generation Backends
+      path: ./0.7.0/pages/about/backends.md
+      slug: backends
+    - page: Quick Start
+      path: ./0.7.0/pages/about/quick-start.md
+      slug: quick-start
+    - page: Installation and Prerequisites
+      path: ./0.7.0/pages/about/installation.md
+      slug: installation
+    - section: Algorithms
+      path: ./0.7.0/pages/about/algorithms/index.md
+      contents:
+      - page: GRPO
+        path: ./0.7.0/pages/about/algorithms/grpo.md
+        slug: grpo
+      - page: DAPO
+        path: ./0.7.0/pages/about/algorithms/dapo.md
+        slug: dapo
+      - page: CISPO
+        path: ./0.7.0/pages/about/algorithms/cispo.md
+        slug: cispo
+      - page: PPO
+        path: ./0.7.0/pages/about/algorithms/ppo.md
+        slug: ppo
+      - page: On-policy Distillation
+        path: ./0.7.0/pages/about/algorithms/on-policy-distillation.md
+        slug: on-policy-distillation
+      - page: Multi-Teacher On-Policy Distillation (MOPD)
+        path: ./0.7.0/pages/about/algorithms/mopd.md
+        slug: mopd
+      - page: Supervised Fine-Tuning (SFT)
+        path: ./0.7.0/pages/about/algorithms/sft.md
+        slug: sft
+      - page: DPO
+        path: ./0.7.0/pages/about/algorithms/dpo.md
+        slug: dpo
+      - page: RM
+        path: ./0.7.0/pages/about/algorithms/rm.md
+        slug: rm
+      slug: algorithms
+    - page: Evaluation
+      path: ./0.7.0/pages/about/evaluation.md
+      slug: evaluation
+    - page: Set Up Clusters
+      path: ./0.7.0/pages/about/clusters.md
+      slug: clusters
+    - page: Tips and Tricks
+      path: ./0.7.0/pages/about/tips-and-tricks.md
+      slug: tips-and-tricks
+    slug: about
+    path: ./0.7.0/pages/about/index.md
+  - section: Environment Start
+    contents:
+    - page: Run on Your Local Workstation
+      path: ./0.7.0/pages/local-workstation.md
+      slug: local-workstation
+    - page: Set Up Clusters
+      path: ./0.7.0/pages/cluster.md
+      slug: cluster
+    slug: environment-start
+  - section: E2E Examples
+    contents:
+    - page: SFT on OpenMathInstruct-2
+      path: ./0.7.0/pages/guides/sft-openmathinstruct2.md
+      slug: sft-openmathinstruct2
+    slug: e2e-examples
+  - section: Guides
+    contents:
+    - page: Nemotron 3 Nano
+      path: ./0.7.0/pages/guides/nemotron-3-nano.md
+      slug: nemotron-3-nano
+    - page: Nemotron 3 Nano Omni
+      path: ./0.7.0/pages/guides/nemotron-3-nano-omni.md
+      slug: nemotron-3-nano-omni
+    - page: Nemotron 3 Super
+      path: ./0.7.0/pages/guides/nemotron-3-super.md
+      slug: nemotron-3-super
+    - page: Add New Models
+      path: ./0.7.0/pages/adding-new-models.md
+      slug: adding-new-models
+    - page: Supervised Fine-Tuning in NeMo RL
+      path: ./0.7.0/pages/guides/sft.md
+      slug: sft
+    - page: Direct Preference Optimization in NeMo RL
+      path: ./0.7.0/pages/guides/dpo.md
+      slug: dpo
+    - page: An in-depth Walkthrough of DAPO in NeMo RL
+      path: ./0.7.0/pages/guides/dapo.md
+      slug: dapo
+    - page: LoRA (Low-Rank Adaptation)
+      path: ./0.7.0/pages/guides/lora.md
+      slug: lora
+    - page: An in-depth Walkthrough of CISPO in NeMo RL
+      path: ./0.7.0/pages/guides/cispo.md
+      slug: cispo
+    - page: An In-Depth Walkthrough of ProRLv2 in NeMo RL
+      path: ./0.7.0/pages/guides/prorlv2.md
+      slug: prorlv2
+    - page: Two-Stage SWE RL for Qwen3-30B-A3B-Thinking
+      path: ./0.7.0/pages/guides/swe-rl-qwen3.md
+      slug: swe-rl-qwen3
+    - page: An In-depth Walkthrough of GRPO in NeMo RL
+      path: ./0.7.0/pages/guides/grpo.md
+      slug: grpo
+    - page: An In-Depth Walkthrough of PPO in NeMo RL
+      path: ./0.7.0/pages/guides/ppo.md
+      slug: ppo
+    - page: GRPO on DeepScaler
+      path: ./0.7.0/pages/guides/grpo-deepscaler.md
+      slug: grpo-deepscaler
+    - page: Solve a Sliding Puzzle Using GRPO
+      path: ./0.7.0/pages/guides/grpo-sliding-puzzle.md
+      slug: grpo-sliding-puzzle
+    - page: Audio Post-training with NeMo RL
+      path: ./0.7.0/pages/guides/grpo-audio.md
+      slug: grpo-audio
+    - page: Reward Model Training in NeMo RL
+      path: ./0.7.0/pages/guides/rm.md
+      slug: rm
+    - page: Environments for GRPO Training
+      path: ./0.7.0/pages/guides/environments.md
+      slug: environments
+    - page: Evaluation
+      path: ./0.7.0/pages/guides/eval.md
+      slug: eval
+    - page: DeepSeek-V3
+      path: ./0.7.0/pages/guides/deepseek.md
+      slug: deepseek
+    - page: Model Quirks
+      path: ./0.7.0/pages/model-quirks.md
+      slug: model-quirks
+    - page: Train with Async GRPO
+      path: ./0.7.0/pages/guides/async-grpo.md
+      slug: async-grpo
+    - page: Quantization-Aware RL (QARL)
+      path: ./0.7.0/pages/guides/quantization-aware-rl.md
+      slug: quantization-aware-rl
+    - page: Train with Eagle3 Speculative Decoding
+      path: ./0.7.0/pages/guides/eagle3-speculative-decoding.md
+      slug: eagle3-speculative-decoding
+    - page: YaRN Long-Context Training
+      path: ./0.7.0/pages/guides/yarn-long-context.md
+      slug: yarn-long-context
+    - page: Cross-Tokenizer (X-Token) Off-Policy Distillation
+      path: ./0.7.0/pages/guides/xtoken-off-policy-distillation.md
+      slug: xtoken-off-policy-distillation
+    - page: Router Replay
+      path: ./0.7.0/pages/guides/router-replay.md
+      slug: router-replay
+    - page: Muon Optimizer
+      path: ./0.7.0/pages/guides/muon-optimizer.md
+      slug: muon-optimizer
+    - page: DTensor Tensor Parallel Accuracy Issue
+      path: ./0.7.0/pages/guides/dtensor-tp-accuracy.md
+      slug: dtensor-tp-accuracy
+    - page: Fault Tolerance Launcher Guide
+      path: ./0.7.0/pages/guides/ft-launcher-guide.md
+      slug: ft-launcher-guide
+    slug: guides
+  - section: Containers
+    contents:
+    - page: Build Docker Images
+      path: ./0.7.0/pages/docker.md
+      slug: docker
+    slug: containers
+  - section: Development
+    contents:
+    - page: CI/CD
+      path: ./0.7.0/pages/ci-cd.md
+      slug: ci-cd
+    - page: Test NeMo RL
+      path: ./0.7.0/pages/testing.md
+      slug: testing
+    - page: Documentation Development
+      path: ./0.7.0/pages/documentation.md
+      slug: documentation
+    - page: Debug NeMo RL Applications
+      path: ./0.7.0/pages/debugging.md
+      slug: debugging
+    - page: Profile GPU with Nsys
+      path: ./0.7.0/pages/nsys-profiling.md
+      slug: nsys-profiling
+    - page: FP8 Quantization in NeMo RL
+      path: ./0.7.0/pages/fp8.md
+      slug: fp8
+    - page: Experiment with Custom vLLM
+      path: ./0.7.0/pages/guides/use-custom-vllm.md
+      slug: use-custom-vllm
+    slug: development
+  - section: Design Docs
+    contents:
+    - page: Design and Philosophy
+      path: ./0.7.0/pages/design-docs/design-and-philosophy.md
+      slug: design-and-philosophy
+    - page: Padding in NeMo RL
+      path: ./0.7.0/pages/design-docs/padding.md
+      slug: padding
+    - page: Logger
+      path: ./0.7.0/pages/design-docs/logger.md
+      slug: logger
+    - page: uv in NeMo RL
+      path: ./0.7.0/pages/design-docs/uv.md
+      slug: uv
+    - page: Dependency Management
+      path: ./0.7.0/pages/design-docs/dependency-management.md
+      slug: dependency-management
+    - page: Data Format
+      path: ./0.7.0/pages/design-docs/chat-datasets.md
+      slug: chat-datasets
+    - page: Generation Interface
+      path: ./0.7.0/pages/design-docs/generation.md
+      slug: generation
+    - page: Exporting Checkpoints to Hugging Face Format
+      path: ./0.7.0/pages/design-docs/checkpointing.md
+      slug: checkpointing
+    - page: Loss functions in NeMo RL
+      path: ./0.7.0/pages/design-docs/loss-functions.md
+      slug: loss-functions
+    - page: FSDP2 Parallel Plan
+      path: ./0.7.0/pages/design-docs/fsdp2-parallel-plan.md
+      slug: fsdp2-parallel-plan
+    - page: Training Backends
+      path: ./0.7.0/pages/design-docs/training-backends.md
+      slug: training-backends
+    - page: Sequence Packing and Dynamic Batching
+      path: ./0.7.0/pages/design-docs/sequence-packing-and-dynamic-batching.md
+      slug: sequence-packing-and-dynamic-batching
+    - page: Environment Variable Precedence in NeMo RL
+      path: ./0.7.0/pages/design-docs/env-vars.md
+      slug: env-vars
+    - page: NeMo Gym Integration
+      path: ./0.7.0/pages/design-docs/nemo-gym-integration.md
+      slug: nemo-gym-integration
+    slug: design-docs
+- tab: api
+  layout:
+  - section: API Reference
+    skip-slug: true
+    collapsed: false
+    contents:
+    - page: Overview
+      path: ./0.7.0/pages/api-reference.md
+      slug: ''
+  - folder: ../api-reference/0.7.0/nemo-rl-0-7-0/nemo_rl/algorithms
+    collapsed: true
+  - folder: ../api-reference/0.7.0/nemo-rl-0-7-0/nemo_rl/data
+    collapsed: true
+  - folder: ../api-reference/0.7.0/nemo-rl-0-7-0/nemo_rl/data_plane
+    collapsed: true
+  - folder: ../api-reference/0.7.0/nemo-rl-0-7-0/nemo_rl/distributed
+    collapsed: true
+  - folder: ../api-reference/0.7.0/nemo-rl-0-7-0/nemo_rl/environments
+    collapsed: true
+  - folder: ../api-reference/0.7.0/nemo-rl-0-7-0/nemo_rl/evals
+    collapsed: true
+  - folder: ../api-reference/0.7.0/nemo-rl-0-7-0/nemo_rl/experience
+    collapsed: true
+  - folder: ../api-reference/0.7.0/nemo-rl-0-7-0/nemo_rl/modelopt
+    collapsed: true
+  - folder: ../api-reference/0.7.0/nemo-rl-0-7-0/nemo_rl/models
+    collapsed: true
+  - folder: ../api-reference/0.7.0/nemo-rl-0-7-0/nemo_rl/utils
+    collapsed: true
+  - folder: ../api-reference/0.7.0/nemo-rl-0-7-0/nemo_rl/weight_sync
+    collapsed: true
