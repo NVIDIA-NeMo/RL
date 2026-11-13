@@ -320,7 +320,8 @@ def check_outdated_config(config: dict[str, Any]) -> None:
     Call this from every entrypoint on the resolved config, before the MasterConfig is
     built. Validation rejects a missing required key on its own terms, so a check that
     runs after it can never explain a removal that changed such a key's shape. Add a
-    check here whenever a key is removed or the shape it accepts changes.
+    check here when a previously supported key is removed or its accepted shape changes.
+    Spellings or shapes introduced and replaced within the same unmerged PR need no check.
 
     Args:
         config: The config as the user wrote it, resolved by OmegaConf.to_container.
