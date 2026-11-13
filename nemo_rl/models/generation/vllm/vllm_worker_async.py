@@ -17,7 +17,6 @@ import contextvars
 import copy
 import gc
 import logging
-import os
 import secrets
 import threading
 import time
@@ -31,6 +30,7 @@ import torch
 import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+from ray.util.queue import Queue as RayQueue
 
 from nemo_rl.data.captured_media import (
     CapturedMedia,
@@ -364,6 +364,8 @@ class VllmAsyncGenerationWorkerImpl(
         self._http_engine_client = None
         # The task serving this engine through Dynamo, when it is registered.
         self._dynamo_endpoint_task: Optional[asyncio.Task] = None
+        # Where this engine sends its chat settings before it loads, when asked to.
+        self._dynamo_chat_settings_queue: Optional[RayQueue] = None
 
         self._init_token_capture_state()
 
@@ -543,6 +545,15 @@ class VllmAsyncGenerationWorkerImpl(
             )
 
         self.llm_async_engine_args = AsyncEngineArgs(**llm_kwargs)
+        if self._dynamo_chat_settings_queue is not None:
+            # ai-dynamo is optional: import it only for engines served through Dynamo.
+            from nemo_rl.models.generation.dynamo.vllm.adapter import (
+                chat_runtime_data,
+            )
+
+            # Sent before the engine is built, which takes far longer than the
+            # frontend's render workers do.
+            self._dynamo_chat_settings_queue.put(chat_runtime_data(self))
         self.llm = AsyncLLM.from_engine_args(
             self.llm_async_engine_args, stat_loggers=self.stat_loggers
         )
@@ -723,6 +734,15 @@ class VllmAsyncGenerationWorkerImpl(
                 self._setup_vllm_server()
             )
 
+    def announce_dynamo_chat_settings_to(self, queue: RayQueue) -> None:
+        """Have this engine send ``queue`` its chat settings before it loads.
+
+        It sends what it publishes at registration, as soon as it has its engine
+        args. Dynamo's frontend builds its render workers from them while the
+        engine loads.
+        """
+        self._dynamo_chat_settings_queue = queue
+
     async def start_dynamo_endpoint_async(
         self, *, namespace: str, engine_env: dict[str, str], leader_worker_idx: int
     ) -> None:
@@ -734,20 +754,15 @@ class VllmAsyncGenerationWorkerImpl(
         engine serves report it, as ``generate_async`` results do.
         """
         # ai-dynamo is optional: import it only for engines served through Dynamo.
-        from dynamo._core import fetch_model
-
         from nemo_rl.models.generation.dynamo.engine_adapter import (
             start_dynamo_endpoint,
+            weight_free_model_path,
         )
         from nemo_rl.models.generation.dynamo.vllm.adapter import DynamoVllmAdapter
 
         # Dynamo fetches a Hub ID's whole checkpoint before it registers; the engine's
         # weights come from refit, so register the config and tokenizer files only.
-        model_path = (
-            self.model_name
-            if os.path.exists(self.model_name)
-            else await fetch_model(self.model_name, ignore_weights=True)
-        )
+        model_path = await weight_free_model_path(self.model_name)
         kv_events = self.llm.vllm_config.kv_events_config
         publishes = kv_events is not None and kv_events.enable_kv_cache_events
         # The Dynamo functional overlays check the router applied these.

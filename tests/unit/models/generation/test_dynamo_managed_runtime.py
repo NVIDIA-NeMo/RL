@@ -36,7 +36,7 @@ from nemo_rl.models.generation.dynamo.managed_runtime import (
 FRONTEND_URLS = ["http://10.0.0.2:3000/v1", "http://10.0.0.3:3000/v1"]
 
 
-def _runtime(**frontend_args) -> ManagedDynamoRuntime:
+def _runtime(serves_chat: bool = False, **frontend_args) -> ManagedDynamoRuntime:
     return ManagedDynamoRuntime(
         dynamo_cfg=DynamoCfg(
             startup_timeout_s=5, frontend_args=DynamoFrontendArgs(**frontend_args)
@@ -44,6 +44,7 @@ def _runtime(**frontend_args) -> ManagedDynamoRuntime:
         model_name="model",
         frontend_python="/venvs/vllm/bin/python",
         ray_address="10.0.0.1:6379",
+        serves_chat=serves_chat,
     )
 
 
@@ -388,7 +389,9 @@ class _FakeFrontendHostActor:
     def __init__(self):
         self.node_ids: list[str] = []
         self.envs: list[dict[str, str]] = []
+        self.serve_chat: list[bool] = []
         self.captures: list[dict] = []
+        self.chat_settings: list[dict] = []
 
     def options(self, scheduling_strategy):
         self.node_ids.append(scheduling_strategy.node_id)
@@ -402,6 +405,7 @@ class _FakeFrontendHostActor:
                 @staticmethod
                 def remote(**kwargs):
                     actor.envs.append(kwargs["env"])
+                    actor.serve_chat.append(kwargs["serves_chat"])
                     host = f"frontend-{len(actor.envs)}"
                     return FrontendUrls(
                         base_url=f"http://{host}:3000/v1",
@@ -413,6 +417,11 @@ class _FakeFrontendHostActor:
                 def remote(capture):
                     actor.captures.append(capture)
 
+            class publish_chat_settings:
+                @staticmethod
+                def remote(settings):
+                    actor.chat_settings.append(settings)
+
         return _Host()
 
 
@@ -422,7 +431,10 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
     hosts = _FakeFrontendHostActor()
     monkeypatch.setattr(managed_runtime, "_FrontendHostActor", hosts)
     runtime = _runtime(
-        num_frontends=3, render_workers=3, extra_env={"DYN_TCP_LISTEN_BACKLOG": "8192"}
+        True,
+        num_frontends=3,
+        render_workers=3,
+        extra_env={"DYN_TCP_LISTEN_BACKLOG": "8192"},
     )
     runtime._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
 
@@ -436,6 +448,7 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
         generation_cut_control_token="secret",
         generation_cut_control_timeout_s=60.0,
     )
+    runtime.publish_chat_settings({"nemo_rl_chat": {"engine_args": {}}})
 
     assert hosts.node_ids == [node_a, node_b, node_a]
     assert runtime.frontend_urls == [f"http://frontend-{i}:3000/v1" for i in (1, 2, 3)]
@@ -461,14 +474,20 @@ def test_frontends_spread_over_the_nodes_with_the_extra_environment(
         }
     ]
 
+    # Every frontend starts its render workers at launch, and builds them from
+    # the chat settings an engine sends before it loads.
+    assert hosts.serve_chat == 3 * [True]
+    assert hosts.chat_settings == 3 * [{"nemo_rl_chat": {"engine_args": {}}}]
+
     clashing = _runtime(extra_env={"DYN_NAMESPACE": "mine"})
     clashing._manager_env = {"DYN_NAMESPACE": "nemo-rl-test"}
     with pytest.raises(ValueError, match=r"\['DYN_NAMESPACE'\] is set by both"):
         clashing._start_frontends([node_a])
 
 
+@pytest.mark.parametrize("serves_chat", [True, False])
 def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, serves_chat: bool
 ) -> None:
     launched = []
     monkeypatch.setattr(
@@ -494,6 +513,7 @@ def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
         namespace="nemo-rl-test",
         dynamo_cfg=DynamoCfg(),
         env={"DYN_NAMESPACE": "nemo-rl-test"},
+        serves_chat=serves_chat,
     )
     host.publish_chat_capture({"staging_partition": "staging"})
 
@@ -518,6 +538,19 @@ def test_frontend_host_launches_nemo_rls_chat_engine_on_a_free_port(
     # from the file on its own node that the frontend was told about.
     with open(env[managed_runtime.CAPTURE_FILE_ENV], "rb") as capture_file:
         assert pickle.load(capture_file) == {"staging_partition": "staging"}
+    # Only a run that serves chat names the file an engine's chat settings
+    # arrive in before it loads; the frontend starts its render workers on it.
+    assert (managed_runtime.CHAT_SETTINGS_FILE_ENV in env) is serves_chat
+    if serves_chat:
+        monkeypatch.setenv(
+            managed_runtime.CHAT_SETTINGS_FILE_ENV,
+            env[managed_runtime.CHAT_SETTINGS_FILE_ENV],
+        )
+        assert managed_runtime.read_chat_settings() is None
+        host.publish_chat_settings({"nemo_rl_chat": {"engine_args": {}}})
+        assert managed_runtime.read_chat_settings() == {
+            "nemo_rl_chat": {"engine_args": {}}
+        }
 
 
 def test_shutdown_logs_the_kv_events_the_router_applied(
