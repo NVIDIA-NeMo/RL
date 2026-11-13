@@ -107,6 +107,7 @@ policy:
     sequence_parallel: false
     gradient_accumulation_fusion: false
     use_fused_weighted_squared_relu: false
+    reuse_logits_storage: false
 
     optimizer:
       optimizer: "adam"

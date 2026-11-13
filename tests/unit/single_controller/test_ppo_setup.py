@@ -44,6 +44,7 @@ from nemo_rl.algorithms.grpo import GRPOConfig
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.loss.loss_functions import MseValueLossConfig, MseValueLossFn
 from nemo_rl.algorithms.ppo import PPOConfig
+from nemo_rl.algorithms.reward_functions import RewardShapingConfig
 from nemo_rl.algorithms.single_controller_utils import (
     AsyncRLConfig,
     MasterConfig,
@@ -52,6 +53,7 @@ from nemo_rl.algorithms.single_controller_utils import (
 )
 from nemo_rl.algorithms.single_controller_utils.config import (
     algo_config,
+    logprob_passes_required,
     validate_single_controller_config,
 )
 from nemo_rl.distributed.virtual_cluster import ClusterConfig
@@ -419,26 +421,39 @@ class TestPPOValidation:
 
         validate_single_controller_config(mc)
 
-    @pytest.mark.parametrize(
-        ("importance_correction", "force_on_policy_ratio", "match"),
-        [
-            (False, False, "use_importance_sampling_correction=true"),
-            (True, True, "force_on_policy_ratio=false"),
-        ],
-    )
-    def test_ready_first_requires_sampling_policy_correction(
-        self,
-        importance_correction: bool,
-        force_on_policy_ratio: bool,
-        match: str,
-    ) -> None:
+    def test_ready_first_requires_sampling_policy_correction(self) -> None:
         mc = _ppo_master_config()
         mc.async_rl.sampler = ReadyFirstSamplerConfig()
-        mc.loss_fn.use_importance_sampling_correction = importance_correction
-        mc.loss_fn.force_on_policy_ratio = force_on_policy_ratio
+        mc.loss_fn.use_importance_sampling_correction = False
+        mc.loss_fn.force_on_policy_ratio = False
 
-        with pytest.raises(ValueError, match=match):
+        with pytest.raises(ValueError, match="use_importance_sampling_correction=true"):
             validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("ready_first", [False, True])
+    def test_forced_ratio_requires_one_policy_epoch(self, ready_first: bool) -> None:
+        mc = _ppo_master_config()
+        if ready_first:
+            mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        mc.loss_fn.use_importance_sampling_correction = True
+        mc.loss_fn.force_on_policy_ratio = True
+        mc.ppo.ppo_epochs = 4
+
+        with pytest.raises(ValueError, match="requires ppo.ppo_epochs=1"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("ready_first", [False, True])
+    def test_accepts_forced_ratio_with_one_policy_epoch(
+        self, ready_first: bool
+    ) -> None:
+        mc = _ppo_master_config()
+        if ready_first:
+            mc.async_rl.sampler = ReadyFirstSamplerConfig()
+        mc.loss_fn.use_importance_sampling_correction = True
+        mc.loss_fn.force_on_policy_ratio = True
+        mc.ppo.ppo_epochs = 1
+
+        validate_single_controller_config(mc)
 
     @staticmethod
     def _warmup_ckpt_config(*, constant_structure: bool) -> MasterConfig:
@@ -464,27 +479,17 @@ class TestPPOValidation:
             self._warmup_ckpt_config(constant_structure=False)
         )
 
-    @pytest.mark.parametrize(
-        "enable",
-        [
-            lambda cfg: setattr(cfg, "use_dynamic_sampling", True),
-            lambda cfg: setattr(cfg.reward_scaling, "enabled", True),
-            lambda cfg: setattr(cfg.reward_shaping, "enabled", True),
-        ],
-        ids=[
-            "use_dynamic_sampling",
-            "reward_scaling",
-            "reward_shaping",
-        ],
-    )
-    def test_rejects_shaping_the_sc_path_does_not_implement(self, enable):
+    def test_accepts_dapo_reward_shaping_on_a_ppo_run(self) -> None:
+        """SC setup accepts a validated PPO reward-shaping configuration."""
         mc = _ppo_master_config()
-        enable(mc.ppo)
+        mc.ppo.reward_shaping = RewardShapingConfig(
+            enabled=True,
+            overlong_buffer_length=512,
+            overlong_buffer_penalty=1,
+            max_response_length=4096,
+        )
 
-        with pytest.raises(
-            NotImplementedError, match="not supported on the SingleController"
-        ):
-            validate_single_controller_config(mc)
+        validate_single_controller_config(mc)
 
     def test_rejects_length_penalty_until_sc_applies_it(self):
         # The SC path has no length-penalty hook yet; fail at setup rather
@@ -580,11 +585,181 @@ class TestPPOValidation:
         with pytest.raises(ValueError, match="trains zero steps"):
             validate_single_controller_config(mc)
 
+    @pytest.mark.parametrize(
+        "make_config", [_ppo_master_config, _make_master_config], ids=["ppo", "grpo"]
+    )
+    def test_rejects_a_batch_multiplier_that_cannot_take_effect(self, make_config):
+        """The SC dataloader batches num_prompts_per_step directly, so nothing
+        over-generates. Checked with the filter off too, since the knob is inert
+        either way and a user who sets it has sized their run around it."""
+        mc = make_config()
+        algo_config(mc).batch_multiplier = 1.5
+
+        with pytest.raises(ValueError, match="batch_multiplier"):
+            validate_single_controller_config(mc)
+
     def test_grpo_is_free_to_use_any_sampler(self):
         mc = _make_master_config()
         mc.async_rl.sampler = WindowedSamplerConfig()
 
         validate_single_controller_config(mc)
+
+
+def _dynamic_sampling_config(
+    *,
+    on_dropped_prompt: str = "replace",
+    sampler: str = "in_order",
+    num_generations_per_prompt: int = _NUM_GENERATIONS_PER_PROMPT,
+    max_gen_batches: int = 10,
+    # This reserve controls rollout-failure replacements, not dynamic sampling.
+    replacement_reserve_prompts: int = _NUM_PROMPTS_PER_STEP,
+) -> MasterConfig:
+    """A GRPO SC config with dynamic sampling on and the knobs it validates."""
+    mc = _make_master_config()
+    mc.grpo.use_dynamic_sampling = True
+    mc.grpo.dynamic_sampling_max_gen_batches = max_gen_batches
+    mc.grpo.num_generations_per_prompt = num_generations_per_prompt
+    mc.policy["train_global_batch_size"] = (
+        _NUM_PROMPTS_PER_STEP * num_generations_per_prompt
+    )
+    sampler_cfg = {"name": sampler}
+    if sampler == "custom":
+        # A custom sampler config requires a target; the validator does not import it.
+        sampler_cfg["target"] = "my_pkg.samplers:MySampler"
+    mc.async_rl = AsyncRLConfig(
+        min_groups_for_streaming_train=_NUM_PROMPTS_PER_STEP,
+        max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
+        sampler=sampler_cfg,
+        rollout_failure={
+            "on_dropped_prompt": on_dropped_prompt,
+            "replacement_reserve_prompts": replacement_reserve_prompts,
+        },
+    )
+    return mc
+
+
+class TestDynamicSamplingValidation:
+    """Dynamic sampling needs a substitute for every filtered group, or steps shrink."""
+
+    @pytest.mark.parametrize("estimator", ["reinforce_plus_plus", "opd"])
+    def test_rejects_estimators_with_nonzero_constant_reward_advantages(
+        self, estimator
+    ):
+        mc = _dynamic_sampling_config()
+        mc.grpo.adv_estimator.name = estimator
+        with pytest.raises(ValueError, match="requires grpo.adv_estimator.name='grpo'"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        "key", ["invalid_tool_call_advantage", "malformed_thinking_advantage"]
+    )
+    @pytest.mark.parametrize("value", [-1.0, 1.0])
+    def test_rejects_nonzero_message_advantage_overrides(self, key, value):
+        mc = _dynamic_sampling_config()
+        setattr(mc.grpo, key, value)
+        with pytest.raises(ValueError, match=f"grpo.{key} to be 0 or null"):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize("value", [0.0, None])
+    def test_accepts_zero_or_absent_message_advantage_overrides(self, value):
+        mc = _dynamic_sampling_config()
+        mc.env["should_use_nemo_gym"] = True
+        mc.policy["generation"]["vllm_cfg"] = {
+            "async_engine": True,
+            "expose_http_server": True,
+        }
+        mc.grpo.invalid_tool_call_advantage = value
+        mc.grpo.malformed_thinking_advantage = value
+        validate_single_controller_config(mc)
+
+    def test_accepts_replace_with_a_stamping_sampler(self):
+        validate_single_controller_config(_dynamic_sampling_config())
+
+    def test_rejects_a_custom_sampler(self):
+        # Narrowed to in_order: a custom class cannot declare at setup that it stamps
+        # a target step or that its admission wait can be interrupted for a refill.
+        # #4784 reopens this through a capability protocol.
+        mc = _dynamic_sampling_config(sampler="custom")
+
+        with pytest.raises(ValueError, match="sampler.name='in_order'"):
+            validate_single_controller_config(mc)
+
+    def test_accepts_shrink_because_filtering_replaces_regardless(self):
+        # Filtering replaces uniform groups even when rollout failures shrink.
+        validate_single_controller_config(
+            _dynamic_sampling_config(on_dropped_prompt="shrink")
+        )
+
+    def test_rejects_token_capture(self):
+        # The capture path cannot borrow a finished group from a later step, so every
+        # drop would stall its step for a full fresh rollout.
+        mc = _dynamic_sampling_config()
+        mc.token_capture.enabled = True
+
+        with pytest.raises(ValueError, match="token_capture.enabled"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_a_zero_generation_batch_allowance(self):
+        mc = _dynamic_sampling_config(max_gen_batches=0)
+
+        with pytest.raises(
+            ValueError, match="dynamic_sampling_max_gen_batches must be >= 1"
+        ):
+            validate_single_controller_config(mc)
+
+    @pytest.mark.parametrize(
+        ("mode", "reserve"),
+        [
+            ("shrink", 0),
+            ("shrink", 1),
+            ("replace", 1),
+            ("replace", _NUM_PROMPTS_PER_STEP),
+        ],
+    )
+    def test_filter_pool_is_independent_of_failure_reserve(
+        self, mode: str, reserve: int
+    ) -> None:
+        mc = _dynamic_sampling_config(
+            on_dropped_prompt=mode, replacement_reserve_prompts=reserve
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)
+            validate_single_controller_config(mc)
+
+    def test_rejects_a_sampler_that_stamps_no_target_step(self):
+        mc = _dynamic_sampling_config(sampler="ready_first")
+
+        with pytest.raises(ValueError, match="sampler.name='in_order'"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_a_single_generation_per_prompt(self):
+        mc = _dynamic_sampling_config(num_generations_per_prompt=1)
+
+        with pytest.raises(ValueError, match="num_generations_per_prompt >= 2"):
+            validate_single_controller_config(mc)
+
+    def test_ppo_rejects_dynamic_sampling_outright(self):
+        # Removed from the SC `unsupported` list, PPO dynamic sampling is now rejected
+        # by the GRPO-only guard at the top of the dynamic-sampling block instead.
+        mc = _ppo_master_config()
+        mc.ppo.use_dynamic_sampling = True
+
+        with pytest.raises(ValueError, match="GRPO-only"):
+            validate_single_controller_config(mc)
+
+    def test_ppo_rejects_dynamic_sampling_even_when_grpo_requirements_are_met(self):
+        # PPO advantages depend on the critic, so uniform rewards can still train.
+        mc = _ppo_master_config()
+        mc.ppo.use_dynamic_sampling = True
+        mc.async_rl = AsyncRLConfig(
+            min_groups_for_streaming_train=_NUM_PROMPTS_PER_STEP,
+            max_buffered_rollouts=_NUM_PROMPTS_PER_STEP * 2,
+            sampler={"name": "in_order"},
+            rollout_failure={"on_dropped_prompt": "replace"},
+        )
+
+        with pytest.raises(ValueError, match="GRPO-only"):
+            validate_single_controller_config(mc)
 
 
 class TestAdvantageEstimatorSelection:
@@ -972,3 +1147,42 @@ class TestTrainClusterSizesForTheCritic:
         else:
             # The critic never lands on the inference cluster.
             assert inference.kwargs["max_colocated_worker_groups"] == 1
+
+
+def _in_loss_ppo_config(*, streaming: bool = False) -> MasterConfig:
+    mc = _ppo_master_config(
+        megatron_enabled=True,
+        min_groups_for_streaming_train=1 if streaming else _NUM_PROMPTS_PER_STEP,
+    )
+    mc.ppo.ppo_epochs = 1
+    mc.ppo.seq_logprob_error_threshold = 2.0
+    mc.loss_fn.seq_logprob_error_in_loss = True
+    mc.loss_fn.force_on_policy_ratio = True
+    mc.loss_fn.token_level_loss = True
+    return mc
+
+
+class TestInLossSeqFilterForPPO:
+    @pytest.mark.parametrize("streaming", [False, True])
+    def test_accepts_one_policy_epoch_and_skips_policy_logprobs(
+        self, streaming: bool
+    ) -> None:
+        mc = _in_loss_ppo_config(streaming=streaming)
+
+        validate_single_controller_config(mc)
+        policy_pass, _ = logprob_passes_required(mc, mc.ppo)
+        assert not policy_pass
+
+    def test_rejects_multiple_policy_epochs(self) -> None:
+        mc = _in_loss_ppo_config()
+        mc.ppo.ppo_epochs = 4
+
+        with pytest.raises(ValueError, match="requires ppo.ppo_epochs=1"):
+            validate_single_controller_config(mc)
+
+    def test_rejects_kl_in_reward(self) -> None:
+        mc = _in_loss_ppo_config()
+        mc.loss_fn.use_kl_in_reward = True
+
+        with pytest.raises(ValueError, match="without use_kl_in_reward"):
+            validate_single_controller_config(mc)

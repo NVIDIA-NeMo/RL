@@ -245,6 +245,13 @@ def test_validation_refuses_a_user_supplied_kv_transfer_config():
         validate_vllm_disaggregation(resolve_vllm_role_overrides(cfg))
 
 
+def test_validation_refuses_dynamo_serving():
+    cfg = _config(disaggregation={"enabled": True})
+    cfg["dynamo"] = True
+    with pytest.raises(ValueError, match="policy.generation.dynamo=true"):
+        validate_vllm_disaggregation(resolve_vllm_role_overrides(cfg))
+
+
 def test_validation_refuses_a_non_default_refit_transport():
     cfg = _config(disaggregation={"enabled": True})
     cfg["refit_transport"] = "nixl"

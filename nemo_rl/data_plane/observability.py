@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import itertools
 import logging
+import threading
 import zlib
 from bisect import bisect_left
 from collections.abc import Iterator, Sequence
@@ -1305,6 +1306,7 @@ class MetricsDataPlaneClient(DataPlaneClient):
         self._verify_tensor_hash = verify_tensor_hash
         self._observability_enabled = observability_enabled
         self._stats = DataPlaneStats()
+        self._stats_lock = threading.Lock()
         # Live bytes and live keys per partition. Populated on successful
         # ``put_samples``, released on successful ``clear_samples`` -- or, for
         # a process that never issues one, by ``_release_cleared_samples``.
@@ -1322,6 +1324,17 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # every trainer use get_step_metrics() without copying the
         # differencing and unit-conversion logic.
         self._prev_snapshot: dict[str, Any] = {}
+
+    def __getstate__(self) -> dict[str, Any]:
+        # The SC driver cloudpickles this client into the controller actor, and a
+        # lock cannot be pickled.
+        state = self.__dict__.copy()
+        del state["_stats_lock"]
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._stats_lock = threading.Lock()
 
     @property
     def observability_enabled(self) -> bool:
@@ -1351,23 +1364,23 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # codec timer is drained destructively, so an inspection snapshot that
         # took it would delete that time from the series the step reader
         # reports. Both callers that consume a step pass True.
-        if reset_step_window:
-            codec = drain_codec_ms()
+        codec = drain_codec_ms() if reset_step_window else {}
+        with self._stats_lock:
             self._stats.pack_ms += codec.get("pack", 0.0)
             self._stats.unpack_ms += codec.get("unpack", 0.0)
-        out = asdict(self._stats)
+            out = asdict(self._stats)
+            if reset_step_window:
+                self._stats.step_wall_ms = 0.0
+                for bucket in self._stats.by_op.values():
+                    bucket.step_max_ms = 0.0
         out["n_keys_outstanding"] = sum(
-            len(k) for k in self._keys_by_partition.values()
+            len(k) for k in list(self._keys_by_partition.values())
         )
-        _derive_op_metrics(out["by_op"], self._stats.total_wall_ms)
+        _derive_op_metrics(out["by_op"], out["total_wall_ms"])
         # Communication volume, derived from by_op so there is one source of
         # truth for bytes. Distinct from ``bytes_outstanding``, which is
         # occupancy (what is held) rather than traffic (what moved).
         out.update(_comm_volume(out["by_op"]))
-        if reset_step_window:
-            self._stats.step_wall_ms = 0.0
-            for bucket in self._stats.by_op.values():
-                bucket.step_max_ms = 0.0
         return out
 
     def get_step_metrics(
@@ -1807,33 +1820,34 @@ class MetricsDataPlaneClient(DataPlaneClient):
         # Time is charged for every status: a timeout is often the single
         # largest contributor, so dropping it would understate the cost.
         stats = self._stats
-        stats.total_wall_ms += wall_ms
-        stats.step_wall_ms += wall_ms
-        bucket = stats.by_op.get(op)
-        if bucket is None:
-            # Not setdefault(): its default is evaluated eagerly, building a
-            # throwaway OpStats (and its 16-bucket histogram) on every op.
-            bucket = stats.by_op[op] = OpStats()
-        bucket.calls += 1
-        bucket.wall_ms += wall_ms
-        if wall_ms > bucket.max_ms:
-            bucket.max_ms = wall_ms
-        if wall_ms > bucket.step_max_ms:
-            bucket.step_max_ms = wall_ms
-        bucket.latency_hist[bisect_left(LATENCY_BUCKETS_MS, wall_ms)] += 1
-        if status != "ok":
-            bucket.errors += 1
-            return
-        stats.total_bytes += n_bytes
-        stats.total_keys += n_keys
-        stats.total_ops += 1
-        bucket.n_bytes += n_bytes
-        bucket.n_keys += n_keys
-        if op == "put" and n_keys:
-            per_key = n_bytes // n_keys
-            stats.last_put_bytes_per_key = per_key
-            if per_key > stats.max_bytes_per_key_seen:
-                stats.max_bytes_per_key_seen = per_key
+        with self._stats_lock:
+            stats.total_wall_ms += wall_ms
+            stats.step_wall_ms += wall_ms
+            bucket = stats.by_op.get(op)
+            if bucket is None:
+                # Not setdefault(): its default is evaluated eagerly, building
+                # a throwaway OpStats (and its 16-bucket histogram) on every op.
+                bucket = stats.by_op[op] = OpStats()
+            bucket.calls += 1
+            bucket.wall_ms += wall_ms
+            if wall_ms > bucket.max_ms:
+                bucket.max_ms = wall_ms
+            if wall_ms > bucket.step_max_ms:
+                bucket.step_max_ms = wall_ms
+            bucket.latency_hist[bisect_left(LATENCY_BUCKETS_MS, wall_ms)] += 1
+            if status != "ok":
+                bucket.errors += 1
+                return
+            stats.total_bytes += n_bytes
+            stats.total_keys += n_keys
+            stats.total_ops += 1
+            bucket.n_bytes += n_bytes
+            bucket.n_keys += n_keys
+            if op == "put" and n_keys:
+                per_key = n_bytes // n_keys
+                stats.last_put_bytes_per_key = per_key
+                if per_key > stats.max_bytes_per_key_seen:
+                    stats.max_bytes_per_key_seen = per_key
 
     def register_partition(
         self,

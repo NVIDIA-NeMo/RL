@@ -789,17 +789,17 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(
         "nemo_rl.experience.route_assembly.encode_routed_experts",
     ):
         monkeypatch.setattr(target, forbidden_codec)
-
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
-    worker._capture_calls = {}
-    worker._capture_top_logprobs = 0
+    worker._init_token_capture_state()
+    sink = TQTokenSink(
+        dp,
+        staging_partition="staging",
+        capture_media=True,
+        media_pixel_dtype=torch.float32,
+    )
+    worker._capture_sink = sink
     worker.token_capture = RolloutTokenCapture(
-        sink=TQTokenSink(
-            dp,
-            staging_partition="staging",
-            capture_media=True,
-            media_pixel_dtype=torch.float32,
-        ),
+        sink=sink,
         weight_version_fn=lambda: 0,
         adapter=VLLMCaptureAdapter(),
     )
@@ -830,7 +830,7 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(
     assert "media" not in response and MEDIA_SPANS_FIELD not in response
     assert "routed_experts" not in response["choices"][0]["message"]
     json.dumps(response)
-    assert worker._capture_calls == {}
+    assert len(worker._capture_registry) == 0
     [media] = staged_media(dp, "r0/c1")
     torch.testing.assert_close(media.imgs, torch.ones(1, 6, 3))
     if with_routed_experts:
@@ -1400,12 +1400,18 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     )
     _install_fake_vllm(monkeypatch)
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._init_token_capture_state()
     worker.__dict__.update(state.__dict__)
     worker.cfg = dict(
-        temperature=1.0, top_p=1.0, val_temperature=0.0, val_top_p=1.0, vllm_cfg={}
+        temperature=1.0,
+        top_p=1.0,
+        top_k=None,
+        val_temperature=0.0,
+        val_top_p=1.0,
+        val_top_k=None,
+        vllm_cfg={},
     )
     worker.token_capture = MagicMock(adapter=VLLMCaptureAdapter())
-    worker._capture_calls = {}
     worker._http_engine_client = MagicMock()
     worker.llm_async_engine_args = MagicMock()
     worker.llm_async_engine_args.create_model_config.return_value = SimpleNamespace(
@@ -1429,6 +1435,11 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     handler = dict(app.routes)["/v1/chat/completions"]
     request = SimpleNamespace(
         top_k=-1,
+        min_p=None,
+        repetition_penalty=None,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+        logit_bias=None,
         top_p=1.0,
         temperature=1.0,
         ng_capture=admission.model_dump(),
@@ -1455,7 +1466,7 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
     inference.assert_not_awaited()
     worker.token_capture.begin_call.assert_not_called()
     worker.token_capture.complete_call_from_response.assert_not_called()
-    assert worker._capture_calls == {}
+    assert len(worker._capture_registry) == 0
 
     # Exercise Gym's actual middleware, which wraps upstream 400s as 500s.
     upstream = ClientResponseError(

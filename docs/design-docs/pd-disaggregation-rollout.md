@@ -231,6 +231,10 @@ policy:
         backend: NIXL                 # DEFAULT | UCX | NIXL | MOONCAKE | MPI
 ```
 
+With `backend: NIXL`, run with `export UCX_NET_DEVICES=all` so the KV transfer uses the
+RDMA HCAs instead of the image's management NIC (see
+`tests/test_suites/llm/grpo-qwen3-1.7b-2n4g-megatron-trtllm-disagg-swe1.sh`).
+
 The same layout behind the vLLM backend (a runnable version is
 `examples/configs/recipes/llm/grpo-qwen3-1.7b-2n4g-megatron-vllm-disagg-swe1.yaml`):
 
@@ -267,9 +271,9 @@ policy:
         kv_load_failure_policy: fail
 ```
 
-vLLM-specific requirements, checked at setup: `colocated.enabled: false`,
-`async_engine` with `expose_http_server`, `pipeline_parallel_size: 1`, no
-`refit_transport` override, and, with in-flight weight updates
+vLLM-specific requirements, checked at setup: `colocated.enabled: false`, no Dynamo
+serving (`policy.generation.dynamo`), `async_engine` with `expose_http_server`,
+`pipeline_parallel_size: 1`, no `refit_transport` override, and, with in-flight weight updates
 (`grpo.async_grpo.in_flight_weight_updates`, or any SingleController run), neither
 `bidirectional_kv_xfer` nor `recompute_kv_cache_after_weight_updates`: vLLM's cache
 reset at the pause raises while a decode request still holds blocks for KV in transit,

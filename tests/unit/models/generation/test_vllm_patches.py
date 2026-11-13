@@ -450,6 +450,27 @@ def test_moe_routed_experts_patch_anchor_still_matches_installed_vllm(
 
 
 @pytest.mark.vllm
+def test_compile_cache_relative_artifacts_patch_anchor_still_matches_installed_vllm(
+    tmp_path, monkeypatch
+):
+    """If vLLM moves `path = handle[1]`, the backport must fail here, not in a job."""
+    copied = write_unpatched_copy(
+        "compilation/compiler_interface.py",
+        "_patch_vllm_compile_cache_relative_artifacts",
+        tmp_path / "compiler_interface.py",
+    )
+    monkeypatch.setattr(patches, "_get_vllm_file", lambda _relative: str(copied))
+    patches._patch_vllm_compile_cache_relative_artifacts(logging.getLogger(__name__))
+    content = copied.read_text()
+    assert "NeMo-RL: vllm#52142" in content, (
+        "the vllm#52142 backport did not apply to the installed vLLM; update it, "
+        "or remove it if vLLM >= 0.31.1 already has the fix."
+    )
+    assert "\nimport os\n" in content  # the replacement calls os.path.join
+    ast.parse(content)
+
+
+@pytest.mark.vllm
 def test_glm_decoder_sp_moe_patch_is_idempotent(patched_glm_dsa_source, monkeypatch):
     before = patched_glm_dsa_source.read_text()
     monkeypatch.setattr(

@@ -22,7 +22,8 @@
 #   --build-arg SKIP_VLLM_BUILD=1    # Skip vLLM dependencies
 #   --build-arg SKIP_SGLANG_BUILD=1  # Skip SGLang dependencies
 #   --build-arg SKIP_TRTLLM_BUILD=1  # Skip TRT-LLM dependencies
-# Optional isolated managed Dynamo runtime (Dynamo + vLLM only):
+# Optional etcd and nats-server binaries for Dynamo serving
+# (policy.generation.dynamo=true; ai-dynamo itself ships in the vLLM venvs):
 #   --build-arg BUILD_DYNAMO=1
 # Optional: drop the uv cache from the image (smaller, but no offline `uv run --extra`):
 #   --build-arg STRIP_UV_CACHE=1
@@ -159,7 +160,7 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
 # Install uv and python outside /root so an unprivileged runtime UID (for example
 # 65532) can execute them: /root is not traversable by other users, and the project
 # venv's python is a symlink into uv's managed-Python directory.
-ARG UV_VERSION=0.11.28
+ARG UV_VERSION=0.13.6
 ARG PYTHON_VERSION=3.13.14
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 # One uv cache for the build and for every runtime identity. It holds every wheel the venvs are
@@ -168,7 +169,8 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
 ENV UV_CACHE_DIR=/opt/nemo_rl_cache/uv
 RUN curl -LsSf https://astral.sh/uv/${UV_VERSION}/install.sh \
         | env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh && \
-    uv python install ${PYTHON_VERSION}
+    uv python install ${PYTHON_VERSION} && \
+    find /opt/uv/python -path "*/pip/_vendor/distlib/*.exe" -delete
 
 # Disable usage stats by default for users who are sensitive to sharing usage.
 # Users are encouraged to enable if the wish.
@@ -271,6 +273,8 @@ COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
 COPY --from=nemo-rl nemo_rl/distributed/actor_environments.py ./nemo_rl/distributed/
 COPY --from=nemo-rl tools/build-custom-vllm.sh ./tools/build-custom-vllm.sh
 COPY --from=nemo-rl tools/build-custom-flashinfer.sh ./tools/build-custom-flashinfer.sh
+# Part of this recipe, not of the selected source: an older NRL_GIT_REF has no such script.
+COPY docker/prune_uv_cache.py /usr/local/bin/prune_uv_cache.py
 COPY --from=nemo-rl --link research/ ./research/
 COPY --from=nemo-rl --link \
     --exclude=TensorRT-LLM-workspace \
@@ -290,7 +294,7 @@ RUN --mount=type=ssh \
 # downloads persist for the next build. This is the first uv-writing RUN in
 # the stage, so it force-copies the whole store in and prunes on sync-back
 # (see docker/uv_cache_mount.sh). Every later RUN in this stage that also
-# invokes uv (TRT-LLM build, Dynamo install, worker-venv prefetch phase 2,
+# invokes uv (TRT-LLM build, worker-venv prefetch phase 2,
 # Gym prefetch) sources the same helper but only tops up what it adds,
 # instead of re-shipping the whole store again in its own layer.
 # Whether the materialized copy also ships in the final image (for the
@@ -301,6 +305,17 @@ uv_cache_restore force
 trap 'uv_cache_persist prune' EXIT
 
 uv venv --seed
+# Drop what the restored cache carried in that uv.lock no longer pins -- versions from
+# older locks, which neither the seed export's `uv cache prune --ci` (it keeps every
+# source-built version) nor the durable cache mount ever evict (see
+# docker/prune_uv_cache.py). It runs before any sync, so it only ever judges restored
+# content: build-isolation deps the syncs below resolve outside uv.lock (setuptools, a
+# build-time torch, ...) are kept. It runs in this RUN because deleting files in a later
+# layer only hides them, and the image would still ship every byte; and the
+# `uv_cache_persist prune` trap above mirrors the result back into the cache mount.
+du -sh "${UV_CACHE_DIR}"
+"${UV_PROJECT_ENVIRONMENT}/bin/python" /usr/local/bin/prune_uv_cache.py --lock uv.lock --cache-dir "${UV_CACHE_DIR}"
+du -sh "${UV_CACHE_DIR}"
 # The custom build scripts will alter the pyproject.toml and uv.lock
 if [[ -n "${BUILD_CUSTOM_VLLM:-}" ]]; then
     UV_LINK_MODE=hardlink bash tools/build-custom-vllm.sh ${BUILD_CUSTOM_VLLM_URL:-} ${BUILD_CUSTOM_VLLM_REF:-} ${BUILD_CUSTOM_VLLM_PRECOMPILED_WHEEL_LOCATION:-}
@@ -321,7 +336,6 @@ apt-get update
 # DeepEP's multinode link needs the exact filename libnvidia-ml.so.1; the CUDA base
 # only ships stubs/libnvidia-ml.so. Purged again after the syncs below.
 apt-get install -y --no-install-recommends libnvidia-ml-dev
-uv cache clean deep-ep
 # Everything is hardlinked against the uv cache; this layer holds exactly one real copy of every wheel.
 UV_LINK_MODE=hardlink uv sync --frozen --no-install-project
 if [[ -z "${SKIP_VLLM_BUILD:-}" ]]; then
@@ -641,7 +655,6 @@ ARG BASE_IMAGE
 ARG UV_VERSION
 ARG HYBRID_EP_MULTINODE
 ARG BUILD_DYNAMO
-ARG DYNAMO_PYTHON_VERSION=3.12.11
 ARG ETCD_VERSION=v3.5.21
 ARG NATS_VERSION=v2.11.6
 # Space-separated config paths whose NeMo Gym venvs are prefetched into the image
@@ -661,7 +674,7 @@ ENV NVIDIA_BUILD_REF=${NVIDIA_BUILD_REF:-<unknown>}
 LABEL com.nvidia.build.id="${NVIDIA_BUILD_ID}"
 LABEL com.nvidia.build.ref="${NVIDIA_BUILD_REF}"
 
-ENV NEMO_RL_DYNAMO_VENV_DIR=/opt/dynamo_venv
+ENV NEMO_RL_DYNAMO_BIN_DIR=/opt/dynamo/bin
 
 # AWS EFA OFI plugin discovery (p4d / p5 / p5en multi-node NCCL via SRD).
 # The host's aws-efa-installer places libnccl-net-ofi.so under
@@ -678,22 +691,14 @@ ENV LD_LIBRARY_PATH="/opt/amazon/ofi-nccl/lib:/opt/amazon/efa/lib:${LD_LIBRARY_P
 # Exclude pyproject.toml and uv.lock since those may be altered by build-custom-vllm.sh
 COPY --from=nemo-rl --exclude=pyproject.toml --exclude=uv.lock . /opt/nemo-rl
 
-# Keep Dynamo's Python 3.12 dependency graph isolated from NeMo-RL's normal
-# Ray/vLLM environments. Default image builds do not create this environment.
-RUN --mount=from=uv-cache-helper,src=/,dst=/tmp/uv-cache-helper \
-    --mount=type=cache,id=uv-cache-${TARGETARCH}-${BASE_IMAGE}-${UV_VERSION}-${HYBRID_EP_MULTINODE},from=uv-cache-seed,source=.,target=/root/.uv-cache-store,sharing=locked <<"EOF" bash -exu -o pipefail
+# The control-plane binaries Dynamo serving starts. Default image builds skip them.
+# Not a uv-writing RUN (install.sh only downloads etcd and nats-server), so it
+# needs no uv cache mount.
+RUN <<"EOF" bash -exu -o pipefail
 if [[ "${BUILD_DYNAMO:-0}" != "1" ]]; then
-    echo "BUILD_DYNAMO is not 1; skipping the managed Dynamo runtime"
+    echo "BUILD_DYNAMO is not 1; skipping the Dynamo service binaries"
     exit 0
 fi
-# Same materialize/sync-back/strip dance as the other uv-writing RUNs --
-# docker/dynamo/install.sh calls uv sync with no explicit UV_CACHE_DIR override, so
-# it uses the image-wide UV_CACHE_DIR (set in base), which must be a plain
-# same-filesystem directory for hardlink installs. Already exists from the
-# hermetic stage unless STRIP_UV_CACHE removed it there.
-source /tmp/uv-cache-helper/uv_cache_mount.sh
-uv_cache_restore
-trap 'uv_cache_persist' EXIT
 bash docker/dynamo/install.sh
 EOF
 # Unshallow the repo to get the full history (in the case it was from the scratch layer).
@@ -862,7 +867,7 @@ echo "Exporting uv cache for build ${UV_CACHE_EXPORT_NONCE:-local}"
 # RUN command, leaving this builder-local mount empty. Restore the seed only in
 # that case; unconditionally merging it would resurrect wheels uv evicted.
 if [[ -z "$(find /root/.uv-cache-store -mindepth 1 -print -quit)" ]]; then
-    rsync -a /tmp/uv-cache-seed/ /root/.uv-cache-store/
+    rsync -aH /tmp/uv-cache-seed/ /root/.uv-cache-store/
 fi
 mkdir -p /tmp/uv-cache-export
 cp -a /root/.uv-cache-store/. /tmp/uv-cache-export/
