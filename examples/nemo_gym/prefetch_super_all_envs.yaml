@@ -11,6 +11,7 @@ env:
   nemo_gym:
     swe_pivot_single_step_tool_use_with_argument_comparison_environment_server:
       environment_servers:
+        _delete_key: single_agent_turn_legacy
         legacy_agent:
           entrypoint: app.py
           agent_server:
