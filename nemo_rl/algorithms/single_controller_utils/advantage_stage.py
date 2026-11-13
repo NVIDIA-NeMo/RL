@@ -45,11 +45,13 @@ from nemo_rl.algorithms.grpo import (
     _binary_participation,
     _clip_grpo_advantages,
     compute_and_apply_seq_logprob_error_masking,
+    scale_rewards,
 )
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
 )
+from nemo_rl.algorithms.reward_functions import apply_reward_shaping
 from nemo_rl.algorithms.single_controller_utils.config import (
     AdvantageConfig,
     logprob_passes_required,
@@ -226,6 +228,9 @@ class AdvantageRequest:
     # names its file after it and the pool has no view of the controller's
     # counter. Unset when the dump is off, which is the default.
     train_step: Optional[int] = None
+    # Overrides the config's policy_logprobs_required for this call, e.g. a PPO
+    # critic-warmup step that ran the policy-logprob pass under in-loss filtering.
+    policy_logprobs_required: Optional[bool] = None
 
 
 def split_meta_by_prompt_group(
@@ -349,6 +354,10 @@ class AdvantageComputer:
         """Run one call's advantage stage and return its reduced results."""
         meta = request.meta
         cfg = self._config
+        if request.policy_logprobs_required is not None:
+            cfg = replace(
+                cfg, policy_logprobs_required=request.policy_logprobs_required
+            )
         adv_cfg = cfg.advantage
         logical = has_logical_owners(meta)
         if logical and (
@@ -391,6 +400,10 @@ class AdvantageComputer:
         rewards = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.reward_field)
         ).float()
+        # Scale before baselines/metrics; keep DataPlane rewards raw for replay.
+        rewards = scale_rewards(
+            BatchedDataDict({"total_reward": rewards}), cfg.algo.reward_scaling
+        )["total_reward"]
         token_mask = tensor_field(data, adv_cfg.token_mask_field).float()
         sample_mask = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.sample_mask_field)
@@ -401,6 +414,18 @@ class AdvantageComputer:
         truncated = squeeze_trailing_unit_dim(
             tensor_field(data, adv_cfg.truncated_field)
         ).bool()
+
+        # Shape after scaling; token_mask counts generated tokens on both producers.
+        rewards = apply_reward_shaping(
+            BatchedDataDict(
+                {
+                    "total_reward": rewards,
+                    "response_token_lengths": token_mask.sum(dim=-1).long(),
+                    "truncated": truncated,
+                }
+            ),
+            cfg.algo.reward_shaping,
+        )["total_reward"]
 
         has_response_tokens = token_mask[:, 1:].bool().any(dim=-1)
         # A context-only segment has no physical loss row, but its empty mask
@@ -507,7 +532,7 @@ class AdvantageComputer:
             )
             seq_error_metrics["_num_valid_seqs_before"] = num_valid_seqs_before
             seq_error_metrics["_num_valid_seqs_after"] = num_valid_seqs_after
-            # SingleController rejects seq_logprob_error_in_loss, so this count is
+            # This pass never runs with seq_logprob_error_in_loss, so this count is
             # always pre-training and disjoint from the reasons attributed above.
             sample_mask_metrics["num_masked_seqs_total"] += int(
                 seq_error_metrics["num_masked_seqs_by_logprob_error"]

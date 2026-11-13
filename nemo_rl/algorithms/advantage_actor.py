@@ -29,6 +29,7 @@ from nemo_rl.algorithms.single_controller_utils.advantage_stage import (
 )
 from nemo_rl.data_plane import DataPlaneConfig, build_data_plane_client
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
+from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.utils.rpc_guard import assert_metadata_only
 
 
@@ -48,8 +49,9 @@ class AdvantageActor:  # pragma: no cover
         advantage_estimator: Any,
         shard_id: str = "0",
     ) -> None:
+        self._dp_client = build_data_plane_client(dp_config, bootstrap=False)
         self._computer = AdvantageComputer(
-            build_data_plane_client(dp_config, bootstrap=False),
+            self._dp_client,
             config=config,
             advantage_estimator=advantage_estimator,
             shard_id=shard_id,
@@ -66,6 +68,11 @@ class AdvantageActor:  # pragma: no cover
     async def flush_train_data_dump(self) -> None:
         """Wait until this worker's dump chunks are written (before the merge)."""
         await asyncio.to_thread(self._computer.flush_train_data_dump)
+
+    def get_data_plane_snapshot(self) -> dict[str, Any] | None:
+        if not is_metrics_client(self._dp_client):
+            return None
+        return self._dp_client.snapshot(reset_step_window=True)
 
     async def run(self, request: AdvantageRequest) -> AdvantageOutcome:
         """Run one advantage stage without letting payloads cross Ray RPC."""
