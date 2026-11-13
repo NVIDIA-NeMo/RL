@@ -22,6 +22,8 @@ import asyncio
 import json
 import os
 import signal
+import time
+from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 
 import pytest
@@ -33,6 +35,7 @@ from transformers import AutoTokenizer  # noqa: E402
 
 from nemo_rl.models.generation.dynamo.vllm.render_pool import (  # noqa: E402
     RenderPool,
+    _wait_for_settings,
     _Worker,
 )
 from nemo_rl.models.generation.prefix_recovery.restore import (  # noqa: E402
@@ -110,6 +113,12 @@ def _template_ids(tokenizer, messages, *, add_generation_prompt: bool) -> list[i
     return tokenizer.encode(text, add_special_tokens=False)
 
 
+def _pool(spec: dict, model_dir: str) -> RenderPool:
+    pool = RenderPool(workers=1)
+    pool.build(spec, model_dir)
+    return pool
+
+
 def test_the_pool_renders_and_answers_with_the_checkpoints_template_and_parsers(
     tiny_qwen3_model_path,
 ) -> None:
@@ -121,7 +130,7 @@ def test_the_pool_renders_and_answers_with_the_checkpoints_template_and_parsers(
     reply_ids = tokenizer.encode(reply_text, add_special_tokens=False)
 
     async def serve():
-        pool = RenderPool(SPEC, tiny_qwen3_model_path, workers=1)
+        pool = _pool(SPEC, tiny_qwen3_model_path)
         try:
             info = await pool.info()
             rendered = await pool.render(
@@ -170,16 +179,38 @@ def test_the_pool_renders_and_answers_with_the_checkpoints_template_and_parsers(
     assert json.loads(tool_call["function"]["arguments"]) == {"city": "Lyon"}
 
 
-def test_start_brings_up_every_worker_before_any_call(tiny_qwen3_model_path) -> None:
+def test_workers_start_before_their_settings_and_build_when_they_arrive(
+    tiny_qwen3_model_path,
+) -> None:
     async def serve():
-        pool = RenderPool(SPEC, tiny_qwen3_model_path, workers=2)
+        pool = RenderPool(workers=2)
         try:
-            await pool.start()
-            return len(pool._executor._processes)
+            start = asyncio.ensure_future(pool.start())
+            # Both come up before any settings exist, as at the frontend's launch.
+            async with asyncio.timeout(60):
+                while len(pool._executor._processes) < 2:
+                    await asyncio.sleep(0.01)
+            assert not start.done()
+            pool.build(SPEC, tiny_qwen3_model_path)
+            await start
+            return (await pool.info())["max_model_len"]
         finally:
             pool.shutdown()
 
-    assert asyncio.run(serve()) == 2
+    assert asyncio.run(serve()) == MAX_MODEL_LEN
+
+
+def test_a_worker_waits_for_its_settings_until_its_pool_is_shut_down(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        waiting = worker.submit(_wait_for_settings, str(path))
+        time.sleep(0.3)
+        assert not waiting.done()
+        path.write_text(json.dumps({"spec": SPEC, "model_dir": "/snapshots/model"}))
+        assert waiting.result(timeout=10) == (SPEC, "/snapshots/model")
+    # Shutdown removes the pool's directory; a worker left waiting would leak.
+    with pytest.raises(SystemExit):
+        _wait_for_settings(str(tmp_path / "removed" / "settings.json"))
 
 
 def test_a_dead_worker_fails_only_its_calls(tiny_qwen3_model_path) -> None:
@@ -192,7 +223,7 @@ def test_a_dead_worker_fails_only_its_calls(tiny_qwen3_model_path) -> None:
     }
 
     async def serve():
-        pool = RenderPool(SPEC, tiny_qwen3_model_path, workers=1)
+        pool = _pool(SPEC, tiny_qwen3_model_path)
         try:
             await pool.info()
             (pid,) = pool._executor._processes
@@ -215,7 +246,7 @@ def test_workers_that_cannot_start_fail_the_call_by_name(tiny_qwen3_model_path):
     spec = {**SPEC, "generation": {**SPEC["generation"], "vllm_cfg": vllm_cfg}}
 
     async def serve():
-        pool = RenderPool(spec, tiny_qwen3_model_path, workers=1)
+        pool = _pool(spec, tiny_qwen3_model_path)
         try:
             await pool.info()
         finally:
@@ -245,7 +276,7 @@ def test_workers_decode_videos_with_nemo_rls_loader(tiny_qwen3_model_path) -> No
     spec = {**SPEC, "generation": {**SPEC["generation"], "vllm_cfg": vllm_cfg}}
 
     async def serve():
-        pool = RenderPool(spec, tiny_qwen3_model_path, workers=1)
+        pool = _pool(spec, tiny_qwen3_model_path)
         try:
             return await pool._submit(_nemotron_vl_loader)
         finally:

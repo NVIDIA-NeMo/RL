@@ -222,6 +222,10 @@ class _ServiceProcess:
 # writes the capture config, the Ray cluster its TQ reads go through, and the
 # port it takes NeMo-Gym's generation cuts on (dynamo/vllm/generation_cut.py).
 RENDER_WORKERS_ENV = "NEMO_RL_DYNAMO_RENDER_WORKERS"
+# Where the driver writes the chat settings an engine sends before it loads.
+# Set only for a run that serves chat: the frontend then starts its render
+# workers at launch.
+CHAT_SETTINGS_FILE_ENV = "NEMO_RL_DYNAMO_CHAT_SETTINGS_FILE"
 CAPTURE_FILE_ENV = "NEMO_RL_DYNAMO_CAPTURE_FILE"
 RAY_ADDRESS_ENV = "NEMO_RL_DYNAMO_RAY_ADDRESS"
 GENERATION_CUT_PORT_ENV = "NEMO_RL_DYNAMO_GENERATION_CUT_PORT"
@@ -234,6 +238,15 @@ def read_chat_capture() -> dict[str, Any] | None:
         return None
     with open(path, "rb") as capture_file:
         return pickle.load(capture_file)
+
+
+def read_chat_settings() -> dict[str, Any] | None:
+    """What ``publish_chat_settings`` wrote for this frontend; None before it has."""
+    path = os.environ[CHAT_SETTINGS_FILE_ENV]
+    if not os.path.exists(path):
+        return None
+    with open(path) as settings_file:
+        return json.load(settings_file)
 
 
 class FrontendUrls(NamedTuple):
@@ -262,8 +275,12 @@ class FrontendHost:
         namespace: str,
         dynamo_cfg: DynamoCfg,
         env: dict[str, str],
+        serves_chat: bool,
     ) -> FrontendUrls:
-        """Launch the frontend on free ports of this node; return where it serves."""
+        """Launch the frontend on free ports of this node; return where it serves.
+
+        With ``serves_chat`` the frontend starts its render workers at launch.
+        """
         port = _get_free_port_local(
             DEFAULT_DYNAMO_HTTP_PORT_RANGE_LOW,
             DEFAULT_DYNAMO_HTTP_PORT_RANGE_HIGH,
@@ -287,6 +304,10 @@ class FrontendHost:
         self._chat_dir = tempfile.mkdtemp(prefix="nemorl_dynamo_chat_")
         frontend_env = _service_env(env)
         frontend_env[CAPTURE_FILE_ENV] = os.path.join(self._chat_dir, "capture.pkl")
+        if serves_chat:
+            frontend_env[CHAT_SETTINGS_FILE_ENV] = os.path.join(
+                self._chat_dir, "chat_settings.json"
+            )
         frontend_env[GENERATION_CUT_PORT_ENV] = str(generation_cut_port)
         self._process = _ServiceProcess(command, env=frontend_env, label="frontend")
         host = _get_node_ip_local()
@@ -298,16 +319,22 @@ class FrontendHost:
 
     def publish_chat_capture(self, capture: dict[str, Any]) -> None:
         """Write the token-capture config this frontend's chat engine reads."""
+        # Pickled: the data-plane config holds pydantic storage configs.
+        self._write_chat_file("capture.pkl", pickle.dumps(capture))
+
+    def publish_chat_settings(self, settings: dict[str, Any]) -> None:
+        """Write the chat settings this frontend builds its render workers from."""
+        self._write_chat_file("chat_settings.json", json.dumps(settings).encode())
+
+    def _write_chat_file(self, name: str, content: bytes) -> None:
         if self._chat_dir is None:
             raise RuntimeError("The Dynamo frontend was never started")
-        path = os.path.join(self._chat_dir, "capture.pkl")
-        # Pickled: the data-plane config holds pydantic storage configs.
         with tempfile.NamedTemporaryFile(
-            "wb", dir=self._chat_dir, suffix=".pkl", delete=False
-        ) as capture_file:
-            pickle.dump(capture, capture_file)
+            "wb", dir=self._chat_dir, delete=False
+        ) as chat_file:
+            chat_file.write(content)
         # Renamed into place, so the chat engine never reads a partial file.
-        os.replace(capture_file.name, path)
+        os.replace(chat_file.name, os.path.join(self._chat_dir, name))
 
     def returncode(self) -> int | None:
         """The frontend's exit code, or None while it runs."""
@@ -348,6 +375,7 @@ class ManagedDynamoRuntime:
         model_name: str,
         frontend_python: str,
         ray_address: str,
+        serves_chat: bool,
     ) -> None:
         """Describe the services; nothing starts until :meth:`start`.
 
@@ -358,11 +386,15 @@ class ManagedDynamoRuntime:
                 the vLLM workers' own.
             ray_address: The Ray cluster's GCS address; the frontend's chat
                 engine reads token-capture prefixes from TQ through it.
+            serves_chat: Whether the engines expose chat
+                (``vllm_cfg.expose_http_server``, which NeMo-Gym requires). The
+                frontend then starts its render workers at launch.
         """
         self._dynamo_cfg = dynamo_cfg
         self._model_name = model_name
         self._frontend_python = frontend_python
         self._ray_address = ray_address
+        self.serves_chat = serves_chat
         self._namespace = _managed_namespace()
         self._host = ""
         self._etcd_port = 0
@@ -570,6 +602,7 @@ class ManagedDynamoRuntime:
                     namespace=self._namespace,
                     dynamo_cfg=self._dynamo_cfg,
                     env=env,
+                    serves_chat=self.serves_chat,
                 )
                 for host in self._frontend_hosts
             ]
@@ -606,6 +639,22 @@ class ManagedDynamoRuntime:
         }
         ray.get(
             [host.publish_chat_capture.remote(capture) for host in self._frontend_hosts]
+        )
+
+    def publish_chat_settings(self, settings: dict[str, Any]) -> None:
+        """Hand every frontend the chat settings an engine sent before it loaded.
+
+        ``settings`` is what the engine publishes at registration
+        (``chat_runtime_data``). Each frontend builds its render workers from
+        them while the engines load, and registration confirms them.
+        """
+        if not self._started:
+            raise RuntimeError("Managed Dynamo runtime has not been started")
+        ray.get(
+            [
+                host.publish_chat_settings.remote(settings)
+                for host in self._frontend_hosts
+            ]
         )
 
     def wait_for_engines(

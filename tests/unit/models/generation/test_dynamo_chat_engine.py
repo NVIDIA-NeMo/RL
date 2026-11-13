@@ -30,6 +30,7 @@ pytest.importorskip("vllm")
 
 from dynamo.llm.exceptions import HttpError, InvalidArgument  # noqa: E402
 
+from nemo_rl.models.generation.dynamo import managed_runtime  # noqa: E402
 from nemo_rl.models.generation.dynamo.vllm import chat_engine  # noqa: E402
 from nemo_rl.models.generation.dynamo.vllm.render_pool import (  # noqa: E402
     RenderedCall,
@@ -489,8 +490,11 @@ def test_render_workers_start_at_registration_only_where_chat_is_served(
     started: list[int] = []
 
     class _StartedPool:
-        def __init__(self, spec: dict, model_dir: str, *, workers: int) -> None:
+        def __init__(self, *, workers: int) -> None:
             self._workers = workers
+
+        def build(self, spec: dict, model_dir: str) -> None:
+            pass
 
         async def start(self) -> None:
             started.append(self._workers)
@@ -514,3 +518,78 @@ def test_render_workers_start_at_registration_only_where_chat_is_served(
     asyncio.run(register())
 
     assert started == ([3] if exposes_chat else [])
+
+
+@pytest.mark.parametrize(
+    "sent_early, kept, built_from",
+    [
+        # The engine registers the policy.generation it sent before it loaded.
+        ("the same generation", True, "/snapshots/early"),
+        ("another generation", False, "/snapshots/registered"),
+        # Nothing came before registration: the waiting workers build then.
+        (None, True, "/snapshots/registered"),
+    ],
+)
+def test_registration_keeps_render_workers_built_from_the_same_settings(
+    monkeypatch, tmp_path, sent_early, kept: bool, built_from: str
+) -> None:
+    pools: list = []
+
+    class _Pool:
+        def __init__(self, *, workers: int) -> None:
+            self.built: list[tuple[dict, str]] = []
+            self.shut_down = False
+            pools.append(self)
+
+        def build(self, spec: dict, model_dir: str) -> None:
+            self.built.append((spec, model_dir))
+
+        async def start(self) -> None:
+            pass
+
+        def shutdown(self) -> None:
+            self.shut_down = True
+
+    async def early_model_dir(model: str) -> str:
+        return "/snapshots/early"
+
+    monkeypatch.setattr(chat_engine, "RenderPool", _Pool)
+    monkeypatch.setattr(chat_engine, "weight_free_model_path", early_model_dir)
+    monkeypatch.setenv(chat_engine.RENDER_WORKERS_ENV, "3")
+    settings_file = tmp_path / "chat_settings.json"
+    monkeypatch.setenv(managed_runtime.CHAT_SETTINGS_FILE_ENV, str(settings_file))
+    generation = {
+        **GENERATION,
+        "model_name": "model",
+        "vllm_cfg": {"expose_http_server": True},
+    }
+    spec = {"engine_args": {}, "generation": generation}
+    if sent_early is not None:
+        early = {
+            # vLLM fills in more engine args while it builds the engine.
+            "engine_args": {"max_num_seqs": None},
+            "generation": {
+                **generation,
+                "top_p": 0.9 if sent_early == "the same generation" else 0.5,
+            },
+        }
+        settings_file.write_text(json.dumps({chat_engine.RUNTIME_DATA_KEY: early}))
+    model = SimpleNamespace(
+        runtime_config=lambda: {"runtime_data": {chat_engine.RUNTIME_DATA_KEY: spec}},
+        name=lambda: "model",
+        local_dir=lambda: "/snapshots/registered",
+    )
+
+    async def launch_then_register() -> None:
+        factory = chat_engine.ChatEngineFactory()
+        factory.start_render_workers()
+        while sent_early is not None and not pools[0].built:
+            await asyncio.sleep(0.01)
+        await factory.chat_engine_factory(0, model, _Router())
+
+    asyncio.run(launch_then_register())
+
+    assert pools[0].shut_down is not kept
+    assert len(pools) == (1 if kept else 2)
+    ((built_spec, model_dir),) = pools[-1].built
+    assert (built_spec["generation"], model_dir) == (generation, built_from)
