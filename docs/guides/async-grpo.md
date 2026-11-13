@@ -81,17 +81,13 @@ cluster:
 
 ### Configure the training duration
 
-Async GRPO uses the same two training bounds as synchronous GRPO and stops at
-the first one reached:
+Async GRPO uses the same two training bounds as synchronous GRPO and stops at the first one reached:
 
 ```text
 min(max_num_steps, max_num_epochs × batches_per_epoch)
 ```
 
-One epoch is one complete pass over the training dataloader. The background
-trajectory collector cycles through the stateful dataloader as needed, while
-the trainer stops at the effective step limit above. Async checkpoints retain
-the collector's dataloader position for resume.
+One epoch is one complete pass over the training dataloader. The background trajectory collector cycles through the stateful dataloader as needed, while the trainer stops at the effective step limit above. Async checkpoints retain the collector's dataloader position for resume.
 
 ## Implementation Structure
 This section covers the internal architecture of async GRPO and includes detailed explanations of how the core components interact.
@@ -221,7 +217,7 @@ If no `replay_buffer.pt` file is found in the latest checkpoint directory, train
 
 3. **Resource Allocation**: Ensure sufficient GPU memory for both the training and generation clusters
 
-4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` to refit without waiting for the longest in-flight generation to finish. Except for managed Dynamo, the collector requests a generation pause and resume from every async backend around the weight transfer. Async vLLM implements this contract while preserving request state. SGLang acknowledges these hooks through its weight synchronizer, which pauses, flushes KV, transfers weights, and resumes generation; its configured pause mode determines whether requests are requeued or aborted. A backend that does not implement the hook emits a warning once per backend type per process and refits without a collector-side pause or drain. Managed Dynamo always drains active trajectories before refit. vLLM requires `async_engine: true`; the Megatron backend is always async-engine.
+4. **In-Flight Weight Updates**: Enable `in_flight_weight_updates: true` to refit without waiting for the longest in-flight generation to finish. The collector requests a generation pause and resume from every async backend around the weight transfer. Async vLLM implements this contract while preserving request state. SGLang acknowledges these hooks through its weight synchronizer, which pauses, flushes KV, transfers weights, and resumes generation; its configured pause mode determines whether requests are requeued or aborted. A backend that does not implement the hook emits a warning once per backend type per process and refits without a collector-side pause or drain. vLLM requires `async_engine: true`; the Megatron backend is always async-engine.
 
 5. **Recompute KV Cache After Weight Updates**: `recompute_kv_cache_after_weight_updates` defaults to `true` to invalidate reusable KV/prefix caches when weights change. On the native async vLLM in-flight path, caches are cleared while generation is paused, so preserved requests recompute their KV after resuming. This repeats prefill for those requests and can reduce throughput. SGLang always flushes KV inside its weight synchronizer before the transfer, regardless of this flag; on its in-flight path, the collector skips a second flush after generation resumes. Other refit paths keep their existing post-update invalidation behavior. Set the flag to `false` to retain pre-update KV caches and avoid this recomputation cost on backends that support doing so. On the Megatron generation backend, the flag must agree with `policy.generation.mcore_generation_config.kv_cache_management_mode`: use `true` with `recompute`, or explicitly set `false` with `persist`/`offload`; setup errors on a mismatch.
 

@@ -39,7 +39,7 @@ if [[ "${FAST:-0}" != "1" ]]; then
         [[ -d "$i" ]] || continue
         project_dir=$(dirname "$(dirname "$i")")
         pushd "$project_dir"
-        uv sync --locked --inexact --group test
+        uv sync --locked --group test
         uv run --no-sync pytest tests/unit
         popd
     done
