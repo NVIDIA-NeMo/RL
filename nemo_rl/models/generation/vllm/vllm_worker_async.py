@@ -19,6 +19,7 @@ import functools
 import gc
 import logging
 import secrets
+import sys
 import threading
 import time
 import uuid
@@ -89,6 +90,7 @@ from nemo_rl.models.generation.vllm.collective_rpc import (
 )
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
+    VllmSpecificArgs,
     parse_nvfp4_pertoken_rollout,
 )
 from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
@@ -112,6 +114,25 @@ LOGGER = logging.getLogger(__name__)
 # size: more threads only queue more puts on TQ's single client loop per process.
 _CAPTURE_READ_THREADS = 64
 _CAPTURE_WRITE_THREADS = 32
+
+
+def _tune_actor_interpreter(vllm_cfg: VllmSpecificArgs) -> None:
+    """Apply the actor_gil_switch_interval_ms and actor_gc_* settings to this process."""
+    applied = []
+    interval_ms = vllm_cfg.get("actor_gil_switch_interval_ms")
+    if interval_ms is not None:
+        sys.setswitchinterval(interval_ms / 1000)
+        applied.append(f"switchinterval={sys.getswitchinterval()}s")
+    threshold = vllm_cfg.get("actor_gc_threshold")
+    if threshold is not None:
+        gc.set_threshold(*threshold)
+        applied.append(f"gc_threshold={gc.get_threshold()}")
+    if vllm_cfg.get("actor_gc_freeze"):
+        gc.collect()
+        gc.freeze()
+        applied.append(f"gc_frozen={gc.get_freeze_count()}")
+    if applied:
+        LOGGER.info("generation actor interpreter: %s", " ".join(applied))
 
 
 # The captured model call the current HTTP request serves. Set when capture
@@ -664,6 +685,8 @@ class VllmAsyncGenerationWorkerImpl(
             install_output_loop_yield(
                 self.llm, reader_budget_s=output_loop_yield_budget_ms / 1000
             )
+        # After engine startup, so a GC freeze covers the engine's long-lived objects.
+        _tune_actor_interpreter(self.cfg["vllm_cfg"])
 
         # vLLM Metrics Logger
         # Metrics logger only enabled for per-actor, model-owner only
