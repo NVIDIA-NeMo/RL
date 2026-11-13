@@ -33,7 +33,7 @@ from nemo_rl.models.generation.prefix_recovery.progress import (
 from nemo_rl.models.generation.vllm.utils import extract_generation_logprobs
 
 if TYPE_CHECKING:
-    from nemo_rl.models.generation.vllm.vllm_worker_async import _AsyncLLMHTTPClient
+    from nemo_rl.models.generation.vllm.frontend import _AsyncLLMHTTPClient
 
 # The vLLM release whose private OutputProcessor layout these reads were
 # checked against; see VllmProgressReader.

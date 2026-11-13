@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from nemo_rl.models.generation.vllm.vllm_worker_async import _AsyncLLMHTTPClient
+from nemo_rl.models.generation.vllm.frontend import _AsyncLLMHTTPClient
 
 pytestmark = pytest.mark.vllm
 

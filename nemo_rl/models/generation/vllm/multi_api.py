@@ -50,7 +50,9 @@ class MultiAPIServerPool:
     def raise_if_unavailable(self) -> None:
         """Reject operations after the first failure."""
         if self._failure is not None:
-            raise RuntimeError(f"HTTP API pool failed: {self._failure}") from self._failure
+            raise RuntimeError(
+                f"HTTP API pool failed: {self._failure}"
+            ) from self._failure
 
     def create_engine(self, engine_args: Any, stat_loggers: list[Any]) -> Any:
         """Launch one shared engine and attach its frontend clients.
@@ -286,31 +288,18 @@ class MultiAPIServerPool:
             namespace: Ray namespace used when token capture connects to the cluster.
             routed_experts_dtype: Dtype used to carry captured routed-expert IDs.
         """
-        # Spawned frontends reuse the capture/renderer implementation without running
-        # the GPU-owning worker constructor or creating a second engine.
+        # vLLM and Ray are optional outside generation workers.
         import ray
         from vllm.v1.engine.async_llm import AsyncLLM
         from vllm.v1.executor.abstract import Executor
         from vllm.v1.metrics.prometheus import shutdown_prometheus
 
         from nemo_rl.models.generation.vllm.config import resolve_vllm_video_config
-        from nemo_rl.models.generation.vllm.vllm_worker_async import (
-            VllmAsyncGenerationWorkerImpl,
-            _AsyncLLMHTTPClient,
-        )
+        from nemo_rl.models.generation.vllm.frontend import VllmHTTPFrontend
         from nemo_rl.telemetry.setup import init_telemetry_worker, shutdown_telemetry
 
-        host: Any = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-        host._init_frontend_state()
-        host.cfg = generation_config
-        host.routed_experts_dtype = routed_experts_dtype
-        host.is_model_owner = True
-        host._sparse_refit_receiver = None
-        host._reserved_socket = listener
-        host._reserved_port = listener.getsockname()[1]
-        host._reserved_node_ip = node_ip
-        host.llm_async_engine_args = copy.deepcopy(engine_args)
-        host.llm_async_engine_args._api_process_rank = index
+        frontend_args = copy.deepcopy(engine_args)
+        frontend_args._api_process_rank = index
         engine = None
         engine_config.parallel_config._api_process_rank = index
         try:
@@ -335,7 +324,7 @@ class MultiAPIServerPool:
                 client_count=count,
                 client_index=index,
             )
-            budget_ms = host.cfg["vllm_cfg"].get("output_loop_yield_budget_ms")
+            budget_ms = generation_config["vllm_cfg"].get("output_loop_yield_budget_ms")
             if budget_ms is not None:
                 # Keep the optional output-loop patch local to generation workers.
                 from nemo_rl.models.generation.vllm.patches import (
@@ -343,23 +332,25 @@ class MultiAPIServerPool:
                 )
 
                 install_output_loop_yield(engine, reader_budget_s=budget_ms / 1000)
-            host.llm = engine
             connection.send(("ok", None))
 
             async def serve() -> None:
-                host._engine_loop = asyncio.get_running_loop()
-                host._http_engine_client = _AsyncLLMHTTPClient(
-                    host.llm,
-                    host._engine_loop,
-                    flat_logprobs=bool(host.cfg["vllm_cfg"].get("flat_logprobs")),
+                host = VllmHTTPFrontend(
+                    generation_config,
+                    engine_client=engine,
+                    engine_args=frontend_args,
+                    engine_loop=asyncio.get_running_loop(),
+                    listener=listener,
+                    node_ip=node_ip,
+                    routed_experts_dtype=routed_experts_dtype,
                 )
                 while True:
                     name, args = await asyncio.to_thread(connection.recv)
                     result = None
                     if name == "start":
-                        host.server_thread, host.base_url, host.http_server = (
-                            host._setup_vllm_server()
-                        )
+                        host.start()
+                        assert host.http_server is not None
+                        assert host.server_thread is not None
                         deadline = time.monotonic() + 60
                         while not host.http_server.started:
                             if (
@@ -386,10 +377,7 @@ class MultiAPIServerPool:
                     elif name == "snapshot":
                         result = host.get_data_plane_snapshot()
                     elif name == "stop":
-                        if host.http_server is not None:
-                            host.http_server.should_exit = True
-                            assert host.server_thread is not None
-                            await asyncio.to_thread(host.server_thread.join, 30)
+                        await host.stop(join_timeout=30)
                         await asyncio.to_thread(shutdown_telemetry)
                         connection.send(("ok", None))
                         return

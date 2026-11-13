@@ -56,8 +56,11 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             lifecycle.attach_mock(shutdown_telemetry, "flush")
 
             class Host:
-                def _init_frontend_state(self):
+                def __init__(self, cfg, **kwargs):
+                    self.cfg = cfg
+                    self.settings = kwargs
                     self.http_server = None
+                    self.stop = AsyncMock()
                     self.setup_token_capture = AsyncMock()
                     lifecycle.attach_mock(self.setup_token_capture, "capture")
                     self.set_rollout_weight_version = AsyncMock()
@@ -88,7 +91,6 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             ]
             listener = Mock()
             listener.getsockname.return_value = ("localhost", 8100)
-            http_client = Mock()
             install_yield = Mock()
             modules = {
                 "ray": SimpleNamespace(is_initialized=lambda: False, init=Mock()),
@@ -110,9 +112,8 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                 "vllm.v1.metrics.prometheus": SimpleNamespace(
                     shutdown_prometheus=Mock()
                 ),
-                "nemo_rl.models.generation.vllm.vllm_worker_async": SimpleNamespace(
-                    VllmAsyncGenerationWorkerImpl=Host,
-                    _AsyncLLMHTTPClient=http_client,
+                "nemo_rl.models.generation.vllm.frontend": SimpleNamespace(
+                    VllmHTTPFrontend=Host,
                 ),
                 "nemo_rl.telemetry.setup": SimpleNamespace(
                     init_telemetry_worker=init_telemetry,
@@ -139,11 +140,19 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                     namespace="test",
                     routed_experts_dtype=dtype,
                 )
-            self.assertEqual(hosts[0].routed_experts_dtype, dtype)
+            self.assertEqual(hosts[0].settings["routed_experts_dtype"], dtype)
+            self.assertIs(hosts[0].settings["engine_client"], engine)
+            self.assertIs(hosts[0].settings["listener"], listener)
+            self.assertEqual(hosts[0].settings["node_ip"], "localhost")
+            self.assertEqual(hosts[0].settings["engine_args"]._api_process_rank, 1)
+            self.assertIsInstance(
+                hosts[0].settings["engine_loop"], asyncio.AbstractEventLoop
+            )
+            hosts[0].stop.assert_awaited_once_with(join_timeout=30)
             self.assertEqual(connection.send.call_args_list[0].args, (("ok", None),))
             if video_config is None:
                 register_video_loader.assert_not_called()
-            self.assertTrue(http_client.call_args.kwargs["flat_logprobs"])
+            self.assertTrue(hosts[0].cfg["vllm_cfg"]["flat_logprobs"])
             install_yield.assert_called_once_with(engine, reader_budget_s=0.02)
             hosts[0].setup_token_capture.assert_awaited_once_with(
                 {"impl": "transfer_queue"},

@@ -25,11 +25,11 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from nemo_rl.models.generation.vllm.frontend import (
+    install_http_server_api_key_check,
+)
 from nemo_rl.models.generation.vllm.vllm_generation import (
     http_server_api_key_and_worker_config,
-)
-from nemo_rl.models.generation.vllm.vllm_worker_async import (
-    install_http_server_api_key_check,
 )
 
 
