@@ -262,6 +262,32 @@ def _validate_draft_refit_info(
         )
 
 
+def _target_language_model(model_runner: Any) -> Any:
+    target_model = model_runner.model
+    return (
+        target_model.get_language_model()
+        if hasattr(target_model, "get_language_model")
+        else target_model
+    )
+
+
+def _shares_weight(draft_module: Any, target_module: Any) -> bool:
+    return (
+        draft_module is not None
+        and target_module is not None
+        and draft_module.weight.data_ptr() == target_module.weight.data_ptr()
+    )
+
+
+def _drafter_shares_target_embed_tokens(model_runner: Any, draft_model: Any) -> bool:
+    """Whether the drafter's embed_tokens is the target model's own embedding."""
+    target_lm = _target_language_model(model_runner)
+    return _shares_weight(
+        getattr(getattr(draft_model, "model", None), "embed_tokens", None),
+        getattr(getattr(target_lm, "model", None), "embed_tokens", None),
+    )
+
+
 def _assert_drafter_owns_modules(
     model_runner: Any,
     draft_model: Any,
@@ -277,27 +303,12 @@ def _assert_drafter_owns_modules(
     that reintroduces the sharing fails loudly instead of silently
     corrupting generation.
     """
-    target_model = model_runner.model
-    target_lm = (
-        target_model.get_language_model()
-        if hasattr(target_model, "get_language_model")
-        else target_model
-    )
+    target_lm = _target_language_model(model_runner)
     refits_embed = any("embed_tokens" in name for name, _ in draft_weights)
     refits_lm_head = any("lm_head" in name for name, _ in draft_weights)
 
-    def _shares_weight(draft_module: Any, target_module: Any) -> bool:
-        return (
-            draft_module is not None
-            and target_module is not None
-            and draft_module.weight.data_ptr() == target_module.weight.data_ptr()
-        )
-
     shared = []
-    if refits_embed and _shares_weight(
-        getattr(getattr(draft_model, "model", None), "embed_tokens", None),
-        getattr(getattr(target_lm, "model", None), "embed_tokens", None),
-    ):
+    if refits_embed and _drafter_shares_target_embed_tokens(model_runner, draft_model):
         shared.append("embed_tokens")
     if refits_lm_head and _shares_weight(
         getattr(draft_model, "lm_head", None),
