@@ -1,10 +1,24 @@
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
+index 0f13a26..1501df1 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py
-@@ -38,6 +38,13 @@
+@@ -22,7 +22,6 @@ import numpy as np
+ import regex as re
+ import torch
+ import zmq
+-
+ from vllm.distributed.kv_transfer.kv_connector.utils import (
+     BlockIds,
+     EngineId,
+@@ -38,6 +37,18 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
      KVConnectorTransferResults,
  )
  from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
++from vllm.distributed.kv_transfer.kv_connector.v1.nixl.job_failure import (
++    DEFAULT_KV_FAILURE_ACTION,
++    KVFailurePolicy,
++    node_name,
++)
 +from vllm.distributed.kv_transfer.kv_connector.v1.nixl.lease_slots import (
 +    LeaseVerifier,
 +    ProducerLeaseSlots,
@@ -15,7 +29,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/
  from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
      GET_META_MSG,
      NixlAgentMetadata,
-@@ -169,6 +176,12 @@
+@@ -169,6 +180,12 @@ class NixlBaseConnectorWorker:
      # caches under PP.
      _supports_pp_hma = False
  
@@ -28,7 +42,22 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/
      def _compute_desc_ids(
          self,
          block_ids: BlockIds,
-@@ -818,6 +831,7 @@
+@@ -527,6 +544,14 @@ class NixlBaseConnectorWorker:
+         if vllm_config.kv_transfer_config is None:
+             raise ValueError("kv_transfer_config must be set for NixlConnector")
+         self.kv_transfer_config = vllm_config.kv_transfer_config
++        self._kv_failure_policy = KVFailurePolicy.create(
++            self.kv_transfer_config.get_from_extra_config(
++                "kv_failure_action", DEFAULT_KV_FAILURE_ACTION
++            ),
++            load_failure_policy=self.kv_transfer_config.kv_load_failure_policy,
++            lease_verification=lease_verification_enabled(vllm_config),
++        )
++        self._remote_node_names: dict[EngineId, dict[int, str]] = defaultdict(dict)
+ 
+         self.nixl_backends = vllm_config.kv_transfer_config.get_from_extra_config(
+             "backends", ["UCX"]
+@@ -818,6 +843,7 @@ class NixlBaseConnectorWorker:
          self._failed_recv_reqs: queue.Queue[ReqId] = queue.Queue()
          self._recv_failures: set[ReqId] = set()
          self._pending_recv_notifs: dict[ReqId, list[tuple[str, bytes]]] = {}
@@ -36,7 +65,15 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/
  
          # Handshake metadata of this worker for NIXL transfers.
          self.xfer_handshake_metadata: NixlHandshakePayload | None = None
-@@ -1742,6 +1756,8 @@
+@@ -1251,6 +1277,7 @@ class NixlBaseConnectorWorker:
+             exc_info=error is not None,
+             stacklevel=2,
+         )
++        self._stop_on_kv_failure(req_id, reason=failure_type, meta=meta)
+ 
+     def _ensure_handshake(
+         self,
+@@ -1742,6 +1769,8 @@ class NixlBaseConnectorWorker:
              descs = self.nixl_wrapper.get_reg_descs(ranges_for_mem_type, mem_type)
              self.nixl_wrapper.register_memory(descs, backends=self.nixl_backends)
              self._registered_descs.append(descs)
@@ -45,7 +82,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/
  
          self.device_kv_caches = kv_caches
          self.dst_num_blocks[self.engine_id] = self.num_blocks
-@@ -1770,6 +1786,7 @@
+@@ -1770,6 +1799,7 @@ class NixlBaseConnectorWorker:
          self.src_xfer_handles_by_block_size[self.block_size], self.src_blocks_data = (
              self.register_local_xfer_handler(self.block_size)
          )
@@ -53,7 +90,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/
  
          # After KV Caches registered, listen for new connections.
          agent_metadata = NixlAgentMetadata(
-@@ -1796,6 +1813,10 @@
+@@ -1796,6 +1826,11 @@ class NixlBaseConnectorWorker:
              dcp_size=self.dcp_size,
              pcp_size=self.pcp_size,
              region_members=self.region_members,
@@ -61,14 +98,14 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/
 +                lease_tensor.data_ptr() if lease_tensor is not None else None
 +            ),
 +            lease_num_slots=lease_tensor.numel() if lease_tensor is not None else 0,
++            node_name=node_name(),
          )
          # Wrap metadata in payload with hash for defensive decoding
          assert self.compat_hash is not None
-@@ -1804,6 +1825,40 @@
-             compatibility_hash=self.compat_hash,
+@@ -1805,6 +1840,41 @@ class NixlBaseConnectorWorker:
              agent_metadata_bytes=encoder.encode(agent_metadata),
          )
-+
+ 
 +    def _register_lease_slots(self) -> None:
 +        """Register the lease slots and landing cells of pull mode in DRAM.
 +
@@ -89,8 +126,9 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/
 +            if self._lease_verification:
 +                raise RuntimeError(
 +                    f"Cannot register NIXL KV lease slots in DRAM ({e}), so "
-+                    "pulled KV cannot be verified. Set kv_lease_verification "
-+                    "to false in kv_connector_extra_config to pull without it."
++                    "pulled KV cannot be verified. Only for controlled diagnostics, "
++                    "set kv_failure_action=fail_request and "
++                    "kv_lease_verification=false in kv_connector_extra_config."
 +                ) from e
 +            logger.exception("Cannot register NIXL KV lease slots in DRAM.")
 +            return
@@ -102,10 +140,11 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/
 +        )
 +        self._lease_slots = slots
 +        self._lease_verifier = verifier
- 
++
      def _build_mamba_local(self, base_addresses: list[int]) -> np.ndarray:
          """Build desc regions (conv sub-projections + ssm) per layer for
-@@ -2384,6 +2439,20 @@
+         local mamba blocks with DS conv layout, as an Nx3 uint64 array.
+@@ -2384,7 +2454,22 @@ class NixlBaseConnectorWorker:
          self.dst_xfer_side_handles[engine_id][remote_tp_rank] = (
              self.nixl_wrapper.prep_xfer_dlist(remote_agent_name, descs)
          )
@@ -124,9 +163,11 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/
 +                ),
 +            )
  
++        self._remote_node_names[engine_id][remote_tp_rank] = nixl_agent_meta.node_name
          return remote_agent_name
  
-@@ -2822,6 +2891,7 @@
+     def _validate_remote_agent_handshake(
+@@ -2822,6 +2907,7 @@ class NixlBaseConnectorWorker:
          done_recving, newly_failed = self._pop_done_transfers(self._recving_transfers)
          if newly_failed:
              self._recv_failures.update(newly_failed)
@@ -134,7 +175,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/
  
          done_sending.update(self._replicated_pcp_done_sending)
          self._replicated_pcp_done_sending.clear()
-@@ -2870,6 +2940,8 @@
+@@ -2870,6 +2956,8 @@ class NixlBaseConnectorWorker:
              # Skip KV sync and post-processing for failed requests
              if req_id in failed_recv_reqs:
                  self._pending_recv_notifs.pop(req_id, None)
@@ -143,8 +184,11 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/
                  # TODO (NickLucche) handle failed transfer for HMA.
                  if not self._is_hma_required:
                      self._invalid_block_ids.put(set(meta.local_block_ids[0]))
-@@ -2960,7 +3032,10 @@
+@@ -2958,9 +3046,13 @@ class NixlBaseConnectorWorker:
+                 req_id,
+                 count,
              )
++            self._stop_on_kv_failure(req_id, reason="producer KV lease expired")
              self._reqs_to_process.remove(req_id)
              del self._reqs_to_send[req_id]
 +            self._clear_lease_slot(req_id)
@@ -154,11 +198,10 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/
  
          return KVConnectorTransferResults(
              finished_sending=done_sending,
-@@ -2987,6 +3062,37 @@
-         Subclasses must implement this to handle mode-specific notifications.
+@@ -2988,6 +3080,60 @@ class NixlBaseConnectorWorker:
          """
          raise NotImplementedError
-+
+ 
 +    def _verify_read_leases(self, done_recving: set[ReqId]) -> set[ReqId]:
 +        """Hold back finished pulls until their remote leases are checked.
 +
@@ -181,18 +224,50 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/
 +                reason,
 +            )
 +            self.xfer_stats.record_lease_check_failure()
++            self._stop_on_kv_failure(req_id, reason=reason)
 +            # The block READs completed, so every source may release its blocks.
 +            self._send_pending_recv_notifs(req_id)
 +            self._recv_failures.add(req_id)
 +        return (done_recving - reads_done) | verified | failures.keys()
 +
++    def _stop_on_kv_failure(
++        self, req_id: str | None, *, reason: str, meta: ReqMeta | None = None
++    ) -> None:
++        """Attach worker and peer identity to the fatal allocation report."""
++        if meta is None and req_id is not None:
++            meta = self._recving_metadata.get(req_id)
++        remote = meta.remote if meta is not None else None
++        context = {
++            "request_id": req_id,
++            "engine_id": self.engine_id,
++            "tp_rank": self.tp_rank,
++            "remote_engine_id": remote.engine_id if remote else None,
++            "remote_host": remote.host if remote else None,
++            "remote_request_id": remote.request_id if remote else None,
++            "remote_nodes_by_tp_rank": (
++                self._remote_node_names.get(remote.engine_id, {}).copy()
++                if remote
++                else {}
++            ),
++        }
++        self._kv_failure_policy.on_failure(reason=reason, context=context)
++
 +    def _clear_lease_slot(self, req_id: ReqId) -> None:
 +        if self._lease_slots is not None:
 +            self._lease_slots.clear(req_id)
- 
++
      def _handle_heartbeat(self, payload: str) -> None:
          """Extend leases for requests referenced in a heartbeat.
-@@ -3515,12 +3621,15 @@
+ 
+@@ -3097,6 +3243,7 @@ class NixlBaseConnectorWorker:
+                 transport failures) pass False.
+ 
+         """
++        self._stop_on_kv_failure(req_id, reason="KV transfer failed or expired")
+         if record_failed_transfer:
+             self.xfer_stats.record_failed_transfer()
+         if failed_req_ids is not None:
+@@ -3515,12 +3662,15 @@ class NixlBaseConnectorWorker:
          it runs, so a transfer that outlives the TTL leaves its engine looking
          idle. A peer that has lost its NIC holds one indefinitely.
          """
@@ -209,7 +284,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/
  
      def _cleanup_remote_engine(
          self, engine_id: EngineId, *, log_eviction: bool = True
-@@ -3536,6 +3645,8 @@
+@@ -3536,6 +3686,8 @@ class NixlBaseConnectorWorker:
          # Notif-only engines (push-mode D side) have no descriptor state.
          for handle in self.dst_xfer_side_handles.pop(engine_id, {}).values():
              self.nixl_wrapper.release_dlist_handle(handle)
@@ -218,15 +293,143 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py b/
          # Pop under the handshake lock; NIXL teardown stays outside it.
          with self._handshake_lock:
              agents = self._remote_agents.pop(engine_id)
-@@ -3612,4 +3723,6 @@
+@@ -3543,6 +3695,7 @@ class NixlBaseConnectorWorker:
+             self.nixl_wrapper.remove_remote_agent(agent_name)
+ 
+         self.kv_caches_base_addr.pop(engine_id, None)
++        self._remote_node_names.pop(engine_id, None)
+         self.dst_num_blocks.pop(engine_id, None)
+         self.dst_region_num_blocks.pop(engine_id, None)
+         self.dst_region_group_ids.pop(engine_id, None)
+@@ -3612,4 +3765,6 @@ class NixlBaseConnectorWorker:
              for handle in handles:
                  self.nixl_wrapper.release_xfer_handle(handle)
          self._recving_transfers.clear()
 +        if self._lease_verifier is not None:
 +            self._lease_verifier.shutdown()
          self._finish_shutdown()
+diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/job_failure.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/job_failure.py
+new file mode 100644
+index 0000000..dadb554
+--- /dev/null
++++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/job_failure.py
+@@ -0,0 +1,113 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Log NIXL incident context and stop the current Slurm allocation."""
++
++import json
++import logging
++import os
++import shutil
++import socket
++import subprocess
++from dataclasses import dataclass
++from datetime import UTC, datetime
++from typing import Any
++
++logger = logging.getLogger(__name__)
++DEFAULT_KV_FAILURE_ACTION = "stop_job"
++
++
++def node_name() -> str:
++    """Return the worker's actual hostname."""
++    return socket.gethostname()
++
++
++@dataclass(frozen=True)
++class KVFailurePolicy:
++    """Validated response to KV transport, expiry, and verification failures."""
++
++    action: str
++    job_id: str | None = None
++    cancel_command: str | None = None
++
++    @classmethod
++    def create(
++        cls,
++        action: str,
++        *,
++        load_failure_policy: str,
++        lease_verification: bool,
++    ) -> "KVFailurePolicy":
++        """Reject an unusable fail-stop deployment before registering KV."""
++        if action not in ("stop_job", "fail_request"):
++            raise ValueError("kv_failure_action must be stop_job or fail_request")
++        if action == "fail_request":
++            return cls(action)
++        if load_failure_policy != "fail" or not lease_verification:
++            raise ValueError(
++                "stop_job requires kv_load_failure_policy=fail and "
++                "kv_lease_verification=true; use kv_failure_action=fail_request "
++                "only for request-level diagnostics"
++            )
++        job_id = os.environ.get("SLURM_JOB_ID", "")
++        if not job_id or not job_id.isascii() or not job_id.isdigit():
++            raise ValueError("stop_job requires the current numeric SLURM_JOB_ID")
++        cancel_command = shutil.which("scancel")
++        if cancel_command is None:
++            raise ValueError(
++                "stop_job requires scancel in every P/D worker environment; "
++                "make the Slurm client available before starting workers"
++            )
++        return cls(action, job_id, cancel_command)
++
++    def on_failure(self, *, reason: str, context: dict[str, Any]) -> None:
++        """Flush a node report before cancelling this allocation and raising."""
++        if self.action == "fail_request":
++            return
++        report = {
++            **context,
++            "event": "nixl_job_stop_requested",
++            "time_utc": datetime.now(UTC).isoformat(),
++            "slurm_job_id": self.job_id,
++            "allocation_nodes": os.environ.get("SLURM_JOB_NODELIST"),
++            "local_node": node_name(),
++            "slurm_node": os.environ.get("SLURMD_NODENAME"),
++            "reason": reason,
++        }
++        message = (
++            "NIXL fail-stop: please report to AGA support team "
++            "(#oci-aga-slurm-1-support) with this node report and preceding "
++            "NIXL error logs. Cluster support should assess the reported endpoints. "
++            + json.dumps(report, sort_keys=True)
++        )
++        logger.critical("%s", message)
++        assert self.cancel_command is not None and self.job_id is not None
++        try:
++            subprocess.run(
++                [self.cancel_command, self.job_id],
++                check=True,
++                capture_output=True,
++                text=True,
++                timeout=10,
++            )
++        except (OSError, subprocess.SubprocessError) as error:
++            logger.critical(
++                "scancel failed for job %s: %s; terminate this allocation manually",
++                self.job_id,
++                error,
++            )
++            raise RuntimeError(
++                message + "; scancel failed; terminate this allocation manually"
++            ) from error
++        raise RuntimeError(message + "; allocation cancellation requested")
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/lease_slots.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/lease_slots.py
 new file mode 100644
+index 0000000..7699117
 --- /dev/null
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/lease_slots.py
 @@ -0,0 +1,383 @@
@@ -614,30 +817,32 @@ new file mode 100644
 +            self._nixl.release_dlist_handle(self.local_handle)
 +            self.local_handle = None
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
+index ca6f30d..b135579 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py
-@@ -48,8 +48,9 @@
+@@ -48,8 +48,9 @@ PUSH_REG_NOTIF_PREFIX = b"PUSH_REG:"
  #  10: Add dense virtual transfer pages for compressed MLA caches
  #  11: Add per-region transfer geometry and memory types to NixlAgentMetadata
  #  12: Add per-region member names for PP push
-+#  15062065: vLLM0.30 backport of PR62065 pull lease slot verification.
++#  15062066: vLLM0.30 backport of PR62065 pull lease slot verification.
  #
 -NIXL_CONNECTOR_VERSION: int = 12
-+NIXL_CONNECTOR_VERSION: int = 15062065
++NIXL_CONNECTOR_VERSION: int = 15062066
  
  
  @dataclass
-@@ -74,6 +75,9 @@
+@@ -74,6 +75,10 @@ class NixlAgentMetadata:
      pcp_size: int = 1
      # Layer names sharing each advertised region, in region order.
      region_members: list[list[str]] = field(default_factory=list)
 +    # Pull-mode lease slots (DRAM, int64 per slot); None when not exported.
 +    lease_slots_addr: int | None = None
 +    lease_num_slots: int = 0
++    node_name: str = "unknown"
  
  
  @dataclass
-@@ -230,6 +234,9 @@
+@@ -230,6 +235,9 @@ class RemoteMeta:
      request_id: str
      blocks_expiry_time: float | None = None
      num_tokens: int | None = None
@@ -647,7 +852,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py b/vll
  
  
  @dataclass
-@@ -270,6 +277,11 @@
+@@ -270,6 +278,11 @@ class NixlConnectorMetadata(KVConnectorMetadata):
          self.scheduler_clock: float = 0.0
          self.reqs_in_batch: set[ReqId] = set()
          self.reqs_not_processed: set[ReqId] = set()
@@ -659,7 +864,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py b/vll
          # Heartbeat data grouped by remote engine, sent by D worker to P.
          self.heartbeat_by_engine: dict[EngineId, HeartbeatInfo] = {}
          # Push mode (D side): registration data the D worker should send to
-@@ -330,5 +342,22 @@
+@@ -330,5 +343,22 @@ class NixlConnectorMetadata(KVConnectorMetadata):
              port=kv_transfer_params["remote_port"],
              blocks_expiry_time=kv_transfer_params.get("remote_blocks_expiry_time"),
              num_tokens=kv_transfer_params.get("remote_num_tokens"),
@@ -683,9 +888,10 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py b/vll
 +    req_id, expected_consumers, nonce = msg.rsplit(":", 2)
 +    return req_id, int(expected_consumers), int(nonce) if nonce else None
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
+index f283a40..b0f17b2 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
-@@ -6,15 +6,25 @@
+@@ -6,15 +6,25 @@ import time
  from typing import TYPE_CHECKING, Any
  
  from vllm.distributed.kv_transfer.kv_connector.utils import BlockIds
@@ -711,7 +917,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
      from vllm.v1.request import Request
  
  logger = init_logger(__name__)
-@@ -30,6 +40,26 @@
+@@ -30,6 +40,26 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
          kv_cache_config: "KVCacheConfig",
      ):
          super().__init__(vllm_config, engine_id, kv_cache_config)
@@ -738,7 +944,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
  
      def get_num_new_matched_tokens(
          self, request: "Request", num_computed_tokens: int
-@@ -123,6 +153,10 @@
+@@ -123,6 +153,10 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
              params.get("do_remote_prefill") and self.is_bidirectional_kv_xfer_enabled
          ):
              self._reqs_in_batch.add(request.request_id)
@@ -749,7 +955,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
          if self.use_host_buffer and params.get("do_remote_decode"):
              # NOTE: when accelerator is not directly supported by Nixl,
              # prefilled blocks need to be saved to host memory before transfer.
-@@ -241,6 +275,7 @@
+@@ -241,6 +275,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
              self._reqs_not_processed.add(request.request_id)
              # Clear _reqs_need_save if a request is aborted as partial prefill.
              self._reqs_need_save.pop(request.request_id, None)
@@ -757,7 +963,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
              return False, None
  
          # TODO: check whether block_ids actually ever be 0. If not we could
-@@ -248,7 +283,12 @@
+@@ -248,7 +283,12 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
          delay_free_blocks = any(len(group) > 0 for group in block_ids)
          remote_num_tokens = 0
          blocks_expiry_time = None
@@ -771,7 +977,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
              # Prefill request on remote. It will be read from D upon completion
              request_kv_blocks_ttl = self._kv_lease_duration
              if is_d_node:
-@@ -288,5 +328,7 @@
+@@ -288,5 +328,7 @@ class NixlPullConnectorScheduler(NixlBaseConnectorScheduler):
              pp_size=self.vllm_config.parallel_config.pipeline_parallel_size,
              remote_num_tokens=remote_num_tokens,
              remote_blocks_expiry_time=blocks_expiry_time,
@@ -780,9 +986,10 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_scheduler.py
              transfer_mode=self._TRANSFER_MODE,
          )
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py
+index 6539b7e..9341ded 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py
-@@ -14,6 +14,8 @@
+@@ -14,6 +14,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.base_worker import (
  from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
      NixlConnectorMetadata,
      ReqMeta,
@@ -791,20 +998,20 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/
  )
  from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
      ReadSpec,
-@@ -93,6 +95,12 @@
-             # sibling connector inside a MultiConnector) still completes.
+@@ -94,6 +96,12 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
              self._replicated_pcp_done_sending.update(metadata.reqs_to_send)
              return
-+
+ 
 +        if self._lease_slots is not None:
 +            self._lease_slots.update(
 +                metadata.lease_slots_to_clear | metadata.reqs_not_processed,
 +                metadata.lease_slots_to_arm,
 +            )
- 
++
          # Keep around the requests that have been part of a batch. This is
          # needed because async scheduling pushes the misalignment between the
-@@ -141,6 +149,38 @@
+         # moment in which requests expiration is set (P side) and the moment in
+@@ -141,6 +149,39 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
          deadline = blocks_expiry_time - clock_offset
          return time.perf_counter() + _KV_BLOCKS_EXPIRY_SAFETY_MARGIN >= deadline
  
@@ -838,28 +1045,29 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/
 +            reason,
 +        )
 +        self.xfer_stats.record_lease_check_failure()
++        self._stop_on_kv_failure(req_id, reason=reason, meta=meta)
 +        return None
 +
      def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
          assert meta.remote is not None and self.transfer_topo is not None
          engine_id = meta.remote.engine_id
-@@ -157,6 +197,15 @@
-             self.xfer_stats.record_kv_expired_req()
-             # KV expiry is reported separately from transport failures, so only
-             # the state cleanup side of _handle_failed_transfer runs here.
+@@ -162,6 +203,15 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
+             )
+             return
+ 
++        verify_lease = self._should_verify_lease(
++            req_id, meta, self.tp_mappings[engine_id].all_source_ranks
++        )
++        if verify_lease is None:
 +            self._handle_failed_transfer(
 +                req_id, None, self._recv_failures, record_failed_transfer=False
 +            )
 +            return
 +
-+        verify_lease = self._should_verify_lease(
-+            req_id, meta, self.tp_mappings[engine_id].all_source_ranks
-+        )
-+        if verify_lease is None:
-             self._handle_failed_transfer(
-                 req_id, None, self._recv_failures, record_failed_transfer=False
-             )
-@@ -362,6 +411,9 @@
+         if any(len(group) > 0 for group in meta.local_block_ids):
+             # The scheduler waits for finished_recving from *every* worker.
+             # Under DCP a rank's slice can legitimately come out empty when its
+@@ -362,6 +412,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                  remote_xfer_side_handle=remote_xfer_side_handle,
                  expected_consumers=plan.local_consumers,
                  awaiting_kvs=meta.awaiting_kvs,
@@ -869,7 +1077,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/
              ):
                  return
  
-@@ -370,7 +422,9 @@
+@@ -370,7 +423,9 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
              # have the blocks we need so they can update the request state.
              # Same thing for DCP (tp_size == dcp_size), so the raw tp_ratio already
              # reflects whether any remote replica is left unchosen.
@@ -880,7 +1088,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/
              remote_agents = self._remote_agents[meta.remote.engine_id]
              for rank_to_notify, agent in remote_agents.items():
                  if rank_to_notify != (0, read_specs[0].remote_rank):
-@@ -400,9 +454,15 @@
+@@ -400,10 +455,16 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
          remote_xfer_side_handle: int,
          expected_consumers: int,
          awaiting_kvs: bool,
@@ -890,13 +1098,14 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/
      ) -> bool:
          """Post a READ point-to-point xfer request from a single local worker to
          a single remote worker.
-+
+ 
 +        With ``verify_lease``, the remote is notified only after the READ
 +        completed and its lease slot still held ``lease_nonce``.
- 
++
          Returns True when the read was posted (or was unnecessary), False
          when the request was routed to failure reporting — the caller must
-@@ -438,7 +498,7 @@
+         not post further transfers for it.
+@@ -438,7 +499,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
  
          # Number of local workers that will notify this producer worker.
          # Propagate on notification so dst worker can wait before freeing.
@@ -905,7 +1114,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/
  
          # Full prefix cache hit: do not need to read remote blocks,
          # just notify P worker that we have the blocks we need.
-@@ -528,6 +588,7 @@
+@@ -528,6 +589,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
  
          # Prepare transfer with Nixl.
          handle = None
@@ -913,7 +1122,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/
          try:
              if self._mixed_mem_types:
                  self._read_blocks_mixed(
-@@ -538,24 +599,36 @@
+@@ -538,24 +600,36 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                      remote_xfer_side_handle=remote_xfer_side_handle,
                      local_block_descs_ids=local_block_descs_ids,
                      remote_block_descs_ids=remote_block_descs_ids,
@@ -930,12 +1139,6 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/
 -                remote_block_descs_ids,
 -                notif_msg=notif_id,
 -            )
--
--            # Begin async xfer.
--            self.nixl_wrapper.transfer(handle)
--
--            # Use handle to check completion in future step().
--            self._recving_transfers[request_id].append(handle)
 +            else:
 +                handle = self.nixl_wrapper.make_prepped_xfer(
 +                    "READ",
@@ -947,10 +1150,14 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/
 +                    # the notification lets the remote zero the lease slot.
 +                    notif_msg=b"" if verify_lease else notif_id,
 +                )
-+
+ 
+-            # Begin async xfer.
+-            self.nixl_wrapper.transfer(handle)
 +                # Begin async xfer.
 +                self.nixl_wrapper.transfer(handle)
-+
+ 
+-            # Use handle to check completion in future step().
+-            self._recving_transfers[request_id].append(handle)
 +                # Use handle to check completion in future step().
 +                self._recving_transfers[request_id].append(handle)
 +                if verify_lease:
@@ -966,7 +1173,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/
              return True
          except Exception as e:
              self._log_failure(
-@@ -648,7 +721,7 @@
+@@ -648,7 +722,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                      self._handle_heartbeat(msg[3:])
                      continue
  
@@ -975,7 +1182,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/
                  if (
                      req_id not in self._reqs_to_send
                      and req_id not in self._reqs_to_process
-@@ -656,17 +729,30 @@
+@@ -656,7 +730,22 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                      logger.error(
                          "Potentially invalid KV blocks for "
                          "unrecognized request %s were retrieved by "
@@ -983,9 +1190,9 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/
 +                        "a decode worker. They may have expired. Decode "
 +                        "workers that verify KV leases reject reads of "
 +                        "released blocks.",
-                         req_id,
-                     )
-                     continue
++                        req_id,
++                    )
++                    continue
 +                if (
 +                    nonce is not None
 +                    and self._lease_slots is not None
@@ -996,10 +1203,10 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/
 +                    logger.warning(
 +                        "Ignoring a read notification for request %s from an "
 +                        "earlier lease of the same request id.",
-+                        req_id,
-+                    )
-+                    continue
- 
+                         req_id,
+                     )
+                     continue
+@@ -664,9 +753,7 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                  # Every reader of this req_id reports the same count (it's
                  # derived from aggregate topology, not the specific rank),
                  # so repeated notifications never disagree on it.
@@ -1010,16 +1217,17 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py b/
  
                  self.consumer_notification_counts_by_req[req_id] += 1
                  # Wait all consumers (D) to be done reading before freeing.
-@@ -679,4 +765,5 @@
+@@ -679,4 +766,5 @@ class NixlPullConnectorWorker(NixlBaseConnectorWorker):
                      del self.expected_consumer_notifications_by_req[req_id]
                      self._reqs_to_process.remove(req_id)
                      self._reqs_to_send.pop(req_id, None)
 +                    self._clear_lease_slot(req_id)
          return notified_req_ids
 diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/stats.py b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/stats.py
+index f6d0684..e016f00 100644
 --- a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/stats.py
 +++ b/vllm/distributed/kv_transfer/kv_connector/v1/nixl/stats.py
-@@ -41,6 +41,7 @@
+@@ -41,6 +41,7 @@ class NixlKVConnectorStats(KVConnectorStats):
              "num_failed_notifications": [],
              "num_failed_handshakes": [],
              "num_kv_expired_reqs": [],
@@ -1027,18 +1235,18 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/stats.py b/vllm/d
          }
  
      def record_transfer(self, res: "nixlXferTelemetry"):
-@@ -65,6 +66,10 @@
-     def record_kv_expired_req(self):
+@@ -66,6 +67,10 @@ class NixlKVConnectorStats(KVConnectorStats):
          """Record a request that had its KV blocks expire."""
          self.data["num_kv_expired_reqs"].append(1)
-+
+ 
 +    def record_lease_check_failure(self):
 +        """Record a pull declined because its KV lease was lost or uncheckable."""
 +        self.data["num_lease_check_failures"].append(1)
- 
++
      def clone_and_reset(self) -> "NixlKVConnectorStats":
          old = copy.copy(self)
-@@ -79,6 +84,7 @@
+         self.reset()
+@@ -79,6 +84,7 @@ class NixlKVConnectorStats(KVConnectorStats):
              and len(self.data["num_failed_notifications"]) == 0
              and len(self.data["num_failed_handshakes"]) == 0
              and len(self.data["num_kv_expired_reqs"]) == 0
@@ -1046,7 +1254,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/stats.py b/vllm/d
          )
  
      def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
-@@ -101,6 +107,7 @@
+@@ -101,6 +107,7 @@ class NixlKVConnectorStats(KVConnectorStats):
              + len(self.data["num_failed_handshakes"])
              + len(self.data["num_failed_notifications"]),
              "Num KV expired reqs": len(self.data["num_kv_expired_reqs"]),
@@ -1054,12 +1262,10 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/stats.py b/vllm/d
          }
          if self.num_successful_transfers == 0:
              # Timing / throughput stats only cover successful transfers. If
-@@ -260,6 +267,18 @@
-         )
-         self.counter_nixl_num_kv_expired_reqs = create_metric_per_engine(
+@@ -262,6 +269,18 @@ class NixlPromMetrics(KVConnectorPromMetrics):
              counter_nixl_num_kv_expired_reqs, self.per_engine_labelvalues
-+        )
-+
+         )
+ 
 +        counter_nixl_num_lease_check_failures = self._counter_cls(
 +            name="vllm:nixl_num_lease_check_failures",
 +            documentation="Number of KV pulls declined because the remote "
@@ -1070,10 +1276,12 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/stats.py b/vllm/d
 +        )
 +        self.counter_nixl_num_lease_check_failures = create_metric_per_engine(
 +            counter_nixl_num_lease_check_failures, self.per_engine_labelvalues
-         )
- 
++        )
++
      def observe(self, transfer_stats_data: dict[str, Any], engine_idx: int = 0):
-@@ -284,6 +303,7 @@
+         for prom_obj, list_item_key in zip(
+             [
+@@ -284,6 +303,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
                  self.counter_nixl_num_failed_transfers,
                  self.counter_nixl_num_failed_notifications,
                  self.counter_nixl_num_kv_expired_reqs,
@@ -1081,7 +1289,7 @@ diff --git a/vllm/distributed/kv_transfer/kv_connector/v1/nixl/stats.py b/vllm/d
              ],
              [
                  # Transfer, handshake and notification failures are grouped:
-@@ -297,6 +317,7 @@
+@@ -297,6 +317,7 @@ class NixlPromMetrics(KVConnectorPromMetrics):
                  ),
                  ("num_failed_notifications",),
                  ("num_kv_expired_reqs",),

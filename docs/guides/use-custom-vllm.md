@@ -167,12 +167,12 @@ This is an opt-in backport for the qualified build
 `0.30.0+g116da885561b.cu132`. NeMo RL's default vLLM dependency is not changed.
 The tool checks exact source SHA-256 values and rejects other builds, including
 unqualified 0.29 builds. The checked-in manifest records the upstream revision,
-original and patched file hashes, and backport wire version `15062065`.
+original and patched file hashes, and backport wire version `15062066`.
 
 NeMo RL's runtime monkey patches live in
 `nemo_rl/models/generation/vllm/patches.py`. This backport instead belongs in the
 image build, after installing the custom vLLM package and creating frozen worker
-environments, but before importing vLLM or starting any worker. It changes six
+environments, but before importing vLLM or starting any worker. It changes seven
 source files spanning scheduler, worker, metadata, and lease handling; rewriting
 files after imports would leave cached modules using different implementations.
 For a different vLLM revision, use the custom build workflow above and validate
@@ -222,23 +222,63 @@ package; mixed wire versions are unsupported. Rebuilding frozen environments
 can discard the fix and requires applying and checking it again.
 
 After the patch, lease verification is enabled by default through
-`kv_connector_extra_config.kv_lease_verification`. An invalid handoff fails
-safely under the default failure policy. To recover by locally recomputing the
-prompt KV on decode, set the decode engine's
-`kv_transfer_config.kv_load_failure_policy` to `"recompute"`. The policy alone
-does not add lease verification to an unpatched package. Increasing the lease
-can reduce expiry frequency but does not replace validity checking. If NIXL
-cannot release a lease-check transfer handle, its landing cells remain
-quarantined. Requests wait while active reads or prepared batches can return
-capacity; when none can, an unsatisfiable queued request fails through the
-existing fail/recompute policy instead of waiting indefinitely.
+`kv_connector_extra_config.kv_lease_verification`. The qualified backport also
+enables **job-level fail-stop** by default. Its native worker checks apply to
+both direct vLLM and Dynamo-managed vLLM P/D workers using the patched package.
 
-Controlled two-node, TP=2 GPU qualification covered a normal handoff, expiry
-without cache pressure, expiry with block reuse, a longer-lease control, and
-expiry followed by decode recomputation. The patched path rejected stale leases
-before model execution; the recompute case produced finite output. This does
-not establish full SWE training correctness, scaling performance, or correctness
-for every NIXL transfer topology. The linked PR's W&B runs cover the pre-review
-backport. Subsequent installer transaction/ownership hardening and the permanent
-landing-cell exhaustion path have CPU regression coverage; those changes have
-not been rerun on GPUs.
+| Setting | Default | Behavior |
+| --- | --- | --- |
+| `kv_connector_extra_config.kv_failure_action` | `"stop_job"` | Log a node report, request cancellation of the current Slurm allocation, and raise on a KV transfer error, producer/consumer lease expiry, missing lease metadata, or failed nonce verification. |
+| `kv_connector_extra_config.kv_failure_action` | Explicit `"fail_request"` | Retain request-level fail/recompute behavior for controlled diagnostics. Does not cancel the job. |
+
+For AGA training, retain `"stop_job"`, `kv_lease_verification=true`, and
+`kv_transfer_config.kv_load_failure_policy="fail"`. Startup rejects recompute or
+disabled verification in stop-job mode. Increasing the lease does not replace
+validity checking. The check does not wait for NaN logprobs or garbled output.
+
+Every actual P/D worker, including TP processes inside containers and frozen
+Ray environments, must inherit the current numeric `SLURM_JOB_ID` and have a
+working Slurm `scancel` client in `PATH`, with access to the cluster controller
+and permission to cancel that job. Ensure the Slurm client and its runtime
+configuration/libraries are available in the container. The worker checks the
+job ID and client availability at initialization and refuses to start if either
+is missing; it never falls back to request-level recovery. Retain
+`SLURM_JOB_NODELIST` for allocation context. Reports use the actual hostname
+and separately record `SLURMD_NODENAME` when present. Outside
+Slurm, explicitly select `"fail_request"` for diagnostics.
+
+Before calling `scancel <current-job-id>`, the worker logs a critical report
+containing UTC time, job ID, allocation node list, local node/engine/TP rank,
+request ID, available remote host/engine/request IDs, peer node names from the
+handshake, and the failure reason. It says:
+
+```text
+please report to AGA support team (#oci-aga-slurm-1-support)
+```
+
+The report identifies implicated endpoints; the cluster team determines the
+faulty node or fabric component. Preserve the report and preceding NIXL errors,
+then report them manually in the support channel. No Slack credentials or
+outbound Slack messages are used. Cancellation is requested for the whole
+current Slurm job, not only a request or worker. If the cancellation command
+fails or times out after ten seconds, the worker still raises and explicitly
+instructs the operator to terminate the allocation manually; cancellation is
+not reported as successful. No automatic retry or resubmission is performed.
+
+For controlled request-level recovery experiments only, set
+`kv_connector_extra_config.kv_failure_action="fail_request"`. Then the decode
+engine's `kv_transfer_config.kv_load_failure_policy="recompute"` can recover by
+locally recomputing prompt KV. The policy alone does not add lease verification
+to an unpatched package. If a lease-check handle cannot be released, its landing
+cells remain quarantined; checks wait for temporary occupancy but fail if no
+active read or prepared batch can return enough capacity.
+
+Historical two-node, TP=2 GPU qualification covered normal handoff, expiry,
+block reuse, a longer-lease control, and decode recomputation using the earlier
+request-level bundle. Those runs validated lease rejection before model
+execution, not the job-level fail-stop added here. Installer transaction and
+ownership hardening, landing-cell exhaustion, and the new stop/report paths
+have CPU coverage. The stop/report tests use a fake Slurm client and never
+cancel live jobs. The latest bundle has not been rerun on GPUs or on a live
+Slurm allocation. Full SWE training correctness, scaling performance, and other
+NIXL topologies remain unvalidated.

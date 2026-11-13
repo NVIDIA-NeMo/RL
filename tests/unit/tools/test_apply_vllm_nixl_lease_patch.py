@@ -322,7 +322,7 @@ def test_symlink_is_rejected(fixture_bundle, tmp_path):
 
 def test_real_bundle_integrity():
     bundle = installer.load_bundle(installer.BUNDLE_DIR)
-    assert len(bundle.files) == 6
+    assert len(bundle.files) == 7
 
 
 def test_tampered_patch_is_rejected(tmp_path):
