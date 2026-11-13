@@ -12,6 +12,7 @@ NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 # ~25 min startup (30B-MoE load + CUDA-graph warmup + nemo_gym servers) plus 8
 # async steps at ~21 min/step on GB200 4n4g.
 NUM_MINUTES=240
+USES_OPENSANDBOX=1
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached

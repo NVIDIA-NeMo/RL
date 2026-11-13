@@ -12,6 +12,7 @@ NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 # Smoke sizing: ~25 min startup + 3 async steps. Deliberately small — this
 # leg exists for the mcore-triggered lanes.
 NUM_MINUTES=100
+USES_OPENSANDBOX=1
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached

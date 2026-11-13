@@ -12,6 +12,7 @@ NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 # ~16 min/step. Three steps still cover a refit with requests in flight and a
 # checkpoint save through the finalizer.
 NUM_MINUTES=82  # 2n x 8g x 82 min = 21 GPU-hours
+USES_OPENSANDBOX=1
 # ===== END CONFIG =====
 
 exit_if_max_steps_reached

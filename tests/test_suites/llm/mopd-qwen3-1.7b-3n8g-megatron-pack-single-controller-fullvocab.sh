@@ -27,6 +27,7 @@ NUM_RUNS=$(( (MAX_STEPS + STEPS_PER_RUN - 1) / STEPS_PER_RUN ))  # Round up
 # Wider than the top-k sibling: payload transport + divergence kernels cost more.
 NUM_MINUTES=25
 USES_SANDBOX=1
+USES_OPENSANDBOX=1
 USE_GYM_CONTAINER=true
 # ===== END CONFIG =====
 
