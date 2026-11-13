@@ -864,7 +864,8 @@ class DataPlaneClient(ABC):
 
         The caller may resume mutations before persisting the returned handle,
         but must release it after writes settle, including on failure. Return
-        None to request the synchronous save_checkpoint path instead.
+        None to request the synchronous save_checkpoint path instead. Raise
+        CheckpointReleaseError when a failed capture cannot release its view.
         """
         return None
 

@@ -752,7 +752,11 @@ For the no-data-plane path use the legacy `nemo_rl.algorithms.grpo.grpo_train`; 
 the adapter requests synchronous fallback. The caller must hold a global mutation
 barrier while capturing. After capture returns, it may resume live traffic,
 call `persist()`, and then `release()` after all writes settle, including on
-failure or cancellation. Publication remains the caller's responsibility.
+failure or cancellation. Publication remains the caller's responsibility. If a
+failed or cancelled capture cannot confirm its own release, it raises
+`CheckpointReleaseError` naming the capture token, even past repeated
+cancellation; the caller has no handle to retry with and must stop
+checkpointing.
 
 This API requires caller integration: setting the flag alone does not change
 the existing synchronous `save_checkpoint` calls. Other backends return `None`.
@@ -760,8 +764,12 @@ SimpleStorage capture requires SSD offload disabled and writes the existing
 native TQ checkpoint format, so restore does not need a new format.
 
 Capture copies storage indexes, not tensor payloads. References retain the old
-values while live puts replace them and clears remove them. Retained values may
-temporarily increase host-memory use until persistence finishes. This contract
+values while live puts replace them and clears remove them, until `release()`.
+Persistence pickles each shard like the synchronous save, which holds a
+serialized copy of the shard in the storage actor until the write ends. Size a
+storage unit's host memory for live data plus twice its share of the cut: one
+copy retained and one being serialized. The synchronous save needs live data
+plus one copy. This contract
 is audited against the pinned TQ 0.1.11 implementation; a dependency update needs
 the same audit. Only one snapshot may be retained at a time.
 
@@ -796,10 +804,11 @@ taking snapshot N+1's mutation barrier; the one-view error is an invariant,
 not scheduling flow control.
 
 CPU-only real Ray/ZMQ validation, including concurrent PUT/CLEAR requests,
-failure cleanup and restore into fresh actors:
+failure cleanup and restore into fresh actors, runs in
+`L1_Functional_Tests_SingleController_3`. To run it locally:
 
 ```bash
-RAY_ENABLE_UV_RUN_RUNTIME_ENV=0 uv run tests/functional/data_plane_simple_checkpoint_cpu.py --output /tmp/tq-capture-result.json
+bash tests/functional/data_plane_simple_checkpoint_cpu.sh
 ```
 
 ## Async path (proposed)

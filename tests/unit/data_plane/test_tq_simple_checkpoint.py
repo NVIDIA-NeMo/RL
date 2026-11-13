@@ -41,6 +41,7 @@ from nemo_rl.data_plane.adapters import (
     tq_controller_patch as controller_patch,  # noqa: E402
 )
 from nemo_rl.data_plane.adapters import tq_simple_checkpoint as snapshot  # noqa: E402
+from nemo_rl.data_plane.checkpoint import CheckpointReleaseError  # noqa: E402
 from nemo_rl.data_plane.interfaces import SimpleStorageConfig  # noqa: E402
 
 
@@ -665,6 +666,109 @@ def test_release_ack_timeout_can_be_retried(fake_cluster, tmp_path):
     assert units[1]._snapshot_views
     assert not units[0]._snapshot_views
     captured.units[0].nrl_release_snapshot = original
+    captured.release()
+    assert all(not unit._snapshot_views for unit in units)
+
+
+@pytest.mark.parametrize(
+    "hung_actor", ["TransferQueueController", "TransferQueueStorageUnit#0"]
+)
+def test_capture_timeout_releases_and_raises(
+    fake_cluster, monkeypatch, tmp_path, hung_actor
+):
+    units, client = fake_cluster
+    pending = concurrent.futures.Future()
+    get_actor = snapshot.ray.get_actor
+
+    def get_hung_actor(name, **kwargs):
+        actor = get_actor(name, **kwargs)
+        if name != hung_actor:
+            return actor
+        return SimpleNamespace(
+            **{
+                **vars(actor),
+                "nrl_capture_snapshot": SimpleNamespace(remote=lambda token: pending),
+            }
+        )
+
+    def bounded_get(ref, timeout=None):
+        # An unbounded wait on the hung RPC would block forever; fail instead.
+        assert timeout is not None, "checkpoint RPC waits must be bounded"
+        return _fake_get(ref, timeout)
+
+    monkeypatch.setattr(snapshot.ray, "get_actor", get_hung_actor)
+    monkeypatch.setattr(snapshot.ray, "get", bounded_get)
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="RPC wait timed out"):
+        snapshot.capture_simple_checkpoint(
+            tmp_path / "state", num_storage_units=2, metadata=None, timeout_s=0.05
+        )
+    assert time.monotonic() - started < 2
+    assert not client.controller._controller_snapshot_views
+    assert all(not unit._snapshot_views for unit in units)
+    assert not (tmp_path / "state/metadata.json").exists()
+
+
+def test_failed_capture_with_unconfirmed_release_is_terminal(
+    fake_cluster, monkeypatch, tmp_path
+):
+    units, _ = fake_cluster
+    # A retained view on one unit makes this capture fail after others capture.
+    units[0].nrl_capture_snapshot("prior")
+    get_actor = snapshot.ray.get_actor
+
+    def fail_release(token):
+        raise OSError("controller unreachable")
+
+    def get_failing_actor(name, **kwargs):
+        actor = get_actor(name, **kwargs)
+        if name != "TransferQueueController":
+            return actor
+        return SimpleNamespace(
+            **{**vars(actor), "nrl_release_snapshot": _RemoteMethod(fail_release)}
+        )
+
+    monkeypatch.setattr(snapshot.ray, "get_actor", get_failing_actor)
+    with pytest.raises(
+        CheckpointReleaseError, match="SimpleStorage capture [0-9a-f]{32}"
+    ) as raised:
+        snapshot.capture_simple_checkpoint(
+            tmp_path / "state", num_storage_units=2, metadata=None, timeout_s=5.0
+        )
+    assert isinstance(raised.value.__cause__, OSError)
+
+
+def test_release_during_persist_reports_running_operation(fake_cluster, tmp_path):
+    units, _ = fake_cluster
+    captured = snapshot.capture_simple_checkpoint(
+        tmp_path / "state", num_storage_units=2, metadata=None, timeout_s=5.0
+    )
+    entered, finish = threading.Event(), threading.Event()
+
+    def slow_write(*args):
+        entered.set()
+        assert finish.wait(5)
+        return units[1].nrl_persist_snapshot(*args)
+
+    with (
+        concurrent.futures.ThreadPoolExecutor(1) as writer,
+        concurrent.futures.ThreadPoolExecutor(1) as caller,
+    ):
+        captured.units[0].nrl_persist_snapshot = SimpleNamespace(
+            remote=lambda *args: writer.submit(slow_write, *args)
+        )
+        persisting = caller.submit(captured.persist)
+        try:
+            assert entered.wait(5)
+            # persist keeps its own 5 s deadline; release now waits briefly.
+            captured.timeout_s = 0.05
+            with pytest.raises(TimeoutError, match="still running"):
+                captured.release()
+            assert all(unit._snapshot_views for unit in units)
+        finally:
+            finish.set()
+        persisting.result(timeout=5)
+    assert (tmp_path / "state/metadata.json").exists()
     captured.release()
     assert all(not unit._snapshot_views for unit in units)
 

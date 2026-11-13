@@ -30,8 +30,19 @@ LOGGER = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+class CheckpointReleaseError(RuntimeError):
+    """A capture the caller holds no handle for may still be retained.
+
+    Raised when a failed or cancelled capture cannot confirm its release. The
+    caller cannot retry it, so it must stop checkpointing.
+    """
+
+
 class CheckpointCapture(ABC):
     """One retained snapshot; callers must release it even after failed saves."""
+
+    # Names this snapshot's retained views on every backend actor.
+    token: str
 
     def __enter__(self) -> Self:
         return self
@@ -81,17 +92,32 @@ async def checkpoint_io(operation: Callable[[], T]) -> T:
 
 
 async def capture_checkpoint(client: Any, **kwargs: Any) -> CheckpointCapture | None:
-    """Capture via an adapter, releasing late results if capture is cancelled."""
+    """Capture via an adapter, releasing late results if capture is cancelled.
+
+    Raises CheckpointReleaseError, even past repeated cancellation, when a
+    cancelled capture's release cannot be confirmed.
+    """
     task = asyncio.create_task(
         call_data_plane(client, "capture_checkpoint", offload_sync=True, **kwargs)
     )
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
+        captured = None
         try:
             captured = await _settle(task)
-            if captured is not None:
-                await checkpoint_io(captured.release)
+        except CheckpointReleaseError:
+            raise
         except Exception:
-            LOGGER.exception("Checkpoint capture cleanup failed during cancellation")
+            LOGGER.exception("Checkpoint capture failed while settling cancellation")
+        if captured is not None:
+            release = asyncio.create_task(asyncio.to_thread(captured.release))
+            try:
+                await _settle(release)
+            except Exception as error:
+                raise CheckpointReleaseError(
+                    f"Cannot confirm release of cancelled checkpoint capture "
+                    f"{captured.token}; actors may still retain it, so stop "
+                    "checkpointing"
+                ) from error
         raise
