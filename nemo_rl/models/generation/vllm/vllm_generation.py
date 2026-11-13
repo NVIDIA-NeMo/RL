@@ -208,6 +208,8 @@ class _TokenCaptureSetup:
     generation_prefix_cuts_enabled: bool
     generation_cut_control_token: str | None
     generation_cut_control_timeout_s: float | None
+    generation_prefix_batch_size: int
+    generation_prefix_batch_max_tokens: int
 
 
 class VllmGeneration(GenerationInterface):
@@ -843,6 +845,8 @@ class VllmGeneration(GenerationInterface):
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
+        generation_prefix_batch_size: int,
+        generation_prefix_batch_max_tokens: int,
     ) -> "Optional[MediaColumnSpec]":
         """Install ledger-authoritative token capture in every DP-leader worker.
 
@@ -865,6 +869,8 @@ class VllmGeneration(GenerationInterface):
             generation_prefix_cuts_enabled,
             generation_cut_control_token,
             generation_cut_control_timeout_s,
+            generation_prefix_batch_size,
+            generation_prefix_batch_max_tokens,
         )
         futures = self.worker_group.run_all_workers_single_data(
             "setup_token_capture",

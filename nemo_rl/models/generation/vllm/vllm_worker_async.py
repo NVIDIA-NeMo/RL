@@ -888,6 +888,8 @@ class VllmAsyncGenerationWorkerImpl(
         generation_prefix_cuts_enabled: bool = False,
         generation_cut_control_token: str | None = None,
         generation_cut_control_timeout_s: float | None = None,
+        generation_prefix_batch_size: int,
+        generation_prefix_batch_max_tokens: int,
     ) -> MediaColumnSpec | None:
         """Host ledger-authoritative token capture in this worker.
 
@@ -976,6 +978,7 @@ class VllmAsyncGenerationWorkerImpl(
             weight_version_fn=lambda: self._rollout_weight_version,
             adapter=VLLMCaptureAdapter(),
         )
+        await self._prefix_recovery.aclose()
         self._prefix_recovery.shutdown()
         self._prefix_recovery = NoPrefixRecovery()
         self._cut_routes_dtype = (
@@ -1001,6 +1004,10 @@ class VllmAsyncGenerationWorkerImpl(
                     router_replay=self._cut_routes_dtype is not None,
                     prefix_row_extras=self._generation_cut_record_payload,
                     restore_media=self._restore_generation_cut_media,
+                    generation_prefix_batch_size=generation_prefix_batch_size,
+                    generation_prefix_batch_max_tokens=(
+                        generation_prefix_batch_max_tokens
+                    ),
                 )
             )
         if not capture_media:
@@ -1848,10 +1855,15 @@ class VllmAsyncGenerationWorkerImpl(
                     capture_prefix_token_ids = await asyncio.to_thread(
                         worker_self._resolve_admission_prefix, serving_admission
                     )
+                    # Concurrent restores share their chunk reads.
+                    cut_chunks = await worker_self._prefix_recovery.read_restore_chunks(
+                        serving_admission
+                    )
                     resolved_admission, resolved_cut = await asyncio.to_thread(
                         worker_self._prefix_recovery.resolve_restore,
                         serving_admission,
                         capture_prefix_token_ids,
+                        cut_chunks,
                     )
                     # An unusable prefix comes back without its cut, so the
                     # call regenerates; storage and serving share one admission here.
@@ -3294,6 +3306,7 @@ class VllmAsyncGenerationWorkerImpl(
             # Waiting for a wedged TQ write here would make actor shutdown hang.
             prefix_recovery = getattr(self, "_prefix_recovery", None)
             if prefix_recovery is not None:
+                await prefix_recovery.aclose()
                 prefix_recovery.shutdown()
             if self.server_thread is not None:
                 self.http_server.should_exit = True
