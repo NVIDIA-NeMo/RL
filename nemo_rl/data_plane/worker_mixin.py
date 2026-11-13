@@ -42,7 +42,7 @@ from nemo_rl.data.multimodal_utils import PackedTensor
 from nemo_rl.data_plane.adapters.tq_mooncake_checkpoint import run_checkpoint_command
 from nemo_rl.data_plane.codec import pad_batch
 from nemo_rl.data_plane.column_io import fetch_columns
-from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, backend_config
+from nemo_rl.data_plane.interfaces import LocalDataPlaneConfig, gdr_enabled
 from nemo_rl.data_plane.observability import is_metrics_client
 from nemo_rl.data_plane.schema import (
     ELEM_COUNTS_PER_GB,
@@ -63,6 +63,7 @@ from nemo_rl.experience.route_assembly import (
     RouteLayout,
     execute_route_plan,
 )
+from nemo_rl.models.policy.draft_sample_ids import stable_draft_sample_ids
 from nemo_rl.telemetry.instrumentation import accepts_trace_context
 from nemo_rl.utils.nsys import wrap_with_nvtx_name
 from nemo_rl.utils.r3_trace import trace_tq_fetch_payload
@@ -137,6 +138,21 @@ def _unpack_route_fragments(
         }
         for entries in index
     ]
+
+
+def _attach_draft_sample_ids(
+    data: BatchedDataDict[Any],
+    sample_ids: list[str],
+) -> BatchedDataDict[Any]:
+    """Attach deterministic numeric IDs without using microbatch row order."""
+    if data["input_ids"].shape[0] != len(sample_ids):
+        raise ValueError("stable sample-ID count must match the fetched training batch")
+    data["draft_sample_ids"] = torch.tensor(
+        stable_draft_sample_ids(sample_ids),
+        dtype=torch.int64,
+        device=data["input_ids"].device,
+    )
+    return data
 
 
 def _broadcast_batched_data_dict(
@@ -417,8 +433,7 @@ class TQWorkerMixin:
         # mooncake, so no GDR to order against a CUDA context.
         if (
             not isinstance(cfg, LocalDataPlaneConfig)
-            and cfg["backend"] == "mooncake_cpu"
-            and backend_config(cfg).use_gdr
+            and gdr_enabled(cfg)
             and not torch.cuda.is_initialized()
         ):
             raise RuntimeError(
@@ -992,6 +1007,7 @@ class TQWorkerMixin:
         *,
         result_key: str,
         tq_field: str,
+        keep_on_gpu: bool = False,
     ) -> None:
         """Single chokepoint for ``*_presharded`` write-backs.
 
@@ -1003,6 +1019,8 @@ class TQWorkerMixin:
             result: Worker output containing ``result_key``.
             result_key: Key into ``result`` for the tensor to write back.
             tq_field: Field name on the TQ side.
+            keep_on_gpu: Write the tensor from its own device instead of
+                copying it to CPU first.
         """
         if not self._is_replica_leader():
             return
@@ -1027,7 +1045,8 @@ class TQWorkerMixin:
                 f"result[{result_key!r}] has batch dim {val.shape[0]} "
                 f"but meta.sample_ids has {len(meta.sample_ids)}."
             )
-        self._write_back(meta, {tq_field: val.detach().to("cpu")})
+        val = val.detach() if keep_on_gpu else val.detach().to("cpu")
+        self._write_back(meta, {tq_field: val})
 
     @accepts_trace_context
     @wrap_with_nvtx_name("policy_worker/train_presharded")
@@ -1042,6 +1061,7 @@ class TQWorkerMixin:
         """Per-rank training entrypoint. Fetch → packing prep → delegate."""
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
+        data = _attach_draft_sample_ids(data, meta.sample_ids)
         return self.train(  # type: ignore[attr-defined]
             data,
             loss_fn=loss_fn,
@@ -1114,6 +1134,7 @@ class TQWorkerMixin:
         micro_batch_size: Optional[int] = None,
         opd_full_payload: Optional[str] = None,
         opd_full_payload_dtype: Optional[str] = None,
+        keep_outputs_on_gpu: bool = False,
         opd_full_payload_field: Optional[str] = None,
         opd_full_teacher_index: Optional[int] = None,
         opd_full_teacher_index_field: Optional[str] = None,
@@ -1126,6 +1147,10 @@ class TQWorkerMixin:
             opd_full_payload: When set (``"hidden_states"`` or ``"logits"``), also
                 emit the full-vocabulary teacher payload from the same forward.
             opd_full_payload_dtype: Torch dtype name for that payload.
+            keep_outputs_on_gpu: Keep everything this call writes (logprobs
+                and any full-vocabulary payload) on this rank's GPU until the
+                data-plane PUT instead of copying it to CPU. The driver sets it
+                only on a GDR data plane (``gdr_keep_teacher_payload_on_gpu``).
             opd_full_payload_field: Data-plane column the payload is written to.
             opd_full_teacher_index: This teacher group's stable index (see
                 ``create_teacher_worker_groups``), tagged onto every row this
@@ -1159,6 +1184,7 @@ class TQWorkerMixin:
             result: BatchedDataDict[Any] = self.get_logprobs(  # type: ignore[attr-defined]
                 data=data,
                 micro_batch_size=micro_batch_size,
+                keep_on_gpu=keep_outputs_on_gpu,
             )
         else:
             if opd_full_payload_field is None:
@@ -1187,13 +1213,17 @@ class TQWorkerMixin:
                 payload=opd_full_payload,
                 payload_dtype=opd_full_payload_dtype,
                 micro_batch_size=micro_batch_size,
+                keep_on_gpu=keep_outputs_on_gpu,
             )
             # None off the last pipeline stage, which is what keeps this to a
             # single writer: the payload never leaves the stage that produced it.
             teacher_full_payload = result.get("teacher_full_payload")
             if teacher_full_payload is not None:
+                # On GPU when keep_outputs_on_gpu is set: the GDR PUT copies it
+                # straight into TQ's staging buffer, and TQ synchronizes this
+                # device before it reads.
                 stage_local_fields = {
-                    opd_full_payload_field: teacher_full_payload.detach().cpu()
+                    opd_full_payload_field: teacher_full_payload.detach()
                 }
                 if opd_full_teacher_index_field is not None:
                     # Guarded above: a column without an index already raised,
@@ -1206,6 +1236,7 @@ class TQWorkerMixin:
                         (teacher_full_payload.shape[0],),
                         int(opd_full_teacher_index),
                         dtype=torch.int64,
+                        device=teacher_full_payload.device,
                     )
                 self._write_back_stage_local(meta, stage_local_fields)
             del teacher_full_payload
@@ -1214,6 +1245,7 @@ class TQWorkerMixin:
             result,
             result_key="logprobs",
             tq_field="teacher_reference_logprobs",
+            keep_on_gpu=keep_outputs_on_gpu,
         )
         del result
 
@@ -1290,6 +1322,7 @@ class TQWorkerMixin:
         """
         data = self._fetch(meta)
         data = self._attach_or_repack_pack_metadata(data, meta)
+        data = _attach_draft_sample_ids(data, meta.sample_ids)
         self.train_microbatch(  # type: ignore[attr-defined]
             data=data,
         )

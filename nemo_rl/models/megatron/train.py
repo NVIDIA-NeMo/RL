@@ -40,6 +40,7 @@ from megatron.core.utils import (
 from nemo_rl.algorithms.logits_sampling_utils import (
     TrainingSamplingParams,
     need_top_k_or_top_p_filtering,
+    replays_sampler_support,
 )
 from nemo_rl.algorithms.loss import (
     DraftLossWrapper,
@@ -52,7 +53,7 @@ from nemo_rl.algorithms.loss import (
 )
 from nemo_rl.algorithms.loss.draft import DEFAULT_DRAFT_TOKEN_CHUNK_SIZE
 from nemo_rl.algorithms.loss.interfaces import LossFunction
-from nemo_rl.algorithms.loss.utils import _pack_input_ids
+from nemo_rl.algorithms.loss.loss_input import sampler_support_logprobs
 from nemo_rl.algorithms.utils import mask_filtered_logprobs_outside_tokens
 from nemo_rl.data.megatron_sft_packed import is_direct_packed_row
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -67,6 +68,7 @@ from nemo_rl.models.megatron.data import ProcessedMicrobatch
 from nemo_rl.models.megatron.draft.hidden_capture import (
     get_capture_context,
 )
+from nemo_rl.models.megatron.draft.training import DraftSpeculator
 from nemo_rl.models.megatron.opd_full_capture import get_opd_full_capture_context
 from nemo_rl.models.megatron.router_replay import (
     clear_router_replay,
@@ -304,6 +306,8 @@ def forward_with_post_processing_fn(
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
+    draft_provider: DraftSpeculator | None = None,
+    draft_optimizer_step: int = 0,
     enable_hidden_capture: Optional[bool] = False,
     enable_opd_full_capture: bool = False,
     use_fused_linear_logprobs: bool = False,
@@ -369,7 +373,13 @@ def forward_with_post_processing_fn(
     # opd_full capture below the unqualified name reads as the generic one. Not
     # done here: it would pull draft/*.py and three @patch paths in
     # test_train.py into an unrelated feature's review.
-    capture_context, capture = get_capture_context(model, enable_hidden_capture)
+    capture_context, capture = get_capture_context(
+        model,
+        enable_hidden_capture,
+        aux_layer_indices=(
+            draft_provider.capture_layer_ids() if draft_provider is not None else None
+        ),
+    )
     # Independent of the draft capture above: grabs the pre-LM-head hidden states
     # a frozen MOPD teacher ships for full-vocabulary distillation.
     opd_full_capture_context, opd_full_capture = get_opd_full_capture_context(
@@ -409,38 +419,25 @@ def forward_with_post_processing_fn(
             clear_router_replay(model)
 
     if capture is not None:
-        from megatron.core.transformer.multi_token_prediction import roll_tensor
-
-        captured_states = capture.get_captured_states()
-        if packed_seq_params is not None:
-            # Packed layout: rolling the captured embeddings would leak the
-            # next segment's first token across every packing boundary, so
-            # shift the token ids per sequence before packing and re-embed
-            # them instead (one extra embedding lookup; also yields the
-            # correct sequence-parallel layout for free). no_grad matches the
-            # capture hooks, which hand the draft detached embeddings.
-            with torch.no_grad():
-                shifted_input_ids = _pack_input_ids(
-                    data_dict["input_ids"],
-                    to_cpu_int_tuple(packed_seq_params.cu_seqlens_q),
-                    to_cpu_int_tuple(packed_seq_params.cu_seqlens_q_padded),
-                    roll_shift=-1,
-                )
-                shifted_input_embeds = capture.model.embedding(
-                    input_ids=shifted_input_ids, position_ids=position_ids
-                )
-        else:
-            shifted_input_embeds = roll_tensor(
-                captured_states.inputs_embeds,
-                shifts=-1,
-                dims=0,
-                cp_group=get_context_parallel_group(),
-            )[0]
-        data_dict["student_logits"] = draft_model(
-            hidden_states=captured_states.hidden_states,
-            input_embeds=shifted_input_embeds,
+        captured_states = capture.get_captured_states(
+            sequence_layout=processed_mb.draft_sequence_layout
+        )
+        if draft_provider is None or draft_model is None:
+            raise RuntimeError(
+                "draft hidden capture requires a draft provider and model"
+            )
+        draft_provider.forward(
+            policy_model=model,
+            draft_model=draft_model,
+            captured_states=captured_states,
+            input_ids_cp_local=input_ids_cp_sharded,
             attention_mask=attention_mask,
+            data=data_dict,
+            optimizer_step=draft_optimizer_step,
+            sequence_layout=processed_mb.draft_sequence_layout,
             packed_seq_params=packed_seq_params,
+            context_parallel_group=get_context_parallel_group(),
+            tensor_parallel_group=get_tensor_model_parallel_group(),
         )
 
     # Apply temperature scaling only for sampling-oriented post-processors.
@@ -475,6 +472,9 @@ def forward_with_post_processing_fn(
             input_ids=input_ids,
             cu_seqlens_padded=cu_seqlens_padded,
             original_seq_length=original_seq_length,
+            cu_seqlens=(
+                None if packed_seq_params is None else packed_seq_params.cu_seqlens_q
+            ),
         )
     elif isinstance(post_processing_fn, TeacherFullPayloadPostProcessor):
         assert original_seq_length is not None
@@ -518,6 +518,8 @@ def megatron_forward_backward(
     sampling_params: Optional[TrainingSamplingParams] = None,
     straggler_timer: Optional[StragglerDetector] = None,
     draft_model: Optional[MegatronModule] = None,
+    draft_provider: DraftSpeculator | None = None,
+    draft_optimizer_step: int = 0,
     enable_hidden_capture: Optional[bool] = False,
     enable_opd_full_capture: bool = False,
     use_fused_linear_logprobs: bool = False,
@@ -562,6 +564,8 @@ def megatron_forward_backward(
         sampling_params=sampling_params,
         straggler_timer=straggler_timer,
         draft_model=draft_model,
+        draft_provider=draft_provider,
+        draft_optimizer_step=draft_optimizer_step,
         enable_hidden_capture=enable_hidden_capture,
         enable_opd_full_capture=enable_opd_full_capture,
         use_fused_linear_logprobs=use_fused_linear_logprobs,
@@ -598,6 +602,8 @@ class LossPostProcessor:
         cp_normalize: bool = True,
         sampling_params: Optional[TrainingSamplingParams] = None,
         draft_model: Optional[MegatronModule] = None,
+        draft_provider: DraftSpeculator | None = None,
+        draft_normalization_counts: torch.Tensor | None = None,
         prepare_fn: Optional[Callable[..., Any]] = None,
         defer_draft_normalization: bool = False,
         teacher_output_layer_weight_by_index: Optional[dict[int, torch.Tensor]] = None,
@@ -636,8 +642,15 @@ class LossPostProcessor:
         self.prepare_fn = prepare_fn
         self.defer_draft_normalization = defer_draft_normalization
         self.teacher_output_layer_weight_by_index = teacher_output_layer_weight_by_index
-        if draft_model is not None and draft_model.eagle_module is not None:
-            self.d2t = getattr(draft_model.eagle_module, "d2t", None)
+        self.draft_provider = draft_provider
+        self.draft_normalization_counts = draft_normalization_counts
+        eagle_module = (
+            getattr(draft_model, "eagle_module", None)
+            if draft_model is not None
+            else None
+        )
+        if eagle_module is not None:
+            self.d2t = getattr(eagle_module, "d2t", None)
         else:
             self.d2t = None
 
@@ -730,6 +743,7 @@ class LossPostProcessor:
                 chunk_size=logprob_chunk_size,
                 teacher_output_layer_weight_by_index=self.teacher_output_layer_weight_by_index,
             )
+        draft_prepare_fn = prepare_loss_input_wrapped
 
         # wrap loss function with loss input preparation
         pack_sequences = self.cfg["sequence_packing"]["enabled"]
@@ -750,10 +764,14 @@ class LossPostProcessor:
                     prepare_packed_loss_input,
                     sampling_params=self.sampling_params,
                     chunk_size=logprob_chunk_size,
+                    reuse_logits_storage=bool(
+                        self.cfg["megatron_cfg"].get("reuse_logits_storage")
+                    ),
                 )
             else:
                 wrapper_cls = SequencePackingLossWrapper
                 prepare_fn = prepare_loss_input_wrapped
+            draft_prepare_fn = prepare_fn
 
             cu_seqlens_q_cpu = to_cpu_int_tuple(packed_seq_params.cu_seqlens_q)
             cu_seqlens_q_padded_cpu = (
@@ -770,34 +788,6 @@ class LossPostProcessor:
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
-            if "student_logits" in data_dict:
-                # draft + use_fused_linear_logprobs is rejected at setup in
-                # lm_policy.py (the fused path never materializes the full
-                # next-token logits the teacher needs), so no check here.
-                # Keep the draft head's packed logits out of the policy-loss
-                # data so the per-sequence packing slicers never see them.
-                student_logits = data_dict.pop("student_logits")
-                loss_fn_wrapped = DraftLossWrapper(
-                    loss_fn=loss_fn_wrapped,
-                    prepare_fn=None,
-                    data_dict=data_dict,
-                    loss_weight=float(self.cfg["draft"].loss_weight),
-                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
-                    vocab_parallel_group=get_tensor_model_parallel_group(),
-                    context_parallel_group=get_context_parallel_group(),
-                    cu_seqlens_q=packed_seq_params.cu_seqlens_q,
-                    cu_seqlens_q_padded=packed_seq_params.cu_seqlens_q_padded,
-                    d2t=self.d2t,
-                    student_logits=student_logits,
-                    token_chunk_size=int(
-                        getattr(
-                            self.cfg["draft"],
-                            "token_chunk_size",
-                            DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
-                        )
-                    ),
-                    defer_normalization=self.defer_draft_normalization,
-                )
         else:
             loss_fn_wrapped = partial(
                 wrap_loss_fn_with_input_preparation,
@@ -807,24 +797,27 @@ class LossPostProcessor:
                 vocab_parallel_group=get_tensor_model_parallel_group(),
                 context_parallel_group=get_context_parallel_group(),
             )
-            if "student_logits" in data_dict:
-                loss_fn_wrapped = DraftLossWrapper(
-                    loss_fn=loss_fn_wrapped,
-                    prepare_fn=prepare_loss_input_wrapped,
-                    data_dict=data_dict,
-                    loss_weight=float(self.cfg["draft"].loss_weight),
-                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
-                    vocab_parallel_group=get_tensor_model_parallel_group(),
-                    context_parallel_group=get_context_parallel_group(),
-                    token_chunk_size=int(
-                        getattr(
-                            self.cfg["draft"],
-                            "token_chunk_size",
-                            DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
-                        )
-                    ),
-                    defer_normalization=self.defer_draft_normalization,
-                )
+
+        if self.draft_provider is not None:
+            loss_fn_wrapped = DraftLossWrapper(
+                loss_fn=loss_fn_wrapped,
+                prepare_fn=draft_prepare_fn,
+                data_dict=data_dict,
+                loss_weight=float(self.cfg["draft"].loss_weight),
+                vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                vocab_parallel_group=get_tensor_model_parallel_group(),
+                context_parallel_group=get_context_parallel_group(),
+                defer_normalization=self.defer_draft_normalization,
+                draft_provider=self.draft_provider,
+                draft_normalization_counts=self.draft_normalization_counts,
+                token_chunk_size=int(
+                    getattr(
+                        self.cfg["draft"],
+                        "token_chunk_size",
+                        DEFAULT_DRAFT_TOKEN_CHUNK_SIZE,
+                    )
+                ),
+            )
 
         loss_fn_wrapped = partial(
             loss_fn_wrapped,
@@ -891,6 +884,7 @@ class LogprobsPostProcessor:
         input_ids: torch.Tensor,
         cu_seqlens_padded: Optional[torch.Tensor | CpuIntTuple],
         original_seq_length: int,
+        cu_seqlens: Optional[torch.Tensor | CpuIntTuple] = None,
     ) -> Callable[[torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]]:
         """Create a post-processing function that computes token log probabilities.
 
@@ -902,6 +896,8 @@ class LogprobsPostProcessor:
             input_ids: Processed input token IDs
             cu_seqlens_padded: Cumulative sequence lengths for packed sequences
             original_seq_length: Sequence width before dense padding was applied
+            cu_seqlens: Unpadded packed-sequence boundaries; needed to replay the
+                sampler's support on packed sequences
 
         Returns:
             Callable: Function that takes output tensor and returns (dummy_loss, {"logprobs": token_logprobs})
@@ -916,6 +912,23 @@ class LogprobsPostProcessor:
             if self.use_fused_linear_logprobs:
                 token_logprobs = output_tensor.to(torch.float32)
                 token_logprobs = token_logprobs[:, : original_seq_length - 1]
+            elif replays_sampler_support(self.sampling_params):
+                # Same support-renormalized log-probs as the actor loss.
+                packed = self.cfg["sequence_packing"]["enabled"]
+                assert not packed or cu_seqlens is not None
+                token_logprobs, _ = sampler_support_logprobs(
+                    output_tensor,
+                    data_dict,
+                    self.sampling_params,
+                    vocab_parallel_rank=get_tensor_model_parallel_rank(),
+                    vocab_parallel_group=get_tensor_model_parallel_group(),
+                    context_parallel_group=(
+                        get_context_parallel_group() if packed else None
+                    ),
+                    chunk_size=self.cfg.get("logprob_chunk_size", None),
+                    cu_seqlens_q=to_cpu_int_tuple(cu_seqlens) if packed else None,
+                    cu_seqlens_q_padded=cu_seqlens_padded_cpu,
+                )
             elif self.cfg["sequence_packing"]["enabled"]:
                 assert cu_seqlens_padded_cpu is not None
                 tp_grp = get_tensor_model_parallel_group()
@@ -980,7 +993,9 @@ class TeacherFullPayloadPostProcessor:
 
     The payload is returned in canonical ``[B, S, D]`` layout with tensor,
     context, and sequence parallelism already undone, so the student's own
-    parallelism can differ from the teacher's.
+    parallelism can differ from the teacher's. It moves to CPU as each
+    microbatch is produced, unless ``keep_payload_on_gpu`` keeps it on the
+    device for a GPU-sourced data-plane PUT.
     """
 
     def __init__(
@@ -989,6 +1004,7 @@ class TeacherFullPayloadPostProcessor:
         payload: str,
         payload_dtype: torch.dtype,
         sampling_params: Optional[TrainingSamplingParams] = None,
+        keep_payload_on_gpu: bool = False,
     ):
         if payload not in ("hidden_states", "logits"):
             raise ValueError(
@@ -998,6 +1014,7 @@ class TeacherFullPayloadPostProcessor:
         self.payload = payload
         self.payload_dtype = payload_dtype
         self.sampling_params = sampling_params
+        self.keep_payload_on_gpu = keep_payload_on_gpu
         self._logprobs_post_processor = LogprobsPostProcessor(
             cfg=cfg, sampling_params=sampling_params
         )
@@ -1133,14 +1150,15 @@ class TeacherFullPayloadPostProcessor:
                 payload_full = unpacked_payload
             payload_full = payload_full[:, :original_seq_length, :]
 
+            # Off the GPU here, inside the schedule, unless kept for a
+            # GPU-sourced PUT: mcore retains every microbatch's output dict until
+            # the whole forward completes, so a device tensor accumulates the
+            # entire data-parallel shard's payload rather than one microbatch's.
+            payload_device = payload_full.device if self.keep_payload_on_gpu else "cpu"
             return output_tensor.new_zeros(()), {
                 "logprobs": logprob_outputs["logprobs"],
-                # Off the GPU here, inside the schedule: mcore retains every
-                # microbatch's output dict until the whole forward completes, so
-                # a device tensor would accumulate the entire data-parallel
-                # shard's payload rather than one microbatch's.
                 "teacher_full_payload": payload_full.to(
-                    device="cpu", dtype=self.payload_dtype
+                    device=payload_device, dtype=self.payload_dtype
                 ),
             }
 

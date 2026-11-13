@@ -132,6 +132,7 @@ from nemo_rl.models.generation.interfaces import (
     GenerationConfig,
     GenerationInterface,
     GenerationSamplingParams,
+    sampler_replay_enabled,
     should_use_async_rollouts,
 )
 from nemo_rl.models.generation.megatron import MegatronGeneration
@@ -155,7 +156,11 @@ from nemo_rl.models.megatron.router_replay import (
 )
 from nemo_rl.models.megatron.zero_train_gen_mismatch import validate_zero_train_gen_kl
 from nemo_rl.models.policy import PolicyConfig
-from nemo_rl.models.policy.draft_config import coerce_draft_config
+from nemo_rl.models.policy.draft_config import (
+    MEGATRON_BLOCK_DRAFT_ALGOS,
+    coerce_draft_config,
+)
+from nemo_rl.models.policy.draft_sample_ids import stable_draft_sample_ids
 from nemo_rl.models.policy.interfaces import ColocatablePolicyInterface
 from nemo_rl.models.policy.lm_policy import Policy
 from nemo_rl.models.policy.utils import configure_lora_refit
@@ -559,6 +564,42 @@ class MasterConfig(BaseModel, extra="allow"):
 # ===============================================================================
 
 
+def _validate_val_sampling(master_config: MasterConfig) -> None:
+    """Reject validation sampling params that rollouts cannot honor.
+
+    Validation-only sampling is honored only on the NeMo-Gym vLLM and TRT-LLM
+    rollout paths; everywhere else validation must sample exactly like training.
+    """
+    generation_config = master_config.policy["generation"]
+    val_sampling_overridden = (
+        generation_config["val_temperature"] != generation_config["temperature"]
+        or generation_config["val_top_p"] != generation_config["top_p"]
+        or generation_config["val_top_k"] != generation_config["top_k"]
+    )
+    if not val_sampling_overridden:
+        return
+    assert generation_config["backend"] in ("vllm", "trtllm") and should_use_nemo_gym(
+        master_config
+    ), (
+        "generation.val_temperature/val_top_p/val_top_k differing from the "
+        "train sampling params is only supported for vLLM and TRT-LLM "
+        "NeMo-Gym rollouts."
+    )
+    # NeMo-Gym requests carry only temperature/top_p; the vLLM and TRT-LLM
+    # servers pin top_k to the train or validation profile, telling them apart
+    # by those two.
+    assert (
+        generation_config["val_top_k"] == generation_config["top_k"]
+        or generation_config["val_temperature"] != generation_config["temperature"]
+        or generation_config["val_top_p"] != generation_config["top_p"]
+    ), (
+        "generation.val_top_k differs from top_k while val_temperature/val_top_p "
+        "equal the train values: the Gym server cannot tell validation requests "
+        "apart and would sample them with top_k. Change val_temperature or "
+        "val_top_p too, or keep val_top_k equal to top_k."
+    )
+
+
 def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
     """Validate the single-forward threshold path before allocating workers."""
     if not master_config.loss_fn.seq_logprob_error_in_loss:
@@ -593,6 +634,31 @@ def _validate_seq_logprob_error_in_loss(master_config: MasterConfig) -> None:
         raise ValueError(
             "loss_fn.seq_logprob_error_in_loss does not support MTP, draft, "
             "positive-example NLL, or distillation losses"
+        )
+
+
+def _validate_draft_trainer_entrypoint(master_config: MasterConfig) -> None:
+    """Reject draft layouts that the selected GRPO trainer cannot feed.
+
+    The worker repeats the CP check at train time; this copy fails before
+    vLLM starts and before the first rollout.
+    """
+    draft = coerce_draft_config(master_config.policy.get("draft"))
+    if draft is None or not draft.enabled:
+        return
+    data_plane_enabled = bool((master_config.data_plane or {}).get("enabled", False))
+    async_config = master_config.grpo.async_grpo
+    async_enabled = bool(async_config is not None and async_config.enabled)
+    megatron_cfg = master_config.policy.get("megatron_cfg") or {}
+    cp_size = int(megatron_cfg.get("context_parallel_size", 1))
+    if cp_size > 1 and (async_enabled or not data_plane_enabled):
+        # Only grpo_train_sync drives the split begin/train_microbatch/finish
+        # API that context-parallel draft normalization needs.
+        raise ValueError(
+            "policy.draft with policy.megatron_cfg.context_parallel_size > 1 "
+            "requires the synchronous TransferQueue trainer. Set "
+            "data_plane.enabled=true and grpo.async_grpo.enabled=false, or set "
+            "context_parallel_size=1."
         )
 
 
@@ -702,9 +768,9 @@ def setup(
     policy_config = master_config.policy
     generation_config = policy_config["generation"]
     loss_config: ClippedPGLossConfig = master_config.loss_fn
-    if loss_config.score_centering:
+    if loss_config.score_centering or sampler_replay_enabled(generation_config):
         raise ValueError(
-            "Score centering requires SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy GRPO trainer does not capture sampler tensors."
+            "Score centering and policy.generation.sampler_replay.enabled require SingleController with NeMo Gym + vLLM and policy.generation.top_logprobs > 0; the legacy GRPO trainer does not capture sampler tensors."
         )
     env_configs = master_config.env
     data_config = master_config.data
@@ -779,29 +845,10 @@ def setup(
 
     _validate_multimodal_dedup_capability(master_config)
     _validate_seq_logprob_error_in_loss(master_config)
+    _validate_draft_trainer_entrypoint(master_config)
     enable_nemo_gym = should_use_nemo_gym(master_config)
 
-    # Validation-only sampling is honored only on the NeMo-Gym vLLM rollout
-    # path; everywhere else validation must sample exactly like training.
-    val_sampling_overridden = (
-        generation_config["val_temperature"] != generation_config["temperature"]
-        or generation_config["val_top_p"] != generation_config["top_p"]
-        or generation_config["val_top_k"] != generation_config["top_k"]
-    )
-    if val_sampling_overridden:
-        assert generation_config["backend"] == "vllm" and should_use_nemo_gym(
-            master_config
-        ), (
-            "generation.val_temperature/val_top_p/val_top_k differing from the "
-            "train sampling params is only supported for vLLM NeMo-Gym rollouts."
-        )
-        # The NeMo-Gym path only stamps temperature/top_p onto requests and
-        # rejects any top_k at rollout time, so a val_top_k override can never
-        # be honored — fail here instead of at the first validation step.
-        assert not generation_config["val_top_k"], (
-            "generation.val_top_k is not supported: the NeMo-Gym rollout path "
-            "only honors val_temperature/val_top_p. Leave val_top_k null."
-        )
+    _validate_val_sampling(master_config)
     assert grpo_config.val_num_generations_per_prompt >= 1, (
         "grpo.val_num_generations_per_prompt must be >= 1"
     )
@@ -2689,6 +2736,67 @@ def _preserve_router_replay_routed_experts(
         target["routed_experts"] = flat_messages["routed_experts"]
 
 
+def _draft_needs_sample_ids(policy_config: PolicyConfig) -> bool:
+    """Whether the draft trainer plans batches by stable rollout-row identity."""
+    draft = coerce_draft_config(policy_config.get("draft"))
+    return (
+        draft is not None
+        and draft.enabled
+        and draft.speculator_type in MEGATRON_BLOCK_DRAFT_ALGOS
+    )
+
+
+def _attach_grpo_draft_sample_ids(
+    repeated_batch: BatchedDataDict,
+    *,
+    num_generations_per_prompt: int,
+) -> None:
+    """Stamp rollout rows with IDs stable under downstream batch reordering."""
+    if num_generations_per_prompt < 1:
+        raise ValueError("num_generations_per_prompt must be positive")
+    if repeated_batch.size % num_generations_per_prompt != 0:
+        raise ValueError("repeated GRPO batch does not contain complete prompt groups")
+
+    task_names = repeated_batch.get("task_name", [None] * repeated_batch.size)
+    # BatchedDataDict columns may be lists or tensors; keys must match for both.
+    prompt_ids = repeated_batch["idx"]
+    if isinstance(prompt_ids, torch.Tensor):
+        prompt_ids = prompt_ids.tolist()
+    row_keys = [
+        json.dumps(
+            [
+                task_names[row],
+                prompt_ids[row],
+                row % num_generations_per_prompt,
+            ],
+            separators=(",", ":"),
+        )
+        for row in range(repeated_batch.size)
+    ]
+    repeated_batch["draft_sample_ids"] = torch.tensor(
+        stable_draft_sample_ids(row_keys), dtype=torch.int64
+    )
+
+
+def _preserve_draft_sample_ids(
+    target: BatchedDataDict,
+    repeated_batch: BatchedDataDict,
+) -> None:
+    """Carry stable rollout identity into the policy training payload."""
+    if "draft_sample_ids" not in repeated_batch:
+        return
+    sample_ids = repeated_batch["draft_sample_ids"]
+    # A row-count mismatch means the source batch no longer lines up with the
+    # target, so the IDs would silently label the wrong rows.
+    if target.size != len(sample_ids):
+        raise ValueError(
+            f"draft_sample_ids carries {len(sample_ids)} rows but the target "
+            f"batch has {target.size}; rollout postprocessing must preserve "
+            "input row order and row count."
+        )
+    target["draft_sample_ids"] = sample_ids
+
+
 def _policy_dtype(policy_config: PolicyConfig) -> torch.dtype:
     """Resolve the configured policy precision to its matching torch dtype."""
     return getattr(torch, policy_config["precision"])
@@ -2711,6 +2819,7 @@ def _build_async_grpo_train_data(
         }
     )
     _preserve_router_replay_routed_experts(train_data, flat_messages, policy_config)
+    _preserve_draft_sample_ids(train_data, repeated_batch)
     # update multimodal data unconditionally
     extra_multimodal_data = flat_messages.get_multimodal_dict(
         as_tensors=False, pixel_dtype=_policy_dtype(policy_config)
@@ -3790,6 +3899,11 @@ def _grpo_train_impl(
                             ),
                         )
                     )
+                    if _draft_needs_sample_ids(master_config.policy):
+                        _attach_grpo_draft_sample_ids(
+                            repeated_batch,
+                            num_generations_per_prompt=master_config.grpo.num_generations_per_prompt,
+                        )
                     print_multimodal_payload_metrics(
                         collect_multimodal_payload_metrics(
                             repeated_batch,
@@ -3925,9 +4039,17 @@ def _grpo_train_impl(
                                 master_config.grpo.debug_payload_metrics
                             ),
                         )
-                        repeated_batch = nemo_gym_rollout_result.final_batch
+                        gym_final_batch = nemo_gym_rollout_result.final_batch
+                        # Gym rebuilds the batch from its own result rows and
+                        # keeps only the columns it models, so draft_sample_ids
+                        # would be dropped here. The rebuilt batch is in input
+                        # row order (run_nemo_gym_rollout_sync restores it), so
+                        # the IDs carry over positionally.
+                        _preserve_draft_sample_ids(gym_final_batch, repeated_batch)
+                        repeated_batch = gym_final_batch
                         rollout_metrics = nemo_gym_rollout_result.rollout_metrics
                         del nemo_gym_rollout_result
+                        del gym_final_batch
 
                     # Use async rollouts when enabled by config/backend defaults.
                     elif should_use_async_rollouts(master_config.policy["generation"]):
@@ -4181,6 +4303,7 @@ def _grpo_train_impl(
                             "sample_mask": repeated_batch["loss_multiplier"],
                         }
                     )
+                    _preserve_draft_sample_ids(train_data, repeated_batch)
                     # this will be mini-batched inside the policy, so maintain the packed multimodal structure
                     # This is also used to populate part of the downstream logprob calculation data
                     extra_multimodal_data = flat_messages.get_multimodal_dict(
@@ -4696,6 +4819,8 @@ def _grpo_train_impl(
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
+                if "attribution_key" in repeated_batch:
+                    log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages["content"]
                 log_data["rewards"] = rewards.tolist()
                 if master_config.grpo.use_dynamic_sampling:
@@ -4948,15 +5073,20 @@ def validate(
         )
 
         total_rewards = []
-        total_lengths = []
+        # Sum of per-batch mean length x rollouts, so a partial batch weighs less.
+        total_length_tokens = 0.0
         all_message_logs = []  # Collect all message logs
 
-        max_batches = (
-            master_config.grpo.max_val_samples // master_config.grpo.val_batch_size
-        )
+        max_val_samples = master_config.grpo.max_val_samples
+        val_batch_size = master_config.grpo.val_batch_size
+        # Include the partial final batch, then trim it to the prompt cap.
+        max_batches = -(-max_val_samples // val_batch_size)
         for batch_idx, val_batch in enumerate(val_dataloader):
             if batch_idx >= max_batches:
                 break
+            num_left = max_val_samples - batch_idx * val_batch_size
+            if val_batch.size > num_left:
+                val_batch = val_batch.slice(0, num_left)
 
             if val_num_generations_per_prompt > 1:
                 val_batch = val_batch.repeat_interleave(val_num_generations_per_prompt)
@@ -5042,8 +5172,11 @@ def validate(
                     ),
                 )
 
-            total_rewards.extend(val_batch["total_reward"].tolist())
-            total_lengths.append(gen_metrics["mean_gen_tokens_per_sample"])
+            batch_rewards = val_batch["total_reward"].tolist()
+            total_rewards.extend(batch_rewards)
+            total_length_tokens += gen_metrics["mean_gen_tokens_per_sample"] * len(
+                batch_rewards
+            )
 
             # Collect message logs for later display
             to_env = [
@@ -5078,9 +5211,7 @@ def validate(
         else:
             accuracy = 0.0
 
-        avg_length = (
-            sum(total_lengths) / len(total_lengths) if len(total_lengths) > 0 else 0.0
-        )
+        avg_length = total_length_tokens / num_samples if num_samples > 0 else 0.0
 
         val_metrics = {
             "accuracy": accuracy,
@@ -6670,6 +6801,8 @@ def async_grpo_train(
                 log_data = {}
                 if "agent_ref" in repeated_batch:
                     log_data["agent_ref"] = repeated_batch["agent_ref"]
+                if "attribution_key" in repeated_batch:
+                    log_data["attribution_key"] = repeated_batch["attribution_key"]
                 log_data["content"] = flat_messages_content
                 log_data["rewards"] = rewards.tolist()
                 if master_config.grpo.use_dynamic_sampling:

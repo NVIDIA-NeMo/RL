@@ -30,8 +30,6 @@ if TYPE_CHECKING:
 # functions: tools/external_gym_vllm/serve_vllm_on_ray.py loads it by path and
 # calls _apply_vllm_patches in serving containers that do not install NeMo RL.
 
-VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR = "NRL_VLLM_FP32_LM_HEAD"
-
 
 def _get_vllm_file(relative_path: str) -> str:
     """Return absolute path to a vLLM file or raise if it cannot be found.
@@ -1662,7 +1660,6 @@ def _apply_vllm_patches(
     py_executable: str,
     *,
     extra_env_vars: list[str] | None = None,
-    nemotron_h_fp32_lm_head: bool | None = None,
     require_moe_routed_experts_capture: bool = False,
 ) -> None:
     # Import lazily so importing the worker module does not import vLLM.
@@ -1670,15 +1667,6 @@ def _apply_vllm_patches(
     from vllm.logger import init_logger
 
     patch_logger = init_logger("vllm_patch")
-    nemotron_h_fp32_lm_head_enabled = bool(nemotron_h_fp32_lm_head)
-    if nemotron_h_fp32_lm_head_enabled:
-        os.environ[VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR] = "1"
-        extra_env_vars = [
-            *(extra_env_vars or []),
-            VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR,
-        ]
-    else:
-        os.environ.pop(VLLM_NEMOTRON_H_FP32_LM_HEAD_ENV_VAR, None)
 
     # Whether the v1 patch matters at all depends on which executor vLLM will
     # select. 0.25 defaults this to "1" (RayExecutorV2), which has no
@@ -1725,15 +1713,6 @@ def _apply_vllm_patches(
     _patch_vllm_radio_final_layernorm(patch_logger)
     _patch_vllm_nano_vl_projector_loader(patch_logger)
     _patch_vllm_glm_decoder_sequence_parallel_moe(patch_logger)
-    if nemotron_h_fp32_lm_head_enabled and not _patch_vllm_nemotron_h_fp32_lm_head(
-        patch_logger
-    ):
-        raise RuntimeError(
-            "vllm_cfg.fp32_lm_head is enabled, but that flag currently maps to "
-            "the Nemotron-H-only vLLM fp32 LM head source patch, and the patch "
-            "could not be applied. Disable the flag or update the patch anchors "
-            "for this vLLM version."
-        )
     _patch_vllm_moe_routed_experts_capture(
         patch_logger, required=require_moe_routed_experts_capture
     )

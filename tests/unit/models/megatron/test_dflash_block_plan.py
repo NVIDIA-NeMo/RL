@@ -18,8 +18,10 @@ from __future__ import annotations
 
 import ast
 import dataclasses
-import importlib
+import importlib.util
 import inspect
+import sys
+from pathlib import Path
 from types import ModuleType
 from typing import Any
 
@@ -30,16 +32,54 @@ from torch import Tensor
 pytestmark = pytest.mark.mcore
 
 _PLAN_MODULE = "nemo_rl.models.megatron.draft.block_plan"
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_PLAN_PATH = _REPO_ROOT / "nemo_rl/models/megatron/draft/block_plan.py"
+_LAYOUT_MODULE = "nemo_rl.models.megatron.draft.sequence_layout"
+_LAYOUT_PATH = _REPO_ROOT / "nemo_rl/models/megatron/draft/sequence_layout.py"
+
+
+def _load_module(module_name: str, path: Path) -> ModuleType:
+    if not path.is_file():
+        pytest.fail(f"Production contract is missing: {path}", pytrace=False)
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    if spec is None:
+        raise RuntimeError(f"Unable to create a module spec for {path}")
+    if spec.loader is None:
+        raise RuntimeError(f"Module spec has no loader for {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _load_plan_module() -> ModuleType:
-    try:
-        return importlib.import_module(_PLAN_MODULE)
-    except ModuleNotFoundError as error:
-        pytest.fail(
-            f"DFlash batch-plan production contract is missing: {error}",
-            pytrace=False,
-        )
+    return _load_module(_PLAN_MODULE, _PLAN_PATH)
+
+
+def _build_layout(
+    *,
+    cp_rank: int,
+    cp_size: int = 2,
+    cu_seqlens_q: list[int] | None = None,
+    cu_seqlens_q_padded: list[int] | None = None,
+) -> Any:
+    module = _load_module(_LAYOUT_MODULE, _LAYOUT_PATH)
+    return module.build_draft_sequence_layout(
+        logical_sample_ids=torch.tensor([11, 22], dtype=torch.int64),
+        cu_seqlens_q=torch.tensor(
+            cu_seqlens_q if cu_seqlens_q is not None else [0, 7, 12],
+            dtype=torch.int64,
+        ),
+        cu_seqlens_q_padded=torch.tensor(
+            cu_seqlens_q_padded if cu_seqlens_q_padded is not None else [0, 8, 16],
+            dtype=torch.int64,
+        ),
+        cp_rank=cp_rank,
+        cp_size=cp_size,
+        tp_rank=0,
+        tp_size=1,
+        device=torch.device("cpu"),
+    )
 
 
 def _build_plan(
@@ -50,8 +90,12 @@ def _build_plan(
     gamma: int,
     optimizer_step: int,
     seed: int,
+    sequence_layout: Any | None = None,
 ) -> Any:
     module = _load_plan_module()
+    kwargs: dict[str, Any] = {}
+    if sequence_layout is not None:
+        kwargs["sequence_layout"] = sequence_layout
     return module.build_dflash_batch_plan(
         token_valid_mask,
         sample_ids,
@@ -59,6 +103,7 @@ def _build_plan(
         gamma=gamma,
         optimizer_step=optimizer_step,
         seed=seed,
+        **kwargs,
     )
 
 
@@ -303,6 +348,84 @@ def test_noncontiguous_mask_without_full_window_emits_safe_invalid_blocks() -> N
     assert torch.equal(plan.query_positions, torch.zeros((2, 2), dtype=torch.int64))
     assert not plan.slot_valid.any()
     assert not plan.loss_mask.any()
+
+
+def test_packed_cp_plans_execute_each_window_once_without_crossing_boundaries() -> None:
+    """Catches duplicated CP work and draft windows crossing a packed segment."""
+    token_valid_mask = torch.tensor(
+        [
+            [True, True, True, True, True, True, True, False],
+            [True, True, True, True, True, False, False, False],
+        ]
+    )
+    sample_ids = torch.tensor([11, 22], dtype=torch.int64)
+    plans = [
+        _build_plan(
+            token_valid_mask,
+            sample_ids,
+            anchors_per_sample=3,
+            gamma=2,
+            optimizer_step=4,
+            seed=17,
+            sequence_layout=_build_layout(cp_rank=cp_rank),
+        )
+        for cp_rank in range(2)
+    ]
+
+    assert plans[0].sample_rows.numel() == 0
+    assert plans[1].sample_rows.numel() == 6
+    assert plans[1].logical_sample_ids.tolist() == [11, 11, 11, 22, 22, 22]
+    assert set(plans[1].logical_anchor_positions[:3].tolist()) <= {2, 3}
+    assert set(plans[1].logical_anchor_positions[3:].tolist()) == {2}
+    assert plans[1].owner_cp_ranks.eq(1).all()
+    assert plans[1].local_query_positions.ge(0).all()
+
+    assert plans[0].excluded_window_count.item() == 5
+    assert plans[1].excluded_window_count.item() == 5
+    assert plans[0].eligible_window_count.item() == 3
+    assert plans[1].eligible_window_count.item() == 3
+
+    for plan in plans:
+        assert plan.boundary_valid_mask.all()
+        assert torch.all(
+            plan.global_query_positions >= plan.packed_segment_starts[:, None]
+        )
+        assert torch.all(
+            plan.global_query_positions < plan.packed_segment_ends[:, None]
+        )
+        assert torch.equal(
+            plan.packed_rope_positions,
+            plan.logical_anchor_positions[:, None] + torch.arange(3)[None, :],
+        )
+
+
+def test_packed_cp_plan_does_not_index_past_a_short_padded_segment() -> None:
+    """Catches candidate mapping through a later segment or past packed storage."""
+    token_valid_mask = torch.tensor(
+        [
+            [True] * 16,
+            [True, True, True] + [False] * 13,
+        ]
+    )
+    plan = _build_plan(
+        token_valid_mask,
+        torch.tensor([11, 22], dtype=torch.int64),
+        anchors_per_sample=2,
+        gamma=2,
+        optimizer_step=1,
+        seed=3,
+        sequence_layout=_build_layout(
+            cp_rank=0,
+            cp_size=1,
+            cu_seqlens_q=[0, 16, 19],
+            cu_seqlens_q_padded=[0, 16, 20],
+        ),
+    )
+
+    second_sample = plan.logical_sample_ids == 22
+    assert second_sample.any()
+    assert torch.all(plan.global_query_positions[second_sample] >= 16)
+    assert torch.all(plan.global_query_positions[second_sample] < 19)
 
 
 def test_plan_builder_has_no_host_sync_or_python_row_anchor_loops() -> None:

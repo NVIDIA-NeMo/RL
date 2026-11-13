@@ -45,6 +45,40 @@ def _tiny_config(*, num_hidden_layers: int = 2) -> DFlashBodyConfig:
     )
 
 
+def test_qwen_moe_asymmetric_attention_projection_is_valid() -> None:
+    """Qwen3-30B-A3B has a 2048 residual width and a 32x128 Q projection."""
+    config = DFlashBodyConfig(
+        hidden_size=2048,
+        intermediate_size=6144,
+        num_attention_heads=32,
+        num_key_value_heads=4,
+        head_dim=128,
+        num_hidden_layers=5,
+        num_target_taps=5,
+    )
+
+    assert config.hidden_size == 2048
+    assert config.num_attention_heads * config.head_dim == 4096
+
+
+def test_body_constructs_asymmetric_attention_projection() -> None:
+    config = DFlashBodyConfig(
+        hidden_size=8,
+        intermediate_size=24,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=4,
+        num_hidden_layers=1,
+        num_target_taps=2,
+        rope_theta=10_000.0,
+    )
+
+    body = DFlashBody(config, parallel_config=_fp32_parallel_config())
+
+    assert body.layers[0].self_attn.q_proj.weight.shape == (16, 8)
+    assert body.layers[0].self_attn.o_proj.weight.shape == (8, 16)
+
+
 def _fp32_parallel_config(
     *,
     tensor_parallel_size: int = 1,
@@ -529,6 +563,7 @@ def test_tensor_parallel_input_metadata_uses_rank_ordered_all_gather(
         target_taps=torch.randn(1, 4, 2, 8),
         block_embeddings=torch.randn(1, plan.block_size, 8),
         plan=plan,
+        sequence_layout=None,
     )
 
     assert len(calls) == 1

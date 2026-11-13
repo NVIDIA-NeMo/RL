@@ -282,6 +282,7 @@ def _run_trtllm_server_process(
             model_name=MODEL,
             max_seq_len=4096,
             sampling_config={"temperature": 0.0, "top_p": 1.0, "top_k": None},
+            val_sampling_config={"temperature": 0.0, "top_p": 1.0, "top_k": None},
             tool_parser="qwen3",
             reasoning_parser=TRTLLM_REASONING_PARSERS[reasoning_parser],
         )

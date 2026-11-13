@@ -30,6 +30,8 @@ from transformers import PreTrainedTokenizerBase
 from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
+    _attach_grpo_draft_sample_ids,
+    _draft_needs_sample_ids,
     _get_effort_config,
 )
 from nemo_rl.algorithms.grpo import (
@@ -202,6 +204,7 @@ class AsyncTrajectoryCollector:
         self._num_prompts_per_step = int(algorithm_config.num_prompts_per_step)
         self._num_generations_per_prompt = algorithm_config.num_generations_per_prompt
         self._max_rollout_turns = algorithm_config.max_rollout_turns
+        self._draft_needs_sample_ids = _draft_needs_sample_ids(master_config.policy)
         self.replay_buffer = replay_buffer
         self.teacher_worker_groups = teacher_worker_groups or {}
         self.alias_to_group_alias = alias_to_group_alias or {}
@@ -926,6 +929,10 @@ class AsyncTrajectoryCollector:
                 num_generations,
                 share_immutable_media=self._deduplicate_multimodal_data,
             )
+            if self._draft_needs_sample_ids:
+                _attach_grpo_draft_sample_ids(
+                    repeated_batch, num_generations_per_prompt=num_generations
+                )
             print_multimodal_payload_metrics(
                 collect_multimodal_payload_metrics(
                     repeated_batch,
@@ -1377,7 +1384,7 @@ class AsyncTrajectoryCollector:
     def _compute_teacher_logprobs(
         self,
         input_ids: torch.Tensor,
-        agent_refs: list[dict[str, Any]],
+        agent_refs: list[dict[str, Any]] | list[str],
         input_lengths: Optional[torch.Tensor] = None,
         multimodal_data: Optional[dict[str, Any]] = None,
     ) -> tuple[torch.Tensor, float]:
@@ -1387,7 +1394,7 @@ class AsyncTrajectoryCollector:
 
         Args:
             input_ids: [B, S] tokenized input tensor
-            agent_refs: list of B agent reference dicts
+            agent_refs: B attribution keys or legacy agent reference dicts
             input_lengths: [B] per-sample lengths (required for sequence packing)
             multimodal_data: batch-level multimodal inputs, row-aligned with
                 ``input_ids`` and sliced per teacher
@@ -1400,9 +1407,8 @@ class AsyncTrajectoryCollector:
         default_teacher_alias = opd_cfg.get("default_teacher_alias")
         strict = opd_cfg.get("strict_agent_name_match", False)
 
-        # Resolve each sample's agent -> the teacher alias it should be distilled
-        # from: the agent name is looked up in teacher_model_by_agent_name; unmapped
-        # agents fall back to default_teacher_alias (or raise if strict_agent_name_match).
+        # Route tasksets and flat-row agent names through the existing teacher map.
+        # Unmapped keys fall back to default_teacher_alias (or raise if strict_agent_name_match).
         # Returns one alias per sample, index-aligned with agent_refs.
         reference_aliases = resolve_reference_aliases(
             agent_refs,
@@ -1712,8 +1718,12 @@ class AsyncTrajectoryCollector:
 
         # Teacher inference is blocking. Keep it off this worker's event loop so
         # other completed prompt groups can continue moving toward the buffer.
-        if self._has_distillation_teachers and "agent_ref" in final_batch_cpu:
-            agent_refs = final_batch_cpu["agent_ref"]
+        if self._has_distillation_teachers and (
+            "attribution_key" in final_batch_cpu or "agent_ref" in final_batch_cpu
+        ):
+            agent_refs = final_batch_cpu.get(
+                "attribution_key", final_batch_cpu.get("agent_ref")
+            )
             if isinstance(agent_refs, list):
                 from nemo_rl.data.llm_message_utils import (
                     batched_message_log_to_flat_message,
@@ -1856,6 +1866,9 @@ class AsyncTrajectoryCollector:
             )
             for group_index in range(expected_prompt_groups)
         ]
+        # NeMo-Gym rebuilds each group's batch without the input columns, so
+        # carry the stable draft IDs from the input rows the same way.
+        input_draft_sample_ids = repeated_batch.get("draft_sample_ids")
         buffered_group_indices: set[int] = set()
         last_error: Exception | None = None
         max_attempts = 1 + (_MAX_NEMO_GYM_STREAM_RETRIES if use_nemo_gym else 0)
@@ -1896,6 +1909,13 @@ class AsyncTrajectoryCollector:
                             f"Rollout stream yielded prompt group {group_index} twice"
                         )
                     scheduled_group_indices.add(group_index)
+                    if input_draft_sample_ids is not None:
+                        rollout_result.final_batch["draft_sample_ids"] = (
+                            input_draft_sample_ids[
+                                group_index * num_generations : (group_index + 1)
+                                * num_generations
+                            ]
+                        )
                     push_tasks.append(
                         asyncio.create_task(
                             self._enqueue_rollout_group(

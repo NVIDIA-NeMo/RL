@@ -45,6 +45,7 @@ from nemo_rl.algorithms.grpo import (
     AsyncGRPOConfig,
     GRPOConfig,
     MasterConfig,
+    _attach_grpo_draft_sample_ids,
     _startup_pipeline_ready,
     add_grpo_token_loss_masks_and_generation_logprobs,
     extract_initial_prompt_messages,
@@ -67,8 +68,19 @@ from nemo_rl.models.generation.interfaces import (
     GenerationInterface,
     _warn_unsupported_in_flight_refit_pause_once,
 )
+from nemo_rl.models.policy.draft_config import MegatronDFlashDraftConfig
 from nemo_rl.utils.length_penalty import LengthPenaltyConfig
 from nemo_rl.utils.logger import LoggerConfig
+
+
+def _dflash_draft_config() -> MegatronDFlashDraftConfig:
+    return MegatronDFlashDraftConfig(
+        enabled=True,
+        gamma=2,
+        anchors_per_sample=1,
+        mask_token_id=0,
+        target_hidden_state_layer_ids=[0],
+    )
 
 
 @ray.remote(num_cpus=0)
@@ -529,6 +541,59 @@ class TestReplayBufferImplCheckpointing:
         torch.testing.assert_close(
             restored_media.as_tensor(),
             torch.tensor([[1.0, 2.0], [1.0, 2.0]]),
+        )
+
+    def test_local_restore_merges_pre_taskset_batches_with_new_batches(self, tmp_path):
+        def flat_group(agent_name: str, *, with_attribution_key: bool) -> dict:
+            batch = BatchedDataDict(
+                {
+                    "agent_ref": [{"name": agent_name}] * 2,
+                    "total_reward": torch.tensor([1.0, 0.0]),
+                }
+            )
+            if with_attribution_key:
+                batch["attribution_key"] = [agent_name] * 2
+            return {"batch": batch, "rollout_metrics": {}}
+
+        # A checkpoint written before taskset attribution has no
+        # attribution_key column in its buffered batches.
+        checkpoint_path = tmp_path / "replay_buffer.pt"
+        source = ReplayBufferImpl(max_size=10, drop_incomplete_targets_on_restore=False)
+        assert (
+            source.add(
+                flat_group("math_agent", with_attribution_key=False),
+                weight_version=1,
+                target_weight_version=2,
+            )
+            == "success"
+        )
+        source.save_to_path(str(checkpoint_path))
+
+        restored = ReplayBufferImpl(
+            max_size=10, drop_incomplete_targets_on_restore=False
+        )
+        restored.load_from_path(
+            str(checkpoint_path), num_prompts_per_step=2, current_training_step=2
+        )
+        # The collector fills the rest of the resumed step with a new group.
+        assert (
+            restored.add(
+                flat_group("code_agent", with_attribution_key=True),
+                weight_version=1,
+                target_weight_version=2,
+            )
+            == "success"
+        )
+        sampled = restored.sample(2, current_weight_version=2, max_age_steps=1)
+
+        # Async GRPO merges the sampled groups into one training batch this way.
+        train_batch = BatchedDataDict.from_batches(
+            [trajectory["batch"] for trajectory in sampled["trajectories"]]
+        )
+        assert train_batch["attribution_key"] == ["math_agent"] * 2 + ["code_agent"] * 2
+        assert (
+            train_batch["agent_ref"]
+            == [{"name": "math_agent"}] * 2 + [{"name": "code_agent"}] * 2
         )
 
 
@@ -1360,6 +1425,7 @@ class TestAsyncTrajectoryCollector:
         ordinals_frontier_aligned: bool = True,
         resume_frontier_ordinal=None,
         resume_covered_task_indices=None,
+        draft=None,
     ):
         """Create a non-Ray collector instance for unit-testing local state."""
         collector_cls = AsyncTrajectoryCollector.__ray_metadata__.modified_class
@@ -1368,6 +1434,8 @@ class TestAsyncTrajectoryCollector:
         task_to_env = {}
         master_config = self.create_mock_config()
         master_config.grpo.async_grpo.max_generation_failures = max_generation_failures
+        if draft is not None:
+            master_config.policy["draft"] = draft
         if replay_buffer is None:
             replay_buffer = mock.MagicMock()
             replay_buffer.get_held_task_indices.remote.return_value = []
@@ -3127,7 +3195,10 @@ class TestAsyncTrajectoryCollector:
         assert collector.get_rollouts_state() == {"next_ng_task_index": 39}
         assert target_weight not in collector._generating_targets
 
-    def test_process_batch_non_gym_uses_one_batched_worker(self, monkeypatch):
+    @pytest.mark.parametrize("block_draft", [False, True])
+    def test_process_batch_non_gym_uses_one_batched_worker(
+        self, monkeypatch, block_draft
+    ):
         """Native collection repeats all prompts into one batch worker."""
 
         class RemoteMethod:
@@ -3155,7 +3226,10 @@ class TestAsyncTrajectoryCollector:
                 return False
 
         target_weight = 11
-        collector = self.create_local_collector(replay_buffer=FakeReplayBuffer())
+        collector = self.create_local_collector(
+            replay_buffer=FakeReplayBuffer(),
+            draft=_dflash_draft_config() if block_draft else None,
+        )
         collector.running = True
 
         def reserve_target(generation_weight_version):
@@ -3178,7 +3252,12 @@ class TestAsyncTrajectoryCollector:
             trajectory_collector_mod._threading, "Thread", RecordingThread
         )
 
-        collector._process_batch(self.create_mock_batch(size=2))
+        batch = self.create_mock_batch(size=2)
+        batch["idx"] = [17, 23]
+        expected_ids = batch.repeat_interleave(3)
+        _attach_grpo_draft_sample_ids(expected_ids, num_generations_per_prompt=3)
+
+        collector._process_batch(batch)
 
         assert len(started_threads) == 1
         assert captured["repeated_batch"].size == 6
@@ -3188,6 +3267,14 @@ class TestAsyncTrajectoryCollector:
             "_ng_task_index" not in row
             for row in captured["repeated_batch"]["extra_env_info"]
         )
+        # Block drafts get the same row IDs the sync trainer stamps.
+        if block_draft:
+            assert torch.equal(
+                captured["repeated_batch"]["draft_sample_ids"],
+                expected_ids["draft_sample_ids"],
+            )
+        else:
+            assert "draft_sample_ids" not in captured["repeated_batch"]
         assert collector.get_rollouts_state() == {"next_ng_task_index": 0}
         assert target_weight not in collector._generating_targets
 
@@ -3428,6 +3515,81 @@ class TestAsyncTrajectoryCollector:
         assert rollout_calls == 2
         assert replay_buffer.add.task_indices == [7, 8]
         assert target_weight not in collector._generating_targets
+
+    def test_nemo_gym_groups_carry_input_draft_sample_ids_across_retry(
+        self, monkeypatch
+    ):
+        """Gym rebuilds group batches without draft IDs; the collector restores them."""
+
+        class _ReadyResult:
+            def __await__(self):
+                async def _resolve():
+                    return "success"
+
+                return _resolve().__await__()
+
+        class _AddRemote:
+            def __init__(self):
+                self.batches = []
+
+            def remote(self, trajectory_group, *args):
+                self.batches.append(trajectory_group["batch"])
+                return _ReadyResult()
+
+        replay_buffer = SimpleNamespace(add=_AddRemote())
+        collector = self.create_local_collector(replay_buffer=replay_buffer)
+        collector.running = True
+        draft_sample_ids = torch.tensor([101, 102, 201, 202], dtype=torch.int64)
+        repeated_batch = BatchedDataDict(
+            {
+                "extra_env_info": [
+                    {"_ng_task_index": 7},
+                    {"_ng_task_index": 7},
+                    {"_ng_task_index": 8},
+                    {"_ng_task_index": 8},
+                ],
+                "loss_multiplier": torch.ones(4),
+                "draft_sample_ids": draft_sample_ids,
+            }
+        )
+        rollout_calls = 0
+
+        async def fake_groups(**kwargs):
+            nonlocal rollout_calls
+            rollout_calls += 1
+            # The retry only resubmits group 1, yet keeps its original index.
+            for group_index in (0, 1) if rollout_calls == 1 else (1,):
+                if rollout_calls == 1 and group_index == 1:
+                    raise RuntimeError("transient stream failure")
+                yield trajectory_collector_mod.RolloutGroupResult(
+                    group_index=group_index,
+                    final_batch=BatchedDataDict({"loss_multiplier": torch.ones(2)}),
+                    rollout_metrics={},
+                )
+
+        async def no_sleep(delay):
+            return None
+
+        monkeypatch.setattr(collector, "_iter_rollout_groups", fake_groups)
+        monkeypatch.setattr(trajectory_collector_mod.asyncio, "sleep", no_sleep)
+
+        asyncio.run(
+            collector._collect_rollout_batch(
+                repeated_batch=repeated_batch,
+                generation_weight_version=3,
+                target_weight_version=4,
+                num_generations=2,
+                use_nemo_gym=True,
+            )
+        )
+
+        assert rollout_calls == 2
+        assert [
+            batch["draft_sample_ids"].tolist() for batch in replay_buffer.add.batches
+        ] == [
+            [101, 102],
+            [201, 202],
+        ]
 
     def test_nemo_gym_actor_death_is_not_retried(self, monkeypatch):
         from ray.exceptions import ActorDiedError

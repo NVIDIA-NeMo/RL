@@ -552,6 +552,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
     def _iter_real_quant_refit_params(
         self,
         kv_scales: dict[str, float] | None = None,
+        *,
+        draft_metadata_only: bool = False,
+        draft_weights: tuple[tuple[str, torch.Tensor], ...] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Export canonical ModelOpt deployment tensors for non-IPC transports."""
         groups = iter(self._iter_real_quant_refit_groups(kv_scales))
@@ -582,6 +585,37 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
             worker_name=str(self),
             drain_between_groups=True,
         )
+
+        if draft_weights is None:
+            yield from self._iter_draft_weights_for_refit(
+                metadata_only=draft_metadata_only
+            )
+        else:
+            yield from draft_weights
+
+        if not vllm_cfg["kv_cache_dtype"].startswith("fp8"):
+            return
+
+        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+            get_vllm_qkv_scale_names,
+        )
+
+        keys: list[str] = []
+        for layer_idx in range(self.megatron_bridge.transformer_config.num_layers):
+            keys.extend(get_vllm_qkv_scale_names(layer_idx).values())
+
+        for param_name in keys:
+            scale_value = (
+                kv_scales[param_name] if kv_scales and param_name in kv_scales else 1.0
+            )
+            yield (
+                param_name,
+                torch.tensor(
+                    scale_value,
+                    dtype=torch.float32,
+                    device="cuda",
+                ).reshape(1),
+            )
 
     @staticmethod
     def _find_weight_quantizer(
@@ -660,6 +694,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         kv_scales: dict[str, float] | None = None,
         conversion_tasks=None,
         include_draft: bool = True,
+        *,
+        draft_metadata_only: bool = False,
+        draft_weights: tuple[tuple[str, torch.Tensor], ...] | None = None,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Pre-fold weights on-the-fly via lazy proxy tasks.
 
@@ -667,6 +704,9 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
         weight_quantizer(weight) instead of the raw weight. The folded tensor
         is computed lazily when export_hf_weights accesses it, so only one
         extra weight-sized tensor exists at a time — O(1) extra memory.
+
+        ``draft_metadata_only`` is forwarded to the base refit iterator after
+        quant folding so draft metadata keeps the base worker's PP-lane behavior.
 
         Raises:
             RuntimeError: If weight folding fails for a specific parameter,
@@ -677,7 +717,11 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 raise NotImplementedError(
                     "ModelOpt real-quant refit does not support filtered conversion tasks"
                 )
-            yield from self._iter_real_quant_refit_params(kv_scales)
+            yield from self._iter_real_quant_refit_params(
+                kv_scales,
+                draft_metadata_only=draft_metadata_only,
+                draft_weights=draft_weights,
+            )
             return
 
         class _FoldedTask:
@@ -743,6 +787,8 @@ class MegatronQuantPolicyWorker(MegatronPolicyWorkerImpl):
                 kv_scales,
                 conversion_tasks=folded_tasks,
                 include_draft=include_draft,
+                draft_metadata_only=draft_metadata_only,
+                draft_weights=draft_weights,
             ):
                 if "weight_quantizer" in name:
                     continue

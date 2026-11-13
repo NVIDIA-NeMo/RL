@@ -63,13 +63,19 @@ from nemo_rl.distributed.virtual_cluster import (
 )
 from nemo_rl.environments.call_selection import resolve_selection_policy
 from nemo_rl.environments.nemo_gym import should_use_nemo_gym
+from nemo_rl.environments.nemo_gym_task import (
+    get_nemo_gym_attribution_key,
+    is_nemo_gym_task,
+)
 from nemo_rl.experience.rollout_recovery import (
     RecoveryGranularity,
     RecoveryTargetLevel,
 )
+from nemo_rl.models.generation.interfaces import sampler_replay_enabled
 from nemo_rl.models.generation.vllm.config import (
     VllmConfig,
     parse_nvfp4_pertoken_rollout,
+    resolve_vllm_logprobs_mode,
 )
 from nemo_rl.models.policy import AutomodelConfig, MegatronConfig, PolicyConfig
 from nemo_rl.models.value import ValueConfig
@@ -713,10 +719,10 @@ class TokenCaptureConfig(BaseModel, extra="allow"):
 class TaskSourceRecoveryGranularity:
     """Resolved retry and restore policy for a prompt-group reservation.
 
-    ``task_source`` is copied from the raw Gym row when present. ``restore_level``
-    is the configured restart target. Until Gym advertises group-scoring
-    capabilities, ``granularity`` is derived from that target and explicit
-    task-source or agent overrides.
+    ``task_source`` is the materialized taskset or the flat Gym row's task source.
+    Materialized rows select a taskset override or the global default; flat rows
+    select an agent override, a task-source override, or the global default.
+    ``restore_level`` records that target; ``granularity`` derives its retry unit.
     """
 
     task_source: Optional[str]
@@ -733,17 +739,17 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     ``turn`` requests Gym participant recovery, ``sibling`` preserves completed
     generations and restarts unfinished siblings, and ``prompt_group`` restarts
     every sibling in an unfinished group. Overrides may only make a particular
-    task source or agent coarser than the global target.
+    taskset, task source, or agent coarser than the global target.
     """
 
     target_level: RecoveryTargetLevel = RecoveryTargetLevel.SIBLING
-    # Keyed by ``extra_env_info.task_source``, which is available before Gym
-    # resolves the concrete agent used to execute the row.
+    # Keyed by ``extra_env_info.task_id.taskset`` for materialized tasks or
+    # ``extra_env_info.task_source`` for flat rows, before Gym resolves an agent.
     task_source_target_level_overrides: dict[str, RecoveryTargetLevel] = Field(
         default_factory=dict
     )
     # Keyed by ``extra_env_info.agent_ref.name`` when the input row already has
-    # a concrete Gym route. A matching agent override wins over task_source.
+    # a concrete Gym route. For flat rows, this wins over task_source.
     agent_target_level_overrides: dict[str, RecoveryTargetLevel] = Field(
         default_factory=dict
     )
@@ -807,11 +813,23 @@ class RolloutRecoveryConfig(BaseModel, extra="allow"):
     def resolve_for_prompt(
         self, prompt: Mapping[str, Any]
     ) -> TaskSourceRecoveryGranularity:
-        """Resolve using matching agent, matching task source, then default."""
+        """Resolve by taskset for materialized tasks, or agent then source for flat rows."""
         extra_env_info = prompt.get("extra_env_info")
         task_source: Optional[str] = None
         agent_name: Optional[str] = None
         if isinstance(extra_env_info, Mapping):
+            if is_nemo_gym_task(extra_env_info):
+                task_source = get_nemo_gym_attribution_key(extra_env_info)
+                if task_source is None:
+                    raise ValueError(
+                        "materialized Gym prompt must have a non-empty task_id.taskset"
+                    )
+                return TaskSourceRecoveryGranularity(
+                    task_source=task_source,
+                    restore_level=self.task_source_target_level_overrides.get(
+                        task_source, self.target_level
+                    ),
+                )
             raw_task_source = extra_env_info.get("task_source")
             if raw_task_source is not None and not isinstance(raw_task_source, str):
                 raise TypeError("prompt task_source must be a string or None")
@@ -1621,10 +1639,12 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
         or top_logprobs < 0
     ):
         raise ValueError("policy.generation.top_logprobs must be a nonnegative integer")
-    if top_logprobs > 0 and not master_config.loss_fn.score_centering:
+    score_centering = master_config.loss_fn.score_centering
+    replay = sampler_replay_enabled(generation_cfg)
+    if top_logprobs > 0 and not (score_centering or replay):
         raise ValueError(
-            "policy.generation.top_logprobs > 0 is only read by loss_fn.score_centering; "
-            "set it to 0 or enable score centering"
+            "policy.generation.top_logprobs > 0 is only read by loss_fn.score_centering "
+            "and policy.generation.sampler_replay.enabled; set it to 0 or enable one"
         )
     if top_logprobs > 0:
         if master_config.policy["generation"]["backend"] != "vllm":
@@ -1635,18 +1655,13 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
             raise ValueError(
                 "policy.generation.top_logprobs requires token_capture.enabled=true"
             )
-    if master_config.loss_fn.score_centering:
+    if score_centering:
         if top_logprobs == 0:
             raise ValueError(
                 "loss_fn.score_centering requires policy.generation.top_logprobs > 0"
             )
-        generation_cfg = master_config.policy["generation"]
         temperature = generation_cfg["temperature"]
-        logprobs_mode = (generation_cfg.get("vllm_cfg") or {}).get("logprobs_mode")
-        if logprobs_mode is None:
-            logprobs_mode = (generation_cfg.get("vllm_kwargs") or {}).get(
-                "logprobs_mode"
-            )
+        logprobs_mode = resolve_vllm_logprobs_mode(cast(VllmConfig, generation_cfg))
         if temperature <= 0 or not math.isfinite(temperature):
             raise ValueError(
                 "loss_fn.score_centering requires a finite positive sampling temperature"
@@ -1661,13 +1676,27 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 "processed_logprobs when policy.generation.temperature != 1.0"
             )
         if (
-            generation_cfg.get("top_p") != 1.0
-            or generation_cfg.get("top_k") is not None
+            need_top_k_or_top_p_filtering(
+                TrainingSamplingParams(
+                    top_k=generation_cfg["top_k"], top_p=generation_cfg["top_p"]
+                )
+            )
+            and not replay
         ):
             raise ValueError(
-                "loss_fn.score_centering needs unfiltered sampling "
-                "(policy.generation.top_p=1, top_k=null) so the captured top-k is "
-                "the sampling distribution"
+                "loss_fn.score_centering with top-k/top-p sampling requires "
+                "policy.generation.sampler_replay.enabled=true: the estimator is "
+                "exact only over the support the sampler drew from"
+            )
+    if score_centering or replay:
+        # Both score the trainer's logits at the captured sampler head ids.
+        top_k = generation_cfg["top_k"]
+        if top_k is not None and top_logprobs < top_k:
+            raise ValueError(
+                "loss_fn.score_centering and policy.generation.sampler_replay.enabled "
+                "with top-k sampling require policy.generation.top_logprobs >= "
+                "policy.generation.top_k, so the captured head holds the kept set. "
+                "See docs/guides/sampler-replay.md#head-size-and-top-p"
             )
 
         automodel_cfg = master_config.policy.get("automodel_cfg")
@@ -1678,16 +1707,23 @@ def validate_single_controller_config(master_config: MasterConfig) -> None:
                 or enabled_automodel_cfg["context_parallel_size"] > 1
             ):
                 raise ValueError(
-                    "loss_fn.score_centering supports Automodel only with "
-                    "tensor_parallel_size=1 and context_parallel_size=1; use Megatron for TP/CP"
+                    "loss_fn.score_centering and policy.generation.sampler_replay.enabled "
+                    "support Automodel only with tensor_parallel_size=1 and "
+                    "context_parallel_size=1; use Megatron for TP/CP"
                 )
         megatron_cfg = master_config.policy.get("megatron_cfg") or {}
         if megatron_cfg.get("enabled") and megatron_cfg.get(
             "use_fused_linear_logprobs"
         ):
             raise ValueError(
-                "loss_fn.score_centering needs vocabulary logits; disable "
+                "loss_fn.score_centering and policy.generation.sampler_replay.enabled "
+                "need vocabulary logits; disable "
                 "policy.megatron_cfg.use_fused_linear_logprobs"
+            )
+        if megatron_cfg.get("enabled") and megatron_cfg.get("reuse_logits_storage"):
+            raise ValueError(
+                "loss_fn.score_centering reads the packed logits again; disable "
+                "policy.megatron_cfg.reuse_logits_storage"
             )
 
     if algo_cfg.num_prompts_per_step < async_config.min_groups_for_streaming_train:

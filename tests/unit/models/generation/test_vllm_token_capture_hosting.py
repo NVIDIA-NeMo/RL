@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 from copy import deepcopy
+from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -52,6 +53,9 @@ from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noq
 from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
     VllmAsyncGenerationWorkerImpl,
 )
+from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
+    routed_experts_tensor_metadata,
+)
 
 pytestmark = pytest.mark.nemo_gym
 
@@ -59,10 +63,13 @@ pytestmark = pytest.mark.nemo_gym
 class _MemorySink:
     def __init__(self) -> None:
         self.records: list[StagedCallRecord] = []
-        self.attachments: list[dict | None] = []
+        self.attachments: list[dict[str, torch.Tensor] | None] = []
 
     def stage(
-        self, record: StagedCallRecord, *, attachments: dict | None = None
+        self,
+        record: StagedCallRecord,
+        *,
+        attachments: dict[str, torch.Tensor] | None = None,
     ) -> StageResult:
         self.records.append(record)
         self.attachments.append(attachments)
@@ -204,18 +211,119 @@ def test_generation_setup_token_capture_requires_async_engine():
         gen.setup_token_capture({}, "rollout_staging", top_logprobs=0)
 
 
-def test_generation_set_rollout_weight_version_fans_out(monkeypatch):
+@pytest.mark.parametrize("top_logprobs", [0, 4])
+def test_generation_setup_token_capture_keeps_its_arguments_for_restarts(
+    monkeypatch, top_logprobs
+):
     gen = _generation_with_mock_group()
+    gen.worker_group.run_all_workers_single_data.return_value = [None, None]
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_generation.ray.get",
         lambda futures: futures,
     )
-    gen.set_rollout_weight_version(7)
+    gen.setup_token_capture(
+        {"backend": "simple"}, "rollout_staging", top_logprobs=top_logprobs
+    )
+    assert asdict(gen._token_capture_setup) == {
+        "dp_cfg": {"backend": "simple"},
+        "staging_partition": "rollout_staging",
+        "capture_media": False,
+        "top_logprobs": top_logprobs,
+    }
+    assert gen._token_capture_media is None
     gen.worker_group.run_all_workers_single_data.assert_called_once_with(
-        "set_rollout_weight_version",
-        version=7,
+        "setup_token_capture",
+        **asdict(gen._token_capture_setup),
         run_rank_0_only_axes=["tensor_parallel", "pipeline_parallel"],
     )
+
+
+def _generation_with_leaders(
+    num_shards: int, *, membership=None, fleet_monitor=None
+) -> tuple[VllmGeneration, list[MagicMock]]:
+    """One worker per shard, so each worker is its shard's DP leader."""
+    gen = object.__new__(VllmGeneration)
+    gen.cfg = {"vllm_cfg": {"async_engine": True}}
+    leaders = [MagicMock(name=f"leader{i}") for i in range(num_shards)]
+    for i, leader in enumerate(leaders):
+        leader.set_rollout_weight_version.remote.return_value = f"ref{i}"
+    gen.worker_group = SimpleNamespace(workers=list(leaders))
+    gen.dp_size = num_shards
+    gen._refit_membership = membership
+    gen.fleet_monitor = fleet_monitor
+    gen._rollout_weight_version = None
+    return gen, leaders
+
+
+def test_generation_set_rollout_weight_version_fans_out(monkeypatch):
+    gen, leaders = _generation_with_leaders(2)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_generation.ray.get", lambda ref: ref
+    )
+    gen.set_rollout_weight_version(7)
+    for leader in leaders:
+        leader.set_rollout_weight_version.remote.assert_called_once_with(version=7)
+    assert gen._rollout_weight_version == 7
+
+
+def test_set_rollout_weight_version_skips_shards_outside_the_refit(monkeypatch):
+    # Shard 1 is dead or still restarting: the rebuilt refit left it out.
+    membership = SimpleNamespace(workers_per_shard=1, shard_prefixes={0: 0})
+    gen, leaders = _generation_with_leaders(2, membership=membership)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_generation.ray.get", lambda ref: ref
+    )
+    gen.set_rollout_weight_version(7)
+    leaders[0].set_rollout_weight_version.remote.assert_called_once_with(version=7)
+    leaders[1].set_rollout_weight_version.remote.assert_not_called()
+
+
+def test_set_rollout_weight_version_skips_a_shard_condemned_since_the_refit(
+    monkeypatch,
+):
+    # Shard 1 was a refit member, then died and is restarting: its handle may already be
+    # a replacement that is still loading, and must not be waited on.
+    monitor = MagicMock()
+    monitor.absent_shards.return_value = [1]
+    gen, leaders = _generation_with_leaders(2, fleet_monitor=monitor)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_generation.ray.get", lambda ref: ref
+    )
+    gen.set_rollout_weight_version(7)
+    leaders[0].set_rollout_weight_version.remote.assert_called_once_with(version=7)
+    leaders[1].set_rollout_weight_version.remote.assert_not_called()
+    assert gen._rollout_weight_version == 7
+
+
+def test_set_rollout_weight_version_records_a_death_since_the_refit(monkeypatch):
+    import ray
+
+    def get(ref):
+        if ref == "ref1":
+            raise ray.exceptions.ActorDiedError()
+        return ref
+
+    monitor = MagicMock()
+    gen, leaders = _generation_with_leaders(2, fleet_monitor=monitor)
+    monkeypatch.setattr("nemo_rl.models.generation.vllm.vllm_generation.ray.get", get)
+    gen.set_rollout_weight_version(7)
+    leaders[0].set_rollout_weight_version.remote.assert_called_once_with(version=7)
+    monitor.record_actor_death.assert_called_once()
+    assert monitor.record_actor_death.call_args.args == (1,)
+
+
+def test_set_rollout_weight_version_raises_a_death_without_fleet_health(
+    monkeypatch,
+):
+    import ray
+
+    def get(ref):
+        raise ray.exceptions.ActorDiedError()
+
+    gen, _ = _generation_with_leaders(1)
+    monkeypatch.setattr("nemo_rl.models.generation.vllm.vllm_generation.ray.get", get)
+    with pytest.raises(ray.exceptions.ActorDiedError):
+        gen.set_rollout_weight_version(7)
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +369,7 @@ def test_capture_rejects_mismatched_http_topk(logprobs, top_logprobs):
     worker = _worker_with_capture(_MemorySink())
     worker._capture_top_logprobs = 4
     request = SimpleNamespace(logprobs=logprobs, top_logprobs=top_logprobs)
-    admission = CaptureAdmission(rollout_id="r0", model_call_id="c1", mode="text")
+    admission = CaptureAdmission(capture_key="r0", model_call_id="c1", mode="text")
 
     with pytest.raises(ValueError, match="top_logprobs=4 over HTTP"):
         VllmAsyncGenerationWorkerImpl._begin_request_capture(
@@ -274,7 +382,7 @@ def test_capture_accepts_matching_http_topk():
     worker = _worker_with_capture(_MemorySink())
     worker._capture_top_logprobs = 4
     request = SimpleNamespace(logprobs=True, top_logprobs=4)
-    admission = CaptureAdmission(rollout_id="r0", model_call_id="c1", mode="text")
+    admission = CaptureAdmission(capture_key="r0", model_call_id="c1", mode="text")
 
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
         worker, request, [10, 11], admission=admission
@@ -332,6 +440,7 @@ def test_request_capture_round_trip_stages_and_rides_coords(
     )
     VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
     content = _served_content([13, 14], [-0.1, -0.2])
+    content["choices"][0]["routed_experts"] = None  # vLLM's choice-level field
     message = content["choices"][0]["message"]
     if with_message_tokens:
         # The HTTP serializer preserves these dynamic fields on the message.
@@ -341,7 +450,7 @@ def test_request_capture_round_trip_stages_and_rides_coords(
             generation_log_probs=[-0.1, -0.2],
         )
     if with_routed_experts:
-        message["routed_experts"] = [[[0]]] * 5
+        message["routed_experts"] = torch.zeros((5, 1, 1), dtype=torch.int16)
     content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
         worker, request, content
     )
@@ -357,9 +466,16 @@ def test_request_capture_round_trip_stages_and_rides_coords(
         -0.2,
     ]
     if with_routed_experts:
-        assert sink.records[0].extras["routed_experts"]
+        metadata = sink.records[0].extras["routed_experts"]
+        assert metadata["dtype"] == "int16"
+        assert metadata["shape"] == [5, 1, 1]
+        torch.testing.assert_close(
+            sink.attachments[0]["routed_experts"],
+            torch.zeros((5, 1, 1), dtype=torch.int16),
+        )
     else:
         assert sink.records[0].extras is None
+        assert sink.attachments[0] is None
     coords = content["ng_commit_coords"]
     assert coords["disposition"] == "staged"
     assert (coords["delta_len"], coords["cum_len"]) == (5, 5)
@@ -374,7 +490,17 @@ def test_request_capture_round_trip_stages_and_rides_coords(
     assert worker._capture_calls == {}
 
 
-def test_request_capture_token_in_prev_len_chains():
+@pytest.mark.parametrize("dtype", [torch.int8, torch.int16, torch.int32])
+def test_request_capture_token_in_prev_len_chains_without_codec(monkeypatch, dtype):
+    def reject_codec(*args, **kwargs):
+        pytest.fail("worker-owned capture must not encode or decode route envelopes")
+
+    monkeypatch.setattr(
+        "nemo_rl.utils.routed_experts_codec.encode_routed_experts", reject_codec
+    )
+    monkeypatch.setattr(
+        "nemo_rl.utils.routed_experts_codec.decode_routed_experts", reject_codec
+    )
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     request = _FakeRequest(
@@ -393,13 +519,48 @@ def test_request_capture_token_in_prev_len_chains():
     VllmAsyncGenerationWorkerImpl._begin_request_capture(
         worker, request, spliced_prompt
     )
+    content = _served_content([22], [-0.5])
+    routes = torch.arange(12, dtype=dtype).reshape(6, 1, 2)
+    content["choices"][0]["message"]["routed_experts"] = routes
     content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
-        worker, request, _served_content([22], [-0.5])
+        worker, request, content
     )
     coords = content["ng_commit_coords"]
     assert coords["parent_call_id"] == "c1"
     assert (coords["delta_len"], coords["cum_len"]) == (3, 6)
     assert sink.records[0].token_ids_delta == [20, 21, 22]
+    staged_routes = sink.attachments[0]["routed_experts"]
+    # Include the previous turn's last token, now routed by this call's prefill.
+    torch.testing.assert_close(staged_routes, routes[2:])
+    # Staging reuses the slice, preserving the compact dtype without a copy.
+    assert staged_routes.data_ptr() == routes[2:].data_ptr()
+    assert sink.records[0].extras["routed_experts"]["shape"] == [4, 1, 2]
+    assert "routed_experts" not in content["choices"][0]["message"]
+
+
+@pytest.mark.parametrize(
+    "routes",
+    [torch.zeros(3, dtype=torch.int16), torch.zeros((2, 1, 1), dtype=torch.int16)],
+)
+def test_request_capture_drops_routes_with_wrong_rank_or_length(routes, caplog):
+    sink = _MemorySink()
+    worker = _worker_with_capture(sink)
+    request = _FakeRequest(
+        ng_capture={"capture_key": "r", "model_call_id": "c", "mode": "text"},
+        stream=False,
+    )
+    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [1, 2])
+    content = _served_content([3], [-0.1])
+    content["choices"][0]["message"]["routed_experts"] = routes
+
+    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        worker, request, content
+    )
+
+    assert content["ng_commit_coords"]["disposition"] == "staged"
+    assert sink.records[0].extras is None
+    assert sink.attachments[0] is None
+    assert "dropping invalid routed_experts" in caplog.text
 
 
 def _staging_chain_request(prev_len: int = 3) -> _FakeRequest:
@@ -553,7 +714,7 @@ def test_request_capture_is_a_noop_without_context_or_capture(
 def _text_root_request() -> _FakeRequest:
     return _FakeRequest(
         ng_capture={
-            "rollout_id": "r0",
+            "capture_key": "r0",
             "model_call_id": "c1",
             "parent_call_id": None,
             "prev_len": 0,
@@ -769,12 +930,9 @@ def test_request_capture_text_call_in_media_run_stages_without_attachments():
 
 @pytest.mark.parametrize("prev_len", [0, 3])
 def test_route_delta_preserves_actual_predecessor_tail(prev_len):
-    import torch
     from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
 
-    from nemo_rl.utils.routed_experts_codec import decode_routed_experts
-
-    routes = [[[i]] for i in range(7)]
+    routes = torch.arange(7, dtype=torch.int16).reshape(7, 1, 1)
     payload = {
         "choices": [
             {
@@ -784,15 +942,13 @@ def test_route_delta_preserves_actual_predecessor_tail(prev_len):
             }
         ]
     }
-    VllmAsyncGenerationWorkerImpl._delta_align_routed_experts(
+    staged_routes = VllmAsyncGenerationWorkerImpl._delta_align_routed_experts(
         payload,
         prev_len=prev_len,
         prompt_len=5,
         generated_len=2,
     )
     extras = VLLMCaptureAdapter().extract_extras(payload)
-    assert (
-        decode_routed_experts(extras["routed_experts"], torch.int16).tolist()
-        == routes[max(0, prev_len - 1) :]
-    )
+    torch.testing.assert_close(staged_routes, routes[max(0, prev_len - 1) :])
+    assert extras["routed_experts"] == routed_experts_tensor_metadata(staged_routes)
     assert "predecessor_tail_route" not in extras

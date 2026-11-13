@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -50,6 +52,23 @@ def _config() -> DFlashBodyConfig:
         num_hidden_layers=1,
         num_target_taps=2,
         rope_theta=10_000.0,
+    )
+
+
+def _asymmetric_config() -> DFlashBodyConfig:
+    # Q width 64, KV width 32 and hidden width 16 all differ (GQA 4Q:2KV). The
+    # wide init keeps attention visible against the residual so a head
+    # permutation moves the output well past the parity tolerance.
+    return DFlashBodyConfig(
+        hidden_size=16,
+        intermediate_size=48,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=1,
+        num_target_taps=2,
+        rope_theta=10_000.0,
+        initializer_range=0.2,
     )
 
 
@@ -254,6 +273,7 @@ def _run_tp2_projection_forward_gradient_and_checkpoint_parity(
     world_size: int,
     *,
     tmp_path: str,
+    config_factory: Callable[[], DFlashBodyConfig],
 ) -> None:
     tp_group = torch.distributed.group.WORLD
     singleton_groups = _singleton_groups(2)
@@ -262,14 +282,14 @@ def _run_tp2_projection_forward_gradient_and_checkpoint_parity(
 
     torch.manual_seed(31)
     body = DFlashBody(
-        _config(),
+        config_factory(),
         tp_group=tp_group,
         parallel_config=_fp32_parallel_config(2),
     ).to(device)
     global_state = _gather_global_state(body)
     torch.manual_seed(31)
     reference = DFlashBody(
-        _config(),
+        config_factory(),
         tp_group=dp_group,
         parallel_config=_fp32_parallel_config(1),
     ).to(device)
@@ -281,7 +301,7 @@ def _run_tp2_projection_forward_gradient_and_checkpoint_parity(
     )
     assert local_parameter_count * 5 < reference_parameter_count * 3
 
-    plan, target, blocks = _inputs(device)
+    plan, target, blocks = _inputs(device, hidden_size=body.config.hidden_size)
     target_actual = target.clone().requires_grad_()
     blocks_actual = blocks.clone().requires_grad_()
     target_reference = target.clone().requires_grad_()
@@ -332,7 +352,7 @@ def _run_tp2_projection_forward_gradient_and_checkpoint_parity(
     torch.distributed.barrier()
     dist_checkpointing.save({"model": sharded}, checkpoint_dir)
     restored = DFlashBody(
-        _config(),
+        config_factory(),
         tp_group=tp_group,
         parallel_config=_fp32_parallel_config(2),
     ).to(device)
@@ -442,6 +462,39 @@ def _run_tp2_rank_local_valid_shapes_fail_before_first_projection(
     ]
 
 
+def _run_tp2_target_qk_layernorm_finalize_collective_is_not_bypassed(
+    rank: int, world_size: int
+) -> None:
+    from megatron.core.distributed.finalize_model_grads import (
+        _allreduce_non_tensor_model_parallel_grads,
+    )
+
+    device = torch.device("cuda", rank)
+    target = torch.nn.Module()
+    target.q_layernorm = torch.nn.LayerNorm(8, elementwise_affine=True).to(device)
+    target.ddp_config = SimpleNamespace(use_megatron_fsdp=False)
+    assert target.q_layernorm.weight is not None
+    target.q_layernorm.weight.grad = torch.full(
+        (8,),
+        float(rank + 1),
+        device=device,
+    )
+    before = [torch.empty(8, device=device) for _ in range(world_size)]
+    torch.distributed.all_gather(before, target.q_layernorm.weight.grad)
+    assert not torch.equal(before[0], before[1])
+
+    _allreduce_non_tensor_model_parallel_grads(
+        [target],
+        SimpleNamespace(sequence_parallel=False, qk_layernorm=True),
+        torch.distributed.group.WORLD,
+    )
+
+    after = [torch.empty(8, device=device) for _ in range(world_size)]
+    torch.distributed.all_gather(after, target.q_layernorm.weight.grad)
+    assert torch.equal(after[0], after[1])
+    assert torch.equal(after[0], torch.full((8,), 3.0, device=device))
+
+
 def _run_tp2_rejects_sequence_parallel_config(rank: int, world_size: int) -> None:
     parallel_config = _fp32_parallel_config(2, sequence_parallel=True)
 
@@ -542,14 +595,21 @@ def test_tp4_forward_and_gradient_parity(distributed_test_runner) -> None:
     distributed_test_runner(_run_tp4_forward_and_gradient_parity, world_size=4)
 
 
+@pytest.mark.parametrize(
+    "config_factory",
+    [_config, _asymmetric_config],
+    ids=["symmetric", "asymmetric"],
+)
 def test_tp2_projection_forward_gradient_and_checkpoint_parity(
     distributed_test_runner,
     tmp_path: Path,
+    config_factory: Callable[[], DFlashBodyConfig],
 ) -> None:
     distributed_test_runner(
         partial(
             _run_tp2_projection_forward_gradient_and_checkpoint_parity,
             tmp_path=str(tmp_path),
+            config_factory=config_factory,
         ),
         world_size=2,
     )
@@ -568,6 +628,15 @@ def test_tp2_rank_local_valid_shapes_fail_before_first_projection(
 ) -> None:
     distributed_test_runner(
         _run_tp2_rank_local_valid_shapes_fail_before_first_projection, world_size=2
+    )
+
+
+def test_tp2_target_qk_layernorm_finalize_collective_is_not_bypassed(
+    distributed_test_runner,
+) -> None:
+    distributed_test_runner(
+        _run_tp2_target_qk_layernorm_finalize_collective_is_not_bypassed,
+        world_size=2,
     )
 
 

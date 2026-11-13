@@ -31,6 +31,7 @@ import pytest
 import torch
 
 from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.loss.draft import DraftLossStats
 from nemo_rl.algorithms.loss.interfaces import LossInputType
 
 pytestmark = pytest.mark.mcore
@@ -598,6 +599,51 @@ class TestForwardWithPostProcessingFn:
         assert forward_kwargs["position_ids"] is processed_mb.position_ids
 
     @patch("nemo_rl.models.megatron.train.model_forward")
+    def test_forward_passes_unpadded_cu_seqlens_to_logprobs_post_processor(
+        self, mock_model_forward
+    ):
+        """Replaying the sampler support on packed rows needs the unpadded boundaries."""
+        from types import SimpleNamespace
+
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            LogprobsPostProcessor,
+            forward_with_post_processing_fn,
+        )
+
+        mock_model_forward.return_value = torch.randn(1, 8, 100)
+        packed_seq_params = SimpleNamespace(
+            cu_seqlens_q=torch.tensor([0, 3, 5]),
+            cu_seqlens_q_padded=torch.tensor([0, 4, 8]),
+        )
+        processed_mb = ProcessedMicrobatch(
+            data_dict=MagicMock(),
+            input_ids=torch.zeros(1, 8, dtype=torch.long),
+            input_ids_cp_sharded=torch.zeros(1, 8, dtype=torch.long),
+            attention_mask=None,
+            position_ids=None,
+            packed_seq_params=packed_seq_params,
+            cu_seqlens_padded=packed_seq_params.cu_seqlens_q_padded,
+            original_seq_length=4,
+        )
+        post_processor = LogprobsPostProcessor(
+            cfg={"sequence_packing": {"enabled": True}}
+        )
+
+        with patch.object(
+            LogprobsPostProcessor, "__call__", return_value=MagicMock()
+        ) as call:
+            forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                post_processing_fn=post_processor,
+            )
+
+        kwargs = call.call_args.kwargs
+        assert kwargs["cu_seqlens"] is packed_seq_params.cu_seqlens_q
+        assert kwargs["cu_seqlens_padded"] is packed_seq_params.cu_seqlens_q_padded
+
+    @patch("nemo_rl.models.megatron.train.model_forward")
     def test_forward_with_topk_post_processor(self, mock_model_forward):
         """Test forward with TopkLogitsPostProcessor."""
         from nemo_rl.models.megatron.data import ProcessedMicrobatch
@@ -988,6 +1034,7 @@ class TestForwardWithPostProcessingFn:
         assert torch.equal(output, mock_model_forward.return_value)
 
     @patch("megatron.core.transformer.multi_token_prediction.roll_tensor")
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_capture_context")
     @patch("nemo_rl.models.megatron.train.model_forward")
@@ -996,10 +1043,12 @@ class TestForwardWithPostProcessingFn:
         mock_model_forward,
         mock_get_capture_context,
         mock_get_cp_group,
+        mock_get_tp_group,
         mock_roll_tensor,
     ):
         """Draft forward should consume the one-token-shifted input embeddings."""
         from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.draft.training import Eagle3Speculator
         from nemo_rl.models.megatron.train import (
             LogprobsPostProcessor,
             forward_with_post_processing_fn,
@@ -1016,6 +1065,7 @@ class TestForwardWithPostProcessingFn:
         mock_get_cp_group.return_value = cp_group
         mock_roll_tensor.return_value = (shifted_embeds, None)
         mock_capture = MagicMock()
+        draft_sequence_layout = MagicMock()
         mock_capture.get_captured_states.return_value = SimpleNamespace(
             hidden_states=hidden_states,
             inputs_embeds=inputs_embeds,
@@ -1032,6 +1082,7 @@ class TestForwardWithPostProcessingFn:
             position_ids=torch.tensor([[0, 1, 2]]),
             packed_seq_params=None,
             cu_seqlens_padded=None,
+            draft_sequence_layout=draft_sequence_layout,
             original_seq_length=3,
         )
         post_processor = LogprobsPostProcessor(
@@ -1045,6 +1096,9 @@ class TestForwardWithPostProcessingFn:
                 model=MagicMock(),
                 post_processing_fn=post_processor,
                 draft_model=draft_model,
+                draft_provider=Eagle3Speculator(
+                    config=SimpleNamespace(aux_layer_indices=None)
+                ),
             )
 
         mock_roll_tensor.assert_called_once_with(
@@ -1053,59 +1107,64 @@ class TestForwardWithPostProcessingFn:
             dims=0,
             cp_group=cp_group,
         )
+        mock_capture.get_captured_states.assert_called_once_with(
+            sequence_layout=draft_sequence_layout
+        )
         draft_model.assert_called_once_with(
             hidden_states=hidden_states,
             input_embeds=shifted_embeds,
             attention_mask=attention_mask,
-            packed_seq_params=None,
         )
         assert data_dict["student_logits"] is student_logits
+        assert "eagle3_output" not in data_dict
 
-    @patch("nemo_rl.models.megatron.train._pack_input_ids")
+    @patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group")
+    @patch("nemo_rl.models.megatron.train.get_context_parallel_group")
     @patch("nemo_rl.models.megatron.train.get_capture_context")
     @patch("nemo_rl.models.megatron.train.model_forward")
-    def test_forward_with_draft_model_packed_shifts_ids_and_reembeds(
+    def test_forward_with_draft_model_packed_rolls_embeds_per_segment(
         self,
         mock_model_forward,
         mock_get_capture_context,
-        mock_pack_input_ids,
+        mock_get_cp_group,
+        mock_get_tp_group,
     ):
-        """Packed draft forward must shift ids per segment, re-embed, and pass packed_seq_params."""
+        """Packed draft forward must roll embeds within segments and pass packed_seq_params."""
         from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.draft.training import (
+            Eagle3PackedForwardOutput,
+            Eagle3Speculator,
+        )
         from nemo_rl.models.megatron.train import (
             LogprobsPostProcessor,
             forward_with_post_processing_fn,
         )
 
-        output_tensor = torch.randn(1, 6, 5)
-        student_logits = torch.randn(1, 6, 5)
+        student_logits = torch.randn(6, 1, 5)
         hidden_states = torch.randn(6, 1, 4)
-        shifted_input_ids = torch.tensor([[2, 3, 0, 5, 6, 0]])
-        shifted_embeds = torch.randn(6, 1, 4)
-        position_ids = torch.tensor([[0, 1, 2, 0, 1, 2]])
+        inputs_embeds = torch.arange(1.0, 7.0).reshape(6, 1, 1)
+        d2t = torch.tensor([0, 2])
         packed_seq_params = SimpleNamespace(
-            cu_seqlens_q=torch.tensor([0, 3, 6]),
+            cu_seqlens_q=torch.tensor([0, 2, 5]),
             cu_seqlens_q_padded=torch.tensor([0, 3, 6]),
         )
 
-        mock_model_forward.return_value = output_tensor
-        mock_pack_input_ids.return_value = shifted_input_ids
+        mock_model_forward.return_value = torch.randn(1, 6, 5)
         mock_capture = MagicMock()
         mock_capture.get_captured_states.return_value = SimpleNamespace(
             hidden_states=hidden_states,
-            inputs_embeds=None,
+            inputs_embeds=inputs_embeds,
         )
-        mock_capture.model.embedding.return_value = shifted_embeds
         mock_get_capture_context.return_value = (nullcontext(), mock_capture)
 
-        data_dict = {"input_ids": torch.tensor([[1, 2, 3], [4, 5, 6]])}
+        data_dict = {"input_ids": torch.tensor([[1, 2, 0], [4, 5, 6]])}
         attention_mask = torch.ones(1, 6)
         processed_mb = ProcessedMicrobatch(
             data_dict=data_dict,
-            input_ids=torch.tensor([[1, 2, 3, 4, 5, 6]]),
-            input_ids_cp_sharded=torch.tensor([[1, 2, 3, 4, 5, 6]]),
+            input_ids=torch.tensor([[1, 2, 0, 4, 5, 6]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 0, 4, 5, 6]]),
             attention_mask=attention_mask,
-            position_ids=position_ids,
+            position_ids=torch.tensor([[0, 1, 2, 0, 1, 2]]),
             packed_seq_params=packed_seq_params,
             cu_seqlens_padded=packed_seq_params.cu_seqlens_q_padded,
             original_seq_length=3,
@@ -1114,6 +1173,7 @@ class TestForwardWithPostProcessingFn:
             cfg={"sequence_packing": {"enabled": True}}
         )
         draft_model = MagicMock(return_value=student_logits)
+        draft_model.eagle_module.d2t = d2t
 
         with patch.object(post_processor, "__call__", return_value=MagicMock()):
             forward_with_post_processing_fn(
@@ -1121,24 +1181,65 @@ class TestForwardWithPostProcessingFn:
                 model=MagicMock(),
                 post_processing_fn=post_processor,
                 draft_model=draft_model,
+                draft_provider=Eagle3Speculator(
+                    config=SimpleNamespace(aux_layer_indices=None)
+                ),
             )
 
-        mock_pack_input_ids.assert_called_once_with(
-            data_dict["input_ids"],
-            (0, 3, 6),
-            (0, 3, 6),
-            roll_shift=-1,
+        draft_model.assert_called_once()
+        draft_kwargs = draft_model.call_args.kwargs
+        assert draft_kwargs["hidden_states"] is hidden_states
+        assert draft_kwargs["attention_mask"] is attention_mask
+        assert draft_kwargs["packed_seq_params"] is packed_seq_params
+        # A global roll would move segment 2's first embed (4) into segment 1.
+        torch.testing.assert_close(
+            draft_kwargs["input_embeds"].flatten(),
+            torch.tensor([2.0, 3.0, 0.0, 5.0, 6.0, 0.0]),
         )
-        mock_capture.model.embedding.assert_called_once_with(
-            input_ids=shifted_input_ids, position_ids=position_ids
+        assert "student_logits" not in data_dict
+        packed_output = data_dict["eagle3_output"]
+        assert isinstance(packed_output, Eagle3PackedForwardOutput)
+        assert packed_output.student_logits is student_logits
+        assert packed_output.d2t is d2t
+        assert torch.equal(packed_output.cu_seqlens, packed_seq_params.cu_seqlens_q)
+        assert torch.equal(
+            packed_output.cu_seqlens_padded, packed_seq_params.cu_seqlens_q_padded
         )
-        draft_model.assert_called_once_with(
-            hidden_states=hidden_states,
-            input_embeds=shifted_embeds,
-            attention_mask=attention_mask,
-            packed_seq_params=packed_seq_params,
+
+    @patch("nemo_rl.models.megatron.train.get_capture_context")
+    @patch("nemo_rl.models.megatron.train.model_forward")
+    def test_forward_with_hidden_capture_requires_draft_provider(
+        self, mock_model_forward, mock_get_capture_context
+    ):
+        """Captured draft states without a provider would be silently dropped."""
+        from nemo_rl.models.megatron.data import ProcessedMicrobatch
+        from nemo_rl.models.megatron.train import (
+            LogprobsPostProcessor,
+            forward_with_post_processing_fn,
         )
-        assert data_dict["student_logits"] is student_logits
+
+        mock_model_forward.return_value = torch.randn(1, 3, 5)
+        mock_get_capture_context.return_value = (nullcontext(), MagicMock())
+        processed_mb = ProcessedMicrobatch(
+            data_dict={"input_ids": torch.tensor([[1, 2, 3]])},
+            input_ids=torch.tensor([[1, 2, 3]]),
+            input_ids_cp_sharded=torch.tensor([[1, 2, 3]]),
+            attention_mask=torch.ones(1, 3),
+            position_ids=torch.tensor([[0, 1, 2]]),
+            packed_seq_params=None,
+            cu_seqlens_padded=None,
+            original_seq_length=3,
+        )
+
+        with pytest.raises(RuntimeError, match="requires a draft provider"):
+            forward_with_post_processing_fn(
+                data_iterator=iter([processed_mb]),
+                model=MagicMock(),
+                post_processing_fn=LogprobsPostProcessor(
+                    cfg={"sequence_packing": {"enabled": False}}
+                ),
+                draft_model=MagicMock(),
+            )
 
 
 class TestMegatronForwardBackward:
@@ -1589,6 +1690,92 @@ class TestLossPostProcessor:
         # Loss should be scaled by num_microbatches / (cp_size * cp_size) = 4 / (2 * 2) = 1.0
         assert torch.isclose(loss, torch.tensor(1.0))
 
+    @pytest.mark.parametrize("cp_size", [1, 2, 4])
+    def test_packed_draft_gradient_correction_is_cp_invariant(
+        self, cp_size: int
+    ) -> None:
+        from nemo_rl.models.megatron.draft.step_state import DraftStepState
+        from nemo_rl.models.megatron.train import LossPostProcessor
+
+        raw_numerator = 12.0
+        draft_count = 4.0
+        policy_count = 32.0
+        num_microbatches = 3
+        owner_parameter = torch.nn.Parameter(torch.tensor(2.0))
+        mock_loss_fn = MagicMock()
+        mock_loss_fn.input_type = LossInputType.LOGIT
+        packed_wrapper = MagicMock(
+            side_effect=lambda *_args, **_kwargs: (
+                owner_parameter * raw_numerator,
+                {},
+            )
+        )
+        cfg = {"sequence_packing": {"enabled": True, "fuse_loss": False}}
+
+        with (
+            patch(
+                "nemo_rl.models.megatron.train.get_context_parallel_world_size",
+                return_value=cp_size,
+            ),
+            patch("nemo_rl.models.megatron.train.get_context_parallel_group"),
+            patch("nemo_rl.models.megatron.train.get_tensor_model_parallel_group"),
+            patch(
+                "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank",
+                return_value=0,
+            ),
+            patch(
+                "nemo_rl.models.megatron.train.SequencePackingLossWrapper",
+                return_value=packed_wrapper,
+            ),
+        ):
+            post_processor = LossPostProcessor(
+                loss_fn=mock_loss_fn,
+                cfg=cfg,
+                num_microbatches=num_microbatches,
+                cp_normalize=True,
+            )
+            wrapped_loss = post_processor(
+                data_dict=MagicMock(), packed_seq_params=MagicMock()
+            )
+            local_loss, _ = wrapped_loss(torch.tensor(0.0))
+            mcore_scaled_loss = local_loss * cp_size / num_microbatches
+            mcore_scaled_loss.backward()
+
+        assert owner_parameter.grad is not None
+        zero_owner_grads = [torch.zeros_like(owner_parameter.grad)] * (cp_size - 1)
+        reduced_main_grad = (
+            sum(
+                [owner_parameter.grad, *zero_owner_grads],
+                start=torch.zeros_like(owner_parameter.grad),
+            )
+            / policy_count
+        )
+        assert reduced_main_grad.item() == pytest.approx(
+            raw_numerator / (cp_size * policy_count)
+        )
+
+        draft_parameter = torch.nn.Parameter(torch.tensor(1.0))
+        draft_parameter.grad_norm_group = "draft"
+        draft_parameter.main_grad = reduced_main_grad.clone()
+        state = DraftStepState()
+        stats = DraftLossStats(
+            numerators=torch.tensor([raw_numerator]),
+            counts=torch.tensor([draft_count]),
+            weights=torch.ones(1),
+        )
+        state.accumulate(state.metric_payload(stats))
+        state.set_global_counts(torch.tensor([draft_count]))
+
+        state.correct_main_grads(
+            [draft_parameter],
+            policy_normalization_count=torch.tensor(policy_count),
+            context_parallel_size=cp_size,
+        )
+
+        assert draft_parameter.main_grad.item() == pytest.approx(
+            raw_numerator / draft_count
+        )
+
     @patch(
         "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
     )
@@ -1809,6 +1996,74 @@ class TestLogprobsPostProcessor:
         mock_from_logits_packed.assert_called_once()
         assert "logprobs" in result
 
+    @pytest.mark.parametrize("packed", [False, True])
+    @patch(
+        "nemo_rl.models.megatron.train.get_context_parallel_group", return_value=None
+    )
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_group",
+        return_value=None,
+    )
+    @patch(
+        "nemo_rl.models.megatron.train.get_tensor_model_parallel_rank", return_value=0
+    )
+    def test_logprobs_post_processor_replays_the_sampler_support(
+        self, mock_tp_rank, mock_tp_grp, mock_cp_grp, packed
+    ):
+        """Prev logprobs renormalize over the captured S_q, like the actor loss."""
+        from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+        from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+        from nemo_rl.models.megatron.train import LogprobsPostProcessor
+
+        torch.manual_seed(0)
+        processor = LogprobsPostProcessor(
+            cfg={"sequence_packing": {"enabled": packed}, "logprob_chunk_size": 2},
+            sampling_params=TrainingSamplingParams(
+                top_k=3, top_p=0.9, sampler_replay=True
+            ),
+        )
+        logits = torch.randn(2, 4, 6)
+        head_ids = torch.tensor([[2, 4, 1], [5, 0, 3]]).repeat(2, 2, 1)  # [2, 4, 3]
+        head_logprobs = torch.tensor([0.6, 0.4, 0.0]).log().expand(2, 4, 3)
+        input_ids = head_ids[..., 0].clone()
+        input_ids[:, 2] = head_ids[:, 2, 1]
+        data = BatchedDataDict(
+            {
+                "input_ids": input_ids,
+                # Row 1 has three tokens; its last position is padding.
+                "token_mask": torch.tensor(
+                    [[0.0, 0.0, 1.0, 1.0], [0.0, 1.0, 1.0, 0.0]]
+                ),
+                "sample_mask": torch.ones(2),
+                "sampler_topk_token_ids": head_ids,
+                "sampler_topk_logprobs": head_logprobs.clone(),
+            }
+        )
+        if packed:
+            # Each sequence is padded to 4 in the pack: unpadded (0, 4, 7).
+            output_tensor = torch.cat(
+                [logits[0], logits[1, :3], torch.zeros(1, 6)]
+            ).unsqueeze(0)
+            boundaries = dict(cu_seqlens_padded=(0, 4, 8), cu_seqlens=(0, 4, 7))
+        else:
+            output_tensor = logits
+            boundaries = dict(cu_seqlens_padded=None)
+        wrapped_fn = processor(
+            data_dict=data,
+            input_ids=input_ids,
+            original_seq_length=4,
+            **boundaries,
+        )
+        _, result = wrapped_fn(output_tensor)
+
+        support = head_ids[:, 1:, :2]  # the sampler kept the first two head ids
+        z = logits[:, :-1].gather(-1, support)
+        sampled = (support == input_ids[:, 1:, None]).int().argmax(-1, keepdim=True)
+        replayed = (z - z.logsumexp(-1, keepdim=True)).gather(-1, sampled).squeeze(-1)
+        expected = torch.cat([torch.zeros(2, 1), replayed], dim=1)
+        expected = torch.where(data["token_mask"].bool(), expected, 0.0)
+        torch.testing.assert_close(result["logprobs"], expected)
+
 
 @pytest.mark.parametrize("boundary_type", [torch.tensor, tuple])
 @pytest.mark.parametrize("cp_size", [1, 2])
@@ -1902,6 +2157,52 @@ def test_teacher_full_payload_cpu_boundaries(
         torch.testing.assert_close(call.args[0], shard)
         assert call.args[1] is cp_group
         assert call.kwargs == {"seq_dim": 1}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize("keep_payload_on_gpu", [False, True])
+def test_teacher_full_payload_stays_on_gpu_only_when_asked(
+    keep_payload_on_gpu: bool,
+) -> None:
+    """A GPU-sourced PUT needs the payload on the device it was produced on."""
+    from nemo_rl.models.megatron.train import TeacherFullPayloadPostProcessor
+
+    cfg = {
+        "sequence_packing": {"enabled": False},
+        "megatron_cfg": {"context_parallel_size": 1},
+    }
+    hidden_states = torch.randn(4, 2, 3, device="cuda")  # [S, B, H]
+    data = {
+        "input_ids": torch.zeros(2, 4, dtype=torch.long),
+        "input_lengths": torch.tensor([4, 4]),
+    }
+    with patch("nemo_rl.models.megatron.train.LogprobsPostProcessor") as logprob_cls:
+        logprob_cls.return_value.return_value.return_value = (
+            torch.tensor(0.0),
+            {"logprobs": torch.zeros(2, 4)},
+        )
+        processor = TeacherFullPayloadPostProcessor(
+            cfg,
+            "hidden_states",
+            torch.bfloat16,
+            keep_payload_on_gpu=keep_payload_on_gpu,
+        )
+        wrapped_fn = processor(
+            data_dict=data,
+            input_ids=data["input_ids"],
+            cu_seqlens_padded=None,
+            original_seq_length=4,
+            hidden_states=hidden_states,
+        )
+        _, result = wrapped_fn(torch.randn(2, 4, 8, device="cuda"))
+
+    payload = result["teacher_full_payload"]
+    assert payload.dtype == torch.bfloat16
+    expected_device = hidden_states.device if keep_payload_on_gpu else "cpu"
+    assert payload.device == torch.device(expected_device)
+    torch.testing.assert_close(
+        payload.cpu(), hidden_states.transpose(0, 1).to(torch.bfloat16).cpu()
+    )
 
 
 class TestTopkLogitsPostProcessor:
