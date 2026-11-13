@@ -191,4 +191,8 @@ def test_vllm_keeps_target_dict_overrides_out_of_draft_model():
         }
     )
 
-    assert draft_hf_overrides is SpeculativeConfig.hf_config_override
+    # vLLM binds its own draft override through a partial; the target's dict
+    # override must not be part of it.
+    assert draft_hf_overrides.func is SpeculativeConfig.hf_config_override
+    assert draft_hf_overrides.args == ()
+    assert draft_hf_overrides.keywords == {"transformers_mtp_overrides": None}

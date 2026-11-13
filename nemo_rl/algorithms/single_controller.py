@@ -425,6 +425,11 @@ class SingleControllerActor:
             stage_cfg.message_level_advantage_penalties_enabled
         )
         self._policy_logprobs_required = stage_cfg.policy_logprobs_required
+        # In-loss filtering decides rejections in the policy loss, which does not
+        # run during critic warmup; those steps take the separate pass instead.
+        self._warmup_policy_logprobs_required = (
+            self._is_ppo and master_config.loss_fn.seq_logprob_error_in_loss
+        )
         self._reference_logprobs_required = stage_cfg.reference_logprobs_required
         self._teacher_logprobs_required = stage_cfg.teacher_logprobs_required
         self._train_fields = _train_fields_for_step(
@@ -2600,6 +2605,9 @@ class SingleControllerActor:
             aborted_stale_inflight_groups = 0
             # Always True off the PPO path: the start step is pinned to 0 there.
             is_policy_training_step = self._train_steps >= policy_training_start_step
+            policy_logprobs_required = self._policy_logprobs_required or (
+                self._warmup_policy_logprobs_required and not is_policy_training_step
+            )
             consumed_metas: list[KVBatchMeta] = []
             consumed_training_claim_ids: list[str] = []
             consumed_group_count = 0
@@ -2865,10 +2873,7 @@ class SingleControllerActor:
                                 )
 
                     # Compute prev_logprobs / ref_logprobs
-                    if (
-                        self._policy_logprobs_required
-                        or self._reference_logprobs_required
-                    ):
+                    if policy_logprobs_required or self._reference_logprobs_required:
                         with (
                             self._timer.time("logprob_inference_prep"),
                             managed_span(
@@ -2895,7 +2900,7 @@ class SingleControllerActor:
                                 tracer=self._tracer,
                             ),
                         ):
-                            if self._policy_logprobs_required:
+                            if policy_logprobs_required:
                                 await asyncio.to_thread(
                                     self._trainer.get_logprobs_from_meta, train_meta
                                 )
@@ -2917,7 +2922,10 @@ class SingleControllerActor:
                         (
                             train_meta,
                             has_valid_training_tokens,
-                        ) = await self._advantage_stage(train_meta)
+                        ) = await self._advantage_stage(
+                            train_meta,
+                            policy_logprobs_required=policy_logprobs_required,
+                        )
                     if forest_training:
                         # The advantage stage has verified every owner/segment.
                         # Count those owners, not the physical rows or sampler tally.
@@ -3393,6 +3401,9 @@ class SingleControllerActor:
 
                 if self._train_data_dump is not None:
                     with self._timer.time("train_data_dump"):
+                        # The stage writes its chunks in the background: every
+                        # writer finishes this step's parts before the merge.
+                        await self._flush_advantage_dumps()
                         await asyncio.to_thread(
                             self._train_data_dump.finish_step,
                             self._train_steps,
@@ -5027,7 +5038,12 @@ class SingleControllerActor:
         assert result is not None
         return result
 
-    async def _advantage_stage(self, meta: KVBatchMeta) -> tuple[KVBatchMeta, bool]:
+    async def _advantage_stage(
+        self,
+        meta: KVBatchMeta,
+        *,
+        policy_logprobs_required: Optional[bool] = None,
+    ) -> tuple[KVBatchMeta, bool]:
         """Fetch advantage inputs, compute advantages, and write them back.
 
         SC owns the prompt-group-scoped advantage stage because the selected
@@ -5100,6 +5116,7 @@ class SingleControllerActor:
                 train_step=(
                     self._train_steps if self._train_data_dump is not None else None
                 ),
+                policy_logprobs_required=policy_logprobs_required,
             )
             for shard in (shards if shards is not None else [meta])
         ]
@@ -5121,6 +5138,15 @@ class SingleControllerActor:
         # Shards only ever add field names, never touch per-sample rows, so the
         # full-batch meta carrying the union of those names is the whole result.
         return meta.with_fields(new_fields), has_valid_training_tokens
+
+    async def _flush_advantage_dumps(self) -> None:
+        """Wait until every advantage writer has stored this step's dump chunks."""
+        if not self._advantage_actors:
+            await asyncio.to_thread(self._advantage_computer.flush_train_data_dump)
+            return
+        await asyncio.gather(
+            *(actor.flush_train_data_dump.remote() for actor in self._advantage_actors)
+        )
 
     async def _run_advantage_stage(self, request: AdvantageRequest) -> AdvantageOutcome:
         """Run one advantage stage on the pool, or in-process without one."""
