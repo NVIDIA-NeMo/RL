@@ -12,9 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, Literal, NotRequired, TypedDict, Union
+from typing import Annotated, Any, Literal, NotRequired, TypedDict, Union
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from nemo_rl.models.generation.interfaces import GenerationConfig
 from nemo_rl.models.policy.draft_config import (
@@ -198,13 +198,23 @@ class AutomodelCheckpointConfig(TypedDict, total=False):
     consolidation_timeout_minutes: int
 
 
+class AutomodelPipelineConfig(BaseModel, extra="forbid"):
+    """1F1B schedule settings, required when pipeline_parallel_size > 1."""
+
+    # Microbatches per schedule call; must be >= pipeline_parallel_size.
+    microbatches_per_step: Annotated[int, Field(gt=0)]
+
+
 class AutomodelConfig(TypedDict):
     enabled: Literal[True]
     env_vars: NotRequired[dict[str, str] | None]
     # Distributed parallelism sizes
-    # data_parallel_size is derived from world_size / (tp * cp * ep)
+    # data_parallel_size is derived from world_size / (pp * tp * cp * ep)
     tensor_parallel_size: int
     context_parallel_size: int
+    # Omitted means PP=1. See docs/design-docs/automodel-pipeline-parallel.md.
+    pipeline_parallel_size: NotRequired[int]
+    pipeline: NotRequired[AutomodelPipelineConfig]
     expert_parallel_size: NotRequired[int]
     # Size of the HSDP replicate dimension within the data-parallel axis.
     dp_replicate_size: NotRequired[int]

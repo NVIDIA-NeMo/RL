@@ -1350,6 +1350,7 @@ def _manager_with_stub_config(monkeypatch):
     )
     manager.checkpointer = None
     manager.moe_mesh = None
+    manager.pp_mesh = None
     manager._get_dp_rank = lambda: 0
     manager._get_tp_rank = lambda: 0
     return manager, built
@@ -1401,3 +1402,82 @@ def test_init_checkpointer_respects_an_explicit_prefix_store_choice(monkeypatch)
     manager.init_checkpointer(config_updates={"is_async": True})
 
     assert os.environ["DCP_USE_PREFIX_STORE"] == "0"
+
+
+@pytest.mark.automodel
+@pytest.mark.parametrize("pp_size", [1, 2])
+def test_init_checkpointer_passes_pipeline_rank_and_group(monkeypatch, pp_size):
+    from nemo_rl.models.automodel import checkpoint as ckpt_mod
+
+    built = {}
+
+    class _StubConfig:
+        def __init__(self, **kwargs):
+            pass
+
+        def build(self, **kwargs):
+            built.update(kwargs)
+            return object()
+
+    monkeypatch.setattr(ckpt_mod, "AutomodelCheckpointingConfig", _StubConfig)
+    pp_mesh = MagicMock()
+    pp_mesh.size.return_value = pp_size
+    pp_mesh.get_local_rank.return_value = pp_size - 1
+    manager = ckpt_mod.AutomodelCheckpointManager.__new__(
+        ckpt_mod.AutomodelCheckpointManager
+    )
+    manager.checkpointer = None
+    manager.moe_mesh = None
+    manager.pp_mesh = pp_mesh
+    manager._get_dp_rank = lambda: 0
+    manager._get_tp_rank = lambda: 0
+
+    manager.init_checkpointer(config_updates={})
+
+    if pp_size > 1:
+        assert built["pp_rank"] == 1
+        assert built["pp_group"] is pp_mesh.get_group.return_value
+    else:
+        assert built["pp_rank"] == 0
+        assert built["pp_group"] is None
+
+
+@pytest.mark.automodel
+def test_pipeline_checkpoint_forwards_stage_part_ids(tmp_path):
+    from nemo_rl.models.automodel import checkpoint as ckpt_mod
+
+    manager = ckpt_mod.AutomodelCheckpointManager.__new__(
+        ckpt_mod.AutomodelCheckpointManager
+    )
+    manager.checkpointer = MagicMock()
+    manager.moe_mesh = None
+    stage = torch.nn.Linear(2, 2)
+    optimizer = torch.optim.SGD(stage.parameters(), lr=0.1)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda epoch: 1)
+
+    manager.save_checkpoint(
+        model=stage,
+        weights_path=str(tmp_path / "weights"),
+        optimizer=optimizer,
+        optimizer_path=str(tmp_path / "optim"),
+        scheduler=scheduler,
+        is_final_checkpoint=False,
+        optimizer_part_ids=[1],
+    )
+    save_kwargs = manager.checkpointer.save_optimizer.call_args.kwargs
+    assert save_kwargs["model"] is stage
+    assert save_kwargs["optimizer"] is optimizer
+    assert save_kwargs["scheduler"] is scheduler
+    assert save_kwargs["optimizer_part_ids"] == [1]
+
+    manager.load_checkpoint(
+        model=stage,
+        weights_path=str(tmp_path / "weights"),
+        optimizer=optimizer,
+        optimizer_path=str(tmp_path / "optim"),
+        scheduler=scheduler,
+        optimizer_part_ids=[1],
+    )
+    assert manager.checkpointer.load_model.call_args.kwargs["model"] is stage
+    load_kwargs = manager.checkpointer.load_optimizer.call_args.kwargs
+    assert load_kwargs["optimizer_part_ids"] == [1]

@@ -58,7 +58,9 @@ from nemo_rl.models.policy.interfaces import (
 from nemo_rl.models.policy.utils import (
     DETERMINISTIC_ENV_VARS,
     aggregate_per_sample_handles,
+    automodel_pipeline_parallel_size,
     resolve_policy_worker_cls,
+    validate_automodel_pipeline_config,
     validate_fp32_lm_head_config,
     validate_lora_refit_policy_config,
 )
@@ -345,6 +347,16 @@ class Policy(ColocatablePolicyInterface, GenerationInterface):
 
             tp_size = config["automodel_cfg"]["tensor_parallel_size"]
             cp_size = config["automodel_cfg"]["context_parallel_size"]
+            pp_size = automodel_pipeline_parallel_size(config["automodel_cfg"])
+            if pp_size != 1:
+                validate_automodel_pipeline_config(
+                    config,
+                    is_vlm=processor is not None,
+                    model_config=get_hf_config(
+                        config["model_name"],
+                        **(config.get("hf_config_overrides") or {}),
+                    ),
+                )
 
             env_vars = config["automodel_cfg"].get("env_vars", {})
             if config["automodel_cfg"].get("deterministic"):

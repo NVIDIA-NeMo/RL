@@ -46,6 +46,17 @@ from nemo_rl.models.automodel.data import (
     get_microbatch_iterator,
     process_global_batch,
 )
+from nemo_rl.models.automodel.pipeline_parallel import (
+    ExecutionBatch,
+    PipelineWeightExporter,
+    broadcast_object_from_last_stage,
+    broadcast_tensor_from_last_stage,
+    pipeline_forward_backward,
+    pipeline_forward_logprobs,
+    pipeline_optimizer_part_ids,
+    plan_execution_batches,
+    release_pipeline_runtime_state,
+)
 from nemo_rl.models.automodel.router_replay import (
     microbatch_replay_context,
     router_replay_gates,
@@ -443,13 +454,14 @@ class AutomodelPolicyWorkerImpl(
             return f"{self.__class__.__qualname__}"
 
     def _get_replica_group(self) -> Optional[Any]:
-        """Replica group = flattened (cp, tp) sub-mesh — see V1 worker."""
-        return self.device_mesh[("cp", "tp")]._flatten().get_group()
+        """Group sharing input data and one TQ write-back leader within a DP rank."""
+        return self.device_mesh[("pp", "cp", "tp")]._flatten().get_group()
 
     def _local_coords(self) -> dict[str, int]:
         return {
             "tensor_parallel": self.device_mesh["tp"].get_local_rank(),
             "context_parallel": self.device_mesh["cp"].get_local_rank(),
+            "pipeline_parallel": self.device_mesh["pp"].get_local_rank(),
         }
 
     @traced_worker_init("rl.policy.load_model", **{"rl.backend": "automodel"})
@@ -538,6 +550,7 @@ class AutomodelPolicyWorkerImpl(
         self.dp_mesh = self.device_mesh["dp"]
         self.tp_mesh = self.device_mesh["tp"]
         self.cp_mesh = self.device_mesh["cp"]
+        self.pp_mesh = self.device_mesh["pp"]
         self.moe_mesh = distributed_context.moe_mesh
         self.dp_size = distributed_context.dp_size
         self.tp_size = distributed_context.tp_size
@@ -593,6 +606,7 @@ class AutomodelPolicyWorkerImpl(
         # Set instance attributes from model and optimizer state. Access by
         # field name (not positional unpacking) so optional fields appended to
         # ModelAndOptimizerState stay backward compatible across workers.
+        self.pipeline = model_and_optimizer_state.pipeline
         self.model = model_and_optimizer_state.model
         self.optimizer = model_and_optimizer_state.optimizer
         self.scheduler = model_and_optimizer_state.scheduler
@@ -634,6 +648,8 @@ class AutomodelPolicyWorkerImpl(
         if init_reference_model:
             self.reference_model_state_dict = setup_reference_model_state(self.model)
 
+        self._weight_exporter: Optional[PipelineWeightExporter] = None
+
         if defer_checkpoint_load:
             self.load_checkpoint(weights_path, optimizer_path)
 
@@ -659,6 +675,14 @@ class AutomodelPolicyWorkerImpl(
         update_moe_gate_bias = getattr(self.model, "update_moe_gate_bias", None)
         if update_moe_gate_bias is not None:
             update_moe_gate_bias()
+
+    def _raise_if_pipeline_parallel(self, feature: str) -> None:
+        """Reject a worker feature that has no pipeline-parallel implementation."""
+        if self.pipeline is not None:
+            raise NotImplementedError(
+                f"{feature} is not supported with "
+                "policy.automodel_cfg.pipeline_parallel_size > 1."
+            )
 
     def _autocast_context(self) -> AbstractContextManager[Any]:
         """Return the worker-owned precision context for one microbatch."""
@@ -759,36 +783,55 @@ class AutomodelPolicyWorkerImpl(
 
                 self.optimizer.zero_grad()
 
-                # Get microbatch iterator based on batching strategy
-                processed_iterator, iterator_len = get_microbatch_iterator(
-                    batch,
-                    self.cfg,
-                    mbs,
-                    self.dp_mesh,
-                    tokenizer=self.tokenizer,
-                )
+                if self.pipeline is not None:
+                    execution_batches = self._plan_execution_batches(batch, mbs)
+                    mb_results = pipeline_forward_backward(
+                        self.pipeline,
+                        execution_batches,
+                        loss_post_processor,
+                        autocast_context_factory=self._autocast_context,
+                        forward_only=eval_mode,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                        dp_size=self.dp_size,
+                        cp_size=self.cp_size,
+                        num_global_batches=num_global_batches,
+                    )
+                    iterator_len = sum(
+                        execution_batch.num_real_microbatches
+                        for execution_batch in execution_batches
+                    )
+                else:
+                    processed_iterator, iterator_len = get_microbatch_iterator(
+                        batch,
+                        self.cfg,
+                        mbs,
+                        self.dp_mesh,
+                        tokenizer=self.tokenizer,
+                    )
 
-                # Use automodel_forward_backward for the training loop
-                mb_results = automodel_forward_backward(
-                    model=self.model,
-                    data_iterator=processed_iterator,
-                    post_processing_fn=loss_post_processor,
-                    device_mesh=self.device_mesh,
-                    padding_token_id=self.tokenizer.pad_token_id or 0,
-                    autocast_context_factory=self._autocast_context,
-                    forward_only=eval_mode,
-                    allow_flash_attn_args=self.allow_flash_attn_args,
-                    global_valid_seqs=global_valid_seqs,
-                    global_valid_toks=global_valid_toks,
-                    sampling_params=self.sampling_params,
-                    sequence_dim=sequence_dim,
-                    dp_size=self.dp_size,
-                    cp_size=self.cp_size,
-                    num_global_batches=num_global_batches,
-                    num_valid_microbatches=iterator_len,
-                    on_microbatch_start=on_microbatch_start,
-                    router_replay_gates=self._router_replay_gates,
-                )
+                    mb_results = automodel_forward_backward(
+                        model=self.model,
+                        data_iterator=processed_iterator,
+                        post_processing_fn=loss_post_processor,
+                        device_mesh=self.device_mesh,
+                        padding_token_id=self.tokenizer.pad_token_id or 0,
+                        autocast_context_factory=self._autocast_context,
+                        forward_only=eval_mode,
+                        allow_flash_attn_args=self.allow_flash_attn_args,
+                        global_valid_seqs=global_valid_seqs,
+                        global_valid_toks=global_valid_toks,
+                        sampling_params=self.sampling_params,
+                        sequence_dim=sequence_dim,
+                        dp_size=self.dp_size,
+                        cp_size=self.cp_size,
+                        num_global_batches=num_global_batches,
+                        num_valid_microbatches=iterator_len,
+                        on_microbatch_start=on_microbatch_start,
+                        router_replay_gates=self._router_replay_gates,
+                    )
 
                 # Extract losses and metrics from results
                 mb_losses = []
@@ -822,21 +865,22 @@ class AutomodelPolicyWorkerImpl(
                     # The policy is clipped on its own (Megatron-path parity):
                     # a shared global clip let the draft's larger gradients
                     # scale down the policy's updates on every step. The draft
-                    # is clipped separately below.
+                    # is clipped separately below. num_label_tokens=None avoids
+                    # rescaling gradients already normalized by the loss.
                     grad_norm = scale_grads_and_clip_grad_norm(
                         self.max_grad_norm,
                         [self.model],
                         norm_type=2.0,
-                        pp_enabled=False,
+                        pp_enabled=self.pipeline is not None,
                         device_mesh=self.device_mesh,
                         moe_mesh=self.moe_mesh,
                         ep_axis_name="ep"
                         if self.moe_mesh is not None
                         and "ep" in self.moe_mesh.mesh_dim_names
                         else None,
-                        pp_axis_name=None,
+                        pp_axis_name="pp" if self.pipeline is not None else None,
                         foreach=True,
-                        num_label_tokens=1,
+                        num_label_tokens=None,
                         dp_group_size=self.dp_size * self.cp_size,
                     )
                     grad_norm = torch.tensor(
@@ -868,6 +912,11 @@ class AutomodelPolicyWorkerImpl(
                     self._update_moe_gate_bias_if_supported()
 
                 losses.append(torch.tensor(mb_losses).sum().item())
+
+            if self.pipeline is not None:
+                losses, all_mb_metrics = broadcast_object_from_last_stage(
+                    self.pipeline, (losses, all_mb_metrics)
+                )
 
             # release gradient memory before rollouts
             self.optimizer.zero_grad()
@@ -938,6 +987,18 @@ class AutomodelPolicyWorkerImpl(
             sampling_params=self.sampling_params,
         )
 
+        if self.pipeline is not None:
+            return_data = BatchedDataDict[LogprobOutputSpec]()
+            return_data["logprobs"] = self._get_pipeline_logprobs(
+                data,
+                logprobs_post_processor,
+                micro_batch_size=logprob_batch_size,
+                sequence_dim=sequence_dim,
+                seq_dim_size=seq_dim_size,
+            ).cpu()
+            self.timer.stop("get_logprobs")
+            return return_data
+
         with torch.no_grad():
             data.to("cuda")
             # Get microbatch iterator based on batching strategy
@@ -995,8 +1056,69 @@ class AutomodelPolicyWorkerImpl(
         self.timer.stop("get_logprobs")
         return return_data
 
+    def _plan_execution_batches(
+        self, data: BatchedDataDict[Any], micro_batch_size: int
+    ) -> list[ExecutionBatch]:
+        """Split this rank's ``data`` into the pipeline's schedule calls."""
+        pipeline = self.pipeline
+        if micro_batch_size != pipeline.pp_microbatch_size:
+            raise ValueError(
+                "Pipeline parallelism runs microbatches of "
+                f"{pipeline.pp_microbatch_size} samples "
+                "(policy.train_micro_batch_size), but this call requested "
+                f"micro_batch_size={micro_batch_size}."
+            )
+        return plan_execution_batches(
+            data,
+            model=self.model,
+            micro_batch_size=micro_batch_size,
+            microbatches_per_step=pipeline.pp_batch_size // pipeline.pp_microbatch_size,
+            dp_group=self.dp_mesh.get_group(),
+            tokenizer=self.tokenizer,
+            cfg=self.cfg,
+            allow_flash_attn_args=self.allow_flash_attn_args,
+            device_mesh=self.device_mesh,
+            cp_size=self.cp_size,
+            padding_token_id=self.tokenizer.pad_token_id or 0,
+        )
+
+    @torch.no_grad()
+    def _get_pipeline_logprobs(
+        self,
+        data: BatchedDataDict[Any],
+        post_processing_fn: LogprobsPostProcessor,
+        *,
+        micro_batch_size: int,
+        sequence_dim: int,
+        seq_dim_size: int,
+    ) -> torch.Tensor:
+        """Compute logprobs [data.size, seq_dim_size] and broadcast them to all PP ranks."""
+        pipeline = self.pipeline
+        data.to("cuda")
+        execution_batches = self._plan_execution_batches(data, micro_batch_size)
+        token_logprobs = pipeline_forward_logprobs(
+            pipeline,
+            execution_batches,
+            post_processing_fn,
+            autocast_context_factory=self._autocast_context,
+            sampling_params=self.sampling_params,
+            sequence_dim=sequence_dim,
+        )
+        local_logprobs = None
+        if pipeline.info.has_last_stage:
+            local_logprobs = pad_and_concat(token_logprobs, target_len=seq_dim_size)[
+                : data.size
+            ]
+        return broadcast_tensor_from_last_stage(
+            pipeline,
+            local_logprobs,
+            shape=(data.size, seq_dim_size),
+            dtype=torch.float32,
+        )
+
     @wrap_with_nvtx_name("automodel_policy_worker/score")
     def score(self, data: BatchedDataDict) -> BatchedDataDict[ScoreOutputSpec]:
+        self._raise_if_pipeline_parallel("Reward model scoring")
         global_batch_size = min(self.cfg["batch_size"], data.size)
 
         # Validate sequence dimension
@@ -1074,6 +1196,7 @@ class AutomodelPolicyWorkerImpl(
         - Supports context parallelism with proper CP gather.
         - Otherwise, computes local top-k on full-vocab tensor.
         """
+        self._raise_if_pipeline_parallel("get_topk_logits")
         topk_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -1163,6 +1286,7 @@ class AutomodelPolicyWorkerImpl(
         (``vocab_start_index``, ``global_seq_start``, ...) the consumer uses to
         route shards across heterogeneous teacher/student TP/CP.
         """
+        self._raise_if_pipeline_parallel("get_full_logits_ipc")
         forward_batch_size = (
             micro_batch_size
             if micro_batch_size is not None
@@ -1358,6 +1482,8 @@ class AutomodelPolicyWorkerImpl(
     @torch.no_grad()
     def prepare_refit_info(self) -> Optional[dict[str, Any]]:
         """Prepare state dict metadata for weight refitting and IPC streaming."""
+        if self.pipeline is not None:
+            return self._pipeline_weight_exporter().refit_info()
         if self.lora_enabled and self.lora_refit_mode == "native":
             return {
                 name: (tensor.shape, tensor.dtype)
@@ -1393,10 +1519,22 @@ class AutomodelPolicyWorkerImpl(
 
         return state_dict_info
 
+    def _pipeline_weight_exporter(self) -> PipelineWeightExporter:
+        """The full-model weight stream of a pipeline-parallel policy."""
+        if self._weight_exporter is None:
+            self._weight_exporter = PipelineWeightExporter(
+                self.pipeline,
+                local_params=lambda: _module_params_generator(self.model, self.dtype),
+            )
+        return self._weight_exporter
+
     def _refit_params_generator(
         self,
     ) -> Generator[tuple[str, torch.Tensor], None, None]:
         """Yield native A/B tensors or the unchanged merged full state."""
+        if self.pipeline is not None:
+            yield from self._pipeline_weight_exporter().iter_params()
+            return
         if self.lora_enabled and self.lora_refit_mode == "native":
             yield from automodel_lora_params_generator(self.model, self.dtype)
             return
@@ -1480,8 +1618,13 @@ class AutomodelPolicyWorkerImpl(
             send_hf_buckets_via_ipc_actor_impl,
         )
 
+        params = (
+            self._pipeline_weight_exporter().iter_params()
+            if self.pipeline is not None
+            else automodel_params_generator(self.model, self.dtype)
+        )
         bucket_iter = iter_named_tensor_buckets(
-            automodel_params_generator(self.model, self.dtype),
+            params,
             buffer_size_bytes=buffer_size_bytes,
         )
         send_hf_buckets_via_ipc_actor_impl(
@@ -1638,6 +1781,8 @@ class AutomodelPolicyWorkerImpl(
         if self.optimizer is not None:
             self.move_optimizer_to_device("cpu")
 
+        if self.pipeline is not None:
+            release_pipeline_runtime_state(self.pipeline)
         # Release recompute activations that MoE dispatch state keeps alive;
         # otherwise they pin cached segments and empty_cache() cannot free them.
         release_moe_dispatcher_state(self.model)
@@ -1734,6 +1879,7 @@ class AutomodelPolicyWorkerImpl(
                 tokenizer_path=tokenizer_path,
                 is_final_checkpoint=is_final_checkpoint,
                 peft_config=self.peft_config,
+                optimizer_part_ids=pipeline_optimizer_part_ids(self.pipeline),
             )
 
     def finalize_async_save(self) -> None:
@@ -1776,6 +1922,7 @@ class AutomodelPolicyWorkerImpl(
                 optimizer=self.optimizer,
                 optimizer_path=optimizer_path,
                 scheduler=self.scheduler,
+                optimizer_part_ids=pipeline_optimizer_part_ids(self.pipeline),
             )
 
     def _init_checkpoint_manager(
@@ -1795,6 +1942,7 @@ class AutomodelPolicyWorkerImpl(
                 dp_mesh=self.dp_mesh,
                 tp_mesh=self.tp_mesh,
                 moe_mesh=self.moe_mesh,
+                pp_mesh=self.pp_mesh,
             )
             self.checkpoint_manager.init_checkpointer(
                 config_updates=config_updates,

@@ -26,6 +26,7 @@ from nemo_rl.algorithms.dpo import (
     _initial_dpo_save_state,
     add_ref_logprobs_to_data,
     dpo_train,
+    setup,
 )
 from nemo_rl.algorithms.loss import PreferenceLossFn
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
@@ -506,3 +507,20 @@ def test_ft_save_period_triggers_periodic_saves(mock_dpo_components):
     # ft_save_period=2 -> steps 2, 4; save_period=100 contributes only the last step (5).
     saved_steps = [c.args[0] for c in checkpointer.init_tmp_checkpoint.call_args_list]
     assert saved_steps == [2, 4, 5]
+
+
+def test_setup_rejects_automodel_pipeline_parallel(mock_dpo_components):
+    master_config = mock_dpo_components["master_config"]
+    master_config.data = {}
+    master_config.logger = {}
+    master_config.policy["automodel_cfg"] = {
+        "enabled": True,
+        "pipeline_parallel_size": 2,
+    }
+
+    with patch(
+        "nemo_rl.algorithms.dpo.Logger",
+        side_effect=AssertionError("setup continued into logger initialization"),
+    ):
+        with pytest.raises(ValueError, match="DPO does not support"):
+            setup(master_config, mock_dpo_components["tokenizer"], MagicMock(), {})
