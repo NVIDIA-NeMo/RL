@@ -266,7 +266,9 @@ ENV LD_LIBRARY_PATH="/opt/nemo_rl_venv/lib/python3.13/site-packages/z3/lib:/opt/
 # First copy only the dependency files
 COPY --from=nemo-rl pyproject.toml uv.lock ./
 # Copy in the top level __init__.py/package_info.py since build-custom-vllm.sh needs the nemo_rl package to exist.
-COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py ./nemo_rl/
+# transformers_compat.py comes along because __init__.py imports it, and setuptools imports the
+# package to resolve the dynamic version whenever `uv lock --check` below has to build root metadata.
+COPY --from=nemo-rl nemo_rl/__init__.py nemo_rl/package_info.py nemo_rl/transformers_compat.py ./nemo_rl/
 # The single source of truth for which extras each Ray actor's venv needs. Run as a
 # script by the prefetch below; imported by nemo_rl.distributed.ray_actor_environment_registry
 # at runtime. Kept dependency-free so it can be copied in without the rest of the source.
