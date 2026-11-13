@@ -62,6 +62,7 @@ from nemo_rl.models.generation.vllm.config import (
     normalize_vllm_refit_config,
 )
 from nemo_rl.models.generation.vllm.generation_cut_route import GENERATION_CUT_ROUTE
+from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
 from nemo_rl.models.generation.vllm.vllm_worker import (
     BaseVllmGenerationWorker,
     VllmGenerationWorkerImpl,
@@ -826,6 +827,7 @@ async def test_async_vllm_worker_stops_http_server_before_engine(
     worker.http_server = MagicMock()
     worker._sparse_refit_receiver = SparseRefitReceiver()
     worker.llm = Engine()
+    worker._api_server_pool = None
     worker.tokenizer = MagicMock()
     monkeypatch.setattr(
         "nemo_rl.models.generation.vllm.vllm_worker_async.shutdown_telemetry",
@@ -843,6 +845,58 @@ async def test_async_vllm_worker_stops_http_server_before_engine(
     assert calls == ["server", "sparse-refit", "engine-cleanup", "engine-shutdown"]
     assert worker.http_server.should_exit is True
     assert worker.server_thread is None
+    assert worker.llm is None
+
+
+@pytest.mark.asyncio
+async def test_failed_pool_does_not_update_owner_weight_version() -> None:
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    pool = MultiAPIServerPool(worker, 2)
+    pool.children = [MagicMock(is_alive=MagicMock(return_value=False))]
+    pool.connections = [MagicMock()]
+    worker._api_server_pool = pool
+    worker._rollout_weight_version = 3
+    with pytest.raises(RuntimeError, match="exited"):
+        await pool.command("version", 4)
+    with pytest.raises(RuntimeError, match="exited"):
+        await worker.set_rollout_weight_version(4)
+    assert worker._rollout_weight_version == 3
+
+
+@pytest.mark.asyncio
+async def test_worker_shutdown_cleans_up_an_unavailable_pool(monkeypatch) -> None:
+    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
+    worker._init_frontend_state()
+    worker.server_thread = MagicMock()
+    worker.http_server = MagicMock()
+    worker._sparse_refit_receiver = None
+    worker.llm = MagicMock(collective_rpc=AsyncMock())
+    engine = worker.llm
+    pool = MultiAPIServerPool(worker, 2)
+    pool.children = [MagicMock(is_alive=MagicMock(return_value=False))]
+    pool.connections = [MagicMock()]
+    manager, coordinator = MagicMock(), MagicMock()
+    pool.engine_manager = manager
+    pool.coordinator = coordinator
+    worker._api_server_pool = pool
+    with pytest.raises(RuntimeError, match="exited"):
+        await pool.command("version", 4)
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.shutdown_telemetry",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "nemo_rl.models.generation.vllm.vllm_worker_async.torch.cuda.empty_cache",
+        lambda: None,
+    )
+    assert await worker.shutdown()
+    assert worker.http_server.should_exit
+    assert worker.server_thread is None
+    engine.collective_rpc.assert_not_awaited()
+    engine.shutdown.assert_called_once_with()
+    manager.shutdown.assert_called_once_with()
+    coordinator.shutdown.assert_called_once_with()
+    assert worker._api_server_pool is None
     assert worker.llm is None
 
 

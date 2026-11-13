@@ -987,9 +987,9 @@ class VllmAsyncGenerationWorkerImpl(
 
     async def set_rollout_weight_version(self, version: int) -> None:
         """Rotate the weight version stamped on subsequent captured calls."""
-        self._rollout_weight_version = int(version)
         if self._api_server_pool is not None:
             await self._api_server_pool.command("version", int(version))
+        self._rollout_weight_version = int(version)
 
     async def get_data_plane_snapshots(self) -> list[dict[str, Any]]:
         """Collect each frontend's capture counters and reset its step window.
@@ -3151,7 +3151,11 @@ class VllmAsyncGenerationWorkerImpl(
 
             if self.llm is not None:
                 # Clean up extension resources (e.g., ZMQ sockets)
-                await self.llm.collective_rpc("cleanup", args=tuple())
+                if (
+                    self._api_server_pool is None
+                    or self._api_server_pool._failure is None
+                ):
+                    await self.llm.collective_rpc("cleanup", args=tuple())
                 try:
                     self.llm.shutdown()
                 except Exception as e_stop:

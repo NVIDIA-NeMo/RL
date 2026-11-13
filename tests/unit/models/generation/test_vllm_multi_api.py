@@ -258,11 +258,28 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
         pool.engine_manager = engine
         child.send(("error", "initialization failed"))
         try:
-            with self.assertRaisesRegex(RuntimeError, "initialization failed"):
+            with self.assertRaisesRegex(
+                RuntimeError, "initialization failed"
+            ) as failure:
                 await pool.command("capture", {}, "stage", False, 4)
             engine.shutdown.assert_called_once()
             process.terminate.assert_called_once()
             self.assertEqual(pool.children, [])
+            self.assertIs(pool._failure, failure.exception)
+            for name, args in [
+                ("version", (10,)),
+                ("capture", ({}, "stage", False, 4)),
+            ]:
+                with self.assertRaisesRegex(
+                    RuntimeError, "initialization failed"
+                ) as later:
+                    await pool.command(name, *args)
+                self.assertIs(later.exception.__cause__, failure.exception)
+            self.assertEqual(await pool.command("stop"), [])
+            pool.stop_children()
+            pool.close_engines()
+            engine.shutdown.assert_called_once()
+            process.terminate.assert_called_once()
         finally:
             child.close()
 
@@ -297,6 +314,20 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                     process.terminate.assert_not_called()
                 self.assertEqual(pool.children, [])
                 self.assertEqual(pool.connections, [])
+
+    async def test_cleanup_is_idempotent_and_allows_repeated_stop(self):
+        pool = module.MultiAPIServerPool(SimpleNamespace(), 2)
+        pool.engine_manager = Mock()
+        pool.coordinator = Mock()
+        engine, coordinator = pool.engine_manager, pool.coordinator
+        pool.stop_children()
+        pool.close_engines()
+        pool.stop_children()
+        pool.close_engines()
+        engine.shutdown.assert_called_once_with()
+        coordinator.shutdown.assert_called_once_with()
+        self.assertIsNone(pool._failure)
+        self.assertEqual(await pool.command("stop"), [])
 
 
 if __name__ == "__main__":
