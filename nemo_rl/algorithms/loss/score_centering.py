@@ -14,9 +14,40 @@
 
 """Score-centering corrections shared by policy-gradient objectives."""
 
+from typing import NamedTuple
+
 import torch
 
 from nemo_rl.algorithms.loss.clipped_pg import adaptive_ppo_clip_kept_mask
+
+
+class _SamplerHead(NamedTuple):
+    active: torch.Tensor
+    p_log: torch.Tensor
+    q_log: torch.Tensor
+    p: torch.Tensor
+    q: torch.Tensor
+
+
+def _sampler_head(
+    policy_logprobs_at_sampler_topk: torch.Tensor,
+    *,
+    sampler_topk_logprobs: torch.Tensor,
+    token_mask: torch.Tensor,
+) -> _SamplerHead:
+    """Trainer (``p``) and sampler (``q``) log-probs and probabilities on the head.
+
+    Every field is zero on slots of inactive positions and on slots the sampler
+    filtered out (``-inf``), so no ``-inf`` or NaN reaches a sum over the head.
+    ``p_log`` keeps the gradient; the other fields are detached.
+    """
+    active = token_mask.bool()
+    slots = active.unsqueeze(-1) & ~torch.isneginf(sampler_topk_logprobs)
+    p_log = torch.where(slots, policy_logprobs_at_sampler_topk, 0.0)
+    q_log = torch.where(slots, sampler_topk_logprobs.detach(), 0.0)
+    p = torch.where(slots, p_log.detach().exp(), 0.0)
+    q = torch.where(slots, q_log.exp(), 0.0)
+    return _SamplerHead(active=active, p_log=p_log, q_log=q_log, p=p, q=q)
 
 
 def compute_score_centering_term(
@@ -84,12 +115,11 @@ def compute_score_centering_term(
     Returns:
         The per-token term ``[B, S]`` and the sampler mass the head covers ``[B, S]``.
     """
-    active = token_mask.bool()
-    slots = active.unsqueeze(-1) & ~torch.isneginf(sampler_topk_logprobs)
-    p_log = torch.where(slots, policy_logprobs_at_sampler_topk, 0.0)
-    q_log = torch.where(slots, sampler_topk_logprobs.detach(), 0.0)
-    p = torch.where(slots, p_log.detach().exp(), 0.0)
-    q = torch.where(slots, q_log.exp(), 0.0)
+    active, p_log, q_log, p, q = _sampler_head(
+        policy_logprobs_at_sampler_topk,
+        sampler_topk_logprobs=sampler_topk_logprobs,
+        token_mask=token_mask,
+    )
     head_mass = q.sum(-1)
     if sampler_replay:
         rho = torch.zeros_like(head_mass)
@@ -143,3 +173,72 @@ def compute_score_centering_term(
     coefficients = mass - alpha.unsqueeze(-1) * p
     term = (coefficients.detach() * p_log).sum(-1)
     return torch.where(active, term, 0.0), torch.where(active, head_mass, 0.0)
+
+
+class ScoreCenteringDiagnostics(NamedTuple):
+    """Per-token sampler-trainer mismatch on the captured head, ``[B, S]`` each.
+
+    Both fields are zero at inactive positions.
+
+    Attributes:
+        policy_head_mass: The trainer's mass on the sampler's head, ``sum_H p``.
+            With the sampler's head mass ``sum_H q`` it gives the tail ratio
+            ``rho``.
+        tv_distance: Total variation distance between the sampler, its tail
+            modeled as ``rho * p``, and the trainer:
+            ``(sum_H |q - p| + |t_q - t_p|) / 2`` with ``t = max(1 - sum_H, 0)``.
+            It lies in ``[0, 1]`` and is zero when ``p == q``.
+    """
+
+    policy_head_mass: torch.Tensor
+    tv_distance: torch.Tensor
+
+
+@torch.no_grad()
+def compute_score_centering_diagnostics(
+    policy_logprobs_at_sampler_topk: torch.Tensor,
+    *,
+    sampler_topk_logprobs: torch.Tensor,
+    token_mask: torch.Tensor,
+    sampler_replay: bool,
+) -> ScoreCenteringDiagnostics:
+    """Measure the drift ``compute_score_centering_term`` removes, on the same head.
+
+    With importance sampling off, the gradient of the centering term with
+    respect to the logits is ``q_hat - p``, where ``q_hat`` is the sampler with
+    its tail modeled as ``rho * p``; ``tv_distance`` is half its L1 norm. It
+    measures the mismatch itself, so it does not depend on the
+    importance-sampling mode. Under sampler replay the head holds the support
+    of both distributions, so neither has a tail.
+
+    Args:
+        policy_logprobs_at_sampler_topk: Trainer log-probs at the sampler's
+            top-k ids, ``[B, S, k]``.
+        sampler_topk_logprobs: The sampler's log-probs at those ids,
+            ``[B, S, k]``; ``-inf`` where its filters removed the id.
+        token_mask: Active token/sample positions, ``[B, S]``.
+        sampler_replay: Whether the trainer log-probs are renormalized over the
+            sampler's support.
+
+    Returns:
+        The per-token diagnostics.
+    """
+    head = _sampler_head(
+        policy_logprobs_at_sampler_topk,
+        sampler_topk_logprobs=sampler_topk_logprobs,
+        token_mask=token_mask,
+    )
+    policy_head_mass = head.p.sum(-1)
+    head_distance = (head.q - head.p).abs().sum(-1)
+    if sampler_replay:
+        tail_distance = torch.zeros_like(head_distance)
+    else:
+        sampler_tail = (1.0 - head.q.sum(-1)).clamp(min=0.0)
+        policy_tail = (1.0 - policy_head_mass).clamp(min=0.0)
+        tail_distance = (sampler_tail - policy_tail).abs()
+    return ScoreCenteringDiagnostics(
+        policy_head_mass=torch.where(head.active, policy_head_mass, 0.0),
+        tv_distance=torch.where(
+            head.active, 0.5 * (head_distance + tail_distance), 0.0
+        ),
+    )

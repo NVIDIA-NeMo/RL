@@ -3577,18 +3577,39 @@ def test_score_centering_cancels_the_drift_under_the_sampler(mode, token_level_l
     plain = ClippedPGLossFn(ClippedPGLossConfig(**common))
     centered = ClippedPGLossFn(ClippedPGLossConfig(score_centering=True, **common))
 
-    drift, _ = _expected_gradient_under_sampler(plain, z, q, head)
+    drift, plain_metrics = _expected_gradient_under_sampler(plain, z, q, head)
     if mode != "is":
         assert drift.abs().max() > 1e-3
 
     cancelled, metrics = _expected_gradient_under_sampler(centered, z, q, head)
     torch.testing.assert_close(cancelled, torch.zeros_like(z), atol=1e-9, rtol=0.0)
-    torch.testing.assert_close(
-        torch.tensor(metrics["score_centering_head_mass"], dtype=torch.float64),
-        q[head].sum(),
+    # One active token whose head is the same for every sampled y. q's tail is
+    # exactly rho * p, so the head's TV estimate is the full-vocabulary TV.
+    p = torch.softmax(z, -1)
+    expected = {
+        "score_centering_head_mass": q[head].sum(),
+        "score_centering_head_mass_min": q[head].sum(),
+        "score_centering_policy_head_mass": p[head].sum(),
+        "score_centering_tv_distance": 0.5 * (q - p).abs().sum(),
+    }
+    for key, value in expected.items():
+        torch.testing.assert_close(
+            torch.tensor(metrics[key], dtype=torch.float64), value
+        )
+        assert key in centered.metric_normalizations
+        assert key not in plain.metric_normalizations
+        assert key not in plain_metrics
+    assert (
+        centered.metric_normalizations["score_centering_head_mass_min"]
+        is MetricNormalizer.NONE
     )
-    assert "score_centering_head_mass" in centered.metric_normalizations
-    assert "score_centering_head_mass" not in plain.metric_normalizations
+    # Deferred: single_controller_utils pulls the whole SingleController and
+    # data-plane stack, which nothing else in this loss-level module needs.
+    from nemo_rl.algorithms.loss.wrapper import _SEQ_METRIC_MIN
+    from nemo_rl.algorithms.single_controller_utils.utils import _MB_METRIC_MIN
+
+    # Packed sequences and microbatches must combine the extremum with min.
+    assert "score_centering_head_mass_min" in _SEQ_METRIC_MIN & _MB_METRIC_MIN
 
 
 def _shared_ratio_tail_distributions(tail_ratio: float):
