@@ -43,7 +43,11 @@ from nemo_rl.algorithms.utils import get_tokenizer
 from nemo_rl.data.captured_media import MediaCaptureRejected
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.refit_watchdog import RefitAborted
-from nemo_rl.distributed.virtual_cluster import RayVirtualCluster
+from nemo_rl.distributed.virtual_cluster import (
+    DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    DEFAULT_GENERATION_PORT_RANGE_LOW,
+    RayVirtualCluster,
+)
 from nemo_rl.models.generation import configure_generation_config
 from nemo_rl.models.generation.interfaces import (
     GenerationDatumSpec,
@@ -59,6 +63,7 @@ from nemo_rl.models.generation.vllm.config import (
 )
 from nemo_rl.models.generation.vllm.generation_cut_route import GENERATION_CUT_ROUTE
 from nemo_rl.models.generation.vllm.vllm_worker import (
+    BaseVllmGenerationWorker,
     VllmGenerationWorkerImpl,
     _context_capped_max_new_tokens,
     _resolve_enable_prefix_caching,
@@ -446,6 +451,44 @@ def test_context_capped_max_new_tokens():
             input_length=8192,
             max_model_len=8192,
         )
+
+
+@pytest.mark.parametrize("defer_model_load", [False, True])
+@pytest.mark.parametrize("api_server_count", [1, 2])
+@pytest.mark.parametrize("port_range", [None, (3400, 3410)])
+def test_async_vllm_worker_reserves_distinct_ports_in_range(
+    defer_model_load: bool,
+    api_server_count: int,
+    port_range: tuple[int, int] | None,
+    monkeypatch,
+) -> None:
+    config = deepcopy(basic_vllm_test_config)
+    config["vllm_cfg"]["async_engine"] = True
+    config["vllm_cfg"]["expose_http_server"] = True
+    config["vllm_cfg"]["http_api_server_count"] = api_server_count
+    if port_range is not None:
+        config["port_range_low"], config["port_range_high"] = port_range
+    low, high = port_range or (
+        DEFAULT_GENERATION_PORT_RANGE_LOW,
+        DEFAULT_GENERATION_PORT_RANGE_HIGH,
+    )
+
+    def initialize_base(worker: Any, worker_config: VllmConfig, *args: Any) -> None:
+        worker.cfg = worker_config
+        worker.is_model_owner = True
+
+    monkeypatch.setattr(BaseVllmGenerationWorker, "__init__", initialize_base)
+    with contextlib.ExitStack() as cleanup:
+        workers = []
+        for index in range(2):
+            worker = VllmAsyncGenerationWorkerImpl(
+                config, bundle_indices=[index], defer_model_load=defer_model_load
+            )
+            cleanup.callback(worker._reserved_socket.close)
+            assert low <= worker._reserved_port < high
+            assert worker._reserved_socket.getsockname()[1] == worker._reserved_port
+            workers.append(worker)
+        assert workers[0]._reserved_port != workers[1]._reserved_port
 
 
 @pytest.mark.asyncio

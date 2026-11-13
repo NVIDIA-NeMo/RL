@@ -21,7 +21,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 # Import by path to avoid the vLLM package's GPU/Ray worker imports.
 MODULE_PATH = (
@@ -49,11 +49,17 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             ),
         ]:
             hosts = []
+            lifecycle = Mock()
+            init_telemetry = Mock()
+            shutdown_telemetry = Mock()
+            lifecycle.attach_mock(init_telemetry, "init")
+            lifecycle.attach_mock(shutdown_telemetry, "flush")
 
             class Host:
                 def _init_frontend_state(self):
                     self.http_server = None
                     self.setup_token_capture = AsyncMock()
+                    lifecycle.attach_mock(self.setup_token_capture, "capture")
                     self.set_rollout_weight_version = AsyncMock()
                     self.captured_call_progress = AsyncMock(
                         return_value={"weight_version": 10, "calls": [["child", 20]]}
@@ -72,6 +78,7 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                 return engine
 
             connection = Mock()
+            lifecycle.attach_mock(connection.send, "send")
             connection.recv.side_effect = [
                 ("capture", ({"impl": "transfer_queue"}, "stage", True, 4)),
                 ("version", (10,)),
@@ -106,6 +113,10 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
                 "nemo_rl.models.generation.vllm.vllm_worker_async": SimpleNamespace(
                     VllmAsyncGenerationWorkerImpl=Host,
                     _AsyncLLMHTTPClient=http_client,
+                ),
+                "nemo_rl.telemetry.setup": SimpleNamespace(
+                    init_telemetry_worker=init_telemetry,
+                    shutdown_telemetry=shutdown_telemetry,
                 ),
             }
             with patch.dict(sys.modules, modules):
@@ -143,6 +154,22 @@ class MultiAPITest(unittest.IsolatedAsyncioTestCase):
             hosts[0].set_rollout_weight_version.assert_awaited_once_with(10)
             hosts[0].captured_call_progress.assert_awaited_once_with()
             hosts[0].get_data_plane_snapshot.assert_called_once_with()
+            init_telemetry.assert_called_once_with()
+            self.assertLess(
+                lifecycle.mock_calls.index(call.init()),
+                lifecycle.mock_calls.index(
+                    call.capture(
+                        {"impl": "transfer_queue"},
+                        "stage",
+                        capture_media=True,
+                        top_logprobs=4,
+                    )
+                ),
+            )
+            self.assertEqual(
+                lifecycle.mock_calls[-3:],
+                [call.flush(), call.send(("ok", None)), call.flush()],
+            )
             self.assertEqual(
                 [call.args[0] for call in connection.send.call_args_list],
                 [

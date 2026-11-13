@@ -286,6 +286,7 @@ class MultiAPIServerPool:
             VllmAsyncGenerationWorkerImpl,
             _AsyncLLMHTTPClient,
         )
+        from nemo_rl.telemetry.setup import init_telemetry_worker, shutdown_telemetry
 
         host: Any = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
         host._init_frontend_state()
@@ -301,6 +302,7 @@ class MultiAPIServerPool:
         engine = None
         engine_config.parallel_config._api_process_rank = index
         try:
+            init_telemetry_worker()
             video_config = resolve_vllm_video_config(generation_config)
             if video_config is not None:
                 # Spawned video frontends need their own process-local loader registration.
@@ -376,6 +378,7 @@ class MultiAPIServerPool:
                             host.http_server.should_exit = True
                             assert host.server_thread is not None
                             await asyncio.to_thread(host.server_thread.join, 30)
+                        await asyncio.to_thread(shutdown_telemetry)
                         connection.send(("ok", None))
                         return
                     else:
@@ -389,6 +392,7 @@ class MultiAPIServerPool:
             finally:
                 raise
         finally:
+            shutdown_telemetry()
             if engine is not None:
                 engine.shutdown()
             shutdown_prometheus()

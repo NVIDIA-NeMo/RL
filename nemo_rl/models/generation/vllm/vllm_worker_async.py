@@ -55,6 +55,7 @@ from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.distributed.virtual_cluster import (
     DEFAULT_GENERATION_PORT_RANGE_HIGH,
     DEFAULT_GENERATION_PORT_RANGE_LOW,
+    _bind_socket_in_range,
     _get_free_port_local,
     _get_node_ip_local,
 )
@@ -97,7 +98,7 @@ from nemo_rl.models.generation.vllm.checkpoint_engine import (
 from nemo_rl.models.generation.vllm.collective_rpc import (
     resolve_collective_rpc_result,
 )
-from nemo_rl.models.generation.vllm.config import parse_nvfp4_pertoken_rollout
+from nemo_rl.models.generation.vllm.config import VllmConfig, parse_nvfp4_pertoken_rollout
 from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
 from nemo_rl.models.generation.vllm.request_pipeline import (
     rollout_output,
@@ -393,7 +394,7 @@ class VllmAsyncGenerationWorkerImpl(
         self._init_frontend_state()
 
         if bundle_indices is not None and config["vllm_cfg"].get("expose_http_server"):
-            self._reserve_port()
+            self._reserve_port(config)
 
         super().__init__(
             config,
@@ -493,8 +494,8 @@ class VllmAsyncGenerationWorkerImpl(
             self.cfg.get("vllm_kwargs", {}).get("enable_return_routed_experts", False)
         )
 
-    def _reserve_port(self) -> None:
-        """Bind and listen on a TCP socket to reserve a free port from the OS.
+    def _reserve_port(self, config: VllmConfig) -> None:
+        """Reserve a listening socket within the configured generation port range.
 
         The socket is held open in LISTENING state and later passed directly to
         uvicorn via the ``sockets=`` parameter in ``server.serve()``. The socket
@@ -507,7 +508,11 @@ class VllmAsyncGenerationWorkerImpl(
 
         self._reserved_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._reserved_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._reserved_socket.bind(("", 0))
+        _bind_socket_in_range(
+            self._reserved_socket,
+            config.get("port_range_low", DEFAULT_GENERATION_PORT_RANGE_LOW),
+            config.get("port_range_high", DEFAULT_GENERATION_PORT_RANGE_HIGH),
+        )
         self._reserved_socket.listen(128)
         self._reserved_socket.setblocking(False)
         self._reserved_port = self._reserved_socket.getsockname()[1]
