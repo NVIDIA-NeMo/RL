@@ -24,7 +24,7 @@ from __future__ import annotations
 import os
 import time
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass
 from functools import partial
@@ -115,6 +115,7 @@ from nemo_rl.environments.interfaces import EnvironmentInterface
 from nemo_rl.environments.nemo_gym import (
     NemoGymShardSet,
     build_nemo_gym_actors,
+    scan_dataset_agent_names,
     set_nemo_gym_log_dir,
     should_use_nemo_gym,
     validate_dataset_agent_coverage,
@@ -2017,6 +2018,12 @@ def setup_single_controller(
     # Submit build tasks and get results
     submitted: dict[str, Any] = {}
     nemo_gym_shards = None
+    # The route-coverage scan needs only the datasets, so it runs on its own thread beside the builds;
+    # only the comparison with the hosted routes waits for Gym.
+    scan_executor = ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="agent-name-scan"
+    )
+    agent_name_scan: Optional[Future] = None
     try:
         with ThreadPoolExecutor(max_workers=len(build_tasks)) as executor:
             # A Megatron trainer waits for the dataset; see _TRAINER_BUILD_DATASET_WAIT_S.
@@ -2033,6 +2040,11 @@ def setup_single_controller(
             }
             if preloaded_training_data is not None:
                 dataset, _val_dataset, env_handles, dataloader = preloaded_training_data
+                if use_nemo_gym:
+                    agent_name_scan = scan_executor.submit(
+                        scan_dataset_agent_names,
+                        {"training": dataset, "validation": _val_dataset},
+                    )
             else:
                 # Generation and Gym build meanwhile; the load does not write train_iters,
                 # which a trainer already building would be reading.
@@ -2069,6 +2081,11 @@ def setup_single_controller(
                     "(overlapped with generation and NeMo-Gym spin-up)",
                     flush=True,
                 )
+                if use_nemo_gym:
+                    agent_name_scan = scan_executor.submit(
+                        scan_dataset_agent_names,
+                        {"training": dataset, "validation": _val_dataset},
+                    )
                 final_train_iters = _megatron_train_iters(master_config)
                 if final_train_iters != speculative_train_iters:
                     # Correct but slow: the speculative trainer has the wrong
@@ -2123,6 +2140,11 @@ def setup_single_controller(
                 validate_dataset_agent_coverage(
                     nemo_gym_shards,
                     {"training": dataset, "validation": _val_dataset},
+                    agent_names=(
+                        agent_name_scan.result()
+                        if agent_name_scan is not None
+                        else None
+                    ),
                 )
                 env_handles["nemo_gym"] = cast(EnvironmentInterface, nemo_gym_shards)
                 setup_timing_metrics.nemo_gym_init_time_s = gym_time
@@ -2137,6 +2159,7 @@ def setup_single_controller(
                 nemo_gym_shards.shutdown()
         raise
     finally:
+        scan_executor.shutdown(wait=False, cancel_futures=True)
         for megatron_port_holder in megatron_port_holders:
             # The frontend ranks adopted (or will never adopt) the held sockets;
             # drop the holders.

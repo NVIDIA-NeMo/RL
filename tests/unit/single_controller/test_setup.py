@@ -2621,6 +2621,8 @@ class TestSetup:
         mock_validate.assert_called_once_with(
             fake_gym_shards,
             {"training": list(range(8)), "validation": None},
+            # Scanned while the builds ran, so validation only compares.
+            agent_names={"training": set(), "validation": set()},
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
         warmup_fields = actor_args.dp_client.register_partition.call_args.kwargs[
@@ -2713,6 +2715,7 @@ class TestSetup:
                 "training": patched_factories["setup_response_data"].return_value[0],
                 "validation": None,
             },
+            agent_names={"validation": set()},
         )
         assert actor_args.env_handles["nemo_gym"] is fake_gym_shards
         fake_gym_shards.shutdown.assert_not_called()

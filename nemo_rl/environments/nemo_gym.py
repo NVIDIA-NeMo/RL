@@ -25,7 +25,7 @@ import threading
 import urllib.parse
 import urllib.request
 from collections import Counter
-from collections.abc import AsyncGenerator, Awaitable, Iterator, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Collection, Iterator, Mapping
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -3875,9 +3875,37 @@ def spinup_nemo_gym_actor(
     ).sole_handle()
 
 
+def scan_dataset_agent_names(datasets: Mapping[str, Any]) -> dict[str, set[str]]:
+    """Collect the route names each split's rows reference.
+
+    This needs only the datasets, not the running Gym actors, so a caller can run
+    it while the actors are still starting and hand the result to
+    ``validate_dataset_agent_coverage``.
+
+    A split with materialized task rows is left out: their routes come from the
+    Environment Server map, which only the running actors report, so
+    ``validate_dataset_agent_coverage`` scans that split itself.
+
+    Args:
+        datasets: Split name to dataset. ``None`` values yield an empty set.
+
+    Returns:
+        Split name to the agent or task-source names its rows reference, for
+        every split without materialized task rows.
+    """
+    agent_names: dict[str, set[str]] = {}
+    for split, dataset in datasets.items():
+        try:
+            agent_names[split] = _iter_dataset_agent_names(dataset)
+        except ValueError:
+            continue
+    return agent_names
+
+
 def validate_dataset_agent_coverage(
     shard_set: NemoGymShardSet,
     datasets: Mapping[str, Any],
+    agent_names: Mapping[str, Collection[str]] | None = None,
 ) -> None:
     """Fail at setup if any row names a route no shard hosts.
 
@@ -3898,6 +3926,8 @@ def validate_dataset_agent_coverage(
             built at setup; an unsharded set is asked for its entries here.
         datasets: Split name to dataset, for the error message. ``None`` values
             and datasets without gym rows are skipped.
+        agent_names: Optional result of ``scan_dataset_agent_names`` for these
+            datasets. A split missing from it is scanned here.
 
     Raises:
         ShardSetupError: A split references routes no shard hosts.
@@ -3915,15 +3945,18 @@ def validate_dataset_agent_coverage(
             )
         )
     for split, dataset in datasets.items():
-        try:
-            referenced = _iter_dataset_agent_names(
-                dataset,
-                shard_set.environment_server_routes,
-            )
-        except ValueError as error:
-            raise ShardSetupError(
-                f"The {split} dataset failed NeMo-Gym validation: {error}"
-            ) from error
+        if agent_names is not None and split in agent_names:
+            referenced = set(agent_names[split])
+        else:
+            try:
+                referenced = _iter_dataset_agent_names(
+                    dataset,
+                    shard_set.environment_server_routes,
+                )
+            except ValueError as error:
+                raise ShardSetupError(
+                    f"The {split} dataset failed NeMo-Gym validation: {error}"
+                ) from error
         unhosted = sorted(referenced - hosted)
         if unhosted:
             raise ShardSetupError(
