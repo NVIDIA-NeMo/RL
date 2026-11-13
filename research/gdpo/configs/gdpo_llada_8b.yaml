@@ -114,6 +114,8 @@ policy:
     # Masked diffusion models decode a fixed-width canvas and keep no KV cache,
     # so rollouts run in the training workers rather than in vLLM/SGLang/TRT-LLM.
     backend: "automodel"
+    # Rollouts use the live LoRA weights, so nothing is refit; native refit is vLLM only.
+    lora_refit_mode: merged
     colocated:
       enabled: true
     max_new_tokens: 256
