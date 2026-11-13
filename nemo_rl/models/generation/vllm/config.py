@@ -26,7 +26,7 @@ from pydantic import (
 )
 
 from nemo_rl.models.generation import disagg_layout
-from nemo_rl.models.generation.dynamo.config import DynamoCfg
+from nemo_rl.models.generation.dynamo.config import DynamoCfg, dynamo_enabled
 from nemo_rl.models.generation.interfaces import (
     DisaggConfig,
     GenerationConfig,
@@ -1116,6 +1116,13 @@ def validate_vllm_disaggregation(config: VllmConfig) -> None:
             "sleeps the engines between rollouts, which drops the KV cache the "
             "connector hands between prefill and decode. Set colocated.enabled=false "
             "or generation.disaggregation.enabled=false."
+        )
+    if dynamo_enabled(config):
+        raise ValueError(
+            "PD disaggregation cannot be combined with policy.generation.dynamo=true: "
+            "the Dynamo frontend registers every engine and routes whole requests "
+            "to them, bypassing the prefill/decode frontends. Remove "
+            "policy.generation.dynamo or set generation.disaggregation.enabled=false."
         )
     if not vllm_cfg.get("async_engine") or not vllm_cfg.get("expose_http_server"):
         raise ValueError(

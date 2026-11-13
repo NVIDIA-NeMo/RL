@@ -264,9 +264,9 @@ policy:
         kv_load_failure_policy: fail
 ```
 
-vLLM-specific requirements, checked at setup: `colocated.enabled: false`,
-`async_engine` with `expose_http_server`, `pipeline_parallel_size: 1`, no
-`refit_transport` override, and, with in-flight weight updates
+vLLM-specific requirements, checked at setup: `colocated.enabled: false`, no Dynamo
+serving (`policy.generation.dynamo`), `async_engine` with `expose_http_server`,
+`pipeline_parallel_size: 1`, no `refit_transport` override, and, with in-flight weight updates
 (`grpo.async_grpo.in_flight_weight_updates`, or any SingleController run), neither
 `bidirectional_kv_xfer` nor `recompute_kv_cache_after_weight_updates`: vLLM's cache
 reset at the pause raises while a decode request still holds blocks for KV in transit,
