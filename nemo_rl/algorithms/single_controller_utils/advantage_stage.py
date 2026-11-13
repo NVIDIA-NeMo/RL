@@ -706,13 +706,13 @@ class AdvantageComputer:
         if self._train_data_dump is not None:
             assert request.train_step is not None
             dump_started = time.perf_counter()
+            # Raw columns stay jagged: the writer trims rows to input_lengths, so
+            # padding them here only for the writer to strip it costs 3x the data.
             sequences = {
-                "token_ids": tensor_field(data, INPUT_IDS),
+                "token_ids": data[INPUT_IDS],
                 "token_loss_mask": token_mask,
                 "advantages": advantages,
-                "generation_logprobs": tensor_field(
-                    data, adv_cfg.generation_logprobs_field
-                ),
+                "generation_logprobs": data[adv_cfg.generation_logprobs_field],
             }
             if cfg.policy_logprobs_required:
                 sequences["prev_logprobs"] = tensor_field(
