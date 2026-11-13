@@ -98,6 +98,38 @@ class TestBandMultiplier:
         assert _band_multiplier(30, self.CH) == pytest.approx(0.5)
         assert _band_multiplier(10_000, self.CH) == pytest.approx(0.5)
 
+    @pytest.mark.parametrize("field", ["a", "b", "f"])
+    @pytest.mark.parametrize(
+        "value", [float("nan"), float("inf"), float("-inf"), "invalid", True]
+    )
+    def test_invalid_channel_value_is_noop(self, field: str, value: object) -> None:
+        channel = {**self.CH, field: value}
+        assert _band_multiplier(15, channel) == 1.0
+
+    @pytest.mark.parametrize("floor", [-0.5, 1.5])
+    def test_out_of_range_floor_is_noop(self, floor: float) -> None:
+        assert _band_multiplier(15, {**self.CH, "f": floor}) == 1.0
+
+    @pytest.mark.parametrize(
+        ("length", "channel", "expected"),
+        [
+            (15, {"a": 10**400, "b": 10**400 + 20, "f": 0.5}, 1.0),
+            (10**400, {"a": 0, "b": 10**400, "f": 0.5}, 0.5),
+            (10**400 + 10, {"a": 10**400, "b": 10**400 + 20, "f": 0.5}, 0.75),
+            (0, {"a": -(10**400), "b": 10**400, "f": 0.5}, 0.75),
+        ],
+        ids=[
+            "below-large-start",
+            "at-large-end",
+            "inside-large-band",
+            "across-large-band",
+        ],
+    )
+    def test_finite_integer_bounds_keep_endpoint_and_interpolation_behavior(
+        self, length: int, channel: dict[str, int | float], expected: float
+    ) -> None:
+        assert _band_multiplier(length, channel) == pytest.approx(expected)
+
     def test_missing_or_malformed_channel_is_noop(self):
         assert _band_multiplier(100, None) == 1.0
         assert _band_multiplier(100, {}) == 1.0
@@ -107,6 +139,37 @@ class TestBandMultiplier:
 
 class TestProfileBandPerRow:
     """profile_band multipliers driven by per-row dataset metadata."""
+
+    @pytest.mark.parametrize("channel_name", ["total", "reasoning", "answer"])
+    @pytest.mark.parametrize(
+        "channel",
+        [
+            {"a": float("nan"), "b": 20, "f": 0.5},
+            {"a": 10, "b": float("inf"), "f": 0.5},
+            {"a": 10, "b": 20, "f": float("nan")},
+            {"a": 10, "b": 20, "f": -2.0},
+            {"a": 10, "b": 20, "f": 2.0},
+            {"a": "invalid", "b": 20, "f": 0.5},
+        ],
+        ids=[
+            "nan-start",
+            "infinite-end",
+            "nan-floor",
+            "negative-floor",
+            "inflated-floor",
+            "nonnumeric-start",
+        ],
+    )
+    def test_malformed_row_band_keeps_rewards_unchanged(
+        self, channel_name: str, channel: dict[str, object]
+    ) -> None:
+        results = [
+            make_result("r" * 15, "a" * 15, 1.0, band={channel_name: channel}),
+            make_result("r" * 25, "a" * 25, 0.0, band={channel_name: channel}),
+        ]
+        cfg = make_config(default={f"profile_band_{channel_name}": True})
+        apply(results, cfg)
+        assert rewards_of(results) == [1.0, 0.0]
 
     def test_total_channel_scales_correct_rollouts(self):
         band = {"total": {"a": 10, "b": 20, "f": 0.5}}
@@ -224,6 +287,15 @@ class TestProfileBandGlobalDefaults:
         ]
         apply(results, cfg)
         assert rewards_of(results) == pytest.approx([1.0, 1.0])
+
+    @pytest.mark.parametrize("field", ["a", "b"])
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_nonfinite_global_bounds_rejected(self, field: str, value: float) -> None:
+        channel = {"a": 10, "b": 20, "f": 0.5, field: value}
+        with pytest.raises(ValueError):
+            LengthPenaltyConfig.model_validate(
+                {"profile_band": {"enabled": True, "defaults": {"total": channel}}}
+            )
 
     def test_malformed_global_channel_rejected(self):
         # b <= a and f outside [0, 1] are config errors, caught at validation
