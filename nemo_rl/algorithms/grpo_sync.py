@@ -327,6 +327,9 @@ def validate_sync(
                     finish_generation=False,
                     task_to_env_override=val_task_to_env,
                     carry_keys=["total_reward", "turn_roles", "turn_contents"],
+                    # RL does not train on validation rollouts, so Gym captures none of their
+                    # model calls: a token-capture run stages nothing for them.
+                    skip_token_capture=True,
                 )
             )
             roles = driver_carry["turn_roles"]

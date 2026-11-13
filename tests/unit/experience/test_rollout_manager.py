@@ -56,6 +56,7 @@ from nemo_rl.experience.interfaces import (
     NEMO_GYM_GROUP_ATTEMPT_KEY,
     NEMO_GYM_GROUP_ID_KEY,
     NEMO_GYM_ROLLOUT_INDEX_KEY,
+    NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY,
     NEMO_GYM_TASK_INDEX_KEY,
     Completion,
     PromptGroupRecord,
@@ -1505,6 +1506,21 @@ def test_nemo_gym_build_inputs_stamps_logical_group_coordinates():
     assert [row[NEMO_GYM_GROUP_ATTEMPT_KEY] for row in rows] == [0, 0, 0]
     assert [row[NEMO_GYM_ROLLOUT_INDEX_KEY] for row in rows] == [0, 1, 2]
     assert [row["_rowidx"] for row in rows] == [0, 1, 2]
+
+
+def test_nemo_gym_build_inputs_removes_a_leftover_skip_mark():
+    # The single controller trains on every rollout it collects, so none skips capture.
+    impl = _nemo_gym_impl(True)
+    impl._num_generations_per_prompt = 2
+    extra_env_info = {
+        "responses_create_params": {},
+        NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY: True,
+    }
+
+    rows = impl._build_inputs({"extra_env_info": extra_env_info}, task_index=7)
+
+    assert [NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY in row for row in rows] == [False, False]
+    assert extra_env_info[NEMO_GYM_SKIP_TOKEN_CAPTURE_KEY] is True
 
 
 def test_nemo_gym_build_inputs_preserves_explicit_group_identity():

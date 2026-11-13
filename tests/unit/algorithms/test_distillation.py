@@ -692,6 +692,7 @@ def test_validate_uses_nemo_gym_rollout_when_enabled(mock_components):
     assert rollout_kwargs["max_rollout_turns"] is None
     assert rollout_kwargs["greedy"] is False
     assert rollout_kwargs["log_full_result_tables"] is False
+    assert rollout_kwargs["skip_token_capture"] is True
     mock_async_rollout.assert_not_called()
     mock_rollout.assert_not_called()
     assert val_metrics["accuracy"] == 1.0
