@@ -2013,6 +2013,89 @@ def test_clipped_pg_loss_entropy():
     )
 
 
+def test_clipped_pg_loss_skips_generation_diagnostics_when_unavailable():
+    cfg = ClippedPGLossConfig(
+        reference_policy_kl_penalty=0.0,
+        sequence_level_importance_ratios=True,
+        token_level_loss=False,
+    )
+    loss_fn = ClippedPGLossFn(cfg, generation_logprobs_available=False)
+    data, _, _, _ = _setup_clipped_pg_test_data(seq_len=3, device="cpu")
+    data["advantages"] = torch.tensor([[0.0, 1.0, -1.0]])
+    data["prev_logprobs"] = torch.tensor([[0.0, -1.0, -1.0]])
+
+    _, metrics = loss_fn(
+        next_token_logprobs=torch.tensor([[0.0, -0.9, -1.1]]),
+        data=data,
+        global_valid_seqs=torch.tensor(1.0),
+        global_valid_toks=torch.tensor(2.0),
+        shift_labels=False,
+    )
+
+    for name in (
+        "token_mult_prob_error",
+        "gen_kl_error",
+        "policy_kl_error",
+        "js_divergence_error",
+        "sampling_importance_ratio",
+        "approx_entropy",
+    ):
+        assert metrics[name] == 0.0
+
+
+@pytest.mark.parametrize("token_level", [False, True])
+@pytest.mark.parametrize("reference_penalty", [0.0, 0.01])
+@pytest.mark.parametrize("force_on_policy", [False, True])
+def test_clipped_pg_same_position_matches_padded_metadata(
+    token_level, reference_penalty, force_on_policy
+):
+    """shift_labels=False keeps every position, loss, metric and gradient."""
+    scores = torch.tensor([[-1.1, -2.2, -0.7], [-0.8, -1.7, -2.5]], requires_grad=True)
+    data = BatchedDataDict(
+        token_mask=torch.tensor([[1, 0, 1], [1, 1, 0]]),
+        sample_mask=torch.tensor([1.0, 0.5]),
+        advantages=torch.tensor([[1.0, -0.5, -1.0], [-0.4, 0.8, 0.5]]),
+        prev_logprobs=scores.detach() + 0.1,
+        generation_logprobs=scores.detach() - 0.2,
+        reference_policy_logprobs=scores.detach() + 0.3,
+    )
+    padded = BatchedDataDict(
+        {
+            key: torch.nn.functional.pad(value, (1, 0)) if value.ndim == 2 else value
+            for key, value in data.items()
+        }
+    )
+    loss_fn = ClippedPGLossFn(
+        ClippedPGLossConfig(
+            token_level_loss=token_level,
+            reference_policy_kl_penalty=reference_penalty,
+            force_on_policy_ratio=force_on_policy,
+            use_importance_sampling_correction=True,
+        )
+    )
+    kwargs = dict(
+        next_token_logprobs=scores,
+        global_valid_seqs=data["sample_mask"].sum(),
+        global_valid_toks=(data["token_mask"] * data["sample_mask"][:, None]).sum(),
+    )
+    expected_loss, expected_metrics = loss_fn(data=padded, **kwargs)
+    loss, metrics = loss_fn(data=data, shift_labels=False, **kwargs)
+    torch.testing.assert_close(loss, expected_loss)
+    assert metrics == pytest.approx(expected_metrics)
+    expected_grad = torch.autograd.grad(expected_loss, scores, retain_graph=True)[0]
+    grad = torch.autograd.grad(loss, scores)[0]
+    torch.testing.assert_close(grad, expected_grad)
+    assert grad[:, 0].abs().sum() > 0  # First-position targets must not be dropped.
+    assert not grad[~data["token_mask"].bool()].any()
+
+
+def test_clipped_pg_loss_rejects_importance_sampling_without_generation_logprobs():
+    cfg = ClippedPGLossConfig(use_importance_sampling_correction=True)
+
+    with pytest.raises(ValueError, match="requires generation logprobs"):
+        ClippedPGLossFn(cfg, generation_logprobs_available=False)
+
+
 def test_clipped_pg_loss_gspo():
     """Tests GSPO path in ClippedPGLossFn."""
     if not torch.cuda.is_available():

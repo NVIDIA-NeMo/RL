@@ -5844,6 +5844,18 @@ def test_grpo_train_preserves_advantages_when_clipping_disabled(
 
 
 @pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
+def test_grpo_train_reuses_rollouts_for_policy_iterations(
+    mock_grpo_components, train_func, monkeypatch
+):
+    master_config = mock_grpo_components["master_config"]
+    master_config.grpo.num_iterations = 2
+
+    _run_single_grpo_train_step(mock_grpo_components, train_func, monkeypatch)
+
+    assert mock_grpo_components["policy"].train.call_count == 2
+
+
+@pytest.mark.parametrize("train_func", [grpo_train, async_grpo_train])
 @pytest.mark.parametrize("policy", ["exclude", "include"])
 @pytest.mark.parametrize(
     ("mask_sample", "loss_multiplier", "expected_valid"),
