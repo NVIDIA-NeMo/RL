@@ -157,6 +157,11 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
     (when only netdevs were named, it becomes this host's ``rdma_rails()``),
     so a launcher never has to set them (some clusters inject ``UCX_TLS=tcp``
     and an ``eth0`` into every job). Replacing a set value logs a warning.
+    An unset ``UCX_MODULES`` becomes ``^fuse``: HPC-X's NCCL net plugin loads
+    HPC-X's UCX into every NCCL process, and its ``fuse`` module, loaded
+    ``RTLD_GLOBAL``, makes NIXL's bundled UCX bind into HPC-X's ``libucs`` and
+    lose its ``rc`` and CUDA transports (``NIXL_ERR_BACKEND``). NCCL keeps its
+    plugin; only UCX's monitoring filesystem is off.
     ``mooncake_cpu``: the MC_* knobs
     below. ``simple`` has no engine.
     MC_* values already present in the environment are left alone, so a launcher can
@@ -179,6 +184,9 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
         from nemo_rl.data_plane.nixl.errors import TransportPolicyError
         from nemo_rl.data_plane.nixl.nixl_io import check_rdma_only
 
+        # Before any UCX loads: a libucs_fuse dlopen'ed RTLD_GLOBAL by the
+        # HPC-X UCX that NCCL's net plugin pulls in hijacks NIXL's bundled UCX.
+        os.environ.setdefault("UCX_MODULES", "^fuse")
         tls = os.environ.get("UCX_TLS", "")
         try:
             check_rdma_only({"UCX_TLS": tls})

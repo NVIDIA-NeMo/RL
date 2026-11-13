@@ -218,6 +218,7 @@ def clean_env(monkeypatch):
     monkeypatch.setattr(os, "environ", dict(os.environ))
     monkeypatch.delenv("MC_ENABLE_DEST_DEVICE_AFFINITY", raising=False)
     monkeypatch.delenv("MC_STORE_MEMCPY", raising=False)
+    monkeypatch.delenv("UCX_MODULES", raising=False)
     monkeypatch.setattr(tq_env, "_engine_already_imported", lambda: None)
 
 
@@ -276,6 +277,16 @@ def test_nixl_defaults_ucx_to_rdma_only(clean_env, monkeypatch, preset):
     tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
     assert os.environ["UCX_TLS"] == (preset or "rc,cuda_copy,cuda_ipc,self,sm")
     assert "MC_ENABLE_DEST_DEVICE_AFFINITY" not in os.environ
+
+
+@pytest.mark.parametrize("preset", [None, "^fuse,cma"])
+def test_nixl_keeps_ucx_fuse_out(clean_env, monkeypatch, preset):
+    """HPC-X's RTLD_GLOBAL libucs_fuse hijacks NIXL's UCX; a launcher's value wins."""
+    monkeypatch.delenv("UCX_NET_DEVICES", raising=False)
+    if preset:
+        monkeypatch.setenv("UCX_MODULES", preset)
+    tq_env.configure_engine_env({**_mooncake_cfg(), "backend": "nixl"})
+    assert os.environ["UCX_MODULES"] == (preset or "^fuse")
 
 
 @pytest.mark.parametrize("injected", ["rc,tcp,self", "all"])
@@ -344,6 +355,7 @@ def test_ucx_swap_is_nixl_only(clean_env, fake_fabric, monkeypatch, cfg):
     maybe_configure_data_plane_env(cfg)
     assert os.environ["UCX_TLS"] == "tcp"
     assert os.environ["UCX_NET_DEVICES"] == "mlx5_0:1,eth0"
+    assert "UCX_MODULES" not in os.environ
 
 
 def test_raises_when_the_engine_was_already_imported(engine_imported, fake_fabric):
