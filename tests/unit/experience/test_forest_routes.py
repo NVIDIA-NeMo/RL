@@ -31,8 +31,8 @@ from nemo_gym.token_id_capture.staging.records import RolloutReceipt
 
 from nemo_rl.data_plane.tq_token_sink import TQTokenSink
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
-from nemo_rl.models.generation.vllm.vllm_worker_async import (
-    VllmAsyncGenerationWorkerImpl,
+from nemo_rl.models.generation.vllm.frontend import (
+    VllmHTTPFrontend,
 )
 from tests.unit.data_plane.token_capture_test_fixtures import _manifest
 from tests.unit.experience.test_logical_owner_finalization import (
@@ -86,7 +86,7 @@ def _segment(
             )
         request = _FakeRequest(ng_capture=admission, stream=False)
         prompt = prefix + [10, 11]
-        VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, prompt)
+        VllmHTTPFrontend._begin_request_capture(worker, request, prompt)
         payload = _served_content([12], [-0.25])
         # Old prefix routes deliberately disagree everywhere. Only its last
         # token may be overwritten; the new decode tail remains a sentinel.
@@ -99,9 +99,7 @@ def _segment(
             payload["choices"][0]["message"]["routed_experts"] = torch.tensor(
                 values, dtype=torch.int32
             ).reshape(-1, 1, 1)
-        result = VllmAsyncGenerationWorkerImpl._finish_request_capture(
-            worker, request, payload
-        )
+        result = VllmHTTPFrontend._finish_request_capture(worker, request, payload)
         assert result["ng_commit_coords"]["disposition"] == "staged"
         assert "routed_experts" not in result["choices"][0]["message"]
         assert "predecessor_tail_route" not in result["choices"][0]["message"]

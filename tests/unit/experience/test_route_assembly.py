@@ -42,8 +42,8 @@ from nemo_rl.experience.route_plan import (  # noqa: E402
     RouteAssemblyPlan,
     RouteSpan,
 )
-from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
-    VllmAsyncGenerationWorkerImpl,
+from nemo_rl.models.generation.vllm.frontend import (  # noqa: E402
+    VllmHTTPFrontend,
 )
 
 pytestmark = pytest.mark.nemo_gym
@@ -64,7 +64,7 @@ def _assemble(calls: list[tuple[torch.Tensor, int, int]]) -> torch.Tensor:
     spans, fragments = [], {}
     for index, (vllm_routes, prev_len, prompt_len) in enumerate(calls):
         payload = {"choices": [{"message": {"routed_experts": vllm_routes}}]}
-        staged = VllmAsyncGenerationWorkerImpl._delta_align_routed_experts(
+        staged = VllmHTTPFrontend._delta_align_routed_experts(
             payload,
             prev_len=prev_len,
             prompt_len=prompt_len,

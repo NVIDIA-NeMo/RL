@@ -556,6 +556,10 @@ def test_sync_sparse_refit_server_shutdown_cleans_transport_resources(
 async def test_async_sparse_refit_post_init_records_worker_locality() -> None:
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
     worker._sparse_refit_receiver = MagicMock()
+    worker.llm_async_engine_args = MagicMock()
+    worker.routed_experts_dtype = torch.int16
+    worker._reserved_socket = None
+    worker._reserved_node_ip = None
     worker.cfg = {"vllm_cfg": {"expose_http_server": False}}
     worker._mtp_load_from_disk = False
     worker._mtp_speculative_enabled = True

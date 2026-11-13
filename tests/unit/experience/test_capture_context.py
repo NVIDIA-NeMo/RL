@@ -313,32 +313,25 @@ async def test_worker_managed_root_clears_untrusted_prefix_and_keeps_media_check
     from types import SimpleNamespace
     from unittest.mock import MagicMock
 
-    from nemo_rl.models.generation.vllm.vllm_worker_async import (
-        VllmAsyncGenerationWorkerImpl,
+    from nemo_rl.models.generation.vllm.frontend import (
+        VllmHTTPFrontend,
     )
     from tests.unit.models.generation.test_vllm_chat_template_wiring import (
+        _BUILT,
         _build_server,
         _OnlineRenderer,
     )
 
     renderer = _build_server(monkeypatch, {})[0][0]
     renderer.renderer = SimpleNamespace()
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "token_capture", object(), raising=False
-    )
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "_capture_media", True, raising=False
-    )
+    monkeypatch.setattr(_BUILT["frontend"][0], "token_capture", object())
+    monkeypatch.setattr(_BUILT["frontend"][0], "_capture_media", True)
     capture_media = MagicMock(return_value=None)
     begin = MagicMock()
     fetch = MagicMock(side_effect=AssertionError("root must not fetch a prefix"))
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "_capture_request_media", capture_media
-    )
-    monkeypatch.setattr(VllmAsyncGenerationWorkerImpl, "_begin_request_capture", begin)
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "_resolve_admission_prefix", fetch
-    )
+    monkeypatch.setattr(VllmHTTPFrontend, "_capture_request_media", capture_media)
+    monkeypatch.setattr(VllmHTTPFrontend, "_begin_request_capture", begin)
+    monkeypatch.setattr(VllmHTTPFrontend, "_resolve_admission_prefix", fetch)
     prompt = {"prompt_token_ids": [10, 11]}
 
     async def render(self, **kwargs):

@@ -41,8 +41,8 @@ import torch
 from nemo_rl.data.captured_media import capture_processed_media
 from nemo_rl.models.generation.prefix_recovery import NoPrefixRecovery
 from nemo_rl.models.generation.vllm import utils as vllm_utils
-from nemo_rl.models.generation.vllm.vllm_worker_async import (
-    VllmAsyncGenerationWorkerImpl,
+from nemo_rl.models.generation.vllm.frontend import (
+    VllmHTTPFrontend,
     _AsyncLLMHTTPClient,
 )
 
@@ -50,7 +50,7 @@ from nemo_rl.models.generation.vllm.vllm_worker_async import (
 # recording list is bound explicitly rather than looked up through the instance.
 # A class attribute would be shadowed by the subclass and the construction would
 # be recorded somewhere the assertions never look.
-_BUILT: dict[str, list] = {"renderer": [], "chat": [], "tokenize": []}
+_BUILT: dict[str, list] = {"renderer": [], "chat": [], "tokenize": [], "frontend": []}
 
 
 def _recorder(slot: str):
@@ -219,31 +219,40 @@ class _AdmittedRequests:
         return self._admitted.get(id(request))
 
 
-def _build_server(monkeypatch, serving_chat_kwargs, *, capture_requests=(), app=None):
+def _build_server(
+    monkeypatch,
+    serving_chat_kwargs,
+    *,
+    capture_requests=(),
+    app=None,
+    capture_media=False,
+):
     """Run the real server setup and hand back the three consumer stubs."""
     _install_fake_vllm(monkeypatch)
 
-    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.cfg = {
+    cfg = {
         "temperature": 1.0,
         "top_p": 1.0,
         "vllm_cfg": {"http_server_serving_chat_kwargs": serving_chat_kwargs},
     }
-    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
-    worker._http_engine_client = MagicMock(
-        model_config="http-model-config", renderer="http-renderer"
-    )
-    worker.llm_async_engine_args = MagicMock()
-    worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
+    engine = MagicMock(model_config="http-model-config", renderer="http-renderer")
+    engine_args = MagicMock()
+    engine_args.create_model_config.return_value = MagicMock(
         served_model_name="served-model", model="model-path"
+    )
+    worker = VllmHTTPFrontend(
+        cfg,
+        engine_client=engine,
+        engine_args=engine_args,
+        engine_loop=MagicMock(),
+        routed_experts_dtype=torch.int16,
     )
     worker._capture_registry = _AdmittedRequests(
         {id(request): None for request in capture_requests}
     )
-    # Its hooks do nothing, as a worker without generation-prefix cuts.
-    worker._prefix_recovery = NoPrefixRecovery()
-    worker.routed_experts_dtype = torch.int16
 
+    worker._capture_media = capture_media
+    _BUILT["frontend"].append(worker)
     worker._setup_vllm_openai_api_server(app if app is not None else _FakeApp())
     assert _BUILT["chat"][0].kwargs["engine_client"] is worker._http_engine_client
     return _BUILT["renderer"], _BUILT["chat"], _BUILT["tokenize"]
@@ -255,7 +264,7 @@ def _serving_chat_without_capture_state(monkeypatch: Any) -> Any:
     serving = chats[0]
     serving.renderer = types.SimpleNamespace(tokenizer=None)
     monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl,
+        VllmHTTPFrontend,
         "_return_routed_experts_enabled",
         lambda _self: False,
     )
@@ -299,7 +308,7 @@ async def test_captured_chat_logprobs_bypass(
 ) -> None:
     """Drive the real serving MRO and retain engine-native arrays unchanged."""
     monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl,
+        VllmHTTPFrontend,
         "_return_routed_experts_enabled",
         lambda _self: False,
     )
@@ -756,32 +765,25 @@ def test_prefix_splice_remaps_image_once(monkeypatch, capture_media):
 
     monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", preprocess, raising=False)
     monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "_capture_media", capture_media, raising=False
-    )
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl,
+        VllmHTTPFrontend,
         "_capture_admission",
         lambda self, request: admission,
     )
     monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl,
+        VllmHTTPFrontend,
         "_resolve_admission_prefix",
         lambda self, admission: [10, 77, 31, 2],
     )
     monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl,
+        VllmHTTPFrontend,
         "_enter_request_prefix",
         lambda self, request, prefix: setattr(
             request, "required_prefix_token_ids", prefix
         ),
     )
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "_capture_request_media", capture
-    )
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "_begin_request_capture", MagicMock()
-    )
-    renderers, _, _ = _build_server(monkeypatch, {})
+    monkeypatch.setattr(VllmHTTPFrontend, "_capture_request_media", capture)
+    monkeypatch.setattr(VllmHTTPFrontend, "_begin_request_capture", MagicMock())
+    renderers, _, _ = _build_server(monkeypatch, {}, capture_media=capture_media)
     renderer = renderers[0]
     renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
     request = SimpleNamespace(required_prefix_token_ids=[10, 77, 31, 2])
@@ -822,21 +824,16 @@ def test_prefix_overflow_precedes_media_validation(
 
     monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", preprocess, raising=False)
     monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "_capture_media", False, raising=False
-    )
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "_capture_admission", lambda self, request: None
+        VllmHTTPFrontend, "_capture_admission", lambda self, request: None
     )
     capture = MagicMock(
         side_effect=ValueError("retiled media") if failure_stage == "capture" else None,
         return_value=None,
     )
     remap = MagicMock(side_effect=ValueError("retiled media"))
+    monkeypatch.setattr(VllmHTTPFrontend, "_capture_request_media", capture)
     monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "_capture_request_media", capture
-    )
-    monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async.remap_multimodal_placeholders",
+        "nemo_rl.models.generation.vllm.frontend.remap_multimodal_placeholders",
         remap,
     )
     renderers, _, _ = _build_server(monkeypatch, {}, app=app)
@@ -903,13 +900,10 @@ def test_restored_call_reaches_the_engine_with_the_remaining_budget(
 
     monkeypatch.setattr(_OnlineRenderer, "preprocess_chat", preprocess, raising=False)
     monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "_capture_media", False, raising=False
+        VllmHTTPFrontend, "_capture_admission", lambda self, r: admission
     )
     monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl, "_capture_admission", lambda self, r: admission
-    )
-    monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl,
+        VllmHTTPFrontend,
         "_resolve_admission_prefix",
         lambda self, admission: list(conversation),
     )
@@ -922,14 +916,14 @@ def test_restored_call_reaches_the_engine_with_the_remaining_budget(
         ),
     )
     monkeypatch.setattr(
-        VllmAsyncGenerationWorkerImpl,
+        VllmHTTPFrontend,
         "_enter_request_prefix",
         lambda self, request, prefix: setattr(
             request, "required_prefix_token_ids", prefix
         ),
     )
     begin = MagicMock()
-    monkeypatch.setattr(VllmAsyncGenerationWorkerImpl, "_begin_request_capture", begin)
+    monkeypatch.setattr(VllmHTTPFrontend, "_begin_request_capture", begin)
     renderers, _, _ = _build_server(monkeypatch, {}, app=app)
     renderer = renderers[0]
     renderer.renderer = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=2))
@@ -942,7 +936,7 @@ def test_restored_call_reaches_the_engine_with_the_remaining_budget(
     # vLLM may rebuild the prompt before it reaches the engine client.
     built = []
     monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async."
+        "nemo_rl.models.generation.vllm.frontend."
         "_build_restored_prefix_terminal_output",
         lambda request_id, finished: built.append(finished) or "finished output",
     )

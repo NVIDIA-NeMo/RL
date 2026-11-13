@@ -27,6 +27,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
@@ -61,6 +62,10 @@ from nemo_rl.models.generation.vllm.config import (
     normalize_nvfp4_pertoken_policy_config,
     normalize_vllm_refit_config,
 )
+from nemo_rl.models.generation.vllm.frontend import (
+    VllmHTTPFrontend,
+    _AsyncLLMHTTPClient,
+)
 from nemo_rl.models.generation.vllm.generation_cut_route import GENERATION_CUT_ROUTE
 from nemo_rl.models.generation.vllm.multi_api import MultiAPIServerPool
 from nemo_rl.models.generation.vllm.vllm_worker import (
@@ -71,7 +76,6 @@ from nemo_rl.models.generation.vllm.vllm_worker import (
 )
 from nemo_rl.models.generation.vllm.vllm_worker_async import (
     VllmAsyncGenerationWorkerImpl,
-    _AsyncLLMHTTPClient,
 )
 from nemo_rl.models.policy import LoRAConfig, PolicyConfig
 from nemo_rl.models.policy.draft_config import Eagle3DraftConfig
@@ -808,7 +812,7 @@ async def test_async_vllm_worker_stops_http_server_before_engine(
     calls = []
 
     class ServerThread:
-        def join(self) -> None:
+        def join(self, timeout=None) -> None:
             calls.append("server")
 
     class SparseRefitReceiver:
@@ -823,8 +827,15 @@ async def test_async_vllm_worker_stops_http_server_before_engine(
             calls.append("engine-shutdown")
 
     worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.server_thread = ServerThread()
-    worker.http_server = MagicMock()
+    worker._frontend = VllmHTTPFrontend(
+        {"vllm_cfg": {}},
+        engine_client=MagicMock(),
+        engine_args=MagicMock(),
+        engine_loop=MagicMock(),
+        routed_experts_dtype=torch.int16,
+    )
+    worker._frontend.server_thread = ServerThread()
+    worker._frontend.http_server = MagicMock()
     worker._sparse_refit_receiver = SparseRefitReceiver()
     worker.llm = Engine()
     worker._api_server_pool = None
@@ -843,8 +854,8 @@ async def test_async_vllm_worker_stops_http_server_before_engine(
 
     assert await worker.shutdown()
     assert calls == ["server", "sparse-refit", "engine-cleanup", "engine-shutdown"]
-    assert worker.http_server.should_exit is True
-    assert worker.server_thread is None
+    assert worker._frontend.http_server.should_exit is True
+    assert worker._frontend.server_thread is None
     assert worker.llm is None
 
 
@@ -855,20 +866,26 @@ async def test_failed_pool_does_not_update_owner_weight_version() -> None:
     pool.children = [MagicMock(is_alive=MagicMock(return_value=False))]
     pool.connections = [MagicMock()]
     worker._api_server_pool = pool
-    worker._rollout_weight_version = 3
+    worker._frontend = SimpleNamespace(_rollout_weight_version=3)
     with pytest.raises(RuntimeError, match="exited"):
         await pool.command("version", 4)
     with pytest.raises(RuntimeError, match="exited"):
         await worker.set_rollout_weight_version(4)
-    assert worker._rollout_weight_version == 3
+    assert worker._frontend._rollout_weight_version == 3
 
 
 @pytest.mark.asyncio
 async def test_worker_shutdown_cleans_up_an_unavailable_pool(monkeypatch) -> None:
     worker = object.__new__(VllmAsyncGenerationWorkerImpl)
-    worker._init_frontend_state()
-    worker.server_thread = MagicMock()
-    worker.http_server = MagicMock()
+    worker._frontend = VllmHTTPFrontend(
+        {"vllm_cfg": {}},
+        engine_client=MagicMock(),
+        engine_args=MagicMock(),
+        engine_loop=MagicMock(),
+        routed_experts_dtype=torch.int16,
+    )
+    worker._frontend.server_thread = MagicMock()
+    worker._frontend.http_server = MagicMock()
     worker._sparse_refit_receiver = None
     worker.llm = MagicMock(collective_rpc=AsyncMock())
     engine = worker.llm
@@ -890,8 +907,8 @@ async def test_worker_shutdown_cleans_up_an_unavailable_pool(monkeypatch) -> Non
         lambda: None,
     )
     assert await worker.shutdown()
-    assert worker.http_server.should_exit
-    assert worker.server_thread is None
+    assert worker._frontend.http_server.should_exit
+    assert worker._frontend.server_thread is None
     engine.collective_rpc.assert_not_awaited()
     engine.shutdown.assert_called_once_with()
     manager.shutdown.assert_called_once_with()
@@ -1290,8 +1307,7 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
         openai_serving_chat,
     ) = _install_fake_vllm_openai_modules(monkeypatch)
 
-    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.cfg = {
+    cfg = {
         "temperature": 1.0,
         "top_p": 1.0,
         "vllm_cfg": {
@@ -1302,11 +1318,17 @@ def test_vllm_async_http_server_loads_reasoning_parser_plugin(monkeypatch):
             },
         },
     }
-    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
-    worker._http_engine_client = worker.llm
     model_config = MagicMock(served_model_name="served-model", model="model-path")
-    worker.llm_async_engine_args = MagicMock()
-    worker.llm_async_engine_args.create_model_config.return_value = model_config
+    engine_args = MagicMock()
+    engine_args.create_model_config.return_value = model_config
+
+    worker = VllmHTTPFrontend(
+        cfg,
+        engine_client=MagicMock(model_config="model-config", renderer="renderer"),
+        engine_args=engine_args,
+        engine_loop=MagicMock(),
+        routed_experts_dtype=torch.int16,
+    )
 
     app = _FakeFastAPIApp()
     assert worker._setup_vllm_openai_api_server(app) is app
@@ -1368,8 +1390,7 @@ def _setup_fake_vllm_app(
         )
         serving_chat_cls = openai_serving_chat
 
-    worker = VllmAsyncGenerationWorkerImpl.__new__(VllmAsyncGenerationWorkerImpl)
-    worker.cfg = {
+    cfg = {
         "temperature": 1.0,
         "top_p": 1.0,
         "top_k": None,
@@ -1378,20 +1399,17 @@ def _setup_fake_vllm_app(
         "val_top_k": None,
         "vllm_cfg": {},
     }
-    worker.llm = MagicMock(model_config="model-config", renderer="renderer")
-    worker._http_engine_client = worker.llm
-    from nemo_rl.models.generation.prefix_recovery import (
-        CaptureRegistry,
-        NoPrefixRecovery,
+    engine_args = MagicMock()
+    engine_args.create_model_config.return_value = MagicMock(
+        served_model_name="served-model", model="model-path"
     )
 
-    worker._capture_registry = CaptureRegistry()
-    worker._prefix_recovery = NoPrefixRecovery()
-    worker._capture_top_logprobs = 0
-    worker.token_capture = None
-    worker.llm_async_engine_args = MagicMock()
-    worker.llm_async_engine_args.create_model_config.return_value = MagicMock(
-        served_model_name="served-model", model="model-path"
+    worker = VllmHTTPFrontend(
+        cfg,
+        engine_client=MagicMock(model_config="model-config", renderer="renderer"),
+        engine_args=engine_args,
+        engine_loop=MagicMock(),
+        routed_experts_dtype=torch.int16,
     )
 
     app = _FakeFastAPIApp()
@@ -1977,7 +1995,7 @@ def test_chat_disconnect_releases_capture_queued_for_finalization(
     ].ChatCompletionResponse
     serving_chat.create_chat_completion = AsyncMock(return_value=response_type())
     monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async."
+        "nemo_rl.models.generation.vllm.frontend."
         "model_dump_chat_response_with_dynamic_message_fields",
         lambda _response: {"choices": []},
     )

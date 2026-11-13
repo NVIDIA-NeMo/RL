@@ -17,7 +17,7 @@ import inspect
 import json
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 import torch
@@ -64,8 +64,8 @@ from nemo_rl.data_plane.tq_token_sink import (
 from nemo_rl.experience.rollout_reassembler import RolloutReassembler
 from nemo_rl.experience.route_assembly import verify_route_fragment_integrity
 from nemo_rl.models.generation.openai_server_utils import splice_prefix_tokens
-from nemo_rl.models.generation.vllm.vllm_worker_async import (
-    VllmAsyncGenerationWorkerImpl,
+from nemo_rl.models.generation.vllm.frontend import (
+    VllmHTTPFrontend,
 )
 
 pytestmark = pytest.mark.nemo_gym
@@ -172,7 +172,7 @@ def stage(
     }
     attachments = media.tensors
     if routes:
-        routed = VllmAsyncGenerationWorkerImpl._delta_align_routed_experts(
+        routed = VllmHTTPFrontend._delta_align_routed_experts(
             payload,
             prev_len=prev_len,
             prompt_len=len(prompt["prompt_token_ids"]),
@@ -745,7 +745,7 @@ def test_worker_restart_validates_retained_media(
         required_prefix_token_ids=prefix if inline else [],
         staging_chain=[] if inline else [root.staging_key],
     )
-    descriptor = VllmAsyncGenerationWorkerImpl._capture_request_media(
+    descriptor = VllmHTTPFrontend._capture_request_media(
         worker,
         engine_prompt(prefix + [50], [(Span(1, 2), a)]),
         admission=admission,
@@ -754,7 +754,7 @@ def test_worker_restart_validates_retained_media(
     assert descriptor.items == ()
     assert descriptor.tensors is None
     with pytest.raises(ValueError, match="Retained media"):
-        VllmAsyncGenerationWorkerImpl._capture_request_media(
+        VllmHTTPFrontend._capture_request_media(
             worker,
             engine_prompt(prefix + [50], [(Span(1, 2), torch.ones(3, 3, 2))]),
             admission=admission,
@@ -765,7 +765,7 @@ def test_worker_restart_validates_retained_media(
         with pytest.raises(
             MediaCaptureRejected, match="Retained processed media changed"
         ) as excinfo:
-            VllmAsyncGenerationWorkerImpl._capture_request_media(
+            VllmHTTPFrontend._capture_request_media(
                 worker,
                 engine_prompt(prefix + [50], [(Span(1, 2), a + 1)]),
                 admission=admission,
@@ -789,8 +789,13 @@ def test_worker_completion_stages_pixels_and_only_returns_capture_coordinates(
         "nemo_rl.experience.route_assembly.encode_routed_experts",
     ):
         monkeypatch.setattr(target, forbidden_codec)
-    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
-    worker._init_token_capture_state()
+    worker = VllmHTTPFrontend(
+        {"vllm_cfg": {}},
+        engine_client=MagicMock(),
+        engine_args=MagicMock(),
+        engine_loop=MagicMock(),
+        routed_experts_dtype=torch.int16,
+    )
     sink = TQTokenSink(
         dp,
         staging_partition="staging",
@@ -1149,13 +1154,11 @@ def test_worker_rejects_corrupt_media_metadata_before_capture(
         row[MEDIA_METADATA_DIGEST_FIELD] = row[MEDIA_METADATA_DIGEST_FIELD].float()
     capture = Mock(side_effect=AssertionError("corrupt metadata reached pixel capture"))
     monkeypatch.setattr(
-        "nemo_rl.models.generation.vllm.vllm_worker_async.capture_processed_media",
+        "nemo_rl.models.generation.vllm.frontend.capture_processed_media",
         capture,
     )
     with pytest.raises(MediaCaptureRejected, match="Invalid retained media metadata"):
-        VllmAsyncGenerationWorkerImpl._capture_request_media(
-            worker, prompt, admission=admission
-        )
+        VllmHTTPFrontend._capture_request_media(worker, prompt, admission=admission)
     capture.assert_not_called()
     assert all(
         not (set(read) & {*MEDIA_TENSOR_COLUMNS.values(), "routed_experts"})
@@ -1165,7 +1168,7 @@ def test_worker_rejects_corrupt_media_metadata_before_capture(
 
 def test_valid_media_metadata_checksum_needs_no_pixels_or_routes(retained_call):
     worker, admission, prompt, client = retained_call
-    result = VllmAsyncGenerationWorkerImpl._capture_request_media(
+    result = VllmHTTPFrontend._capture_request_media(
         worker, prompt, admission=admission
     )
     assert result.items == () and result.tensors is None
@@ -1180,9 +1183,7 @@ def test_worker_rejects_media_when_capture_disabled(retained_call):
     worker, admission, prompt, _ = retained_call
     worker._capture_media = False
     with pytest.raises(MediaCaptureRejected, match="requires media capture setup"):
-        VllmAsyncGenerationWorkerImpl._capture_request_media(
-            worker, prompt, admission=admission
-        )
+        VllmHTTPFrontend._capture_request_media(worker, prompt, admission=admission)
 
 
 def test_worker_bounds_cyclic_inline_chain_lookup(retained_call):
@@ -1196,9 +1197,7 @@ def test_worker_bounds_cyclic_inline_chain_lookup(retained_call):
     ]
     worker._staging_source = source
     with pytest.raises(MediaCaptureRejected, match="Cycle"):
-        VllmAsyncGenerationWorkerImpl._capture_request_media(
-            worker, prompt, admission=admission
-        )
+        VllmHTTPFrontend._capture_request_media(worker, prompt, admission=admission)
     assert source.fetch_for_finalization.call_count == 2
 
 
@@ -1220,9 +1219,7 @@ def test_worker_rejects_invalid_retained_call_chain(retained_call, field, value)
     )
     admission = admission.model_copy(update={"staging_chain": ["r0/c1"]})
     with pytest.raises(MediaCaptureRejected, match="Invalid retained media call chain"):
-        VllmAsyncGenerationWorkerImpl._capture_request_media(
-            worker, prompt, admission=admission
-        )
+        VllmHTTPFrontend._capture_request_media(worker, prompt, admission=admission)
 
 
 @pytest.mark.parametrize(
@@ -1239,9 +1236,7 @@ def test_worker_rejects_chain_that_disagrees_with_admission(
     worker, admission, prompt, _ = retained_call
     admission = admission.model_copy(update={"staging_chain": ["r0/c1"], field: value})
     with pytest.raises(MediaCaptureRejected, match="does not match capture admission"):
-        VllmAsyncGenerationWorkerImpl._capture_request_media(
-            worker, prompt, admission=admission
-        )
+        VllmHTTPFrontend._capture_request_media(worker, prompt, admission=admission)
 
 
 def test_worker_rejects_missing_retained_media_spans(retained_call):
@@ -1251,9 +1246,7 @@ def test_worker_rejects_missing_retained_media_spans(retained_call):
         fetch_for_finalization=lambda *a, **k: [replace(call, extras={})]
     )
     with pytest.raises(MediaCaptureRejected, match="media spans are missing"):
-        VllmAsyncGenerationWorkerImpl._capture_request_media(
-            worker, prompt, admission=admission
-        )
+        VllmHTTPFrontend._capture_request_media(worker, prompt, admission=admission)
 
 
 @pytest.fixture
@@ -1399,8 +1392,13 @@ async def test_retained_media_rejection_precedes_inference_and_survives_gym(
         prompt["prompt_token_ids"], [(Span(1, 2), torch.ones(3, 3, 2))]
     )
     _install_fake_vllm(monkeypatch)
-    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
-    worker._init_token_capture_state()
+    worker = VllmHTTPFrontend(
+        {"vllm_cfg": {}},
+        engine_client=MagicMock(),
+        engine_args=MagicMock(),
+        engine_loop=MagicMock(),
+        routed_experts_dtype=torch.int16,
+    )
     worker.__dict__.update(state.__dict__)
     worker.cfg = dict(
         temperature=1.0,
@@ -1801,7 +1799,7 @@ def test_worker_rejects_uncommitted_retained_offsets_before_splice(dp, reseal_me
     )
     expected = "extras commitment" if reseal_metadata else "metadata checksum mismatch"
     with pytest.raises(ValueError, match=expected):
-        VllmAsyncGenerationWorkerImpl._capture_request_media(
+        VllmHTTPFrontend._capture_request_media(
             worker,
             engine_prompt(
                 [10, 18, 18, 11, 31, 2, 50], [(Span(1, 2), torch.ones(3, 2, 3))]

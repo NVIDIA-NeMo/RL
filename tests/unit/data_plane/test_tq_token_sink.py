@@ -989,8 +989,8 @@ def _stage_example_through_vllm(
     when a refit lands while the call is in flight.
     """
     from nemo_rl.models.generation.openai_server_utils import replace_prefix_tokens
-    from nemo_rl.models.generation.vllm.vllm_worker_async import (
-        VllmAsyncGenerationWorkerImpl,
+    from nemo_rl.models.generation.vllm.frontend import (
+        VllmHTTPFrontend,
     )
     from tests.unit.models.generation.test_vllm_token_capture_hosting import (
         _FakeRequest,
@@ -1005,11 +1005,9 @@ def _stage_example_through_vllm(
     def call(record, request, prompt, **begin_kwargs):
         _, generated, logprobs = _split_delta(record)
         worker._rollout_weight_version = admitted_version
-        VllmAsyncGenerationWorkerImpl._begin_request_capture(
-            worker, request, prompt, **begin_kwargs
-        )
+        VllmHTTPFrontend._begin_request_capture(worker, request, prompt, **begin_kwargs)
         worker._rollout_weight_version = finished_version
-        content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+        content = VllmHTTPFrontend._finish_request_capture(
             worker, request, _served_content(generated, logprobs)
         )
         return content["ng_commit_coords"]

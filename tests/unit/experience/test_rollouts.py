@@ -3405,7 +3405,7 @@ def test_run_async_nemo_gym_rollout(
     """
     If the result here does not match, please check the following:
     1. In nemo_rl/experience/rollouts.py::run_async_nemo_gym_rollout, the sampling params are passed appropriately
-    2. In nemo_rl/models/generation/vllm/vllm_worker_async.py::VllmAsyncGenerationWorker::_setup_vllm_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
+    2. In nemo_rl/models/generation/vllm/frontend.py::VllmHTTPFrontend::_setup_vllm_openai_api_server::create_chat_completion, the sampling params (like top_k) are set as appropriate
     """
 
 

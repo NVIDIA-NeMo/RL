@@ -9,6 +9,7 @@ import json
 from collections import Counter
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -43,8 +44,8 @@ from nemo_rl.experience.route_plan import (  # noqa: E402
     encode_route_plan,
 )
 from nemo_rl.models.generation.vllm import utils as vllm_utils  # noqa: E402
-from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
-    VllmAsyncGenerationWorkerImpl,
+from nemo_rl.models.generation.vllm.frontend import (  # noqa: E402
+    VllmHTTPFrontend,
 )
 from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
     routed_experts_tensor_metadata,
@@ -112,8 +113,13 @@ def test_served_capture_bypasses_codec_through_route_consumers(
     dtype, prev_len, has_routes, has_sampler_topk, forbid_route_codec
 ):
     client = _StagingClient()
-    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
-    worker._init_token_capture_state()
+    worker = VllmHTTPFrontend(
+        {"vllm_cfg": {}},
+        engine_client=MagicMock(),
+        engine_args=MagicMock(),
+        engine_loop=MagicMock(),
+        routed_experts_dtype=torch.int16,
+    )
     worker._capture_top_logprobs = 2 if has_sampler_topk else 0
     worker.token_capture = RolloutTokenCapture(
         sink=TQTokenSink(client, staging_partition="staging"),
@@ -134,7 +140,7 @@ def test_served_capture_bypasses_codec_through_route_consumers(
     request = SimpleNamespace(
         ng_capture=admission, stream=False, logprobs=True, top_logprobs=2
     )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, prompt)
+    VllmHTTPFrontend._begin_request_capture(worker, request, prompt)
     prompt_routes = torch.arange((len(prompt) - 1) * 2, dtype=dtype).reshape(-1, 1, 2)
     prompt_routes[0, 0, 0] = -1
     generated_routes = torch.tensor([[[8, 9]]], dtype=dtype)
@@ -165,7 +171,7 @@ def test_served_capture_bypasses_codec_through_route_consumers(
         sampler_logprobs = torch.tensor([[-0.25, -1.5]], dtype=torch.float32)
         response.choices[0].message.sampler_topk_token_ids = sampler_ids
         response.choices[0].message.sampler_topk_logprobs = sampler_logprobs
-    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+    content = VllmHTTPFrontend._finish_request_capture(
         worker,
         request,
         vllm_utils.model_dump_chat_response_with_dynamic_message_fields(response),

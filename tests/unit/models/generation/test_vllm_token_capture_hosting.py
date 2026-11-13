@@ -12,13 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""S2 worker hosting: install_capture wiring, fan-outs, version stamping.
-
-Marked nemo_gym (run with ``--nemo-gym-only``): the hosting seam imports
-Gym's capture core. No engine or GPU is needed — the worker methods are
-driven unbound against light fakes, and the VllmGeneration fan-outs against
-a mock worker group.
-"""
+"""Frontend capture wiring, generation fan-outs, and weight-version stamping."""
 
 from __future__ import annotations
 
@@ -76,6 +70,11 @@ from nemo_rl.models.generation.prefix_recovery.state import (  # noqa: E402
     _FrozenCut,
     _RequestCaptureState,
 )
+from nemo_rl.models.generation.vllm.frontend import (  # noqa: E402
+    _CAPTURED_MODEL_CALL,
+    VllmHTTPFrontend,
+    _AsyncLLMHTTPClient,
+)
 from nemo_rl.models.generation.vllm.generation_cut_route import (  # noqa: E402
     GENERATION_CUT_ROUTE as RL_GENERATION_CUT_ROUTE,
 )
@@ -86,11 +85,6 @@ from nemo_rl.models.generation.vllm.utils import (  # noqa: E402
     extract_generation_logprobs,
 )
 from nemo_rl.models.generation.vllm.vllm_generation import VllmGeneration  # noqa: E402
-from nemo_rl.models.generation.vllm.vllm_worker_async import (  # noqa: E402
-    _CAPTURED_MODEL_CALL,
-    VllmAsyncGenerationWorkerImpl,
-    _AsyncLLMHTTPClient,
-)
 from nemo_rl.utils.routed_experts_codec import (  # noqa: E402
     routed_experts_tensor_metadata,
 )
@@ -154,14 +148,15 @@ class _NoCallsInVllm:
         return extract_generation_logprobs(token_ids, logprobs, start=start)
 
 
-def _fake_worker(*, is_model_owner: bool = True) -> VllmAsyncGenerationWorkerImpl:
-    """A real worker's token-capture state, minus the engine."""
-    worker = object.__new__(VllmAsyncGenerationWorkerImpl)
-    worker._init_token_capture_state()
-    worker.is_model_owner = is_model_owner
-    worker._http_engine_client = None
-    worker._api_server_pool = None
-    return worker
+def _fake_frontend() -> VllmHTTPFrontend:
+    """A frontend attached to a fake engine."""
+    return VllmHTTPFrontend(
+        {"vllm_cfg": {}},
+        engine_client=MagicMock(),
+        engine_args=MagicMock(),
+        engine_loop=MagicMock(),
+        routed_experts_dtype=torch.int16,
+    )
 
 
 def _cuts(
@@ -217,10 +212,10 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
             sink
         ),
     )
-    worker = _fake_worker()
+    worker = _fake_frontend()
 
     installed = asyncio.run(
-        VllmAsyncGenerationWorkerImpl.setup_token_capture(
+        VllmHTTPFrontend.setup_token_capture(
             worker,
             dp_cfg={"backend": "simple"},
             staging_partition="rollout_staging",
@@ -240,18 +235,21 @@ def test_setup_token_capture_installs_capture_with_vllm_adapter(monkeypatch):
     assert payload["required_prefix_token_ids"] == [1, 2]
 
 
-def test_setup_token_capture_skips_non_model_owners(monkeypatch):
-    worker = _fake_worker(is_model_owner=False)
+def test_setup_token_capture_skips_non_model_owners():
+    from nemo_rl.models.generation.vllm.vllm_worker_async import (
+        VllmAsyncGenerationWorkerImpl,
+    )
+
+    worker = SimpleNamespace(is_model_owner=False, _frontend=None)
     installed = asyncio.run(
         VllmAsyncGenerationWorkerImpl.setup_token_capture(
             worker, dp_cfg={}, staging_partition="rollout_staging", top_logprobs=0
         )
     )
     assert installed is None
-    assert worker.token_capture is None
 
 
-def test_weight_version_is_stamped_from_worker_state(monkeypatch):
+def test_weight_version_is_stamped_from_frontend_state(monkeypatch):
     """The install closure reads _rollout_weight_version live: a
     set_rollout_weight_version between calls changes the stamp."""
     sink = _MemorySink()
@@ -265,18 +263,18 @@ def test_weight_version_is_stamped_from_worker_state(monkeypatch):
             sink
         ),
     )
-    worker = _fake_worker()
+    worker = _fake_frontend()
     asyncio.run(
-        VllmAsyncGenerationWorkerImpl.setup_token_capture(
+        VllmHTTPFrontend.setup_token_capture(
             worker, dp_cfg={}, staging_partition="rollout_staging", top_logprobs=0
         )
     )
 
-    asyncio.run(VllmAsyncGenerationWorkerImpl.set_rollout_weight_version(worker, 4))
+    asyncio.run(VllmHTTPFrontend.set_rollout_weight_version(worker, 4))
     first = worker.token_capture.begin_call(
         CaptureAdmission(capture_key="r", model_call_id="c1", mode="text")
     )
-    asyncio.run(VllmAsyncGenerationWorkerImpl.set_rollout_weight_version(worker, 5))
+    asyncio.run(VllmHTTPFrontend.set_rollout_weight_version(worker, 5))
     second = worker.token_capture.begin_call(
         CaptureAdmission(capture_key="r", model_call_id="c2", mode="text")
     )
@@ -375,10 +373,10 @@ def test_prefix_capture_setup_requires_a_control_token(monkeypatch):
         "nemo_rl.data_plane.build_data_plane_client",
         lambda dp_cfg, bootstrap, segment_size=None: MagicMock(),
     )
-    worker = _fake_worker()
+    worker = _fake_frontend()
     with pytest.raises(ValueError, match="control bearer token"):
         asyncio.run(
-            VllmAsyncGenerationWorkerImpl.setup_token_capture(
+            VllmHTTPFrontend.setup_token_capture(
                 worker,
                 {},
                 "rollout_staging",
@@ -582,9 +580,7 @@ def _captured_text_call(
         ng_capture={"rollout_id": "r0", "model_call_id": model_call_id, "mode": "text"},
         stream=False,
     )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(
-        worker, request, list(prompt_token_ids)
-    )
+    VllmHTTPFrontend._begin_request_capture(worker, request, list(prompt_token_ids))
     return request
 
 
@@ -950,12 +946,12 @@ def test_only_the_call_record_touches_its_locks_and_fields():
     import inspect
 
     from nemo_rl.models.generation.prefix_recovery import recovery, restore, state
-    from nemo_rl.models.generation.vllm import progress_reader, vllm_worker_async
+    from nemo_rl.models.generation.vllm import frontend, progress_reader
 
     private = set(_RequestCaptureState.__slots__)
     owners = {"_RequestCaptureState", "_CallLifecycle"}
     offenders = []
-    for module in (state, recovery, restore, progress_reader, vllm_worker_async):
+    for module in (state, recovery, restore, progress_reader, frontend):
         for top in ast.parse(inspect.getsource(module)).body:
             if isinstance(top, ast.ClassDef) and top.name in owners:
                 continue
@@ -1257,10 +1253,10 @@ def _single_call_inventory(
 
 
 def _worker_with_capture(sink: _MemorySink):
-    """A real worker, minus the engine, with in-memory token capture."""
+    """A frontend attached to a fake engine with in-memory token capture."""
     from nemo_gym.token_id_capture.adapters.vllm import VLLMCaptureAdapter
 
-    worker = _fake_worker()
+    worker = _fake_frontend()
     worker._capture_sink = sink
     worker.token_capture = RolloutTokenCapture(
         sink=sink,
@@ -1281,7 +1277,7 @@ def test_capture_rejects_mismatched_http_topk(logprobs, top_logprobs):
     admission = CaptureAdmission(capture_key="r0", model_call_id="c1", mode="text")
 
     with pytest.raises(ValueError, match="top_logprobs=4 over HTTP"):
-        VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        VllmHTTPFrontend._begin_request_capture(
             worker, request, [10, 11], admission=admission
         )
     assert len(worker._capture_registry) == 0
@@ -1293,7 +1289,7 @@ def test_capture_accepts_matching_http_topk():
     request = SimpleNamespace(logprobs=True, top_logprobs=4)
     admission = CaptureAdmission(capture_key="r0", model_call_id="c1", mode="text")
 
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+    VllmHTTPFrontend._begin_request_capture(
         worker, request, [10, 11], admission=admission
     )
     assert request in worker._capture_registry
@@ -1360,9 +1356,7 @@ def test_request_capture_round_trip_stages_and_rides_coords(
         )
     if with_routed_experts:
         message["routed_experts"] = torch.zeros((5, 1, 1), dtype=torch.int16)
-    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
-        worker, request, content
-    )
+    content = VllmHTTPFrontend._finish_request_capture(worker, request, content)
     # Bytes were staged before the coords existed (fail-closed ordering).
     assert len(sink.records) == 1
     assert sink.records[0].token_ids_delta == [10, 11, 12, 13, 14]
@@ -1415,7 +1409,7 @@ def test_generation_cut_stages_prefix_then_terminal_row_replaces_it():
     assert sink.generation_prefix_records[0][1].token_ids_delta == [10, 11, 20, 21]
     assert list(state.snapshot().staging_keys) == sink.generation_prefix_keys
 
-    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+    content = VllmHTTPFrontend._finish_request_capture(
         worker,
         request,
         _served_content([20, 21, 22], [-0.1, -0.2, -0.3]),
@@ -1531,7 +1525,7 @@ def _active_call_inventory(
             },
             stream=False,
         )
-        VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10])
+        VllmHTTPFrontend._begin_request_capture(worker, request, [10])
         state = worker._capture_registry.get(request)
         if output_limit is not None:
             state.set_effective_output_limit(output_limit)
@@ -2053,7 +2047,7 @@ def test_unusable_restored_prefix_regenerates_instead_of_failing(failure, caplog
     assert served.generation_cut is None
     assert "regenerating it from its turn boundary" in caplog.text
     # The regenerated call is admitted as an ordinary call from its boundary.
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+    VllmHTTPFrontend._begin_request_capture(
         worker, request, [10], admission=served, prefix_token_ids=[]
     )
     assert list(worker._capture_registry.get(request).snapshot().staging_keys) == []
@@ -2083,7 +2077,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
         }
     )
     with pytest.raises(CaptureError, match="identity does not match admission"):
-        VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        VllmHTTPFrontend._begin_request_capture(
             resumed_worker,
             request,
             [10, 12, 13],
@@ -2094,7 +2088,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
             ),
             resumed_generation_token_ids=[12, 13],
         )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+    VllmHTTPFrontend._begin_request_capture(
         resumed_worker,
         request,
         [10, 12, 13],
@@ -2104,7 +2098,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
         resumed_generation_token_ids=[12, 13],
     )
     # Only the restore Gym accepted counts.
-    counts = VllmAsyncGenerationWorkerImpl.get_generation_prefix_counts(resumed_worker)
+    counts = VllmHTTPFrontend.get_generation_prefix_counts(resumed_worker)
     assert (counts["restored_calls"], counts["restored_prefix_tokens"]) == (1, 2)
     replays = []
 
@@ -2141,7 +2135,7 @@ def test_restored_generation_cut_is_extended_and_retired_on_completion(
     assert second_receipt.prefixes[0].staging_keys[0] == cut_key
     assert len(second_receipt.prefixes[0].staging_keys) == 2
 
-    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+    content = VllmHTTPFrontend._finish_request_capture(
         resumed_worker,
         request,
         _served_content([14], [-0.3]),
@@ -2188,15 +2182,11 @@ def test_request_capture_token_in_prev_len_chains_without_codec(monkeypatch, dty
         stream=False,
     )
     spliced_prompt = [10, 11, 12, 20, 21]  # exact prefix + fresh suffix
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(
-        worker, request, spliced_prompt
-    )
+    VllmHTTPFrontend._begin_request_capture(worker, request, spliced_prompt)
     content = _served_content([22], [-0.5])
     routes = torch.arange(12, dtype=dtype).reshape(6, 1, 2)
     content["choices"][0]["message"]["routed_experts"] = routes
-    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
-        worker, request, content
-    )
+    content = VllmHTTPFrontend._finish_request_capture(worker, request, content)
     coords = content["ng_commit_coords"]
     assert coords["parent_call_id"] == "c1"
     assert (coords["delta_len"], coords["cum_len"]) == (3, 6)
@@ -2221,13 +2211,11 @@ def test_request_capture_drops_routes_with_wrong_rank_or_length(routes, caplog):
         ng_capture={"capture_key": "r", "model_call_id": "c", "mode": "text"},
         stream=False,
     )
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [1, 2])
+    VllmHTTPFrontend._begin_request_capture(worker, request, [1, 2])
     content = _served_content([3], [-0.1])
     content["choices"][0]["message"]["routed_experts"] = routes
 
-    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
-        worker, request, content
-    )
+    content = VllmHTTPFrontend._finish_request_capture(worker, request, content)
 
     assert content["ng_commit_coords"]["disposition"] == "staged"
     assert sink.records[0].extras is None
@@ -2262,7 +2250,7 @@ def test_staging_chain_prefix_flows_through_adapter_and_begin_call():
     admission = worker._capture_admission(request)
     prefix = worker._resolve_admission_prefix(admission)
     worker._enter_request_prefix(request, prefix)
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+    VllmHTTPFrontend._begin_request_capture(
         worker,
         request,
         prefix + [20],
@@ -2314,10 +2302,8 @@ def test_staging_chain_cache_fetches_only_uncached_suffix():
     source = _MemoryPrefixSource({"r0/c1": [10, 11], "r0/c2": [12]})
     worker._chain_prefix.install(source)
 
-    first = VllmAsyncGenerationWorkerImpl._fetch_chain_prefix(worker, ["r0/c1"])
-    second = VllmAsyncGenerationWorkerImpl._fetch_chain_prefix(
-        worker, ["r0/c1", "r0/c2"]
-    )
+    first = VllmHTTPFrontend._fetch_chain_prefix(worker, ["r0/c1"])
+    second = VllmHTTPFrontend._fetch_chain_prefix(worker, ["r0/c1", "r0/c2"])
 
     assert first == [10, 11]
     assert second == [10, 11, 12]
@@ -2335,7 +2321,7 @@ def test_staging_chain_prefix_length_mismatch_is_rejected_by_begin_call():
     prefix = worker._resolve_admission_prefix(admission)
     assert prefix == [10, 11]
     with pytest.raises(CaptureError, match="does not equal prev_len 3"):
-        VllmAsyncGenerationWorkerImpl._begin_request_capture(
+        VllmHTTPFrontend._begin_request_capture(
             worker, request, prefix + [20], admission=admission, prefix_token_ids=prefix
         )
 
@@ -2351,9 +2337,7 @@ def test_staging_chain_admission_requires_the_resolved_prefix_keyword():
         CaptureError,
         match="requires the caller to pass the resolved prefix_token_ids",
     ):
-        VllmAsyncGenerationWorkerImpl._begin_request_capture(
-            worker, request, [10, 11, 12, 20]
-        )
+        VllmHTTPFrontend._begin_request_capture(worker, request, [10, 11, 12, 20])
 
     assert len(worker._capture_registry) == 0
 
@@ -2368,7 +2352,7 @@ def test_request_capture_is_a_noop_without_context_or_capture(
     if not capture_enabled:
         worker.token_capture = None
         plain.ng_capture = {"capture_key": "r0", "model_call_id": "c1", "mode": "text"}
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, plain, [1, 2])
+    VllmHTTPFrontend._begin_request_capture(worker, plain, [1, 2])
     content = _served_content([3], [-0.1])
     content["choices"][0]["message"].update(
         prompt_token_ids=[1, 2],
@@ -2377,7 +2361,7 @@ def test_request_capture_is_a_noop_without_context_or_capture(
         routed_experts=[[[0]]] * 3,
     )
     original = deepcopy(content)
-    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(worker, plain, content)
+    out = VllmHTTPFrontend._finish_request_capture(worker, plain, content)
     assert out == original
     assert len(worker._capture_registry) == 0
     assert sink.records == []
@@ -2411,14 +2395,12 @@ def test_request_capture_stages_topk_with_the_call():
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     request = _text_root_request()
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
+    VllmHTTPFrontend._begin_request_capture(worker, request, [10, 11, 12])
     content = _content_with_topk([13, 14], [-0.1, -0.2])
     ids = content["choices"][0]["message"]["sampler_topk_token_ids"]
     logprobs = content["choices"][0]["message"]["sampler_topk_logprobs"]
 
-    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
-        worker, request, content
-    )
+    content = VllmHTTPFrontend._finish_request_capture(worker, request, content)
 
     assert content["ng_commit_coords"]["disposition"] == "staged"
     assert len(sink.records) == 1
@@ -2440,9 +2422,9 @@ def test_request_capture_skips_topk_when_the_call_did_not_stage():
     sink = _RejectingSink()
     worker = _worker_with_capture(sink)
     request = _text_root_request()
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
+    VllmHTTPFrontend._begin_request_capture(worker, request, [10, 11, 12])
 
-    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+    content = VllmHTTPFrontend._finish_request_capture(
         worker, request, _content_with_topk([13], [-0.1])
     )
 
@@ -2456,7 +2438,7 @@ def test_request_capture_drops_topk_from_uncaptured_responses():
     worker = _worker_with_capture(sink)
     plain = _FakeRequest(stream=False)  # no ng_capture attribute
 
-    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+    out = VllmHTTPFrontend._finish_request_capture(
         worker, plain, _content_with_topk([3], [-0.1])
     )
 
@@ -2469,9 +2451,9 @@ def test_request_capture_missing_required_topk_fails_before_staging():
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     request = _text_root_request()
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
+    VllmHTTPFrontend._begin_request_capture(worker, request, [10, 11, 12])
     worker._capture_top_logprobs = 2
-    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+    out = VllmHTTPFrontend._finish_request_capture(
         worker, request, _served_content([13], [-0.1])
     )
     assert out["ng_commit_coords"]["disposition"] == "capture_failed"
@@ -2492,8 +2474,8 @@ def test_request_capture_topk_partial_write_returns_capture_failed():
     sink._store.put.side_effect = failed_put
     worker = _worker_with_capture(sink)
     request = _text_root_request()
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(worker, request, [10, 11, 12])
-    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+    VllmHTTPFrontend._begin_request_capture(worker, request, [10, 11, 12])
+    content = VllmHTTPFrontend._finish_request_capture(
         worker, request, _content_with_topk([13], [-0.1])
     )
     assert content["ng_commit_coords"]["disposition"] == "capture_failed"
@@ -2520,7 +2502,7 @@ def test_aborted_call_clears_its_rows_at_the_next_snapshot():
     worker = _worker_with_capture(sink)
     request = _cut_active_call(worker, sink)
 
-    assert VllmAsyncGenerationWorkerImpl._abort_request_capture(
+    assert VllmHTTPFrontend._abort_request_capture(
         worker, request, reason="client_disconnected", blocking=False
     )
     assert sink.cleared_generation_prefix_keys == []
@@ -2542,7 +2524,7 @@ def test_call_whose_terminal_staging_fails_clears_its_cut_rows():
     worker = _worker_with_capture(sink)
     request = _cut_active_call(worker, sink)
 
-    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+    content = VllmHTTPFrontend._finish_request_capture(
         worker,
         request,
         _served_content([20, 21, 22], [-0.1, -0.2, -0.3]),
@@ -2557,16 +2539,14 @@ def test_request_capture_abort_fails_the_call_and_drains_state():
     sink = _MemorySink()
     worker = _worker_with_capture(sink)
     request = _captured_text_call(worker, "c1", (1, 2))
-    VllmAsyncGenerationWorkerImpl._abort_request_capture(
-        worker, request, reason="engine_error"
-    )
+    VllmHTTPFrontend._abort_request_capture(worker, request, reason="engine_error")
     assert len(worker._capture_registry) == 0
     assert sink.records == []
     # A call that was never cut has no chunk rows to clear.
     _flush_retired_rows(worker)
     assert sink.cleared_generation_prefix_keys == []
     # A late finish after abort is a no-op (state already drained).
-    out = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+    out = VllmHTTPFrontend._finish_request_capture(
         worker, request, _served_content([3], [-0.1])
     )
     assert "ng_commit_coords" not in out
@@ -2596,7 +2576,7 @@ def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
         "get_hf_config",
         lambda self: SimpleNamespace(patch_size=2),
     )
-    worker = _fake_worker()
+    worker = _fake_frontend()
     worker.llm = SimpleNamespace(
         renderer=SimpleNamespace(get_mm_processor=lambda: SimpleNamespace(info=info)),
         model_config=SimpleNamespace(dtype=torch.bfloat16),
@@ -2608,13 +2588,13 @@ def test_omni_capture_setup_rejects_video_pruning(monkeypatch, pruning_rate):
     if pruning_rate:
         with pytest.raises(ValueError, match="video token pruning"):
             asyncio.run(
-                VllmAsyncGenerationWorkerImpl.setup_token_capture(
+                VllmHTTPFrontend.setup_token_capture(
                     worker, {}, staging_partition="staging", capture_media=True
                 )
             )
     else:
         spec = asyncio.run(
-            VllmAsyncGenerationWorkerImpl.setup_token_capture(
+            VllmHTTPFrontend.setup_token_capture(
                 worker, {}, staging_partition="staging", capture_media=True
             )
         )
@@ -2630,11 +2610,11 @@ def test_request_capture_text_call_in_media_run_stages_without_attachments():
     worker = _worker_with_capture(sink)
     request = _text_root_request()
     # A text-only call in a media-capture run adds no media tensors.
-    VllmAsyncGenerationWorkerImpl._begin_request_capture(
+    VllmHTTPFrontend._begin_request_capture(
         worker, request, [10, 11, 12], media=CapturedMedia((), None)
     )
 
-    content = VllmAsyncGenerationWorkerImpl._finish_request_capture(
+    content = VllmHTTPFrontend._finish_request_capture(
         worker, request, _served_content([13], [-0.1])
     )
 
@@ -2656,7 +2636,7 @@ def test_route_delta_preserves_actual_predecessor_tail(prev_len):
             }
         ]
     }
-    staged_routes = VllmAsyncGenerationWorkerImpl._delta_align_routed_experts(
+    staged_routes = VllmHTTPFrontend._delta_align_routed_experts(
         payload,
         prev_len=prev_len,
         prompt_len=5,

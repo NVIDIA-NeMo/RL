@@ -22,10 +22,12 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
-from nemo_rl.models.generation.vllm.vllm_worker_async import (
+from nemo_rl.models.generation.vllm.frontend import (
     _CAPTURED_MODEL_CALL,
-    VllmAsyncGenerationWorkerImpl,
     _AsyncLLMHTTPClient,
+)
+from nemo_rl.models.generation.vllm.vllm_worker_async import (
+    VllmAsyncGenerationWorkerImpl,
 )
 
 pytestmark = pytest.mark.vllm
@@ -109,9 +111,6 @@ def test_an_engine_without_output_processor_state_reports_nothing() -> None:
 def test_worker_combines_frontend_progress(
     local_capture: bool, multiple_frontends: bool
 ) -> None:
-    client = SimpleNamespace(
-        captured_call_progress=AsyncMock(return_value=[["owner", 20]])
-    )
     pool = SimpleNamespace(
         command=AsyncMock(
             return_value=[
@@ -122,9 +121,16 @@ def test_worker_combines_frontend_progress(
         )
     )
     worker = SimpleNamespace(
-        _http_engine_client=client if local_capture else None,
-        token_capture=object() if local_capture else None,
-        _rollout_weight_version=4,
+        _frontend=SimpleNamespace(
+            _rollout_weight_version=4,
+            captured_call_progress=AsyncMock(
+                return_value=(
+                    {"weight_version": 4, "calls": [["owner", 20]]}
+                    if local_capture
+                    else None
+                )
+            ),
+        ),
         _api_server_pool=pool if multiple_frontends else None,
     )
     result = asyncio.run(VllmAsyncGenerationWorkerImpl.captured_call_progress(worker))
@@ -144,9 +150,10 @@ def test_worker_combines_frontend_progress(
 
 def test_worker_rejects_mixed_frontend_weight_versions() -> None:
     worker = SimpleNamespace(
-        _http_engine_client=None,
-        token_capture=None,
-        _rollout_weight_version=4,
+        _frontend=SimpleNamespace(
+            _rollout_weight_version=4,
+            captured_call_progress=AsyncMock(return_value=None),
+        ),
         _api_server_pool=SimpleNamespace(
             command=AsyncMock(return_value=[{"weight_version": 3, "calls": []}])
         ),
