@@ -2,9 +2,10 @@
 #
 # NeMo Speech and Automodel main need transformers 5.18 and TransformerEngine
 # 2.19, which the root lock does not admit, so this project has its own lock.
-# Torch, CUDA libraries and indexes follow the root pyproject.toml so that
-# colocated refits share vLLM's Torch ABI; build sources for packages Automodel
-# main moved follow Automodel's pyproject.toml.
+# Torch, CUDA libraries and indexes follow the root automodel extra: its Torch
+# 2.13 writes the CUDA IPC handle version vLLM's Torch 2.14 opens for colocated
+# refits. Build sources for packages Automodel main moved follow Automodel's
+# pyproject.toml.
 
 [project]
 name = "speechlm-gspo-policy-env"
@@ -79,7 +80,7 @@ override-dependencies = [
 nemo-rl = { path = "../../../..", editable = true }
 speechlm-gspo = { path = "../..", editable = true }
 nemo-automodel = { git = "https://github.com/NVIDIA-NeMo/Automodel.git", rev = "752a71ebf731f84b19ca9af5e7c242be003082bd" }
-nemo-toolkit = { git = "https://github.com/NVIDIA-NeMo/Speech.git", rev = "732041d294dd432aea2bdca5e6b8bbac5c0fd356" }
+nemo-toolkit = { git = "https://github.com/NVIDIA-NeMo/Speech.git", rev = "079e48770098a4cffcf542a4bc974cafc84502a3" }
 mamba-ssm = { git = "https://github.com/akoumpa/cute-mamba.git", rev = "a8b8882fa03668613f7b06831950d504a03b647a" }
 deep_ep = { git = "https://github.com/deepseek-ai/DeepEP.git", rev = "96e3d1fc77be942438673e88b07be21d454af8a9" }
 megatron-fsdp = { git = "https://github.com/yuhezhang-ai/Megatron-LM.git", rev = "455389c480af6b3acdca74c7830c68b3274eb083", subdirectory = "megatron/core/distributed/fsdp/src" }

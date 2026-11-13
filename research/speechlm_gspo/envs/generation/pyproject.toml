@@ -38,8 +38,9 @@ environments = [
 preview = true
 default-groups = ["build"]
 link-mode = "copy"
-no-build-isolation-package = ["deep_gemm", "deep_ep"]
 override-dependencies = [
+  "flashinfer-jit-cache-sm110a==0.7.2.post1; platform_machine == 'aarch64'",
+  "flashinfer-jit-cache-sm121a==0.7.2.post1; platform_machine == 'aarch64'",
   "nvidia-cublas==13.5.1.27; sys_platform != 'darwin'",
   "nvidia-cudnn-cu13==9.26.0.51; sys_platform != 'darwin'",
   "nvidia-cudnn-frontend==1.25.0 ; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')",
@@ -47,12 +48,13 @@ override-dependencies = [
   "nvidia-nvshmem-cu13>=3.6.5; sys_platform != 'darwin'",
   "opencv-python-headless; sys_platform == 'never'",
   "av; sys_platform == 'never'",
+  "aisimulate; sys_platform == 'never'",
+  "kubernetes; sys_platform == 'never'",
   "timm<=1.0.22",
   "fastapi[standard]>=0.133.0,<0.137.0",
   "instanttensor>=0.1.9; platform_machine == 'x86_64'",
   "llguidance>=1.7.0,<1.8.0",
   "setuptools>=80.10.2",
-  "deep_ep @ git+https://github.com/deepseek-ai/DeepEP.git@17cfb817bccec3a9c247013360cc550c2bac441e",
   "xgrammar>=0.2.1,<1.0.0",
   "apache-tvm-ffi==0.1.11",
   "numpy>=2.1.0,<2.5",
@@ -62,12 +64,15 @@ override-dependencies = [
 [tool.uv.sources]
 nemo-rl = { path = "../../../..", editable = true }
 speechlm-gspo = { path = "../..", editable = true }
-nemo-toolkit = { git = "https://github.com/NVIDIA-NeMo/Speech.git", rev = "732041d294dd432aea2bdca5e6b8bbac5c0fd356" }
+nemo-toolkit = { git = "https://github.com/NVIDIA-NeMo/Speech.git", rev = "079e48770098a4cffcf542a4bc974cafc84502a3" }
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 triton = { index = "pytorch-cu130" }
 flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-cu130" }
+# The overrides above replace nemo-rl's requirements, so their index comes from here.
+flashinfer-jit-cache-sm110a = { index = "flashinfer-cu130" }
+flashinfer-jit-cache-sm121a = { index = "flashinfer-cu130" }
 
 [[tool.uv.index]]
 name = "pypi"
@@ -88,17 +93,3 @@ explicit = true
 name = "flashinfer-cu130"
 url = "https://flashinfer.ai/whl/cu130"
 explicit = true
-
-[tool.uv.extra-build-dependencies]
-deep_ep = [{ requirement = "torch", match-runtime = true }]
-deep_gemm = [{ requirement = "torch", match-runtime = true }]
-
-[[tool.uv.dependency-metadata]]
-name = "deep_ep"
-version = "1.2.1+17cfb81"
-requires-dist = ["torch", "packaging", "ninja"]
-
-[[tool.uv.dependency-metadata]]
-name = "deep_gemm"
-version = "2.5.0"
-requires-dist = ["torch", "packaging", "ninja"]
