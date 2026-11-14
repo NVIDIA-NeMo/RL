@@ -1465,7 +1465,7 @@ def _validate_algo_settings(master_config: MasterConfig) -> None:
         name
         for name, enabled in (
             (
-                "length_penalty",
+                "ppo.length_penalty",
                 master_config.ppo is not None
                 and getattr(algo_cfg, "length_penalty", None) is not None,
             ),
