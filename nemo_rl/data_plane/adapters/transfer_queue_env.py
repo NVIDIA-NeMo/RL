@@ -174,8 +174,10 @@ def configure_engine_env(cfg: DataPlaneConfig) -> None:
     the driver before ``init_ray``, and Ray hands the result to every worker.
 
     Raises:
-        TransportPolicyError: nixl, only if the UCX swap failed to make the
-            env RDMA-only (an internal invariant, not a launcher error).
+        TransportPolicyError: nixl, when ``UCX_NET_DEVICES`` names only
+            netdevs and this host has no active RDMA rail (a launcher or host
+            problem: the data plane has no RDMA device to run on), or if the
+            UCX swap failed to make the env RDMA-only (an internal invariant).
         RuntimeError: if a variable still needs setting but the engine is
             already imported, i.e. the value can no longer reach it. Fatal on
             purpose — the alternative is a run that looks configured and is not.
