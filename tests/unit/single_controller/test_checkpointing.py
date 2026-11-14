@@ -2489,6 +2489,7 @@ class TestPeriodicRolloutCheckpoint:
             "reason_missing_trainer_anchor",
             "reason_no_data_plane_mutations",
             "reason_optimizer_commit_in_progress",
+            "reason_shortfall_reconciliation_pending",
             "reason_timeout",
             "reason_trainer_state_changed",
         }
