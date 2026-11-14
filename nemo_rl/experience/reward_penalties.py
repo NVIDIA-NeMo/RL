@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 from nemo_rl.environments.nemo_gym_task import get_nemo_gym_task_input
 from nemo_rl.experience.metric_utils import calculate_single_metric
+from nemo_rl.utils.length_penalty import LengthPenaltyConfig, LengthPenaltyInput
 
 if TYPE_CHECKING:
     from nemo_rl.algorithms.grpo import RewardPenaltyConfig
@@ -156,17 +157,7 @@ class RewardChecks:
     duplicated_reasoning: bool
     empty_final_answer: bool
     low_effort: bool
-
-    def __post_init__(self) -> None:
-        if any(
-            type(value) is not bool
-            for value in (
-                self.duplicated_reasoning,
-                self.empty_final_answer,
-                self.low_effort,
-            )
-        ):
-            raise ValueError("reward checks must be booleans")
+    length_penalty: LengthPenaltyInput | None = None
 
 
 @dataclass(frozen=True)
@@ -223,6 +214,30 @@ class EffortRewardSettings:
 
 
 @dataclass(frozen=True)
+class LengthRewardSettings:
+    """Checkpoint projection of grpo.length_penalty.
+
+    Mirrors how effort is stored: the reward-affecting rules only, excluding the
+    logging-only ``verbose`` flag, so a logging change does not block resume.
+    ``rules`` is the config's ``exclude_unset`` dump, so an omitted agent-override
+    field keeps its inherited value rather than this model's default.
+    """
+
+    rules: dict[str, Any]
+
+    @classmethod
+    def from_configs(
+        cls, length_penalty: LengthPenaltyConfig | None
+    ) -> LengthRewardSettings | None:
+        """Project live length-penalty config to its checkpoint settings."""
+        if length_penalty is None:
+            return None
+        rules = length_penalty.model_dump(mode="json", exclude_unset=True)
+        rules.pop("verbose", None)
+        return cls(rules)
+
+
+@dataclass(frozen=True)
 class CaptureRewardSettings:
     """Semantic checkpoint identity; user-config extras are never persisted."""
 
@@ -233,6 +248,7 @@ class CaptureRewardSettings:
     # configured ones (None = inferred from the tokenizer, which is fixed per run).
     think_tag_ids: tuple[int | None, int | None] | None
     thinking_tags: tuple[str, ...] | None
+    length_penalty: LengthRewardSettings | None = None
 
     @classmethod
     def from_configs(
@@ -240,7 +256,19 @@ class CaptureRewardSettings:
         penalties: RewardPenaltyConfig,
         effort: EffortLevelsConfig | None,
         thinking_tags: Sequence[str] | None,
+        length_penalty: LengthPenaltyConfig | None = None,
     ) -> CaptureRewardSettings:
+        """Build the capture reward rules saved for checkpoint compatibility.
+
+        Args:
+            penalties: Configured token and text reward penalties.
+            effort: Optional low-effort shaping configuration.
+            thinking_tags: Resolved tag strings for the malformed-think-tag penalty.
+            length_penalty: Optional group length-adjustment configuration.
+
+        Returns:
+            Capture reward settings to persist and compare when restoring a run.
+        """
         unwanted: tuple[int, ...] = ()
         if penalties.penalize_unwanted_tokens:
             assert penalties.token_ids is not None
@@ -256,6 +284,7 @@ class CaptureRewardSettings:
             think_tag_ids = (
                 (ids.think_open, ids.think_close) if ids is not None else (None, None)
             )
+        length_settings = LengthRewardSettings.from_configs(length_penalty)
         return cls(
             tuple(spec.flag for spec in CAPTURE_PENALTIES if spec.enabled(penalties)),
             unwanted,
@@ -268,13 +297,14 @@ class CaptureRewardSettings:
             tuple(thinking_tags)
             if penalties.penalize_malformed_think_tag and thinking_tags
             else None,
+            length_settings,
         )
 
     def to_state(self) -> dict[str, Any]:
-        """Serialize version 1 using the existing config field names.
+        """Serialize capture reward rules to their checkpoint representation.
 
-        Think-tag rules appear only with the think-tag penalty, which version-1
-        sidecars could not record before (capture rejected it), so no migration.
+        Returns:
+            A versioned dictionary containing the saved reward settings.
         """
         penalties: dict[str, Any] = {flag: True for flag in self.enabled_penalties}
         token_ids: dict[str, Any] = {}
@@ -287,31 +317,34 @@ class CaptureRewardSettings:
         if self.thinking_tags is not None:
             penalties["thinking_tags"] = list(self.thinking_tags)
         return {
-            "version": 1,
+            "version": 2,
             "penalties": penalties,
             "effort": asdict(self.effort) if self.effort is not None else None,
+            "length_penalty": asdict(self.length_penalty)
+            if self.length_penalty is not None
+            else None,
         }
 
     @classmethod
     def from_state(cls, value: object) -> CaptureRewardSettings:
-        """Validate a version-1 record written by ``to_state``.
+        """Validate saved reward rules while accepting version-1 checkpoints.
 
-        Sidecars always write version 1; the live config never passes through
-        this path (see ``from_configs``). Existing model defaults fill absent
-        config fields. A future change to reward semantics must explicitly
-        version/migrate this projection.
+        Args:
+            value: A versioned capture reward-settings dictionary.
+
+        Returns:
+            Restored and validated capture reward settings.
         """
         # Config modules import this module for the shared calculations.
         from nemo_rl.algorithms.grpo import RewardPenaltyConfig
         from nemo_rl.experience.rollouts import EffortLevelsConfig
 
-        if not isinstance(value, dict) or set(value) != {
-            "version",
-            "penalties",
-            "effort",
+        required = {"version", "penalties", "effort"}
+        if not isinstance(value, dict) or not required <= set(value) <= required | {
+            "length_penalty"
         }:
             raise ValueError("invalid capture reward_settings record")
-        if type(value["version"]) is not int or value["version"] != 1:
+        if type(value["version"]) is not int or value["version"] not in (1, 2):
             raise ValueError(
                 f"unsupported capture reward_settings version={value['version']!r}"
             )
@@ -324,11 +357,28 @@ class CaptureRewardSettings:
         # An extra field on RewardPenaltyConfig; absent unless the think-tag
         # penalty was on, where from_configs rejects its absence.
         thinking_tags = value["penalties"].get("thinking_tags")
-        return cls.from_configs(penalties, effort, thinking_tags)
+        expected = required | ({"length_penalty"} if value["version"] == 2 else set())
+        if set(value) != expected:
+            raise ValueError("invalid capture reward_settings fields for version")
+        length_penalty = None
+        saved_length = value.get("length_penalty")
+        if saved_length is not None:
+            if (
+                not isinstance(saved_length, dict)
+                or set(saved_length) != {"rules"}
+                or not isinstance(saved_length["rules"], dict)
+            ):
+                raise ValueError("invalid length penalty reward settings")
+            length_penalty = LengthPenaltyConfig.model_validate(saved_length["rules"])
+        return cls.from_configs(penalties, effort, thinking_tags, length_penalty)
 
     def require_compatible(self, current: CaptureRewardSettings) -> None:
         """Reject changed reward rules with actionable field names."""
         differences = []
+        # Both are the reward-only projection (logging excluded), so a verbose-only
+        # change compares equal and does not block resume.
+        if self.length_penalty != current.length_penalty:
+            differences.append("grpo.length_penalty")
         for spec in CAPTURE_PENALTIES:
             if (spec.flag in self.enabled_penalties) != (
                 spec.flag in current.enabled_penalties
@@ -544,6 +594,11 @@ def aggregate_capture_reward_metrics(
     if not count:
         return {}
     result: dict[str, Any] = {"finalize/reward_count": float(count)}
+    for name, values in metrics.items():
+        if name.startswith("finalize/length_penalty/") and name.endswith("_sum"):
+            result[name.removeprefix("finalize/").removesuffix("_sum")] = (
+                sum(values) / count
+            )
     # finalize/penalty_count/*: summed over groups, then divided by valid rows.
     for category, metric in CAPTURE_PENALTY_METRICS.items():
         key = f"finalize/penalty_count/{category}"

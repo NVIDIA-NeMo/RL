@@ -2851,6 +2851,7 @@ def test_rollout_manager_consumes_stream_and_restores_input_order():
     }
     manager._tokenizer = None
     manager._effort_config = None
+    manager._length_penalty_config = None
     manager._results_to_completions = lambda results: (
         [result["value"] for result in results],
         {},
@@ -3002,6 +3003,7 @@ def test_rollout_manager_rejects_duplicate_stream_rows():
     }
     manager._tokenizer = None
     manager._effort_config = None
+    manager._length_penalty_config = None
 
     with pytest.raises(ValueError, match="duplicate row index 0"):
         asyncio.run(
@@ -3090,6 +3092,7 @@ def test_rollout_manager_rotates_replicas_and_reports_group_share():
     }
     manager._tokenizer = None
     manager._effort_config = None
+    manager._length_penalty_config = None
     manager._stats = None
 
     async def fake_stream_rows(
@@ -3484,6 +3487,7 @@ def test_restored_turn_is_dispatched_to_its_checkpoint_owner():
     }
     impl._tokenizer = None
     impl._effort_config = None
+    impl._length_penalty_config = None
 
     async def fake_stream_rows(environment, pending, results, shaping, *_a, **_k):
         selected.append(environment)

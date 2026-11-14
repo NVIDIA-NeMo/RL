@@ -1,0 +1,82 @@
+defaults: ../../grpo_math_1B_megatron_single_controller.yaml
+grpo:
+  num_prompts_per_step: 8
+  num_generations_per_prompt: 4
+  max_num_steps: 100
+  max_num_epochs: 10
+  length_penalty:
+    default:
+      length_type: all_generated_tokens
+      group_total_length_penalty_coeff: 0.2
+policy:
+  model_name: Qwen/Qwen3-1.7B
+  tokenizer:
+    name: Qwen/Qwen3-1.7B
+    chat_template_kwargs:
+      enable_thinking: false
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
+  max_total_sequence_length: 1024
+  megatron_cfg:
+    optimizer:
+      lr: 2.0e-06
+      min_lr: 2.0e-06
+      weight_decay: 0.0
+  generation:
+    max_new_tokens: 256
+    colocated:
+      resources:
+        gpus_per_node: 4
+    vllm_cfg:
+      expose_http_server: true
+      max_model_len: 1024
+      enforce_eager: true
+      skip_tokenizer_init: false
+      http_server_serving_chat_kwargs:
+        tool_parser: hermes
+loss_fn:
+  reference_policy_kl_penalty: 0.0
+async_rl:
+  max_buffered_rollouts: ${mul:${grpo.num_prompts_per_step}, 2}
+checkpointing:
+  checkpoint_dir: results/grpo-qwen3-1.7b-1n8g-megatron-vllm-gym-single-controller-length_penalty
+cluster:
+  gpus_per_node: 8
+data:
+  _override_: true
+  max_input_seq_length: 512
+  shuffle: false
+  num_workers: 0
+  use_multiple_dataloader: false
+  train:
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/workplace_assistant/data/example.jsonl
+  validation:
+    data_path: 3rdparty/Gym-workspace/Gym/resources_servers/workplace_assistant/data/example.jsonl
+  default:
+    processor: nemo_gym_data_processor
+    env_name: nemo_gym
+    prompt_file: null
+    system_prompt_file: null
+    dataset_name: NemoGymDataset
+env:
+  _override_: true
+  should_use_nemo_gym: true
+  should_log_nemo_gym_responses: true
+  should_mask_flagged_samples: true
+  nemo_gym:
+    is_trajectory_collection: false
+    config_paths:
+    - responses_api_models/vllm_model/configs/vllm_model_for_training.yaml
+    - resources_servers/workplace_assistant/configs/workplace_assistant.yaml
+    policy_model:
+      responses_api_models:
+        vllm_model:
+          uses_reasoning_parser: false
+          extra_body:
+            chat_template_kwargs:
+              enable_thinking: false
+logger:
+  log_dir: logs/grpo-qwen3-1.7b-1n8g-megatron-vllm-gym-single-controller-length_penalty
+  wandb:
+    project: nemo-rl
+    name: grpo-qwen3-1.7b-1n8g-megatron-vllm-gym-single-controller-length_penalty
