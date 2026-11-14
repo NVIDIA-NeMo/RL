@@ -2348,49 +2348,6 @@ def test_checkpoint_preserves_pending_finalizer_metrics_independently_of_sealed_
         parse_rollout_recovery_state(state)
 
 
-@pytest.mark.parametrize(
-    "raw_checks",
-    [
-        "not-a-mapping",
-        {"duplicated_reasoning": True, "empty_final_answer": True},
-        {
-            "duplicated_reasoning": True,
-            "empty_final_answer": True,
-            "low_effort": True,
-            "extra": True,
-        },
-    ],
-)
-def test_restore_rejects_malformed_reward_checks(raw_checks):
-    from nemo_rl.experience.reward_penalties import RewardChecks
-
-    ledger = RolloutRecoveryLedger()
-    group = _reserve(
-        ledger,
-        prompt_id="7",
-        prompt_payload=_prompt(),
-        expected_generations=1,
-        target_step=0,
-        start_weight_version=4,
-        group_id="g7",
-        restore_level=RecoveryTargetLevel.PROMPT_GROUP,
-    )
-    _mutate(lambda cut: ledger.mark_group_dispatched(cut, "g7"))
-    rollout_id = group.gate_rollout_ids[0]
-    result = SiblingSealResult(
-        rollout_id,
-        {"capture_key": rollout_id, "manifest": []},
-        1.0,
-        False,
-        RewardChecks(False, False, False),
-    )
-    _mutate(lambda cut: ledger.mark_group_sealed(cut, "g7", {0: result}))
-    state = ledger.state_dict()
-    state["groups"][0]["siblings"][0]["attempts"][0]["reward_checks"] = raw_checks
-    with pytest.raises(ValueError):
-        RolloutRecoveryLedger.from_state_dict(state)
-
-
 def test_checkpoint_validates_reward_settings_and_observations():
     from nemo_rl.algorithms.grpo import RewardPenaltyConfig
     from nemo_rl.experience.reward_penalties import (

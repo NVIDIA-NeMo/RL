@@ -225,16 +225,16 @@ class LengthRewardSettings:
 
     rules: dict[str, Any]
 
-
-def _length_reward_settings(
-    length_penalty: LengthPenaltyConfig | None,
-) -> LengthRewardSettings | None:
-    """Project live length-penalty config to its checkpoint settings."""
-    if length_penalty is None:
-        return None
-    rules = length_penalty.model_dump(mode="json", exclude_unset=True)
-    rules.pop("verbose", None)
-    return LengthRewardSettings(rules)
+    @classmethod
+    def from_configs(
+        cls, length_penalty: LengthPenaltyConfig | None
+    ) -> LengthRewardSettings | None:
+        """Project live length-penalty config to its checkpoint settings."""
+        if length_penalty is None:
+            return None
+        rules = length_penalty.model_dump(mode="json", exclude_unset=True)
+        rules.pop("verbose", None)
+        return cls(rules)
 
 
 @dataclass(frozen=True)
@@ -256,7 +256,7 @@ class CaptureRewardSettings:
         penalties: RewardPenaltyConfig,
         effort: EffortLevelsConfig | None,
         thinking_tags: Sequence[str] | None,
-        length_penalty: LengthPenaltyConfig | LengthRewardSettings | None = None,
+        length_penalty: LengthPenaltyConfig | None = None,
     ) -> CaptureRewardSettings:
         """Build the capture reward rules saved for checkpoint compatibility.
 
@@ -284,11 +284,7 @@ class CaptureRewardSettings:
             think_tag_ids = (
                 (ids.think_open, ids.think_close) if ids is not None else (None, None)
             )
-        length_settings = (
-            length_penalty
-            if isinstance(length_penalty, LengthRewardSettings)
-            else _length_reward_settings(length_penalty)
-        )
+        length_settings = LengthRewardSettings.from_configs(length_penalty)
         return cls(
             tuple(spec.flag for spec in CAPTURE_PENALTIES if spec.enabled(penalties)),
             unwanted,
@@ -373,7 +369,7 @@ class CaptureRewardSettings:
                 or not isinstance(saved_length["rules"], dict)
             ):
                 raise ValueError("invalid length penalty reward settings")
-            length_penalty = LengthRewardSettings(saved_length["rules"])
+            length_penalty = LengthPenaltyConfig.model_validate(saved_length["rules"])
         return cls.from_configs(penalties, effort, thinking_tags, length_penalty)
 
     def require_compatible(self, current: CaptureRewardSettings) -> None:
