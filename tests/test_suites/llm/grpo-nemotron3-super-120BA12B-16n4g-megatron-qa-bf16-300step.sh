@@ -44,7 +44,7 @@ assert_not_grep "FakeQuantWorker" "$RUN_LOG" \
 
 uv run --no-sync tests/check_metrics.py "$JSON_METRICS" \
     'data["train/num_valid_samples"]["1"] >= 64' \
-    'data["train/reward"]["1"] >= 0.4' \
+    'data["train/unfiltered_reward"]["1"] >= 0.4' \
     'data["train/gen_kl_error"]["1"] < 0.03' \
     'data["train/token_mult_prob_error"]["1"] < 1.05' \
     'data["validation/accuracy"]["1"] >= 0.5'
