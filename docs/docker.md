@@ -53,7 +53,7 @@ docker buildx build -f docker/Dockerfile \
 | Build argument | Default | Effect |
 |---|---|---|
 | `NRL_EXTRAS` | all extras | Only these extras are installed, and only the worker virtual environments that need no other extra are prefetched. An unknown name fails the build. |
-| `NRL_GROUPS` | all dependency groups | Only these dependency groups (for example `build`) are installed in the main virtual environment. |
+| `NRL_GROUPS` | all dependency groups | Dependency groups to install in the main virtual environment, for example `build`. `uv run` always installs the default groups (`dev`, `build`), so this can only leave out the others (`docs`, `test`). |
 
 The Rust toolchain is only installed when `sglang` is built.
 
