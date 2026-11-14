@@ -38,7 +38,9 @@ ARG HYBRID_EP_MULTINODE=1
 # every uv cache mount id includes all four. NVCC_THREADS is left out: it does not
 # change the wheel.
 ARG TORCH_CUDA_ARCH_LIST="9.0 10.0 10.3"
-ARG NVTE_CUDA_ARCHS=90;100;103
+# No 103 here: TE's 100 already builds its GB300 (103a) kernels, and a plain 103
+# fails TE's own family-arch check if TE is ever built from source.
+ARG NVTE_CUDA_ARCHS=90;100
 ARG FLASH_ATTN_CUDA_ARCHS
 ARG FLASH_MLA_DISABLE_SM90
 # Unprivileged runtime identity (for example the NeMo CI agent workloads) that owns the shared

@@ -92,19 +92,19 @@ Several dependencies compile CUDA code once per GPU architecture, and that is mo
 ```sh
 docker buildx build -f docker/Dockerfile \
     --build-arg TORCH_CUDA_ARCH_LIST=10.3 \
-    --build-arg NVTE_CUDA_ARCHS=103 \
+    --build-arg NVTE_CUDA_ARCHS=100 \
     --build-arg FLASH_ATTN_CUDA_ARCHS=100 \
     --build-arg FLASH_MLA_DISABLE_SM90=1 \
     --tag <registry>/nemo-rl:latest \
     .
 ```
 
-flash-attn has no separate GB300 target, so it stays at `100`.
+flash-attn has no separate GB300 target, so it stays at `100`. Transformer Engine's `100` already includes its GB300 (`103a`) kernels.
 
 | Build argument | Default | Read by |
 |---|---|---|
 | `TORCH_CUDA_ARCH_LIST` | `9.0 10.0 10.3` | PyTorch C++/CUDA extension builds such as DeepEP. Also kept in the image: the Megatron backend refuses to start without it, and Megatron-Core compiles a small extension at run time. |
-| `NVTE_CUDA_ARCHS` | `90;100;103` | Transformer Engine. |
+| `NVTE_CUDA_ARCHS` | `90;100` | Transformer Engine. |
 | `FLASH_ATTN_CUDA_ARCHS` | flash-attn's own default | flash-attn. |
 | `FLASH_MLA_DISABLE_SM90` | unset | FlashMLA. Set to `1` to skip its Hopper kernels. |
 | `NVCC_THREADS` | each package's own default (flash-attn `4`, FlashMLA `32`) | flash-attn and FlashMLA (threads per `nvcc` call). |
