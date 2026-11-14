@@ -307,6 +307,7 @@ project-includes = [
   "nemo_rl/models/generation/vllm/generation_cut_route.py",
   "nemo_rl/models/generation/vllm/lora_utils.py",
   "nemo_rl/models/generation/vllm/metric_names.py",
+  "nemo_rl/models/generation/vllm/multi_api.py",
   "nemo_rl/models/generation/vllm/patches.py",
   "nemo_rl/models/generation/vllm/progress_reader.py",
   "nemo_rl/models/generation/vllm/quantization/deepseek_v4_fp8.py",

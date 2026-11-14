@@ -136,7 +136,8 @@ def _install_fake_vllm(monkeypatch):
         return type(name, (), {})
 
     module(
-        "vllm.entrypoints.chat_utils", load_chat_template=MagicMock(return_value=None)
+        "vllm.renderers.chat_utils.chat_template",
+        load_chat_template=MagicMock(return_value=None),
     )
     module(
         "vllm.entrypoints.openai.chat_completion.protocol",

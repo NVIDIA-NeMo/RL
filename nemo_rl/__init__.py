@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import importlib.metadata
 import logging
 import os
 import sys
@@ -338,6 +339,30 @@ def patch_transformers_module_dir(
 
 
 patch_transformers_module_dir(os.environ, apply_to_current_interpreter=True)
+
+
+def use_per_torch_version_extension_dir(env_vars: dict[str, str]) -> None:
+    """Build torch JIT extensions in a folder of their own per torch version.
+
+    torch 2.14 leaves the build lock file in place after a build, and older torch
+    reads an existing lock file as a running build and waits on it forever. Worker
+    venvs with different torch versions would otherwise share one build folder.
+    """
+    try:
+        torch_version = importlib.metadata.version("torch")
+    except importlib.metadata.PackageNotFoundError:
+        return
+    root = env_vars.get("TORCH_EXTENSIONS_DIR") or os.path.expanduser(
+        "~/.cache/torch_extensions"
+    )
+    # A worker inherits the folder its parent chose for the parent's torch version.
+    folder = os.path.basename(root)
+    if folder.startswith("torch-") and folder[len("torch-") :][:1].isdigit():
+        root = os.path.dirname(root)
+    env_vars["TORCH_EXTENSIONS_DIR"] = os.path.join(root, f"torch-{torch_version}")
+
+
+use_per_torch_version_extension_dir(os.environ)
 
 
 # Install compatibility fixes before trust_remote_code model configurations are

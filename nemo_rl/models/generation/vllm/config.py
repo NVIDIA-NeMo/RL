@@ -37,6 +37,7 @@ from nemo_rl.models.generation.vllm.quantization.nvfp4_pertoken_config import (
     NvFp4PerTokenRolloutConfig,
     resolve_boundary_ignore_patterns,
 )
+from nemo_rl.models.generation.vllm.worker_utils import resolve_vllm_dp_size
 
 VllmRefitTransportName = Literal["s3", "zmq"]
 VllmRefitSelector = Literal["vllm_s3_sparse", "vllm_zmq_sparse", "nixl", "nccl_reshard"]
@@ -126,6 +127,9 @@ class VllmSpecificArgs(TypedDict):
     # Exposing vLLM as a server is useful in instances where the multi-turn rollout is performed with utilities outside of NeMo RL, but the user still wants to take advantage of the refit logic in NeMo RL that keeps the policy and generation up to date.
     # Currently it will expose the /tokenize and /v1/chat/completions endpoints. Later on we may expose /v1/completions or /v1/responses.
     expose_http_server: NotRequired[bool]
+    # Positive frontend process count sharing one engine and socket; 1
+    # keeps a single frontend. Multiple processes require async HTTP serving.
+    http_api_server_count: NotRequired[int]
     # Require `Authorization: Bearer <key>` on the exposed server's OpenAI routes
     # (/v1/* and /tokenize). VllmGeneration generates one random key per job, hands
     # it to the workers, and exposes it as `http_server_api_key` for the NeMo-Gym
@@ -353,6 +357,33 @@ def validate_vllm_async_actor_settings(config: VllmConfig) -> None:
     vllm_cfg = config.get("vllm_cfg")
     if vllm_cfg is None:
         return
+    api_server_count = vllm_cfg.get("http_api_server_count", 1)
+    if api_server_count < 1:
+        raise ValueError("http_api_server_count must be a positive integer")
+    if api_server_count > 1:
+        if not (vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")):
+            raise ValueError(
+                "Multiple API servers require async_engine=true and expose_http_server=true"
+            )
+        if config.get("refit_transport") in VLLM_SPARSE_REFIT_TRANSPORTS:
+            raise ValueError("Multiple HTTP API servers do not support sparse refit")
+        vllm_kwargs = config.get("vllm_kwargs") or {}
+        data_parallel_size = vllm_kwargs.get("data_parallel_size")
+        tp_size = vllm_cfg.get("tensor_parallel_size")
+        ep_size = vllm_cfg.get("expert_parallel_size")
+        if (
+            (data_parallel_size is not None and data_parallel_size != 1)
+            or vllm_kwargs.get("data_parallel_backend") == "ray"
+            or (
+                tp_size is not None
+                and ep_size is not None
+                and resolve_vllm_dp_size(tp_size, ep_size) != 1
+            )
+        ):
+            raise ValueError(
+                "Multiple HTTP API servers require local vLLM DP=1 and "
+                "data_parallel_backend other than 'ray'"
+            )
     if vllm_cfg.get("flat_logprobs") and not (
         vllm_cfg.get("async_engine") and vllm_cfg.get("expose_http_server")
     ):
