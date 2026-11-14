@@ -205,7 +205,8 @@ def multiprocess_metrics_reader(tmp_path, monkeypatch):
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(
             data_parallel_size=1, data_parallel_backend="mp"
-        )
+        ),
+        scheduler_config=SimpleNamespace(max_num_queued_reqs=None),
     )
     engine_args = SimpleNamespace(
         create_engine_config=lambda: config, disable_log_stats=False
@@ -217,8 +218,10 @@ def multiprocess_metrics_reader(tmp_path, monkeypatch):
             "ray.get_runtime_context", return_value=SimpleNamespace(namespace="test")
         ),
         patch(
-            "vllm.v1.engine.utils.get_engine_zmq_addresses",
-            return_value=SimpleNamespace(inputs=["ipc://owner", "ipc://child"]),
+            "vllm.v1.engine.utils.bind_engine_zmq_listeners",
+            return_value=Mock(
+                addresses=SimpleNamespace(inputs=["ipc://owner", "ipc://child"])
+            ),
         ),
         patch("vllm.v1.executor.abstract.Executor.get_class", return_value=object),
         patch(

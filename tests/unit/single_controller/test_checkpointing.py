@@ -934,6 +934,7 @@ def _actor_master_config(
             "train_global_batch_size": num_prompts_per_step * 2,
             "generation": {
                 "backend": "vllm",
+                "vllm_cfg": {"http_api_server_count": 1},
                 "top_k": None,
                 "top_p": 1.0,
                 "colocated": {"enabled": False},
