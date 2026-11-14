@@ -99,6 +99,7 @@ policy: &POLICY_BASE
         checkpoint:
           async_save: false
           ckpt_assume_constant_structure: false
+          parallel_read_threads: 4  # threads per rank reading torch_dist checkpoints; 1 = off
         force_reconvert_from_hf: False # Set to True to force reconvert of the model from Hugging Face
         empty_unused_memory_level: 0
         # Megatron-style manual GC: disable automatic Python GC and collect on every rank
@@ -154,6 +155,7 @@ policy: &POLICY_BASE
         flash_attention_version: 2
         bias_activation_fusion: True
         defer_fp32_logits: False
+        reuse_logits_storage: false
         fp32_lm_head: false # Emit fp32 logits from Megatron's LM head; must match policy.generation.vllm_cfg.fp32_lm_head.
         moe_per_layer_logging: False
         moe_enable_deepep: false
@@ -249,7 +251,7 @@ policy: &POLICY_BASE
             precision: ${...precision}
             kv_cache_dtype: "auto"
             logprobs_mode: processed_logprobs
-            fp32_lm_head: ${...megatron_cfg.fp32_lm_head} # Compute Nemotron-H logits with an fp32 LM head.
+            fp32_lm_head: ${...megatron_cfg.fp32_lm_head} # Compute vLLM logits with an fp32 LM head.
             # false: use NeMo-RL's legacy refit loader; true: opt into vLLM reload_weights.
             refit_with_reload_api: false
             tensor_parallel_size: 1
